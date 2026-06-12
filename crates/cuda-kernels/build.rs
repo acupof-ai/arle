@@ -624,6 +624,58 @@ const TRITON_GDR_RMS_NORM_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_
 const TRITON_GDR_RMS_NORM_SIGNATURE: &str = "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, \
      128, 128, 128, i32, 128, fp32, 128, 4, 1, 1, 1, \"swish\"";
 
+// ============================================================================
+// U3 — SGLang fused_moe decode lane (opt-in, `ARLE_QWEN35_MOE_FUSED_SGLANG`).
+// Three vendored Triton kernels, AOT-compiled to bf16 cubins:
+//   FM1  fused_moe_kernel, GEMM1 (gate||up): MUL_ROUTED_WEIGHT=0, top_k=8.
+//   FM2  fused_moe_kernel, GEMM2 (down):     MUL_ROUTED_WEIGHT=1, top_k=1.
+//   ACT  act_and_mul_kernel: silu(gate)*up over [M*top_k, 2N] -> [M*top_k, N].
+//   SUM  _moe_sum_reduce_kernel: [M, top_k, K] -> [M, K] x routed_scaling_factor.
+//
+// fused_moe_kernel param order (51 args) — bf16 specialization. Runtime args
+// kept in the C prototype: 7 pointers {a, b, c, topk_weights, sorted_token_ids,
+// expert_ids, num_tokens_post_padded} + 11 i32 scalars {N, K, EM,
+// num_valid_tokens, stride_am, stride_ak, stride_be, stride_bk, stride_bn,
+// stride_cm, stride_cn}. Baked: a_desc/b_desc/bias_ptr/a_scale_ptr/b_scale_ptr/
+// add_mask_ptr = `none` (triton DCEs the TMA + bias + quant branches), the
+// dead bias/scale strides = 0, group_n/group_k = 0 (no block-quant),
+// compute_type = "bf16", all quant flags + swap_ab + FUSE_* + c_sorted = 0,
+// even_Ks = 1 (K is a multiple of BLOCK_SIZE_K), filter_expert = 1,
+// ROUTER_TOPK = 8. Tiles: BLOCK_SIZE_M/N/K = 64/64/32, GROUP_SIZE_M = 1
+// (decode band, M*top_k <= 64 routed rows). num_warps=4, num_stages=3.
+//
+// The strides differ between GEMM1 and GEMM2, but they are RUNTIME args, so the
+// only constexpr difference is MUL_ROUTED_WEIGHT (0 vs 1) and top_k (8 vs 1) —
+// hence two cubins from one kernel source.
+const TRITON_FUSED_MOE_GEMM_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* a_ptr, const uint16_t* b_ptr, uint16_t* c_ptr, const float* topk_weights_ptr, const int32_t* sorted_token_ids_ptr, const int32_t* expert_ids_ptr, const int32_t* num_tokens_post_padded_ptr, int32_t N, int32_t K, int32_t EM, int32_t num_valid_tokens, int32_t stride_am, int32_t stride_ak, int32_t stride_be, int32_t stride_bk, int32_t stride_bn, int32_t stride_cm, int32_t stride_cn, CUstream stream";
+
+// FM1 — GEMM1 (gate||up): MUL_ROUTED_WEIGHT=0, top_k=8.
+const TRITON_FUSED_MOE_GEMM1_SIGNATURE: &str = "*bf16:16, none, *bf16:16, none, none, *bf16:16, none, none, *fp32:16, *i32:16, *i32:16, *i32:16, none, \
+     i32, i32, i32, i32, \
+     i32, i32, i32, i32, i32, 0, 0, i32, i32, 0, 0, 0, 0, 0, \
+     0, 0, 64, 64, 32, 1, 0, 8, \"bf16\", 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 8";
+
+// FM2 — GEMM2 (down): MUL_ROUTED_WEIGHT=1, top_k=1 (cache2 is already per-route).
+const TRITON_FUSED_MOE_GEMM2_SIGNATURE: &str = "*bf16:16, none, *bf16:16, none, none, *bf16:16, none, none, *fp32:16, *i32:16, *i32:16, *i32:16, none, \
+     i32, i32, i32, i32, \
+     i32, i32, i32, i32, i32, 0, 0, i32, i32, 0, 0, 0, 0, 0, \
+     0, 0, 64, 64, 32, 1, 1, 1, \"bf16\", 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 8";
+
+// ACT — act_and_mul_kernel: grid (M*top_k,), expert_step=1, BLOCK_SIZE=512,
+// ACTIVATION_TYPE="silu", SWIGLU_LIMIT=0.0, HAS_SWIGLU_LIMIT=False. Runtime:
+// {gateup_output, down_input, hidden_size, expert_ids_ptr}.
+const TRITON_FUSED_MOE_ACT_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* gateup_output, uint16_t* down_input, int32_t hidden_size, const int32_t* expert_ids_ptr, CUstream stream";
+const TRITON_FUSED_MOE_ACT_SIGNATURE: &str = "*bf16:16, *bf16:16, i32, *i32:16, \
+     1, 512, \"silu\", 0.0, 0";
+
+// SUM — _moe_sum_reduce_kernel: BLOCK_M=1, BLOCK_DIM=2048, NUM_STAGE=1,
+// num_warps=16, routed_scaling_factor baked from the loaded config (the Rust
+// dispatch asserts cfg.routed_scaling_factor == 1.0). Runtime: {input, 3 input
+// strides, output, 2 output strides, token_num, topk_num, hidden_dim}.
+const TRITON_FUSED_MOE_SUM_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* input_ptr, int32_t input_stride_0, int32_t input_stride_1, int32_t input_stride_2, uint16_t* output_ptr, int32_t output_stride_0, int32_t output_stride_1, int32_t token_num, int32_t topk_num, int32_t hidden_dim, CUstream stream";
+const TRITON_FUSED_MOE_SUM_SIGNATURE: &str = "*bf16:16, i32, i32, i32, *bf16:16, i32, i32, i32, i32, i32, \
+     1.0, 1, 2048, 1";
+
 /// Locate the directories the TileLang AOT generator needs for nvcc to
 /// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
 /// the cutlass headers it bundles, and the active CUDA toolkit include.
@@ -1565,7 +1617,7 @@ struct TritonAotKernelSpec {
     public_decl: &'static str,
 }
 
-fn triton_aot_kernels() -> [TritonAotKernelSpec; 3] {
+fn triton_aot_kernels() -> [TritonAotKernelSpec; 7] {
     [
         TritonAotKernelSpec {
             kernel_path: "tools/triton/kernels/arle_gdn_conv1d_update.py",
@@ -1593,6 +1645,43 @@ fn triton_aot_kernels() -> [TritonAotKernelSpec; 3] {
             num_warps: 1,
             num_stages: 1,
             public_decl: TRITON_GDR_RMS_NORM_PUBLIC_DECL,
+        },
+        // U3 SGLang fused_moe lane (opt-in ARLE_QWEN35_MOE_FUSED_SGLANG).
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_fused_moe.py",
+            kernel_name: "fused_moe_kernel",
+            out_base: "arle_fused_moe_gemm1",
+            signature: TRITON_FUSED_MOE_GEMM1_SIGNATURE,
+            num_warps: 4,
+            num_stages: 3,
+            public_decl: TRITON_FUSED_MOE_GEMM_PUBLIC_DECL,
+        },
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_fused_moe.py",
+            kernel_name: "fused_moe_kernel",
+            out_base: "arle_fused_moe_gemm2",
+            signature: TRITON_FUSED_MOE_GEMM2_SIGNATURE,
+            num_warps: 4,
+            num_stages: 3,
+            public_decl: TRITON_FUSED_MOE_GEMM_PUBLIC_DECL,
+        },
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_fused_moe_act.py",
+            kernel_name: "act_and_mul_kernel",
+            out_base: "arle_fused_moe_act",
+            signature: TRITON_FUSED_MOE_ACT_SIGNATURE,
+            num_warps: 4,
+            num_stages: 1,
+            public_decl: TRITON_FUSED_MOE_ACT_PUBLIC_DECL,
+        },
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_fused_moe_sum.py",
+            kernel_name: "_moe_sum_reduce_kernel",
+            out_base: "arle_fused_moe_sum",
+            signature: TRITON_FUSED_MOE_SUM_SIGNATURE,
+            num_warps: 16,
+            num_stages: 1,
+            public_decl: TRITON_FUSED_MOE_SUM_PUBLIC_DECL,
         },
     ]
 }
@@ -1864,8 +1953,9 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmS
                 build_triton_kernel(python, out_dir, &sm90_targets, spec, &mut generated_sources);
             }
             println!(
-                "cargo:warning=Triton AOT GDN lane: built sm_90 cubins for conv1d_update + \
-                 fused_recurrent_decode + rms_norm_gated (opt-in ARLE_QWEN35_SGL_GDN). \
+                "cargo:warning=Triton AOT lane: built sm_90 cubins for conv1d_update + \
+                 fused_recurrent_decode + rms_norm_gated (opt-in ARLE_QWEN35_SGL_GDN) and \
+                 fused_moe gemm1/gemm2 + act + sum (opt-in ARLE_QWEN35_MOE_FUSED_SGLANG). \
                  See tools/triton/README.md."
             );
         }

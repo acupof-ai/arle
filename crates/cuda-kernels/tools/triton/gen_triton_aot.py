@@ -35,6 +35,13 @@ Signature grammar (subset of triton's, sufficient for ARLE's GDN kernels):
   * `<int|float>`    a literal = baked constexpr; removed from the C prototype
                      and passed to the kernel as a compile-time constant.
   * `"<string>"`     a baked string constexpr (e.g. activation "swish").
+  * `none`           a baked `None` constexpr; removed from the C prototype.
+                     Triton treats a `None` constant specially: every
+                     `if <param> is not None` branch DCEs at compile time. Used
+                     to specialize away the optional pointer args of SGLang's
+                     fused_moe_kernel (a_desc/b_desc/bias_ptr/add_mask_ptr and
+                     the unused-on-bf16 scale ptrs) so the bf16 cubin carries no
+                     TMA/quant code.
 
 Argument ORDER in the signature string MUST match the kernel's parameter order;
 constexpr parameters appear in that same positional order as literals.
@@ -115,6 +122,8 @@ def _parse_signature(sig: str):
             descriptors.append(
                 {"kind": "pointer", "dtype": dtype.strip(), "divisibility": div}
             )
+        elif tok == "none" or tok == "None":
+            descriptors.append({"kind": "constexpr_none"})
         elif tok.startswith('"') and tok.endswith('"'):
             descriptors.append({"kind": "constexpr_str", "value": tok[1:-1]})
         elif tok in _SCALAR_CTYPE:
@@ -167,6 +176,9 @@ def _triton_signature_and_constants(fn, descriptors):
         elif kind == "constexpr_str":
             signature[name] = "constexpr"
             constants[name] = desc["value"]
+        elif kind == "constexpr_none":
+            signature[name] = "constexpr"
+            constants[name] = None
         else:  # pragma: no cover - defensive
             raise RuntimeError(f"unhandled descriptor kind {kind!r}")
     return signature, constants, divisibilities
