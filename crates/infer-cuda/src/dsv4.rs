@@ -2376,10 +2376,20 @@ impl Dsv4Model {
         // FlashMLA sparse forward per layer with per-row positions + branch
         // indices, zero ring writes (the kill of the per-row launch cost —
         // fast-path plan P1). `ARLE_DSV4_MTP_TREE_ATTN=0` falls back to the
-        // per-row ring-replay lane (the needle-validated reference). Chains
-        // stay on the validated per-row path either way.
+        // per-row ring-replay lane (the needle-validated reference).
+        // CHAIN-shaped spec verifies take this lane too under the commit fold
+        // (ckl's minimal scheme: top-1 chain prediction, candidates checked by
+        // comparison only — no wide rows) — but ONLY when the schedule carries
+        // populated branches: `SpecVerifySchedule::chain()` (re-forward /
+        // selftests) has empty ancestors and MUST stay per-row, both for the
+        // attention prefix and because the commit re-forward must WRITE rings.
         let tree_meta = match verify {
-            Some(sched) if seq_len > 1 && !sched.is_chain() && dsv4_mtp_tree_attn_enabled() => {
+            Some(sched)
+                if seq_len > 1
+                    && dsv4_mtp_tree_attn_enabled()
+                    && sched.ancestors.iter().skip(1).all(|a| !a.is_empty())
+                    && (!sched.is_chain() || dsv4_mtp_commit_fold_enabled()) =>
+            {
                 Some(crate::attention::Dsv4TreeAttnMeta::new(
                     &self.ctx,
                     &sched.positions,
