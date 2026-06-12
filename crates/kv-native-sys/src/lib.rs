@@ -184,6 +184,19 @@ pub fn remove_file(path: &Path, ignore_not_found: bool) -> io::Result<()> {
 }
 
 pub fn block_path(root: &Path, fingerprint: [u8; 16]) -> io::Result<PathBuf> {
+    let filename = block_filename(fingerprint);
+    Ok(root.join(filename))
+}
+
+pub fn block_path_sharded(root: &Path, fingerprint: [u8; 16]) -> io::Result<PathBuf> {
+    let filename = block_filename(fingerprint);
+    Ok(root
+        .join(&filename[0..2])
+        .join(&filename[2..4])
+        .join(filename))
+}
+
+fn block_filename(fingerprint: [u8; 16]) -> String {
     let mut filename = String::with_capacity(35);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in fingerprint.iter() {
@@ -191,7 +204,7 @@ pub fn block_path(root: &Path, fingerprint: [u8; 16]) -> io::Result<PathBuf> {
         filename.push(HEX[(byte & 0x0f) as usize] as char);
     }
     filename.push_str(".kv");
-    Ok(root.join(filename))
+    filename
 }
 
 pub fn write_block_atomic(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> io::Result<()> {
@@ -201,6 +214,18 @@ pub fn write_block_atomic(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> i
 
 pub fn write_block_cache(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> io::Result<()> {
     let path = block_path(root, fingerprint)?;
+    write_file_atomic_cache(&path, bytes)
+}
+
+pub fn write_block_cache_sharded(
+    root: &Path,
+    fingerprint: [u8; 16],
+    bytes: &[u8],
+) -> io::Result<()> {
+    let path = block_path_sharded(root, fingerprint)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     write_file_atomic_cache(&path, bytes)
 }
 
@@ -214,6 +239,15 @@ pub fn read_block_into(root: &Path, fingerprint: [u8; 16], dst: &mut Vec<u8>) ->
     read_file_into(&path, dst)
 }
 
+pub fn read_block_into_sharded(
+    root: &Path,
+    fingerprint: [u8; 16],
+    dst: &mut Vec<u8>,
+) -> io::Result<()> {
+    let path = block_path_sharded(root, fingerprint)?;
+    read_file_into(&path, dst)
+}
+
 /// Like [`read_block`] but returns an owning guard over the heap-allocated
 /// payload. The guard derefs to `&[u8]` and frees its buffer on `Drop`.
 pub fn read_block_owned(root: &Path, fingerprint: [u8; 16]) -> io::Result<KvNativeOwnedBytes> {
@@ -223,6 +257,15 @@ pub fn read_block_owned(root: &Path, fingerprint: [u8; 16]) -> io::Result<KvNati
 
 pub fn remove_block(root: &Path, fingerprint: [u8; 16], ignore_not_found: bool) -> io::Result<()> {
     let path = block_path(root, fingerprint)?;
+    remove_file(&path, ignore_not_found)
+}
+
+pub fn remove_block_sharded(
+    root: &Path,
+    fingerprint: [u8; 16],
+    ignore_not_found: bool,
+) -> io::Result<()> {
+    let path = block_path_sharded(root, fingerprint)?;
     remove_file(&path, ignore_not_found)
 }
 
@@ -1230,6 +1273,29 @@ mod tests {
 
         write_block_cache(dir.path(), fp, b"second-payload").unwrap();
         assert_eq!(read_block(dir.path(), fp).unwrap(), b"second-payload");
+    }
+
+    #[test]
+    fn cache_block_sharded_roundtrips_and_removes() {
+        let dir = tempdir().unwrap();
+        let fp = [0xABu8; 16];
+        write_block_cache_sharded(dir.path(), fp, b"payload").unwrap();
+
+        let path = block_path_sharded(dir.path(), fp).unwrap();
+        assert!(
+            path.starts_with(dir.path().join("ab").join("ab")),
+            "sharded path should use first two fingerprint bytes: {}",
+            path.display()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+
+        let mut scratch = Vec::new();
+        read_block_into_sharded(dir.path(), fp, &mut scratch).unwrap();
+        assert_eq!(scratch, b"payload");
+
+        remove_block_sharded(dir.path(), fp, false).unwrap();
+        assert!(!path.exists());
+        remove_block_sharded(dir.path(), fp, true).unwrap();
     }
 
     #[test]
