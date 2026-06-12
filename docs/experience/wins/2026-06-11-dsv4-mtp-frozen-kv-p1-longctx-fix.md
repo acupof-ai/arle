@@ -74,13 +74,16 @@ proven:
 
 ## Perf state
 
-Option A always-re-forwards the accepted prefix (correctness-first), so it is
-currently **net-negative**: pod 8×H20 depth-1 20.5 / depth-4 16.1 tok/s
-(deeper-is-slower; baseline no-spec ~44). The wall-clock win is the
-follow-up — **compressor-only commit** (drop the re-forward; the SW/FP8 KV is
-already written by the verify, only the compressor needs committing for the
-accepted prefix) + **batched s_q=K verify** (amortize the per-token attention)
-— both unblocked by the freeze. Tracked as the MTP perf axis.
+Correctness is banked; perf is open and the lever is **tokens accepted per
+verify forward (A)**, NOT forward cost. A decode forward is weight-read-bound:
+it costs ~the same whether it processes 1 query token or a whole tree, so the
+only thing that matters is how many *accepted* tokens come out of one forward.
+depth-1 linear gives A≈1.6 and depth-K linear breaks at the first wrong token —
+both too low, which is why they don't beat no-spec. Forward-cost tweaks
+(re-forward removal, `per_token_attn`/batched-attention) optimize a fixed cost
+and are not the lever. The real lever is a **topk≥2 draft tree verified in one
+forward** (topk=1 = the degenerate one-chain case), which raises A by giving
+multiple candidate paths. Tracked as the MTP perf axis.
 
 ## Rule
 
