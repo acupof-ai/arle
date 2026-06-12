@@ -1551,18 +1551,72 @@ impl Dsv4Model {
                 self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
                 hiddens.push(h);
             }
-            let mut argmax = Vec::with_capacity(n);
-            for i in 1..=n {
-                let tok = self.forward_stream_last_token(
-                    &stream,
-                    i,
-                    &params,
-                    position + (sched.positions[i - 1] - start_pos) as u64,
-                    None,
-                    &mut keepalive,
-                )?;
-                argmax.push(tok);
+            // Batched greedy extraction: fold every row's stream, ONE batched
+            // lm_head + ONE batched argmax + ONE D2H. The per-row
+            // forward_stream_last_token loop cost n lm_head GEMVs and n
+            // device syncs (~10 ms at n=7). Verify is definitionally greedy.
+            let hidden_size = self.config.hidden_size;
+            let eps = self.config.rms_norm_eps;
+            let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, n)? };
+            {
+                let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+                let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
+                for i in 0..n {
+                    crate::hc::head_hidden_from_stream(
+                        &self.ctx,
+                        &self.config,
+                        &self.head_hc,
+                        &stream,
+                        i,
+                        &mut last_hidden,
+                    )?;
+                    crate::ops::rms_norm_vec(
+                        &self.ctx,
+                        &last_hidden,
+                        &self.norm,
+                        eps,
+                        &mut last_normed,
+                    )?;
+                    let mut dst = head_normed
+                        .data
+                        .slice_mut(i * hidden_size..(i + 1) * hidden_size);
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&last_normed.data, &mut dst)
+                        .map_err(|e| anyhow!("DSv4 verify head row copy failed: {e}"))?;
+                }
             }
+            keepalive.keep_hidden(&head_normed);
+            let mut logits = unsafe { HiddenStates::uninit(&self.ctx, self.lm_head.rows, n)? };
+            self.lm_head_project_batch(&head_normed, &mut logits)?;
+            keepalive.keep_hidden(&logits);
+            let mut ids_dev = self
+                .ctx
+                .stream
+                .alloc_zeros::<i32>(n)
+                .map_err(|e| anyhow!("DSv4 verify argmax ids alloc failed: {e}"))?;
+            {
+                let (logits_ptr, _lg) = logits.data.device_ptr(&self.ctx.stream);
+                let (ids_ptr, _ig) = ids_dev.device_ptr_mut(&self.ctx.stream);
+                // SAFETY: logits [n, vocab] and ids [n] sized above.
+                unsafe {
+                    ffi::argmax_batch_cuda(
+                        logits_ptr as *const ffi::Half,
+                        ids_ptr as *mut i32,
+                        n as i32,
+                        self.lm_head.rows as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+            let ids: Vec<i32> = self
+                .ctx
+                .stream
+                .clone_dtoh(&ids_dev)
+                .map_err(|e| anyhow!("DSv4 verify argmax D2H failed: {e}"))?;
+            let argmax: Vec<u32> = ids.into_iter().map(|t| t as u32).collect();
+            let _ = &params;
             std::hint::black_box(keepalive.len());
             drop(keepalive);
             return Ok((argmax, hiddens));
