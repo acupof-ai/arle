@@ -330,6 +330,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) low_impact: bool,
 
+    /// Opt into the SSD/NVMe KV tier using the default local cache root.
+    #[arg(long, default_value_t = false)]
+    pub(crate) kv_ssd: bool,
+
     /// Opt into the SSD/NVMe KV tier root. The rewrite stack validates this
     /// request and fails closed until a backend exposes real SSD recall.
     #[arg(long, value_name = "DIR")]
@@ -339,8 +343,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
     pub(crate) kv_cache_dtype: ServeKvCacheDtypeArg,
 
-    /// Maximum bytes this serve process may use under --kv-ssd-path.
-    #[arg(long, value_parser = parse_positive_usize, requires = "kv_ssd_path")]
+    /// Maximum bytes this serve process may use under the SSD KV tier root.
+    #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) kv_ssd_max_bytes: Option<usize>,
 
     /// Host-RAM budget in bytes for the T1 prefix-KV tier (default-on:

@@ -253,14 +253,17 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
 }
 
 fn resolve_kv_ssd_options(serve_args: &ServeArgs) -> Result<ServeKvSsdOptions, String> {
-    if serve_args.kv_ssd_max_bytes.is_some() && serve_args.kv_ssd_path.is_none() {
-        return Err("--kv-ssd-max-bytes requires --kv-ssd-path".to_string());
-    }
+    let root = serve_args.kv_ssd_path.clone().or_else(|| {
+        (serve_args.kv_ssd || serve_args.kv_ssd_max_bytes.is_some())
+            .then(ServeKvSsdOptions::default_root)
+    });
 
     Ok(ServeKvSsdOptions {
-        root: serve_args.kv_ssd_path.clone(),
+        root,
         max_bytes: serve_args.kv_ssd_max_bytes,
-        high_performance_non_preemptive: serve_args.kv_ssd_path.is_some(),
+        high_performance_non_preemptive: serve_args.kv_ssd
+            || serve_args.kv_ssd_path.is_some()
+            || serve_args.kv_ssd_max_bytes.is_some(),
     })
 }
 
@@ -604,6 +607,52 @@ mod tests {
         assert_eq!(
             config.options.kv_ssd.root.as_deref(),
             Some(std::path::Path::new("/tmp/arle-kv"))
+        );
+        assert_eq!(config.options.kv_ssd.max_bytes, Some(1_073_741_824));
+        assert!(config.options.kv_ssd.high_performance_non_preemptive);
+    }
+
+    #[test]
+    fn kv_ssd_flag_uses_default_root() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--kv-ssd",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(
+            config.options.kv_ssd.root,
+            Some(ServeKvSsdOptions::default_root())
+        );
+        assert!(config.options.kv_ssd.high_performance_non_preemptive);
+    }
+
+    #[test]
+    fn kv_ssd_max_bytes_uses_default_root_without_path() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--kv-ssd-max-bytes",
+            "1073741824",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert_eq!(
+            config.options.kv_ssd.root,
+            Some(ServeKvSsdOptions::default_root())
         );
         assert_eq!(config.options.kv_ssd.max_bytes, Some(1_073_741_824));
         assert!(config.options.kv_ssd.high_performance_non_preemptive);
