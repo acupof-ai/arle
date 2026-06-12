@@ -415,6 +415,7 @@ unsafe extern "C" {
     pub fn diffusion_gemma_set_embed(
         model: *mut std::ffi::c_void,
         embed_id: i32,
+        lm_head_id: i32,
         final_norm_id: i32,
     );
     #[allow(clippy::too_many_arguments)]
@@ -481,6 +482,29 @@ unsafe extern "C" {
         out_sampled: *mut u32,
         out_argmax: *mut u32,
         out_entropy: *mut f32,
+    ) -> i32;
+    pub fn diffusion_gemma_generate(
+        model: *mut std::ffi::c_void,
+        prompt: *const i32,
+        prompt_len: i32,
+        max_new_tokens: i32,
+        canvas_len: i32,
+        max_steps: i32,
+        entropy_bound: f32,
+        confidence_threshold: f32,
+        t_min: f32,
+        t_max: f32,
+        stability_threshold: i32,
+        seed: u64,
+        stop_ids: *const u32,
+        stop_ids_len: i32,
+        out_tokens: *mut u32,
+        out_len: *mut i32,
+        out_finish: *mut i32,
+        out_blocks: *mut i32,
+        out_steps: *mut i32,
+        out_forced: *mut i32,
+        out_adaptive: *mut i32,
     ) -> i32;
 
     // === Compiled Qwen3.5 model ===
