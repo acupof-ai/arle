@@ -2520,6 +2520,62 @@ impl Dsv4SpecRingSnapshot {
     }
 }
 
+/// Device-side draft-tree topology for ONE spec-verify forward: per-row
+/// absolute positions (`start_pos + depth`, repeats across siblings) and
+/// per-row branch ancestors as flattened chunk-row indices (`[n, max_anc]`,
+/// root included, self implicit, -1 padded). Feeds the positions-array
+/// prepare-QK/inverse-RoPE kernels and `arle_flashmla_tree_build_indices`,
+/// so ONE batched forward verifies the whole tree with every row attending
+/// exactly its own branch — no ring writes, no per-row replay.
+pub(crate) struct Dsv4TreeAttnMeta {
+    pub(crate) positions: CudaSlice<i32>,
+    pub(crate) ancestors: CudaSlice<i32>,
+    pub(crate) max_anc: usize,
+    pub(crate) n_rows: usize,
+}
+
+impl Dsv4TreeAttnMeta {
+    /// Upload host topology. `ancestors[r]` lists row r's branch chunk-rows
+    /// shallow→deep (root included, self excluded).
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        positions: &[usize],
+        ancestors: &[Vec<usize>],
+    ) -> Result<Self> {
+        let n = positions.len();
+        ensure!(
+            n > 0 && ancestors.len() == n,
+            "DSv4 tree meta shape mismatch: positions={} ancestors={}",
+            n,
+            ancestors.len()
+        );
+        let max_anc = ancestors.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let pos_host: Vec<i32> = positions
+            .iter()
+            .map(|&p| i32::try_from(p).map_err(|_| anyhow!("DSv4 tree position {p} overflows i32")))
+            .collect::<Result<_>>()?;
+        let mut anc_host = vec![-1i32; n * max_anc];
+        for (r, chain) in ancestors.iter().enumerate() {
+            for (j, &a) in chain.iter().enumerate() {
+                ensure!(a < n, "DSv4 tree ancestor row {a} out of {n} rows");
+                anc_host[r * max_anc + j] = a as i32;
+            }
+        }
+        Ok(Self {
+            positions: ctx
+                .stream
+                .clone_htod(&pos_host)
+                .map_err(|e| anyhow!("DSv4 tree positions H2D failed: {e}"))?,
+            ancestors: ctx
+                .stream
+                .clone_htod(&anc_host)
+                .map_err(|e| anyhow!("DSv4 tree ancestors H2D failed: {e}"))?,
+            max_anc,
+            n_rows: n,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paged_attention(
     ctx: &DeviceContext,
@@ -4231,9 +4287,10 @@ fn try_flashmla_prefill_attention(
     q_prepared: &HiddenStates,
     k_prepared: &HiddenStates,
     selected: Option<&CudaSlice<i32>>,
-    compressed: &HiddenStates,
+    compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
     start_pos: usize,
+    tree: Option<&Dsv4TreeAttnMeta>,
     tp: &TpRuntime,
     local_heads: usize,
     local_attn: &mut HiddenStates,
@@ -4250,7 +4307,10 @@ fn try_flashmla_prefill_attention(
     if q_prepared.seq_len <= 1 {
         return Ok(false);
     }
-    if mode == DeepSeekV4AttentionMode::SlidingWindow {
+    // Pure-SW layers go through this path ONLY for tree-verify chunks (the
+    // unified pool degenerates to [SW cache | chunk K] and the tree indices
+    // carry the branch mask); plain prefill keeps the cheaper contiguous swa.
+    if mode == DeepSeekV4AttentionMode::SlidingWindow && tree.is_none() {
         return Ok(false);
     }
     ensure!(
@@ -4266,6 +4326,13 @@ fn try_flashmla_prefill_attention(
     );
 
     let token_count = q_prepared.seq_len;
+    if let Some(meta) = tree {
+        ensure!(
+            meta.n_rows == token_count,
+            "DSv4 tree meta rows {} != verify rows {token_count}",
+            meta.n_rows
+        );
+    }
     let tp_world = tp.config().world_size;
     let tp_rank = tp.config().rank;
     let global_heads = local_heads
@@ -4276,15 +4343,21 @@ fn try_flashmla_prefill_attention(
         "DSv4 FlashMLA prefill requires global heads 64/128, got {global_heads}"
     );
 
-    let compressed_count = compressed.seq_len;
+    let compressed_count = compressed.map_or(0, |c| c.seq_len);
     let max_compressed_keys = match mode {
         DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
         DeepSeekV4AttentionMode::HybridCompressed => compressed_count.div_ceil(128) * 128,
-        DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+        // Tree-only: no compressed region in the unified pool.
+        DeepSeekV4AttentionMode::SlidingWindow => 0,
     };
+    // Tree rows attend committed-window + branch + compressed: the branch part
+    // (<= max_anc + 1 <= 128) needs its own padded slot block on top of the
+    // chain layout's sw_window + compressed budget.
+    let tree_pad = if tree.is_some() { 128 } else { 0 };
     let topk_unified = config
         .sliding_window
-        .checked_add(max_compressed_keys)
+        .checked_add(tree_pad)
+        .and_then(|v| v.checked_add(max_compressed_keys))
         .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill topk overflow"))?;
     ensure!(
         topk_unified.is_multiple_of(128),
@@ -4305,17 +4378,19 @@ fn try_flashmla_prefill_attention(
         let (kv_ptr, _kvg) = kv_unified.data.device_ptr_mut(&ctx.stream);
         let (window_ptr, _wg) = sw_window_cache.device_ptr(&ctx.stream);
         let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-        let (comp_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
+        let (comp_ptr, _cg) = match compressed.filter(|_| compressed_count > 0) {
+            Some(c) => {
+                let (p, g) = c.data.device_ptr(&ctx.stream);
+                (p as *const ffi::Half, Some(g))
+            }
+            None => (std::ptr::null(), None),
+        };
         unsafe {
             ffi::arle_flashmla_csa_pack_kv(
                 kv_ptr as *mut ffi::Half,
                 window_ptr as *const ffi::Half,
                 k_ptr as *const ffi::Half,
-                if compressed_count > 0 {
-                    comp_ptr as *const ffi::Half
-                } else {
-                    std::ptr::null()
-                },
+                comp_ptr,
                 start_pos as i32,
                 config.sliding_window as i32,
                 token_count as i32,
@@ -4340,44 +4415,92 @@ fn try_flashmla_prefill_attention(
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_build_indices");
         let (indices_ptr, _ig) = indices.device_ptr_mut(&ctx.stream);
         let (topk_ptr, _tg) = topk_length.device_ptr_mut(&ctx.stream);
-        unsafe {
-            match mode {
-                DeepSeekV4AttentionMode::CompressedSparse => {
-                    let selected = selected.ok_or_else(|| {
-                        anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
-                    })?;
-                    let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                    ffi::arle_flashmla_csa_build_indices(
-                        indices_ptr as *mut i32,
-                        topk_ptr as *mut i32,
-                        selected_ptr as *const i32,
-                        token_count as i32,
-                        start_pos as i32,
-                        config.sliding_window as i32,
-                        config.index_topk as i32,
-                        compressed_count as i32,
-                        compress_ratio as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
+        if let Some(meta) = tree {
+            // Tree-verify chunk: per-row positions + branch ancestors replace
+            // the causal-contiguous window arithmetic. CSA passes the selector
+            // output; HCA passes its identity cap; pure-SW passes neither.
+            let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+            let (anc_ptr, _ag) = meta.ancestors.device_ptr(&ctx.stream);
+            let (sel_ptr, _sg) = match (mode, selected) {
+                (DeepSeekV4AttentionMode::CompressedSparse, Some(sel)) => {
+                    let (p, g) = sel.device_ptr(&ctx.stream);
+                    (p as *const i32, Some(g))
                 }
-                DeepSeekV4AttentionMode::HybridCompressed => {
-                    ffi::arle_flashmla_hca_build_indices(
-                        indices_ptr as *mut i32,
-                        topk_ptr as *mut i32,
-                        token_count as i32,
-                        start_pos as i32,
-                        config.sliding_window as i32,
-                        max_compressed_keys as i32,
-                        compressed_count as i32,
-                        compress_ratio as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
+                (DeepSeekV4AttentionMode::CompressedSparse, None) => {
+                    bail!("DSv4 FlashMLA CSA tree verify missing selected topk")
                 }
-                DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                _ => (std::ptr::null(), None),
+            };
+            let max_compressed_arg = if mode == DeepSeekV4AttentionMode::HybridCompressed {
+                max_compressed_keys
+            } else {
+                0
+            };
+            unsafe {
+                ffi::arle_flashmla_tree_build_indices(
+                    indices_ptr as *mut i32,
+                    topk_ptr as *mut i32,
+                    pos_ptr as *const i32,
+                    anc_ptr as *const i32,
+                    meta.max_anc as i32,
+                    sel_ptr,
+                    token_count as i32,
+                    start_pos as i32,
+                    config.sliding_window as i32,
+                    if sel_ptr.is_null() {
+                        0
+                    } else {
+                        config.index_topk as i32
+                    },
+                    max_compressed_arg as i32,
+                    topk_unified as i32,
+                    compressed_count as i32,
+                    compress_ratio as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA tree verify indices failed: {e}"))?;
+            }
+        } else {
+            unsafe {
+                match mode {
+                    DeepSeekV4AttentionMode::CompressedSparse => {
+                        let selected = selected.ok_or_else(|| {
+                            anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
+                        })?;
+                        let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                        ffi::arle_flashmla_csa_build_indices(
+                            indices_ptr as *mut i32,
+                            topk_ptr as *mut i32,
+                            selected_ptr as *const i32,
+                            token_count as i32,
+                            start_pos as i32,
+                            config.sliding_window as i32,
+                            config.index_topk as i32,
+                            compressed_count as i32,
+                            compress_ratio as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
+                    }
+                    DeepSeekV4AttentionMode::HybridCompressed => {
+                        ffi::arle_flashmla_hca_build_indices(
+                            indices_ptr as *mut i32,
+                            topk_ptr as *mut i32,
+                            token_count as i32,
+                            start_pos as i32,
+                            config.sliding_window as i32,
+                            max_compressed_keys as i32,
+                            compressed_count as i32,
+                            compress_ratio as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
+                    }
+                    DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                }
             }
         }
     }
@@ -4542,26 +4665,51 @@ fn try_flashmla_prefill_attention(
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_inverse_rope");
         unsafe {
-            ffi::arle_dsv4_output_inverse_rope_cuda(
-                out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                config.head_dim as i32,
-                config.qk_rope_head_dim as i32,
-                start_pos as i32,
-                rope_base,
-                original_seq_len,
-                rope_factor,
-                rope_beta_fast,
-                rope_beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
+            if let Some(meta) = tree {
+                let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+                ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    pos_ptr as *const i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_factor,
+                    rope_beta_fast,
+                    rope_beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA tree output inverse-rope failed: {e}"))?;
+            } else {
+                ffi::arle_dsv4_output_inverse_rope_cuda(
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_pos as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_factor,
+                    rope_beta_fast,
+                    rope_beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
+            }
         }
     }
 
-    update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+    // Tree verify is PURE: the frozen forward owns no ring state — the commit
+    // path re-establishes the rings for exactly the accepted prefix. Plain
+    // prefill keeps rolling the window with the chunk K.
+    if tree.is_none() {
+        update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+    }
 
     if env_flag("ARLE_DSV4_FLASHMLA_PREFILL_SYNC")? {
         ctx.sync()?;
@@ -5167,6 +5315,10 @@ pub(crate) fn mla_attention(
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    // Spec tree-verify chunk: per-row positions + branch topology. Routes the
+    // whole multi-row chunk through ONE FlashMLA sparse forward per layer
+    // (every mode incl. pure-SW) with zero ring writes; `None` everywhere else.
+    tree: Option<&Dsv4TreeAttnMeta>,
     tp: &TpRuntime,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -5367,7 +5519,30 @@ pub(crate) fn mla_attention(
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; head/dim args checked above.
         unsafe {
-            if let Some(start_pos_device) = start_pos_device {
+            if let Some(meta) = tree {
+                // Tree-verify chunk: per-row absolute positions (siblings
+                // repeat) instead of start_pos + row.
+                let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+                ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    pos_ptr as *const i32,
+                    config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else if let Some(start_pos_device) = start_pos_device {
                 let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
                 ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
                     q_raw_ptr as *const ffi::Half,
@@ -5425,11 +5600,11 @@ pub(crate) fn mla_attention(
         // The kernel reads the pre-roped q/k, attends over the bf16 SW ring cache
         // (which it also updates), adds the sink, and un-rotates the rope tail of
         // the OUTPUT (sign = -1) before returning.
-        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
-            let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
-            })?;
-            try_flashmla_decode_attention(
+        if let Some(meta) = tree {
+            // Tree-verify chunk: the contiguous swa kernel cannot express the
+            // branch mask (siblings share positions), so route through the
+            // sparse forward over [SW cache | chunk K] with tree indices.
+            let used = try_flashmla_prefill_attention(
                 ctx,
                 config,
                 attention,
@@ -5440,10 +5615,8 @@ pub(crate) fn mla_attention(
                 None,
                 None,
                 &mut state.sw_window_cache,
-                flash,
-                pool,
                 start_pos,
-                start_pos_device,
+                Some(meta),
                 tp,
                 local_heads,
                 &mut local_attn,
@@ -5453,69 +5626,112 @@ pub(crate) fn mla_attention(
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-            )?
+            )?;
+            ensure!(
+                used,
+                "DSv4 spec tree verify requires the FlashMLA prefill path \
+                 (ARLE_DSV4_FLASHMLA_PREFILL disabled?)"
+            );
+            // Falls through to the shared O-projection tail below.
         } else {
-            false
-        };
-        maybe_probe_flashmla_decode_path(layer_idx, mode, flashmla_used, token_count, start_pos);
-        if !flashmla_used {
-            let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
-            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-            // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
-            // skips to this rank's head block in the whole-loaded attn_sink vector.
-            unsafe {
-                if let Some(start_pos_device) = start_pos_device {
-                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                    ffi::dsv4_swa_attention_start_pos_ptr_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        config.sliding_window as i32,
-                        start_ptr as *const i32,
-                        sink_offset as i32,
-                        sm_scale,
-                        config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len,
-                        rope.factor,
-                        rope.beta_fast,
-                        rope.beta_slow,
-                        1,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                } else {
-                    ffi::dsv4_swa_attention_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        config.sliding_window as i32,
-                        start_pos_i32,
-                        sink_offset as i32,
-                        sm_scale,
-                        config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len,
-                        rope.factor,
-                        rope.beta_fast,
-                        rope.beta_slow,
-                        1,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+            let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+                let flash = state.flashmla.as_mut().ok_or_else(|| {
+                    anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+                })?;
+                try_flashmla_decode_attention(
+                    ctx,
+                    config,
+                    attention,
+                    mode,
+                    compress_ratio,
+                    &q_prepared,
+                    &k_prepared,
+                    None,
+                    None,
+                    &mut state.sw_window_cache,
+                    flash,
+                    pool,
+                    start_pos,
+                    start_pos_device,
+                    tp,
+                    local_heads,
+                    &mut local_attn,
+                    sm_scale,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                )?
+            } else {
+                false
+            };
+            maybe_probe_flashmla_decode_path(
+                layer_idx,
+                mode,
+                flashmla_used,
+                token_count,
+                start_pos,
+            );
+            if !flashmla_used {
+                let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+                let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+                let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+                let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+                let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
+                // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
+                // skips to this rank's head block in the whole-loaded attn_sink vector.
+                unsafe {
+                    if let Some(start_pos_device) = start_pos_device {
+                        let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                        ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            window_ptr as *mut ffi::Half,
+                            sink_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            config.sliding_window as i32,
+                            start_ptr as *const i32,
+                            sink_offset as i32,
+                            sm_scale,
+                            config.qk_rope_head_dim as i32,
+                            rope_base,
+                            original_seq_len,
+                            rope.factor,
+                            rope.beta_fast,
+                            rope.beta_slow,
+                            1,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    } else {
+                        ffi::dsv4_swa_attention_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            window_ptr as *mut ffi::Half,
+                            sink_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            config.sliding_window as i32,
+                            start_pos_i32,
+                            sink_offset as i32,
+                            sm_scale,
+                            config.qk_rope_head_dim as i32,
+                            rope_base,
+                            original_seq_len,
+                            rope.factor,
+                            rope.beta_fast,
+                            rope.beta_slow,
+                            1,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
                 }
             }
         }
@@ -5660,9 +5876,10 @@ pub(crate) fn mla_attention(
             &q_prepared,
             &k_prepared,
             selected.as_ref(),
-            compressed,
+            Some(compressed),
             &mut state.sw_window_cache,
             start_pos,
+            tree,
             tp,
             local_heads,
             &mut local_attn,
@@ -5674,6 +5891,11 @@ pub(crate) fn mla_attention(
             rope.beta_slow,
         )? {
             true
+        } else if tree.is_some() {
+            bail!(
+                "DSv4 spec tree verify requires the FlashMLA prefill path \
+                 (ARLE_DSV4_FLASHMLA_PREFILL disabled?)"
+            );
         } else if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
                 anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")

@@ -287,10 +287,16 @@ pub(crate) struct SpecVerifySchedule {
     pub(crate) positions: Vec<usize>,
     /// Per row: source rows whose parked ring slots must be replayed BEFORE
     /// this row's attention (ancestors whose slot a sibling overwrote).
+    /// Per-row REPLAY lane only; the batched tree-attention lane reads
+    /// `ancestors` instead and never touches the rings.
     pub(crate) restores: Vec<Vec<usize>>,
     /// Per row: park this row's ring slot AFTER its attention (set exactly for
-    /// rows some later row restores).
+    /// rows some later row restores). Per-row replay lane only.
     pub(crate) saves: Vec<bool>,
+    /// Per row: the full branch as chunk-row indices, shallow→deep, ROOT
+    /// included, self excluded. Feeds [`crate::attention::Dsv4TreeAttnMeta`]
+    /// for the batched tree-attention lane.
+    pub(crate) ancestors: Vec<Vec<usize>>,
 }
 
 impl SpecVerifySchedule {
@@ -301,6 +307,7 @@ impl SpecVerifySchedule {
             positions: (0..n).map(|r| start_pos + r).collect(),
             restores: vec![Vec::new(); n],
             saves: vec![false; n],
+            ancestors: vec![Vec::new(); n],
         }
     }
 
@@ -1841,6 +1848,7 @@ impl Dsv4Model {
                         dsa_shared,
                         start_positions[r],
                         Some(&slot.start_pos_device),
+                        None,
                         &self.tp,
                         &mut attn_out_row,
                         &mut keepalive,
@@ -2304,6 +2312,22 @@ impl Dsv4Model {
         } else {
             (None, None, None)
         };
+        // Tree-verify chunks default to the BATCHED tree-attention lane: one
+        // FlashMLA sparse forward per layer with per-row positions + branch
+        // indices, zero ring writes (the kill of the per-row launch cost —
+        // fast-path plan P1). `ARLE_DSV4_MTP_TREE_ATTN=0` falls back to the
+        // per-row ring-replay lane (the needle-validated reference). Chains
+        // stay on the validated per-row path either way.
+        let tree_meta = match verify {
+            Some(sched) if seq_len > 1 && !sched.is_chain() && dsv4_mtp_tree_attn_enabled() => {
+                Some(crate::attention::Dsv4TreeAttnMeta::new(
+                    &self.ctx,
+                    &sched.positions,
+                    &sched.ancestors,
+                )?)
+            }
+            _ => None,
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
@@ -2332,7 +2356,31 @@ impl Dsv4Model {
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            if let Some(sched) = verify.filter(|_| seq_len > 1) {
+            if let Some(meta) = tree_meta.as_ref() {
+                // P1 batched tree verify: the whole chunk through ONE
+                // mla_attention (FlashMLA sparse fwd inside), host start_pos,
+                // no ring writes, no per-row replay.
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_tree_batch");
+                let (layer_pool, dsa_shared) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                crate::attention::mla_attention(
+                    &self.ctx,
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                    layer.compress_ratio,
+                    layer_idx,
+                    &normed,
+                    &mut slot.attention[layer_idx],
+                    layer_pool,
+                    dsa_shared,
+                    start_pos,
+                    None,
+                    Some(meta),
+                    &self.tp,
+                    &mut attn_out,
+                    &mut keepalive,
+                )?;
+            } else if let Some(sched) = verify.filter(|_| seq_len > 1) {
                 // MTP verify: attention PER ROW on the seq_len==1 decode path
                 // (device start_pos), in schedule order so each row attends to
                 // its ancestor path's just-written KV. Mirrors
@@ -2387,6 +2435,7 @@ impl Dsv4Model {
                         dsa_shared.as_deref_mut(),
                         pos_r,
                         Some(&*verify_pos_dev),
+                        None,
                         &self.tp,
                         attn_out_row,
                         &mut keepalive,
@@ -2430,6 +2479,7 @@ impl Dsv4Model {
                         dsa_shared,
                         start_pos,
                         start_pos_device,
+                        None,
                         &self.tp,
                         &mut attn_out,
                         &mut keepalive,
@@ -2999,6 +3049,7 @@ impl Dsv4Model {
             target_dsa_shared,
             start_pos,
             Some(&start_pos_device),
+            None,
             &self.tp,
             &mut attn_out,
             &mut keepalive,
@@ -3198,6 +3249,7 @@ impl Dsv4Model {
                             None,
                             start_pos,
                             Some(&slot.start_pos_device),
+                            None,
                             &self.tp,
                             attn_out,
                             &mut keepalive,
@@ -3264,6 +3316,7 @@ impl Dsv4Model {
                             None,
                             start_pos,
                             Some(&slot.start_pos_device),
+                            None,
                             &self.tp,
                             attn_out,
                             &mut keepalive,
@@ -3584,6 +3637,16 @@ pub(crate) fn dsv4_spec_decode_enabled() -> bool {
 pub(crate) fn dsv4_mtp_batched_verify_enabled() -> bool {
     !matches!(
         std::env::var("ARLE_DSV4_MTP_BATCHED_VERIFY").as_deref(),
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    )
+}
+
+/// Batched tree-attention verify lane (fast-path plan P1): default ON for
+/// tree-shaped verify chunks; `ARLE_DSV4_MTP_TREE_ATTN=0` falls back to the
+/// per-row ring-replay lane (the needle-validated reference, ~10 ms/row).
+pub(crate) fn dsv4_mtp_tree_attn_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_DSV4_MTP_TREE_ATTN").as_deref(),
         Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }

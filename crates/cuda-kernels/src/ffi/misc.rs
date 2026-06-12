@@ -758,6 +758,31 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    /// Spec-decode TREE per-row unified indices: `positions` (per-row absolute
+    /// position; tree rows at the same draft depth repeat) + `ancestors`
+    /// (per-row branch chunk-rows, `[s_q, max_anc]` -1 padded, root included,
+    /// self implicit). CSA when `selected` non-null (translate + causality
+    /// gate), HCA when `max_compressed > 0` (identity causal), pure-SW when
+    /// neither. `topk_unified` is caller-sized:
+    /// `sw_window + 128 + (index_topk | max_compressed | 0)`, %128 == 0.
+    pub fn arle_flashmla_tree_build_indices(
+        indices: *mut i32,
+        topk_length: *mut i32,
+        positions: *const i32,
+        ancestors: *const i32,
+        max_anc: i32,
+        selected: *const i32,
+        s_q: i32,
+        start_pos: i32,
+        sw_window: i32,
+        index_topk: i32,
+        max_compressed: i32,
+        topk_unified: i32,
+        compressed_count: i32,
+        compress_ratio: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     /// Fill the [s_q_actual..s_q_padded) rows of the indices buffer with -1
     /// and the corresponding topk_length entries with 0, for FlashMLA s_q
     /// padding (V2.3). Use this after a build_indices call that wrote rows
