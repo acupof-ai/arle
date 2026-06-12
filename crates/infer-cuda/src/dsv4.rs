@@ -3786,6 +3786,10 @@ fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
         let cfg = crate::tp::resolve_tp_config_from_env().map_err(|e| anyhow!("{e}"))?;
         if !cfg.is_single() {
             let ordinal = cuda_kernels::tensor::parse_device_ordinal_from_env()?;
+            // Pin BEFORE CUDA/NCCL init so launch threads + allocator pages
+            // land NUMA-local to this rank's GPU (rank-skew mitigation; loud
+            // no-op on failure, ARLE_NUMA_PIN=0 opts out).
+            crate::numa_pin::pin_to_gpu_numa(ordinal as usize, cfg.world_size as usize);
             cudarc::runtime::result::device::set(ordinal as i32)
                 .map_err(|e| anyhow!("cudaSetDevice({ordinal}) before NCCL init failed: {e}"))?;
             let unique_id = crate::loader::nccl_unique_id_from_env()?;

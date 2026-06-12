@@ -54,8 +54,11 @@ mod hc;
 mod linear_profile;
 #[cfg(feature = "cuda")]
 mod loader;
+// GPU-NUMA worker pinning (boot one-shot; rank-skew mitigation).
 #[cfg(feature = "cuda")]
 mod model;
+#[cfg(feature = "cuda")]
+mod numa_pin;
 #[cfg(feature = "cuda")]
 mod nvtx;
 #[cfg(feature = "cuda")]
