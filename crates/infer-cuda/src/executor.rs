@@ -958,6 +958,53 @@ pub(crate) struct Dsv4CudaExecutor {
     /// byte-budget cap (CudaKvTierStore reuse) is the follow-up tracked in
     /// docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md.
     slot_swap_store: std::collections::BTreeMap<u64, Dsv4SlotSwapEntry>,
+    /// `ARLE_DSV4_STEP_PROFILE=1` evidence probe (measurement runs only):
+    /// per plain-decode step, `fwd` = `forward_tokens` wall (GPU forward +
+    /// NCCL spin + sampling D2H) and `gap` = host time between this step's
+    /// entry and the previous step's exit (engine scheduler / detok / HTTP /
+    /// lockstep IPC — everything above the executor). Rolling report every
+    /// 100 steps names which side of the executor boundary holds a TPOT gap.
+    step_profile: Option<StepProfileProbe>,
+}
+
+struct StepProfileProbe {
+    last_exit: Option<std::time::Instant>,
+    fwd_ms: Vec<f64>,
+    gap_ms: Vec<f64>,
+}
+
+impl StepProfileProbe {
+    fn from_env() -> Option<Self> {
+        (std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1")).then(|| StepProfileProbe {
+            last_exit: None,
+            fwd_ms: Vec::with_capacity(128),
+            gap_ms: Vec::with_capacity(128),
+        })
+    }
+
+    fn record(&mut self, entry: std::time::Instant, exit: std::time::Instant) {
+        if let Some(prev) = self.last_exit {
+            self.gap_ms.push((entry - prev).as_secs_f64() * 1000.0);
+        }
+        self.fwd_ms.push((exit - entry).as_secs_f64() * 1000.0);
+        self.last_exit = Some(exit);
+        if self.fwd_ms.len() >= 100 {
+            let stats = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = v[v.len() / 2];
+                let mean = v.iter().sum::<f64>() / v.len() as f64;
+                (mean, med)
+            };
+            let (fm, fp50) = stats(&mut self.fwd_ms);
+            let (gm, gp50) = stats(&mut self.gap_ms);
+            eprintln!(
+                "[step-profile] n=100 fwd mean={fm:.3}ms p50={fp50:.3}ms | gap mean={gm:.3}ms p50={gp50:.3}ms | period~{:.3}ms",
+                fm + gm
+            );
+            self.fwd_ms.clear();
+            self.gap_ms.clear();
+        }
+    }
 }
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
@@ -1284,6 +1331,7 @@ impl Dsv4CudaExecutor {
             mtp_accepts: 0,
             mtp_rejects: 0,
             slot_swap_store: std::collections::BTreeMap::new(),
+            step_profile: StepProfileProbe::from_env(),
         })
     }
 
@@ -1428,6 +1476,7 @@ impl Dsv4CudaExecutor {
         position: u64,
     ) -> Result<Vec<u32>> {
         if !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled()) {
+            let entry = std::time::Instant::now();
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1436,6 +1485,9 @@ impl Dsv4CudaExecutor {
                 params,
                 position,
             )?;
+            if let Some(probe) = self.step_profile.as_mut() {
+                probe.record(entry, std::time::Instant::now());
+            }
             self.model.dump_mtp_rollback_state(
                 &self.slots[slot_idx],
                 "nonspec_after_forward",
