@@ -32,10 +32,12 @@ authority rather than defining a second equal architecture.
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
 | `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
 | `infer-plan` | Backend-neutral data IR: `ForwardPlan`, `ForwardMode`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Any device or backend type |
-| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
+| `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll core + opt-in capability default-methods: stop ids, row/request caps, prefix reuse, KV page-tier and slot-tier hooks, OPD weight offload) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `KvBatchDescriptor` + `ResourceGovernor` + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
 | `infer-core` | The one device-neutral `Engine<E,K>`: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
 | `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
 | `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) over `mlx-sys`; `MetalKvPool` is only a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
+| `infer-hip` | HIP/ROCm `BackendExecutor` + KV pool (experimental AIPC lane, #76/#77): DSv4-Flash GGUF 2-bit shim-portable forward over `hip-sys`/`hip-kernels`; temporarily hosts the GGUF reader / CPU dequant / deepseek4-config modules (extraction to `infer-gguf` is [refactor roadmap](plans/2026-06-12-architecture-refactor-roadmap.md) R1) | Scheduler logic, HTTP, datacenter CUDA paths (FlashMLA/DeepGEMM/DeepEP) |
+| `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4, Gemma4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI | Scheduler logic, HTTP |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
 | `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` engine thread | Terminal UX, agent-session orchestration |
@@ -43,9 +45,12 @@ authority rather than defining a second equal architecture.
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
+| `hip-sys` / `hip-kernels` | Thin hand-declared HIP runtime FFI (stubs off-box) / HIP kernel build + FFI layer (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus, hipcc-gated) | Model code, scheduler logic |
+| `vulkan-sys` / `vulkan-kernels` | ash-backed Vulkan loader wrapper / glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` | Model code, scheduler logic |
 | `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
-| `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations | Runtime model code beyond the spec |
+| `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
+| `gemma-spec` | Gemma4 config spec (consumer today: `infer-vulkan` order pin; unranked in the model queue — ratification pending, roadmap §6) | Implementation code |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
 | `train` | On-Policy Distillation substrate (teacher via `infer-api`, student LoRA), train-side `/v1/train/*` control plane, shared async observability. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see `docs/projects/2026-05-18-opd-only-pivot.md`. | GPU kernels, scheduler |
 
@@ -68,9 +73,12 @@ infer-core        -> infer-plan, infer-seam            (the one Engine<E,K>; no 
 
 infer-cuda        -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
 infer-metal       -> infer-plan, infer-seam, [mlx-sys]
+infer-hip         -> infer-plan, infer-seam, deepseek-spec, [hip-sys, hip-kernels]
+infer-vulkan      -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
+                     infer-hip (GGUF host substrate — lateral-dep DEBT, dies in roadmap R1), [vulkan-sys, vulkan-kernels]
 
 infer-server      -> infer-core, infer-seam, infer-plan
-infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, cuda-kernels]
+infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, infer-hip, infer-vulkan, cuda-kernels]
 
 workspace root package (agent-infer)
   -> cli
@@ -102,7 +110,9 @@ backends; a backend is a seam impl, not a scheduler fork.
 infer-plan      data IR (ForwardPlan / ForwardMode / SamplingParams / StepOutput)
    ▲
 infer-seam      host-only trait seam (no device types):
-   │              BackendExecutor (submit/poll), KvPool = KvQuery+KvAllocator+KvPrefixStore
+   │              BackendExecutor (submit/poll core + opt-in capability
+   │              default-methods), KvPool = KvQuery+KvAllocator+KvPrefixStore,
+   │              KvBatchDescriptor, ResourceGovernor
    ▲
 infer-core      device-neutral Engine<E,K> + scheduler + radix prefix + overlap (no backend dep)
 
@@ -118,6 +128,17 @@ infer-server    OpenAI v1 HTTP frontend: ServeHandle<E,K> engine thread + tokeni
 infer-api       single front-door lib (LoadedInferenceEngine, EngineLoadConfig,
                 RawLogits, OPD teacher); backends plug in behind it
 ```
+
+**Seam growth pattern (deliberate).** Cross-cutting engine features (KV
+page/slot tiering, prefix-reuse limits, OPD weight offload, row/request
+caps) land as **opt-in default-methods on `BackendExecutor`**: the engine
+drives the feature generically, backends opt in by overriding, and
+non-participating backends are untouched (`0`/`false`/no-op defaults keep
+the baseline byte-for-byte). The cost is a wide trait (~15 methods today)
+whose capability×backend×model coverage must stay documented (the parity
+matrix above). Regrouping into capability traits is trigger-gated — see
+[refactor roadmap](plans/2026-06-12-architecture-refactor-roadmap.md) R6;
+do not pre-split speculatively.
 
 ### Engine-core crate boundaries
 
@@ -154,6 +175,11 @@ sequencing is tracked in
 - `metal`: serial backend path for Apple Silicon via `mlx-sys`.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
   end-to-end validation on non-GPU machines.
+- `hip`: experimental AIPC lane (AMD ROCm) — DSv4 GGUF 2-bit shim-portable
+  forward; on-box validation pending-remote
+  ([runbook](plans/2026-06-11-hip-onbox-runbook.md)).
+- `vulkan`: experimental AIPC skeleton (cross-vendor) — seam impls + host
+  order pins; device execution pending the shader ABI.
 
 ## Backend Parity Matrix
 
@@ -162,18 +188,26 @@ Status labels mirror [`support-matrix.md`](support-matrix.md); this table is
 the architecture-level view only. Do not treat a ✅ in one column as implying
 parity in another.
 
-| Capability | CUDA | Metal | CPU |
-| --- | --- | --- | --- |
-| Production serving target | Supported | Beta | No (smoke only) |
-| Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Yes (same `Engine<E,K>`; packed varlen batched decode) | No |
-| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No |
-| Chunked prefill + decode-priority | Yes | Partial | No |
-| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | Yes (INT8 default via MLX affine groups; BF16 fallback) | No |
-| Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots) | No |
-| Speculative decode | Not shipped (plumbing only) | Beta (DFlash for Qwen3.5) | No |
-| Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No |
-| OPD teacher surface | Yes | No | No |
-| OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) |
+| Capability | CUDA | Metal | CPU | HIP | Vulkan |
+| --- | --- | --- | --- | --- | --- |
+| Production serving target | Supported | Beta | No (smoke only) | No (experimental) | No (skeleton) |
+| Continuous batching scheduler | Yes (one `Engine<E,K>` in `infer-core`) | Yes (same `Engine<E,K>`; packed varlen batched decode) | No | Seam impl (single-stream MVP) | Seam impl (skeleton) |
+| Paged / batched KV | Yes (`cuda-kernels` `PagedKVPool`, page_size=16) | Yes (`BatchKVCache` pattern via `mlx-sys`) | No | Host KV pool (DSv4 slot shape) | Host KV pool (bookkeeping) |
+| Chunked prefill + decode-priority | Yes | Partial | No | No | No |
+| Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
+| Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No | No | No |
+| Speculative decode | Not shipped (plumbing only) | Beta (DFlash for Qwen3.5) | No | No | No |
+| Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No | No | No |
+| OPD teacher surface | Yes | No | No | No | No |
+| OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) | Wired (validation pending-remote) | Wired (device pending) |
+
+The HIP/Vulkan columns describe the experimental AIPC lane (#76/#77): seam
+impls compile and test on any host (device layers stub off-feature); HIP
+device validation is pending-remote per the
+[on-box runbook](plans/2026-06-11-hip-onbox-runbook.md), Vulkan device
+execution pends the shader ABI. The lane started ahead of strategy v2
+Phase 3 ordering — ratification pending
+([roadmap §6](plans/2026-06-12-architecture-refactor-roadmap.md)).
 
 Evidence pointers:
 

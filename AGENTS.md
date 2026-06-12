@@ -158,6 +158,7 @@ ARLE/
 │   ├── infer-core/            ← Engine<E,K>: scheduler, RadixCache, chunked prefill, sampling
 │   ├── infer-cuda/            ← CUDA executor (Qwen + DSv4, TP/EP, FlashMLA/DeepGEMM/DeepEP)
 │   ├── infer-metal/           ← Metal/MLX executor (packed varlen decode)
+│   ├── infer-hip/ infer-vulkan/  ← experimental AIPC backends (HIP DSv4 GGUF lane; Vulkan skeleton)
 │   ├── infer-server/          ← HTTP serving (OpenAI v1 compat)
 │   ├── infer-api/             ← single front door: LoadedInferenceEngine + OPD-teacher surface
 │   ├── infer-topo/ infer-moe/ infer-util/  ← shared leaves (TP/EP topology, MoE, hf_hub/logging)
@@ -165,7 +166,8 @@ ARLE/
 │   ├── autograd/              ← from-scratch autograd + optimizer (OPD substrate)
 │   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/tilelang/, ffi/, NCCL
 │   ├── deepep-sys/            ← DeepEP/NVSHMEM FFI (internode_ll dispatch/combine)
-│   ├── deepseek-spec/ qwen3-spec/ qwen35-spec/  ← model config + tensor-name + Shard contracts
+│   ├── hip-sys/ hip-kernels/ vulkan-sys/ vulkan-kernels/  ← AIPC FFI + kernel layers (stub off-box)
+│   ├── deepseek-spec/ qwen3-spec/ qwen35-spec/ gemma-spec/  ← model config + tensor-name + Shard contracts
 │   ├── kv-native-sys/         ← local persistence substrate for KV tier transports
 │   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
 │   ├── train/                 ← OPD-only training (teacher via infer-api)

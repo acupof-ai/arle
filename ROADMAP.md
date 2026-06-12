@@ -61,10 +61,16 @@ The model-coverage queue is ranked, not parallel:
 Other families in the support matrix sit behind these two and are not
 actively scheduled.
 
-Backend queue: CUDA + Metal are shipped; **HIP/ROCm** is the third
-backend, entering at Phase 3 as the AIPC lane
-([#71](https://github.com/cklxx/arle/issues/71)) — the v2 §5 DEFER
-stands for Phase 0–2.
+Backend queue: CUDA + Metal are shipped. **HIP/ROCm + Vulkan** are the AIPC
+lane ([#71](https://github.com/cklxx/arle/issues/71), #76/#77): code began
+landing 2026-06-10/11 ahead of the Phase 3 ordering (`infer-hip`,
+`infer-vulkan` + `hip-/vulkan-{sys,kernels}`; plans
+[`2026-06-10-hip-backend-mvp.md`](docs/plans/2026-06-10-hip-backend-mvp.md),
+[`2026-06-11-hip-onbox-runbook.md`](docs/plans/2026-06-11-hip-onbox-runbook.md)).
+**Phase-ordering ratification pending** — see
+[refactor roadmap §6](docs/plans/2026-06-12-architecture-refactor-roadmap.md).
+A `gemma-spec` + Vulkan Gemma4 order pin is also in-tree, **unranked** in the
+model queue above (same pending ratification).
 
 ## History
 
