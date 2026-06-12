@@ -65,6 +65,16 @@ impl DraftTree {
         &self.tokens
     }
 
+    /// Node `i`'s token.
+    fn token(&self, i: usize) -> u32 {
+        self.tokens[i]
+    }
+
+    /// Node `i`'s parent index, or `None` for the root.
+    fn parent(&self, i: usize) -> Option<usize> {
+        (i != 0).then(|| self.parent[i])
+    }
+
     /// Total node count (root + drafts).
     fn len(&self) -> usize {
         self.tokens.len()
@@ -157,10 +167,12 @@ impl Dsv4CudaExecutor {
         }
     }
 
-    /// Draft the tree off the MTP head. `topk == 1` chains each draft off the
-    /// previous draft's wide MTP stream (`d_{i+1}` conditions on `d_i`). `topk >= 2`
-    /// is not yet wired — it needs a top-k expansion of the head logits and the
-    /// tree-mask verify; the [`DraftTree`] shape is already general for it.
+    /// Draft the tree off the MTP head: branch each node into the head's
+    /// top-`shape.topk` candidates, `shape.depth` levels deep. `topk == 1` is the
+    /// linear chain; `topk >= 2` branches. Each node's wide MTP stream is the
+    /// `h_prev` its children chain from, so every child conditions on its parent
+    /// token. BFS by depth, so every node at depth `d` is drafted at the same
+    /// absolute position `start_pos + d`.
     fn draft_tree(
         &mut self,
         slot_idx: usize,
@@ -169,27 +181,38 @@ impl Dsv4CudaExecutor {
         shape: &SpecShape,
         start_pos: usize,
     ) -> Result<DraftTree> {
-        ensure!(
-            shape.topk == 1,
-            "DSv4 MTP tree draft (topk={}) not yet wired — needs top-k head expansion + the tree-mask verify kernel",
-            shape.topk
-        );
         let mut tree = DraftTree::new(pending);
-        let mut leaf = 0;
-        let mut chain_token = pending;
-        let mut prev_stream: Option<DeviceVec> = None;
-        for i in 0..shape.depth {
-            let h_prev = prev_stream.as_ref().unwrap_or(trunk_hidden);
-            let (draft, draft_stream) = self.model.mtp_forward(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                h_prev,
-                chain_token,
-                (start_pos + i) as u64,
-            )?;
-            leaf = tree.push(leaf, draft);
-            chain_token = draft;
-            prev_stream = Some(draft_stream);
+        // Per-node wide MTP stream from expanding that node — its children's
+        // `h_prev`. Indexed in lockstep with the tree's nodes. The borrow ends at
+        // the `mtp_forward` call (NLL), so the later `node_stream[node] = …` write
+        // and the per-child `push` don't conflict — and topk=1 needs no clone.
+        let mut node_stream: Vec<Option<DeviceVec>> = vec![None];
+        let mut frontier = vec![0usize];
+        for depth in 0..shape.depth {
+            let mut next = Vec::with_capacity(frontier.len() * shape.topk);
+            for node in frontier {
+                let token = tree.token(node);
+                let h_prev: &DeviceVec = match tree.parent(node) {
+                    Some(parent) => node_stream[parent].as_ref().expect("parent stream"),
+                    None => trunk_hidden,
+                };
+                let (candidates, stream) = self.model.mtp_forward(
+                    &mut self.slots[slot_idx],
+                    &mut self.kv_adapter,
+                    h_prev,
+                    token,
+                    (start_pos + depth) as u64,
+                    shape.topk,
+                )?;
+                node_stream[node] = Some(stream);
+                for &candidate in &candidates {
+                    let child = tree.push(node, candidate);
+                    debug_assert_eq!(child, node_stream.len());
+                    node_stream.push(None);
+                    next.push(child);
+                }
+            }
+            frontier = next;
         }
         Ok(tree)
     }

@@ -2547,7 +2547,8 @@ impl Dsv4Model {
         h_prev: &DeviceVec,
         next_token: u32,
         position: u64,
-    ) -> Result<(u32, DeviceVec)> {
+        top_k: usize,
+    ) -> Result<(Vec<u32>, DeviceVec)> {
         ensure!(
             self.spec_decode_on,
             "DSv4 MTP forward called while spec decode is off (need --spec-type mtp / \
@@ -2652,12 +2653,23 @@ impl Dsv4Model {
         crate::ops::rms_norm_vec(ctx, &last_hidden, &mtp.norm, eps, &mut last_normed)?;
         let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
         self.lm_head_project(&last_normed, &mut logits)?;
-        let token =
-            crate::executor::sample_cuda_token(ctx, &logits, &SamplingParams::default(), position)?;
-        // Return the wide MTP stream (stream_dim) so a depth-2 draft can chain from it.
+        // Draft candidates: `top_k == 1` (chain) uses the device argmax sampler;
+        // `top_k >= 2` (tree branch) takes the host top-k of the head logits.
+        // Highest-first either way, so `tokens[0]` is always the greedy draft.
+        let tokens = if top_k <= 1 {
+            vec![crate::executor::sample_cuda_token(
+                ctx,
+                &logits,
+                &SamplingParams::default(),
+                position,
+            )?]
+        } else {
+            crate::ops::topk_host(ctx, &logits, top_k)?
+        };
+        // Return the wide MTP stream (stream_dim) so the next draft chains from it.
         let stream_len = stream.hidden_dim * stream.seq_len;
         Ok((
-            token,
+            tokens,
             DeviceVec {
                 data: stream.data,
                 len: stream_len,
