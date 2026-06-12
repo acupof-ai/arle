@@ -62,13 +62,16 @@ Current workspace members (ownership and boundaries are listed in
 - workspace root package `agent-infer` (produces the `arle` binary)
 - **runtime crate graph:** `crates/infer-plan`, `crates/infer-seam`,
   `crates/infer-core`, `crates/infer-cuda`, `crates/infer-metal`,
+  `crates/infer-hip`, `crates/infer-vulkan`,
   `crates/infer-server`, `crates/infer-api`, `crates/infer-topo`,
   `crates/infer-moe`, `crates/infer-util`
 - **GPU / bridge:** `crates/cuda-kernels`, `crates/mlx-sys`,
-  `crates/deepep-sys`
+  `crates/deepep-sys`, `crates/hip-sys`, `crates/hip-kernels`,
+  `crates/vulkan-sys`, `crates/vulkan-kernels`
 - **control plane / helpers:** `crates/agent`, `crates/chat`, `crates/cli`,
   `crates/tools`
-- **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`
+- **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
+  `crates/gemma-spec`
 - **training:** `crates/autograd`, `crates/train`
 - **substrate:** `crates/kv-native-sys`, `crates/xgrammar-sys`,
   `crates/agent-bench`
@@ -186,13 +189,27 @@ server → front door), with `infer-core` carrying **no** backend dependency.
 
 ### 3.2 `infer-seam` — host-only trait seam
 
-- `crates/infer-seam/src/lib.rs`: `BackendExecutor` (submit/poll/warmup) — the
-  one proven seam trait; plus `Communicator`/`Sampler`/`GraphRunner`/`ModelArch`/`ResourceGovernor`
-  defined-but-undriven (hypothesis-grade).
+- `crates/infer-seam/src/lib.rs`: `BackendExecutor` — the proven seam trait:
+  `submit`/`poll`/`warmup` core plus opt-in capability default-methods
+  (model stop ids, `max_rows_per_step`/`max_live_requests`, prefix-reuse
+  hooks, page-tier demote/promote ×4, whole-slot tier ×3, OPD weight
+  offload/reload). Also `ResourceGovernor` (+ `Permissive`/`Cooperative`
+  impls) — **driven**: `Engine` holds a `Box<dyn ResourceGovernor>`
+  (`infer-core/src/lib.rs`) and `infer-api/src/loaded.rs` wires the
+  cooperative governor. The earlier
+  `Communicator`/`Sampler`/`GraphRunner`/`ModelArch` hypothesis traits were
+  deleted. Capability-trait regrouping is trigger-gated — see
+  [`plans/2026-06-12-architecture-refactor-roadmap.md`](plans/2026-06-12-architecture-refactor-roadmap.md) R6.
 - `crates/infer-seam/src/kv.rs` + `kv_query.rs` + `allocator.rs` +
   `prefix_store.rs`: the three-way `KvPool = KvQuery + KvAllocator + KvPrefixStore`
   split (alloc/grow/truncate + prefix retain/release lookup) — the host-only KV
   contract both backend KV pools implement.
+- `crates/infer-seam/src/kv_batch.rs`: `KvBatchDescriptor`/`KvBatchRow` — the
+  host-only batch-addressable description backends lower from
+  (the Phase 1 unified-batched plan's seam piece).
+- `crates/infer-seam/src/{kv_dtype,resource,host_paged_kv_pool}.rs`:
+  `KvCacheDtype`, `SlotBudget`/`HostTierBudget`/`split_host_tiers`, and the
+  shared production host page allocator.
 
 This is the old `infer/src/backend.rs` backend-trait surface, recast as a
 host-only seam with zero device coupling.
@@ -315,6 +332,29 @@ front door) + `infer-util`.
   `infer/src/logging.rs`). A leaf crate so host-only commands (cli
   `doctor`/`download`) avoid dragging in a backend-gated engine crate.
 
+### 3.9 `infer-hip` / `infer-vulkan` — AIPC backends (experimental)
+
+The AIPC lane (#71/#76/#77; plans
+[`2026-06-10-hip-backend-mvp.md`](plans/2026-06-10-hip-backend-mvp.md),
+[`2026-06-11-hip-onbox-runbook.md`](plans/2026-06-11-hip-onbox-runbook.md))
+landed ahead of the Phase 3 ordering — ratification pending, see
+[`plans/2026-06-12-architecture-refactor-roadmap.md`](plans/2026-06-12-architecture-refactor-roadmap.md) §6.
+
+- `crates/infer-hip/src/{executor,kv_pool,model,loader,gguf,dequant,config}.rs`:
+  `HipDsv4Executor` + `HipKvPool` seam impls; DSv4-Flash GGUF 2-bit
+  shim-portable lane (FlashMLA/official-DSA/DeepGEMM datacenter paths
+  excluded by design). GGUF reader + CPU dequant + deepseek4 GGUF→config
+  mapping currently live here — extraction to a neutral `infer-gguf` leaf is
+  roadmap tranche R1.
+- `crates/infer-vulkan/src/{executor,kv_pool,model_*.rs}`: seam-correct
+  skeleton — `VulkanExecutor` + `VulkanKvPool` implement the seam; forward
+  order pinned for Qwen3/3.5/3.6, DSv4, and Gemma4; device execution pending
+  the shader ABI. Re-exports `infer-hip`'s GGUF host modules (the lateral
+  dep R1 kills).
+
+Both compile and test on any host (device features off ⇒ stub layers), so
+they ride the normal CPU CI lanes.
+
 ## 4. Surrounding crate map
 
 These crates sit around the runtime graph:
@@ -326,11 +366,16 @@ These crates sit around the runtime graph:
 - `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate in commit `a4e12f5`, 2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tilelang`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/deepep-sys`: DeepEP all-to-all transport bindings used by `infer-cuda`'s DSv4 MoE path
-- `crates/kv-native-sys`: local persistence substrate (POSIX file + content-addressed block object ops, WAL append/replay, mmap + shared-memory descriptors) reserved for the KV-tier transports — currently **zero dependents**; the tier re-port is tracked in #82/#83
-- `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode)
+- `crates/hip-sys`: thin hand-declared HIP runtime FFI (no bindgen; every entry point stubs to `HIP_NOT_COMPILED` off-box)
+- `crates/hip-kernels`: HIP kernel build + FFI layer for the AIPC DSv4 2-bit lane (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus; hipcc-gated, layout helpers always compiled)
+- `crates/vulkan-sys`: ash-backed Vulkan loader wrapper (stub off the `vulkan` feature, mirroring `hip-sys`)
+- `crates/vulkan-kernels`: glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` (typecheck-only without `glslc`)
+- `crates/kv-native-sys`: local persistence substrate (POSIX file + content-addressed block object ops, WAL append/replay, mmap + shared-memory descriptors) backing the KV T2 disk tiers — consumers: `infer-cuda/src/kv_tier.rs` (RAM + disk store) and `infer-metal`'s SSD tier (`MetalSsdTier`)
+- `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — **zero code consumers** since the monolith deletion; license-or-kill verdict pending ([roadmap §6](plans/2026-06-12-architecture-refactor-roadmap.md))
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
-- `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries, and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
+- `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan` — consumed by `infer-hip` today; making it the single DSv4 forward-order authority is roadmap tranche R3), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
+- `crates/gemma-spec`: Gemma4 config spec (config load + validation). In-tree consumer today: `infer-vulkan`'s `model_gemma4` order pin. **Unranked** in the model priority queue — ratification pending (roadmap §6)
 - `crates/autograd`: from-scratch autograd + optimizer + lr-schedule + AdamW codec (OPD substrate)
 - `crates/train`: train-side control plane + OPD stack (post-2026-05-18 pivot)
 - `crates/agent-bench`: agent-workload benchmark harness
@@ -366,7 +411,19 @@ infer-cuda
 
 infer-metal
   -> infer-plan, infer-seam (+ mlx-sys under "metal")        (never infer-core)
+
+infer-hip
+  -> infer-plan, infer-seam, deepseek-spec
+     (+ hip-sys, hip-kernels under "hip")                    (never infer-core)
+
+infer-vulkan
+  -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
+     infer-hip (GGUF host substrate — DEBT, dies in roadmap R1)
+     (+ vulkan-sys, vulkan-kernels under "vulkan")           (never infer-core)
 ```
+
+`infer-api` pulls `infer-hip` / `infer-vulkan` behind the optional `hip` /
+`vulkan` features, mirroring `cuda`/`metal`.
 
 ## 5. Tests and validation map
 
