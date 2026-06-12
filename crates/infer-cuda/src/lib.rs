@@ -225,7 +225,9 @@ impl CudaExecutor {
         }
     }
 
-    /// Build the real CUDA executor for dense BF16 Qwen3 safetensors.
+    /// Build the real CUDA executor for dense BF16 Qwen3 safetensors ("bf16"
+    /// names the WEIGHTS dtype; `kv_dtype` selects the paged KV-cache format —
+    /// BF16 default or the INT8/FP8 quant pools, #68 T3).
     ///
     /// `total_pages` must match the host [`CudaKvPool`] so device page
     /// allocation mirrors host logical pages.
@@ -234,6 +236,7 @@ impl CudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        kv_dtype: CudaKvCacheDtype,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -241,6 +244,7 @@ impl CudaExecutor {
                     model_path,
                     num_slots,
                     total_pages,
+                    kv_dtype,
                 )?,
             )),
         })

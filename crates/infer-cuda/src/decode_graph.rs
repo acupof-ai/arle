@@ -96,6 +96,12 @@ impl DecodeGraphContext {
                 positions: alloc_i32(ctx, 1)?,
                 seq_len,
                 num_pages: 0,
+                // Quant-KV metadata: the decode graph never runs under quant
+                // formats (warmup hard-disables the graph for non-BF16 pools).
+                start_pos: 0,
+                new_token_rows: None,
+                prefix_token_rows: None,
+                quant_decode_meta: None,
             },
             max_pages,
             key: None,
