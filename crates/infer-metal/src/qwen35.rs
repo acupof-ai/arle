@@ -856,4 +856,84 @@ impl CppQwen35Model {
         }
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
+
+    pub(crate) fn step_session_paged_bf16(
+        &self,
+        token: &MlxArray,
+        cache_pos: i32,
+        k_full_per_layer: &[MlxArray],
+        v_full_per_layer: &[MlxArray],
+    ) -> Result<MlxArray> {
+        anyhow::ensure!(
+            k_full_per_layer.len() == v_full_per_layer.len(),
+            "paged session step requires matching K/V layer counts"
+        );
+        let mut k_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            k_full_per_layer.iter().map(MlxArray::as_raw).collect();
+        let mut v_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            v_full_per_layer.iter().map(MlxArray::as_raw).collect();
+        let mut empty_int8_k: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let mut empty_int8_v: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_step_session_paged(
+                self.raw,
+                token.as_raw(),
+                cache_pos,
+                k_ptrs.as_mut_ptr(),
+                v_ptrs.as_mut_ptr(),
+                k_ptrs.len() as i32,
+                empty_int8_k.as_mut_ptr(),
+                empty_int8_v.as_mut_ptr(),
+                0,
+                &raw mut out_logits,
+            )
+        };
+        if rc != 0 {
+            return Err(mlx::check_mlx_error().unwrap_err());
+        }
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    pub(crate) fn step_session_paged_int8(
+        &self,
+        token: &MlxArray,
+        cache_pos: i32,
+        k_int8_full_per_layer: &[MlxArray],
+        v_int8_full_per_layer: &[MlxArray],
+    ) -> Result<MlxArray> {
+        anyhow::ensure!(
+            k_int8_full_per_layer.len() == v_int8_full_per_layer.len(),
+            "paged INT8 session step requires matching K/V triple counts"
+        );
+        anyhow::ensure!(
+            k_int8_full_per_layer.len().is_multiple_of(3),
+            "paged INT8 session step requires q/scale/bias triples"
+        );
+        let mut empty_bf16_k: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let mut empty_bf16_v: Vec<*mut mlx_sys::mlx_array> = Vec::new();
+        let mut k_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            k_int8_full_per_layer.iter().map(MlxArray::as_raw).collect();
+        let mut v_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            v_int8_full_per_layer.iter().map(MlxArray::as_raw).collect();
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_step_session_paged(
+                self.raw,
+                token.as_raw(),
+                cache_pos,
+                empty_bf16_k.as_mut_ptr(),
+                empty_bf16_v.as_mut_ptr(),
+                0,
+                k_ptrs.as_mut_ptr(),
+                v_ptrs.as_mut_ptr(),
+                (k_ptrs.len() / 3) as i32,
+                &raw mut out_logits,
+            )
+        };
+        if rc != 0 {
+            return Err(mlx::check_mlx_error().unwrap_err());
+        }
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
 }

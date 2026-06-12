@@ -609,6 +609,12 @@ struct Qwen35CompiledModel {
         bool kv_cache_int8 = false;
         bool has_rope_offsets = false;
         array rope_offsets = array(0);
+        bool has_paged_full_kv = false;
+        bool paged_full_kv_int8 = false;
+        const std::vector<array>* paged_k_full = nullptr;
+        const std::vector<array>* paged_v_full = nullptr;
+        const std::vector<array>* paged_k_int8_full = nullptr;
+        const std::vector<array>* paged_v_int8_full = nullptr;
         bool keep_intermediates = false;
         bool record_tapes = false;
         const std::vector<int>* capture_layer_ids = nullptr;
@@ -677,6 +683,16 @@ struct Qwen35CompiledModel {
     // variable-length batches (each row rotated at its own logical position).
     mutable array current_rope_offsets = array(0);
     mutable bool current_has_rope_offsets = false;
+    mutable bool current_has_paged_full_kv = false;
+    mutable bool current_paged_full_kv_int8 = false;
+    mutable std::vector<array> current_paged_k_full;
+    mutable std::vector<array> current_paged_v_full;
+    mutable std::vector<array> current_paged_k_int8_full;
+    mutable std::vector<array> current_paged_v_int8_full;
+    // Keep recent external paged-prefix arrays alive across pipelined lazy evals.
+    // MLX graphs are lazy; decode logits/sampled tokens may still reference a
+    // previous step's prefix when the next prequeue starts building.
+    mutable std::vector<std::vector<array>> paged_input_keepalive_history;
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
@@ -732,7 +748,58 @@ struct Qwen35CompiledModel {
         current_has_cache_pos_arr = false;
         current_rope_offsets = array(0);
         current_has_rope_offsets = false;
+        current_has_paged_full_kv = false;
+        current_paged_full_kv_int8 = false;
+        current_paged_k_full.clear();
+        current_paged_v_full.clear();
+        current_paged_k_int8_full.clear();
+        current_paged_v_int8_full.clear();
         current_is_verify = false;
+    }
+
+    void validate_paged_prefix_array(
+        const array& prefix,
+        const char* label,
+        int B,
+        int nkv,
+        int cache_pos,
+        int hd
+    ) const {
+        if (prefix.ndim() != 4) {
+            throw std::runtime_error(std::string("paged full-attn ") + label + " prefix must be rank-4");
+        }
+        if (prefix.dtype() != bfloat16) {
+            throw std::runtime_error(std::string("paged full-attn ") + label + " prefix must be bf16");
+        }
+        if (prefix.shape(0) != B ||
+            prefix.shape(1) != nkv ||
+            prefix.shape(2) != cache_pos ||
+            prefix.shape(3) != hd) {
+            throw std::runtime_error(std::string("paged full-attn ") + label + " prefix shape mismatch");
+        }
+    }
+
+    void validate_paged_int8_prefix_array(
+        const array& prefix,
+        const char* label,
+        int B,
+        int nkv,
+        int cache_pos,
+        int tail_dim,
+        Dtype expected_dtype
+    ) const {
+        if (prefix.ndim() != 4) {
+            throw std::runtime_error(std::string("paged int8 full-attn ") + label + " prefix must be rank-4");
+        }
+        if (prefix.dtype() != expected_dtype) {
+            throw std::runtime_error(std::string("paged int8 full-attn ") + label + " prefix dtype mismatch");
+        }
+        if (prefix.shape(0) != B ||
+            prefix.shape(1) != nkv ||
+            prefix.shape(2) != cache_pos ||
+            prefix.shape(3) != tail_dim) {
+            throw std::runtime_error(std::string("paged int8 full-attn ") + label + " prefix shape mismatch");
+        }
     }
 
     bool can_use_verify_sdpa_2pass(
@@ -779,6 +846,7 @@ struct Qwen35CompiledModel {
     array full_attn_step(
         const array& x, const FullAttnLayerWeights& lw,
         const array& k_cache, const array& v_cache, int cache_pos,
+        int full_layer_idx,
         const ForwardContext& ctx,
         ForwardArtifacts* artifacts,
         array& new_k_cache, array& new_v_cache
@@ -893,8 +961,26 @@ struct Qwen35CompiledModel {
             int end = cache_pos + S;
             new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {B,nkv,end,hd});
             new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {B,nkv,end,hd});
-            k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
-            v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
+            if (ctx.has_paged_full_kv) {
+                if (S != 1 || B != 1) {
+                    throw std::runtime_error("paged full-attn KV read supports only single-token decode");
+                }
+                if (!ctx.paged_k_full || !ctx.paged_v_full ||
+                    full_layer_idx < 0 ||
+                    full_layer_idx >= static_cast<int>(ctx.paged_k_full->size()) ||
+                    full_layer_idx >= static_cast<int>(ctx.paged_v_full->size())) {
+                    throw std::runtime_error("paged full-attn KV read missing layer input");
+                }
+                const auto& k_prefix = (*ctx.paged_k_full)[full_layer_idx];
+                const auto& v_prefix = (*ctx.paged_v_full)[full_layer_idx];
+                validate_paged_prefix_array(k_prefix, "K", B, nkv, cache_pos, hd);
+                validate_paged_prefix_array(v_prefix, "V", B, nkv, cache_pos, hd);
+                k_full = concatenate(std::vector<array>{k_prefix, k}, 2);
+                v_full = concatenate(std::vector<array>{v_prefix, v}, 2);
+            } else {
+                k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
+                v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
+            }
         }
 
         array attn_out(0);
@@ -952,6 +1038,7 @@ struct Qwen35CompiledModel {
         const array& k_q_cache, const array& k_s_cache, const array& k_b_cache,
         const array& v_q_cache, const array& v_s_cache, const array& v_b_cache,
         int cache_pos,
+        int full_layer_idx,
         const ForwardContext& ctx,
         ForwardArtifacts* artifacts,
         array& new_k_q_cache, array& new_k_s_cache, array& new_k_b_cache,
@@ -1014,12 +1101,48 @@ struct Qwen35CompiledModel {
         new_v_s_cache = slice_update(v_s_cache, vq[1], {0,0,cache_pos,0}, {B,nkv,end,scale_hd});
         new_v_b_cache = slice_update(v_b_cache, vq[2], {0,0,cache_pos,0}, {B,nkv,end,scale_hd});
 
-        auto k_q_full = slice(new_k_q_cache, {0,0,0,0}, {B,nkv,end,packed_hd});
-        auto k_s_full = slice(new_k_s_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
-        auto k_b_full = slice(new_k_b_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
-        auto v_q_full = slice(new_v_q_cache, {0,0,0,0}, {B,nkv,end,packed_hd});
-        auto v_s_full = slice(new_v_s_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
-        auto v_b_full = slice(new_v_b_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+        array k_q_full(0), k_s_full(0), k_b_full(0);
+        array v_q_full(0), v_s_full(0), v_b_full(0);
+        if (ctx.has_paged_full_kv) {
+            if (!ctx.paged_full_kv_int8) {
+                throw std::runtime_error("paged int8 full-attn KV read requires int8 prefix triples");
+            }
+            if (S != 1 || B != 1) {
+                throw std::runtime_error("paged int8 full-attn KV read supports only single-token decode");
+            }
+            if (!ctx.paged_k_int8_full || !ctx.paged_v_int8_full ||
+                full_layer_idx < 0 ||
+                (full_layer_idx * 3 + 2) >= static_cast<int>(ctx.paged_k_int8_full->size()) ||
+                (full_layer_idx * 3 + 2) >= static_cast<int>(ctx.paged_v_int8_full->size())) {
+                throw std::runtime_error("paged int8 full-attn KV read missing layer triples");
+            }
+            int base = full_layer_idx * 3;
+            const auto& k_q_prefix = (*ctx.paged_k_int8_full)[base];
+            const auto& k_s_prefix = (*ctx.paged_k_int8_full)[base + 1];
+            const auto& k_b_prefix = (*ctx.paged_k_int8_full)[base + 2];
+            const auto& v_q_prefix = (*ctx.paged_v_int8_full)[base];
+            const auto& v_s_prefix = (*ctx.paged_v_int8_full)[base + 1];
+            const auto& v_b_prefix = (*ctx.paged_v_int8_full)[base + 2];
+            validate_paged_int8_prefix_array(k_q_prefix, "K.q", B, nkv, cache_pos, packed_hd, uint32);
+            validate_paged_int8_prefix_array(k_s_prefix, "K.scale", B, nkv, cache_pos, scale_hd, bfloat16);
+            validate_paged_int8_prefix_array(k_b_prefix, "K.bias", B, nkv, cache_pos, scale_hd, bfloat16);
+            validate_paged_int8_prefix_array(v_q_prefix, "V.q", B, nkv, cache_pos, packed_hd, uint32);
+            validate_paged_int8_prefix_array(v_s_prefix, "V.scale", B, nkv, cache_pos, scale_hd, bfloat16);
+            validate_paged_int8_prefix_array(v_b_prefix, "V.bias", B, nkv, cache_pos, scale_hd, bfloat16);
+            k_q_full = concatenate(std::vector<array>{k_q_prefix, kq[0]}, 2);
+            k_s_full = concatenate(std::vector<array>{k_s_prefix, kq[1]}, 2);
+            k_b_full = concatenate(std::vector<array>{k_b_prefix, kq[2]}, 2);
+            v_q_full = concatenate(std::vector<array>{v_q_prefix, vq[0]}, 2);
+            v_s_full = concatenate(std::vector<array>{v_s_prefix, vq[1]}, 2);
+            v_b_full = concatenate(std::vector<array>{v_b_prefix, vq[2]}, 2);
+        } else {
+            k_q_full = slice(new_k_q_cache, {0,0,0,0}, {B,nkv,end,packed_hd});
+            k_s_full = slice(new_k_s_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+            k_b_full = slice(new_k_b_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+            v_q_full = slice(new_v_q_cache, {0,0,0,0}, {B,nkv,end,packed_hd});
+            v_s_full = slice(new_v_s_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+            v_b_full = slice(new_v_b_cache, {0,0,0,0}, {B,nkv,end,scale_hd});
+        }
         auto k_full = dequantize(k_q_full, k_s_full, k_b_full, group_size, 8);
         auto v_full = dequantize(v_q_full, v_s_full, v_b_full, group_size, 8);
 
@@ -1443,6 +1566,7 @@ struct Qwen35CompiledModel {
                         inputs[si], inputs[si+1], inputs[si+2],
                         inputs[si+3], inputs[si+4], inputs[si+5],
                         cache_pos,
+                        full_idx,
                         ctx,
                         artifacts,
                         new_kv_caches[oi], new_kv_caches[oi+1], new_kv_caches[oi+2],
@@ -1451,6 +1575,7 @@ struct Qwen35CompiledModel {
                     attn_out = full_attn_step(xn, layer.full,
                         inputs[si], inputs[si+1],
                         cache_pos,
+                        full_idx,
                         ctx,
                         artifacts,
                         new_kv_caches[oi], new_kv_caches[oi+1]);
@@ -1540,6 +1665,12 @@ struct Qwen35CompiledModel {
         ctx.kv_cache_int8 = current_kv_cache_int8;
         ctx.has_rope_offsets = current_has_rope_offsets;
         ctx.rope_offsets = current_rope_offsets;
+        ctx.has_paged_full_kv = current_has_paged_full_kv;
+        ctx.paged_full_kv_int8 = current_paged_full_kv_int8;
+        ctx.paged_k_full = current_has_paged_full_kv ? &current_paged_k_full : nullptr;
+        ctx.paged_v_full = current_has_paged_full_kv ? &current_paged_v_full : nullptr;
+        ctx.paged_k_int8_full = current_has_paged_full_kv ? &current_paged_k_int8_full : nullptr;
+        ctx.paged_v_int8_full = current_has_paged_full_kv ? &current_paged_v_int8_full : nullptr;
         ctx.keep_intermediates = keep_step_intermediates(current_seq_len);
         ctx.record_tapes = tape_mode;
         ctx.capture_layer_ids = &capture_layer_ids;
@@ -2183,6 +2314,8 @@ int32_t qwen35_session_begin(
         m->session_kv_caches = std::move(session_kv_caches);
         m->session_gdr_states = std::move(session_gdr_states);
         m->current_kv_cache_int8 = kv_int8;
+        m->paged_input_keepalive_history.clear();
+        m->clear_optional_batch_inputs();
         m->session_active = true;
         return 0;
     } catch (const std::exception& e) {
@@ -2279,14 +2412,11 @@ int32_t qwen35_compiled_session_kv_clone(
     }
 }
 
-// M_e.1 P3.1a — paged-KV variant of step_session. Accepts pre-gathered
-// per-layer K/V tensors so the kernel can (in P3.1c) read attention K/V
-// directly from MetalKVPool's slot layout instead of slice_update'ing the
-// session's left-pad cache. For now (P3.1a) the body is identical to
-// step_session — the new arguments are accepted but not yet consumed.
-// P3.1b will call this entry point (with parity-checked gathered K/V),
-// P3.1c will switch SDPA to read from those inputs, P3.1d will retire the
-// legacy step_session entry point.
+// Paged-KV variant of step_session. For single-token decode, the session still
+// writes this step's fresh K/V into its contiguous cache, but attention reads
+// the already-live prefix from caller-provided per-full-layer K/V arrays. BF16
+// passes K/V prefix tensors; INT8 passes flat q/scale/bias triples per layer.
+// Prefill, batch, and verify keep their existing cache-owned read source.
 int32_t qwen35_compiled_step_session_paged(
     void* model,
     mlx_array* token_id,
@@ -2294,12 +2424,11 @@ int32_t qwen35_compiled_step_session_paged(
     mlx_array** k_full_per_layer, // n_full_layers entries, nullable for legacy fallthrough
     mlx_array** v_full_per_layer, // n_full_layers entries, nullable for legacy fallthrough
     int32_t n_full_layers,
+    mlx_array** k_int8_full_per_layer, // n_int8_full_layers * 3 entries: q,scale,bias
+    mlx_array** v_int8_full_per_layer, // n_int8_full_layers * 3 entries: q,scale,bias
+    int32_t n_int8_full_layers,
     mlx_array** out_logits
 ) {
-    (void)k_full_per_layer; // P3.1c will consume these
-    (void)v_full_per_layer;
-    (void)n_full_layers;
-
     auto* m = static_cast<Qwen35CompiledModel*>(model);
     const int32_t capture_started = maybe_capture_qwen35_step_begin();
     try {
@@ -2319,6 +2448,79 @@ int32_t qwen35_compiled_step_session_paged(
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
         m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
+        std::vector<array> paged_keepalive;
+        if (n_full_layers < 0 || n_int8_full_layers < 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_step_session_paged received negative layer count");
+        }
+        if (m->current_kv_cache_int8 && n_int8_full_layers > 0) {
+            if (!k_int8_full_per_layer || !v_int8_full_per_layer) {
+                throw std::runtime_error(
+                    "qwen35_compiled_step_session_paged requires both INT8 K and V triples");
+            }
+            if (n_int8_full_layers != m->n_full_attn) {
+                throw std::runtime_error(
+                    "qwen35_compiled_step_session_paged INT8 layer count mismatch");
+            }
+            m->current_paged_k_int8_full.reserve(static_cast<size_t>(n_int8_full_layers) * 3);
+            m->current_paged_v_int8_full.reserve(static_cast<size_t>(n_int8_full_layers) * 3);
+            paged_keepalive.reserve(static_cast<size_t>(n_int8_full_layers) * 6);
+            for (int32_t i = 0; i < n_int8_full_layers * 3; ++i) {
+                if (!k_int8_full_per_layer[i] || !v_int8_full_per_layer[i]) {
+                    throw std::runtime_error(
+                        "qwen35_compiled_step_session_paged received null INT8 layer triple");
+                }
+                array k_prefix = *to_arr(k_int8_full_per_layer[i]);
+                array v_prefix = *to_arr(v_int8_full_per_layer[i]);
+                m->current_paged_k_int8_full.push_back(k_prefix);
+                m->current_paged_v_int8_full.push_back(v_prefix);
+                paged_keepalive.push_back(k_prefix);
+                paged_keepalive.push_back(v_prefix);
+            }
+            m->current_has_paged_full_kv = true;
+            m->current_paged_full_kv_int8 = true;
+        } else if (!m->current_kv_cache_int8 && n_full_layers > 0) {
+            if (!k_full_per_layer || !v_full_per_layer) {
+                throw std::runtime_error(
+                    "qwen35_compiled_step_session_paged requires both K and V arrays");
+            }
+            if (n_full_layers != m->n_full_attn) {
+                throw std::runtime_error(
+                    "qwen35_compiled_step_session_paged layer count mismatch");
+            }
+            m->current_paged_k_full.reserve(n_full_layers);
+            m->current_paged_v_full.reserve(n_full_layers);
+            paged_keepalive.reserve(static_cast<size_t>(n_full_layers) * 2);
+            for (int32_t i = 0; i < n_full_layers; ++i) {
+                if (!k_full_per_layer[i] || !v_full_per_layer[i]) {
+                    throw std::runtime_error(
+                        "qwen35_compiled_step_session_paged received null layer input");
+                }
+                array k_prefix = *to_arr(k_full_per_layer[i]);
+                array v_prefix = *to_arr(v_full_per_layer[i]);
+                m->current_paged_k_full.push_back(k_prefix);
+                m->current_paged_v_full.push_back(v_prefix);
+                paged_keepalive.push_back(k_prefix);
+                paged_keepalive.push_back(v_prefix);
+            }
+            m->current_has_paged_full_kv = true;
+            m->current_paged_full_kv_int8 = false;
+        } else if (m->current_kv_cache_int8 && n_full_layers > 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_step_session_paged INT8 session requires INT8 prefix triples");
+        } else if (!m->current_kv_cache_int8 && n_int8_full_layers > 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_step_session_paged BF16 session received INT8 prefix triples");
+        }
+        if (m->current_has_paged_full_kv) {
+            m->paged_input_keepalive_history.push_back(std::move(paged_keepalive));
+            constexpr size_t kMaxPagedKeepaliveHistory = 4;
+            if (m->paged_input_keepalive_history.size() > kMaxPagedKeepaliveHistory) {
+                m->paged_input_keepalive_history.erase(
+                    m->paged_input_keepalive_history.begin(),
+                    m->paged_input_keepalive_history.end() - kMaxPagedKeepaliveHistory);
+            }
+        }
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -2331,6 +2533,7 @@ int32_t qwen35_compiled_step_session_paged(
         }
 
         m->prev_outputs = m->forward(inputs);
+        m->clear_optional_batch_inputs();
         auto& outputs = m->prev_outputs;
 
         if (capture_started) {
@@ -2355,6 +2558,7 @@ int32_t qwen35_compiled_step_session_paged(
         maybe_capture_qwen35_step_end(capture_started);
         return 0;
     } catch (const std::exception& e) {
+        m->clear_optional_batch_inputs();
         mlx_set_error(e.what());
         maybe_capture_qwen35_step_end(capture_started);
         return -1;
@@ -2524,122 +2728,6 @@ int32_t qwen35_compiled_step_batch(
 
         if (batch_size <= 0) {
             throw std::runtime_error("qwen35_compiled_step_batch requires batch_size > 0");
-        }
-
-        m->current_cache_pos = cache_pos;
-        m->current_batch_size = batch_size;
-        m->current_seq_len = 1;
-        m->current_has_attn_mask = attn_mask != nullptr;
-        if (m->current_has_attn_mask) {
-            m->current_attn_mask = *to_arr(attn_mask);
-        } else {
-            m->current_attn_mask = array(0);
-        }
-        m->current_has_cache_pos_arr = false;
-        m->current_cache_pos_arr = nullptr;
-        m->current_has_rope_offsets = rope_offsets != nullptr;
-        if (m->current_has_rope_offsets) {
-            m->current_rope_offsets = *to_arr(rope_offsets);
-        } else {
-            m->current_rope_offsets = array(0);
-        }
-
-        std::vector<array> inputs;
-        inputs.reserve(1 + n_kv_per_request + n_gdr_per_request);
-        inputs.push_back(*to_arr(token_ids));
-
-        for (int kv_idx = 0; kv_idx < n_kv_per_request; ++kv_idx) {
-            std::vector<array> per_request;
-            per_request.reserve(batch_size);
-            for (int b = 0; b < batch_size; ++b) {
-                per_request.push_back(*to_arr(kv_caches[b * n_kv_per_request + kv_idx]));
-            }
-            inputs.push_back(concatenate(per_request, 0));
-        }
-
-        for (int gdr_idx = 0; gdr_idx < n_gdr_per_request; ++gdr_idx) {
-            std::vector<array> per_request;
-            per_request.reserve(batch_size);
-            for (int b = 0; b < batch_size; ++b) {
-                per_request.push_back(*to_arr(gdr_states[b * n_gdr_per_request + gdr_idx]));
-            }
-            inputs.push_back(concatenate(per_request, 0));
-        }
-
-        m->prev_outputs = m->forward(inputs);
-        auto& outputs = m->prev_outputs;
-
-        *out_logits = from_arr(std::move(outputs[0]));
-
-        auto slice_batch_row = [](const array& arr, int row) {
-            Shape start = arr.shape();
-            Shape end = arr.shape();
-            std::fill(start.begin(), start.end(), 0);
-            start[0] = row;
-            end[0] = row + 1;
-            return slice(arr, start, end);
-        };
-
-        for (int kv_idx = 0; kv_idx < n_kv_per_request; ++kv_idx) {
-            const auto& batched = outputs[1 + kv_idx];
-            for (int b = 0; b < batch_size; ++b) {
-                out_kv_caches[b * n_kv_per_request + kv_idx] =
-                    from_arr(slice_batch_row(batched, b));
-            }
-        }
-
-        for (int gdr_idx = 0; gdr_idx < n_gdr_per_request; ++gdr_idx) {
-            const auto& batched = outputs[1 + n_kv_per_request + gdr_idx];
-            for (int b = 0; b < batch_size; ++b) {
-                out_gdr_states[b * n_gdr_per_request + gdr_idx] =
-                    from_arr(slice_batch_row(batched, b));
-            }
-        }
-
-        m->clear_optional_batch_inputs();
-        m->current_batch_size = 1;
-        return 0;
-    } catch (const std::exception& e) {
-        mlx_set_error(e.what());
-        m->clear_optional_batch_inputs();
-        m->current_batch_size = 1;
-        return -1;
-    }
-}
-
-// M_e.1 P3.1c.3b — paged-KV variant of step_batch. Accepts per-state
-// per-layer pre-gathered K and V arrays; in P3.1c.3b the new arguments
-// are accepted but ignored (body is identical to step_batch). P3.1c.3c
-// will flip the C++ SDPA read source on the batched path. Symmetric to
-// step_session_paged for c=1.
-int32_t qwen35_compiled_step_batch_paged(
-    void* model,
-    mlx_array* token_ids,
-    int32_t batch_size,
-    int32_t cache_pos,
-    mlx_array** kv_caches,
-    int32_t n_kv_per_request,
-    mlx_array** gdr_states,
-    int32_t n_gdr_per_request,
-    mlx_array** k_full_per_state, // batch_size * n_full_layers entries; nullable
-    mlx_array** v_full_per_state, // batch_size * n_full_layers entries; nullable
-    int32_t n_full_layers,
-    mlx_array* attn_mask,
-    mlx_array* rope_offsets,
-    mlx_array** out_logits,
-    mlx_array** out_kv_caches,
-    mlx_array** out_gdr_states
-) {
-    (void)k_full_per_state; // P3.1c.3c will consume these
-    (void)v_full_per_state;
-    (void)n_full_layers;
-
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    try {
-        mlx_clear_error();
-
-        if (batch_size <= 0) {
-            throw std::runtime_error("qwen35_compiled_step_batch_paged requires batch_size > 0");
         }
 
         m->current_cache_pos = cache_pos;

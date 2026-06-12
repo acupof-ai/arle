@@ -1,5 +1,11 @@
 # M_e.1 P3.1c.3d — C++ SDPA flip implementation note
 
+> **Superseded (2026-06-12).** The post-rewrite Metal path no longer uses this
+> monolith-era batch-paged design. `qwen35_compiled_step_batch_paged` was removed
+> because it accepted paged arguments but ignored them. Current truth:
+> [`2026-06-12-metal-paged-int8-attention-plan.md`](2026-06-12-metal-paged-int8-attention-plan.md)
+> and [`../experience/wins/2026-06-12-metal-paged-kv-read-9b-probe.md`](../experience/wins/2026-06-12-metal-paged-kv-read-9b-probe.md).
+
 > Final atomic commit of the M_e.1 paged-KV unlock. Reading the actual
 > C++ structure (`Qwen35CompiledModel::forward_impl` →
 > `attention_block` at `crates/mlx-sys/src/mlx_qwen35_model.cpp:718-855`)
