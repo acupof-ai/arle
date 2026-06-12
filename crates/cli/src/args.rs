@@ -453,6 +453,11 @@ pub(crate) enum ServeKvCacheDtypeArg {
     Auto,
     Bf16,
     Int8,
+    /// FP8 (E4M3) paged KV — CUDA only, wired one mode at a time under #68 T3
+    /// (fails loud at engine construction until its path lands).
+    Fp8,
+    /// Trellis 4-bit paged KV — CUDA only, same #68 T3 staging as `Fp8`.
+    Tq4,
 }
 
 #[derive(Debug, Clone, clap::Args)]
