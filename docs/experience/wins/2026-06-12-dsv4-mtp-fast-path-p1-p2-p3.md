@@ -58,10 +58,55 @@ EOS-honoring 256-token essay workload, same binary per comparison. Plan:
 - Depth-3 trees re-confirmed dead with the nextn-1 head (q₂ ≤ 0.41) — width
   beats depth at every measured operating point.
 
+## UPDATE — width deleted; chain-fold depth sweep (7d316523, same binary)
+
+ckl's minimal-scheme verdict landed: a wide candidate without its row ≡ the
+bonus (free), and candidate rows cost more in MoE expert reads than their
+continuation returns → the complete tree was DELETED (`7d316523`, −708
+lines). Chain + fold sweep on the EOS-clean essay workload:
+
+| chain+fold depth | tok/s | A | TPOT |
+|---|---|---|---|
+| **d2** | **38.04 (+17.0% vs no-spec 32.52)** | 1.98 | **26.3 ms** |
+| d3 | 36.35 | 2.17 | 27.5 ms |
+| d4 | 30.64 | 2.11 | 32.6 ms |
+
+d2 is the data-confirmed sweet spot (depth ≥3: +A never pays its draft level
++ verify row). Needle exact ×6 (d2), ×3 (d3); d4 speed-only.
+
+## Base-regression hunt (open): today 33.8 vs the 6-11 record 44.04
+
+Same serve script, same harness, co-tenant-free (the 8×51.5 GB "[Not Found]"
+nvidia-smi PIDs were OUR OWN ranks seen from another PID namespace), CPU
+idle, RUST_LOG=warn no-op, clean reboot no-op. Trace census vs era docs:
+kernel counts IDENTICAL (the +172 pack_quantize / −215 scalar-gemv shift is
+the licensed 6-07 DeepGEMM lever), checkable durations identical (mhc 8.46
+vs 8.51 µs, FlashMLA 15.2 µs). The delta sits in NCCL wait (rank-arrival
+skew: ranks 2/4 arrive last, others spin) + launch dust. The decisive
+control — rebuild exactly `d7be8c9b` and bench in today's session — was
+started but yielded to the sweep; it is the ONE remaining run to split
+"binary regression" from "era session context (e.g. DeepGEMM JIT cache
+state)". Until then, all within-session deltas (everything above) stand;
+cross-day absolutes don't (the standing rule, re-proven).
+
+## Rules (appended)
+
+- **A stale background waiter is a co-tenant**: a leftover engine-ready
+  probe loop fired its own bench against the next serve and halved B=1
+  throughput (38 → 18) while doubling step counts. Kill prior clients
+  before measuring; treat step-count-vs-token mismatch as the tell.
+- **nvidia-smi `[Not Found]` compute PIDs on a pod are often your own ranks
+  in another PID namespace** — verify by stopping your serve before
+  declaring a co-tenant.
+
 ## State
 
-- Default runtime behavior unchanged (topk=1 chain; tree + fold are env
-  opt-ins: `ARLE_DSV4_MTP_TOPK=2 ARLE_DSV4_MTP_UNCLAMP=1 MTP_DEPTH=2
-  ARLE_DSV4_MTP_COMMIT_FOLD=1`).
-- Default-flip license deferred: +3.4% is real but thin; flip decision after
-  tree pruning lands (target ≥ +10%) or with the OPD head.
+- Default runtime behavior unchanged (chain depth-1, no fold). Best known
+  config (opt-in): `ARLE_DSV4_MTP_COMMIT_FOLD=1 ARLE_DSV4_MTP_UNCLAMP=1
+  MTP_DEPTH=2` → 38.04 tok/s = 26.3 ms TPOT, the best recorded number on
+  this lane's clean-workload harness.
+- Default-flip license: +17% clears the bar on this shape; owes one more
+  binding shape (long-input generation) per the multi-shape rule, plus the
+  d7be8c9b control to close the base question.
+- Pod left at `7d316523` serving the best config (ckl's in-flight main
+  temporarily gates `--spec-type` off CUDA).
