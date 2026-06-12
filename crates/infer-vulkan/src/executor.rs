@@ -1,6 +1,7 @@
 //! Vulkan `BackendExecutor` skeleton.
 //!
-//! P2 keeps submit/poll behavior identical to `infer-hip`: one row per plan,
+//! P2 keeps submit/poll behavior identical to the HIP backend: one row per
+//! plan,
 //! synchronous completion, and host sampling once numeric logits exist. Until
 //! a model is loaded, every non-idle plan errors loud.
 
@@ -43,7 +44,7 @@ pub fn classify_vulkan_architecture(
     VulkanModelKind::Qwen3Dense
 }
 
-pub fn classify_vulkan_gguf(gguf: &infer_hip::gguf::GgufFile) -> Result<VulkanModelKind> {
+pub fn classify_vulkan_gguf(gguf: &infer_gguf::gguf::GgufFile) -> Result<VulkanModelKind> {
     let architecture = gguf
         .get_str("general.architecture")
         .unwrap_or("qwen3")
@@ -214,7 +215,7 @@ pub fn load_qwen3_gguf(
 ) -> Result<(VulkanExecutor, VulkanKvPool)> {
     ensure!(num_slots > 0, "Vulkan load requires at least one slot");
     ensure!(max_seq_len > 0, "Vulkan load requires max_seq_len > 0");
-    let gguf = infer_hip::gguf::GgufFile::open(&path)?;
+    let gguf = infer_gguf::gguf::GgufFile::open(&path)?;
     let kind = classify_vulkan_gguf(&gguf)?;
     #[cfg(feature = "vulkan")]
     {
