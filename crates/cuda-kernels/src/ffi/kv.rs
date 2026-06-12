@@ -123,6 +123,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dequantize_paged_kv_int8_per_channel_k_to_hnd_cuda(
+        kv_int8: *const i8,
+        k_static_scales: *const f32,
+        kv_bf16_hnd: *mut Half,
+        token_rows: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        total_tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn quantize_paged_kv_single_cuda(
         kv_bf16: *const Half,
         kv_int8: *mut i8,
@@ -280,6 +292,18 @@ unsafe extern "C" {
     pub fn dequantize_paged_kv_fp8_to_hnd_cuda(
         kv_fp8: *const u8,
         scales: *const f32,
+        kv_bf16_hnd: *mut Half,
+        token_rows: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        total_tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dequantize_paged_kv_fp8_per_channel_k_to_hnd_cuda(
+        kv_fp8: *const u8,
+        k_static_scales: *const f32,
         kv_bf16_hnd: *mut Half,
         token_rows: *const i32,
         num_kv_heads: i32,

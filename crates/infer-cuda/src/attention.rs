@@ -6,6 +6,7 @@
 use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
+use cuda_kernels::kv_quant;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
 use cuda_kernels::tensor::{WeightFormat, cache_ptr};
@@ -2579,6 +2580,274 @@ pub(crate) fn paged_attention(
     }
 }
 
+/// Re-materialize the quantized prefix rows of `layer_idx` into the shared
+/// bf16 work buffers (pool→work dequant) before the prefill prep kernel
+/// appends the new chunk's rows. The work buffer is shared across layers and
+/// overwritten every layer/forward, and prefix pages may arrive via radix
+/// attach / COW detach / tier promote — the quantized plane is the only
+/// durable source, so the prefix is unconditionally re-materialized. K uses
+/// the per-channel KIVI dequant (per-channel K quantize never writes
+/// per-token K scales); V uses the per-token sibling.
+fn refill_prefix_rows_to_work(
+    ctx: &DeviceContext,
+    layer_idx: usize,
+    pool: &PagedKVPool,
+    meta: &PageMeta,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if meta.start_pos == 0 {
+        return Ok(());
+    }
+    let stream = &ctx.stream;
+    let prefix_rows = meta.prefix_token_rows.as_ref().ok_or_else(|| {
+        anyhow!(
+            "quant KV prefill missing prefix_token_rows for start_pos={}",
+            meta.start_pos
+        )
+    })?;
+    let k_static_scales_ptr = pool
+        .k_static_scales_ptr(layer_idx, stream)
+        .ok_or_else(|| anyhow!("quant KV pool missing KIVI k_static_scales (layer {layer_idx})"))?;
+    match pool.format {
+        KVFormat::FP8E4M3 => {
+            kv_quant::dequantize_paged_kv_fp8_per_channel_k_to_hnd(
+                ctx,
+                pool.k_data_ptr(layer_idx, stream),
+                k_static_scales_ptr,
+                pool.k_work_ptr(stream),
+                prefix_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                meta.start_pos,
+            )?;
+            kv_quant::dequantize_paged_kv_fp8_to_hnd(
+                ctx,
+                pool.v_data_ptr(layer_idx, stream),
+                pool.v_scales_ptr(layer_idx, stream),
+                pool.v_work_ptr(stream),
+                prefix_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                meta.start_pos,
+            )
+        }
+        KVFormat::INT8 => {
+            kv_quant::dequantize_paged_kv_int8_per_channel_k_to_hnd(
+                ctx,
+                pool.k_data_ptr(layer_idx, stream),
+                k_static_scales_ptr,
+                pool.k_work_ptr(stream),
+                prefix_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                meta.start_pos,
+            )?;
+            kv_quant::dequantize_paged_kv_int8_to_hnd(
+                ctx,
+                pool.v_data_ptr(layer_idx, stream),
+                pool.v_scales_ptr(layer_idx, stream),
+                pool.v_work_ptr(stream),
+                prefix_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                meta.start_pos,
+            )
+        }
+        other => bail!("quant KV prefix refill does not support format {other:?}"),
+    }
+}
+
+/// Quantize this forward's new bf16 rows work→pool for `layer_idx`,
+/// calibrating the KIVI per-channel K scale table first if the layer's latch
+/// is still unset. K goes through the per-channel quantize against the static
+/// table; V keeps per-(token, head) scales.
+fn calibrate_and_quantize_new_rows(
+    ctx: &DeviceContext,
+    layer_idx: usize,
+    pool: &PagedKVPool,
+    meta: &PageMeta,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let stream = &ctx.stream;
+    let new_rows = meta
+        .new_token_rows
+        .as_ref()
+        .ok_or_else(|| anyhow!("quant KV forward missing new_token_rows"))?;
+    let k_static_scales_ptr = pool
+        .k_static_scales_ptr(layer_idx, stream)
+        .ok_or_else(|| anyhow!("quant KV pool missing KIVI k_static_scales (layer {layer_idx})"))?;
+    let batch = meta.seq_len;
+    // Latch-once calibration is REQUIRED under chunked prefill: recalibrating
+    // on a later chunk would rescale the table while earlier chunks' K bytes
+    // remain quantized under the old scale, corrupting every prior row at
+    // decode. First batch through the layer calibrates (absmax → finalize),
+    // then the latch flips and the table is read-only.
+    if !pool.k_kivi_calibrated[layer_idx].load(Ordering::Relaxed) {
+        kv_quant::compute_k_per_channel_absmax(
+            ctx,
+            pool.k_work_ptr(stream),
+            k_static_scales_ptr,
+            new_rows,
+            num_kv_heads,
+            head_dim,
+            pool.kv_dim,
+            batch,
+        )?;
+        match pool.format {
+            KVFormat::FP8E4M3 => kv_quant::finalize_k_per_channel_scales(
+                ctx,
+                k_static_scales_ptr,
+                num_kv_heads * head_dim,
+            )?,
+            KVFormat::INT8 => kv_quant::finalize_k_per_channel_scales_int8(
+                ctx,
+                k_static_scales_ptr,
+                num_kv_heads * head_dim,
+            )?,
+            other => bail!("quant KV calibration does not support format {other:?}"),
+        }
+        pool.k_kivi_calibrated[layer_idx].store(true, Ordering::Relaxed);
+    }
+    match pool.format {
+        KVFormat::FP8E4M3 => {
+            kv_quant::quantize_paged_kv_fp8_per_channel(
+                ctx,
+                pool.k_work_ptr(stream),
+                pool.k_data_ptr(layer_idx, stream),
+                k_static_scales_ptr,
+                new_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                batch,
+            )?;
+            kv_quant::quantize_paged_kv_fp8(
+                ctx,
+                pool.v_work_ptr(stream),
+                pool.v_data_ptr(layer_idx, stream),
+                pool.v_scales_ptr(layer_idx, stream),
+                new_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                batch,
+            )?;
+        }
+        KVFormat::INT8 => {
+            kv_quant::quantize_paged_kv_int8_per_channel(
+                ctx,
+                pool.k_work_ptr(stream),
+                pool.k_data_ptr(layer_idx, stream),
+                k_static_scales_ptr,
+                new_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                batch,
+            )?;
+            kv_quant::quantize_paged_kv_single(
+                ctx,
+                pool.v_work_ptr(stream),
+                pool.v_data_ptr(layer_idx, stream),
+                pool.v_scales_ptr(layer_idx, stream),
+                new_rows,
+                num_kv_heads,
+                head_dim,
+                pool.kv_dim,
+                batch,
+            )?;
+        }
+        other => bail!("quant KV new-row quantize does not support format {other:?}"),
+    }
+    Ok(())
+}
+
+/// Fused-dequant decode attention over the quantized pool planes (replaces
+/// the TileLang bf16 kernel for INT8/FP8 pools). NOT
+/// `decode_attention_varlen_fp8` — that kernel consumes per-token K scales
+/// and is incompatible with per-channel K.
+#[allow(clippy::too_many_arguments)]
+fn run_quant_decode(
+    ctx: &DeviceContext,
+    layer_idx: usize,
+    pool: &PagedKVPool,
+    q_batch: &HiddenStates,
+    meta: &PageMeta,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let stream = &ctx.stream;
+    let quant_meta = meta
+        .quant_decode_meta
+        .as_ref()
+        .ok_or_else(|| anyhow!("quant KV decode missing quant_decode_meta"))?;
+    let k_static_scales_ptr = pool
+        .k_static_scales_ptr(layer_idx, stream)
+        .ok_or_else(|| anyhow!("quant KV pool missing KIVI k_static_scales (layer {layer_idx})"))?;
+    let ws = pool
+        .int8_attn_workspace
+        .as_ref()
+        .ok_or_else(|| anyhow!("quant KV pool missing split-KV attention workspace"))?;
+    // The pool sizes the workspace with an approximate-max-heads heuristic
+    // (num_splits=32, paged_kv.rs); fail loud rather than overrun it.
+    let needed = kv_quant::decode_attention_int8_workspace_bytes(1, num_q_heads, head_dim, 32);
+    ensure!(
+        needed <= pool.int8_attn_workspace_bytes,
+        "quant decode workspace needs {needed} bytes, pool allocated {}",
+        pool.int8_attn_workspace_bytes
+    );
+    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    match pool.format {
+        KVFormat::FP8E4M3 => kv_quant::decode_attention_fp8_per_channel_k(
+            ctx,
+            q_batch,
+            pool.k_data_ptr(layer_idx, stream),
+            pool.v_data_ptr(layer_idx, stream),
+            k_static_scales_ptr,
+            pool.v_scales_ptr(layer_idx, stream),
+            &meta.kv_indices,
+            quant_meta,
+            out,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pool.kv_dim,
+            sm_scale,
+            ws,
+            pool.int8_attn_workspace_bytes,
+        ),
+        KVFormat::INT8 => kv_quant::decode_attention_int8_per_channel_k(
+            ctx,
+            q_batch,
+            pool.k_data_ptr(layer_idx, stream),
+            pool.v_data_ptr(layer_idx, stream),
+            k_static_scales_ptr,
+            pool.v_scales_ptr(layer_idx, stream),
+            &meta.kv_indices,
+            quant_meta,
+            out,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pool.kv_dim,
+            sm_scale,
+            ws,
+            pool.int8_attn_workspace_bytes,
+        ),
+        other => bail!("quant KV decode does not support format {other:?}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prefill_attention(
     ctx: &DeviceContext,
@@ -2598,6 +2867,20 @@ fn prefill_attention(
     head_dim: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
+    if !quant && pool.format != KVFormat::BF16 {
+        // Defensive: CudaKvCacheDtype::resolve admits only BF16/INT8/FP8.
+        bail!(
+            "dense-Qwen3 paged prefill supports BF16/INT8/FP8E4M3 KV pools, got {:?}",
+            pool.format
+        );
+    }
+    if quant {
+        // Prefix rows must be back in the bf16 work buffer before the prep
+        // kernel appends this chunk's rows (TileLang reads the whole [0,
+        // start_pos + seq_len) span from the work buffer via pool.k_ptr).
+        refill_prefix_rows_to_work(ctx, layer_idx, pool, meta, num_kv_heads, head_dim)?;
+    }
     {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
@@ -2648,7 +2931,13 @@ fn prefill_attention(
         num_kv_heads,
         head_dim,
         out,
-    )
+    )?;
+    if quant {
+        // FINALIZE after TileLang has consumed the bf16 work buffer: calibrate
+        // (latch-once) and persist this chunk's new rows into the quant planes.
+        calibrate_and_quantize_new_rows(ctx, layer_idx, pool, meta, num_kv_heads, head_dim)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2670,6 +2959,14 @@ fn decode_attention(
     head_dim: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
+    if !quant && pool.format != KVFormat::BF16 {
+        // Defensive: CudaKvCacheDtype::resolve admits only BF16/INT8/FP8.
+        bail!(
+            "dense-Qwen3 paged decode supports BF16/INT8/FP8E4M3 KV pools, got {:?}",
+            pool.format
+        );
+    }
     {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
@@ -2711,6 +3008,25 @@ fn decode_attention(
             )
             .result()?;
         }
+    }
+    if quant {
+        // Calibrate-if-unlatched covers the 1-token-prompt edge — a seq_len==1
+        // first forward routes here with start_pos==0 and zero-init static
+        // scales; quantizing K against a zero table would write garbage for
+        // the whole request. Then quantize this step's row and run the fused
+        // dequant decode kernel (graph is hard-disabled for quant pools).
+        calibrate_and_quantize_new_rows(ctx, layer_idx, pool, meta, num_kv_heads, head_dim)?;
+        return run_quant_decode(
+            ctx,
+            layer_idx,
+            pool,
+            q_batch,
+            meta,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            out,
+        );
     }
     run_tilelang_paged(
         ctx,
