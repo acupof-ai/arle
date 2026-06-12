@@ -58,10 +58,10 @@ cudaError_t arle_fused_add_rmsnorm_offset_bf16_cuda(__nv_bfloat16 *input,
   // with weight_bias = 1.0f for the (1+weight) gain.
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = flashinfer::ceil_div(block_size, 32);
   dim3 nblks(batch);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
+  const uint32_t smem_size = (flashinfer::ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 1.0f;
   T *weight_mut = const_cast<T *>(weight);
 
