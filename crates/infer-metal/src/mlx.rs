@@ -165,6 +165,10 @@ impl MlxArray {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Int32) }
     }
 
+    pub fn from_bytes(data: &[u8], shape: &[i32], dtype: Dtype) -> Self {
+        unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, dtype) }
+    }
+
     pub fn scalar_f32(value: f32) -> Self {
         mlx_array_from_raw_or_panic(
             unsafe { mlx_sys::mlx_array_new_float32(value) },
@@ -200,6 +204,26 @@ impl MlxArray {
         panic_if_mlx_error("mlx_array_dtype");
         Dtype::from_raw(raw)
             .unwrap_or_else(|| panic!("mlx_array_dtype returned unknown dtype {raw}"))
+    }
+
+    pub fn nbytes(&self) -> usize {
+        let bytes = unsafe { mlx_sys::mlx_array_nbytes(self.0) };
+        panic_if_mlx_error("mlx_array_nbytes");
+        bytes
+    }
+
+    pub fn export_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; self.nbytes()];
+        let written = unsafe {
+            mlx_sys::mlx_array_export_bytes(self.0, bytes.as_mut_ptr().cast(), bytes.len())
+        };
+        panic_if_mlx_error("mlx_array_export_bytes");
+        assert_eq!(
+            written,
+            bytes.len(),
+            "mlx_array_export_bytes wrote a different byte count"
+        );
+        bytes
     }
 
     pub fn item_i32(&self) -> i32 {

@@ -6,9 +6,9 @@
 //! `#[cfg(feature = "metal")]`.
 
 #[cfg(feature = "metal")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "metal")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
@@ -18,6 +18,51 @@ use crate::{config, mlx, model_source, qwen35, wired_limit};
 
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
+#[cfg(feature = "metal")]
+const METAL_T2_MAGIC: &[u8; 8] = b"AMT2KV1\0";
+#[cfg(feature = "metal")]
+const METAL_T2_VERSION: u8 = 1;
+#[cfg(feature = "metal")]
+const METAL_T2_PAGE_RECORD: u8 = 1;
+#[cfg(feature = "metal")]
+const METAL_T2_PREFIX_RECORD: u8 = 2;
+
+#[cfg(feature = "metal")]
+static METAL_T2_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "metal")]
+#[must_use]
+pub fn default_t2_budget_bytes(root: &Path) -> usize {
+    infer_seam::split_host_tiers(
+        None,
+        free_disk_bytes(root),
+        true,
+        infer_seam::HostTierPolicy::default(),
+    )
+    .ssd_bytes
+}
+
+#[cfg(all(feature = "metal", unix))]
+fn free_disk_bytes(path: &Path) -> Option<usize> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let stat = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        stat
+    };
+    let bytes = u128::from(stat.f_frsize).saturating_mul(u128::from(stat.f_bavail));
+    usize::try_from(bytes).ok()
+}
+
+#[cfg(all(feature = "metal", not(unix)))]
+fn free_disk_bytes(_path: &Path) -> Option<usize> {
+    None
+}
 
 /// Metal KV-cache storage dtype. The host `MetalKvPool` remains a logical page
 /// allocator; this controls the MLX arrays inside each Metal slot.
@@ -357,6 +402,21 @@ impl MetalExecutor {
         })
     }
 
+    #[cfg(feature = "metal")]
+    pub fn set_kv_tier_disk(
+        &mut self,
+        root: PathBuf,
+        budget_bytes: usize,
+        page_size: usize,
+    ) -> bool {
+        let Some(real) = self.real.as_mut() else {
+            return false;
+        };
+        let bytes_per_page =
+            estimated_metal_kv_page_bytes(&real.config, real.kv_cache_dtype, page_size.max(1));
+        real.page_store.set_ssd(root, budget_bytes, bytes_per_page)
+    }
+
     /// Feature-free placeholder forward: one deterministic token per scheduled
     /// row, so the submit/poll seam is exercisable on CPU without MLX.
     fn placeholder_forward(plan: &ForwardPlan) -> StepOutput {
@@ -449,6 +509,41 @@ impl BackendExecutor for MetalExecutor {
         if let Some(real) = self.real.as_mut() {
             real.page_store.release_pages(_pages);
         }
+    }
+
+    fn kv_tier_capacity_pages(&self) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.kv_tier_capacity_pages();
+        }
+        0
+    }
+
+    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            return real.page_store.demote_prefix_pages(entries);
+        }
+        let _ = entries;
+        Ok(0)
+    }
+
+    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            return real.page_store.promote_prefix_pages(entries);
+        }
+        let _ = entries;
+        anyhow::bail!("Metal placeholder backend has no KV tier store")
+    }
+
+    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_mut() {
+            real.page_store.drop_kv_tier_entries(keys);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = keys;
     }
 
     fn warmup(&mut self) -> anyhow::Result<()> {
@@ -850,25 +945,578 @@ impl RealMetalExecutor {
 }
 
 #[cfg(feature = "metal")]
-#[derive(Default)]
 struct MetalPageStore {
     pages: HashMap<u32, MetalPageBlock>,
-    prefixes: HashMap<Vec<u32>, MetalPrefixSnapshot>,
+    prefixes: HashMap<Vec<u64>, MetalPrefixSnapshot>,
+    next_logical_id: u64,
+    ssd: Option<MetalSsdTier>,
 }
 
 #[cfg(feature = "metal")]
+impl Default for MetalPageStore {
+    fn default() -> Self {
+        Self {
+            pages: HashMap::new(),
+            prefixes: HashMap::new(),
+            next_logical_id: 1,
+            ssd: None,
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+#[derive(Clone)]
 struct MetalPageBlock {
+    logical_id: u64,
+    owner: Option<MetalPageOwner>,
     kv_flat: Vec<mlx::MlxArray>,
 }
 
 #[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+struct MetalPageOwner {
+    slot: usize,
+    slot_epoch: u64,
+    page_idx: usize,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Clone)]
 struct MetalPrefixSnapshot {
     cache_len: usize,
     gdr_flat: Vec<mlx::MlxArray>,
 }
 
 #[cfg(feature = "metal")]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum MetalDiskKey {
+    Page(u64),
+    Prefix(Vec<u64>),
+}
+
+#[cfg(feature = "metal")]
+struct MetalDiskRecord {
+    bytes: usize,
+    stamp: u64,
+}
+
+#[cfg(feature = "metal")]
+struct MetalSsdTier {
+    root: PathBuf,
+    budget_bytes: usize,
+    capacity_pages: usize,
+    used_bytes: usize,
+    clock: u64,
+    records: HashMap<MetalDiskKey, MetalDiskRecord>,
+    lru: BTreeSet<(u64, MetalDiskKey)>,
+    tier_to_logical: HashMap<u64, u64>,
+    read_scratch: Vec<u8>,
+}
+
+#[cfg(feature = "metal")]
+impl Drop for MetalSsdTier {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(feature = "metal")]
+impl MetalSsdTier {
+    fn new(root: PathBuf, budget_bytes: usize, bytes_per_page: usize) -> Option<Self> {
+        let capacity_pages = budget_bytes.checked_div(bytes_per_page.max(1)).unwrap_or(0);
+        if capacity_pages == 0 {
+            return None;
+        }
+        let root = metal_t2_namespace(root);
+        if let Err(err) = std::fs::create_dir_all(&root) {
+            log::warn!(
+                "Metal KV T2 namespace creation failed under {}: {err}",
+                root.display()
+            );
+            return None;
+        }
+        Some(Self {
+            root,
+            budget_bytes,
+            capacity_pages,
+            used_bytes: 0,
+            clock: 0,
+            records: HashMap::new(),
+            lru: BTreeSet::new(),
+            tier_to_logical: HashMap::new(),
+            read_scratch: Vec::new(),
+        })
+    }
+
+    fn has_prefix(&self, key: &[u64]) -> bool {
+        self.records
+            .contains_key(&MetalDiskKey::Prefix(key.to_vec()))
+    }
+
+    fn write_page(&mut self, block: &MetalPageBlock) -> bool {
+        match encode_metal_t2_page(block) {
+            Ok(bytes) => self.write_record(MetalDiskKey::Page(block.logical_id), &bytes),
+            Err(err) => {
+                log::warn!(
+                    "Metal KV T2 page encode failed for logical page {}: {err:#}",
+                    block.logical_id
+                );
+                false
+            }
+        }
+    }
+
+    fn write_prefix(&mut self, key: &[u64], snapshot: &MetalPrefixSnapshot) -> bool {
+        match encode_metal_t2_prefix(key, snapshot) {
+            Ok(bytes) => self.write_record(MetalDiskKey::Prefix(key.to_vec()), &bytes),
+            Err(err) => {
+                log::warn!("Metal KV T2 prefix encode failed for key {key:?}: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn bind_tier_key(&mut self, tier_key: u64, block: &MetalPageBlock) -> bool {
+        if !self
+            .records
+            .contains_key(&MetalDiskKey::Page(block.logical_id))
+            && !self.write_page(block)
+        {
+            return false;
+        }
+        self.tier_to_logical.insert(tier_key, block.logical_id);
+        true
+    }
+
+    fn read_tier_page(&mut self, tier_key: u64) -> anyhow::Result<MetalPageBlock> {
+        let logical_id = *self
+            .tier_to_logical
+            .get(&tier_key)
+            .ok_or_else(|| anyhow::anyhow!("Metal KV T2 missing tier key {tier_key}"))?;
+        self.read_page(logical_id)
+    }
+
+    fn read_page(&mut self, logical_id: u64) -> anyhow::Result<MetalPageBlock> {
+        let key = MetalDiskKey::Page(logical_id);
+        self.read_record(&key)?;
+        decode_metal_t2_page(&self.read_scratch, logical_id)
+    }
+
+    fn read_prefix(&mut self, key: &[u64]) -> anyhow::Result<MetalPrefixSnapshot> {
+        let disk_key = MetalDiskKey::Prefix(key.to_vec());
+        self.read_record(&disk_key)?;
+        decode_metal_t2_prefix(&self.read_scratch, key)
+    }
+
+    fn drop_tier_entries(&mut self, keys: &[u64]) {
+        for key in keys {
+            self.tier_to_logical.remove(key);
+        }
+    }
+
+    fn read_record(&mut self, key: &MetalDiskKey) -> anyhow::Result<()> {
+        let fingerprint = metal_t2_fingerprint(key);
+        kv_native_sys::read_block_into_sharded(&self.root, fingerprint, &mut self.read_scratch)
+            .map_err(|err| anyhow::anyhow!("Metal KV T2 read for {key:?}: {err}"))?;
+        self.touch_record(key);
+        Ok(())
+    }
+
+    fn write_record(&mut self, key: MetalDiskKey, bytes: &[u8]) -> bool {
+        if bytes.len() > self.budget_bytes {
+            log::warn!(
+                "Metal KV T2 record {key:?} has {} bytes, exceeding budget {}",
+                bytes.len(),
+                self.budget_bytes
+            );
+            return false;
+        }
+        let existing = self.records.get(&key).map_or(0, |record| record.bytes);
+        while self
+            .used_bytes
+            .saturating_sub(existing)
+            .saturating_add(bytes.len())
+            > self.budget_bytes
+        {
+            if !self.evict_one_excluding(&key) {
+                return false;
+            }
+        }
+        let fingerprint = metal_t2_fingerprint(&key);
+        if let Err(err) = kv_native_sys::write_block_cache_sharded(&self.root, fingerprint, bytes) {
+            log::warn!(
+                "Metal KV T2 write failed for {key:?} under {}: {err}",
+                self.root.display()
+            );
+            return false;
+        }
+        let stamp = self.next_stamp();
+        if let Some(old) = self.records.insert(
+            key.clone(),
+            MetalDiskRecord {
+                bytes: bytes.len(),
+                stamp,
+            },
+        ) {
+            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+            self.lru.remove(&(old.stamp, key.clone()));
+        }
+        self.used_bytes = self.used_bytes.saturating_add(bytes.len());
+        self.lru.insert((stamp, key));
+        true
+    }
+
+    fn touch_record(&mut self, key: &MetalDiskKey) {
+        let Some(old_stamp) = self.records.get(key).map(|record| record.stamp) else {
+            return;
+        };
+        let stamp = self.next_stamp();
+        self.lru.remove(&(old_stamp, key.clone()));
+        if let Some(record) = self.records.get_mut(key) {
+            record.stamp = stamp;
+        }
+        self.lru.insert((stamp, key.clone()));
+    }
+
+    fn evict_one_excluding(&mut self, excluded: &MetalDiskKey) -> bool {
+        let candidate = self
+            .lru
+            .iter()
+            .find(|(_, key)| key != excluded && !self.is_pinned(key))
+            .cloned();
+        let Some((stamp, key)) = candidate else {
+            return false;
+        };
+        self.lru.remove(&(stamp, key.clone()));
+        if let Some(record) = self.records.remove(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(record.bytes);
+            let _ =
+                kv_native_sys::remove_block_sharded(&self.root, metal_t2_fingerprint(&key), true);
+        }
+        true
+    }
+
+    fn is_pinned(&self, key: &MetalDiskKey) -> bool {
+        match key {
+            MetalDiskKey::Page(logical_id) => self
+                .tier_to_logical
+                .values()
+                .any(|pinned| pinned == logical_id),
+            MetalDiskKey::Prefix(_) => false,
+        }
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+}
+
+#[cfg(feature = "metal")]
+fn metal_t2_namespace(root: PathBuf) -> PathBuf {
+    let counter = METAL_T2_NAMESPACE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    root.join(format!(
+        "arle-metal-kv-tier-{}-{nanos}-{counter}",
+        std::process::id()
+    ))
+}
+
+#[cfg(feature = "metal")]
+fn metal_t2_fingerprint(key: &MetalDiskKey) -> [u8; 16] {
+    fn mix(hash: &mut u64, bytes: &[u8]) {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    let mut h1 = 0xcbf2_9ce4_8422_2325_u64;
+    let mut h2 = 0x9e37_79b9_7f4a_7c15_u64;
+    match key {
+        MetalDiskKey::Page(logical_id) => {
+            mix(&mut h1, &[METAL_T2_PAGE_RECORD]);
+            mix(&mut h1, &logical_id.to_le_bytes());
+            mix(&mut h2, &logical_id.to_be_bytes());
+            mix(&mut h2, &[METAL_T2_PAGE_RECORD]);
+        }
+        MetalDiskKey::Prefix(ids) => {
+            mix(&mut h1, &[METAL_T2_PREFIX_RECORD]);
+            mix(&mut h1, &(ids.len() as u64).to_le_bytes());
+            mix(&mut h2, &(ids.len() as u64).to_be_bytes());
+            for id in ids {
+                mix(&mut h1, &id.to_le_bytes());
+                mix(&mut h2, &id.to_be_bytes());
+            }
+            mix(&mut h2, &[METAL_T2_PREFIX_RECORD]);
+        }
+    }
+    let mut f = [0u8; 16];
+    f[..8].copy_from_slice(&h1.to_le_bytes());
+    f[8..].copy_from_slice(&h2.to_le_bytes());
+    f
+}
+
+#[cfg(feature = "metal")]
+fn encode_metal_t2_page(block: &MetalPageBlock) -> anyhow::Result<Vec<u8>> {
+    encode_metal_t2_record(METAL_T2_PAGE_RECORD, &[block.logical_id], 0, &block.kv_flat)
+}
+
+#[cfg(feature = "metal")]
+fn encode_metal_t2_prefix(key: &[u64], snapshot: &MetalPrefixSnapshot) -> anyhow::Result<Vec<u8>> {
+    encode_metal_t2_record(
+        METAL_T2_PREFIX_RECORD,
+        key,
+        snapshot.cache_len,
+        &snapshot.gdr_flat,
+    )
+}
+
+#[cfg(feature = "metal")]
+fn encode_metal_t2_record(
+    kind: u8,
+    ids: &[u64],
+    cache_len: usize,
+    arrays: &[mlx::MlxArray],
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(METAL_T2_MAGIC);
+    out.push(METAL_T2_VERSION);
+    out.push(kind);
+    put_u32(&mut out, usize_to_u32(ids.len())?);
+    for id in ids {
+        put_u64(&mut out, *id);
+    }
+    put_u64(&mut out, usize_to_u64(cache_len)?);
+    put_u32(&mut out, usize_to_u32(arrays.len())?);
+    for array in arrays {
+        let dtype = array.dtype();
+        let shape = array.shape().to_vec();
+        let bytes = array.export_bytes();
+        anyhow::ensure!(
+            bytes.len() == expected_array_nbytes(&shape, dtype)?,
+            "Metal KV T2 encode byte size mismatch for shape={shape:?} dtype={dtype:?}"
+        );
+        put_i32(&mut out, dtype.to_raw());
+        put_u32(&mut out, usize_to_u32(shape.len())?);
+        for dim in &shape {
+            put_i32(&mut out, *dim);
+        }
+        put_u64(&mut out, usize_to_u64(bytes.len())?);
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "metal")]
+fn decode_metal_t2_page(bytes: &[u8], logical_id: u64) -> anyhow::Result<MetalPageBlock> {
+    let record = decode_metal_t2_record(bytes, METAL_T2_PAGE_RECORD)?;
+    anyhow::ensure!(
+        record.ids == [logical_id],
+        "Metal KV T2 page logical id mismatch: requested={logical_id}, record={:?}",
+        record.ids
+    );
+    Ok(MetalPageBlock {
+        logical_id,
+        owner: None,
+        kv_flat: record.arrays,
+    })
+}
+
+#[cfg(feature = "metal")]
+fn decode_metal_t2_prefix(bytes: &[u8], key: &[u64]) -> anyhow::Result<MetalPrefixSnapshot> {
+    let record = decode_metal_t2_record(bytes, METAL_T2_PREFIX_RECORD)?;
+    anyhow::ensure!(
+        record.ids == key,
+        "Metal KV T2 prefix key mismatch: requested={key:?}, record={:?}",
+        record.ids
+    );
+    Ok(MetalPrefixSnapshot {
+        cache_len: record.cache_len,
+        gdr_flat: record.arrays,
+    })
+}
+
+#[cfg(feature = "metal")]
+struct DecodedMetalT2Record {
+    ids: Vec<u64>,
+    cache_len: usize,
+    arrays: Vec<mlx::MlxArray>,
+}
+
+#[cfg(feature = "metal")]
+fn decode_metal_t2_record(bytes: &[u8], expected_kind: u8) -> anyhow::Result<DecodedMetalT2Record> {
+    let mut cursor = MetalT2Cursor { bytes, offset: 0 };
+    anyhow::ensure!(
+        cursor.take(METAL_T2_MAGIC.len())? == METAL_T2_MAGIC,
+        "Metal KV T2 record magic mismatch"
+    );
+    let version = cursor.u8()?;
+    anyhow::ensure!(
+        version == METAL_T2_VERSION,
+        "Metal KV T2 record version mismatch: {version}"
+    );
+    let kind = cursor.u8()?;
+    anyhow::ensure!(
+        kind == expected_kind,
+        "Metal KV T2 record kind mismatch: expected={expected_kind}, got={kind}"
+    );
+    let id_count = cursor.u32()? as usize;
+    let mut ids = Vec::with_capacity(id_count);
+    for _ in 0..id_count {
+        ids.push(cursor.u64()?);
+    }
+    let cache_len = usize::try_from(cursor.u64()?)
+        .map_err(|_| anyhow::anyhow!("Metal KV T2 cache_len exceeds usize"))?;
+    let array_count = cursor.u32()? as usize;
+    let mut arrays = Vec::with_capacity(array_count);
+    for _ in 0..array_count {
+        let dtype_raw = cursor.i32()?;
+        let dtype = mlx::Dtype::from_raw(dtype_raw)
+            .ok_or_else(|| anyhow::anyhow!("Metal KV T2 unknown dtype {dtype_raw}"))?;
+        let ndim = cursor.u32()? as usize;
+        let mut shape = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            shape.push(cursor.i32()?);
+        }
+        let byte_len = usize::try_from(cursor.u64()?)
+            .map_err(|_| anyhow::anyhow!("Metal KV T2 array byte_len exceeds usize"))?;
+        anyhow::ensure!(
+            byte_len == expected_array_nbytes(&shape, dtype)?,
+            "Metal KV T2 array byte size mismatch for shape={shape:?} dtype={dtype:?}"
+        );
+        let data = cursor.take(byte_len)?;
+        arrays.push(mlx::MlxArray::from_bytes(data, &shape, dtype));
+    }
+    anyhow::ensure!(
+        cursor.offset == bytes.len(),
+        "Metal KV T2 record has {} trailing bytes",
+        bytes.len().saturating_sub(cursor.offset)
+    );
+    Ok(DecodedMetalT2Record {
+        ids,
+        cache_len,
+        arrays,
+    })
+}
+
+#[cfg(feature = "metal")]
+struct MetalT2Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+#[cfg(feature = "metal")]
+impl<'a> MetalT2Cursor<'a> {
+    fn take(&mut self, len: usize) -> anyhow::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("Metal KV T2 cursor overflow"))?;
+        anyhow::ensure!(
+            end <= self.bytes.len(),
+            "Metal KV T2 truncated record: need {len} bytes at offset {}",
+            self.offset
+        );
+        let slice = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> anyhow::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> anyhow::Result<u32> {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(self.take(4)?);
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn i32(&mut self) -> anyhow::Result<i32> {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(self.take(4)?);
+        Ok(i32::from_le_bytes(raw))
+    }
+
+    fn u64(&mut self) -> anyhow::Result<u64> {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(raw))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(feature = "metal")]
+fn put_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(feature = "metal")]
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(feature = "metal")]
+fn usize_to_u32(value: usize) -> anyhow::Result<u32> {
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("value {value} exceeds u32::MAX"))
+}
+
+#[cfg(feature = "metal")]
+fn usize_to_u64(value: usize) -> anyhow::Result<u64> {
+    u64::try_from(value).map_err(|_| anyhow::anyhow!("value {value} exceeds u64::MAX"))
+}
+
+#[cfg(feature = "metal")]
+fn expected_array_nbytes(shape: &[i32], dtype: mlx::Dtype) -> anyhow::Result<usize> {
+    let mut elements = 1usize;
+    for dim in shape {
+        anyhow::ensure!(*dim >= 0, "negative MLX array dimension {dim}");
+        elements = elements
+            .checked_mul(*dim as usize)
+            .ok_or_else(|| anyhow::anyhow!("MLX array shape overflows usize: {shape:?}"))?;
+    }
+    elements
+        .checked_mul(dtype_size(dtype))
+        .ok_or_else(|| anyhow::anyhow!("MLX array byte size overflows usize: {shape:?}"))
+}
+
+#[cfg(feature = "metal")]
+fn dtype_size(dtype: mlx::Dtype) -> usize {
+    match dtype {
+        mlx::Dtype::Bool | mlx::Dtype::Uint8 | mlx::Dtype::Int8 => 1,
+        mlx::Dtype::Uint16 | mlx::Dtype::Int16 | mlx::Dtype::Float16 | mlx::Dtype::Bfloat16 => 2,
+        mlx::Dtype::Uint32 | mlx::Dtype::Int32 | mlx::Dtype::Float32 => 4,
+        mlx::Dtype::Uint64 | mlx::Dtype::Int64 | mlx::Dtype::Float64 | mlx::Dtype::Complex64 => 8,
+    }
+}
+
+#[cfg(feature = "metal")]
 impl MetalPageStore {
+    fn set_ssd(&mut self, root: PathBuf, budget_bytes: usize, bytes_per_page: usize) -> bool {
+        let Some(ssd) = MetalSsdTier::new(root, budget_bytes, bytes_per_page) else {
+            return false;
+        };
+        eprintln!(
+            "[infer-metal] KV T2 SSD tier: root={}, budget_bytes={}, capacity_pages={}",
+            ssd.root.display(),
+            ssd.budget_bytes,
+            ssd.capacity_pages
+        );
+        self.ssd = Some(ssd);
+        true
+    }
+
+    fn kv_tier_capacity_pages(&self) -> usize {
+        self.ssd.as_ref().map_or(0, |ssd| ssd.capacity_pages)
+    }
+
     /// Largest leading page count of `block_ids` (in prompt order) for which a
     /// GDR prefix snapshot exists. The host radix caches every page boundary,
     /// but linear-attention (GDR) recurrent/conv state is only snapshotted at
@@ -878,7 +1526,10 @@ impl MetalPageStore {
     fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
         (1..=block_ids.len())
             .rev()
-            .find(|&k| self.prefixes.contains_key(&block_ids[..k]))
+            .find(|&k| {
+                self.logical_key_for_pages(&block_ids[..k])
+                    .is_some_and(|key| self.prefix_available(&key))
+            })
             .unwrap_or(0)
     }
 
@@ -886,11 +1537,89 @@ impl MetalPageStore {
         if pages.is_empty() {
             return;
         }
+        let mut released_logical_ids = Vec::new();
         for page in pages {
-            self.pages.remove(page);
+            if let Some(block) = self.pages.remove(page) {
+                released_logical_ids.push(block.logical_id);
+            }
         }
-        self.prefixes
-            .retain(|key, _| !pages.iter().any(|page| key.contains(page)));
+        if released_logical_ids.is_empty() {
+            return;
+        }
+        self.prefixes.retain(|key, _| {
+            !released_logical_ids
+                .iter()
+                .any(|logical_id| key.contains(logical_id))
+        });
+    }
+
+    fn next_logical_id(&mut self) -> u64 {
+        let id = self.next_logical_id.max(1);
+        self.next_logical_id = id.saturating_add(1);
+        id
+    }
+
+    fn logical_key_for_pages(&self, pages: &[u32]) -> Option<Vec<u64>> {
+        let mut key = Vec::with_capacity(pages.len());
+        for page in pages {
+            key.push(self.pages.get(page)?.logical_id);
+        }
+        Some(key)
+    }
+
+    fn prefix_available(&self, key: &[u64]) -> bool {
+        self.prefixes.contains_key(key) || self.ssd.as_ref().is_some_and(|ssd| ssd.has_prefix(key))
+    }
+
+    fn ensure_prefix_snapshot_resident(&mut self, key: &[u64]) -> anyhow::Result<()> {
+        if self.prefixes.contains_key(key) {
+            return Ok(());
+        }
+        let ssd = self
+            .ssd
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Metal prefix snapshot {key:?} is not resident"))?;
+        let snapshot = ssd.read_prefix(key)?;
+        self.prefixes.insert(key.to_vec(), snapshot);
+        Ok(())
+    }
+
+    fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+        let Some(ssd) = self.ssd.as_mut() else {
+            return Ok(0);
+        };
+        let mut accepted = 0usize;
+        for &(page, tier_key) in entries {
+            let Some(block) = self.pages.get(&page) else {
+                break;
+            };
+            if !ssd.bind_tier_key(tier_key, block) {
+                break;
+            }
+            accepted = accepted.saturating_add(1);
+        }
+        Ok(accepted)
+    }
+
+    fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
+        let ssd = self
+            .ssd
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Metal KV T2 store is not configured"))?;
+        for &(tier_key, dst_page) in entries {
+            let block = ssd.read_tier_page(tier_key)?;
+            if let Some(old) = self.pages.insert(dst_page, block) {
+                let old_id = old.logical_id;
+                self.prefixes.retain(|key, _| !key.contains(&old_id));
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+        if let Some(ssd) = self.ssd.as_mut() {
+            ssd.drop_tier_entries(keys);
+        }
     }
 
     fn publish_slot(&mut self, slot: &MetalSlotState, kv: &dyn KvPool) -> anyhow::Result<()> {
@@ -902,6 +1631,7 @@ impl MetalPageStore {
 
         let page_ids = kv.page_indices(slot.slot);
         let publish_pages = full_pages.min(page_ids.len());
+        let mut overwritten_logical_ids = Vec::new();
         for (page_idx, page_id) in page_ids.iter().take(publish_pages).enumerate() {
             let start = page_idx * page_size;
             let end = start + page_size;
@@ -909,42 +1639,72 @@ impl MetalPageStore {
             for array in &slot.kv_flat {
                 kv_flat.push(slice_kv_tokens(array, start, end)?);
             }
+            let owner = MetalPageOwner {
+                slot: slot.slot,
+                slot_epoch: slot.slot_epoch,
+                page_idx,
+            };
+            let logical_id = if self
+                .pages
+                .get(page_id)
+                .and_then(|block| block.owner)
+                .is_some_and(|old| {
+                    old.slot == owner.slot
+                        && old.slot_epoch == owner.slot_epoch
+                        && old.page_idx == owner.page_idx
+                }) {
+                self.pages
+                    .get(page_id)
+                    .expect("page checked above")
+                    .logical_id
+            } else {
+                self.next_logical_id()
+            };
             // Host page ids may be reused after the seam frees a slot. Overwrite
             // with the current slot's contents; retained/shared pages cannot be
             // reallocated by the host pool, so this does not corrupt live reuse.
-            if self
-                .pages
-                .insert(*page_id, MetalPageBlock { kv_flat })
-                .is_some()
-            {
-                // Alias hazard: overwriting a page block means this page id was
-                // recycled to a new occupant (or republished). Any surviving
-                // prefix key containing it would pair the NEW page contents with
-                // a STALE GDR snapshot in `materialize_slot_from_prefix` —
-                // silently corrupt linear-attention state. Prune every such key
-                // except exact prefixes of the live occupant's own page list,
-                // which the boundary insert below keeps coherent.
-                let overwritten = *page_id;
-                self.prefixes.retain(|key, _| {
-                    !key.contains(&overwritten)
-                        || (key.len() <= page_ids.len() && page_ids[..key.len()] == key[..])
-                });
+            let block = MetalPageBlock {
+                logical_id,
+                owner: Some(owner),
+                kv_flat,
+            };
+            if let Some(old) = self.pages.insert(*page_id, block) {
+                if old.logical_id != logical_id {
+                    overwritten_logical_ids.push(old.logical_id);
+                }
             }
+            if let (Some(ssd), Some(block)) = (self.ssd.as_mut(), self.pages.get(page_id)) {
+                ssd.write_page(block);
+            }
+        }
+        if !overwritten_logical_ids.is_empty()
+            && let Some(live_key) = self.logical_key_for_pages(&page_ids[..publish_pages])
+        {
+            // Alias hazard: overwriting a logical page means this page id was
+            // recycled to a new occupant. Any surviving prefix containing the old
+            // logical id would pair NEW K/V with a STALE GDR snapshot. Keep only
+            // exact prefixes of the live occupant's logical page list.
+            self.prefixes.retain(|key, _| {
+                !overwritten_logical_ids
+                    .iter()
+                    .any(|logical_id| key.contains(logical_id))
+                    || (key.len() <= live_key.len() && live_key[..key.len()] == key[..])
+            });
         }
 
         // GDR state is prefix-wide, not page-local. Only publish a hot-prefix
         // snapshot at an exact page boundary where the exported recurrent/conv
         // state corresponds to the same token length as the page-id prefix.
         if slot.cache_len.is_multiple_of(page_size) && publish_pages == full_pages {
-            let key = page_ids[..full_pages].to_vec();
-            if key.iter().all(|page| self.pages.contains_key(page)) {
-                self.prefixes.insert(
-                    key,
-                    MetalPrefixSnapshot {
-                        cache_len: slot.cache_len,
-                        gdr_flat: slot.gdr_flat.clone(),
-                    },
-                );
+            if let Some(key) = self.logical_key_for_pages(&page_ids[..full_pages]) {
+                let snapshot = MetalPrefixSnapshot {
+                    cache_len: slot.cache_len,
+                    gdr_flat: slot.gdr_flat.clone(),
+                };
+                self.prefixes.insert(key.clone(), snapshot);
+                if let (Some(ssd), Some(snapshot)) = (self.ssd.as_mut(), self.prefixes.get(&key)) {
+                    ssd.write_prefix(&key, snapshot);
+                }
             }
         }
 
@@ -952,7 +1712,7 @@ impl MetalPageStore {
     }
 
     fn materialize_slot_from_prefix(
-        &self,
+        &mut self,
         slot: usize,
         slot_epoch: u64,
         kv: &dyn KvPool,
@@ -973,10 +1733,17 @@ impl MetalPageStore {
             "Metal prefix attach for slot {slot} needs {prefix_pages} pages, host slot has {}",
             slot_pages.len()
         );
-        let key = slot_pages[..prefix_pages].to_vec();
+        let key = self
+            .logical_key_for_pages(&slot_pages[..prefix_pages])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Metal prefix attach missing resident logical pages for slot {slot}, prefix_tokens={prefix_tokens}"
+                )
+            })?;
+        self.ensure_prefix_snapshot_resident(&key)?;
         let snapshot = self.prefixes.get(&key).ok_or_else(|| {
             anyhow::anyhow!(
-                "Metal prefix attach missing GDR snapshot for slot {slot}, prefix_tokens={prefix_tokens}, pages={key:?}"
+                "Metal prefix attach missing GDR snapshot for slot {slot}, prefix_tokens={prefix_tokens}, key={key:?}"
             )
         })?;
         anyhow::ensure!(
@@ -988,16 +1755,21 @@ impl MetalPageStore {
 
         let first_page = key
             .first()
+            .ok_or_else(|| anyhow::anyhow!("Metal prefix attach got empty logical key"))?;
+        let first_physical_page = slot_pages
+            .first()
             .ok_or_else(|| anyhow::anyhow!("Metal prefix attach got empty page key"))?;
-        let first_block = self.pages.get(first_page).ok_or_else(|| {
-            anyhow::anyhow!("Metal prefix attach missing K/V page {first_page} for slot {slot}")
+        let first_block = self.pages.get(first_physical_page).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Metal prefix attach missing K/V page {first_physical_page} for slot {slot}, logical={first_page}"
+            )
         })?;
 
         let mut kv_flat = Vec::with_capacity(first_block.kv_flat.len());
         let capacity = round_up_capacity(capacity_tokens.max(prefix_tokens)) as usize;
         for array_idx in 0..first_block.kv_flat.len() {
             let mut page_arrays = Vec::with_capacity(key.len());
-            for page in &key {
+            for page in &slot_pages[..prefix_pages] {
                 let block = self.pages.get(page).ok_or_else(|| {
                     anyhow::anyhow!("Metal prefix attach missing K/V page {page} for slot {slot}")
                 })?;
@@ -1377,6 +2149,41 @@ pub(crate) fn int8_kv_group_size(head_dim: usize) -> anyhow::Result<usize> {
 }
 
 #[cfg(feature = "metal")]
+fn estimated_metal_kv_page_bytes(
+    config: &config::MetalModelConfig,
+    kv_cache_dtype: MetalKvCacheDtype,
+    page_size: usize,
+) -> usize {
+    let layers = config.arch.num_full_attention_layers();
+    let nkv = config.num_key_value_heads;
+    let hd = config.head_dim;
+    match kv_cache_dtype {
+        MetalKvCacheDtype::Bf16 => layers
+            .saturating_mul(2)
+            .saturating_mul(nkv)
+            .saturating_mul(page_size)
+            .saturating_mul(hd)
+            .saturating_mul(dtype_size(mlx::Dtype::Bfloat16)),
+        MetalKvCacheDtype::Int8 => {
+            let group_size = int8_kv_group_size(config.head_dim).unwrap_or(128);
+            let packed = nkv
+                .saturating_mul(page_size)
+                .saturating_mul(hd / 4)
+                .saturating_mul(dtype_size(mlx::Dtype::Uint32));
+            let scale_or_bias = nkv
+                .saturating_mul(page_size)
+                .saturating_mul(hd / group_size)
+                .saturating_mul(dtype_size(mlx::Dtype::Bfloat16));
+            layers.saturating_mul(
+                packed
+                    .saturating_mul(2)
+                    .saturating_add(scale_or_bias.saturating_mul(4)),
+            )
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
 fn allocate_kv_flat(
     config: &config::MetalModelConfig,
     kv_cache_dtype: MetalKvCacheDtype,
@@ -1625,6 +2432,19 @@ mod tests {
         mlx::as_dtype(&arr, mlx::Dtype::Float32)
     }
 
+    #[cfg(feature = "metal")]
+    fn temp_ssd_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "arle-metal-ssd-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     // Defect-2 regression guard (stale prefix snapshot aliasing): host page ids
     // are recycled LIFO after radix eviction, but `prefixes` keys used to live
     // forever. A later radix match colliding with a stale key would serve the
@@ -1651,6 +2471,9 @@ mod tests {
             vec![gdr_array(1)],
         );
         store.publish_slot(&state_a, &pool).unwrap();
+        let first_key = store
+            .logical_key_for_pages(&first_pages)
+            .expect("first occupant logical key");
         assert_eq!(store.reusable_prefix_pages(&first_pages), 2);
 
         // Free slot 0 and allocate slot 1: the LIFO free list recycles the SAME
@@ -1685,17 +2508,20 @@ mod tests {
         // The first occupant's prefix key is pruned: it contains overwritten
         // page ids and is not a prefix of the new occupant's page list.
         assert!(
-            !store.prefixes.contains_key(&first_pages),
-            "stale prefix key {first_pages:?} must be pruned on page reuse"
+            !store.prefixes.contains_key(&first_key),
+            "stale prefix key {first_key:?} must be pruned on page reuse"
         );
         assert_eq!(store.reusable_prefix_pages(&first_pages), 0);
 
         // The new occupant's own boundary snapshot survives and carries ITS GDR
         // state, not the first occupant's.
         assert_eq!(store.reusable_prefix_pages(&second_pages), 2);
+        let second_key = store
+            .logical_key_for_pages(&second_pages)
+            .expect("second occupant logical key");
         let snap = store
             .prefixes
-            .get(&second_pages)
+            .get(&second_key)
             .expect("new occupant's boundary snapshot must survive");
         assert_eq!(snap.cache_len, 8);
         mlx::eval(&[&snap.gdr_flat[0]]);
@@ -1724,6 +2550,9 @@ mod tests {
             vec![gdr_array(1)],
         );
         store.publish_slot(&state, &pool).unwrap();
+        let one_key = store
+            .logical_key_for_pages(&one_page)
+            .expect("one-page logical key");
         assert_eq!(store.reusable_prefix_pages(&one_page), 1);
 
         // Second chunk: 8 tokens = 2 pages. Page p0's block is overwritten
@@ -1739,9 +2568,12 @@ mod tests {
             vec![gdr_array(1)],
         );
         store.publish_slot(&state, &pool).unwrap();
+        let two_key = store
+            .logical_key_for_pages(&two_pages)
+            .expect("two-page logical key");
 
-        assert!(store.prefixes.contains_key(&one_page));
-        assert!(store.prefixes.contains_key(&two_pages));
+        assert!(store.prefixes.contains_key(&one_key));
+        assert!(store.prefixes.contains_key(&two_key));
         assert_eq!(store.reusable_prefix_pages(&one_page), 1);
         assert_eq!(store.reusable_prefix_pages(&two_pages), 2);
     }
@@ -1764,6 +2596,9 @@ mod tests {
             vec![gdr_array(1)],
         );
         store.publish_slot(&state, &pool).unwrap();
+        let key = store
+            .logical_key_for_pages(&pages)
+            .expect("published logical key");
         assert_eq!(store.pages.len(), 2);
         assert_eq!(store.reusable_prefix_pages(&pages), 2);
 
@@ -1774,10 +2609,76 @@ mod tests {
             "evicted page mirror must be dropped"
         );
         assert!(
-            !store.prefixes.contains_key(&pages),
+            !store.prefixes.contains_key(&key),
             "prefix snapshot containing the evicted page must be pruned"
         );
         assert_eq!(store.reusable_prefix_pages(&pages), 0);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn ssd_write_through_promotes_released_pages_and_prefix_snapshot() {
+        use infer_seam::{KvAllocator, KvQuery};
+        let _guard = mlx_sys::mlx_guard();
+        let root = temp_ssd_root("promote");
+        let mut store = MetalPageStore::default();
+        assert!(store.set_ssd(root.clone(), 8 * 1024 * 1024, 1024));
+        let mut pool = MetalKvPool::new(1, 8, 4);
+
+        pool.alloc(0, 8).unwrap();
+        let pages: Vec<u32> = pool.page_indices(0).to_vec();
+        let state = MetalSlotState::from_arrays(
+            0,
+            pool.slot_epoch(0),
+            8,
+            vec![kv_bf16_array(8, 10)],
+            vec![gdr_array(7)],
+        );
+        store.publish_slot(&state, &pool).unwrap();
+        let logical_key = store
+            .logical_key_for_pages(&pages)
+            .expect("published logical key");
+        assert!(
+            store
+                .ssd
+                .as_ref()
+                .is_some_and(|ssd| ssd.has_prefix(&logical_key)),
+            "write-through must persist the prefix snapshot"
+        );
+        assert_eq!(
+            store
+                .demote_prefix_pages(&[(pages[0], 10), (pages[1], 11)])
+                .unwrap(),
+            2
+        );
+
+        store.release_pages(&pages);
+        assert!(store.pages.is_empty(), "release must drop RAM page mirrors");
+        assert!(
+            store.prefixes.is_empty(),
+            "release must drop RAM prefix snapshots"
+        );
+        assert_eq!(store.reusable_prefix_pages(&pages), 0);
+
+        store
+            .promote_prefix_pages(&[(10, pages[0]), (11, pages[1])])
+            .unwrap();
+        assert_eq!(store.reusable_prefix_pages(&pages), 2);
+        let restored = store
+            .materialize_slot_from_prefix(0, pool.slot_epoch(0), &pool, 8, 8)
+            .unwrap();
+        assert_eq!(restored.cache_len, 8);
+        let kv = mlx::as_dtype(&restored.kv_flat[0], mlx::Dtype::Float32);
+        mlx::eval(&[&kv, &restored.gdr_flat[0]]);
+        assert_eq!(
+            &kv.as_slice_f32()[..16],
+            &[
+                10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0, 60.0, 61.0, 70.0, 71.0,
+                80.0, 81.0
+            ]
+        );
+        assert_eq!(restored.gdr_flat[0].as_slice_f32(), &[7.0]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

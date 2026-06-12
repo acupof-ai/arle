@@ -10,6 +10,8 @@ anyhow = "1.0"
 hf-hub = { version = "0.5", features = ["tokio"], optional = true }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
+kv-native-sys = { path = "../kv-native-sys", optional = true }
+libc = { version = "0.2", optional = true }
 log = "0.4"
 mlx-sys = { path = "../mlx-sys", optional = true }
 serde = { workspace = true, optional = true }
@@ -17,7 +19,7 @@ serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
-metal = ["dep:hf-hub", "dep:mlx-sys", "dep:serde", "dep:serde_json"]
+metal = ["dep:hf-hub", "dep:kv-native-sys", "dep:libc", "dep:mlx-sys", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true
