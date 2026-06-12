@@ -5,27 +5,17 @@
 //! constructor dispatching to the active variant. [`EngineLoadConfig`] is always
 //! available; the enum + impls require a backend feature.
 
+/// Requested KV-cache dtype — re-exported from the device-neutral seam so the
+/// service/scheduler layers stay backend-agnostic. Backends resolve it against
+/// their own support matrix at construction (Metal → `MetalKvCacheDtype`).
+pub use infer_seam::KvCacheDtype;
+
 /// Slot / page configuration for [`LoadedInferenceEngine::load_with_config`].
 ///
 /// Serde: the multiproc coordinator serializes its resolved config into
 /// `ARLE_WORKER_ENGINE_CONFIG` so worker ranks build their engines from the
 /// SAME values — any divergence (slots, budgets, chunk size) diverges the
 /// deterministic planner across ranks and deadlocks the NCCL lockstep.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KvCacheDtype {
-    /// Backend default. Metal resolves this to INT8 after the Metal int8 gate;
-    /// other backends keep their established default.
-    #[default]
-    Auto,
-    /// Native BF16 / model-dtype KV cache.
-    Bf16,
-    /// INT8 KV cache. Metal uses MLX affine 8-bit groups; CUDA support is a
-    /// separate backend implementation detail and must not be silently assumed.
-    Int8,
-}
-
-/// Slot / page configuration for [`LoadedInferenceEngine::load_with_config`].
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EngineLoadConfig {
     /// Logical request slots.
@@ -181,8 +171,6 @@ mod backend {
     #[cfg(feature = "cuda")]
     use super::CudaModelKind;
     use super::EngineLoadConfig;
-    #[cfg(feature = "metal")]
-    use super::KvCacheDtype;
     use crate::serve_engine::ServeInferenceEngine;
     use crate::types::{
         CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry,
@@ -593,10 +581,7 @@ mod backend {
         if config.mtp_draft_tokens.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
-        let metal_kv_dtype = match config.kv_cache_dtype {
-            KvCacheDtype::Auto | KvCacheDtype::Int8 => infer_metal::MetalKvCacheDtype::Int8,
-            KvCacheDtype::Bf16 => infer_metal::MetalKvCacheDtype::Bf16,
-        };
+        let metal_kv_dtype = infer_metal::MetalKvCacheDtype::resolve(config.kv_cache_dtype)?;
         let resolved = infer_metal::resolve_model_path(model_path)?;
         let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);

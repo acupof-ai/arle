@@ -17,6 +17,8 @@ mod host_paged_kv_pool;
 mod kv;
 #[path = "kv_batch.rs"]
 mod kv_batch;
+#[path = "kv_dtype.rs"]
+mod kv_dtype;
 #[path = "kv_query.rs"]
 mod kv_query;
 #[path = "prefix_store.rs"]
@@ -28,6 +30,7 @@ pub use allocator::KvAllocator;
 pub use host_paged_kv_pool::HostPagedKvPool;
 pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};
+pub use kv_dtype::KvCacheDtype;
 pub use kv_query::KvQuery;
 pub use prefix_store::KvPrefixStore;
 pub use resource::{
