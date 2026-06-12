@@ -445,11 +445,12 @@ impl RadixCache {
         evicted
     }
 
-    /// A resident block is evictable when it is idle and holds no resident
-    /// descendants. Demoted children do not pin their parent (otherwise a
-    /// demoted leaf would freeze its whole ancestor chain on the device);
-    /// demoted nodes never have resident descendants — inserting through a
-    /// demoted node revives it first (see `insert`) — so one level suffices.
+    /// A resident block is on the relaxed evictable frontier when it is idle
+    /// and holds no resident descendants. Demoted children do not pin their
+    /// parent (otherwise a demoted leaf would freeze its whole ancestor chain
+    /// on the device); demoted nodes never have resident descendants —
+    /// inserting through a demoted node revives it first (see `insert`) — so
+    /// one level suffices.
     fn is_evictable_leaf(&self, idx: usize) -> bool {
         let node = &self.nodes[idx];
         !node.evicted
@@ -461,10 +462,22 @@ impl RadixCache {
                 .all(|&child| self.nodes[child].is_demoted())
     }
 
+    fn is_strict_evictable_leaf(&self, idx: usize) -> bool {
+        self.is_evictable_leaf(idx) && self.nodes[idx].children.is_empty()
+    }
+
     fn least_recent_evictable_leaf(&self) -> Option<usize> {
+        // Prefer true leaves. A resident parent with only demoted descendants is
+        // safe to sever, but it drops more prefix shape than a strict leaf.
+        // Use that relaxed frontier only after all strict leaves are gone.
         (1..self.nodes.len())
-            .filter(|&idx| self.is_evictable_leaf(idx))
+            .filter(|&idx| self.is_strict_evictable_leaf(idx))
             .min_by_key(|&idx| self.nodes[idx].last_access)
+            .or_else(|| {
+                (1..self.nodes.len())
+                    .filter(|&idx| self.is_evictable_leaf(idx))
+                    .min_by_key(|&idx| self.nodes[idx].last_access)
+            })
     }
 
     fn tick(&mut self) -> u64 {
@@ -573,6 +586,25 @@ mod tests {
         assert_eq!(cache.take_dropped_tier_keys(), vec![9]);
         assert_eq!(cache.demoted_block_count(), 0);
         assert_eq!(cache.cached_page_count(), 0);
+    }
+
+    #[test]
+    fn lru_prefers_strict_leaf_before_demoted_only_parent() {
+        let mut cache = two_block_cache();
+        assert!(cache.demote_block(11, 9));
+
+        // Page 10 is older but only a relaxed frontier node: evicting it would
+        // sever the demoted child too. A newer true leaf should go first.
+        let newly = cache.insert(&[9, 9], &[20]);
+        assert_eq!(newly, vec![20]);
+        assert_eq!(cache.lru_evictable_page(), Some(20));
+        assert_eq!(cache.evict_lru(1), vec![20]);
+
+        // Once no strict leaves remain, the demoted-only parent remains a safe
+        // fallback victim.
+        assert_eq!(cache.lru_evictable_page(), Some(10));
+        assert_eq!(cache.evict_lru(1), vec![10]);
+        assert_eq!(cache.take_dropped_tier_keys(), vec![9]);
     }
 
     #[test]

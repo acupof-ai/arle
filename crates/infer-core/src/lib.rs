@@ -2198,8 +2198,14 @@ mod tests {
         assert!(tier.promote_failures >= 1, "failure counted: {tier:?}");
         assert_eq!(tier.promoted_pages, 0);
         assert!(
-            engine.executor.store.is_empty(),
-            "failed entries dropped from the store"
+            engine.executor.dropped.contains(&0),
+            "failed tier entry dropped: {:?}",
+            engine.executor.dropped
+        );
+        assert!(
+            !engine.executor.store.contains_key(&0),
+            "failed tier entry must not remain in the store: {:?}",
+            engine.executor.store
         );
         Ok(())
     }
