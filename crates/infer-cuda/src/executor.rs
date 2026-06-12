@@ -1449,7 +1449,7 @@ impl Dsv4CudaExecutor {
             position,
         );
         crate::attention::set_dsv4_verify_frozen(false);
-        let (argmax, hiddens) = verify_res?;
+        let (argmax, mut hiddens) = verify_res?;
         ensure!(
             argmax.len() == depth + 1 && hiddens.len() == depth + 1,
             "DSv4 MTP depth-{depth} verify expected {} rows, got argmax={} hidden={}",
@@ -1483,6 +1483,30 @@ impl Dsv4CudaExecutor {
             );
         }
 
+        // PERF-CEILING DIAGNOSTIC (ARLE_DSV4_MTP_SKIP_REFORWARD=1): skip the commit
+        // re-forward to measure the A1 (compressor-only commit) perf target. The
+        // accepted prefix's SW/FP8 KV is already written by the verify; this just
+        // advances seq_len to the committed length and reuses the verify hidden.
+        // CORRECTNESS-BROKEN: the frozen compressor is never committed for the
+        // accepted tokens, so compressed blocks desync past the first boundary —
+        // for tok/s measurement ONLY, never a default.
+        if std::env::var("ARLE_DSV4_MTP_SKIP_REFORWARD").as_deref() == Ok("1") {
+            self.model
+                .truncate_slot(&mut self.slots[slot_idx], start_pos + n + 1)?;
+            self.model.restore_spec_ring_tail(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                start_pos,
+                n,
+                depth,
+            )?;
+            spec.pending = Some(bonus);
+            spec.hidden = Some(hiddens.remove(n));
+            let mut out: Vec<u32> = Vec::with_capacity(n + 1);
+            out.extend_from_slice(&drafts[..n]);
+            out.push(bonus);
+            return Ok(out);
+        }
         // Frozen-KV commit (Option A): the speculative verify mutated nothing
         // compressed, so there is no rollback snapshot and no full/partial split.
         // Truncate to the pre-step length, then re-forward the accepted prefix
