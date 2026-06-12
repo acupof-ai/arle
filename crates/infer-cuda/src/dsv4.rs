@@ -1438,11 +1438,22 @@ impl Dsv4Model {
             );
         }
 
+        // ARLE_DSV4_STEP_PROFILE inner decomposition (decode only, rank 0):
+        // `layers` = stream_impl wall — pure host launch time of the whole
+        // layer stack (no sync inside), so layers ≈ fwd means the host can't
+        // feed the GPU fast enough; `tail` = lm_head + sampling wall, which
+        // contains the only sync and absorbs whatever the GPU still owes.
+        let prof = seq_len == 1
+            && self.tp.config().rank == 0
+            && std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1");
+        let t0 = std::time::Instant::now();
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
+        let t_layers = t0.elapsed();
         if let Some(out) = last_hidden_out {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
+        let t1 = std::time::Instant::now();
         let token = self.forward_stream_last_token(
             &stream,
             seq_len,
@@ -1451,6 +1462,22 @@ impl Dsv4Model {
             None,
             &mut keepalive,
         )?;
+        if prof {
+            static ACC: std::sync::Mutex<(f64, f64, u32)> = std::sync::Mutex::new((0.0, 0.0, 0));
+            let mut acc = ACC.lock().unwrap();
+            acc.0 += t_layers.as_secs_f64() * 1000.0;
+            acc.1 += t1.elapsed().as_secs_f64() * 1000.0;
+            acc.2 += 1;
+            if acc.2 >= 100 {
+                eprintln!(
+                    "[step-profile-inner] n={} layers-launch mean={:.3}ms tail(lm_head+sample) mean={:.3}ms",
+                    acc.2,
+                    acc.0 / acc.2 as f64,
+                    acc.1 / acc.2 as f64
+                );
+                *acc = (0.0, 0.0, 0);
+            }
+        }
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
