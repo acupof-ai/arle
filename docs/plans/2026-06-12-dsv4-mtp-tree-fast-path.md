@@ -170,6 +170,53 @@ reviewed diff against the green gate. If P2's gate fails, P1+deeper trees
   semantics unchanged); with P1 the verify no longer cares about them, and
   `capture_spec_rings` shrinks to the draft's layer-0 writes only.
 
+## Implementation checklist — the road to ~66 tok/s (d2k2, A=2.43)
+
+Step accounting today (d2k2 ≈ 164 ms): draft 3 expansions ≈ 30 + verify
+7 rows × ~10 ≈ 70 + re-forward ≈ 30 + fix-ups/overhead ≈ 34. Targets:
+
+**P1 — batched verify (−~38 ms; verify 70 → 32). The biggest single buy.**
+- [ ] csrc `dsv4_prepare_qk` positions-array variant (`positions: *const
+      i32`, one per row; tree rows repeat `start_pos+depth`) —
+      `csrc/misc/`, mirror of the `_start_pos_ptr` variant.
+- [ ] Tree-verify batched lane beside `try_flashmla_prefill_attention`
+      (attention.rs:3905): reuse `arle_flashmla_csa_pack_kv` unchanged;
+      HOST-built per-row indices (committed window + ancestors + self,
+      pad to `topk_unified % 128`; n ≤ 64 rows → one ≤200 KB H2D).
+- [ ] Frozen pin on the batched lane: extend csa_select's P1-A `key_count`
+      pin (attention.rs:~5795) from `start_pos_device.is_some()` to also
+      fire under `dsv4_verify_frozen()` on the host-start_pos path.
+- [ ] SW-only layers 0/1: same sparse fwd over `[SW cache | chunk K]`
+      (d_qk=512) or keep per-row swa ×2 layers (~0.5 ms, off critical path).
+- [ ] Route: `forward_tokens_stream_impl` verify branch → batched lane when
+      enabled; per-row loop stays as the validated fallback. Verify becomes
+      PURE (indices point at kv_unified chunk rows — zero ring writes, no
+      fix-ups); `capture_spec_rings` shrinks to draft layer-0 only.
+- [ ] Early gate: needle 3k/6k ×3 chain+tree; kill if batched verify
+      > 45 ms at n=7. **P1+P3 alone ≈ 34 tok/s (+5%) — do not stop here.**
+
+**P3 — level-batched draft + device top-k (−~25 ms; draft 30 → ~5). Small,
+independent — build alongside P1.**
+- [ ] `mtp_forward` level batch: frontier tokens `[m]` one call (linears +
+      lm_head batch over m; attention per-row at the ONE target layer).
+- [ ] Device top-k: k× (argmax + mask) launches, D2H k ids — kills the
+      129k-logit D2H per expansion (`ops::topk_host` stays for tests).
+
+**P2 — fold the commit re-forward (−~30 ms; the gate to 2×).**
+- [ ] Design note first (§0.1 enumeration): non-frozen tree verify has
+      sibling last-writer-wins on rings AND boundary compressed rows, so the
+      fold is NOT plain SGLang self-heal: commit = truncate + replay the
+      ACCEPTED path's parked node-scratch slots into the rings + restore
+      rejected positions + **compressor-only ingestion** of accepted tokens
+      (linears ~2-3 ms, not a full forward). Reject tail machinery exists
+      (ring tail restore, packed_rows/bootstrapped, dsa_official clamp).
+- [ ] Lands ONLY as one reviewed diff against a green P1 gate; fallback if
+      its gate fails: P1+P3 + depth-3 trees (~+10–15%) while P2 is re-cut.
+
+**P4 — sweep + ONE license-or-kill.**
+- [ ] d2k2 / d3k2 / d2k3 / d3k3 on the EOS-clean essay workload ×3,
+      same-binary vs no-spec 32.52; license the best config or kill.
+
 ## Validation ladder (one pass at the end, plus one early gate)
 
 1. After P1: needle 3000,6000 ×3 @0.5 — chain (fallback lane untouched) AND
