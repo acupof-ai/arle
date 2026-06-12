@@ -123,6 +123,19 @@ target, 4 decode tokens, `--memory-budget-gib 12 --low-impact false`.
 | BF16 | default on | 4 | 0 | 798.1721 | ` Metal int8 KV` |
 | INT8 | `INFER_METAL_PAGED_KV_READ=0` | 0 | 0 | 813.1649 | ` Metal int8 KV` |
 
+Current-HEAD risk replay (`31da38c1`), 512-token prompt target, 32 decode
+tokens, one warmup run, two measured runs:
+
+| dtype | env | measured hits | fallbacks | avg ms/token | output prefix |
+| --- | --- | --- | ---: | ---: | --- |
+| INT8 | default on | `32, 32` | 0 | 44.2083 | ` Metal int8 KV...` |
+| INT8 | `INFER_METAL_PAGED_KV_READ=0` | `0, 0` | 0 | 44.0500 | ` Metal int8 KV...` |
+
+Qwen3.6-35B-A3B was attempted with the same probe shape but blocked by the
+Metal resource guard on the current desktop memory state: 48.0 GiB total,
+18.2 GiB available, 441 MiB swap used, 25 GiB fixed requirement. Do not treat
+the 35B gate as passed until it runs on a host state with enough headroom.
+
 Build/test gates:
 
 - `cargo check -p infer-api --release --no-default-features --features metal,no-cuda --example metal_kv_memory_probe`
@@ -133,7 +146,8 @@ Build/test gates:
 
 ## Next Work
 
-The next licensing step is a canonical Qwen3.6-35B-A3B guideLLM/server
-benchmark with enough decode tokens to measure wall-clock impact. A custom INT8
-attention kernel is not licensed by this change alone; it still needs component
-evidence that full-prefix dequantize-before-SDPA is the wall-clock bottleneck.
+The next licensing step remains a canonical Qwen3.6-35B-A3B guideLLM/server
+benchmark with enough decode tokens to measure wall-clock impact, on a host
+state that clears the Metal resource guard. A custom INT8 attention kernel is
+not licensed by this change alone; it still needs component evidence that
+full-prefix dequantize-before-SDPA is the wall-clock bottleneck.

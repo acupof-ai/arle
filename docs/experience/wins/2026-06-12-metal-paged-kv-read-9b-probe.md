@@ -51,6 +51,43 @@ Earlier same-binary BF16 env-flip smoke before defaulting:
 | `INFER_METAL_PAGED_KV_READ=0` | 830.1845 | 207.5461 | 0 | 0 | ` Metal int8 KV` |
 | `INFER_METAL_PAGED_KV_READ=1` | 831.9837 | 207.9959 | 4 | 0 | ` Metal int8 KV` |
 
+Follow-up risk convergence on current `origin/main` (`31da38c1`):
+
+| mode | model | prompt tokens | decode tokens | warmup | measured runs | avg ms/token | per-run paged hits | fallbacks | output prefix |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |
+| default on | Qwen3.5-9B | 518 | 32 | 1 | 2 | 44.2083 | `32, 32` | 0 | ` Metal int8 KV...` |
+| opt-out | Qwen3.5-9B | 518 | 32 | 1 | 2 | 44.0500 | `0, 0` | 0 | ` Metal int8 KV...` |
+
+The default-on run printed both reachability probes:
+
+```text
+[infer-metal] paged KV read LIVE (single-token decode)
+[infer-metal] pipeline fast path LIVE (overlapped decode)
+```
+
+Qwen3.6-35B-A3B gate attempt:
+
+```text
+cargo run -p infer-api --example metal_kv_memory_probe --release \
+  --no-default-features --features metal,no-cuda -- \
+  --model mlx-community/Qwen3.6-35B-A3B-4bit \
+  --kv-cache-dtype auto --prompt-tokens 512 --max-tokens 32 \
+  --low-impact false --warmup-runs 1 --repeat 2
+```
+
+Verdict: blocked by the Metal resource guard on this desktop state, not by the
+paged-read path.
+
+```text
+system total=48.0GiB available=18.2GiB gpu_working_set=37.4GiB swap_used=441MiB
+memory budget 12 GiB is below fixed requirement 25 GiB
+(weights 19 GiB + runtime headroom 6 GiB + static state 61 MiB)
+```
+
+This is intentionally not bypassed. The 35B fixed footprint exceeds current
+available memory before the anti-swap reserve, so forcing the run would turn the
+gate into a host-pressure experiment.
+
 Verification:
 
 - `cargo check -p infer-api --release --no-default-features --features metal,no-cuda --example metal_kv_memory_probe`: passed.
@@ -71,10 +108,10 @@ This is a small 9B reachability smoke, not a Qwen3.6 performance license:
 - Wall-clock differences are noise-level and must not be read as a win or loss.
 - Prefill, batch, and verify keep their existing cache-owned read source because
   their mask and per-row cursor contracts differ from scalar session decode.
-- The current working tree contains unrelated, incomplete Metal T2 changes
-  (`Cargo.lock`, `crates/infer-metal/Cargo.toml`, `crates/infer-metal/src/mlx.rs`,
-  and unstaged hunks in `executor.rs`). They are not part of this paged-read
-  commit and currently block a final full `infer-metal` test rerun.
+- The original tranche landed while unrelated Metal T2 work was still in-flight.
+  Follow-up `31da38c1` has that work committed and pushed; this entry now records
+  a current-HEAD long 9B default/opt-out replay plus the 35B resource-guard
+  blocker.
 
 ## Learnings
 
