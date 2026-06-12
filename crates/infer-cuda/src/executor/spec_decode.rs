@@ -484,9 +484,11 @@ impl Dsv4CudaExecutor {
         // FROZEN verify's hidden of the last accepted row — stale by at most
         // the compression-boundary rows inside the accepted prefix (needle
         // gate licenses this).
+        // Chains fold too (ckl's minimal scheme): the spec verify's schedule
+        // carries populated branches, so topk=1 rides the same batched lane +
+        // persisted rows.
         let fold = crate::dsv4::dsv4_mtp_commit_fold_enabled()
-            && crate::dsv4::dsv4_mtp_tree_attn_enabled()
-            && self.spec_shape().topk > 1;
+            && crate::dsv4::dsv4_mtp_tree_attn_enabled();
         if fold {
             let mut rows = Vec::with_capacity(accepted + 1);
             rows.push(0usize);
