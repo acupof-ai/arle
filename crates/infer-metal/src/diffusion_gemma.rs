@@ -5,7 +5,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use infer_plan::{
-    DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerationConfig, DiffusionModelError,
+    DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateOutput,
+    DiffusionGenerateStats, DiffusionGenerationConfig, DiffusionModelError, FinishReason,
 };
 
 use crate::config::{MetalDiffusionGemmaConfig, QuantConfig};
@@ -47,6 +48,19 @@ impl MetalDiffusionGemmaModel {
 }
 
 impl DiffusionBlockModel for MetalDiffusionGemmaModel {
+    fn generate(
+        &mut self,
+        prompt_tokens: &[u32],
+        config: &DiffusionGenerationConfig,
+    ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
+        let tokens =
+            i32_tokens(prompt_tokens).map_err(|err| DiffusionModelError::new(err.to_string()))?;
+        self.cpp
+            .generate(&tokens, config)
+            .map(Some)
+            .map_err(|err| DiffusionModelError::new(err.to_string()))
+    }
+
     fn begin_request(
         &mut self,
         config: &DiffusionGenerationConfig,
@@ -250,6 +264,77 @@ impl CppDiffusionGemmaModel {
                 .unwrap_or_else(|| anyhow::anyhow!("MLX FFI failed")))
         }
     }
+
+    fn generate(
+        &mut self,
+        prompt: &[i32],
+        config: &DiffusionGenerationConfig,
+    ) -> Result<DiffusionGenerateOutput> {
+        let max_new_tokens =
+            i32::try_from(config.max_new_tokens).context("max_new_tokens does not fit in i32")?;
+        let canvas_len =
+            i32::try_from(config.canvas_length).context("canvas_length does not fit in i32")?;
+        let max_steps = i32::try_from(config.max_denoising_steps)
+            .context("max_denoising_steps does not fit in i32")?;
+        let stability_threshold = i32::try_from(config.stability_threshold)
+            .context("stability_threshold does not fit in i32")?;
+        let mut tokens = vec![0u32; config.max_new_tokens];
+        let mut out_len = 0i32;
+        let mut out_finish = 0i32;
+        let mut out_blocks = 0i32;
+        let mut out_steps = 0i32;
+        let mut out_forced = 0i32;
+        let mut out_adaptive = 0i32;
+        self.check_rc(unsafe {
+            mlx_sys::diffusion_gemma_generate(
+                self.raw,
+                prompt.as_ptr(),
+                prompt.len() as i32,
+                max_new_tokens,
+                canvas_len,
+                max_steps,
+                config.entropy_bound,
+                config.confidence_threshold,
+                config.t_min,
+                config.t_max,
+                stability_threshold,
+                config.seed,
+                config.stop_token_ids.as_ptr(),
+                config.stop_token_ids.len() as i32,
+                tokens.as_mut_ptr(),
+                &mut out_len,
+                &mut out_finish,
+                &mut out_blocks,
+                &mut out_steps,
+                &mut out_forced,
+                &mut out_adaptive,
+            )
+        })?;
+        let len = usize::try_from(out_len).context("negative DiffusionGemma output length")?;
+        anyhow::ensure!(
+            len <= tokens.len(),
+            "DiffusionGemma output length {} exceeds buffer {}",
+            len,
+            tokens.len()
+        );
+        tokens.truncate(len);
+        let finish = if out_finish == 1 {
+            FinishReason::Stop
+        } else {
+            FinishReason::Length
+        };
+        Ok(DiffusionGenerateOutput {
+            generated_tokens: tokens,
+            finish,
+            stats: DiffusionGenerateStats {
+                blocks: usize::try_from(out_blocks).unwrap_or_default(),
+                denoise_steps: usize::try_from(out_steps).unwrap_or_default(),
+                forced_commits: usize::try_from(out_forced).unwrap_or_default(),
+                adaptive_commits: usize::try_from(out_adaptive).unwrap_or_default(),
+            },
+            trace: Vec::new(),
+        })
+    }
 }
 
 struct CppDiffusionGemmaBuilder {
@@ -282,10 +367,16 @@ impl CppDiffusionGemmaBuilder {
             quant.for_base(&format!("{prefix}.embed_tokens")),
         )?;
         let embed_id = self.add_dense_array(&embed)?;
+        let lm_head = load_proj_from_tensors(
+            tensors,
+            &format!("{prefix}.embed_tokens"),
+            quant.for_base(&format!("{prefix}.embed_tokens")),
+        )?;
+        let lm_head_id = self.add_weight(&lm_head)?;
         let final_norm = tensor_get(tensors, &format!("{prefix}.norm.weight"))?;
         let final_norm_id = self.add_dense_array(&final_norm)?;
         unsafe {
-            mlx_sys::diffusion_gemma_set_embed(self.raw, embed_id, final_norm_id);
+            mlx_sys::diffusion_gemma_set_embed(self.raw, embed_id, lm_head_id, final_norm_id);
         }
         mlx::check_mlx_error()?;
 

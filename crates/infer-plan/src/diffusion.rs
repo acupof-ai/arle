@@ -158,6 +158,19 @@ impl DiffusionCanvasPrediction {
 
 /// Backend hook consumed by [`generate_diffusion`].
 pub trait DiffusionBlockModel {
+    /// Optional backend-owned generation fast path.
+    ///
+    /// Implementors that can keep the whole denoise loop on device may return a
+    /// completed generation here. The default falls back to the portable host
+    /// loop below.
+    fn generate(
+        &mut self,
+        _prompt_tokens: &[u32],
+        _config: &DiffusionGenerationConfig,
+    ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
+        Ok(None)
+    }
+
     /// Start a request with the exact generation config selected by the engine.
     fn begin_request(
         &mut self,
@@ -261,6 +274,9 @@ pub fn generate_diffusion<M: DiffusionBlockModel>(
             stats: DiffusionGenerateStats::default(),
             trace: Vec::new(),
         });
+    }
+    if let Some(output) = model.generate(prompt_tokens, config)? {
+        return Ok(output);
     }
 
     model.begin_request(config)?;
