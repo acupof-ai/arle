@@ -417,7 +417,7 @@ cargo test -p kv-native-sys --release
 
 **KV precision parity gate — re-ported 2026-06-10 (#58).** The monolith's
 trajectory-match audit is superseded by the correct-inference gate
-(`scripts/dsv4_needle_gate.py` + `scripts/dsv4_lever_gate.sh`): needle ladder
+(`scripts/needle_gate.py` + `scripts/lever_gate.sh`): needle ladder
 x3 same-config repeats vs the baseline envelope, NOT byte-identity (MoE
 non-determinism). DSv4 lever verdicts
 ([wins entry](docs/experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md)):
