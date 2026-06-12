@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use infer_seam::{HostTierPolicy, split_host_tiers};
 
+static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 /// Bytes of *available* system RAM (Linux `/proc/meminfo` `MemAvailable`).
 ///
 /// `None` off Linux or when the field is unreadable — [`split_host_tiers`]
@@ -100,10 +103,17 @@ struct T1Entry {
 }
 
 struct DiskTier {
+    /// Process-owned namespace under the operator-provided root.
     root: PathBuf,
     capacity_pages: usize,
     /// Keys whose payloads currently live on disk.
     keys: BTreeSet<u64>,
+}
+
+impl Drop for DiskTier {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 fn fingerprint(key: u64) -> [u8; 16] {
@@ -126,13 +136,43 @@ impl CudaKvTierStore {
     }
 
     /// Attach the T2 disk level (opt-in). Pre-serve only.
-    pub(crate) fn set_disk(&mut self, root: PathBuf, budget_bytes: usize, bytes_per_page: usize) {
+    ///
+    /// Each serve process gets its own namespace under the operator-provided
+    /// root because tier keys are engine-local. Sharing a flat root across two
+    /// processes would let key 0 in one process overwrite key 0 in another.
+    pub(crate) fn set_disk(
+        &mut self,
+        root: PathBuf,
+        budget_bytes: usize,
+        bytes_per_page: usize,
+    ) -> bool {
         let capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
+        let root = self.disk_namespace(root);
+        if let Err(err) = std::fs::create_dir_all(&root) {
+            log::warn!(
+                "KV T2 namespace creation failed under {}: {err}",
+                root.display()
+            );
+            return false;
+        }
         self.disk = Some(DiskTier {
             root,
             capacity_pages,
             keys: BTreeSet::new(),
         });
+        true
+    }
+
+    fn disk_namespace(&mut self, root: PathBuf) -> PathBuf {
+        let counter =
+            DISK_TIER_NAMESPACE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        root.join(format!(
+            "arle-kv-tier-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
     }
 
     /// Total pages the store can hold (T1 + T2) — what the engine budgets
@@ -190,7 +230,7 @@ impl CudaKvTierStore {
         if !already_present && disk.keys.len() >= disk.capacity_pages {
             return false;
         }
-        match kv_native_sys::write_block_cache(&disk.root, fingerprint(key), payload) {
+        match kv_native_sys::write_block_cache_sharded(&disk.root, fingerprint(key), payload) {
             Ok(()) => {
                 if !already_present {
                     disk.keys.insert(key);
@@ -245,7 +285,7 @@ impl CudaKvTierStore {
             }
         });
         if let Some(root) = disk_root {
-            kv_native_sys::read_block_into(&root, fingerprint(key), &mut self.read_scratch)
+            kv_native_sys::read_block_into_sharded(&root, fingerprint(key), &mut self.read_scratch)
                 .with_context(|| format!("KV T2 read for key {key}"))?;
             return Ok(Cow::Borrowed(self.read_scratch.as_slice()));
         }
@@ -260,9 +300,8 @@ impl CudaKvTierStore {
             }
             if let Some(disk) = &mut self.disk {
                 if disk.keys.remove(key) {
-                    if let Ok(path) = kv_native_sys::block_path(&disk.root, fingerprint(*key)) {
-                        let _ = std::fs::remove_file(path);
-                    }
+                    let _ =
+                        kv_native_sys::remove_block_sharded(&disk.root, fingerprint(*key), true);
                 }
             }
         }
@@ -276,6 +315,11 @@ impl CudaKvTierStore {
     #[cfg(test)]
     fn disk_len(&self) -> usize {
         self.disk.as_ref().map_or(0, |d| d.keys.len())
+    }
+
+    #[cfg(test)]
+    fn disk_root(&self) -> Option<&Path> {
+        self.disk.as_ref().map(|d| d.root.as_path())
     }
 
     #[cfg(test)]
@@ -323,7 +367,7 @@ mod tests {
     fn t1_overflow_spills_coldest_to_disk_and_reads_back() {
         let root = temp_root("spill");
         let mut store = CudaKvTierStore::with_budget(16, 8);
-        store.set_disk(root.clone(), 32, 8);
+        assert!(store.set_disk(root.clone(), 32, 8));
         assert_eq!(store.capacity_pages(), 2 + 4);
 
         assert!(store.insert(1, vec![1; 8]));
@@ -351,7 +395,7 @@ mod tests {
     fn disk_read_reuses_store_scratch_buffer() {
         let root = temp_root("scratch");
         let mut store = CudaKvTierStore::with_budget(0, 8);
-        store.set_disk(root.clone(), 32, 8);
+        assert!(store.set_disk(root.clone(), 32, 8));
         assert!(store.insert(1, vec![1; 8]));
 
         {
@@ -381,7 +425,7 @@ mod tests {
     fn disk_full_allows_replacing_existing_key() {
         let root = temp_root("replace");
         let mut store = CudaKvTierStore::with_budget(0, 8);
-        store.set_disk(root.clone(), 8, 8);
+        assert!(store.set_disk(root.clone(), 8, 8));
 
         assert!(store.insert(1, vec![1; 8]));
         assert!(store.is_full());
@@ -403,7 +447,7 @@ mod tests {
         // --kv-t1-budget-bytes 0 --kv-ssd-path ...: T1 disabled, disk active.
         let root = temp_root("disk_only");
         let mut store = CudaKvTierStore::with_budget(0, 8);
-        store.set_disk(root.clone(), 16, 8);
+        assert!(store.set_disk(root.clone(), 16, 8));
         assert_eq!(store.capacity_pages(), 2);
 
         assert!(store.insert(1, vec![1; 8]), "insert lands on disk");
@@ -418,10 +462,50 @@ mod tests {
     }
 
     #[test]
+    fn disk_namespace_shards_and_cleans_up_process_owned_cache() {
+        let root = temp_root("namespace");
+        let namespace;
+        let block_path;
+
+        {
+            let mut store = CudaKvTierStore::with_budget(0, 8);
+            assert!(store.set_disk(root.clone(), 16, 8));
+            namespace = store.disk_root().expect("disk namespace").to_path_buf();
+
+            assert!(namespace.starts_with(&root));
+            assert_ne!(namespace, root, "disk tier must not write into shared root");
+            assert!(
+                namespace
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("arle-kv-tier-")),
+                "unexpected namespace path {}",
+                namespace.display()
+            );
+
+            assert!(store.insert(1, vec![1; 8]));
+            block_path = kv_native_sys::block_path_sharded(&namespace, fingerprint(1)).unwrap();
+            assert!(
+                block_path.starts_with(namespace.join("01").join("00")),
+                "block path should shard under namespace: {}",
+                block_path.display()
+            );
+            assert!(block_path.exists());
+        }
+
+        assert!(
+            !namespace.exists(),
+            "dropping disk tier should remove its process namespace"
+        );
+        assert!(root.exists(), "operator-provided root must survive");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn full_means_both_levels_full() {
         let root = temp_root("full");
         let mut store = CudaKvTierStore::with_budget(8, 8);
-        store.set_disk(root.clone(), 8, 8);
+        assert!(store.set_disk(root.clone(), 8, 8));
         assert!(store.insert(1, vec![1; 8]));
         assert!(!store.is_full(), "disk still has room");
         assert!(store.insert(2, vec![2; 8]), "spills 1 to disk");
