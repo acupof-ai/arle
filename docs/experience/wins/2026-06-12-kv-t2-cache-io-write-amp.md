@@ -36,6 +36,7 @@ device wall-clock gate must run remotely.
 - `cargo clippy -p infer-cuda --release --no-default-features --features no-cuda -- -D warnings`: passed.
 - `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`: passed.
 - `CUDARC_CUDA_VERSION=12080 cargo clippy -p infer-api --release --no-default-features --features cuda,no-cuda --lib -- -D warnings`: passed.
+- `cargo test -p kv-native-sys cache_block_io_bench --release -- --ignored --nocapture`: passed.
 
 Structural delta:
 
@@ -44,6 +45,18 @@ Structural delta:
 | T2 cache write | temp write + `sync_data` + rename + parent dir fsync | temp write + rename |
 | T2 cache read | allocate a fresh `Vec<u8>` per read | reuse store scratch buffer |
 | T1 spill victim | scan all T1 entries by stamp | O(log n) LRU index |
+
+Local Rust substrate microbench (Apple Silicon tempdir, release build):
+
+| payload | durable atomic write | cache write | read fresh `Vec` | read into scratch |
+| --- | ---: | ---: | ---: | ---: |
+| 4 KiB x128 | 0.4 MiB/s | 5.3 MiB/s | 132.4 MiB/s | 234.7 MiB/s |
+| 256 KiB x32 | 29.2 MiB/s | 139.2 MiB/s | 1729.2 MiB/s | 3849.2 MiB/s |
+| 4 MiB x4 | 370.5 MiB/s | 1988.3 MiB/s | 3021.5 MiB/s | 7966.0 MiB/s |
+
+This verifies the pure storage substrate directly. It does not prove GPU
+wall-clock serving impact; the HBM↔host copy and scheduler interaction still
+need CUDA validation.
 
 ## Problems
 

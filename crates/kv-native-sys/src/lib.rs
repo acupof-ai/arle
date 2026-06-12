@@ -1290,4 +1290,78 @@ mod tests {
             elapsed.as_nanos(),
         );
     }
+
+    #[test]
+    #[ignore = "microbench: cargo test -p kv-native-sys cache_block_io_bench --release -- --ignored --nocapture"]
+    fn cache_block_io_bench() {
+        fn bench_fp(seed: u64) -> [u8; 16] {
+            let mut fp = [0u8; 16];
+            fp[..8].copy_from_slice(&seed.to_le_bytes());
+            fp[8..].copy_from_slice(&(!seed).to_le_bytes());
+            fp
+        }
+
+        fn payload(len: usize) -> Vec<u8> {
+            (0..len).map(|idx| (idx as u8).wrapping_mul(31)).collect()
+        }
+
+        fn mib_per_s(bytes: usize, elapsed: std::time::Duration) -> f64 {
+            let secs = elapsed.as_secs_f64().max(1e-9);
+            (bytes as f64 / (1 << 20) as f64) / secs
+        }
+
+        let cases = [
+            (4 * 1024usize, 128usize),
+            (256 * 1024usize, 32usize),
+            (4 * 1024 * 1024usize, 4usize),
+        ];
+
+        for (size, iters) in cases {
+            let dir = tempdir().unwrap();
+            let payload = payload(size);
+
+            let start = Instant::now();
+            for iter in 0..iters {
+                write_block_atomic(dir.path(), bench_fp(iter as u64), &payload).unwrap();
+            }
+            let atomic_write = start.elapsed();
+
+            let start = Instant::now();
+            for iter in 0..iters {
+                write_block_cache(dir.path(), bench_fp((iters + iter) as u64), &payload).unwrap();
+            }
+            let cache_write = start.elapsed();
+
+            let read_fp = bench_fp((iters * 2 + 1) as u64);
+            write_block_cache(dir.path(), read_fp, &payload).unwrap();
+
+            let mut checksum = 0u8;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let bytes = read_block(dir.path(), read_fp).unwrap();
+                checksum ^= bytes[0];
+                black_box(&bytes);
+            }
+            let read_vec = start.elapsed();
+
+            let mut scratch = Vec::with_capacity(size);
+            let start = Instant::now();
+            for _ in 0..iters {
+                read_block_into(dir.path(), read_fp, &mut scratch).unwrap();
+                checksum ^= scratch[0];
+                black_box(&scratch);
+            }
+            let read_into = start.elapsed();
+
+            eprintln!(
+                "cache_block_io_bench size={size} iters={iters} atomic_write_ms={:.3} cache_write_ms={:.3} atomic_write_mib_s={:.1} cache_write_mib_s={:.1} read_vec_mib_s={:.1} read_into_mib_s={:.1} checksum={checksum}",
+                atomic_write.as_secs_f64() * 1000.0,
+                cache_write.as_secs_f64() * 1000.0,
+                mib_per_s(size * iters, atomic_write),
+                mib_per_s(size * iters, cache_write),
+                mib_per_s(size * iters, read_vec),
+                mib_per_s(size * iters, read_into),
+            );
+        }
+    }
 }
