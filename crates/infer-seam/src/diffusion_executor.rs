@@ -58,6 +58,12 @@ impl<M> BufferedDiffusionExecutor<M> {
         if let Some(max_new_tokens) = params.max_new_tokens {
             config.max_new_tokens = max_new_tokens;
         }
+        if let Ok(raw) = std::env::var("ARLE_DIFFUSION_MAX_DENOISING_STEPS")
+            && let Ok(steps) = raw.parse::<usize>()
+            && steps > 0
+        {
+            config.max_denoising_steps = steps;
+        }
         if let Some(seed) = params.seed {
             config.seed = seed;
         }
@@ -132,6 +138,18 @@ impl<M> BufferedDiffusionExecutor<M> {
         let config = Self::config_for_row(&self.base_config, &row.params);
         let output =
             generate_diffusion(&mut self.model, &prompt, &config).map_err(map_diffusion_error)?;
+        if std::env::var_os("ARLE_DIFFUSION_TRACE").is_some() {
+            eprintln!(
+                "diffusion generate complete: prompt_tokens={} generated_tokens={} blocks={} denoise_steps={} forced_commits={} adaptive_commits={} finish={:?}",
+                prompt.len(),
+                output.generated_tokens.len(),
+                output.stats.blocks,
+                output.stats.denoise_steps,
+                output.stats.forced_commits,
+                output.stats.adaptive_commits,
+                output.finish
+            );
+        }
         let tokens = output.generated_tokens;
         anyhow::ensure!(
             !tokens.is_empty(),
