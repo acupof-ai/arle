@@ -132,6 +132,7 @@ impl DraftTree {
         let mut owner = vec![usize::MAX; max_depth + 1];
         let mut restores: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut saves = vec![false; n];
+        let mut ancestors: Vec<Vec<usize>> = vec![Vec::new(); n];
         for i in 0..n {
             for anc in self.branch_ancestors(i) {
                 if owner[self.depth[anc]] != anc {
@@ -141,11 +142,18 @@ impl DraftTree {
                 }
             }
             owner[self.depth[i]] = i;
+            // Full branch for the batched tree-attention lane: ROOT included
+            // (row 0 is a chunk row every node attends), self excluded.
+            if i != 0 {
+                ancestors[i].push(0);
+                ancestors[i].extend(self.branch_ancestors(i));
+            }
         }
         SpecVerifySchedule {
             positions,
             restores,
             saves,
+            ancestors,
         }
     }
 }
@@ -550,6 +558,11 @@ mod tests {
         // Parked exactly the restored sources: a and b.
         let parked: Vec<usize> = (0..tree.len()).filter(|&i| sched.saves[i]).collect();
         assert_eq!(parked, vec![a, b]);
+        // Batched-lane branches: root included, self excluded.
+        assert!(sched.ancestors[0].is_empty());
+        assert_eq!(sched.ancestors[a], vec![0]);
+        assert_eq!(sched.ancestors[c], vec![0, a]);
+        assert_eq!(sched.ancestors[e], vec![0, b]);
     }
 
     /// Capacity cap: pushes beyond MAX_SPEC_TREE_NODES would be the draft
