@@ -283,55 +283,61 @@ impl Dsv4CudaExecutor {
     ) -> Result<DraftTree> {
         let mut tree = DraftTree::new(pending);
         // Per-node wide MTP stream from expanding that node — its children's
-        // `h_prev`. Indexed in lockstep with the tree's nodes. The borrow ends at
-        // the `mtp_forward` call (NLL), so the later `node_stream[node] = …` write
-        // and the per-child `push` don't conflict — and topk=1 needs no clone.
+        // `h_prev`. Indexed in lockstep with the tree's nodes.
         let mut node_stream: Vec<Option<DeviceVec>> = vec![None];
         let mut frontier = vec![0usize];
         // Ring-slot owner per draft depth (MTP target layer only).
         let mut owner = vec![usize::MAX; shape.depth + 1];
         for depth in 0..shape.depth {
-            let mut next = Vec::with_capacity(frontier.len() * shape.topk);
+            if frontier.is_empty() {
+                break;
+            }
+            // Respect the node budget: drop frontier tails whose children
+            // could not be pushed anyway.
+            let room = MAX_SPEC_TREE_NODES.saturating_sub(tree.len());
+            if room == 0 {
+                break;
+            }
             // A lone frontier node owns its slot until its children expand —
-            // park only contested depths.
+            // park only contested depths. The owner walk runs in the SAME row
+            // order the level forward processes its per-row attention.
             let contested = frontier.len() > 1;
-            for node in frontier {
-                if tree.len() >= MAX_SPEC_TREE_NODES {
-                    break;
-                }
+            let mut rows = Vec::with_capacity(frontier.len());
+            for &node in &frontier {
+                let mut restores = Vec::new();
                 for anc in tree.branch_ancestors(node) {
                     if owner[tree.depth(anc)] != anc {
-                        self.model.mtp_restore_node_ring(
-                            &mut self.slots[slot_idx],
-                            &mut self.kv_adapter,
-                            anc,
-                            start_pos + tree.depth(anc),
-                        )?;
+                        restores.push((anc, start_pos + tree.depth(anc)));
                         owner[tree.depth(anc)] = anc;
                     }
                 }
-                let token = tree.token(node);
-                let h_prev: &DeviceVec = match tree.parent(node) {
+                owner[depth] = node;
+                rows.push(crate::dsv4::MtpDraftRow {
+                    token: tree.token(node),
+                    node,
+                    restores,
+                    save: contested,
+                });
+            }
+            let h_prevs: Vec<&DeviceVec> = frontier
+                .iter()
+                .map(|&node| match tree.parent(node) {
                     Some(parent) => node_stream[parent].as_ref().expect("parent stream"),
                     None => trunk_hidden,
-                };
-                let (candidates, stream) = self.model.mtp_forward(
-                    &mut self.slots[slot_idx],
-                    &mut self.kv_adapter,
-                    h_prev,
-                    token,
-                    (start_pos + depth) as u64,
-                    shape.topk,
-                )?;
-                owner[depth] = node;
-                if contested {
-                    self.model.mtp_save_node_ring(
-                        &mut self.slots[slot_idx],
-                        &mut self.kv_adapter,
-                        node,
-                        start_pos + depth,
-                    )?;
-                }
+                })
+                .collect();
+            // ONE level-batched MTP forward expands the whole frontier.
+            let expanded = self.model.mtp_forward_level(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &rows,
+                &h_prevs,
+                (start_pos + depth) as u64,
+                shape.topk,
+            )?;
+            drop(h_prevs);
+            let mut next = Vec::with_capacity(frontier.len() * shape.topk);
+            for (&node, (candidates, stream)) in frontier.iter().zip(expanded) {
                 node_stream[node] = Some(stream);
                 for &candidate in &candidates {
                     if tree.len() >= MAX_SPEC_TREE_NODES {
