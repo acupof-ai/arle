@@ -410,6 +410,19 @@ impl Dsv4CudaExecutor {
                 "[dsv4-mtp] depth={depth} nodes={drafts} accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
                 self.mtp_accepts, self.mtp_rejects
             );
+            // P0 accept-rate probe (fast-path plan): per-step (target, level-1
+            // drafts) token-id pairs, detokenized offline. Near-miss rejects =
+            // head quality; nonsense rejects = draft-path bug.
+            if std::env::var("ARLE_DSV4_MTP_PROBE").as_deref() == Ok("1") {
+                let drafts_l1: Vec<u32> =
+                    tree.children[0].iter().map(|&c| tree.tokens()[c]).collect();
+                eprintln!(
+                    "[dsv4-mtp-probe] pending={} target={} drafts_l1={:?}",
+                    tree.tokens()[0],
+                    argmax[0],
+                    drafts_l1
+                );
+            }
         }
 
         self.model
