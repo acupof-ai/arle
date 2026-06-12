@@ -206,6 +206,19 @@ impl Dsv4CudaExecutor {
             .ok_or_else(|| anyhow!("DSv4 MTP decode missing previous hidden"))?
             .clone();
 
+        // Step-phase profile (evidence probe): sync at phase boundaries and
+        // report host millis. Distorts overlap — measurement runs only.
+        let prof = std::env::var("ARLE_DSV4_MTP_STEP_PROFILE").as_deref() == Ok("1");
+        let mut t = std::time::Instant::now();
+        let mut phase_ms = [0f64; 4];
+        let mut lap = |i: usize, t: &mut std::time::Instant, model: &crate::dsv4::Dsv4Model| {
+            if prof {
+                let _ = model.ctx.sync();
+                phase_ms[i] = t.elapsed().as_secs_f64() * 1000.0;
+                *t = std::time::Instant::now();
+            }
+        };
+
         // Frozen-KV P1-2: snapshot the ring slots the draft + verify will overwrite
         // BEFORE any speculative write (the draft itself writes the frozen target
         // layer's SW/FP8 ring). Positions cover `start_pos..=start_pos+depth` — the
@@ -217,12 +230,15 @@ impl Dsv4CudaExecutor {
             start_pos,
             shape.depth,
         )?;
+        lap(0, &mut t, &self.model);
 
         // 1. Draft the tree off the MTP head.
         let tree = self.draft_tree(slot_idx, pending, &hidden, &shape, start_pos)?;
+        lap(1, &mut t, &self.model);
 
         // 2. Verify the whole tree in ONE frozen forward.
         let (argmax, hiddens) = self.verify_tree(slot_idx, &tree, start_pos, position)?;
+        lap(2, &mut t, &self.model);
 
         // 3. Accept the longest matching path.
         let path = longest_accepted_path(&tree, &argmax);
@@ -230,7 +246,7 @@ impl Dsv4CudaExecutor {
         // 4. Commit accepted drafts + the bonus correction. The ring restore
         //    must use the depth the snapshot CAPTURED (shape.depth), not a
         //    tree-derived count.
-        self.commit_path(
+        let out = self.commit_path(
             slot_idx,
             &tree,
             &path,
@@ -239,7 +255,18 @@ impl Dsv4CudaExecutor {
             start_pos,
             position,
             shape.depth,
-        )
+        )?;
+        if prof {
+            let _ = self.model.ctx.sync();
+            phase_ms[3] = t.elapsed().as_secs_f64() * 1000.0;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp-prof] capture={:.2} draft={:.2} verify={:.2} commit={:.2} ms",
+                    phase_ms[0], phase_ms[1], phase_ms[2], phase_ms[3]
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// The draft shape for this step. `depth` honours `--mtp-draft-tokens` only
