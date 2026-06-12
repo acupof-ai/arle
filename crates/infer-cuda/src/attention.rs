@@ -2279,59 +2279,6 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    /// Park one spec-tree node's just-written ring K/V (BF16 SW slot + FP8
-    /// data+scale) into node-scratch slot `node_idx`, right AFTER that node's
-    /// attention. Tree nodes at the same draft depth share the ring slot
-    /// `(abs_pos % sliding_window)`, so a node another branch will later chain
-    /// from must survive its siblings' overwrites; `restore_spec_node_slot`
-    /// replays it before any non-descendant deeper row attends. Same
-    /// `(i, pos)`-parameterized slot copies as the pre-verify capture; the
-    /// scratch is a node-count-sized [`Dsv4SpecRingSnapshot`] whose
-    /// start-pos/depth window fields are unused.
-    pub(crate) fn save_spec_node_slot(
-        &self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        snap: &mut Dsv4SpecRingSnapshot,
-        node_idx: usize,
-        abs_pos: usize,
-    ) -> Result<()> {
-        ensure!(
-            node_idx <= snap.max_depth,
-            "DSv4 spec-node save index {node_idx} exceeds node-scratch capacity {}",
-            snap.max_depth + 1
-        );
-        snap.capture_sw_slot(ctx, &self.sw_window_cache, node_idx, abs_pos)?;
-        if let Some(flash) = &self.flashmla {
-            snap.capture_fp8_slot(ctx, pool, flash, node_idx, abs_pos)?;
-        }
-        Ok(())
-    }
-
-    /// Replay a parked spec-tree node's ring K/V from node-scratch slot
-    /// `node_idx` back into the live ring slot for `abs_pos`, BEFORE a row whose
-    /// ancestor path runs through that node attends. Counterpart of
-    /// [`Self::save_spec_node_slot`]; per-call counters/flags are untouched (the
-    /// whole-verify capture/restore owns those).
-    pub(crate) fn restore_spec_node_slot(
-        &mut self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        snap: &Dsv4SpecRingSnapshot,
-        node_idx: usize,
-        abs_pos: usize,
-    ) -> Result<()> {
-        ensure!(
-            node_idx <= snap.max_depth,
-            "DSv4 spec-node restore index {node_idx} exceeds node-scratch capacity {}",
-            snap.max_depth + 1
-        );
-        snap.restore_sw_slot(ctx, &mut self.sw_window_cache, node_idx, abs_pos)?;
-        if let Some(slot_idx) = self.flashmla.as_ref().map(|f| f.slot_idx) {
-            snap.restore_fp8_slot(ctx, pool, slot_idx, node_idx, abs_pos)?;
-        }
-        Ok(())
-    }
 }
 
 impl Dsv4SpecRingSnapshot {
