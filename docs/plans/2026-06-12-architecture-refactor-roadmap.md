@@ -31,9 +31,10 @@ instantiations. The structural debts are:
    not another one-off resync. **Resynced** (`07948a3d`) and **gated in CI**
    (`215807e3`).
 4. **Sequencing is everything.** R2 (batched lowering) **is** Phase 1 — not
-   new work. R3–R5 must not start while `attention.rs`/`dsv4.rs` carry
-   uncommitted WIP. R4/R6 have explicit *trigger conditions*; starting them
-   early is speculative interface shaping and will be reverted.
+   new work. R3 must wait for R2's final Phase-1 gate and a fresh line-level
+   brief; R5 waits for the same gate plus clean target files. R4/R6 have
+   explicit *trigger conditions*; starting them early is speculative interface
+   shaping and will be reverted.
 
 ## §1 Global guardrails (binding for every tranche)
 
@@ -82,9 +83,9 @@ before committing: ckl lands divergent commits mid-session.
 | P1 | DSv4 forward-order truth ×3: CUDA imperative (`infer-cuda/src/dsv4.rs`), declarative `DeepSeekV4AttentionLayerPlan` (`deepseek-spec/src/v4.rs`, consumed **only** by `infer-hip/src/model.rs`), HIP doc comments pinning CUDA line numbers ("call sites at attention.rs:4372/… on today's tree" — already rotting). §0.1 mutated-buffer enumerations also per-backend. Model files: infer-cuda{model,qwen35,dsv4}, infer-metal{qwen35}, infer-hip{model}, infer-vulkan{model_qwen3,_qwen35,_qwen36,_dsv4,_gemma4} | `grep -rn AttentionLayerPlan crates` |
 | P2 | Lateral backend dep: `infer-vulkan` → `infer-hip` for `{config, dequant, gguf}`. **Resolved by R1** (`31bf4322`): both consume the neutral `infer-gguf` leaf | `crates/infer-vulkan/Cargo.toml`; `crates/infer-vulkan/src/lib.rs:8` (pre-R1) |
 | P3 | Truth surface stale: codebase-map missing 7 crates (`gemma-spec`, `hip-sys`, `hip-kernels`, `infer-hip`, `infer-vulkan`, `vulkan-sys`, `vulkan-kernels`); §3.2 describes deleted seam traits (Communicator/Sampler/GraphRunner/ModelArch) and misses driven `ResourceGovernor` (`infer-core/src/lib.rs:308`, `infer-api/src/loaded.rs:641`) + `KvBatchDescriptor`; kv-native-sys "zero dependents" false (infer-cuda `kv_tier.rs`, infer-metal `MetalSsdTier`); architecture.md parity matrix lacks HIP/Vulkan; CLAUDE.md/AGENTS.md workspace tree stale; ROADMAP says ROCm enters at Phase 3 while ~10k LOC landed. **Resynced in R0.1** (`07948a3d`), **CI-gated in R0.2** (`215807e3`) | this survey |
-| P4 | infer-cuda re-monolithization: 31.5k LOC; `attention.rs` 6,679 lines mixing 4 concerns (MLA attention, `ModelKvAdapter` at `attention.rs:257` `pub(crate)` with one impl, KvBatchDescriptor lowering, FlashMLA/TileLang glue); `moe.rs` 4.3k; `dsv4.rs` 3.6k; per-capability per-model match arms in `executor.rs` (kv-tier: Qwen only; slot-tier: DSv4 only — coverage matrix lives nowhere) | `wc -l`, `executor.rs:210-260` |
+| P4 | infer-cuda re-monolithization: ~32k LOC; `attention.rs` is ~7k lines mixing 4 concerns (MLA attention, `ModelKvAdapter` `pub(crate)` with one impl, KvBatchDescriptor lowering, FlashMLA/TileLang glue); `moe.rs` ~4.3k; `dsv4.rs` ~3.6k; per-capability per-model match arms in `executor.rs` (kv-tier: Qwen only; slot-tier: DSv4 only — coverage matrix lives nowhere) | `wc -l`, executor capability match arms |
 | P5 | Seam narrative vs reality: `BackendExecutor` is 15+ methods (capability default-methods: stop ids, max rows/live, prefix reuse ×2, page-tier ×4, slot-tier ×3, weight offload ×2) while docs say "two traits, submit/poll". The default-method pattern itself is **correct** (KV tier is the model example: engine drives, backends store) — the gap is governance + docs | `infer-seam/src/lib.rs:53-198` |
-| P6 | Dead/residual: `xgrammar-sys` has zero code consumers (grammar decode lost in monolith deletion); 63 `env::var("ARLE_/INFER_*")` runtime knobs vs decision D5 (CLI flags), audit plan exists (`2026-06-07-dsv4-code-cleanup-audit.md`); `EchoExecutor` duplicated (`infer-server/src/lib.rs:518`, `agent-bench/src/lib.rs:167`); ~2k lines of test mocks inline in `infer-core/src/lib.rs` | greps in this survey |
+| P6 | Dead/residual: `xgrammar-sys` has zero code consumers (grammar decode lost in monolith deletion); `ARLE_/INFER_` env-var call sites are moving and must be re-swept before D5 cleanup (old survey said 63; latest spot check is higher); audit plan exists (`2026-06-07-dsv4-code-cleanup-audit.md`); `EchoExecutor` duplicated (`infer-server/src/lib.rs:518`, `agent-bench/src/lib.rs:167`); ~2k lines of test mocks inline in `infer-core/src/lib.rs` | greps in this survey |
 | P7 | Strategy-execution divergence: D4 strict-serial vs simultaneous kv-tier SSD + MTP top-k tree + HIP/Vulkan AIPC + Gemma4 in one week; Gemma4 absent from every priority doc | git log 2026-06-10..12 |
 
 Healthy, do not "fix": dependency direction (zero reverse deps found); KV
@@ -162,7 +163,8 @@ Do not delete or wire anything until the verdict lands.
 
 Execute per the existing audit plan
 [`2026-06-07-dsv4-code-cleanup-audit.md`](2026-06-07-dsv4-code-cleanup-audit.md).
-63 call sites; classify bootstrap-legit (`INFER_TP_RANK`,
+Do a fresh `ARLE_/INFER_` env-var sweep first; do **not** trust the old
+63-call-site count. Classify bootstrap-legit (`INFER_TP_RANK`,
 `INFER_NCCL_UNIQUE_ID`, build/toolchain) vs runtime-knob→CLI-flag. Touches
 hot paths → needs its own brief + bench entries; do not fold into R0.1/R0.2.
 
@@ -223,11 +225,13 @@ Commit: `refactor(gguf): extract GGUF host substrate from infer-hip to infer-ggu
 This **is** [`2026-06-07-unified-batched-kvpool-abstraction.md`](2026-06-07-unified-batched-kvpool-abstraction.md)
 (authoritative; already ACTIVE as #60/#61). The only addition from this
 roadmap: when the batched path passes the c-sweep gate (TTFT+ITL+tok/s per
-bench spec), the sequential single-row split at
-`infer-cuda/src/executor.rs:1531-1563` is **deleted** or demoted to an
-explicit named A/B arm — no silent parallel old+new paths.
+bench spec), delete or demote the sequential single-row fallback in
+`Dsv4Executor::forward_decode_batch` plus the mixed/multi-prefill split in
+`Dsv4Executor::submit` (`submit_prefill_row` loop + decode sub-batch) to an
+explicit named A/B arm — no silent parallel old+new paths. Do not key this work
+off stale line numbers; find the functions by name in the current tree.
 
-### R3 — DSv4 forward-order single truth — **blocked until attention.rs/dsv4.rs WIP lands**
+### R3 — DSv4 forward-order single truth — **blocked until R2 final gate + brief**
 
 **Goal:** make `deepseek_spec::v4::DeepSeekV4AttentionLayerPlan` the single
 forward-order authority for DSv4.
@@ -236,8 +240,8 @@ Approach (parity-test-first, no behavior change):
 
 1. Add a host-only parity test in `infer-cuda` that derives the
    launcher-order table from `dsv4.rs` **as data** and asserts it against
-   the spec plan walk. (Detailed line-level brief to be written when the
-   files unblock; do not start before.)
+   the spec plan walk. (Detailed line-level brief to be written after R2's
+   final c-sweep/cleanup gate; do not start from this high-level sketch.)
 2. Replace `infer-hip/src/model.rs` line-number doc pins with spec-plan
    references; same for `infer-vulkan/src/model_dsv4.rs`.
 3. Lift the §0.1 mutated-buffer enumeration (HIP's
@@ -256,22 +260,25 @@ their own module; acceptance = Qwen3.6 CUDA serving on the shared lowering
 with **zero `infer-core` changes**. Lifting earlier = speculative shaping;
 don't.
 
-### R5 — infer-cuda file splits — trigger: after #70 + Phase 1 WIP lands
+### R5 — infer-cuda file splits — trigger: after #70 + R2 final gate
 
 Pure-move `#[path]` flat splits (per repo convention, no `mod.rs`):
 `attention.rs` → `attention/{mla,flashmla,adapter,batch}.rs`-shaped
 siblings; then `moe.rs`, `dsv4.rs`. One file per tranche, each compiling +
-tests green + committed separately. Soft bar: no file >3k LOC. Blocked
-today by §1.1.
+tests green + committed separately. Soft bar: no file >3k LOC. Before each
+split, `git status` must show the target file is clean; if not, §1.1 blocks it.
 
 ### R6 — seam capability governance — trigger-only, do nothing now
 
-Trigger: `BackendExecutor` exceeds ~20 methods **or** a third capability
-family lands. Then regroup into capability traits (KvTierStore /
-SlotTierStore / WeightOffload). Until then the default-method pattern is
-the documented, deliberate choice (R0.1 notes it in architecture.md).
+Trigger: `BackendExecutor` exceeds ~20 methods **or** a new stateful capability
+family lands beyond the current documented set. Current set: scalar metadata
+(`model_stop_token_ids`, row/live caps), prefix/page-tier hooks, whole-slot
+tier hooks, and weight-offload hooks. If the trigger fires, regroup into
+capability traits (KvTierStore / SlotTierStore / WeightOffload / new family).
+Until then the default-method pattern is the documented, deliberate choice
+(R0.1 notes it in architecture.md).
 
-## §5 Sequencing
+## §5 Sequencing and TODO
 
 ```
 R0.1 ✅ ──▶ R0.2 ✅     (landed 2026-06-12: 07948a3d, 215807e3)
@@ -280,6 +287,19 @@ R2 (= Phase 1, active) ──▶ R3 ──▶ R4 (= Phase 3 Qwen3.6 item)
                        └─▶ R5 (opportunistic, after WIP lands)
 R6: trigger-only.   R0.3: blocked on ckl.   R0.4: queued, own brief.
 ```
+
+### Remaining TODOs
+
+| Item | Status | Next action | Stop condition |
+|---|---|---|---|
+| R2 Phase 1 batched lowering closeout | ACTIVE | Finish Phase 4-6 in `2026-06-07-unified-batched-kvpool-abstraction.md`; run c-sweep gate; then delete or explicitly name the single-row fallback arms | TTFT/ITL/tok/s gate not passed, or target files dirty |
+| R3 DSv4 forward-order single truth | BLOCKED | After R2 gate, write a line-level brief for spec-plan parity tests + mutated-buffer table lift | R2 incomplete, no brief, or pod needle gate unavailable |
+| R4 `ModelKvAdapter` trait graduation | TRIGGER-ONLY | Wait for Qwen3.6 CUDA second adapter | No second impl; lifting now is speculative |
+| R5 infer-cuda file splits | TRIGGER-ONLY | After R2/#70 and clean target files, do pure `#[path]` splits one file per commit | Any non-move behavior change or dirty target file |
+| R6 seam capability governance | TRIGGER-ONLY | Keep default-method pattern until method/family trigger fires | No new stateful capability family and method count below threshold |
+| R0.3 xgrammar-sys verdict | BLOCKED on ckl | Decide re-port vs remove from workspace | No owner verdict |
+| R0.4 D5 env-knob cleanup | QUEUED | Fresh env-var sweep, classify bootstrap vs runtime knobs, write separate brief | Touches hot path without bench-entry plan |
+| P7 ratification | BLOCKED on ckl | Amend strategy v2 for AIPC/Gemma4 or re-serialize priorities | No strategy verdict |
 
 ## §6 Pending ckl verdicts
 
