@@ -1390,10 +1390,15 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
         );
     }
 
-    // FlashQLA chunked GDR fwd — sm_90 ONLY (TileLang lowering uses Hopper
-    // barriers/warp-spec/gemm_v1 that fail on every other SM). Build the real
-    // cubins only for sm_90 targets; every other build flavor links the
-    // NOT_SUPPORTED stubs so the FFI surface stays complete.
+    // FlashQLA chunked GDR fwd — OPT-IN (ARLE_CUDA_ENABLE_FLASHQLA_GDR=1) and
+    // sm_90 ONLY (TileLang lowering uses Hopper barriers/warp-spec/TMA that fail
+    // on every other SM). The runtime path is itself env-gated OFF by default
+    // (ARLE_QWEN35_GDR_CHUNKED → use_fq_chunked in infer-cuda/src/qwen35.rs), so
+    // its AOT is not a hard build dependency — same opt-in discipline as
+    // ARLE_CUDA_ENABLE_FA3. When the flag is unset (or building off-sm90) every
+    // build flavor links the NOT_SUPPORTED stubs, keeping the FFI surface
+    // complete so the rest of the tree builds while these fwd kernels (TileLang
+    // T.gemm TMA-descriptor wrapper gen) are still being iterated on.
     let flashqla_specs = [
         TileLangKernelSpec {
             artifact_dir: "flashqla_gdr_cumsum".to_string(),
@@ -1438,13 +1443,15 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
             allow_sm70: false,
         },
     ];
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHQLA_GDR");
+    let enable_flashqla_gdr = env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR");
     let sm90_targets: Vec<SmSpec> = sm_targets
         .iter()
         .filter(|sm| sm.sm == "90")
         .cloned()
         .collect();
     for spec in &flashqla_specs {
-        if sm90_targets.is_empty() {
+        if !enable_flashqla_gdr || sm90_targets.is_empty() {
             write_tilelang_unsupported_stub(
                 out_dir,
                 &spec.artifact_dir,
