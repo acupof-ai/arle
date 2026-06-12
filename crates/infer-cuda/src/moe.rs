@@ -2686,32 +2686,12 @@ mod dsv4_gpu {
         up_s: CudaSlice<u64>,
         w2_w: CudaSlice<u64>,
         w2_s: CudaSlice<u64>,
-        /// Keepalive owners of the re-encoded scale bytes the tables point at.
-        _w13_scales_u8: CudaSlice<u8>,
-        _w2_scales_u8: CudaSlice<u8>,
         /// w13-half geometry: [I/128, H/128] per expert half.
         sr_half: usize,
         sc13: usize,
         /// w2 geometry: [H/128, I/128] per expert.
         sr2: usize,
         sc2: usize,
-    }
-
-    /// Lossless f32 → UE8M0 re-encode: DSv4 checkpoint block scales are
-    /// powers of two (UE8M0 in the checkpoint; the DeepGEMM cache stores
-    /// them widened to f32), so `bits >> 23` recovers the exponent byte
-    /// exactly. Any mantissa/sign/denormal ⇒ `None` (lane disabled).
-    fn encode_ue8m0(scales: &[f32]) -> Option<Vec<u8>> {
-        let mut out = Vec::with_capacity(scales.len());
-        for &s in scales {
-            let bits = s.to_bits();
-            let exp = ((bits >> 23) & 0xFF) as u8;
-            if bits & 0x8000_0000 != 0 || bits & 0x007F_FFFF != 0 || exp == 0 || exp == 0xFF {
-                return None;
-            }
-            out.push(exp);
-        }
-        Some(out)
     }
 
     fn build_gemv_tables(
@@ -2758,37 +2738,15 @@ mod dsv4_gpu {
             g * stride2
         );
 
-        let s13_host: Vec<f32> = ctx
-            .stream
-            .clone_dtoh(&w13.scales)
-            .map_err(|e| anyhow::anyhow!("GEMV tables: w13 scale D2H failed: {e}"))?;
-        let s2_host: Vec<f32> = ctx
-            .stream
-            .clone_dtoh(&w2.scales)
-            .map_err(|e| anyhow::anyhow!("GEMV tables: w2 scale D2H failed: {e}"))?;
-        let (Some(s13_u8), Some(s2_u8)) = (encode_ue8m0(&s13_host), encode_ue8m0(&s2_host)) else {
-            log::warn!(
-                "DSv4 GEMV decode lane disabled: block scales are not exact powers of two"
-            );
-            return Ok(None);
-        };
-        let w13_scales_u8 = ctx
-            .stream
-            .clone_htod(&s13_u8)
-            .map_err(|e| anyhow::anyhow!("GEMV tables: w13 u8 scale H2D failed: {e}"))?;
-        let w2_scales_u8 = ctx
-            .stream
-            .clone_htod(&s2_u8)
-            .map_err(|e| anyhow::anyhow!("GEMV tables: w2 u8 scale H2D failed: {e}"))?;
-
-        // Take raw base addresses in an inner scope so the device_ptr guards
-        // drop before the scale buffers move into the returned struct (the
-        // buffers themselves stay alive there, keeping the addresses valid).
+        // Scale tables point straight into the layer's f32 DeepGEMM scale
+        // buffers (the GEMV kernels read f32 block scales — the MoE expert
+        // caches do NOT store UE8M0; that encoding is attention-side only).
+        // Offsets below are in BYTES (f32 ⇒ ×4).
         let (w13_base, w2_base, s13_base, s2_base) = {
             let (a, _g13) = w13.weight.device_ptr(&ctx.stream);
             let (b, _g2) = w2.weight.device_ptr(&ctx.stream);
-            let (c, _gs13) = w13_scales_u8.device_ptr(&ctx.stream);
-            let (d, _gs2) = w2_scales_u8.device_ptr(&ctx.stream);
+            let (c, _gs13) = w13.scales.device_ptr(&ctx.stream);
+            let (d, _gs2) = w2.scales.device_ptr(&ctx.stream);
             (a as u64, b as u64, c as u64, d as u64)
         };
         let wstride13 = (2 * i_dim * h) as u64;
@@ -2803,11 +2761,11 @@ mod dsv4_gpu {
             let wb = w13_base + e as u64 * wstride13;
             gate_w.push(wb);
             up_w.push(wb + half_off);
-            let sb = s13_base + (e * stride13) as u64;
+            let sb = s13_base + (e * stride13 * 4) as u64;
             gate_s.push(sb);
-            up_s.push(sb + (sr_half * sc13) as u64);
+            up_s.push(sb + (sr_half * sc13 * 4) as u64);
             w2_w.push(w2_base + (e * h * i_dim) as u64);
-            w2_s.push(s2_base + (e * stride2) as u64);
+            w2_s.push(s2_base + (e * stride2 * 4) as u64);
         }
         let h2d = |v: &[u64]| -> Result<CudaSlice<u64>> {
             ctx.stream
@@ -2821,8 +2779,6 @@ mod dsv4_gpu {
             up_s: h2d(&up_s)?,
             w2_w: h2d(&w2_w)?,
             w2_s: h2d(&w2_s)?,
-            _w13_scales_u8: w13_scales_u8,
-            _w2_scales_u8: w2_scales_u8,
             sr_half,
             sc13,
             sr2,
