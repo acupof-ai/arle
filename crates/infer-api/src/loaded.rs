@@ -93,6 +93,8 @@ pub(crate) enum CudaModelKind {
     Qwen3Moe,
     /// DeepSeek-V4-Flash (multi-GPU only).
     Dsv4,
+    /// DiffusionGemma/Gemma4 block-diffusion checkpoint. Not a CUDA AR path.
+    DiffusionGemma,
 }
 
 /// Pure classification of a parsed `config.json`: DeepSeek-V4 by
@@ -111,6 +113,13 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     };
     if model_type == "deepseek_v4" || arch_contains("DeepseekV4") {
         return CudaModelKind::Dsv4;
+    }
+    if model_type == "diffusion_gemma"
+        || model_type == "gemma4"
+        || arch_contains("DiffusionGemma")
+        || arch_contains("Gemma4")
+    {
+        return CudaModelKind::DiffusionGemma;
     }
     let expert_count = |key: &str| v.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
     let is_moe = arch_contains("Moe")
@@ -150,6 +159,18 @@ mod classify_tests {
             ),
             CudaModelKind::Dsv4
         );
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["DiffusionGemmaForBlockDiffusion"], "model_type": "diffusion_gemma"})
+            ),
+            CudaModelKind::DiffusionGemma
+        );
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4"})
+            ),
+            CudaModelKind::DiffusionGemma
+        );
         // Unknown / minimal config falls back to dense Qwen3.
         assert_eq!(classify_cuda_model(&json!({})), CudaModelKind::Qwen3Dense);
     }
@@ -182,7 +203,9 @@ mod backend {
     #[cfg(feature = "hip")]
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
-    use infer_metal::{MetalExecutor, MetalKvPool};
+    use infer_metal::{MetalDiffusionGemmaModel, MetalExecutor, MetalKvPool};
+    #[cfg(feature = "metal")]
+    use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool};
     #[cfg(feature = "vulkan")]
     use infer_vulkan::{VulkanExecutor, VulkanKvPool};
     // The CPU path reuses infer-metal's feature-free placeholder executor over
@@ -207,6 +230,15 @@ mod backend {
         /// Metal backend (Apple Silicon, MLX). Fully wired and runnable.
         #[cfg(feature = "metal")]
         Metal(ServeInferenceEngine<MetalExecutor, MetalKvPool>),
+        /// Metal DiffusionGemma backend. The block-diffusion model is adapted
+        /// to the shared autoregressive engine by a buffered executor.
+        #[cfg(feature = "metal")]
+        MetalDiffusionGemma(
+            ServeInferenceEngine<
+                BufferedDiffusionExecutor<MetalDiffusionGemmaModel>,
+                HostPagedKvPool,
+            >,
+        ),
         /// CUDA backend (Linux + NVIDIA). Structurally wired (typechecks); the
         /// real forward is lead-owned and not yet runnable.
         #[cfg(feature = "cuda")]
@@ -288,6 +320,8 @@ mod backend {
             match self {
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => "metal",
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => "metal-diffusion-gemma",
                 #[cfg(feature = "cuda")]
                 Self::Cuda(_) => "cuda",
                 #[cfg(feature = "hip")]
@@ -313,6 +347,10 @@ mod backend {
                 Self::Cuda(engine) => engine.forward_token_logits(input_ids, positions),
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
                 #[cfg(feature = "hip")]
@@ -341,6 +379,10 @@ mod backend {
                 Self::Cuda(engine) => engine.offload_engine_weights(),
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("offload_engine_weights is only available on CUDA")
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "vulkan")]
@@ -360,6 +402,10 @@ mod backend {
                 Self::Cuda(engine) => engine.reload_engine_weights(),
                 #[cfg(feature = "metal")]
                 Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("reload_engine_weights is only available on CUDA")
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "vulkan")]
@@ -395,6 +441,13 @@ mod backend {
                     let _ = update;
                     anyhow::bail!("student LoRA re-merge is CUDA-only; active backend is Metal")
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
+                    let _ = update;
+                    anyhow::bail!(
+                        "student LoRA re-merge is CUDA-only; active backend is Metal DiffusionGemma"
+                    )
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => {
                     let _ = update;
@@ -416,6 +469,19 @@ mod backend {
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             let kv_ssd = crate::serve::ServeKvSsdOptions::default();
+            let resolved = infer_metal::resolve_model_path(model_path)?;
+            if infer_metal::model_dir_is_diffusion_gemma(&resolved) {
+                let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
+                    model_path,
+                    &resolved,
+                    config,
+                    &kv_ssd,
+                    infer_server::ServeShutdown::new(),
+                )?;
+                return Ok(Self::MetalDiffusionGemma(ServeInferenceEngine::new(
+                    model_id, tokenizer, serve,
+                )));
+            }
             let (serve, tokenizer, model_id) = metal_serve_handle(
                 model_path,
                 config,
@@ -683,9 +749,80 @@ mod backend {
         kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
+        let resolved = infer_metal::resolve_model_path(model_path)?;
+        if infer_metal::model_dir_is_diffusion_gemma(&resolved) {
+            let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
+                model_path, &resolved, config, kv_ssd, shutdown,
+            )?;
+            return Ok(infer_server::openai_router(serve, tokenizer, model_id));
+        }
         let (serve, tokenizer, model_id) =
             metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_diffusion_gemma_serve_handle(
+        model_path: &str,
+        resolved: &std::path::Path,
+        config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<(
+        ServeHandle<BufferedDiffusionExecutor<MetalDiffusionGemmaModel>, HostPagedKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
+
+        if config.mtp_draft_tokens.is_some() {
+            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
+        }
+        anyhow::ensure!(
+            !kv_ssd.requested(),
+            "--kv-ssd-path: DiffusionGemma Metal owns no page-addressable KV tier store"
+        );
+
+        let tokenizer = OpenAiTokenizer::from_model_dir_without_chat(
+            resolved,
+            "DiffusionGemma checkpoint tokenizer_config.json has chat_template=null; \
+             use /v1/completions until a verified DiffusionGemma chat renderer is added",
+        )?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+        let model_source = resolved.to_string_lossy().to_string();
+        let mut scheduler = config.scheduler_config();
+        scheduler.num_slots = 1;
+        scheduler.enable_prefix_cache = false;
+        let page_size = config.page_size.max(1);
+        let total_pages = config.total_pages.max(1);
+        let low_impact = config.low_impact;
+
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || {
+                let loaded = infer_metal::MetalDiffusionGemmaModel::load(std::path::Path::new(
+                    &model_source,
+                ))?;
+                let executor = BufferedDiffusionExecutor::new(loaded.model, loaded.generation);
+                let kv = HostPagedKvPool::new(1, total_pages, page_size);
+                if low_impact {
+                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
+                        max_tokens: scheduler.chunked_prefill_size.max(1),
+                        max_micros: 20_000,
+                    })
+                    .with_yield_every_ticks(8);
+                    Ok(infer_core::Engine::with_config_and_governor(
+                        executor,
+                        kv,
+                        scheduler,
+                        Box::new(governor),
+                    ))
+                } else {
+                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                }
+            },
+            shutdown,
+        )?;
+        Ok((serve, tokenizer, model_id))
     }
 
     /// Read a CUDA checkpoint's `config.json` and classify it for `load_cuda`.
@@ -758,6 +895,7 @@ mod backend {
             CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len()
                 .saturating_add(4096)
                 .saturating_mul(num_slots.max(1)),
+            CudaModelKind::DiffusionGemma => config.total_pages.saturating_mul(ps),
         };
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
@@ -829,6 +967,13 @@ mod backend {
         config: &EngineLoadConfig,
     ) -> Result<infer_core::Engine<CudaExecutor, CudaKvPool>> {
         let kind = detect_cuda_model_kind(model_path)?;
+        if matches!(kind, CudaModelKind::DiffusionGemma) {
+            anyhow::bail!(
+                "DiffusionGemma CUDA loading is not wired: the repository has the \
+                 backend-neutral block-diffusion generate loop, but no CUDA Gemma4/\
+                 DiffusionGemma forward path or weight mapping"
+            );
+        }
         // Resolve the requested KV dtype against the CUDA support matrix at the
         // engine boundary, mirroring the Metal path's `MetalKvCacheDtype::resolve`
         // (#68 T2). Admits BF16/INT8/FP8 (tq4 fails loud — see resolve); the
@@ -927,6 +1072,7 @@ mod backend {
                 infer_cuda::dsv4_max_seq_len(),
                 config.mtp_draft_tokens,
             )?,
+            CudaModelKind::DiffusionGemma => unreachable!("checked before CUDA executor build"),
         };
         let mut executor = executor;
         if let Some(bytes) = config.kv_t1_budget_bytes {
@@ -1221,6 +1367,8 @@ mod backend {
             match self {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.model_id(),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.model_id(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.model_id(),
                 #[cfg(feature = "hip")]
@@ -1236,6 +1384,8 @@ mod backend {
             match self {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.complete(req),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.complete(req),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete(req),
                 #[cfg(feature = "hip")]
@@ -1255,6 +1405,8 @@ mod backend {
             match self {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.complete_stream(req, tx),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "hip")]
@@ -1270,6 +1422,8 @@ mod backend {
             match self {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.tokenize(text),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.tokenize(text),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.tokenize(text),
                 #[cfg(feature = "hip")]
@@ -1285,6 +1439,8 @@ mod backend {
             match self {
                 #[cfg(feature = "metal")]
                 Self::Metal(engine) => engine.telemetry(),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.telemetry(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.telemetry(),
                 #[cfg(feature = "hip")]

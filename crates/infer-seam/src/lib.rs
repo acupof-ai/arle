@@ -11,6 +11,8 @@ use infer_plan::{ForwardPlan, StepOutput};
 
 #[path = "allocator.rs"]
 mod allocator;
+#[path = "diffusion_executor.rs"]
+mod diffusion_executor;
 #[path = "host_paged_kv_pool.rs"]
 mod host_paged_kv_pool;
 #[path = "kv.rs"]
@@ -27,6 +29,7 @@ mod prefix_store;
 mod resource;
 
 pub use allocator::KvAllocator;
+pub use diffusion_executor::BufferedDiffusionExecutor;
 pub use host_paged_kv_pool::HostPagedKvPool;
 pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};

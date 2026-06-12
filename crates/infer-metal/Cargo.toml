@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+gemma-spec = { path = "../gemma-spec", optional = true }
 hf-hub = { version = "0.5", features = ["tokio"], optional = true }
 infer-plan = { path = "../infer-plan" }
 infer-seam = { path = "../infer-seam" }
@@ -19,7 +20,7 @@ serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
-metal = ["dep:hf-hub", "dep:kv-native-sys", "dep:libc", "dep:mlx-sys", "dep:serde", "dep:serde_json"]
+metal = ["dep:gemma-spec", "dep:hf-hub", "dep:kv-native-sys", "dep:libc", "dep:mlx-sys", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true
