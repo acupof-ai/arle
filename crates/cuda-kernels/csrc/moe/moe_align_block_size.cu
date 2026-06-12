@@ -10,8 +10,18 @@
 //     `numel` (= M*top_k) so the GEMM masks them via `< num_valid_tokens`.
 //   * expert_ids [num_blocks] — the expert id for each block_size-row block.
 //   * total_tokens_post_pad [1] — Σ_e ceil(count_e / block_size) * block_size.
-//   * cumsum_buffer [E+1] — scratch the kernel needs (padded exclusive prefix
-//     sums over expert counts); caller preallocates it.
+//   * cumsum_buffer [num_experts + 1] — scratch the kernel needs (padded
+//     exclusive prefix sums over expert counts); caller preallocates it.
+//
+// EXPERT-ID +1 SHIFT (load-bearing, matches upstream `moe_align_block_size`):
+//   the kernel reindexes `expert_id = topk_ids[i] + 1` so slot 0 is a dummy
+//   and the E real experts occupy slots [1, E]. The caller MUST therefore pass
+//   `num_experts = E + 1` (NOT the bare E) and size `cumsum_buffer` to
+//   `(E + 1) + 1 = E + 2`, exactly as the python wrapper does
+//   (`sgl_moe_align_block_size(topk_ids, num_experts + 1, ...)`,
+//   `cumsum_buffer = empty(num_experts + 2)`). Passing the bare E drops the
+//   highest real expert: its count lands in `shared_counts[E]`, which aliases
+//   `prefix[0]` (never zeroed, never read into the scan).
 //
 // DEVIATIONS (every intentional change vs. the upstream .cu file):
 //   1. The torch::Tensor `moe_align_block_size` wrapper is replaced by a raw
