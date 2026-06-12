@@ -286,10 +286,7 @@ impl RealCudaExecutor {
         budget_bytes: usize,
     ) -> bool {
         match self {
-            Self::Qwen(q) => {
-                q.set_kv_tier_disk(root, budget_bytes);
-                true
-            }
+            Self::Qwen(q) => q.set_kv_tier_disk(root, budget_bytes),
             Self::Qwen35(_) | Self::Dsv4(_) => false,
         }
     }
@@ -534,9 +531,13 @@ impl QwenCudaExecutor {
     }
 
     /// Attach the opt-in T2 disk spill level (`--kv-ssd-path`). Pre-serve only.
-    pub(crate) fn set_kv_tier_disk(&mut self, root: std::path::PathBuf, budget_bytes: usize) {
+    pub(crate) fn set_kv_tier_disk(
+        &mut self,
+        root: std::path::PathBuf,
+        budget_bytes: usize,
+    ) -> bool {
         self.tier
-            .set_disk(root, budget_bytes, self.kv.storage_bytes_per_page());
+            .set_disk(root, budget_bytes, self.kv.storage_bytes_per_page())
     }
 
     /// Copy device pages into the host tier store (synchronous: the copy is
