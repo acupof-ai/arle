@@ -32,6 +32,8 @@ pub mod quant;
 pub mod recurrent;
 #[path = "ffi/sampling.rs"]
 pub mod sampling;
+#[path = "ffi/triton.rs"]
+pub mod triton;
 
 pub use attention::*;
 pub use elementwise::*;
@@ -45,3 +47,4 @@ pub use norm::*;
 pub use quant::*;
 pub use recurrent::*;
 pub use sampling::*;
+pub use triton::*;
