@@ -43,7 +43,9 @@ use crate::executor::sample_cuda_token_scratched;
 use crate::loader::SafetensorLoader;
 use crate::moe::{MoeForwardScratch, moe_forward_into};
 use crate::moe_config::ExpertSplit;
-use crate::ops::{add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul};
+use crate::ops::{
+    add_batch, add_batch_inplace, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul,
+};
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
@@ -115,6 +117,28 @@ fn qwen35_sgl_gdn_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("ARLE_QWEN35_SGL_GDN").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
+/// `ARLE_QWEN35_FUSED_ADDNORM=1`: fuse the post-attention residual add +
+/// `post_attention_layernorm` RMSNorm into one vendored flashinfer
+/// `FusedAddRMSNorm` launch (with `weight_bias = 1.0` for Qwen's `(1+weight)`
+/// gain), replacing the `add_batch` + `rms_norm_batched_offset` pair. Default
+/// OFF — flag-off is byte-identical to the hand path. Scope MIN: only the
+/// post-attn pair is fused (the `input_layernorm` and the MLP residual add stay
+/// on the hand kernels); no cross-layer residual carry. The fused kernel does
+/// no module load / no alloc and uses fixed buffers, so it is CUDA-graph
+/// capture-safe (decode graph). The residual buffers are `[seq_len,
+/// hidden_size]` row-major (one token = `hidden_size` contiguous bf16), so the
+/// same fused path is correct for both decode (`seq_len == 1`) and prefill
+/// (`seq_len > 1`) — `batch = seq_len`, `stride = hidden_size`.
+fn qwen35_fused_addnorm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_QWEN35_FUSED_ADDNORM").as_deref(),
             Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
         )
     })
@@ -1644,15 +1668,34 @@ impl Qwen35Model {
                 }
             }
 
-            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
-
-            rms_norm_offset(
-                &self.ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
-            )?;
+            // Post-attn residual add + post_attention_layernorm. Scope MIN
+            // fusion (ARLE_QWEN35_FUSED_ADDNORM): one flashinfer FusedAddRMSNorm
+            // mutates `hidden` → post-attn sum and `attn_out` → normalized, so
+            // the MLP reads the fused-normalized `attn_out` and the final MLP
+            // residual add accumulates straight into `hidden`. Flag OFF keeps
+            // the byte-identical `add_batch` + `rms_norm_offset` pair via
+            // `hidden_mid`/`normed`.
+            let fused_addnorm = qwen35_fused_addnorm_enabled();
+            let mlp_in: &HiddenStates = if fused_addnorm {
+                fused_add_rms_norm_offset(
+                    &self.ctx,
+                    attn_out,
+                    hidden,
+                    &layer.post_attention_layernorm,
+                    eps,
+                )?;
+                attn_out
+            } else {
+                add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+                rms_norm_offset(
+                    &self.ctx,
+                    hidden_mid,
+                    &layer.post_attention_layernorm,
+                    eps,
+                    normed,
+                )?;
+                normed
+            };
             if let Some(moe_weights) = &layer.moe {
                 let cfg = self
                     .moe_config
@@ -1661,7 +1704,7 @@ impl Qwen35Model {
                 moe_forward_into(
                     &self.ctx,
                     moe_weights,
-                    normed,
+                    mlp_in,
                     cfg,
                     &self.expert_split,
                     moe,
@@ -1672,7 +1715,7 @@ impl Qwen35Model {
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, normed, dense, mlp_out)?;
+                self.dense_mlp(mlp, mlp_in, dense, mlp_out)?;
             }
             // ONE all-reduce covers the whole FFN partial: the MoE buffer already
             // sums this rank's routed experts (non-local routes contribute zero)
@@ -1680,11 +1723,17 @@ impl Qwen35Model {
             // row-parallel down_proj partial. No-op on a single GPU.
             self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
 
-            // Residual add straight into `hidden` (the old per-layer
-            // `hidden_next` alloc + move): add_cuda reads hidden_mid/mlp_out
-            // and writes hidden, whose previous value is dead here — same
-            // kernel, same bytes, one fewer buffer.
-            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            // MLP residual add producing the next layer's residual stream.
+            // Fused arm: `hidden` already holds the post-attn sum, so add the
+            // MLP output in place. Hand arm: the sum lives in `hidden_mid`;
+            // add_cuda reads hidden_mid/mlp_out and writes `hidden` (whose
+            // previous value is dead) — same kernel, same bytes, one fewer
+            // buffer.
+            if fused_addnorm {
+                add_batch_inplace(&self.ctx, hidden, mlp_out)?;
+            } else {
+                add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            }
         }
 
         Ok(())
@@ -2845,15 +2894,32 @@ impl Qwen35Model {
                 }
             }
 
-            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
-
-            rms_norm_offset(
-                &self.ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
-            )?;
+            // Post-attn residual add + post_attention_layernorm. Scope MIN
+            // fusion (ARLE_QWEN35_FUSED_ADDNORM) — identical mapping to
+            // `forward_hidden_staged`: fused arm mutates `hidden` → post-attn
+            // sum and `attn_out` → normalized; flag OFF keeps the byte-identical
+            // `add_batch` + `rms_norm_offset` pair.
+            let fused_addnorm = qwen35_fused_addnorm_enabled();
+            let mlp_in: &HiddenStates = if fused_addnorm {
+                fused_add_rms_norm_offset(
+                    &self.ctx,
+                    attn_out,
+                    hidden,
+                    &layer.post_attention_layernorm,
+                    eps,
+                )?;
+                attn_out
+            } else {
+                add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+                rms_norm_offset(
+                    &self.ctx,
+                    hidden_mid,
+                    &layer.post_attention_layernorm,
+                    eps,
+                    normed,
+                )?;
+                normed
+            };
             if let Some(moe_weights) = &layer.moe {
                 let cfg = self
                     .moe_config
@@ -2862,7 +2928,7 @@ impl Qwen35Model {
                 moe_forward_into(
                     &self.ctx,
                     moe_weights,
-                    normed,
+                    mlp_in,
                     cfg,
                     &self.expert_split,
                     moe,
@@ -2873,13 +2939,17 @@ impl Qwen35Model {
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, normed, dense, mlp_out)?;
+                self.dense_mlp(mlp, mlp_in, dense, mlp_out)?;
             }
             // ONE all-reduce covers the whole FFN partial (see the per-layer
             // enumeration in the method docs); exact `[hidden, B]` message.
             self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
 
-            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            if fused_addnorm {
+                add_batch_inplace(&self.ctx, hidden, mlp_out)?;
+            } else {
+                add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            }
         }
 
         // ── Final norm over ALL rows + batched lm_head GEMM. ──
@@ -3542,6 +3612,50 @@ fn rms_norm_offset(
             out_ptr as *mut ffi::Half,
             x.hidden_dim as i32,
             x.seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Fused residual-add + (1+weight) RMSNorm over a `[hidden_size, seq_len]`
+/// batch, replacing `add_batch(residual, input, sum)` +
+/// `rms_norm_offset(sum, weight, normed)`. Mutates BOTH buffers in place:
+/// after the call `residual` holds the pre-norm running sum (`input + residual`)
+/// and `input` holds the normalized output. The underlying device buffers are
+/// `[seq_len, hidden_size]` row-major (one token = `hidden_size` contiguous
+/// bf16), so `batch = seq_len` and the per-token row stride = `hidden_size`.
+/// Opt-in via [`qwen35_fused_addnorm_enabled`]; the hand `add_batch` +
+/// `rms_norm_offset` pair is the default.
+fn fused_add_rms_norm_offset(
+    ctx: &DeviceContext,
+    input: &mut HiddenStates,
+    residual: &mut HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+) -> Result<()> {
+    ensure!(
+        input.hidden_dim == residual.hidden_dim && input.seq_len == residual.seq_len,
+        "fused_add_rms_norm_offset shape mismatch"
+    );
+    let hidden_dim = input.hidden_dim;
+    let seq_len = input.seq_len;
+    let (input_ptr, _gi) = input.data.device_ptr_mut(&ctx.stream);
+    let (residual_ptr, _gr) = residual.data.device_ptr_mut(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    // SAFETY: input/residual/weight valid on ctx.stream; input & residual share
+    // the [seq_len, hidden_size] row-major shape; weight is read-only [hidden].
+    unsafe {
+        ffi::arle_fused_add_rmsnorm_offset_bf16_cuda(
+            input_ptr as *mut ffi::Half,
+            residual_ptr as *mut ffi::Half,
+            w_ptr as *const ffi::Half,
+            seq_len as u32,
+            hidden_dim as u32,
+            hidden_dim as u32,
+            hidden_dim as u32,
             eps,
             ctx.stream.cu_stream(),
         )
