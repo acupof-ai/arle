@@ -154,8 +154,8 @@ pub fn load_dsv4_gguf(
 ) -> Result<(HipDsv4Executor, HipKvPool)> {
     ensure!(num_slots > 0, "HIP load requires at least one slot");
     ensure!(max_seq_len > 0, "HIP load requires max_seq_len > 0");
-    let gguf = crate::gguf::GgufFile::open(&path)?;
-    let config = crate::config::dsv4_config_from_gguf(&gguf)?;
+    let gguf = infer_gguf::gguf::GgufFile::open(&path)?;
+    let config = infer_gguf::deepseek4::dsv4_config_from_gguf(&gguf)?;
     let plan = crate::loader::plan_model(&gguf, config.num_hidden_layers)?;
     crate::model::validate_matmul_residency(
         plan.tensors.iter().map(|t| {
@@ -295,7 +295,7 @@ mod tests {
 
     #[cfg(not(feature = "hip"))]
     fn synthetic_loadable_gguf() -> std::path::PathBuf {
-        use crate::gguf::test_writer::{T, V, write_to_temp};
+        use infer_gguf::gguf::test_writer::{T, V, write_to_temp};
         let kvs = vec![
             ("general.architecture", V::Str("deepseek4")),
             ("deepseek4.block_count", V::U32(1)),

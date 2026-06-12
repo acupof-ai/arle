@@ -36,8 +36,8 @@ authority rather than defining a second equal architecture.
 | `infer-core` | The one device-neutral `Engine<E,K>`: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
 | `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
 | `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) over `mlx-sys`; `MetalKvPool` is only a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
-| `infer-hip` | HIP/ROCm `BackendExecutor` + KV pool (experimental AIPC lane, #76/#77): DSv4-Flash GGUF 2-bit shim-portable forward over `hip-sys`/`hip-kernels`; temporarily hosts the GGUF reader / CPU dequant / deepseek4-config modules (extraction to `infer-gguf` is [refactor roadmap](plans/2026-06-12-architecture-refactor-roadmap.md) R1) | Scheduler logic, HTTP, datacenter CUDA paths (FlashMLA/DeepGEMM/DeepEP) |
-| `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4, Gemma4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI | Scheduler logic, HTTP |
+| `infer-hip` | HIP/ROCm `BackendExecutor` + KV pool (experimental AIPC lane, #76/#77): DSv4-Flash GGUF 2-bit shim-portable forward over `hip-sys`/`hip-kernels`; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP, datacenter CUDA paths (FlashMLA/DeepGEMM/DeepEP) |
+| `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4, Gemma4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
 | `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` engine thread | Terminal UX, agent-session orchestration |
@@ -47,6 +47,7 @@ authority rather than defining a second equal architecture.
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
 | `hip-sys` / `hip-kernels` | Thin hand-declared HIP runtime FFI (stubs off-box) / HIP kernel build + FFI layer (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus, hipcc-gated) | Model code, scheduler logic |
 | `vulkan-sys` / `vulkan-kernels` | ash-backed Vulkan loader wrapper / glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` | Model code, scheduler logic |
+| `infer-gguf` | GGUF container reading (v2/v3 memmap reader), CPU dequant (llama.cpp ports), per-arch GGUF→spec-config mappers (`deepseek4`) | Model forward code, scheduler |
 | `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
@@ -73,9 +74,10 @@ infer-core        -> infer-plan, infer-seam            (the one Engine<E,K>; no 
 
 infer-cuda        -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
 infer-metal       -> infer-plan, infer-seam, [mlx-sys]
-infer-hip         -> infer-plan, infer-seam, deepseek-spec, [hip-sys, hip-kernels]
+infer-gguf        -> deepseek-spec   (neutral GGUF host substrate leaf; spec crates never depend back)
+infer-hip         -> infer-plan, infer-seam, deepseek-spec, infer-gguf, [hip-sys, hip-kernels]
 infer-vulkan      -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
-                     infer-hip (GGUF host substrate — lateral-dep DEBT, dies in roadmap R1), [vulkan-sys, vulkan-kernels]
+                     infer-gguf, [vulkan-sys, vulkan-kernels]
 
 infer-server      -> infer-core, infer-seam, infer-plan
 infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, infer-hip, infer-vulkan, cuda-kernels]

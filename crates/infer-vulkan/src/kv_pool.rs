@@ -1,6 +1,6 @@
 //! Host KV bookkeeping for the Vulkan backend.
 //!
-//! Mirrors the `infer-hip`/`infer-metal` page accounting shape: LIFO free
+//! Mirrors the HIP/Metal backends' page accounting shape: LIFO free
 //! pages, retained pages survive `free_slot`, and device buffers are hidden
 //! from the seam. P2 allocates host page ids only; real Vulkan arenas land
 //! with the first numeric model path.
