@@ -143,6 +143,12 @@ pub(crate) struct Dsv4Attention {
     /// scratch. `None` unless the fused-wqkv decode alloc gate is on.
     pub wo_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wo_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
+    /// Replicated decode attention (`ARLE_DSV4_REPLICATED_ATTN=1`, TP>1):
+    /// FULL-width `wq_b`/`wo_a` so decode computes the whole attention block
+    /// per rank with zero attention collectives. `None` when the flag is off
+    /// or single-rank. Prefill keeps the sharded tensors above.
+    pub wq_b_full: Option<DeviceMatrix>,
+    pub wo_a_full: Option<DeviceMatrix>,
     pub attn_sink: DeviceVec,
     pub attn_sink_f32: CudaSlice<f32>,
     pub compressor: Option<Dsv4Compressor>,
@@ -1422,6 +1428,10 @@ impl Dsv4Model {
             && last_hidden_out.is_none()
             && seq_len == 1
             && !use_deepep_transport
+            // Replicated decode attention skips ARs the captured graph
+            // contains — run eager (the collectives it removes are the
+            // graph's main win anyway).
+            && !self.replicated_attn_active()
         {
             return self.forward_tokens_decode_graph(
                 slot, kv_adapter, tokens[0], start_pos, params, position,
@@ -1886,7 +1896,7 @@ impl Dsv4Model {
             // to N per-row all-reduces: NCCL tiles a [hidden,N] message differently
             // than N×[hidden,1], so identical-input rows pick up ~1 bf16 ULP of
             // per-row drift here. This is the legitimate batched-numerics seed.
-            {
+            if !self.replicated_attn_active() {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
             }
@@ -2500,7 +2510,12 @@ impl Dsv4Model {
                 self.dump_tail_row("attn_out_pre_ar_L0", &attn_out, start_pos);
             }
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
-            {
+            // Replicated decode attention: single-row chunks and the per-row
+            // verify lane produced COMPLETE outputs — skip the AR. The batched
+            // tree lane and prefill (multi-row single calls) stay sharded.
+            let rows_replicated = self.replicated_attn_active()
+                && (seq_len == 1 || (verify.is_some() && tree_meta.is_none()));
+            if !rows_replicated {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                 crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
                     self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
@@ -3002,7 +3017,9 @@ impl Dsv4Model {
                     .map_err(|e| anyhow!("DSv4 MTP attn copy-out failed: {e}"))?;
             }
         }
-        self.tp.all_reduce_sum(ctx, &mut attn_out)?;
+        if !self.replicated_attn_active() {
+            self.tp.all_reduce_sum(ctx, &mut attn_out)?;
+        }
         let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
         crate::hc::hc_post(
             ctx,
@@ -3198,6 +3215,17 @@ impl Dsv4Model {
                 Ok(id as u32)
             })
             .collect()
+    }
+
+    /// Replicated decode attention active: single-row `mla_attention` calls
+    /// produce COMPLETE outputs (full-width wq_b/wo_a loaded), so callers
+    /// skip the post-attention TP all-reduce for those chunks.
+    fn replicated_attn_active(&self) -> bool {
+        crate::attention::dsv4_replicated_attn_enabled()
+            && self
+                .layers
+                .first()
+                .is_some_and(|l| l.attention.wq_b_full.is_some())
     }
 
     fn mtp_frozen_target_layer_idx(&self, mtp: &Dsv4MtpLayer) -> Result<usize> {
