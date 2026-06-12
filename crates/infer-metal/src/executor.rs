@@ -110,6 +110,55 @@ pub fn pipeline_fast_path_hits() -> u64 {
     PIPELINE_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Paged-prefix read path for single-token decode. The C++ session still owns
+/// K/V writes; only SDPA's prefix read source changes. Default on after BF16
+/// and INT8 reachability gates; opt out with `INFER_METAL_PAGED_KV_READ=0`.
+#[cfg(feature = "metal")]
+fn paged_kv_read_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var("INFER_METAL_PAGED_KV_READ")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        eprintln!("[infer-metal] paged KV read (INFER_METAL_PAGED_KV_READ) = {on}");
+        on
+    })
+}
+
+#[cfg(feature = "metal")]
+pub(crate) static PAGED_KV_READ_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "metal")]
+pub(crate) static PAGED_KV_READ_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "metal")]
+fn probe_paged_kv_read_hit() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| eprintln!("[infer-metal] paged KV read LIVE (single-token decode)"));
+    PAGED_KV_READ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "metal")]
+fn probe_paged_kv_read_fallback() {
+    PAGED_KV_READ_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "metal")]
+#[must_use]
+pub fn paged_kv_read_hits() -> u64 {
+    PAGED_KV_READ_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "metal")]
+#[must_use]
+pub fn paged_kv_read_fallbacks() -> u64 {
+    PAGED_KV_READ_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// In-flight handle for a submitted Metal step.
 pub enum MetalInflight {
     /// CPU placeholder output.
@@ -620,6 +669,7 @@ impl RealMetalExecutor {
             )?;
             self.slots.insert(row.slot, state);
         }
+        let kv_cache_dtype = self.kv_cache_dtype;
         let slot = self
             .slots
             .get_mut(&row.slot)
@@ -639,7 +689,7 @@ impl RealMetalExecutor {
         slot.ensure_session_active(model)?;
         self.active_session_slot = Some(row.slot);
         let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
-        let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
+        let logits = step_session_decode(model, slot, kv_cache_dtype, &token_arr)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
         slot.committed_len = slot.cache_len;
@@ -733,6 +783,7 @@ impl RealMetalExecutor {
         };
         let model = self.weights.cpp_model()?;
         let token_arr = mlx::reshape(&seed, &[1]);
+        let kv_cache_dtype = self.kv_cache_dtype;
         let slot = self
             .slots
             .get_mut(&slot_idx)
@@ -748,7 +799,7 @@ impl RealMetalExecutor {
         }
         slot.ensure_session_active(model)?;
         self.active_session_slot = Some(slot_idx);
-        let logits = model.step_session(&token_arr, slot.cache_len as i32)?;
+        let logits = step_session_decode(model, slot, kv_cache_dtype, &token_arr)?;
         mlx::async_eval(&[&logits]);
         slot.cache_len = slot.cache_len.saturating_add(1);
         let next = mlx::argmax(&logits);
@@ -1088,6 +1139,81 @@ impl MetalSlotState {
         Ok(())
     }
 
+    fn bf16_prefix_read_inputs(
+        &self,
+        cache_len: usize,
+    ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
+        anyhow::ensure!(
+            cache_len <= self.cache_len,
+            "paged KV read cache_len {cache_len} exceeds slot cache_len {}",
+            self.cache_len
+        );
+        anyhow::ensure!(
+            self.kv_flat.len().is_multiple_of(2),
+            "bf16 slot cache must contain K/V pairs, got {} arrays",
+            self.kv_flat.len()
+        );
+
+        let mut k_full = Vec::with_capacity(self.kv_flat.len() / 2);
+        let mut v_full = Vec::with_capacity(self.kv_flat.len() / 2);
+        for (layer_idx, pair) in self.kv_flat.chunks_exact(2).enumerate() {
+            for (axis, array) in pair.iter().enumerate() {
+                anyhow::ensure!(
+                    array.dtype() == mlx::Dtype::Bfloat16,
+                    "paged KV read expected bf16 layer {layer_idx} axis {axis}, got {:?}",
+                    array.dtype()
+                );
+            }
+            k_full.push(slice_kv_tokens(&pair[0], 0, cache_len)?);
+            v_full.push(slice_kv_tokens(&pair[1], 0, cache_len)?);
+        }
+        Ok((k_full, v_full))
+    }
+
+    fn int8_prefix_read_inputs(
+        &self,
+        cache_len: usize,
+    ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
+        anyhow::ensure!(
+            cache_len <= self.cache_len,
+            "paged INT8 KV read cache_len {cache_len} exceeds slot cache_len {}",
+            self.cache_len
+        );
+        anyhow::ensure!(
+            self.kv_flat.len().is_multiple_of(6),
+            "int8 slot cache must contain K/V q/scale/bias sextets, got {} arrays",
+            self.kv_flat.len()
+        );
+
+        let mut k_full = Vec::with_capacity(self.kv_flat.len() / 2);
+        let mut v_full = Vec::with_capacity(self.kv_flat.len() / 2);
+        for (layer_idx, sextet) in self.kv_flat.chunks_exact(6).enumerate() {
+            let expected = [
+                mlx::Dtype::Uint32,
+                mlx::Dtype::Bfloat16,
+                mlx::Dtype::Bfloat16,
+                mlx::Dtype::Uint32,
+                mlx::Dtype::Bfloat16,
+                mlx::Dtype::Bfloat16,
+            ];
+            for (axis, (array, dtype)) in sextet.iter().zip(expected).enumerate() {
+                anyhow::ensure!(
+                    array.dtype() == dtype,
+                    "paged INT8 KV read expected layer {layer_idx} axis {axis} dtype {:?}, got {:?}",
+                    dtype,
+                    array.dtype()
+                );
+            }
+            for array in &sextet[..3] {
+                k_full.push(slice_kv_tokens(array, 0, cache_len)?);
+            }
+            for array in &sextet[3..6] {
+                v_full.push(slice_kv_tokens(array, 0, cache_len)?);
+            }
+        }
+        Ok((k_full, v_full))
+    }
+
     /// Guarantee the flat K/V cache can hold `cache_len + needed` tokens, growing
     /// the seq axis with zeros when the prefill reservation is exhausted.
     ///
@@ -1131,6 +1257,35 @@ impl MetalSlotState {
         self.kv_flat = grown;
         Ok(())
     }
+}
+
+#[cfg(feature = "metal")]
+fn step_session_decode(
+    model: &qwen35::CppQwen35Model,
+    slot: &MetalSlotState,
+    kv_cache_dtype: MetalKvCacheDtype,
+    token: &mlx::MlxArray,
+) -> anyhow::Result<mlx::MlxArray> {
+    let cache_pos = usize_to_i32(slot.cache_len)?;
+    if paged_kv_read_enabled() {
+        if slot.cache_len > 0 {
+            let logits = match kv_cache_dtype {
+                MetalKvCacheDtype::Bf16 => {
+                    let (k_full, v_full) = slot.bf16_prefix_read_inputs(slot.cache_len)?;
+                    model.step_session_paged_bf16(token, cache_pos, &k_full, &v_full)
+                }
+                MetalKvCacheDtype::Int8 => {
+                    let (k_full, v_full) = slot.int8_prefix_read_inputs(slot.cache_len)?;
+                    model.step_session_paged_int8(token, cache_pos, &k_full, &v_full)
+                }
+            }
+            .map_err(|err| anyhow::anyhow!("paged KV read step_session failed: {err}"))?;
+            probe_paged_kv_read_hit();
+            return Ok(logits);
+        }
+        probe_paged_kv_read_fallback();
+    }
+    model.step_session(token, cache_pos)
 }
 
 /// Extend a rank-4 `[B, n_kv, seq, head_dim]` K/V cache array along the seq axis
@@ -1369,6 +1524,70 @@ mod tests {
         assert!(int8_kv_group_size(80).is_err());
     }
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn bf16_prefix_read_inputs_slices_live_prefix_pairs() {
+        let _guard = mlx_sys::mlx_guard();
+        let state = MetalSlotState::from_arrays(
+            0,
+            0,
+            3,
+            vec![
+                kv_bf16_array(5, 10),
+                kv_bf16_array(5, 20),
+                kv_bf16_array(5, 30),
+                kv_bf16_array(5, 40),
+            ],
+            vec![],
+        );
+
+        let (k_full, v_full) = state.bf16_prefix_read_inputs(3).unwrap();
+        assert_eq!(k_full.len(), 2);
+        assert_eq!(v_full.len(), 2);
+        assert_eq!(k_full[0].shape(), &[1, 1, 3, 2]);
+        assert_eq!(v_full[1].shape(), &[1, 1, 3, 2]);
+        assert_eq!(k_full[0].dtype(), mlx::Dtype::Bfloat16);
+
+        let k0 = mlx::as_dtype(&k_full[0], mlx::Dtype::Float32);
+        mlx::eval(&[&k0]);
+        assert_eq!(k0.as_slice_f32(), &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn int8_prefix_read_inputs_slices_q_scale_bias_triples() {
+        let _guard = mlx_sys::mlx_guard();
+        let state = MetalSlotState::from_arrays(
+            0,
+            0,
+            3,
+            vec![
+                kv_u32_array(5, 10),
+                kv_bf16_array(5, 20),
+                kv_bf16_array(5, 30),
+                kv_u32_array(5, 40),
+                kv_bf16_array(5, 50),
+                kv_bf16_array(5, 60),
+            ],
+            vec![],
+        );
+
+        let (k_full, v_full) = state.int8_prefix_read_inputs(3).unwrap();
+        assert_eq!(k_full.len(), 3);
+        assert_eq!(v_full.len(), 3);
+        assert_eq!(k_full[0].shape(), &[1, 1, 3, 2]);
+        assert_eq!(k_full[0].dtype(), mlx::Dtype::Uint32);
+        assert_eq!(k_full[1].dtype(), mlx::Dtype::Bfloat16);
+        assert_eq!(v_full[0].dtype(), mlx::Dtype::Uint32);
+
+        let k_scale = mlx::as_dtype(&k_full[1], mlx::Dtype::Float32);
+        mlx::eval(&[&k_scale]);
+        assert_eq!(
+            k_scale.as_slice_f32(),
+            &[20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
+        );
+    }
+
     /// Rank-4 `[1, 1, seq, 2]` f32 K/V array filled with `fill` — the minimal
     /// shape `slice_kv_tokens` accepts, no model load needed.
     #[cfg(feature = "metal")]
@@ -1376,6 +1595,26 @@ mod tests {
         let vals = vec![fill; seq * 2];
         let arr = mlx::MlxArray::from_slice_i32(&vals, &[1, 1, seq as i32, 2]);
         mlx::as_dtype(&arr, mlx::Dtype::Float32)
+    }
+
+    /// Rank-4 `[1, 1, seq, 2]` bf16 K/V array with per-token values:
+    /// `base + token*10 + dim`. Small integers round-trip exactly through bf16.
+    #[cfg(feature = "metal")]
+    fn kv_bf16_array(seq: usize, base: i32) -> mlx::MlxArray {
+        let vals: Vec<i32> = (0..seq)
+            .flat_map(|token| [base + token as i32 * 10, base + token as i32 * 10 + 1])
+            .collect();
+        let arr = mlx::MlxArray::from_slice_i32(&vals, &[1, 1, seq as i32, 2]);
+        mlx::as_dtype(&arr, mlx::Dtype::Bfloat16)
+    }
+
+    #[cfg(feature = "metal")]
+    fn kv_u32_array(seq: usize, base: i32) -> mlx::MlxArray {
+        let vals: Vec<i32> = (0..seq)
+            .flat_map(|token| [base + token as i32 * 10, base + token as i32 * 10 + 1])
+            .collect();
+        let arr = mlx::MlxArray::from_slice_i32(&vals, &[1, 1, seq as i32, 2]);
+        mlx::as_dtype(&arr, mlx::Dtype::Uint32)
     }
 
     /// Tiny stand-in GDR state array carrying a distinguishable `fill` value so a
