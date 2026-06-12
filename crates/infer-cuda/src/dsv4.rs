@@ -348,6 +348,12 @@ pub(crate) struct Dsv4SlotState {
     /// Distinct lifetime from `spec_rings` (committed pre-verify contents vs
     /// in-flight per-node speculative contents).
     spec_nodes: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
+    /// P2 commit-fold scratch: per-layer attn-normed verify rows
+    /// (`[hidden, MAX_SPEC_TREE_NODES]`), persisted by the batched tree lane so
+    /// the commit can re-ingest the accepted prefix (compressor/indexer + ring
+    /// K) without a second full forward. `Some` only when
+    /// `model.spec_decode_on`.
+    spec_normed: Option<Vec<HiddenStates>>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
@@ -667,6 +673,19 @@ impl Dsv4SlotState {
         } else {
             None
         };
+        // P2 commit-fold scratch: per-layer persisted verify rows.
+        let spec_normed = if model.spec_decode_on {
+            let mut cache = Vec::with_capacity(attention.len());
+            for _ in 0..attention.len() {
+                // SAFETY: rows are written by the tree lane before any read.
+                cache.push(unsafe {
+                    HiddenStates::uninit(&model.ctx, model.config.hidden_size, MAX_SPEC_TREE_NODES)?
+                });
+            }
+            Some(cache)
+        } else {
+            None
+        };
         let start_pos_device = model
             .ctx
             .stream
@@ -691,6 +710,7 @@ impl Dsv4SlotState {
             attention,
             spec_rings,
             spec_nodes,
+            spec_normed,
             start_pos_device,
             decode_graph: None,
             #[cfg(feature = "deepep")]
@@ -1311,6 +1331,64 @@ impl Dsv4Model {
         slot.restore_spec_ring_tail(&self.ctx, kv_adapter, start_pos, accepted_n, depth)
     }
 
+    /// P2 commit fold: commit the accepted prefix (`accepted_rows` = tree row
+    /// indices in chain order, root first) from the verify rows the batched
+    /// tree lane persisted — per layer: compressor/indexer re-ingestion + ring
+    /// K re-derivation — then advance the slot length. Replaces the
+    /// accepted-prefix re-forward. Caller order: truncate → rejected-tail
+    /// restore → THIS.
+    pub(crate) fn commit_accepted_fold(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        accepted_rows: &[usize],
+        start_pos: usize,
+    ) -> Result<()> {
+        let m = accepted_rows.len();
+        ensure!(m > 0, "DSv4 commit fold needs at least the pending row");
+        let hidden_size = self.config.hidden_size;
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        // Gather scratch reused across layers.
+        let mut gathered = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, m)? };
+        keepalive.keep_hidden(&gathered);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            {
+                let cache = slot
+                    .spec_normed
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 commit fold without persisted verify rows"))?;
+                for (i, &row) in accepted_rows.iter().enumerate() {
+                    let src = cache[layer_idx]
+                        .data
+                        .slice(row * hidden_size..(row + 1) * hidden_size);
+                    let mut dst = gathered
+                        .data
+                        .slice_mut(i * hidden_size..(i + 1) * hidden_size);
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSv4 commit fold gather failed: {e}"))?;
+                }
+            }
+            let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+            crate::attention::commit_layer_fold(
+                &self.ctx,
+                &self.config,
+                &layer.attention,
+                layer.mode,
+                layer.compress_ratio,
+                &mut slot.attention[layer_idx],
+                layer_pool,
+                &gathered,
+                start_pos,
+                &mut keepalive,
+            )?;
+        }
+        std::hint::black_box(keepalive.len());
+        drop(keepalive);
+        slot.seq_len = start_pos + m;
+        Ok(())
+    }
 
     pub(crate) fn dump_mtp_rollback_state(
         &self,
@@ -2289,6 +2367,20 @@ impl Dsv4Model {
                 // mla_attention (FlashMLA sparse fwd inside), host start_pos,
                 // no ring writes, no per-row replay.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_tree_batch");
+                // P2 commit fold: persist this layer's attn-normed rows so the
+                // commit can re-ingest the accepted prefix without a second
+                // full forward.
+                if dsv4_mtp_commit_fold_enabled() {
+                    if let Some(cache) = slot.spec_normed.as_mut() {
+                        let rows = seq_len * hidden_size;
+                        let src = normed.data.slice(0..rows);
+                        let mut dst = cache[layer_idx].data.slice_mut(0..rows);
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(&src, &mut dst)
+                            .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
+                    }
+                }
                 let (layer_pool, dsa_shared) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 crate::attention::mla_attention(
                     &self.ctx,
@@ -3723,6 +3815,17 @@ pub(crate) fn dsv4_mtp_tree_attn_enabled() -> bool {
     !matches!(
         std::env::var("ARLE_DSV4_MTP_TREE_ATTN").as_deref(),
         Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    )
+}
+
+/// P2 commit fold (fast-path plan): commit the accepted prefix from persisted
+/// verify rows instead of a second full forward. Opt-in
+/// (`ARLE_DSV4_MTP_COMMIT_FOLD=1`) until its own needle + perf gate licenses
+/// the flip; requires the batched tree lane (the persist hook lives there).
+pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_MTP_COMMIT_FOLD").as_deref(),
+        Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
     )
 }
 

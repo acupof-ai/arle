@@ -400,13 +400,14 @@ impl Dsv4CudaExecutor {
     /// `restore_spec_ring_tail` replays the committed contents of the rest —
     /// non-path nodes only ever lived inside that window.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn commit_path(
         &mut self,
         slot_idx: usize,
         tree: &DraftTree,
         path: &[usize],
         argmax: &[u32],
-        _hiddens: Vec<DeviceVec>,
+        mut hiddens: Vec<DeviceVec>,
         start_pos: usize,
         position: u64,
         depth: usize,
@@ -450,20 +451,44 @@ impl Dsv4CudaExecutor {
         )?;
 
         let accepted_tokens: Vec<u32> = path.iter().map(|&i| tree.tokens()[i]).collect();
-        let mut prefix = Vec::with_capacity(accepted + 1);
-        prefix.push(tree.tokens()[0]);
-        prefix.extend_from_slice(&accepted_tokens);
-        let (_, mut re_hiddens) = self.model.forward_tokens_verify(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            &prefix,
-            start_pos,
-            position,
-        )?;
-
-        let spec = &mut self.spec_slots[slot_idx];
-        spec.pending = Some(bonus);
-        spec.hidden = Some(re_hiddens.remove(accepted));
+        // P2 commit fold: commit from the persisted verify rows — no second
+        // full forward. Requires the batched tree lane (the persist hook);
+        // chains keep the validated re-forward. The next draft chains from the
+        // FROZEN verify's hidden of the last accepted row — stale by at most
+        // the compression-boundary rows inside the accepted prefix (needle
+        // gate licenses this).
+        let fold = crate::dsv4::dsv4_mtp_commit_fold_enabled()
+            && crate::dsv4::dsv4_mtp_tree_attn_enabled()
+            && self.spec_shape().topk > 1;
+        if fold {
+            let mut rows = Vec::with_capacity(accepted + 1);
+            rows.push(0usize);
+            rows.extend_from_slice(path);
+            self.model.commit_accepted_fold(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &rows,
+                start_pos,
+            )?;
+            let last_row = path.last().copied().unwrap_or(0);
+            let spec = &mut self.spec_slots[slot_idx];
+            spec.pending = Some(bonus);
+            spec.hidden = Some(hiddens.swap_remove(last_row));
+        } else {
+            let mut prefix = Vec::with_capacity(accepted + 1);
+            prefix.push(tree.tokens()[0]);
+            prefix.extend_from_slice(&accepted_tokens);
+            let (_, mut re_hiddens) = self.model.forward_tokens_verify(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &prefix,
+                start_pos,
+                position,
+            )?;
+            let spec = &mut self.spec_slots[slot_idx];
+            spec.pending = Some(bonus);
+            spec.hidden = Some(re_hiddens.remove(accepted));
+        }
 
         let mut out = accepted_tokens;
         out.push(bonus);
