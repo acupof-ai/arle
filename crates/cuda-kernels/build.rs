@@ -590,6 +590,40 @@ const FQ_FWD_PUBLIC_DECL: &str = "const uint16_t* q, const uint16_t* k, const ui
 const FQ_FWD_EXTERN_DECL: &str = FQ_FWD_PUBLIC_DECL;
 const FQ_FWD_CALL_ARGS: &str = "q, k, v, a_inv, g_cumsum, beta, h0, o, ht, seq_len, stream";
 
+// ============================================================================
+// Triton AOT GDN decode lane (U1 + U2) — opt-in (`ARLE_QWEN35_SGL_GDN`),
+// Hopper-only (sm_90). Three SGLang GDN decode kernels vendored under
+// `tools/triton/kernels/`, AOT-compiled to cubins via `tools/triton/
+// gen_triton_aot.py`, and linked into `libtriton_kernels_aot.a`. On any other
+// SM target, on `KernelSet::Dsv4Flash`, or when no triton-capable Python is
+// found, the build links `CUDA_ERROR_NOT_SUPPORTED` stubs (non-fatal) and the
+// runtime gate keeps the hand kernels as the default decode arm.
+//
+// The C decls below MUST stay byte-for-byte aligned with the externs in
+// `crates/cuda-kernels/src/ffi/triton.rs` (grid gX/gY/gZ FIRST, stream LAST).
+// Each kernel additionally exports a `<base>_load_cuda(void)` loader symbol;
+// the gen script emits `<out_name>` + `<out_name>_load`, so the per-SM symbols
+// are `<base>_sm90` + `<base>_sm90_load` and the dispatch wrapper maps both.
+
+// K1 — fused_recurrent_gated_delta_rule_packed_decode.
+const TRITON_GDR_RECURRENT_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* mixed_qkv, const uint16_t* a_proj, const uint16_t* b_proj, const float* a_log, const uint16_t* dt_bias, uint16_t* o, const uint64_t* state_ptrs, float scale, CUstream stream";
+// `scale` (the only runtime scalar) is the sole non-pointer arg the gen script
+// keeps in the prototype; pointers/grid/stream are fixed by the FFI convention.
+const TRITON_GDR_RECURRENT_SIGNATURE: &str = "*bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *u64:16, fp32, \
+     8192, 32, 32, 16, 32, 128, 128, 128, 32, 20.0, 1";
+
+// K2 — causal_conv1d_update (decode).
+const TRITON_GDR_CONV1D_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* x, const uint16_t* w, const uint64_t* conv_state_ptrs, uint16_t* o, int32_t batch, CUstream stream";
+const TRITON_GDR_CONV1D_SIGNATURE: &str = "*bf16:16, *bf16:16, *u64:16, *bf16:16, i32, \
+     8192, 1, 3, 8192, 1, 0, 4, 1, 3, 1, 8192, 1, 0, 0, 4, 1, 4, 256";
+
+// K3 — rms_norm_gated (layernorm_gated, RMS + NORM_BEFORE_GATE swish).
+const TRITON_GDR_RMS_NORM_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* x, uint16_t* y, const float* weight, const uint16_t* z, float* rstd, int32_t m, float eps, CUstream stream";
+// Row strides (X/Y/Z) bake to 128 (the [M,128] views are row-contiguous), so
+// the runtime args reduce to {x, y, weight, z, rstd, m, eps} matching the FFI.
+const TRITON_GDR_RMS_NORM_SIGNATURE: &str = "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, \
+     128, 128, 128, i32, 128, fp32, 128, 4, 1, 1, 1, \"swish\"";
+
 /// Locate the directories the TileLang AOT generator needs for nvcc to
 /// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
 /// the cutlass headers it bundles, and the active CUDA toolkit include.
@@ -1508,6 +1542,367 @@ fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[S
     println!("cargo:rerun-if-env-changed=INFER_TILELANG_PYTHON");
 }
 
+// ============================================================================
+// Triton AOT GDN decode lane (U1 generator wiring + U2 three kernels).
+// ============================================================================
+
+/// One AOT-specialized Triton kernel.
+///   - `kernel_path`: the `@triton.jit` .py file under `tools/triton/kernels/`.
+///   - `kernel_name`: the `@triton.jit` fn symbol in that file.
+///   - `out_base`: base for the per-SM symbol (`<out_base>_sm90`) and the
+///     dispatch wrapper public symbol (`<out_base>_cuda` + `<out_base>_load_cuda`).
+///   - `signature`: the triton signature string (kernel-parameter order;
+///     pointers/scalars become runtime args, literals/strings bake as constexprs).
+///   - `public_decl` / `extern_decl`: the C prototype body shared by the
+///     dispatch wrapper and the stub; must match `ffi/triton.rs`.
+struct TritonAotKernelSpec {
+    kernel_path: &'static str,
+    kernel_name: &'static str,
+    out_base: &'static str,
+    signature: &'static str,
+    num_warps: u32,
+    num_stages: u32,
+    public_decl: &'static str,
+}
+
+fn triton_aot_kernels() -> [TritonAotKernelSpec; 3] {
+    [
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_gdn_conv1d_update.py",
+            kernel_name: "arle_gdn_conv1d_update",
+            out_base: "arle_gdn_conv1d_update",
+            signature: TRITON_GDR_CONV1D_SIGNATURE,
+            num_warps: 4,
+            num_stages: 3,
+            public_decl: TRITON_GDR_CONV1D_PUBLIC_DECL,
+        },
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_gdn_fused_recurrent.py",
+            kernel_name: "arle_gdn_fused_recurrent_decode",
+            out_base: "arle_gdn_fused_recurrent_decode",
+            signature: TRITON_GDR_RECURRENT_SIGNATURE,
+            num_warps: 1,
+            num_stages: 3,
+            public_decl: TRITON_GDR_RECURRENT_PUBLIC_DECL,
+        },
+        TritonAotKernelSpec {
+            kernel_path: "tools/triton/kernels/arle_gdn_rms_norm_gated.py",
+            kernel_name: "arle_gdn_rms_norm_gated",
+            out_base: "arle_gdn_rms_norm_gated",
+            signature: TRITON_GDR_RMS_NORM_SIGNATURE,
+            num_warps: 1,
+            num_stages: 1,
+            public_decl: TRITON_GDR_RMS_NORM_PUBLIC_DECL,
+        },
+    ]
+}
+
+fn probe_triton_python(candidate: &str) -> Result<String, String> {
+    let output = Command::new(candidate)
+        .args(["-c", "import triton"])
+        .output()
+        .map_err(|err| format!("{candidate}: {err}"))?;
+    if output.status.success() {
+        Ok(candidate.to_string())
+    } else {
+        Err(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Locate a triton-capable interpreter for the AOT generator. Unlike the
+/// TileLang path, absence is **non-fatal**: returns `None` so the caller can
+/// fall back to NOT_SUPPORTED stubs (the lane is opt-in). Honors
+/// `INFER_TRITON_PYTHON` first, then probes `python3`/`python`.
+fn find_triton_python() -> Option<String> {
+    if let Some(candidate) = env_nonempty("INFER_TRITON_PYTHON") {
+        match probe_triton_python(&candidate) {
+            Ok(path) => return Some(path),
+            Err(message) => {
+                println!(
+                    "cargo:warning=INFER_TRITON_PYTHON=`{candidate}` could not import triton ({message}); \
+                     Triton AOT GDN lane will link NOT_SUPPORTED stubs. See tools/triton/README.md."
+                );
+                return None;
+            }
+        }
+    }
+    for candidate in ["python3", "python"] {
+        if let Ok(path) = probe_triton_python(candidate) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Dispatch wrapper for a Triton kernel: emits the public `<base>_cuda` and
+/// `<base>_load_cuda` symbols, each switching over the bound device's SM to the
+/// per-SM `<base>_sm{sm}` / `<base>_sm{sm}_load` symbol the gen script emitted.
+/// Reuses the `__thread` SM-cache pattern of `format_dispatch_wrapper`.
+fn format_triton_dispatch_wrapper(out_base: &str, public_decl: &str, per_sm: &[String]) -> String {
+    // Runtime call args = the public_decl arg NAMES (drop the leading type of
+    // each "type name" pair). The launch symbol takes gX,gY,gZ,<args>,stream.
+    let call_args = public_decl
+        .split(',')
+        .map(|param| {
+            param
+                .trim()
+                .rsplit(|c: char| c.is_whitespace() || c == '*')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let launch_externs = per_sm
+        .iter()
+        .map(|sm| format!("CUresult {out_base}_sm{sm}({public_decl});"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let load_externs = per_sm
+        .iter()
+        .map(|sm| format!("CUresult {out_base}_sm{sm}_load(void);"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let launch_cases = per_sm
+        .iter()
+        .map(|sm| format!("        case {sm}: return {out_base}_sm{sm}({call_args});"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let load_cases = per_sm
+        .iter()
+        .map(|sm| format!("        case {sm}: return {out_base}_sm{sm}_load();"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "#include <cuda.h>\n\
+         #include <stdint.h>\n\
+         \n\
+         {launch_externs}\n\
+         {load_externs}\n\
+         \n\
+         static __thread int g_sm_pack = -1;\n\
+         \n\
+         static int load_sm_pack(void) {{\n\
+         \x20   int major = 0, minor = 0;\n\
+         \x20   CUdevice dev = 0;\n\
+         \x20   if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) return -1;\n\
+         \x20   if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) != CUDA_SUCCESS) return -1;\n\
+         \x20   if (cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) != CUDA_SUCCESS) return -1;\n\
+         \x20   return major * 10 + minor;\n\
+         }}\n\
+         \n\
+         CUresult {out_base}_load_cuda(void) {{\n\
+         \x20   int sm = g_sm_pack;\n\
+         \x20   if (sm < 0) {{\n\
+         \x20       sm = load_sm_pack();\n\
+         \x20       if (sm < 0) return CUDA_ERROR_NOT_SUPPORTED;\n\
+         \x20       g_sm_pack = sm;\n\
+         \x20   }}\n\
+         \x20   switch (sm) {{\n\
+         {load_cases}\n\
+         \x20       default: return CUDA_ERROR_NOT_SUPPORTED;\n\
+         \x20   }}\n\
+         }}\n\
+         \n\
+         CUresult {out_base}_cuda({public_decl}) {{\n\
+         \x20   int sm = g_sm_pack;\n\
+         \x20   if (sm < 0) {{\n\
+         \x20       sm = load_sm_pack();\n\
+         \x20       if (sm < 0) return CUDA_ERROR_NOT_SUPPORTED;\n\
+         \x20       g_sm_pack = sm;\n\
+         \x20   }}\n\
+         \x20   switch (sm) {{\n\
+         {launch_cases}\n\
+         \x20       default: return CUDA_ERROR_NOT_SUPPORTED;\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
+
+/// NOT_SUPPORTED stub for both the launch (`<base>_cuda`) and loader
+/// (`<base>_load_cuda`) symbols of one Triton kernel.
+fn write_triton_unsupported_stub(
+    out_dir: &Path,
+    spec: &TritonAotKernelSpec,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let src = format!(
+        "#include <cuda.h>\n\
+         #include <stdint.h>\n\
+         \n\
+         CUresult {base}_load_cuda(void) {{\n\
+         \x20   return CUDA_ERROR_NOT_SUPPORTED;\n\
+         }}\n\
+         \n\
+         CUresult {base}_cuda({decl}) {{\n\
+         \x20   return CUDA_ERROR_NOT_SUPPORTED;\n\
+         }}\n",
+        base = spec.out_base,
+        decl = spec.public_decl,
+    );
+    let stub_dir = out_dir.join("triton_stub").join(spec.out_base);
+    std::fs::create_dir_all(&stub_dir).expect("create Triton stub directory");
+    let stub_path = stub_dir.join(format!("{}_stub.c", spec.out_base));
+    std::fs::write(&stub_path, src).expect("write Triton unsupported stub");
+    generated_sources.push(stub_path);
+}
+
+/// AOT-compile one Triton kernel for every sm90 target via `gen_triton_aot.py`,
+/// then write the SM-dispatch wrapper. Hard-fails on a compile error (the lane
+/// was explicitly requested: triton present + sm90 in the build).
+fn build_triton_kernel(
+    python: &str,
+    out_dir: &Path,
+    sm90_targets: &[SmSpec],
+    spec: &TritonAotKernelSpec,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let generator_path = PathBuf::from("tools/triton/gen_triton_aot.py");
+    let mut per_sm = Vec::new();
+
+    for sm in sm90_targets {
+        let sm_token = &sm.sm;
+        let cuda_arch: u32 = sm_token
+            .parse()
+            .expect("SmSpec.sm passed whitelist; must parse as u32");
+        let per_sm_out_name = format!("{}_sm{sm_token}", spec.out_base);
+        let artifact_dir = out_dir
+            .join("triton_aot")
+            .join(format!("{}_sm{sm_token}", spec.out_base));
+
+        let output = Command::new(python)
+            .arg(&generator_path)
+            .arg("--kernel-path")
+            .arg(spec.kernel_path)
+            .arg("--kernel-name")
+            .arg(spec.kernel_name)
+            .arg("--out-name")
+            .arg(&per_sm_out_name)
+            .arg("--out-dir")
+            .arg(&artifact_dir)
+            .arg("--signature")
+            .arg(spec.signature)
+            .arg("--arch")
+            .arg(cuda_arch.to_string())
+            .arg("--num-warps")
+            .arg(spec.num_warps.to_string())
+            .arg("--num-stages")
+            .arg(spec.num_stages.to_string())
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to spawn Triton AOT generator for {} on sm_{sm_token}: {err}",
+                    spec.kernel_name
+                )
+            });
+
+        if !output.status.success() {
+            panic!(
+                "Triton AOT failed to compile {} for sm_{sm_token}.\n\
+                 stdout: {}\n\
+                 stderr: {}\n\n\
+                 Hint: ensure INFER_TRITON_PYTHON has a working triton (pinned 3.5.1 on the pod), \
+                 or exclude sm_{sm_token}. The lane is opt-in (ARLE_QWEN35_SGL_GDN); a stub build \
+                 keeps the hand kernels. See tools/triton/README.md.",
+                spec.kernel_name,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut c_path = None;
+        for line in stdout.lines() {
+            if let Some(value) = line.strip_prefix("C_PATH=") {
+                c_path = Some(PathBuf::from(value.trim()));
+            }
+        }
+        let c_path = c_path.expect("Triton generator did not print C_PATH");
+        generated_sources.push(c_path);
+        per_sm.push(sm_token.clone());
+    }
+
+    let wrapper_src = format_triton_dispatch_wrapper(spec.out_base, spec.public_decl, &per_sm);
+    let dispatch_dir = out_dir
+        .join("triton_aot")
+        .join(format!("{}_dispatch", spec.out_base));
+    std::fs::create_dir_all(&dispatch_dir).expect("create Triton dispatch directory");
+    let wrapper_path = dispatch_dir.join(format!("{}_dispatch.c", spec.out_base));
+    std::fs::write(&wrapper_path, wrapper_src).expect("write Triton dispatch wrapper");
+    generated_sources.push(wrapper_path);
+}
+
+/// Build (or stub) the Triton AOT GDN decode lane into
+/// `libtriton_kernels_aot.a`. AOT only when ALL hold: `KernelSet::Full`, an
+/// sm90 target is in the build, and a triton-capable Python is found. Any miss
+/// links NOT_SUPPORTED stubs (non-fatal — the lane is opt-in via
+/// `ARLE_QWEN35_SGL_GDN`; the runtime loud-fails if the flag is on and a stub
+/// is hit).
+fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec], aot: bool) {
+    let mut generated_sources = Vec::new();
+    let specs = triton_aot_kernels();
+
+    let sm90_targets: Vec<SmSpec> = sm_targets
+        .iter()
+        .filter(|sm| sm.sm == "90")
+        .cloned()
+        .collect();
+    let python = if aot && !sm90_targets.is_empty() {
+        find_triton_python()
+    } else {
+        None
+    };
+
+    match (aot, sm90_targets.is_empty(), &python) {
+        (true, false, Some(python)) => {
+            for spec in &specs {
+                build_triton_kernel(python, out_dir, &sm90_targets, spec, &mut generated_sources);
+            }
+            println!(
+                "cargo:warning=Triton AOT GDN lane: built sm_90 cubins for conv1d_update + \
+                 fused_recurrent_decode + rms_norm_gated (opt-in ARLE_QWEN35_SGL_GDN). \
+                 See tools/triton/README.md."
+            );
+        }
+        _ => {
+            for spec in &specs {
+                write_triton_unsupported_stub(out_dir, spec, &mut generated_sources);
+            }
+            let reason = if !aot {
+                "DSv4 kernel set selected"
+            } else if sm90_targets.is_empty() {
+                "no sm_90 target in this build"
+            } else {
+                "no triton-capable Python found (set INFER_TRITON_PYTHON)"
+            };
+            println!(
+                "cargo:warning=Triton AOT GDN lane: linking NOT_SUPPORTED stubs ({reason}); \
+                 the hand kernels remain the default decode arm. See tools/triton/README.md."
+            );
+        }
+    }
+
+    let mut build = cc::Build::new();
+    build
+        .cuda(false)
+        .include(format!("{}/include", cuda_path))
+        .flag("-std=c11")
+        .warnings(false);
+    for source in &generated_sources {
+        build.file(source);
+    }
+    build.compile("triton_kernels_aot");
+
+    emit_rerun_recursive(Path::new("tools/triton"));
+    println!("cargo:rerun-if-changed=tools/triton");
+    println!("cargo:rerun-if-env-changed=INFER_TRITON_PYTHON");
+}
+
 // Recursively collect every `.cu` file under `dir` so domain subdirs
 // (attention/, gemm/, kv/, quant/, misc/) are picked up automatically.
 fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1709,7 +2104,11 @@ fn validate_cuda_archive_has_symbol(archive: &Path, symbol: &str, context: &str)
 
 fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
     println!("cargo:rerun-if-changed=build.rs");
-    let required = ["libkernels_cuda.a", "libtilelang_kernels_aot.a"];
+    let required = [
+        "libkernels_cuda.a",
+        "libtilelang_kernels_aot.a",
+        "libtriton_kernels_aot.a",
+    ];
     for lib in required {
         let path = prebuilt_dir.join(lib);
         if !path.is_file() {
@@ -1724,6 +2123,7 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
     println!("cargo:rustc-link-search=native={}", prebuilt_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=static=tilelang_kernels_aot");
+    println!("cargo:rustc-link-lib=static=triton_kernels_aot");
     emit_cuda_system_link_libs(cuda_path);
     if let Some(sidecar) = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT") {
         emit_prebuilt_deepep_sidecar(Path::new(&sidecar));
@@ -2236,8 +2636,19 @@ fn main() {
         compile_tilelang_stub_kernels(&cuda_path, &out_dir);
     }
 
+    // Triton AOT GDN decode lane (opt-in ARLE_QWEN35_SGL_GDN). AOT only on the
+    // Full kernel set (DSv4 builds stub it); the orchestrator further requires
+    // an sm90 target + a triton-capable Python, else links NOT_SUPPORTED stubs.
+    compile_triton_aot_kernels(
+        &cuda_path,
+        &out_dir,
+        &sm_targets,
+        kernel_set.tilelang_aot_enabled(),
+    );
+
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
+    println!("cargo:rustc-link-lib=static=triton_kernels_aot");
     emit_cuda_system_link_libs(&cuda_path);
     if enable_deepgemm_native {
         println!(

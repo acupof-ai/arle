@@ -100,6 +100,37 @@ fn qwen35_gdr_chunked_enabled() -> bool {
     })
 }
 
+/// `ARLE_QWEN35_SGL_GDN=1`: route the GDN **decode** step (`seq_len == 1`
+/// single-row AND the batched decode path) through the vendored SGLang triton
+/// AOT trio (conv1d_update → fused_recurrent_decode → rms_norm_gated) instead
+/// of the in-tree hand kernels. Default OFF — the hand kernels stay the default
+/// decode arm; this is an additive opt-in lane (U1/U2). Only the baked Qwen3.6
+/// single-GPU shard is supported (H=16 key / HV=32 value / 128 / 128 — the call
+/// sites additionally shape-guard). The triton cubins are Hopper-only AOT; a
+/// non-sm90 / no-triton build links NOT_SUPPORTED stubs and the runtime
+/// loud-fails when this flag is on and a stub is hit. Prefill chunks
+/// (`seq_len > 1`) are unaffected (the trio is decode-only).
+fn qwen35_sgl_gdn_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_QWEN35_SGL_GDN").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
+/// Shared loud-fail message when the triton AOT lane resolves to a
+/// NOT_SUPPORTED stub but `ARLE_QWEN35_SGL_GDN` is on.
+fn sgl_gdn_stub_err(kernel: &str) -> anyhow::Error {
+    anyhow!(
+        "ARLE_QWEN35_SGL_GDN is on but the triton AOT lane is not built ({kernel} returned \
+         CUDA_ERROR_NOT_SUPPORTED). Rebuild with an sm_90 target and INFER_TRITON_PYTHON set to a \
+         triton-capable interpreter, or unset ARLE_QWEN35_SGL_GDN to use the hand kernels. \
+         See crates/cuda-kernels/tools/triton/README.md."
+    )
+}
+
 /// Raw (un-scaled) LoRA A/B matrices for one full-attention q/v projection,
 /// pushed from the train crate's OPD student loop for the per-step re-merge.
 ///
@@ -340,6 +371,13 @@ pub(crate) struct LinearAttnScratch {
     fq_g: SliceSlot<f32>,
     fq_g_cumsum: SliceSlot<f32>,
     fq_beta: SliceSlot<f32>,
+    /// SGLang triton GDN decode lane (`ARLE_QWEN35_SGL_GDN`) single-row
+    /// scratch: a 1-entry u64 conv-ring table, a 1-entry u64 GDR-state table,
+    /// and the rms_norm_gated Rstd output (`[HV]` f32, one 1/std per value
+    /// head). Unused unless the flag is on.
+    sgl_conv_tbl: SliceSlot<u64>,
+    sgl_gdr_tbl: SliceSlot<u64>,
+    sgl_rstd: SliceSlot<f32>,
 }
 
 #[derive(Default)]
@@ -464,6 +502,10 @@ pub(crate) struct Qwen35BatchDecodeState {
     logits_batch: HiddenSlot,
     /// Batched greedy argmax outputs `[B]` i32.
     argmax: SliceSlot<i32>,
+    /// SGLang triton GDN decode lane (`ARLE_QWEN35_SGL_GDN`) Rstd output for
+    /// rms_norm_gated: `[HV*B]` f32 (one 1/std per (value-head, row)). Unused
+    /// unless the flag is on.
+    sgl_rstd: SliceSlot<f32>,
 }
 
 impl Qwen35BatchDecodeState {
@@ -496,6 +538,7 @@ impl Qwen35BatchDecodeState {
             staged_slot_indices: Vec::new(),
             logits_batch: HiddenSlot::default(),
             argmax: SliceSlot::default(),
+            sgl_rstd: SliceSlot::default(),
         })
     }
 
@@ -2308,7 +2351,21 @@ impl Qwen35Model {
             fq_g,
             fq_g_cumsum,
             fq_beta,
+            sgl_conv_tbl,
+            sgl_gdr_tbl,
+            sgl_rstd,
         } = lw;
+        // SGLang triton GDN decode lane: replaces the conv1d + recurrent + gated
+        // RMSNorm hand kernels with the vendored SGLang trio on the baked
+        // Qwen3.6 shard. Decode-only (seq_len == 1); prefill chunks stay on the
+        // hand/FlashQLA path. Default OFF — every hand-kernel block below is
+        // byte-for-byte unchanged when this is false.
+        let use_sgl_decode = seq_len == 1
+            && qwen35_sgl_gdn_enabled()
+            && self.local_linear_k_heads == 16
+            && self.local_linear_v_heads == 32
+            && c.linear_key_head_dim == 128
+            && c.linear_value_head_dim == 128;
         let qkv = qkv.get(&self.ctx, qkv_dim, seq_len)?;
         let z = z.get(&self.ctx, z_dim, seq_len)?;
         let b_proj = b_proj.get(&self.ctx, b_dim, seq_len)?;
@@ -2327,7 +2384,34 @@ impl Qwen35Model {
             conv_state.len,
             qkv_dim * (c.linear_conv_kernel_dim - 1)
         );
-        {
+        if use_sgl_decode {
+            // SGLang triton causal_conv1d_update over a 1-entry u64 ring table.
+            // grid = (batch=1, cdiv(dim, BLOCK_N=256) = 32, 1), block num_warps*32.
+            let (s_ptr, _gs) = conv_state.data.device_ptr_mut(&self.ctx.stream);
+            let conv_tbl = sgl_conv_tbl.upload(&self.ctx, &[s_ptr])?;
+            let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
+            let (tbl_ptr, _g2) = conv_tbl.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: x/weight/out live `[1, dim]`/`[dim, width]` on ctx.stream;
+            // `tbl_ptr` is a 1-entry u64 table pointing at the live `[dim, K-1]`
+            // bf16 ring. grid baked into the wrapper: gX=1 (batch), gY=32, gZ=1.
+            unsafe {
+                ffi::arle_gdn_conv1d_update_cuda(
+                    1,
+                    (qkv_dim as u32).div_ceil(256),
+                    1,
+                    x_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    tbl_ptr as *const u64,
+                    o_ptr as *mut ffi::Half,
+                    1,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|_| sgl_gdn_stub_err("arle_gdn_conv1d_update"))?;
+            }
+        } else {
             let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
             let (s_ptr, _g2) = conv_state.data.device_ptr_mut(&self.ctx.stream);
@@ -2443,7 +2527,44 @@ impl Qwen35Model {
                 .result()?;
             }
         }
-        if !use_fq_chunked {
+        if use_sgl_decode {
+            // SGLang triton fused_recurrent_gated_delta_rule decode over a
+            // 1-entry u64 [HV, K, V] f32 state table. grid = (V/BV = 4,
+            // B*HV = 1*32 = 32, 1), block num_warps*32 = 32. scale = K^-0.5.
+            let gdr_state = &mut slot.gdr_states[linear_idx];
+            let (s_ptr, _gs) = gdr_state.device_ptr_mut(&self.ctx.stream);
+            let gdr_tbl = sgl_gdr_tbl.upload(&self.ctx, &[s_ptr])?;
+            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
+            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
+            let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+            let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+            let (tbl_ptr, _g5) = gdr_tbl.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+            let scale = (c.linear_key_head_dim as f32).powf(-0.5);
+            let nv = (c.linear_value_head_dim as u32) / 32; // V / BV (BV = 32)
+            let grid_y = (self.local_linear_v_heads as u32) * (seq_len as u32);
+            // SAFETY: all buffers live on ctx.stream; `tbl_ptr` is a 1-entry u64
+            // table pointing at the live `[HV, K, V]` f32 state (in-place update).
+            unsafe {
+                ffi::arle_gdn_fused_recurrent_decode_cuda(
+                    nv,
+                    grid_y,
+                    1,
+                    qkv_ptr as *const ffi::Half,
+                    a_ptr as *const ffi::Half,
+                    b_ptr as *const ffi::Half,
+                    alog_ptr as *const f32,
+                    dt_ptr as *const ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    tbl_ptr as *const u64,
+                    scale,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|_| sgl_gdn_stub_err("arle_gdn_fused_recurrent_decode"))?;
+            }
+        } else if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
             let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
             let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
@@ -2493,7 +2614,36 @@ impl Qwen35Model {
 
         // ── gated output RMSNorm (per value head; gate = z). ──
         let normed_out = normed_out.get(&self.ctx, z_dim, seq_len)?;
-        {
+        if use_sgl_decode {
+            // SGLang triton rms_norm_gated over the [M, 128] views (M = HV*B).
+            // grid = (cdiv(M, ROWS_PER_BLOCK = 4), ngroups = 1, 1), num_warps 1.
+            let m = self.local_linear_v_heads * seq_len;
+            let rstd = sgl_rstd.get(&self.ctx, m)?;
+            let (rstd_ptr, _gr) = rstd.device_ptr_mut(&self.ctx.stream);
+            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
+            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: x/y/z `[M, 128]` row-major, weight `[128]` f32, rstd `[M]`
+            // f32 scratch — all live on ctx.stream.
+            unsafe {
+                ffi::arle_gdn_rms_norm_gated_cuda(
+                    (m as u32).div_ceil(4),
+                    1,
+                    1,
+                    x_ptr as *const ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    w_ptr as *const f32,
+                    gate_ptr as *const ffi::Half,
+                    rstd_ptr as *mut f32,
+                    m as i32,
+                    c.rms_norm_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|_| sgl_gdn_stub_err("arle_gdn_rms_norm_gated"))?;
+            }
+        } else {
             let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
             let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
@@ -2628,6 +2778,7 @@ impl Qwen35Model {
             gdr_state_ptrs,
             logits_batch,
             argmax,
+            sgl_rstd,
             ..
         } = bd;
         let Qwen35Workspace {
@@ -2687,6 +2838,7 @@ impl Qwen35Model {
                         &conv_state_ptrs[linear_idx],
                         &gdr_state_ptrs[linear_idx],
                         linear,
+                        sgl_rstd,
                         attn_out,
                     )?;
                     linear_idx += 1;
@@ -2946,10 +3098,20 @@ impl Qwen35Model {
         conv_table: &CudaSlice<u64>,
         gdr_table: &CudaSlice<u64>,
         lw: &mut LinearAttnScratch,
+        sgl_rstd: &mut SliceSlot<f32>,
         out: &mut HiddenStates,
     ) -> Result<()> {
         let c = &self.config;
         let b = normed.seq_len;
+        // SGLang triton GDN decode lane (`ARLE_QWEN35_SGL_GDN`). Batched decode
+        // is per-token recurrent, so the trio applies directly over the staged
+        // [>=B] u64 conv/gdr tables. Shape-guarded to the baked Qwen3.6 shard;
+        // default OFF leaves the hand kernels byte-for-byte unchanged.
+        let use_sgl_decode = qwen35_sgl_gdn_enabled()
+            && self.local_linear_k_heads == 16
+            && self.local_linear_v_heads == 32
+            && c.linear_key_head_dim == 128
+            && c.linear_value_head_dim == 128;
         let qkv_dim = self.local_linear_qkv_dim();
         let z_dim = self.local_linear_z_dim();
         let b_dim = attn.in_proj_b.rows;
@@ -2971,6 +3133,13 @@ impl Qwen35Model {
             fq_g: _,
             fq_g_cumsum: _,
             fq_beta: _,
+            // Single-row SGLang scratch is unused here: the batched lane drives
+            // the trio off the staged `conv_table`/`gdr_table` params and the
+            // `sgl_rstd` param (from the batch-decode state), not these 1-entry
+            // single-row tables.
+            sgl_conv_tbl: _,
+            sgl_gdr_tbl: _,
+            sgl_rstd: _,
         } = lw;
         let qkv = qkv.get(&self.ctx, qkv_dim, b)?;
         let z = z.get(&self.ctx, z_dim, b)?;
@@ -2983,7 +3152,32 @@ impl Qwen35Model {
 
         // ── Batched conv1d (advances every row's conv ring in place). ──
         let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, b)?;
-        {
+        if use_sgl_decode {
+            // SGLang triton causal_conv1d_update over the staged `[>=B]` u64 ring
+            // table. grid = (batch=B, cdiv(dim, BLOCK_N=256), 1).
+            let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
+            let (tbl_ptr, _g2) = conv_table.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: x/weight/out live `[B, C]`/`[C*K]` on ctx.stream; `tbl_ptr`
+            // is the SAME staged `[>=B]` u64 table the hand kernel reads (cast to
+            // u64 here); first B entries point at live `[C, K-1]` bf16 rings.
+            unsafe {
+                ffi::arle_gdn_conv1d_update_cuda(
+                    b as u32,
+                    (qkv_dim as u32).div_ceil(256),
+                    1,
+                    x_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    tbl_ptr as *const u64,
+                    o_ptr as *mut ffi::Half,
+                    b as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|_| sgl_gdn_stub_err("arle_gdn_conv1d_update"))?;
+            }
+        } else {
             let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
             let (tbl_ptr, _g2) = conv_table.device_ptr(&self.ctx.stream);
@@ -3008,7 +3202,42 @@ impl Qwen35Model {
 
         // ── Batched gated-delta recurrent (advances every row's state). ──
         let gdr_out = gdr_out.get(&self.ctx, z_dim, b)?;
-        {
+        if use_sgl_decode {
+            // SGLang triton fused_recurrent_gated_delta_rule decode over the
+            // staged `[>=B]` u64 `[HV, K, V]` f32 state table. grid =
+            // (V/BV = Vd/32, B*HV = B*local_v_heads, 1). scale = Kd^-0.5.
+            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
+            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
+            let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+            let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+            let (tbl_ptr, _g5) = gdr_table.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+            let scale = (c.linear_key_head_dim as f32).powf(-0.5);
+            let nv = (c.linear_value_head_dim as u32) / 32; // V / BV (BV = 32)
+            let grid_y = (self.local_linear_v_heads as u32) * (b as u32);
+            // SAFETY: all buffers live on ctx.stream; `tbl_ptr` is the SAME
+            // staged `[>=B]` u64 table the hand kernel reads (cast to u64 here);
+            // first B entries point at live `[HV, K, V]` f32 states (in-place).
+            unsafe {
+                ffi::arle_gdn_fused_recurrent_decode_cuda(
+                    nv,
+                    grid_y,
+                    1,
+                    qkv_ptr as *const ffi::Half,
+                    a_ptr as *const ffi::Half,
+                    b_ptr as *const ffi::Half,
+                    alog_ptr as *const f32,
+                    dt_ptr as *const ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    tbl_ptr as *const u64,
+                    scale,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|_| sgl_gdn_stub_err("arle_gdn_fused_recurrent_decode"))?;
+            }
+        } else {
             let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
             let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
             let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
@@ -3041,7 +3270,37 @@ impl Qwen35Model {
 
         // ── Gated output RMSNorm over all (token, head) slices. ──
         let normed_out = normed_out.get(&self.ctx, z_dim, b)?;
-        {
+        if use_sgl_decode {
+            // SGLang triton rms_norm_gated over the `[M, 128]` views (M = HV*B).
+            // grid = (cdiv(M, ROWS_PER_BLOCK = 4), ngroups = 1, 1).
+            let m = self.local_linear_v_heads * b;
+            let rstd = sgl_rstd.get(&self.ctx, m)?;
+            let (rstd_ptr, _gr) = rstd.device_ptr_mut(&self.ctx.stream);
+            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
+            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: x/y/z `[M, 128]` row-major (M = HV*B) over the `[B, Vh*Vd]`
+            // buffers, weight `[128]` f32, rstd `[M]` f32 scratch — all on
+            // ctx.stream.
+            unsafe {
+                ffi::arle_gdn_rms_norm_gated_cuda(
+                    (m as u32).div_ceil(4),
+                    1,
+                    1,
+                    x_ptr as *const ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    w_ptr as *const f32,
+                    gate_ptr as *const ffi::Half,
+                    rstd_ptr as *mut f32,
+                    m as i32,
+                    c.rms_norm_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|_| sgl_gdn_stub_err("arle_gdn_rms_norm_gated"))?;
+            }
+        } else {
             let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
             let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
