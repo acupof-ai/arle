@@ -260,16 +260,17 @@ pub(crate) struct Dsv4SlotImage {
 }
 
 /// Max MTP draft depth (K) the per-slot frozen-KV spec-ring snapshot is sized
-/// for; valid verify-slot count is K+1. The model does NOT retain the requested
-/// `--mtp-draft-tokens` count (only the `spec_decode_on` bool), and under
-/// `ARLE_DSV4_MTP_UNCLAMP=1` the runtime depth follows the requested value, so
-/// the snapshot is sized to a fixed safe ceiling rather than the request. The
-/// executor verify path asserts `depth <= max_depth` (via
-/// `capture_spec_rings`), turning an over-large request into a clean error
-/// instead of silent ring corruption. 8 covers every shipped MTP head config
-/// (the 1-layer nextn checkpoint runs depth-1 by default; deeper EAGLE-tree
-/// drafts are the future axis this ceiling anticipates).
-const MAX_SPEC_DRAFT_DEPTH: usize = 8;
+/// for; valid verify-slot count is K+1. The model retains only the
+/// `spec_decode_on` bool, not the requested `--mtp-draft-tokens` count, so the
+/// snapshot is sized to this fixed ceiling rather than the per-request depth.
+/// `spec_depth` clamps the requested depth into `[1, MAX_SPEC_DRAFT_DEPTH]`, so
+/// the verify path can never exceed the snapshot; the `capture_spec_rings`
+/// assert is then a redundant safety net. 8 covers every shipped MTP head
+/// config (the 1-layer nextn checkpoint runs depth-1 by default; deeper
+/// EAGLE-tree drafts are the future axis this ceiling anticipates).
+/// FUTURE (ideal): plumb the requested depth to the model so the snapshot sizes
+/// to `depth+1` instead of this fixed `MAX+1`, reclaiming per-slot memory.
+pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
 
 /// Row schedule for one speculative verify forward: how each flattened
 /// draft-tree row maps onto an absolute position, and which node-scratch ring
