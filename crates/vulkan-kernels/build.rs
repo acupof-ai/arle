@@ -74,6 +74,17 @@ const VENDORED: &[ShaderSpec] = &[
         ],
     },
     ShaderSpec {
+        name: "mul_mat_vecq_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_Q8_0", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+        ],
+    },
+    ShaderSpec {
         name: "rms_norm",
         source: "vendor/llama.cpp/vulkan-shaders/rms_norm.comp",
         defines: &[
