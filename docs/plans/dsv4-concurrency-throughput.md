@@ -12,39 +12,48 @@ DSv4 concurrent decode barely scales: batched aggregate **1.40× for 16× load**
 (c=1→16: 44→62 tok/s); the default serve is flat ~53 (batched-decode opt-in,
 off). The ceiling is **not** the GPU.
 
-## Root cause (4 converging lines)
+## Root cause (measured)
 
-1. **c-sweep arithmetic**: `T_step ≈ 7ms floor + 15.7ms/req`. The floor
-   (collectives + launch + skew) amortizes (= the 1.40×, 2.7% of step at B=16);
-   the ~15.7ms/req is per-request compute that does **not** amortize.
-2. **stage profiler**: step is host-launch-bound (~36ms host issuing kernels:
-   attn-half ~16ms + moe-half ~20ms).
-3. **our code**: `forward_decode_batch` runs attention **per-row**
-   (`dsv4.rs:2498-2544`, `for r in 0..seq_len { mla_attention(...) }`); MoE
-   batched. At B=8 → 8× per-row attention kernels + 8× launches.
-4. **SGLang**: batched MLA decode = ONE `flash_mla_with_kvcache` for all B
+**B=1 per-stage GPU `cuda_ms`** (in-house stage profiler, real CUDA-event GPU
+time, rank-0; the `INFER_TP_RANK=0` print-gate fix made it emit on the serve):
+
+| stage | % of GPU |
+|---|---|
+| **mla_attn** | **41%** (the single biggest) |
+| shared_expert (dense FFN, amortizes with batch) | 17% |
+| moe_allreduce + moe_route (routed MoE) | 15% |
+| attn_hc / ffn_hc params+norms | ~12% |
+| **attn_allreduce (TP collective)** | **4%** |
+
+Converging evidence:
+1. **Attention is the biggest GPU stage (41% at B=1)** — and it is using its
+   *best* kernel there (FlashMLA decode, `seq_len==1`).
+2. **Batched decode is NOT per-row** — `forward_decode_batch` calls
+   `mla_attention` once per layer (`calls=43/step`); the per-row loop
+   (`dsv4.rs:2498-2544`) is **MTP-verify only**. The real gap: **FlashMLA
+   decode is gated `seq_len==1` (attention.rs:4945)**, so at c=8 (seq_len=8)
+   attention **falls off FlashMLA onto the general/prefill path** for 8 decode
+   rows — the biggest GPU stage loses its optimized kernel exactly at batch.
+3. **MoE ∝ active_experts ∝ c** (ckl `74b721db`, Qwen #88; same on DSv4): each
+   active expert = ≥1 kernel block regardless of its token count; #active-experts
+   grows with c (E=256/top-6: c=8 → ~45 distinct) → routed-MoE per-step time
+   grows with c. EP=8 distributes it (~/8 per rank) → DSv4 gets 1.4× not flat.
+4. **collective is only 4%** → DP-attn (which removes it) is the lowest lever.
+5. **SGLang**: batched MLA decode = ONE `flash_mla_with_kvcache` for all B
    (`block_table`+`cache_seqlens`), inside a CUDA graph.
-5. **MoE ∝ active_experts ∝ c** (ckl `74b721db`, root-caused on Qwen #88; same
-   structure on DSv4): at decode each *active* expert needs ≥1 kernel block
-   regardless of how few tokens route to it, and #active-experts grows with c
-   (E=256, top-6: c=8 → ~45 distinct). So per-step MoE time grows with c → the
-   MoE half does not amortize. EP=8 distributes it (~/8 per rank) — which is why
-   DSv4 gets 1.4× not dead-flat (ckl's Qwen `fused_moe` was flat). Fundamental to
-   sparse-MoE decode below expert saturation (c << E/top_k ≈ 43).
 
-→ The non-amortizing marginal (~15.7ms/req) is **TWO halves**: (a) per-row
-attention compute (attn-half, ~16ms host — fixable) + (b) MoE ∝ active_experts
-(moe-half, ~20ms host — fundamental). Eager host-launch compounds both. NOT the
-collectives. **Gap**: the precise attention-vs-MoE *GPU* `cuda_ms` split is not
-yet measured — the stage profiler emitted only host-time this run; host-time says
-moe-half (20) > attn-half (16). Close with a clean rank-0 per-stage GPU profile.
+→ Two non-amortizing axes: **(a) attention loses its batched-decode kernel at
+B>1** (biggest stage, fixable via a batched MLA decode kernel) + **(b) routed
+MoE ∝ active_experts** (fundamental sparse-MoE-decode). Collective is negligible.
+
+**Measurement note** (honest): the exact B=8 attn-vs-MoE *GPU* `cuda_ms` split
+was not obtained — the nsys B=8 capture succeeded (7.5 GB trace) but the
+projection was a processing runaway (21 GB SQLite). The B=1 GPU split (attn 41%
+biggest) + the FlashMLA `seq_len==1` gate make the #1 lever certain without it:
+attention is the biggest stage at B=1 *with* its best kernel, and degrades at
+batch.
 
 ## Lever ranking
-
-The cap is two non-amortizing halves. Levers 1-2 attack the **tractable** half
-(attention + launch); the MoE half is **fundamental** (lever 3); DP-attn is
-orthogonal (lever 4). Which of attn-half vs moe-half is bigger in GPU time is the
-open gap above (host-time says moe-half).
 
 ### 1. Batched MLA decode — most tractable win (#60; "Phase 5 batched FlashMLA")
 - **SGLang**: `flashmla_backend.py` `forward_decode` issues one
