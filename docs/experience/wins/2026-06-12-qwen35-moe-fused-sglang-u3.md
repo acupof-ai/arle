@@ -1,12 +1,15 @@
-# Qwen3.6-35B MoE FFN → SGLang fused_moe triton lane (U3) — opt-in, pending-remote
+# Qwen3.6-35B MoE FFN → SGLang fused_moe triton lane (U3) — opt-in, OOM fixed, A/B pending-remote
 
-**Date:** 2026-06-12. **Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1.
-**Status:** `pending-remote` — code complete + Mac-typecheck/clippy green; the
-on-device needle gate + A/B runs in the **one-shot validation pass** that also
-covers U1+U2 (GDN decode) and U4 (fused add-RMSNorm), per ckl's "写完代码一把验证"
-directive (#88). No default flip lands without that pass. **Lowest-confidence
-swap of the four** — bar is correctness + clean opt-in + byte-identical flag-OFF;
-no perf claim is made here (the lead runs the pod A/B).
+**Date:** 2026-06-12 (impl); **2026-06-13** OOM root-cause + build-and-replace fix.
+**Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1.
+**Status:** `pending-remote` — code complete + Mac-typecheck/clippy green. The
+#88 validate3 pod pass found a lazy-build **OOM** (memory doubling); fixed by
+build-and-replace at load (see resolved-design-question #1). The no-OOM confirm +
+needle-envelope + dgoff-vs-moe perf A/B re-run is the remaining pending-remote
+item — **deferred: all 8 H20s occupied by the lead's DSv4 TP=8/EP=8 serve
+(~54 GB/GPU 2026-06-13); the 35B BF16 needs a free single GPU.** No default flip
+lands without that pass. **Lowest-confidence swap of the four** — bar is
+correctness + clean opt-in + byte-identical flag-OFF; no perf claim is made here.
 
 ## Context
 
@@ -44,14 +47,20 @@ current hand decode-band path).
   `fused_moe_gemm1/gemm2/act_and_mul/sum_reduce`, `fused_moe_max_num_tokens_padded`,
   block-size consts. `.result()?` → CUresult; NOT_SUPPORTED maps to the loud
   opt-in failure in the caller.
-- **Lazy stacked weights** (`crates/infer-cuda/src/loader.rs`): per-layer
-  `OnceCell<MoeFusedSglangWeights>` on `MoeLayerWeights`. `w1 [E, 2N, K]`
+- **Stacked weights — build-and-replace at LOAD** (`crates/infer-cuda/src/loader.rs`):
+  `Option<MoeFusedSglangWeights>` on `MoeLayerWeights`. `w1 [E, 2N, K]`
   (gate rows then up rows per expert — matches SGLang stacked `w13_weight`),
-  `w2 [E, K, N]` (down verbatim). Pure D2D gather-concat from the existing
-  per-expert `DeviceMatrix` Vecs; **+~1.5 GB** on the single-GPU shard
-  (w1 ≈ 256·1024·2048·2 B ≈ 1.0 GB, w2 ≈ 256·2048·512·2 B ≈ 0.5 GB),
-  materialized only on the first fused forward → **load-time byte-identical**.
-  Single-threaded `!Sync` executor → `OnceCell` over `&self` weights is sound.
+  `w2 [E, K, N]` (down verbatim). Pure D2D gather-concat from the per-expert
+  `DeviceMatrix` Vecs, **then the Vecs are freed** (`ctx.sync()?` →
+  `gate/up/down.clear()`), exactly mirroring the DeepGEMM grouped block in the
+  same loader. Restacked size ≈ source size (w1 ≈ 256·1024·2048·2 B ≈ 1.0 GB,
+  w2 ≈ 256·2048·512·2 B ≈ 0.5 GB/layer) — so resident routed-expert VRAM does
+  **not** grow. **Superseded the first-forward-lazy `OnceCell` design**, which
+  OOM'd the 35B BF16 shard (see the OOM resolved-design-question below). The
+  fused lane reads w1/w2 directly; the per-expert ptr tables are empty on this
+  path. Mutually exclusive with DeepGEMM (the grouped cache already freed the
+  Vecs) — needs `ARLE_QWEN35_DEEPGEMM=0`; both-on loud-fails at the first
+  forward via the cache getter.
 - **Fused forward + dispatch** (`crates/infer-cuda/src/moe.rs`):
   `moe_forward_fused_sglang` runs moe_align → GEMM1 (`a`=normed, **token-major
   `[T, K]`** → `stride_am=hidden_dim, stride_ak=1`) → act_and_mul → GEMM2
@@ -69,6 +78,26 @@ current hand decode-band path).
 
 ## Resolved design questions
 
+- **Lazy first-forward build OOM'd → build-and-replace at load (caught in pod
+  validation, #88 validate3):** the original `OnceCell` "materialize on first
+  fused forward" design doubled routed-expert VRAM. The fused `w1 [E,2N,K]` +
+  `w2 [E,K,N]` BF16 cache is a SECOND full copy of the MoE weights (~1.6 GB/layer:
+  w1 1.07 GB + w2 0.54 GB) built lazily per layer ON TOP of the still-resident
+  per-expert Vecs (DeepGEMM-off keeps them). On the 35B-A3B single-GPU shard
+  (~70 GB weights on a 96 GB H20, ~30 GB free after load), the lazy build hit
+  `CUDA_ERROR_OUT_OF_MEMORY` around layer 20 (20 × 1.6 GB ≈ 32 GB > 30 GB free).
+  The lazy build takes `weights: &MoeLayerWeights` (immutable, pool-shared
+  `&self`) so it **cannot** free the Vecs — the fix had to move to the loader
+  where the Vecs are owned `mut`. Now `MoeFusedSglangWeights::build` runs in
+  `load_moe_layer_experts` (mirror of the DeepGEMM `concat → ctx.sync()? →
+  gate/up/down.clear()` block): restack → sync → free Vecs per layer. Resident
+  = restacked size (replacing the freed Vecs); peak = baseline + one layer's
+  transient (~1.6 GB) → fits. The fused forward's `build_fused_sglang_weights`
+  is now a pure cache getter (`fused_sglang.as_ref()`), and the forward gate
+  loud-fails if the flag is on for a non-device-route-eligible config (the
+  non-fused fallback is gone — its Vecs were freed). The doc comment's
+  "+1.5 GB total" was wrong by ~40× — it is +1.5 GB *per layer* before the fix,
+  and net-zero growth after.
 - **Activation layout (caught + fixed in review):** the `HiddenStates` buffer
   fed to GEMM1 (`normed`) and written by sum_reduce (`out`) is **token-major /
   token-contiguous** — element (token t, feature k) at `t*hidden_dim + k`, so a
@@ -139,6 +168,15 @@ decode-band path is byte-for-byte unchanged.
 - build.rs no-cuda path skips kernel compile (links stubs) — confirmed.
 
 ## Pending (one-shot pod pass, #88)
+
+**validate3 progress (2026-06-13):** lane-RUNS probe fired (fused_moe lane
+engaged); the lazy-build OOM was hit and **fixed** (build-and-replace at load).
+The remaining items 1–3 re-run once the H20s free (lead's DSv4 8×H20 serve holds
+all 8 GPUs; the 35B BF16 single-GPU validation has no room until then). The U3
+control is `dgoff` (`ARLE_QWEN35_DEEPGEMM=0`, hand-grouped) vs treatment `moe`
+(`ARLE_QWEN35_DEEPGEMM=0 ARLE_QWEN35_MOE_FUSED_SGLANG=1`) — both DeepGEMM-off so
+the A/B isolates the fused-kernel swap (DeepGEMM gives no benefit at this shape;
+see the 2026-06-13 validation entry).
 
 1. Build on 8×H20 pod with `INFER_TRITON_PYTHON` set (`CARGO_NET_OFFLINE=1`);
    confirm the 4 fused cubins compile (not stubs) via the runtime loud-fail probe.
