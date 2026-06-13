@@ -8,6 +8,7 @@
 
 pub use infer_gguf::{deepseek4, dequant, gguf};
 
+pub mod config;
 pub mod executor;
 pub mod kv_pool;
 pub mod loader;
