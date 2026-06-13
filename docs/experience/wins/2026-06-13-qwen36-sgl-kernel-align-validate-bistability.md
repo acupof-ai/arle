@@ -234,3 +234,35 @@ here. The in-tree hand decode-band kernel is already the right tool for this sha
   grouped path. Diagnose the *shape* of the throughput-vs-c curve (flat ⇒
   per-step time ∝ c ⇒ work ∝ active_experts), not just the Δ% — the curve shape
   names the mechanism.
+
+---
+
+## Action (2026-06-14): lanes deleted
+
+The verdicts above license **removal**: U1 triton-AOT infra, U2 GDN decode, U3
+fused_moe, U4 fused add-RMSNorm were all opt-in, default-OFF, and validated
+WASH (U2/U4) or KILL (U3) — the live default path never ran them, and keeping
+two kernel sets demands a second AOT precompile step that slows every pod build
+(triton 3.5.1 + a full triton-AOT pass on top of the tilelang AOT pass) for
+zero default-path benefit. All four lanes + the entire triton-AOT build path
+were deleted in one atomic commit (20 files, −3.9k LOC):
+
+- `crates/cuda-kernels/`: `src/ffi/triton.rs`, `csrc/misc/arle_fused_add_rmsnorm.cu`,
+  `csrc/moe/moe_align_block_size.cu`, the whole `tools/triton/` tree (gen script +
+  6 kernels), the build.rs triton consts/section/call-site + `triton_kernels_aot`
+  link, the U3 wrappers in `src/moe.rs`, and the two now-dead externs
+  (`arle_moe_align_block_size_cuda`, `arle_fused_add_rmsnorm_offset_bf16_cuda`).
+- `crates/infer-cuda/`: the three flags + stubs, `MoeFusedSglangWeights` +
+  loader build-and-replace, the U3 host dispatch (`moe_forward_fused_sglang` +
+  `fm_*` scratch), and the U2/U4 decode-lane branches in `qwen35.rs` — each
+  `if <flag> { sgl } else { hand }` collapsed to the **hand** branch, verified
+  byte-identical to the flag-OFF default. The now-orphaned `add_batch_inplace`
+  (U4-only) was deleted rather than `#[allow(dead_code)]`-annotated.
+
+**Perf-neutral by construction**: the surviving path is the flag-OFF default,
+which was the running default — no default-path bytes changed, so no new bench
+run is owed (the KILL/WASH A/B above is the license). Preserved: the hand
+GDN/add-RMSNorm kernels, all tilelang AOT, vendored `flashinfer/norm.cuh`,
+and every DSv4 path. Gates green: Mac CUDA typecheck + cpu build + clippy clean
+(the 5 residual clippy warnings are pre-existing, all inside `mod dsv4_gpu` /
+`dsv4.rs`).

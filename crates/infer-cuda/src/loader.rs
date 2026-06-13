@@ -866,39 +866,13 @@ impl SafetensorLoader {
             (None, None, None)
         };
 
-        // SGLang fused_moe stacked cache (opt-in, `ARLE_QWEN35_MOE_FUSED_SGLANG`),
-        // mutually exclusive with DeepGEMM (both restack the same routed-expert
-        // weights). Build-and-replace exactly like the DeepGEMM block above:
-        // restack the per-expert Vecs into w1/w2, sync, then DROP the Vecs —
-        // keeping both would double routed-expert VRAM (the lazy first-forward
-        // build OOM'd the 35B BF16 shard at ~layer 20). The fused lane reads
-        // w1/w2 directly, so the per-expert ptr tables below stay empty here.
-        let fused_sglang = if !deepgemm_ready && crate::moe::qwen35_moe_fused_sglang_enabled() {
-            let built = MoeFusedSglangWeights::build(ctx, &gate, &up, &down, hidden_size)?;
-            // Event tracking disabled: the async D2D restacks MUST complete
-            // before the drop frees the per-expert sources.
-            ctx.sync()?;
-            gate.clear();
-            up.clear();
-            down.clear();
-            Some(built)
-        } else {
-            None
-        };
-
         // Per-expert weight-pointer tables (one device pointer per owned
         // expert) — built from the per-expert matrices on the default path,
-        // from the grouped buffer offsets on the DeepGEMM path, or empty when
-        // the fused lane has freed the Vecs (it reads w1/w2 directly).
+        // or from the grouped buffer offsets on the DeepGEMM path.
         let (gate_ptrs, up_ptrs, down_ptrs) = match (&gate_grouped, &up_grouped, &down_grouped) {
             (Some(g), Some(u), Some(d)) => {
                 (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
             }
-            _ if fused_sglang.is_some() => (
-                cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &[])?,
-                cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &[])?,
-                cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &[])?,
-            ),
             _ => {
                 let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
                 let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
@@ -926,7 +900,6 @@ impl SafetensorLoader {
             shared_up,
             shared_down,
             shared_gate_router,
-            fused_sglang,
         })
     }
 
@@ -1718,136 +1691,6 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) shared_up: DeviceMatrix,
     pub(crate) shared_down: DeviceMatrix,
     pub(crate) shared_gate_router: DeviceMatrix,
-    /// SGLang `fused_moe` stacked weight cache (`w1 [E, 2N, K]` gate-then-up +
-    /// `w2 [E, K, N]` down, contiguous BF16, this rank's local experts). Built
-    /// at LOAD when `ARLE_QWEN35_MOE_FUSED_SGLANG=1` AND DeepGEMM is off
-    /// (mutually exclusive grouped caches): the per-expert Vecs are restacked
-    /// into w1/w2 and then FREED — build-and-replace, mirroring the DeepGEMM
-    /// grouped path, so resident VRAM does NOT double (the lazy first-forward
-    /// build OOM'd on the 35B BF16 shard: w1/w2 ≈ 1.6 GB/layer on top of the
-    /// still-resident 1.6 GB/layer Vecs × 40 layers). `None` by default —
-    /// the hand path load is byte-identical. Restacked size ≈ source size
-    /// (w1 ≈ 256·1024·2048·2 B ≈ 1.0 GB, w2 ≈ 256·2048·512·2 B ≈ 0.5 GB/layer).
-    pub(crate) fused_sglang: Option<MoeFusedSglangWeights>,
-}
-
-/// SGLang `fused_moe` stacked expert-weight cache for one MoE layer (built
-/// lazily by the U3 fused path; see [`MoeLayerWeights::fused_sglang`]).
-///
-/// `w1` is `[E_l, 2N, K]` row-major BF16: for local expert `e`, rows `[0, N)`
-/// are the gate `[N, K]` and rows `[N, 2N)` are the up `[N, K]` (gate-then-up,
-/// matching SGLang's stacked `w13_weight`). `w2` is `[E_l, K, N]` row-major
-/// BF16: the per-expert down `[K, N]` verbatim. `num_experts` = this rank's
-/// local expert count, `gate_up_rows` = `2N`, `hidden` = `K`, `moe_inter` = `N`.
-pub(crate) struct MoeFusedSglangWeights {
-    pub(crate) w1: CudaSlice<half::bf16>,
-    pub(crate) w2: CudaSlice<half::bf16>,
-    pub(crate) num_experts: usize,
-    pub(crate) gate_up_rows: usize,
-    pub(crate) hidden: usize,
-    pub(crate) moe_inter: usize,
-}
-
-impl MoeFusedSglangWeights {
-    /// Build the SGLang stacked `w1 [E, 2N, K]` (gate rows then up rows per
-    /// expert) + `w2 [E, K, N]` (down verbatim) cache from the per-expert
-    /// `[N, K]` / `[K, N]` matrices by D2D gather-concat. Mirrors
-    /// [`MoeExpertGroup::concat`]: the caller MUST `ctx.sync()` before dropping
-    /// the source Vecs (event tracking is disabled, so a Rust drop frees device
-    /// memory immediately — before the async copies may have run). `num_experts`
-    /// is the passed slices' length (this rank's local experts); `hidden_dim`
-    /// pins `K`.
-    fn build(
-        ctx: &DeviceContext,
-        gate: &[DeviceMatrix],
-        up: &[DeviceMatrix],
-        down: &[DeviceMatrix],
-        hidden_dim: usize,
-    ) -> Result<Self> {
-        let num_experts = gate.len();
-        ensure!(
-            num_experts > 0 && up.len() == num_experts && down.len() == num_experts,
-            "fused MoE build needs per-expert Vecs (gate={} up={} down={})",
-            gate.len(),
-            up.len(),
-            down.len()
-        );
-        // Per-expert dims (gate/up `[N, K]`, down `[K, N]`); uniform across
-        // experts (the concat path enforces uniformity too).
-        let moe_inter = gate[0].rows; // N
-        let k = gate[0].cols; // K (= hidden_dim)
-        ensure!(
-            k == hidden_dim,
-            "fused MoE gate K {k} != hidden_dim {hidden_dim}"
-        );
-        let gate_up_rows = 2 * moe_inter; // 2N
-        let w1_elems = num_experts * gate_up_rows * k;
-        let w2_elems = num_experts * k * moe_inter;
-        let mut w1 = ctx
-            .stream
-            .alloc_zeros::<half::bf16>(w1_elems)
-            .map_err(|e| anyhow!("fused MoE w1 alloc failed: {e}"))?;
-        let mut w2 = ctx
-            .stream
-            .alloc_zeros::<half::bf16>(w2_elems)
-            .map_err(|e| anyhow!("fused MoE w2 alloc failed: {e}"))?;
-
-        let expert_nk = moe_inter * k; // gate / up slab elements
-        let down_kn = k * moe_inter; // down slab elements
-        for e in 0..num_experts {
-            let g = &gate[e];
-            let u = &up[e];
-            let d = &down[e];
-            ensure!(
-                g.rows == moe_inter && g.cols == k && u.rows == moe_inter && u.cols == k,
-                "fused MoE expert {e} gate/up shape ({}x{} / {}x{}) != {moe_inter}x{k}",
-                g.rows,
-                g.cols,
-                u.rows,
-                u.cols
-            );
-            ensure!(
-                d.rows == k && d.cols == moe_inter,
-                "fused MoE expert {e} down shape {}x{} != {k}x{moe_inter}",
-                d.rows,
-                d.cols
-            );
-            ensure!(
-                g.qweight.is_none()
-                    && u.qweight.is_none()
-                    && d.qweight.is_none()
-                    && g.group_size == 0
-                    && u.group_size == 0
-                    && d.group_size == 0,
-                "fused MoE expert {e} is quantized — the BF16 fused cache needs dense BF16"
-            );
-            // w1[e]: rows [0, N) = gate `[N, K]`, rows [N, 2N) = up `[N, K]`.
-            let w1_base = e * gate_up_rows * k;
-            ctx.stream
-                .memcpy_dtod(&g.data, &mut w1.slice_mut(w1_base..w1_base + expert_nk))
-                .map_err(|err| anyhow!("fused MoE w1 gate D2D failed: {err}"))?;
-            ctx.stream
-                .memcpy_dtod(
-                    &u.data,
-                    &mut w1.slice_mut(w1_base + expert_nk..w1_base + 2 * expert_nk),
-                )
-                .map_err(|err| anyhow!("fused MoE w1 up D2D failed: {err}"))?;
-            // w2[e]: down `[K, N]` verbatim.
-            let w2_base = e * down_kn;
-            ctx.stream
-                .memcpy_dtod(&d.data, &mut w2.slice_mut(w2_base..w2_base + down_kn))
-                .map_err(|err| anyhow!("fused MoE w2 down D2D failed: {err}"))?;
-        }
-
-        Ok(Self {
-            w1,
-            w2,
-            num_experts,
-            gate_up_rows,
-            hidden: k,
-            moe_inter,
-        })
-    }
 }
 
 /// One contiguous `[groups, rows, cols]` row-major BF16 expert-weight buffer —

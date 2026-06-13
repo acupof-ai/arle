@@ -397,25 +397,4 @@ unsafe extern "C" {
         global_expert_idx: i32,
         stream: CUstream,
     ) -> CUresult;
-
-    /// SGLang `moe_align_block_size` FULL path (vendored, 256-expert Qwen3.6).
-    /// From token-major `topk_ids [numel]` (i32 expert ids in [0, E)) produces
-    /// `sorted_token_ids [max_num_tokens_padded]` (token rows grouped by expert,
-    /// each group padded to a `block_size` multiple, pad slots = `numel`),
-    /// `expert_ids [num_blocks]`, and `total_tokens_post_pad [1]`.
-    /// `cumsum_buffer [num_experts + 1]` is caller-preallocated scratch and,
-    /// together with `total_tokens_post_pad`, MUST be device-zeroed before each
-    /// call (atomicAdd accumulators). Drives the fused-MoE GEMM grids.
-    pub fn arle_moe_align_block_size_cuda(
-        topk_ids: *const i32,
-        sorted_token_ids: *mut i32,
-        expert_ids: *mut i32,
-        total_tokens_post_pad: *mut i32,
-        cumsum_buffer: *mut i32,
-        num_experts: i32,
-        block_size: i32,
-        numel: i32,
-        max_num_tokens_padded: i32,
-        stream: CUstream,
-    ) -> CUresult;
 }

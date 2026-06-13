@@ -218,38 +218,6 @@ pub(crate) fn add_batch(
     Ok(())
 }
 
-/// In-place element-wise add: `acc[i] += addend[i]`. `add_cuda` reads `acc` and
-/// `addend` and writes `acc`, which is element-local (no cross-element
-/// dependency), so the aliased read/write pointer is safe. Used by the fused
-/// add+RMSNorm post-attn path, where the running residual already lives in `acc`
-/// (`hidden`) and the MLP output is folded in without a separate sum buffer.
-pub(crate) fn add_batch_inplace(
-    ctx: &DeviceContext,
-    acc: &mut HiddenStates,
-    addend: &HiddenStates,
-) -> Result<()> {
-    ensure!(
-        acc.hidden_dim == addend.hidden_dim && acc.seq_len == addend.seq_len,
-        "add_batch_inplace shape mismatch"
-    );
-    let n = acc.hidden_dim * acc.seq_len;
-    let (addend_ptr, _gb) = addend.data.device_ptr(&ctx.stream);
-    let (acc_ptr, _ga) = acc.data.device_ptr_mut(&ctx.stream);
-    // SAFETY: acc/addend valid on ctx.stream, same shape; add_cuda's per-element
-    // `out[i] = a[i] + b[i]` aliases `a == out` (== acc) safely.
-    unsafe {
-        ffi::add_cuda(
-            acc_ptr as *const ffi::Half,
-            addend_ptr as *const ffi::Half,
-            acc_ptr as *mut ffi::Half,
-            n as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
-    Ok(())
-}
-
 pub(crate) fn silu_mul(
     ctx: &DeviceContext,
     gate: &HiddenStates,
