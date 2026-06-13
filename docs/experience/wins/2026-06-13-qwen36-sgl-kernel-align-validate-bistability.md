@@ -266,3 +266,34 @@ GDN/add-RMSNorm kernels, all tilelang AOT, vendored `flashinfer/norm.cuh`,
 and every DSv4 path. Gates green: Mac CUDA typecheck + cpu build + clippy clean
 (the 5 residual clippy warnings are pre-existing, all inside `mod dsv4_gpu` /
 `dsv4.rs`).
+
+Landed as `23d6a0b8` (21 files, +71/−3963). `codex review --commit 23d6a0b8`:
+**no correctness issues** — it checked out the commit in an isolated worktree
+and ran `cargo check -p infer-cuda --release --features cuda,no-cuda` (compiles
+in 7.22s) + the infer-cuda unit suite (**76 passed, 0 failed**), so the
+committed snapshot builds and tests green on its own. The commit was isolated
+from a concurrent in-flight ckl refactor sharing `build.rs` (his
+`rustc-cfg=arle_flashmla` / `arle_deepgemm_native` capability-cfg emissions +
+the `HAS_FLASHMLA` / `HAS_DEEPGEMM_NATIVE` consts in `src/lib.rs` + the
+`dsv4-config-mechanism-classification.md` plan) — those hunks were excluded by
+staging a hand-built `build.rs` blob, leaving his WIP untouched in the working
+tree.
+
+### Orphan-kernel sweep (same pass): no further safe deletions
+
+Swept the non-DSv4 CUDA extern surface for the *same class* of dead code
+(compiled-but-never-invoked, like the `moe_align_block_size` /
+`arle_fused_add_rmsnorm` kernels just removed). All U1-U4 references are gone.
+A broader set of externs has zero call sites in `infer-cuda` — the closest
+match is the hand `fused_add_rms_norm{,_batched,_offset}_cuda` family (declared
+in `ffi/norm.rs` + re-declared via the HIP `$decl!` macro, but invoked by
+neither backend; backed by `csrc/misc/norm.cu`, shared with the live RMSNorm
+kernels). **Deferred, not deleted** — unlike U1-U4 these have *no
+license-or-kill verdict*, and per `feedback_necessity_not_callers` a
+zero-caller kernel reads as unfinished infra, not dead. The rest of the orphan
+set (GGUF quant `q{3,4,5,6}k`/`w{2,4,8}a16`/marlin/turboquant, paged-KV/MLA,
+GDN-prefill-chunk) is shared-kernel-library infra spanning the HIP GGUF lane,
+the quant roadmap, and DSv4 — out of the #88/Qwen3.5 scope and each needing its
+own verdict before removal. A caller-count grep alone is *not* a deletion
+license here (the cuda-kernels crate is consumed cross-backend through
+macro-generated FFI, so "no `infer-cuda` caller" ≠ dead).
