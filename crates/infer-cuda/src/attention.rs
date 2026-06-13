@@ -3965,11 +3965,11 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     // same vendored kernel SGLang uses. Licensed 2026-06-06 on the TP=8/EP=8 pod:
     // 64-tok resident same-load A/B token-exact vs scalar, 29.47 -> 36.59 tok/s
     // (+24%). `dsv4_flashmla_decode_alloc_enabled` falls through to this, so the
-    // arena allocates under the default. Opt out with ARLE_DSV4_FLASHMLA_DECODE=0.
-    Ok(!matches!(
-        std::env::var("ARLE_DSV4_FLASHMLA_DECODE").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    ))
+    // arena allocates under the default. Compile-gated via `cuda_kernels::HAS_FLASHMLA`
+    // (build.rs sets it from `enable_flashmla`); a build without the FlashMLA kernels
+    // reports false and falls back to scalar — no env var. The AtomicI8 override
+    // above stays for tests/A-B.
+    Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
@@ -3977,22 +3977,17 @@ fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
     // 4096-token warm prefill 7189 -> 4299 ms, and the 2048-token edge case is
     // within the legacy same-config floor on both synthetic and real-prose prompts.
-    // Opt out with ARLE_DSV4_FLASHMLA_PREFILL=0.
-    Ok(!matches!(
-        std::env::var("ARLE_DSV4_FLASHMLA_PREFILL").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    ))
+    // Compile-gated via `cuda_kernels::HAS_FLASHMLA`; scalar fallback when absent.
+    Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
 fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
     // Default ON: prefill wq_a|wkv projection fusion routes the shared hidden
     // activation through FP8 DeepGEMM instead of the scalar FP8 GEMV path. Licensed
-    // 2026-06-07 by the six-shape within-floor gate; keep the scalar fallback via
-    // ARLE_DSV4_FP8_LINEAR_DEEPGEMM=0.
-    Ok(!matches!(
-        std::env::var("ARLE_DSV4_FP8_LINEAR_DEEPGEMM").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    ))
+    // 2026-06-07 by the six-shape within-floor gate. Runtime preflight probe
+    // (`cuda_kernels::has_deepgemm_native()`, cached); scalar FP8-GEMV fallback
+    // when native DeepGEMM is not compiled in.
+    Ok(cuda_kernels::has_deepgemm_native())
 }
 
 fn dsv4_decode_proj_deepgemm_enabled() -> bool {
@@ -4003,10 +3998,7 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
     // reproduced ×2) with the 37-tok needle retrieved bit-identically (divergence
     // only in the free-continuation tail = legitimate FP8 numerics). Opt out with
     // ARLE_DSV4_DECODE_PROJ_DEEPGEMM=0.
-    !matches!(
-        std::env::var("ARLE_DSV4_DECODE_PROJ_DEEPGEMM").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    )
+    cuda_kernels::has_deepgemm_native()
 }
 
 /// Prefill residual projections (wq_b now; wo/indexer next) → tensor-core DeepGEMM
@@ -4016,10 +4008,7 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
 /// retrieved byte-identically (scalar fp8_gemv scales O(M); it's a decode GEMV).
 /// Opt out with ARLE_DSV4_PREFILL_PROJ_DEEPGEMM=0.
 fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_DSV4_PREFILL_PROJ_DEEPGEMM").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    )
+    cuda_kernels::has_deepgemm_native()
 }
 
 /// Prefill DSA indexer query projection → DeepGEMM (134.9 → 6.05ms, −95.5% at M=1024).
@@ -4034,10 +4023,7 @@ fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
 /// borderline at ≥2K is the pre-existing compression-fidelity residual (tracked
 /// separately), NOT a selection break. Opt out with ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM=0.
 fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    )
+    cuda_kernels::has_deepgemm_native()
 }
 
 pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
@@ -4160,11 +4146,10 @@ fn dsv4_fused_wqkv_decode_enabled() -> Result<bool> {
     // decode GPU — the #1 real decode kernel). Licensed 2026-06-06 on the TP=8/EP=8
     // pod, 64-tok same-binary env A/B: 31.774 -> 37.633 tok/s (+18.4%), token-exact.
     // `dsv4_fused_wqkv_decode_alloc_enabled` falls through to this, so the fused
-    // scratch allocates under the default. Opt out with ARLE_DSV4_FUSED_WQKV_DECODE=0.
-    Ok(!matches!(
-        std::env::var("ARLE_DSV4_FUSED_WQKV_DECODE").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    ))
+    // scratch allocates under the default. Runtime preflight probe
+    // (`cuda_kernels::has_deepgemm_native()`, cached); scalar fallback when native
+    // DeepGEMM is absent. The AtomicI8 override above stays for tests/A-B.
+    Ok(cuda_kernels::has_deepgemm_native())
 }
 
 fn env_flag(name: &str) -> Result<bool> {

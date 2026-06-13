@@ -3851,22 +3851,17 @@ pub(crate) fn dsv4_spec_decode_enabled() -> bool {
 /// tok/s; decode ~27→~16ms). The earlier col1 "divergence" was a selftest artifact
 /// (the bonus on a forced-reject draft, which real decode discards) + the per-token
 /// reject mis-applied to the batched path; both resolved. Only matters when
-/// ARLE_DSV4_SPEC_DECODE is on. Opt out with ARLE_DSV4_MTP_BATCHED_VERIFY=0.
+/// ARLE_DSV4_SPEC_DECODE is on. Locked default-on (licensed; pure scheduling over
+/// already-compiled kernels — no build dependency, not an A/B knob).
 pub(crate) fn dsv4_mtp_batched_verify_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_DSV4_MTP_BATCHED_VERIFY").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    )
+    true
 }
 
-/// Batched tree-attention verify lane (fast-path plan P1): default ON for
-/// tree-shaped verify chunks; `ARLE_DSV4_MTP_TREE_ATTN=0` falls back to the
-/// per-row ring-replay lane (the needle-validated reference, ~10 ms/row).
+/// Batched tree-attention verify lane (fast-path plan P1): locked default-on
+/// (licensed; the per-row ring-replay reference lane stays in code as the
+/// non-tree-chunk path, just no longer env-selectable).
 pub(crate) fn dsv4_mtp_tree_attn_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_DSV4_MTP_TREE_ATTN").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    )
+    true
 }
 
 /// P2 commit fold (fast-path plan): commit the accepted prefix from persisted
@@ -3876,10 +3871,7 @@ pub(crate) fn dsv4_mtp_tree_attn_enabled() -> bool {
 /// `ARLE_DSV4_MTP_COMMIT_FOLD=0`. Requires the batched tree lane (default ON;
 /// the persist hook lives there), so the gate is `fold && tree_attn`.
 pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_DSV4_MTP_COMMIT_FOLD").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    )
+    true
 }
 
 /// TP runtime for DSv4 load — multi-rank `nccl` builds resolve the NCCL

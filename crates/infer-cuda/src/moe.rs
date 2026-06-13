@@ -2522,13 +2522,10 @@ mod dsv4_gpu {
         let total_routes = num_tokens * topk;
         // Decode-band FP8 grouped GEMM lane (B=1): compact (real routed rows
         // only, no pad), 16-byte vectorized FP8 weight loads, per-route
-        // correct. Default ON in band; ARLE_DSV4_MOE_DECODE_FP8=0 reverts to
-        // the contiguous DeepGEMM lane (the one-line kill switch). This is the
-        // bandwidth-fixed successor to the scalar-GEMV lane (which lost at 25%
-        // HBM — errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
-        if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES
-            && std::env::var("ARLE_DSV4_MOE_DECODE_FP8").as_deref() != Ok("0")
-        {
+        // correct. Locked default-on in band (native kernel, always compiled —
+        // the bandwidth-fixed successor to the scalar-GEMV lane that lost at 25%
+        // HBM, errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
+        if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
             let tables = layer.gemv_tables.get_or_init(|| {
                 build_gemv_tables(ctx, layer).unwrap_or_else(|e| {
                     log::warn!("DSv4 GEMV decode lane table build failed: {e}");
