@@ -145,13 +145,57 @@ pub const QWEN36_MUTATED_MOE_BUFFERS: &[&str] = &[
     "scratch.expert_mix",
 ];
 
+/// A loaded Qwen3.6 MoE model with all weights resident on the Vulkan device.
+///
+/// Shares the Qwen3.5 loader/config path: the same GGUF→config mapper (it reads
+/// the `qwen35moe` arch + `expert_*` keys) and the same residency plan (routed
+/// experts are Q4_K/Q5_K kept packed). Stores a leaked `&'static` context so the
+/// resident `DeviceBuffer`s outlive any forward call (see [`super::model_qwen35::VulkanQwen35Model`]).
 #[cfg(feature = "vulkan")]
 pub struct VulkanQwen36Model {
     pub config: qwen35_spec::Qwen35Config,
+    ctx: &'static vulkan_sys::VulkanContext,
+    weights: crate::loader::upload::ResidentWeights<'static>,
 }
 
 #[cfg(feature = "vulkan")]
 impl VulkanQwen36Model {
+    /// Load every Qwen3.6 MoE weight resident onto `ctx`'s device via the shared
+    /// Qwen3.5 loader/config path. `ctx` must be `'static` (leak it at the call
+    /// site) so the resident `DeviceBuffer`s outlive any forward call.
+    pub fn load(
+        ctx: &'static vulkan_sys::VulkanContext,
+        gguf: &infer_gguf::gguf::GgufFile,
+    ) -> anyhow::Result<Self> {
+        let config = crate::config::qwen35_config_from_gguf(gguf)?;
+        let plan = crate::loader::plan_model(gguf, config.num_hidden_layers)?;
+        let weights = crate::loader::upload::upload_plan(ctx, gguf, &plan)?;
+        Ok(Self {
+            config,
+            ctx,
+            weights,
+        })
+    }
+
+    /// Number of device-resident weight tensors (token_embd is host-side).
+    pub fn resident_tensor_count(&self) -> usize {
+        self.weights.tensors.len()
+    }
+
+    /// Total bytes of device-resident weights across all tensors.
+    pub fn resident_device_bytes(&self) -> u64 {
+        self.weights
+            .tensors
+            .values()
+            .map(|t| t.buffer.len() as u64)
+            .sum()
+    }
+
+    /// The Vulkan device this model is resident on.
+    pub fn device_name(&self) -> &str {
+        self.ctx.device_name()
+    }
+
     pub fn forward_token(
         &mut self,
         _slot: usize,
@@ -160,6 +204,9 @@ impl VulkanQwen36Model {
         _start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
         let _ = qwen36_moe_launcher_sequence();
+        // Resident MoE state is bound (`self.weights` on `self.ctx`); the numeric
+        // forward over the launcher sequence is a later task.
+        let _ = (&self.weights, self.ctx);
         anyhow::bail!(
             "Vulkan Qwen3.6 numeric forward requires MoE weight residency binding for the launcher sequence"
         )

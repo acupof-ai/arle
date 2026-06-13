@@ -226,13 +226,63 @@ pub const QWEN35_MUTATED_RECURRENT_BUFFERS: &[&str] = &[
     "slot.full.v_cache_bf16",
 ];
 
+/// A loaded Qwen3.5 hybrid model with all weights resident on the Vulkan device.
+///
+/// `ResidentWeights<'a>`'s `DeviceBuffer`s borrow the [`vulkan_sys::VulkanContext`]
+/// they were allocated on, so the context must outlive every forward call. The
+/// model lives until process exit, so we store a **leaked** `&'static` context
+/// (`Box::leak`) and pin the resident weights to that `'static` lifetime — the
+/// context (and its GPU allocations) are released only when the process ends.
 #[cfg(feature = "vulkan")]
 pub struct VulkanQwen35Model {
     pub config: qwen35_spec::Qwen35Config,
+    ctx: &'static vulkan_sys::VulkanContext,
+    weights: crate::loader::upload::ResidentWeights<'static>,
 }
 
 #[cfg(feature = "vulkan")]
 impl VulkanQwen35Model {
+    /// Load every Qwen3.5 weight resident onto `ctx`'s device.
+    ///
+    /// Maps the GGUF metadata to a [`qwen35_spec::Qwen35Config`], plans the
+    /// per-tensor residency for all `num_hidden_layers` blocks, and uploads the
+    /// plan (K-quant/Q8_0 packed, F16/BF16→F16, F32→F32, token_embd host-side).
+    /// `ctx` must be `'static` (leak it at the call site) so the resident
+    /// `DeviceBuffer`s outlive any single forward call.
+    pub fn load(
+        ctx: &'static vulkan_sys::VulkanContext,
+        gguf: &infer_gguf::gguf::GgufFile,
+    ) -> anyhow::Result<Self> {
+        let config = crate::config::qwen35_config_from_gguf(gguf)?;
+        let plan = crate::loader::plan_model(gguf, config.num_hidden_layers)?;
+        let weights = crate::loader::upload::upload_plan(ctx, gguf, &plan)?;
+        Ok(Self {
+            config,
+            ctx,
+            weights,
+        })
+    }
+
+    /// Number of device-resident weight tensors (token_embd is host-side and not
+    /// counted). Lets a load smoke-test assert the model actually landed.
+    pub fn resident_tensor_count(&self) -> usize {
+        self.weights.tensors.len()
+    }
+
+    /// Total bytes of device-resident weights across all tensors.
+    pub fn resident_device_bytes(&self) -> u64 {
+        self.weights
+            .tensors
+            .values()
+            .map(|t| t.buffer.len() as u64)
+            .sum()
+    }
+
+    /// The Vulkan device this model is resident on.
+    pub fn device_name(&self) -> &str {
+        self.ctx.device_name()
+    }
+
     pub fn forward_token(
         &mut self,
         _slot: usize,
@@ -241,6 +291,9 @@ impl VulkanQwen35Model {
         _start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
         let _ = qwen35_forward_kernel_sequence(&self.config.layer_types);
+        // Resident state is bound (`self.weights` on `self.ctx`); the numeric
+        // forward over the launcher sequence is a later task.
+        let _ = (&self.weights, self.ctx);
         anyhow::bail!(
             "Vulkan Qwen3.5 numeric forward requires GGUF/safetensor residency binding for the launcher sequence"
         )

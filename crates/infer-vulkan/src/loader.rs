@@ -10,8 +10,11 @@
 //! (`crates/vulkan-kernels`) consumes:
 //! - K-quants (Q4_K/Q5_K/Q6_K) stay quantized on device — the registered
 //!   `mul_mat_vecq` GEMV path reads them directly (no dequant).
-//! - Q8_0/F16/BF16 weights dequantize to F16 (coopmat-FP16 GEMM consumer;
-//!   no Q8_0 GEMV is registered yet — Phase 1 may add one to keep them packed).
+//! - Q8_0 weights ALSO stay packed: `Kernel::GemvQ8_0` (`q8_0_gemv_with_params`)
+//!   reads the raw 34 B/32 blocks directly. Dequantizing them to F16 would
+//!   double device bytes and decode bandwidth versus llama.cpp, so they ride
+//!   the same packed tier as the K-quants.
+//! - F16/BF16 weights dequantize to F16 (coopmat-FP16 GEMM consumer).
 //! - F32 tensors (norms, SSM params, router) stay F32 on device.
 //! - `token_embd.weight` stays as raw GGUF bytes on the host so the embedding
 //!   "lookup" gathers + dequantizes a single row per token instead of
@@ -21,20 +24,14 @@ use anyhow::{Result, bail, ensure};
 
 use infer_gguf::gguf::{GgmlType, GgufFile, TensorInfo};
 
-/// K-quant tiers the Vulkan GEMV surface serves directly (kept packed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KQuant {
-    Q4K,
-    Q5K,
-    Q6K,
-}
-
 /// Per-tensor device-format decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Residency {
-    /// Q4_K/Q5_K/Q6_K uploaded as-is; consumed by the quantized GEMV.
-    KeepKQuant(KQuant),
-    /// Q8_0/F16/BF16 dequantized to F16 on device.
+    /// Q4_K/Q5_K/Q6_K/Q8_0 uploaded as raw GGUF bytes; consumed directly by the
+    /// matching quantized GEMV (`mul_mat_vecq` for K-quants, `q8_0_gemv` for
+    /// Q8_0). The held [`GgmlType`] selects the device decode path.
+    KeepQuant(GgmlType),
+    /// F16/BF16 dequantized to F16 on device.
     DequantF16,
     /// F32 norms / SSM params / router uploaded as F32.
     DequantF32,
@@ -73,6 +70,11 @@ pub enum Qwen35TensorKind {
     SsmDtBias,
     SsmNorm,
     SsmOut,
+    // --- dense FFN (Qwen3.5 dense, e.g. the 27B) ---
+    FfnNorm,
+    FfnGate,
+    FfnUp,
+    FfnDown,
     // --- MoE FFN ---
     FfnGateInp,
     FfnGateExps,
@@ -103,6 +105,7 @@ impl Qwen35TensorKind {
                 | Self::AttnQNorm
                 | Self::AttnKNorm
                 | Self::SsmNorm
+                | Self::FfnNorm
         )
     }
 }
@@ -163,6 +166,11 @@ pub fn classify_qwen35_tensor(name: &str) -> Result<Qwen35TensorRole> {
         "ssm_dt.bias" => SsmDtBias,
         "ssm_norm.weight" => SsmNorm,
         "ssm_out.weight" => SsmOut,
+        // dense FFN (Qwen3.5 dense)
+        "ffn_norm.weight" => FfnNorm,
+        "ffn_gate.weight" => FfnGate,
+        "ffn_up.weight" => FfnUp,
+        "ffn_down.weight" => FfnDown,
         // MoE FFN
         "ffn_gate_inp.weight" => FfnGateInp,
         "ffn_gate_exps.weight" => FfnGateExps,
@@ -186,11 +194,11 @@ pub fn plan_residency(kind: Qwen35TensorKind, ty: GgmlType) -> Residency {
         return Residency::HostEmbedding;
     }
     match ty {
-        GgmlType::Q4K => Residency::KeepKQuant(KQuant::Q4K),
-        GgmlType::Q5K => Residency::KeepKQuant(KQuant::Q5K),
-        GgmlType::Q6K => Residency::KeepKQuant(KQuant::Q6K),
+        // Quant tiers with a registered device GEMV stay packed (raw bytes):
+        // K-quants via `mul_mat_vecq`, Q8_0 via `q8_0_gemv`.
+        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0 => Residency::KeepQuant(ty),
         GgmlType::F32 => Residency::DequantF32,
-        // Q8_0 / F16 / BF16 (and anything else dequantizable) → F16 on device.
+        // F16 / BF16 (and anything else dequantizable) → F16 on device.
         _ => Residency::DequantF16,
     }
 }
@@ -202,7 +210,7 @@ pub fn device_bytes(residency: Residency, info: &TensorInfo) -> Result<u64> {
         Residency::HostEmbedding => 0,
         Residency::DequantF16 => n * 2,
         Residency::DequantF32 => n * 4,
-        Residency::KeepKQuant(_) => info.byte_len().ok_or_else(|| {
+        Residency::KeepQuant(_) => info.byte_len().ok_or_else(|| {
             anyhow::anyhow!(
                 "tensor {}: cannot keep {:?} packed (unaligned ne0 {} for {:?})",
                 info.name,
@@ -462,7 +470,7 @@ pub mod upload {
             let mut buffer = vulkan_sys::DeviceBuffer::alloc(ctx, t.bytes as usize)
                 .map_err(|e| anyhow!("alloc {} ({} B): {e}", t.name, t.bytes))?;
             match t.residency {
-                Residency::KeepKQuant(_) => {
+                Residency::KeepQuant(_) => {
                     buffer
                         .copy_from_host(src)
                         .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
@@ -553,8 +561,8 @@ pub mod upload {
             // Synthesize a tiny qwen35moe GGUF:
             //   token_embd.weight  F32  [hidden=8, vocab=4]      -> HostEmbedding
             //   blk.0.attn_norm.weight F32 [8]                   -> DequantF32
-            //   blk.0.attn_q.weight    Q8_0 [32]  (34 B/32)      -> DequantF16
-            //   blk.0.ffn_gate_exps.weight Q4_K [256] (144 B/256)-> KeepKQuant(Q4K)
+            //   blk.0.attn_q.weight    Q8_0 [32]  (34 B/32)      -> KeepQuant(Q8_0)
+            //   blk.0.ffn_gate_exps.weight Q4_K [256] (144 B/256)-> KeepQuant(Q4K)
             let hidden = 8u64;
             let vocab = 4u64;
             let mut embd = Vec::new();
@@ -587,7 +595,7 @@ pub mod upload {
                         name: "blk.0.attn_q.weight".into(),
                         dims: vec![32],
                         type_id: 8, // Q8_0
-                        data: q8_0,
+                        data: q8_0.clone(),
                     },
                     T {
                         name: "blk.0.ffn_gate_exps.weight".into(),
@@ -631,12 +639,32 @@ pub mod upload {
                 );
             }
 
-            // KeepKQuant Q4_K round-trips byte-for-byte (raw quant bytes uploaded).
+            // KeepQuant Q4_K round-trips byte-for-byte (raw quant bytes uploaded).
             let q4 = resident.get("blk.0.ffn_gate_exps.weight").unwrap();
-            assert!(matches!(q4.residency, Residency::KeepKQuant(_)));
+            assert!(matches!(
+                q4.residency,
+                Residency::KeepQuant(infer_gguf::gguf::GgmlType::Q4K)
+            ));
             let mut back = vec![0u8; q4.buffer.len()];
             q4.buffer.copy_to_host(&mut back).expect("D2H Q4_K");
             assert_eq!(back, q4_k, "Q4_K device round-trip mismatch");
+
+            // Q8_0 now stays PACKED (KeepQuant), not dequantized to F16: the raw
+            // 34 B block round-trips byte-for-byte (it would be 64 B of F16 if it
+            // had been dequantized — proving the packed Q8_0 tier holds).
+            let q8 = resident.get("blk.0.attn_q.weight").unwrap();
+            assert!(matches!(
+                q8.residency,
+                Residency::KeepQuant(infer_gguf::gguf::GgmlType::Q8_0)
+            ));
+            assert_eq!(
+                q8.buffer.len(),
+                34,
+                "Q8_0 kept packed at 34 B (not 64 B F16)"
+            );
+            let mut q8_back = vec![0u8; q8.buffer.len()];
+            q8.buffer.copy_to_host(&mut q8_back).expect("D2H Q8_0");
+            assert_eq!(q8_back, q8_0, "Q8_0 device round-trip mismatch");
 
             // Embedding row 0 gathers `hidden` f32 values.
             let row0 = resident.embedding.embed_row(0).expect("embed_row(0)");
@@ -740,21 +768,13 @@ mod tests {
             Residency::HostEmbedding
         );
         // K-quants stay packed for the GEMV.
-        assert_eq!(
-            plan_residency(FfnGateExps, Q4K),
-            Residency::KeepKQuant(KQuant::Q4K)
-        );
-        assert_eq!(
-            plan_residency(FfnDownExps, Q5K),
-            Residency::KeepKQuant(KQuant::Q5K)
-        );
-        assert_eq!(
-            plan_residency(LmHead, Q6K),
-            Residency::KeepKQuant(KQuant::Q6K)
-        );
-        // Q8_0 attention/projection weights → F16.
-        assert_eq!(plan_residency(AttnQ, Q8_0), Residency::DequantF16);
-        assert_eq!(plan_residency(SsmOut, Q8_0), Residency::DequantF16);
+        assert_eq!(plan_residency(FfnGateExps, Q4K), Residency::KeepQuant(Q4K));
+        assert_eq!(plan_residency(FfnDownExps, Q5K), Residency::KeepQuant(Q5K));
+        assert_eq!(plan_residency(LmHead, Q6K), Residency::KeepQuant(Q6K));
+        // Q8_0 attention/projection weights now ALSO stay packed (q8_0_gemv
+        // reads them directly) — NOT dequantized to F16.
+        assert_eq!(plan_residency(AttnQ, Q8_0), Residency::KeepQuant(Q8_0));
+        assert_eq!(plan_residency(SsmOut, Q8_0), Residency::KeepQuant(Q8_0));
         // F32 norms / SSM params / router → F32.
         assert_eq!(plan_residency(AttnNorm, F32), Residency::DequantF32);
         assert_eq!(plan_residency(SsmA, F32), Residency::DequantF32);

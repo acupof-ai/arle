@@ -35,10 +35,20 @@ pub fn classify_vulkan_architecture(
     if arch.contains("gemma4") || name.contains("gemma-4") || name.contains("gemma4") {
         return VulkanModelKind::Gemma4;
     }
-    if arch.contains("qwen3moe") || arch.contains("qwen3_moe") || expert_count > 0 {
+    // MoE first: `qwen35moe` / `qwen3moe` archs and anything with experts. Note
+    // `qwen35moe.contains("qwen35")` is true, so this MUST precede the dense
+    // `qwen35` hybrid check below.
+    if arch.contains("qwen35moe")
+        || arch.contains("qwen3moe")
+        || arch.contains("qwen3_moe")
+        || expert_count > 0
+    {
         return VulkanModelKind::Qwen36Moe;
     }
-    if name.contains("qwen3.5") || name.contains("qwen35") {
+    // Dense Qwen3.5/3.6 hybrid: the on-box 27B reports `general.architecture =
+    // "qwen35"` (the model name is unset/unreliable), so match the arch string
+    // as well as any "qwen3.5"/"qwen35" in the name.
+    if arch.contains("qwen35") || name.contains("qwen3.5") || name.contains("qwen35") {
         return VulkanModelKind::Qwen35Hybrid;
     }
     VulkanModelKind::Qwen3Dense
@@ -105,6 +115,45 @@ impl VulkanExecutor {
     #[must_use]
     pub fn unloaded() -> Self {
         Self::default()
+    }
+
+    /// Whether a model is resident on the device.
+    #[must_use]
+    pub fn has_model(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        {
+            self.model.is_some()
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
+    }
+
+    /// `(resident_tensor_count, resident_device_bytes)` for the loaded model, or
+    /// `None` if no model is loaded. Lets a load smoke-test assert the weights
+    /// actually landed on the device.
+    #[cfg(feature = "vulkan")]
+    #[must_use]
+    pub fn resident_stats(&self) -> Option<(usize, u64)> {
+        let model = self.model.as_ref()?;
+        Some(match model {
+            VulkanLoadedModel::Qwen35(m) => (m.resident_tensor_count(), m.resident_device_bytes()),
+            VulkanLoadedModel::Qwen36(m) => (m.resident_tensor_count(), m.resident_device_bytes()),
+            _ => return None,
+        })
+    }
+
+    /// Device name of the loaded model, or `None` if no model is loaded.
+    #[cfg(feature = "vulkan")]
+    #[must_use]
+    pub fn device_name(&self) -> Option<&str> {
+        let model = self.model.as_ref()?;
+        Some(match model {
+            VulkanLoadedModel::Qwen35(m) => m.device_name(),
+            VulkanLoadedModel::Qwen36(m) => m.device_name(),
+            _ => return None,
+        })
     }
 
     fn forward_tokens(
@@ -219,11 +268,46 @@ pub fn load_qwen3_gguf(
     let kind = classify_vulkan_gguf(&gguf)?;
     #[cfg(feature = "vulkan")]
     {
-        let _ = gguf;
-        bail!(
-            "Vulkan {kind:?} GGUF load is pending per-model config mapping and residency upload; \
-             host GGUF parse and architecture classification succeeded"
-        )
+        // Build the right model with all weights resident on the GPU. The
+        // model's `ResidentWeights` hold `DeviceBuffer`s that borrow the
+        // `VulkanContext`, and the model must outlive every forward call, so we
+        // leak a `'static` context (released only at process exit — acceptable
+        // for a process-lifetime resident model).
+        let model = match kind {
+            VulkanModelKind::Qwen35Hybrid => {
+                let ctx: &'static vulkan_sys::VulkanContext =
+                    Box::leak(Box::new(vulkan_sys::VulkanContext::create()?));
+                let model = crate::model_qwen35::VulkanQwen35Model::load(ctx, &gguf)?;
+                VulkanLoadedModel::Qwen35(Box::new(model))
+            }
+            VulkanModelKind::Qwen36Moe => {
+                let ctx: &'static vulkan_sys::VulkanContext =
+                    Box::leak(Box::new(vulkan_sys::VulkanContext::create()?));
+                let model = crate::model_qwen36::VulkanQwen36Model::load(ctx, &gguf)?;
+                VulkanLoadedModel::Qwen36(Box::new(model))
+            }
+            other => bail!(
+                "Vulkan {other:?} GGUF load is not wired yet \
+                 (only Qwen35Hybrid / Qwen36Moe land resident); \
+                 host GGUF parse + classification succeeded"
+            ),
+        };
+        let stop_tokens = match &model {
+            VulkanLoadedModel::Qwen35(m) => m.config.stop_token_ids.clone(),
+            VulkanLoadedModel::Qwen36(m) => m.config.stop_token_ids.clone(),
+            _ => Vec::new(),
+        };
+
+        // Page the KV cache so `num_slots` sequences can each reach `max_seq_len`.
+        let pages_per_slot = max_seq_len.div_ceil(DEFAULT_PAGE_SIZE);
+        let total_pages = num_slots * pages_per_slot;
+        let pool = VulkanKvPool::new(num_slots, total_pages, DEFAULT_PAGE_SIZE, max_seq_len);
+
+        let exec = VulkanExecutor {
+            model: Some(model),
+            stop_tokens,
+        };
+        Ok((exec, pool))
     }
     #[cfg(not(feature = "vulkan"))]
     {
@@ -324,5 +408,50 @@ mod tests {
         assert!(err.to_string().contains("no model loaded"), "{err}");
         let err = exec.submit(&one_row_plan(true), &mut pool).unwrap_err();
         assert!(err.to_string().contains("no model loaded"), "{err}");
+    }
+
+    /// On-box load test against the REAL Qwen3.6-27B GGUF. `#[ignore]` by
+    /// default (loads ~26 GB onto the GPU); run with
+    /// `cargo test -p infer-vulkan --features vulkan --lib -- --ignored --nocapture`.
+    /// Skips gracefully if the model file or a Vulkan device is absent. Proves
+    /// the 27B lands resident on the 8060S via ARLE (the step before the
+    /// numeric forward, which still bails).
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "needs the on-box Qwen3.6-27B GGUF + ~26 GB VRAM"]
+    fn loads_real_27b_resident_on_device() {
+        let path = std::path::Path::new(r"C:\Users\Asus\models\qwen3.6\Qwen3.6-27B-Q8_0.gguf");
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            return;
+        }
+        // Skip cleanly if no Vulkan device is available on this box.
+        if let Err(e) = vulkan_sys::VulkanContext::create() {
+            eprintln!("skip: no Vulkan device available ({e})");
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let (exec, _pool) =
+            load_qwen3_gguf(path, 1, 4096).expect("load_qwen3_gguf on the real 27B must succeed");
+        let elapsed = started.elapsed();
+
+        assert!(exec.has_model(), "executor must hold a loaded model");
+        let (tensor_count, device_bytes) = exec
+            .resident_stats()
+            .expect("loaded model must report resident stats");
+        assert!(
+            tensor_count > 0,
+            "model must have at least one device-resident tensor"
+        );
+
+        let device_gb = device_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        eprintln!(
+            "PASS: loaded Qwen3.6-27B resident on {}: {} tensors, {:.2} GiB device bytes, {:.1}s",
+            exec.device_name().unwrap_or("<unknown>"),
+            tensor_count,
+            device_gb,
+            elapsed.as_secs_f64(),
+        );
     }
 }
