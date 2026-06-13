@@ -370,6 +370,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_fp8_grouped_swiglu_decode_cuda(
+        weight_gate_ptrs: *const u64,
+        scale_gate_ptrs: *const u64,
+        weight_up_ptrs: *const u64,
+        scale_up_ptrs: *const u64,
+        input: *const Half,
+        act: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_cols: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dsv4_fp8_grouped_down_decode_cuda(
+        weight_ptrs: *const u64,
+        scale_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_fp4_grouped_gemv_batch_cuda(
         weight_ptrs: *const u64,
         scale_ptrs: *const u64,
