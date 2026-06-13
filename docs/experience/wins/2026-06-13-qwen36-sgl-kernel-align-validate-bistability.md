@@ -146,6 +146,56 @@ the perf A/B at every c**:
 Disposition: **opt-in default-OFF, no flip.** Both load-path bugs fixed (the
 lane is now usable for anyone who wants it), but it is a perf loss at this shape.
 
+### U3 root cause — fused_moe is a per-(expert,N-tile)-block kernel; at decode that makes cost ∝ active_experts ∝ c (flat throughput)
+
+Not a tuning miss — **structural mismatch of the kernel family to the shape.**
+Source-confirmed chain (no runtime counter needed for the verdict):
+
+1. **`BLOCK_SIZE_M = 64` baked** into the AOT cubin (`build.rs:645` —
+   `BLOCK_SIZE_M/N/K = 64/64/32, GROUP_SIZE_M = 1`, a single prefill/large-batch
+   tile config; we compiled ONE config, not SGLang's per-M tuning sweep).
+2. **`moe_align_block_size` pads each active expert's token group up to a
+   multiple of 64** (`csrc/moe/moe_align_block_size.cu:12` —
+   `total_tokens_post_pad = Σ_e ceil(count_e / block_size) · block_size`). At
+   decode each touched expert carries 1–2 real tokens → a full 64-row block.
+3. **The GEMM grid is launched at the host worst case**
+   `max_padded = numel + (E+1)·63` (`moe.rs:1222`, passed as `EM` at `moe.rs:1293`)
+   → `num_pid_m = cdiv(EM, 64) ≈ 254`, `num_pid_n = cdiv(2N=1024, 64) = 16` →
+   **≈ 4064 GEMM1 blocks launched regardless of c** (the `E·63` term dominates;
+   `numel = c·8` is negligible). Only `active_experts × 16` do real work; the
+   rest early-return (`arle_fused_moe.py:165`,
+   `if pid_m·BLOCK_SIZE_M >= num_tokens_post_padded: return`).
+4. **The hand control uses a decode-specialized, row-linear, weight-read-bound
+   path** at `R ≤ 256`: `moe_bf16_grouped_gemm_swiglu_decode` → `_decode`
+   (`moe.rs:14-19`). No fixed-block padding — cost ∝ real routed rows +
+   touched-expert weight bytes, not padded blocks.
+
+**Mechanism.** At decode the `c·top_k` routed rows scatter across ~`c·top_k`
+*distinct* experts (E=256 ≫ c·top_k → few collisions: c=8 → 64 draws →
+256·(1−(255/256)^64) ≈ 57 distinct). Fused real work = active_experts blocks ∝
+active_experts ∝ c → **per-step MoE time grows linearly with c → aggregate
+throughput is flat** (138.7 → 139.5 → 138.8). The ~constant ~4k-block grid
+(worst-case `E·63` padding) is a fixed per-step overhead → worst *per token* at
+c=1, which is the extra −17.8% there. The hand decode kernel keeps MoE a small,
+row-linear fraction of the step, so the fixed per-step overhead (attention /
+norm / sample / launch) amortizes as c grows → 154 → 207 → 256.
+
+**Open (ncu, verdict-robust).** Which resource binds the fused path — compute on
+the ~64× inflated MMA, occupancy/scheduling on the ~3k early-returning tiny
+blocks, or HBM — needs an `ncu` profile on a free GPU. It does **not** move the
+verdict: all three scale ∝ active_experts ∝ c, so each predicts the same flat
+plateau. (Per §0, recorded as hypothesis, not asserted.)
+
+**Why a retune won't rescue it.** SGLang's small-M decode config
+(`BLOCK_SIZE_M = 16`) cuts the constant padding factor 64× → 16× but the
+∝active_experts structure persists: at E ≫ c·top_k every active expert still
+needs ≥1 block. `fused_moe` triton is architected for large M-per-expert
+(prefill big batch), few experts-per-rank (EP sharding concentrates tokens →
+count_e large → padding amortized), or FP8 (tensor-core-bound, where the
+padding's compute waste hides under the dtype win). Single-GPU bf16 256-expert
+top-8 **decode** is its worst case — SGLang itself does not run fused_moe triton
+here. The in-tree hand decode-band kernel is already the right tool for this shape.
+
 ## Rule
 
 - **At `c == num_slots`, throughput is bimodal (one-wave vs two-wave admission);
@@ -173,3 +223,14 @@ lane is now usable for anyone who wants it), but it is a perf loss at this shape
   reads shared-expert weights, not the routed Vecs. Codex review caught the same
   gap by static analysis — the §0.1 "enumerate every mutated buffer + prove each"
   discipline applies symmetrically to every *reader* of a freed buffer.
+- **A fixed-block (`BLOCK_SIZE_M`) GEMM is the wrong kernel family for `E ≫
+  c·top_k` decode, and no tile retune fixes it.** A per-(expert,N-tile)-block
+  kernel pays ≥1 padded block per *active* expert; at decode the routed rows
+  scatter ~1-per-expert across a huge expert pool, so cost ∝ active_experts ∝ c
+  → flat (non-scaling) throughput, independent of the constant padding factor.
+  Match the kernel family to the batch regime *before* porting: fused_moe triton
+  wants large M-per-expert (prefill), few experts-per-rank (EP), or FP8;
+  single-GPU bf16 many-expert decode wants the row-linear weight-read-bound
+  grouped path. Diagnose the *shape* of the throughput-vs-c curve (flat ⇒
+  per-step time ∝ c ⇒ work ∝ active_experts), not just the Δ% — the curve shape
+  names the mechanism.
