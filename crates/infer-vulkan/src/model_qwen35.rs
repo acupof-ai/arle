@@ -238,6 +238,8 @@ pub struct VulkanQwen35Model {
     pub config: qwen35_spec::Qwen35Config,
     ctx: &'static vulkan_sys::VulkanContext,
     weights: crate::loader::upload::ResidentWeights<'static>,
+    /// Per-slot recurrent + KV state for the (single-slot) numeric forward.
+    state: crate::forward::Qwen35ForwardState,
 }
 
 #[cfg(feature = "vulkan")]
@@ -256,11 +258,18 @@ impl VulkanQwen35Model {
         let config = crate::config::qwen35_config_from_gguf(gguf)?;
         let plan = crate::loader::plan_model(gguf, config.num_hidden_layers)?;
         let weights = crate::loader::upload::upload_plan(ctx, gguf, &plan)?;
+        let state = crate::forward::Qwen35ForwardState::new(&config);
         Ok(Self {
             config,
             ctx,
             weights,
+            state,
         })
+    }
+
+    /// Reset the per-slot recurrent + KV state for a fresh generation.
+    pub fn reset_state(&mut self) {
+        self.state.reset();
     }
 
     /// Number of device-resident weight tensors (token_embd is host-side and not
@@ -283,19 +292,30 @@ impl VulkanQwen35Model {
         self.ctx.device_name()
     }
 
+    /// Numeric forward for one token at `start_pos`, returning logits `[vocab]`.
+    ///
+    /// Heavy matmuls run on-device (proven Q8_0 GEMV); the elementwise / norm /
+    /// attention / gated-delta math runs on the host in f32. See
+    /// [`crate::forward`] for the contract. This single-slot lane runs the
+    /// uncached full-prefix path: `start_pos` must equal the materialized
+    /// sequence length (advanced here), so feed a sequence's tokens in order
+    /// (call [`Self::reset_state`] between sequences). `slot` / `epoch` are
+    /// accepted for executor-signature parity but unused by this single-slot
+    /// state.
     pub fn forward_token(
         &mut self,
         _slot: usize,
         _epoch: u64,
-        _token: u32,
-        _start_pos: usize,
+        token: u32,
+        start_pos: usize,
     ) -> anyhow::Result<Vec<f32>> {
-        let _ = qwen35_forward_kernel_sequence(&self.config.layer_types);
-        // Resident state is bound (`self.weights` on `self.ctx`); the numeric
-        // forward over the launcher sequence is a later task.
-        let _ = (&self.weights, self.ctx);
-        anyhow::bail!(
-            "Vulkan Qwen3.5 numeric forward requires GGUF/safetensor residency binding for the launcher sequence"
+        crate::forward::forward_token(
+            self.ctx,
+            &self.config,
+            &self.weights,
+            &mut self.state,
+            token,
+            start_pos,
         )
     }
 }
@@ -431,5 +451,110 @@ mod tests {
         assert_eq!(spec.specialization_u32()[4], (4, 256));
         assert_eq!(spec.specialization_u32()[12], (12, 1));
         assert_eq!(spec.specialization_u32()[14], (14, 2));
+    }
+
+    /// On-box numeric forward over the REAL dense 27B GGUF. `#[ignore]` by
+    /// default; run with
+    /// `cargo test -p infer-vulkan --features vulkan --lib -- --ignored --nocapture`.
+    /// Skips cleanly if the model file or a Vulkan device is absent.
+    ///
+    /// Asserts the logits are FINITE and length == vocab, prints the argmax
+    /// token id and the top-5 logits, then greedy-decodes ~10 tokens.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "needs the on-box Qwen3.6-27B GGUF + a Vulkan device"]
+    fn qwen35_27b_numeric_forward_is_finite() {
+        let path = std::path::Path::new(r"C:\Users\Asus\models\qwen3.6\Qwen3.6-27B-Q8_0.gguf");
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            return;
+        }
+        let ctx: &'static vulkan_sys::VulkanContext = match vulkan_sys::VulkanContext::create() {
+            Ok(c) => Box::leak(Box::new(c)),
+            Err(e) => {
+                eprintln!("no Vulkan device available ({e}); skipping 27B forward test");
+                return;
+            }
+        };
+        eprintln!("ARLE Vulkan 27B forward on: {}", ctx.device_name());
+        for (i, (size, dev_local)) in ctx.memory_heaps().iter().enumerate() {
+            eprintln!("  heap {i}: {} MB, device_local={dev_local}", size >> 20);
+        }
+
+        let gguf = infer_gguf::gguf::GgufFile::open(path).expect("open 27B GGUF");
+        let mut model = VulkanQwen35Model::load(ctx, &gguf).expect("load 27B onto device");
+        eprintln!(
+            "loaded 27B: {} resident tensors, {} device bytes, vocab {}",
+            model.resident_tensor_count(),
+            model.resident_device_bytes(),
+            model.config.vocab_size
+        );
+
+        // A handful of arbitrary in-range token ids (no tokenizer here): a small
+        // prompt-shaped prefix. The forward runs the uncached full-prefix path,
+        // so feed positions 0..n in order.
+        let prompt: [u32; 5] = [785, 6722, 315, 9625, 374]; // arbitrary, < vocab
+        let vocab = model.config.vocab_size;
+
+        let mut last_logits: Vec<f32> = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let tok = tok % vocab as u32;
+            last_logits = model
+                .forward_token(0, 0, tok, pos)
+                .unwrap_or_else(|e| panic!("forward_token(pos={pos}) failed: {e}"));
+            assert_eq!(last_logits.len(), vocab, "logits length must equal vocab");
+            assert!(
+                last_logits.iter().all(|v| v.is_finite()),
+                "logits at pos {pos} contain NaN/Inf"
+            );
+        }
+
+        // Top-5 of the final prompt token's logits.
+        let argmax = argmax_of(&last_logits);
+        let mut idx: Vec<usize> = (0..last_logits.len()).collect();
+        idx.sort_unstable_by(|&a, &b| {
+            last_logits[b]
+                .partial_cmp(&last_logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        eprintln!(
+            "argmax token id = {argmax} (logit {:+.4})",
+            last_logits[argmax]
+        );
+        eprintln!("top-5 logits:");
+        for &i in idx.iter().take(5) {
+            eprintln!("  token {i:>6} -> {:+.4}", last_logits[i]);
+        }
+
+        // Greedy-decode ~10 tokens continuing from the prompt.
+        let mut decoded: Vec<u32> = Vec::new();
+        let mut next = argmax as u32;
+        let mut pos = prompt.len();
+        for _ in 0..10 {
+            decoded.push(next);
+            let logits = model
+                .forward_token(0, 0, next, pos)
+                .unwrap_or_else(|e| panic!("greedy forward_token(pos={pos}) failed: {e}"));
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "greedy logits at pos {pos} contain NaN/Inf"
+            );
+            next = argmax_of(&logits) as u32;
+            pos += 1;
+        }
+        eprintln!("greedy-decoded 10 token ids: {decoded:?}");
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn argmax_of(v: &[f32]) -> usize {
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &x) in v.iter().enumerate() {
+            if x > best_v {
+                best_v = x;
+                best = i;
+            }
+        }
+        best
     }
 }

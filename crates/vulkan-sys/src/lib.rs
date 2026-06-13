@@ -245,6 +245,44 @@ mod real {
             &self.device
         }
 
+        /// Per-heap `(size_bytes, is_device_local)` for diagnostics / budgeting.
+        pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_memory_properties(self.physical_device)
+            };
+            (0..props.memory_heap_count as usize)
+                .map(|i| {
+                    let heap = props.memory_heaps[i];
+                    (
+                        heap.size,
+                        heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
+                    )
+                })
+                .collect()
+        }
+
+        /// Per-memory-type `(heap_index, device_local, host_visible)` — lets a
+        /// caller see which heap a HOST_VISIBLE allocation actually lands on.
+        pub fn memory_types(&self) -> Vec<(u32, bool, bool)> {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_memory_properties(self.physical_device)
+            };
+            (0..props.memory_type_count as usize)
+                .map(|i| {
+                    let ty = props.memory_types[i];
+                    (
+                        ty.heap_index,
+                        ty.property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+                        ty.property_flags
+                            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
+                    )
+                })
+                .collect()
+        }
+
         fn memory_type_index(
             &self,
             type_bits: u32,
@@ -254,17 +292,28 @@ mod real {
                 self.instance
                     .get_physical_device_memory_properties(self.physical_device)
             };
+            // Among the compatible memory types, prefer the one whose heap is
+            // largest. On a unified-memory APU several device-local types map to
+            // different-sized heaps (e.g. 32 GB vs 64 GB); steering multi-GB
+            // weight allocations to the biggest heap maximizes headroom for the
+            // later per-dispatch working set.
+            let mut best: Option<(u32, u64)> = None;
             for i in 0..props.memory_type_count {
                 let bit = 1u32.checked_shl(i).unwrap_or(0);
                 if type_bits & bit == 0 {
                     continue;
                 }
-                let flags = props.memory_types[i as usize].property_flags;
-                if flags.contains(required) {
-                    return Ok(i);
+                let ty = props.memory_types[i as usize];
+                if !ty.property_flags.contains(required) {
+                    continue;
+                }
+                let heap_size = props.memory_heaps[ty.heap_index as usize].size;
+                match best {
+                    Some((_, best_size)) if best_size >= heap_size => {}
+                    _ => best = Some((i, heap_size)),
                 }
             }
-            Err(VulkanError::NoMemoryType {
+            best.map(|(i, _)| i).ok_or(VulkanError::NoMemoryType {
                 type_bits,
                 required_flags: required.as_raw(),
             })
@@ -438,6 +487,48 @@ mod real {
                 self.ctx.device.unmap_memory(self.memory);
             }
             Ok(())
+        }
+
+        /// Allocate a **DEVICE_LOCAL** (not host-visible) buffer and fill it from
+        /// `src` via a temporary host-visible staging buffer + a one-shot copy.
+        ///
+        /// Resident weights are written once and only read by the GPU, so they
+        /// belong in device-local memory. On a unified-memory APU the
+        /// host-visible heap is a smaller carve-out; routing multi-GB weights
+        /// through it (as `alloc` + `copy_from_host` does) exhausts it and makes
+        /// later per-dispatch submits fail with `ERROR_OUT_OF_DEVICE_MEMORY`.
+        /// Staging keeps the big buffers on the large device-local heap and
+        /// frees the staging copy immediately.
+        pub fn alloc_device_local_from_host(ctx: &'a VulkanContext, src: &[u8]) -> Result<Self> {
+            let dst = Self::alloc_with_usage(
+                ctx,
+                src.len().max(1),
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            if src.is_empty() {
+                return Ok(dst);
+            }
+            // Temporary host-visible staging buffer (freed on scope exit).
+            let mut staging = Self::alloc_with_usage(
+                ctx,
+                src.len(),
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            staging.copy_from_host(src)?;
+            let pool = CommandPool::create(ctx)?;
+            pool.one_shot_submit(|cmd| {
+                let region = vk::BufferCopy::default().size(src.len() as vk::DeviceSize);
+                unsafe {
+                    ctx.device
+                        .cmd_copy_buffer(cmd, staging.buffer, dst.buffer, &[region]);
+                }
+                Ok(())
+            })?;
+            Ok(dst)
         }
     }
 

@@ -416,6 +416,12 @@ pub mod upload {
         pub layer: Option<usize>,
         pub residency: Residency,
         pub buffer: vulkan_sys::DeviceBuffer<'a>,
+        /// `(ncols=in=ne0, nrows=out=ne1)` for 2-D weight tensors; `(len=ne0,
+        /// 1)` for 1-D norm/param tensors. Recorded at upload so the GEMV path
+        /// can derive its `[nrows, ncols]` contract — and the norm read-backs
+        /// their length — without re-reading the GGUF. `None` only if a tensor
+        /// somehow had no dims.
+        pub gemv_dims: Option<(usize, usize)>,
     }
 
     /// All device-resident weights for a model plus the host embedding table.
@@ -467,33 +473,46 @@ pub mod upload {
                 .tensor(&t.name)
                 .map(|i| i.element_count() as usize)
                 .unwrap_or(0);
-            let mut buffer = vulkan_sys::DeviceBuffer::alloc(ctx, t.bytes as usize)
-                .map_err(|e| anyhow!("alloc {} ({} B): {e}", t.name, t.bytes))?;
-            match t.residency {
-                Residency::KeepQuant(_) => {
-                    buffer
-                        .copy_from_host(src)
-                        .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
-                }
+            // Build the exact device bytes per residency tier.
+            let host_bytes: std::borrow::Cow<'_, [u8]> = match t.residency {
+                Residency::KeepQuant(_) => std::borrow::Cow::Borrowed(src),
                 Residency::DequantF16 => {
                     let f = dequant_row_f32(t.ggml_type, src, n).context(t.name.clone())?;
-                    let bytes: Vec<u8> = f
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect();
-                    buffer
-                        .copy_from_host(&bytes)
-                        .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
+                    std::borrow::Cow::Owned(
+                        f.iter()
+                            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                            .collect(),
+                    )
                 }
                 Residency::DequantF32 => {
                     let f = dequant_row_f32(t.ggml_type, src, n).context(t.name.clone())?;
-                    let bytes: Vec<u8> = f.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    buffer
-                        .copy_from_host(&bytes)
-                        .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
+                    std::borrow::Cow::Owned(f.iter().flat_map(|v| v.to_le_bytes()).collect())
                 }
                 Residency::HostEmbedding => unreachable!("handled above"),
-            }
+            };
+            // F32 norm/SSM-param tensors are read BACK to the host during the
+            // forward (`copy_to_host` needs a mappable, host-visible buffer), so
+            // they stay HOST_VISIBLE. The large read-only GPU-only weights
+            // (KeepQuant / DequantF16) go to DEVICE_LOCAL via a staged upload —
+            // routing tens of GB through the smaller host-visible heap is what
+            // exhausted it and broke per-dispatch submits on the APU.
+            let buffer = if matches!(t.residency, Residency::DequantF32) {
+                let mut b = vulkan_sys::DeviceBuffer::alloc(ctx, t.bytes as usize)
+                    .map_err(|e| anyhow!("alloc {} ({} B): {e}", t.name, t.bytes))?;
+                b.copy_from_host(&host_bytes)
+                    .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
+                b
+            } else {
+                vulkan_sys::DeviceBuffer::alloc_device_local_from_host(ctx, &host_bytes)
+                    .map_err(|e| anyhow!("staged upload {} ({} B): {e}", t.name, t.bytes))?
+            };
+            // Record (ncols=in=ne0, nrows=out=ne1) for the GEMV path; 1-D
+            // tensors carry (ne0, 1) so norm read-backs know their length.
+            let gemv_dims = gguf.tensor(&t.name).map(|info| {
+                let ne0 = info.dims.first().copied().unwrap_or(0) as usize;
+                let ne1 = info.dims.get(1).copied().map(|v| v as usize).unwrap_or(1);
+                (ne0, ne1)
+            });
             tensors.insert(
                 t.name.clone(),
                 DeviceTensor {
@@ -502,6 +521,7 @@ pub mod upload {
                     layer: t.layer,
                     residency: t.residency,
                     buffer,
+                    gemv_dims,
                 },
             );
         }
