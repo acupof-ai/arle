@@ -1,10 +1,11 @@
-# Qwen3.6-35B post-attn add+RMSNorm → flashinfer FusedAddRMSNorm (U4) — opt-in, pending-remote
+# Qwen3.6-35B post-attn add+RMSNorm → flashinfer FusedAddRMSNorm (U4) — opt-in, validated WASH
 
-**Date:** 2026-06-12. **Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1.
-**Status:** `pending-remote` — code complete + Mac fmt/typecheck/clippy green;
-the on-device needle gate + A/B runs in the **one-shot validation pass** that
-also covers U1+U2 (GDN Triton-AOT) and U3 (fused_moe), per ckl's "写完代码一把
-验证" directive (#88). No default flip lands without that pass.
+**Date:** 2026-06-12 (impl); **2026-06-13** validation.
+**Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1.
+**Verdict (2026-06-13):** lane RUNS (probe fired) + correct (DET, minor
+fusion-FP envelope caveat); perf is a **WASH** at every c. Stays opt-in, no
+default flip. See the
+[validation entry](2026-06-13-qwen36-sgl-kernel-align-validate-bistability.md).
 
 ## Context
 
