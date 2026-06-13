@@ -347,15 +347,24 @@ fn find_glslc() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    // On Windows the binary is `glslc.exe`; check both names so a bare `glslc`
+    // under VULKAN_SDK\bin or on PATH (e.g. MSYS2's glslc.exe) is still found.
+    const NAMES: &[&str] = &["glslc", "glslc.exe"];
     if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
-        let path = Path::new(&sdk).join("bin").join("glslc");
-        if path.exists() {
-            return Some(path);
+        let bin = Path::new(&sdk).join("bin");
+        for name in NAMES {
+            let path = bin.join(name);
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
     std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join("glslc"))
-            .find(|candidate| candidate.exists())
+        std::env::split_paths(&paths).find_map(|dir| {
+            NAMES
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|candidate| candidate.exists())
+        })
     })
 }
