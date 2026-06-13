@@ -3898,13 +3898,15 @@ pub(crate) fn dsv4_mtp_tree_attn_enabled() -> bool {
 }
 
 /// P2 commit fold (fast-path plan): commit the accepted prefix from persisted
-/// verify rows instead of a second full forward. Opt-in
-/// (`ARLE_DSV4_MTP_COMMIT_FOLD=1`) until its own needle + perf gate licenses
-/// the flip; requires the batched tree lane (the persist hook lives there).
+/// verify rows instead of a second full forward. **Default ON** — licensed
+/// 2026-06-13 on the FP8+NUMA base: d2 chain-fold needle 512/2048/6000 PASS
+/// (same envelope) + 53.3 tok/s B=1 (+20% vs 44.5 no-spec). Opt out with
+/// `ARLE_DSV4_MTP_COMMIT_FOLD=0`. Requires the batched tree lane (default ON;
+/// the persist hook lives there), so the gate is `fold && tree_attn`.
 pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ARLE_DSV4_MTP_COMMIT_FOLD").as_deref(),
-        Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }
 
