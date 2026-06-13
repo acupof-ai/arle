@@ -10,6 +10,7 @@ pub use infer_gguf::{deepseek4, dequant, gguf};
 
 pub mod executor;
 pub mod kv_pool;
+pub mod loader;
 pub mod model_dsv4;
 pub mod model_gemma4;
 pub mod model_qwen3;
