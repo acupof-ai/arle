@@ -1,19 +1,25 @@
-# Qwen3.6-35B MoE FFN → SGLang fused_moe triton lane (U3) — opt-in, 2 load-path bugs fixed, A/B pending-remote
+# Qwen3.6-35B MoE FFN → SGLang fused_moe triton lane (U3) — opt-in, 2 load-path bugs fixed, RUNS + correct, perf KILL
 
 **Date:** 2026-06-12 (impl); **2026-06-13** OOM root-cause + build-and-replace
-fix + expert-count validator fix.
-**Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1.
-**Status:** `pending-remote` — code complete + Mac-typecheck/clippy green. The
-#88 validate3 pod pass found two load-path bugs in sequence: a lazy-build
-**OOM** (memory doubling) → build-and-replace at load (`59cea517`,
-resolved-design-question #1); then the freed-Vecs form tripped
-`moe_forward_into`'s expert-count precheck → `|| fused_sglang.is_some()`
-(`ad39dc77`, codex-confirmed). Both fixed. The no-OOM confirm +
-needle-envelope + dgoff-vs-moe perf A/B re-run is the remaining pending-remote
-item — **deferred: all 8 H20s occupied by the lead's DSv4 TP=8/EP=8 serve
-(~54 GB/GPU 2026-06-13); the 35B BF16 needs a free single GPU.** No default flip
-lands without that pass. **Lowest-confidence swap of the four** — bar is
-correctness + clean opt-in + byte-identical flag-OFF; no perf claim is made here.
+fix + expert-count validator fix + validation A/B.
+**Backend:** CUDA, Qwen3.6-35B-A3B, single H20 (96 GB), TP=1, `--num-slots 8`.
+**Status:** **VALIDATED — opt-in default-OFF, no flip (perf KILL).** Code
+complete; Mac-typecheck/clippy green. The #88 validate3 pod pass found two
+load-path bugs in sequence: a lazy-build **OOM** (memory doubling) →
+build-and-replace at load (`59cea517`, resolved-design-question #1); then the
+freed-Vecs form tripped `moe_forward_into`'s expert-count precheck →
+`|| fused_sglang.is_some()` (`ad39dc77`, codex-confirmed). Both fixed. With the
+lane usable, the validation A/B ran (same binary, single free H20):
+**lane RUNS** (probe fired), **correct inference** (RAW-needle envelope-match,
+moe ≥ dgoff at all lengths, c=8 batched-decode coherent), but **perf KILL** —
+moe is pinned at ~139 tok/s with no concurrency scaling, losing
+**−17.8% / −10.0% / −32.8% / −45.7%** vs the `dgoff` control @ c=1/2/4/8. The
+lane stays opt-in default-OFF. Full A/B + measurement caveat in the
+[validation entry](2026-06-13-qwen36-sgl-kernel-align-validate-bistability.md).
+**Lowest-confidence swap of the four** — both load-path bugs fixed (the lane is
+now usable for anyone who wants it), but SGLang's fused_moe is tuned for a
+different regime (large batch / EP / FP8); at the single-GPU bf16 Qwen3.6-A3B
+shape it caps at ~139 tok/s.
 
 ## Context
 
@@ -171,40 +177,52 @@ decode-band path is byte-for-byte unchanged.
   Finished, 0 warnings.
 - build.rs no-cuda path skips kernel compile (links stubs) — confirmed.
 
-## Pending (one-shot pod pass, #88)
+## Validation (one-shot pod pass, #88) — DONE
 
-**validate3 progress (2026-06-13):** lane-RUNS probe fired (fused_moe lane
-engaged). Two load-path bugs were surfaced in sequence and **both fixed**: (1)
-the lazy-build **OOM** (memory doubling) → build-and-replace at load (`59cea517`);
-(2) with that fixed, the re-run still failed `MoE expert count mismatch: gate=0
-up=0 down=0` because `moe_forward_into`'s `!use_deepgemm` precheck rejected the
-freed-Vecs form → added `|| weights.fused_sglang.is_some()` to the validator
-(`ad39dc77`). Codex review independently flagged bug 2 and prescribed the same
-fix. Both Mac-typecheck/clippy green; pod tree staged + rebuilt non-stale. The
-remaining items 1–3 re-run once the H20s free (lead's DSv4 8×H20 serve holds all
-8 GPUs at 100% util; the 35B BF16 single-GPU validation has no room until then;
-per "等等 h20 的使用" no GPU is grabbed mid-run). The U3 control is `dgoff`
-(`ARLE_QWEN35_DEEPGEMM=0`, hand-grouped) vs treatment `moe`
-(`ARLE_QWEN35_DEEPGEMM=0 ARLE_QWEN35_MOE_FUSED_SGLANG=1`) — both DeepGEMM-off so
-the A/B isolates the fused-kernel swap (DeepGEMM gives no benefit at this shape;
-see the 2026-06-13 validation entry).
+**validate3 (2026-06-13), all gates run on a free single H20:** lane-RUNS probe
+fired (fused_moe lane engaged). Two load-path bugs were surfaced in sequence and
+**both fixed**: (1) the lazy-build **OOM** (memory doubling) → build-and-replace
+at load (`59cea517`); (2) with that fixed, the re-run still failed `MoE expert
+count mismatch: gate=0 up=0 down=0` because `moe_forward_into`'s `!use_deepgemm`
+precheck rejected the freed-Vecs form → added `|| weights.fused_sglang.is_some()`
+to the validator (`ad39dc77`). Codex review independently flagged bug 2 and
+prescribed the same fix. Both Mac-typecheck/clippy green; pod tree staged +
+rebuilt non-stale. The U3 control is `dgoff` (`ARLE_QWEN35_DEEPGEMM=0`,
+hand-grouped) vs treatment `moe` (`ARLE_QWEN35_DEEPGEMM=0
+ARLE_QWEN35_MOE_FUSED_SGLANG=1`) — both DeepGEMM-off so the A/B isolates the
+fused-kernel swap (DeepGEMM gives no benefit at this shape; see the 2026-06-13
+validation entry).
 
-1. Build on 8×H20 pod with `INFER_TRITON_PYTHON` set (`CARGO_NET_OFFLINE=1`);
-   confirm the 4 fused cubins compile (not stubs) via the runtime loud-fail probe.
-2. Needle gate ×3 DET vs the locked 2026-06-12 envelope (len 2000/8000 exact) —
-   MoE non-determinism confound: gate on needle + same-config-twice floor +
-   self-consistency, NOT byte-identity. **MUST include a c≥2 (batched-decode)
-   correctness check, not just c=1** — the stride class of bug fixed in review is
-   c=1-invisible (transposed activation strides coincide at `num_tokens=1`); a
-   batched needle or a coherence check on a c=4 run is the gate that catches it.
-   The perf A/B (item 3) measures tok/s, not output correctness, so it does
-   **not** substitute for the c≥2 correctness check.
-3. Same-binary same-shell A/B `ARLE_QWEN35_MOE_FUSED_SGLANG` OFF vs ON, c=1/2/4/8,
-   vs the locked baseline. Δ% per c. License-or-kill on wall-clock per shape; a
-   losing A/B keeps the lane opt-in with the verdict recorded. Note +1.5 GB
-   device cost in the ON arm.
-4. fp8 cubin (1-shape signature add) is a separate follow-on once the bf16 lane
-   is licensed.
+1. **Lane RUNS — PASS.** moe probe fired (`SGLang fused_moe lane engaged
+   top_k=8 ep_size=1`); dgoff probe count=0. The 4 fused cubins load non-stub
+   (the probe only fires past the NOT_SUPPORTED loud-fail).
+2. **Correct inference — PASS.** RAW-needle envelope-match: moe = dgoff at len
+   115/446/2000 (miss/partial/exact) and **strictly better at len 1000** (moe
+   exact 3/3 where the hand-grouped control misses 3/3), all DET. Plus the
+   mandatory c≥2 check (catches the c=1-invisible stride bug fixed in review):
+   the c=8 batched-decode responses are coherent English (essay text, well-formed
+   `<think>`, no repetition/garbage). The fused kernel produces correct inference.
+3. **Perf A/B — KILL.** Same-binary OFF(`dgoff`) vs ON(`moe`), c=1/2/4/8:
+
+   | c | dgoff (control) | moe (fused) | Δ% |
+   |---|-----------------|-------------|-----|
+   | 1 | 96.0 | 78.9 | **−17.8%** |
+   | 2 | 154.1 | 138.7 | **−10.0%** |
+   | 4 | 207.5 | 139.5 | **−32.8%** |
+   | 8 | 255.6 | 138.8 | **−45.7%** |
+
+   moe scales c=1→c=2 (+76%) then **plateaus flat** (138.7 → 139.5 → 138.8 across
+   c=2/4/8) — it saturates its grid at ~16 routed rows (c=2 × top_k=8) and
+   serializes the rest, while dgoff keeps scaling 154 → 207 → 256. License-or-kill
+   on wall-clock: **KILL at every c.** Lane stays opt-in, verdict recorded.
+   *Measurement caveat:* c=1/c=2 Δ are same-run same-binary; the c=4/c=8 v2 dgoff
+   readings were `0.0` (teardown-race after SIGKILL'ing 8× DSv4 contexts seconds
+   prior) so they fall back to the triple-confirmed baseline (this-session v1 full
+   sweep + locked 2026-06-12, both 207.5/255.6). The KILL is certain regardless:
+   moe's flat ~139 ceiling cannot approach dgoff's measured 207/256.
+4. fp8 cubin (1-shape signature add) — moot for a default flip (bf16 lane is a
+   perf KILL); only worth revisiting if the fp8 regime is the one SGLang's
+   fused_moe is actually tuned for, and only as a fresh license pass.
 
 ## Rule
 
