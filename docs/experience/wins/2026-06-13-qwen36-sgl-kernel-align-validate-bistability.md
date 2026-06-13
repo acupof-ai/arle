@@ -27,7 +27,7 @@ the per-lane impl entries are [U2](2026-06-12-qwen35-sgl-gdn-triton-aot.md),
 | U1 triton AOT | — | — | — | **PASS** — all 7 cubins load non-stub (the 3 lane probes below fire, which only happens past the NOT_SUPPORTED loud-fail) |
 | U2 GDN decode | yes (probe) | yes (= off math) | **WASH** | opt-in, no flip |
 | U4 fused add-RMSNorm | yes (probe) | yes (DET, minor fusion-FP envelope caveat) | **WASH** | opt-in, no flip |
-| U3 fused_moe | yes (probe) | n/a (didn't serve) | **2 load-path bugs → both fixed**, A/B pending-remote | opt-in, no flip |
+| U3 fused_moe | yes (probe) | yes (needle env-match + c=8 coherent) | **KILL** −10/−33/−46% @ c=2/4/8 (no concurrency scaling) | opt-in, no flip |
 
 ## What worked — the c=8 admission bistability that manufactured a false win
 
@@ -107,11 +107,44 @@ fix** ("Include the fused cache in that precheck") — static analysis and the p
 failure converged on the same root cause.
 
 Mac typecheck + clippy green for both fixes; pod tree staged + rebuilt (binary
-mtime 07:59:42, 3 crates recompiled — non-stale). The no-OOM confirm +
-needle-envelope + dgoff-vs-moe A/B re-runs when the H20 frees (all 8 GPUs held
-by the lead's DSv4 TP=8/EP=8 serve, ~55 GB/GPU at 100% util — the 35B BF16 needs
-a free single GPU; per "等等 h20 的使用" no GPU is grabbed mid-run). Detail in the
+mtime 07:59:42, 3 crates recompiled — non-stale). Detail in the
 [U3 entry](2026-06-12-qwen35-moe-fused-sglang-u3.md).
+
+### U3 validated — RUNS + correct, perf KILL (no concurrency scaling)
+
+With both bugs fixed, the moe arm served and cleared correctness, then **lost
+the perf A/B at every c**:
+
+| c | dgoff (control) | moe (fused) | Δ% |
+|---|-----------------|-------------|-----|
+| 1 | 96.0 | 78.9 | **−17.8%** |
+| 2 | 154.1 | 138.7 | **−10.0%** |
+| 4 | 207.5 | 139.5 | **−32.8%** |
+| 8 | 255.6 | 138.8 | **−45.7%** |
+
+- **Lane RUNS:** moe probe fired (`SGLang fused_moe lane engaged top_k=8
+  ep_size=1`); dgoff probe count=0. Not a no-op stub.
+- **Correct:** RAW-needle envelope-match — moe = dgoff at len 115/446/2000
+  (miss/partial/exact) and **strictly better at len 1000** (moe exact 3/3 where
+  the hand-grouped control misses 3/3), all DET. Plus an explicit c≥2 check:
+  the c=8 batched-decode responses are coherent English (essay text, well-formed
+  `<think>`, no repetition/garbage). The fused kernel produces correct inference.
+- **Perf KILL:** moe scales c=1→c=2 (+76%) then **plateaus flat** (138.7 →
+  139.5 → 138.8 across c=2/4/8) — it saturates its grid at ~16 routed rows
+  (c=2 × top_k=8) and serializes the rest, while dgoff keeps scaling 154 → 207 →
+  256. SGLang's fused_moe is tuned for a different regime (large batch / EP /
+  FP8); at the single-GPU bf16 Qwen3.6-A3B shape it caps at ~139 tok/s.
+- **Measurement caveat (honest):** the c=1/c=2 Δ are same-run same-binary (v2).
+  The c=4/c=8 v2 dgoff readings were `0.0` (failed requests) — a teardown-race
+  artifact: the dgoff arm served *first*, seconds after 8× DSv4 CUDA contexts
+  (~67 GB each) were SIGKILL'd, racing the kernel's context teardown; the moe
+  arm ~10 min later was clean. The c=4/c=8 dgoff figures fall back to the
+  triple-confirmed baseline (this-session v1 full sweep + locked 2026-06-12, both
+  207.5/255.6). The KILL is certain regardless: moe's flat ~139 ceiling cannot
+  approach dgoff's measured 207/256.
+
+Disposition: **opt-in default-OFF, no flip.** Both load-path bugs fixed (the
+lane is now usable for anyone who wants it), but it is a perf loss at this shape.
 
 ## Rule
 
