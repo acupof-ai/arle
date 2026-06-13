@@ -254,29 +254,6 @@ pub(crate) fn qwen35_moe_decode_kernel_enabled() -> bool {
     )
 }
 
-/// `ARLE_QWEN35_MOE_FUSED_SGLANG=1`: route the Qwen3.6 MoE FFN through the
-/// vendored SGLang `fused_moe` triton lane (U3) — moe_align → fused_moe_kernel
-/// GEMM1 (gate||up) → act_and_mul (silu·up) → fused_moe_kernel GEMM2 (down,
-/// MUL_ROUTED_WEIGHT) → moe_sum_reduce — instead of the in-tree pack +
-/// grouped-GEMM + scatter/combine path. Default OFF: flag-off is byte-for-byte
-/// the current hand decode-band path (this helper is read once, gating the
-/// whole fused branch). The triton cubins are Hopper-only AOT; a
-/// non-sm90 / no-triton build links NOT_SUPPORTED stubs and the runtime
-/// loud-fails when this flag is on and a stub is hit. The stacked `w1/w2` cache
-/// (`MoeLayerWeights::fused_sglang`) is built at LOAD via build-and-replace (the
-/// per-expert Vecs are restacked then freed — the lazy first-forward build
-/// OOM'd the 35B BF16 shard by doubling routed-expert VRAM), so it is mutually
-/// exclusive with DeepGEMM and needs `ARLE_QWEN35_DEEPGEMM=0`. bf16-only for now
-/// (fp8 is a 1-shape AOT signature add). Read per call, mirroring the sibling
-/// MoE gates; inside a captured decode graph the value read at capture replays.
-#[cfg(feature = "cuda")]
-pub(crate) fn qwen35_moe_fused_sglang_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_QWEN35_MOE_FUSED_SGLANG").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
 /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
 ///
 /// A `clone_htod(&vec![-1; n])` here would record a CUDA-graph memcpy node
@@ -319,7 +296,6 @@ mod gpu {
     use super::{
         DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
         deepgemm_contig_rows_cap, qwen35_deepgemm_enabled, qwen35_moe_decode_kernel_enabled,
-        qwen35_moe_fused_sglang_enabled,
     };
     use crate::loader::MoeLayerWeights;
     use crate::moe_config::ExpertSplit;
@@ -383,19 +359,6 @@ mod gpu {
     /// | `gate_out`/`up_out`  | `[I, rows_p]`| none          | masked/contiguous GEMM writes rows within its tile coverage; rows outside coverage are read only by `silu_mul`, whose outputs land in the matching `act` pad rows (down-GEMM tile coverage is identical, scatter skips pads) |
     /// | `act`                | `[I, rows_p]`| none          | `silu_mul` writes all elements |
     /// | `expert_out`         | `[H, rows_p]`| none          | GEMM writes within tile coverage; scatter reads only `packed_route_slot >= 0` rows, all within coverage |
-    ///
-    /// SGLang fused lane (`ARLE_QWEN35_MOE_FUSED_SGLANG=1`) — extra slots, never
-    /// touched on the default path (`numel = T·topk`, `2N`/`N`/`K` from cfg):
-    ///
-    /// | slot                  | shape            | init on reuse | proof |
-    /// |-----------------------|------------------|---------------|-------|
-    /// | `fm_sorted_token_ids` | `[max_padded]` i32 | none        | the native align kernel int4-fills the whole buffer with the `numel` pad sentinel (block 1) then scatters every real route id (block 0) — every slot written each call |
-    /// | `fm_expert_ids`       | `[num_blocks]` i32 | none        | the align kernel writes the per-block expert id for every block |
-    /// | `fm_total_padded`     | `[1]` i32        | memset 0      | REQUIRED: align kernel `atomicAdd`s the cumsum/total |
-    /// | `fm_cumsum`           | `[E + 2]` i32    | memset 0      | REQUIRED: align kernel `atomicAdd`s per-expert counts then scans in place (E+1 padded experts + the `total` slot, mirroring SGLang's `num_experts + 2`) |
-    /// | `fm_cache1`           | `[numel, 2N]` bf16 | none        | GEMM1 writes every valid route row (`offs_token < numel`); pad-tile rows are masked stores, never read by act (act runs over `numel` rows) |
-    /// | `fm_cache2`           | `[numel, N]` bf16  | none        | act_and_mul writes all `numel` rows (silu·up); GEMM2 reads exactly these |
-    /// | `fm_cache3`           | `[numel, K]` bf16  | none        | GEMM2 writes every valid route row; sum-reduce reads `[T, topk, K]` = all `numel` rows |
     #[derive(Default)]
     pub(crate) struct MoeForwardScratch {
         logits: HiddenSlot,
@@ -423,25 +386,6 @@ mod gpu {
         shared_act: HiddenSlot,
         shared_out: HiddenSlot,
         gate_logit: HiddenSlot,
-        // ── SGLang fused_moe lane (U3, `ARLE_QWEN35_MOE_FUSED_SGLANG`). All
-        // unused (never allocated) on the default hand path. ────────────────
-        /// `[max_num_tokens_padded]` i32 — moe_align sorted route ids.
-        fm_sorted_token_ids: SliceSlot<i32>,
-        /// `[num_blocks]` i32 — moe_align per-block expert id. Sized to the
-        /// max block count `cdiv(max_num_tokens_padded, BLOCK_SIZE_M)`.
-        fm_expert_ids: SliceSlot<i32>,
-        /// `[1]` i32 — moe_align total padded tokens (zeroed every call).
-        fm_total_padded: SliceSlot<i32>,
-        /// `[num_experts + 2]` i32 — moe_align cumsum scratch (zeroed). E+1
-        /// padded experts (SGLang's `+1` dummy expert-0 shift) + the `total`
-        /// slot, matching the python wrapper's `num_experts + 2`.
-        fm_cumsum: SliceSlot<i32>,
-        /// cache1 `[num_tokens*topk, 2*moe_inter]` bf16 (gate||up GEMM1 out).
-        fm_cache1: SliceSlot<bf16>,
-        /// cache2 `[num_tokens*topk, moe_inter]` bf16 (silu·up act out).
-        fm_cache2: SliceSlot<bf16>,
-        /// cache3 `[num_tokens*topk, hidden]` bf16 (down GEMM2 out, summed).
-        fm_cache3: SliceSlot<bf16>,
     }
 
     impl MoeForwardScratch {
@@ -477,13 +421,6 @@ mod gpu {
                 shared_act,
                 shared_out,
                 gate_logit,
-                fm_sorted_token_ids,
-                fm_expert_ids,
-                fm_total_padded,
-                fm_cumsum,
-                fm_cache1,
-                fm_cache2,
-                fm_cache3,
             } = self;
             logits.release();
             route_indices.release();
@@ -510,13 +447,6 @@ mod gpu {
             shared_act.release();
             shared_out.release();
             gate_logit.release();
-            fm_sorted_token_ids.release();
-            fm_expert_ids.release();
-            fm_total_padded.release();
-            fm_cumsum.release();
-            fm_cache1.release();
-            fm_cache2.release();
-            fm_cache3.release();
         }
     }
 
@@ -624,12 +554,9 @@ mod gpu {
         if !use_deepgemm {
             // Grouped-mode loads cleared the per-expert Vecs (the hand
             // kernels run through the rebuilt ptr tables into the grouped
-            // buffer); the U3 fused-sglang load likewise clears them after
-            // restacking into `fused_sglang` w1/w2 (build-and-replace, no
-            // memory doubling). Accept any of the three weight forms here.
+            // buffer). Accept either weight form here.
             ensure!(
                 weights.gate_grouped.is_some()
-                    || weights.fused_sglang.is_some()
                     || (weights.gate.len() == local_experts
                         && weights.up.len() == local_experts
                         && weights.down.len() == local_experts),
@@ -740,78 +667,6 @@ mod gpu {
         // `&mut scratch`; the buffers themselves persist in the scratch.
         let route_indices_ptr = cache_ptr(route_indices, ctx);
         let route_weights_ptr = cache_ptr(route_weights, ctx);
-
-        // ── 2b. SGLang fused_moe lane (opt-in, `ARLE_QWEN35_MOE_FUSED_SGLANG`).
-        // Single-GPU only (global == local expert ids); flag-off this branch is
-        // never entered, so the default path below is byte-for-byte unchanged.
-        if qwen35_moe_fused_sglang_enabled() {
-            // The load-time fused build freed the per-expert Vecs, so the
-            // non-fused fallback below is unavailable when the flag is on. A
-            // non-device-route-eligible config (non-greedy / grouped top-k)
-            // would otherwise silently fall through to it and crash on empty
-            // Vecs — loud-fail instead. (Qwen3.6-A3B is always eligible.)
-            ensure!(
-                device_route_eligible(cfg),
-                "ARLE_QWEN35_MOE_FUSED_SGLANG requires a device-route-eligible config \
-                 (greedy top-k, no expert groups); this model is not eligible. The \
-                 per-expert weight Vecs were freed at load to build the fused w1/w2 \
-                 cache, so the non-fused fallback is unavailable. Unset the flag."
-            );
-            ensure!(
-                split.ep_size == 1,
-                "ARLE_QWEN35_MOE_FUSED_SGLANG requires ep_size == 1 (single-GPU); \
-                 got ep_size={} ep_rank={}. The fused lane consumes GLOBAL expert ids \
-                 directly — EP local remap is unsupported. Unset the flag for EP runs.",
-                split.ep_size,
-                split.ep_rank
-            );
-            // `routed_scaling_factor` is BAKED into the sum-reduce cubin (1.0);
-            // a different value would silently mis-scale. Loud-fail instead.
-            ensure!(
-                (cfg.routed_scaling_factor - 1.0).abs() < f32::EPSILON,
-                "ARLE_QWEN35_MOE_FUSED_SGLANG: routed_scaling_factor={} but the \
-                 fused sum-reduce cubin bakes 1.0. Rebuild the cubin or unset the flag.",
-                cfg.routed_scaling_factor
-            );
-            // `top_k` is BAKED into the GEMM1 cubin (top_k=8, the Qwen3.6-A3B
-            // routing fan-out; A's row offset is `offs_token // top_k`). A model
-            // with a different top_k would silently mis-index the activation
-            // rows. Loud-fail instead of producing garbage.
-            ensure!(
-                topk == 8,
-                "ARLE_QWEN35_MOE_FUSED_SGLANG: top_k={} but the fused GEMM1 cubin \
-                 bakes top_k=8 (Qwen3.6-A3B). Rebuild the cubin or unset the flag.",
-                topk
-            );
-            // Path-RUNS probe: fire once when the fused lane is actually taken
-            // (not merely when the flag is read), so the validation harness can
-            // grep the server log to prove the SGLang fused_moe kernel ran on
-            // this model/shard — distinguishing "ran, perf-neutral" from "no-op".
-            {
-                static FUSED_MOE_PROBE: std::sync::Once = std::sync::Once::new();
-                FUSED_MOE_PROBE.call_once(|| {
-                    eprintln!(
-                        "[lane-probe] ARLE_QWEN35_MOE_FUSED_SGLANG active: \
-                         SGLang fused_moe lane engaged (top_k={topk}, ep_size=1)"
-                    );
-                });
-            }
-            moe_forward_fused_sglang(
-                ctx,
-                weights,
-                normed,
-                cfg,
-                scratch,
-                route_indices_ptr,
-                route_weights_ptr,
-                num_tokens,
-                hidden_dim,
-                num_experts,
-                topk,
-                out,
-            )?;
-            return add_shared_expert_gated(ctx, weights, normed, scratch, out);
-        }
 
         // ── 3. Per-expert route counts (LOCAL experts only). ────────────────
         // Kernels write these through raw device pointers, so no Rust `mut`.
@@ -1129,253 +984,6 @@ mod gpu {
                 hidden_dim,
                 ctx.stream.cu_stream(),
             )?;
-        }
-
-        Ok(())
-    }
-
-    /// Loud-fail message when the fused triton AOT lane resolves to a
-    /// NOT_SUPPORTED stub (non-sm90 / no-triton build) but the flag is on.
-    fn fused_moe_stub_err(kernel: &str) -> anyhow::Error {
-        anyhow::anyhow!(
-            "ARLE_QWEN35_MOE_FUSED_SGLANG is on but the fused_moe triton AOT lane is not built \
-             ({kernel} returned CUDA_ERROR_NOT_SUPPORTED). Rebuild with an sm_90 target and \
-             INFER_TRITON_PYTHON set to a triton-capable interpreter, or unset \
-             ARLE_QWEN35_MOE_FUSED_SGLANG to use the hand kernels. \
-             See crates/cuda-kernels/tools/triton/README.md."
-        )
-    }
-
-    /// Borrow the SGLang stacked expert-weight cache (`w1 [E_l, 2N, K]` +
-    /// `w2 [E_l, K, N]`) built at LOAD time (build-and-replace in
-    /// `Loader::load_moe_layer_experts`: the per-expert Vecs are restacked into
-    /// w1/w2 and freed, so the resident routed-expert VRAM does not double).
-    /// `None` means the cache was not built — either the flag was off at load
-    /// (unreachable here: the forward gate checks the same flag) or DeepGEMM was
-    /// on (the grouped cache freed the Vecs and the fused cache is its mutually
-    /// exclusive sibling).
-    fn build_fused_sglang_weights(
-        weights: &MoeLayerWeights,
-    ) -> Result<&crate::loader::MoeFusedSglangWeights> {
-        weights.fused_sglang.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "ARLE_QWEN35_MOE_FUSED_SGLANG: fused w1/w2 cache absent. It is built at \
-                 load and is mutually exclusive with DeepGEMM (the grouped cache frees the \
-                 per-expert Vecs). Set ARLE_QWEN35_DEEPGEMM=0 together with the fused flag."
-            )
-        })
-    }
-
-    /// SGLang `fused_moe` routed-expert path (opt-in lane, single-GPU only). The
-    /// `route_*_ptr` are the token-major `[num_tokens*topk]` GLOBAL expert ids /
-    /// renormed weights produced by step 2 (== SGLang's `topk_ids`/
-    /// `topk_weights`). Writes the routed sum into `out` (token-major `[T, K]`,
-    /// fully overwritten by the final sum-reduce); the caller adds the shared
-    /// expert.
-    ///
-    /// Data flow (all caches keyed by flattened route id = `token*topk + k`):
-    ///   moe_align → GEMM1 (`a`=normed `[T,K]`, w1 `[E,2N,K]` → cache1
-    ///   `[T*topk, 2N]`) → act_and_mul (silu(gate)·up → cache2 `[T*topk, N]`) →
-    ///   GEMM2 (cache2, w2 `[E,K,N]`, MUL_ROUTED_WEIGHT → cache3 `[T*topk, K]`)
-    ///   → sum_reduce (cache3 viewed `[T, topk, K]` → out `[T, K]`).
-    ///
-    /// `normed` is token-major (token-contiguous) `[T, K]`: a token's K features
-    /// are contiguous, so GEMM1 `a` uses `stride_am=hidden_dim, stride_ak=1`.
-    /// `out.data` is the same token-major `[T, K]` (it is added to the
-    /// token-major residual downstream), so sum-reduce uses
-    /// `output_stride_0=hidden_dim, output_stride_1=1`. (Confirmed against the
-    /// validated hand pack kernel `dsv4_pack_local_experts_kernel`, which reads
-    /// `normed` at `token*hidden_dim + col`.)
-    #[allow(clippy::too_many_arguments)]
-    fn moe_forward_fused_sglang(
-        ctx: &DeviceContext,
-        weights: &MoeLayerWeights,
-        normed: &HiddenStates,
-        cfg: &MoeConfig,
-        scratch: &mut MoeForwardScratch,
-        route_indices_ptr: RawDevicePtr<i32>,
-        route_weights_ptr: RawDevicePtr<f32>,
-        num_tokens: usize,
-        hidden_dim: usize,
-        num_experts: usize,
-        topk: usize,
-        out: &mut HiddenStates,
-    ) -> Result<()> {
-        let _ = cfg; // routed_scaling_factor asserted == 1.0 by the caller (baked in cubin).
-        let fused = build_fused_sglang_weights(weights)?;
-        let moe_inter = fused.moe_inter; // N
-        let gate_up_rows = fused.gate_up_rows; // 2N
-        debug_assert_eq!(fused.hidden, hidden_dim);
-        debug_assert_eq!(fused.num_experts, num_experts);
-
-        let numel = num_tokens * topk; // flattened topk_ids length
-        let block_size = moe::FUSED_MOE_BLOCK_SIZE_M;
-        // SGLang shifts expert ids by +1 (`topk_ids + 1`, a dummy expert-0
-        // slot), so the align kernel runs over E+1 expert slots — the kernel's
-        // `num_experts` arg, the cumsum scratch, and the pad-fill envelope must
-        // ALL use the padded count, mirroring the python `moe_align_block_size`
-        // wrapper: kernel arg = `num_experts + 1`, `cumsum_buffer` =
-        // `num_experts + 2`, `max_num_tokens_padded` over `num_experts + 1`
-        // groups. Passing the bare E drops the highest expert (its count lands
-        // in `shared_counts[E]`, which aliases `prefix[0]` and is never read).
-        let align_experts = num_experts + 1;
-        let max_padded = moe::fused_moe_max_num_tokens_padded(numel, align_experts, block_size);
-        let num_blocks = max_padded.div_ceil(block_size);
-
-        // ── moe_align scratch. sorted_token_ids must be the numel sentinel for
-        // pad rows so GEMM tiles skip them; the native kernel int4-fills the
-        // whole buffer with `numel` (block 1) then scatters the real ids, so a
-        // plain `get` is enough — the kernel writes every slot. total_padded +
-        // cumsum are atomicAdd accumulators → zeroed every call. expert_ids is
-        // fully written by the kernel (per-block expert id). ─────────────────
-        let sorted_token_ids = scratch.fm_sorted_token_ids.get(ctx, max_padded)?;
-        let sorted_token_ids_ptr = cache_ptr(sorted_token_ids, ctx);
-        let expert_ids = scratch.fm_expert_ids.get(ctx, num_blocks)?;
-        let expert_ids_ptr = cache_ptr(expert_ids, ctx);
-        let total_padded = scratch.fm_total_padded.get_zeroed(ctx, 1)?;
-        let total_padded_ptr = cache_ptr(total_padded, ctx);
-        let cumsum = scratch.fm_cumsum.get_zeroed(ctx, num_experts + 2)?;
-        let cumsum_ptr = cache_ptr(cumsum, ctx);
-
-        // SAFETY: all buffers valid on ctx.stream for the documented shapes;
-        // route_indices_ptr is the token-major `[numel]` global expert id buffer.
-        unsafe {
-            moe::moe_align_block_size(
-                route_indices_ptr,
-                sorted_token_ids_ptr,
-                expert_ids_ptr,
-                total_padded_ptr,
-                cumsum_ptr,
-                align_experts,
-                block_size,
-                numel,
-                max_padded,
-                ctx.stream.cu_stream(),
-            )
-            .map_err(|_| fused_moe_stub_err("arle_moe_align_block_size"))?;
-        }
-
-        // ── cache slots. cache1/2/3 are fully written by their producer kernel
-        // within the valid route rows; pad rows past `numel` are never read by
-        // the next stage (act over numel rows; sum-reduce over `numel` route
-        // ids = `T*topk`). Sized exactly `[numel, *]`. ───────────────────────
-        let cache1 = scratch.fm_cache1.get(ctx, numel * gate_up_rows)?;
-        let cache1_ptr = cache_ptr(cache1, ctx);
-        let cache2 = scratch.fm_cache2.get(ctx, numel * moe_inter)?;
-        let cache2_ptr = cache_ptr(cache2, ctx);
-        let cache3 = scratch.fm_cache3.get(ctx, numel * hidden_dim)?;
-        let cache3_ptr = cache_ptr(cache3, ctx);
-
-        let w1_ptr = cache_ptr(&fused.w1, ctx);
-        let w2_ptr = cache_ptr(&fused.w2, ctx);
-
-        // ── GEMM1: a = normed `[T, K]`, b = w1 `[E, 2N, K]`, c = cache1
-        // `[T*topk, 2N]`. normed is token-major (token-contiguous) `[T, K]`:
-        // stride_am=hidden_dim (next token = +K), stride_ak=1 (next feature =
-        // +1). w1 row-major `[E, 2N, K]`: stride_be=2N*K, stride_bk=1,
-        // stride_bn=K. cache1 row-major: stride_cm=2N, stride_cn=1. ───────────
-        let n1 = gate_up_rows; // 2N
-        let k1 = hidden_dim; // K
-        // SAFETY: a/b/c + align outputs valid on ctx.stream; route_weights
-        // unused in GEMM1 (MUL_ROUTED_WEIGHT=0 baked) but passed for the shared
-        // kernel signature.
-        unsafe {
-            moe::fused_moe_gemm1(
-                cache_ptr(&normed.data, ctx),
-                w1_ptr,
-                cache1_ptr,
-                route_weights_ptr,
-                sorted_token_ids_ptr,
-                expert_ids_ptr,
-                total_padded_ptr,
-                n1,
-                k1,
-                max_padded,
-                numel,
-                k1,      // stride_am = hidden_dim (token-major: next token = +K)
-                1,       // stride_ak = 1 (token-contiguous: next feature = +1)
-                n1 * k1, // stride_be = 2N*K
-                1,       // stride_bk
-                k1,      // stride_bn = K
-                n1,      // stride_cm = 2N
-                1,       // stride_cn
-                ctx.stream.cu_stream(),
-            )
-            .map_err(|_| fused_moe_stub_err("arle_fused_moe_gemm1"))?;
-        }
-
-        // ── act_and_mul: cache1 `[numel, 2N]` → cache2 `[numel, N]`,
-        // cache2 = silu(gate) * up. hidden_size = 2N (kernel halves it).
-        // expert_ids row buffer = route_indices (pad-row skip; never fires on
-        // the dense bf16 path). Grid = (numel,). ─────────────────────────────
-        // SAFETY: cache1/cache2/route_indices valid on ctx.stream.
-        unsafe {
-            moe::fused_moe_act_and_mul(
-                cache1_ptr,
-                cache2_ptr,
-                route_indices_ptr,
-                numel,
-                gate_up_rows,
-                ctx.stream.cu_stream(),
-            )
-            .map_err(|_| fused_moe_stub_err("arle_fused_moe_act"))?;
-        }
-
-        // ── GEMM2: a = cache2 `[numel, N]`, b = w2 `[E, K, N]`, c = cache3
-        // `[numel, K]`. top_k=1 baked → a_ptrs uses offs_token//1 = route id.
-        // MUL_ROUTED_WEIGHT=1 baked → applies route_weights here. cache2
-        // row-major: stride_am=N, stride_ak=1. w2 row-major `[E, K, N]`:
-        // stride_be=K*N, stride_bk=1, stride_bn=N. cache3 row-major:
-        // stride_cm=K, stride_cn=1. ──────────────────────────────────────────
-        let n2 = hidden_dim; // K
-        let k2 = moe_inter; // N
-        // SAFETY: a/b/c + align outputs + route_weights valid on ctx.stream.
-        unsafe {
-            moe::fused_moe_gemm2(
-                cache2_ptr,
-                w2_ptr,
-                cache3_ptr,
-                route_weights_ptr,
-                sorted_token_ids_ptr,
-                expert_ids_ptr,
-                total_padded_ptr,
-                n2,
-                k2,
-                max_padded,
-                numel,
-                k2,      // stride_am = N
-                1,       // stride_ak
-                n2 * k2, // stride_be = K*N
-                1,       // stride_bk
-                k2,      // stride_bn = N
-                n2,      // stride_cm = K
-                1,       // stride_cn
-                ctx.stream.cu_stream(),
-            )
-            .map_err(|_| fused_moe_stub_err("arle_fused_moe_gemm2"))?;
-        }
-
-        // ── sum_reduce: cache3 viewed `[T, topk, K]` → out `[T, K]`, summed
-        // over topk × routed_scaling_factor (1.0 baked). cache3 row-major
-        // `[numel, K]` = `[T, topk, K]` contiguous: input_stride_0=topk*K,
-        // input_stride_1=K, input_stride_2=1. out is token-major `[T, K]`
-        // (token-contiguous): output_stride_0=hidden_dim, output_stride_1=1. ──
-        // SAFETY: cache3/out valid on ctx.stream for the documented shapes.
-        unsafe {
-            moe::fused_moe_sum_reduce(
-                cache3_ptr,
-                topk * hidden_dim, // input_stride_0
-                hidden_dim,        // input_stride_1
-                1,                 // input_stride_2
-                cache_ptr(&out.data, ctx),
-                hidden_dim, // output_stride_0 = hidden_dim (token-major: next token = +K)
-                1,          // output_stride_1 = 1 (token-contiguous: next feature = +1)
-                num_tokens,
-                topk,
-                hidden_dim,
-                ctx.stream.cu_stream(),
-            )
-            .map_err(|_| fused_moe_stub_err("arle_fused_moe_sum"))?;
         }
 
         Ok(())
