@@ -1721,6 +1721,14 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     validate_prebuilt_cuda_archive_symbols(&prebuilt_dir.join("libkernels_cuda.a"));
+    // The prebuilt fast-build path returns before the normal-build cfg emission,
+    // so set `arle_flashmla` here too — otherwise `cuda_kernels::HAS_FLASHMLA` is
+    // false for a valid prebuilt and DSv4 loses FlashMLA (codex P1). `validate_*`
+    // above mandates the real FlashMLA marker, which is real-only (the stub omits
+    // it), so a linked prebuilt has real FlashMLA. (DeepGEMM uses a runtime
+    // preflight probe, not a cfg — nothing to set here, and a stub can't be
+    // misreported.)
+    println!("cargo:rustc-cfg=arle_flashmla");
     println!("cargo:rustc-link-search=native={}", prebuilt_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=static=tilelang_kernels_aot");
@@ -1819,6 +1827,11 @@ fn run_nvcc_jobs(nvcc: &str, wrapper: Option<&str>, jobs: &[NvccJob]) {
 }
 
 fn main() {
+    // Compile-capability cfgs, consumed cross-crate via the `cuda_kernels::HAS_*`
+    // consts in lib.rs (a `cfg!` set here is not visible in `infer-cuda`).
+    // Declared unconditionally — before the no-cuda early-return — so the lib.rs
+    // `#[cfg(...)]` arms never trip the unexpected-cfg lint.
+    println!("cargo:rustc-check-cfg=cfg(arle_flashmla)");
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
         println!("cargo:warning=metal feature active: relying on mlx-sys bridge only.");
     }
@@ -1892,6 +1905,11 @@ fn main() {
     let flashmla_root = Path::new("vendor/flashmla");
     let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
     let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
+    if enable_flashmla {
+        // Runtime FlashMLA gates read `cuda_kernels::HAS_FLASHMLA` (this cfg); a
+        // build without the FlashMLA kernels falls back to scalar — no env var.
+        println!("cargo:rustc-cfg=arle_flashmla");
+    }
     if enable_flashmla && env_flag("ARLE_CUDA_DISABLE_FLASHMLA_DECODE") {
         panic!(
             "ARLE_CUDA_DISABLE_FLASHMLA_DECODE would create a FlashMLA half-state. \
@@ -2006,6 +2024,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
     let enable_deepgemm_native =
         env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE") || env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
+    // DeepGEMM availability is a RUNTIME preflight probe (`cuda_kernels::
+    // has_deepgemm_native`), not a cfg — the non-native stub exports the same
+    // bridge symbols, so it can't be build-determined. No cfg emitted here.
     let deepgemm_root = std::env::var("ARLE_DEEPGEMM_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("vendor/deepgemm"));
