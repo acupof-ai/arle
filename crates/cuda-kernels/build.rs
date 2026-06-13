@@ -639,7 +639,8 @@ const TRITON_GDR_RMS_NORM_SIGNATURE: &str = "*bf16:16, *bf16:16, *fp32:16, *bf16
 // stride_cm, stride_cn}. Baked: a_desc/b_desc/bias_ptr/a_scale_ptr/b_scale_ptr/
 // add_mask_ptr = `none` (triton DCEs the TMA + bias + quant branches), the
 // dead bias/scale strides = 0, group_n/group_k = 0 (no block-quant),
-// compute_type = "bf16", all quant flags + swap_ab + FUSE_* + c_sorted = 0,
+// compute_type = dtype:bf16 (a triton dtype OBJECT constexpr, not a string),
+// all quant flags + swap_ab + FUSE_* + c_sorted = 0,
 // even_Ks = 1 (K is a multiple of BLOCK_SIZE_K), filter_expert = 1,
 // ROUTER_TOPK = 8. Tiles: BLOCK_SIZE_M/N/K = 64/64/32, GROUP_SIZE_M = 1
 // (decode band, M*top_k <= 64 routed rows). num_warps=4, num_stages=3.
@@ -650,16 +651,19 @@ const TRITON_GDR_RMS_NORM_SIGNATURE: &str = "*bf16:16, *bf16:16, *fp32:16, *bf16
 const TRITON_FUSED_MOE_GEMM_PUBLIC_DECL: &str = "uint32_t gX, uint32_t gY, uint32_t gZ, const uint16_t* a_ptr, const uint16_t* b_ptr, uint16_t* c_ptr, const float* topk_weights_ptr, const int32_t* sorted_token_ids_ptr, const int32_t* expert_ids_ptr, const int32_t* num_tokens_post_padded_ptr, int32_t N, int32_t K, int32_t EM, int32_t num_valid_tokens, int32_t stride_am, int32_t stride_ak, int32_t stride_be, int32_t stride_bk, int32_t stride_bn, int32_t stride_cm, int32_t stride_cn, CUstream stream";
 
 // FM1 — GEMM1 (gate||up): MUL_ROUTED_WEIGHT=0, top_k=8.
+// compute_type = `dtype:bf16` — a triton dtype OBJECT constexpr (the kernel does
+// `tl.zeros(dtype=compute_type)` / `acc.to(compute_type)`); a `"bf16"` string
+// constexpr raises `'str' object has no attribute to_ir` at AOT compile.
 const TRITON_FUSED_MOE_GEMM1_SIGNATURE: &str = "*bf16:16, none, *bf16:16, none, none, *bf16:16, none, none, *fp32:16, *i32:16, *i32:16, *i32:16, none, \
      i32, i32, i32, i32, \
      i32, i32, i32, i32, i32, 0, 0, i32, i32, 0, 0, 0, 0, 0, \
-     0, 0, 64, 64, 32, 1, 0, 8, \"bf16\", 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 8";
+     0, 0, 64, 64, 32, 1, 0, 8, dtype:bf16, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 8";
 
 // FM2 — GEMM2 (down): MUL_ROUTED_WEIGHT=1, top_k=1 (cache2 is already per-route).
 const TRITON_FUSED_MOE_GEMM2_SIGNATURE: &str = "*bf16:16, none, *bf16:16, none, none, *bf16:16, none, none, *fp32:16, *i32:16, *i32:16, *i32:16, none, \
      i32, i32, i32, i32, \
      i32, i32, i32, i32, i32, 0, 0, i32, i32, 0, 0, 0, 0, 0, \
-     0, 0, 64, 64, 32, 1, 1, 1, \"bf16\", 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 8";
+     0, 0, 64, 64, 32, 1, 1, 1, dtype:bf16, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 8";
 
 // ACT — act_and_mul_kernel: grid (M*top_k,), expert_step=1, BLOCK_SIZE=512,
 // ACTIVATION_TYPE="silu", SWIGLU_LIMIT=0.0, HAS_SWIGLU_LIMIT=False. Runtime:

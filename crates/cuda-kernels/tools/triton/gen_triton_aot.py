@@ -35,6 +35,11 @@ Signature grammar (subset of triton's, sufficient for ARLE's GDN kernels):
   * `<int|float>`    a literal = baked constexpr; removed from the C prototype
                      and passed to the kernel as a compile-time constant.
   * `"<string>"`     a baked string constexpr (e.g. activation "swish").
+  * `dtype:<name>`   a baked triton dtype constexpr (e.g. `dtype:bf16` for
+                     SGLang fused_moe's `compute_type`). Resolved to the real
+                     `tl.<dtype>` OBJECT — `tl.zeros(dtype=…)` / `.to(…)` call
+                     `dtype.to_ir(builder)`, which a bare `"bf16"` string
+                     constexpr cannot satisfy. Removed from the C prototype.
   * `none`           a baked `None` constexpr; removed from the C prototype.
                      Triton treats a `None` constant specially: every
                      `if <param> is not None` branch DCEs at compile time. Used
@@ -55,6 +60,7 @@ import sys
 from pathlib import Path
 
 import triton  # noqa: E402  (import after argparse docstring is fine)
+import triton.language as tl  # noqa: E402  (constexpr dtype object resolution)
 
 # triton 3.5.x public compiler surface.
 from triton.backends.compiler import GPUTarget
@@ -77,6 +83,23 @@ _SCALAR_CTYPE = {
     "bf16": "float",
     "fp32": "float",
     "fp64": "double",
+}
+
+# `dtype:<name>` constexpr token -> the real `triton.language` dtype OBJECT.
+# A dtype constexpr (e.g. SGLang fused_moe's `compute_type`) is used inside the
+# kernel as `tl.zeros(dtype=compute_type)` / `acc.to(compute_type)`, which calls
+# `dtype.to_ir(builder)` — so it MUST be a `tl.dtype`, not a Python `str`. The
+# JIT path binds it to `tl.bfloat16`; AOT must reproduce that exact object (a
+# bare `"bf16"` string constexpr raises `'str' object has no attribute to_ir`).
+_CONSTEXPR_DTYPE = {
+    "fp16": tl.float16,
+    "bf16": tl.bfloat16,
+    "fp32": tl.float32,
+    "fp64": tl.float64,
+    "i8": tl.int8,
+    "i16": tl.int16,
+    "i32": tl.int32,
+    "i64": tl.int64,
 }
 
 
@@ -124,6 +147,16 @@ def _parse_signature(sig: str):
             )
         elif tok == "none" or tok == "None":
             descriptors.append({"kind": "constexpr_none"})
+        elif tok.startswith("dtype:"):
+            name = tok[len("dtype:") :].strip()
+            if name not in _CONSTEXPR_DTYPE:
+                raise RuntimeError(
+                    f"unknown dtype constexpr {name!r} in {sig!r}. "
+                    f"Known: {sorted(_CONSTEXPR_DTYPE)}."
+                )
+            descriptors.append(
+                {"kind": "constexpr_dtype", "value": _CONSTEXPR_DTYPE[name]}
+            )
         elif tok.startswith('"') and tok.endswith('"'):
             descriptors.append({"kind": "constexpr_str", "value": tok[1:-1]})
         elif tok in _SCALAR_CTYPE:
@@ -174,6 +207,9 @@ def _triton_signature_and_constants(fn, descriptors):
             signature[name] = "constexpr"
             constants[name] = desc["value"]
         elif kind == "constexpr_str":
+            signature[name] = "constexpr"
+            constants[name] = desc["value"]
+        elif kind == "constexpr_dtype":
             signature[name] = "constexpr"
             constants[name] = desc["value"]
         elif kind == "constexpr_none":
