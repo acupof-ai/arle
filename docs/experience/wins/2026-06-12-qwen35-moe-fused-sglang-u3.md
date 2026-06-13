@@ -1,10 +1,14 @@
-# Qwen3.6-35B MoE FFN → SGLang fused_moe triton lane (U3) — opt-in, OOM fixed, A/B pending-remote
+# Qwen3.6-35B MoE FFN → SGLang fused_moe triton lane (U3) — opt-in, 2 load-path bugs fixed, A/B pending-remote
 
-**Date:** 2026-06-12 (impl); **2026-06-13** OOM root-cause + build-and-replace fix.
+**Date:** 2026-06-12 (impl); **2026-06-13** OOM root-cause + build-and-replace
+fix + expert-count validator fix.
 **Backend:** CUDA, Qwen3.6-35B-A3B, H20, TP=1.
 **Status:** `pending-remote` — code complete + Mac-typecheck/clippy green. The
-#88 validate3 pod pass found a lazy-build **OOM** (memory doubling); fixed by
-build-and-replace at load (see resolved-design-question #1). The no-OOM confirm +
+#88 validate3 pod pass found two load-path bugs in sequence: a lazy-build
+**OOM** (memory doubling) → build-and-replace at load (`59cea517`,
+resolved-design-question #1); then the freed-Vecs form tripped
+`moe_forward_into`'s expert-count precheck → `|| fused_sglang.is_some()`
+(`ad39dc77`, codex-confirmed). Both fixed. The no-OOM confirm +
 needle-envelope + dgoff-vs-moe perf A/B re-run is the remaining pending-remote
 item — **deferred: all 8 H20s occupied by the lead's DSv4 TP=8/EP=8 serve
 (~54 GB/GPU 2026-06-13); the 35B BF16 needs a free single GPU.** No default flip
@@ -170,10 +174,17 @@ decode-band path is byte-for-byte unchanged.
 ## Pending (one-shot pod pass, #88)
 
 **validate3 progress (2026-06-13):** lane-RUNS probe fired (fused_moe lane
-engaged); the lazy-build OOM was hit and **fixed** (build-and-replace at load).
-The remaining items 1–3 re-run once the H20s free (lead's DSv4 8×H20 serve holds
-all 8 GPUs; the 35B BF16 single-GPU validation has no room until then). The U3
-control is `dgoff` (`ARLE_QWEN35_DEEPGEMM=0`, hand-grouped) vs treatment `moe`
+engaged). Two load-path bugs were surfaced in sequence and **both fixed**: (1)
+the lazy-build **OOM** (memory doubling) → build-and-replace at load (`59cea517`);
+(2) with that fixed, the re-run still failed `MoE expert count mismatch: gate=0
+up=0 down=0` because `moe_forward_into`'s `!use_deepgemm` precheck rejected the
+freed-Vecs form → added `|| weights.fused_sglang.is_some()` to the validator
+(`ad39dc77`). Codex review independently flagged bug 2 and prescribed the same
+fix. Both Mac-typecheck/clippy green; pod tree staged + rebuilt non-stale. The
+remaining items 1–3 re-run once the H20s free (lead's DSv4 8×H20 serve holds all
+8 GPUs at 100% util; the 35B BF16 single-GPU validation has no room until then;
+per "等等 h20 的使用" no GPU is grabbed mid-run). The U3 control is `dgoff`
+(`ARLE_QWEN35_DEEPGEMM=0`, hand-grouped) vs treatment `moe`
 (`ARLE_QWEN35_DEEPGEMM=0 ARLE_QWEN35_MOE_FUSED_SGLANG=1`) — both DeepGEMM-off so
 the A/B isolates the fused-kernel swap (DeepGEMM gives no benefit at this shape;
 see the 2026-06-13 validation entry).
