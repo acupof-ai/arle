@@ -328,6 +328,331 @@ impl HostEmbeddingTable {
     }
 }
 
+/// Device residency upload: allocate one [`vulkan_sys::DeviceBuffer`] per
+/// planned tensor and fill it per residency tier (mirrors the DSv4 HIP
+/// `upload` module, but lands F16 not BF16 and targets `vulkan_sys`).
+///
+/// `token_embd.weight` is the one exception — it never gets a device buffer;
+/// its raw GGUF bytes go into the host-resident [`HostEmbeddingTable`] for the
+/// per-token row gather.
+#[cfg(feature = "vulkan")]
+pub mod upload {
+    use anyhow::{Context, Result, anyhow, bail, ensure};
+
+    use super::{
+        GgufFile, HostEmbeddingTable, Qwen35TensorKind, Residency, ResidencyPlan, dequant_row_f32,
+    };
+
+    /// Convert one f32 to an IEEE-754 binary16 (half) bit pattern with
+    /// round-to-nearest-even. Handles inf/NaN passthrough, subnormal halves,
+    /// and overflow-to-inf.
+    pub fn f32_to_f16(x: f32) -> u16 {
+        let bits = x.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let mant = bits & 0x007f_ffff;
+
+        // Inf / NaN: keep a set mantissa bit for NaN so it stays NaN.
+        if exp == 0xff {
+            if mant != 0 {
+                return sign | 0x7e00; // qNaN
+            }
+            return sign | 0x7c00; // +/- inf
+        }
+
+        // Unbias f32 exponent, rebias to f16 (bias 15).
+        let unbiased = exp - 127;
+        let half_exp = unbiased + 15;
+
+        if half_exp >= 0x1f {
+            // Overflow → inf.
+            return sign | 0x7c00;
+        }
+        if half_exp <= 0 {
+            // Subnormal half or underflow to zero. Build the 24-bit
+            // significand (implicit leading 1 for normal f32 inputs) and
+            // shift it into the subnormal range with round-to-nearest-even.
+            if half_exp < -10 {
+                // Too small even for the smallest subnormal → signed zero.
+                return sign;
+            }
+            let significand = mant | 0x0080_0000; // implicit 1.fraction
+            // Right shift so the value aligns to the 10-bit half mantissa.
+            let shift = (14 - half_exp) as u32; // in [14, 24]
+            let half_mant = significand >> shift;
+            // Round-to-nearest-even on the discarded low bits.
+            let remainder = significand & ((1u32 << shift) - 1);
+            let halfway = 1u32 << (shift - 1);
+            let mut result = half_mant;
+            if remainder > halfway || (remainder == halfway && (half_mant & 1) == 1) {
+                result += 1; // may carry into the exponent field — that's fine
+            }
+            return sign | (result as u16);
+        }
+
+        // Normal half. Round the 23-bit mantissa down to 10 bits, RNE.
+        let half_mant = mant >> 13;
+        let remainder = mant & 0x1fff;
+        let halfway = 0x1000u32;
+        let mut result = ((half_exp as u32) << 10) | half_mant;
+        if remainder > halfway || (remainder == halfway && (half_mant & 1) == 1) {
+            result += 1; // carries mantissa→exponent correctly; exp 0x1e→0x1f = inf
+        }
+        sign | (result as u16)
+    }
+
+    /// One device-resident weight tensor plus its provenance.
+    pub struct DeviceTensor<'a> {
+        pub name: String,
+        pub kind: Qwen35TensorKind,
+        pub layer: Option<usize>,
+        pub residency: Residency,
+        pub buffer: vulkan_sys::DeviceBuffer<'a>,
+    }
+
+    /// All device-resident weights for a model plus the host embedding table.
+    pub struct ResidentWeights<'a> {
+        pub tensors: std::collections::HashMap<String, DeviceTensor<'a>>,
+        pub embedding: HostEmbeddingTable,
+    }
+
+    impl<'a> ResidentWeights<'a> {
+        pub fn get(&self, name: &str) -> Option<&DeviceTensor<'a>> {
+            self.tensors.get(name)
+        }
+    }
+
+    /// Walk the residency plan, uploading each tensor onto `ctx`'s device per
+    /// its tier and stashing `token_embd.weight` host-side. Exactly one
+    /// `HostEmbedding` tensor (the token embedding) is expected.
+    pub fn upload_plan<'a>(
+        ctx: &'a vulkan_sys::VulkanContext,
+        gguf: &GgufFile,
+        plan: &ResidencyPlan,
+    ) -> Result<ResidentWeights<'a>> {
+        let mut tensors = std::collections::HashMap::new();
+        let mut embedding: Option<HostEmbeddingTable> = None;
+
+        for t in &plan.tensors {
+            // The host-resident token embedding: never gets a device buffer.
+            if t.residency == Residency::HostEmbedding {
+                let info = gguf
+                    .tensor(&t.name)
+                    .ok_or_else(|| anyhow!("token_embd {} vanished from GGUF", t.name))?;
+                let hidden = usize::try_from(info.dims.first().copied().unwrap_or(0))
+                    .map_err(|_| anyhow!("{}: hidden dim overflow", t.name))?;
+                let vocab = usize::try_from(info.dims.get(1).copied().unwrap_or(0))
+                    .map_err(|_| anyhow!("{}: vocab dim overflow", t.name))?;
+                let raw = gguf.tensor_data(&t.name)?.to_vec();
+                let table = HostEmbeddingTable::new(t.ggml_type, hidden, vocab, raw)
+                    .with_context(|| format!("building host embedding table from {}", t.name))?;
+                ensure!(
+                    embedding.replace(table).is_none(),
+                    "more than one HostEmbedding tensor in plan (second: {})",
+                    t.name
+                );
+                continue;
+            }
+
+            let src = gguf.tensor_data(&t.name)?;
+            let n = gguf
+                .tensor(&t.name)
+                .map(|i| i.element_count() as usize)
+                .unwrap_or(0);
+            let mut buffer = vulkan_sys::DeviceBuffer::alloc(ctx, t.bytes as usize)
+                .map_err(|e| anyhow!("alloc {} ({} B): {e}", t.name, t.bytes))?;
+            match t.residency {
+                Residency::KeepKQuant(_) => {
+                    buffer
+                        .copy_from_host(src)
+                        .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
+                }
+                Residency::DequantF16 => {
+                    let f = dequant_row_f32(t.ggml_type, src, n).context(t.name.clone())?;
+                    let bytes: Vec<u8> = f
+                        .iter()
+                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                        .collect();
+                    buffer
+                        .copy_from_host(&bytes)
+                        .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
+                }
+                Residency::DequantF32 => {
+                    let f = dequant_row_f32(t.ggml_type, src, n).context(t.name.clone())?;
+                    let bytes: Vec<u8> = f.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    buffer
+                        .copy_from_host(&bytes)
+                        .map_err(|e| anyhow!("upload {}: {e}", t.name))?;
+                }
+                Residency::HostEmbedding => unreachable!("handled above"),
+            }
+            tensors.insert(
+                t.name.clone(),
+                DeviceTensor {
+                    name: t.name.clone(),
+                    kind: t.kind,
+                    layer: t.layer,
+                    residency: t.residency,
+                    buffer,
+                },
+            );
+        }
+
+        let Some(embedding) = embedding else {
+            bail!("no HostEmbedding (token_embd.weight) tensor found in plan");
+        };
+        Ok(ResidentWeights { tensors, embedding })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn f16_pinned() {
+            assert_eq!(f32_to_f16(1.0), 0x3C00);
+            assert_eq!(f32_to_f16(-2.0), 0xC000);
+            assert_eq!(f32_to_f16(0.0), 0x0000);
+            assert_eq!(f32_to_f16(-0.0), 0x8000);
+            assert_eq!(f32_to_f16(65504.0), 0x7BFF); // largest finite half
+            // 2049 = 0x4000_0800: not exactly representable (step is 2 at this
+            // magnitude); RNE → 2048.0 = 0x6800.
+            assert_eq!(f32_to_f16(2049.0), 0x6800);
+            // 2051 rounds up to 2052.0 = 0x6802.
+            assert_eq!(f32_to_f16(2051.0), 0x6802);
+            // Overflow above the half range → +inf.
+            assert_eq!(f32_to_f16(f32::MAX), 0x7C00);
+            assert_eq!(f32_to_f16(f32::INFINITY), 0x7C00);
+            assert_eq!(f32_to_f16(f32::NEG_INFINITY), 0xFC00);
+            // NaN stays NaN (exp all ones, nonzero mantissa).
+            let nan = f32_to_f16(f32::NAN);
+            assert_eq!(nan & 0x7C00, 0x7C00);
+            assert_ne!(nan & 0x03FF, 0);
+            // Smallest normal/subnormal halves round-trip sanity.
+            assert_eq!(f32_to_f16(6.103515625e-5), 0x0400); // 2^-14 smallest normal
+            assert_eq!(f32_to_f16(5.9604645e-8), 0x0001); // smallest subnormal
+        }
+
+        #[cfg(feature = "vulkan")]
+        #[test]
+        fn upload_plan_lands_bytes_on_device() {
+            use crate::loader::plan_model;
+            use infer_gguf::gguf::GgufFile;
+            use infer_gguf::gguf::test_writer::{T, V, write_to_temp};
+            use vulkan_sys::VulkanContext;
+
+            let ctx = match VulkanContext::create() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("no Vulkan device available ({e}); skipping upload_plan device test");
+                    return;
+                }
+            };
+            eprintln!("ARLE Vulkan upload_plan device: {}", ctx.device_name());
+
+            // Synthesize a tiny qwen35moe GGUF:
+            //   token_embd.weight  F32  [hidden=8, vocab=4]      -> HostEmbedding
+            //   blk.0.attn_norm.weight F32 [8]                   -> DequantF32
+            //   blk.0.attn_q.weight    Q8_0 [32]  (34 B/32)      -> DequantF16
+            //   blk.0.ffn_gate_exps.weight Q4_K [256] (144 B/256)-> KeepKQuant(Q4K)
+            let hidden = 8u64;
+            let vocab = 4u64;
+            let mut embd = Vec::new();
+            for v in 0..(hidden * vocab) {
+                embd.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            let norm: Vec<u8> = (0..hidden).flat_map(|v| (v as f32).to_le_bytes()).collect();
+            // Q8_0: 34 B per 32-element block; one block. Distinct bytes so the
+            // raw-vs-dequant path is exercised (we only assert sizes for it).
+            let q8_0: Vec<u8> = (0..34u8).collect();
+            // Q4_K: 144 B per 256-element block; one block, distinct bytes.
+            let q4_k: Vec<u8> = (0..144u32).map(|i| (i % 251) as u8).collect();
+
+            let path = write_to_temp(
+                &[("general.architecture", V::Str("qwen35moe"))],
+                &[
+                    T {
+                        name: "token_embd.weight".into(),
+                        dims: vec![hidden, vocab],
+                        type_id: 0, // F32
+                        data: embd,
+                    },
+                    T {
+                        name: "blk.0.attn_norm.weight".into(),
+                        dims: vec![hidden],
+                        type_id: 0, // F32
+                        data: norm,
+                    },
+                    T {
+                        name: "blk.0.attn_q.weight".into(),
+                        dims: vec![32],
+                        type_id: 8, // Q8_0
+                        data: q8_0,
+                    },
+                    T {
+                        name: "blk.0.ffn_gate_exps.weight".into(),
+                        dims: vec![256],
+                        type_id: 12, // Q4_K
+                        data: q4_k.clone(),
+                    },
+                ],
+                "vulkan-upload",
+            );
+
+            let gguf = GgufFile::open(&path).expect("open synthetic GGUF");
+            let plan = plan_model(&gguf, 1).expect("plan_model");
+            let resident = upload_plan(&ctx, &gguf, &plan).expect("upload_plan");
+
+            // token_embd is NOT in the device tensor map (it's host-resident).
+            assert!(
+                resident.get("token_embd.weight").is_none(),
+                "token_embd must not be a device tensor"
+            );
+            assert_eq!(
+                resident.tensors.len(),
+                3,
+                "three device tensors expected (norm, attn_q, ffn_gate_exps)"
+            );
+
+            // Each device buffer is exactly its planned byte count.
+            let by_name = |n: &str| plan.tensors.iter().find(|t| t.name == n).unwrap();
+            for name in [
+                "blk.0.attn_norm.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.ffn_gate_exps.weight",
+            ] {
+                let dt = resident
+                    .get(name)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                assert_eq!(
+                    dt.buffer.len() as u64,
+                    by_name(name).bytes,
+                    "{name} buffer size != planned bytes"
+                );
+            }
+
+            // KeepKQuant Q4_K round-trips byte-for-byte (raw quant bytes uploaded).
+            let q4 = resident.get("blk.0.ffn_gate_exps.weight").unwrap();
+            assert!(matches!(q4.residency, Residency::KeepKQuant(_)));
+            let mut back = vec![0u8; q4.buffer.len()];
+            q4.buffer.copy_to_host(&mut back).expect("D2H Q4_K");
+            assert_eq!(back, q4_k, "Q4_K device round-trip mismatch");
+
+            // Embedding row 0 gathers `hidden` f32 values.
+            let row0 = resident.embedding.embed_row(0).expect("embed_row(0)");
+            assert_eq!(row0.len(), hidden as usize);
+            assert_eq!(row0, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+
+            std::fs::remove_file(path).ok();
+            eprintln!(
+                "PASS: upload_plan landed {} device tensors on {}",
+                resident.tensors.len(),
+                ctx.device_name()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Qwen35TensorKind::*;
