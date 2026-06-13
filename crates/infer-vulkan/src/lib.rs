@@ -10,6 +10,8 @@ pub use infer_gguf::{deepseek4, dequant, gguf};
 
 pub mod config;
 pub mod executor;
+#[cfg(feature = "vulkan")]
+pub mod forward;
 pub mod kv_pool;
 pub mod loader;
 pub mod model_dsv4;
