@@ -53,26 +53,6 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
     DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
-/// Replicated decode attention (B=1 DP-attn degenerate form, opt-in
-/// `ARLE_DSV4_REPLICATED_ATTN=1`): every rank loads FULL `wq_b`/`wo_a` and
-/// computes the whole attention block redundantly at decode. Inputs are
-/// rank-identical (the MoE all-reduce output), weights identical, kernels
-/// deterministic ⇒ outputs identical on every rank — so the per-layer
-/// attention AllGather (FlashMLA Q gather) AND AllReduce (O-LoRA partial
-/// sum) both disappear: 43+43 latency-bound 8 KB collectives/token gone.
-/// The attention KERNEL was already computed full-width on every rank
-/// (h_q%64==0), so the added compute is only the two full-width projections.
-/// Prefill keeps the sharded math + collectives.
-pub(crate) fn dsv4_replicated_attn_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_DSV4_REPLICATED_ATTN").as_deref(),
-            Ok("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
-        )
-    })
-}
-
 static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -4928,9 +4908,6 @@ fn try_flashmla_decode_attention(
     start_pos_device: Option<&CudaSlice<i32>>,
     tp: &TpRuntime,
     local_heads: usize,
-    // Replicated decode: q already carries ALL heads — no TP gather/repack,
-    // and the full output lands in local_attn directly (no slice).
-    replicated: bool,
     local_attn: &mut HiddenStates,
     sm_scale: f32,
     rope_base: f32,
@@ -4959,13 +4936,9 @@ fn try_flashmla_decode_attention(
 
     let tp_world = tp.config().world_size;
     let tp_rank = tp.config().rank;
-    let global_heads = if replicated {
-        local_heads
-    } else {
-        local_heads
-            .checked_mul(tp_world)
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA global head overflow"))?
-    };
+    let global_heads = local_heads
+        .checked_mul(tp_world)
+        .ok_or_else(|| anyhow!("DSv4 FlashMLA global head overflow"))?;
     ensure!(
         matches!(global_heads, 64 | 128),
         "DSv4 FlashMLA decode requires global heads 64/128, got {global_heads}"
@@ -5053,7 +5026,7 @@ fn try_flashmla_decode_attention(
     let (sched_ptr, sched_guard) = flash.sched_meta.device_ptr(&ctx.stream);
     let (splits_ptr, splits_guard) = flash.num_splits.device_ptr(&ctx.stream);
 
-    let q_for_flashmla = if !replicated && tp_world > 1 {
+    let q_for_flashmla = if tp_world > 1 {
         let (gather_ptr, gather_guard) = flash.tp_gathered_q.device_ptr_mut(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather");
@@ -5106,7 +5079,7 @@ fn try_flashmla_decode_attention(
         unsafe { (sink_base as *const f32).add(tp_rank * local_heads) }
     };
 
-    let flash_out_ptr = if !replicated && tp_world > 1 {
+    let flash_out_ptr = if tp_world > 1 {
         let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr_mut(&ctx.stream);
         drop(full_out_guard);
         full_out_ptr as *mut ffi::Half
@@ -5171,7 +5144,7 @@ fn try_flashmla_decode_attention(
         }
     }
 
-    if !replicated && tp_world > 1 {
+    if tp_world > 1 {
         let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice");
@@ -5516,23 +5489,7 @@ pub(crate) fn mla_attention(
 
     let head_dim = config.head_dim;
     let token_count = hidden.seq_len;
-    // Replicated decode attention: single-row chunks compute the FULL block
-    // per rank from the full-width weights — zero attention collectives
-    // (caller skips the AR via the same predicate). Prefill / multi-row
-    // chunks keep the sharded math.
-    let replicated = token_count == 1
-        && dsv4_replicated_attn_enabled()
-        && attention.wq_b_full.is_some()
-        && attention.wo_a_groups.is_some()
-        && attention.wo_b_full.is_some();
-    let wq_b_active = if replicated {
-        attention
-            .wq_b_full
-            .as_ref()
-            .expect("replicated gate checked")
-    } else {
-        &attention.wq_b
-    };
+    let wq_b_active = &attention.wq_b;
     let local_width = wq_b_active.rows;
     ensure!(
         head_dim > 0 && local_width.is_multiple_of(head_dim),
@@ -5543,42 +5500,18 @@ pub(crate) fn mla_attention(
     let tp_rank = tp.config().rank;
     // This rank owns global heads [tp_rank*local_heads, +local_heads); the
     // whole-loaded attn_sink must be indexed from that offset (see fn docs).
-    // Replicated: this rank owns ALL heads — offset 0.
-    let sink_offset = if replicated { 0 } else { tp_rank * local_heads };
-    // Non-replicated drives the single sharded wo_a (one group); replicated
-    // applies the per-group wo_a matrices block-diagonally in mla_oproj, so the
-    // single-matrix `wo_a_active` is only used off the replicated path.
+    let sink_offset = tp_rank * local_heads;
     let wo_a_active = &attention.wo_a;
     ensure!(
         attention.wkv.rows == head_dim,
         "DSv4 MLA wkv rows {} != head_dim {head_dim}",
         attention.wkv.rows
     );
-    if replicated {
-        // The o-projection is grouped: each wo_a group projects ITS group's
-        // head slice (`heads_per_group*head_dim`), and the groups tile the full
-        // attention width. Validate the tiling rather than a single-matrix cols.
-        let groups = attention
-            .wo_a_groups
-            .as_ref()
-            .expect("replicated gate checked");
-        let group_in = groups[0].cols;
-        ensure!(
-            !groups.is_empty()
-                && groups.iter().all(|g| g.cols == group_in)
-                && group_in > 0
-                && groups.len() * group_in == local_width,
-            "DSv4 replicated wo_a groups {}x{} do not tile local width {local_width}",
-            groups.len(),
-            group_in
-        );
-    } else {
-        ensure!(
-            wo_a_active.cols == local_width,
-            "DSv4 MLA wo_a cols {} != local attention width {local_width}",
-            wo_a_active.cols
-        );
-    }
+    ensure!(
+        wo_a_active.cols == local_width,
+        "DSv4 MLA wo_a cols {} != local attention width {local_width}",
+        wo_a_active.cols
+    );
     ensure!(
         attention.wo_b.rows == out.hidden_dim && out.seq_len == token_count,
         "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
@@ -5641,7 +5574,7 @@ pub(crate) fn mla_attention(
     // ARLE_DSV4_FP8_LINEAR_DEEPGEMM; the default branch below preserves the
     // scalar reference order exactly. Replicated decode forces the plain arm:
     // the fused/DeepGEMM scratches and weight caches are shard-shaped.
-    let fused_wqkv = token_count == 1 && !replicated && dsv4_fused_wqkv_decode_enabled()?;
+    let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
     let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
@@ -5882,7 +5815,6 @@ pub(crate) fn mla_attention(
                     start_pos_device,
                     tp,
                     local_heads,
-                    replicated,
                     &mut local_attn,
                     sm_scale,
                     rope_base,
@@ -6145,7 +6077,6 @@ pub(crate) fn mla_attention(
                 start_pos_device,
                 tp,
                 local_heads,
-                replicated,
                 &mut local_attn,
                 sm_scale,
                 rope_base,
@@ -6265,7 +6196,6 @@ pub(crate) fn mla_attention(
         &local_attn,
         token_count,
         wo_a_active,
-        replicated,
         keepalive,
         out,
     )
@@ -6284,63 +6214,13 @@ fn mla_oproj(
     state: &mut Dsv4LayerAttentionState,
     local_attn: &HiddenStates,
     token_count: usize,
-    // Non-replicated: the single sharded wo_a (one group). Replicated uses the
-    // per-group wo_a matrices + full wo_b on `attention` instead (grouped
-    // o-projection); the shard-shaped DeepGEMM caches are bypassed there.
     wo_a_active: &DeviceMatrix,
-    replicated: bool,
     keepalive: &mut Dsv4ForwardKeepalive,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    if replicated {
-        // Grouped o-projection (token_count == 1 by the replicated gate): each
-        // rank computed ALL heads, so apply EVERY wo_a group block-diagonally —
-        // group g projects its head slice `local_attn[g*group_in ..]` (BF16,
-        // contiguous at 1 token) through its FP8 wo_a → its `o_lora` latent
-        // rows — then full wo_b combines all group latents into `out`. No
-        // all-reduce (each rank already holds the complete output).
-        ensure!(
-            token_count == 1,
-            "replicated o-proj assumes single-token decode (contiguous group \
-             slices); got token_count {token_count}"
-        );
-        let groups = attention
-            .wo_a_groups
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("replicated o-proj: wo_a_groups missing"))?;
-        let wo_b_full = attention
-            .wo_b_full
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("replicated o-proj: wo_b_full missing"))?;
-        let o_lora = groups[0].rows;
-        let group_in = groups[0].cols;
-        let mut latent = unsafe { HiddenStates::uninit(ctx, groups.len() * o_lora, token_count)? };
-        for (g, wo_a_g) in groups.iter().enumerate() {
-            // group g's attention slice → temp [group_in, token]
-            let mut attn_g = unsafe { HiddenStates::uninit(ctx, group_in, token_count)? };
-            ctx.stream
-                .memcpy_dtod(
-                    &local_attn.data.slice(g * group_in..(g + 1) * group_in),
-                    &mut attn_g.data,
-                )
-                .map_err(|e| anyhow::anyhow!("replicated o-proj attn slice {g}: {e}"))?;
-            let mut latent_g = unsafe { HiddenStates::uninit(ctx, o_lora, token_count)? };
-            dsv4_linear(ctx, wo_a_g, &attn_g, &mut latent_g)?;
-            ctx.stream
-                .memcpy_dtod(
-                    &latent_g.data,
-                    &mut latent.data.slice_mut(g * o_lora..(g + 1) * o_lora),
-                )
-                .map_err(|e| anyhow::anyhow!("replicated o-proj latent place {g}: {e}"))?;
-        }
-        keepalive.keep_hidden(&latent);
-        dsv4_linear(ctx, wo_b_full, &latent, out)?;
-        return Ok(());
-    }
     // SAFETY: dsv4_linear writes the full latent buffer.
     let mut latent = unsafe { HiddenStates::uninit(ctx, wo_a_active.rows, token_count)? };
     let wo_dg = token_count == 1
-        && !replicated
         && dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_a_deepgemm.is_some()
