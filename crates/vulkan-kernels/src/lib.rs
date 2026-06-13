@@ -7,6 +7,7 @@
 //! fail loud with [`KernelError::ShaderMissing`].
 
 pub const QK_K: usize = 256;
+pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
 
 pub const BLOCK_IQ2_XXS_BYTES: usize = 66;
@@ -14,6 +15,7 @@ pub const BLOCK_Q2_K_BYTES: usize = 84;
 pub const BLOCK_Q4_K_BYTES: usize = 144;
 pub const BLOCK_Q5_K_BYTES: usize = 176;
 pub const BLOCK_Q6_K_BYTES: usize = 210;
+pub const BLOCK_Q8_0_BYTES: usize = 34;
 pub const BLOCK_Q8_1_BYTES: usize = 36;
 
 pub const fn iq2_xxs_row_bytes(ncols: usize) -> Option<usize> {
@@ -51,6 +53,13 @@ pub const fn q6_k_row_bytes(ncols: usize) -> Option<usize> {
     Some(ncols / QK_K * BLOCK_Q6_K_BYTES)
 }
 
+pub const fn q8_0_row_bytes(ncols: usize) -> Option<usize> {
+    if ncols == 0 || !ncols.is_multiple_of(QK8_0) {
+        return None;
+    }
+    Some(ncols / QK8_0 * BLOCK_Q8_0_BYTES)
+}
+
 pub const fn q8_1_row_bytes(ncols: usize) -> Option<usize> {
     if ncols == 0 || !ncols.is_multiple_of(QK8_1) {
         return None;
@@ -65,6 +74,7 @@ pub enum Kernel {
     GemvQ4K,
     GemvQ5K,
     GemvQ6K,
+    GemvQ8_0,
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
@@ -121,6 +131,7 @@ impl Kernel {
         Self::GemvQ4K,
         Self::GemvQ5K,
         Self::GemvQ6K,
+        Self::GemvQ8_0,
         Self::QuantizeQ8_1,
         Self::RmsNorm,
         Self::RopeNeox,
@@ -153,6 +164,7 @@ impl Kernel {
             Kernel::GemvQ4K => "mul_mat_vecq_q4_k",
             Kernel::GemvQ5K => "mul_mat_vecq_q5_k",
             Kernel::GemvQ6K => "mul_mat_vecq_q6_k",
+            Kernel::GemvQ8_0 => "mul_mat_vecq_q8_0",
             Kernel::QuantizeQ8_1 => "q8_1_quantize",
             Kernel::RmsNorm => "rms_norm",
             Kernel::RopeNeox => "rope_neox",
@@ -183,7 +195,9 @@ impl Kernel {
         match self {
             Kernel::MmvqIq2Xxs => SPEC_MMVQ_IQ2_XXS,
             Kernel::MmvqQ2K => SPEC_MMVQ_Q2_K,
-            Kernel::GemvQ4K | Kernel::GemvQ5K | Kernel::GemvQ6K => SPEC_GEMV_K_Q8_1,
+            Kernel::GemvQ4K | Kernel::GemvQ5K | Kernel::GemvQ6K | Kernel::GemvQ8_0 => {
+                SPEC_GEMV_K_Q8_1
+            }
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
@@ -341,6 +355,42 @@ impl KernelParams {
     }
 }
 
+/// Push-constant layout for the `mul_mat_vecq` GEMV (binding interface in
+/// `mul_mat_vec_base.glsl`, non-`MUL_MAT_ID` branch). 13 `uint`s, in order:
+/// `ncols, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b,
+/// batch_stride_d, fusion_flags, base_work_group_y, ne02, ne12, broadcast2,
+/// broadcast3`.
+///
+/// `stride_d` is the shader's row-count guard (number of output rows), and
+/// `ncols` is the per-row width in elements (a multiple of 256 for the K-quant
+/// shaders, 32 for Q8_0). For a single, unbatched `[nrows, ncols]` weight ×
+/// `[ncols]` activation matvec with no bias/scale fusion, the remaining fields
+/// reduce to: strides set to their natural row widths, every batch stride 0,
+/// `fusion_flags = 0`, and `ne02 = ne12 = broadcast2 = broadcast3 = 1`.
+pub fn gemv_params(ncols: u32, nrows: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        ncols,      // ncols: per-row width in elements
+        ncols,      // stride_a: weight row stride (elements); unused for batch 0
+        ncols / 32, // stride_b: activation row stride in q8_1 blocks; unused for batch 0
+        nrows,      // stride_d: ROW COUNT guard the shader checks first_row against
+        ncols,      // batch_stride_a (elements); only used via /QUANT_K when batched
+        0,          // batch_stride_b: single batch
+        0,          // batch_stride_d: single batch
+        0,          // fusion_flags: no bias/scale fusion (bindings 3/4 unread)
+        0,          // base_work_group_y: batch offset
+        1,          // ne02
+        1,          // ne12
+        1,          // broadcast2
+        1,          // broadcast3
+    ])
+}
+
+/// Dispatch grid for [`gemv_params`]: one workgroup per output row (NUM_ROWS=1),
+/// single batch. `main()` derives `first_row` from `gl_WorkGroupID.x`.
+pub fn gemv_dispatch(nrows: u32) -> Dispatch {
+    Dispatch::x(nrows.max(1))
+}
+
 pub const Q8_1_X4_VALUES_PER_GROUP: u32 = 128;
 
 pub fn q8_1_quantize_params(ne: u32) -> KernelParams {
@@ -391,6 +441,57 @@ macro_rules! launcher_fns {
             dispatch: Dispatch,
         ) -> Result<()> {
             $call(Kernel::GemvQ6K, ctx, buffers, dispatch)
+        }
+
+        // The `mul_mat_vecq` GEMV requires the 13-uint push-constant block from
+        // `mul_mat_vec_base.glsl` (ncols/strides/row-count). The no-push
+        // launchers above are insufficient on their own — use these
+        // `*_with_params` variants (see [`gemv_params`]) for a working matvec.
+        // Buffer order: [A weights, B q8_1_x4 activations, D f32 dst,
+        // Fuse0, Fuse1] — bindings 3/4 are declared by the shader but only read
+        // when `fusion_flags != 0`; bind small dummies to satisfy the layout.
+        pub fn q4_k_gemv_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvQ4K, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q5_k_gemv_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvQ5K, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q6_k_gemv_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvQ6K, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q8_0_gemv(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+        ) -> Result<()> {
+            $call(Kernel::GemvQ8_0, ctx, buffers, dispatch)
+        }
+
+        pub fn q8_0_gemv_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvQ8_0, ctx, buffers, dispatch, params)
         }
 
         pub fn q8_1_quantize(
@@ -790,6 +891,25 @@ mod tests {
         assert_eq!(q8_1_row_bytes(32), Some(36));
         assert_eq!(q4_k_row_bytes(255), None);
         assert_eq!(q8_1_row_bytes(31), None);
+        assert_eq!(q8_0_row_bytes(32), Some(34));
+        assert_eq!(q8_0_row_bytes(256), Some(8 * 34));
+        assert_eq!(q8_0_row_bytes(31), None);
+    }
+
+    #[test]
+    fn gemv_params_match_mul_mat_vec_base_layout() {
+        // 13 uints: ncols, stride_a, stride_b, stride_d, batch_stride_a,
+        // batch_stride_b, batch_stride_d, fusion_flags, base_work_group_y,
+        // ne02, ne12, broadcast2, broadcast3.
+        let params = gemv_params(256, 4);
+        assert_eq!(params.len_bytes(), 13 * 4);
+        assert_eq!(
+            params,
+            KernelParams::from_words(vec![256, 256, 8, 4, 256, 0, 0, 0, 0, 1, 1, 1, 1])
+        );
+        // stride_d (index 3) is the row-count guard the shader checks.
+        assert_eq!(gemv_dispatch(4), Dispatch::x(4));
+        assert_eq!(gemv_dispatch(0), Dispatch::x(1));
     }
 
     #[test]
@@ -800,6 +920,7 @@ mod tests {
             Kernel::GemvQ4K.shader_name(),
             Kernel::GemvQ5K.shader_name(),
             Kernel::GemvQ6K.shader_name(),
+            Kernel::GemvQ8_0.shader_name(),
             Kernel::QuantizeQ8_1.shader_name(),
             Kernel::RmsNorm.shader_name(),
             Kernel::RopeNeox.shader_name(),
@@ -814,7 +935,7 @@ mod tests {
             Kernel::ArgMax.shader_name(),
             Kernel::FlashAttn.shader_name(),
         ];
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
         assert!(names.iter().all(|name| !name.is_empty()));
     }
 
@@ -838,6 +959,10 @@ mod tests {
         );
         assert_eq!(
             Kernel::GemvQ6K.specialization_u32(),
+            Kernel::GemvQ4K.specialization_u32()
+        );
+        assert_eq!(
+            Kernel::GemvQ8_0.specialization_u32(),
             Kernel::GemvQ4K.specialization_u32()
         );
         assert_eq!(Kernel::SoftMax.specialization_u32(), &[(0, 32)]);
