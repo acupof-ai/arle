@@ -27,7 +27,7 @@ the per-lane impl entries are [U2](2026-06-12-qwen35-sgl-gdn-triton-aot.md),
 | U1 triton AOT | — | — | — | **PASS** — all 7 cubins load non-stub (the 3 lane probes below fire, which only happens past the NOT_SUPPORTED loud-fail) |
 | U2 GDN decode | yes (probe) | yes (= off math) | **WASH** | opt-in, no flip |
 | U4 fused add-RMSNorm | yes (probe) | yes (DET, minor fusion-FP envelope caveat) | **WASH** | opt-in, no flip |
-| U3 fused_moe | yes (probe) | n/a (OOM'd) | **OOM → fixed**, A/B pending-remote | opt-in, no flip |
+| U3 fused_moe | yes (probe) | n/a (didn't serve) | **2 load-path bugs → both fixed**, A/B pending-remote | opt-in, no flip |
 
 ## What worked — the c=8 admission bistability that manufactured a false win
 
@@ -64,27 +64,53 @@ in-tree hybrid-dispatch crossover note in `moe_forward_into`). Consequence for
 U3: its control is `dgoff`, not `off` — both DeepGEMM-off so the A/B isolates the
 fused-kernel swap rather than confounding it with the (no-op) DeepGEMM flip.
 
-## U3 OOM — root cause + fix (this session)
+## U3 — two load-path bugs, both found by validation + fixed (this session)
 
-The `moe` arm never served: `fused MoE w1 alloc failed: DriverError(
-CUDA_ERROR_OUT_OF_MEMORY)` (pod, fresh). Root cause: the fused `w1 [E,2N,K]` +
+The `moe` arm failed to serve **twice**, for two distinct reasons surfaced in
+sequence by the same validation harness. Both are now fixed; the perf A/B is
+the only step left (GPU-blocked).
+
+### Bug 1 — OOM (memory doubling)
+
+`fused MoE w1 alloc failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY)` (pod,
+fresh). Root cause: the fused `w1 [E,2N,K]` +
 `w2 [E,K,N]` BF16 cache is a **second full copy** of the MoE weights
 (~1.6 GB/layer) and the first design built it **lazily on the first forward**,
 ON TOP of the still-resident per-expert Vecs (DeepGEMM-off keeps them). On the
 35B-A3B shard (~70 GB weights on a 96 GB H20, ~30 GB free), the per-layer lazy
 builds exhausted the free pool around layer 20 (20 × 1.6 GB ≈ 32 GB).
 
-Fix (`crates/infer-cuda/src/{loader,moe}.rs`): **build-and-replace at LOAD**,
-mirroring the DeepGEMM grouped block in the same loader — restack the Vecs into
-w1/w2, `ctx.sync()?`, then `gate/up/down.clear()` per layer. The lazy build
-could not free the Vecs (it held `&MoeLayerWeights`, pool-shared `&self`); the
-loader owns them `mut`. Resident is now net-zero growth (restacked ≈ freed);
+Fix (`59cea517`, `crates/infer-cuda/src/{loader,moe}.rs`): **build-and-replace
+at LOAD**, mirroring the DeepGEMM grouped block in the same loader — restack the
+Vecs into w1/w2, `ctx.sync()?`, then `gate/up/down.clear()` per layer. The lazy
+build could not free the Vecs (it held `&MoeLayerWeights`, pool-shared `&self`);
+the loader owns them `mut`. Resident is now net-zero growth (restacked ≈ freed);
 peak = baseline + one layer's transient. `build_fused_sglang_weights` becomes a
 pure cache getter; the forward gate loud-fails if the flag is on for a
-non-device-route-eligible config (the non-fused fallback's Vecs are gone). Mac
-typecheck + clippy green; the no-OOM confirm + needle-envelope + dgoff-vs-moe
-A/B re-runs when the H20 frees (all 8 GPUs held by the lead's DSv4 TP=8/EP=8
-serve, ~54 GB/GPU — the 35B BF16 needs a free single GPU). Detail in the
+non-device-route-eligible config (the non-fused fallback's Vecs are gone).
+
+### Bug 2 — expert-count validator rejects the cleared-Vecs form
+
+With Bug 1 fixed, the re-run's `moe` arm **still** failed — but no longer OOM:
+`engine step failed: MoE expert count mismatch: gate=0 up=0 down=0
+local_experts=256 (ep_size=1 ep_rank=0)`. Bug 1's fix had done its job (the
+Vecs were freed), but `moe_forward_into`'s early `!use_deepgemm` precheck only
+accepted two weight forms — `gate_grouped.is_some()` (DeepGEMM) or full
+per-expert Vecs — and tripped on the freed Vecs **before** control reached the
+fused branch (which returns at `moe.rs:813`, well past the check). Fix
+(`ad39dc77`): add `|| weights.fused_sglang.is_some()` as the third accepted
+form, mirroring how `gate_grouped` is already accepted. The fused branch and
+`add_shared_expert_gated` (shared-expert weights, not the routed Vecs) were the
+only other consumers — enumerated, both safe. **Codex review (`--commit
+59cea517`) independently flagged this exact precheck gap and prescribed the same
+fix** ("Include the fused cache in that precheck") — static analysis and the pod
+failure converged on the same root cause.
+
+Mac typecheck + clippy green for both fixes; pod tree staged + rebuilt (binary
+mtime 07:59:42, 3 crates recompiled — non-stale). The no-OOM confirm +
+needle-envelope + dgoff-vs-moe A/B re-runs when the H20 frees (all 8 GPUs held
+by the lead's DSv4 TP=8/EP=8 serve, ~55 GB/GPU at 100% util — the 35B BF16 needs
+a free single GPU; per "等等 h20 的使用" no GPU is grabbed mid-run). Detail in the
 [U3 entry](2026-06-12-qwen35-moe-fused-sglang-u3.md).
 
 ## Rule
@@ -103,3 +129,14 @@ serve, ~54 GB/GPU — the 35B BF16 needs a free single GPU). Detail in the
   the sources are owned `mut`. Enumerate the doubled buffer (here w1 1.07 GB +
   w2 0.54 GB per layer × 40 layers) before assuming "+1.5 GB total" — it was
   +1.5 GB *per layer*.
+- **A load path that frees the per-expert Vecs must be allowed past EVERY
+  Vec-length precheck, not just the kernel it feeds.** Build-and-replace clears
+  `gate/up/down`, so any forward-side validator asserting `gate.len() ==
+  local_experts` rejects the new weight form before the consuming branch runs —
+  even when that branch never touches the Vecs. Grep every reader of the cleared
+  buffer (`weights.{gate,up,down}` len/index/iter) and prove each: here the
+  precheck (`moe.rs:628`) needed the third OR arm; the shape-resolution block
+  (`moe.rs:919`) was already past the fused early-return; `add_shared_expert_gated`
+  reads shared-expert weights, not the routed Vecs. Codex review caught the same
+  gap by static analysis — the §0.1 "enumerate every mutated buffer + prove each"
+  discipline applies symmetrically to every *reader* of a freed buffer.
