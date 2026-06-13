@@ -17,7 +17,7 @@
 //!   "lookup" gathers + dequantizes a single row per token instead of
 //!   uploading the whole (~0.5–1 GB) table.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
 use infer_gguf::gguf::{GgmlType, GgufFile, TensorInfo};
 
@@ -261,6 +261,73 @@ pub fn plan_model(gguf: &GgufFile, num_layers: usize) -> Result<ResidencyPlan> {
     Ok(plan)
 }
 
+/// Dequantize a single GGUF row (`n` elements at `data`) to f32, dispatching on
+/// type. Covers every type the qwen35moe K-quant GGUFs use; fails loud on an
+/// unsupported type (e.g. MXFP4) so the 122B's MXFP4 experts surface a clear
+/// "needs a dedicated path" error instead of silently producing garbage.
+pub fn dequant_row_f32(ty: GgmlType, data: &[u8], n: usize) -> Result<Vec<f32>> {
+    use infer_gguf::dequant;
+    match ty {
+        GgmlType::F32 => dequant::dequantize_row_f32(data, n),
+        GgmlType::F16 => dequant::dequantize_row_f16(data, n),
+        GgmlType::Bf16 => dequant::dequantize_row_bf16(data, n),
+        GgmlType::Q8_0 => dequant::dequantize_row_q8_0(data, n),
+        GgmlType::Q2K => dequant::dequantize_row_q2_k(data, n),
+        GgmlType::Q4K => dequant::dequantize_row_q4_k(data, n),
+        GgmlType::Q5K => dequant::dequantize_row_q5_k(data, n),
+        GgmlType::Q6K => dequant::dequantize_row_q6_k(data, n),
+        other => {
+            bail!("qwen35: no CPU dequant for {other:?} (e.g. MXFP4 experts need a dedicated path)")
+        }
+    }
+}
+
+/// Host-resident token-embedding table for the per-token gather "lookup".
+///
+/// `token_embd.weight` is `[hidden, vocab]` in GGUF order (ne0 = `hidden` is the
+/// contiguous dim), so token `t`'s vector is the `t`-th `hidden`-element row.
+/// Kept on the host (not uploaded) because a forward only ever gathers the few
+/// rows for the current tokens — dequantizing one row is far cheaper than
+/// materializing the whole (~0.5–1 GB) table on device.
+pub struct HostEmbeddingTable {
+    pub ggml_type: GgmlType,
+    pub hidden: usize,
+    pub vocab: usize,
+    row_bytes: usize,
+    data: Vec<u8>,
+}
+
+impl HostEmbeddingTable {
+    /// Build from the raw GGUF bytes of `token_embd.weight` and its dims.
+    pub fn new(ggml_type: GgmlType, hidden: usize, vocab: usize, data: Vec<u8>) -> Result<Self> {
+        let row_bytes = ggml_type.row_bytes(hidden).ok_or_else(|| {
+            anyhow::anyhow!("token_embd: {ggml_type:?} row of {hidden} cols is not block-aligned")
+        })?;
+        let need = row_bytes * vocab;
+        ensure!(
+            data.len() >= need,
+            "token_embd: {} bytes < {need} needed ({vocab} rows x {row_bytes} B)",
+            data.len()
+        );
+        Ok(Self {
+            ggml_type,
+            hidden,
+            vocab,
+            row_bytes,
+            data,
+        })
+    }
+
+    /// Gather + dequantize the embedding row for `token` → `hidden` f32 values.
+    pub fn embed_row(&self, token: u32) -> Result<Vec<f32>> {
+        let t = token as usize;
+        ensure!(t < self.vocab, "token id {t} >= vocab {}", self.vocab);
+        let off = t * self.row_bytes;
+        let row = &self.data[off..off + self.row_bytes];
+        dequant_row_f32(self.ggml_type, row, self.hidden)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Qwen35TensorKind::*;
@@ -367,5 +434,26 @@ mod tests {
         assert_eq!(plan_residency(AttnNorm, F32), Residency::DequantF32);
         assert_eq!(plan_residency(SsmA, F32), Residency::DequantF32);
         assert_eq!(plan_residency(FfnGateInp, F32), Residency::DequantF32);
+    }
+
+    #[test]
+    fn embedding_lookup_gathers_correct_row() {
+        // vocab=3, hidden=4, F32. Row t = [t*10+0 .. t*10+3].
+        let (hidden, vocab) = (4usize, 3usize);
+        let mut bytes = Vec::new();
+        for t in 0..vocab {
+            for i in 0..hidden {
+                bytes.extend_from_slice(&((t * 10 + i) as f32).to_le_bytes());
+            }
+        }
+        let tbl = HostEmbeddingTable::new(GgmlType::F32, hidden, vocab, bytes).unwrap();
+        assert_eq!(tbl.embed_row(0).unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(tbl.embed_row(2).unwrap(), vec![20.0, 21.0, 22.0, 23.0]);
+        assert!(tbl.embed_row(3).is_err(), "out-of-range token must fail");
+    }
+
+    #[test]
+    fn dequant_row_rejects_mxfp4() {
+        assert!(dequant_row_f32(GgmlType::Mxfp4, &[0u8; 64], 32).is_err());
     }
 }
