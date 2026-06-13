@@ -148,7 +148,14 @@ pub(crate) struct Dsv4Attention {
     /// per rank with zero attention collectives. `None` when the flag is off
     /// or single-rank. Prefill keeps the sharded tensors above.
     pub wq_b_full: Option<DeviceMatrix>,
-    pub wo_a_full: Option<DeviceMatrix>,
+    /// Replicated decode: `o_groups` per-group wo_a matrices (each
+    /// `[o_lora_rank, heads_per_group*head_dim]`), applied block-diagonally to
+    /// the full attention output. The o-projection is grouped, so a single
+    /// full-width wo_a does not exist — see `load_dsv4_wo_a_groups`.
+    pub wo_a_groups: Option<Vec<DeviceMatrix>>,
+    /// Replicated decode: full-width wo_b `[hidden, o_groups*o_lora_rank]`
+    /// (combines all group latents; the sharded wo_b is Row-split + AR-summed).
+    pub wo_b_full: Option<DeviceMatrix>,
     pub attn_sink: DeviceVec,
     pub attn_sink_f32: CudaSlice<f32>,
     pub compressor: Option<Dsv4Compressor>,
@@ -3323,11 +3330,15 @@ impl Dsv4Model {
     /// produce COMPLETE outputs (full-width wq_b/wo_a loaded), so callers
     /// skip the post-attention TP all-reduce for those chunks.
     fn replicated_attn_active(&self) -> bool {
+        // Must match mla_attention's `replicated` gate exactly — these are the
+        // AR-skip predicates, and skipping the attention all-reduce when the
+        // replicated o-projection did NOT run would drop 7/8 of the output.
         crate::attention::dsv4_replicated_attn_enabled()
-            && self
-                .layers
-                .first()
-                .is_some_and(|l| l.attention.wq_b_full.is_some())
+            && self.layers.first().is_some_and(|l| {
+                l.attention.wq_b_full.is_some()
+                    && l.attention.wo_a_groups.is_some()
+                    && l.attention.wo_b_full.is_some()
+            })
     }
 
     fn mtp_frozen_target_layer_idx(&self, mtp: &Dsv4MtpLayer) -> Result<usize> {
