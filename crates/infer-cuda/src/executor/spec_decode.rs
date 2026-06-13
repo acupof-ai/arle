@@ -211,13 +211,16 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// The draft depth for this step. Honours `--mtp-draft-tokens` only under
-    /// `ARLE_DSV4_MTP_UNCLAMP=1`; otherwise clamps to 1 so a stray
-    /// `--mtp-draft-tokens N` can never run an un-validated depth.
+    /// The draft depth for this step: the explicit `--mtp-draft-tokens` request,
+    /// clamped to `[1, MAX_SPEC_DRAFT_DEPTH]`. The CLI flag is the single source
+    /// of truth — there is no env gate (the old `ARLE_DSV4_MTP_UNCLAMP` made the
+    /// flag beg permission from an env var, which is backwards). The clamp to
+    /// the snapshot ceiling keeps an over-large request safe-by-construction
+    /// rather than overflowing the per-slot spec-ring buffers.
     fn spec_depth(&self) -> usize {
-        let requested = self.spec_draft_tokens.unwrap_or(1).max(1);
-        let unclamp = std::env::var("ARLE_DSV4_MTP_UNCLAMP").as_deref() == Ok("1");
-        if unclamp { requested } else { 1 }
+        self.spec_draft_tokens
+            .unwrap_or(1)
+            .clamp(1, crate::dsv4::MAX_SPEC_DRAFT_DEPTH)
     }
 
     /// Draft a top-1 chain: `depth` sequential MTP head passes, each chaining
