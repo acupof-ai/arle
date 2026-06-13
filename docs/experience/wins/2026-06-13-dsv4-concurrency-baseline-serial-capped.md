@@ -33,16 +33,37 @@ only, so the DSv4 default decode path is byte-identical — the baseline here
 | 8 | 53.2 | 6.6 | 19.25 | 8×2.40 = 19.25 ✓ |
 | 16 | 53.2 | 3.3 | 38.49 | 16×2.40 = 38.49 ✓ |
 
-**Aggregate throughput is dead flat at ~53 tok/s regardless of C; wall-clock
-is exactly C × single-stream.** The lockstep single-scheduler serve processes
-each concurrent decode request as its own B=1 forward, back-to-back — **zero
-batching benefit.** per-req = agg / C is the signature of pure serialization.
+**Aggregate is dead flat at ~53 tok/s regardless of C; wall-clock is exactly
+C × single-stream.** per-req = agg / C — the signature of pure serialization.
+But the flat cap is **not** "lockstep cannot batch" — it is that **batched
+decode is opt-in** (`--dsv4-batched-decode` / `INFER_DSV4_BATCHED_DECODE`,
+serve.rs:69) and this serve had it **off**. See the control below.
 
-This is the precise, measured motivation for the throughput work: the ceiling
-is not the GPU, it is the **single-scheduler lockstep** admission model that
-never co-batches concurrent decodes (batched-decode lowering is the open
-keystone #60; DP-attn #89 is the architecture that breaks the single
-scheduler).
+## Control — batched-decode ON (no spec), same binary, same c-sweep
+
+| c | batched agg tok/s | per-req | vs default (d2 no-batch) |
+|---|---|---|---|
+| 1 | 44.4 | 44.4 | −17% (no spec) |
+| 4 | 53.8 | 13.5 | +1% |
+| 8 | 57.4 | 7.2 | +8% |
+| 16 | **62.0** | 3.9 | **+17%** |
+
+The batched lockstep lane **works on the current binary**: aggregate *rises*
+44→62 with c (not flat), so lockstep **can** co-batch concurrent decodes. Two
+things follow:
+
+1. **The immediate throughput win is the batched-decode default flip (#60)** —
+   it already exists and lifts c=16 to 62. (c=1 batched 44.4 < d2-spec 53.3
+   because this arm ran *no spec*: spec is the single-stream win, batching is
+   the concurrency win; composing batched+spec is an open follow-up — they were
+   not co-enabled here.)
+2. **But batching scales WEAKLY — 1.40× aggregate for 16× the load.** A single
+   TP=8 group still pays the per-token attention collectives (Q all-gather + O
+   all-reduce) and lockstep skew on every step; those do not amortize with
+   batch size, so they cap the scaling. **This weak curve is the real, measured
+   motivation for DP-attention** (#89) — DP-attn removes the per-token
+   attention-collective floor that batched-TP-decode cannot. The ceiling is the
+   admission + attention-collective model, not the GPU.
 
 ## Deletion refactor — replicated-attn removed (default byte-identical)
 
@@ -70,13 +91,21 @@ grouped-o-projection design is preserved in the kill entry for re-derivation
 
 ## Rule
 
-- **Baseline concurrency before claiming a throughput lever.** The flat
-  aggregate (53 @ c=1..16) proves the bottleneck is the admission model, not
-  the GPU — DP-attn / batched-decode is licensed by *this* curve, not by a
-  source-survey of "lockstep looks serial."
-- **per-req = agg/C is the serialization fingerprint.** When wall-clock is
-  exactly C × single-stream, the server is not batching; no kernel-level work
-  changes that ceiling.
+- **A flat default curve is "a lane is off," not "the lane can't exist" — run
+  the opt-in control before attributing root cause.** The default flat-53 looked
+  like "lockstep serializes," but batched-decode was simply opt-in and off;
+  enabling it (the control) rose 44→62. Attributing the cap to lockstep without
+  the `INFER_DSV4_BATCHED_DECODE` control would have mis-licensed DP-attn as the
+  *only* fix when the immediate fix is the #60 default flip. (§0 root-cause
+  license-or-kill: the root-cause hypothesis itself needs a control experiment.)
+- **per-req = agg/C is the serialization fingerprint — but read it per-config.**
+  It is true for the *default* (batched off); the batched arm scales (1.40×),
+  just weakly, because per-token attention collectives don't amortize with batch.
+- **Separate the immediate lever from the structural one.** Batched-decode (#60)
+  is the existing, cheap concurrency win (default flip). DP-attn (#89) is the
+  structural lever *beyond* it (removes the attention-collective floor that caps
+  batched-TP scaling). Don't conflate "DP-attn is the lever" with "DP-attn is
+  the only lever."
 - **Delete the whole killed lane, not just its gate.** A killed opt-in path
   whose impl is the wrong shape for the successor (scalar vs vectorized
   o-proj) is dead code in the final ideal state — remove it, preserve the

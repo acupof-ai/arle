@@ -7,18 +7,20 @@ not yet implemented. Effort estimate: **3-4 weeks**, scheduler is the crux.
 
 ## Why (the measured problem)
 
-The lockstep single-scheduler serve processes concurrent decode requests
-serially: aggregate throughput is flat at ~53 tok/s for c=1..16, wall-clock =
-C × single-stream (baseline above). The ceiling is the **admission model**,
-not the GPU.
-
-Two distinct levers sit on top of this:
+The **default** serve processes concurrent decode serially: aggregate flat at
+~53 tok/s for c=1..16 (baseline above) — but only because batched-decode is
+opt-in and off. Two distinct levers sit on top of this; both are measured:
 
 - **Batched-TP decode (#60)** — one TP=8 group co-batches B requests in one
-  forward. Amortizes weight reads, but attention still does the per-token
-  TP collectives (Q all-gather + O all-reduce) whose *latency* does not
-  amortize with B. Helps, but the collective floor caps the scaling.
-- **DP-attention (this doc, #89)** — each rank runs attention **data-parallel**:
+  forward (opt-in `--dsv4-batched-decode`). Measured on the current binary
+  (no spec): agg **44.4 → 53.8 → 57.4 → 62.0** at c=1/4/8/16 — it *does* batch,
+  but scales **weakly (1.40× for 16× load)**. Amortizes weight reads, but
+  attention still does the per-token TP collectives (Q all-gather + O
+  all-reduce) whose *latency* does not amortize with B — the collective floor
+  caps the scaling. This is the **immediate** win (default flip), not the
+  structural one.
+- **DP-attention (this doc, #89)** — the structural lever *beyond* batched-TP:
+  each rank runs attention **data-parallel**:
   it computes the *full* attention (all 64 heads) for its **own** subset of
   requests, with **zero per-token attention collectives**. The MoE stays
   EP-sharded; the only cross-rank exchange is the all-to-all at the attn→MoE
