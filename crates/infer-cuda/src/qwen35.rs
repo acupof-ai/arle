@@ -144,6 +144,21 @@ fn qwen35_fused_addnorm_enabled() -> bool {
     })
 }
 
+/// Path-RUNS probe: fire once (across both the eager and captured-decode
+/// forward sites) when the fused add-RMSNorm lane is actually taken. Unlike
+/// the GDN/MoE lanes, fused-addnorm has no loud-fail negative probe, so this
+/// is the only signal that the lane ran rather than silently falling back to
+/// the hand kernels. Default-off path never calls this.
+fn addnorm_lane_probe() {
+    static FUSED_ADDNORM_PROBE: std::sync::Once = std::sync::Once::new();
+    FUSED_ADDNORM_PROBE.call_once(|| {
+        eprintln!(
+            "[lane-probe] ARLE_QWEN35_FUSED_ADDNORM active: \
+             flashinfer FusedAddRMSNorm lane engaged (post-attn pair fused)"
+        );
+    });
+}
+
 /// Shared loud-fail message when the triton AOT lane resolves to a
 /// NOT_SUPPORTED stub but `ARLE_QWEN35_SGL_GDN` is on.
 fn sgl_gdn_stub_err(kernel: &str) -> anyhow::Error {
@@ -1677,6 +1692,7 @@ impl Qwen35Model {
             // `hidden_mid`/`normed`.
             let fused_addnorm = qwen35_fused_addnorm_enabled();
             let mlp_in: &HiddenStates = if fused_addnorm {
+                addnorm_lane_probe();
                 fused_add_rms_norm_offset(
                     &self.ctx,
                     attn_out,
@@ -2901,6 +2917,7 @@ impl Qwen35Model {
             // `add_batch` + `rms_norm_offset` pair.
             let fused_addnorm = qwen35_fused_addnorm_enabled();
             let mlp_in: &HiddenStates = if fused_addnorm {
+                addnorm_lane_probe();
                 fused_add_rms_norm_offset(
                     &self.ctx,
                     attn_out,
@@ -3182,6 +3199,18 @@ impl Qwen35Model {
             && self.local_linear_v_heads == 32
             && c.linear_key_head_dim == 128
             && c.linear_value_head_dim == 128;
+        if use_sgl_decode {
+            // Path-RUNS probe: fire once when the triton GDN decode trio is
+            // actually selected (flag on AND shape-guard passed), so the
+            // validation harness can prove the lane ran via the server log.
+            static SGL_GDN_PROBE: std::sync::Once = std::sync::Once::new();
+            SGL_GDN_PROBE.call_once(|| {
+                eprintln!(
+                    "[lane-probe] ARLE_QWEN35_SGL_GDN active: triton GDN decode \
+                     trio engaged (conv1d_update → fused_recurrent_decode → rms_norm_gated)"
+                );
+            });
+        }
         let qkv_dim = self.local_linear_qkv_dim();
         let z_dim = self.local_linear_z_dim();
         let b_dim = attn.in_proj_b.rows;

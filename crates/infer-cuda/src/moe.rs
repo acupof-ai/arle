@@ -262,9 +262,11 @@ pub(crate) fn qwen35_moe_decode_kernel_enabled() -> bool {
 /// the current hand decode-band path (this helper is read once, gating the
 /// whole fused branch). The triton cubins are Hopper-only AOT; a
 /// non-sm90 / no-triton build links NOT_SUPPORTED stubs and the runtime
-/// loud-fails when this flag is on and a stub is hit. The lazily-built stacked
-/// `w1/w2` cache (`MoeLayerWeights::fused_sglang`, +~1.5 GB) materializes only
-/// on the first fused forward, so load-time is unaffected. bf16-only for now
+/// loud-fails when this flag is on and a stub is hit. The stacked `w1/w2` cache
+/// (`MoeLayerWeights::fused_sglang`) is built at LOAD via build-and-replace (the
+/// per-expert Vecs are restacked then freed — the lazy first-forward build
+/// OOM'd the 35B BF16 shard by doubling routed-expert VRAM), so it is mutually
+/// exclusive with DeepGEMM and needs `ARLE_QWEN35_DEEPGEMM=0`. bf16-only for now
 /// (fp8 is a 1-shape AOT signature add). Read per call, mirroring the sibling
 /// MoE gates; inside a captured decode graph the value read at capture replays.
 #[cfg(feature = "cuda")]
@@ -739,7 +741,19 @@ mod gpu {
         // ── 2b. SGLang fused_moe lane (opt-in, `ARLE_QWEN35_MOE_FUSED_SGLANG`).
         // Single-GPU only (global == local expert ids); flag-off this branch is
         // never entered, so the default path below is byte-for-byte unchanged.
-        if qwen35_moe_fused_sglang_enabled() && device_route_eligible(cfg) {
+        if qwen35_moe_fused_sglang_enabled() {
+            // The load-time fused build freed the per-expert Vecs, so the
+            // non-fused fallback below is unavailable when the flag is on. A
+            // non-device-route-eligible config (non-greedy / grouped top-k)
+            // would otherwise silently fall through to it and crash on empty
+            // Vecs — loud-fail instead. (Qwen3.6-A3B is always eligible.)
+            ensure!(
+                device_route_eligible(cfg),
+                "ARLE_QWEN35_MOE_FUSED_SGLANG requires a device-route-eligible config \
+                 (greedy top-k, no expert groups); this model is not eligible. The \
+                 per-expert weight Vecs were freed at load to build the fused w1/w2 \
+                 cache, so the non-fused fallback is unavailable. Unset the flag."
+            );
             ensure!(
                 split.ep_size == 1,
                 "ARLE_QWEN35_MOE_FUSED_SGLANG requires ep_size == 1 (single-GPU); \
@@ -766,6 +780,19 @@ mod gpu {
                  bakes top_k=8 (Qwen3.6-A3B). Rebuild the cubin or unset the flag.",
                 topk
             );
+            // Path-RUNS probe: fire once when the fused lane is actually taken
+            // (not merely when the flag is read), so the validation harness can
+            // grep the server log to prove the SGLang fused_moe kernel ran on
+            // this model/shard — distinguishing "ran, perf-neutral" from "no-op".
+            {
+                static FUSED_MOE_PROBE: std::sync::Once = std::sync::Once::new();
+                FUSED_MOE_PROBE.call_once(|| {
+                    eprintln!(
+                        "[lane-probe] ARLE_QWEN35_MOE_FUSED_SGLANG active: \
+                         SGLang fused_moe lane engaged (top_k={topk}, ep_size=1)"
+                    );
+                });
+            }
             moe_forward_fused_sglang(
                 ctx,
                 weights,
@@ -1116,122 +1143,24 @@ mod gpu {
         )
     }
 
-    /// Lazily build (once per layer) the SGLang stacked expert-weight cache
-    /// `w1 [E_l, 2N, K]` (gate rows then up rows per expert) + `w2 [E_l, K, N]`
-    /// (down verbatim) from the per-expert `DeviceMatrix` Vecs. Pure D2D
-    /// gather-concat (~+1.5 GB on the Qwen3.6 single-GPU shard); returns a
-    /// borrow of the populated `OnceCell`. Requires the per-expert Vecs to be
-    /// present — DeepGEMM grouped-mode loads clear them, so the fused lane is
-    /// incompatible with `ARLE_QWEN35_DEEPGEMM=1` and loud-fails here.
-    fn build_fused_sglang_weights<'w>(
-        ctx: &DeviceContext,
-        weights: &'w MoeLayerWeights,
-        hidden_dim: usize,
-    ) -> Result<&'w crate::loader::MoeFusedSglangWeights> {
-        use cudarc::driver::CudaSlice;
-
-        // Already built this layer? (Single-threaded `!Sync` executor, so this
-        // check-then-`set` cannot race — `get_or_try_init` is still unstable.)
-        if let Some(cached) = weights.fused_sglang.get() {
-            return Ok(cached);
-        }
-
-        let built = (|| -> Result<crate::loader::MoeFusedSglangWeights> {
-            let num_experts = weights.gate.len();
-            ensure!(
-                num_experts > 0
-                    && weights.up.len() == num_experts
-                    && weights.down.len() == num_experts,
-                "ARLE_QWEN35_MOE_FUSED_SGLANG needs the per-expert weight Vecs \
-                 (gate={} up={} down={}); they are cleared under ARLE_QWEN35_DEEPGEMM=1. \
-                 Unset DeepGEMM to use the fused lane.",
-                weights.gate.len(),
-                weights.up.len(),
-                weights.down.len()
-            );
-
-            // Per-expert dims (gate/up `[N, K]`, down `[K, N]`); uniform across
-            // experts (the loader concat path already enforces this).
-            let moe_inter = weights.gate[0].rows; // N
-            let k = weights.gate[0].cols; // K (= hidden_dim)
-            ensure!(
-                k == hidden_dim,
-                "fused MoE gate K {k} != hidden_dim {hidden_dim}"
-            );
-            let gate_up_rows = 2 * moe_inter; // 2N
-
-            let w1_elems = num_experts * gate_up_rows * k;
-            let w2_elems = num_experts * k * moe_inter;
-            let mut w1: CudaSlice<bf16> = ctx
-                .stream
-                .alloc_zeros(w1_elems)
-                .map_err(|e| anyhow::anyhow!("fused MoE w1 alloc failed: {e}"))?;
-            let mut w2: CudaSlice<bf16> = ctx
-                .stream
-                .alloc_zeros(w2_elems)
-                .map_err(|e| anyhow::anyhow!("fused MoE w2 alloc failed: {e}"))?;
-
-            let expert_nk = moe_inter * k; // gate / up slab elements
-            let down_kn = k * moe_inter; // down slab elements
-            for e in 0..num_experts {
-                let gate = &weights.gate[e];
-                let up = &weights.up[e];
-                let down = &weights.down[e];
-                ensure!(
-                    gate.rows == moe_inter
-                        && gate.cols == k
-                        && up.rows == moe_inter
-                        && up.cols == k,
-                    "fused MoE expert {e} gate/up shape ({}x{} / {}x{}) != {moe_inter}x{k}",
-                    gate.rows,
-                    gate.cols,
-                    up.rows,
-                    up.cols
-                );
-                ensure!(
-                    down.rows == k && down.cols == moe_inter,
-                    "fused MoE expert {e} down shape {}x{} != {k}x{moe_inter}",
-                    down.rows,
-                    down.cols
-                );
-                // w1[e]: rows [0, N) = gate `[N, K]`, rows [N, 2N) = up `[N, K]`.
-                let w1_base = e * gate_up_rows * k;
-                ctx.stream
-                    .memcpy_dtod(&gate.data, &mut w1.slice_mut(w1_base..w1_base + expert_nk))
-                    .map_err(|err| anyhow::anyhow!("fused MoE w1 gate D2D failed: {err}"))?;
-                ctx.stream
-                    .memcpy_dtod(
-                        &up.data,
-                        &mut w1.slice_mut(w1_base + expert_nk..w1_base + 2 * expert_nk),
-                    )
-                    .map_err(|err| anyhow::anyhow!("fused MoE w1 up D2D failed: {err}"))?;
-                // w2[e]: down `[K, N]` verbatim.
-                let w2_base = e * down_kn;
-                ctx.stream
-                    .memcpy_dtod(&down.data, &mut w2.slice_mut(w2_base..w2_base + down_kn))
-                    .map_err(|err| anyhow::anyhow!("fused MoE w2 down D2D failed: {err}"))?;
-            }
-
-            Ok(crate::loader::MoeFusedSglangWeights {
-                w1,
-                w2,
-                num_experts,
-                gate_up_rows,
-                hidden: k,
-                moe_inter,
-            })
-        })()?;
-
-        // `set` only fails if another thread won the race — impossible on the
-        // `!Sync` executor (we already returned early on a populated cell).
-        weights
-            .fused_sglang
-            .set(built)
-            .map_err(|_| anyhow::anyhow!("fused MoE weight cache double-init (unreachable)"))?;
-        weights
-            .fused_sglang
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("fused MoE weight cache empty after set"))
+    /// Borrow the SGLang stacked expert-weight cache (`w1 [E_l, 2N, K]` +
+    /// `w2 [E_l, K, N]`) built at LOAD time (build-and-replace in
+    /// `Loader::load_moe_layer_experts`: the per-expert Vecs are restacked into
+    /// w1/w2 and freed, so the resident routed-expert VRAM does not double).
+    /// `None` means the cache was not built — either the flag was off at load
+    /// (unreachable here: the forward gate checks the same flag) or DeepGEMM was
+    /// on (the grouped cache freed the Vecs and the fused cache is its mutually
+    /// exclusive sibling).
+    fn build_fused_sglang_weights(
+        weights: &MoeLayerWeights,
+    ) -> Result<&crate::loader::MoeFusedSglangWeights> {
+        weights.fused_sglang.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "ARLE_QWEN35_MOE_FUSED_SGLANG: fused w1/w2 cache absent. It is built at \
+                 load and is mutually exclusive with DeepGEMM (the grouped cache frees the \
+                 per-expert Vecs). Set ARLE_QWEN35_DEEPGEMM=0 together with the fused flag."
+            )
+        })
     }
 
     /// SGLang `fused_moe` routed-expert path (opt-in lane, single-GPU only). The
@@ -1270,7 +1199,7 @@ mod gpu {
         out: &mut HiddenStates,
     ) -> Result<()> {
         let _ = cfg; // routed_scaling_factor asserted == 1.0 by the caller (baked in cubin).
-        let fused = build_fused_sglang_weights(ctx, weights, hidden_dim)?;
+        let fused = build_fused_sglang_weights(weights)?;
         let moe_inter = fused.moe_inter; // N
         let gate_up_rows = fused.gate_up_rows; // 2N
         debug_assert_eq!(fused.hidden, hidden_dim);
