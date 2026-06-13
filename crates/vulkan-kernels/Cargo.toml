@@ -9,6 +9,11 @@ publish = false
 ash = { version = "0.38.0", default-features = false, features = ["loaded"], optional = true }
 vulkan-sys = { path = "../vulkan-sys", default-features = false }
 
+[dev-dependencies]
+# Reference dequantizers for the on-device GEMV correctness test. The Vulkan
+# weight bytes are dequantized with the SAME routine to build the CPU reference.
+infer-gguf = { path = "../infer-gguf" }
+
 [features]
 default = []
 # Compile and launch Vulkan kernels through vulkan-sys. Off by default so the
