@@ -24,12 +24,29 @@ off). The ceiling is **not** the GPU.
    batched. At B=8 → 8× per-row attention kernels + 8× launches.
 4. **SGLang**: batched MLA decode = ONE `flash_mla_with_kvcache` for all B
    (`block_table`+`cache_seqlens`), inside a CUDA graph.
+5. **MoE ∝ active_experts ∝ c** (ckl `74b721db`, root-caused on Qwen #88; same
+   structure on DSv4): at decode each *active* expert needs ≥1 kernel block
+   regardless of how few tokens route to it, and #active-experts grows with c
+   (E=256, top-6: c=8 → ~45 distinct). So per-step MoE time grows with c → the
+   MoE half does not amortize. EP=8 distributes it (~/8 per rank) — which is why
+   DSv4 gets 1.4× not dead-flat (ckl's Qwen `fused_moe` was flat). Fundamental to
+   sparse-MoE decode below expert saturation (c << E/top_k ≈ 43).
 
-→ The cap is **per-row attention compute + eager host-launch**, not collectives.
+→ The non-amortizing marginal (~15.7ms/req) is **TWO halves**: (a) per-row
+attention compute (attn-half, ~16ms host — fixable) + (b) MoE ∝ active_experts
+(moe-half, ~20ms host — fundamental). Eager host-launch compounds both. NOT the
+collectives. **Gap**: the precise attention-vs-MoE *GPU* `cuda_ms` split is not
+yet measured — the stage profiler emitted only host-time this run; host-time says
+moe-half (20) > attn-half (16). Close with a clean rank-0 per-stage GPU profile.
 
 ## Lever ranking
 
-### 1. Batched MLA decode — PRIMARY (#60; "Phase 5 batched FlashMLA")
+The cap is two non-amortizing halves. Levers 1-2 attack the **tractable** half
+(attention + launch); the MoE half is **fundamental** (lever 3); DP-attn is
+orthogonal (lever 4). Which of attn-half vs moe-half is bigger in GPU time is the
+open gap above (host-time says moe-half).
+
+### 1. Batched MLA decode — most tractable win (#60; "Phase 5 batched FlashMLA")
 - **SGLang**: `flashmla_backend.py` `forward_decode` issues one
   `flash_mla_with_kvcache(q=[bs*heads,…], block_table=[bs,max_pages],
   cache_seqlens=[bs], tile_scheduler_metadata, num_splits)` — all B requests'
@@ -55,7 +72,21 @@ off). The ceiling is **not** the GPU.
 - **Coupling**: levers 1+2 are ONE mechanism in SGLang (batched kernel inside
   the graph). Build them together; a captured per-row loop is pointless.
 
-### 3. DP-attention — LOWER / orthogonal (#89)
+### 3. MoE ∝ active_experts — the FUNDAMENTAL half (#88 lessons)
+- **Mechanism**: at decode each active expert = ≥1 kernel block regardless of its
+  (tiny) token count; #active-experts ∝ c (E=256, top-6) → MoE per-step time ∝ c
+  → non-amortizing. The moe-half (~20ms host, likely the bigger half).
+- **Already mitigated**: EP=8 distributes active experts (~/8 per rank) → DSv4
+  gets 1.4× not dead-flat (ckl's Qwen `fused_moe` without enough EP was flat,
+  `74b721db`).
+- **Further gains are hard**: batching can't fix it below expert saturation
+  (c << ~43). Options: a decode-tuned grouped-MoE kernel (small-M-per-expert
+  efficient), higher EP, or accept the sparse-MoE-decode floor. This is the
+  hard ceiling on concurrent DSv4 decode throughput — track with the #88 MoE
+  kernel-shape work. **Diagnose by the curve SHAPE** (flat ⇒ per-step ∝ c ⇒
+  work ∝ active_experts), not Δ% (ckl's rule).
+
+### 4. DP-attention — LOWER / orthogonal (#89)
 - **SGLang**: `dp_attention.py` splits TP into `attn_tp × dp`; gather/scatter at
   the attn↔MLP boundary (`dp_gather_partial`/`dp_scatter`, MAX_LEN/SUM_LEN
   padding for rank-uniform collectives); scheduler entry = `attn_tp_rank==0`.
@@ -67,12 +98,16 @@ off). The ceiling is **not** the GPU.
 
 ## Recommended sequence
 
-1. **Batched MLA decode kernel** (#60) — biggest, direct win on the measured cap.
+0. **First close the gap**: a clean rank-0 per-stage GPU `cuda_ms` profile (or
+   nsys) at B=1 vs B=8 to rank attn-half vs moe-half. If moe-half dominates GPU
+   time (host-time suggests it), the attention levers below cap out at the MoE
+   floor and the #88 MoE-kernel work is the higher-ROI track.
+1. **Batched MLA decode kernel** (#60) — the tractable win; removes the attn-half.
 2. **Couple it into a whole-step CUDA graph** with SGLang's device-metadata
    capture pattern (#70) — kills the residual host-launch and unblocks our IMA.
-3. **DP-attention** (#89) — only after 1+2, and only if a re-baselined c-sweep
-   shows the residual collective/skew floor (now larger relative to a fast
-   batched+graph step) is worth the scheduler re-architecture.
+3. **MoE decode-kernel shape** (#88 lessons) — the fundamental ceiling; the
+   higher-ROI track if moe-half dominates. Independent of 1-2.
+4. **DP-attention** (#89) — only after the above, re-baselined; orthogonal.
 
 Each step gates on a c-sweep wall-clock A/B (TTFT + ITL + agg), multi-shape,
 per the bench spec — no default flip on a single-shape ROI.
