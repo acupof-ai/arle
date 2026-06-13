@@ -1,9 +1,16 @@
 # DSv4 DP-attention — design (request-level data-parallel attention)
 
-Status: **design** (2026-06-13). Tracks GitHub #89. Licensed by the measured
-serial-cap baseline
-([wins](../experience/wins/2026-06-13-dsv4-concurrency-baseline-serial-capped.md)),
-not yet implemented. Effort estimate: **3-4 weeks**, scheduler is the crux.
+Status: **design** (2026-06-13). Tracks GitHub #89. Effort: **3-4 weeks**,
+scheduler is the crux.
+
+> **PRIORITY (corrected 2026-06-13):** DP-attn is concurrency lever **#3
+> (lower / orthogonal)**, not the primary one. The measured cap on batched
+> scaling (1.40× for 16× load) is **per-row attention compute + host-launch**,
+> not the attention collectives DP-attn removes (those are the ~7ms floor, 2.7%
+> of the step at B=16). The primary levers are **batched MLA decode (#60)** and
+> **whole-step CUDA graph (#70)**. See
+> [`dsv4-concurrency-throughput.md`](dsv4-concurrency-throughput.md) for the
+> ranking + evidence. Do DP-attn only after #60+#70, re-baselined.
 
 ## Why (the measured problem)
 

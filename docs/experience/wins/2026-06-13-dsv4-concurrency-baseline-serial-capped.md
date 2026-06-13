@@ -57,13 +57,44 @@ things follow:
    because this arm ran *no spec*: spec is the single-stream win, batching is
    the concurrency win; composing batched+spec is an open follow-up — they were
    not co-enabled here.)
-2. **But batching scales WEAKLY — 1.40× aggregate for 16× the load.** A single
-   TP=8 group still pays the per-token attention collectives (Q all-gather + O
-   all-reduce) and lockstep skew on every step; those do not amortize with
-   batch size, so they cap the scaling. **This weak curve is the real, measured
-   motivation for DP-attention** (#89) — DP-attn removes the per-token
-   attention-collective floor that batched-TP-decode cannot. The ceiling is the
-   admission + attention-collective model, not the GPU.
+2. **But batching scales WEAKLY — 1.40× aggregate for 16× the load.** Root
+   cause confirmed by 4 converging lines (see below) — it is **per-row
+   attention compute**, NOT the collectives.
+
+## Root cause CONFIRMED + SGLang-grounded lever ranking
+
+Four converging lines of evidence:
+1. **c-sweep arithmetic** (measured): `T_step(B) ≈ 7ms floor + 15.7ms/req`
+   (B=1/4/8/16 → 22.5/74.4/139.4/258.1 ms). The fixed floor (collectives +
+   launch + skew) is the ONLY part that amortizes (→ the 1.40×; it is 2.7% of
+   the step at B=16). The ~15.7ms/req ≈ a standalone request's compute → compute
+   does **not** amortize.
+2. **stage profiler** (measured, noisy 8-rank log): the step is largely
+   host-launch-bound — `layers-launch ~36ms` (attn-half host ~16ms + moe-half
+   host ~20ms).
+3. **our code** (confirmed): `forward_decode_batch` runs attention **per-row** —
+   `dsv4.rs:2498-2544` `for r in 0..seq_len { mla_attention(...) }` (NVTX
+   `dsv4/mla_attn_per_token`); MoE/pointwise are batched. So at B=8 attention is
+   8× per-row kernels + 8× launches → the non-amortizing marginal + host-launch.
+4. **SGLang reference** (`/sgl-workspace/sglang`): batched MLA decode is ONE
+   `flash_mla_with_kvcache` kernel for all B requests via a `block_table` +
+   `cache_seqlens` metadata tensor (no per-row Python loop;
+   `flashmla_backend.py` `forward_decode`), run INSIDE a CUDA graph
+   (`cuda_graph_runner.py` + `init_forward_metadata_replay_cuda_graph` —
+   device-resident metadata updated in-place, captured at bs=[1,2,4,8,…]).
+
+**Lever ranking** (SGLang couples #1+#2; #3 is orthogonal):
+1. **Batched MLA decode — PRIMARY (#60, "Phase 5 batched FlashMLA").** One
+   kernel for all B rows (SGLang `block_table`/`cache_seqlens` pattern). Removes
+   the per-row attention that caps our scaling at 1.4×.
+2. **Whole-step CUDA graph with capture-safe MLA metadata — SECONDARY (#70).**
+   Kills the ~36ms host-launch. SGLang's pattern: pre-allocate device metadata,
+   update in-place before replay, capture the `.copy_()` — directly addresses our
+   FlashMLA-capture-IMA blocker.
+3. **DP-attention — LOWER / orthogonal (#89).** Removes the attention
+   collectives (the ~7ms floor, only 2.7% at B=16) + lockstep skew; it does
+   **not** reduce per-rank attention compute (TP B×8 heads == DP B/8×64 heads).
+   Helps memory-bound / very-high-concurrency, not the compute-bound 1.4× gap.
 
 ## Deletion refactor — replicated-attn removed (default byte-identical)
 
@@ -101,11 +132,17 @@ grouped-o-projection design is preserved in the kill entry for re-derivation
 - **per-req = agg/C is the serialization fingerprint — but read it per-config.**
   It is true for the *default* (batched off); the batched arm scales (1.40×),
   just weakly, because per-token attention collectives don't amortize with batch.
-- **Separate the immediate lever from the structural one.** Batched-decode (#60)
-  is the existing, cheap concurrency win (default flip). DP-attn (#89) is the
-  structural lever *beyond* it (removes the attention-collective floor that caps
-  batched-TP scaling). Don't conflate "DP-attn is the lever" with "DP-attn is
-  the only lever."
+- **Decompose the weak-scaling cap before naming the lever — floor vs marginal.**
+  The c-sweep arithmetic (floor ~7ms amortizes, marginal ~15.7ms/req does not)
+  said the cap is *compute*, not collectives — which flips the lever from DP-attn
+  (removes collectives = the small floor) to batched MLA decode (removes per-row
+  attention = the large marginal). I initially mis-ranked DP-attn as the lever;
+  the floor/marginal split + SGLang's own priority + our per-row code corrected it.
+- **Align to the reference's COUPLING, not just its feature list.** SGLang runs
+  batched MLA decode *inside* a CUDA graph with device-resident, in-place-updated
+  metadata — the two primary levers (#60 + #70) are one coupled mechanism, and
+  the capture-safe metadata pattern is exactly what unblocks our FlashMLA-capture
+  IMA. Port the coupling, not three isolated features.
 - **Delete the whole killed lane, not just its gate.** A killed opt-in path
   whose impl is the wrong shape for the successor (scalar vs vectorized
   o-proj) is dead code in the final ideal state — remove it, preserve the
