@@ -23,7 +23,24 @@
 //   act/out  : [num_routes, N]   BF16
 //   offsets/counts/expert_indices : [num_experts]  (expert_indices null = id)
 //
+// Upstream lineage (借鉴原版 then specialize for the decode band):
+//   * Numerics are the DeepSeek/DeepGEMM original — FP8 e4m3 weights with f32
+//     128×128 block scales and the clamped SwiGLU are copied bit-for-bit from
+//     dsv4_deepgemm_ops.cu::dg_swiglu / dsv4_route.cu::dsv4_swiglu_clamped_one
+//     (the prod contiguous lane), so this lane is a numeric drop-in (validated
+//     by the needle gate against that backend, not by byte-identity).
+//   * STRUCTURE is the in-tree BF16 `*_decode` template (moe_grouped_gemm.cu,
+//     9e37bc77): warp-per-output-row, exactly-once weight reads, vectorized
+//     loads — the established ARLE decode-band grouped pattern.
+//   * Why not the throughput upstream (SGLang fp8_blockwise_moe_kernel /
+//     CUTLASS group GEMM, or DeepGEMM contiguous): those tile M and want
+//     aligned/padded rows — efficient at prefill, but at B=1 decode (M≈1 real
+//     row/expert) the tiling/padding is pure waste (the −23% regression's
+//     padding tax). The decode band needs a row-compact kernel; CUTLASS/Triton
+//     fused_moe has no efficient M=1 path, hence this specialization.
+//
 // Refs: crates/cuda-kernels/csrc/gemm/moe_grouped_gemm.cu (BF16 template),
+//       crates/cuda-kernels/csrc/gemm/dsv4_deepgemm_ops.cu (dg_swiglu numerics),
 //       crates/cuda-kernels/csrc/gemm/quantized_gemv.cu (FP8 decode helper).
 
 #include <cuda_bf16.h>

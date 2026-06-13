@@ -98,26 +98,61 @@ fn try_pin(ordinal: usize, world_size: usize) -> anyhow::Result<String> {
     let slice = &cpus[slot * per..((slot + 1) * per).min(cpus.len())];
     ensure!(!slice.is_empty(), "empty core slice");
 
-    // SAFETY: plain libc cpu_set_t manipulation on this process (pid 0).
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        for &c in slice {
-            libc::CPU_SET(c, &mut set);
-        }
-        ensure!(
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0,
-            "sched_setaffinity failed: {}",
-            std::io::Error::last_os_error()
-        );
+    // SAFETY: plain libc cpu_set_t manipulation. Pinning the calling thread
+    // alone is NOT enough: `sched_setaffinity(0)` only sets the *current*
+    // thread, and threads spawned BEFORE this call (the coordinator/rank-0
+    // process already runs the tokio HTTP + router pool by the time it builds
+    // the engine) do not inherit it — they would keep wandering the whole
+    // machine. So build the mask once and apply it to EVERY thread of this
+    // process (existing + the calling thread); future threads inherit from the
+    // calling thread. This makes the pin automatic and complete for all ranks,
+    // including rank 0 in the multi-threaded coordinator.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &c in slice {
+        unsafe { libc::CPU_SET(c, &mut set) };
     }
+    // Calling thread first (the inheritance anchor for threads spawned later).
+    ensure!(
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) } == 0,
+        "sched_setaffinity(self) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let (pinned, total) = pin_all_threads(&set);
     Ok(format!(
-        "rank gpu{ordinal} → numa{my_node}, cores {}..{} ({} of {} on node, {} sharers)",
+        "rank gpu{ordinal} → numa{my_node}, cores {}..{} ({} of {} on node, {} sharers), {pinned}/{total} threads pinned",
         slice[0],
         slice[slice.len() - 1],
         slice.len(),
         cpus.len(),
         nshare
     ))
+}
+
+/// Apply `set` to every thread of this process. Walks `/proc/self/task`; a
+/// per-thread failure (a thread exiting mid-walk, or a TID-reuse race) is
+/// non-fatal — it just leaves that thread on the previous mask. Returns
+/// `(pinned, total_seen)` for the boot log. New threads spawned after this
+/// inherit from the already-pinned calling thread, so the walk only has to
+/// catch the pre-existing pool.
+#[cfg(target_os = "linux")]
+fn pin_all_threads(set: &libc::cpu_set_t) -> (usize, usize) {
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return (0, 0);
+    };
+    let (mut pinned, mut total) = (0usize, 0usize);
+    for entry in entries.flatten() {
+        let Ok(tid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+            continue;
+        };
+        total += 1;
+        // SAFETY: cpu_set_t by const ptr; tid is a thread of this process.
+        let rc =
+            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), set) };
+        if rc == 0 {
+            pinned += 1;
+        }
+    }
+    (pinned, total)
 }
 
 /// Parse a sysfs cpulist like `0-23,96-119` into core ids.
