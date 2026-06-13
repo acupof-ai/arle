@@ -2669,10 +2669,9 @@ mod dsv4_gpu {
         )
     }
 
-    /// Routed-row ceiling for the grouped-GEMV decode lane: B=1 × topk(8).
-    /// The grouped GEMV re-reads expert weights once per grid-Y row (1×
-    /// weight reuse), so the lane is licensed for the single-decode shape
-    /// only; batched decode keeps the contiguous DeepGEMM lane.
+    /// Routed-row ceiling for the FP8 decode lane: B=1 × topk (DSv4 top_k=6,
+    /// so ≤8 covers single-token decode). Above it (batched decode / prefill)
+    /// the contiguous DeepGEMM lane's weight-once GEMM amortizes better.
     const DSV4_DECODE_GEMV_MAX_ROUTES: usize = 8;
 
     /// Per-expert pointer tables + UE8M0-re-encoded block scales for the
@@ -2686,11 +2685,10 @@ mod dsv4_gpu {
         up_s: CudaSlice<u64>,
         w2_w: CudaSlice<u64>,
         w2_s: CudaSlice<u64>,
-        /// w13-half geometry: [I/128, H/128] per expert half.
-        sr_half: usize,
+        /// w13-half scale columns (= H/128) — used as the swiglu kernel's
+        /// `scale_cols`; the per-row scale row is derived in-kernel.
         sc13: usize,
-        /// w2 geometry: [H/128, I/128] per expert.
-        sr2: usize,
+        /// w2 scale columns (= I/128) — the down kernel's `scale_cols`.
         sc2: usize,
     }
 
@@ -2779,9 +2777,7 @@ mod dsv4_gpu {
             up_s: h2d(&up_s)?,
             w2_w: h2d(&w2_w)?,
             w2_s: h2d(&w2_s)?,
-            sr_half,
             sc13,
-            sr2,
             sc2,
         }))
     }
@@ -2794,7 +2790,7 @@ mod dsv4_gpu {
     /// grouped lane's padding tax entirely (the −23% regression's residual
     /// after the 64-align fix).
     #[allow(clippy::too_many_arguments)]
-    fn dsv4_moe_forward_decode_gemv(
+    fn dsv4_moe_forward_decode_fp8(
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
         tables: &Dsv4GemvTables,
@@ -2886,47 +2882,37 @@ mod dsv4_gpu {
             )?;
         }
 
-        // Pair GEMV (gate/up halves) → SwiGLU → w2 GEMV. BF16 activations
-        // throughout (w8a16); rows never packed for unrouted experts stay
-        // zero and their -1 route slots exclude them at the scatter.
-        let gate_out = HiddenStates::zeros(ctx, i_dim, rows)?;
-        let up_out = HiddenStates::zeros(ctx, i_dim, rows)?;
+        // Fused gate+up+clamped-SwiGLU decode GEMM → down (w2) decode GEMM.
+        // BF16 activations throughout (w8a16); each kernel reads its expert
+        // weights once with 16-byte vectorized FP8 loads and writes only the
+        // real routed rows — no pad rows, no activation quantize. max_count =
+        // total_routes is the safe host upper bound on per-expert row count
+        // (kernels exit early on `chunk_base >= counts[e]`).
         let act = HiddenStates::zeros(ctx, i_dim, rows)?;
         let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        keepalive.keep_hidden(&gate_out);
-        keepalive.keep_hidden(&up_out);
         keepalive.keep_hidden(&act);
         keepalive.keep_hidden(&expert_out);
         // SAFETY: pointer tables hold experts_per_rank entries built over the
         // layer's grouped caches; packed rows are bounded by offsets+counts.
         unsafe {
-            moe::dsv4_fp8_grouped_gemv_pair_batch(
+            moe::dsv4_fp8_grouped_swiglu_decode(
                 cache_ptr(&tables.gate_w, ctx),
                 cache_ptr(&tables.gate_s, ctx),
                 cache_ptr(&tables.up_w, ctx),
                 cache_ptr(&tables.up_s, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
-                cache_ptr(&gate_out.data, ctx),
-                cache_ptr(&up_out.data, ctx),
+                cache_ptr(&act.data, ctx),
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&counts, ctx),
                 experts_per_rank,
-                num_tokens,
+                rows,
                 i_dim,
                 hidden_dim,
-                tables.sr_half,
                 tables.sc13,
-                ctx.stream.cu_stream(),
-            )?;
-            moe::dsv4_swiglu_clamped_batch(
-                cache_ptr(&gate_out.data, ctx),
-                cache_ptr(&up_out.data, ctx),
-                cache_ptr(&act.data, ctx),
-                rows * i_dim,
                 model.config.swiglu_limit,
                 ctx.stream.cu_stream(),
             )?;
-            moe::dsv4_fp8_grouped_gemv_batch(
+            moe::dsv4_fp8_grouped_down_decode(
                 cache_ptr(&tables.w2_w, ctx),
                 cache_ptr(&tables.w2_s, ctx),
                 cache_ptr(&act.data, ctx),
@@ -2934,10 +2920,9 @@ mod dsv4_gpu {
                 cache_ptr(&offsets, ctx),
                 cache_ptr(&counts, ctx),
                 experts_per_rank,
-                num_tokens,
+                rows,
                 hidden_dim,
                 i_dim,
-                tables.sr2,
                 tables.sc2,
                 ctx.stream.cu_stream(),
             )?;
@@ -2995,16 +2980,14 @@ mod dsv4_gpu {
         let experts_per_rank = split.experts_per_rank;
         let local_start = split.local_expert_start;
         let total_routes = num_tokens * topk;
-        // Decode-band grouped-GEMV lane (B=1): zero pad rows, no activation
-        // quantize. KILLED as a default 2026-06-13: the scalar dequant GEMV
-        // runs ~25% of HBM bandwidth and loses to DeepGEMM grinding the
-        // 64-aligned pad rows (34.9 vs 36.5 tok/s B=1; needle 512 flipped
-        // exact->partial x1). Opt-in ARLE_DSV4_MOE_DECODE_GEMV=1 keeps the
-        // lane as the substrate for a vectorized/MMA grouped decode kernel
-        // (or the vendored SGLang fused_moe lane) — the padding-tax target
-        // it aimed at (+2.8ms/tok vs era) is real and still open.
+        // Decode-band FP8 grouped GEMM lane (B=1): compact (real routed rows
+        // only, no pad), 16-byte vectorized FP8 weight loads, per-route
+        // correct. Default ON in band; ARLE_DSV4_MOE_DECODE_FP8=0 reverts to
+        // the contiguous DeepGEMM lane (the one-line kill switch). This is the
+        // bandwidth-fixed successor to the scalar-GEMV lane (which lost at 25%
+        // HBM — errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
         if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES
-            && std::env::var("ARLE_DSV4_MOE_DECODE_GEMV").as_deref() == Ok("1")
+            && std::env::var("ARLE_DSV4_MOE_DECODE_FP8").as_deref() != Ok("0")
         {
             let tables = layer.gemv_tables.get_or_init(|| {
                 build_gemv_tables(ctx, layer).unwrap_or_else(|e| {
@@ -3013,7 +2996,7 @@ mod dsv4_gpu {
                 })
             });
             if let Some(tables) = tables.as_ref() {
-                return dsv4_moe_forward_decode_gemv(
+                return dsv4_moe_forward_decode_fp8(
                     model,
                     layer,
                     tables,

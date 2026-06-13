@@ -1377,6 +1377,98 @@ pub unsafe fn dsv4_swiglu_clamped_batch(
     Ok(())
 }
 
+/// DSv4 FP8 decode-band fused gate+up+SwiGLU grouped GEMM (w8a16, f32 block
+/// scales). Compact (work scales with real routed rows), 16-byte vectorized
+/// FP8 weight loads, per-route correct (one warp per output row, no tile
+/// contract). `N` = moe intermediate, `K` = hidden; `scale_cols` = K/128.
+/// Writes `act[route, :] = silu(gate·x) * (up·x)`.
+///
+/// # Safety
+/// All pointers/tables valid on `stream`; tables hold `num_experts` entries;
+/// `K % 16 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_fp8_grouped_swiglu_decode(
+    weight_gate_ptrs: RawDevicePtr<u64>,
+    scale_gate_ptrs: RawDevicePtr<u64>,
+    weight_up_ptrs: RawDevicePtr<u64>,
+    scale_up_ptrs: RawDevicePtr<u64>,
+    input: RawDevicePtr<bf16>,
+    act: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    scale_cols: usize,
+    limit: f32,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_fp8_grouped_swiglu_decode_cuda(
+            weight_gate_ptrs.as_ptr(),
+            scale_gate_ptrs.as_ptr(),
+            weight_up_ptrs.as_ptr(),
+            scale_up_ptrs.as_ptr(),
+            input.as_ptr() as *const Half,
+            act.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            std::ptr::null(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_cols)?,
+            limit,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// DSv4 FP8 decode-band down (w2) grouped GEMM (w8a16, f32 block scales).
+/// `N` = hidden, `K` = moe intermediate; `scale_cols` = K/128.
+///
+/// # Safety
+/// See [`dsv4_fp8_grouped_swiglu_decode`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_fp8_grouped_down_decode(
+    weight_ptrs: RawDevicePtr<u64>,
+    scale_ptrs: RawDevicePtr<u64>,
+    input: RawDevicePtr<bf16>,
+    output: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    scale_cols: usize,
+    stream: CUstream,
+) -> Result<()> {
+    unsafe {
+        ffi::dsv4_fp8_grouped_down_decode_cuda(
+            weight_ptrs.as_ptr(),
+            scale_ptrs.as_ptr(),
+            input.as_ptr() as *const Half,
+            output.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            std::ptr::null(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_cols)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Convenience: build a [`RawDevicePtr`] over a [`DeviceVec`]'s dense data.
 #[must_use]
 pub fn device_vec_ptr(vec: &DeviceVec, ctx: &DeviceContext) -> RawDevicePtr<bf16> {
