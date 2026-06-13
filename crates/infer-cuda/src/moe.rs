@@ -624,9 +624,12 @@ mod gpu {
         if !use_deepgemm {
             // Grouped-mode loads cleared the per-expert Vecs (the hand
             // kernels run through the rebuilt ptr tables into the grouped
-            // buffer), so accept either weight form here.
+            // buffer); the U3 fused-sglang load likewise clears them after
+            // restacking into `fused_sglang` w1/w2 (build-and-replace, no
+            // memory doubling). Accept any of the three weight forms here.
             ensure!(
                 weights.gate_grouped.is_some()
+                    || weights.fused_sglang.is_some()
                     || (weights.gate.len() == local_experts
                         && weights.up.len() == local_experts
                         && weights.down.len() == local_experts),
