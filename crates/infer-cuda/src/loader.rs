@@ -1238,72 +1238,6 @@ impl SafetensorLoader {
         }
     }
 
-    /// Load `wo_a` as `o_groups` per-group FP8 matrices (each `[o_lora_rank,
-    /// heads_per_group*head_dim]`) for replicated decode attention. DSv4's
-    /// o-projection is grouped (`wo_a` rows = `o_groups * o_lora_rank`, sharded
-    /// `Column{dim:0}` so each TP rank normally owns exactly one group); a
-    /// replicated rank computes all heads, so it applies ALL groups' wo_a
-    /// block-diagonally. Slicing the raw FP8 bytes + e8m0 scales by group rows
-    /// at load time keeps each group a clean block-scaled matrix the proven
-    /// `dsv4_linear`/`mla_linear` path drives — no runtime FP8 slicing. Requires
-    /// `o_lora_rank % 128 == 0` (true for DSv4-Flash: 1024) so the 128-block
-    /// scale rows slice on group boundaries.
-    pub(crate) fn load_dsv4_wo_a_groups(
-        &self,
-        ctx: &DeviceContext,
-        name: &str,
-        o_groups: usize,
-        o_lora_rank: usize,
-    ) -> Result<Vec<DeviceMatrix>> {
-        let tensor = self.load_raw_tensor(name)?;
-        ensure!(
-            tensor.shape.len() == 2 && tensor.dtype == Dtype::F8_E4M3,
-            "{name}: replicated wo_a expects 2D FP8 E4M3, got {:?} {:?}",
-            tensor.shape,
-            tensor.dtype
-        );
-        let scale_name = name
-            .strip_suffix(".weight")
-            .map(|prefix| format!("{prefix}.scale"))
-            .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
-        let scale = self.load_raw_tensor(&scale_name)?;
-        ensure!(
-            scale.dtype == Dtype::F8_E8M0 && scale.shape.len() == 2,
-            "{scale_name}: expected 2D F8_E8M0 block scale, got {:?} {:?}",
-            scale.dtype,
-            scale.shape
-        );
-        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
-        let (scale_rows, scale_cols) = (scale.shape[0], scale.shape[1]);
-        ensure!(
-            rows == o_groups * o_lora_rank && o_groups > 0,
-            "{name}: wo_a rows {rows} != o_groups {o_groups} * o_lora_rank {o_lora_rank}"
-        );
-        ensure!(
-            scale_rows % o_groups == 0,
-            "{name}: scale rows {scale_rows} not divisible by o_groups {o_groups} \
-             (need o_lora_rank {o_lora_rank} 128-aligned for clean group scale slices)"
-        );
-        let w_per_group = o_lora_rank * cols; // FP8: 1 byte/elem
-        let scale_rows_per_group = scale_rows / o_groups;
-        let s_per_group = scale_rows_per_group * scale_cols;
-        let mut groups = Vec::with_capacity(o_groups);
-        for g in 0..o_groups {
-            let m = DeviceMatrix::from_dsv4_fp8_block_scaled(
-                ctx,
-                &tensor.bytes[g * w_per_group..(g + 1) * w_per_group],
-                &scale.bytes[g * s_per_group..(g + 1) * s_per_group],
-                o_lora_rank,
-                cols,
-                scale_rows_per_group,
-                scale_cols,
-            )
-            .with_context(|| format!("upload DSv4 wo_a group {g} of {name}"))?;
-            groups.push(m);
-        }
-        Ok(groups)
-    }
-
     fn dsv4_scale_shard_for_value_shard(
         name: &str,
         value: &ShardingSpec,
@@ -1685,37 +1619,6 @@ impl SafetensorLoader {
             } else {
                 (None, None)
             };
-        // Replicated decode attention: each rank computes ALL heads, so it
-        // needs full-width wq_b (Q, all heads), all o_groups of wo_a applied
-        // block-diagonally, and full-width wo_b (combine all group latents) —
-        // then it skips the attention all-reduce. prefill keeps the sharded
-        // math. wo_a is loaded per-group (the o-projection is grouped); wq_b
-        // and wo_b replicate whole.
-        let (wq_b_full, wo_a_groups, wo_b_full) =
-            if crate::attention::dsv4_replicated_attn_enabled() && tp.world_size > 1 {
-                (
-                    Some(self.load_dsv4_block_scaled_sharded(
-                        ctx,
-                        &names.wq_b,
-                        Shard::Replicated,
-                        tp,
-                    )?),
-                    Some(self.load_dsv4_wo_a_groups(
-                        ctx,
-                        &names.wo_a,
-                        config.o_groups,
-                        config.o_lora_rank,
-                    )?),
-                    Some(self.load_dsv4_block_scaled_sharded(
-                        ctx,
-                        &names.wo_b,
-                        Shard::Replicated,
-                        tp,
-                    )?),
-                )
-            } else {
-                (None, None, None)
-            };
         Ok(crate::dsv4::Dsv4Attention {
             wq_a,
             wqkv_a_deepgemm,
@@ -1728,9 +1631,6 @@ impl SafetensorLoader {
             wo_b,
             wo_a_deepgemm,
             wo_b_deepgemm,
-            wq_b_full,
-            wo_a_groups,
-            wo_b_full,
             attn_sink,
             attn_sink_f32,
             compressor: names
