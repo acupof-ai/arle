@@ -220,16 +220,25 @@ Per served rollout sequence (G2):
    default-on, 4.99×; tape disabled, CUDA-graph + paged-KV).
 2. **Score + step (two-pass-inline — the bring-up choice)** — keep the fast
    no-tape rollout, then recompute+step: set the OPD rollout = the just-served
-   tokens; the existing `backward_chunked_kl_rollout` computes
-   KL(student ‖ **EMA-self-teacher**) and steps AdamW on the **adapter only**.
+   tokens; the existing `backward_chunked_kl_rollout` + `mix_gkd_losses` compute
+   the GKD blend `λ·CE(student ‖ its own rollout) + (1−λ)·KL(student ‖ **EMA-self-teacher**)`
+   and step AdamW on the **adapter only**.
    *(Fused-single-pass — reuse the rollout's own logits/activations in one pass —
    is a later perf option; it loses CUDA-graph speed, so bench before adopting.
    Survey §7 Q4.)*
 3. **EMA update** — after the step: `θ_ema ← α·θ_ema + (1−α)·θ_student` over
-   **adapter tensors only** (`α≈0.999`). Tiny elementwise op on rank-r A/B. The
-   EMA *lag* makes the KL target non-degenerate (identical weights ⇒ KL=0 —
-   survey §5 / Codex pass-2) and is the online-update anti-divergence anchor
-   (mean-teacher).
+   **adapter tensors only** (`α≈0.999`). Tiny elementwise op on rank-r A/B.
+   The EMA lag is the **steady-state stabilizer** (mean-teacher anti-divergence),
+   **not** the bootstrap signal. At cold start the adapter inits `lora_b=0`, so
+   student = EMA = base and `KL(student‖EMA)=0` with **zero gradient** — a
+   pure-KL A1 loop is dead on arrival (the "identical weights ⇒ KL=0" of survey
+   §5 / Codex pass-2 cuts the other way at step 0). The bootstrap gradient comes
+   from the `λ>0` CE self-anchor in step 2 (`GkdSftAnchor::StudentRollout`); only
+   once the student moves off base does the EMA-KL term become non-degenerate and
+   take over as the stabilizer. Hence Phase 0 ships **default `λ>0`** — the
+   `opd.rs:216` `λ=0.0` (pure-KL) default is wrong for a teacher-free cold start.
+   Phase 0 stays teacher-free: the CE anchor is the student's OWN rollout, not an
+   external teacher.
 4. **Accepted-update bookkeeping (REQUIRED, not optional)** — bump the adapter
    epoch and **invalidate/flush the prefix cache**. `RadixCache` is token-keyed
    with no version and `enable_prefix_cache` is default-on, so a later request
