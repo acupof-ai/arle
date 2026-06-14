@@ -79,6 +79,14 @@ pub enum Kernel {
     GemvQ5K,
     GemvQ6K,
     GemvQ8_0,
+    /// Fused MoE expert GEMV (`mul_mat_vec_id`): one dispatch runs a token
+    /// through ALL its top-k routed experts. Same `mul_mat_vecq` body + q8_1
+    /// activation as the plain GEMV, but the `MUL_MAT_ID` push tail + a 6th
+    /// expert-id binding (see [`gemv_id_params`]).
+    GemvIdQ4K,
+    GemvIdQ5K,
+    GemvIdQ6K,
+    GemvIdQ8_0,
     QuantizeQ8_1,
     RmsNorm,
     RopeNeox,
@@ -137,6 +145,10 @@ impl Kernel {
         Self::GemvQ5K,
         Self::GemvQ6K,
         Self::GemvQ8_0,
+        Self::GemvIdQ4K,
+        Self::GemvIdQ5K,
+        Self::GemvIdQ6K,
+        Self::GemvIdQ8_0,
         Self::QuantizeQ8_1,
         Self::RmsNorm,
         Self::RopeNeox,
@@ -171,6 +183,10 @@ impl Kernel {
             Kernel::GemvQ5K => "mul_mat_vecq_q5_k",
             Kernel::GemvQ6K => "mul_mat_vecq_q6_k",
             Kernel::GemvQ8_0 => "mul_mat_vecq_q8_0",
+            Kernel::GemvIdQ4K => "mul_mat_vec_id_q4_k",
+            Kernel::GemvIdQ5K => "mul_mat_vec_id_q5_k",
+            Kernel::GemvIdQ6K => "mul_mat_vec_id_q6_k",
+            Kernel::GemvIdQ8_0 => "mul_mat_vec_id_q8_0",
             Kernel::QuantizeQ8_1 => "q8_1_quantize",
             Kernel::RmsNorm => "rms_norm",
             Kernel::RopeNeox => "rope_neox",
@@ -202,9 +218,14 @@ impl Kernel {
         match self {
             Kernel::MmvqIq2Xxs => SPEC_MMVQ_IQ2_XXS,
             Kernel::MmvqQ2K => SPEC_MMVQ_Q2_K,
-            Kernel::GemvQ4K | Kernel::GemvQ5K | Kernel::GemvQ6K | Kernel::GemvQ8_0 => {
-                SPEC_GEMV_K_Q8_1
-            }
+            Kernel::GemvQ4K
+            | Kernel::GemvQ5K
+            | Kernel::GemvQ6K
+            | Kernel::GemvQ8_0
+            | Kernel::GemvIdQ4K
+            | Kernel::GemvIdQ5K
+            | Kernel::GemvIdQ6K
+            | Kernel::GemvIdQ8_0 => SPEC_GEMV_K_Q8_1,
             Kernel::QuantizeQ8_1 => SPEC_WORKGROUP_32,
             Kernel::RmsNorm => SPEC_RMS_NORM_MUL,
             Kernel::SoftMax | Kernel::ArgMax => SPEC_WORKGROUP_32,
@@ -402,6 +423,69 @@ pub fn gemv_params(ncols: u32, nrows: u32) -> KernelParams {
 /// single batch. `main()` derives `first_row` from `gl_WorkGroupID.x`.
 pub fn gemv_dispatch(nrows: u32) -> Dispatch {
     Dispatch::x(nrows.max(1))
+}
+
+/// Push-constant layout for the FUSED MoE expert GEMV (`mul_mat_vecq.comp` built
+/// with `MUL_MAT_ID`). The `MUL_MAT_ID` branch of `mul_mat_vec_base.glsl` replaces
+/// the trailing 5 batch fields of [`gemv_params`] with 4 expert-id fields, so the
+/// block is 12 `uint`s in order:
+/// `ncols, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b,
+/// batch_stride_d, fusion_flags, nei0, ne11, expert_i1, nbi1`.
+///
+/// Mapped from `ggml_vk_mul_mat_vec_id_q_f16` (ggml-vulkan.cpp:8454) for ONE
+/// decode token routed to `n_experts` (= top-k) experts, with the activation
+/// shared by every expert (`ne11 = 1`, single `expert_i1 = 0` batch). Field map:
+///
+/// - `ncols` = `ne00` = the expert in-dim (per-row width, elements).
+/// - `stride_a` = `ne10` = `ncols` (weight row stride; the real expert offset is
+///   `batch_stride_a`).
+/// - `stride_b` = `ne10` = `ncols` (activation row stride, elements).
+/// - `stride_d` = `ne01` = `nrows` = per-expert OUTPUT row count. BOTH the
+///   row-count guard `main()` checks `first_row` against AND the per-expert dst
+///   stride (`d_offset = expert_i0 * stride_d`): expert `i` writes rows
+///   `[i*nrows .. +nrows)`.
+/// - `batch_stride_a` = `ncols * nrows` = the full expert matrix in ELEMENTS; the
+///   shader does `expert_id * (batch_stride_a / QUANT_K)` to land on expert
+///   `data_ids[expert_i0]`'s slice.
+/// - `batch_stride_b` = `ncols` (one token's activation; unused at expert_i1=0).
+/// - `batch_stride_d` = `nrows * n_experts` (full dst; unused at expert_i1=0).
+/// - `fusion_flags` = 0 (no bias/scale fusion; bindings 3/4 unread).
+/// - `nei0` = `n_experts` = experts selected for this token (the y dispatch
+///   dimension; `expert_i0 = gl_WorkGroupID.y`).
+/// - `ne11` = 1 (one token → every expert reads activation offset 0).
+/// - `expert_i1` = 0 (single-token batch row).
+/// - `nbi1` = `n_experts` = the id-buffer row stride (`data_ids[expert_i0 +
+///   expert_i1*nbi1]`; irrelevant at expert_i1=0, set to the natural `nei0`).
+///
+/// Binding order is the plain GEMV's 5 buffers + a 6th: `[A weights (stacked
+/// experts), B q8_1_x4 activation, D f32 dst (n_experts*nrows rows), Fuse0, Fuse1,
+/// IDS (i32 expert-id list)]`.
+pub fn gemv_id_params(ncols: u32, nrows: u32, n_experts: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        ncols,             // ncols: per-row width in elements
+        ncols,             // stride_a: weight row stride (elements)
+        ncols,             // stride_b: activation row stride (elements)
+        nrows,             // stride_d: per-expert row count guard + dst stride
+        ncols * nrows,     // batch_stride_a: full expert matrix (elements) -> /QUANT_K
+        ncols,             // batch_stride_b: one token's activation
+        nrows * n_experts, // batch_stride_d: full dst
+        0,                 // fusion_flags: no bias/scale fusion
+        n_experts,         // nei0: experts selected for this token
+        1,                 // ne11: single token
+        0,                 // expert_i1: single-token batch row
+        n_experts,         // nbi1: id-buffer row stride
+    ])
+}
+
+/// Dispatch grid for [`gemv_id_params`]: `x` = output rows per expert (each
+/// workgroup computes `NUM_ROWS=1` rows of one expert), `y` = `n_experts` (the
+/// expert slot; `mul_mat_vec_base.glsl` reads `expert_i0 = gl_WorkGroupID.y`).
+pub fn gemv_id_dispatch(nrows: u32, n_experts: u32) -> Dispatch {
+    Dispatch {
+        x: nrows.max(1),
+        y: n_experts.max(1),
+        z: 1,
+    }
 }
 
 pub const Q8_1_X4_VALUES_PER_GROUP: u32 = 128;
@@ -650,6 +734,46 @@ macro_rules! launcher_fns {
             params: &KernelParams,
         ) -> Result<()> {
             $call_params(Kernel::GemvQ8_0, ctx, buffers, dispatch, params)
+        }
+
+        // Fused MoE expert GEMV (`mul_mat_vec_id`). Buffer order is the plain
+        // GEMV's 5 + a 6th IDS binding: [A stacked-expert weights, B q8_1_x4
+        // activation, D f32 dst (n_experts*nrows rows), Fuse0, Fuse1, IDS (i32
+        // expert ids)]. Push = [`gemv_id_params`]; dispatch = [`gemv_id_dispatch`].
+        pub fn q4_k_gemv_id_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvIdQ4K, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q5_k_gemv_id_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvIdQ5K, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q6_k_gemv_id_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvIdQ6K, ctx, buffers, dispatch, params)
+        }
+
+        pub fn q8_0_gemv_id_with_params(
+            ctx: &vulkan_sys::VulkanContext,
+            buffers: &[&vulkan_sys::DeviceBuffer<'_>],
+            dispatch: Dispatch,
+            params: &KernelParams,
+        ) -> Result<()> {
+            $call_params(Kernel::GemvIdQ8_0, ctx, buffers, dispatch, params)
         }
 
         pub fn q8_1_quantize(
@@ -1025,6 +1149,51 @@ mod tests {
         // stride_d (index 3) is the row-count guard the shader checks.
         assert_eq!(gemv_dispatch(4), Dispatch::x(4));
         assert_eq!(gemv_dispatch(0), Dispatch::x(1));
+    }
+
+    #[test]
+    fn gemv_id_params_match_mul_mat_vec_id_layout() {
+        // 12 uints (MUL_MAT_ID branch): ncols, stride_a, stride_b, stride_d,
+        // batch_stride_a, batch_stride_b, batch_stride_d, fusion_flags, nei0,
+        // ne11, expert_i1, nbi1. For ncols=256, nrows=4, n_experts=8.
+        let p = gemv_id_params(256, 4, 8);
+        assert_eq!(p.len_bytes(), 12 * 4);
+        assert_eq!(
+            p,
+            KernelParams::from_words(vec![
+                256,     // ncols
+                256,     // stride_a
+                256,     // stride_b
+                4,       // stride_d (per-expert row count guard + dst stride)
+                256 * 4, // batch_stride_a (full expert matrix in elements)
+                256,     // batch_stride_b (one token)
+                4 * 8,   // batch_stride_d (full dst)
+                0,       // fusion_flags
+                8,       // nei0 (experts selected)
+                1,       // ne11 (single token)
+                0,       // expert_i1
+                8,       // nbi1
+            ])
+        );
+        // x = rows per expert, y = n_experts (gl_WorkGroupID.y = expert slot).
+        assert_eq!(gemv_id_dispatch(4, 8), Dispatch { x: 4, y: 8, z: 1 });
+        assert_eq!(gemv_id_dispatch(0, 0), Dispatch { x: 1, y: 1, z: 1 });
+    }
+
+    #[test]
+    fn gemv_id_specialization_matches_plain_gemv() {
+        // The _id variants reuse the plain decode GEMV spec (BLOCK_SIZE=32,
+        // NUM_ROWS=1, NUM_COLS=1); only the push tail + the 6th binding differ.
+        for k in [
+            Kernel::GemvIdQ4K,
+            Kernel::GemvIdQ5K,
+            Kernel::GemvIdQ6K,
+            Kernel::GemvIdQ8_0,
+        ] {
+            assert_eq!(k.specialization_u32(), Kernel::GemvQ4K.specialization_u32());
+        }
+        assert_eq!(Kernel::GemvIdQ4K.shader_name(), "mul_mat_vec_id_q4_k");
+        assert_eq!(Kernel::GemvIdQ8_0.shader_name(), "mul_mat_vec_id_q8_0");
     }
 
     #[test]

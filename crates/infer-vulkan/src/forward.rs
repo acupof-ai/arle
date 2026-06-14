@@ -55,9 +55,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use qwen35_spec::{LayerType, Qwen35Config};
 use vulkan_kernels::{
-    BLOCK_Q8_1_BYTES, Kernel, KernelCache, Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params,
-    gemv_dispatch, gemv_params, q8_1_quantize_dispatch, q8_1_quantize_params, rms_norm_dispatch,
-    rms_norm_params, scaled_add_dispatch, scaled_add_params, swiglu_dispatch, swiglu_params,
+    BLOCK_Q8_1_BYTES, Kernel, KernelCache, KernelParams, Q8_1_X4_VALUES_PER_GROUP, add_dispatch,
+    add_params, gemv_dispatch, gemv_id_dispatch, gemv_id_params, gemv_params,
+    q8_1_quantize_dispatch, q8_1_quantize_params, rms_norm_dispatch, rms_norm_params,
+    scaled_add_dispatch, scaled_add_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -188,6 +189,27 @@ pub struct DeviceArena<'a> {
     /// dense FFN's peak live set: {post_sum, mlp_in, gate, up} coexist after the
     /// up-proj GEMV (before swiglu frees mlp_in/gate).
     work: [Slot; 4],
+    // ── Fused MoE (`mul_mat_vec_id`) slots: the per-layer 8×3 per-expert GEMVs
+    // collapse into 3 fused dispatches, each producing ALL top-k experts'
+    // gate/up/down at once into back-to-back per-expert blocks. Zero-sized on a
+    // dense-only model. ──
+    /// q8_1_x4 of the shared MoE input `mlp_in` (`hidden`-wide; gate+up read it).
+    moe_in_quant: Slot,
+    /// f32 `[top_k * moe_inter]` — every selected expert's gate projection.
+    moe_gate: Slot,
+    /// f32 `[top_k * moe_inter]` — every selected expert's up projection (then
+    /// reused for the swiglu output `act_all`).
+    moe_up: Slot,
+    /// q8_1_x4 of `act_all` (`top_k * moe_inter`-wide; the down dispatch reads it
+    /// per-expert via `ne11 = top_k`, `stride_b = moe_inter`).
+    moe_act_quant: Slot,
+    /// f32 `[top_k * hidden]` — every selected expert's down projection.
+    moe_down: Slot,
+    /// i32 `[top_k]` — the routed expert-id list (binding 5 of `mul_mat_vec_id`).
+    moe_ids: Slot,
+    /// MoE fused caps: top-k experts and the widest expert intermediate.
+    moe_top_k: usize,
+    moe_inter_cap: usize,
     /// Pre-sized caps so a GEMV can bail loud rather than silently corrupt.
     max_cols: usize,
     max_rows: usize,
@@ -196,8 +218,14 @@ pub struct DeviceArena<'a> {
 impl<'a> DeviceArena<'a> {
     /// Allocate the arena sized to the widest GEMV (`max_cols` input width,
     /// `max_rows` output rows), aligning every slot to the device's storage
-    /// buffer offset granularity.
-    pub fn new(ctx: &'a VulkanContext, max_cols: usize, max_rows: usize) -> Result<Self> {
+    /// buffer offset granularity. `config` sizes the fused-MoE slots (zero on a
+    /// dense-only model).
+    pub fn new(
+        ctx: &'a VulkanContext,
+        config: &Qwen35Config,
+        max_cols: usize,
+        max_rows: usize,
+    ) -> Result<Self> {
         let align = ctx.min_storage_buffer_offset_alignment().max(1) as usize;
         let x_in_len = max_cols * std::mem::size_of::<f32>();
         let quant_len = q8_1_x4_bytes(max_cols);
@@ -207,6 +235,22 @@ impl<'a> DeviceArena<'a> {
         // op touches is `max_cols` f32 (the FFN intermediate). dst can also hold a
         // hidden-wide vector, but max_cols already covers hidden.
         let work_len = max_cols * std::mem::size_of::<f32>();
+
+        // Fused-MoE slots: the 3 fused `mul_mat_vec_id` dispatches produce ALL
+        // top-k experts' gate/up/down at once. The shared-expert dense path reuses
+        // these too (its 1-expert "id list" is a single dispatch), so cap the
+        // intermediate at the wider of the routed / shared expert width.
+        let moe_top_k = config.num_experts_per_tok;
+        let moe_inter_cap = config
+            .moe_intermediate_size
+            .max(config.shared_expert_intermediate_size);
+        let h = config.hidden_size;
+        // gate/up/act are `[top_k * moe_inter]`; down is `[top_k * hidden]`.
+        let moe_gate_len = moe_top_k * moe_inter_cap * std::mem::size_of::<f32>();
+        let moe_down_len = moe_top_k * h * std::mem::size_of::<f32>();
+        // q8_1 of the hidden-wide shared input, and of the `top_k*moe_inter` act.
+        let moe_in_quant_len = q8_1_x4_bytes(h);
+        let moe_act_quant_len = q8_1_x4_bytes(moe_top_k * moe_inter_cap);
 
         let mut cursor = 0u64;
         let mut place = |len: usize| -> Slot {
@@ -225,6 +269,12 @@ impl<'a> DeviceArena<'a> {
             place(work_len),
             place(work_len),
         ];
+        let moe_in_quant = place(moe_in_quant_len);
+        let moe_gate = place(moe_gate_len);
+        let moe_up = place(moe_gate_len);
+        let moe_act_quant = place(moe_act_quant_len);
+        let moe_down = place(moe_down_len);
+        let moe_ids = place(moe_top_k.max(1) * std::mem::size_of::<i32>());
         let total = cursor as usize;
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
@@ -237,6 +287,14 @@ impl<'a> DeviceArena<'a> {
             fuse0,
             fuse1,
             work,
+            moe_in_quant,
+            moe_gate,
+            moe_up,
+            moe_act_quant,
+            moe_down,
+            moe_ids,
+            moe_top_k,
+            moe_inter_cap,
             max_cols,
             max_rows,
         })
@@ -292,6 +350,8 @@ pub struct DecodeResources<'a> {
     ring2: DescriptorSetRing<'a>,
     ring3: DescriptorSetRing<'a>,
     ring5: DescriptorSetRing<'a>,
+    /// 6-binding ring for the fused MoE `mul_mat_vec_id` ([A,B,D,F0,F1,IDS]).
+    ring6: DescriptorSetRing<'a>,
     /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
     /// attribute time between the GPU GEMV submits and the surrounding host
     /// prep/readback. Drained + printed via [`Self::take_profile`].
@@ -303,7 +363,7 @@ pub struct DecodeResources<'a> {
 impl<'a> DecodeResources<'a> {
     pub fn new(ctx: &'a VulkanContext, config: &Qwen35Config) -> Result<Self> {
         let (max_cols, max_rows) = widest_gemv(config);
-        let arena = DeviceArena::new(ctx, max_cols, max_rows)?;
+        let arena = DeviceArena::new(ctx, config, max_cols, max_rows)?;
         let cache = KernelCache::new();
         let recorder =
             CommandRecorder::new(ctx).map_err(|e| anyhow!("create decode CommandRecorder: {e}"))?;
@@ -327,15 +387,17 @@ impl<'a> DecodeResources<'a> {
         let (l2, ring2) = mk(2)?;
         let (l3, ring3) = mk(3)?;
         let (l5, ring5) = mk(5)?;
+        let (l6, ring6) = mk(6)?;
 
         Ok(Self {
             arena,
             cache,
             recorder,
-            _layouts: vec![l2, l3, l5],
+            _layouts: vec![l2, l3, l5, l6],
             ring2,
             ring3,
             ring5,
+            ring6,
             gemv_submit_ns: 0,
             gemv_other_ns: 0,
             gemv_count: 0,
@@ -349,6 +411,7 @@ impl<'a> DecodeResources<'a> {
         self.ring2.reset();
         self.ring3.reset();
         self.ring5.reset();
+        self.ring6.reset();
     }
 
     /// Drain the accumulated GEMV timing as
@@ -491,24 +554,30 @@ pub fn forward_token<'a>(
 ///            gated by sigmoid(ffn_gate_inp_shexp · x) if that router exists
 ///   ffn_out = routed + shared
 ///
-/// Device-resident (perf-parity Step 5c): the router top-k stays on host (tiny —
-/// a softmax over the readback router logits), but every expert's per-element op
-/// — gate/up GEMV, SwiGLU, down GEMV, and the `acc += w_e · y_e` accumulate —
-/// runs **on the GPU** through the Step-5b `record_swiglu` / `record_scaled_add`
-/// helpers, threading arena work slots with **no host hop between the GEMVs**.
-/// One submit per expert (and one for the shared expert) batches its ~8
-/// barrier-chained dispatches; the accumulator lives in arena `work[0]`
-/// device-resident across every submit and reads back **once** at the end.
+/// Device-resident, FUSED (perf-parity — the `mul_mat_vec_id` win): the router
+/// top-k stays on host (tiny — a softmax over the readback router logits), then
+/// the per-layer **8×3 per-expert GEMVs collapse into 3 fused
+/// `mul_mat_vec_id` dispatches** (gate_exps, up_exps, down_exps), each running
+/// the token through ALL its top-k routed experts at once. One quantize of the
+/// shared `mlp_in` feeds gate+up; one quantize of the per-expert swiglu output
+/// `act_all` feeds down; the swiglu + the weighted accumulate stay on-device. The
+/// whole routed mix is ONE submit (a few fused dispatches + barriers), reading
+/// back only the `[hidden]` accumulator once. The shared expert keeps the dense
+/// single-expert path.
 ///
-/// Arena work-slot plan (4 slots, the arena's full set):
-///   work[0] = acc     — Σ contributions, persists the whole FFN, read back once
-///   work[1] = mlp_in  — the FFN input x, persists (every expert + shared reads it)
-///   work[2] = gate → (reused) act      — per-expert transient
-///   work[3] = up   → (reused) y        — per-expert transient
+/// Arena fused-MoE slot plan:
+///   work[0]      = acc        — Σ w_e·down_e, persists, read back once
+///   work[1]      = mlp_in     — the FFN input x (gate+up read it; shexp too)
+///   moe_in_quant = q8_1(mlp_in)             — shared by gate+up dispatches
+///   moe_gate     = [top_k * inter] gate     — fused gate dispatch out
+///   moe_up       = [top_k * inter] up→act   — fused up dispatch out, then swiglu
+///   moe_act_quant= q8_1(act_all)            — per-expert activation for down
+///   moe_down     = [top_k * hidden] down    — fused down dispatch out
+///   moe_ids      = i32 [top_k] routed expert ids
 ///
-/// The router weight scale `w_e` folds into the accumulate (`record_scaled_add`),
-/// not a separate scalar-multiply pass; the down GEMV's linearity makes
-/// `acc += w_e · down_e(act)` exact whether the scale is applied before or after.
+/// The router weight scale `w_e` folds into the per-expert accumulate
+/// (`record_scaled_add`); the down GEMV's linearity makes
+/// `acc += w_e · down_e(act)` exact whether the scale lands before or after.
 fn moe_ffn<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
@@ -542,20 +611,16 @@ fn moe_ffn<'a>(
         config.norm_topk_prob,
     );
 
-    // Arena work-slot offsets (see the fn doc).
+    // Arena slot offsets.
     let acc_off = res.arena.work[0].offset;
     let mlp_in_off = res.arena.work[1].offset;
-    let gate_off = res.arena.work[2].offset; // gate -> act
-    let up_off = res.arena.work[3].offset; // up   -> y
 
-    // Land mlp_in into its slot once (read by every expert + the shared expert)
+    // Land mlp_in into its slot once (read by gate/up + the shared expert)
     // and zero the accumulator slot so the first scaled-add starts from 0.
     res.arena.write_work(1, mlp_in)?;
     res.arena.write_work(0, &vec![0.0f32; h])?;
 
-    // ── Routed experts: slice each selected expert e out of the 3-D stacked
-    // ffn_*_exps tensors by byte offset and run the swiglu MLP device-resident,
-    // accumulating `acc += w_e · y_e` on-device. ──
+    // ── Routed experts via 3 FUSED `mul_mat_vec_id` dispatches. ──
     let gate_exps = weights
         .get(&format!("blk.{layer}.ffn_gate_exps.weight"))
         .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_exps.weight"))?;
@@ -569,29 +634,9 @@ fn moe_ffn<'a>(
     if moe_in != h {
         bail!("ffn_gate_exps[{layer}] in-dim {moe_in} != hidden {h}");
     }
-    if moe_inter > res.arena.max_cols {
-        bail!(
-            "moe_ffn[{layer}]: expert intermediate {moe_inter} exceeds arena ({})",
-            res.arena.max_cols
-        );
-    }
-
-    for route in &routes {
-        let e = route.expert;
-        moe_expert_submit(
-            ctx,
-            res,
-            gate_exps,
-            up_exps,
-            down_exps,
-            e,
-            h,
-            moe_inter,
-            route.weight,
-            mlp_in_off,
-            gate_off,
-            up_off,
-            acc_off,
+    if !routes.is_empty() {
+        moe_routed_fused_submit(
+            ctx, res, gate_exps, up_exps, down_exps, h, moe_inter, &routes, mlp_in_off, acc_off,
         )?;
     }
 
@@ -626,9 +671,23 @@ fn moe_ffn<'a>(
             1.0
         };
 
+        // The dense shared expert reuses work[2]/work[3] as its gate/up/act
+        // scratch (the fused routed path's moe_* slots are already consumed).
+        let sh_gate_off = res.arena.work[2].offset;
+        let sh_up_off = res.arena.work[3].offset;
         moe_dense_expert_submit(
-            ctx, res, gate_shexp, up_shexp, down_shexp, h, sh_inter, s, mlp_in_off, gate_off,
-            up_off, acc_off,
+            ctx,
+            res,
+            gate_shexp,
+            up_shexp,
+            down_shexp,
+            h,
+            sh_inter,
+            s,
+            mlp_in_off,
+            sh_gate_off,
+            sh_up_off,
+            acc_off,
         )?;
     }
 
@@ -636,109 +695,187 @@ fn moe_ffn<'a>(
     res.arena.read_work(0, h)
 }
 
-/// Record one routed expert's `acc += w_e · y_e` device-resident into ONE submit:
-/// gate/up GEMV (sliced from the stacked `ffn_*_exps` at expert `e`), SwiGLU,
-/// down GEMV, then the weighted accumulate — all barrier-chained against arena
-/// slots. `mlp_in_off`/`acc_off` are the persistent input/accumulator slots;
-/// `gate_off`/`up_off` are reused for the transient act/y.
+/// Record ALL top-k routed experts' `acc += Σ w_e · down_e(silu(gate_e·x)·up_e·x)`
+/// device-resident into ONE submit, using 3 FUSED `mul_mat_vec_id` dispatches
+/// (the `mul_mat_vec_id` perf win — replaces the old per-expert 8×3 loop):
+///
+///   ids       := routed expert ids                       (host → moe_ids slot)
+///   q_in      := quantize(mlp_in)                         (1 q8_1 dispatch)
+///   gate_all  := gate_exps[ids] · q_in   [top_k, inter]   (fused, ne11=1)
+///   up_all    := up_exps[ids]   · q_in   [top_k, inter]   (fused, ne11=1)
+///   act_all   := silu(gate_all) * up_all [top_k, inter]   (1 swiglu over the
+///                                                          contiguous block)
+///   q_act     := quantize(act_all)       [top_k*inter]    (1 q8_1 dispatch)
+///   down_all  := down_exps[ids] · q_act  [top_k, hidden]  (fused, ne11=top_k)
+///   acc      += Σ_e w_e · down_all[e]                     (top_k scaled-adds)
+///
+/// Per-expert ops that the fused GEMV cannot batch (the swiglu is one contiguous
+/// pass; the weighted accumulate is `top_k` cheap adds) stay in the SAME submit,
+/// barrier-chained. The activation rows of `gate_all`/`up_all`/`act_all` are
+/// contiguous (each `inter`-wide, `inter` a multiple of 128 so q8_1_x4
+/// super-blocks align per expert), so down's `ne11=top_k` indexes each expert's
+/// own activation row.
 #[allow(clippy::too_many_arguments)]
-fn moe_expert_submit<'a>(
+fn moe_routed_fused_submit<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,
     gate_exps: &DeviceTensor<'_>,
     up_exps: &DeviceTensor<'_>,
     down_exps: &DeviceTensor<'_>,
-    e: usize,
     h: usize,
     inter: usize,
-    weight: f32,
+    routes: &[crate::model_qwen36::Qwen36Route],
     mlp_in_off: u64,
-    gate_off: u64,
-    up_off: u64,
     acc_off: u64,
 ) -> Result<()> {
-    let (g_off, g_len) = expert_slice(gate_exps, e, "ffn_gate_exps")?;
-    let (u_off, u_len) = expert_slice(up_exps, e, "ffn_up_exps")?;
-    let (d_off, d_len) = expert_slice(down_exps, e, "ffn_down_exps")?;
+    let top_k = routes.len();
+    if top_k > res.arena.moe_top_k {
+        bail!(
+            "moe_routed_fused_submit: {top_k} routes exceed arena top-k cap {}",
+            res.arena.moe_top_k
+        );
+    }
+    if inter > res.arena.moe_inter_cap {
+        bail!(
+            "moe_routed_fused_submit: expert intermediate {inter} exceeds arena cap {}",
+            res.arena.moe_inter_cap
+        );
+    }
+    // Per-expert q8_1 super-block alignment for the down activation: each
+    // expert's `inter`-wide act row must start on a 128-value x4 boundary.
+    if !inter.is_multiple_of(Q8_1_X4_VALUES_PER_GROUP as usize) {
+        bail!(
+            "moe_routed_fused_submit: expert intermediate {inter} not a multiple of {} \
+             (fused down q8_1 rows would misalign)",
+            Q8_1_X4_VALUES_PER_GROUP
+        );
+    }
+
+    // Land the routed expert ids (i32) into the arena id slot.
+    let ids_off = res.arena.moe_ids.offset;
+    let ids: Vec<i32> = routes.iter().map(|r| r.expert as i32).collect();
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+    res.arena
+        .buffer
+        .copy_from_host_at(ids_off, &id_bytes)
+        .map_err(|e| anyhow!("ffn_exps: write routed ids: {e}"))?;
+
+    let in_quant_off = res.arena.moe_in_quant.offset;
+    let gate_off = res.arena.moe_gate.offset;
+    let up_off = res.arena.moe_up.offset;
+    let act_quant_off = res.arena.moe_act_quant.offset;
+    let down_off = res.arena.moe_down.offset;
 
     let t_start = std::time::Instant::now();
     res.recorder
         .begin()
-        .map_err(|er| anyhow!("ffn_exps[{e}]: recorder begin: {er}"))?;
+        .map_err(|er| anyhow!("ffn_exps: recorder begin: {er}"))?;
 
-    // gate = gate_e · mlp_in -> gate_off
-    record_quantize_gemv(
+    // q_in = quantize(mlp_in) — shared by the gate + up fused dispatches.
+    record_quantize(ctx, res, "ffn_exps_qin", h, mlp_in_off, in_quant_off)?;
+    res.recorder.barrier();
+
+    // gate_all = gate_exps[ids] · q_in  (fused; ne11=1, every expert reads q_in).
+    record_gemv_id(
         ctx,
         res,
         gate_exps,
         "ffn_gate_exps",
         h,
         inter,
-        g_off,
-        g_len,
-        mlp_in_off,
+        top_k,
+        1,
+        in_quant_off,
         gate_off,
+        ids_off,
     )?;
-    res.recorder.barrier();
-    // up = up_e · mlp_in -> up_off
-    record_quantize_gemv(
+    // up_all = up_exps[ids] · q_in (fused; ne11=1). No barrier needed between
+    // gate and up — both only read q_in and write disjoint dst slots — but the
+    // swiglu below reads both, so barrier once after up.
+    record_gemv_id(
         ctx,
         res,
         up_exps,
         "ffn_up_exps",
         h,
         inter,
-        u_off,
-        u_len,
-        mlp_in_off,
+        top_k,
+        1,
+        in_quant_off,
         up_off,
+        ids_off,
     )?;
     res.recorder.barrier();
-    // act = silu(gate) * up -> gate_off (gate now dead)
+
+    // act_all = silu(gate_all) * up_all over the whole [top_k*inter] block (one
+    // swiglu pass; per-expert rows are contiguous so a single op covers them).
     record_swiglu(
         ctx,
         res,
         "ffn_exps_swiglu",
-        inter,
+        top_k * inter,
         gate_off,
         up_off,
         gate_off,
     )?;
     res.recorder.barrier();
-    // y = down_e · act -> up_off (up now dead)
-    record_quantize_gemv(
+
+    // q_act = quantize(act_all) — the per-expert down activation (ne11=top_k).
+    record_quantize(
+        ctx,
+        res,
+        "ffn_exps_qact",
+        top_k * inter,
+        gate_off,
+        act_quant_off,
+    )?;
+    res.recorder.barrier();
+
+    // down_all = down_exps[ids] · q_act (fused; ne11=top_k, expert e reads row e).
+    record_gemv_id(
         ctx,
         res,
         down_exps,
         "ffn_down_exps",
         inter,
         h,
-        d_off,
-        d_len,
-        gate_off,
-        up_off,
+        top_k,
+        top_k,
+        act_quant_off,
+        down_off,
+        ids_off,
     )?;
     res.recorder.barrier();
-    // acc += w_e · y -> acc_off
-    record_scaled_add(
-        ctx,
-        res,
-        "ffn_exps_acc",
-        h,
-        weight,
-        acc_off,
-        up_off,
-        acc_off,
-    )?;
+
+    // acc += Σ_e w_e · down_all[e]. The fused down wrote each expert's [hidden]
+    // output back-to-back; accumulate with the router weight per expert.
+    for (slot, route) in routes.iter().enumerate() {
+        let y_off = down_off + (slot * h * std::mem::size_of::<f32>()) as u64;
+        record_scaled_add(
+            ctx,
+            res,
+            "ffn_exps_acc",
+            h,
+            route.weight,
+            acc_off,
+            y_off,
+            acc_off,
+        )?;
+        if slot + 1 < top_k {
+            // Serialize the accumulators (all read+write acc_off).
+            res.recorder.barrier();
+        }
+    }
 
     let t_submit = std::time::Instant::now();
     res.recorder
         .submit_and_wait()
-        .map_err(|er| anyhow!("ffn_exps[{e}]: submit: {er}"))?;
+        .map_err(|er| anyhow!("ffn_exps: submit: {er}"))?;
     let submit_ns = t_submit.elapsed().as_nanos();
     let total_ns = t_start.elapsed().as_nanos();
     res.gemv_submit_ns += submit_ns;
     res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    // 3 fused GEMV dispatches stand in for the old top_k*3 per-expert GEMVs.
     res.gemv_count += 3;
     Ok(())
 }
@@ -832,33 +969,6 @@ fn moe_dense_expert_submit<'a>(
     res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
     res.gemv_count += 3;
     Ok(())
-}
-
-/// Byte `(offset, len)` of expert slice `e` inside a 3-D stacked `ffn_*_exps`
-/// tensor `[ne0=in, ne1=out, ne2=n_expert]` (row-major, ne0 fastest): expert `e`
-/// is the 2-D `[out, in]` matrix at `e · out · row_bytes(in)`, length
-/// `out · row_bytes(in)`. The stride is a multiple of the quant block bytes
-/// (Q4_K 144 B / Q5_K 176 B / Q8_0 34 B per block), which clears the AMD storage-
-/// buffer offset granularity. Shared with the (now device-resident) MoE recorder.
-fn expert_slice(exps: &DeviceTensor<'_>, e: usize, name: &str) -> Result<(u64, u64)> {
-    let (ncols, nrows) = weight_dims(exps, name)?;
-    let ty = match exps.residency {
-        Residency::KeepQuant(ty) => ty,
-        other => bail!("{name}: expert GEMV expects packed quant, got {other:?}"),
-    };
-    let row_bytes = ty
-        .row_bytes(ncols)
-        .ok_or_else(|| anyhow!("{name}: {ty:?} row of {ncols} cols not block-aligned"))?
-        as u64;
-    let per_expert = nrows as u64 * row_bytes; // bytes for one [out, in] slice
-    let offset = e as u64 * per_expert;
-    if offset + per_expert > exps.buffer.len() as u64 {
-        bail!(
-            "{name}: expert {e} slice [{offset}, +{per_expert}) exceeds buffer {}",
-            exps.buffer.len()
-        );
-    }
-    Ok((offset, per_expert))
 }
 
 /// Tiny F32 matvec on the host: `y[r] = Σ_c W[r,c] · x[c]` for an F32-resident
@@ -1488,6 +1598,146 @@ fn gemv_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
         GgmlType::Q8_0 => Kernel::GemvQ8_0,
         other => bail!("{name}: no registered GEMV kernel for packed type {other:?}"),
     })
+}
+
+/// The FUSED `mul_mat_vec_id` kernel for a packed-quant expert tensor's GGUF
+/// type. Same activation/decode math as [`gemv_kernel_for`]; only the per-expert
+/// id-offset push tail differs (the `MUL_MAT_ID` build of `mul_mat_vecq.comp`).
+fn gemv_id_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
+    let Residency::KeepQuant(ty) = weight.residency else {
+        bail!(
+            "{name}: fused expert GEMV expects a packed-quant weight, got {:?}",
+            weight.residency
+        );
+    };
+    Ok(match ty {
+        GgmlType::Q4K => Kernel::GemvIdQ4K,
+        GgmlType::Q5K => Kernel::GemvIdQ5K,
+        GgmlType::Q6K => Kernel::GemvIdQ6K,
+        GgmlType::Q8_0 => Kernel::GemvIdQ8_0,
+        other => bail!("{name}: no registered fused expert GEMV for packed type {other:?}"),
+    })
+}
+
+/// Record (no submit) ONLY the q8_1 quantize of a `[ne]` f32 activation at arena
+/// byte `in_off` into the arena slot at `quant_off`. The MoE fused path quantizes
+/// the shared `mlp_in` once (gate+up read it) and the post-swiglu `act_all`
+/// once (the down dispatch reads it per-expert) — separate from the GEMV, since
+/// one quantize feeds two/eight expert dispatches.
+fn record_quantize<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    ne: usize,
+    in_off: u64,
+    quant_off: u64,
+) -> Result<()> {
+    let quant_bytes = q8_1_x4_bytes(ne);
+    let q_spec = Kernel::QuantizeQ8_1.specialization_u32();
+    let q_push = q8_1_quantize_params(ne as u32).to_le_bytes();
+    let q_groups = {
+        let d = q8_1_quantize_dispatch(ne as u32);
+        [d.x, d.y, d.z]
+    };
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring2,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::QuantizeQ8_1, q_spec, q_push.len() as u32, 2)
+        .map_err(|e| anyhow!("{name}: build q8_1_quantize pipeline: {e}"))?;
+    let set = ring2
+        .next_updated(&[
+            (arena_buf, in_off, (ne * 4) as u64),
+            (arena_buf, quant_off, quant_bytes as u64),
+        ])
+        .map_err(|e| anyhow!("{name}: bind q8_1 ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &q_push, q_groups);
+    Ok(())
+}
+
+/// Record (no submit) ONE fused MoE expert GEMV (`mul_mat_vec_id`) into the OPEN
+/// recorder: every selected expert's `[nrows]` projection of the per-expert q8_1
+/// activation against its slice of the stacked `exps` weight, written back-to-back
+/// into the arena `dst` slot (expert slot `i` → rows `[i*nrows ..]`). The caller
+/// supplies the already-recorded q8_1 activation (`b_off`, with `n_experts` rows
+/// of `ncols` each when each expert has its own activation — for gate/up there is
+/// ONE shared row and `b_stride`=0-style via `ne11=1`; the params encode it).
+///
+/// `n_act_rows` is the number of `ncols`-wide q8_1 activation rows present at
+/// `b_off` (1 when every expert shares one activation — gate/up; `n_experts`
+/// when each expert has its own — down). It must equal `gemv_id_params`' `ne11`
+/// for the per-expert `b_offset` math to be in range; the params are derived
+/// here from it so they stay consistent.
+///
+/// `ids_off` is the arena byte offset of the i32 `[n_experts]` id list. Bindings
+/// `[A exps weight, B q8_1 act, D f32 dst, Fuse0, Fuse1, IDS]`.
+#[allow(clippy::too_many_arguments)]
+fn record_gemv_id<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    weight: &DeviceTensor<'_>,
+    name: &str,
+    ncols: usize,
+    nrows: usize,
+    n_experts: usize,
+    n_act_rows: usize,
+    b_off: u64,
+    dst_off: u64,
+    ids_off: u64,
+) -> Result<()> {
+    let kernel = gemv_id_kernel_for(weight, name)?;
+    let spec = kernel.specialization_u32();
+    let mut push = gemv_id_params(ncols as u32, nrows as u32, n_experts as u32);
+    // Override ne11 (word index 9) with the actual activation-row count so the
+    // shader's `b_offset = (expert_i0 % ne11) * stride_b` indexes the right row:
+    // shared activation (1 row) for gate/up, per-expert (n_experts rows) for down.
+    let mut words = push.words().to_vec();
+    words[9] = n_act_rows as u32;
+    push = KernelParams::from_words(words);
+    let push = push.to_le_bytes();
+    let groups = {
+        let d = gemv_id_dispatch(nrows as u32, n_experts as u32);
+        [d.x, d.y, d.z]
+    };
+    let quant_bytes = q8_1_x4_bytes(n_act_rows * ncols);
+    let dst_bytes = n_experts * nrows * std::mem::size_of::<f32>();
+    let ids_bytes = (n_experts * std::mem::size_of::<i32>()) as u64;
+    let fuse0 = (res.arena.fuse0.offset, res.arena.fuse0.len as u64);
+    let fuse1 = (res.arena.fuse1.offset, res.arena.fuse1.len as u64);
+
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring6,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, kernel, spec, push.len() as u32, 6)
+        .map_err(|e| anyhow!("{name}: build {kernel:?} fused expert GEMV pipeline: {e}"))?;
+    let set = ring6
+        .next_updated(&[
+            // binding 0: the WHOLE stacked expert weight (the shader slices by id).
+            (&weight.buffer, 0, weight.buffer.len() as u64),
+            // binding 1: q8_1 activation (1 or n_experts rows of ncols).
+            (arena_buf, b_off, quant_bytes as u64),
+            // binding 2: f32 dst (n_experts * nrows).
+            (arena_buf, dst_off, dst_bytes as u64),
+            // bindings 3/4: fuse dummies (unread, fusion_flags=0).
+            (arena_buf, fuse0.0, fuse0.1),
+            (arena_buf, fuse1.0, fuse1.1),
+            // binding 5: the i32 expert-id list.
+            (arena_buf, ids_off, ids_bytes),
+        ])
+        .map_err(|e| anyhow!("{name}: bind fused expert GEMV ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
