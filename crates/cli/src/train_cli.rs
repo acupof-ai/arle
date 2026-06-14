@@ -20,7 +20,7 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -50,6 +50,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
         TrainCommand::Opd(args) => run_opd(args),
+        TrainCommand::SelfOpd(args) => run_self_opd(args),
     }
 }
 
@@ -404,6 +405,385 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         println!(
             "ARLE train opd smoke: ran {} step(s) on tiny Qwen3.5 (vocab={}, hidden={}, layers={}, backend={})",
             args.steps, cfg.vocab_size, cfg.hidden_size, cfg.num_hidden_layers, backend_label,
+        );
+    }
+    Ok(())
+}
+
+fn parse_lora_target_set(raw: &str) -> Result<train::lora::LoraTargetSet> {
+    use train::lora::LoraTargetSet;
+    match raw {
+        "attention-qv" | "attention_qv" | "qv" => Ok(LoraTargetSet::AttentionQv),
+        "all-linear" | "all_linear" | "all" => Ok(LoraTargetSet::AllLinear),
+        other => bail!("unknown --lora-target-set {other:?} (expected attention-qv or all-linear)"),
+    }
+}
+
+fn run_self_opd(args: TrainSelfOpdArgs) -> ExitCode {
+    if args.smoke {
+        return exit_from_result(run_self_opd_smoke(args));
+    }
+    if args.student_model.is_some() {
+        return exit_from_result(run_self_opd_from_dir(args));
+    }
+    eprintln!(
+        "[arle train self-opd] error: either `--student-model <dir>` or `--smoke` is required.\n\
+         See `arle train self-opd --help` for the full surface."
+    );
+    ExitCode::FAILURE
+}
+
+/// Forward-only held-out NLL: mean next-token cross-entropy of predicting
+/// `eval_ids[t+1]` from `eval_ids[..=t]` over a FIXED reference sequence.
+/// Tape-off (scratch tape dropped after the forward); non-circular — the
+/// reference text is fixed, independent of the moving EMA teacher — so it is a
+/// valid SOPD no-regression signal (KL-vs-EMA would be circular).
+fn heldout_nll(
+    student: &train::qwen35::Qwen35Model,
+    eval_ids: &[u32],
+    vocab: usize,
+    store: &mut TensorStore,
+) -> Result<f32> {
+    use autograd::Tape;
+    if eval_ids.len() < 2 {
+        bail!("--eval-ids needs at least 2 token ids for a next-token NLL");
+    }
+    let input: Vec<usize> = eval_ids[..eval_ids.len() - 1]
+        .iter()
+        .map(|&id| id as usize)
+        .collect();
+    let seq_len = input.len();
+    let mut eval_tape = Tape::new();
+    let logits_id = student
+        .forward_tokens(&input, store, &mut eval_tape)
+        .context("held-out NLL forward")?;
+    let host = store.to_host(logits_id)?;
+    let expected = seq_len
+        .checked_mul(vocab)
+        .ok_or_else(|| anyhow!("held-out NLL logits shape overflow"))?;
+    if host.len() != expected {
+        bail!(
+            "held-out NLL logits len {} != seq_len*vocab {} (seq_len={seq_len}, vocab={vocab})",
+            host.len(),
+            expected
+        );
+    }
+    let mut nll_sum = 0.0_f64;
+    for t in 0..seq_len {
+        let row = &host[t * vocab..(t + 1) * vocab];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0.0_f64;
+        for &v in row {
+            denom += f64::from(v - max).exp();
+        }
+        let target = eval_ids[t + 1] as usize;
+        if target >= vocab {
+            bail!("held-out NLL target token {target} >= vocab {vocab}");
+        }
+        let log_prob = f64::from(row[target] - max) - denom.ln();
+        nll_sum += -log_prob;
+    }
+    Ok((nll_sum / seq_len as f64) as f32)
+}
+
+fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
+    use autograd::{Tape, optim::AdamW};
+    use train::{
+        ema_self_teacher::EmaSelfTeacher,
+        lora::LoraConfig,
+        opd::{
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
+        },
+        qwen35_loader::load_qwen35_lora_from_hf_dir,
+    };
+
+    let student_dir = args
+        .student_model
+        .as_deref()
+        .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
+
+    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let mut tape = Tape::new();
+
+    eprintln!(
+        "[arle train self-opd] loading student from {}",
+        student_dir.display()
+    );
+    let student = load_qwen35_lora_from_hf_dir(student_dir, lora, target_set, &mut store)
+        .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    // Build the EMA self-teacher IMMEDIATELY after the student and BEFORE any
+    // other scratch alloc: from_student calls retain_ids which frees the rest.
+    let mut ema = EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)
+        .context("build EMA self-teacher")?;
+
+    let student_trainable: Vec<TensorId> = student
+        .all_parameter_ids()
+        .into_iter()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    let cfg = student.config().clone();
+    let vocab = cfg.vocab_size;
+
+    let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
+    if prompt_ids.iter().any(|&id| (id as usize) >= vocab) {
+        bail!("prompt token ids must be < {vocab} (student vocab size); got {prompt_ids:?}");
+    }
+    let eval_ids = match args.eval_ids.as_deref() {
+        Some(raw) => parse_prompt_ids(Some(raw))?,
+        None => prompt_ids.clone(),
+    };
+    if eval_ids.iter().any(|&id| (id as usize) >= vocab) {
+        bail!("eval token ids must be < {vocab} (student vocab size); got {eval_ids:?}");
+    }
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let step_cfg = OpdStepConfig {
+        rollout_len: args.rollout_len,
+        grad_clip: args.grad_clip,
+    };
+
+    let gate_on = args.gate_every_n > 0;
+    let mut snap = ema
+        .snapshot(&student, &optimizer, &mut store)
+        .context("initial EMA snapshot")?;
+    let mut nll_baseline = if gate_on {
+        heldout_nll(&student, &eval_ids, vocab, &mut store)?
+    } else {
+        f32::INFINITY
+    };
+    if gate_on && !args.json {
+        println!("gate baseline_nll {nll_baseline:.6}");
+    }
+
+    let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    let mut reverts = 0usize;
+    for step in 1..=args.steps {
+        let outcome = {
+            let teacher = ema.as_teacher();
+            opd_step_with_teacher_forward_profiled_gkd_anchor(
+                &student,
+                &teacher,
+                &prompt_ids,
+                step_cfg,
+                &student_trainable,
+                &mut optimizer,
+                &mut store,
+                &mut tape,
+                GkdLossConfig {
+                    lambda: args.gkd_lambda,
+                    sft_anchor: GkdSftAnchor::StudentRollout,
+                    corpus_tokens: None,
+                    kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                    logits_window_size: None,
+                    kl_mask: OpdKlMask::CompletionOnly,
+                },
+                #[cfg(feature = "cuda")]
+                None,
+                None,
+            )
+            .with_context(|| format!("self-opd step {step} failed"))?
+        };
+        ema.update(&student, &mut store, args.ema_alpha)
+            .with_context(|| format!("EMA update at step {step}"))?;
+        losses.push(outcome.loss);
+
+        let mut gate_action = "none";
+        let mut gate_nll = f32::NAN;
+        if gate_on && step % args.gate_every_n == 0 {
+            gate_nll = heldout_nll(&student, &eval_ids, vocab, &mut store)?;
+            if gate_nll > nll_baseline * (1.0 + args.gate_regress_tol) {
+                ema.restore(&snap, &student, &mut optimizer, &mut store)
+                    .with_context(|| format!("EMA revert at step {step}"))?;
+                reverts += 1;
+                gate_action = "revert";
+            } else {
+                nll_baseline = gate_nll;
+                gate_action = "accept";
+            }
+            // Re-snapshot from the post-gate (restored-or-accepted) good state.
+            snap = ema
+                .snapshot(&student, &optimizer, &mut store)
+                .with_context(|| format!("EMA re-snapshot at step {step}"))?;
+        }
+
+        if !args.json {
+            let grad_norm = current_grad_norm(&student_trainable, &store);
+            if gate_on && step % args.gate_every_n == 0 {
+                println!(
+                    "step {step}/{total} loss {loss:.6} grad_norm {grad_norm:.6} rollout_len {rl} \
+                     gate {gate_action} nll {gate_nll:.6} baseline {nll_baseline:.6}",
+                    total = args.steps,
+                    loss = outcome.loss,
+                    rl = outcome.rollout_len,
+                );
+            } else {
+                println!(
+                    "step {step}/{total} loss {loss:.6} grad_norm {grad_norm:.6} rollout_len {rl}",
+                    total = args.steps,
+                    loss = outcome.loss,
+                    rl = outcome.rollout_len,
+                );
+            }
+        }
+    }
+
+    if args.json {
+        let report = serde_json::json!({
+            "mode": "self-opd",
+            "backend": backend_label,
+            "student_model": student_dir.display().to_string(),
+            "steps": args.steps,
+            "rollout_len": args.rollout_len,
+            "lr": args.lr,
+            "ema_alpha": args.ema_alpha,
+            "gkd_lambda": args.gkd_lambda,
+            "gate_every_n": args.gate_every_n,
+            "gate_regress_tol": args.gate_regress_tol,
+            "gate_reverts": reverts,
+            "final_nll_baseline": nll_baseline,
+            "losses": losses,
+            "prompt_ids": prompt_ids,
+            "eval_ids": eval_ids,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "lora_target_set": args.lora_target_set,
+            "vocab_size": vocab,
+            "hidden_size": cfg.hidden_size,
+            "num_hidden_layers": cfg.num_hidden_layers,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "ARLE train self-opd: ran {} step(s) on Qwen3.x (vocab={}, hidden={}, layers={}, \
+             ema_alpha={}, gkd_lambda={}, gate_every_n={}, reverts={}, backend={})",
+            args.steps,
+            vocab,
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            args.ema_alpha,
+            args.gkd_lambda,
+            args.gate_every_n,
+            reverts,
+            backend_label,
+        );
+    }
+    Ok(())
+}
+
+fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
+    use autograd::{Tape, optim::AdamW};
+    use train::{
+        ema_self_teacher::EmaSelfTeacher,
+        lora::LoraConfig,
+        opd::{
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
+        },
+        qwen35::Qwen35Model,
+    };
+
+    let cfg = embedded_tiny_qwen35_config();
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank.min(4),
+        alpha: args.lora_alpha,
+    };
+    let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
+    if prompt_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
+        bail!(
+            "smoke prompt token ids must be < {} (embedded tiny vocab size)",
+            cfg.vocab_size
+        );
+    }
+
+    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let mut tape = Tape::new();
+    let student = Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, &mut store)
+        .context("build smoke LoRA student")?;
+    let mut ema = EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)
+        .context("build smoke EMA self-teacher")?;
+    let student_trainable: Vec<TensorId> = student
+        .all_parameter_ids()
+        .into_iter()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let step_cfg = OpdStepConfig {
+        rollout_len: args.rollout_len,
+        grad_clip: args.grad_clip,
+    };
+
+    let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    for step in 1..=args.steps {
+        let outcome = {
+            let teacher = ema.as_teacher();
+            opd_step_with_teacher_forward_profiled_gkd_anchor(
+                &student,
+                &teacher,
+                &prompt_ids,
+                step_cfg,
+                &student_trainable,
+                &mut optimizer,
+                &mut store,
+                &mut tape,
+                GkdLossConfig {
+                    lambda: args.gkd_lambda,
+                    sft_anchor: GkdSftAnchor::StudentRollout,
+                    corpus_tokens: None,
+                    kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                    logits_window_size: None,
+                    kl_mask: OpdKlMask::CompletionOnly,
+                },
+                #[cfg(feature = "cuda")]
+                None,
+                None,
+            )
+            .with_context(|| format!("self-opd smoke step {step} failed"))?
+        };
+        ema.update(&student, &mut store, args.ema_alpha)
+            .with_context(|| format!("EMA update at smoke step {step}"))?;
+        losses.push(outcome.loss);
+        if !args.json {
+            println!(
+                "step {step}/{total} loss {loss:.6} rollout_len {rl}",
+                total = args.steps,
+                loss = outcome.loss,
+                rl = outcome.rollout_len,
+            );
+        }
+    }
+
+    if args.json {
+        let report = serde_json::json!({
+            "mode": "self-opd-smoke",
+            "backend": backend_label,
+            "steps": args.steps,
+            "rollout_len": args.rollout_len,
+            "lr": args.lr,
+            "ema_alpha": args.ema_alpha,
+            "gkd_lambda": args.gkd_lambda,
+            "losses": losses,
+            "prompt_ids": prompt_ids,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "ARLE train self-opd smoke: ran {} step(s) on tiny Qwen3.5 (vocab={}, hidden={}, \
+             layers={}, ema_alpha={}, gkd_lambda={}, backend={})",
+            args.steps,
+            cfg.vocab_size,
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            args.ema_alpha,
+            args.gkd_lambda,
+            backend_label,
         );
     }
     Ok(())
