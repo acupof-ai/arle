@@ -398,6 +398,25 @@ impl AdamW {
         }
     }
 
+    /// Drop the optimizer moments for the given parameter ids, returning how
+    /// many entries were actually removed.
+    ///
+    /// SOPD rollback ([`EmaSelfTeacher::restore`](../../train/src/ema_self_teacher.rs))
+    /// needs this: [`AdamWState::import_state`](crate::adamw_state::AdamWState::import_state)
+    /// only re-installs the entries serialized in the snapshot, so a step that
+    /// gets rejected *after* the snapshot — e.g. the first gated step, taken
+    /// before any moments existed — would otherwise leave its freshly-created
+    /// m/v behind. Clearing the adapter ids first makes restore exact.
+    pub fn clear_param_state(&mut self, ids: &[TensorId]) -> usize {
+        let mut removed = 0;
+        for id in ids {
+            if self.state.remove(id).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     // ------------------------------------------------------------------
     // Accessors used by the opaque state codec in `adamw_state.rs`.
     // They deliberately avoid exposing the private `ParamMoments` struct.
