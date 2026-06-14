@@ -6,7 +6,7 @@ It states what the repository currently supports, what is still limited, and
 what validation exists for each area. If something is not listed as supported
 here, do not assume it is supported just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-06-12.
+State reflected here is based on repository evidence as of 2026-06-14.
 **The device-neutral rewrite (`crates/infer-*`) IS the product** — PR #53 merged
 to `main` 2026-06-04, and the legacy monolithic `infer/` crate is **deleted**.
 Sections 1–7 below were written against the legacy runtime; those capabilities
@@ -32,11 +32,13 @@ a dated `wins/` entry says so. Project framing:
 | Backend | New-stack status | What is verified | Open |
 | --- | --- | --- | --- |
 | Metal (`infer-metal`) | **Verified** | Real MLX Qwen3.5/3.6 forward, **bit-identical greedy parity** vs legacy across 4 configs (Qwen3.5-0.8B single-token / full 16-tok / chunked prefill, and canonical Qwen3.6-35B-A3B-4bit MoE). Cross-step decode pipeline recovered the c=1 perf regression. Metal serve is intentionally single-flight on macOS: the executor reports one live request and one plan row, so a second live HTTP request is rejected instead of queued. | Full packed batched-decode parity with CUDA; FP8/4-bit Metal MoE quant swap points. |
-| CUDA (`infer-cuda`) | **Verified (serve: prefill + decode)** | Qwen3 dense **16/16** vs HF gold; DSv4-Flash **TP=8/EP=8** (MLA+CSA/HCA+FP8 DeepGEMM MoE, FlashMLA, DeepEP) serves in-process multi-rank (`63d814a4`); per-layer RoPE theta fix (`fa355315`) → needle exact at 32K; decode ~39 tok/s c=1. | Long-ctx ≥241 trailing-digit residual (#56); 256K admission band-aid (#57); KV-precision-parity gate re-port (#58); batched lane license (#60/#61); spec-decode default (#62). |
+| CUDA (`infer-cuda`) | **Verified (serve: prefill + decode)** | Qwen3 dense **16/16** vs HF gold; DSv4-Flash **TP=8/EP=8** (MLA+CSA/HCA+FP8 DeepGEMM MoE, FlashMLA, DeepEP) serves in-process multi-rank (`63d814a4`); per-layer RoPE theta fix (`fa355315`) → needle exact at 32K; KV-precision parity gate re-ported + FlashMLA decode licensed (#58, 2026-06-10); INT8/FP8 paged quant-KV dispatch landed opt-in, correctness licensed (#68); DSv4 MTP-d2 chain-fold spec **default-on** → decode ~53 tok/s c=1 (44.5 no-spec). | Long-ctx ≥241 trailing-digit residual (#56); 256K admission band-aid (#57); DSv4 batched-decode default flip (#60 — lane works, c=16→62 agg, pending wall-clock license); DP-attn for c>1 throughput (#89); Qwen3.6 CUDA serving (#65). |
+| Vulkan (`infer-vulkan`) | **Experimental (bring-up)** | Qwen3.5-MoE 27B GGUF forward runs end-to-end on Radeon 8060S (Strix Halo, gfx1151) with finite logits (`0e41214e`); device residency upload, per-row dequant, GGUF→`Qwen35Config` mapper landed. llama.cpp Vulkan reference bar captured ([wins](experience/wins/2026-06-13-llama-cpp-vulkan-8060s-baseline.md)). | No serving path / throughput bench yet; ARLE ≥ llama.cpp parity is the bring-up goal (#71). |
+| HIP/ROCm (`infer-hip`) | **Experimental (substrate)** | Stage A (GGUF loader, CPU dequant, DSv4 config map, slot pool) + Stage B (DSv4 forward orchestration over the HIP kernel surface + `BackendExecutor`) landed; GGUF host substrate extracted to `infer-gguf`. | AIPC executor MVP + perf license (#77/#78); not a serving target yet. |
 
 **New-stack model coverage:** Qwen3.5 / Qwen3.6 on Metal (verified); Qwen3 dense +
-DeepSeek-V4-Flash (TP=8/EP=8) on CUDA (prefill verified, decode in progress);
-Qwen3.5/3.6 hybrid on CUDA (parity follow-up). DiffusionGemma has the
+DeepSeek-V4-Flash (TP=8/EP=8) on CUDA (prefill + decode verified, needle-exact
+to 32K, ~53 tok/s c=1); Qwen3.5/3.6 hybrid on CUDA (parity follow-up). DiffusionGemma has the
 backend-neutral block-diffusion generate-loop substrate wired through
 `infer-plan`/`infer-seam`, Engine completion and repeated-prompt tests, Gemma4 /
 DiffusionGemma config parsing, and a first Metal `MetalDiffusionGemmaModel`
@@ -45,12 +47,15 @@ still fail closed. Target 26B completions/chat smoke passed locally after the
 checkpoint download; throughput and long-generation validation remain pending.
 
 **Now in the new stack (was legacy-only):** TP / EP / DeepEP multi-GPU, DeepGEMM
-(FP8 grouped GEMM), DSv4 (MLA + FP8 KV), and the HTTP/serving surface
-(`infer-server` + `infer-api`, both executors wired). **Still pending re-port /
-verification:** PP (pipeline parallel), the full weight/KV **quantization** Rust
-dispatch, tiered KV (T1–T3), speculative decode (IR hooks only), and DSv4
-incremental decode — tracked in §1–§7 + the active tasks. The capability detail
-in §1–§7 below predates the rewrite; verify against §0 + dated `wins/` entries.
+(FP8 grouped GEMM), DSv4 (MLA + FP8 KV) with incremental decode + MTP
+speculative decode (**default-on**, #62/`5f48f90f`), INT8/FP8 paged quant-KV
+dispatch (opt-in, #68), tiered KV **T1 default-on + T2 opt-in disk spill**
+(#82–#84), and the HTTP/serving surface (`infer-server` + `infer-api`, both
+executors wired). **Still pending re-port / verification:** PP (pipeline
+parallel), the full **weight** quantization Rust dispatch matrix, T3
+cluster-shared KV (stub only, #87), and DSv4/hybrid radix prefix-cache re-enable
+(#85) — tracked in §1–§7 + the active tasks. The capability detail in §1–§7
+below predates the rewrite; verify against §0 + dated `wins/` entries.
 
 ---
 
@@ -108,8 +113,8 @@ Notes:
 | --- | --- | --- |
 | Qwen3.5 | Supported | Primary supported family. Supported on normal runtime paths; Metal live runtime has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Qwen3.5-0.8B has two measured Metal single-request paths: MLX SafeTensors 4bit step-driver reaches 305.5 tok/s for `1024/256`, while GGUF Q4_K_M exact default is 202.1 tok/s direct and its opt-in native-q4 load path reaches 236.7 tok/s direct / 239.8 tok/s step-driver on the same `1024/256` profile. RoPE scaling (YARN / Linear / NtkAware) wired through `Qwen35Config::rope_scaling` for long-ctx extend (Phase 1+2 closed; Phase 3 bench pending). Metal DFlash is substrate-only in the rewrite serve path; see §4a for the current validation note. |
 | Qwen3.6 / Qwen3.5-MoE | Supported (Metal canonical), CUDA pending (#65) | `mlx-community/Qwen3.6-35B-A3B-4bit` is the **canonical Metal production model** (globally unified 2026-05-07) — every Metal serve/bench/test defaults to it. CUDA classifies Qwen3 MoE checkpoints (`infer-api` `classify_cuda_model`), but Qwen3.6 CUDA serving needs the second `ModelKvAdapter` (#65, Phase 3). |
-| DeepSeek V4 | Serving (CUDA 8×H20 TP=8/EP=8) | DSv4-Flash serves via `arle serve --backend cuda` in-process multi-rank: FlashMLA + DSA/CSA/HCA hybrid attention, FP8 KV, DeepGEMM FP8 MoE, DeepEP/allreduce transports. Needle-exact to 32K after the per-layer RoPE theta fix (`fa355315`); decode ~39 tok/s c=1. Open debt tracked in #55 (Phase 0: #56–#58; batched lane #60/#61; MTP default #62). `crates/deepseek-spec` remains V4-only; DSv4 scratch pretrain stays retired (2026-05-18 OPD-only pivot). |
-| DiffusionGemma | Metal smoke verified, perf pending | `infer-plan` contains a backend-neutral block-diffusion generate loop matching the public DiffusionGemma generation contract shape: fixed canvas, denoise passes, entropy-bound acceptance, stability/confidence convergence, and whole-canvas commit hook. `infer-seam::BufferedDiffusionExecutor` adapts that loop into the normal `BackendExecutor`/Engine path, disables cross-request prefix reuse, and honors Engine-normalized `max_tokens`. `gemma-spec` parses the top-level DiffusionGemma config, nested Gemma4 RoPE map, and MoE fields. `infer-metal` now loads `model.decoder.*` with per-weight MLX quantization overrides, registers a dedicated C++ Gemma4/DiffusionGemma forward bridge, handles full-attention K=V layers, self-conditioning, tied embedding logits, and canvas-sized device sampling summaries, then `infer-api` routes it as `MetalDiffusionGemma`. The OpenAI facade reads both inline `tokenizer_config.json` templates and external `chat_template.jinja`, matching the downloaded checkpoint layout. Local target smoke passed for `/v1/completions` and `/v1/chat/completions` on `mlx-community/diffusiongemma-26B-A4B-it-4bit`; throughput, long-generation quality, and memory-pressure validation remain pending. CUDA/Vulkan classification fails closed instead of falling through to Qwen/Qwen3 dense. |
+| DeepSeek V4 | Serving (CUDA 8×H20 TP=8/EP=8) | DSv4-Flash serves via `arle serve --backend cuda` in-process multi-rank: FlashMLA + DSA/CSA/HCA hybrid attention, FP8 KV, DeepGEMM FP8 MoE, DeepEP/allreduce transports. Needle-exact to 32K after the per-layer RoPE theta fix (`fa355315`); decode ~53 tok/s c=1 (MTP-d2 chain-fold spec **default-on**, `5f48f90f`; 44.5 no-spec). Aggregate c>1 is serial-capped ~53 — the batched-decode lane lifts c=16 to 62 (+17%) but scales weakly; DP-attn is the throughput lever (#89). Open debt tracked in #55 (Phase 0: #56–#57; batched-decode default flip #60). `crates/deepseek-spec` remains V4-only; DSv4 scratch pretrain stays retired (2026-05-18 OPD-only pivot). |
+| DiffusionGemma | Metal smoke + 60 tok/s fast path; quality pending | `infer-plan` contains a backend-neutral block-diffusion generate loop matching the public DiffusionGemma generation contract shape: fixed canvas, denoise passes, entropy-bound acceptance, stability/confidence convergence, and whole-canvas commit hook. `infer-seam::BufferedDiffusionExecutor` adapts that loop into the normal `BackendExecutor`/Engine path, disables cross-request prefix reuse, and honors Engine-normalized `max_tokens`. `gemma-spec` parses the top-level DiffusionGemma config, nested Gemma4 RoPE map, and MoE fields. `infer-metal` now loads `model.decoder.*` with per-weight MLX quantization overrides, registers a dedicated C++ Gemma4/DiffusionGemma forward bridge, handles full-attention K=V layers, self-conditioning, tied embedding logits, and canvas-sized device sampling summaries, then `infer-api` routes it as `MetalDiffusionGemma`. The OpenAI facade reads both inline `tokenizer_config.json` templates and external `chat_template.jinja`, matching the downloaded checkpoint layout. Local target smoke passed for `/v1/completions` and `/v1/chat/completions` on `mlx-community/diffusiongemma-26B-A4B-it-4bit`, and a 64-token chat completion reaches **60 generated tok/s** on the Metal fast path (`ARLE_DIFFUSION_MAX_DENOISING_STEPS=4`, [wins](experience/wins/2026-06-12-diffusiongemma-metal-fast-path-60tps.md)); long-generation quality and memory-pressure validation remain pending. CUDA/Vulkan classification fails closed instead of falling through to Qwen/Qwen3 dense. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Not carried | Deleted from the current registry/spec/train surface; reintroduction would require a new explicit project, not a compatibility branch inside DSv4. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
@@ -149,6 +154,14 @@ Backend reach:
   defaults to INT8 full-attention KV (MLX affine 8-bit groups) with
   `--kv-cache-dtype bf16` as the reference fallback. Metal does not support
   FP8/TurboQuant KV. Metal weight-quantized MLX models are unaffected.
+- **Rewrite-stack CUDA `--kv-cache-dtype` dispatch landed (#68, 2026-06-12).**
+  Seam-level INT8/FP8 paged quant-KV on the dense-Qwen3 CUDA path is wired
+  end-to-end (refill / KIVI calibrate / row-quantize / fused-dequant decode) —
+  **correctness LICENSED** (needle exact = BF16 envelope), **opt-in only, no
+  default flip** (default stays BF16; post-fix −27% vs bf16+graph, −7% vs eager
+  bf16; the initial −77% was an uncached `cudaGetDeviceProperties`, fixed same
+  day). TQ4 deferred on the page_size=1 vs TileLang PAGE_SIZE=16 mismatch.
+  [wins](experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md).
 
 ---
 
@@ -180,7 +193,7 @@ is pending pod time** — see the dated `wins/` entries per row.
 | --- | --- | --- |
 | Metal DFlash (Qwen3.5) | Substrate only | End-to-end correctness existed in the legacy tree, but the rewrite serve path has no Metal DFlash route. |
 | Metal DFlash (Qwen3.6 / Qwen3.5-MoE) | Substrate only / diagnostic | Target/draft assets exist, but rewrite serving is fail-closed until the external draft route is re-ported and benchmarked. |
-| CUDA speculative decoding | Opt-in DSv4 MTP only | `arle serve --backend cuda --spec-type mtp --mtp-draft-tokens N` lowers into the DSv4 checkpoint-native MTP head. Classical/self/external draft routes remain not shipped; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See [`plans/2026-05-01-longctx-spec-decode-phase2.md`](plans/2026-05-01-longctx-spec-decode-phase2.md) and [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md). |
+| CUDA speculative decoding | DSv4 MTP (d2 chain-fold **default-on**) | `arle serve --backend cuda --spec-type mtp --mtp-draft-tokens N` lowers into the DSv4 checkpoint-native MTP head; `N` is the single source of truth (clamped `[1, 8]`), and `commit_fold` is default-on (`5f48f90f`) so `--mtp-draft-tokens 2` is the optimal config with no env hacks (+20%, 44.5→53.3 tok/s B=1 — [wins](experience/wins/2026-06-13-dsv4-mtp-d2-chain-fold-53.md)). Classical/self/external draft routes remain not shipped; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See [`plans/2026-05-01-longctx-spec-decode-phase2.md`](plans/2026-05-01-longctx-spec-decode-phase2.md) and [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md). |
 
 ---
 

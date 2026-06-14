@@ -90,7 +90,7 @@ Models: **Qwen3.5 family** (CUDA + Metal) · **Qwen3.6** (Metal) · **DeepSeek-V
 Agent and RL workloads waste compute re-processing the same prompt + history + tool output every turn. ARLE fixes this once and shares the fix across serving and training:
 
 - **KV stays hot across turns.** Prior-turn KV stays in its slot on GPU so only new tokens prefill; page-aligned prefix pages are shared across requests through the host radix cache. Under memory pressure, evicted prefix blocks demote into a host-RAM tier (default-on, 4 GiB; `--kv-t1-budget-bytes 0` opts out) with opt-in disk spill (`--kv-ssd-path`), and promote back on the next hit instead of re-prefilling — preempted requests get the same treatment (Qwen3-dense CUDA today, pod gate pending; DSv4/hybrid via #85 — [support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix)).
-- **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV kernels ship in `cuda-kernels`; the rewrite serve flag (`--kv-cache-dtype`) re-lands with the model-generic parity gate (#68).
+- **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV kernels ship in `cuda-kernels`; the rewrite serve flag (`--kv-cache-dtype`) landed via the model-generic parity gate (#68) — INT8/FP8 correctness licensed, opt-in (default stays BF16).
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code — the OPD teacher *is* the production server.
 
 ```mermaid
