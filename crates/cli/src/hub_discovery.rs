@@ -2,19 +2,13 @@
 //!
 //! Walks `~/.cache/huggingface/hub/models--*/snapshots/*/` looking for
 //! snapshot dirs containing `config.json` or `model.safetensors`, filters to
-//! supported model families, and sorts newest-first.
+//! checkpoints the compiled backend's serve path can actually load (by
+//! `config.json` `model_type` / `architectures`, not the id name), and sorts
+//! newest-first.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-/// Supported model family substrings (case-insensitive).
-///
-/// Keep in sync with `docs/support-matrix.md`. `diffusiongemma` is the
-/// block-diffusion model the Metal serve path handles (measured 55.7 tok/s e2e,
-/// [bench](../../../benchmarks/README.md)); plain `gemma` stays OUT because only
-/// the DiffusionGemma variant is wired.
-const SUPPORTED_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "qwen3.5", "diffusiongemma"];
 
 /// Architectures the picker must never offer as a primary, standalone model.
 ///
@@ -69,9 +63,61 @@ pub(crate) fn hub_cache_root() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".cache/huggingface/hub"))
 }
 
-fn is_family_supported(model_id: &str) -> bool {
-    let lc = model_id.to_ascii_lowercase();
-    SUPPORTED_FAMILIES.iter().any(|f| lc.contains(f))
+/// Does the **compiled backend's** serve path actually load this checkpoint?
+///
+/// The authoritative signal is `config.json#model_type` + `architectures`, NOT
+/// the model-id name — a substring family match let non-servable look-alikes
+/// through (Qwen3-0.6B is `model_type=qwen3`, the MTP draft is `qwen3_5_mtp`)
+/// and hid `diffusion_gemma`. The per-backend sets are the serve-path truth:
+/// Metal requires the Qwen3.5 `layer_types` config (`infer-metal/config.rs`) so
+/// only `qwen3_5` / `qwen3_5_moe` / DiffusionGemma load; CUDA serves the
+/// Qwen3 / Qwen3.5 dense+MoE families and DeepSeek-V4 (mirrors
+/// `infer_api::classify_cuda_model`). Measured 2026-06-14: `benchmarks/README.md`.
+/// Best-effort: unreadable / unparseable config → `false` (don't offer what we
+/// can't classify).
+fn snapshot_is_servable(path: &Path) -> bool {
+    let cfg = path.join("config.json");
+    let Ok(raw) = fs::read_to_string(&cfg) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let model_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("");
+    let arch_contains = |needle: &str| {
+        v.get("architectures")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|s| s.as_str().is_some_and(|s| s.contains(needle)))
+            })
+    };
+    let is_diffusion = matches!(model_type, "diffusion_gemma" | "gemma4")
+        || arch_contains("DiffusionGemma")
+        || arch_contains("Gemma4");
+
+    let mut servable = false;
+    #[cfg(feature = "metal")]
+    {
+        servable |= is_diffusion
+            || matches!(model_type, "qwen3_5" | "qwen3_5_moe")
+            || arch_contains("Qwen3_5");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        servable |= is_diffusion
+            || model_type == "deepseek_v4"
+            || arch_contains("DeepseekV4")
+            || (model_type.starts_with("qwen3") && model_type != "qwen3_5_mtp")
+            || arch_contains("Qwen3");
+    }
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    {
+        let _ = is_diffusion;
+        servable |= (model_type.starts_with("qwen3") && model_type != "qwen3_5_mtp")
+            || arch_contains("Qwen3");
+    }
+    servable
 }
 
 fn snapshot_has_usable_content(path: &Path) -> bool {
@@ -106,7 +152,7 @@ fn snapshot_mtime(path: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-/// Discover HF cache snapshots matching the supported families. Sorted by
+/// Discover HF cache snapshots the compiled backend can serve. Sorted by
 /// mtime descending (newest first).
 pub(crate) fn discover_hub_snapshots() -> Vec<HubSnapshot> {
     let Some(root) = hub_cache_root() else {
@@ -141,12 +187,10 @@ pub(crate) fn discover_hub_snapshots() -> Vec<HubSnapshot> {
             let Some(model_id) = decode_hub_snapshot_path(&snap_path) else {
                 continue;
             };
-            if !is_family_supported(&model_id) {
-                continue;
-            }
-            // Reject draft-only / non-servable architectures (e.g. DFlash
-            // speculative drafts that ship without a tokenizer).
-            if snapshot_is_draft_only(&snap_path) {
+            // Offer only what the compiled backend's serve path can actually
+            // load (config model_type/architectures), and never a draft-only
+            // half (DFlash drafts ship without a tokenizer).
+            if !snapshot_is_servable(&snap_path) || snapshot_is_draft_only(&snap_path) {
                 continue;
             }
             out.push(HubSnapshot {
@@ -201,18 +245,62 @@ mod tests {
     }
 
     #[test]
-    fn is_family_supported_matches_supported_qwen_families() {
-        assert!(is_family_supported("Qwen/Qwen3-4B"));
-        assert!(is_family_supported("mlx-community/qwen3.5-4b-4bit"));
-        assert!(is_family_supported("Qwen/Qwen2.5-7B"));
-        // DiffusionGemma serves on Metal (55.7 tok/s e2e) — must be offered.
-        assert!(is_family_supported(
-            "mlx-community/diffusiongemma-26B-A4B-it-4bit"
+    fn servable_rejects_unsupported_on_every_backend() {
+        // Served by neither Metal nor CUDA — must never be offered.
+        for cfg in [
+            r#"{"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2"}"#,
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+            r#"{"architectures":["MistralForCausalLM"],"model_type":"mistral"}"#,
+            // The MTP draft fails the Qwen3.5 weight-prefix check on Metal and
+            // is not a standalone CUDA target either.
+            r#"{"model_type":"qwen3_5_mtp"}"#,
+        ] {
+            assert!(
+                !super::snapshot_is_servable(write_config(cfg).path()),
+                "should be rejected: {cfg}"
+            );
+        }
+        // Unreadable / missing config → don't offer what we can't classify.
+        assert!(!super::snapshot_is_servable(
+            tempfile::tempdir().expect("tempdir").path()
         ));
-        assert!(!is_family_supported("mistralai/Mistral-7B"));
-        assert!(!is_family_supported("meta-llama/Llama-3-8B"));
-        // Plain Gemma (non-diffusion) is NOT wired — stays out.
-        assert!(!is_family_supported("google/gemma-2-9b"));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn servable_metal_set() {
+        // Metal serves qwen3.5 dense, qwen3.5/3.6 MoE, and DiffusionGemma.
+        for cfg in [
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"model_type":"qwen3_5_moe"}"#,
+            r#"{"architectures":["DiffusionGemmaForBlockDiffusion"],"model_type":"diffusion_gemma"}"#,
+        ] {
+            assert!(
+                super::snapshot_is_servable(write_config(cfg).path()),
+                "{cfg}"
+            );
+        }
+        // Plain Qwen3 (e.g. Qwen3-0.6B) needs Qwen3.5 `layer_types` — not served.
+        assert!(!super::snapshot_is_servable(
+            write_config(r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#).path()
+        ));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn servable_cuda_set() {
+        // CUDA serves Qwen3 / Qwen3.5 dense+MoE, DeepSeek-V4, DiffusionGemma.
+        for cfg in [
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"model_type":"qwen3_5_moe"}"#,
+            r#"{"architectures":["DeepseekV4ForCausalLM"],"model_type":"deepseek_v4"}"#,
+            r#"{"architectures":["DiffusionGemmaForBlockDiffusion"],"model_type":"diffusion_gemma"}"#,
+        ] {
+            assert!(
+                super::snapshot_is_servable(write_config(cfg).path()),
+                "{cfg}"
+            );
+        }
     }
 
     fn write_config(json: &str) -> tempfile::TempDir {
