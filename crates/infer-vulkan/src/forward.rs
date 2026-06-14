@@ -21,8 +21,8 @@
 //!   heads=24, kv_heads=4, head_dim=256, rope_theta=1e7, rotary_dim=256,
 //!   rms_eps=1e-6, dense FFN intermediate=17408.
 //!   FULL layer: attn_q `[5120,12288]` (out=24*256*2 = [query|gate] per head),
-//!   attn_k/v `[5120,1024]`, attn_q_norm/attn_k_norm `[256]` f32 (USED WITH THE
-//!   `(1+w)` OFFSET), attn_output `[6144,5120]`. Per-head q/k RMSNorm → NeoX
+//!   attn_k/v `[5120,1024]`, attn_q_norm/attn_k_norm `[256]` f32 (PLAIN weight —
+//!   see `rms_norm_weight`), attn_output `[6144,5120]`. Per-head q/k RMSNorm → NeoX
 //!   RoPE → causal SDPA (scale 1/sqrt(head_dim)) → per-head `*sigmoid(gate)` →
 //!   o_proj.
 //!   LINEAR layer: attn_qkv `[5120,10240]` ([q=2048|k=2048|v=6144]), attn_gate
@@ -30,8 +30,9 @@
 //!   `[48]` f32, ssm_dt.bias `[48]` f32, ssm_conv1d `[4,10240]` f32
 //!   (per-channel depthwise, SiLU), ssm_norm `[128]` f32 (gated RMSNorm, PLAIN
 //!   weight, ×silu(z)), ssm_out `[6144,5120]`.
-//!   All three block RMSNorms (input / post-attention / final) use the `(1+w)`
-//!   offset; the gated output RMSNorm uses the plain weight.
+//!   All RMSNorms (input / post-attention / final / q / k / gated output) use
+//!   the PLAIN GGUF weight `x*inv_rms*w` (the GGUF converter already folded the
+//!   `+1` of the HF zero-centered scale — see `rms_norm_weight`).
 //!
 //! State: this lane runs the **uncached full-prefix** path for a single slot —
 //! a forward of one token at `start_pos` recomputes nothing it does not own.
@@ -191,9 +192,9 @@ pub fn forward_token(
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
     for (layer, &layer_type) in config.layer_types.iter().enumerate() {
-        // input_layernorm: (1+w) offset RMSNorm.
+        // input_layernorm: plain RMSNorm (GGUF weight applied directly).
         let attn_norm = norm_weight(weights, layer, "attn_norm")?;
-        let normed = rms_norm_offset(&hidden, &attn_norm, eps);
+        let normed = rms_norm_weight(&hidden, &attn_norm, eps);
 
         let attn_out = match layer_type {
             LayerType::FullAttention => {
@@ -227,10 +228,10 @@ pub fn forward_token(
             }
         };
 
-        // Post-attention residual add + post_attention_layernorm ((1+w) offset).
+        // Post-attention residual add + post_attention_layernorm (plain RMSNorm).
         let post_sum = add_vec(&hidden, &attn_out);
         let post_norm_w = norm_weight(weights, layer, "post_attention_norm")?;
-        let mlp_in = rms_norm_offset(&post_sum, &post_norm_w, eps);
+        let mlp_in = rms_norm_weight(&post_sum, &post_norm_w, eps);
 
         // Dense FFN: down( silu(gate(x)) * up(x) ).
         let gate = gemv_layer(ctx, weights, &mut scratch, layer, "ffn_gate", &mlp_in)?;
@@ -242,12 +243,12 @@ pub fn forward_token(
         hidden = add_vec(&post_sum, &mlp_out);
     }
 
-    // Final norm ((1+w) offset) + LM head GEMV → logits.
+    // Final norm (plain RMSNorm) + LM head GEMV → logits.
     let final_norm = weights
         .get("output_norm.weight")
         .ok_or_else(|| anyhow!("missing output_norm.weight"))?;
     let final_norm_w = dequant_f32(final_norm, h)?;
-    let normed = rms_norm_offset(&hidden, &final_norm_w, eps);
+    let normed = rms_norm_weight(&hidden, &final_norm_w, eps);
     let logits = gemv_global(
         ctx,
         weights,
@@ -301,14 +302,14 @@ fn full_attention(
     let mut q = vec![0.0f32; q_dim];
     for hh in 0..nq {
         let src = &q_full[hh * 2 * hd..hh * 2 * hd + hd];
-        let normed_head = rms_norm_offset(src, &q_norm, eps); // (1+w) per-head
+        let normed_head = rms_norm_weight(src, &q_norm, eps); // plain per-head
         let rotated = rope_neox(&normed_head, pos, half, hd, theta);
         q[hh * hd..hh * hd + hd].copy_from_slice(&rotated);
     }
     let mut k_row = vec![0.0f32; kv_dim];
     for hh in 0..nkv {
         let src = &k_in[hh * hd..hh * hd + hd];
-        let normed_head = rms_norm_offset(src, &k_norm, eps);
+        let normed_head = rms_norm_weight(src, &k_norm, eps);
         let rotated = rope_neox(&normed_head, pos, half, hd, theta);
         k_row[hh * hd..hh * hd + hd].copy_from_slice(&rotated);
     }
@@ -469,7 +470,13 @@ fn linear_attention(
     let gdr = &mut state.gdr_state[linear_idx];
     let mut gdr_out = vec![0.0f32; v_dim_total];
     for vh in 0..nv {
-        let kh = vh * nk / nv;
+        // GQA key-head mapping. llama.cpp expands the 16 key heads to 48 value
+        // heads with `ggml_repeat` (qwen35.cpp:326-327, delta-net-base.cpp:362),
+        // which TILES rather than block-broadcasts: value head `vh` reads key
+        // head `vh % nk`, NOT `vh * nk / nv`. See ggml_compute_forward_repeat_f32
+        // (dst dim1 index = i1*ne01 + k1, so src head = dst_head % ne01). Using
+        // `vh * nk / nv` scrambled every linear layer's q/k → degenerate output.
+        let kh = vh % nk;
         let q_head = &qkv_conv[kh * kd..kh * kd + kd];
         let k_head = &qkv_conv[q_dim_total + kh * kd..q_dim_total + kh * kd + kd];
         let v_head = &qkv_conv
@@ -487,7 +494,11 @@ fn linear_attention(
 
         let a_val = a_proj[vh];
         let b_val = b_proj[vh];
-        let exp_g = (-(a_log[vh].exp()) * softplus(a_val + dt_bias[vh])).exp();
+        // GGUF `ssm_a` already stores A = -exp(A_log) (converter pre-applied the
+        // -exp; verified negative on-box). So the log-decay is A*softplus(dt),
+        // NOT -exp(A)*softplus(dt). Matches llama.cpp delta-net-base.cpp:341
+        // (`g = ggml_exp(g)` where g = softplus * ssm_a, qwen35.cpp:232).
+        let exp_g = (a_log[vh] * softplus(a_val + dt_bias[vh])).exp();
         let beta = sigmoid(b_val);
 
         let base = vh * kd * vd;
@@ -688,16 +699,26 @@ fn weight_dims(weight: &DeviceTensor<'_>, name: &str) -> Result<(usize, usize)> 
 // Host f32 elementwise / norm primitives (transcribed from the CUDA reference).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `(1+w)` offset RMSNorm: `out[i] = x[i] * inv_rms * (1 + w[i])`,
+/// Plain RMSNorm: `out[i] = x[i] * inv_rms * w[i]`,
 /// `inv_rms = 1/sqrt(mean(x^2) + eps)`. Qwen3.5 input / post / final / q-k norms.
-fn rms_norm_offset(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+///
+/// NOTE: the HF/safetensors reference (`crates/infer-cuda/src/qwen35.rs` +
+/// `norm.cu`'s `rms_norm_offset_kernel`) applies the **`(1+w)` offset** because
+/// Qwen3-Next/3.5 store the norm scale zero-centered in HF. The **GGUF
+/// converter folds the `+1` into the stored weight** (verified on the on-box
+/// 27B: `attn_norm` ≈ 0.98, `output_norm` ≈ 1.96, q/k_norm ≈ 1.2 — centered on
+/// 1, not 0), so the GGUF weights must be applied **plain**. This matches
+/// llama.cpp's `build_norm(..., LLM_NORM_RMS)` (plain `x*inv_rms*w`) on the
+/// same file, which decodes coherently. Applying `(1+w)` here roughly doubled
+/// every norm scale AND scrambled the per-element ratios → garbage logits.
+fn rms_norm_weight(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
     let mut sumsq = 0.0f32;
     for &v in x {
         sumsq += v * v;
     }
     let inv = 1.0 / (sumsq / n as f32 + eps).sqrt();
-    (0..n).map(|i| x[i] * inv * (1.0 + w[i])).collect()
+    (0..n).map(|i| x[i] * inv * w[i]).collect()
 }
 
 /// NeoX-style RoPE on one head vector `[head_dim]`. Pairs `(x[d], x[d+half])`
