@@ -420,6 +420,18 @@ fn parse_lora_target_set(raw: &str) -> Result<train::lora::LoraTargetSet> {
 }
 
 fn run_self_opd(args: TrainSelfOpdArgs) -> ExitCode {
+    // Reject 0.0, negatives, AND NaN (`NaN <= 0.0` is false, so the is_nan arm).
+    if args.gkd_lambda <= 0.0 || args.gkd_lambda.is_nan() {
+        eprintln!(
+            "[arle train self-opd] error: --gkd-lambda must be > 0 ({} given).\n\
+             SOPD cold-starts with the EMA teacher == an exact copy of the student\n\
+             (lora_b=0 ⇒ student == EMA == base), so the pure KL term has zero gradient\n\
+             and the run is a silent no-op. The bootstrap gradient comes from the λ>0\n\
+             GKD CE self-anchor on the rollouts; default is 0.5.",
+            args.gkd_lambda
+        );
+        return ExitCode::FAILURE;
+    }
     if args.smoke {
         return exit_from_result(run_self_opd_smoke(args));
     }
@@ -557,6 +569,12 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     } else {
         f32::INFINITY
     };
+    if gate_on && !nll_baseline.is_finite() {
+        bail!(
+            "initial held-out NLL is non-finite ({nll_baseline}); the student is degenerate \
+             — cannot establish a no-regression gate baseline. Check the loaded adapter/weights."
+        );
+    }
     if gate_on && !args.json {
         println!("gate baseline_nll {nll_baseline:.6}");
     }
@@ -597,7 +615,10 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         let mut gate_nll = f32::NAN;
         if gate_on && step % args.gate_every_n == 0 {
             gate_nll = heldout_nll(&student, &eval_ids, vocab, &mut store)?;
-            if gate_nll > nll_baseline * (1.0 + args.gate_regress_tol) {
+            // A non-finite gate NLL means the update diverged — `NaN > x` is false,
+            // so without this guard the accept branch would store NaN as the baseline
+            // and permanently disable the gate. Treat it as a regression → revert.
+            if !gate_nll.is_finite() || gate_nll > nll_baseline * (1.0 + args.gate_regress_tol) {
                 ema.restore(&snap, &student, &mut optimizer, &mut store)
                     .with_context(|| format!("EMA revert at step {step}"))?;
                 reverts += 1;
