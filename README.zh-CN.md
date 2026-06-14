@@ -71,17 +71,29 @@ print(client.chat.completions.create(
 
 ---
 
-## 当前状态一览
+## 性能
 
-| 后端 | 平台 | 状态 | 关键数字 |
-|---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | L4 上 197 tok/s(Qwen3.5-4B BF16,c=16) |
-| **Metal** | Apple Silicon | **Beta** | M4 Pro 上 85.6 tok/s(Qwen3.6 35B-A3B 4-bit) |
-| **Metal DFlash** | Apple Silicon | **Beta** | Qwen3.5 推测解码,比特一致 |
-| **OPD 训练(CUDA)** | Linux + NVIDIA | **Beta** | 比 HF TRL `GKDTrainer` 快 2.49–2.91×;LoRA 4 GB 显卡可跑 |
-| **CPU** | 通用 | **仅开发用** | 冒烟测试 |
+数字都是运行时实测，不是估算 —— 新鲜的 `arle serve` bench，一个二进制。
 
-模型:**Qwen3.5 全家族**(CUDA + Metal)· **Qwen3.6**(Metal)· **DeepSeek-V4-Flash**(CUDA 8×H20,TP=8 / EP=8 FP8 —— prefill 23 ms,B=1 decode 15 ms/token)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
+**Apple Silicon —— 一台 M4 Pro 笔记本(48 GB),单用户。** 35B-A3B MoE 的 decode 和 4B dense 一样快、是 9B 的 1.7×,因为每个 token 只激活 ~3B 参数:
+
+| 模型 · Metal 4-bit | Decode | TPOT | TTFT |
+|---|---:|---:|---:|
+| Qwen3.5-0.8B | **318 tok/s** | 3.2 ms | 0.17 s |
+| Qwen3.5-4B | 84 tok/s | 11.9 ms | 0.82 s |
+| Qwen3.5-9B | 50 tok/s | 20.0 ms | 1.45 s |
+| **Qwen3.6-35B-A3B** · MoE | **85 tok/s** | 11.7 ms | 1.23 s |
+
+<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = 单流生成速率 · <a href="docs/experience/wins/2026-06-14-bench-metal-m4pro-local-model-ladder.md">测量方法</a></sub>
+
+**NVIDIA —— DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
+
+<p align="center">
+  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode 33.5 → 53.3 tok/s,2026-06-13 → 06-14 campaign" width="720">
+</p>
+<p align="center"><sub>DSv4 B=1 decode,<b>33.5 → 53.3 tok/s</b>,2026-06-13 → 06-14 campaign —— 每一步都对应一条 <code>docs/experience/wins/</code> 记录。</sub></p>
+
+**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 2.5–2.9×,LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5 全家族(CUDA + Metal)· Qwen3.6(Metal)· DeepSeek-V4-Flash(CUDA 8×H20)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
 
@@ -127,22 +139,6 @@ flowchart TB
 ```
 
 架构详解:[docs/onboarding.md](docs/onboarding.md)(新人 30 分钟)· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
-
----
-
-## 最新动态
-
-<!-- 最近 1-2 条,更早历史见 CHANGELOG.md。 -->
-
-**2026-06-10 — Phase 0 还债收口:** DSv4 256K 可启动、needle 230K 精确命中、admission 按真实 KV 预算、KV-parity gate 移植完成(FlashMLA decode 已 license),下一步 Phase 1 批量化 serving lane([#55](https://github.com/cklxx/arle/issues/55))。
-
-**2026-06-08 — DeepSeek-V4-Flash B=1:prefill 23 ms,decode 27 → 15 ms/token**(8×H20,TP=8 / EP=8,FP8 MoE)。官方 DSA indexer 让 decode 不再随上下文增长(4.8× @4k),tensor-core DeepGEMM 投影(每段 −94%),MTP batched verify **decode tok/s +71%** —— 逐字节一致。[最终报告](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md)。
-
-<p align="center">
-  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 延迟优化历程:decode 不再随上下文增长、prefill DeepGEMM 投影、MTP 摊薄的 decode wall" width="100%">
-</p>
-
-完整历史:[CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
