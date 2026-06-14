@@ -91,6 +91,118 @@ serve path, and the upgrade/requant step.
 
 ---
 
+## 训推一体 architecture (operators / weights / process) — code-grounded
+
+ckl's pushback: *is the train-infer-unified architecture actually thought
+through — operators, weights, process, and the failure modes?* This section is
+the answer, every claim anchored to a file:line, every mutated buffer
+enumerated (§0.1). The headline: **the bring-up keystone is genuinely simple
+because 4 of the 5 architecture cruxes do not bite in Phase 0** — they are
+real, but they bite in the *later* serve/quant phases, and the section places
+each one exactly where it bites instead of hand-waving.
+
+### Two honest levels of 训推一体 (one process ≠ one serve loop)
+
+Today OPD is a **separate CLI command** (`run_opd_from_dirs`, `train_cli.rs:215`)
+that builds its **own** train `TensorStore` (`build_opd_store`, `train_cli.rs:467`)
+and **embeds** an infer engine (`InferStudent` wraps
+`Arc<Mutex<LoadedInferenceEngine>>`, `infer_student.rs`). It is *not* the
+user-facing `arle serve` loop. So "训推一体" has two distinct levels, and being
+precise about which one each phase targets is the whole point:
+
+| Level | What "rollout" is | Update fires | Where the hard cruxes live |
+|---|---|---|---|
+| **L1 — Phase 0 (bring-up)** | OPD-process-driven generation on a prompt set, via the embedded `InferStudent` (eager `forward_token_logits`) | after each generated sequence, in the same process | none of C1/C2/C5 (proven below) |
+| **L2 — Phase 4 (end-state)** | live agent/user traffic through the production `Engine::step` continuous-batching loop | from real traffic, via the out-of-band control channel | C1 (graph staleness) + C5 (batch skew) — the dangerous ones |
+
+L1 *is* train-infer-unified (one process, one weight store, inline loop) and is
+all Phase 0 needs. The fully-merged "serve self-updates from live traffic" is L2
+= Phase 4, and the architecture below shows the L2-only hazards are **structurally
+absent** at L1.
+
+### 算子 (operators) — what each pass computes, and the one real gap
+
+Per rollout sequence the loop runs four passes; each maps to an existing
+primitive, so **Phase 0 adds zero new GEMM/attention kernels**:
+
+| # | Pass | Memory space | Weights | Tape | Primitive | Status |
+|---|---|---|---|---|---|---|
+| 1 | Rollout decode | infer executor | base + student\_synced | off | `forward_token_logits` (eager `[seq,vocab]`, `infer_student.rs:108`) | ✓ exists |
+| 2 | Teacher score | train store | base + **EMA**-adapter | off | **unmerged** low-rank apply (`lora.rs:186-191`) | ✓ exists (wire EMA tensors) |
+| 3 | Student recompute | train store | base + student-adapter | **on** | unmerged apply (`opd.rs` student forward) | ✓ exists |
+| 4 | KL + bwd + AdamW + EMA | train store | adapter-only | — | `backward_chunked_kl_rollout` + `AdamW::step` + EMA elementwise | ✓ exists + ~30-line EMA |
+
+**The only net-new operator is the elementwise EMA** over rank-r A/B tensors.
+The critical structural fact: passes 2 and 3 share the **same frozen base** with
+**different adapters**, and the train store applies adapters *unmerged*
+(`lora.rs:186-191`: `projected = base·x; if lora { projected += scale·(A·B)·x }`).
+So student and EMA coexist as tensors and either is selected per pass with **no
+re-merge** — **Crux 2 (merge-in-place only) is a non-issue at L1.** Crux 2 returns
+only in Phase 2's quant-base *infer-serve* path, where merge-in-place is the only
+option today.
+
+### 权重 (weights) — every buffer, owner, mutation cadence, disposition
+
+| Buffer | Owner memory | Mutated | Disposition (per §0.1) |
+|---|---|---|---|
+| Frozen base — train copy | train `TensorStore` | never (自更新) | immutable |
+| Frozen base — infer copy | infer executor | never (自更新) | immutable. **Crux 3: two physical copies**, kept in sync adapter-only via D2H→H2D (`sync_lora_from_store`, `infer_student.rs:148`) |
+| Student adapter A/B + AdamW moments | train store | every step | snapshot/restore on gate-fail |
+| **EMA adapter A/B** | train store | every step (elementwise) | snapshot/restore **too** — else the teacher stays trained on rejected state (DSv4-EAGLE partial-rollback lesson) |
+| Merged serving q/v (`full.q_proj`) | infer executor | every accepted sync | **pointer reassign** at `qwen35.rs:2033`, rebuilt each sync from the pristine `lora_base` host cache (`qwen35.rs:640`, `ensure_lora_base_cached:1913`) → idempotent, deltas never accumulate (`infer_student.rs:140` doc) |
+| Prefix-cache KV pages | infer-core `RadixCache` | derived | **epoch-invalidate on every accepted sync** — token-keyed, no version (`radix.rs`, `enable_prefix_cache` default-on `lib.rs:107`) → [[reference_prefix_cache_stale_across_weight_epochs]] |
+| Captured decode graph | infer executor | **not used at L1** | L1 rollout is eager `forward_token_logits`, no captured-graph replay → **Crux 1 dormant**. L2-only hazard (below) |
+
+### 流程 (process) — the per-sequence flow and its single barrier
+
+```
+ ┌─ infer executor ─┐                ┌──────────── train TensorStore ────────────┐
+ │ 1. rollout decode│                │ 2. teacher score (base+EMA, tape off)      │
+ │   base+student_s │ ──tokens──▶    │ 3. student recompute (base+student,tape ON)│
+ │   eager, no graph│                │ 4. KL+bwd(adapter)+AdamW+EMA(adapter)       │
+ └──────────────────┘                └────────────────────┬───────────────────────┘
+            ▲                                              │
+            │                              5. gate cadence: every N seq → needle;
+            │                                 regress ⇒ revert {student,AdamW,EMA}
+            │                                              │ accept
+            └──────── 6. SYNC BARRIER ◀────────────────────┘
+               D2H student adapter → H2D remerge_student_lora (pointer reassign)
+               → bump adapter epoch → invalidate prefix cache → resume
+```
+
+Passes 2 and 3 run back-to-back in the **same** train store, different adapters,
+no re-merge (the Crux-2 defusal). Step 6 is the **only** cross-memory barrier and
+the **only** place the serving weights and prefix-cache epoch change. At L1 the
+OPD loop is **serial** — one sequence at a time, the embedded engine is idle
+between sequences — so the re-merge is naturally at a drained point: **Crux 5
+(batch weight-version skew) is a non-issue at L1.** It returns only at L2, where
+`Engine::step` runs a multi-request continuous batch; there the existing
+out-of-band control channel already covers it: re-merge runs as a control closure
+*between* scheduler steps, "the serving loop drains its work before dispatching
+the control request" (`lib.rs:404-441`), so it "never races an in-flight forward
+step" (`serve_engine.rs:133`).
+
+### Crux ledger — the 5, re-ranked by where they actually bite
+
+| Crux | Bites at | Phase-0 (L1) status | Mitigation / when |
+|---|---|---|---|
+| **C1** graph-pointer staleness (re-merge reassigns `full.q_proj` `qwen35.rs:2033`; captured graph keeps the old ptr — no auto re-capture, `graph.rs`) | **L2 serve only** | **dormant** — L1 rollout is eager `forward_token_logits`, never replays a captured decode graph | Phase 4: drop + force re-capture inside the re-merge control closure |
+| **C2** merge-in-place only (no unmerged low-rank serve in infer-cuda) | **Phase 2 quant-serve only** | **non-issue** — train store applies adapters unmerged (`lora.rs:186-191`) | Phase 2: quant-GEMM ‖ fp-adapter low-rank path |
+| **C3** train/infer are separate CUDA memory | every sync | **accepted cost** — adapter-only D2H/H2D (~10 MB), off the L1 perf critical path | Phase 4: minimize/pipeline sync if it limits serve throughput |
+| **C4** rollout KV not tape-recorded | always | **designed-around** — pass 3 recomputes with tape on | n/a (intrinsic to the two-pass design) |
+| **C5** batch weight-version skew | **L2 multi-request serve only** | **non-issue** — L1 loop is serial, engine idle between sequences | Phase 4: re-merge at drained batch via the existing control closure (`lib.rs:404-441`) |
+
+**The architecture verdict (SOLID, evidence above):** Phase 0 keystone =
+existing eager rollout + existing per-step re-merge + existing unmerged train
+forward + **one new elementwise EMA op + one prefix-cache epoch hook + one gate
+driver**. Zero new kernels, zero of the dangerous cruxes. The hard cruxes (C1
+graph staleness, C5 batch skew) are **structurally deferred to Phase 4** because
+L1's rollout path is eager and serial — not waved away, *placed*. This is the
+§0.1 outcome: decomposed until simple, with the difficulty pinned to exactly the
+phase that owns it.
+
+---
+
 ## Phase 0 — KEYSTONE: does the inline (G2) A1-EMA self-update loop run correctly and hold no-regression?
 
 **ckl's locked first cut.** CUDA + Qwen3.5-0.8B, 自更新-only, EMA self-teacher,
@@ -271,6 +383,30 @@ weights consolidate only after a demonstrable, held-out skill improvement.
 - Base weights are **immutable** within the 自更新 cadence, so no update can corrupt
   the base — the strongest safety property LoRA-only buys. (The 升级 cadence is the
   one place the base mutates; that is why it needs the full snapshot above.)
+
+## Risks & mitigations (code-grounded)
+
+Severity = correctness-impact × invisibility. The two HIGH risks are both
+*silent* (no error, just wrong output) — those get the hardest gates.
+
+| # | Risk | Phase | Sev | Mechanism | Mitigation | Gate |
+|---|---|---|---|---|---|---|
+| R1 | **Prefix-cache serves stale-epoch KV** | 0 | **HIGH** | `RadixCache` token-keyed, no version; after a sync a prefix-sharing request reuses KV computed under the old adapter | epoch-tag pages + mismatch-is-miss (prod) / full-flush (bring-up) on **every** accepted sync | a prefix-share request issued *after* an accepted update must NOT serve stale KV — targeted test (Phase-0 PASS bar) |
+| R2 | **Partial rollback poisons the EMA teacher** | 0 | MED | reverting only the student adapter leaves the EMA trained against rejected state → silent drift (DSv4-EAGLE lesson) | snapshot/restore **{student adapter, AdamW moments, EMA adapter}** as one unit | rollback restores all three; verified in §Mutated-state |
+| R3 | **EMA / online-distill divergence (mode collapse, repetition)** | 0 | MED | online self-distill with no external signal can collapse to degenerate output | α≈0.999 mean-teacher lag as the anchor + windowed needle-gate revert + **forward**-KL (not reverse) | no-regression on needle + ≥1 held-out dim, same-config-twice floor |
+| R4 | **BF16 skew: train-store recompute ≠ infer rollout logits** | 0 | LOW | two memory copies (Crux 3), independent BF16 rounding | reuse the existing rollout-via-infer BF16 canary (step-1 token agreement) | canary within tolerance |
+| R5 | **Two-pass recompute loses CUDA-graph speed** | 0 | LOW | pass 3 (tape-on recompute) cannot replay the eager rollout's work | accept for the mechanism keystone; fused-single-pass is a *later* perf option, bench before adopting (survey §7 Q4) | n/a (perf, not correctness) |
+| R6 | **Graph-pointer staleness on live re-merge** | **4** | **HIGH** | `Engine::step` replays a captured decode graph that baked the old `full.q_proj` ptr; re-merge reassigns it with no auto re-capture (`qwen35.rs:2033`, `graph.rs`) | drop + force re-capture **inside** the re-merge control closure (`lib.rs:404-441`); or disable decode-graph while the online loop is active | needle after a live re-merge proves no corruption — Phase-4 PASS bar |
+| R7 | **Batch weight-version skew** | **4** | MED | a continuous batch mixing pre/post-merge weights | re-merge only at a drained batch via the existing control closure ("drains its work before dispatching", `lib.rs:404-441`) | mixed-epoch batch impossible by construction |
+| R8 | **Reward-hack (model games its own judge)** | **0.5** | MED | in-loop verifier score rises while held-out falls | held-out verifier + manual trajectory spot-check; revert + tighten on divergence | Phase-0.5 tripwire (already in that phase) |
+
+**Risk posture:** every Phase-0 risk is either gated by the existing
+correct-inference machinery (R1/R3/R4 → needle + canary) or by full buffer
+enumeration (R2 → §Mutated-state). The two HIGH-severity silent risks split
+cleanly by phase — R1 (prefix cache) is Phase-0 and has a concrete test bar;
+R6 (graph staleness) is Phase-4-only because L1's rollout is eager. Nothing here
+is "should self-heal" — each row names the buffer and the explicit precondition
+(§0.1).
 
 ## DAG / critical path
 
