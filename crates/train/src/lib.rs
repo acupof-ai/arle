@@ -4,6 +4,8 @@ pub mod causal_lm;
 pub mod checkpoint;
 #[path = "control.rs"]
 pub mod control;
+#[path = "ema_self_teacher.rs"]
+pub mod ema_self_teacher;
 #[path = "grad_accum.rs"]
 pub mod grad_accum;
 #[path = "grad_clip.rs"]
