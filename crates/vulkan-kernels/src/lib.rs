@@ -924,9 +924,10 @@ pub fn qwen36_router_topk_params(n_expert: u32, top_k: u32, norm_topk: bool) -> 
     KernelParams::from_words(vec![n_expert, top_k, u32::from(norm_topk)])
 }
 
-/// Dispatch grid for `qwen36_router_topk.comp`: ONE single-thread workgroup
-/// (`local_size_x = 1`). n_expert/top_k are tiny and the selection runs in the
-/// host's exact serial order, so a single invocation does the whole reduction.
+/// Dispatch grid for `qwen36_router_topk.comp`: ONE workgroup of 256 threads
+/// (one expert per lane); parallel max/Σexp reductions + `top_k` parallel
+/// argmax-and-mask rounds. (The earlier single-thread `local_size_x=1` version
+/// was ~428µs/call — ~46% of MoE decode — wasting the whole wave.)
 pub fn qwen36_router_topk_dispatch() -> Dispatch {
     Dispatch { x: 1, y: 1, z: 1 }
 }
