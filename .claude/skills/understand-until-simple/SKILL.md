@@ -1,18 +1,19 @@
 ---
 name: understand-until-simple
-description: Use this skill BEFORE writing code for any task you're tempted to call "hard / 难 / 复杂 / 硬", any "why is X slow / 瓶颈在哪", any "should I optimize / 能不能加速 Y", any concurrency/perf/kernel/scheduler investigation, or any time you catch yourself hand-waving a root cause. It is the pre-implementation understanding GATE — decompose to the atomic (line/kernel/buffer) level, get MEASURED evidence, let measurement correct your hypotheses, until the problem is SIMPLE and quantified. Only then write code. If it still feels hard, you haven't decomposed enough.
+description: Use this skill BEFORE writing code for any task you're tempted to call "hard / tough / complex", any "why is X slow / where's the bottleneck", any "should I optimize Y", any concurrency/perf/kernel/scheduler investigation, or any time you catch yourself hand-waving a root cause. It is the pre-implementation understanding GATE — decompose to the atomic (line/kernel/buffer) level, get MEASURED evidence, let measurement correct your hypotheses, until the problem is SIMPLE and quantified. Only then write code. If it still feels hard, you haven't decomposed enough.
 version: 1.0.0
 ---
 
 # understand-until-simple
 
-The pre-code gate. Operationalizes §0 (SOLID) + §0.1 (抽丝剥茧到实现级) into a
+The pre-code gate. Operationalizes §0 (SOLID) + §0.1 (decompose to the implementation level) into a
 checklist you clear BEFORE writing implementation code.
 
 Born from the DSv4 concurrency case (2026-06-14): I kept calling batched decode
-"very hard / 硬", proposing it as a multi-day lever on hypothesis. ckl's
-correction — *"你现在的表达等于你完全不懂呢，还什么很难很硬；什么时候你搞清楚了
-认为简单了咱们开工"* — was right. Reading the code + measuring collapsed it to:
+"very hard", proposing it as a multi-day lever on hypothesis. ckl's
+correction — *"the way you're talking means you don't understand it at all —
+'so hard, so tough'; we start work only once you've figured it out and consider
+it simple"* — was right. Reading the code + measuring collapsed it to:
 **it's one `for r in 0..n` loop (`dsv4.rs:1872`); batch it → ~2×; pieces exist;
 MoE won't cap it.** Simple. The "hard" was just un-decomposed.
 
@@ -34,9 +35,9 @@ stays sub-linear" — that sentence is the license to start.)
 ## The gate (clear every step before coding)
 
 ### 1. Catch the hand-wave
-If your description contains "hard / 难 / 硬 / 复杂 / tricky / multi-day / it's the
+If your description contains "hard / tough / complex / tricky / multi-day / it's the
 lever" WITHOUT a line number and a measured number, STOP. You are at hypothesis,
-not understanding. The words "hard/硬" are the alarm.
+not understanding. The words "hard / tough" are the alarm.
 
 ### 2. Decompose to the atomic level — READ THE ACTUAL CODE
 Not "attention is slow" → **"`dsv4.rs:1872` is a `for r in 0..n` loop calling
@@ -64,7 +65,7 @@ that precedes it.
 The point of measuring is to be wrong cheaply. (DSv4: MoE was NOT the wall —
 3.70× sub-linear, not ∝c; and `--spec-type mtp` silently *disabled* the batched
 lane — `executor.rs:1563`.) A wrong root cause wastes every downstream hour (§0:
-root-cause 假设也要 license-or-kill). Update the picture; re-decompose if needed.
+root-cause hypotheses also get license-or-kill). Update the picture; re-decompose if needed.
 
 ### 6. Reach simple + quantified
 Write the one-sentence fix with its number and its file:line. Name the next wall
