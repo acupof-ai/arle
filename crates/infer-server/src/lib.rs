@@ -68,11 +68,12 @@ pub use tokenizer::OpenAiTokenizer;
 /// the engine lives on a separate thread.
 pub struct ServeHandle<E: BackendExecutor, K: KvPool> {
     submit_tx: Option<Sender<Submission>>,
-    /// Out-of-band control channel: runs a `FnOnce(&mut E)` on the engine thread
-    /// between steps. The OPD control surface (raw-logits forward, weight
-    /// offload/reload, student-LoRA re-merge) reaches the thread-owned executor
-    /// through here without crossing the request hot path.
-    control_tx: Option<Sender<ControlMessage<E>>>,
+    /// Out-of-band control channel: runs a `FnOnce(&mut Engine<E, K>)` on the
+    /// engine thread between steps. The OPD control surface (raw-logits forward,
+    /// weight offload/reload, student-LoRA re-merge + prefix-cache invalidation)
+    /// reaches the thread-owned engine through here without crossing the request
+    /// hot path.
+    control_tx: Option<Sender<ControlMessage<E, K>>>,
     join: Option<JoinHandle<()>>,
     /// Latest scheduler counters, republished by the engine loop each tick.
     counters: Arc<Mutex<CounterSnapshot>>,
@@ -202,7 +203,7 @@ where
         shutdown: ServeShutdown,
     ) -> Self {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
-        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
         let max_live_requests = executor.max_live_requests().max(1);
@@ -258,7 +259,7 @@ where
         B: FnOnce() -> Result<Engine<E, K>> + Send + 'static,
     {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
-        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E>>();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage<E, K>>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
         let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
         let loop_counters = Arc::clone(&counters);
@@ -439,17 +440,18 @@ where
         self.live_requests.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Run `f` against the engine-thread-owned executor and return its result.
+    /// Run `f` against the engine-thread-owned [`Engine`] and return its result.
     ///
     /// The closure executes on the engine thread (between scheduler steps), so it
-    /// has exclusive `&mut E` access without racing the request hot path. This is
-    /// the out-of-band control seam the OPD surface uses to reach the executor's
-    /// non-serving methods (raw-logits forward, weight offload/reload, LoRA
-    /// re-merge) which the request/response channels cannot express. Blocks until
+    /// has exclusive `&mut Engine<E, K>` access — scheduler, RadixCache, *and*
+    /// executor — without racing the request hot path. This is the engine-level
+    /// out-of-band control seam: the OPD surface uses it when a control op must
+    /// touch engine state the executor cannot reach, e.g. dropping the now-stale
+    /// prefix cache atomically with a resident-weight LoRA re-merge. Blocks until
     /// the engine thread runs the closure and returns its value.
-    pub fn run_on_executor<R, F>(&self, f: F) -> Result<R>
+    pub fn run_on_engine<R, F>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&mut E) -> R + Send + 'static,
+        F: FnOnce(&mut Engine<E, K>) -> R + Send + 'static,
         R: Send + 'static,
     {
         let control_tx = self
@@ -458,14 +460,28 @@ where
             .ok_or_else(|| anyhow!("ServeHandle already shut down"))?;
         let (response_tx, response_rx) = mpsc::channel::<R>();
         control_tx
-            .send(Box::new(move |executor: &mut E| {
+            .send(Box::new(move |engine: &mut Engine<E, K>| {
                 // If the caller dropped the receiver, discard the result.
-                let _ = response_tx.send(f(executor));
+                let _ = response_tx.send(f(engine));
             }))
             .map_err(|_| anyhow!("engine thread closed; cannot run control closure"))?;
         response_rx
             .recv()
             .map_err(|_| anyhow!("engine thread closed before running control closure"))
+    }
+
+    /// Run `f` against the engine-thread-owned executor and return its result.
+    ///
+    /// Thin wrapper over [`Self::run_on_engine`] for the control surface that only
+    /// needs `&mut E` (raw-logits forward, weight offload/reload, LoRA re-merge):
+    /// the executor's non-serving methods the request/response channels cannot
+    /// express. Blocks until the engine thread runs the closure and returns it.
+    pub fn run_on_executor<R, F>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut E) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.run_on_engine(move |engine| f(engine.executor_mut()))
     }
 
     /// Offload the engine's device weights to host RAM (OPD teacher weight

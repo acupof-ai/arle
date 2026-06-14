@@ -127,12 +127,22 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
     }
 
     /// Fold a fresh student LoRA update into the resident q/v projection weights
-    /// (OPD per-step re-merge). Runs the merge on the engine-thread-owned
-    /// [`CudaExecutor`] via the [`ServeHandle`] out-of-band control channel, so
-    /// the resident weight mutation never races an in-flight forward step.
+    /// (OPD per-step re-merge), then drop the now-stale prefix cache. Runs both on
+    /// the engine-thread-owned [`Engine`] via the [`ServeHandle`] out-of-band
+    /// control channel, so the resident weight mutation never races an in-flight
+    /// forward step.
+    ///
+    /// The re-merge changes resident `q_proj`/`v_proj`, so every cached block's
+    /// `V = v_proj(x)` is now a prior-epoch value; serving a post-merge request
+    /// from that KV is a silent correctness bug. Both steps run in **one** control
+    /// closure so no scheduler step can interleave between the weight change and
+    /// the cache drop.
     pub fn remerge_student_lora(&self, update: infer_cuda::StudentLoraUpdate) -> Result<()> {
-        self.serve
-            .run_on_executor(move |executor| executor.remerge_student_lora(update))?
+        self.serve.run_on_engine(move |engine| {
+            engine.executor_mut().remerge_student_lora(update)?;
+            engine.invalidate_prefix_cache();
+            Ok(())
+        })?
     }
 }
 
