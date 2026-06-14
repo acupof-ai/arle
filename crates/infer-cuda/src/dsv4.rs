@@ -2505,19 +2505,22 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
 
-        // Reusable [hidden,1] scratch for the per-row attention copy-in/out and
-        // a per-row device position. Allocated once; reused across rows/layers
-        // (WAR/RAW resolved by stream ordering, like the per-row verify lane).
-        // SAFETY: fully written by the copy-in / mla_attention each row before read.
-        let mut normed_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
-        let mut attn_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
-        let mut verify_pos_dev = self
-            .ctx
-            .stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow!("DSv4 batched verify pos buffer alloc failed: {e}"))?;
-        keepalive.keep_hidden(&normed_row);
-        keepalive.keep_hidden(&attn_out_row);
+        // Per-slot tree-attn verify (sub-mode 1 — the SAME lane per-row MTP uses):
+        // ONE FlashMLA over each slot's chain chunk per layer, NOT per-row. The
+        // per-row ring-replay (sub-mode 2) 3×'d the attn launches and regressed
+        // −44% (errors/2026-06-15-dsv4-batched-mtp-stage1-submode2-regression).
+        // Reusable [hidden, max_chunk] copy-in/out scratch + the per-slot tree
+        // metas (positions + branch ancestors) built ONCE and reused every layer.
+        // SAFETY: the first `len` rows are written by the copy-in before read.
+        let max_chunk = *lens.iter().max().unwrap_or(&1);
+        let mut normed_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
+        let mut attn_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
+        keepalive.keep_hidden(&normed_chunk);
+        keepalive.keep_hidden(&attn_chunk);
+        let tree_metas: Vec<crate::attention::Dsv4TreeAttnMeta> = scheds
+            .iter()
+            .map(|s| crate::attention::Dsv4TreeAttnMeta::new(&self.ctx, &s.positions, &s.ancestors))
+            .collect::<Result<_>>()?;
 
         crate::attention::set_dsv4_verify_frozen(true);
         let result = (|| -> Result<()> {
@@ -2543,72 +2546,67 @@ impl Dsv4Model {
                 )?;
                 keepalive.keep_hidden(&normed);
 
-                // ── Attention PER SLOT: each slot's chain rows replay through the
-                // proven single-slot decode-path verify (device start_pos, ring
-                // K writes), in schedule order, writing into this slot's combined
-                // attn_out block. No new attention kernel — Stage 1's amortization
-                // is the MoE half below, not attention.
-                // SAFETY: every [(off+r)*hidden, (off+r+1)*hidden) span of attn_out
-                // is written by the copy-out below before attn_out is read by hc_post.
+                // ── Attention PER SLOT via the tree-attn lane (sub-mode 1): ONE
+                // FlashMLA over each slot's chain chunk (host start_pos + branch
+                // indices from the per-slot tree meta), frozen (no ring writes),
+                // into this slot's combined attn_out block. This matches per-row
+                // MTP's verify-attention cost (1 tree call/slot/layer) — the MoE
+                // and point-wise below amortize over all M rows. Commit is the
+                // per-slot re-forward (no fold, no spec_normed persist), so the
+                // tree-attn here is decoupled from the per-row path's fold gate.
+                // SAFETY: each [off..off+len) block of attn_out is written by the
+                // copy-out below before attn_out is read by hc_post.
                 let mut attn_out =
                     unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 {
-                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_slot_verify");
+                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_tree_per_slot_verify");
                     for s in 0..n {
                         let off = offsets[s];
                         let len = lens[s];
-                        let sched = &scheds[s];
-                        let (layer_pool, mut dsa_shared) =
+                        normed_chunk.seq_len = len;
+                        attn_chunk.seq_len = len;
+                        let src = normed
+                            .data
+                            .slice(off * hidden_size..(off + len) * hidden_size);
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(
+                                &src,
+                                &mut normed_chunk.data.slice_mut(0..len * hidden_size),
+                            )
+                            .map_err(|e| {
+                                anyhow!("DSv4 batched verify chunk copy-in failed: {e}")
+                            })?;
+                        let (layer_pool, dsa_shared) =
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         let slot = &mut slots[slot_ids[s]];
-                        for r in 0..len {
-                            let pos_r = sched.positions[r];
-                            let pos_r_i32 = i32::try_from(pos_r).map_err(|_| {
-                                anyhow!("DSv4 batched verify pos {pos_r} overflows i32")
+                        crate::attention::mla_attention(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            &normed_chunk,
+                            &mut slot.attention[layer_idx],
+                            layer_pool,
+                            dsa_shared,
+                            start_positions[s],
+                            None,
+                            Some(&tree_metas[s]),
+                            &self.tp,
+                            &mut attn_chunk,
+                            &mut keepalive,
+                        )?;
+                        let mut dst = attn_out
+                            .data
+                            .slice_mut(off * hidden_size..(off + len) * hidden_size);
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(&attn_chunk.data.slice(0..len * hidden_size), &mut dst)
+                            .map_err(|e| {
+                                anyhow!("DSv4 batched verify chunk copy-out failed: {e}")
                             })?;
-                            self.ctx
-                                .stream
-                                .memcpy_htod(&[pos_r_i32], &mut verify_pos_dev)
-                                .map_err(|e| {
-                                    anyhow!("DSv4 batched verify start_pos H2D failed: {e}")
-                                })?;
-                            let src = normed
-                                .data
-                                .slice((off + r) * hidden_size..(off + r + 1) * hidden_size);
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(&src, &mut normed_row.data)
-                                .map_err(|e| {
-                                    anyhow!("DSv4 batched verify attn copy-in failed: {e}")
-                                })?;
-                            crate::attention::mla_attention(
-                                &self.ctx,
-                                &self.config,
-                                &layer.attention,
-                                layer.mode,
-                                layer.compress_ratio,
-                                layer_idx,
-                                &normed_row,
-                                &mut slot.attention[layer_idx],
-                                layer_pool,
-                                dsa_shared.as_deref_mut(),
-                                pos_r,
-                                Some(&verify_pos_dev),
-                                None,
-                                &self.tp,
-                                &mut attn_out_row,
-                                &mut keepalive,
-                            )?;
-                            let mut dst = attn_out
-                                .data
-                                .slice_mut((off + r) * hidden_size..(off + r + 1) * hidden_size);
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(&attn_out_row.data, &mut dst)
-                                .map_err(|e| {
-                                    anyhow!("DSv4 batched verify attn copy-out failed: {e}")
-                                })?;
-                        }
                     }
                 }
                 keepalive.keep_hidden(&attn_out);
