@@ -347,6 +347,11 @@ impl KernelParams {
         self.words.len() * std::mem::size_of::<u32>()
     }
 
+    /// The raw `u32` words (for tests / introspection of a push-constant block).
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
     pub fn is_empty(&self) -> bool {
         self.words.is_empty()
     }
@@ -403,6 +408,133 @@ pub fn q8_1_quantize_params(ne: u32) -> KernelParams {
 
 pub fn q8_1_quantize_dispatch(ne: u32) -> Dispatch {
     Dispatch::x(ne.div_ceil(Q8_1_X4_VALUES_PER_GROUP).max(1))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Elementwise / norm push-constant contracts (perf-parity Step 5b). These move
+// the per-layer RMSNorm / SwiGLU / residual-Add off the host (where each forced
+// a device→host→device hop around a GEMV) onto the already-compiled device
+// kernels, reverse-engineered from their `.comp` push-constant interfaces.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `rms_norm.comp` (+ `generic_binary_head.glsl`, all-f32, no rope fusion),
+/// applying the PLAIN weight `out[i] = x[i] * inv_rms * w[i]` for ONE row of
+/// `ncols` elements. Dispatch is a single workgroup (`gl_NumWorkGroups.x = 1`,
+/// `BLOCK_SIZE = 512` threads reducing the row). Bindings: `0 = A` input (read),
+/// `1 = B` weight (read), `2 = D` output (write). The `do_multiply` spec
+/// constant (id 1 = 1) selects the weighted branch; `eps` is `param1`.
+///
+/// The push block is the 29-uint `generic_binary_head.glsl` `parameter`:
+/// `ne, ne00..ne03, nb00..nb03, ne10..ne13, nb10..nb13, ne20..ne23, nb20..nb23,
+/// misalign_offsets, param1(f32 eps), param2(f32), param3(i32)`. For a single
+/// `[ncols]` row: `ne00 = ne10 = ne20 = ncols`, all higher dims 1, every stride
+/// the natural row width (so all per-row offsets resolve to 0 and the weight is
+/// indexed plainly by column since `ncols <= ne10`).
+pub fn rms_norm_params(ncols: u32, eps: f32) -> KernelParams {
+    let n = ncols;
+    KernelParams::from_words(vec![
+        n, // ne (total elements)
+        n,
+        1,
+        1,
+        1, // ne00..ne03
+        1,
+        n,
+        n,
+        n, // nb00..nb03 (nb00=1 element stride; row strides = n)
+        n,
+        1,
+        1,
+        1, // ne10..ne13 (weight: ncols <= ne10 => plain column index)
+        1,
+        n,
+        n,
+        n, // nb10..nb13
+        n,
+        1,
+        1,
+        1, // ne20..ne23
+        1,
+        n,
+        n,
+        n,             // nb20..nb23
+        0,             // misalign_offsets
+        eps.to_bits(), // param1 (f32 eps)
+        0,             // param2 (f32, unused)
+        0,             // param3 (i32, unused by rms_norm)
+    ])
+}
+
+/// One workgroup reduces the whole row in `rms_norm.comp`, so the grid is a
+/// single workgroup regardless of `ncols` (the 512-thread block strides the row).
+pub fn rms_norm_dispatch() -> Dispatch {
+    Dispatch::x(1)
+}
+
+/// `swiglu.comp` (+ `glu_head.glsl` / `glu_main.glsl`) in SPLIT mode (`mode=2`):
+/// `out[i] = silu(a[i]) * b[i]` over `n` elements with `a` = gate (binding 0),
+/// `b` = up (binding 1), `d` = out (binding 2). The 16-uint push block is
+/// `N, ne00, ne20, mode, alpha(f32), limit(f32), nb01, nb02, nb03, ne01, ne02,
+/// nb11, nb12, nb13, ne11, ne12`. For a flat `[n]` row in split mode: `N = n`,
+/// `ne20 = n` (so every element has row 0), strides natural, `ne00` unused
+/// (split path ignores the `ne00/2` half-offset). `local_size_x = 512`.
+pub fn swiglu_params(n: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        n,     // N (element guard)
+        2 * n, // ne00 (gate||up width; unused in split mode, set for completeness)
+        n,     // ne20 (dst row width => row = i/ne20 = 0)
+        2,     // mode = 2 (Split: op(a[i], b[i]))
+        0,     // alpha (f32, unused by swiglu op)
+        0,     // limit (f32, unused)
+        n,
+        n,
+        n, // nb01, nb02, nb03 (src row strides)
+        1,
+        1, // ne01, ne02
+        n,
+        n,
+        n, // nb11, nb12, nb13 (dst row strides)
+        1,
+        1, // ne11, ne12
+    ])
+}
+
+/// SwiGLU grid: `glu_main.glsl` derives `i` from a 512-wide x dimension, so one
+/// workgroup per 512 elements.
+pub fn swiglu_dispatch(n: u32) -> Dispatch {
+    Dispatch::x(n.div_ceil(512).max(1))
+}
+
+/// `add.comp` (+ `generic_binary_head.glsl`, `ADD_RMS=0`): `out[i] = a[i] + b[i]`
+/// over `n` elements. Same 29-uint generic-binary push block as `rms_norm`, with
+/// `param3 = 0` (skip the RMS-fused reduction). Bindings: `0=A, 1=B, 2=D` — the
+/// shader's optional `3=PartialBuf` is dead-code-eliminated by `glslc -O` when
+/// built with `ADD_RMS=0`, leaving 3 bindings.
+pub fn add_params(n: u32) -> KernelParams {
+    KernelParams::from_words(vec![
+        n, // ne
+        n, 1, 1, 1, // ne00..ne03
+        1, n, n, n, // nb00..nb03
+        n, 1, 1, 1, // ne10..ne13
+        1, n, n, n, // nb10..nb13
+        n, 1, 1, 1, // ne20..ne23
+        1, n, n, n, // nb20..nb23
+        0, // misalign_offsets
+        0, // param1 (f32, unused)
+        0, // param2 (f32, unused)
+        0, // param3 (i32) = 0 => no RMS reduction (binding 3 untouched)
+    ])
+}
+
+/// Add grid. `add.comp` uses `local_size_x = 256` and `num_iter = 2`, with each
+/// thread `t` of workgroup `wg` handling global-thread `wg*256 + t` (iter 0) and
+/// `+256` (iter 1) via `get_idx()`. The coverage of `G` workgroups is therefore
+/// `[0, G*256 + 256)`, so `G = ceil(n / 256)` (which gives `G*256 >= n` and thus
+/// `G*256 + 256 > n`) covers every element. Dispatching `ceil(n/512)` instead
+/// would leave the top `~n/2 mod 512` elements unwritten — the oracle test caught
+/// exactly that (e.g. n=5120 left `[2816, 5120)` at 0).
+pub fn add_dispatch(n: u32) -> Dispatch {
+    Dispatch::x(n.div_ceil(256).max(1))
 }
 
 macro_rules! launcher_fns {
@@ -1017,6 +1149,54 @@ mod tests {
                 0x44, 0x33, 0x22, 0x11, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x80, 0x3f
             ]
         );
+    }
+
+    #[test]
+    fn rms_norm_params_match_generic_binary_head_layout() {
+        // 29 uints: ne, ne00..ne03, nb00..nb03, ne10..ne13, nb10..nb13,
+        // ne20..ne23, nb20..nb23, misalign, param1(f32 eps), param2, param3.
+        let p = rms_norm_params(5120, 1e-6);
+        assert_eq!(p.len_bytes(), 29 * 4);
+        let w = p.words().to_vec();
+        assert_eq!(w.len(), 29);
+        assert_eq!(w[0], 5120); // ne
+        assert_eq!(&w[1..5], &[5120, 1, 1, 1]); // ne00..ne03
+        assert_eq!(&w[5..9], &[1, 5120, 5120, 5120]); // nb00..nb03
+        assert_eq!(&w[9..13], &[5120, 1, 1, 1]); // ne10..ne13 (weight)
+        assert_eq!(w[25], 0); // misalign_offsets
+        assert_eq!(f32::from_bits(w[26]), 1e-6); // param1 = eps
+        assert_eq!(w[28], 0); // param3
+        assert_eq!(rms_norm_dispatch(), Dispatch::x(1));
+    }
+
+    #[test]
+    fn swiglu_params_match_glu_split_layout() {
+        // 16 uints: N, ne00, ne20, mode, alpha(f32), limit(f32), nb01..nb03,
+        // ne01, ne02, nb11..nb13, ne11, ne12.
+        let p = swiglu_params(17408);
+        assert_eq!(p.len_bytes(), 16 * 4);
+        let w = p.words().to_vec();
+        assert_eq!(w[0], 17408); // N
+        assert_eq!(w[1], 2 * 17408); // ne00
+        assert_eq!(w[2], 17408); // ne20 (=> row 0)
+        assert_eq!(w[3], 2); // mode = Split
+        assert_eq!(swiglu_dispatch(17408), Dispatch::x(17408u32.div_ceil(512)));
+        assert_eq!(swiglu_dispatch(0), Dispatch::x(1));
+    }
+
+    #[test]
+    fn add_params_skip_rms_reduction() {
+        // Same 29-uint generic-binary push block; param3 must be 0.
+        let p = add_params(5120);
+        assert_eq!(p.len_bytes(), 29 * 4);
+        let w = p.words().to_vec();
+        assert_eq!(w[0], 5120); // ne
+        assert_eq!(&w[1..5], &[5120, 1, 1, 1]); // ne00..ne03
+        assert_eq!(w[28], 0); // param3 = 0 => no RMS reduction
+        // ceil(n/256) workgroups: each covers [wg*256, wg*256+512), so G*256 >= n
+        // guarantees full coverage (ceil(n/512) would leave the tail unwritten).
+        assert_eq!(add_dispatch(5120), Dispatch::x(5120u32.div_ceil(256)));
+        assert_eq!(add_dispatch(0), Dispatch::x(1));
     }
 
     #[test]
