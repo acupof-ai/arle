@@ -68,8 +68,18 @@ prompt_tokens (32755 / 65505 / 131005). Decode-agg = Δgenerated_tokens /
    follows` — true max concurrency is 6 (6 in-flight + 2 queued), not 8.
 4. **MTP acceptance degrades with context**: tok/step @c=1 1.80 (32K) → 1.60
    (64K) → 1.22 (128K) — at 128K MTP barely accepts beyond the bonus token.
-5. **`--dsv4-batched-decode` is a no-op at long context** — ON vs OFF within
-   run-to-run noise at 32K/64K c=8.
+5. **`--dsv4-batched-decode` showed no effect here** — ON vs OFF within run-to-run
+   noise at 32K/64K c=8. **⚠️ CORRECTION (2026-06-14, Phase-A verify):** this was
+   because the whole campaign ran under `--spec-type mtp`, and **mtp DISABLES the
+   batched decode lane** (`executor.rs:1563` `rows>1 && !spec_decode`) — both arms
+   ran the MTP per-row path, so the flag was *inert*, NOT a no-op. The true batched
+   lane (no-mtp, `INFER_DSV4_BATCHED_DECODE=1`) measured **+48% @c=8 (45.6→67.6
+   tok/s)** at short ctx
+   ([Phase-A verify](2026-06-14-dsv4-batched-flashmla-decode-phaseA.md)). So
+   findings #1 (aggregate flat ~1.0×) + the verdict below describe the **MTP
+   per-row path**, not the batched lane; the no-mtp batched lane DOES scale, and the
+   no-mtp long-ctx scaling is UNMEASURED (a follow-up). Phase A is verified clean on
+   top of that lane.
 
 ## Verdict
 Long-context concurrent serving is **not usable today**: decode aggregate is

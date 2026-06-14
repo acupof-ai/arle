@@ -37,11 +37,29 @@ per forward · `num_splits[max_batch+1]` · `q_batched`/`out_batched`/`tp_gather
 - **Default byte-identical**: flag OFF → the batched scratch is allocated but never
   touched; the n>1 default per-row path is unchanged; N=1 never reaches
   `forward_decode_batch_stream_impl`. B=1 42.0 ms/step + needle hold by construction.
-- **Pod — PENDING-REMOTE**: (1) flag-ON Phase-A batched-meta path runs clean
-  (no IMA, SW/HCA) at c≥2; (2) Phase B wired → needle ×3 (B=1 + c=8 self-consistency)
-  + **c=8 aggregate decode tok/s RISES** (the acceptance bar from the long-ctx
-  campaign). License-to-default-flip is Tier-2 (pod) per the understand-until-simple
-  gate; not flipped here.
+- **Pod — VERIFIED 2026-06-14** (synced 0b70c78c, `INCR_BUILD_EXIT=0`, Phase-A
+  symbol present):
+  - **Default byte-identical ✓** — flag-OFF + mtp B=1: needle 512/6000 exact ×3,
+    **42.68 ms/forward-step** (on the ~42 target), accept 1.69 tok/forward.
+  - **Phase-A meta path runs CLEAN + correct ✓** — flag-ON (BOTH gates, see below)
+    at c=8: zero `illegal memory access`/CUDA-error/panic/assert, 0 WARN/ERROR; needle
+    warm 6/6 @512 + 4/4 @6000 exact (one cold transient 738292 self-corrected, within
+    the MoE/cold non-det floor). `build_layer_batch_meta`→`build_indices_batched`+
+    `sched_meta_for_batch(b=N)` executed under real c=8 traffic, no fault.
+  - **Locked c=8 flag-OFF baseline = 45.60 tok/s** (175.4 ms/step, per-row serial-cap)
+    — the Phase B A/B reference.
+- **TWO env gates (brief-omission caught in verify):** reaching `forward_decode_batch`
+  needs `INFER_DSV4_BATCHED_DECODE=1` (`executor.rs:1563`
+  `dsv4_batched_decode_enabled`); the Phase-A meta-build inside it needs
+  `ARLE_DSV4_FLASHMLA_DECODE_BATCHED=1`. Phase B's A/B treatment arm must set BOTH.
+- **The executor batched lane is NOT a no-op** — isolation run (`INFER_DSV4_BATCHED_DECODE=1`
+  only, Phase-A OFF, no-mtp): **45.6 → 67.6 tok/s = +48% at c=8** (correctness-clean).
+  This **corrects** the long-ctx campaign's "batched flag no-op / aggregate flat":
+  that campaign used `--spec-type mtp`, which *disables* the batched lane, so both
+  arms ran MTP-per-row and the flag was inert. The true batched lane (no-mtp) scales;
+  Phase A's FlashMLA meta adds no perf change on top (per design — per-row kernel kept).
+- **License-to-default-flip is Tier-2** (per understand-until-simple): not flipped;
+  Phase B + a c=8 aggregate-rises A/B (treatment = both gates) is the next gate.
 
 ## Rule
 - **Land the precondition infra gated + byte-identical-default first, verify on a
@@ -49,3 +67,13 @@ per forward · `num_splits[max_batch+1]` · `q_batched`/`out_batched`/`tp_gather
   with zero default-path change; the ~2× is Phase B + a pod perf license.
 - The FlashMLA accum buffers are `[num_sm_parts+b, …]` (b folded via num_splits),
   not `[b×accum_rows, …]` — check the shim doc before sizing batched split-KV accums.
+- **A "batched" flag that washes can be inert, not no-op** — the long-ctx campaign
+  ran `--dsv4-batched-decode` *under* `--spec-type mtp`, which disables the batched
+  lane (`executor.rs:1563`), so the flag never engaged. Always confirm the lane
+  under test actually executes ([[feedback_verify_slo_lane_runs_before_optimizing]]):
+  the no-mtp batched lane is +48% @c=8, not flat.
+- **Phase B watch-item (sched_meta aliasing):** `sched_meta_for_batch` overwrites
+  the shared `self.sched_meta` scratch with a b=N layout — the SAME buffer the kept
+  per-row b=1 `mla_attention` reads. Phase A stayed correct (n matched), but Phase B
+  must FULLY replace the per-row kernel with `sparse_decode_fwd_batched(b=N)` before
+  this aliasing matters; watch the cold-run needle blip under the A/B as the canary.
