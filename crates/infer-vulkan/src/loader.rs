@@ -422,6 +422,16 @@ pub mod upload {
         /// their length — without re-reading the GGUF. `None` only if a tensor
         /// somehow had no dims.
         pub gemv_dims: Option<(usize, usize)>,
+        /// For `DequantF32` tensors: the dequantized values kept in CACHED host
+        /// RAM. The device buffer for these is HOST_VISIBLE (write-combined), so
+        /// reading it back with `copy_to_host` is pathologically slow (~50-300
+        /// MB/s uncached CPU reads). The forward re-reads some of these EVERY
+        /// layer EVERY token (notably the MoE router `ffn_gate_inp`, 40×/token),
+        /// so caching the host copy at upload — we already computed it to fill
+        /// the buffer — turns those read-backs into cached-RAM reads (~GB/s).
+        /// `None` for non-F32 residencies (their buffers are device-local and
+        /// never host-read). See `dequant_f32` / `host_f32_values` in forward.rs.
+        pub host_f32: Option<Vec<f32>>,
     }
 
     /// All device-resident weights for a model plus the host embedding table.
@@ -473,7 +483,11 @@ pub mod upload {
                 .tensor(&t.name)
                 .map(|i| i.element_count() as usize)
                 .unwrap_or(0);
-            // Build the exact device bytes per residency tier.
+            // Build the exact device bytes per residency tier. For DequantF32,
+            // we ALSO keep the dequantized f32 Vec (`host_f32`) in cached RAM so
+            // the forward never reads it back from the write-combined device
+            // buffer (see the field doc on `DeviceTensor::host_f32`).
+            let mut host_f32: Option<Vec<f32>> = None;
             let host_bytes: std::borrow::Cow<'_, [u8]> = match t.residency {
                 Residency::KeepQuant(_) => std::borrow::Cow::Borrowed(src),
                 Residency::DequantF16 => {
@@ -486,7 +500,9 @@ pub mod upload {
                 }
                 Residency::DequantF32 => {
                     let f = dequant_row_f32(t.ggml_type, src, n).context(t.name.clone())?;
-                    std::borrow::Cow::Owned(f.iter().flat_map(|v| v.to_le_bytes()).collect())
+                    let bytes: Vec<u8> = f.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    host_f32 = Some(f);
+                    std::borrow::Cow::Owned(bytes)
                 }
                 Residency::HostEmbedding => unreachable!("handled above"),
             };
@@ -522,6 +538,7 @@ pub mod upload {
                     residency: t.residency,
                     buffer,
                     gemv_dims,
+                    host_f32,
                 },
             );
         }
