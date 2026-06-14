@@ -9,6 +9,7 @@ publish = false
 anyhow = "1.0"
 deepseek-spec = { path = "../deepseek-spec" }
 memmap2 = { workspace = true }
+tokenizers = { workspace = true }
 
 [lints]
 workspace = true
