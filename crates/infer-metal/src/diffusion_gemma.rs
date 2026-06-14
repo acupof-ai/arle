@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use infer_plan::{
@@ -27,8 +28,32 @@ pub struct MetalDiffusionGemmaModel {
 
 impl MetalDiffusionGemmaModel {
     pub fn load(model_dir: &Path) -> Result<LoadedMetalDiffusionGemma> {
+        Self::load_with_resource_plan(model_dir, None)
+    }
+
+    pub fn load_with_resource_plan(
+        model_dir: &Path,
+        resource_plan: Option<crate::resource::MetalResourcePlan>,
+    ) -> Result<LoadedMetalDiffusionGemma> {
         let _guard = mlx_sys::mlx_guard();
-        if let Some(limit) = crate::wired_limit::auto_wired_limit_bytes(model_dir) {
+        if let Some(plan) = resource_plan {
+            let previous_memory = mlx::set_memory_limit_bytes(plan.memory_limit_bytes as u64);
+            let previous_cache = mlx::set_cache_limit_bytes(plan.cache_limit_bytes as u64);
+            let previous_wired = mlx::set_wired_limit_bytes(plan.wired_limit_bytes as u64);
+            eprintln!(
+                "[infer-metal] DiffusionGemma resource guard: {}",
+                plan.describe()
+            );
+            log::info!(
+                "DiffusionGemma Metal resource guard set MLX limits: memory={} (previous {}), cache={} (previous {}), wired={} (previous {})",
+                plan.memory_limit_bytes,
+                previous_memory,
+                plan.cache_limit_bytes,
+                previous_cache,
+                plan.wired_limit_bytes,
+                previous_wired
+            );
+        } else if let Some(limit) = crate::wired_limit::auto_wired_limit_bytes(model_dir) {
             let previous = mlx::set_wired_limit_bytes(limit as u64);
             log::info!(
                 "DiffusionGemma Metal wired limit set to {} bytes (previous {})",
@@ -53,10 +78,19 @@ impl DiffusionBlockModel for MetalDiffusionGemmaModel {
         prompt_tokens: &[u32],
         config: &DiffusionGenerationConfig,
     ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
+        self.generate_with_cancel(prompt_tokens, config, None)
+    }
+
+    fn generate_with_cancel(
+        &mut self,
+        prompt_tokens: &[u32],
+        config: &DiffusionGenerationConfig,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
         let tokens =
             i32_tokens(prompt_tokens).map_err(|err| DiffusionModelError::new(err.to_string()))?;
         self.cpp
-            .generate(&tokens, config)
+            .generate(&tokens, config, cancel)
             .map(Some)
             .map_err(|err| DiffusionModelError::new(err.to_string()))
     }
@@ -107,6 +141,14 @@ fn i32_tokens(tokens: &[u32]) -> Result<Vec<i32>> {
             i32::try_from(token).with_context(|| format!("token id {token} does not fit in i32"))
         })
         .collect()
+}
+
+unsafe extern "C" fn diffusion_cancelled(ctx: *const std::ffi::c_void) -> i32 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let flag = unsafe { &*(ctx as *const AtomicBool) };
+    i32::from(flag.load(Ordering::Acquire))
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +311,7 @@ impl CppDiffusionGemmaModel {
         &mut self,
         prompt: &[i32],
         config: &DiffusionGenerationConfig,
+        cancel: Option<&AtomicBool>,
     ) -> Result<DiffusionGenerateOutput> {
         let max_new_tokens =
             i32::try_from(config.max_new_tokens).context("max_new_tokens does not fit in i32")?;
@@ -285,6 +328,14 @@ impl CppDiffusionGemmaModel {
         let mut out_steps = 0i32;
         let mut out_forced = 0i32;
         let mut out_adaptive = 0i32;
+        let (cancel_fn, cancel_ctx) = if let Some(flag) = cancel {
+            (
+                Some(diffusion_cancelled as unsafe extern "C" fn(*const std::ffi::c_void) -> i32),
+                flag as *const AtomicBool as *const std::ffi::c_void,
+            )
+        } else {
+            (None, std::ptr::null())
+        };
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_generate(
                 self.raw,
@@ -301,6 +352,8 @@ impl CppDiffusionGemmaModel {
                 config.seed,
                 config.stop_token_ids.as_ptr(),
                 config.stop_token_ids.len() as i32,
+                cancel_fn,
+                cancel_ctx,
                 tokens.as_mut_ptr(),
                 &mut out_len,
                 &mut out_finish,
