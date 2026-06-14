@@ -330,6 +330,11 @@ const LOCAL: &[ShaderSpec] = &[
             ("USE_SUBGROUP_ADD", "0"),
         ],
     },
+    ShaderSpec {
+        name: "qwen36_router_topk",
+        source: "crates/vulkan-kernels/shaders/qwen36_router_topk.comp",
+        defines: &[],
+    },
 ];
 
 fn main() {
