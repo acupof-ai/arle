@@ -679,9 +679,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .saturating_sub(prompt_tokens.len()),
         );
         let mut sampling = options.sampling;
-        if sampling.max_new_tokens.is_none() {
-            sampling.max_new_tokens = Some(max_tokens);
-        }
+        // `max_tokens` is the scheduler-admitted budget after max-total clamping.
+        // Keep the sampling copy normalized too: diffusion executors consume it
+        // directly as their generation length.
+        sampling.max_new_tokens = Some(max_tokens);
         if max_tokens == 0 {
             return NormalizedRequest::Completed(
                 RequestState::new(handle, prompt_tokens, options.priority, 0, sampling)
@@ -3352,6 +3353,38 @@ mod tests {
         let model = engine.executor.into_inner();
         assert_eq!(model.begin_configs.len(), 1);
         assert_eq!(model.begin_configs[0].max_new_tokens, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn diffusion_executor_uses_clamped_budget_with_sampling_override() -> Result<()> {
+        let model = FakeDiffusionModel {
+            predictions: vec![diffusion_prediction(&[10, 11, 12], 4)],
+            ..FakeDiffusionModel::default()
+        };
+        let executor = BufferedDiffusionExecutor::new(model, diffusion_config(8));
+        let mut config = test_config(1);
+        config.max_total_tokens = 5;
+        let mut engine = Engine::with_config(executor, HostPagedKvPool::new(1, 8, 4), config);
+
+        let handle = engine.submit_request_with_options(
+            vec![1, 2],
+            100,
+            RequestOptions {
+                sampling: SamplingParams {
+                    max_new_tokens: Some(100),
+                    ..SamplingParams::default()
+                },
+                ..RequestOptions::default()
+            },
+        );
+        engine.run_to_idle()?;
+
+        let completed = engine.completed(handle).expect("request completed");
+        assert_eq!(completed.generated_tokens, vec![10, 11, 12]);
+        let model = engine.executor.into_inner();
+        assert_eq!(model.begin_configs.len(), 1);
+        assert_eq!(model.begin_configs[0].max_new_tokens, 3);
         Ok(())
     }
 

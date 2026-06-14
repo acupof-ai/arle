@@ -40,6 +40,14 @@ pub struct MetalResourceRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct MetalWeightOnlyResourceRequest {
+    pub low_impact: bool,
+    pub memory_budget_bytes: Option<usize>,
+    pub system_reserve_bytes: Option<usize>,
+    pub allow_swap: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct MetalSystemStatus {
     pub total_memory_bytes: Option<usize>,
     pub available_memory_bytes: Option<usize>,
@@ -310,6 +318,118 @@ pub fn plan_resource_budget(
         planned_total_pages,
         capacity_tokens: capacity_tokens.min(requested_capacity_tokens),
         clamped,
+    })
+}
+
+pub fn plan_weight_only_resource_budget(
+    model_dir: &Path,
+    request: MetalWeightOnlyResourceRequest,
+) -> anyhow::Result<MetalResourcePlan> {
+    let weight_bytes = wired_limit::model_weight_bytes(model_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Metal resource guard could not estimate model weight bytes for {}; system={}. \
+             pass a local safetensors/bin/gguf/npz model directory or set an explicit budget after verifying memory headroom",
+            model_dir.display(),
+            MetalSystemStatus::current().describe(),
+        )
+    })?;
+
+    let system_status = MetalSystemStatus::current();
+    let total_memory_bytes = system_status.total_memory_bytes;
+    let available_memory_bytes = system_status.available_memory_bytes;
+    let recommended_max_working_set_bytes = system_status.recommended_max_working_set_bytes;
+    let swap_used_bytes = system_status.swap_used_bytes;
+    let paging = sample_paging_activity();
+    let system_status = MetalSystemStatus {
+        pageouts_delta_bytes: paging.and_then(|p| p.pageouts_delta_bytes),
+        swapouts_delta_bytes: paging.and_then(|p| p.swapouts_delta_bytes),
+        paging_sample_millis: paging.map_or(0, |p| p.sample_millis),
+        ..system_status
+    };
+    let system_status_line = system_status.describe();
+    let residual_swap_warning = swap_used_bytes.is_some_and(|used| used >= SWAP_USED_WARN_BYTES);
+    if residual_swap_warning {
+        log::warn!(
+            "Metal resource guard: residual macOS swap is present but not a hard failure: {}",
+            system_status_line
+        );
+    }
+    if !request.allow_swap && paging.is_some_and(PagingActivity::is_active_pressure) {
+        anyhow::bail!(
+            "Metal resource guard rejected startup: {system_status_line}; active pageout/swapout activity is above the guardrail \
+             (pageout >= {} MiB/s or swapout >= {} MiB/s). This path can spill unified memory to SSD and stall the system. \
+             Close memory-heavy apps and retry, or pass --allow-swap after accepting the risk.",
+            ACTIVE_PAGEOUT_GUARD_BYTES / MIB,
+            ACTIVE_SWAPOUT_GUARD_BYTES / MIB,
+        );
+    }
+
+    let runtime_headroom_bytes = if request.low_impact {
+        LOW_IMPACT_RUNTIME_HEADROOM_BYTES
+    } else {
+        DEFAULT_RUNTIME_HEADROOM_BYTES
+    };
+    let cache_limit_bytes = if request.low_impact {
+        LOW_IMPACT_CACHE_LIMIT_BYTES
+    } else {
+        DEFAULT_CACHE_LIMIT_BYTES
+    };
+    let memory_limit_bytes = resolve_memory_limit(
+        request.memory_budget_bytes,
+        request.system_reserve_bytes,
+        request.low_impact,
+        total_memory_bytes,
+        available_memory_bytes,
+        recommended_max_working_set_bytes,
+        &system_status_line,
+    )?;
+
+    let wired_limit_bytes = weight_bytes
+        .checked_add(WIRED_HEADROOM_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("Metal wired-limit estimate overflowed"))?;
+    let fixed_bytes = weight_bytes
+        .checked_add(runtime_headroom_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Metal fixed memory estimate overflowed"))?;
+    anyhow::ensure!(
+        infer_seam::SlotBudget::fits_fixed(memory_limit_bytes, fixed_bytes),
+        "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below fixed requirement {} GiB \
+         (weights {} GiB + runtime headroom {} GiB). \
+         Close other memory-heavy apps, use a smaller model, or pass --memory-budget-bytes after verifying headroom.",
+        memory_limit_bytes / GIB,
+        fixed_bytes / GIB,
+        weight_bytes / GIB,
+        runtime_headroom_bytes / GIB,
+    );
+    anyhow::ensure!(
+        memory_limit_bytes > wired_limit_bytes,
+        "Metal resource guard rejected startup: {system_status_line}; memory budget {} GiB is below wired requirement {} GiB \
+         (weights + {} GiB).",
+        memory_limit_bytes / GIB,
+        wired_limit_bytes / GIB,
+        WIRED_HEADROOM_BYTES / GIB,
+    );
+
+    Ok(MetalResourcePlan {
+        total_memory_bytes,
+        available_memory_bytes,
+        recommended_max_working_set_bytes,
+        swap_used_bytes,
+        pageouts_delta_bytes: system_status.pageouts_delta_bytes,
+        swapouts_delta_bytes: system_status.swapouts_delta_bytes,
+        paging_sample_millis: system_status.paging_sample_millis,
+        residual_swap_warning,
+        memory_limit_bytes,
+        cache_limit_bytes,
+        wired_limit_bytes,
+        weight_bytes,
+        runtime_headroom_bytes,
+        static_state_bytes: 0,
+        kv_budget_bytes: memory_limit_bytes.saturating_sub(fixed_bytes),
+        kv_bytes_per_token_all_slots: 0,
+        requested_total_pages: 0,
+        planned_total_pages: 0,
+        capacity_tokens: usize::MAX,
+        clamped: false,
     })
 }
 

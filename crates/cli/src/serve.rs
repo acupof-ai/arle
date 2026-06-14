@@ -407,15 +407,17 @@ fn resolve_engine_config(
         ));
     }
 
-    let capacity_tokens = config
-        .total_pages
-        .checked_mul(config.page_size)
-        .ok_or_else(|| "--total-pages * --page-size overflows usize".to_string())?;
-    if capacity_tokens < config.max_total_tokens {
-        return Err(format!(
-            "KV capacity is too small for one max-length request: total_pages({}) * page_size({}) = {} tokens, max_total_tokens={}",
-            config.total_pages, config.page_size, capacity_tokens, config.max_total_tokens
-        ));
+    if !matches!(backend, ServeBackend::Hip | ServeBackend::Vulkan) {
+        let capacity_tokens = config
+            .total_pages
+            .checked_mul(config.page_size)
+            .ok_or_else(|| "--total-pages * --page-size overflows usize".to_string())?;
+        if capacity_tokens < config.max_total_tokens {
+            return Err(format!(
+                "KV capacity is too small for one max-length request: total_pages({}) * page_size({}) = {} tokens, max_total_tokens={}",
+                config.total_pages, config.page_size, capacity_tokens, config.max_total_tokens
+            ));
+        }
     }
 
     Ok(config)
@@ -810,7 +812,7 @@ mod tests {
 
     #[test]
     fn engine_budget_rejects_capacity_below_max_total() {
-        if skip_if_no_backend() {
+        if skip_if_no_backend() || matches!(compiled_backend_flag(), "hip" | "vulkan") {
             return;
         }
         let (args, serve) = parse_serve(&[
@@ -831,6 +833,29 @@ mod tests {
         ]);
         let err = resolve_config(&args, &serve).expect_err("capacity rejected");
         assert!(err.contains("KV capacity is too small"), "got: {err}");
+    }
+
+    #[test]
+    fn hip_engine_budget_ignores_paged_kv_capacity_flags() {
+        let (_args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            "hip",
+            "--model-path",
+            "model.gguf",
+            "--total-pages",
+            "1",
+            "--page-size",
+            "16",
+            "--max-prompt-tokens",
+            "16",
+            "--max-total-tokens",
+            "32",
+        ]);
+        let config = resolve_engine_config(ServeBackend::Hip, &serve).expect("HIP config resolves");
+        assert_eq!(config.total_pages, 1);
+        assert_eq!(config.max_total_tokens, 32);
     }
 
     #[test]

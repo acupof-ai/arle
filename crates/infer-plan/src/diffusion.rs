@@ -6,6 +6,8 @@
 //! and commits the whole converged canvas. This module keeps that outer loop in
 //! pure host code while backends provide the block model implementation.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use thiserror::Error;
 
 use crate::FinishReason;
@@ -171,6 +173,16 @@ pub trait DiffusionBlockModel {
         Ok(None)
     }
 
+    /// Optional backend-owned fast path with a cooperative cancellation flag.
+    fn generate_with_cancel(
+        &mut self,
+        prompt_tokens: &[u32],
+        config: &DiffusionGenerationConfig,
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
+        self.generate(prompt_tokens, config)
+    }
+
     /// Start a request with the exact generation config selected by the engine.
     fn begin_request(
         &mut self,
@@ -223,6 +235,8 @@ pub enum DiffusionGenerateError {
         expected: usize,
         got: usize,
     },
+    #[error("diffusion generation cancelled")]
+    Cancelled,
     #[error("diffusion model error: {0}")]
     Model(#[from] DiffusionModelError),
 }
@@ -266,6 +280,17 @@ pub fn generate_diffusion<M: DiffusionBlockModel>(
     prompt_tokens: &[u32],
     config: &DiffusionGenerationConfig,
 ) -> Result<DiffusionGenerateOutput, DiffusionGenerateError> {
+    generate_diffusion_with_cancel(model, prompt_tokens, config, None)
+}
+
+/// Run the backend-neutral block-diffusion loop with optional cooperative
+/// cancellation.
+pub fn generate_diffusion_with_cancel<M: DiffusionBlockModel>(
+    model: &mut M,
+    prompt_tokens: &[u32],
+    config: &DiffusionGenerationConfig,
+    cancel: Option<&AtomicBool>,
+) -> Result<DiffusionGenerateOutput, DiffusionGenerateError> {
     config.validate()?;
     if config.max_new_tokens == 0 {
         return Ok(DiffusionGenerateOutput {
@@ -275,7 +300,10 @@ pub fn generate_diffusion<M: DiffusionBlockModel>(
             trace: Vec::new(),
         });
     }
-    if let Some(output) = model.generate(prompt_tokens, config)? {
+    if cancelled(cancel) {
+        return Err(DiffusionGenerateError::Cancelled);
+    }
+    if let Some(output) = model.generate_with_cancel(prompt_tokens, config, cancel)? {
         return Ok(output);
     }
 
@@ -289,12 +317,18 @@ pub fn generate_diffusion<M: DiffusionBlockModel>(
     let mut block_index = 0usize;
 
     while output.len() < config.max_new_tokens {
+        if cancelled(cancel) {
+            return Err(DiffusionGenerateError::Cancelled);
+        }
         let remaining = config.max_new_tokens - output.len();
         let valid_len = remaining.min(config.canvas_length);
         let mut canvas = initial_canvas(config, block_index, valid_len);
         let mut history: Vec<Vec<u32>> = Vec::new();
 
         for step in 0..config.max_denoising_steps {
+            if cancelled(cancel) {
+                return Err(DiffusionGenerateError::Cancelled);
+            }
             let temperature = diffusion_temperature(config, step);
             let prediction = model.predict_canvas(&canvas, valid_len, step, temperature)?;
             prediction.validate(config.canvas_length)?;
@@ -375,6 +409,10 @@ pub fn generate_diffusion<M: DiffusionBlockModel>(
         stats,
         trace,
     })
+}
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
 /// Convert row-major logits into compact canvas predictions.
@@ -580,6 +618,8 @@ fn splitmix64(mut x: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     #[derive(Default)]
@@ -692,6 +732,22 @@ mod tests {
         assert_eq!(model.begin_configs, vec![test_config(3)]);
         assert_eq!(model.prefills, vec![vec![1, 2, 3]]);
         assert_eq!(model.commits, vec![vec![10, 11, 12]]);
+    }
+
+    #[test]
+    fn generate_observes_cancel_before_prefill() {
+        let mut model = FakeDiffusionModel {
+            predictions: vec![prediction(&[10, 11, 12, 13], &[0.01, 0.01, 0.01, 0.01], 4)],
+            ..FakeDiffusionModel::default()
+        };
+        let cancel = AtomicBool::new(true);
+        let err =
+            generate_diffusion_with_cancel(&mut model, &[1, 2], &test_config(2), Some(&cancel))
+                .unwrap_err();
+
+        assert_eq!(err, DiffusionGenerateError::Cancelled);
+        assert!(model.prefills.is_empty());
+        assert_eq!(model.calls, 0);
     }
 
     #[test]

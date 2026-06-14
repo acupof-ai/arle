@@ -78,8 +78,9 @@ pub fn is_matmul_bearing(
         TokenEmbedding => tied,
         OutputHead | AttnQA | AttnQB | AttnKvLatent | AttnOutA | AttnOutB | CompressorKv
         | CompressorGate | IndexerProj | IndexerQB | IndexerCompressKv | IndexerCompressGate
-        | RouterGate | RoutedExpertGate | RoutedExpertUp | RoutedExpertGateUp
-        | RoutedExpertDown | SharedExpertGate | SharedExpertUp | SharedExpertDown => true,
+        | RouterGate | RoutedExpertGate | RoutedExpertUp | RoutedExpertDown | SharedExpertGate
+        | SharedExpertUp | SharedExpertDown => true,
+        RoutedExpertGateUp => false,
         HyperConnection | HeadHyperConnection => ndims >= 2,
         _ => false,
     }
@@ -101,6 +102,12 @@ pub fn validate_matmul_residency<'a>(
     tied_embeddings: bool,
 ) -> Result<()> {
     for (name, kind, residency, ndims) in tensors {
+        if kind == infer_gguf::deepseek4::Dsv4TensorKind::RoutedExpertGateUp {
+            bail!(
+                "tensor {name} ({kind:?}) uses fused routed gate/up layout, but HIP DSv4 \
+                 forward requires split ffn_gate_exps.weight and ffn_up_exps.weight tensors"
+            );
+        }
         if is_matmul_bearing(kind, ndims, tied_embeddings) && gemv_kind(residency).is_none() {
             bail!(
                 "tensor {name} ({kind:?}) is matmul-bearing but lands {residency:?}: no HIP \
@@ -1493,6 +1500,7 @@ mod tests {
         // Embedding matmuls only when tied as lm_head.
         assert!(is_matmul_bearing(TokenEmbedding, 2, true));
         assert!(!is_matmul_bearing(TokenEmbedding, 2, false));
+        assert!(!is_matmul_bearing(RoutedExpertGateUp, 3, false));
         for kind in [
             AttnNorm,
             FfnNorm,
@@ -1503,6 +1511,27 @@ mod tests {
         ] {
             assert!(!is_matmul_bearing(kind, 1, true), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn fused_routed_gate_up_rejected_at_load_gate() {
+        use Dsv4TensorKind::*;
+        let err = validate_matmul_residency(
+            [(
+                "blk.0.ffn_gate_up_exps.weight",
+                RoutedExpertGateUp,
+                Residency::KeepKQuant(KQuant::Q4K),
+                3,
+            )]
+            .into_iter(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("fused routed gate/up"),
+            "got: {err}"
+        );
     }
 
     #[test]

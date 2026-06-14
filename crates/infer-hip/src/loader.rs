@@ -55,6 +55,9 @@ pub fn plan_residency(kind: Dsv4TensorKind, ty: GgmlType) -> Residency {
     ) {
         return Residency::HostOnly;
     }
+    if kind == Dsv4TensorKind::TokenEmbedding && matches!(ty, GgmlType::Iq2Xxs | GgmlType::Q2K) {
+        return Residency::DequantBf16;
+    }
     match ty {
         GgmlType::Iq2Xxs => Residency::KeepIq2Xxs,
         GgmlType::Q2K => Residency::KeepQ2K,
@@ -251,6 +254,8 @@ mod tests {
             (SharedExpertDown, Q5K, Residency::KeepKQuant(KQuant::Q5K)),
             (OutputHead, Q6K, Residency::KeepKQuant(KQuant::Q6K)),
             (TokenEmbedding, Q4K, Residency::KeepKQuant(KQuant::Q4K)),
+            (TokenEmbedding, Iq2Xxs, Residency::DequantBf16),
+            (TokenEmbedding, Q2K, Residency::DequantBf16),
             // Q3_K has no Rust launcher decl in hip-kernels → dequant.
             (AttnQB, Q3K, Residency::DequantBf16),
             (AttnNorm, F32, Residency::DequantBf16),

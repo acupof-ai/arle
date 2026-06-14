@@ -1,8 +1,12 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use infer_plan::{
     DiffusionBlockModel, DiffusionGenerateError, DiffusionGenerationConfig, FinishReason,
-    ForwardPlan, SlotToken, StepOutput, generate_diffusion,
+    ForwardPlan, SlotToken, StepOutput, generate_diffusion_with_cancel,
 };
 
 use crate::{BackendExecutor, KvPool, PollResult};
@@ -33,6 +37,7 @@ pub struct BufferedDiffusionExecutor<M> {
     model: M,
     base_config: DiffusionGenerationConfig,
     slots: HashMap<usize, SlotState>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<M> BufferedDiffusionExecutor<M> {
@@ -42,6 +47,21 @@ impl<M> BufferedDiffusionExecutor<M> {
             model,
             base_config,
             slots: HashMap::new(),
+            cancel: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_cancel(
+        model: M,
+        base_config: DiffusionGenerationConfig,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            model,
+            base_config,
+            slots: HashMap::new(),
+            cancel: Some(cancel),
         }
     }
 
@@ -136,8 +156,13 @@ impl<M> BufferedDiffusionExecutor<M> {
         };
 
         let config = Self::config_for_row(&self.base_config, &row.params);
-        let output =
-            generate_diffusion(&mut self.model, &prompt, &config).map_err(map_diffusion_error)?;
+        let output = generate_diffusion_with_cancel(
+            &mut self.model,
+            &prompt,
+            &config,
+            self.cancel.as_deref(),
+        )
+        .map_err(map_diffusion_error)?;
         if std::env::var_os("ARLE_DIFFUSION_TRACE").is_some() {
             eprintln!(
                 "diffusion generate complete: prompt_tokens={} generated_tokens={} blocks={} denoise_steps={} forced_commits={} adaptive_commits={} finish={:?}",
@@ -194,6 +219,13 @@ where
         if plan.is_idle() {
             return Ok(StepOutput { tokens: Vec::new() });
         }
+        anyhow::ensure!(
+            !self
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire)),
+            "diffusion generation cancelled"
+        );
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
         anyhow::ensure!(
             row_count == 1,

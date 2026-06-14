@@ -159,11 +159,9 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
         .get_usize(&key("ssm.time_step_rank"))
         .filter(|&v| v != 0)
         .unwrap_or_else(|| {
-            if linear_value_head_dim == 0 {
-                0
-            } else {
-                ssm_inner_size / linear_value_head_dim
-            }
+            ssm_inner_size
+                .checked_div(linear_value_head_dim)
+                .unwrap_or(0)
         });
     // Key/query heads: ggml `ssm.group_count` is the GVA group count; fall back
     // to the full-attention KV-head count if a converter omits it.

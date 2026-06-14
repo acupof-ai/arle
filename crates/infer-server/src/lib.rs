@@ -106,6 +106,11 @@ impl ServeShutdown {
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
+
+    #[must_use]
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
+    }
 }
 
 impl Default for ServeShutdown {
