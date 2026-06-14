@@ -293,6 +293,25 @@ mod real {
             props.limits.min_storage_buffer_offset_alignment
         }
 
+        /// `(timestampPeriod ns/tick, timestampValidBits)` for GPU timestamp
+        /// profiling. `valid_bits == 0` means the compute queue does not support
+        /// timestamps (profiling must be disabled).
+        pub fn timestamp_info(&self) -> (f32, u32) {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            let qf = unsafe {
+                self.instance
+                    .get_physical_device_queue_family_properties(self.physical_device)
+            };
+            let valid_bits = qf
+                .get(self.queue_family_index as usize)
+                .map(|q| q.timestamp_valid_bits)
+                .unwrap_or(0);
+            (props.limits.timestamp_period, valid_bits)
+        }
+
         /// `(subgroupSize, min, max)` from `VkPhysicalDeviceSubgroupProperties`
         /// and `VkPhysicalDeviceSubgroupSizeControlProperties`. The flash-attn
         /// shader hardcodes `SubGroupSize=32` and uses subgroup shuffles, so the
@@ -751,11 +770,29 @@ mod real {
     /// `submit_and_wait()`. The command buffer and fence are allocated once and
     /// reused across tokens (the pool is created with
     /// `RESET_COMMAND_BUFFER`, so `begin()` can reset the buffer in place).
+    /// Per-dispatch GPU timestamp profiler (ARLE_GPU_TIMESTAMPS=1). Writes a
+    /// `vkCmdWriteTimestamp` after each dispatch; the delta between consecutive
+    /// timestamps is that dispatch's GPU time, accumulated by category label.
+    /// Mirrors what `GGML_VK_PERF_LOGGER` does for llama.cpp so the two per-op
+    /// breakdowns can be compared directly.
+    struct GpuProf {
+        pool: vk::QueryPool,
+        capacity: u32,
+        period_ns: f32,
+        valid_mask: u64,
+        idx: u32,
+        labels: Vec<&'static str>,
+        next_label: &'static str,
+        totals: std::collections::HashMap<&'static str, (u64, u128)>,
+    }
+
     pub struct CommandRecorder<'a> {
         ctx: &'a VulkanContext,
         pool: vk::CommandPool,
         command_buffer: vk::CommandBuffer,
         fence: vk::Fence,
+        /// Optional per-dispatch GPU timestamp profiler (ARLE_GPU_TIMESTAMPS).
+        prof: Option<GpuProf>,
         /// True between `submit_and_wait()`'s `queue_submit` and the next
         /// `begin()`'s fence wait — guards against re-recording a buffer whose
         /// prior submission has not yet been waited on.
@@ -807,15 +844,78 @@ mod real {
                 }
             };
 
+            let prof = if std::env::var("ARLE_GPU_TIMESTAMPS").is_ok() {
+                let (period_ns, valid_bits) = ctx.timestamp_info();
+                if valid_bits == 0 {
+                    eprintln!("ARLE_GPU_TIMESTAMPS: compute queue has no timestamp support");
+                    None
+                } else {
+                    let capacity = 8192u32;
+                    let info = vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(capacity);
+                    match unsafe { ctx.device.create_query_pool(&info, None) } {
+                        Ok(qpool) => Some(GpuProf {
+                            pool: qpool,
+                            capacity,
+                            period_ns,
+                            valid_mask: if valid_bits >= 64 {
+                                u64::MAX
+                            } else {
+                                (1u64 << valid_bits) - 1
+                            },
+                            idx: 0,
+                            labels: Vec::new(),
+                            next_label: "other",
+                            totals: std::collections::HashMap::new(),
+                        }),
+                        Err(e) => {
+                            eprintln!("ARLE_GPU_TIMESTAMPS: query pool create failed: {e}");
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+
             Ok(Self {
                 ctx,
                 pool,
                 command_buffer,
                 fence,
+                prof,
                 pending: false,
                 dispatches_in_batch: 0,
                 submit_count: 0,
             })
+        }
+
+        /// Tag the NEXT recorded dispatch with a category label for the GPU
+        /// timestamp profiler (no-op unless ARLE_GPU_TIMESTAMPS). Consumed by the
+        /// next `dispatch_raw`; unlabeled dispatches fall under "other".
+        pub fn label_next(&mut self, label: &'static str) {
+            if let Some(p) = self.prof.as_mut() {
+                p.next_label = label;
+            }
+        }
+
+        /// Drain the accumulated per-category GPU times as `(label, count,
+        /// total_ms)`, sorted by time descending. Cleared after draining.
+        pub fn take_gpu_profile(&mut self) -> Vec<(&'static str, u64, f64)> {
+            match self.prof.as_mut() {
+                Some(p) => {
+                    let period = p.period_ns as f64;
+                    let mut v: Vec<_> = p
+                        .totals
+                        .drain()
+                        .map(|(k, (c, ticks))| (k, c, ticks as f64 * period / 1e6))
+                        .collect();
+                    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    v
+                }
+                None => Vec::new(),
+            }
         }
 
         /// Dispatches recorded into the currently-open batch (since the last
@@ -865,6 +965,25 @@ mod real {
             }
             .map_err(|e| vk_error("beginning Vulkan command buffer", e))?;
             self.dispatches_in_batch = 0;
+            // GPU profiler: reset the query pool and write the baseline timestamp
+            // (idx 0). Each dispatch then writes idx 1.. ; deltas are per-op times.
+            if let Some((pool, cap)) = self.prof.as_ref().map(|p| (p.pool, p.capacity)) {
+                let cmd = self.command_buffer;
+                unsafe {
+                    self.ctx.device.cmd_reset_query_pool(cmd, pool, 0, cap);
+                    self.ctx.device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        pool,
+                        0,
+                    );
+                }
+                if let Some(p) = self.prof.as_mut() {
+                    p.idx = 1;
+                    p.labels.clear();
+                    p.next_label = "other";
+                }
+            }
             Ok(())
         }
 
@@ -917,6 +1036,29 @@ mod real {
                 device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
             self.dispatches_in_batch += 1;
+            // GPU profiler: timestamp this dispatch's completion (BOTTOM_OF_PIPE),
+            // tagged with the pending category label.
+            let slot = self.prof.as_mut().and_then(|p| {
+                if p.idx < p.capacity {
+                    let s = (p.pool, p.idx);
+                    p.labels.push(p.next_label);
+                    p.idx += 1;
+                    p.next_label = "other";
+                    Some(s)
+                } else {
+                    None
+                }
+            });
+            if let Some((pool, idx)) = slot {
+                unsafe {
+                    self.ctx.device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        pool,
+                        idx,
+                    );
+                }
+            }
         }
 
         /// Record a single compute→compute execution+memory barrier so a later
@@ -966,6 +1108,34 @@ mod real {
             }
             .map_err(|e| vk_error("waiting for Vulkan fence", e))?;
             self.pending = false;
+            // GPU profiler: read this submit's timestamps and accumulate per-op
+            // deltas into the per-category totals.
+            let read = self.prof.as_ref().map(|p| (p.pool, p.idx, p.valid_mask));
+            if let Some((pool, idx, mask)) = read {
+                if idx > 1 {
+                    let mut data = vec![0u64; idx as usize];
+                    let ok = unsafe {
+                        self.ctx.device.get_query_pool_results(
+                            pool,
+                            0,
+                            &mut data,
+                            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                        )
+                    };
+                    if ok.is_ok() {
+                        if let Some(p) = self.prof.as_mut() {
+                            for j in 0..p.labels.len() {
+                                let a = data[j] & mask;
+                                let b = data[j + 1] & mask;
+                                let dt = b.wrapping_sub(a) as u128;
+                                let e = p.totals.entry(p.labels[j]).or_insert((0u64, 0u128));
+                                e.0 += 1;
+                                e.1 += dt;
+                            }
+                        }
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -980,6 +1150,9 @@ mod real {
                         .ctx
                         .device
                         .wait_for_fences(&[self.fence], true, u64::MAX);
+                }
+                if let Some(p) = self.prof.as_ref() {
+                    self.ctx.device.destroy_query_pool(p.pool, None);
                 }
                 self.ctx.device.destroy_fence(self.fence, None);
                 self.ctx.device.destroy_command_pool(self.pool, None);
@@ -1646,6 +1819,12 @@ mod stub {
         }
 
         pub fn barrier(&mut self) {}
+
+        pub fn label_next(&mut self, _label: &'static str) {}
+
+        pub fn take_gpu_profile(&mut self) -> Vec<(&'static str, u64, f64)> {
+            Vec::new()
+        }
 
         pub fn submit_and_wait(&mut self) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)

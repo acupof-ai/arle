@@ -1,21 +1,23 @@
 #version 450
-// ARLE Vulkan shader: Qwen3.6 MoE router top-k selection.
+// ARLE Vulkan shader: Qwen3.6 MoE router top-k selection (PARALLEL).
 //
-// Replaces the host `qwen36_topk_routes` (model_qwen36.rs) so MoE routing never
-// returns to the host: softmax-over-ALL experts, top-k by softmax prob, weights
-// = the selected probs (optionally renormalized to sum 1). It runs once per MoE
-// layer per token (tiny: n_expert ~256, top_k ~8), so ONE thread does the whole
-// reduction in the host's exact serial order — faithfulness beats throughput
-// here (the router GEMV + expert GEMVs dominate; this is microseconds).
+// Replaces the host `qwen36_topk_routes`: softmax-over-ALL experts, top-k by
+// softmax prob, weights = the selected probs (optionally renormalized to sum 1).
 //
-// KEY FACT: softmax is monotonic, so top-k by prob == top-k by raw logit. The
-// kernel selects by logit (strict `>`, so equal logits keep the LOWER expert id
-// — matching the host's stable descending sort with ascending-id tiebreak),
-// then computes weights = exp(logit-max)/sum on the selected k and renorms.
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// ONE workgroup of `BLOCK` threads (one expert per lane for n_expert<=BLOCK):
+// parallel max-reduction, parallel Σexp, then `top_k` rounds of parallel
+// argmax-and-mask, finally the renorm. The earlier version ran this single-
+// threaded (local_size_x=1) — pathologically slow on the GPU (~428µs/call,
+// ~46% of MoE decode); the work is trivially parallel.
+//
+// KEY FACT: softmax is monotonic, so top-k by prob == top-k by raw logit. Select
+// by logit (argmax with strict `>`, ties → LOWER expert id, matching the host's
+// stable descending sort), then weights = exp(logit-max)/sum on the kept k.
+#define BLOCK 256
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
-    uint n_expert;   // total experts (softmax + selection domain)
+    uint n_expert;   // total experts (<= BLOCK)
     uint top_k;      // experts to keep per token
     uint norm_topk;  // 1 = renormalize kept weights to sum 1 (clamp F16_MIN)
 } p;
@@ -33,60 +35,89 @@ layout(binding = 2) writeonly buffer Weights {
 const float NEG_INF = -3.4e38;
 const float F16_MIN = 6.103516e-5; // 2^-14, matches llama.cpp ggml_clamp floor
 
+shared float red_f[BLOCK]; // reduction scratch (values)
+shared int red_i[BLOCK];   // reduction scratch (indices, for argmax tie-break)
+shared int sel[64];        // selected expert ids (top_k <= 64)
+shared float g_max;        // softmax max
+shared float g_sum;        // softmax denominator
+
 void main() {
-    // Single-thread kernel: only invocation 0 works.
-    if (gl_GlobalInvocationID.x != 0u) {
-        return;
-    }
-    uint n = p.n_expert;
-    uint k = min(p.top_k, n);
-    if (k == 0u || n == 0u) {
-        return;
-    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n = p.n_expert;
+    const uint k = min(p.top_k, n);
+    const float my_logit = (tid < n) ? logits[tid] : NEG_INF;
 
-    // 1. softmax denominator over ALL experts, in the host's left-to-right order
-    //    (probs[i] = exp(logits[i]-max)/sum).
-    float maxv = NEG_INF;
-    for (uint i = 0u; i < n; ++i) {
-        maxv = max(maxv, logits[i]);
+    // 1. max over all logits.
+    red_f[tid] = my_logit;
+    barrier();
+    for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red_f[tid] = max(red_f[tid], red_f[tid + s]);
+        }
+        barrier();
     }
-    float sum = 0.0;
-    for (uint i = 0u; i < n; ++i) {
-        sum += exp(logits[i] - maxv);
+    if (tid == 0u) {
+        g_max = red_f[0];
     }
+    barrier();
+    const float maxv = g_max;
 
-    // 2. select top-k by logit (== by prob). Each pass picks the highest-logit
-    //    expert not already chosen; strict `>` keeps the lower id on ties.
-    int sel[64]; // top_k cap (qwen36 top_k=8); 64 is generous headroom
+    // 2. Σ exp(logit - max) over all experts.
+    red_f[tid] = (tid < n) ? exp(my_logit - maxv) : 0.0;
+    barrier();
+    for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red_f[tid] += red_f[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        g_sum = red_f[0];
+    }
+    barrier();
+    const float sumv = g_sum;
+
+    // 3. top-k by logit (== by prob). Each round: parallel argmax over the
+    //    not-yet-selected experts; strict `>` keeps the lower id on ties.
+    bool taken = false;
     for (uint j = 0u; j < k; ++j) {
-        int best = -1;
-        float best_logit = NEG_INF;
-        for (uint i = 0u; i < n; ++i) {
-            bool taken = false;
-            for (uint t = 0u; t < j; ++t) {
-                if (sel[t] == int(i)) {
-                    taken = true;
-                    break;
+        red_f[tid] = (tid < n && !taken) ? my_logit : NEG_INF;
+        red_i[tid] = int(tid);
+        barrier();
+        for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                float a = red_f[tid];
+                float b = red_f[tid + s];
+                int ai = red_i[tid];
+                int bi = red_i[tid + s];
+                // pick the larger value; on a tie keep the lower index.
+                if (b > a || (b == a && bi < ai)) {
+                    red_f[tid] = b;
+                    red_i[tid] = bi;
                 }
             }
-            if (!taken && logits[i] > best_logit) {
-                best_logit = logits[i];
-                best = int(i);
-            }
+            barrier();
         }
-        sel[j] = best;
+        int best = red_i[0];
+        if (tid == uint(best)) {
+            taken = true;
+        }
+        if (tid == 0u) {
+            sel[j] = best;
+        }
+        barrier();
     }
 
-    // 3 + 4. weights = selected softmax probs, optionally renormalized to sum 1.
-    float kept_sum = 0.0;
-    float w[64];
-    for (uint j = 0u; j < k; ++j) {
-        w[j] = exp(logits[sel[j]] - maxv) / sum;
-        kept_sum += w[j];
-    }
-    float denom = (p.norm_topk != 0u) ? max(kept_sum, F16_MIN) : 1.0;
-    for (uint j = 0u; j < k; ++j) {
-        ids[j] = sel[j];
-        weights[j] = w[j] / denom;
+    // 4. weights = selected softmax probs, optionally renormalized to sum 1.
+    if (tid == 0u) {
+        float kept_sum = 0.0;
+        for (uint j = 0u; j < k; ++j) {
+            kept_sum += exp(logits[sel[j]] - maxv) / sumv;
+        }
+        float denom = (p.norm_topk != 0u) ? max(kept_sum, F16_MIN) : 1.0;
+        for (uint j = 0u; j < k; ++j) {
+            ids[j] = sel[j];
+            weights[j] = (exp(logits[sel[j]] - maxv) / sumv) / denom;
+        }
     }
 }
