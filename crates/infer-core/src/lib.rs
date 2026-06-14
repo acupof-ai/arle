@@ -3078,6 +3078,83 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_prefix_cache_drops_all_idle_cached_pages() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 2, 6),
+            test_config(1),
+        );
+        // Seal two distinct single-block prefixes into the cache.
+        let a = engine.submit_request(vec![5, 5], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(a).expect("a completed"));
+        let b = engine.submit_request(vec![7, 7], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(b).expect("b completed"));
+        assert_eq!(engine.radix.cached_page_count(), 2);
+        let total = engine.kv.total_pages();
+        assert_eq!(engine.kv_free_pages(), total - 2);
+
+        // A live re-merge invalidates every cached block; with no in-flight
+        // request pinning a page, all idle pages return to the pool.
+        engine.invalidate_prefix_cache();
+        assert_eq!(engine.radix.cached_page_count(), 0);
+        assert_eq!(engine.kv_free_pages(), total, "every idle page reclaimed");
+        assert_eq!(
+            engine.radix.peek_longest_prefix_match(&[5, 5]).matched_len,
+            0
+        );
+        assert_eq!(
+            engine.radix.peek_longest_prefix_match(&[7, 7]).matched_len,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_prefix_cache_keeps_pinned_drops_idle() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 2, 5),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![1, 1], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        let second = engine.submit_request(vec![2, 2], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        assert_eq!(engine.radix.cached_page_count(), 2);
+
+        // Pin [1,1] via an in-flight request that reuses it (ref_count > 0).
+        let active = engine.submit_request(vec![1, 1, 3], 1);
+        engine.step()?;
+        assert!(
+            engine
+                .active
+                .values()
+                .any(|request| request.handle == active)
+        );
+
+        // Live re-merge invalidation: the idle [2,2] block is dropped, the
+        // pinned [1,1] block is left in place (never freed under a live reader).
+        engine.invalidate_prefix_cache();
+        assert_eq!(
+            engine.radix.peek_longest_prefix_match(&[2, 2]).matched_len,
+            0
+        );
+        assert_eq!(
+            engine.radix.peek_longest_prefix_match(&[1, 1]).matched_len,
+            2,
+            "pinned prefix survives invalidation"
+        );
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(active).expect("active completed"));
+        Ok(())
+    }
+
+    #[test]
     fn prefix_refcount_no_double_free() -> Result<()> {
         let mut engine = Engine::with_config(
             MockExecutor::ready(),

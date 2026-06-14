@@ -227,6 +227,52 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         reclaimed
     }
 
+    /// Invalidate the whole prefix cache after a resident-weight change (OPD
+    /// live LoRA re-merge / SOPD inline adapter update).
+    ///
+    /// Once `q_proj`/`v_proj` change, every cached block's `V = v_proj(x)` was
+    /// computed under the prior adapter epoch and is stale, so no cached block
+    /// — resident *or* host-tier-demoted — may serve a post-update request.
+    /// Unlike [`Self::evict_prefix_cache_for_pages`], which *demotes* victims to
+    /// the host tier (keeping them promotable), this **drops** everything:
+    /// resident pages return to the KV pool, demoted blocks are severed and
+    /// their tier keys forwarded to the backend tier store. Demoting would only
+    /// move stale-epoch KV to host, where a later prefix match could promote it
+    /// back — exactly the contamination we are removing.
+    ///
+    /// Precondition (caller-proven): no in-flight request pins a prefix page
+    /// (`ref_count > 0`). The OPD inline-update loop calls this between rollouts
+    /// on a quiesced engine, so every cached page is idle and is dropped. A page
+    /// pinned by a concurrent in-flight request is **skipped** here (never freed
+    /// under a live reader) and would keep serving stale-epoch KV until that
+    /// request finishes — concurrent serving + live update needs per-request
+    /// epoch tagging, out of scope for the Phase-0 keystone.
+    pub fn invalidate_prefix_cache(&mut self) {
+        // 1. Drop every idle resident cached page. `evict_lru` re-scans the
+        //    evictable frontier each step, so one call bounded by the resident
+        //    count drains the whole idle trie (severing a leaf exposes its
+        //    parent as the next evictable leaf). Pinned pages stay in place.
+        let resident = self.radix.cached_page_count();
+        if resident > 0 {
+            let pages = self.radix.evict_lru(resident);
+            if !pages.is_empty() {
+                self.kv.release_pages(&pages);
+                self.executor.release_prefix_pages(&pages);
+            }
+        }
+        // 2. Drop every idle host-tier demoted block — also stale-epoch KV that
+        //    must not be promotable back into a post-update rollout. After step
+        //    1 no demoted node has a resident descendant, so each is severable;
+        //    the `false` guard is defensive against a pinned-subtree corner.
+        while let Some(key) = self.radix.lru_demoted_key() {
+            if !self.radix.drop_demoted(key) {
+                break;
+            }
+        }
+        // 3. Forward every severed tier key to the backend tier store.
+        self.drain_dropped_tier_keys();
+    }
+
     /// Host-tier capacity in pages; `0` disables every tier path. Tier use is
     /// gated on the prefix cache because demoted blocks are only reachable
     /// through radix prefix matches.
