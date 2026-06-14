@@ -293,6 +293,11 @@ const LOCAL: &[ShaderSpec] = &[
         defines: &[],
     },
     ShaderSpec {
+        name: "sigmoid_mul",
+        source: "crates/vulkan-kernels/shaders/sigmoid_mul.comp",
+        defines: &[],
+    },
+    ShaderSpec {
         name: "qwen35_ssm_conv",
         source: "crates/vulkan-kernels/shaders/qwen35_ssm_conv.comp",
         defines: &[],

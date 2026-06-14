@@ -192,7 +192,10 @@ mod real {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&priorities)];
-            let extensions = [vk::KHR_SHADER_INTEGER_DOT_PRODUCT_NAME.as_ptr()];
+            let extensions = [
+                vk::KHR_SHADER_INTEGER_DOT_PRODUCT_NAME.as_ptr(),
+                vk::EXT_SUBGROUP_SIZE_CONTROL_NAME.as_ptr(),
+            ];
             let base_features = vk::PhysicalDeviceFeatures::default().shader_int16(true);
             let mut storage16 =
                 vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
@@ -202,11 +205,19 @@ mod real {
                 .shader_int8(true);
             let mut integer_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
                 .shader_integer_dot_product(true);
+            // The flash-attn shader hardcodes `SubGroupSize=32` (subgroup shuffle
+            // reductions + `num_subgroups = WorkGroupSize/32`). The 8060S defaults
+            // to wave64, which scrambles those reductions. Enable subgroup-size
+            // control + required-size pipelines so the FA pipeline runs at 32.
+            let mut size_control = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+                .subgroup_size_control(true)
+                .compute_full_subgroups(true);
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .features(base_features)
                 .push_next(&mut integer_dot)
                 .push_next(&mut vulkan12)
-                .push_next(&mut storage16);
+                .push_next(&mut storage16)
+                .push_next(&mut size_control);
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&extensions)
@@ -280,6 +291,31 @@ mod real {
                     .get_physical_device_properties(self.physical_device)
             };
             props.limits.min_storage_buffer_offset_alignment
+        }
+
+        /// `(subgroupSize, min, max)` from `VkPhysicalDeviceSubgroupProperties`
+        /// and `VkPhysicalDeviceSubgroupSizeControlProperties`. The flash-attn
+        /// shader hardcodes `SubGroupSize=32` and uses subgroup shuffles, so the
+        /// pipeline must run at a 32-wide subgroup; this lets the caller diagnose
+        /// whether the device defaults to wave64 (needing size control).
+        pub fn subgroup_size(&self) -> (u32, u32, u32) {
+            let mut size_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut size_control);
+            unsafe {
+                self.instance
+                    .get_physical_device_properties2(self.physical_device, &mut props2);
+            }
+            let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            unsafe {
+                self.instance
+                    .get_physical_device_properties2(self.physical_device, &mut p2);
+            }
+            (
+                subgroup.subgroup_size,
+                size_control.min_subgroup_size,
+                size_control.max_subgroup_size,
+            )
         }
 
         /// Per-heap `(size_bytes, is_device_local)` for diagnostics / budgeting.
@@ -1333,6 +1369,32 @@ mod real {
             push_constant_bytes: u32,
             specialization_u32: &[(u32, u32)],
         ) -> Result<Self> {
+            Self::create_with_push_constants_specialization_and_subgroup_size(
+                ctx,
+                shader,
+                descriptor_layouts,
+                push_constant_bytes,
+                specialization_u32,
+                None,
+            )
+        }
+
+        /// Like [`Self::create_with_push_constants_and_specialization`] but
+        /// optionally pins the compute stage's subgroup size via
+        /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`. The flash-attn
+        /// shader hardcodes `SubGroupSize=32` and reduces with subgroup shuffles,
+        /// so on a wave64 device (the 8060S) its pipeline MUST be created with
+        /// `required_subgroup_size = Some(32)` or every reduction scrambles.
+        /// Requires the `subgroupSizeControl` feature (enabled in
+        /// [`VulkanContext::create`]).
+        pub fn create_with_push_constants_specialization_and_subgroup_size(
+            ctx: &'a VulkanContext,
+            shader: &ShaderModule<'_>,
+            descriptor_layouts: &[&DescriptorSetLayout<'_>],
+            push_constant_bytes: u32,
+            specialization_u32: &[(u32, u32)],
+            required_subgroup_size: Option<u32>,
+        ) -> Result<Self> {
             let set_layouts: Vec<_> = descriptor_layouts
                 .iter()
                 .map(|layout| layout.raw())
@@ -1377,6 +1439,17 @@ mod real {
                 .name(&entry);
             if !specialization_u32.is_empty() {
                 stage = stage.specialization_info(&specialization_info);
+            }
+            // Pin the subgroup size (e.g. 32 for flash-attn on a wave64 device).
+            // REQUIRE_FULL_SUBGROUPS guarantees the workgroup is a multiple of the
+            // pinned size so `num_subgroups = WorkGroupSize/SubGroupSize` holds.
+            let mut required_size_info =
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default();
+            if let Some(size) = required_subgroup_size {
+                required_size_info.required_subgroup_size = size;
+                stage = stage
+                    .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                    .push_next(&mut required_size_info);
             }
             let create = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)

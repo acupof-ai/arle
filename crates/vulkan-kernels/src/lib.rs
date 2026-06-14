@@ -97,6 +97,7 @@ pub enum Kernel {
     SwiGlu,
     Add,
     ScaledAdd,
+    SigmoidMul,
     GetRows,
     SoftMax,
     ArgMax,
@@ -159,6 +160,7 @@ impl Kernel {
         Self::SwiGlu,
         Self::Add,
         Self::ScaledAdd,
+        Self::SigmoidMul,
         Self::GetRows,
         Self::SoftMax,
         Self::ArgMax,
@@ -197,6 +199,7 @@ impl Kernel {
             Kernel::SwiGlu => "swiglu",
             Kernel::Add => "add",
             Kernel::ScaledAdd => "scaled_add",
+            Kernel::SigmoidMul => "sigmoid_mul",
             Kernel::GetRows => "get_rows",
             Kernel::SoftMax => "soft_max",
             Kernel::ArgMax => "argmax",
@@ -238,6 +241,7 @@ impl Kernel {
             | Kernel::SwiGlu
             | Kernel::Add
             | Kernel::ScaledAdd
+            | Kernel::SigmoidMul
             | Kernel::GetRows
             | Kernel::Dsv4PrepareQk
             | Kernel::Dsv4CompressorUpdate
@@ -249,6 +253,19 @@ impl Kernel {
             | Kernel::SwigluClamped
             | Kernel::Qwen35SsmConv
             | Kernel::Qwen35GatedDeltaNet => &[],
+        }
+    }
+
+    /// The subgroup size this kernel's pipeline must be created with, if any.
+    /// `flash_attn` is specialized for `SubGroupSize=32` and reduces with
+    /// subgroup shuffles + `num_subgroups = WorkGroupSize/32`, so on a wave64
+    /// device (the 8060S defaults to 64) its pipeline MUST pin a 32-wide
+    /// subgroup via `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`.
+    /// Every other kernel is subgroup-size-agnostic (`None` = driver default).
+    pub const fn required_subgroup_size(self) -> Option<u32> {
+        match self {
+            Kernel::FlashAttn => Some(32),
+            _ => None,
         }
     }
 }
@@ -499,6 +516,111 @@ pub fn q8_1_quantize_dispatch(ne: u32) -> Dispatch {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RoPE (NeoX) push-constant contract (full-attention on-device, Step 6). The
+// `rope_neox.comp` (+ `rope_head.glsl`, `rope_funcs.glsl`) rotates pairs
+// `(x[d], x[d + n_dims/2])` by `angle = pos * theta_scale^d` for `d < n_dims/2`,
+// passing through dims `>= n_dims`. The host f32 reference it replaces is
+// `forward.rs::rope_neox`, where `theta_scale = rope_theta^(-2/rotary_dim)` so
+// `theta_scale^d = rope_theta^(-2d/rotary_dim) = inv_freq(d)`. We apply RoPE to
+// one (or several batched) head vectors of `head_dim` elements at a fixed
+// position, with no YaRN (ext_factor=0), no freq-factor table (has_ff=0), no
+// set_rows (set_rows_stride=0), and no mscale (attn_factor=1, freq_scale=1).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Push-constant block for `rope_neox.comp` = the `rope_params` struct in
+/// `rope_params.glsl`, laid out as 29 std430 4-byte words in declared order:
+/// `rope_mode, nrows, n_dims, freq_scale(f32), freq_base(f32), ext_factor(f32),
+/// attn_factor(f32), corr_dims[0](f32), corr_dims[1](f32), theta_scale(f32),
+/// has_ff, sections[0..4](i32), is_imrope, is_back, set_rows_stride, ne00, ne01,
+/// ne02, nb01, nb02, nb03, nb11, nb12, nb13, a_offset, d_offset`.
+///
+/// For `nrows` independent head vectors, each `head_dim` f32 wide and laid out
+/// contiguously (row stride = `head_dim`), rotated at a single absolute
+/// `pos` with rotary width `rotary_dim` (= n_dims):
+/// - `rope_mode = 2` (GGML_ROPE_TYPE_NEOX), unused by `rope_neox()` itself but
+///   set for clarity.
+/// - `nrows` = the `main()` row guard (`row >= pc.nrows` returns).
+/// - `n_dims = rotary_dim` — the shader rotates `d < n_dims/2` and passes the
+///   rest through. With `rotary_dim == head_dim`, every dim rotates.
+/// - `freq_scale = 1, ext_factor = 0, attn_factor = 1` → `rope_yarn` reduces to
+///   `cos_theta = cos(theta_base)`, `sin_theta = sin(theta_base)` (no YaRN,
+///   no mscale) — matching the host's bare `(sin, cos)`.
+/// - `corr_dims = [0, 0]` (unused when `ext_factor == 0`).
+/// - `theta_scale = rope_theta^(-2/rotary_dim)` so `theta_scale^d = inv_freq(d)`.
+/// - `has_ff = 0` (binding 2 freq table unread; bind a dummy).
+/// - `sections = [0;4], is_imrope = 0, is_back = 0` (NeoX, not mRoPE).
+/// - `set_rows_stride = 0` (binding 4 indices unread; bind a dummy).
+/// - `ne00 = n_dims` — the `i0 >= p.ne00` early-out guard. `rope_head.glsl`
+///   dispatches `i0 = 2*gl_GlobalInvocationID.y`, so y must cover `n_dims/2`
+///   pairs; `ne00 = n_dims` lets the last pair (i0 = n_dims-2) run and rejects
+///   any padded invocation.
+/// - `ne01 = nrows, ne02 = 1` — used by `main()` to decompose `row` into
+///   `(i1, i2, i3)`; with `ne02 = 1` every row is `i1 = row, i2 = i3 = 0`, so a
+///   single shared `pos` is read from `rope_data_pos[i2] = pos[0]`.
+/// - `nb01 = head_dim` (input row stride, elements), `nb02 = nb03 = 0` (single
+///   channel/sample). The input coord is `a_offset + i1*nb01 + (i0/2)`.
+/// - `nb11 = head_dim, nb12 = nb13 = 0` (output row stride). The NeoX dst coord
+///   is `i0/2 + i1*nb11`, pair halves at `+0` and `+n_dims/2`.
+/// - `a_offset = d_offset = 0` (caller binds the head sub-range directly).
+///
+/// Binding order: `[0 = X input f32, 1 = Y pos int[], 2 = Z freq f32 (dummy),
+/// 3 = D output, 4 = I uvec2 indices (dummy)]`.
+pub fn rope_neox_params(
+    head_dim: u32,
+    rotary_dim: u32,
+    nrows: u32,
+    rope_theta: f32,
+) -> KernelParams {
+    let n_dims = rotary_dim;
+    let theta_scale = rope_theta.powf(-2.0 / n_dims as f32);
+    KernelParams::from_words(vec![
+        2,                     // rope_mode = GGML_ROPE_TYPE_NEOX
+        nrows,                 // nrows (row guard)
+        n_dims,                // n_dims = rotary_dim
+        1.0f32.to_bits(),      // freq_scale
+        rope_theta.to_bits(),  // freq_base (unused by rope_neox path beyond theta_scale)
+        0.0f32.to_bits(),      // ext_factor = 0 (no YaRN)
+        1.0f32.to_bits(),      // attn_factor = 1 (no mscale)
+        0.0f32.to_bits(),      // corr_dims[0]
+        0.0f32.to_bits(),      // corr_dims[1]
+        theta_scale.to_bits(), // theta_scale = rope_theta^(-2/n_dims)
+        0,                     // has_ff = 0 (freq table unread)
+        0,                     // sections[0]
+        0,                     // sections[1]
+        0,                     // sections[2]
+        0,                     // sections[3]
+        0,                     // is_imrope = 0
+        0,                     // is_back = 0
+        0,                     // set_rows_stride = 0 (indices unread)
+        n_dims,                // ne00 = n_dims (i0 >= ne00 early-out)
+        nrows,                 // ne01 = nrows (row decomposition)
+        1,                     // ne02 = 1 (single channel => pos[i2]=pos[0])
+        head_dim,              // nb01 = input row stride (elements)
+        0,                     // nb02
+        0,                     // nb03
+        head_dim,              // nb11 = output row stride (elements)
+        0,                     // nb12
+        0,                     // nb13
+        0,                     // a_offset
+        0,                     // d_offset
+    ])
+}
+
+/// Dispatch grid for [`rope_neox_params`]. `rope_head.glsl` has
+/// `local_size = (1, 256, 1)` and indexes `i0 = 2*gl_GlobalInvocationID.y`,
+/// `row = gl_GlobalInvocationID.x + 32768*z`. So x covers the rows and y covers
+/// the `n_dims/2` rotation pairs (each thread does one pair). With local_y=256,
+/// `y_groups = ceil(rotary_dim/2 / 256)`; one workgroup per row in x.
+pub fn rope_neox_dispatch(rotary_dim: u32, nrows: u32) -> Dispatch {
+    let pairs = (rotary_dim / 2).max(1);
+    Dispatch {
+        x: nrows.max(1),
+        y: pairs.div_ceil(256).max(1),
+        z: 1,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Elementwise / norm push-constant contracts (perf-parity Step 5b). These move
 // the per-layer RMSNorm / SwiGLU / residual-Add off the host (where each forced
 // a device→host→device hop around a GEMV) onto the already-compiled device
@@ -641,6 +763,115 @@ pub fn scaled_add_params(n: u32, scale: f32) -> KernelParams {
 /// `ceil(n / 256)` workgroups cover the row.
 pub fn scaled_add_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
+}
+
+/// `sigmoid_mul.comp` (ARLE-local): `out[i] = sigmoid(a[i]) * b[i]` over `n`
+/// elements. Bindings `0=A` (gate, read), `1=B` (value, read), `2=D` (out,
+/// write) — same 3-binding layout as `add`/`scaled_add`, so it shares the
+/// decode `ring3`. The single push field is `[n (u32)]`. Applies the
+/// full-attention per-head sigmoid gate device-resident.
+pub fn sigmoid_mul_params(n: u32) -> KernelParams {
+    KernelParams::from_words(vec![n])
+}
+
+/// `sigmoid_mul.comp` grid: one thread per element, `local_size_x = 256`, so
+/// `ceil(n / 256)` workgroups cover the row.
+pub fn sigmoid_mul_dispatch(n: u32) -> Dispatch {
+    Dispatch::x(n.div_ceil(256).max(1))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flash-attention push-constant contract (full-attention on-device, Step 6).
+// `flash_attn.comp` (+ `flash_attn_base.glsl`) is the scalar/subgroup-shuffle
+// FA path llama.cpp uses for N==1 decode on RDNA (coopmat is NV/prefill). The
+// registered [`FlashAttentionSpec::f32_f16`] specializes it to:
+//   WorkGroupSize=128, Br=1, Bc=64, HSK=HSV=head_dim, Clamp=1 (KV not a multiple
+//   of Bc), D_split=8, row_split=1, SubGroupSize=32, SHMEM_STAGING=0, Flags=0
+//   (no mask / no softcap), FaTypeK=FaTypeV=F16 (1), FaBlockBytesK/V=2.
+// So Q is f32, K/V are f16 (read directly, no dequant), output is f32. The host
+// reference it replaces is the `full_attention` causal-SDPA inner loop (scale
+// 1/sqrt(head_dim), online softmax) — computed over the SAME f16-rounded K/V.
+//
+// This contract drives ONE query head against `[kv_len, head_dim]` f16 K and V
+// (single KV head; the forward dispatches once per query head with the head's
+// own K/V sub-range, so gqa_ratio stays 1 and the GQA mapping is host-side).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Push-constant block for `flash_attn.comp` = the 33-field `parameter` struct
+/// in `flash_attn_base.glsl`, in declared order:
+/// `N, KV, ne1, ne2, ne3, neq2, neq3, nek2, nek3, nev2, nev3, nem1, nem2, nem3,
+/// nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, scale(f32),
+/// max_bias(f32), logit_softcap(f32), mask_n_head_log2, m0(f32), m1(f32),
+/// gqa_ratio, split_kv, k_num`.
+///
+/// For ONE decode query (`N=1`) of `hsk`-wide Q against `kv_len` cached K/V rows
+/// of `hsk`/`hsv` width, single head (gqa_ratio=1), no split-k (k_num=1), no mask
+/// (Flags has no MASK bit), no ALiBi (max_bias=0):
+/// - `N=1` (one query row), `KV=kv_len` (cached length, the `j*Bc+c < KV` guard).
+/// - `ne1=1` (query rows → output row stride), `ne2=1` (q heads in this dispatch
+///   → output head stride), `ne3=1`.
+/// - `neq2=neq3=nek2=nek3=nev2=nev3=1` (single head/batch → broadcast ratios
+///   `rk2=rk3=rv2=rv3=1`, so `ik2=ik3=iv2=iv3=0`).
+/// - `nem1=nem2=nem3=1` (mask dims; mask unread).
+/// - `nb01=hsk` (Q row stride, elements; `q_stride=nb01` when gqa_ratio=1),
+///   `nb02=nb03=hsk` (unused single-head).
+/// - `nb11=hsk` (K row stride in ELEMENTS — f16 `data_kv4` is indexed
+///   `k_offset/4 + kvrow*(nb11/4) + d`, so a `hsk`-wide row strides `hsk`
+///   elements = `hsk/4` vec4s), `nb12=nb13=0` (single KV head; `k_offset=0`).
+/// - `nb21=hsv` (V row stride, elements), `nb22=nb23=0`.
+/// - `scale` = `1/sqrt(head_dim)` (applied to Q when staged into `Qf`).
+/// - `max_bias=0` (slope=1, no ALiBi), `logit_softcap=0`.
+/// - `mask_n_head_log2=0` (no sink bit, no ALiBi head split), `m0=m1=0`.
+/// - `gqa_ratio=1` (one query head per workgroup; the forward maps GQA on host
+///   by passing each query head its KV head's cache), `split_kv=KV` (so
+///   `end_j = ceil(KV/Bc)` covers every cached position), `k_num=1` (no split-k
+///   reduce pass; the shader divides by L and writes the final O directly).
+///
+/// Binding order: `[0 = Q f32, 1 = K f16, 2 = V f16, 3 = M mask f16 (dummy),
+/// 4 = S sinks f32 (dummy), 5 = O f32 output, 6 = MO mask_opt uint (dummy)]`.
+pub fn flash_attn_params(hsk: u32, hsv: u32, kv_len: u32, scale: f32) -> KernelParams {
+    KernelParams::from_words(vec![
+        1,                // N (query rows)
+        kv_len,           // KV (cached length)
+        1,                // ne1 (query rows -> O row stride)
+        1,                // ne2 (q heads -> O head stride)
+        1,                // ne3
+        1,                // neq2
+        1,                // neq3
+        1,                // nek2
+        1,                // nek3
+        1,                // nev2
+        1,                // nev3
+        1,                // nem1
+        1,                // nem2
+        1,                // nem3
+        hsk,              // nb01 (Q row stride, elements)
+        hsk,              // nb02
+        hsk,              // nb03
+        hsk,              // nb11 (K row stride, elements)
+        0,                // nb12 (single KV head)
+        0,                // nb13
+        hsv,              // nb21 (V row stride, elements)
+        0,                // nb22
+        0,                // nb23
+        scale.to_bits(),  // scale = 1/sqrt(head_dim)
+        0.0f32.to_bits(), // max_bias = 0 (no ALiBi)
+        0.0f32.to_bits(), // logit_softcap = 0
+        0,                // mask_n_head_log2 (no sink, no ALiBi split)
+        0.0f32.to_bits(), // m0
+        0.0f32.to_bits(), // m1
+        1,                // gqa_ratio = 1
+        kv_len,           // split_kv = KV (end_j covers all positions)
+        1,                // k_num = 1 (no split-k reduce)
+    ])
+}
+
+/// Dispatch grid for [`flash_attn_params`]: ONE workgroup. `init_indices` reads
+/// `i = gl_WorkGroupID.x` (query tile), `iq2 = gl_WorkGroupID.y * gqa_ratio`
+/// (head), `iq3 = gl_WorkGroupID.z` (batch). For a single query head / single
+/// batch decode token, all three are 0, so `(1, 1, 1)`.
+pub fn flash_attn_dispatch() -> Dispatch {
+    Dispatch { x: 1, y: 1, z: 1 }
 }
 
 macro_rules! launcher_fns {
