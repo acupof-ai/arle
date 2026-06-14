@@ -211,6 +211,160 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
+    /// Cross-slot batched MTP decode step (batched-MTP Stage 1, gated OFF by
+    /// `ARLE_DSV4_BATCHED_MTP`). Drive the per-row `spec_step`'s draft + verify
+    /// across all N slots at once — batching the MoE/HC/norm over all verify
+    /// chains (`forward_decode_batch_verify`) while attention stays per-slot —
+    /// then per-slot accept / commit / ring-restore. Returns one committed-token
+    /// list per input slot, index-aligned with `slot_ids`.
+    ///
+    /// N=1 IDENTITY: with a single slot this does structurally the same work as
+    /// per-row `spec_step` — same `capture_spec_rings`, same per-slot draft
+    /// (`draft_chain`), same verify forward (M=depth+1 = the single chain), same
+    /// `longest_accepted_prefix` + bonus, same `truncate_slot` /
+    /// `restore_spec_ring_tail` / per-slot re-forward commit.
+    ///
+    /// §0.1 mutated state (per slot s, looped — no cross-slot aliasing; each
+    /// `Dsv4SlotState` owns its rings):
+    /// - `slots[s]` SW/FP8 rings: snapshot pre-draft (`capture_spec_rings`),
+    ///   rejected tail restored post-accept (`restore_spec_ring_tail`) — looped
+    ///   per slot, the PROVEN per-row calls (NOT a batched snapshot).
+    /// - `slots[s].seq_len` + accepted KV `[start_pos .. start_pos+accepted]`:
+    ///   overwritten by the per-slot commit re-forward (`forward_tokens_verify`,
+    ///   which WRITES the accepted-prefix rings + advances seq_len).
+    /// - `spec_slots[s].pending` / `.hidden`: set to the bonus token + the
+    ///   accepted chain head's MTP stream hidden.
+    /// - `slot.spec_normed`: NOT touched — commit-fold is DISABLED for the
+    ///   batched path (per-slot re-forward commit only; the combined verify
+    ///   `normed` must not scatter cross-slot into a fold cache — codex P2).
+    pub(crate) fn spec_step_batched(
+        &mut self,
+        slot_ids: &[usize],
+        start_positions: &[usize],
+        positions: &[u64],
+    ) -> Result<Vec<Vec<u32>>> {
+        let n = slot_ids.len();
+        ensure!(n > 0, "DSv4 batched spec step requires at least one slot");
+        ensure!(
+            start_positions.len() == n && positions.len() == n,
+            "DSv4 batched spec step surface length mismatch (slots {n}, starts {}, positions {})",
+            start_positions.len(),
+            positions.len()
+        );
+        let depth = self.spec_depth();
+
+        // ── 1. Per-slot pre-draft ring capture + draft chain (depth-sequential).
+        // Stage 1: loop the PROVEN per-slot capture + per-slot draft (batching the
+        // draft across slots is a later refinement; per-slot is the safe path).
+        let mut chains: Vec<Vec<u32>> = Vec::with_capacity(n);
+        let mut scheds: Vec<SpecVerifySchedule> = Vec::with_capacity(n);
+        for s in 0..n {
+            let slot_idx = slot_ids[s];
+            let pending = self.spec_slots[slot_idx]
+                .pending
+                .ok_or_else(|| anyhow!("DSv4 MTP batched decode missing pending token"))?;
+            let hidden = self.spec_slots[slot_idx]
+                .hidden
+                .as_ref()
+                .ok_or_else(|| anyhow!("DSv4 MTP batched decode missing previous hidden"))?
+                .clone();
+            // Snapshot the ring slots the draft will overwrite BEFORE any
+            // speculative write (per slot; the batched verify itself is pure).
+            self.model.capture_spec_rings(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                start_positions[s],
+                depth,
+            )?;
+            let chain = self.draft_chain(slot_idx, pending, &hidden, depth, start_positions[s])?;
+            scheds.push(chain.verify_schedule(start_positions[s]));
+            chains.push(chain.tokens);
+        }
+
+        // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
+        // attention per-slot). Frozen-KV is set inside the batched verify.
+        let verified = self.model.forward_decode_batch_verify(
+            &mut self.slots,
+            &mut self.kv_adapter,
+            slot_ids,
+            &chains,
+            start_positions,
+            &scheds,
+        )?;
+        ensure!(
+            verified.len() == n,
+            "DSv4 batched verify returned {} chains for {n} slots",
+            verified.len()
+        );
+
+        // ── 3. Per-slot accept / commit / ring-restore. Host-side accept + the
+        // per-slot ring restore + commit re-forward are cheap (the win is the
+        // batched verify above). Commit-fold is DISABLED here (re-forward only).
+        let mut out = Vec::with_capacity(n);
+        for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
+            let slot_idx = slot_ids[s];
+            let start_pos = start_positions[s];
+            let position = positions[s];
+            let tokens = &chains[s];
+            let chain_depth = tokens.len() - 1;
+            ensure!(
+                argmax.len() == tokens.len() && hiddens.len() == tokens.len(),
+                "DSv4 batched verify slot {slot_idx} expected {} rows, got argmax={} hidden={}",
+                tokens.len(),
+                argmax.len(),
+                hiddens.len()
+            );
+
+            let accepted = longest_accepted_prefix(tokens, &argmax);
+            let bonus = argmax[accepted];
+            self.mtp_accepts += accepted;
+            self.mtp_rejects += chain_depth - accepted;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp-batched] slot={slot_idx} depth={depth} nodes={chain_depth} \
+                     accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
+                    self.mtp_accepts, self.mtp_rejects
+                );
+            }
+
+            // Truncate to the committed length, restore the rejected ring tail
+            // (the draft's speculative layer-0 writes), then commit the accepted
+            // prefix via a per-slot re-forward (writes the accepted rings + sets
+            // the next hidden). Commit-fold intentionally not used (codex P2).
+            self.model
+                .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+            self.model.restore_spec_ring_tail(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                start_pos,
+                accepted,
+                depth,
+            )?;
+            let accepted_tokens: Vec<u32> = tokens[1..=accepted].to_vec();
+            let mut prefix = Vec::with_capacity(accepted + 1);
+            prefix.push(tokens[0]);
+            prefix.extend_from_slice(&accepted_tokens);
+            let (_, mut re_hiddens) = self.model.forward_tokens_verify(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &prefix,
+                start_pos,
+                position,
+            )?;
+            let spec = &mut self.spec_slots[slot_idx];
+            spec.pending = Some(bonus);
+            spec.hidden = Some(re_hiddens.remove(accepted));
+            // Drop the batched verify hiddens for this slot (re-forward supplies
+            // the committed hidden; the batched ones are speculative).
+            hiddens.clear();
+
+            let mut slot_out = accepted_tokens;
+            slot_out.push(bonus);
+            out.push(slot_out);
+        }
+        Ok(out)
+    }
+
     /// The draft depth for this step: the explicit `--mtp-draft-tokens` request,
     /// clamped to `[1, MAX_SPEC_DRAFT_DEPTH]`. The CLI flag is the single source
     /// of truth — there is no env gate (the old `ARLE_DSV4_MTP_UNCLAMP` made the
