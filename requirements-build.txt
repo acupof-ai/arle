@@ -1,8 +1,27 @@
 # Build-time Python dependencies for agent-infer.
 # TileLang: AOT attention/GDR kernel codegen for the CUDA feature set.
-# Pinned to the version on the 8xH20 pod (verified 2026-06-10), which is
-# what every current DSv4 AOT kernel build/bench runs against. Bump
-# deliberately, backed by a pod build + bench entry.
+#
+# Pinned to the EXACT cu12 stack on the 8xH20 pod (verified 2026-06-15), which
+# is what every current DSv4 AOT kernel build/bench runs against. These pins
+# are LOAD-BEARING, not cosmetic: a bare `pip install tilelang==0.1.11` now
+# resolves the CUDA-13 stack (torch 2.12 + apache-tvm-ffi 0.1.12 +
+# cuda-bindings 13.x), and apache-tvm-ffi 0.1.12 is ABI-incompatible with
+# tilelang 0.1.11 — `import tilelang` aborts with `tvm::ffi::Error`
+# (build.rs:1037), killing every CUDA release/Docker build. The pod's working
+# set is the cu12 stack below. Bump deliberately, backed by a pod build + bench
+# entry.
+#
+# torch ships its own bundled CUDA runtime (nvidia-*-cu12 12.9.x), so the cu129
+# wheel imports cleanly in the CUDA-12.8 build image — no GPU and no matching
+# system CUDA are needed at build time (build.rs only imports tilelang for
+# codegen; nvcc 12.8 compiles the emitted .cu separately).
+# torch pins its own triton (==3.5.1 on Linux) — don't re-pin it here. apache-tvm-ffi
+# and cuda-python ARE pinned: tilelang 0.1.11 leaves them loose, so a fresh resolve
+# grabs the cu13 0.1.12 / 13.x wheels that abort `import tilelang`.
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.9.1+cu129
+apache-tvm-ffi==0.1.11
+cuda-python==12.9.0
 tilelang==0.1.11
 
 # Model downloads in setup.sh use huggingface_hub.snapshot_download.
