@@ -66,6 +66,7 @@ decode MoE batched, and does ARLE need EPLB? Method: read SGLang's implementatio
 | Piece | ARLE | Verdict |
 |---|---|---|
 | Decode MoE grouping | DeepEP LL dispatch + DeepGEMM masked grouped GEMM + EP-reduce combine (`dsv4_moe_forward_deepep_ll`); grouped over `[N]`, no per-row MoE scratch (`dsv4.rs:1808`) | **Parity — done** |
+| MoE transport default | `dsv4_use_deepep_transport()` defaults to **`allreduce`** (`dsv4.rs:4030`); DeepEP LL is **opt-in** (`ARLE_DSV4_MOE_TRANSPORT=deepep_ll`). Both transports run the grouped GEMM; allreduce path is `dsv4_moe_forward` (EP-sharded → TP all-reduce, `dsv4.rs:2297,2312`) | grouped either way; LL = SGLang-shaped a2a, opt-in |
 | Fused pre-dispatch quant+pack | per-token FP8 quant + pack present in the LL path | parity (kernel-level fusion gap, if any, is a separate micro-lever) |
 | Expert placement | static `ExpertSplit` (contiguous `256/world` per rank, `dsv4.rs:925`) | **EPLB absent** |
 | Expert-load recorder | none | absent |
