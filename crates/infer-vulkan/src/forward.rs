@@ -62,6 +62,7 @@ use vulkan_sys::{CommandRecorder, DescriptorSet, DeviceBuffer, VulkanContext};
 
 use crate::loader::Residency;
 use crate::loader::upload::{DeviceTensor, ResidentWeights};
+use infer_gguf::gguf::GgmlType;
 
 /// Per-slot recurrent / cache state carried across forward calls for one
 /// sequence. Sized from the config's local (single-GPU) widths.
@@ -272,10 +273,18 @@ impl<'a> DecodeResources<'a> {
 /// gated q-proj `[query|gate]` width.
 fn widest_gemv(config: &Qwen35Config) -> (usize, usize) {
     let h = config.hidden_size;
-    let max_cols = config.intermediate_size.max(h).max(config.vocab_size);
+    // MoE down-proj consumes `moe_intermediate_size` cols; the shared expert
+    // consumes `shared_expert_intermediate_size`. Both gate/up project TO those
+    // widths (rows). Fold them in so the arena is wide enough for either the
+    // dense or the MoE FFN (and the 122B's larger expert width).
+    let ffn_inter = config
+        .intermediate_size
+        .max(config.moe_intermediate_size)
+        .max(config.shared_expert_intermediate_size);
+    let max_cols = ffn_inter.max(h).max(config.vocab_size);
     let max_rows = config
         .vocab_size
-        .max(config.intermediate_size)
+        .max(ffn_inter)
         .max(2 * config.num_attention_heads * config.head_dim);
     (max_cols, max_rows)
 }
@@ -342,11 +351,17 @@ pub fn forward_token<'a>(
         let post_norm_w = norm_weight(weights, layer, "post_attention_norm")?;
         let mlp_in = rms_norm_weight(&post_sum, &post_norm_w, eps);
 
-        // Dense FFN: down( silu(gate(x)) * up(x) ).
-        let gate = gemv_layer(ctx, weights, res, layer, "ffn_gate", &mlp_in)?;
-        let up = gemv_layer(ctx, weights, res, layer, "ffn_up", &mlp_in)?;
-        let act = swiglu(&gate, &up);
-        let mlp_out = gemv_layer(ctx, weights, res, layer, "ffn_down", &act)?;
+        // FFN: DENSE swiglu MLP (qwen35) or sparse MoE (qwen35moe). Branch on
+        // whether THIS layer is a MoE layer (decoder_sparse_step / mlp_only).
+        let mlp_out = if config.is_moe_layer(layer) {
+            moe_ffn(ctx, config, weights, res, layer, &mlp_in)?
+        } else {
+            // Dense FFN: down( silu(gate(x)) * up(x) ).
+            let gate = gemv_layer(ctx, weights, res, layer, "ffn_gate", &mlp_in)?;
+            let up = gemv_layer(ctx, weights, res, layer, "ffn_up", &mlp_in)?;
+            let act = swiglu(&gate, &up);
+            gemv_layer(ctx, weights, res, layer, "ffn_down", &act)?
+        };
 
         // MLP residual add into the next layer's residual stream.
         hidden = add_vec(&post_sum, &mlp_out);
@@ -362,6 +377,168 @@ pub fn forward_token<'a>(
 
     state.seq_len += 1;
     Ok(logits)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MoE FFN (qwen35moe): softmax router → top-k routed experts + a sigmoid-gated
+// shared expert. Transcribed from llama.cpp `build_moe_ffn` (SOFTMAX gating,
+// norm_topk) + `llm_build_qwen35moe::build_layer_ffn` (shared expert mix).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The sparse MoE FFN for one token. Returns the FFN output `[hidden]` to be
+/// residual-added by the caller (matching the dense path's `mlp_out`).
+///
+/// Per llama.cpp:
+///   router = ffn_gate_inp · mlp_in           → [n_expert] logits
+///   probs  = softmax(router); top-k by prob; weights renormalized (norm_topk)
+///   routed = Σ_e w_e · down_e( silu(gate_e·x) * up_e·x )      (e ∈ top-k)
+///   shared = down_shexp( silu(gate_shexp·x) * up_shexp·x )
+///            gated by sigmoid(ffn_gate_inp_shexp · x) if that router exists
+///   ffn_out = routed + shared
+fn moe_ffn<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    layer: usize,
+    mlp_in: &[f32],
+) -> Result<Vec<f32>> {
+    use crate::model_qwen36::qwen36_topk_routes;
+
+    let h = config.hidden_size;
+
+    // ── Router: F32 GEMV [hidden → n_expert]. The router weight is F32-resident
+    // (DequantF32), not packed, so the quantized GEMV path does not apply — do
+    // the small matvec on the host (n_expert is tiny, e.g. 256). ──
+    let router = weights
+        .get(&format!("blk.{layer}.ffn_gate_inp.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_inp.weight"))?;
+    let router_logits = gemv_f32_host(router, mlp_in, config.num_experts)?;
+
+    let routes = qwen36_topk_routes(
+        &router_logits,
+        config.num_experts_per_tok,
+        config.norm_topk_prob,
+    );
+
+    // ── Routed experts: slice each selected expert e out of the 3-D stacked
+    // ffn_*_exps tensors by byte offset and run the swiglu MLP, accumulating
+    // w_e · y_e. ──
+    let gate_exps = weights
+        .get(&format!("blk.{layer}.ffn_gate_exps.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_exps.weight"))?;
+    let up_exps = weights
+        .get(&format!("blk.{layer}.ffn_up_exps.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_up_exps.weight"))?;
+    let down_exps = weights
+        .get(&format!("blk.{layer}.ffn_down_exps.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_down_exps.weight"))?;
+
+    let mut acc = vec![0.0f32; h];
+    for route in &routes {
+        let e = route.expert;
+        // gate_e, up_e: [hidden → moe_inter]; act = silu(gate)*up; down_e:
+        // [moe_inter → hidden].
+        let gate = gemv_expert(ctx, gate_exps, res, mlp_in, e, "ffn_gate_exps")?;
+        let up = gemv_expert(ctx, up_exps, res, mlp_in, e, "ffn_up_exps")?;
+        let act = swiglu(&gate, &up);
+        let y = gemv_expert(ctx, down_exps, res, &act, e, "ffn_down_exps")?;
+        if y.len() != h {
+            bail!("ffn_down_exps[{e}] out {} != hidden {h}", y.len());
+        }
+        let w = route.weight;
+        for (a, &yv) in acc.iter_mut().zip(&y) {
+            *a += w * yv;
+        }
+    }
+
+    // ── Shared expert (present on qwen35moe): a dense swiglu MLP gated by a
+    // per-token sigmoid scalar from ffn_gate_inp_shexp. ──
+    if let Some(up_shexp) = weights.get(&format!("blk.{layer}.ffn_up_shexp.weight")) {
+        let gate_shexp = weights
+            .get(&format!("blk.{layer}.ffn_gate_shexp.weight"))
+            .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_shexp.weight"))?;
+        let down_shexp = weights
+            .get(&format!("blk.{layer}.ffn_down_shexp.weight"))
+            .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_down_shexp.weight"))?;
+
+        let gate = gemv_device(ctx, gate_shexp, res, mlp_in, "ffn_gate_shexp")?;
+        let up = gemv_device(ctx, up_shexp, res, mlp_in, "ffn_up_shexp")?;
+        let act = swiglu(&gate, &up);
+        let mut shared = gemv_device(ctx, down_shexp, res, &act, "ffn_down_shexp")?;
+        if shared.len() != h {
+            bail!("ffn_down_shexp out {} != hidden {h}", shared.len());
+        }
+
+        // Sigmoid gate: ffn_gate_inp_shexp is F32 [hidden → 1] (one scalar/token).
+        if let Some(shgate) = weights.get(&format!("blk.{layer}.ffn_gate_inp_shexp.weight")) {
+            let g = gemv_f32_host(shgate, mlp_in, 1)?;
+            let s = sigmoid(g[0]);
+            for v in &mut shared {
+                *v *= s;
+            }
+        }
+        for (a, &sv) in acc.iter_mut().zip(&shared) {
+            *a += sv;
+        }
+    }
+
+    Ok(acc)
+}
+
+/// GEMV for one expert slice `e` of a 3-D `ffn_*_exps` tensor. GGUF stores the
+/// stack as `[ne0=in, ne1=out, ne2=n_expert]` row-major (ne0 fastest), so
+/// expert `e` is the 2-D `[out, in]` matrix at byte offset `e · out ·
+/// row_bytes(in)`, length `out · row_bytes(in)`. `gemv_dims` on the 3-D tensor
+/// already carries `(in, out)` (its ne0/ne1), and the per-expert stride is a
+/// multiple of the quant block bytes (Q4_K 144 B / Q5_K 176 B per 256 cols),
+/// which clears the AMD storage-buffer offset granularity.
+fn gemv_expert<'a>(
+    ctx: &'a VulkanContext,
+    exps: &DeviceTensor<'_>,
+    res: &mut DecodeResources<'a>,
+    x: &[f32],
+    e: usize,
+    name: &str,
+) -> Result<Vec<f32>> {
+    let (ncols, nrows) = weight_dims(exps, name)?;
+    let ty = match exps.residency {
+        Residency::KeepQuant(ty) => ty,
+        other => bail!("{name}: expert GEMV expects packed quant, got {other:?}"),
+    };
+    let row_bytes = ty
+        .row_bytes(ncols)
+        .ok_or_else(|| anyhow!("{name}: {ty:?} row of {ncols} cols not block-aligned"))?
+        as u64;
+    let per_expert = nrows as u64 * row_bytes; // bytes for one [out, in] slice
+    let offset = e as u64 * per_expert;
+    gemv_device_at(ctx, exps, res, x, name, ncols, nrows, offset, per_expert)
+}
+
+/// Tiny F32 matvec on the host: `y[r] = Σ_c W[r,c] · x[c]` for an F32-resident
+/// weight `[ncols=in, nrows=out]` (GGUF row-major `[out, in]`). Used for the MoE
+/// routers (`ffn_gate_inp` → n_expert, `ffn_gate_inp_shexp` → 1), which are F32
+/// and too small to justify a device round-trip.
+fn gemv_f32_host(weight: &DeviceTensor<'_>, x: &[f32], nrows: usize) -> Result<Vec<f32>> {
+    if !matches!(weight.residency, Residency::DequantF32) {
+        bail!(
+            "{}: host F32 matvec expects F32-resident weight, got {:?}",
+            weight.name,
+            weight.residency
+        );
+    }
+    let ncols = x.len();
+    let w = dequant_f32(weight, nrows * ncols)?;
+    let mut y = vec![0.0f32; nrows];
+    for (r, yr) in y.iter_mut().enumerate() {
+        let row = &w[r * ncols..r * ncols + ncols];
+        let mut s = 0.0f32;
+        for (&wv, &xv) in row.iter().zip(x) {
+            s += wv * xv;
+        }
+        *yr = s;
+    }
+    Ok(y)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -663,8 +840,12 @@ fn linear_attention<'a>(
 // pair into the persistent recorder/cache against arena sub-buffers.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run one quantized GEMV `y[out] = W[out,in] · x[in]` on the device for a
-/// per-layer weight tensor `blk.{layer}.{suffix}.weight`.
+/// Run one GEMV `y[out] = W[out,in] · x[in]` for a per-layer weight tensor
+/// `blk.{layer}.{suffix}.weight`. Packed-quant weights run on the device (the
+/// proven `mul_mat_vecq` path); F32-resident weights (e.g. the MoE 35B-A3B's
+/// small `ssm_alpha`/`ssm_beta` `[hidden→32]` projections, which the converter
+/// ships as F32 rather than Q8_0) run on the host — they are tiny and avoid a
+/// device round-trip and a non-quantized GEMV pipeline.
 fn gemv_layer<'a>(
     ctx: &'a VulkanContext,
     weights: &ResidentWeights<'_>,
@@ -677,6 +858,10 @@ fn gemv_layer<'a>(
     let w = weights
         .get(&name)
         .ok_or_else(|| anyhow!("missing weight {name}"))?;
+    if matches!(w.residency, Residency::DequantF32) {
+        let nrows = weight_dims(w, &name)?.1;
+        return gemv_f32_host(w, x, nrows);
+    }
     gemv_device(ctx, w, res, x, &name)
 }
 
@@ -710,6 +895,41 @@ fn gemv_device<'a>(
     name: &str,
 ) -> Result<Vec<f32>> {
     let (ncols, nrows) = weight_dims(weight, name)?;
+    // Whole 2-D weight: bind from byte 0 over the full buffer.
+    gemv_device_at(
+        ctx,
+        weight,
+        res,
+        x,
+        name,
+        ncols,
+        nrows,
+        0,
+        weight.buffer.len() as u64,
+    )
+}
+
+/// GEMV against a sub-range of a (possibly 3-D, expert-stacked) packed-quant
+/// weight buffer: the matrix is `[nrows=out, ncols=in]` starting at
+/// `weight_offset` bytes (length `weight_len` bytes). For a whole 2-D tensor,
+/// `weight_offset = 0` and the dims come from `gemv_dims`; for one expert slice
+/// `e` of an `[in, out, n_expert]` GGUF tensor, `weight_offset = e * out *
+/// row_bytes(in)`. `weight_offset` must be a multiple of the device's
+/// `minStorageBufferOffsetAlignment` (caller-checked: every K-quant expert
+/// stride is a multiple of its block bytes, which clears the AMD 16/32 B
+/// granularity — see the MoE FFN caller).
+#[allow(clippy::too_many_arguments)]
+fn gemv_device_at<'a>(
+    ctx: &'a VulkanContext,
+    weight: &DeviceTensor<'_>,
+    res: &mut DecodeResources<'a>,
+    x: &[f32],
+    name: &str,
+    ncols: usize,
+    nrows: usize,
+    weight_offset: u64,
+    weight_len: u64,
+) -> Result<Vec<f32>> {
     if x.len() != ncols {
         bail!(
             "{name}: GEMV input width {} != weight in-dim (ncols) {ncols}",
@@ -720,6 +940,12 @@ fn gemv_device<'a>(
         bail!(
             "{name}: GEMV expects a packed-quant weight, got {:?}",
             weight.residency
+        );
+    }
+    if weight_offset + weight_len > weight.buffer.len() as u64 {
+        bail!(
+            "{name}: GEMV weight sub-range [{weight_offset}, +{weight_len}) exceeds buffer {}",
+            weight.buffer.len()
         );
     }
     if ncols > res.arena.max_cols {
@@ -758,7 +984,13 @@ fn gemv_device<'a>(
         [d.x, d.y, d.z]
     };
 
-    let g_spec = Kernel::GemvQ8_0.specialization_u32();
+    // Pick the GEMV kernel from the weight's packed quant type: the K-quant and
+    // Q8_0 `mul_mat_vecq_*` shaders all consume the SAME q8_1_x4 activation and
+    // the SAME 13-uint `gemv_params`; only the weight-decode shader differs. The
+    // dense 27B is Q8_0; the 35B-A3B experts are Q4_K (gate/up) + Q5_K (down)
+    // with Q8_0 shared experts.
+    let gemv_kernel = gemv_kernel_for(weight, name)?;
+    let g_spec = gemv_kernel.specialization_u32();
     let g_push = gemv_params(ncols as u32, nrows as u32).to_le_bytes();
     let g_groups = {
         let d = gemv_dispatch(nrows as u32);
@@ -804,14 +1036,15 @@ fn gemv_device<'a>(
     let g_set = {
         let (g_pipeline, g_layout) = res
             .cache
-            .get(ctx, Kernel::GemvQ8_0, g_spec, g_push.len() as u32, 5)
-            .map_err(|e| anyhow!("{name}: build q8_0 GEMV pipeline: {e}"))?;
+            .get(ctx, gemv_kernel, g_spec, g_push.len() as u32, 5)
+            .map_err(|e| anyhow!("{name}: build {gemv_kernel:?} GEMV pipeline: {e}"))?;
         let set = DescriptorSet::storage_buffers_ranged(
             ctx,
             g_layout,
             &[
-                // binding 0: weight (full range, offset 0) — resident, no re-upload.
-                (&weight.buffer, 0, weight.buffer.len() as u64),
+                // binding 0: weight sub-range — resident expert slice (or whole
+                // 2-D tensor at offset 0), no re-upload.
+                (&weight.buffer, weight_offset, weight_len),
                 // binding 1: q8_1_x4 activations.
                 (arena_buf, res.arena.quant.offset, quant_bytes as u64),
                 // binding 2: f32 dst rows.
@@ -868,6 +1101,26 @@ fn weight_dims(weight: &DeviceTensor<'_>, name: &str) -> Result<(usize, usize)> 
     weight
         .gemv_dims
         .ok_or_else(|| anyhow!("{name}: resident tensor has no GEMV dims recorded"))
+}
+
+/// The `mul_mat_vecq_*` GEMV kernel for a packed-quant weight's GGUF type.
+/// All four share the q8_1_x4 activation + `gemv_params` layout; only the
+/// weight-decode shader differs. Fails loud on a type with no registered GEMV
+/// (e.g. the 122B's MXFP4 experts, which need a dedicated kernel).
+fn gemv_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
+    let Residency::KeepQuant(ty) = weight.residency else {
+        bail!(
+            "{name}: GEMV expects a packed-quant weight, got {:?}",
+            weight.residency
+        );
+    };
+    Ok(match ty {
+        GgmlType::Q4K => Kernel::GemvQ4K,
+        GgmlType::Q5K => Kernel::GemvQ5K,
+        GgmlType::Q6K => Kernel::GemvQ6K,
+        GgmlType::Q8_0 => Kernel::GemvQ8_0,
+        other => bail!("{name}: no registered GEMV kernel for packed type {other:?}"),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
