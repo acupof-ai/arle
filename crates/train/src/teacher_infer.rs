@@ -579,6 +579,25 @@ impl<'a> InProcessTeacher<'a> {
             parameter_ids: model.all_parameter_ids(),
         }
     }
+
+    /// Build a teacher exposing an EXPLICIT parameter-id list instead of the
+    /// model's full `all_parameter_ids()`.
+    ///
+    /// SOPD's EMA self-teacher needs this: its base-shared model is built via
+    /// `Qwen35Model::new_lora_from_base(student, ...)`, and
+    /// `share_base_parameters_from` rebuilds `param_ids` by copying the base
+    /// model's `param_ids` wholesale — so when the base is a LoRA *student*, the
+    /// EMA model's `all_parameter_ids()` also lists the student's *trainable*
+    /// adapter ids. The OPD step rejects any teacher param with
+    /// `requires_grad=true` (and treats teacher params as off-limits for the
+    /// student), so the EMA teacher must expose only its own frozen params
+    /// (base + EMA adapter), excluding the student adapter.
+    pub fn with_parameter_ids(model: &'a Qwen35Model, parameter_ids: Vec<TensorId>) -> Self {
+        Self {
+            model,
+            parameter_ids,
+        }
+    }
 }
 
 impl TeacherForward for InProcessTeacher<'_> {
