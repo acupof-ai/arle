@@ -1749,6 +1749,17 @@ impl Dsv4Model {
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
 
+        // Batched (b=N) FlashMLA decode lane (#60, the #1 concurrency lever).
+        // Default OFF. When ON AND the model-wide batched scratch is allocated,
+        // Phase A exercises the per-forward block_table + sched_meta(b=N)
+        // plumbing for the n>1 lane (the orphaned batched indices builder + the
+        // per-forward sched_meta — the cached-meta-is-b=1-only pitfall fix). The
+        // per-row attention kernel call is KEPT in Phase A; Phase B swaps it for
+        // one sparse_decode_fwd(b=N) at the marked site below. N=1 never reaches
+        // this function, so the single-row path is unaffected.
+        let batched_attn_lane = crate::attention::dsv4_flashmla_decode_batched_enabled()?
+            && kv_adapter.has_flashmla_batch_scratch();
+
         // Per-slot decode position scalars (each row's attention reads its own).
         for r in 0..n {
             let start_pos_i32 = i32::try_from(start_positions[r])
@@ -1869,6 +1880,41 @@ impl Dsv4Model {
             // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
             // the copy-out below before attn_out is read by hc_post.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            // Phase A (#60): for the batched lane, build this layer's per-forward
+            // block_table + indices(b=N) + sched_meta(b=N) BEFORE the per-row
+            // loop. This validates the orphaned batched indices builder and the
+            // per-forward sched_meta on the pod (the cached-meta is b=1-only).
+            // CSA layers need per-row `selected` (only produced inside
+            // mla_attention), so the batched indices build is skipped for them in
+            // Phase A; Phase B collects `selected` and removes this guard.
+            // PHASE B: replace the per-row mla_attention loop below with one
+            //   gather → flashmla.sparse_decode_fwd_batched(b=N) → scatter, using
+            //   the indices/sched_meta built here. See
+            //   docs/plans/dsv4-batched-flashmla-decode.md.
+            if batched_attn_lane && layer.mode != DeepSeekV4AttentionMode::CompressedSparse {
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_meta");
+                let mut slot_block_offsets = Vec::with_capacity(n);
+                {
+                    let (layer_pool, _dsa, _flash) =
+                        kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                    for &row in slot_ids.iter().take(n) {
+                        slot_block_offsets.push(layer_pool.flashmla_slot_first_block(row)?);
+                    }
+                }
+                let (_layer_pool, _dsa, flash_batch) =
+                    kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                if let Some(flash_batch) = flash_batch {
+                    flash_batch.build_layer_batch_meta(
+                        &self.ctx,
+                        &self.config,
+                        layer_idx,
+                        layer.mode,
+                        layer.compress_ratio,
+                        &start_positions[..n],
+                        &slot_block_offsets,
+                    )?;
+                }
+            }
             {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
                 for r in 0..n {
