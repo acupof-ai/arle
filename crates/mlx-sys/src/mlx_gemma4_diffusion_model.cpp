@@ -16,6 +16,11 @@
 namespace {
 
 using mlx::core::array;
+using DiffusionCancelFn = int32_t (*)(const void*);
+
+bool cancelled(DiffusionCancelFn cancel_fn, const void* cancel_ctx) {
+    return cancel_fn != nullptr && cancel_fn(cancel_ctx) != 0;
+}
 
 array array_from_i32(const int32_t* data, int32_t len) {
     if (len < 0) {
@@ -624,6 +629,8 @@ struct DiffusionGemmaModel {
         uint64_t seed,
         const uint32_t* stop_ids,
         int stop_ids_len,
+        DiffusionCancelFn cancel_fn,
+        const void* cancel_ctx,
         uint32_t* out_tokens) {
         using Clock = std::chrono::steady_clock;
         const bool profile = std::getenv("ARLE_DIFFUSION_CPP_PROFILE") != nullptr;
@@ -647,6 +654,9 @@ struct DiffusionGemmaModel {
         random::seed(seed);
         reset_request_state();
         const auto prefill_start = Clock::now();
+        if (cancelled(cancel_fn, cancel_ctx)) {
+            throw std::runtime_error("DiffusionGemma generation cancelled");
+        }
         if (prompt_len > 0) {
             auto next_caches = std::vector<LayerCache>(layers.size());
             encode_tokens_into(prompt, prompt_len, next_caches, 0);
@@ -675,13 +685,18 @@ struct DiffusionGemmaModel {
         const int stable_need = std::max(stability_threshold, 1);
 
         while (static_cast<int>(output.size()) < max_new_tokens) {
+            if (cancelled(cancel_fn, cancel_ctx)) {
+                throw std::runtime_error("DiffusionGemma generation cancelled");
+            }
             const int remaining = max_new_tokens - static_cast<int>(output.size());
             const int valid_len = std::min(remaining, canvas_len);
             auto current_canvas = random_canvas(valid_len);
-            array previous_argmax(0);
-            bool have_previous = false;
+            std::vector<array> history;
 
             for (int step = 0; step < max_steps; ++step) {
+                if (cancelled(cancel_fn, cancel_ctx)) {
+                    throw std::runtime_error("DiffusionGemma generation cancelled");
+                }
                 const auto step_start = Clock::now();
                 const int remaining_steps = std::max(max_steps - step, 1);
                 const float schedule_temperature =
@@ -695,8 +710,12 @@ struct DiffusionGemmaModel {
                 const bool forced = step + 1 >= max_steps;
                 result.steps += 1;
 
+                history.push_back(argmax_tokens);
+                if (static_cast<int>(history.size()) > stable_need) {
+                    history.erase(history.begin());
+                }
+
                 if (forced) {
-                    previous_argmax = argmax_tokens;
                     result.forced += 1;
                     denoise_ms += std::chrono::duration<double, std::milli>(
                         Clock::now() - step_start).count();
@@ -712,26 +731,32 @@ struct DiffusionGemmaModel {
 
                 auto mean_entropy = mean(entropy);
                 bool stable = false;
-                if (have_previous && stable_need <= 1) {
-                    stable = all(equal(argmax_tokens, previous_argmax)).item<bool>();
+                if (static_cast<int>(history.size()) >= stable_need) {
+                    stable = true;
+                    for (size_t i = 1; i < history.size(); ++i) {
+                        if (!all(equal(history[i], history[0])).item<bool>()) {
+                            stable = false;
+                            break;
+                        }
+                    }
                 }
                 bool confident = mean_entropy.item<float>() < confidence_threshold;
                 update_self_conditioning(probs);
                 if (stable && confident) {
-                    previous_argmax = argmax_tokens;
                     result.adaptive += 1;
                     denoise_ms += std::chrono::duration<double, std::milli>(
                         Clock::now() - step_start).count();
                     break;
                 }
-                previous_argmax = argmax_tokens;
-                have_previous = true;
                 denoise_ms += std::chrono::duration<double, std::milli>(
                     Clock::now() - step_start).count();
             }
 
             const auto final_start = Clock::now();
-            auto final_canvas = contiguous(previous_argmax);
+            if (history.empty()) {
+                throw std::runtime_error("DiffusionGemma generated no denoise canvas");
+            }
+            auto final_canvas = contiguous(history.back());
             eval({final_canvas});
             const auto* final_ptr = final_canvas.data<int32_t>();
             int commit_len = valid_len;
@@ -1131,6 +1156,8 @@ int32_t diffusion_gemma_generate(
     uint64_t seed,
     const uint32_t* stop_ids,
     int32_t stop_ids_len,
+    DiffusionCancelFn cancel_fn,
+    const void* cancel_ctx,
     uint32_t* out_tokens,
     int32_t* out_len,
     int32_t* out_finish,
@@ -1158,6 +1185,8 @@ int32_t diffusion_gemma_generate(
             seed,
             stop_ids,
             stop_ids_len,
+            cancel_fn,
+            cancel_ctx,
             out_tokens);
         *out_len = result.tokens;
         *out_finish = result.finish;

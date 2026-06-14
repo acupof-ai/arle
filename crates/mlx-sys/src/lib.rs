@@ -498,6 +498,8 @@ unsafe extern "C" {
         seed: u64,
         stop_ids: *const u32,
         stop_ids_len: i32,
+        cancel_fn: Option<unsafe extern "C" fn(ctx: *const std::ffi::c_void) -> i32>,
+        cancel_ctx: *const std::ffi::c_void,
         out_tokens: *mut u32,
         out_len: *mut i32,
         out_finish: *mut i32,
