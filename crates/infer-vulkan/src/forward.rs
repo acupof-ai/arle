@@ -873,6 +873,22 @@ pub fn forward_token<'a>(
     // `output.weight`, and only the [vocab] logits read back.
     let logits = final_norm_lm_head(ctx, weights, res, &hidden, eps)?;
 
+    // Per-op GPU timestamp breakdown (ARLE_GPU_TIMESTAMPS): drain the per-category
+    // device times accumulated across this token's submits and print them, to
+    // compare our op-type cost directly against llama.cpp's GGML_VK_PERF_LOGGER.
+    let gpu_prof = res.recorder.take_gpu_profile();
+    if !gpu_prof.is_empty() {
+        let total: f64 = gpu_prof.iter().map(|(_, _, ms)| *ms).sum();
+        let parts: Vec<String> = gpu_prof
+            .iter()
+            .map(|(label, count, ms)| format!("{label} {ms:.2}ms/{count}"))
+            .collect();
+        eprintln!(
+            "  GPU OP PROFILE (pos {start_pos}): total {total:.2}ms | {}",
+            parts.join(" | ")
+        );
+    }
+
     state.seq_len += 1;
     Ok(logits)
 }
@@ -2481,6 +2497,7 @@ fn record_linear_attention<'a>(
                 (arena_buf, qkv_conv_off, xseq_len),      // 3: OutSeq
             ])
             .map_err(|e| anyhow!("linear[{layer}]: bind conv set: {e}"))?;
+        recorder.label_next("linear");
         recorder.dispatch_raw(pipeline, set, &conv_push, conv_groups);
     }
     // Barrier: the gated-delta net (next dispatch) reads the conv's `lin_qkv_conv`
@@ -2534,6 +2551,7 @@ fn record_linear_attention<'a>(
                 (arena_buf, out_off, out_len),              // 6: Output
             ])
             .map_err(|e| anyhow!("linear[{layer}]: bind gated-delta set: {e}"))?;
+        recorder.label_next("linear");
         recorder.dispatch_raw(pipeline, set, &gd_push, gd_groups);
     }
 
@@ -2859,6 +2877,7 @@ fn record_quantize_gemv<'a>(
                 (arena_buf, quant_off, quant_bytes as u64),
             ])
             .map_err(|e| anyhow!("{name}: bind q8_1 ring set: {e}"))?;
+        recorder.label_next("quant");
         recorder.dispatch_raw(pipeline, set, &q_push, q_groups);
     }
 
@@ -2883,6 +2902,7 @@ fn record_quantize_gemv<'a>(
                 (arena_buf, fuse1.0, fuse1.1),
             ])
             .map_err(|e| anyhow!("{name}: bind GEMV ring set: {e}"))?;
+        recorder.label_next("gemv");
         recorder.dispatch_raw(pipeline, set, &g_push, g_groups);
     }
     Ok(())
@@ -2949,6 +2969,7 @@ fn record_gemv_only<'a>(
             (arena_buf, fuse1.0, fuse1.1),
         ])
         .map_err(|e| anyhow!("{name}: bind GEMV-only ring set: {e}"))?;
+    recorder.label_next("gemv");
     recorder.dispatch_raw(pipeline, set, &g_push, g_groups);
     Ok(())
 }
@@ -3039,6 +3060,7 @@ fn record_quantize<'a>(
             (arena_buf, quant_off, quant_bytes as u64),
         ])
         .map_err(|e| anyhow!("{name}: bind q8_1 ring set: {e}"))?;
+    recorder.label_next("quant");
     recorder.dispatch_raw(pipeline, set, &q_push, q_groups);
     Ok(())
 }
@@ -3119,6 +3141,7 @@ fn record_gemv_id<'a>(
             (arena_buf, ids_off, ids_bytes),
         ])
         .map_err(|e| anyhow!("{name}: bind fused expert GEMV ring set: {e}"))?;
+    recorder.label_next("gemv");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3176,6 +3199,7 @@ fn record_rms_norm<'a>(
             (arena_buf, out_off, row),
         ])
         .map_err(|e| anyhow!("{name}: bind rms_norm ring set: {e}"))?;
+    recorder.label_next("norm");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3217,6 +3241,7 @@ fn record_swiglu<'a>(
             (arena_buf, out_off, row),
         ])
         .map_err(|e| anyhow!("{name}: bind swiglu ring set: {e}"))?;
+    recorder.label_next("swiglu");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3260,6 +3285,7 @@ fn record_add<'a>(
             (arena_buf, out_off, row),
         ])
         .map_err(|e| anyhow!("{name}: bind add ring set: {e}"))?;
+    recorder.label_next("add");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3307,6 +3333,7 @@ fn record_scaled_add<'a>(
             (arena_buf, out_off, row),
         ])
         .map_err(|e| anyhow!("{name}: bind scaled_add ring set: {e}"))?;
+    recorder.label_next("add");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3371,6 +3398,7 @@ fn record_rope_neox<'a>(
             (arena_buf, pos_off, 8),       // 4: I indices uvec2 (set_rows_stride=0, unread)
         ])
         .map_err(|e| anyhow!("{name}: bind rope_neox ring set: {e}"))?;
+    recorder.label_next("rope");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3441,6 +3469,7 @@ fn record_flash_attn<'a>(
             (arena_buf, fuse0.0, fuse0.1.max(8)), // 6: MO mask_opt (dummy)
         ])
         .map_err(|e| anyhow!("{name}: bind flash_attn ring set: {e}"))?;
+    recorder.label_next("flash");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3484,6 +3513,7 @@ fn record_sigmoid_mul<'a>(
             (arena_buf, out_off, row),
         ])
         .map_err(|e| anyhow!("{name}: bind sigmoid_mul ring set: {e}"))?;
+    recorder.label_next("sigmoid");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3539,6 +3569,7 @@ fn record_f16_kv_pack<'a>(
             (kv_buf, dst_off, dst_bytes),    // 1: f16 dst cache row
         ])
         .map_err(|e| anyhow!("{name}: bind f16_kv_pack ring set: {e}"))?;
+    recorder.label_next("kvpack");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3762,6 +3793,7 @@ fn record_router_gemv<'a>(
             (arena_buf, out_off, out_row),
         ])
         .map_err(|e| anyhow!("{name}: bind router_gemv ring set: {e}"))?;
+    recorder.label_next("gemv");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3808,6 +3840,7 @@ fn record_router_topk<'a>(
             (arena_buf, weights_off, topk_row),
         ])
         .map_err(|e| anyhow!("{name}: bind router_topk ring set: {e}"))?;
+    recorder.label_next("topk");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
@@ -3861,6 +3894,7 @@ fn record_weighted_accum<'a>(
             (arena_buf, acc_off, acc_row),
         ])
         .map_err(|e| anyhow!("{name}: bind weighted_accum ring set: {e}"))?;
+    recorder.label_next("accum");
     recorder.dispatch_raw(pipeline, set, &push, groups);
     Ok(())
 }
