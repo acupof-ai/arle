@@ -35,6 +35,16 @@ const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
 static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 
+/// Batched (`b = N`) FlashMLA sparse decode lane (#60, the #1 concurrency
+/// lever). Default OFF: the n>1 decode path keeps the byte-identical per-row
+/// `try_flashmla_decode_attention` loop until the pod licenses the batched
+/// kernel on a c-sweep (correctness ladder + aggregate-rises-with-c). When ON,
+/// the n>1 lane routes attention through ONE `sparse_decode_fwd(b=N)` over the
+/// shared KV pool (the per-row pack ops stay a loop — each writes one slot's KV
+/// into the unified pool). N=1 is unaffected (always the cached-meta single-row
+/// path).
+static DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
+
 pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
     let value = match enabled {
         Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
@@ -51,6 +61,15 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
         None => DSV4_FLASHMLA_OVERRIDE_ENV,
     };
     DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+pub(crate) fn set_dsv4_flashmla_decode_batched_override(enabled: Option<bool>) {
+    let value = match enabled {
+        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
+        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
+        None => DSV4_FLASHMLA_OVERRIDE_ENV,
+    };
+    DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
 static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
@@ -232,6 +251,12 @@ pub(crate) struct Dsv4KvAdapter {
     /// One shared-expert decode output for ALL layers and slots (issue #60).
     /// `None` when the GPU router decode scratch path is disabled.
     shared_expert_out: Option<HiddenStates>,
+    /// One shared batched (`b = N`) FlashMLA sparse-decode scratch for ALL
+    /// FlashMLA layers and slots (#60). `None` when FlashMLA decode is disabled
+    /// at the build/override level (no arena), or when the model has no FlashMLA
+    /// layer. Sized for `max_batch = num_slots` rows. Engaged only on the n>1
+    /// batched lane when `dsv4_flashmla_decode_batched_enabled()`.
+    flashmla_batch: Option<Dsv4FlashMlaDecodeBatchScratch>,
 }
 
 pub(crate) struct Dsv4LayerKvLayout {
@@ -345,6 +370,33 @@ impl Dsv4KvAdapter {
         // and keeping it pre-allocated avoids a per-step `uninit` on the default
         // decode path.
         let shared_expert_out = Some(unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? });
+        // One model-wide batched (b=N) FlashMLA decode scratch (#60). Built only
+        // when the FlashMLA decode arena is live (same gate as the per-slot
+        // single-row state) AND the build supports it; sized for max_batch =
+        // num_slots. When OFF this stays None, so the n>1 default per-row lane
+        // and the N=1 path are byte-identical to before.
+        let flashmla_batch = if dsv4_flashmla_decode_alloc_enabled()? {
+            let mut layer_shapes = Vec::with_capacity(layer_specs.len());
+            for &(mode, compress_ratio, local_heads) in layer_specs {
+                layer_shapes.push(Dsv4FlashMlaDecodeShape::new(
+                    config,
+                    mode,
+                    compress_ratio,
+                    max_seq_len,
+                    kv_arena,
+                    local_heads,
+                    tp_world,
+                )?);
+            }
+            Some(Dsv4FlashMlaDecodeBatchScratch::new(
+                ctx,
+                config,
+                num_slots,
+                &layer_shapes,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             layers,
             num_slots,
@@ -352,6 +404,7 @@ impl Dsv4KvAdapter {
             dsa_shared,
             moe_decode_shared,
             shared_expert_out,
+            flashmla_batch,
         })
     }
 
@@ -367,6 +420,36 @@ impl Dsv4KvAdapter {
             .get_mut(layer_idx)
             .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
         Ok((layer, self.dsa_shared.as_mut()))
+    }
+
+    /// Split-borrow accessor for the batched (`b = N`) FlashMLA decode lane
+    /// (#60): one layer's KV layout, the model-wide shared DSA scratch, AND the
+    /// model-wide batched-decode scratch (all disjoint fields). `None` for the
+    /// batched scratch when the build/override disabled FlashMLA decode — the
+    /// caller then takes the per-row lane.
+    pub(crate) fn layer_dsa_and_flashmla_batch_mut(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(
+        &mut Dsv4LayerKvLayout,
+        Option<&mut Dsv4DsaSharedScratch>,
+        Option<&mut Dsv4FlashMlaDecodeBatchScratch>,
+    )> {
+        let len = self.layers.len();
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
+        Ok((
+            layer,
+            self.dsa_shared.as_mut(),
+            self.flashmla_batch.as_mut(),
+        ))
+    }
+
+    /// Whether the model-wide batched FlashMLA decode scratch is allocated.
+    pub(crate) fn has_flashmla_batch_scratch(&self) -> bool {
+        self.flashmla_batch.is_some()
     }
 
     /// Split-borrow accessor: model-wide shared MoE decode scratch plus the
@@ -654,6 +737,23 @@ impl Dsv4LayerKvLayout {
             pool_bytes
         );
         Ok(range)
+    }
+
+    /// First physical pool BLOCK of one slot's contiguous FlashMLA band (#60
+    /// batched lane): `slot_layer_block_offsets[row]` for the batched indices
+    /// builder, which translates each row's slot-relative indices to
+    /// pool-absolute coords via `block_offset * page_block_size`. Derives from
+    /// the same table-routed contiguous byte range as the single-row path, so it
+    /// inherits the Stage-A contiguity invariant.
+    pub(crate) fn flashmla_slot_first_block(&self, slot_idx: usize) -> Result<usize> {
+        let range = self.flashmla_pages_byte_range(slot_idx)?;
+        ensure!(
+            self.flashmla_page_bytes > 0 && range.start % self.flashmla_page_bytes == 0,
+            "DSv4 FlashMLA slot {slot_idx} band start {} not page-block aligned ({})",
+            range.start,
+            self.flashmla_page_bytes
+        );
+        Ok(range.start / self.flashmla_page_bytes)
     }
 
     fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
@@ -950,6 +1050,472 @@ impl Dsv4FlashMlaDecodeState {
         self.fp8_kv_sw_bootstrapped = false;
         self.fp8_kv_comp_packed_rows = 0;
         pool.reset_flashmla_slot(ctx, self)?;
+        Ok(())
+    }
+}
+
+/// Model-wide (one instance, NOT per-slot/per-layer) scratch for the batched
+/// (`b = N`) FlashMLA sparse decode lane (#60). The single-row
+/// [`Dsv4FlashMlaDecodeState`] is per-(slot, layer) and sized for `s_q = 1`;
+/// the batched lane runs ONE `sparse_decode_fwd(b=N)` over N DIFFERENT slots
+/// that all share one layer's KV pool, so its row-major buffers must live in a
+/// single shared instance sized for `max_batch` rows. Mirrors the
+/// allocate-once / reuse-every-forward discipline of the other model-wide
+/// scratches ([`Dsv4DsaSharedScratch`], `Dsv4MoeDecodeScratch`).
+///
+/// All row-dimension buffers are `[max_batch, …]`; a forward over `n ≤ max_batch`
+/// rows uses the `[0, n)` prefix. `max_topk_unified` is the MAX across every
+/// FlashMLA layer mode (SW vs HCA vs CSA differ in `topk_unified`); `h_q` is
+/// uniform (global heads 64 or 128). The split-KV accum scratch is sized
+/// `[num_sm_parts + max_batch, …]` and SHARED across the batch. Pool addressing:
+/// the batched indices builder emits POOL-ABSOLUTE block coords (it adds
+/// `slot_block_offsets[row] * page_block_size`), so the single batched fwd reads
+/// one pool base pointer — unlike the single-row path's per-slot `pool_view`.
+pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
+    /// `[max_batch, max_topk_unified]` i32 — per-row unified sparse indices in
+    /// pool-absolute block coords. Written by the batched indices builder each
+    /// forward (all `n` rows) before the fwd reads it.
+    indices: CudaSlice<i32>,
+    /// `[max_batch]` i32 — per-row effective topk length (= each row's mode's
+    /// `topk_unified`). Written by the batched indices builder.
+    topk_length: CudaSlice<i32>,
+    /// `[max_batch]` i32 — per-row absolute decode position. Host→device each
+    /// forward; feeds the batched indices builder's causal gate.
+    start_pos: CudaSlice<i32>,
+    /// `[max_batch]` i32 — each row's slot's first FlashMLA pool block (the
+    /// slot→pool translation the batched indices builder applies). Host→device
+    /// each forward from the slot page tables.
+    slot_block_offsets: CudaSlice<i32>,
+    /// `[max_batch, h_q]` f32 — per-row LSE output of the sparse decode.
+    lse_out: CudaSlice<f32>,
+    /// `[num_sm_parts + max_batch, h_q]` f32 — split-KV LSE accumulator, SHARED
+    /// across the batch (split dim folds b in via `num_splits`). Strides match
+    /// the single-row path (split stride = s_q*h_q).
+    lse_accum: CudaSlice<f32>,
+    /// `[num_sm_parts + max_batch, h_q * head_dim]` f32 — split-KV O accumulator,
+    /// shared across the batch (see `lse_accum`).
+    o_accum: CudaSlice<f32>,
+    /// `[num_sm_parts_max * 8]` i32 — tile-scheduler metadata. RECOMPUTED PER
+    /// FORWARD via `sched_meta(b=n)` (the cached-constant pitfall: the b=1 cached
+    /// meta is WRONG for n>1 — wrong split-KV merge).
+    sched_meta: CudaSlice<i32>,
+    /// `[max_batch + 1]` i32 — split offsets. Written per forward by `sched_meta`.
+    num_splits: CudaSlice<i32>,
+    /// `[max_batch, h_q * head_dim]` bf16 — gathered+repacked global-head Q
+    /// (TP path) or the row-major batched Q (single-GPU). Fed as the fwd's q.
+    /// PHASE B: read by `sparse_decode_fwd_batched` (not yet wired — see there).
+    #[allow(dead_code)]
+    q_batched: CudaSlice<half::bf16>,
+    /// `[max_batch, h_q * head_dim]` bf16 — full global-head fwd output before
+    /// the per-rank slice (TP path only). PHASE B (see `q_batched`).
+    #[allow(dead_code)]
+    out_batched: CudaSlice<half::bf16>,
+    /// `[max_batch, tp_world * local_heads * head_dim]` bf16 — TP all-gather
+    /// landing buffer for Q before repack (TP path only). PHASE B (see `q_batched`).
+    #[allow(dead_code)]
+    tp_gathered_q: CudaSlice<half::bf16>,
+    /// Per-layer decode shape (`topk_unified`/`sw_blocks`/`comp_blocks`/… per
+    /// mode), indexed by layer. The batched build_indices / fwd read the
+    /// engaged layer's shape; stored here so the dsv4 loop needs only `layer_idx`.
+    layer_shapes: Vec<Dsv4FlashMlaDecodeShape>,
+    max_batch: usize,
+    max_topk_unified: usize,
+    /// PHASE B: read by `sparse_decode_fwd_batched` (shape derives h_q today).
+    #[allow(dead_code)]
+    h_q: usize,
+    /// PHASE B: read by `sparse_decode_fwd_batched` (config carries head_dim today).
+    #[allow(dead_code)]
+    head_dim: usize,
+    /// `num_sm_parts + max_batch` — total split rows in the shared accum scratch.
+    /// PHASE B: read by `sparse_decode_fwd_batched` accum bounds.
+    #[allow(dead_code)]
+    accum_splits_max: usize,
+    num_sm_parts: i32,
+    fixed_overhead_num_blocks: i32,
+    block_size_topk: i32,
+}
+
+impl Dsv4FlashMlaDecodeBatchScratch {
+    /// Allocate the batched-decode scratch sized for `max_batch` concurrent
+    /// decode rows over the model's FlashMLA layers. `layer_shapes` are every
+    /// FlashMLA layer's decode shape (so `max_topk_unified` / `accum_rows_max`
+    /// cover the worst mode); all must share `h_q` and `head_dim`.
+    fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        max_batch: usize,
+        layer_shapes: &[Dsv4FlashMlaDecodeShape],
+    ) -> Result<Self> {
+        ensure!(
+            max_batch > 0,
+            "DSv4 batched FlashMLA decode needs max_batch>0"
+        );
+        ensure!(
+            !layer_shapes.is_empty(),
+            "DSv4 batched FlashMLA decode needs at least one FlashMLA layer shape"
+        );
+        let h_q = layer_shapes[0].h_q;
+        ensure!(
+            layer_shapes.iter().all(|s| s.h_q == h_q),
+            "DSv4 batched FlashMLA decode requires a uniform h_q across layers"
+        );
+        let head_dim = config.head_dim;
+        let max_topk_unified = layer_shapes
+            .iter()
+            .map(|s| s.topk_unified)
+            .max()
+            .unwrap_or(0);
+        // The scheduler tuning meta (num_sm_parts/fixed_overhead/block_size_topk)
+        // depends only on (h_q, s_q=1, model). Same call the single-row state
+        // uses; the resulting `num_sm_parts` sizes the accum + sched buffers.
+        let mut num_sm_parts = 0_i32;
+        let mut fixed_overhead_num_blocks = 0_i32;
+        let mut block_size_topk = 0_i32;
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+                h_q as i32,
+                DSV4_FLASHMLA_S_Q as i32,
+                DSV4_FLASHMLA_MODEL1,
+                &mut num_sm_parts,
+                &mut fixed_overhead_num_blocks,
+                &mut block_size_topk,
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched FlashMLA decode meta failed: {e}"))?;
+        }
+        let num_sm_parts_max = (num_sm_parts as usize).max(256);
+        // Split-KV accum scratch is shared across the whole batch: the shim
+        // documents lse_accum/o_accum as `[num_sm_parts + b, s_q, h_q(*d_v)]`
+        // (arle_flashmla_decode_shim.cu:202-203) — the split dimension is
+        // `num_sm_parts + b`, NOT `b * num_sm_parts`. Accum strides therefore
+        // stay the single-row values (split stride = s_q*h_q etc.); b is folded
+        // into the split index via `num_splits[b+1]`, not a separate batch axis.
+        let accum_splits_max = num_sm_parts_max + max_batch;
+        let h_q_d = h_q
+            .checked_mul(head_dim)
+            .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d overflow"))?;
+        let tp_gather_cols = h_q_d; // tp_world * local_heads * head_dim == global h_q * head_dim
+        Ok(Self {
+            indices: ctx
+                .stream
+                .alloc_zeros::<i32>(max_batch * max_topk_unified)?,
+            topk_length: ctx.stream.alloc_zeros::<i32>(max_batch)?,
+            start_pos: ctx.stream.alloc_zeros::<i32>(max_batch)?,
+            slot_block_offsets: ctx.stream.alloc_zeros::<i32>(max_batch)?,
+            lse_out: ctx.stream.alloc_zeros::<f32>(max_batch * h_q)?,
+            lse_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q)?,
+            o_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q_d)?,
+            sched_meta: ctx.stream.alloc_zeros::<i32>(num_sm_parts_max * 8)?,
+            num_splits: ctx.stream.alloc_zeros::<i32>(max_batch + 1)?,
+            q_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
+            out_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
+            tp_gathered_q: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(max_batch * tp_gather_cols)?,
+            layer_shapes: layer_shapes.to_vec(),
+            max_batch,
+            max_topk_unified,
+            h_q,
+            head_dim,
+            accum_splits_max,
+            num_sm_parts,
+            fixed_overhead_num_blocks,
+            block_size_topk,
+        })
+    }
+
+    /// Upload the per-row decode positions + slot→pool block offsets for an
+    /// `n`-row forward. `start_positions[r]` is row r's absolute position;
+    /// `slot_block_offsets[r]` is row r's slot's first FlashMLA pool block (from
+    /// [`Dsv4LayerKvLayout::flashmla_slot_first_block`]). Both feed the batched
+    /// indices builder. Writes the `[0, n)` prefix of `self.start_pos` /
+    /// `self.slot_block_offsets`.
+    fn upload_row_meta(
+        &mut self,
+        ctx: &DeviceContext,
+        start_positions: &[usize],
+        slot_block_offsets: &[usize],
+    ) -> Result<()> {
+        let n = start_positions.len();
+        ensure!(
+            n == slot_block_offsets.len(),
+            "DSv4 batched decode start_pos/offsets length mismatch ({n} vs {})",
+            slot_block_offsets.len()
+        );
+        ensure!(
+            n <= self.max_batch,
+            "DSv4 batched decode n={n} exceeds max_batch={}",
+            self.max_batch
+        );
+        let start_host: Vec<i32> = start_positions
+            .iter()
+            .map(|&p| {
+                i32::try_from(p)
+                    .map_err(|_| anyhow!("DSv4 batched decode start_pos {p} overflows i32"))
+            })
+            .collect::<Result<_>>()?;
+        let off_host: Vec<i32> = slot_block_offsets
+            .iter()
+            .map(|&b| {
+                i32::try_from(b)
+                    .map_err(|_| anyhow!("DSv4 batched decode block offset {b} overflows i32"))
+            })
+            .collect::<Result<_>>()?;
+        let mut start_view = self.start_pos.slice_mut(0..n);
+        ctx.stream
+            .memcpy_htod(&start_host, &mut start_view)
+            .map_err(|e| anyhow!("DSv4 batched decode start_pos H2D failed: {e}"))?;
+        let mut off_view = self.slot_block_offsets.slice_mut(0..n);
+        ctx.stream
+            .memcpy_htod(&off_host, &mut off_view)
+            .map_err(|e| anyhow!("DSv4 batched decode block-offset H2D failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Phase A convenience: build a layer's complete per-forward batched
+    /// metadata — `upload_row_meta(n)` → `build_indices_batched(b=N)` →
+    /// `sched_meta_for_batch(b=N)` — using the layer's STORED decode shape
+    /// (`self.layer_shapes[layer_idx]`, the exact per-mode shape). For SW/HCA
+    /// only (CSA needs per-row `selected`; the caller guards on mode in Phase A).
+    /// Leaves `self.indices`/`topk_length`/`sched_meta`/`num_splits` populated
+    /// for this layer, ready for `sparse_decode_fwd_batched`.
+    pub(crate) fn build_layer_batch_meta(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        layer_idx: usize,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        start_positions: &[usize],
+        slot_block_offsets: &[usize],
+    ) -> Result<()> {
+        let n = start_positions.len();
+        let shape = *self.layer_shapes.get(layer_idx).ok_or_else(|| {
+            anyhow!(
+                "DSv4 batched decode layer {layer_idx} outside stored shapes {}",
+                self.layer_shapes.len()
+            )
+        })?;
+        self.upload_row_meta(ctx, start_positions, slot_block_offsets)?;
+        self.build_indices_batched(ctx, n, mode, compress_ratio, config, &shape, 0)?;
+        self.sched_meta_for_batch(ctx, n, shape.topk_unified)?;
+        Ok(())
+    }
+
+    /// ONE batched indices build over all `n` rows (the orphaned
+    /// `dsv4_flashmla_decode_build_indices_batched` kernel, #60). Emits
+    /// `indices[n, topk_unified]` in pool-absolute block coords (slot→pool via
+    /// `slot_block_offsets`) and `topk_length[n]`. `mode`/`compress_ratio` are
+    /// uniform within a layer; `total_blocks` is this layer's `sw+comp` block
+    /// count (bounds the offset translation). `selected` is the CSA per-row topk
+    /// (`[n, max_compressed_keys]`) device ptr, or 0 for SW/HCA.
+    ///
+    /// Precondition: `upload_row_meta(n)` already ran this forward (reads
+    /// `self.start_pos`/`self.slot_block_offsets` `[0,n)`).
+    #[allow(clippy::too_many_arguments)]
+    fn build_indices_batched(
+        &mut self,
+        ctx: &DeviceContext,
+        n: usize,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        config: &DeepSeekV4Config,
+        shape: &Dsv4FlashMlaDecodeShape,
+        selected_ptr: u64,
+    ) -> Result<()> {
+        ensure!(
+            n > 0 && n <= self.max_batch,
+            "DSv4 batched indices n={n} invalid"
+        );
+        ensure!(
+            shape.topk_unified <= self.max_topk_unified,
+            "DSv4 batched indices layer topk {} exceeds scratch {}",
+            shape.topk_unified,
+            self.max_topk_unified
+        );
+        let mode_int = flashmla_mode_int(mode);
+        let (indices_ptr, indices_guard) = self.indices.device_ptr_mut(&ctx.stream);
+        let (start_ptr, start_guard) = self.start_pos.device_ptr(&ctx.stream);
+        let (off_ptr, off_guard) = self.slot_block_offsets.device_ptr(&ctx.stream);
+        let (topk_ptr, topk_guard) = self.topk_length.device_ptr_mut(&ctx.stream);
+        flash_kv::dsv4_flashmla_decode_build_indices_batched_raw(
+            ctx,
+            indices_ptr,
+            start_ptr,
+            off_ptr,
+            selected_ptr,
+            topk_ptr,
+            n,
+            shape.sw_blocks,
+            config.sliding_window,
+            shape.max_compressed_keys,
+            if mode == DeepSeekV4AttentionMode::SlidingWindow {
+                1
+            } else {
+                compress_ratio
+            },
+            mode_int,
+            64,
+            shape.total_blocks,
+        )?;
+        drop(indices_guard);
+        drop(start_guard);
+        drop(off_guard);
+        drop(topk_guard);
+        Ok(())
+    }
+
+    /// Recompute the tile-scheduler metadata + split offsets for `b = n` THIS
+    /// forward (the cached-constant pitfall, #60: the b=1 cached meta is wrong
+    /// for n>1). Reads `self.topk_length[0..n]` (filled by `build_indices_batched`),
+    /// writes `self.sched_meta` + `self.num_splits[0..=n]`. `layer_topk` is this
+    /// layer's `topk_unified` (uniform per row in one layer).
+    fn sched_meta_for_batch(
+        &mut self,
+        ctx: &DeviceContext,
+        n: usize,
+        layer_topk: usize,
+    ) -> Result<()> {
+        ensure!(
+            n > 0 && n <= self.max_batch,
+            "DSv4 batched sched_meta n={n} invalid"
+        );
+        let topk = i32::try_from(layer_topk)
+            .map_err(|_| anyhow!("DSv4 batched sched_meta topk {layer_topk} overflows i32"))?;
+        let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);
+        let (sched_ptr, sched_guard) = self.sched_meta.device_ptr_mut(&ctx.stream);
+        let (splits_ptr, splits_guard) = self.num_splits.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
+                n as i32,
+                1,
+                self.block_size_topk,
+                self.fixed_overhead_num_blocks,
+                topk,
+                0,
+                topk_ptr as *const i32,
+                std::ptr::null(),
+                sched_ptr as *mut i32,
+                splits_ptr as *mut i32,
+                self.num_sm_parts,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched FlashMLA sched_meta failed: {e}"))?;
+        }
+        drop(topk_guard);
+        drop(sched_guard);
+        drop(splits_guard);
+        Ok(())
+    }
+
+    /// ONE batched `sparse_decode_fwd(b=n)` over the whole shared KV pool base
+    /// (#60 — the actual concurrency win, one launch over N rows replacing the
+    /// per-row loop). `q_ptr` is `[n, h_q*head_dim]` bf16 (= `self.q_batched`
+    /// prefix on the TP path, or the row-major global Q on single-GPU);
+    /// `pool_ptr` is the layer's whole FP8 KV pool base (indices are
+    /// pool-absolute); `out_ptr` is `[n, h_q*head_dim]` bf16.
+    ///
+    /// Precondition: `build_indices_batched(n)` + `sched_meta_for_batch(n)` ran
+    /// this forward; `shape` is this layer's decode shape.
+    ///
+    /// PHASE B (#60): this is the actual batched kernel call. It is written and
+    /// verified for shape/stride correctness but not yet wired into the decode
+    /// loop — Phase B collects per-row gathered Q + per-row `selected` from
+    /// `mla_attention` and swaps the per-row loop in `forward_decode_batch_stream_impl`
+    /// for `build_layer_batch_meta` → this fwd → scatter. Kept allocated so the
+    /// Phase-B swap is a single call-site change, not a re-derivation of the
+    /// stride mapping (see `docs/plans/dsv4-batched-flashmla-decode.md`).
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn sparse_decode_fwd_batched(
+        &mut self,
+        ctx: &DeviceContext,
+        n: usize,
+        config: &DeepSeekV4Config,
+        shape: &Dsv4FlashMlaDecodeShape,
+        q_ptr: *const ffi::Half,
+        pool_ptr: *const ffi::Half,
+        sink_ptr: *const f32,
+        out_ptr: *mut ffi::Half,
+        sm_scale: f32,
+    ) -> Result<()> {
+        ensure!(
+            n > 0 && n <= self.max_batch,
+            "DSv4 batched fwd n={n} invalid"
+        );
+        let global_heads = shape.h_q;
+        let head_dim = config.head_dim;
+        let bytes_per_token = 584_i32;
+        let stride_kv_block_bytes = 64_i32 * bytes_per_token;
+        let stride_q = (global_heads * head_dim) as i32; // per-row Q stride (s_q=1)
+        let stride_o = stride_q;
+        let stride_indices = self.max_topk_unified as i32; // row stride of self.indices
+        let stride_lse = global_heads as i32;
+        let (indices_ptr, indices_guard) = self.indices.device_ptr(&ctx.stream);
+        let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);
+        let (sched_ptr, sched_guard) = self.sched_meta.device_ptr(&ctx.stream);
+        let (splits_ptr, splits_guard) = self.num_splits.device_ptr(&ctx.stream);
+        let (lse_out_ptr, lse_guard) = self.lse_out.device_ptr_mut(&ctx.stream);
+        let (lse_accum_ptr, lse_accum_guard) = self.lse_accum.device_ptr_mut(&ctx.stream);
+        let (o_accum_ptr, o_accum_guard) = self.o_accum.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_fwd(
+                q_ptr,
+                pool_ptr,
+                indices_ptr as *const i32,
+                topk_ptr as *const i32,
+                sink_ptr,
+                out_ptr,
+                lse_out_ptr as *mut f32,
+                lse_accum_ptr as *mut f32,
+                o_accum_ptr as *mut f32,
+                sched_ptr as *const i32,
+                splits_ptr as *const i32,
+                n as i32,
+                1,
+                global_heads as i32,
+                1,
+                head_dim as i32,
+                head_dim as i32,
+                (shape.sw_blocks + shape.comp_blocks) as i32,
+                64,
+                stride_indices,
+                self.num_sm_parts,
+                DSV4_FLASHMLA_MODEL1,
+                sm_scale,
+                stride_q,
+                stride_q,
+                head_dim as i32,
+                stride_kv_block_bytes,
+                bytes_per_token,
+                stride_indices,
+                stride_indices,
+                stride_lse,
+                1,
+                stride_o,
+                stride_o,
+                head_dim as i32,
+                // Split-KV accum strides: the accum buffers are `[num_sm_parts+b,
+                // s_q=1, h_q(*d_v)]` (shim:202-203), so split stride = s_q*h_q etc.
+                // — identical to the single-row path; b folds into the split index
+                // via num_splits, NOT a stride.
+                stride_lse,      // stride_lse_accum_split = s_q*h_q = global_heads
+                stride_lse,      // stride_lse_accum_s_q  = h_q     = global_heads
+                stride_o,        // stride_o_accum_split  = s_q*h_q*d_v
+                stride_o,        // stride_o_accum_s_q    = h_q*d_v
+                head_dim as i32, // stride_o_accum_h_q = d_v
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched FlashMLA sparse decode failed: {e}"))?;
+        }
+        drop(indices_guard);
+        drop(topk_guard);
+        drop(sched_guard);
+        drop(splits_guard);
+        drop(lse_guard);
+        drop(lse_accum_guard);
+        drop(o_accum_guard);
         Ok(())
     }
 }
@@ -3970,6 +4536,24 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     // reports false and falls back to scalar — no env var. The AtomicI8 override
     // above stays for tests/A-B.
     Ok(cuda_kernels::HAS_FLASHMLA)
+}
+
+/// Batched (`b = N`) FlashMLA sparse decode lane gate (#60). Default OFF until
+/// the pod licenses the batched kernel; gated under `dsv4_flashmla_decode_enabled`
+/// so it can only engage where the single-row FlashMLA decode is itself live.
+/// N=1 forwards never consult this — they always take the cached-meta single-row
+/// path. The AtomicI8 override is for tests / `ARLE_DSV4_FLASHMLA_DECODE_BATCHED`
+/// A-B; without an override the lane stays OFF.
+pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
+    match DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE.load(Ordering::Relaxed) {
+        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
+        DSV4_FLASHMLA_OVERRIDE_ON => return dsv4_flashmla_decode_enabled(),
+        _ => {}
+    }
+    if env_flag("ARLE_DSV4_FLASHMLA_DECODE_BATCHED")? {
+        return dsv4_flashmla_decode_enabled();
+    }
+    Ok(false)
 }
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
