@@ -253,6 +253,14 @@ impl Dsv4CudaExecutor {
         );
         let depth = self.spec_depth();
 
+        // Phase profile (measurement only, ARLE_DSV4_MTP_STEP_PROFILE=1): sync at
+        // boundaries + report host ms for draft / verify / commit, so the batched
+        // win is attributable (verify is batched across slots; draft + commit stay
+        // per-slot). The syncs distort overlap — profiling runs only.
+        let prof = std::env::var("ARLE_DSV4_MTP_STEP_PROFILE").as_deref() == Ok("1");
+        let mut t = std::time::Instant::now();
+        let mut phase_ms = [0f64; 3];
+
         // ── 1. Per-slot pre-draft ring capture + draft chain (depth-sequential).
         // Stage 1: loop the PROVEN per-slot capture + per-slot draft (batching the
         // draft across slots is a later refinement; per-slot is the safe path).
@@ -280,6 +288,11 @@ impl Dsv4CudaExecutor {
             scheds.push(chain.verify_schedule(start_positions[s]));
             chains.push(chain.tokens);
         }
+        if prof {
+            let _ = self.model.ctx.sync();
+            phase_ms[0] = t.elapsed().as_secs_f64() * 1000.0;
+            t = std::time::Instant::now();
+        }
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
         // attention per-slot tree-attn). When fold (default), the verify persists
@@ -301,10 +314,15 @@ impl Dsv4CudaExecutor {
             "DSv4 batched verify returned {} chains for {n} slots",
             verified.len()
         );
+        if prof {
+            let _ = self.model.ctx.sync();
+            phase_ms[1] = t.elapsed().as_secs_f64() * 1000.0;
+            t = std::time::Instant::now();
+        }
 
-        // ── 3. Per-slot accept / commit / ring-restore. Host-side accept + the
-        // per-slot ring restore + commit re-forward are cheap (the win is the
-        // batched verify above). Commit-fold is DISABLED here (re-forward only).
+        // ── 3. Per-slot accept / commit / ring-restore. The batched verify above
+        // is the amortized phase; the per-slot draft (phase 0) and per-slot commit
+        // (phase 2) stay sequential — the profile shows which dominates the wave.
         let mut out = Vec::with_capacity(n);
         for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
             let slot_idx = slot_ids[s];
@@ -380,6 +398,17 @@ impl Dsv4CudaExecutor {
             let mut slot_out = accepted_tokens;
             slot_out.push(bonus);
             out.push(slot_out);
+        }
+        if prof {
+            let _ = self.model.ctx.sync();
+            phase_ms[2] = t.elapsed().as_secs_f64() * 1000.0;
+            if self.model.tp.config().rank == 0 {
+                let total = phase_ms[0] + phase_ms[1] + phase_ms[2];
+                eprintln!(
+                    "[dsv4-mtp-batched-prof] n={n} depth={depth} draft={:.2} verify={:.2} commit={:.2} total={:.2} ms",
+                    phase_ms[0], phase_ms[1], phase_ms[2], total
+                );
+            }
         }
         Ok(out)
     }
