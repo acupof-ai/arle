@@ -16,7 +16,7 @@
 //! partial-rollback failure mode as the DSv4-EAGLE truncate that restored only
 //! `compressed.seq_len` and corrupted the draft at the boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, anyhow};
 use autograd::{TensorId, TensorStore, adamw_state::AdamWState, optim::AdamW};
@@ -84,6 +84,19 @@ pub struct EmaSelfTeacher {
     /// EMA adapter pairs, layer-ordered (sorted by base name) so index `i`
     /// lines up with [`Self::student_adapter_pairs`] index `i`.
     adapter_ids: Vec<(TensorId, TensorId)>,
+    /// The teacher parameter ids exposed via [`Self::as_teacher`] — the EMA
+    /// model's frozen params (shared base + frozen EMA adapter), EXCLUDING the
+    /// student's trainable adapter ids.
+    ///
+    /// Why a stored, filtered list instead of `model.all_parameter_ids()`:
+    /// `new_lora_from_base`'s `share_base_parameters_from` rebuilds the EMA
+    /// model's `param_ids` from the base model's `param_ids` wholesale, and the
+    /// base IS the LoRA student — so `model.all_parameter_ids()` also lists the
+    /// student's trainable adapter ids. Exposing those as teacher params makes
+    /// the OPD step reject them (`requires_grad=true` teacher param / student
+    /// param owned by teacher). The student adapter is kept alive for the step
+    /// via the student's own `all_parameter_ids()`, so dropping it here is safe.
+    teacher_param_ids: Vec<TensorId>,
 }
 
 impl EmaSelfTeacher {
@@ -112,7 +125,24 @@ impl EmaSelfTeacher {
     ) -> Result<Self> {
         let model = Qwen35Model::new_lora_from_base(student, lora, target_set, store)?;
         let adapter_ids = pair_adapters(&model.adapter_name_map())?;
-        let mut teacher = Self { model, adapter_ids };
+
+        // Teacher params = EMA model params MINUS the student's trainable adapter
+        // ids (which `share_base_parameters_from` folds into the EMA model's
+        // param_ids — see the field doc). TensorIds are allocation-stable, so a
+        // snapshot taken here stays valid for the EMA teacher's lifetime.
+        let student_adapter_ids: HashSet<TensorId> =
+            student.adapter_name_map().values().copied().collect();
+        let teacher_param_ids: Vec<TensorId> = model
+            .all_parameter_ids()
+            .into_iter()
+            .filter(|id| !student_adapter_ids.contains(id))
+            .collect();
+
+        let mut teacher = Self {
+            model,
+            adapter_ids,
+            teacher_param_ids,
+        };
         teacher.copy_from_student(student, store)?;
         teacher.freeze_adapter(store)?;
         Ok(teacher)
@@ -206,9 +236,11 @@ impl EmaSelfTeacher {
     }
 
     /// The [`TeacherForward`](crate::teacher_infer::TeacherForward) the OPD step
-    /// consumes: base + EMA-adapter, tape off, in the train store.
+    /// consumes: base + EMA-adapter, tape off, in the train store. Exposes only
+    /// the EMA model's frozen params (NOT the student's trainable adapter — see
+    /// [`Self::teacher_param_ids`]).
     pub fn as_teacher(&self) -> InProcessTeacher<'_> {
-        InProcessTeacher::new(&self.model)
+        InProcessTeacher::with_parameter_ids(&self.model, self.teacher_param_ids.clone())
     }
 }
 
@@ -629,6 +661,61 @@ mod tests {
             0,
             "restore must clear adapter moments the snapshot did not contain"
         );
+
+        Ok(())
+    }
+
+    /// P1 regression: the EMA teacher must expose only its own frozen params
+    /// (shared base + frozen EMA adapter), NOT the student's trainable adapter.
+    /// `share_base_parameters_from` folds the student adapter ids into the EMA
+    /// model's `all_parameter_ids()`, which would make the OPD step reject the
+    /// teacher (`requires_grad=true`) and the student (param "owned by teacher").
+    #[test]
+    fn ema_teacher_excludes_trainable_student_adapter() -> TestResult {
+        use crate::teacher_infer::TeacherForward;
+
+        let mut store = TensorStore::default();
+        let cfg = tiny_qwen35_config();
+        let lora = lora_config();
+        let target_set = LoraTargetSet::AttentionQv;
+
+        let student = Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, &mut store)?;
+        let ema = EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)?;
+
+        let teacher = ema.as_teacher();
+        let teacher_ids: HashSet<TensorId> = teacher.parameter_ids().iter().copied().collect();
+        assert!(!teacher_ids.is_empty(), "teacher must expose params");
+
+        // Student adapter ids (trainable, student-owned) must be ABSENT.
+        let student_adapter: Vec<TensorId> = student.adapter_name_map().values().copied().collect();
+        assert!(!student_adapter.is_empty(), "student must have adapters");
+        for id in &student_adapter {
+            assert!(
+                !teacher_ids.contains(id),
+                "teacher params must exclude trainable student adapter id {id}"
+            );
+        }
+
+        // EMA adapter ids must be PRESENT (forward reads them; retention needs them).
+        for &(ea, eb) in ema.adapter_ids.iter() {
+            assert!(
+                teacher_ids.contains(&ea),
+                "ema lora_a must be a teacher param"
+            );
+            assert!(
+                teacher_ids.contains(&eb),
+                "ema lora_b must be a teacher param"
+            );
+        }
+
+        // Every exposed teacher param must be frozen — exactly the
+        // validate_teacher_params bar the OPD step enforces.
+        for &id in teacher.parameter_ids() {
+            assert!(
+                !store.get(id).expect("teacher param present").requires_grad,
+                "teacher param {id} must be frozen (requires_grad=false)"
+            );
+        }
 
         Ok(())
     }
