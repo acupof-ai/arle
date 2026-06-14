@@ -40,6 +40,12 @@ const VENDORED: &[ShaderSpec] = &[
             ("D_TYPE", "float"),
         ],
     },
+    // The decode GEMVs run a BLOCK_SIZE=64 workgroup pinned to a single 64-wide
+    // subgroup (see `SPEC_GEMV_K_Q8_1` + `Kernel::required_subgroup_size`), so
+    // `USE_SUBGROUP_ADD` collapses the cross-lane row reduction to ONE hardware
+    // `subgroupAdd` instead of a 6-step barrier'd shmem tree. This mirrors
+    // llama.cpp's `SHADER_REDUCTION_MODE_SUBGROUP` choice for the q8_1 decode
+    // pipelines on AMD non-GCN (use_subgroups = subgroup_arithmetic && !GCN).
     ShaderSpec {
         name: "mul_mat_vecq_q4_k",
         source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
@@ -49,6 +55,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("DATA_A_Q4_K", "1"),
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {
@@ -60,6 +67,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("DATA_A_Q5_K", "1"),
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {
@@ -71,6 +79,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("DATA_A_Q6_K", "1"),
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {
@@ -82,6 +91,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("DATA_A_Q8_0", "1"),
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     // Fused MoE expert GEMV (`mul_mat_vec_id`) — the same `mul_mat_vecq.comp`
@@ -101,6 +111,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
             ("MUL_MAT_ID", "1"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {
@@ -113,6 +124,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
             ("MUL_MAT_ID", "1"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {
@@ -125,6 +137,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
             ("MUL_MAT_ID", "1"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {
@@ -137,6 +150,7 @@ const VENDORED: &[ShaderSpec] = &[
             ("D_TYPE", "float"),
             ("ACC_TYPE", "float"),
             ("MUL_MAT_ID", "1"),
+            ("USE_SUBGROUP_ADD", "1"),
         ],
     },
     ShaderSpec {

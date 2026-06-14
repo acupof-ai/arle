@@ -140,7 +140,15 @@ const SPEC_FLASH_ATTN_F32_F16_HD256: &[(u32, u32)] = &[
 ];
 const SPEC_MMVQ_IQ2_XXS: &[(u32, u32)] = &[(0, 32), (1, 4), (2, 1)];
 const SPEC_MMVQ_Q2_K: &[(u32, u32)] = &[(0, 32), (1, 2), (2, 1)];
-const SPEC_GEMV_K_Q8_1: &[(u32, u32)] = &[(0, 32), (1, 1), (2, 1)];
+// BLOCK_SIZE=64 matches the 8060S wave width (subgroup_size=64): a 32-wide
+// workgroup would leave half of every wave idle. `mul_mat_vecq.comp` derives its
+// per-thread iteration count from `ncols/(K_PER_ITER*BLOCK_SIZE)`, so a wider
+// BLOCK_SIZE is purely a lane-occupancy change — the dot-product math and the
+// 13-uint/5-buffer ABI are untouched. NUM_ROWS=1 (constant_id 1) matches
+// llama.cpp's `rm_kq_int`/`rm_stdq_int` for AMD non-GCN. The pipeline pins
+// requiredSubgroupSize=64 (see `Kernel::required_subgroup_size`) so the wave is
+// exactly one full subgroup.
+const SPEC_GEMV_K_Q8_1: &[(u32, u32)] = &[(0, 64), (1, 1), (2, 1)];
 const SPEC_RMS_NORM_MUL: &[(u32, u32)] = &[(1, 1)];
 
 impl Kernel {
@@ -269,10 +277,26 @@ impl Kernel {
     /// subgroup shuffles + `num_subgroups = WorkGroupSize/32`, so on a wave64
     /// device (the 8060S defaults to 64) its pipeline MUST pin a 32-wide
     /// subgroup via `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`.
+    ///
+    /// The `mul_mat_vecq` GEMVs run a `BLOCK_SIZE`-wide workgroup (constant_id 0
+    /// = 64) and pin requiredSubgroupSize=64 so the workgroup is exactly one
+    /// full 64-wide wave — every lane busy, and (when `USE_SUBGROUP_ADD` is
+    /// compiled in) the cross-lane reduction is a single-subgroup `subgroupAdd`.
+    /// This mirrors llama.cpp's `subgroup_size_int = device->subgroup_size` for
+    /// the q8_1 decode pipelines on AMD non-GCN.
+    ///
     /// Every other kernel is subgroup-size-agnostic (`None` = driver default).
     pub const fn required_subgroup_size(self) -> Option<u32> {
         match self {
             Kernel::FlashAttn => Some(32),
+            Kernel::GemvQ4K
+            | Kernel::GemvQ5K
+            | Kernel::GemvQ6K
+            | Kernel::GemvQ8_0
+            | Kernel::GemvIdQ4K
+            | Kernel::GemvIdQ5K
+            | Kernel::GemvIdQ6K
+            | Kernel::GemvIdQ8_0 => Some(64),
             _ => None,
         }
     }
