@@ -55,10 +55,12 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use qwen35_spec::{LayerType, Qwen35Config};
 use vulkan_kernels::{
-    BLOCK_Q8_1_BYTES, Kernel, KernelCache, KernelParams, Q8_1_X4_VALUES_PER_GROUP, add_dispatch,
-    add_params, gemv_dispatch, gemv_id_dispatch, gemv_id_params, gemv_params,
-    q8_1_quantize_dispatch, q8_1_quantize_params, rms_norm_dispatch, rms_norm_params,
-    scaled_add_dispatch, scaled_add_params, swiglu_dispatch, swiglu_params,
+    BLOCK_Q8_1_BYTES, FlashAttentionSpec, Kernel, KernelCache, KernelParams,
+    Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params, flash_attn_dispatch, flash_attn_params,
+    gemv_dispatch, gemv_id_dispatch, gemv_id_params, gemv_params, q8_1_quantize_dispatch,
+    q8_1_quantize_params, rms_norm_dispatch, rms_norm_params, rope_neox_dispatch, rope_neox_params,
+    scaled_add_dispatch, scaled_add_params, sigmoid_mul_dispatch, sigmoid_mul_params,
+    swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -71,11 +73,11 @@ use infer_gguf::gguf::GgmlType;
 /// Per-slot recurrent / cache state carried across forward calls for one
 /// sequence. Sized from the config's local (single-GPU) widths.
 pub struct Qwen35ForwardState {
-    /// One growing K cache per FULL-attention layer, row-major `[pos, kv_dim]`
-    /// f32 (kv_dim = kv_heads*head_dim). RoPE already applied at write time.
-    pub k_cache: Vec<Vec<f32>>,
-    /// One growing V cache per FULL-attention layer, `[pos, kv_dim]` f32.
-    pub v_cache: Vec<Vec<f32>>,
+    // NOTE: the full-attention K/V cache is now **device-resident f16**
+    // ([`DeviceKvCache`], owned by [`DecodeResources`]); RoPE is applied to K on
+    // the device at write time. The host K/V Vecs are gone (the device flash-attn
+    // reads the cache directly). Only the gated-delta recurrent + conv state stay
+    // host-side (that is the NEXT chunk to port).
     /// Gated-delta recurrent state per LINEAR layer, `[v_head, key_dim,
     /// val_dim]` f32 (val contiguous), matching `gated_delta_rule.cu`.
     pub gdr_state: Vec<Vec<f32>>,
@@ -102,22 +104,17 @@ impl Qwen35ForwardState {
             * config.linear_value_head_dim;
         let conv_len = qkv_dim * config.linear_conv_kernel_dim.saturating_sub(1);
         Self {
-            k_cache: vec![Vec::new(); num_full],
-            v_cache: vec![Vec::new(); num_full],
             gdr_state: vec![vec![0.0f32; gdr_len]; num_linear],
             conv_ring: vec![vec![0.0f32; conv_len]; num_linear],
             seq_len: 0,
         }
     }
 
-    /// Reset for a fresh generation (zeros recurrent + conv state, clears caches).
+    /// Reset for a fresh generation (zeros the linear recurrent + conv state).
+    /// The device KV cache is positional (overwritten at each `pos`), so a fresh
+    /// generation starting at pos 0 naturally reuses its planes — no explicit
+    /// clear needed.
     pub fn reset(&mut self) {
-        for c in &mut self.k_cache {
-            c.clear();
-        }
-        for c in &mut self.v_cache {
-            c.clear();
-        }
         for s in &mut self.gdr_state {
             s.iter_mut().for_each(|v| *v = 0.0);
         }
@@ -141,6 +138,144 @@ fn align_up(n: usize, align: usize) -> usize {
         return n;
     }
     n.div_ceil(align) * align
+}
+
+/// f32 -> f16 (IEEE binary16) bit pattern, round-to-nearest-even. The device
+/// flash-attn reads K/V as `float16_t`, and the per-slot KV cache stores them
+/// f16, so the host stages each post-rope K row / V row through this before the
+/// UMA write. Matches the GPU's f16 conversion used in the oracle test.
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | (if mant != 0 { 0x0200 } else { 0 });
+    }
+    let mut e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let mant_with_implicit = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let mut m = mant_with_implicit >> shift;
+        let rem_mask = (1u32 << shift) - 1;
+        let rem = mant_with_implicit & rem_mask;
+        let halfway = 1u32 << (shift - 1);
+        if rem > halfway || (rem == halfway && (m & 1) == 1) {
+            m += 1;
+        }
+        return sign | m as u16;
+    }
+    let mut m = mant >> 13;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        m += 1;
+        if m == 0x0400 {
+            m = 0;
+            e += 1;
+            if e >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((e as u16) << 10) | m as u16
+}
+
+/// Decode-time cap on the per-slot full-attention KV cache (positions). The full
+/// 32k context would need ~17 GB of f16 K+V across the 16 full layers; the decode
+/// path (prefill + a generation run) stays well under this, and a forward that
+/// exceeds it bails loud rather than corrupting. A production path would page the
+/// KV; this single-slot lane sizes a fixed window.
+pub const KV_CACHE_MAX_SEQ: usize = 8192;
+
+/// The per-slot full-attention KV cache, **device-resident f16**. One wide UMA
+/// buffer laid out as `[K block | V block]`, each block indexed
+/// `[full_layer, kv_head, pos, head_dim]` (f16). The flash-attn kernel reads a
+/// query head's K/V directly from its `(layer, kv_head)` `[max_seq, head_dim]`
+/// sub-range (row stride = head_dim elements, `nb11 = head_dim`), so a per-head
+/// dispatch needs only the head's base offset. RoPE is applied to K at write
+/// time (matching the host cache contract); V is stored raw.
+pub struct DeviceKvCache<'a> {
+    buffer: DeviceBuffer<'a>,
+    /// Byte offset of the V block (K block starts at 0).
+    v_base: u64,
+    head_dim: usize,
+    /// Bytes per `(layer, kv_head)` `[max_seq, head_dim]` f16 plane.
+    plane_bytes: u64,
+    /// Bytes per `(layer)` slab (`n_kv_heads` planes).
+    layer_bytes: u64,
+}
+
+impl<'a> DeviceKvCache<'a> {
+    /// Allocate the f16 K+V cache for `n_full_layers` full-attention layers.
+    pub fn new(
+        ctx: &'a VulkanContext,
+        n_full_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> Result<Self> {
+        let f16 = std::mem::size_of::<u16>();
+        let plane_bytes = (max_seq * head_dim * f16) as u64;
+        let layer_bytes = plane_bytes * n_kv_heads as u64;
+        let block_bytes = layer_bytes * n_full_layers.max(1) as u64;
+        let total = (block_bytes * 2) as usize; // K + V
+        let buffer = DeviceBuffer::alloc_uma(ctx, total.max(4))
+            .map_err(|e| anyhow!("alloc device KV cache ({total} B): {e}"))?;
+        Ok(Self {
+            buffer,
+            v_base: block_bytes,
+            head_dim,
+            plane_bytes,
+            layer_bytes,
+        })
+    }
+
+    /// Byte offset of the K plane base for `(full_idx, kv_head)`.
+    fn k_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
+        full_idx as u64 * self.layer_bytes + kv_head as u64 * self.plane_bytes
+    }
+
+    /// Byte offset of the V plane base for `(full_idx, kv_head)`.
+    fn v_plane_off(&self, full_idx: usize, kv_head: usize) -> u64 {
+        self.v_base + self.k_plane_off(full_idx, kv_head)
+    }
+
+    /// Byte offset of one position row `[head_dim]` f16 inside a plane.
+    fn pos_row_off(&self, plane_off: u64, pos: usize) -> u64 {
+        plane_off + (pos * self.head_dim * std::mem::size_of::<u16>()) as u64
+    }
+
+    /// Write one f32 K/V head row into the cache at `(full_idx, kv_head, pos)`,
+    /// converting to f16 (UMA, no staging buffer). `is_v` selects the V block.
+    fn write_row(
+        &mut self,
+        full_idx: usize,
+        kv_head: usize,
+        pos: usize,
+        row: &[f32],
+        is_v: bool,
+    ) -> Result<()> {
+        debug_assert_eq!(row.len(), self.head_dim);
+        let plane = if is_v {
+            self.v_plane_off(full_idx, kv_head)
+        } else {
+            self.k_plane_off(full_idx, kv_head)
+        };
+        let off = self.pos_row_off(plane, pos);
+        let bytes: Vec<u8> = row
+            .iter()
+            .flat_map(|&v| f32_to_f16_bits(v).to_le_bytes())
+            .collect();
+        self.buffer.copy_from_host_at(off, &bytes).map_err(|e| {
+            anyhow!("write KV cache row (layer {full_idx}, kv_head {kv_head}, pos {pos}): {e}")
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -210,6 +345,23 @@ pub struct DeviceArena<'a> {
     /// MoE fused caps: top-k experts and the widest expert intermediate.
     moe_top_k: usize,
     moe_inter_cap: usize,
+    // ── Full-attention slots (on-device norm/rope/flash/gate). The q-projection
+    // is `[query|gate]` per head (`2*q_dim` wide); the gate half stays here for
+    // the device sigmoid-mul. The per-head q/k RMSNorm + NeoX RoPE write into
+    // `attn_q`/`attn_k`; flash-attn writes per-head into `attn_out`, which is
+    // then gated in place. K is read back (post-rope) to land f16 in the KV
+    // cache; the flash output is read back once for the o-proj GEMV. ──
+    /// f32 `[2*q_dim]` — the gated q-projection `[query|gate]` per head.
+    attn_qkv: Slot,
+    /// f32 `[q_dim]` — per-head normed+roped query.
+    attn_q: Slot,
+    /// f32 `[kv_dim]` — per-head normed+roped key (then f16->cache).
+    attn_k: Slot,
+    /// f32 `[q_dim]` — per-head flash-attn output, gated in place.
+    attn_out: Slot,
+    /// 8 bytes — the RoPE position (i32 at offset 0; also serves as the unread
+    /// `uvec2` set-rows-indices dummy for binding 4).
+    attn_pos: Slot,
     /// Pre-sized caps so a GEMV can bail loud rather than silently corrupt.
     max_cols: usize,
     max_rows: usize,
@@ -252,6 +404,14 @@ impl<'a> DeviceArena<'a> {
         let moe_in_quant_len = q8_1_x4_bytes(h);
         let moe_act_quant_len = q8_1_x4_bytes(moe_top_k * moe_inter_cap);
 
+        // Full-attention slot widths (f32).
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let attn_qkv_len = 2 * q_dim * std::mem::size_of::<f32>();
+        let attn_q_len = q_dim * std::mem::size_of::<f32>();
+        let attn_k_len = kv_dim * std::mem::size_of::<f32>();
+        let attn_out_len = q_dim * std::mem::size_of::<f32>();
+
         let mut cursor = 0u64;
         let mut place = |len: usize| -> Slot {
             let offset = cursor;
@@ -275,6 +435,11 @@ impl<'a> DeviceArena<'a> {
         let moe_act_quant = place(moe_act_quant_len);
         let moe_down = place(moe_down_len);
         let moe_ids = place(moe_top_k.max(1) * std::mem::size_of::<i32>());
+        let attn_qkv = place(attn_qkv_len);
+        let attn_q = place(attn_q_len);
+        let attn_k = place(attn_k_len);
+        let attn_out = place(attn_out_len);
+        let attn_pos = place(8);
         let total = cursor as usize;
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
@@ -295,9 +460,34 @@ impl<'a> DeviceArena<'a> {
             moe_ids,
             moe_top_k,
             moe_inter_cap,
+            attn_qkv,
+            attn_q,
+            attn_k,
+            attn_out,
+            attn_pos,
             max_cols,
             max_rows,
         })
+    }
+
+    /// Write `data` (f32) into the arena at byte `off` (UMA, no staging).
+    fn write_at(&mut self, off: u64, data: &[f32]) -> Result<()> {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.buffer
+            .copy_from_host_at(off, &bytes)
+            .map_err(|e| anyhow!("write arena @{off}: {e}"))
+    }
+
+    /// Read `len` f32 from the arena at byte `off` (UMA, no staging).
+    fn read_at(&self, off: u64, len: usize) -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; len * std::mem::size_of::<f32>()];
+        self.buffer
+            .copy_to_host_at(off, &mut bytes[..])
+            .map_err(|e| anyhow!("read arena @{off}: {e}"))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     /// Map+write `data` (f32) into work slot `i` (UMA, no staging).
@@ -352,6 +542,12 @@ pub struct DecodeResources<'a> {
     ring5: DescriptorSetRing<'a>,
     /// 6-binding ring for the fused MoE `mul_mat_vec_id` ([A,B,D,F0,F1,IDS]).
     ring6: DescriptorSetRing<'a>,
+    /// 7-binding ring for flash-attn ([Q,K,V,M,S,O,MO]). The full-attn records one
+    /// per query head into one submit, so it is sized to `num_attention_heads`.
+    ring7: DescriptorSetRing<'a>,
+    /// Per-slot full-attention KV cache (device-resident f16). RoPE is applied to
+    /// K at write time; V is stored raw. flash-attn reads each head's plane.
+    kv_cache: DeviceKvCache<'a>,
     /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
     /// attribute time between the GPU GEMV submits and the surrounding host
     /// prep/readback. Drained + printed via [`Self::take_profile`].
@@ -370,34 +566,53 @@ impl<'a> DecodeResources<'a> {
 
         // One persistent layout + ring per decode binding count. A ring of N sets
         // permits N live dispatches between resets; each GEMV pair / FFN sub-step
-        // submits + fence-waits before the next, so a modest ring (16) is ample
-        // even with the fused FFN recording several dispatches into one submit.
-        const RING_SIZE: usize = 16;
-        let mk =
-            |binding_count: usize| -> Result<(DescriptorSetLayout<'a>, DescriptorSetRing<'a>)> {
-                let layout =
-                    DescriptorSetLayout::storage_buffers(ctx, binding_count).map_err(|e| {
-                        anyhow!("build descriptor layout ({binding_count} bindings): {e}")
-                    })?;
-                let ring = DescriptorSetRing::new(ctx, &layout, binding_count, RING_SIZE).map_err(
-                    |e| anyhow!("build descriptor ring ({binding_count} bindings): {e}"),
-                )?;
-                Ok((layout, ring))
-            };
-        let (l2, ring2) = mk(2)?;
-        let (l3, ring3) = mk(3)?;
-        let (l5, ring5) = mk(5)?;
-        let (l6, ring6) = mk(6)?;
+        // submits + fence-waits before the next. The 3-binding ring is the busiest
+        // single-submit case: the full-attention per-head norm+rope records
+        // `2*(num_heads + num_kv_heads)` rms_norm/rope dispatches into ONE submit,
+        // so size it to cover that plus headroom. The 7-binding flash-attn ring
+        // records one dispatch per query head into one submit.
+        let n_heads = config.num_attention_heads;
+        let n_kv = config.num_key_value_heads;
+        let ring3_size = (2 * (n_heads + n_kv) + 16).max(32);
+        // ring5 is shared by the GEMV (one dispatch/submit) and the full-attn
+        // per-head RoPE (`n_heads + n_kv` dispatches into ONE submit), so size it
+        // to cover the busier RoPE case.
+        let ring5_size = (n_heads + n_kv + 16).max(32);
+        let ring7_size = (n_heads + 4).max(8);
+        let mk = |binding_count: usize,
+                  size: usize|
+         -> Result<(DescriptorSetLayout<'a>, DescriptorSetRing<'a>)> {
+            let layout = DescriptorSetLayout::storage_buffers(ctx, binding_count)
+                .map_err(|e| anyhow!("build descriptor layout ({binding_count} bindings): {e}"))?;
+            let ring = DescriptorSetRing::new(ctx, &layout, binding_count, size)
+                .map_err(|e| anyhow!("build descriptor ring ({binding_count} bindings): {e}"))?;
+            Ok((layout, ring))
+        };
+        let (l2, ring2) = mk(2, 16)?;
+        let (l3, ring3) = mk(3, ring3_size)?;
+        let (l5, ring5) = mk(5, ring5_size)?;
+        let (l6, ring6) = mk(6, 16)?;
+        let (l7, ring7) = mk(7, ring7_size)?;
+
+        // Device KV cache for the full-attention layers.
+        let n_full = config
+            .layer_types
+            .iter()
+            .filter(|&&t| t == LayerType::FullAttention)
+            .count();
+        let kv_cache = DeviceKvCache::new(ctx, n_full, n_kv, config.head_dim, KV_CACHE_MAX_SEQ)?;
 
         Ok(Self {
             arena,
             cache,
             recorder,
-            _layouts: vec![l2, l3, l5, l6],
+            _layouts: vec![l2, l3, l5, l6, l7],
             ring2,
             ring3,
             ring5,
             ring6,
+            ring7,
+            kv_cache,
             gemv_submit_ns: 0,
             gemv_other_ns: 0,
             gemv_count: 0,
@@ -412,6 +627,7 @@ impl<'a> DecodeResources<'a> {
         self.ring3.reset();
         self.ring5.reset();
         self.ring6.reset();
+        self.ring7.reset();
     }
 
     /// Drain the accumulated GEMV timing as
@@ -497,7 +713,7 @@ pub fn forward_token<'a>(
         let attn_out = match layer_type {
             LayerType::FullAttention => {
                 let out = full_attention(
-                    ctx, config, weights, res, state, layer, full_idx, &normed, start_pos,
+                    ctx, config, weights, res, layer, full_idx, &normed, start_pos,
                 )?;
                 full_idx += 1;
                 out
@@ -998,7 +1214,13 @@ fn gemv_f32_host(weight: &DeviceTensor<'_>, x: &[f32], nrows: usize) -> Result<V
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Full-attention layer (gated q_proj, per-head q/k norm + NeoX RoPE, causal SDPA)
+// Full-attention layer (gated q_proj, per-head q/k norm + NeoX RoPE, KV-cached
+// flash-attention + sigmoid gate). The q/k RMSNorm, NeoX RoPE, KV-cached
+// flash-attention, and per-head sigmoid gate now run **ON THE DEVICE**
+// (full-attention on-device, Step 6), each oracle-gated against the host f32
+// reference in `crates/vulkan-kernels/tests/device_full_attention.rs`. Only the
+// projections (already device GEMV) bracket this block; the heavy host SDPA
+// triple-loop and the per-element norm/rope/gate host math are gone.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1007,7 +1229,6 @@ fn full_attention<'a>(
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
     res: &mut DecodeResources<'a>,
-    state: &mut Qwen35ForwardState,
     layer: usize,
     full_idx: usize,
     normed: &[f32],
@@ -1018,91 +1239,144 @@ fn full_attention<'a>(
     let nkv = config.num_key_value_heads;
     let q_dim = nq * hd;
     let kv_dim = nkv * hd;
-    let half = config.rotary_dim / 2;
+    let rotary_dim = config.rotary_dim;
     let theta = config.rope_theta;
     let eps = config.rms_norm_eps;
     let pos = start_pos;
+    let group = nq / nkv;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+
+    if pos >= KV_CACHE_MAX_SEQ {
+        bail!(
+            "full_attention[{layer}]: position {pos} exceeds device KV cache cap {KV_CACHE_MAX_SEQ}"
+        );
+    }
 
     // q_proj → [query|gate] per head (out = 2*nq*hd); k/v_proj → [nkv*hd].
     let q_full = gemv_layer(ctx, weights, res, layer, "attn_q", normed)?; // 2*q_dim
     let k_in = gemv_layer(ctx, weights, res, layer, "attn_k", normed)?; // kv_dim
     let v_in = gemv_layer(ctx, weights, res, layer, "attn_v", normed)?; // kv_dim
 
-    let q_norm = norm_weight(weights, layer, "attn_q_norm")?; // [hd]
-    let k_norm = norm_weight(weights, layer, "attn_k_norm")?; // [hd]
+    // q/k RMSNorm weights are F32-resident device tensors (PLAIN per-head, head_dim
+    // wide, broadcast across heads). Bind them directly into the device rms_norm.
+    let q_norm = packed_or_f32_norm(weights, layer, "attn_q_norm")?;
+    let k_norm = packed_or_f32_norm(weights, layer, "attn_k_norm")?;
 
-    // Build this token's query heads (q/k norm + RoPE) and the K/V rows.
-    // Query layout in q_full per head h: [h*2*hd .. h*2*hd+hd] = query,
-    // [h*2*hd+hd .. h*2*hd+2*hd] = gate (consumed after attention).
-    let mut q = vec![0.0f32; q_dim];
+    // Land q_full ([query|gate] per head) and k_in into arena slots (UMA).
+    let qkv_off = res.arena.attn_qkv.offset;
+    let q_off = res.arena.attn_q.offset;
+    let k_off = res.arena.attn_k.offset;
+    let out_off = res.arena.attn_out.offset;
+    res.arena.write_at(qkv_off, &q_full)?;
+    res.arena.write_at(k_off, &k_in)?;
+
+    let f32_b = std::mem::size_of::<f32>() as u64;
+
+    // ── Submit 1: per-head q/k RMSNorm + NeoX RoPE, all device-resident. ──
+    // q head hh: rms_norm(q_full query half) -> attn_q head; then rope in place.
+    // k head hh: rms_norm(k_in head) -> attn_k head (in place); then rope.
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("full_attn[{layer}]: norm/rope begin: {e}"))?;
     for hh in 0..nq {
-        let src = &q_full[hh * 2 * hd..hh * 2 * hd + hd];
-        let normed_head = rms_norm_weight(src, &q_norm, eps); // plain per-head
-        let rotated = rope_neox(&normed_head, pos, half, hd, theta);
-        q[hh * hd..hh * hd + hd].copy_from_slice(&rotated);
+        // query half of head hh in q_full (stride 2*hd): bytes [hh*2*hd .. +hd].
+        let qsrc = qkv_off + (hh * 2 * hd) as u64 * f32_b;
+        let qdst = q_off + (hh * hd) as u64 * f32_b;
+        record_rms_norm(ctx, res, &q_norm.buffer, "attn_q_norm", hd, eps, qsrc, qdst)?;
     }
-    let mut k_row = vec![0.0f32; kv_dim];
+    res.recorder.barrier();
+    for hh in 0..nq {
+        let qdst = q_off + (hh * hd) as u64 * f32_b;
+        record_rope_neox(
+            ctx,
+            res,
+            "attn_q_rope",
+            hd,
+            rotary_dim,
+            pos,
+            theta,
+            qdst,
+            qdst,
+        )?;
+    }
     for hh in 0..nkv {
-        let src = &k_in[hh * hd..hh * hd + hd];
-        let normed_head = rms_norm_weight(src, &k_norm, eps);
-        let rotated = rope_neox(&normed_head, pos, half, hd, theta);
-        k_row[hh * hd..hh * hd + hd].copy_from_slice(&rotated);
+        let ksrc = k_off + (hh * hd) as u64 * f32_b;
+        record_rms_norm(ctx, res, &k_norm.buffer, "attn_k_norm", hd, eps, ksrc, ksrc)?;
     }
+    res.recorder.barrier();
+    for hh in 0..nkv {
+        let kdst = k_off + (hh * hd) as u64 * f32_b;
+        record_rope_neox(
+            ctx,
+            res,
+            "attn_k_rope",
+            hd,
+            rotary_dim,
+            pos,
+            theta,
+            kdst,
+            kdst,
+        )?;
+    }
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("full_attn[{layer}]: norm/rope submit: {e}"))?;
+    res.gemv_submit_ns += t_submit.elapsed().as_nanos();
 
-    // Append K/V to the per-slot cache (RoPE already applied to K).
-    state.k_cache[full_idx].extend_from_slice(&k_row);
-    state.v_cache[full_idx].extend_from_slice(&v_in);
+    // Read back the post-rope K rows; write K (roped) + V (raw) into the device
+    // f16 KV cache at this position. K head hh -> kv_head hh; V head hh -> hh.
+    let k_roped = res.arena.read_at(k_off, kv_dim)?;
+    for kvh in 0..nkv {
+        res.kv_cache
+            .write_row(full_idx, kvh, pos, &k_roped[kvh * hd..kvh * hd + hd], false)?;
+        res.kv_cache
+            .write_row(full_idx, kvh, pos, &v_in[kvh * hd..kvh * hd + hd], true)?;
+    }
     let kv_len = pos + 1;
 
-    // Causal scaled-dot-product attention, GQA (group = nq/nkv query heads per
-    // kv head). scale = 1/sqrt(head_dim).
-    let scale = 1.0f32 / (hd as f32).sqrt();
-    let group = nq / nkv;
-    let kc = &state.k_cache[full_idx];
-    let vc = &state.v_cache[full_idx];
-    let mut attn = vec![0.0f32; q_dim];
+    // ── Submit 2: per query head flash-attn (KV-cached) + sigmoid gate. ──
+    // gqa_ratio=1: each query head reads its kv head's plane directly. The
+    // gate is q_full's second half per head; sigmoid-mul folds it onto the flash
+    // output in place.
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("full_attn[{layer}]: attn begin: {e}"))?;
     for hh in 0..nq {
-        let kv_h = hh / group;
-        let qh = &q[hh * hd..hh * hd + hd];
-        // scores over all cached positions, softmax, weighted sum of V.
-        let mut scores = vec![0.0f32; kv_len];
-        let mut max_s = f32::NEG_INFINITY;
-        for (t, score) in scores.iter_mut().enumerate() {
-            let krow = &kc[t * kv_dim + kv_h * hd..t * kv_dim + kv_h * hd + hd];
-            let mut dot = 0.0f32;
-            for d in 0..hd {
-                dot += qh[d] * krow[d];
-            }
-            let s = dot * scale;
-            *score = s;
-            if s > max_s {
-                max_s = s;
-            }
-        }
-        let mut denom = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - max_s).exp();
-            denom += *s;
-        }
-        let inv = 1.0 / denom;
-        let out = &mut attn[hh * hd..hh * hd + hd];
-        for (t, &sw) in scores.iter().enumerate() {
-            let w = sw * inv;
-            let vrow = &vc[t * kv_dim + kv_h * hd..t * kv_dim + kv_h * hd + hd];
-            for d in 0..hd {
-                out[d] += w * vrow[d];
-            }
-        }
+        let kvh = hh / group;
+        let qh_off = q_off + (hh * hd) as u64 * f32_b;
+        let oh_off = out_off + (hh * hd) as u64 * f32_b;
+        let k_plane = res.kv_cache.k_plane_off(full_idx, kvh);
+        let v_plane = res.kv_cache.v_plane_off(full_idx, kvh);
+        record_flash_attn(
+            ctx,
+            res,
+            "full_flash",
+            hd,
+            kv_len,
+            scale,
+            qh_off,
+            k_plane,
+            v_plane,
+            oh_off,
+        )?;
     }
+    res.recorder.barrier();
+    for hh in 0..nq {
+        // gate half of head hh in q_full: bytes [hh*2*hd+hd .. +hd].
+        let gate_off = qkv_off + (hh * 2 * hd + hd) as u64 * f32_b;
+        let oh_off = out_off + (hh * hd) as u64 * f32_b;
+        record_sigmoid_mul(ctx, res, "full_gate", hd, gate_off, oh_off, oh_off)?;
+    }
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("full_attn[{layer}]: attn submit: {e}"))?;
+    res.gemv_submit_ns += t_submit.elapsed().as_nanos();
 
-    // Per-head sigmoid gate from q_full's gate half: attn[h,d] *= sigmoid(gate).
-    for hh in 0..nq {
-        let gate = &q_full[hh * 2 * hd + hd..hh * 2 * hd + 2 * hd];
-        let out = &mut attn[hh * hd..hh * hd + hd];
-        for d in 0..hd {
-            out[d] *= sigmoid(gate[d]);
-        }
-    }
+    // Read back the gated attention output → o_proj GEMV (the device KV cache
+    // already owns this token's K/V; the host needs only the gated activation).
+    let attn = res.arena.read_at(out_off, q_dim)?;
 
     // o_proj: [q_dim -> hidden].
     gemv_layer(ctx, weights, res, layer, "attn_output", &attn)
@@ -1928,6 +2202,204 @@ fn record_scaled_add<'a>(
     Ok(())
 }
 
+/// Record (no submit) a NeoX RoPE over ONE head vector `[head_dim]` at arena byte
+/// `in_off`, writing to `out_off` (may alias `in_off` — the shader reads the pair
+/// `(x[d], x[d+n_dims/2])` before writing both). `nrows=1`, single absolute `pos`.
+/// Bindings `[0=X input f32, 1=Y pos int (dummy 1-int slot), 2=Z freq (dummy),
+/// 3=D output f32, 4=I indices (dummy)]`. The `pos` lands in the dummy int slot.
+/// Oracle-gated by `rope_neox_matches_host_oracle`.
+#[allow(clippy::too_many_arguments)]
+fn record_rope_neox<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta: f32,
+    in_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let push = rope_neox_params(head_dim as u32, rotary_dim as u32, 1, theta).to_le_bytes();
+    let groups = {
+        let d = rope_neox_dispatch(rotary_dim as u32, 1);
+        [d.x, d.y, d.z]
+    };
+    let row = (head_dim * 4) as u64;
+    // The position buffer (binding 1) is read as `rope_data_pos[i2]` with i2=0
+    // (ne02=1), so it needs a single i32 = pos. Stage it into the pos slot.
+    let pos_off = res.arena.attn_pos.offset;
+    res.arena
+        .buffer
+        .copy_from_host_at(pos_off, &(pos as i32).to_le_bytes())
+        .map_err(|e| anyhow!("{name}: write rope pos: {e}"))?;
+    let fuse0 = (res.arena.fuse0.offset, res.arena.fuse0.len as u64);
+    let fuse1 = (res.arena.fuse1.offset, res.arena.fuse1.len as u64);
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring5,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(
+            ctx,
+            Kernel::RopeNeox,
+            Kernel::RopeNeox.specialization_u32(),
+            push.len() as u32,
+            5,
+        )
+        .map_err(|e| anyhow!("{name}: build rope_neox pipeline: {e}"))?;
+    let _ = fuse1;
+    let set = ring5
+        .next_updated(&[
+            (arena_buf, in_off, row),      // 0: X input
+            (arena_buf, pos_off, 8),       // 1: Y pos (i32 at index 0)
+            (arena_buf, fuse0.0, fuse0.1), // 2: Z freq (has_ff=0, unread)
+            (arena_buf, out_off, row),     // 3: D output
+            (arena_buf, pos_off, 8),       // 4: I indices uvec2 (set_rows_stride=0, unread)
+        ])
+        .map_err(|e| anyhow!("{name}: bind rope_neox ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) a KV-cached flash-attention for ONE query head: Q `[hd]`
+/// f32 at arena byte `q_off`, against the head's `[kv_len, hd]` f16 K/V planes
+/// in the device KV cache (`k_plane`/`v_plane` byte offsets), writing the `[hsv]`
+/// f32 output to arena byte `o_off`. Single head (gqa_ratio=1), no mask, no
+/// ALiBi. Bindings `[0=Q f32, 1=K f16, 2=V f16, 3=M mask (dummy), 4=S sinks
+/// (dummy), 5=O f32, 6=MO mask_opt (dummy)]`. The flash pipeline is pinned to a
+/// 32-wide subgroup by `Kernel::required_subgroup_size`. Oracle-gated by
+/// `flash_attn_matches_host_sdpa_oracle`.
+#[allow(clippy::too_many_arguments)]
+fn record_flash_attn<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+    q_off: u64,
+    k_plane: u64,
+    v_plane: u64,
+    o_off: u64,
+) -> Result<()> {
+    let spec = FlashAttentionSpec::f32_f16(head_dim as u32);
+    let push =
+        flash_attn_params(head_dim as u32, head_dim as u32, kv_len as u32, scale).to_le_bytes();
+    let groups = {
+        let d = flash_attn_dispatch();
+        [d.x, d.y, d.z]
+    };
+    let q_bytes = (head_dim * 4) as u64;
+    let o_bytes = (head_dim * 4) as u64;
+    // The cache plane is the whole `[max_seq, head_dim]` f16 region for this head;
+    // flash reads only positions `< kv_len`, but bind through the cached length so
+    // the descriptor range covers exactly what is read.
+    let kv_bytes = (kv_len * head_dim * std::mem::size_of::<u16>()) as u64;
+    let fuse0 = (res.arena.fuse0.offset, res.arena.fuse0.len as u64);
+    let fuse1 = (res.arena.fuse1.offset, res.arena.fuse1.len as u64);
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring7,
+        kv_cache,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let kv_buf = &kv_cache.buffer;
+    let (pipeline, _) = cache
+        .get(
+            ctx,
+            Kernel::FlashAttn,
+            spec.specialization_u32(),
+            push.len() as u32,
+            7,
+        )
+        .map_err(|e| anyhow!("{name}: build flash_attn pipeline: {e}"))?;
+    let set = ring7
+        .next_updated(&[
+            (arena_buf, q_off, q_bytes),          // 0: Q f32
+            (kv_buf, k_plane, kv_bytes),          // 1: K f16
+            (kv_buf, v_plane, kv_bytes),          // 2: V f16
+            (arena_buf, fuse0.0, fuse0.1.max(8)), // 3: M mask (dummy)
+            (arena_buf, fuse1.0, fuse1.1.max(8)), // 4: S sinks (dummy)
+            (arena_buf, o_off, o_bytes),          // 5: O f32
+            (arena_buf, fuse0.0, fuse0.1.max(8)), // 6: MO mask_opt (dummy)
+        ])
+        .map_err(|e| anyhow!("{name}: bind flash_attn ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) a per-element sigmoid gate `out[i] = sigmoid(gate[i]) *
+/// val[i]` over `[n]`: `gate` from arena byte `gate_off`, `val` from `val_off`,
+/// output to `out_off` (may alias `val_off`). Bindings 0=A(gate), 1=B(val),
+/// 2=D(out) — same `ring3` as add/rms_norm. Applies the full-attention per-head
+/// sigmoid gate device-resident. Oracle-covered by the elementwise sigmoid path.
+fn record_sigmoid_mul<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    n: usize,
+    gate_off: u64,
+    val_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let spec = Kernel::SigmoidMul.specialization_u32();
+    let push = sigmoid_mul_params(n as u32).to_le_bytes();
+    let groups = {
+        let d = sigmoid_mul_dispatch(n as u32);
+        [d.x, d.y, d.z]
+    };
+    let row = (n * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::SigmoidMul, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build sigmoid_mul pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, gate_off, row),
+            (arena_buf, val_off, row),
+            (arena_buf, out_off, row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind sigmoid_mul ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Fetch a per-layer F32-resident norm weight tensor (`attn_q_norm` /
+/// `attn_k_norm`), erroring if missing or not F32-resident. The device rms_norm
+/// binds its `.buffer` directly (head_dim-wide, broadcast across heads).
+fn packed_or_f32_norm<'w>(
+    weights: &'w ResidentWeights<'_>,
+    layer: usize,
+    suffix: &str,
+) -> Result<&'w DeviceTensor<'w>> {
+    let name = format!("blk.{layer}.{suffix}.weight");
+    let w = weights
+        .get(&name)
+        .ok_or_else(|| anyhow!("missing norm weight {name}"))?;
+    if !matches!(w.residency, Residency::DequantF32) {
+        bail!(
+            "{name}: full-attn norm weight must be F32-resident, got {:?}",
+            w.residency
+        );
+    }
+    Ok(w)
+}
+
 /// Standalone device RMSNorm: write host `x` into a work slot, record + submit +
 /// read back. Oracle-gated drop-in for [`rms_norm_weight`] where the surrounding
 /// data lives on host (the final norm). `w` must be an F32-resident norm weight.
@@ -2168,26 +2640,6 @@ fn rms_norm_weight(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     }
     let inv = 1.0 / (sumsq / n as f32 + eps).sqrt();
     (0..n).map(|i| x[i] * inv * w[i]).collect()
-}
-
-/// NeoX-style RoPE on one head vector `[head_dim]`. Pairs `(x[d], x[d+half])`
-/// rotate by `angle = pos * theta^(-2d/rotary_dim)` for `d < half`; dims beyond
-/// `rotary_dim` pass through (here rotary_dim == head_dim so none).
-fn rope_neox(x: &[f32], pos: usize, half: usize, head_dim: usize, theta: f32) -> Vec<f32> {
-    let mut out = x.to_vec();
-    let rotary_dim = half * 2;
-    for d in 0..half {
-        let inv_freq = theta.powf(-(2.0 * d as f32) / rotary_dim as f32);
-        let angle = pos as f32 * inv_freq;
-        let (s, c) = angle.sin_cos();
-        let x0 = x[d];
-        let x1 = x[d + half];
-        out[d] = x0 * c - x1 * s;
-        out[d + half] = x0 * s + x1 * c;
-    }
-    // dims >= rotary_dim already copied through by to_vec().
-    let _ = head_dim;
-    out
 }
 
 fn add_vec(a: &[f32], b: &[f32]) -> Vec<f32> {
