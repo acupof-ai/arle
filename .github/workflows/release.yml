@@ -144,6 +144,26 @@ jobs:
       - name: Install Python build dependencies (required for AOT kernel compilation)
         run: pip install --no-cache-dir -r requirements-build.txt
 
+      # TileLang 0.1.11 has no Volta (sm_70) bf16->fp16 GEMM fallback, so its
+      # LayoutInference pass fails ("Layout infer conflict between p and p_bf16")
+      # when build.rs emits the attention AOT kernels for sm_70. scripts/sm70_tilelang.patch
+      # adds a cuda.fma scalar fallback (upstream PR tile-ai/tilelang#2339, unmerged).
+      # The patch is C++ (src/cuda/op/gemm.cc) compiled into libtilelang.so, so the
+      # pinned wheel can't carry it — build TileLang from source for THIS SM-pinned
+      # job only. T1 + Blackwell keep the pinned wheel: separate runners, separate
+      # Python envs, zero blast radius. Non-editable install reproduces the official
+      # wheel's data layout (src/tl_templates + 3rdparty/cutlass/include) that
+      # build.rs's probe (tilelang_include_dirs) requires; --no-build-isolation lets
+      # the C++ build see the already-pinned torch / apache-tvm-ffi cu12 stack.
+      # REMOVE WHEN PR #2339 ships in a TileLang release (then re-pin the wheel).
+      - name: Build patched TileLang from source (sm_70 cuda.fma fallback)
+        run: |
+          pip install --no-cache-dir "cython>=3.1.0" scikit-build-core "z3-solver>=4.13.0,<4.15.5" ninja cmake
+          git clone --recursive --shallow-submodules --depth 1 --branch v0.1.11 \
+            https://github.com/tile-ai/tilelang.git /tmp/tilelang-sm70
+          scripts/patch_tilelang_sm70.sh /tmp/tilelang-sm70
+          pip install --no-cache-dir --no-build-isolation /tmp/tilelang-sm70
+
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
