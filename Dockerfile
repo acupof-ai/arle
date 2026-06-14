@@ -13,6 +13,13 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/usr/local/cuda/bin:${PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+# FlashMLA's sm90 sparse_fp8 kernels use thread-block clusters (launch_bounds
+# CLUSTER_SIZE) that require sm_90a, but the T1 arch set above uses plain 9.0 →
+# nvcc hard-fails (build.rs:1783). FlashMLA is a pod-only sm_90a artifact per
+# docs/plans/sm-coverage.md (DSv4-Flash needs the 8xH20 pod toolchain anyway),
+# so disable it in the release image. build.rs swaps in a clean stub; the
+# runtime gate dsv4_flashmla_decode_enabled defaults OFF — no half-state.
+ENV ARLE_CUDA_DISABLE_FLASHMLA=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
