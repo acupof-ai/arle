@@ -71,17 +71,29 @@ Build from source, full install matrix, uninstall: [docs/install.md](docs/instal
 
 ---
 
-## Status at a glance
+## Performance
 
-| Backend | Platform | Status | Headline |
-|---|---|:---:|---|
-| **CUDA** | Linux + NVIDIA | **Stable** | 197 tok/s on L4 (Qwen3.5-4B BF16, c=16) |
-| **Metal** | Apple Silicon | **Beta** | 85.6 tok/s on M4 Pro (Qwen3.6 35B-A3B 4-bit) |
-| **Metal DFlash** | Apple Silicon | **Beta** | Bit-identical spec decode for Qwen3.5 |
-| **OPD train (CUDA)** | Linux + NVIDIA | **Beta** | 2.49–2.91× faster than HF TRL `GKDTrainer`; LoRA fits 4 GB cards |
-| **CPU** | Portable | **Dev-only** | Smoke tests only |
+Measured on the runtime, not projected — fresh `arle serve` benches, one binary.
 
-Models: **Qwen3.5 family** (CUDA + Metal) · **Qwen3.6** (Metal) · **DeepSeek-V4-Flash** (CUDA 8×H20, TP=8 / EP=8 FP8 — prefill 23 ms, B=1 decode 15 ms/token). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
+**Apple Silicon — one M4 Pro laptop (48 GB), single user.** A 35B-A3B MoE decodes as fast as the 4B dense and 1.7× the 9B, because only ~3B params activate per token:
+
+| Model · Metal 4-bit | Decode | TPOT | TTFT |
+|---|---:|---:|---:|
+| Qwen3.5-0.8B | **318 tok/s** | 3.2 ms | 0.17 s |
+| Qwen3.5-4B | 84 tok/s | 11.9 ms | 0.82 s |
+| Qwen3.5-9B | 50 tok/s | 20.0 ms | 1.45 s |
+| **Qwen3.6-35B-A3B** · MoE | **85 tok/s** | 11.7 ms | 1.23 s |
+
+<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="docs/experience/wins/2026-06-14-bench-metal-m4pro-local-model-ladder.md">how it's measured</a></sub>
+
+**NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8.
+
+<p align="center">
+  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode 33.5 → 53.3 tok/s over the 2026-06-13 → 06-14 campaign" width="720">
+</p>
+<p align="center"><sub>DSv4 B=1 decode, <b>33.5 → 53.3 tok/s</b> across the 2026-06-13 → 06-14 campaign — every step traced to a <code>docs/experience/wins/</code> entry.</sub></p>
+
+**Stability:** CUDA **Stable** · Metal **Beta** (DFlash: bit-identical spec decode) · OPD train **Beta** (2.5–2.9× vs HF TRL `GKDTrainer`, LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
 ---
 
@@ -126,23 +138,6 @@ flowchart TB
 ```
 
 Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/architecture.md) · [codebase-map](docs/codebase-map.md).
-
----
-
-## Latest Updates
-
-<!-- Breakthrough-only headlines (shipped capability / perf wins). Research notes + retractions live in docs/. -->
-
-**2026-06-10 — Phase 0 debt cleared:** DSv4 256K boots + needle-exact @230K, admission on real KV budgets, KV-parity gate re-ported (FlashMLA decode licensed) — Phase 1 batched serving lane is next ([#55](https://github.com/cklxx/arle/issues/55)).
-
-**2026-06-08 — DeepSeek-V4-Flash B=1: prefill 23 ms, decode 27 → 15 ms/token** (8×H20, TP=8 / EP=8, FP8 MoE). Official DSA indexer flattens decode across context (4.8× @4k), tensor-core DeepGEMM projections (−94% per stage), MTP batched verify **+71% decode tok/s** — byte-identical. [FINAL report](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md).
-
-<p align="center">
-  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode optimization journey (2026-06-13 → 06-14): 33.5 → 36.9 (64-align packing fix) → 44.0 (FP8 decode-band MoE lane) → 44.5 (NUMA pin) → 53.3 tok/s (d2 chain-fold MTP), with the 06-14 confirmed 49–55.6 tok/s acceptance band" width="720">
-</p>
-<p align="center"><sub>B=1 decode tok/s across the 2026-06-13 → 06-14 campaign — every step traced to a <code>docs/experience/wins/</code> entry.</sub></p>
-
-Older history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
