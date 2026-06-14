@@ -1,8 +1,13 @@
 #version 450
 // ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/conv1d.cu.
 // Qwen3.5 depthwise conv1d includes SiLU and advances the per-slot ring.
-
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+//
+// THROUGHPUT: the per-channel work is fully independent, so one thread per
+// channel via `gl_GlobalInvocationID.x` packs a full 256-wide workgroup (was
+// local_size_x=1 — one active lane per wave, ~1.5% utilization, 10240 single-
+// thread workgroups). The body is unchanged; only the lane packing + dispatch
+// (`ceil(num_channels/256)` workgroups) differ. Tail lanes self-mask on `c >= n`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
     uint num_channels;
