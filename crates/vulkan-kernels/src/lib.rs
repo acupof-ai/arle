@@ -830,12 +830,14 @@ pub fn f16_kv_pack_dispatch(n: u32) -> Dispatch {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Qwen3.5 gated-delta linear-attention push-constant contracts (linear-attention
-// on-device port). The two model-specific serial shaders
-// (`qwen35_ssm_conv.comp`, `qwen35_gated_delta_net.comp`) replace the host
-// depthwise-conv1d + recurrent gated-delta routines in `infer-vulkan`'s
-// `linear_attention`. Both run ONE invocation per output lane (channel / value
-// head) with `local_size_x = 1` — serial fallbacks oracle-gated against the
-// host f32 routine, not throughput kernels.
+// on-device port). The two model-specific shaders (`qwen35_ssm_conv.comp`,
+// `qwen35_gated_delta_net.comp`) replace the host depthwise-conv1d + recurrent
+// gated-delta routines in `infer-vulkan`'s `linear_attention`. Both are now
+// throughput kernels filling a full workgroup: conv runs one thread per channel
+// (`local_size_x = 256`, `ceil(channels/256)` workgroups); gated-delta runs one
+// workgroup per value head with `local_size_x = 128` threads over the `val_dim`
+// state columns. Still oracle-gated byte-for-byte against the host f32 routine
+// (the per-head scalar reductions keep the host's serial order).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Push-constant block for `qwen35_ssm_conv.comp` = `{num_channels, seq_len,
@@ -851,10 +853,11 @@ pub fn qwen35_ssm_conv_params(num_channels: u32, seq_len: u32, kernel_size: u32)
     KernelParams::from_words(vec![num_channels, seq_len, kernel_size])
 }
 
-/// Dispatch grid for `qwen35_ssm_conv.comp`: `local_size_x = 1`, one invocation
-/// per channel (`gl_GlobalInvocationID.x = c`), so `x = num_channels`.
+/// Dispatch grid for `qwen35_ssm_conv.comp`: `local_size_x = 256`, one invocation
+/// per channel (`gl_GlobalInvocationID.x = c`), so `ceil(num_channels/256)`
+/// workgroups cover all channels (tail lanes self-mask on `c >= num_channels`).
 pub fn qwen35_ssm_conv_dispatch(num_channels: u32) -> Dispatch {
-    Dispatch::x(num_channels.max(1))
+    Dispatch::x(num_channels.div_ceil(256).max(1))
 }
 
 /// Push-constant block for `qwen35_gated_delta_net.comp` = `{num_key_heads,
@@ -884,9 +887,10 @@ pub fn qwen35_gated_delta_net_params(
     ])
 }
 
-/// Dispatch grid for `qwen35_gated_delta_net.comp`: `local_size_x = 1`, one
-/// invocation per value head (`gl_GlobalInvocationID.x = v_head`), so
-/// `x = num_value_heads`.
+/// Dispatch grid for `qwen35_gated_delta_net.comp`: ONE workgroup per value head
+/// (`gl_WorkGroupID.x = v_head`, `x = num_value_heads`) with `local_size_x = 128`
+/// threads mapping the `val_dim` state columns. Each thread owns its columns for
+/// the whole sequence, so the recurrence needs no shared memory or barriers.
 pub fn qwen35_gated_delta_net_dispatch(num_value_heads: u32) -> Dispatch {
     Dispatch::x(num_value_heads.max(1))
 }

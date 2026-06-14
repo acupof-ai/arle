@@ -1,8 +1,19 @@
 #version 450
 // ARLE Vulkan shader ported from crates/cuda-kernels/csrc/misc/gated_delta_rule.cu.
-// Serial fallback for Qwen3.5 gated-delta recurrent decode/prefill semantics.
+// Qwen3.5 gated-delta recurrent decode/prefill semantics.
+//
+// THROUGHPUT: one WORKGROUP per value head (`gl_WorkGroupID.x = v_head`) with
+// `local_size_x = 128` threads mapping the `val_dim` columns (was
+// local_size_x=1 — one serial thread doing all key_dim*val_dim*2 inner
+// iterations per head, ~48 single-thread workgroups). The `[key_dim, val_dim]`
+// state is partitioned by `val`: state element `(j, val)` is touched by exactly
+// the thread owning `val`, for every token. So across the recurrence a thread
+// only ever reads/writes ITS OWN columns — no cross-thread state sharing, hence
+// NO shared memory and NO barriers. Each thread recomputes the per-head scalars
+// (q/k l2-norm, decay, beta) with the SAME serial reduction order as the host
+// oracle, so numerics stay byte-identical (no reduction reorder).
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
     uint num_key_heads;
@@ -51,10 +62,11 @@ float k_value(uint token_base, uint q_dim_total, uint k_head, uint j, float k_no
 }
 
 void main() {
-    const uint v_head = gl_GlobalInvocationID.x;
+    const uint v_head = gl_WorkGroupID.x;
     if (v_head >= p.num_value_heads || p.num_key_heads == 0 || p.key_dim == 0 || p.val_dim == 0) {
         return;
     }
+    const uint tid = gl_LocalInvocationID.x;
 
     // GQA key-head mapping: llama.cpp expands the key heads to value heads with
     // `ggml_repeat`, which TILES rather than block-broadcasts — value head
@@ -71,6 +83,8 @@ void main() {
 
     for (uint token = 0; token < p.seq_len; ++token) {
         const uint token_base = token * qkv_stride;
+        // Per-head scalars, recomputed by every thread with the host oracle's
+        // serial reduction order (byte-identical, no tree-reduction reorder).
         float q_sumsq = 0.0;
         float k_sumsq = 0.0;
         for (uint j = 0; j < p.key_dim; ++j) {
@@ -91,8 +105,11 @@ void main() {
         const float exp_g = exp(a_log[v_head] * softplus(a_val + dt_bias[v_head]));
         const float beta = sigmoid(b_val);
 
-        for (uint val = 0; val < p.val_dim; ++val) {
-            const float v_val = qkv[token_base + q_dim_total + k_dim_total + v_head * p.val_dim + val];
+        // Threads stride over the value columns; each owns the state columns it
+        // touches for the whole sequence, so no inter-thread sync is needed.
+        for (uint val = tid; val < p.val_dim; val += gl_WorkGroupSize.x) {
+            const float v_val =
+                qkv[token_base + q_dim_total + k_dim_total + v_head * p.val_dim + val];
             float kv_mem = 0.0;
             for (uint j = 0; j < p.key_dim; ++j) {
                 const uint state_idx = state_base + j * p.val_dim + val;
