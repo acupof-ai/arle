@@ -1,6 +1,6 @@
 # Rubric-based On-policy Distillation (ROPD) — adoption analysis for ARLE / SOPD
 
-**Date**: 2026-06-14 · **Driver**: ckl · **Status**: research → recommended OPD-faithful cut → issue [#98](https://github.com/cklxx/arle/issues/98)
+**Date**: 2026-06-14 · **Driver**: ckl · **Status**: research → **DECIDED Path A** (ckl 2026-06-14: "只用他的策略" — rubric machinery in distillation form, never GRPO) → issue [#98](https://github.com/cklxx/arle/issues/98)
 
 > Companion to the [SOPD survey](2026-06-14-self-training-lora-options-survey.md) (Axis A gains **A5**)
 > and [SOPD plan](../plans/2026-06-14-self-training-lora-opd-sopd.md) (bridges #93 → #97).
@@ -15,15 +15,15 @@
 - **The catch (load-bearing).** ROPD-as-published optimizes with **GRPO** — the rubric score becomes a
   scalar reward `s_i = (Σ w_k v_{i,k}) / (Σ w_k + ε)` fed to policy gradient. That collides head-on with
   ARLE's hard OPD-only / **never-GRPO** line ([2026-05-18 pivot](../projects/2026-05-18-opd-only-pivot.md)).
-- **Recommendation (Path A, default).** Adopt the **rubric machinery** (Rubricator + Verifier + rubric
-  scoring) but drive it with a **rejection / best-of-N distillation** update (RFT-style: select the
-  rubric-best τ*, GKD `λ·CE(student‖τ*) + (1−λ)·KL(student‖EMA)`), **not** GRPO. This is the rubric
-  generalization of [#93](https://github.com/cklxx/arle/issues/93)'s verifier and the **bridge that makes
-  [#97](https://github.com/cklxx/arle/issues/97) (skills / agentic self-evolving) actually work** —
-  agent tasks are not exact-match-verifiable. Stays inside the pivot.
-- **Strategic fork for ckl (Path B).** The literal GRPO-ROPD results require **overturning** the
-  2026-05-18 GRPO KILL (the re-do-a-killed-item rule: overturn its evidence first). Proceeding with Path A
-  by default; say the word to reopen GRPO.
+- **Decision — Path A (confirmed by ckl 2026-06-14: "只用他的策略").** Adopt the **rubric machinery**
+  (Rubricator + Verifier + rubric scoring) but drive it with a **rejection / best-of-N distillation**
+  update (RFT-style: select the rubric-best τ*, GKD `λ·CE(student‖τ*) + (1−λ)·KL(student‖EMA)`), **not**
+  GRPO. This is the rubric generalization of [#93](https://github.com/cklxx/arle/issues/93)'s verifier and
+  the **bridge that makes [#97](https://github.com/cklxx/arle/issues/97) (skills / agentic self-evolving)
+  actually work** — agent tasks are not exact-match-verifiable. Stays inside the pivot.
+- **Path B (literal GRPO-ROPD) — declined.** Would require **overturning** the 2026-05-18 GRPO KILL
+  (the re-do-a-killed-item rule: overturn its evidence first). **Not pursued** per ckl's 2026-06-14 call;
+  recorded here only as the boundary A5 must not cross. Re-opening it is a separate, explicit decision.
 
 ## ROPD mechanism (grounded — from the paper, not memory; it post-dates the Jan-2026 cutoff)
 
