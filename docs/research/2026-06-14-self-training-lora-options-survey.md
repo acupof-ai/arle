@@ -19,18 +19,31 @@ treat it as one candidate in §2, not the chosen approach).
 ckl's vision decomposes into one runtime capability with two cadences:
 
 > A single ARLE process on an AIPC serves the user **and** improves its own weights from its
-> own work ("skills"), **teacher-free**, with the better weights becoming live — fast as a
-> hot-swapped adapter (**自更新 / update**) and, periodically, folded into the base and
-> re-quantized (**升级 / upgrade = 流式自动量化**). One runtime, one weight store: **训推一体**.
+> own work ("skills"), **teacher-free**, *as it serves* — **the update logic runs at rollout
+> time**, not in a separate batch/idle phase. The better adapter is already live (**自更新 /
+> update**); periodically it folds into the base and re-quantizes (**升级 / upgrade =
+> 流式自动量化**). One runtime, one weight store: **训推一体**. The loop is **base-model-agnostic**
+> — you size it by **hardware budget**, then pick whatever base fits.
 
-Five things must be true for that to be *simple and real*, and each is a design axis with
+> **Corrections from ckl (2026-06-14), now binding on this doc:**
+> 1. **Update fires AT rollout time** (online, inline) — NOT an offline/idle batch loop. The act
+>    of rolling out *is* the update. (Reframes the cadence; see new **Axis G**. This is actually
+>    truer to the existing `opd_step`, which already does rollout→backward→step in one tight loop.)
+> 2. **Base-model-agnostic; gate on hardware budget.** The loop is a *unified engine capability*
+>    (like paged-KV — model-neutral in the seam, per `feedback_unified_abstraction_not_per_model`),
+>    not a per-model path. The budget question is therefore **budget-first, base-second** (§3
+>    reoriented; see new **Axis H**).
+
+Seven things must be true for that to be *simple and real*, and each is a design axis with
 peer options (§2):
 
-1. **Where does the learning signal come from with no external teacher?** (signal source)
-2. **What is the trainable surface?** (PEFT variant / target / rank)
-3. **How does a trained adapter become a quantized base?** (streaming auto-quant / 升级)
-4. **What is the process shape that makes train == infer?** (训推一体 boundary)
-5. **Which device runs the train loop, and what generates the prompts?** (backend + skills data)
+1. **Where does the learning signal come from with no external teacher?** (signal source — Axis A)
+2. **What is the trainable surface?** (PEFT variant / target / rank — Axis B)
+3. **How does a trained adapter become a quantized base?** (streaming auto-quant / 升级 — Axis C)
+4. **What is the process shape that makes train == infer?** (训推一体 boundary — Axis D)
+5. **Which device runs the loop, and what generates the prompts?** (backend + skills data — Axes E/F)
+6. **When does the update fire relative to rollout?** (online coupling — **Axis G**, ckl correction 1)
+7. **Where does the loop live — per-model or seam-level?** (base coupling — **Axis H**, ckl correction 2)
 
 This doc does NOT pick the composition. It lays out the peers, the costs, and the ceiling.
 
@@ -194,9 +207,54 @@ replaying what the agent actually did) is the truest match to ckl's vision and t
 step. F4 pairs with A2 (best-of-N) when a verifier exists. Start F1, design the loop so F2 is a
 data-source swap, not a rewrite.
 
+### Axis G — Update timing / rollout coupling (ckl correction 1: "update fires at rollout time")
+
+When does the optimizer step fire relative to the rollout? This is the axis ckl's first
+correction added — and it changes which **signal source (Axis A)** is even compatible.
+
+| Option | When the update fires | On-policy staleness | KV-cache validity | Speed cost | Stability | Impl cost |
+|---|---|---|---|---|---|---|
+| G1. Offline batch *(rejected by ckl)* | after N rollouts, separate trainer run | stale (data ≠ current policy) | n/a | — | easy | — |
+| **G2. Inline-per-rollout** | right after each rollout sequence, same loop | minimal | fresh per sequence | + recompute *or* fused pass | good (with EMA target) | **low — ≈ what `opd_step` already does** |
+| G3. Streaming per-token (test-time training) | after each token/chunk, *mid-sequence* | zero | **stale within sequence** (early KV computed with pre-update adapter) | highest | needs slow EMA + small lr | high |
+
+**Verdict**: ckl's "rollout 时就走更新" = **G2** (with G3 as the aggressive limit). G2 is
+structurally what `opd_step` already is (rollout → backward → step, one tight loop); the
+correction is that there is **no separate idle/batch phase** — the serving rollout *drives* the
+update inline, so 自更新 is *continuous*, not a discrete cadence. **This reshapes Axis A**:
+best-of-N (A2) is inherently batch-y (needs N complete sequences then a filter) and does **not**
+fit G2/G3 cleanly, whereas **A1 EMA soft-KL is computable per-token inside the rollout forward** —
+so the rollout-time constraint *promotes A1 from "simplest" to "the spine"*, and the EMA's
+slow-moving target is precisely the stability mechanism that keeps an online per-rollout update
+from diverging (the classic mean-teacher / online-distillation reason for EMA). Two sub-forks fall
+out (→ §7): **fused-single-pass** (use the rollout's own logits/activations, kill the recompute,
+but lose the no-tape CUDA-graph speed) vs **two-pass-inline** (keep the fast rollout kernel,
+recompute+step immediately after each sequence); and, for G3, the **KV-staleness** handling (accept
+frozen stale KV à la `frozen_kv_mtp`, refresh naturally as new tokens use the new adapter).
+
+### Axis H — Base coupling (ckl correction 2: "base-agnostic; gate on hardware budget")
+
+| Option | Where the loop lives | Per-model work | Matches unified-abstraction principle | Today |
+|---|---|---|---|---|
+| **H1. Seam-level unified loop** (base-agnostic) | `infer-core`/`infer-seam`; each model plugs an adapter-sync trait | one small trait impl per base | ✅ (mirrors paged-KV / batched-decode being model-neutral) | aspiration |
+| H2. Per-model special path | duplicated per base | high | ❌ (the DSv4-special anti-pattern) | current sync is **Qwen3.5-only** |
+
+**Verdict**: base-agnostic per ckl → **H1**. The rollout-time update loop is an *engine capability*
+that sits above the seam, model-neutral; each base plugs an adapter-sync (mirroring how models plug
+paged-KV adapters; `feedback_unified_abstraction_not_per_model`). Today only Qwen3.5 has the
+cached-base re-merge wired (`remerge_student_lora`, AttentionQv-locked) — so "base-agnostic" =
+**generalize that sync into a seam-level capability** (the real gap H1 names). Consequence for the
+budget question: it becomes **budget-first, base-second** — pick the largest base the hardware
+budget allows; the loop is identical regardless of base (§3 reoriented).
+
 ---
 
-## 3. Budget × hardware matrix per model size
+## 3. Budget × hardware — base-agnostic, sized by hardware budget
+
+**Orientation (ckl correction 2): budget-first, base-second.** The loop is base-independent
+(Axis H), so the real input is the hardware budget — you pick the largest base that fits and the
+*same* rollout-time self-update runs. **§3.2 is the budget-first, base-agnostic answer to
+"只看硬件预算"; §3.1 is the per-model backing detail** behind those param-class rows.
 
 **Memory model (matches `arle train estimate-memory`):**
 
@@ -220,7 +278,7 @@ So **self-training peak ≈ inference peak × ~1.1–1.5**, dominated by the qua
 That is the headline: *if a device can serve the model, it can almost-certainly self-train its
 adapter on it.*
 
-### 3.1 The matrix (analytical estimates — validate with `arle train estimate-memory`)
+### 3.1 Per-model backing detail (analytical estimates — validate with `arle train estimate-memory`)
 
 > ⚠️ **These are back-of-envelope estimates (hypothesis per §0), not measured.** 4-bit base ≈
 > params×0.55 B (incl. scales/zeros). KV @4k ctx, bf16. Activation floor for batch=1, seq≈512
@@ -237,21 +295,29 @@ adapter on it.*
 | Qwen3.6-35B-A3B (MoE, Metal canonical) | 35B tot / 3B act | ~19 GB | ~0.7 GB | ~0.1 GB | ~0.7 GB | **~22–24 GB** | 36–64 GB unified | 24–32 GB |
 | DSv4-Flash | huge MoE | multi-GPU | — | — | — | **8×H20 (TP8/EP8)** | cloud only | 8×H20 |
 
-### 3.2 Hardware tiers mapped to the matrix
+### 3.2 Budget-first, base-agnostic (the answer to "只看硬件预算")
 
-| Tier | Example | Train device | Self-trainable in-tree (today) |
+The loop is base-independent (Axis H), so read the table by **budget**, not by model. Rows are a
+**param-class** ("the largest base that self-trains @ rollout"), not a specific model — pick any
+base in that class. Same rollout-time self-update (§Axis G) regardless.
+
+| HW budget | Train device | Largest base class self-training @ rollout | Cadence available |
 |---|---|---|---|
-| 8 GB unified | M1/M2 base, entry M-series | Metal | 0.6B, 0.8B, 4B(tight) |
-| 16 GB unified | M-series base/Pro, RTX 4060/4070 laptop | Metal / CUDA | up to 8B |
-| 24 GB | RTX 4090 / 5090, M-Pro | CUDA / Metal | up to 30B-A3B (tight) |
-| 36–128 GB unified | M3/M4 Max, Mac Studio, **Ryzen AI Max+ 395 128 GB** | Metal (Apple) / **serve-only on Ryzen** | 35B-A3B comfortably *(Ryzen: serve-only — no HIP autograd, Axis E)* |
-| 8×H20 pod | cloud | CUDA TP8/EP8 | DSv4-Flash; the **升级/requant + cloud-teacher** tier |
+| **8 GB** unified | Metal | ≤4B-class (0.6 / 0.8 / 4B-tight) | 自更新 inline |
+| **16 GB** unified | Metal / CUDA | ≤8B-class | 自更新 inline |
+| **24 GB** | CUDA / Metal | ≤30B-A3B MoE-class (tight) | 自更新 inline; 升级 tight |
+| **36–128 GB** unified | Metal (Apple Silicon) | 35B-A3B-class comfortably | 自更新 inline + local 升级 |
+| **8×H20** pod | CUDA TP8/EP8 | DSv4-class | cloud teacher / 升级 (requant) tier |
 
-**Budget reading**: the entire Qwen3 small-to-mid range (0.6B–8B) self-trains on commodity
-8–16 GB AIPC hardware *because LoRA-only makes the trainable block ~MB and the self-teacher adds
-no second base*. The MoE 30–35B tier needs a 24 GB dGPU or a 36 GB+ unified-memory Mac. Ryzen-AI
-AIPCs can serve the whole range but cannot self-train in-tree until a HIP/Vulkan autograd backend
-exists (out of current scope; master-strategy DEFER-until-Phase-3).
+**Budget reading**: the whole small-to-mid class (≤8B) self-trains on commodity 8–16 GB AIPC
+hardware *because LoRA-only makes the trainable block ~MB and the self-teacher (A1) adds no second
+base* — so **self-train fits wherever serve fits** (peak ≈ inference × ~1.1–1.5). The MoE 30–35B
+class needs a 24 GB dGPU or a 36 GB+ unified-memory Mac.
+
+**Base-agnostic caveat (Axis E):** a Ryzen-AI / Radeon AIPC can *serve* any class (HIP/Vulkan) but
+cannot *self-train* in-tree — no HIP/Vulkan autograd backend exists. Base-agnostic on the train
+side still means a **Metal or CUDA** train device (out of scope to change; master-strategy
+DEFER-until-Phase-3).
 
 ---
 
@@ -281,28 +347,43 @@ the fast teacher forward) is what makes the rollout/teacher cost negligible, whi
 why master-strategy-v2 lists OPD as the one training axis where ARLE's runtime authority is
 structurally differentiating.
 
+**ckl's two corrections sharpen the moat into something none of the above can state:**
+- **Update at rollout time (Axis G)** makes 训推一体 *literal*: the rollout pass and the update are
+  the same act, not a serve-phase followed by a train-phase. The model improves *as it serves*,
+  token-stream by token-stream — maximally on-policy by construction (zero data↔update staleness).
+  Apple's on-device pipeline is supervised + offline-trained adapters; verl/TRL collect rollouts
+  then train in a separate process. "Update fires on the rollout path" is the line none of them
+  cross.
+- **Base-agnostic seam-level loop (Axis H)** makes it a *runtime capability*, not a model feature:
+  the same online-update loop runs on whatever base fits the budget (§3.2), each base plugging one
+  adapter-sync trait — exactly how paged-KV/batched-decode are model-neutral in the seam today.
+  The moat is the *runtime that does this for any base*, not a single fine-tuned model.
+
 ---
 
 ## 5. The ceiling — extreme state and final effect
 
 **Extreme state (what "world-top-tier AIPC self-training" looks like at the limit):**
 
-> A laptop/Mac runs one ARLE process. During use it serves the user. During idle it replays the
-> day's skills (F2), generates on-policy rollouts (infer-rollout), scores them against its own
-> EMA self-teacher (A1) and, where a verifier exists, keeps only verified-correct trajectories
-> (A2). It distills the delta into a rank-r adapter (B1), and **hot-swaps a better adapter within
-> seconds** (自更新, C1) — measurably better on the user's own task distribution, gated by the
-> needle ladder so a bad cycle never goes live. Overnight, accepted adapters **merge into the
-> 4-bit base and re-quantize (升级, C2/C3 = 流式自动量化)**, resetting the adapter to zero for the
-> next day. **No cloud, no teacher model, no data leaves the device.**
+> A laptop/Mac runs one ARLE process on whatever base fits its memory budget (§3.2 — base-
+> agnostic). As it **serves**, every rollout *is* an update: the engine produces an on-policy
+> rollout, computes the EMA self-teacher signal (A1) from the same weights in the same pass, and
+> distills the delta into the rank-r adapter **right there on the rollout path** (Axis G) — the
+> better adapter is already live, no separate train run, no idle batch. The model gets measurably
+> better at the user's own skills *while being used*, with the needle gate running periodically to
+> snap the adapter back to the last-good snapshot if a window regresses. Periodically the accepted
+> adapter **merges into the quantized base and re-quantizes (升级, C2/C3 = 流式自动量化)**, resetting
+> the adapter for the next window. **No cloud, no teacher model, no data leaves the device — and
+> the same loop runs on a 0.6B phone-class base or a 35B-A3B MoE, sized only by hardware budget.**
 
 **Final effect, concretely:**
-- **自更新 cadence**: seconds-to-minutes; fp adapter swap; continuous personalization to the
-  user's skills; trivially reversible (drop the adapter).
-- **升级 cadence**: hourly/overnight; base re-quantized; permanent capability gain folded in;
-  gated by correct-inference each cycle.
-- **Budget**: the whole Qwen3 0.6B–8B range does this on 8–16 GB consumer hardware (§3); the
-  35B-A3B MoE on a 36 GB+ Mac.
+- **自更新 (now continuous, at rollout time — Axis G)**: no discrete cycle; the live adapter
+  improves with each served rollout, maximally on-policy, trivially reversible (drop the adapter /
+  revert to the EMA-anchored last-good snapshot).
+- **升级 cadence**: periodic; base re-quantized; permanent capability gain folded in; gated by
+  correct-inference each cycle.
+- **Budget (base-agnostic, §3.2)**: ≤8B-class self-improves-while-serving on 8–16 GB consumer
+  hardware; 35B-A3B-class on a 36 GB+ Mac — pick the base by budget, the loop is identical.
 - **Versus the SOTA anchor (Apple AFM)**: matches on-device LoRA-on-quantized-base + adapter swap
   + privacy; **adds** the self-distillation improvement loop and the merge-then-requant upgrade
   cadence in a single train-infer-unified runtime — the parts Apple's supervised, adapter-only
@@ -326,24 +407,30 @@ This is a **recommendation to decide on**, not an implementation plan:
 
 | Axis | Simplest-viable pick | New surface |
 |---|---|---|
-| A. Signal | **A1 EMA self-teacher** (soft KL), reuse `backward_chunked_kl_rollout` | EMA snapshot buffer + teacher=snapshot wiring |
+| A. Signal | **A1 EMA self-teacher** (soft KL), reuse `backward_chunked_kl_rollout` — *promoted to spine by Axis G* | EMA snapshot buffer + teacher=snapshot wiring |
 | B. PEFT | **B1 vanilla LoRA q/v** (exists) | none for 自更新 |
 | C. Quant | **C1 fp hot-swap** for 自更新 (exists); **C3 dense-merge+TurboQuant** for first 升级 | requant-on-schedule wiring (升级 only) |
 | D. Process | **D1 single-process** (exists) | none |
 | E. Device | **E2 Metal** (AIPC) / **E1 CUDA** (pod) | M5.3b op coverage for speed (works today, slow) |
 | F. Data | **F1 static jsonl** to bring up, design for **F2 skill-replay** | none for bring-up |
+| **G. Timing** | **G2 inline-per-rollout** (≈ existing `opd_step` shape); two-pass-inline first, fused later | loss+step fire on the rollout path, not a batch run |
+| **H. Base coupling** | **H1 seam-level** design; bring up on the wired model, keep the loop base-neutral | adapter-sync as a seam capability (today Qwen3.5-only) |
 
-**Net new surface for a first 自更新-only SOPD**: (1) an EMA snapshot of the base/adapter as the
-self-teacher, (2) the loss wiring to distill student → EMA, (3) the accept/reject gate per cycle
-(needle ladder). Everything else is existing code. **升级/流式自动量化 is a strictly later,
-separable milestone** (C3 first, C2 = QA-LoRA as the clean end-state) and should NOT block the
+**Net new surface for a first 自更新-only SOPD**: (1) an EMA snapshot of the adapter (NOT full
+merged weights — keeps the base shared, §7 Q2) as the self-teacher, (2) the loss wiring to distill
+student → EMA **inline on each rollout** (G2, reuse `backward_chunked_kl_rollout`), (3) a periodic
+needle-gate snapshot/revert. Everything else is existing code. **升级/流式自动量化 is a strictly
+later, separable milestone** (C3 first, C2 = QA-LoRA as the clean end-state) and does NOT block the
 自更新 bring-up.
 
-**Why this is "simple"**: it adds *one buffer and one loss target* to a loop that already does
-on-policy rollout + KL backward + live adapter swap in one process. The hard, novel parts (升级
-requant, skill-replay data, verifier-gated A2, QA-LoRA, Metal op coverage, Ryzen self-train) are
-all **deferrable and independently licensable** — none is on the critical path to a working
-自更新 demo.
+**Why this is "simple"**: it adds *one EMA buffer and one loss target* to a loop that already does
+on-policy rollout + KL backward + live adapter swap in one process — and ckl's correction 1 means
+it reuses the `opd_step` rollout→backward→step shape *as-is* (inline), rather than inventing a
+batch/idle scheduler. The hard, novel parts (升级 requant, skill-replay data, verifier-gated A2,
+QA-LoRA, Metal op coverage, base-agnostic seam generalization, Ryzen self-train) are all
+**deferrable and independently licensable** — none is on the critical path to a working 自更新 demo.
+Bring-up uses the model that already has the LoRA-sync wired (Qwen3.5-0.8B, AttentionQv); the
+*design* stays base-neutral (H1) so other bases plug in via one trait, not a fork.
 
 ---
 
@@ -355,19 +442,38 @@ all **deferrable and independently licensable** — none is on the critical path
 2. **Does the EMA buffer cost a 2nd base copy?** If the self-teacher is the frozen base + a
    *separate* EMA of the adapter, the base is shared (cheap). If it's an EMA of full merged
    weights, that's a 2nd base — re-introduces the memory the unlock was meant to remove. **This
-   is the single most important design decision for the budget story.**
-3. **升级 first cut**: C3 (dense-merge + TurboQuant, reuses kernels, needs bf16 base cache) vs C2
+   is the single most important design decision for the budget story.** *(With Axis G, the EMA-
+   of-adapter answer is also the stability anchor for online updates — strong reason to pick it.)*
+3. **Axis G granularity — per-sequence (G2) vs per-token (G3)?** G2 (update after each rollout
+   sequence) is the safe default and matches `opd_step`. G3 (test-time training, adapter changes
+   mid-sequence) is the aggressive limit and needs the KV-staleness decision (Q4). **Which does
+   ckl's "rollout 时就走更新" mean?** — recommend G2 first, G3 as a gated research follow-on.
+4. **Axis G pass structure — fused vs two-pass-inline?** Fused = use the rollout forward's own
+   logits/activations for the gradient (one pass, but the infer rollout runs no autograd tape +
+   CUDA-graph, so this needs the engine to expose activations / a custom backward → loses graph
+   speed). Two-pass-inline = keep the fast no-tape rollout, then recompute+step immediately
+   (reuses today's path). **Bench which wins; recommend two-pass-inline for bring-up.**
+   *(If G3 per-token: also decide KV-staleness — accept frozen stale KV à la `frozen_kv_mtp` and
+   let it refresh as new tokens use the new adapter, vs recompute KV (expensive).)*
+5. **升级 first cut**: C3 (dense-merge + TurboQuant, reuses kernels, needs bf16 base cache) vs C2
    (QA-LoRA, no bf16 cache, new merge kernel). Pragmatic-first says C3; clean end-state says C2.
-4. **Correct-inference gate per cycle**: is the needle ladder cheap enough to run every 自更新
-   cycle, or only every 升级? (Cost vs safety trade.)
-5. **Metal op coverage (M5.3b)**: which ops still CPU-readback in the student backward, and is the
-   per-step latency acceptable for an idle-time loop on M-series? (Bench, don't assume.)
-6. **Validate §3 numbers**: run `arle train estimate-memory` on each target model+model size to
-   convert the matrix from estimate to evidence before committing hardware claims.
+6. **Correct-inference gate cadence**: with G2/G3 the update is continuous, so the needle ladder
+   can't run every step — run it on a *window* (every N rollouts / wall-clock) and snapshot/revert
+   the adapter to the last-good on regress. What N? (Cost vs safety trade.)
+7. **Axis H — generalize the adapter-sync to a seam capability?** Base-agnostic (H1) needs the
+   Qwen3.5-only `remerge_student_lora`/cached-base re-merge lifted into an `infer-seam` trait each
+   base implements. Bring up on Qwen3.5-0.8B (already wired) but scope the trait now so it's not a
+   later fork. *(Also: should the runtime auto-select the largest base that fits the detected
+   hardware budget — §3.2 — as a first-class feature?)*
+8. **Metal op coverage (M5.3b)**: which ops still CPU-readback in the student backward, and is the
+   per-rollout latency acceptable for an *inline* (Axis G) loop on M-series? (Bench, don't assume.)
+9. **Validate §3 numbers**: run `arle train estimate-memory` per param-class to convert the
+   budget-first matrix (§3.2) from estimate to evidence before committing hardware claims.
 
-**Recommendation**: resolve Q1/Q2 (they define the whole memory + signal story), then a small
-plan for 自更新-only on Qwen3.5-0.8B (the model with existing AttentionQv LoRA sync) is enough to
-prove the loop. Defer 升级 to its own milestone.
+**Recommendation**: resolve Q1/Q2/Q3 (they define the memory + signal + online-granularity story),
+then a small plan for **inline (G2) 自更新-only on Qwen3.5-0.8B** (the model with existing
+AttentionQv LoRA sync), designed base-neutral (H1), is enough to prove the loop. Defer 升级,
+per-token G3, and the seam generalization to their own milestones.
 
 ---
 
