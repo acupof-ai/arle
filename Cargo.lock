@@ -1535,6 +1535,7 @@ dependencies = [
  "anyhow",
  "deepseek-spec",
  "memmap2",
+ "tokenizers",
 ]
 
 [[package]]
