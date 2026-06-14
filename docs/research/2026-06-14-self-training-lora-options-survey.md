@@ -81,8 +81,9 @@ each load-bearing for AIPC feasibility:
 - **Optimizer + gradient memory is governed by adapter size (MB-scale), not model size.** AdamW
   m/v + grads are allocated for trainable params only (`estimate-memory` separates
   `trainable_param_count`). This is why a 30B base can self-train where a full-FT 30B cannot.
-- **Teacher-free self-distillation shares the base.** If the teacher signal comes from the
-  *same frozen base* (EMA snapshot, or the base itself), there is **no second model copy** —
+- **Teacher-free self-distillation shares the base.** The teacher signal comes from the
+  *same frozen base* plus an **adapter-only EMA snapshot** (≈ MB; never a second base copy — the
+  EMA tracks the rank-r adapter, not the merged weights), so there is **no second model copy** —
   this is exactly what killed the classic 9B→0.8B OPD plan (teacher+student co-residency OOM,
   15871/16384 MiB; [plan](../plans/2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md)).
   Self-teacher removes that line item entirely.
@@ -98,6 +99,7 @@ each load-bearing for AIPC feasibility:
 | **Streaming requant (流式自动量化)** | quant is load-time only; no merge-then-requant cadence; no QA-LoRA-style zero-point merge | **core** (升级 only) |
 | **Skills → training prompts** | OPD eats static jsonl (`examples/opd/*.jsonl`); no capture of real agent tool-use traces | **feature** (can start with static, add later) |
 | **Metal/CUDA autograd op coverage** for the full student backward | M5.3b pending; many ops still CPU-readback per step on Metal | **perf** (works, slow on Metal today) |
+| **OPD driver is CUDA-only** — `build_opd_store` falls back to CPU off-CUDA; the inline-rollout student (`InferStudent` / LoRA hot-swap) is `#[cfg(feature="cuda")]`; the CLI `--backend` enum is `auto\|cpu\|cuda` (no `metal`) | the *autograd* backend supports Metal, but no path drives an *inline rollout-time* loop on Metal today | **scope** — Metal SOPD is an unstarted port, NOT runnable today |
 | **No HIP/Vulkan training** | autograd backends are CPU+Metal+CUDA only | **scope** — AIPC train target is Metal (M-series) or CUDA, NOT the HIP/Vulkan inference lanes |
 
 ---
@@ -114,7 +116,7 @@ The literature splits cleanly into **soft (per-token KL)** vs **hard (filter-the
 
 | Option | Signal | Needs verifier? | Needs 2nd model? | On-policy? | Reward-hack risk | OPD-license fit | Impl cost |
 |---|---|---|---|---|---|---|---|
-| **A1. EMA / mean-teacher self-distill** | soft KL: student ← EMA(student) per-token | no | no (EMA buffer = 1× base in fp, or quantized) | yes | low (no reward) | ✅ pure distillation | low — reuse `backward_chunked_kl_rollout`, teacher = EMA snapshot |
+| **A1. EMA / mean-teacher self-distill** | soft KL: student ← EMA(adapter) per-token | no | no (EMA = adapter-only snapshot, ~MB; base shared) | yes | low (no reward) | ✅ pure distillation | low — reuse `backward_chunked_kl_rollout`, teacher = EMA-adapter snapshot |
 | **A2. Best-of-N rejection self-distill** (ReST-EM / STaR / RFT) | hard CE on verified-correct rollouts only | **yes** (answer/schema/tool verifier) | no | yes | medium (verifier gaming) | ✅ CE/SFT-anchor, NOT GRPO | medium — N-sample + filter + SFT-anchor path exists |
 | **A3. Self-consistency distill** | hard CE/soft KL toward majority-vote pseudo-label | no (uses agreement) | no | yes | medium (mode collapse) | ✅ distillation | medium — N-sample + vote |
 | **A4. External small peer teacher** | soft KL from a *different* small model (not self) | no | **yes** (2nd base resident) | yes | low | ✅ classic OPD | low (existing path) but **breaks "teacher-free"** + costs memory |
@@ -185,7 +187,7 @@ moat lives** — see §4.
 | Option | Op coverage | Device-resident | AIPC target? | Notes |
 |---|---|---|---|---|
 | **E1. CUDA autograd** | full | yes | cloud/pod, dGPU laptop | most mature; the pod/upgrade tier |
-| **E2. Metal (MLX) autograd** | most ops; M5.3b gaps | M5.3a done, some CPU-readback | ✅ **the M-series AIPC target** | the canonical AIPC train device |
+| **E2. Metal (MLX) autograd** | most ops; M5.3b gaps | M5.3a done, some CPU-readback | **the M-series AIPC target** | **target, not wired today** — OPD CLI / `build_opd_store` are CUDA/CPU only, `InferStudent`/LoRA hot-swap are CUDA-gated; the Metal inline self-train loop is an unstarted port (§1.3) |
 | **E3. CPU autograd** | full (reference) | n/a | ❌ too slow | correctness reference only |
 
 **Hard scope fact**: there is **no HIP/Vulkan autograd backend**. `infer-hip`/`infer-vulkan` are
@@ -215,7 +217,7 @@ correction added — and it changes which **signal source (Axis A)** is even com
 | Option | When the update fires | On-policy staleness | KV-cache validity | Speed cost | Stability | Impl cost |
 |---|---|---|---|---|---|---|
 | G1. Offline batch *(rejected by ckl)* | after N rollouts, separate trainer run | stale (data ≠ current policy) | n/a | — | easy | — |
-| **G2. Inline-per-rollout** | right after each rollout sequence, same loop | minimal | fresh per sequence | + recompute *or* fused pass | good (with EMA target) | **low — ≈ what `opd_step` already does** |
+| **G2. Inline-per-rollout** | right after each rollout sequence, same loop | minimal | fresh per sequence **only if the prefix cache is epoch-invalidated** (⚠ verdict) | + recompute *or* fused pass | good (with EMA target) | **low — ≈ `opd_step` + prefix-cache versioning** |
 | G3. Streaming per-token (test-time training) | after each token/chunk, *mid-sequence* | zero | **stale within sequence** (early KV computed with pre-update adapter) | highest | needs slow EMA + small lr | high |
 
 **Verdict**: ckl's "rollout 时就走更新" = **G2** (with G3 as the aggressive limit). G2 is
@@ -231,6 +233,18 @@ out (→ §7): **fused-single-pass** (use the rollout's own logits/activations, 
 but lose the no-tape CUDA-graph speed) vs **two-pass-inline** (keep the fast rollout kernel,
 recompute+step immediately after each sequence); and, for G3, the **KV-staleness** handling (accept
 frozen stale KV à la `frozen_kv_mtp`, refresh naturally as new tokens use the new adapter).
+
+**⚠ Prefix-cache staleness (correctness, not perf) — surfaced by Codex review.** "Fresh per
+sequence" holds *only* if served prefix KV is invalidated on each accepted adapter update.
+`enable_prefix_cache` is **default-on** (`infer-core/src/lib.rs:107`) and `RadixCache` is keyed by
+**token blocks only** — there is **no adapter-epoch/version key** (`infer-core/src/radix.rs`).
+`sync_lora_from_store` / `remerge_student_lora` mutate q/v weights **in place**, so after an inline
+update a *later* request sharing a token prefix would reuse KV computed under the *previous* adapter
+epoch — silently serving stale-policy KV. The rollout-time loop therefore **must** either (a)
+tag/version prefix pages with an adapter epoch and treat epoch-mismatch as a cache miss, or (b)
+disable prefix reuse across adapter epochs. This is a **required** line item for G2/G3, not an
+optimization — it joins the rollback/mutated-state enumeration (plan doc §Mutated state). It is the
+strongest reason "inline at rollout time" is *not* free: every accepted update has a KV-cache cost.
 
 ### Axis H — Base coupling (ckl correction 2: "base-agnostic; gate on hardware budget")
 
@@ -282,8 +296,10 @@ adapter on it.*
 
 > ⚠️ **These are back-of-envelope estimates (hypothesis per §0), not measured.** 4-bit base ≈
 > params×0.55 B (incl. scales/zeros). KV @4k ctx, bf16. Activation floor for batch=1, seq≈512
-> with recompute. Run `arle train estimate-memory --model <id> --lora-rank 16 --target qv
-> --seq 512` to convert any row to evidence before committing.
+> with recompute. Run `arle train estimate-memory --model <id> --lora-rank 16 --batch 1`
+> to convert any row to evidence before committing. *(The estimator reports a built-in LoRA count
+> from `--lora-rank` and an activation floor from `--batch`; there is **no** `--target`/`--seq`
+> flag today — a Q/V-only vs all-linear split needs that flag added first. Validation pre-req.)*
 
 | Model | Params | 4-bit base | KV @4k | Trainable blk (Qv r16) | Activation (b1,s512) | **Self-train peak** | Min HW (self-train) | Min HW (serve only) |
 |---|---|---:|---:|---:|---:|---:|---|---|
@@ -317,7 +333,10 @@ class needs a 24 GB dGPU or a 36 GB+ unified-memory Mac.
 **Base-agnostic caveat (Axis E):** a Ryzen-AI / Radeon AIPC can *serve* any class (HIP/Vulkan) but
 cannot *self-train* in-tree — no HIP/Vulkan autograd backend exists. Base-agnostic on the train
 side still means a **Metal or CUDA** train device (out of scope to change; master-strategy
-DEFER-until-Phase-3).
+DEFER-until-Phase-3). **And today only CUDA actually runs the inline loop**: the Metal rows above
+are the *target*, not a runnable lane — the OPD driver (`build_opd_store`, `InferStudent`) is
+CUDA-gated (§1.3), so M-series self-train is an unstarted port. The budget numbers hold; the Metal
+*wiring* does not exist at this commit.
 
 ---
 
@@ -367,8 +386,10 @@ structurally differentiating.
 
 > A laptop/Mac runs one ARLE process on whatever base fits its memory budget (§3.2 — base-
 > agnostic). As it **serves**, every rollout *is* an update: the engine produces an on-policy
-> rollout, computes the EMA self-teacher signal (A1) from the same weights in the same pass, and
-> distills the delta into the rank-r adapter **right there on the rollout path** (Axis G) — the
+> rollout, computes the EMA self-teacher signal (A1) from a separate slow-EMA **adapter** snapshot
+> scored right after the rollout (identical weights would give KL=0 — the teacher must *lag* the
+> student), and distills the delta into the rank-r adapter **right there on the rollout path**
+> (Axis G) — the
 > better adapter is already live, no separate train run, no idle batch. The model gets measurably
 > better at the user's own skills *while being used*, with the needle gate running periodically to
 > snap the adapter back to the last-good snapshot if a window regresses. Periodically the accepted
@@ -469,8 +490,16 @@ Bring-up uses the model that already has the LoRA-sync wired (Qwen3.5-0.8B, Atte
    per-rollout latency acceptable for an *inline* (Axis G) loop on M-series? (Bench, don't assume.)
 9. **Validate §3 numbers**: run `arle train estimate-memory` per param-class to convert the
    budget-first matrix (§3.2) from estimate to evidence before committing hardware claims.
+10. **Prefix-cache epoch invalidation (Axis G correctness, NOT optional)**: an inline adapter
+    update makes any served prefix KV from the previous epoch stale, but `RadixCache` is token-keyed
+    with no version (§Axis G ⚠). Decide the mechanism: (a) tag prefix pages with an adapter epoch
+    and treat epoch-mismatch as a miss (fine-grained, keeps cross-request reuse within an epoch), vs
+    (b) flush the whole prefix cache on each accepted update (simplest, but throws away reuse), vs
+    (c) disable prefix reuse entirely while the inline loop is active. Recommend (a) for production,
+    (b) for bring-up. This is on the critical path for G2 *correctness*, alongside Q1/Q3.
 
-**Recommendation**: resolve Q1/Q2/Q3 (they define the memory + signal + online-granularity story),
+**Recommendation**: resolve Q1/Q2/Q3 **and Q10** (they define the memory + signal + online-
+granularity + cache-correctness story),
 then a small plan for **inline (G2) 自更新-only on Qwen3.5-0.8B** (the model with existing
 AttentionQv LoRA sync), designed base-neutral (H1), is enough to prove the loop. Defer 升级,
 per-token G3, and the seam generalization to their own milestones.
