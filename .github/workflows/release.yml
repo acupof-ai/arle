@@ -98,6 +98,10 @@ jobs:
           # T1 set: sm_80 (A100) + sm_86 (A10/3090) + sm_89 (L4/4090) + sm_90 (H100).
           # See docs/plans/sm-coverage.md for tier policy.
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+          # FlashMLA sm90 sparse_fp8 needs sm_90a (cluster launch_bounds); plain
+          # 9.0 hard-fails (build.rs:1783). FlashMLA is a pod-only sm_90a artifact
+          # (sm-coverage.md), so disable it — build.rs swaps in a clean stub.
+          ARLE_CUDA_DISABLE_FLASHMLA: '1'
         run: cargo build --release --features cuda -p agent-infer --bin arle
 
       - name: Package Linux artifacts
@@ -153,6 +157,8 @@ jobs:
         env:
           # Volta V100 only — SM-pinned, no T1 SMs (sm-coverage.md §"Why sm_70 is separate").
           TORCH_CUDA_ARCH_LIST: '7.0'
+          # FlashMLA is sm_90a-only — cannot target Volta. Disable (pod-only artifact).
+          ARLE_CUDA_DISABLE_FLASHMLA: '1'
         run: cargo build --release --features cuda -p agent-infer --bin arle
 
       - name: Package Linux sm_70 artifacts
@@ -207,6 +213,8 @@ jobs:
         env:
           # B100/B200 (sm_100) + RTX 5090 (sm_120). Datacenter + consumer Blackwell.
           TORCH_CUDA_ARCH_LIST: '10.0;12.0'
+          # FlashMLA is sm_90a-only — cannot target Blackwell. Disable (pod-only artifact).
+          ARLE_CUDA_DISABLE_FLASHMLA: '1'
         run: cargo build --release --features cuda -p agent-infer --bin arle
 
       - name: Package Linux Blackwell artifacts
