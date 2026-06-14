@@ -112,10 +112,124 @@ jobs:
           name: linux-x86_64
           path: arle-${{ github.ref_name }}-linux-x86_64.tar.gz
 
+  # ── Linux x86_64: CUDA sm_70 (Volta / V100 legacy lane) ──────────────────────
+  # SM-pinned legacy build per docs/plans/sm-coverage.md §T0-legacy: TORCH_CUDA_ARCH_LIST=7.0
+  # ONLY (the policy rejects `7.0;8.9` mixing so the T1 binary never carries Volta
+  # fallback). HARDWARE-UNVERIFIED in CI: no V100 on the runner, and build.rs
+  # hard-fails (not warn-skip) if any required operator cannot emit an sm_70 cubin
+  # — so this job is continue-on-error. It attaches the binary only if it compiles;
+  # a failure is non-blocking and signals fix-forward, never nuking the release.
+  build-linux-v100:
+    name: Build Linux x86_64 (CUDA sm_70 / V100, best-effort)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+
+      - name: Install Python build dependencies (required for AOT kernel compilation)
+        run: pip install --no-cache-dir -r requirements-build.txt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x86-sm70-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x86-sm70-cargo-
+
+      - name: Build ARLE CLI (CUDA sm_70 pinned)
+        env:
+          # Volta V100 only — SM-pinned, no T1 SMs (sm-coverage.md §"Why sm_70 is separate").
+          TORCH_CUDA_ARCH_LIST: '7.0'
+        run: cargo build --release --features cuda -p agent-infer --bin arle
+
+      - name: Package Linux sm_70 artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/arle dist/
+          tar -czf arle-${{ github.ref_name }}-linux-x86_64-sm70.tar.gz -C dist .
+
+      - name: Upload Linux sm_70 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-sm70
+          path: arle-${{ github.ref_name }}-linux-x86_64-sm70.tar.gz
+          if-no-files-found: warn
+
+  # ── Linux x86_64: CUDA Blackwell T2 (sm_100 + sm_120, opt-in) ────────────────
+  # T2 opt-in per docs/plans/sm-coverage.md: sm_100 (B100/B200) + sm_120 (RTX 5090).
+  # HARDWARE-UNVERIFIED: no Blackwell hardware exists in CI, and TileLang 0.1.11
+  # sm_120 codegen is not yet confirmed (sm-coverage.md "Why T2 is opt-in"). Same
+  # contract as the V100 job: continue-on-error, attaches only if it compiles.
+  build-linux-blackwell:
+    name: Build Linux x86_64 (CUDA Blackwell sm_100+sm_120, best-effort)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+
+      - name: Install Python build dependencies (required for AOT kernel compilation)
+        run: pip install --no-cache-dir -r requirements-build.txt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x86-blackwell-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x86-blackwell-cargo-
+
+      - name: Build ARLE CLI (CUDA Blackwell)
+        env:
+          # B100/B200 (sm_100) + RTX 5090 (sm_120). Datacenter + consumer Blackwell.
+          TORCH_CUDA_ARCH_LIST: '10.0;12.0'
+        run: cargo build --release --features cuda -p agent-infer --bin arle
+
+      - name: Package Linux Blackwell artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/arle dist/
+          tar -czf arle-${{ github.ref_name }}-linux-x86_64-blackwell.tar.gz -C dist .
+
+      - name: Upload Linux Blackwell artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-blackwell
+          path: arle-${{ github.ref_name }}-linux-x86_64-blackwell.tar.gz
+          if-no-files-found: warn
+
   # ── GitHub Release ────────────────────────────────────────────────────────────
   create-release:
     name: Create GitHub Release
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-linux-v100, build-linux-blackwell]
+    # Gate on the two VERIFIED builds only (Metal + T1 CUDA). The sm_70 and
+    # Blackwell jobs are best-effort: !cancelled() lets this job run even when
+    # they fail, and their artifacts attach via glob only if they were uploaded.
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-linux.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,15 +237,13 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download macOS artifact
+      # No `name` → downloads every uploaded artifact; merge-multiple flattens
+      # them into the workspace. Missing optional artifacts (failed sm_70 /
+      # Blackwell builds) are simply absent — the glob steps below skip them.
+      - name: Download all build artifacts
         uses: actions/download-artifact@v8
         with:
-          name: macos-arm64
-
-      - name: Download Linux artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: linux-x86_64
+          merge-multiple: true
 
       - name: Check out repo (for install.sh)
         uses: actions/checkout@v6
@@ -144,23 +256,17 @@ jobs:
       - name: Generate release checksums
         run: sha256sum arle-${{ github.ref_name }}-*.tar.gz > SHA256SUMS.txt
 
-      - name: Attest macOS artifact provenance
+      - name: Attest artifact provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: arle-${{ github.ref_name }}-macos-arm64.tar.gz
-
-      - name: Attest Linux artifact provenance
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: arle-${{ github.ref_name }}-linux-x86_64.tar.gz
+          subject-path: arle-${{ github.ref_name }}-*.tar.gz
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
-            arle-${{ github.ref_name }}-macos-arm64.tar.gz
-            arle-${{ github.ref_name }}-linux-x86_64.tar.gz
+            arle-${{ github.ref_name }}-*.tar.gz
             SHA256SUMS.txt
             install.sh
 
