@@ -22,7 +22,7 @@ tmux capture-pane -t <s>:<w> -p | tail -80
 tmux capture-pane -t <s>:<w> -S -200 -p | tail -200
 
 # 3a. Send single-line message
-tmux send-keys -t <s>:<w> '继续' Enter
+tmux send-keys -t <s>:<w> 'continue' Enter
 
 # 3b. Send short multi-line message (≤5 lines, no special chars)
 tmux send-keys -t <s>:<w> 'line one
@@ -52,10 +52,10 @@ tmux send-keys -t <s>:<w> Escape
 
 ## When to use
 
-- "看看 tmux 里 codex 在干嘛" / "check what codex is doing"
-- "给 codex 发任务 X" / "send X to codex" / "queue X for codex"
-- "推进 codex" / "nudge codex" / "cron-loop 推进"
-- "打断 codex" / "interrupt codex and tell it to pivot"
+- "check what codex is doing in tmux" / "check what codex is doing"
+- "send task X to codex" / "send X to codex" / "queue X for codex"
+- "nudge codex along" / "nudge codex" / "cron-loop nudge"
+- "interrupt codex" / "interrupt codex and tell it to pivot"
 - Any time **another agent CLI is already running in tmux** and the user wants Claude to drive it.
 
 If no agent is running yet and the user wants one started, see "Spawn a peer agent" in Common patterns — `tmux new-session -d ... 'claude --allow-dangerously-skip-permissions'` is reliable.
@@ -109,16 +109,16 @@ tmux capture-pane -t <s>:<w> -S -200 -p | tail -200
 **Single-line (the common case):**
 
 ```bash
-tmux send-keys -t <session>:<window> '勇闯世界第一' Enter
+tmux send-keys -t <session>:<window> 'go for world #1' Enter
 ```
 
 **Short multi-line (≤5 lines, no special chars):**
 
 ```bash
-tmux send-keys -t <session>:<window> '请按以下顺序推进：
-1. 跑 W3 bench
-2. 把结果写进 wins/
-3. 报告 Δ%' Enter Enter
+tmux send-keys -t <session>:<window> 'proceed in this order:
+1. run the W3 bench
+2. write the result into wins/
+3. report the Δ%' Enter Enter
 ```
 
 Why the double Enter on multi-line: Codex/Claude Code input area is multi-line by design. A single Enter inserts a newline *within* the prompt; only a second Enter on an empty line submits. Single-line sends submit fine with one Enter — they don't have intra-prompt newlines for the first Enter to "use".
@@ -187,9 +187,9 @@ Notes:
 
 If the agent is `Working`, just send — it'll queue and the next-tool-call boundary will flush it. Confirm via the `Messages to be submitted after next tool call` banner. Don't interrupt to "send sooner" unless the user explicitly wants the current direction abandoned.
 
-### Periodic nudge / cron-loop 推进
+### Periodic nudge / cron-loop nudge
 
-The phrase "cron-loop 推进 codex" = on a schedule, send a brief directive (`继续` / `下一步` / a specific action) to keep it moving. Compose with the `loop` skill — `loop` owns the schedule, this skill owns the send-keys mechanics. Each tick: capture-pane → assess → send minimal nudge → verify.
+The phrase "cron-loop nudge codex" = on a schedule, send a brief directive (`continue` / `next step` / a specific action) to keep it moving. Compose with the `loop` skill — `loop` owns the schedule, this skill owns the send-keys mechanics. Each tick: capture-pane → assess → send minimal nudge → verify.
 
 ### Pivot mid-task
 
