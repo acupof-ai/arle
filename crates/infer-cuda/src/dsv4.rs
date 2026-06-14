@@ -2425,6 +2425,13 @@ impl Dsv4Model {
         chains: &[Vec<u32>],
         start_positions: &[usize],
         scheds: &[SpecVerifySchedule],
+        // When true, persist each slot's per-layer attn-normed chain rows into the
+        // OWNING slot's `spec_normed[layer_idx]` so the caller can commit the
+        // accepted prefix via the cheap `commit_accepted_fold` (no per-slot
+        // re-forward — the fold is what makes per-row MTP fast). The scatter is
+        // per-slot (no cross-slot aliasing — codex P2). When false the caller
+        // commits via re-forward and this persist is skipped.
+        fold: bool,
     ) -> Result<Vec<(Vec<u32>, Vec<DeviceVec>)>> {
         let n = slot_ids.len();
         ensure!(n > 0, "DSv4 batched verify requires at least one chain");
@@ -2577,6 +2584,30 @@ impl Dsv4Model {
                             .map_err(|e| {
                                 anyhow!("DSv4 batched verify chunk copy-in failed: {e}")
                             })?;
+                        // Commit-fold scatter (codex P2): persist THIS slot's
+                        // per-layer attn-normed chain rows into the OWNING slot's
+                        // `spec_normed[layer_idx]`, so `commit_accepted_fold` can
+                        // re-ingest the accepted prefix without a re-forward. The
+                        // combined `normed` is sliced per slot → each slot's own
+                        // cache (no cross-slot aliasing).
+                        if fold {
+                            let slot = &mut slots[slot_ids[s]];
+                            let cache = slot.spec_normed.as_mut().ok_or_else(|| {
+                                anyhow!("DSv4 batched verify fold without spec_normed cache")
+                            })?;
+                            let mut dst = cache[layer_idx].data.slice_mut(0..len * hidden_size);
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(
+                                    &normed
+                                        .data
+                                        .slice(off * hidden_size..(off + len) * hidden_size),
+                                    &mut dst,
+                                )
+                                .map_err(|e| {
+                                    anyhow!("DSv4 batched verify spec_normed persist failed: {e}")
+                                })?;
+                        }
                         let (layer_pool, dsa_shared) =
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         let slot = &mut slots[slot_ids[s]];
