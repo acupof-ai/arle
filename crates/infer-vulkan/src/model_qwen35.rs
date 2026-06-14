@@ -545,6 +545,119 @@ mod tests {
         eprintln!("greedy-decoded 10 token ids: {decoded:?}");
     }
 
+    /// The TRUE "跑通" proof: load the real 27B, build the tokenizer from the
+    /// GGUF's embedded vocab, greedy-generate a continuation for a real English
+    /// and a real Chinese prompt, and PRINT the decoded text. Coherent output
+    /// proves the forward math (rope / attention / gated-delta / norms / GEMV)
+    /// is numerically correct; finite logits alone do not.
+    ///
+    /// Run with:
+    /// `cargo test -p infer-vulkan --features vulkan --lib qwen35_27b_generates_coherent_text -- --ignored --nocapture`
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "needs the on-box Qwen3.6-27B GGUF + a Vulkan device"]
+    fn qwen35_27b_generates_coherent_text() {
+        use infer_gguf::tokenizer::GgufTokenizer;
+
+        let path = std::path::Path::new(r"C:\Users\Asus\models\qwen3.6\Qwen3.6-27B-Q8_0.gguf");
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            return;
+        }
+        let ctx: &'static vulkan_sys::VulkanContext = match vulkan_sys::VulkanContext::create() {
+            Ok(c) => Box::leak(Box::new(c)),
+            Err(e) => {
+                eprintln!("no Vulkan device available ({e}); skipping coherence test");
+                return;
+            }
+        };
+        eprintln!("ARLE Vulkan 27B coherence on: {}", ctx.device_name());
+
+        let gguf = infer_gguf::gguf::GgufFile::open(path).expect("open 27B GGUF");
+        let tokenizer = GgufTokenizer::from_gguf(&gguf).expect("build tokenizer from GGUF");
+        let eos = tokenizer.eos_token_id;
+        let mut model = VulkanQwen35Model::load(ctx, &gguf).expect("load 27B onto device");
+        let vocab = model.config.vocab_size;
+        eprintln!(
+            "loaded 27B: vocab {}, tokenizer vocab {}, eos {:?}",
+            vocab,
+            tokenizer.vocab_size(),
+            eos
+        );
+
+        // Greedy-generate `max_new` tokens continuing `prompt`, returning the
+        // generated ids (excludes the prompt). Resets recurrent + KV state first.
+        let generate = |model: &mut VulkanQwen35Model, prompt: &str, max_new: usize| -> Vec<u32> {
+            model.reset_state();
+            let prompt_ids = tokenizer.encode(prompt, false).expect("encode prompt");
+            assert!(!prompt_ids.is_empty(), "prompt encoded to no tokens");
+            eprintln!(
+                "\nprompt {prompt:?} -> {} tokens {prompt_ids:?}",
+                prompt_ids.len()
+            );
+
+            // Prefill: feed prompt tokens in order; keep the final token's logits.
+            let mut last_logits = Vec::new();
+            for (pos, &tok) in prompt_ids.iter().enumerate() {
+                last_logits = model
+                    .forward_token(0, 0, tok, pos)
+                    .unwrap_or_else(|e| panic!("prefill forward_token(pos={pos}) failed: {e}"));
+                assert_eq!(last_logits.len(), vocab, "logits length must equal vocab");
+                assert!(
+                    last_logits.iter().all(|v| v.is_finite()),
+                    "prefill logits at pos {pos} contain NaN/Inf"
+                );
+            }
+
+            let mut generated = Vec::new();
+            let mut pos = prompt_ids.len();
+            for _ in 0..max_new {
+                let next = argmax_of(&last_logits) as u32;
+                if Some(next) == eos {
+                    eprintln!("  hit eos at gen step {}", generated.len());
+                    break;
+                }
+                generated.push(next);
+                last_logits = model
+                    .forward_token(0, 0, next, pos)
+                    .unwrap_or_else(|e| panic!("gen forward_token(pos={pos}) failed: {e}"));
+                assert!(
+                    last_logits.iter().all(|v| v.is_finite()),
+                    "gen logits at pos {pos} contain NaN/Inf"
+                );
+                pos += 1;
+            }
+            generated
+        };
+
+        // ~24 new tokens each (≈ 2 min/prompt at ~5s/token + load). Reduce if
+        // the box is slow; 16 still demonstrates coherence.
+        let prompts = ["The capital of France is", "请用一句话介绍你自己。"];
+        let mut all_ok = true;
+        for prompt in prompts {
+            let gen_ids = generate(&mut model, prompt, 24);
+            let continuation = tokenizer
+                .decode(&gen_ids, true)
+                .expect("decode continuation");
+            eprintln!("=== PROMPT: {prompt}");
+            eprintln!("=== CONTINUATION: {continuation}");
+            eprintln!("=== GEN IDS: {gen_ids:?}");
+
+            assert!(!gen_ids.is_empty(), "no tokens generated for {prompt:?}");
+            // Soft degeneracy check: not the same token repeated for the whole run.
+            let degenerate = gen_ids.windows(2).all(|w| w[0] == w[1]);
+            if degenerate {
+                eprintln!("!!! DEGENERATE: single token repeated for {prompt:?}");
+                all_ok = false;
+            }
+        }
+        assert!(
+            all_ok,
+            "at least one prompt produced degenerate (single-token-repeat) output — \
+             inspect the printed continuations for the numeric symptom"
+        );
+    }
+
     #[cfg(feature = "vulkan")]
     fn argmax_of(v: &[f32]) -> usize {
         let mut best = 0usize;

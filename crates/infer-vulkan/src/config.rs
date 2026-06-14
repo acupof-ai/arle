@@ -117,13 +117,26 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
             )
         })?;
 
-    // ── RoPE geometry. Qwen3.5/3.6 fully rotate head_dim (no partial rotary,
-    // no long-context scaling baked into the GGUF metadata we read here), so
-    // partial_rotary_factor = 1.0 and rotary_dim = head_dim. A `rope.scaling.*`
-    // block, if a converter adds one, would be wired here; the on-box files
-    // ship vanilla RoPE so we leave `rope_scaling = None`.
-    let partial_rotary_factor = 1.0_f32;
-    let rotary_dim = head_dim;
+    // ── RoPE geometry. Qwen3.6 uses PARTIAL rotary: only the first
+    // `rope.dimension_count` of each head's `head_dim` dims are rotated, the
+    // rest pass through (matches the CUDA reference's rotary_dim = head_dim ×
+    // partial_rotary_factor and the HD256 prep kernel's `d >= rotary_dim`
+    // branch). The ggml converter writes the rotary width as
+    // `{arch}.rope.dimension_count` (= 64 on the 27B, i.e. partial_rotary_factor
+    // 0.25). Hard-coding `rotary_dim = head_dim` (256) silently over-rotated
+    // every q/k and scrambled attention into garbage logits. Fall back to
+    // `head_dim` only if the key is absent (vanilla full-rotation). A
+    // `rope.scaling.*` block, if a converter adds one, would be wired here; the
+    // on-box files ship unscaled RoPE so we leave `rope_scaling = None`.
+    let rotary_dim = gguf
+        .get_usize(&key("rope.dimension_count"))
+        .filter(|&d| d != 0)
+        .unwrap_or(head_dim);
+    let partial_rotary_factor = if head_dim == 0 {
+        1.0
+    } else {
+        rotary_dim as f32 / head_dim as f32
+    };
     let rope_cache_len_hint = gguf
         .get_usize(&key("context_length"))
         .or_else(|| gguf.get_usize(&key("max_position_embeddings")));
@@ -297,6 +310,7 @@ mod tests {
             ("qwen35.attention.value_length", V::U32(256)),
             ("qwen35.attention.layer_norm_rms_epsilon", V::F32(1e-6)),
             ("qwen35.rope.freq_base", V::F32(1e7)),
+            ("qwen35.rope.dimension_count", V::U32(64)),
             ("qwen35.context_length", V::U32(262144)),
             ("qwen35.ssm.conv_kernel", V::U32(4)),
             ("qwen35.ssm.group_count", V::U32(16)),
@@ -358,8 +372,9 @@ mod tests {
         assert_eq!(cfg.rope_theta, 1e7);
         assert_eq!(cfg.vocab_size, 248320);
         assert_eq!(cfg.rope_cache_len_hint, Some(262144));
-        assert_eq!(cfg.rotary_dim, 256);
-        assert_eq!(cfg.partial_rotary_factor, 1.0);
+        // Partial rotary: rope.dimension_count = 64 of head_dim 256.
+        assert_eq!(cfg.rotary_dim, 64);
+        assert_eq!(cfg.partial_rotary_factor, 0.25);
 
         // Linear / SSM derivation.
         assert_eq!(cfg.linear_conv_kernel_dim, 4);
