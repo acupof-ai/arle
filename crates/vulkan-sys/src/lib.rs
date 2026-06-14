@@ -169,6 +169,11 @@ mod real {
         queue_family_index: u32,
         queue: vk::Queue,
         device_name: String,
+        /// Device-wide pipeline cache fed to every `createComputePipeline`. The
+        /// driver reuses prior compile results (shader binary / layout) across
+        /// pipelines that share a backend, collapsing redundant compile work.
+        /// Created once at context init; destroyed before the device in `Drop`.
+        pipeline_cache: vk::PipelineCache,
     }
 
     impl VulkanContext {
@@ -214,6 +219,18 @@ mod real {
                 }
             };
             let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+            let pipeline_cache_create = vk::PipelineCacheCreateInfo::default();
+            let pipeline_cache =
+                match unsafe { device.create_pipeline_cache(&pipeline_cache_create, None) } {
+                    Ok(cache) => cache,
+                    Err(e) => {
+                        unsafe {
+                            device.destroy_device(None);
+                            instance.destroy_instance(None);
+                        }
+                        return Err(vk_error("creating Vulkan pipeline cache", e));
+                    }
+                };
             Ok(Self {
                 _entry: entry,
                 instance,
@@ -222,6 +239,7 @@ mod real {
                 queue_family_index,
                 queue,
                 device_name: device_name_from_properties(&props),
+                pipeline_cache,
             })
         }
 
@@ -243,6 +261,14 @@ mod real {
 
         pub fn raw_device(&self) -> &ash::Device {
             &self.device
+        }
+
+        /// The device-wide pipeline cache. Thread this into every
+        /// `createComputePipeline` so the driver can reuse prior compile work
+        /// (mirrors `ggml-vulkan` building each pipeline once; here the driver
+        /// also de-duplicates shared backend state across pipelines).
+        pub fn pipeline_cache(&self) -> vk::PipelineCache {
+            self.pipeline_cache
         }
 
         /// Per-heap `(size_bytes, is_device_local)` for diagnostics / budgeting.
@@ -323,6 +349,8 @@ mod real {
     impl Drop for VulkanContext {
         fn drop(&mut self) {
             unsafe {
+                self.device
+                    .destroy_pipeline_cache(self.pipeline_cache, None);
                 self.device.destroy_device(None);
                 self.instance.destroy_instance(None);
             }
@@ -1073,7 +1101,7 @@ mod real {
                 .layout(layout)];
             let pipeline = match unsafe {
                 ctx.device
-                    .create_compute_pipelines(vk::PipelineCache::null(), &create, None)
+                    .create_compute_pipelines(ctx.pipeline_cache, &create, None)
             } {
                 Ok(mut pipelines) => match pipelines.pop() {
                     Some(pipeline) => pipeline,
@@ -1201,6 +1229,25 @@ mod stub {
 
     impl<'a> CommandRecorder<'a> {
         pub fn new(_ctx: &'a VulkanContext) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn begin(&mut self) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn dispatch(
+            &mut self,
+            _pipeline: &ComputePipeline<'_>,
+            _set: &DescriptorSet<'_>,
+            _push: &[u8],
+            _groups: [u32; 3],
+        ) {
+        }
+
+        pub fn barrier(&mut self) {}
+
+        pub fn submit_and_wait(&mut self) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
@@ -1423,6 +1470,7 @@ void main() {
     ///   2. Reproduce the same chain with 3 sequential `one_shot_submit`s (each
     ///      doing its own submit + `queue_wait_idle`) and assert byte-identical
     ///      results — the new primitive matches the proven drain-per-op path.
+    ///
     /// One `submit_and_wait` call == one `vkQueueSubmit` for all 3 dispatches
     /// (structurally guaranteed: `submit_and_wait` issues exactly one
     /// `queue_submit`), versus 3 submits + 3 full `queue_wait_idle` drains in

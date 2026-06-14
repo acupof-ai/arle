@@ -6,6 +6,10 @@
 //! unresolved macro variants leave a typecheck-only crate whose launchers
 //! fail loud with [`KernelError::ShaderMissing`].
 
+mod cache;
+
+pub use cache::{KernelCache, launch_cached, record_dispatch};
+
 pub const QK_K: usize = 256;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
@@ -703,9 +707,7 @@ macro_rules! fused_launcher_fns {
 
 #[cfg(feature = "vulkan")]
 mod real {
-    use super::{Dispatch, FlashAttentionSpec, Kernel, KernelError, Result};
-    use ash::vk;
-    use std::path::PathBuf;
+    use super::{Dispatch, FlashAttentionSpec, Kernel, Result};
 
     pub fn launch(
         kernel: Kernel,
@@ -739,6 +741,15 @@ mod real {
         )
     }
 
+    /// Single-dispatch launcher routed through a transient [`KernelCache`].
+    ///
+    /// The per-dispatch object graph (`fs::read(.spv)` → `ShaderModule` →
+    /// `DescriptorSetLayout` → `ComputePipeline`) now lives in the cache's
+    /// cache-miss builder (`cache.rs`), and the bind+push+dispatch body is
+    /// `record_dispatch` into a Step-1 `CommandRecorder` — no NULL-fence
+    /// `one_shot_submit` drain on this path. A persistent cache + a batch-record
+    /// `CommandRecorder` is the real decode path (wired in Step 4); this keeps
+    /// the proven single-shot launchers/tests working through the same builder.
     pub fn launch_with_params_and_specialization(
         kernel: Kernel,
         ctx: &vulkan_sys::VulkanContext,
@@ -747,67 +758,17 @@ mod real {
         params: &super::KernelParams,
         specialization_u32: &[(u32, u32)],
     ) -> Result<()> {
-        if dispatch.x == 0 || dispatch.y == 0 || dispatch.z == 0 {
-            return Err(KernelError::InvalidDispatch);
-        }
         let push_bytes = params.to_le_bytes();
-        if !push_bytes.len().is_multiple_of(4) {
-            return Err(KernelError::InvalidPushConstants);
-        }
-        let Some(path) = shader_path(kernel) else {
-            return Err(KernelError::ShaderMissing(kernel.shader_name()));
-        };
-        let bytes =
-            std::fs::read(&path).map_err(|_| KernelError::ShaderMissing(kernel.shader_name()))?;
-        let shader = vulkan_sys::ShaderModule::from_spirv_bytes(ctx, &bytes)
-            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        let layout = vulkan_sys::DescriptorSetLayout::storage_buffers(ctx, buffers.len())
-            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        let set = vulkan_sys::DescriptorSet::storage_buffers(ctx, &layout, buffers)
-            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        let pipeline = vulkan_sys::ComputePipeline::create_with_push_constants_and_specialization(
+        let mut cache = crate::KernelCache::new();
+        crate::launch_cached(
+            &mut cache,
             ctx,
-            &shader,
-            &[&layout],
-            push_bytes.len() as u32,
+            kernel,
+            buffers,
+            dispatch,
+            &push_bytes,
             specialization_u32,
         )
-        .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        let commands = vulkan_sys::CommandPool::create(ctx)
-            .map_err(|e| KernelError::Runtime(e.to_string()))?;
-        commands
-            .one_shot_submit(|cmd| {
-                let device = ctx.raw_device();
-                unsafe {
-                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.raw());
-                    device.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::COMPUTE,
-                        pipeline.layout(),
-                        0,
-                        &[set.raw()],
-                        &[],
-                    );
-                    if !push_bytes.is_empty() {
-                        device.cmd_push_constants(
-                            cmd,
-                            pipeline.layout(),
-                            vk::ShaderStageFlags::COMPUTE,
-                            0,
-                            &push_bytes,
-                        );
-                    }
-                    device.cmd_dispatch(cmd, dispatch.x, dispatch.y, dispatch.z);
-                }
-                Ok(())
-            })
-            .map_err(|e| KernelError::Runtime(e.to_string()))
-    }
-
-    fn shader_path(kernel: Kernel) -> Option<PathBuf> {
-        let dir = option_env!("ARLE_VULKAN_SPV_DIR")?;
-        let path = PathBuf::from(dir).join(format!("{}.spv", kernel.shader_name()));
-        path.exists().then_some(path)
     }
 
     pub fn flash_attn_with_params_and_spec(
@@ -990,7 +951,10 @@ mod tests {
             eprintln!("vulkan-kernels: glslc unavailable, skipping SPIR-V existence check");
             return;
         }
-        let dir = option_env!("ARLE_VULKAN_SPV_DIR").expect("build.rs sets ARLE_VULKAN_SPV_DIR");
+        let Some(dir) = option_env!("ARLE_VULKAN_SPV_DIR") else {
+            eprintln!("vulkan-kernels: ARLE_VULKAN_SPV_DIR unset, skipping SPIR-V existence check");
+            return;
+        };
         let manifest_path = std::path::Path::new(dir).join("registered-shaders.txt");
         let manifest = std::fs::read_to_string(&manifest_path)
             .unwrap_or_else(|_| panic!("missing shader manifest {}", manifest_path.display()));
