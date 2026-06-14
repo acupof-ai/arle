@@ -37,8 +37,11 @@ per-request throughput degrades ≈ 1/c — batched decode loses FlashMLA at the
   ([long-ctx campaign](../experience/wins/2026-06-14-dsv4-longctx-concurrency-serial-capped.md),
   2026-06-14). Decode aggregate pins at ~44-48 tok/s for ALL c at every length;
   per-request collapses 1/c. Three more findings there: (a) **TTFT is linear in
-  both length AND c** (prefill fully serial — 128K c=8 = 214s; a *separate*
-  additive lever, not in batched-decode scope); (b) **`--dsv4-batched-decode` is
+  both length AND c** (128K c=8 = 214s) — but this is prefill being
+  COMPUTE-bound (chunked prefill + mixed batching ARE default-on, `planner.rs`;
+  c×prompt FLOPs on fixed GPUs), NOT a missing feature; only faster prefill
+  kernels / more GPUs reduce it, so it is OUT of software-lever scope here;
+  (b) **`--dsv4-batched-decode` is
   a no-op at long ctx** (ON≈OFF within noise at 32K/64K c=8); (c) slots clamp
   8→6; MTP acceptance degrades with ctx (tok/step 1.80→1.22 at 32K→128K). The
   decode-lever acceptance bar: **aggregate must RISE with c**.
