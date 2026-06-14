@@ -5167,10 +5167,24 @@ pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
         DSV4_FLASHMLA_OVERRIDE_ON => return dsv4_flashmla_decode_enabled(),
         _ => {}
     }
-    if env_flag("ARLE_DSV4_FLASHMLA_DECODE_BATCHED")? {
-        return dsv4_flashmla_decode_enabled();
+    // Default ON (2026-06-15): Phase B batched `b=N` sparse decode is correct
+    // (indices reader-pitch == writer-pitch fix `b566b548`, decode-read coherent
+    // c=4) and +3% @c=8 on top of the batched lane. Opt out with
+    // `ARLE_DSV4_FLASHMLA_DECODE_BATCHED=0`. Still gated under
+    // `dsv4_flashmla_decode_enabled` (only engages where single-row FlashMLA
+    // decode is live) and the batch-scratch presence at the call site; N=1
+    // forwards never consult this.
+    match std::env::var("ARLE_DSV4_FLASHMLA_DECODE_BATCHED") {
+        Ok(v)
+            if matches!(
+                v.as_str(),
+                "0" | "false" | "FALSE" | "no" | "off" | "OFF" | ""
+            ) =>
+        {
+            Ok(false)
+        }
+        _ => dsv4_flashmla_decode_enabled(),
     }
-    Ok(false)
 }
 
 /// Debug-only numerical-diff harness gate (default OFF). When set, the batched
