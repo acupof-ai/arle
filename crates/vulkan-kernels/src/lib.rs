@@ -121,6 +121,14 @@ pub enum Kernel {
     /// top_k weights (f32). Single-thread softmax-over-all → top-k by prob →
     /// renorm, replacing the host `qwen36_topk_routes` so routing stays on-device.
     Qwen36RouterTopk,
+    /// Qwen3.6 MoE router / shared-gate F32 GEMV: `y[e] = Σ_c W[e,c]·x[c]` for an
+    /// F32 weight `[n_out, hidden]`, optional sigmoid (shared-expert gate). Reads
+    /// the router from device bandwidth instead of host write-combined read-back.
+    Qwen36RouterGemv,
+    /// Qwen3.6 MoE device-weighted accumulate: `acc += Σ_e weights[e]·src[e]`
+    /// using DEVICE weights (from `Qwen36RouterTopk`), replacing the host-constant
+    /// per-expert scaled-add loop so routing stays on-device.
+    Qwen36MoeWeightedAccum,
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
@@ -192,6 +200,8 @@ impl Kernel {
         Self::SwigluClamped,
         Self::F16KvPack,
         Self::Qwen36RouterTopk,
+        Self::Qwen36RouterGemv,
+        Self::Qwen36MoeWeightedAccum,
         Self::Qwen35SsmConv,
         Self::Qwen35GatedDeltaNet,
     ];
@@ -235,6 +245,8 @@ impl Kernel {
             Kernel::Qwen35SsmConv => "qwen35_ssm_conv",
             Kernel::Qwen35GatedDeltaNet => "qwen35_gated_delta_net",
             Kernel::Qwen36RouterTopk => "qwen36_router_topk",
+            Kernel::Qwen36RouterGemv => "qwen36_router_gemv",
+            Kernel::Qwen36MoeWeightedAccum => "qwen36_moe_weighted_accum",
         }
     }
 
@@ -275,7 +287,9 @@ impl Kernel {
             | Kernel::F16KvPack
             | Kernel::Qwen35SsmConv
             | Kernel::Qwen35GatedDeltaNet
-            | Kernel::Qwen36RouterTopk => &[],
+            | Kernel::Qwen36RouterTopk
+            | Kernel::Qwen36RouterGemv
+            | Kernel::Qwen36MoeWeightedAccum => &[],
         }
     }
 
@@ -915,6 +929,35 @@ pub fn qwen36_router_topk_params(n_expert: u32, top_k: u32, norm_topk: bool) -> 
 /// host's exact serial order, so a single invocation does the whole reduction.
 pub fn qwen36_router_topk_dispatch() -> Dispatch {
     Dispatch { x: 1, y: 1, z: 1 }
+}
+
+/// Push-constant block for `qwen36_router_gemv.comp` = `{n_out, hidden,
+/// apply_sigmoid}` (3 `uint`s). Bindings (in order): `0 = Input [hidden] f32`
+/// (read), `1 = Weight [n_out*hidden] f32` (read, GGUF row-major [out,in]),
+/// `2 = Output [n_out] f32` (write). `apply_sigmoid` = 1 folds the shared-expert
+/// sigmoid gate.
+pub fn qwen36_router_gemv_params(n_out: u32, hidden: u32, apply_sigmoid: bool) -> KernelParams {
+    KernelParams::from_words(vec![n_out, hidden, u32::from(apply_sigmoid)])
+}
+
+/// Dispatch grid for `qwen36_router_gemv.comp`: one thread per output row
+/// (`local_size_x = 64`), `ceil(n_out/64)` workgroups.
+pub fn qwen36_router_gemv_dispatch(n_out: u32) -> Dispatch {
+    Dispatch::x(n_out.div_ceil(64).max(1))
+}
+
+/// Push-constant block for `qwen36_moe_weighted_accum.comp` = `{hidden, count,
+/// init}` (3 `uint`s). Bindings (in order): `0 = Src [count*hidden] f32` (read,
+/// expert-major), `1 = Weights [count] f32` (read), `2 = Acc [hidden] f32`
+/// (read+write). `init` = 1 starts the accumulate from 0; 0 adds into `acc`.
+pub fn qwen36_moe_weighted_accum_params(hidden: u32, count: u32, init: bool) -> KernelParams {
+    KernelParams::from_words(vec![hidden, count, u32::from(init)])
+}
+
+/// Dispatch grid for `qwen36_moe_weighted_accum.comp`: one thread per hidden
+/// element (`local_size_x = 256`), `ceil(hidden/256)` workgroups.
+pub fn qwen36_moe_weighted_accum_dispatch(hidden: u32) -> Dispatch {
+    Dispatch::x(hidden.div_ceil(256).max(1))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
