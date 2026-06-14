@@ -917,6 +917,13 @@ fn forward_layers_resident<'a>(
     let profile = std::env::var("ARLE_PROFILE_LAYERS").is_ok();
     let mut full_ns: u128 = 0;
     let mut lin_ns: u128 = 0;
+    // Section probe (ARLE_PROFILE_SECTIONS=1): submit after the attention block
+    // and again after the FFN block, bucketing the two — to attribute the decode
+    // floor across attention vs FFN (the MoE FFN's expert GEMVs especially).
+    // Per-section serialization inflates the absolute but keeps the RATIO faithful.
+    let profile_sections = std::env::var("ARLE_PROFILE_SECTIONS").is_ok();
+    let mut attn_ns: u128 = 0;
+    let mut ffn_ns: u128 = 0;
     let t_record = std::time::Instant::now();
     res.recorder
         .begin()
@@ -953,6 +960,16 @@ fn forward_layers_resident<'a>(
             }
         }
         res.recorder.barrier();
+        if profile_sections {
+            let t = std::time::Instant::now();
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("layer[{layer}]: section attn submit: {e}"))?;
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("layer[{layer}]: section attn begin: {e}"))?;
+            attn_ns += t.elapsed().as_nanos();
+        }
         // FFN: post-add(hid + attn_off), post-norm, gate/up/swiglu/down, residual
         // add -> hid. Dense FFN, or the residual-resident MoE FFN (router GEMV →
         // on-device top-k → fused expert gather → device-weighted accumulate +
@@ -967,7 +984,16 @@ fn forward_layers_resident<'a>(
         // this ordering implicitly).
         res.recorder.barrier();
 
-        if profile {
+        if profile_sections {
+            let t = std::time::Instant::now();
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("layer[{layer}]: section ffn submit: {e}"))?;
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("layer[{layer}]: section ffn begin: {e}"))?;
+            ffn_ns += t.elapsed().as_nanos();
+        } else if profile {
             let t = std::time::Instant::now();
             res.recorder
                 .submit_and_wait()
@@ -1000,6 +1026,16 @@ fn forward_layers_resident<'a>(
              linear {lm:.1}ms / {linear_idx} layers = {:.2}ms/layer",
             fm / full_idx.max(1) as f64,
             lm / linear_idx.max(1) as f64,
+        );
+    }
+    if profile_sections {
+        let n = (full_idx + linear_idx).max(1) as f64;
+        eprintln!(
+            "  SECTION PROFILE: attn {:.1}ms ({:.2}ms/layer) | ffn {:.1}ms ({:.2}ms/layer)",
+            attn_ns as f64 / 1e6,
+            attn_ns as f64 / 1e6 / n,
+            ffn_ns as f64 / 1e6,
+            ffn_ns as f64 / 1e6 / n,
         );
     }
 
