@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
-"""DeepSeek-V4-Flash B=1 latency optimization journey on 8xH20 (TP=8/EP=8, FP8 MoE).
+"""DeepSeek-V4-Flash B=1 decode optimization journey on 8xH20 (TP=8/EP=8, FP8 MoE).
 
-A single three-panel figure that tells the whole 2026-06-06 -> 2026-06-08 arc,
-every number traced to a committed wins/ or errors/ entry:
+ONE compact figure (small-display-friendly). A milestone waterfall / step-line of
+B=1 decode tok/s across the campaign, each step annotated with the lever name +
+the sourced number + a tiny date. EVERY number is quoted verbatim from a committed
+docs/experience/wins/ entry (no fabrication, no interpolation):
 
-  A. Decode stops scaling with context  (official DSA indexer)
-       legacy csa_select single-SM -> 124 ms @4096; official multi-SM flat ~26 ms.
-       Source: wins/2026-06-06-dsv4-official-dsa-decode-flat-26ms-variable-shape.md
-  B. Prefill projections: scalar GEMV -> tensor-core DeepGEMM
-       per-stage M=1024 prefill kernel time, wq_b/wo_a/wo_b -94..95%.
-       Source: wins/2026-06-08-dsv4-prefill-proj-deepgemm-clean.md
-  C. The B=1 decode wall: amortization moved it, per-kernel tuning washed
-       27 -> 15 ms via MTP depth-1 batched verify (+71%); 8 levers wall-neutral.
-       Source: wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md,
-               wins/2026-06-08-dsv4-mtp-batched-verify-lands.md
+  33.5  regressed base                wins/2026-06-13-dsv4-decode-band-64align-regression-fix.md
+                                       (also -fp8-decode-moe-lane-44.md "pre-campaign 33.5")
+  36.9  64-align packing fix          wins/2026-06-13-dsv4-decode-band-64align-regression-fix.md
+                                       (a1e15307; "36.90 / 35.95")
+  44.0  FP8 decode-band MoE lane      wins/2026-06-13-dsv4-fp8-decode-moe-lane-44.md
+                                       ("44.11 / 43.76 / 44.18", 3 boots)
+  44.5  + automatic NUMA pin          wins/2026-06-13-dsv4-numa-pin-all-threads-ab.md
+                                       ("44.54 / 44.52 / 44.52", mean 44.48)
+  53.3  d2 chain-fold MTP (default)   wins/2026-06-13-dsv4-mtp-d2-chain-fold-53.md
+                                       ("53.37 / 53.30 / 53.32")
+  49..55.6 confirmed 06-14 baseline   wins/2026-06-14-dsv4-config-mechanism-classification.md
+                                       (forward floor 42.0 ms/step; tok/s 43.2->55.6 by
+                                        MTP acceptance; code-prompt hits 55.6)
+
+CROSS-CAMPAIGN CAVEAT (encoded as a separate side note, NOT spliced into the line
+above): the 2026-06-08 decode-6ms campaign reported 27 -> 15 ms/token / "39.9 ->
+64.2 tok/s" via MTP depth-1 on a DIFFERENT base + spec config.
+  Source: wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md (27 -> 15 ms),
+          wins/2026-06-08-dsv4-mtp-batched-verify-lands.md ("39.9 | 64.2 | +61%").
 
 Usage: python3 scripts/plot_dsv4_perf_journey.py [out.png]
 """
@@ -27,130 +38,103 @@ from matplotlib.patches import FancyArrowPatch
 OUT = sys.argv[1] if len(sys.argv) > 1 else "docs/assets/dsv4-perf-journey.png"
 
 # House palette (matches scripts/plot_mlx_vs_arle_sweep.py)
-BEFORE = "#868e96"   # legacy / scalar  (muted grey)
-AFTER = "#d6336c"    # optimized        (ARLE magenta)
-WIN = "#2f9e44"      # target / win     (green)
+BEFORE = "#868e96"   # legacy / regressed  (muted grey)
+AFTER = "#d6336c"    # optimized           (ARLE magenta)
+WIN = "#2f9e44"      # win / confirmed     (green)
 INK = "#212529"
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
     "axes.edgecolor": "#495057",
     "axes.linewidth": 0.9,
-    "axes.titlesize": 13,
+    "axes.titlesize": 12.5,
     "axes.titleweight": "bold",
-    "axes.labelsize": 11,
+    "axes.labelsize": 10.5,
 })
 
-fig, axs = plt.subplots(1, 3, figsize=(19, 6.4))
+# Campaign milestones (chronological). Each (x_index, tok/s, lever, date, source-tag).
+# tok/s values quoted verbatim from the cited wins/ entry (representative number).
+steps = [
+    (0, 33.5, "regressed\nbase", "06-13", BEFORE),
+    (1, 36.9, "64-align\npacking fix", "06-13", AFTER),
+    (2, 44.0, "FP8 decode-band\nMoE lane", "06-13", AFTER),
+    (3, 44.5, "+ NUMA pin\n(all-threads)", "06-13", AFTER),
+    (4, 53.3, "d2 chain-fold\nMTP (default-on)", "06-13", WIN),
+]
+xs = [s[0] for s in steps]
+ys = [s[1] for s in steps]
+
+fig, ax = plt.subplots(figsize=(10.0, 5.0))
 fig.suptitle(
-    "DeepSeek-V4-Flash  -  B=1 latency optimization journey  (8xH20, TP=8 / EP=8, FP8 MoE,  2026-06-06 -> 06-08)",
-    fontsize=15.5, fontweight="bold", y=0.99)
+    "DeepSeek-V4-Flash — B=1 decode optimization journey  (8×H20, TP=8 / EP=8, FP8 MoE)",
+    fontsize=13.0, fontweight="bold", y=0.985)
 
-# ----------------------------------------------------------------------------
-# Panel A: decode stops scaling with context  (official DSA indexer)
-# ----------------------------------------------------------------------------
-ax = axs[0]
-ctx = [256, 512, 1024, 2048, 4096]
-legacy = [28.16, 37.11, 25.77, 48.03, 124.37]   # csa_select, single CTA / 1-SM
-dsa = [26.02, 26.06, 26.05, 26.11, 26.15]        # official fp8_paged_mqa_logits, multi-SM
+# --- step-line connecting the campaign milestones --------------------------------
+ax.plot(xs, ys, "-", color="#ced4da", lw=2.0, zorder=1)
+for x, y, lever, date, col in steps:
+    ax.plot(x, y, "o", color=col, ms=11, zorder=3,
+            markeredgecolor="white", markeredgewidth=1.3)
+    # tok/s value above the marker
+    ax.annotate(f"{y:.1f}", (x, y), textcoords="offset points", xytext=(0, 11),
+                ha="center", fontsize=11, fontweight="bold", color=col, zorder=4)
+    # lever name + tiny date: below for high markers, above the value for the two
+    # lowest (no room below near the axis floor)
+    if y < 40:
+        ax.annotate(f"{lever} {date}", (x, y), textcoords="offset points",
+                    xytext=(0, 26), ha="center", va="bottom", fontsize=8.0,
+                    color=INK, zorder=4)
+    else:
+        ax.annotate(f"{lever}\n{date}", (x, y), textcoords="offset points",
+                    xytext=(0, -32), ha="center", va="top", fontsize=8.0,
+                    color=INK, zorder=4)
 
-ax.plot(ctx, legacy, "o-", color=BEFORE, lw=2.4, ms=8,
-        label="legacy csa_select (1-SM, scales)")
-ax.plot(ctx, dsa, "s-", color=AFTER, lw=2.4, ms=8,
-        label="official DSA indexer (multi-SM, flat)")
-ax.set_xscale("log", base=2)
-ax.set_xticks(ctx)
-ax.set_xticklabels(["256", "512", "1k", "2k", "4k"])
-ax.set_xlabel("context length (tokens)")
-ax.set_ylabel("decode latency (ms / token)")
-ax.set_title("A.  Decode stops scaling with context\n(official DSA indexer, default-on)")
-ax.set_ylim(0, 135)
-ax.grid(True, which="both", axis="y", alpha=0.25)
-ax.legend(loc="upper left", fontsize=9.5, framealpha=0.95)
-# 4.8x callout at 4096
-ax.annotate("124 ms", (4096, 124.37), textcoords="offset points", xytext=(-6, 4),
-            ha="right", fontsize=9.5, color=BEFORE, fontweight="bold")
-ax.annotate("~26 ms", (4096, 26.15), textcoords="offset points", xytext=(-4, -16),
-            ha="right", fontsize=9.5, color=AFTER, fontweight="bold")
-ax.annotate("4.8x faster\n@ 4k ctx", (4096, 75), ha="center", fontsize=11,
-            color=WIN, fontweight="bold")
-ax.add_patch(FancyArrowPatch((4096, 119), (4096, 31), arrowstyle="-|>",
-             mutation_scale=16, lw=1.6, color=WIN, shrinkA=0, shrinkB=0))
+# --- delta callouts between consecutive steps ------------------------------------
+deltas = [
+    (0, 1, "+10%"),   # 33.5 -> 36.9
+    (1, 2, "+19%"),   # 36.9 -> 44.0 (entry: "+19.5% over 64-align")
+    (3, 4, "+18-20%"),  # 44.5 -> 53.3 (entry: "+18-20% over no-spec base")
+]
+for i, j, txt in deltas:
+    xm = (steps[i][0] + steps[j][0]) / 2
+    ym = (steps[i][1] + steps[j][1]) / 2
+    ax.annotate(txt, (xm, ym), textcoords="offset points", xytext=(0, 8),
+                ha="center", fontsize=8.6, color=WIN, fontweight="bold",
+                style="italic", zorder=4)
 
-# ----------------------------------------------------------------------------
-# Panel B: prefill projections  scalar GEMV -> DeepGEMM  (per-stage, M=1024)
-# ----------------------------------------------------------------------------
-ax = axs[1]
-stages = ["wq_b", "wo_a", "wo_b"]
-scalar = [138.3, 132.0, 137.7]     # dsv4_fp8_gemv_batch (M=1 GEMV run at M=1024)
-deepgemm = [8.4, 8.6, 6.3]         # tensor-core DeepGEMM
-x = range(len(stages))
-w = 0.38
-b1 = ax.bar([i - w / 2 for i in x], scalar, w, color=BEFORE,
-            label="scalar fp8_gemv_batch")
-b2 = ax.bar([i + w / 2 for i in x], deepgemm, w, color=AFTER,
-            label="tensor-core DeepGEMM")
-ax.set_xticks(list(x))
-ax.set_xticklabels(stages)
-ax.set_xlabel("MLA / output projection (M=1024 prefill)")
-ax.set_ylabel("per-stage kernel time (ms)")
-ax.set_title("B.  Prefill projections -> DeepGEMM\nrank-0 LINEAR_PROFILE, load/JIT excluded")
-ax.set_ylim(0, 178)
-ax.grid(True, axis="y", alpha=0.25)
-ax.legend(loc="upper right", fontsize=9.5, framealpha=0.95)
-for i, (s, d) in enumerate(zip(scalar, deepgemm)):
-    ax.annotate(f"{s:.0f}", (i - w / 2, s), textcoords="offset points",
-                xytext=(0, 3), ha="center", fontsize=9, color=BEFORE)
-    ax.annotate(f"{d:.1f}", (i + w / 2, d), textcoords="offset points",
-                xytext=(0, 3), ha="center", fontsize=9, color=AFTER, fontweight="bold")
-    pct = 100 * (s - d) / s
-    ax.annotate(f"-{pct:.0f}%", (i, max(s, 60) * 0.55), ha="center",
-                fontsize=10.5, color=WIN, fontweight="bold")
-ax.text(0.30, 0.985, "TTFT outcome:  prefill ~23 ms\n(projections were 62%\nof prefill GPU)",
-        transform=ax.transAxes, ha="center", va="top", fontsize=9.0, color=INK,
-        bbox=dict(boxstyle="round,pad=0.4", fc="#fff0f3", ec=AFTER, lw=1.0))
+# --- 2026-06-14 confirmed-baseline acceptance band (49 .. 55.6) ------------------
+# Source: wins/2026-06-14-dsv4-config-mechanism-classification.md
+band_x = 5.05
+ax.add_patch(plt.Rectangle((band_x - 0.12, 49.0), 0.24, 55.6 - 49.0,
+             facecolor=WIN, alpha=0.16, edgecolor=WIN, lw=1.1, zorder=2))
+ax.plot([band_x], [53.3], marker="_", ms=18, color=WIN, mew=2.0, zorder=3)
+ax.annotate("06-14 confirmed\nacceptance band\n49 → 55.6 tok/s",
+            (band_x, 55.6), textcoords="offset points", xytext=(0, 9),
+            ha="center", fontsize=8.0, color=WIN, fontweight="bold", zorder=4)
+ax.annotate("forward floor 42.0 ms/step;\ntok/s swings by MTP acceptance",
+            (band_x, 49.0), textcoords="offset points", xytext=(0, -8),
+            ha="center", va="top", fontsize=7.0, color="#495057",
+            style="italic", zorder=4)
 
-# ----------------------------------------------------------------------------
-# Panel C: the B=1 decode wall  -  one lever moved it, eight washed
-# ----------------------------------------------------------------------------
-ax = axs[2]
-labels = ["baseline\n(DSA + DeepGEMM\nprojections)", "MTP depth-1\nbatched verify"]
-vals = [27.0, 15.0]
-bars = ax.bar([0, 1], vals, 0.5, color=[BEFORE, AFTER], zorder=3)
-ax.set_xticks([0, 1])
-ax.set_xticklabels(labels, fontsize=9.5)
-ax.set_ylabel("B=1 decode latency (ms / token)")
-ax.set_title("C.  The B=1 decode wall\namortization moved it, per-kernel tuning washed")
-ax.set_ylim(0, 39)
-ax.grid(True, axis="y", alpha=0.25)
-for i, v in enumerate(vals):
-    ax.annotate(f"{v:.0f} ms", (i, v), textcoords="offset points", xytext=(0, 4),
-                ha="center", fontsize=11, fontweight="bold",
-                color=BEFORE if i == 0 else AFTER, zorder=4)
-# +71% arrow
-ax.add_patch(FancyArrowPatch((0.0, 27), (1.0, 15.6), arrowstyle="-|>",
-             mutation_scale=18, lw=2.0, color=WIN, shrinkA=4, shrinkB=4, zorder=5))
-ax.annotate("+71% tok/s\n(39.9 -> 64.2,\nbyte-identical)", (0.42, 21.0), ha="center",
-            fontsize=9.5, color=WIN, fontweight="bold", zorder=6)
-# reference lines
-ax.axhline(15, color=AFTER, ls=":", lw=1.3, zorder=1)
-ax.annotate("sound B=1 ceiling", (1.46, 15), va="center", ha="right",
-            fontsize=8.5, color=AFTER)
-ax.axhline(6, color=WIN, ls="--", lw=1.5, zorder=1)
-ax.annotate("6 ms target  -  tree-EAGLE + mega-kernel,\nor batching (M=N)", (1.46, 6.6),
-            va="bottom", ha="right", fontsize=8.5, color=WIN)
-ax.annotate("HBM active-weight floor ~0.3 ms (87x below the wall)", (-0.45, 1.1),
-            va="bottom", ha="left", fontsize=8, color="#868e96", style="italic")
-# washed levers callout
-washed = ("8 levers WASHED (wall-neutral):\n"
-          "whole-step CUDA graph . mhc_params uint4 (-25% iso)\n"
-          "M=1 GEMV (1.8x iso) . comm-overlap . mempool\n"
-          "launch removal . per-layer graph . DSA-skip\n"
-          "=> GPU-bound critical path; gpukernsum != crit path")
-ax.text(0.5, 0.985, washed, transform=ax.transAxes, ha="center", va="top",
-        fontsize=7.6, color=INK,
-        bbox=dict(boxstyle="round,pad=0.45", fc="#f1f3f5", ec="#adb5bd", lw=1.0))
+# --- faint reference: the "old 32.52 base" (not a campaign A/B point) -------------
+ax.axhline(32.52, color="#ced4da", ls=":", lw=1.0, zorder=0)
+ax.annotate("old 32.52 base (reference only — prior to this campaign)",
+            (5.62, 32.52), textcoords="offset points", xytext=(0, 2),
+            ha="right", va="bottom", fontsize=6.8, color="#adb5bd", style="italic")
 
-fig.tight_layout(rect=(0, 0.0, 1, 0.955))
+ax.set_xlim(-0.55, 5.65)
+ax.set_ylim(30.5, 63)
+ax.set_xticks([])
+ax.set_ylabel("B=1 decode throughput (tok/s)")
+ax.grid(True, axis="y", alpha=0.22)
+
+# --- cross-campaign caveat box (separate arc, NOT spliced into the line) ----------
+caveat = ("Separate arc — 2026-06-08 decode-6ms campaign (different base + spec config):\n"
+          "decode 27 → 15 ms/token via MTP depth-1 batched verify; \"39.9 → 64.2 tok/s\".\n"
+          "Not continuous with the 33.5→53.3 line above — distinct harness/base/prompt.")
+ax.text(0.015, 0.975, caveat, transform=ax.transAxes, ha="left", va="top",
+        fontsize=6.9, color=INK,
+        bbox=dict(boxstyle="round,pad=0.42", fc="#f1f3f5", ec="#adb5bd", lw=0.9))
+
+fig.tight_layout(rect=(0, 0.0, 1, 0.95))
 fig.savefig(OUT, dpi=150, bbox_inches="tight")
 print(f"wrote {OUT}")

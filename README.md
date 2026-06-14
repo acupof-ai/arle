@@ -138,8 +138,9 @@ Deep dive: [onboarding](docs/onboarding.md) (30 min) · [architecture](docs/arch
 **2026-06-08 — DeepSeek-V4-Flash B=1: prefill 23 ms, decode 27 → 15 ms/token** (8×H20, TP=8 / EP=8, FP8 MoE). Official DSA indexer flattens decode across context (4.8× @4k), tensor-core DeepGEMM projections (−94% per stage), MTP batched verify **+71% decode tok/s** — byte-identical. [FINAL report](docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md).
 
 <p align="center">
-  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 latency optimization journey: decode context-scaling fix, prefill DeepGEMM projections, and the MTP-amortized decode wall" width="100%">
+  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode optimization journey (2026-06-13 → 06-14): 33.5 → 36.9 (64-align packing fix) → 44.0 (FP8 decode-band MoE lane) → 44.5 (NUMA pin) → 53.3 tok/s (d2 chain-fold MTP), with the 06-14 confirmed 49–55.6 tok/s acceptance band" width="720">
 </p>
+<p align="center"><sub>B=1 decode tok/s across the 2026-06-13 → 06-14 campaign — every step traced to a <code>docs/experience/wins/</code> entry.</sub></p>
 
 Older history: [CHANGELOG.md](CHANGELOG.md).
 
