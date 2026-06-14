@@ -10,8 +10,11 @@ use std::time::SystemTime;
 
 /// Supported model family substrings (case-insensitive).
 ///
-/// Keep in sync with `docs/support-matrix.md`.
-const SUPPORTED_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "qwen3.5"];
+/// Keep in sync with `docs/support-matrix.md`. `diffusiongemma` is the
+/// block-diffusion model the Metal serve path handles (measured 55.7 tok/s e2e,
+/// [bench](../../../benchmarks/README.md)); plain `gemma` stays OUT because only
+/// the DiffusionGemma variant is wired.
+const SUPPORTED_FAMILIES: &[&str] = &["qwen3", "qwen2.5", "qwen3.5", "diffusiongemma"];
 
 /// Architectures the picker must never offer as a primary, standalone model.
 ///
@@ -202,8 +205,14 @@ mod tests {
         assert!(is_family_supported("Qwen/Qwen3-4B"));
         assert!(is_family_supported("mlx-community/qwen3.5-4b-4bit"));
         assert!(is_family_supported("Qwen/Qwen2.5-7B"));
+        // DiffusionGemma serves on Metal (55.7 tok/s e2e) — must be offered.
+        assert!(is_family_supported(
+            "mlx-community/diffusiongemma-26B-A4B-it-4bit"
+        ));
         assert!(!is_family_supported("mistralai/Mistral-7B"));
         assert!(!is_family_supported("meta-llama/Llama-3-8B"));
+        // Plain Gemma (non-diffusion) is NOT wired — stays out.
+        assert!(!is_family_supported("google/gemma-2-9b"));
     }
 
     fn write_config(json: &str) -> tempfile::TempDir {
