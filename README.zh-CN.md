@@ -84,7 +84,7 @@ print(client.chat.completions.create(
 | Qwen3.5-9B | 50 tok/s | 20.0 ms | 1.45 s |
 | **Qwen3.6-35B-A3B** · MoE | **85 tok/s** | 11.7 ms | 1.23 s |
 
-<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = 单流生成速率 · <a href="docs/experience/wins/2026-06-14-bench-metal-m4pro-local-model-ladder.md">测量方法</a></sub>
+<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = 单流生成速率 · <a href="benchmarks/README.md">快照 + 方法</a></sub>
 
 **NVIDIA —— DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
 
