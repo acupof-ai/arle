@@ -19,6 +19,20 @@ concurrency, but MTP **disabled the batched lane** → the executor looped per-r
 Italy→Rome/Colosseum, Canada→Ottawa, Egypt→Cairo/Giza) — identical answers, MTP
 acceptance preserved (~0.75 accept/step depth=2, same as per-row).
 
+### Correctness verified — batched fold == per-row reference, ZERO cross-slot contam
+Concurrent DISTINCT-needle (each slot a unique codeword buried in a long context,
+barrier-synced to one batched wave, must retrieve ITS OWN) — fold vs per-row, c=4/8,
+short + long (filler=120) context:
+- **cross-contam = 0 in EVERY run** (both arms) — no slot read another's needle (the
+  critical batched property: no cross-slot KV/attention leakage).
+- **fold own-rate == per-row own-rate** (6–7/8, varying run-to-run by ±1, e.g. `quasar`
+  vs `quamar` flips arm-to-arm = MoE non-determinism, NOT a systematic gap).
+- The non-OWN cases are a SHARED model word-recall limit (both arms truncate the same
+  uncommon words), not a batched bug — the correct-inference gate (needle +
+  self-consistency + NON-byte-identity for MoE non-det) PASSES. The earlier 6-digit
+  needle "FAIL" was a test artifact (model can't recall 6 digits; both arms failed
+  identically) — fixed to word codewords.
+
 ### The mechanism — per-row MTP PLATEAUS, batched SCALES (the load-bearing finding)
 Per-row MTP aggregate is FLAT across offered concurrency — it cannot use more slots:
 
@@ -53,11 +67,36 @@ aggregate scales with c. This is why batching wins: it breaks the sequential pla
 + per-slot `spec_normed` persist) → per-slot `commit_accepted_fold`. Allreduce transport;
 default OFF → main per-row path byte-identical.
 
-## Residual (next, not blocking the win)
-The per-slot DRAFT (`mtp_forward_level` looped, depth-sequential) and per-slot
-capture/restore stay un-batched — batching the draft (N rows × depth levels) is the next
-amortization. The verify (the dominant phase) is batched; draft is the remaining serial
-tail.
+## Why absolute throughput is still low — phase profile (`ARLE_DSV4_MTP_STEP_PROFILE`)
+Per-wave host-ms (profiling syncs distort throughput → attribution only, not the headline):
+
+| | draft+capture | verify (batched) | commit (fold) | total |
+|---|---|---|---|---|
+| **batched fold** n=4 | 15.5 | **76.2 (69%)** | 18.5 | 110 ms |
+| **batched fold** n=6 | 23.1 | **99.7 (64%)** | 32.6 | 155 ms |
+| per-row, **PER SLOT** | 3.8 (cap+draft) | 33.8 | 5–10 | ~43–47 ms |
+
+Root cause, NAILED:
+- **The verify forward DOMINATES (~70% of the batched wave) and is inherently
+  expensive** — DSv4 is 60 layers of MoE + a per-layer TP all-reduce; one batched
+  verify is 76 ms even for 4 slots. It amortizes well (batched 76 ms/12 rows ≈ 6.3
+  ms/row vs per-row 34 ms/3 rows ≈ 11 ms/row = **1.8×**), but it's the floor.
+- Per-row plateaus because its per-slot step (~45 ms, verify-dominated) runs c× serially
+  (c=8 → ~360 ms wave → ~39 tok/s, matching the measured ~42).
+- The un-batched residual (draft+capture ~15 ms, commit ~18 ms = ~30% of the wave) is
+  the smaller lever; **the verify cost is the bigger one.**
+
+Next levers, ranked by this profile:
+1. **Attack the verify (~70%)** — DP-attention (removes the Q-allgather + the 4–9×
+   lockstep all-reduce skew the c-sweep measured, inside the verify attention) + CUDA
+   graph (launch overhead) + lighter TP collectives. These are the c-sweep's #2/#3
+   levers, now confirmed to bind the verify.
+2. **Batch the draft + commit (~30%)** — `mtp_forward_level` over N slots (depth-seq)
+   + a batched fold commit; moderate work, partial unlock.
+
+## Residual
+The per-slot DRAFT (`mtp_forward_level` looped) + per-slot capture/restore + per-slot
+fold commit stay un-batched (~30% of the wave). The verify (dominant) is batched.
 
 ## Rule
 - **A batched lane must batch the axis that ceilings throughput, AND match the commit the
