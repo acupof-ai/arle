@@ -1297,7 +1297,33 @@ fn validate_dsv4_prefill_kv_view(
 /// harness shim. Default OFF keeps the per-row decode loop as the
 /// byte-identical correctness reference.
 fn dsv4_batched_decode_enabled() -> bool {
-    std::env::var_os("INFER_DSV4_BATCHED_DECODE").is_some()
+    // Default ON (2026-06-15 N=4 flip): the no-MTP decode path auto-batches at
+    // `rows >= dsv4_batched_decode_min_rows()`. `--spec-type` defaults to None, so
+    // the DEFAULT serve takes the batched lane at c>=4 (the +58% @c=8 win) with no
+    // env var and no MTP-state risk (the gate also requires `!spec`; batched+MTP
+    // reconciliation stays deferred). Force the per-row byte-identical reference
+    // with `INFER_DSV4_BATCHED_DECODE=0`.
+    match std::env::var("INFER_DSV4_BATCHED_DECODE") {
+        Ok(v) => !matches!(
+            v.as_str(),
+            "0" | "false" | "FALSE" | "no" | "off" | "OFF" | ""
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Minimum concurrent decode rows for the batched lane (default 4 = the N=4
+/// crossover ckl licensed: batched amortization overtakes MTP's c-independent
+/// ~2×/row at c>=3 prod / c>=4 short, [c-sweep]
+/// (docs/experience/wins/2026-06-14-dsv4-batched-decode-csweep-threshold-n4.md)).
+/// Below this the per-row path runs. Clamped to >=2 (single-row never batches).
+/// `INFER_DSV4_BATCHED_DECODE_MIN_ROWS`.
+fn dsv4_batched_decode_min_rows() -> usize {
+    std::env::var("INFER_DSV4_BATCHED_DECODE_MIN_ROWS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&v| v >= 2)
+        .unwrap_or(4)
 }
 
 impl std::fmt::Debug for Dsv4CudaExecutor {
@@ -1557,11 +1583,13 @@ impl Dsv4CudaExecutor {
                 && batch.positions.len() == batch.rows.len(),
             "DSv4 decode batch surface length mismatch"
         );
-        // Opt-in true batched decode (Step A: layer-major driver, per-row
-        // looped attention). Default OFF → the per-row loop below stays the
-        // byte-identical reference. Only the multi-row, non-spec path batches.
+        // True batched decode (layer-major driver, batched attention + grouped
+        // MoE). Default ON at `rows >= dsv4_batched_decode_min_rows()` (N=4); below
+        // the threshold and under `--spec-type mtp` the per-row loop below runs
+        // (the byte-identical reference / the MTP spec path). Only the multi-row,
+        // non-spec path batches.
         if dsv4_batched_decode_enabled()
-            && batch.rows.len() > 1
+            && batch.rows.len() >= dsv4_batched_decode_min_rows()
             && !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled())
         {
             let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
