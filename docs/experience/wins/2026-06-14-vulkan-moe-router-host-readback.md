@@ -88,10 +88,34 @@ kernel:
    reasoning — the diagnosis, then the fix, then the number.
 
 **Net MoE: 1.97 → 0.056 s/token (35×), 93× → 2.65× of llama.cpp.** Coherent
-throughout. The wall now is genuinely GPU kernel efficiency: 2.62 GB/token at
-0.056 s = ~47 GB/s effective = ~21 % of roofline — the top-8 expert GEMVs are
-small `[2048×512]` Q4 matrices whose `mul_mat_vec_id` efficiency, not the
-architecture, is the remaining lever.
+throughout.
+
+## The remaining 2.65× is dispatch overhead — and naive fusion REGRESSES
+
+Localized with `ARLE_PROFILE_SECTIONS` (attn vs ffn) + an `ARLE_NO_BARRIER`
+ablation:
+
+- **It's dispatch-overhead bound, not bandwidth.** attn 0.39 ms ÷ ~10 dispatches
+  ≈ 39 µs/dispatch; ffn 0.79 ms ÷ ~18 ≈ 44 µs/dispatch — **~40 µs/dispatch, total
+  ≈ 40 µs × dispatch-count**. ~1120 dispatches/token ⇒ ~45 ms of the 56 ms. The
+  per-layer op chain is a *sequential* dependency chain, so each step's ~40 µs
+  (launch + the global compute→compute barrier's L2 flush) is fully exposed; the
+  dense 27B hides this behind big Q8 matrices, MoE's tiny Q4 experts can't.
+- **Barriers cost ~12 ms (21 %)** — `ARLE_NO_BARRIER` drops decode to 0.044 s
+  (garbage output) — but they're load-bearing (no-barrier ⇒ NaN), so the only
+  lever is fewer dispatches (fusion removes barriers proportionally).
+- **Naive fusion LOSES.** Fusing post-add + post-norm into one `add_rms_norm`
+  kernel *regressed* 0.056 → 0.059: the vendored llama.cpp `rms_norm`
+  (BLOCK_SIZE=512, unrolled `num_iters`, fused weight-multiply) is so optimized
+  that a naive single-workgroup fused replacement loses more in execution than
+  the one saved dispatch's ~40 µs. **Reverted.**
+
+**Rule:** to capture the dispatch-overhead headroom you must write fused kernels
+that *match* llama.cpp's per-kernel tuning (block size, unrolling, subgroup
+reductions) — a naive fusion that drops a dispatch but executes slower is a net
+loss. So 2.65× (35×) is the clean, correct, shipped landing; the remaining 2× is
+genuine llama.cpp-parity kernel engineering (optimized fused expert-FFN kernels),
+not a clean architectural lever.
 
 ## Rule
 
