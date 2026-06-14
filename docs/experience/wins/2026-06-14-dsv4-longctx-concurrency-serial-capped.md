@@ -53,10 +53,17 @@ prompt_tokens (32755 / 65505 / 131005). Decode-agg = Δgenerated_tokens /
    the short-context 1.4× cap** (zero concurrency benefit on decode). tok/step
    rises ~c× (a step advances all rows) while agg holds → ms/step rises ~c× → the
    per-row-serial-over-rows MLA-decode signature, NOT a true batched kernel.
-2. **TTFT linear in BOTH length AND concurrency — prefill fully serial.** Single
-   prefill 6/12/27s @ 32K/64K/128K; at c=8 it is 48/99/**214s**. No cross-request
-   prefill batching/overlap. This is a SEPARATE, additive bottleneck that
-   batched-*decode* does not address.
+2. **TTFT linear in BOTH length AND concurrency — prefill is COMPUTE-BOUND, NOT
+   unbatched.** Single prefill 6/12/27s @ 32K/64K/128K; at c=8 it is 48/99/**214s**
+   ≈ c× single. Chunked prefill (2048/req) + mixed continuous batching ARE on by
+   default (`planner.rs:41-86`: batches ≤`num_slots` prefill rows under a
+   16384-tok/tick budget — at c=8, 8×2048=16384 = the full budget, so all 8
+   prefill together every tick). TTFT still scales with c because total prefill
+   FLOPs = c×prompt on the same 8 GPUs (a 16384-tok tick ≈ 8× a 2048-tok tick;
+   arithmetic checks: 32K c=8 = 16 fat ticks × ~3.2s ≈ 47.7s). This is
+   FUNDAMENTAL compute scaling, not a missing feature — only faster prefill
+   kernels (per-token throughput) or more GPUs reduce it. Distinct from the
+   decode-aggregate lever (decode has BW/overhead headroom; prefill does not).
 3. **Slot clamp 8→6**: every serve logs `executor clamped slots 8 -> 6; scheduler
    follows` — true max concurrency is 6 (6 in-flight + 2 queued), not 8.
 4. **MTP acceptance degrades with context**: tok/step @c=1 1.80 (32K) → 1.60
@@ -82,4 +89,10 @@ Prefill-serial TTFT (#2) is a distinct lever, not in batched-decode scope.
   ≠ license ([axis2 kill](../errors/2026-05-25-axis2-mixed-default-kill.md)).
   Aggregate-rises-with-c is the only acceptance bar for the decode lever.
 - Use **aggregate decode tok/s vs c** as the scaling metric and **TTFT vs (len,c)**
-  as the separate prefill-serialization metric; report both per cell.
+  as the separate prefill metric; report both per cell.
+- **"TTFT scales with c" ≠ "prefill is serial/unbatched".** Chunked prefill +
+  mixed batching are default-on; the linear TTFT is prefill being compute-bound
+  (c×prompt FLOPs on fixed GPUs). Verify the scheduler (`planner.rs`) before
+  attributing a concurrency wall to a missing feature — decode-aggregate-flat is
+  a fixable kernel inefficiency (BW/overhead headroom), prefill-TTFT-linear is
+  compute physics.
