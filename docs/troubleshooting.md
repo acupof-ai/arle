@@ -33,16 +33,20 @@ actionable message.
 ### `error: linker 'cc' not found` on Linux
 
 Install build essentials: `apt install -y build-essential pkg-config` (Debian /
-Ubuntu) or the equivalent. CUDA users also need `clang` for some FlashInfer
-kernels.
+Ubuntu) or the equivalent. Several `-sys` crates also need `clang` /
+`libclang-dev` (bindgen) and `cmake`; `setup.sh` installs the full native-dep
+set.
 
-### `flashinfer-python` install fails
+### TileLang AOT build dep fails to install
 
-FlashInfer is a build-time-only Python dep used by the CUDA AOT path. It needs
-CUDA 12.x and a matching Triton wheel. The repo pins both in
-[`requirements-build.txt`](../requirements-build.txt). If `pip install` fails,
-verify `nvidia-smi` reports a GPU and that `$CUDA_HOME/bin/nvcc --version`
-matches the pinned major (12.8 today).
+TileLang is the one build-time-only Python dep on the CUDA AOT path (attention /
+GDR kernel codegen); it is pinned in
+[`requirements-build.txt`](../requirements-build.txt) to the version the 8×H20
+pod runs. FlashInfer needs no pip step — its kernels are vendored as C++ headers
+under `crates/cuda-kernels/csrc/vendor/flashinfer/` and compiled by nvcc (the
+Triton-AOT lane and its wheel were deleted in #88, `23d6a0b8`). If the TileLang
+install fails, verify `nvidia-smi` reports a GPU and that
+`$CUDA_HOME/bin/nvcc --version` matches the pinned CUDA major (12.x).
 
 ### `pip install -e ".[bench|dev|observe|serve]"` fails with "no such package"
 
