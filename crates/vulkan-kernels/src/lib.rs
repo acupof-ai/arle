@@ -88,6 +88,7 @@ pub enum Kernel {
     GeGlu,
     SwiGlu,
     Add,
+    ScaledAdd,
     GetRows,
     SoftMax,
     ArgMax,
@@ -145,6 +146,7 @@ impl Kernel {
         Self::GeGlu,
         Self::SwiGlu,
         Self::Add,
+        Self::ScaledAdd,
         Self::GetRows,
         Self::SoftMax,
         Self::ArgMax,
@@ -178,6 +180,7 @@ impl Kernel {
             Kernel::GeGlu => "geglu",
             Kernel::SwiGlu => "swiglu",
             Kernel::Add => "add",
+            Kernel::ScaledAdd => "scaled_add",
             Kernel::GetRows => "get_rows",
             Kernel::SoftMax => "soft_max",
             Kernel::ArgMax => "argmax",
@@ -213,6 +216,7 @@ impl Kernel {
             | Kernel::GeGlu
             | Kernel::SwiGlu
             | Kernel::Add
+            | Kernel::ScaledAdd
             | Kernel::GetRows
             | Kernel::Dsv4PrepareQk
             | Kernel::Dsv4CompressorUpdate
@@ -534,6 +538,24 @@ pub fn add_params(n: u32) -> KernelParams {
 /// would leave the top `~n/2 mod 512` elements unwritten — the oracle test caught
 /// exactly that (e.g. n=5120 left `[2816, 5120)` at 0).
 pub fn add_dispatch(n: u32) -> Dispatch {
+    Dispatch::x(n.div_ceil(256).max(1))
+}
+
+/// `scaled_add.comp` (ARLE-local): `out[i] = a[i] + scale * b[i]` over `n`
+/// elements. Bindings `0=A` (accumulator, read), `1=B` (addend, read),
+/// `2=D` (out, write) — same 3-binding layout as `add`, so it shares the
+/// decode `ring3`. The 2-field push is `[n (u32), scale (f32 bits)]`.
+///
+/// Folds the MoE router weight into the per-expert accumulate
+/// (`acc += w_e * y_e`) so the whole accumulate stays device-resident — no host
+/// readback of the expert output to scale + add.
+pub fn scaled_add_params(n: u32, scale: f32) -> KernelParams {
+    KernelParams::from_words(vec![n, scale.to_bits()])
+}
+
+/// `scaled_add.comp` grid: one thread per element, `local_size_x = 256`, so
+/// `ceil(n / 256)` workgroups cover the row.
+pub fn scaled_add_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
 

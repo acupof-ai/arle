@@ -233,6 +233,11 @@ const LOCAL: &[ShaderSpec] = &[
         defines: &[],
     },
     ShaderSpec {
+        name: "scaled_add",
+        source: "crates/vulkan-kernels/shaders/scaled_add.comp",
+        defines: &[],
+    },
+    ShaderSpec {
         name: "qwen35_ssm_conv",
         source: "crates/vulkan-kernels/shaders/qwen35_ssm_conv.comp",
         defines: &[],

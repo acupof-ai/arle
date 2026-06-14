@@ -1,0 +1,39 @@
+#version 450
+// ARLE Vulkan shader: scaled residual accumulate `out[i] = a[i] + scale * b[i]`.
+//
+// The MoE FFN's per-expert accumulate is `acc += w_e * y_e` (the router softmax
+// prob `w_e` scaling each expert's down-proj output `y_e`). Folding the scalar
+// into the add keeps the whole accumulate device-resident: no host readback of
+// `y_e` to scale + add, and no separate scalar-multiply pass. Bindings mirror the
+// `add` kernel (0=A accumulator, 1=B addend, 2=D out) so it shares the 3-binding
+// descriptor ring; `scale` is the only extra push field.
+//
+// One thread per element (256-wide workgroup). The host dispatches
+// `ceil(n / 256)` workgroups.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n;
+    float scale;
+} p;
+
+layout(binding = 0) readonly buffer A {
+    float a[];
+};
+
+layout(binding = 1) readonly buffer B {
+    float b[];
+};
+
+layout(binding = 2) writeonly buffer D {
+    float out_data[];
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) {
+        return;
+    }
+    out_data[idx] = a[idx] + p.scale * b[idx];
+}
