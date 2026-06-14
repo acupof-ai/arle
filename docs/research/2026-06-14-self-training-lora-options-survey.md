@@ -120,21 +120,34 @@ The literature splits cleanly into **soft (per-token KL)** vs **hard (filter-the
 | **A2. Best-of-N rejection self-distill** (ReST-EM / STaR / RFT) | hard CE on verified-correct rollouts only | **yes** (answer/schema/tool verifier) | no | yes | medium (verifier gaming) | ✅ CE/SFT-anchor, NOT GRPO | medium — N-sample + filter + SFT-anchor path exists |
 | **A3. Self-consistency distill** | hard CE/soft KL toward majority-vote pseudo-label | no (uses agreement) | no | yes | medium (mode collapse) | ✅ distillation | medium — N-sample + vote |
 | **A4. External small peer teacher** | soft KL from a *different* small model (not self) | no | **yes** (2nd base resident) | yes | low | ✅ classic OPD | low (existing path) but **breaks "teacher-free"** + costs memory |
+| **A5. Rubric-graded selection** (ROPD-style) | hard CE on **rubric-best** τ* (auto-induced, prompt-specific rubric); soft-weight = boundary | **yes** (rubric Verifier, not exact-match) | no (self-Rubricator + EMA judge) *or* yes (black-box ext. teacher → A4) | yes | **medium-high** (soft judge ⇒ more gameable than exact-match) | ✅ **only as rejection/best-of-N CE** (Path A); ❌ ROPD-as-published is **GRPO** | medium-high — Rubricator + blind Verifier + structured parse (`xgrammar-sys`) |
 
 Dimensions that decide it: A1 is the only one that is **teacher-free, verifier-free, pure-soft-KL,
 and reuses the existing KL backward unchanged** — lowest new surface. A2/A3 add a sampling+filter
 loop and (A2) a verifier, but give a *stronger* improvement signal on tasks with a checkable
 answer (math, code, tool-call schema) — and A2 is the closest match to ckl's word "skills"
-(verified task completion). **Apples-to-apples verdict**: A1 = simplest correct; A2 = strongest
-on verifiable skills. They compose (A1 KL as the always-on floor, A2 CE as a periodic booster).
-Literature anchors: ReST-EM/ReST (ICLR'24), "Self-Distilled Reasoner: On-Policy Self-Distillation"
-(2026), "A Model Can Help Itself: Reward-Free Self-Training" (2510.18814).
+(verified task completion). **A5 is the open-ended generalization of A2**: it replaces the
+exact-match verifier with an **auto-induced rubric** so the signal extends to **non-verifiable /
+agentic / writing** tasks where exact-match has no purchase — the bridge that makes the skills
+self-evolving end-state (#97) actually work. **Apples-to-apples verdict**: A1 = simplest correct;
+A2 = strongest on verifiable skills; A5 = the only one that reaches *open-ended* skills, at a
+higher reward-hack cost. They compose (A1 KL always-on floor, A2 exact-match booster, A5 rubric
+booster on the open-ended tail). Literature anchors: ReST-EM/ReST (ICLR'24), "Self-Distilled
+Reasoner: On-Policy Self-Distillation" (2026), "A Model Can Help Itself: Reward-Free Self-Training"
+(2510.18814); **A5 grounded in the dedicated [rubric-OPD analysis](2026-06-14-rubric-opd.md)** (ROPD
+arXiv 2605.07396 — note its published optimizer is GRPO; A5 adopts only the rubric machinery in
+distillation form, never the policy gradient).
 
-**License constraint (hard):** all four are distillation/CE — none is GRPO. The 2026-05-18
-OPD-only pivot retired GRPO/multi-turn-RL on an economic argument; A-options stay on the licensed
-side of that line precisely because the update is KL or CE, never a policy-gradient objective.
-([agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md) is RETIRED; its data-flow
-shape — rollout→reward→loss→hot-swap — is reusable ONLY with a distillation loss.)
+**License constraint (hard):** A1–A4 are unconditionally distillation/CE — none is GRPO. **A5 is
+conditional**: ROPD-as-published feeds the rubric score to **GRPO** (policy gradient), which
+collides with the pivot — so A5 is licensed **only in its rejection/best-of-N form** (select the
+rubric-best τ*, CE→τ* + KL→EMA; losers dropped, no negative gradient), the rubric generalization of
+A2. The 2026-05-18 OPD-only pivot retired GRPO/multi-turn-RL on an economic argument; A-options stay
+on the licensed side of that line precisely because the update is KL or CE, never a policy-gradient
+objective. ([agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md) is RETIRED; its
+data-flow shape — rollout→reward→loss→hot-swap — is reusable ONLY with a distillation loss.)
+**Reopening literal GRPO-ROPD = overturning the pivot's KILL evidence first (ckl's strategic call —
+[rubric-OPD analysis](2026-06-14-rubric-opd.md) §Path B).**
 
 ### Axis B — PEFT structural variant
 
