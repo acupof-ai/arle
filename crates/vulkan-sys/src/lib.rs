@@ -816,6 +816,20 @@ mod real {
             push: &[u8],
             groups: [u32; 3],
         ) {
+            self.dispatch_raw(pipeline, set.raw(), push, groups);
+        }
+
+        /// Same as [`Self::dispatch`] but binds an already-resolved raw
+        /// `VkDescriptorSet` (e.g. the next slot of a [`DescriptorSetRing`]),
+        /// avoiding the per-dispatch `DescriptorSet` (pool) creation. The caller
+        /// must keep the underlying set valid until `submit_and_wait`.
+        pub fn dispatch_raw(
+            &mut self,
+            pipeline: &ComputePipeline<'_>,
+            set: vk::DescriptorSet,
+            push: &[u8],
+            groups: [u32; 3],
+        ) {
             let device = &self.ctx.device;
             let cmd = self.command_buffer;
             unsafe {
@@ -825,7 +839,7 @@ mod real {
                     vk::PipelineBindPoint::COMPUTE,
                     pipeline.layout(),
                     0,
-                    &[set.raw()],
+                    &[set],
                     &[],
                 );
                 if !push.is_empty() {
@@ -1142,6 +1156,140 @@ mod real {
         }
     }
 
+    /// A persistent descriptor pool + a round-robin ring of pre-allocated
+    /// `VkDescriptorSet`s, reused across dispatches (perf-parity Step 5a). The
+    /// per-dispatch `DescriptorSet::storage_buffers*` path creates and destroys a
+    /// whole `VkDescriptorPool` every call (~900/token), which dominates the host
+    /// GEMV-prep bucket. This mirrors `ggml-vulkan`'s
+    /// `ggml_pipeline_allocate_descriptor_sets` (grow-by-50% on exhaustion) +
+    /// round-robin `descriptor_set_idx` (ggml-vulkan.cpp:2209-2255, 6303-6332):
+    /// the pool and its sets are allocated ONCE for a fixed
+    /// `(binding_count, max_descriptors_per_set)` layout; each
+    /// [`Self::next_updated`] only runs `vkUpdateDescriptorSets` on the next ring
+    /// slot — no object creation, no destruction.
+    ///
+    /// The ring's `binding_count` is fixed at construction (the layout binds that
+    /// many storage buffers). A token's GEMV dispatches all share the same two
+    /// binding counts (2 for the q8_1 quantize, 5 for the GEMV), so one ring per
+    /// binding count covers the whole decode. Call [`Self::reset`] at the start of
+    /// each token to rewind the round-robin index.
+    pub struct DescriptorSetRing<'a> {
+        ctx: &'a VulkanContext,
+        pool: vk::DescriptorPool,
+        sets: Vec<vk::DescriptorSet>,
+        binding_count: u32,
+        /// Round-robin cursor into `sets`; advanced per `next_updated`, rewound by
+        /// `reset`.
+        next: usize,
+    }
+
+    impl<'a> DescriptorSetRing<'a> {
+        /// Allocate a ring of `ring_size` descriptor sets, each with
+        /// `binding_count` STORAGE_BUFFER bindings, from one persistent pool.
+        pub fn new(
+            ctx: &'a VulkanContext,
+            layout: &DescriptorSetLayout<'_>,
+            binding_count: usize,
+            ring_size: usize,
+        ) -> Result<Self> {
+            let binding_count = u32::try_from(binding_count)
+                .map_err(|e| runtime_error("converting descriptor binding count", e))?;
+            if binding_count == 0 {
+                return Err(VulkanError::Runtime(
+                    "descriptor ring needs at least one storage-buffer binding".to_string(),
+                ));
+            }
+            let ring_size = ring_size.max(1);
+            let ring_size_u32 = u32::try_from(ring_size)
+                .map_err(|e| runtime_error("converting descriptor ring size", e))?;
+            // One pool sized for ring_size sets × binding_count buffers each.
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(binding_count * ring_size_u32)];
+            let pool_create = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(ring_size_u32)
+                .pool_sizes(&pool_sizes);
+            let pool = unsafe { ctx.device.create_descriptor_pool(&pool_create, None) }
+                .map_err(|e| vk_error("creating Vulkan descriptor pool", e))?;
+            let layouts: Vec<_> = std::iter::repeat_n(layout.raw(), ring_size).collect();
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            let sets = match unsafe { ctx.device.allocate_descriptor_sets(&alloc) } {
+                Ok(sets) => sets,
+                Err(e) => {
+                    unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
+                    return Err(vk_error("allocating Vulkan descriptor sets", e));
+                }
+            };
+            Ok(Self {
+                ctx,
+                pool,
+                sets,
+                binding_count,
+                next: 0,
+            })
+        }
+
+        /// Rewind the round-robin cursor. Call once per token so a token's
+        /// dispatches reuse the ring from slot 0 (the prior token's submissions
+        /// have completed — the decode `CommandRecorder` fence-waits per GEMV).
+        pub fn reset(&mut self) {
+            self.next = 0;
+        }
+
+        /// Bind `buffers` (each `(buffer, offset_bytes, range_bytes)`) into the
+        /// next ring slot via one `vkUpdateDescriptorSets` and return its raw
+        /// `VkDescriptorSet`. No pool / set creation. The caller must record the
+        /// dispatch that uses this set BEFORE the slot is reused (a ring of size N
+        /// allows N live dispatches between `reset`s); the decode path submits +
+        /// fence-waits each GEMV pair, so N=4 is ample.
+        pub fn next_updated(
+            &mut self,
+            buffers: &[(&DeviceBuffer<'_>, u64, u64)],
+        ) -> Result<vk::DescriptorSet> {
+            let count = u32::try_from(buffers.len())
+                .map_err(|e| runtime_error("converting descriptor buffer count", e))?;
+            if count != self.binding_count {
+                return Err(VulkanError::Runtime(format!(
+                    "descriptor ring bound with {count} buffers but layout has {} bindings",
+                    self.binding_count
+                )));
+            }
+            let set = self.sets[self.next % self.sets.len()];
+            self.next += 1;
+            let infos: Vec<_> = buffers
+                .iter()
+                .map(|(buf, offset, range)| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buf.raw())
+                        .offset(*offset)
+                        .range(*range)
+                })
+                .collect();
+            let writes: Vec<_> = infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(idx as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+            unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
+            Ok(set)
+        }
+    }
+
+    impl Drop for DescriptorSetRing<'_> {
+        fn drop(&mut self) {
+            // Freeing the pool frees all its sets.
+            unsafe { self.ctx.device.destroy_descriptor_pool(self.pool, None) };
+        }
+    }
+
     pub struct ComputePipeline<'a> {
         ctx: &'a VulkanContext,
         layout: vk::PipelineLayout,
@@ -1283,7 +1431,7 @@ mod real {
 #[cfg(feature = "vulkan")]
 pub use real::{
     CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
-    DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
+    DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(not(feature = "vulkan"))]
@@ -1444,6 +1592,23 @@ mod stub {
         }
     }
 
+    pub struct DescriptorSetRing<'a> {
+        _marker: PhantomData<&'a VulkanContext>,
+    }
+
+    impl<'a> DescriptorSetRing<'a> {
+        pub fn new(
+            _ctx: &'a VulkanContext,
+            _layout: &DescriptorSetLayout<'_>,
+            _binding_count: usize,
+            _ring_size: usize,
+        ) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn reset(&mut self) {}
+    }
+
     pub struct ComputePipeline<'a> {
         _marker: PhantomData<&'a VulkanContext>,
     }
@@ -1481,7 +1646,7 @@ mod stub {
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
     CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
-    DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
+    DescriptorSetRing, DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(test)]
