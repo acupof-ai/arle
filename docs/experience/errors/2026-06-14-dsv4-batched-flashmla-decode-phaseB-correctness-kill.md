@@ -44,6 +44,21 @@ Not yet root-caused (needs the next iteration). Suspects, in order:
    OWN slot's pool blocks (`slot_block_offsets[r]`); a shared/row-0 index = wrong KV.
 The split (B=1 path) is correct; the bug is in the b=N kernel wiring.
 
+### Fix attempt 1 (2026-06-14, commit `33aa8b0f`) — NECESSARY but INSUFFICIENT
+Defect #3 (the offset bound) was real + fixed: `build_indices_batched` passed the
+per-slot `total_blocks` as the kernel's pool-absolute `block_offset` bound, masking
+every index of rows r≥1 to -1. Fixed to `total_blocks * max_batch` (whole-pool).
+**But re-verify (decode-read c=2/c=4) still GARBLED.** New signature: the garbled
+row now **shifts with batch composition** (c=2: Italy garbled / France ok; c=4:
+France+Canada+Egypt garbled / Italy ok) — disproving "row 0 always survives". A
+SECOND defect remains in the b=N split-KV / gather path: batch-composition-dependent
++ deterministic = **per-row data mis-attribution** (rows reading each other's
+KV/Q/accum). Prime suspects now: `sched_meta_for_batch(b=N)` tile-scheduler metadata
++ the shared `[num_sm_parts+b]` split-KV accum's per-row attribution, or the shared
+`tp_gathered_q` staging in `gather_q_row`. Code-read can't pin it (the bound was
+also code-read-airtight yet missed this) — needs controlled isolation: compare each
+row's batched output to its per-row-kernel reference for the SAME inputs.
+
 ## Fix
 Stays gated OFF (main default byte-identical, safe). Next: root-cause the b=N
 corruption (decode greedy tokens at c=8, compare per-row output to the per-row-kernel
