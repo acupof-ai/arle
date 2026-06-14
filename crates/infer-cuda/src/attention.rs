@@ -883,7 +883,7 @@ impl Dsv4FlashMlaDecodeShape {
     }
 }
 
-struct Dsv4FlashMlaDecodeState {
+pub(crate) struct Dsv4FlashMlaDecodeState {
     slot_idx: usize,
     fp8_kv_pool_len: usize,
     sw_blocks: usize,
@@ -1103,16 +1103,17 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     num_splits: CudaSlice<i32>,
     /// `[max_batch, h_q * head_dim]` bf16 — gathered+repacked global-head Q
     /// (TP path) or the row-major batched Q (single-GPU). Fed as the fwd's q.
-    /// PHASE B: read by `sparse_decode_fwd_batched` (not yet wired — see there).
-    #[allow(dead_code)]
+    /// PHASE B: each row r's prepared Q is written into `[r, ..]` by the per-row
+    /// pack/gather before the ONE batched fwd reads the whole `[0, n)` prefix.
     q_batched: CudaSlice<half::bf16>,
-    /// `[max_batch, h_q * head_dim]` bf16 — full global-head fwd output before
-    /// the per-rank slice (TP path only). PHASE B (see `q_batched`).
-    #[allow(dead_code)]
+    /// `[max_batch, h_q * head_dim]` bf16 — full global-head fwd output, read
+    /// per-row by the finish step (TP out-slice on the TP path, direct copy on
+    /// single-GPU). PHASE B.
     out_batched: CudaSlice<half::bf16>,
     /// `[max_batch, tp_world * local_heads * head_dim]` bf16 — TP all-gather
-    /// landing buffer for Q before repack (TP path only). PHASE B (see `q_batched`).
-    #[allow(dead_code)]
+    /// landing buffer (TP path only). PHASE B: the gather loop uses the `[0,
+    /// tp_gather_cols)` slice per row (one row's allgather at a time), then
+    /// repacks the global Q into `q_batched[r]`.
     tp_gathered_q: CudaSlice<half::bf16>,
     /// Per-layer decode shape (`topk_unified`/`sw_blocks`/`comp_blocks`/… per
     /// mode), indexed by layer. The batched build_indices / fwd read the
@@ -1120,14 +1121,13 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     layer_shapes: Vec<Dsv4FlashMlaDecodeShape>,
     max_batch: usize,
     max_topk_unified: usize,
-    /// PHASE B: read by `sparse_decode_fwd_batched` (shape derives h_q today).
-    #[allow(dead_code)]
+    /// Global heads (64/128); PHASE B: row stride `h_q*head_dim` of the
+    /// q_batched/out_batched buffers (`h_q_d`).
     h_q: usize,
-    /// PHASE B: read by `sparse_decode_fwd_batched` (config carries head_dim today).
-    #[allow(dead_code)]
+    /// PHASE B: `h_q_d` row stride component.
     head_dim: usize,
-    /// `num_sm_parts + max_batch` — total split rows in the shared accum scratch.
-    /// PHASE B: read by `sparse_decode_fwd_batched` accum bounds.
+    /// `num_sm_parts + max_batch` — total split rows in the shared accum scratch
+    /// (sizes `lse_accum`/`o_accum` at construction; kept for the alloc rationale).
     #[allow(dead_code)]
     accum_splits_max: usize,
     num_sm_parts: i32,
@@ -1419,14 +1419,13 @@ impl Dsv4FlashMlaDecodeBatchScratch {
     /// Precondition: `build_indices_batched(n)` + `sched_meta_for_batch(n)` ran
     /// this forward; `shape` is this layer's decode shape.
     ///
-    /// PHASE B (#60): this is the actual batched kernel call. It is written and
-    /// verified for shape/stride correctness but not yet wired into the decode
-    /// loop — Phase B collects per-row gathered Q + per-row `selected` from
-    /// `mla_attention` and swaps the per-row loop in `forward_decode_batch_stream_impl`
-    /// for `build_layer_batch_meta` → this fwd → scatter. Kept allocated so the
-    /// Phase-B swap is a single call-site change, not a re-derivation of the
-    /// stride mapping (see `docs/plans/dsv4-batched-flashmla-decode.md`).
-    #[allow(clippy::too_many_arguments, dead_code)]
+    /// PHASE B (#60): the actual batched kernel call — ONE launch over `n` rows.
+    /// Wired by [`Self::decode_lane_fwd`] (which sources `pool_ptr`/`sink_ptr`
+    /// and the `q_batched`/`out_batched` bases) after the per-row pack/gather
+    /// loop fills `q_batched[0..n]` and `build_layer_batch_meta(n)` populated the
+    /// indices/sched_meta. Stride mapping verified against the shim
+    /// (see `docs/plans/dsv4-batched-flashmla-decode.md`).
+    #[allow(clippy::too_many_arguments)]
     fn sparse_decode_fwd_batched(
         &mut self,
         ctx: &DeviceContext,
@@ -1517,6 +1516,215 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         drop(lse_accum_guard);
         drop(o_accum_guard);
         Ok(())
+    }
+
+    /// This layer's stored decode shape (PHASE B: the batched lane reads
+    /// `topk_unified` / `sw_blocks` / `comp_blocks` / `h_q` per layer).
+    fn layer_shape(&self, layer_idx: usize) -> Result<Dsv4FlashMlaDecodeShape> {
+        self.layer_shapes.get(layer_idx).copied().ok_or_else(|| {
+            anyhow!(
+                "DSv4 batched decode layer {layer_idx} outside stored shapes {}",
+                self.layer_shapes.len()
+            )
+        })
+    }
+
+    fn h_q_d(&self) -> usize {
+        self.h_q * self.head_dim
+    }
+
+    /// PHASE B: gather row `r`'s prepared local Q into `q_batched[r]` as
+    /// global-head Q. Single-GPU (tp_world==1): a straight D2D copy of the
+    /// `[local_heads*head_dim]` row (h_q==local_heads). TP: NCCL all-gather of
+    /// this rank's Q into `tp_gathered_q`, then `dsv4_tp_q_repack_cuda` into
+    /// `q_batched[r]` — identical to the single-row `try_flashmla_decode_attention`
+    /// gather, run once per row instead of feeding a per-row fwd.
+    pub(crate) fn gather_q_row(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        q_prepared: &HiddenStates,
+        tp: &TpRuntime,
+        r: usize,
+        local_heads: usize,
+    ) -> Result<()> {
+        ensure!(
+            r < self.max_batch,
+            "DSv4 batched q row {r} >= max_batch {}",
+            self.max_batch
+        );
+        let d = self.h_q_d();
+        let tp_world = tp.config().world_size;
+        let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
+        if tp_world > 1 {
+            let (gather_ptr, gather_guard) = self.tp_gathered_q.device_ptr_mut(&ctx.stream);
+            {
+                let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather_batched");
+                // SAFETY: per-rank Q is local_heads*head_dim bf16; the gather
+                // landing buffer holds tp_world*local_heads*head_dim. Same
+                // contract as the single-row path.
+                unsafe {
+                    tp.all_gather_bf16_raw(
+                        ctx,
+                        q_ptr as *const std::ffi::c_void,
+                        local_heads * config.head_dim,
+                        gather_ptr as *mut std::ffi::c_void,
+                    )?;
+                }
+            }
+            drop(gather_guard);
+            let (gather_ptr, gather_guard) = self.tp_gathered_q.device_ptr(&ctx.stream);
+            // `dst_view` holds the mutable borrow of `self.q_batched[r]` alive
+            // across the FFI call; `dst_ptr` is its raw device ptr.
+            let mut dst_view = self.q_batched.slice_mut(r * d..(r + 1) * d);
+            let (dst_ptr, dst_guard) = dst_view.device_ptr_mut(&ctx.stream);
+            drop(dst_guard);
+            {
+                let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack_batched");
+                // SAFETY: repack tp_world×[local_heads,head_dim] gathered Q into
+                // one global-head row (s_q=1); both buffers valid on ctx.stream.
+                unsafe {
+                    ffi::dsv4_tp_q_repack_cuda(
+                        gather_ptr as *const ffi::Half,
+                        dst_ptr as *mut ffi::Half,
+                        tp_world as i32,
+                        1,
+                        local_heads as i32,
+                        config.head_dim as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 batched FlashMLA TP Q repack failed: {e}"))?;
+                }
+            }
+            drop(gather_guard);
+            // dst_view drops at the end of this branch, ending the q_batched borrow.
+        } else {
+            // Single-GPU: global heads == local heads; copy the row verbatim.
+            ensure!(
+                q_prepared.hidden_dim == d && q_prepared.seq_len == 1,
+                "DSv4 batched q row src {}x{} != [{d},1]",
+                q_prepared.hidden_dim,
+                q_prepared.seq_len
+            );
+            let mut dst = self.q_batched.slice_mut(r * d..(r + 1) * d);
+            ctx.stream
+                .memcpy_dtod(&q_prepared.data, &mut dst)
+                .map_err(|e| anyhow!("DSv4 batched q row copy failed: {e}"))?;
+        }
+        drop(q_guard);
+        Ok(())
+    }
+
+    /// PHASE B: read row `r`'s global-head fwd output from `out_batched` into the
+    /// row's per-rank `local_attn`. Single-GPU: a straight D2D copy. TP:
+    /// `dsv4_tp_out_slice_cuda` slices this rank's `[tp_rank*local_heads, +)`
+    /// head block — identical to the single-row finish, run once per row.
+    pub(crate) fn slice_out_row(
+        &self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        tp: &TpRuntime,
+        r: usize,
+        local_heads: usize,
+        local_attn: &mut HiddenStates,
+    ) -> Result<()> {
+        ensure!(
+            r < self.max_batch,
+            "DSv4 batched out row {r} >= max_batch {}",
+            self.max_batch
+        );
+        let d = self.h_q_d();
+        let tp_world = tp.config().world_size;
+        let tp_rank = tp.config().rank;
+        let local_width = local_heads * config.head_dim;
+        ensure!(
+            local_attn.hidden_dim == local_width && local_attn.seq_len == 1,
+            "DSv4 batched out dst {}x{} != [{local_width},1]",
+            local_attn.hidden_dim,
+            local_attn.seq_len
+        );
+        let src_view = self.out_batched.slice(r * d..(r + 1) * d);
+        if tp_world > 1 {
+            let (src_ptr, src_guard) = src_view.device_ptr(&ctx.stream);
+            let (dst_ptr, dst_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
+            {
+                let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice_batched");
+                // SAFETY: src is one global-head row (h_q*head_dim), dst this
+                // rank's local block; same args as the single-row out-slice.
+                unsafe {
+                    ffi::dsv4_tp_out_slice_cuda(
+                        src_ptr as *const ffi::Half,
+                        dst_ptr as *mut ffi::Half,
+                        1,
+                        (self.h_q * config.head_dim) as i32,
+                        local_width as i32,
+                        (tp_rank * local_width) as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
+                }
+            }
+            drop(src_guard);
+            drop(dst_guard);
+        } else {
+            ctx.stream
+                .memcpy_dtod(&src_view, &mut local_attn.data)
+                .map_err(|e| anyhow!("DSv4 batched out row copy failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// PHASE B: ONE batched `sparse_decode_fwd(b=n)` for `layer_idx` over the
+    /// shared FlashMLA pool base, reading the `q_batched[0..n]` prefix the
+    /// per-row gather filled and writing global-head output into `out_batched`.
+    /// Sources `pool_ptr` (the whole pool base — indices are pool-absolute),
+    /// `sink_ptr` (the f32 sink base; the kernel computes ALL global heads so it
+    /// needs the global sink, not a per-rank slice), and runs the kernel via
+    /// [`Self::sparse_decode_fwd_batched`]. Precondition: `build_layer_batch_meta(n)`
+    /// ran this forward for `layer_idx`.
+    pub(crate) fn decode_lane_fwd(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        attention: &Dsv4Attention,
+        pool: &mut Dsv4LayerKvLayout,
+        layer_idx: usize,
+        n: usize,
+        sm_scale: f32,
+    ) -> Result<()> {
+        let shape = self.layer_shape(layer_idx)?;
+        ensure!(
+            attention.attn_sink_f32.len() >= shape.h_q,
+            "DSv4 batched FlashMLA attn_sink_f32 len {} < global heads {}",
+            attention.attn_sink_f32.len(),
+            shape.h_q
+        );
+        // Resolve raw device pointers and release the cudarc borrow guards BEFORE
+        // the `&mut self` fwd call (the SyncOnDrop guards would otherwise alias
+        // `self.q_batched`/`self.out_batched`). The raw u64 ptrs stay valid —
+        // the buffers are not reallocated; same single-stream discipline the
+        // per-row path uses.
+        let (sink_ptr, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
+        let sink_ptr = sink_ptr as *const f32;
+        drop(sink_guard);
+        let (q_ptr, q_guard) = self.q_batched.device_ptr(&ctx.stream);
+        let q_ptr = q_ptr as *const ffi::Half;
+        drop(q_guard);
+        let (out_ptr, out_guard) = self.out_batched.device_ptr_mut(&ctx.stream);
+        let out_ptr = out_ptr as *mut ffi::Half;
+        drop(out_guard);
+        let pool_ptr = {
+            let pool_buf = pool.flashmla_pool_data()?;
+            let (pool_ptr, pool_guard) = pool_buf.device_ptr(&ctx.stream);
+            let pool_ptr = pool_ptr as *const ffi::Half;
+            drop(pool_guard);
+            pool_ptr
+        };
+        self.sparse_decode_fwd_batched(
+            ctx, n, config, &shape, q_ptr, pool_ptr, sink_ptr, out_ptr, sm_scale,
+        )
     }
 }
 
@@ -2331,6 +2539,42 @@ impl Dsv4DsaOfficialImage {
 }
 
 impl Dsv4LayerAttentionState {
+    /// PHASE B (#60) split borrow for the batched decode pack loop: this slot's
+    /// FlashMLA decode arena (`&mut`), the bf16 SW ring (`&`), and — for HCA —
+    /// the compressed-key pool (`&`, disjoint field, `None` for SW). Errors if
+    /// the FlashMLA arena is absent (the lane only runs with FlashMLA decode on).
+    pub(crate) fn flashmla_pack_borrow(
+        &mut self,
+        want_compressed: bool,
+    ) -> Result<(
+        &mut Dsv4FlashMlaDecodeState,
+        &CudaSlice<half::bf16>,
+        Option<&HiddenStates>,
+    )> {
+        let compressed = if want_compressed {
+            Some(
+                &self
+                    .compressor
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 batched HCA pack: compressor state missing"))?
+                    .compressed,
+            )
+        } else {
+            None
+        };
+        let flash = self
+            .flashmla
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 batched decode pack: FlashMLA arena missing"))?;
+        Ok((flash, &self.sw_window_cache, compressed))
+    }
+
+    /// PHASE B (#60) mutable borrow of the bf16 SW ring for the batched decode
+    /// finish loop (the inverse-rope tail's window update writes it).
+    pub(crate) fn sw_window_cache_mut(&mut self) -> &mut CudaSlice<half::bf16> {
+        &mut self.sw_window_cache
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &DeepSeekV4Config,
@@ -5779,6 +6023,108 @@ fn try_flashmla_decode_attention(
     Ok(true)
 }
 
+/// PHASE B (#60) per-row KV pack for the batched decode lane: the EXACT pack
+/// sequence the single-row [`try_flashmla_decode_attention`] runs before the
+/// fwd (SW ring bootstrap → one-token SW pack → compressed-delta), writing this
+/// row's slot KV into the shared pool. Run once per row in the batched lane's
+/// pack loop; the ONE batched fwd then reads the filled pool. SW passes
+/// `compressed = None`; HCA passes `Some(&state.compressor.compressed)`. CSA is
+/// NOT routed here (stays on the per-row `mla_attention` path — see the lane).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flashmla_decode_pack_row(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    flash: &mut Dsv4FlashMlaDecodeState,
+    pool: &mut Dsv4LayerKvLayout,
+    sw_window_cache: &CudaSlice<half::bf16>,
+    k_prepared: &HiddenStates,
+    compressed: Option<&HiddenStates>,
+    start_pos_device: &CudaSlice<i32>,
+) -> Result<()> {
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring_batched");
+        flashmla_pack_sw_ring(ctx, flash, pool, sw_window_cache, config)?;
+    }
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one_batched");
+        flashmla_pack_one_sw_token(ctx, flash, pool, k_prepared, start_pos_device, config)?;
+    }
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed_batched");
+        flashmla_pack_compressed_delta(
+            ctx,
+            flash,
+            pool,
+            compressed,
+            start_pos_device,
+            compress_ratio,
+            config,
+        )?;
+    }
+    Ok(())
+}
+
+/// PHASE B (#60) per-row finish for the batched decode lane: the EXACT output
+/// tail the single-row [`try_flashmla_decode_attention`] runs AFTER the fwd —
+/// output inverse-RoPE on this row's `local_attn`, then the bf16 SW-window
+/// update — minus the TP out-slice (the lane runs [`Dsv4FlashMlaDecodeBatchScratch::slice_out_row`]
+/// before this) and minus the kernel (batched). `local_attn` must already hold
+/// this rank's local-head output for this row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flashmla_decode_finish_row(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    sw_window_cache: &mut CudaSlice<half::bf16>,
+    k_prepared: &HiddenStates,
+    local_attn: &mut HiddenStates,
+    start_pos: usize,
+    start_pos_device: &CudaSlice<i32>,
+    local_heads: usize,
+    rope_base: f32,
+    original_seq_len: i32,
+    rope_factor: f32,
+    rope_beta_fast: f32,
+    rope_beta_slow: f32,
+) -> Result<()> {
+    let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
+    let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope_batched");
+        // SAFETY: identical args to the single-row inverse-rope; out is one
+        // local-head row (token_count=1), start_pos_device is this row's pos.
+        unsafe {
+            ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
+                out_ptr as *mut ffi::Half,
+                1,
+                local_heads as i32,
+                config.head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_ptr as *const i32,
+                rope_base,
+                original_seq_len,
+                rope_factor,
+                rope_beta_fast,
+                rope_beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope failed: {e}"))?;
+        }
+    }
+    drop(out_guard);
+    drop(start_guard);
+    update_bf16_sw_window(
+        ctx,
+        sw_window_cache,
+        k_prepared,
+        start_pos,
+        Some(start_pos_device),
+        config,
+    )?;
+    Ok(())
+}
+
 /// RMSNorm a `HiddenStates` in place into a fresh buffer (the MLA Q/KV LoRA
 /// norms `q_norm` / `kv_norm`). Thin wrapper over the shared batched RMSNorm.
 fn mla_rms_norm(
@@ -6027,6 +6373,36 @@ fn run_fused_wqkv_decode(
 /// must skip to this rank's head block via `sink_offset = tp_rank * local_heads`
 /// — otherwise every non-zero rank reads rank-0's sink logits and the attention
 /// output diverges by a small head-dependent margin (multi-GPU only).
+/// Prepared-but-not-attended MLA state, the boundary between `mla_attention`'s
+/// per-row PREPARE half (wq/wkv proj + RoPE + — for CSA/HCA — compressor /
+/// indexer / `selected`) and its FWD half (the FlashMLA decode kernel + the
+/// SW/hybrid scalar fallback + O-LoRA). The split (#60 Phase B) lets the batched
+/// decode lane run PREPARE per row, gather each row's `q_prepared` into one
+/// batched Q buffer, then issue ONE `sparse_decode_fwd(b=N)` — replacing the
+/// per-row FlashMLA launch loop. Single-row callers go through `mla_attention`,
+/// which runs `mla_attention_prepare` then `mla_attention_fwd` back-to-back in
+/// the exact original order, so their byte path is unchanged.
+///
+/// `selected` is the CSA per-row top-k (owned, `[max_compressed_keys]`); `None`
+/// for SW/HCA. The compressed-key pool is re-borrowed from `state` inside the
+/// fwd (not stored here, to avoid a self-borrow), so PREPARE must leave
+/// `state.compressor` populated for CSA/HCA.
+pub(crate) struct Dsv4MlaPrepared {
+    pub(crate) q_prepared: HiddenStates,
+    pub(crate) k_prepared: HiddenStates,
+    /// Attention output scratch `[local_width, token_count]`, written by the fwd.
+    pub(crate) local_attn: HiddenStates,
+    pub(crate) selected: Option<CudaSlice<i32>>,
+    pub(crate) local_heads: usize,
+    local_width: usize,
+    token_count: usize,
+    sink_offset: usize,
+    pub(crate) sm_scale: f32,
+    pub(crate) rope_base: f32,
+    pub(crate) original_seq_len: i32,
+    pub(crate) start_pos_i32: i32,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention(
     ctx: &DeviceContext,
@@ -6049,6 +6425,71 @@ pub(crate) fn mla_attention(
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
+    // Single-row + chunked-prefill callers: PREPARE then FWD back-to-back, in
+    // the exact original order — byte-identical to the pre-split body. Only the
+    // batched decode lane (#60) calls the two halves separately.
+    let prepared = mla_attention_prepare(
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        layer_idx,
+        hidden,
+        state,
+        pool,
+        dsa_shared,
+        start_pos,
+        start_pos_device,
+        tree,
+        tp,
+        keepalive,
+    )?;
+    mla_attention_fwd(
+        ctx,
+        config,
+        attention,
+        mode,
+        compress_ratio,
+        layer_idx,
+        state,
+        pool,
+        start_pos,
+        start_pos_device,
+        tree,
+        tp,
+        prepared,
+        out,
+        keepalive,
+    )
+}
+
+/// PREPARE half of `mla_attention` (see [`Dsv4MlaPrepared`]). Q/KV LoRA + partial
+/// RoPE, and for CSA/HCA the compressor + (CSA) indexer top-k `selected`. Leaves
+/// `state.compressor` / `state.indexer` populated for the fwd's compressed-key
+/// re-borrow. Pure host/proj work — no FlashMLA kernel, no pool writes — so the
+/// batched lane can run it per row before the one batched fwd.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mla_attention_prepare(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    layer_idx: usize,
+    hidden: &HiddenStates,
+    state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
+    dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    // Tree-verify chunk positions feed the RoPE prepare (siblings share absolute
+    // positions); `None` for ordinary prefill/decode. The fwd half takes `tree`
+    // separately for the SW prefill dispatch.
+    tree: Option<&Dsv4TreeAttnMeta>,
+    tp: &TpRuntime,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<Dsv4MlaPrepared> {
     ensure!(
         hidden.hidden_dim == config.hidden_size,
         "DSv4 MLA hidden dim {} != hidden_size {}",
@@ -6070,26 +6511,13 @@ pub(crate) fn mla_attention(
     // This rank owns global heads [tp_rank*local_heads, +local_heads); the
     // whole-loaded attn_sink must be indexed from that offset (see fn docs).
     let sink_offset = tp_rank * local_heads;
-    let wo_a_active = &attention.wo_a;
     ensure!(
         attention.wkv.rows == head_dim,
         "DSv4 MLA wkv rows {} != head_dim {head_dim}",
         attention.wkv.rows
     );
-    ensure!(
-        wo_a_active.cols == local_width,
-        "DSv4 MLA wo_a cols {} != local attention width {local_width}",
-        wo_a_active.cols
-    );
-    ensure!(
-        attention.wo_b.rows == out.hidden_dim && out.seq_len == token_count,
-        "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
-        attention.wo_b.rows,
-        out.hidden_dim,
-        out.seq_len,
-        attention.wo_b.rows,
-        token_count
-    );
+    // wo_a/wo_b ↔ out shape checks live in `mla_attention_fwd` (PREPARE has no
+    // `out`); the O-LoRA there owns the projection.
     ensure!(
         config.sliding_window > 0,
         "DSv4 MLA requires a non-zero sliding_window"
@@ -6321,8 +6749,199 @@ pub(crate) fn mla_attention(
     dsv4_dump_kprep(ctx, layer_idx, "q_prepared", &q_prepared, start_pos);
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
-    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer.
-    let mut local_attn = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer
+    // in `mla_attention_fwd`.
+    let local_attn = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+
+    // CSA / HCA: run the compressor (+ for CSA the indexer + top-k `selected`)
+    // here in PREPARE — these are projection/select kernels that produce
+    // `state.compressor` / `selected`, which the fwd consumes. SW has neither.
+    let selected = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        None
+    } else {
+        // ── 4b(prep). compressor → (CSA) indexer top-k select.
+        let compressor = attention.compressor.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
+        })?;
+        let overlap = compress_ratio < 16;
+        {
+            let compressor_state = state.compressor.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+            })?;
+            compressor_forward(
+                ctx,
+                config,
+                compressor,
+                hidden,
+                compressor_state,
+                head_dim,
+                compress_ratio,
+                overlap,
+                start_pos,
+                start_pos_device,
+                true,
+                // YaRN on for compressed layers (matches Q/SW-K + SGLang
+                // compressor freqs_cis); original_seq_len = orig_max_pos here.
+                original_seq_len,
+                keepalive,
+            )?;
+        }
+
+        if mode == DeepSeekV4AttentionMode::CompressedSparse {
+            let indexer = attention.indexer.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights"
+                )
+            })?;
+            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let indexer_rope_original_seq_len = if use_official_dsa {
+                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+                    |_| {
+                        anyhow!(
+                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                            config.rope_parameters.original_max_position_embeddings
+                        )
+                    },
+                )?
+            } else {
+                0
+            };
+            let indexer_rows_before = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
+            // Indexer keys: a second compressor over index_head_dim keys (no APE
+            // gate on the keys — `apply_rope = true`, head_dim = index_head_dim).
+            {
+                let indexer_state = state.indexer.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
+                    )
+                })?;
+                compressor_forward(
+                    ctx,
+                    config,
+                    &indexer.compressor,
+                    hidden,
+                    indexer_state,
+                    config.index_head_dim,
+                    compress_ratio,
+                    true,
+                    start_pos,
+                    start_pos_device,
+                    use_official_dsa,
+                    indexer_rope_original_seq_len,
+                    keepalive,
+                )?;
+            }
+            let indexer_rows_after = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
+            let index_keys = &state
+                .indexer
+                .as_ref()
+                .expect("indexer state checked above")
+                .compressed;
+            let official = state.dsa_official.as_mut();
+            Some(csa_select(
+                ctx,
+                config,
+                layer_idx,
+                indexer,
+                hidden,
+                &c_q_normed,
+                index_keys,
+                official,
+                dsa_shared,
+                pool,
+                indexer_rows_before,
+                indexer_rows_after,
+                start_pos,
+                start_pos_device,
+                compress_ratio,
+                state.prefill_linear.as_mut(),
+                keepalive,
+            )?)
+        } else {
+            None
+        }
+    };
+
+    Ok(Dsv4MlaPrepared {
+        q_prepared,
+        k_prepared,
+        local_attn,
+        selected,
+        local_heads,
+        local_width,
+        token_count,
+        sink_offset,
+        sm_scale,
+        rope_base,
+        original_seq_len,
+        start_pos_i32,
+    })
+}
+
+/// FWD half of `mla_attention` (see [`Dsv4MlaPrepared`]). Runs the FlashMLA
+/// decode kernel (or the prefill / scalar SW/hybrid fallback) over the PREPARE
+/// output, then the O-LoRA. The compressed-key pool is re-borrowed from `state`
+/// here. Single-row + chunked-prefill callers reach this through `mla_attention`;
+/// the batched lane runs PREPARE per row and the batched fwd separately.
+#[allow(clippy::too_many_arguments)]
+fn mla_attention_fwd(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    layer_idx: usize,
+    state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    tree: Option<&Dsv4TreeAttnMeta>,
+    tp: &TpRuntime,
+    prepared: Dsv4MlaPrepared,
+    out: &mut HiddenStates,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    let Dsv4MlaPrepared {
+        q_prepared,
+        k_prepared,
+        mut local_attn,
+        selected,
+        local_heads,
+        local_width,
+        token_count,
+        sink_offset,
+        sm_scale,
+        rope_base,
+        original_seq_len,
+        start_pos_i32,
+    } = prepared;
+    let head_dim = config.head_dim;
+    let rope = &config.rope_parameters;
+    let wo_a_active = &attention.wo_a;
+    ensure!(
+        wo_a_active.cols == local_width,
+        "DSv4 MLA wo_a cols {} != local attention width {local_width}",
+        wo_a_active.cols
+    );
+    ensure!(
+        attention.wo_b.rows == out.hidden_dim && out.seq_len == token_count,
+        "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
+        attention.wo_b.rows,
+        out.hidden_dim,
+        out.seq_len,
+        attention.wo_b.rows,
+        token_count
+    );
+    keepalive.keep_hidden(&q_prepared);
+    keepalive.keep_hidden(&k_prepared);
 
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         // ── 4a. SW: windowed attention + per-head sink + output inverse-RoPE.
@@ -6465,121 +7084,14 @@ pub(crate) fn mla_attention(
             }
         }
     } else {
-        // ── 4b. CSA / HCA: compressor → (CSA) indexer top-k select → hybrid
-        // windowed+compressed attention.
-        let compressor = attention.compressor.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-        })?;
-        let overlap = compress_ratio < 16;
-        {
-            let compressor_state = state.compressor.as_mut().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
-            })?;
-            compressor_forward(
-                ctx,
-                config,
-                compressor,
-                hidden,
-                compressor_state,
-                head_dim,
-                compress_ratio,
-                overlap,
-                start_pos,
-                start_pos_device,
-                true,
-                // YaRN on for compressed layers (matches Q/SW-K + SGLang
-                // compressor freqs_cis); original_seq_len = orig_max_pos here.
-                original_seq_len,
-                keepalive,
-            )?;
-        }
-
-        let selected = if mode == DeepSeekV4AttentionMode::CompressedSparse {
-            let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights"
-                )
-            })?;
-            let use_official_dsa = dsv4_dsa_official_enabled()?;
-            let indexer_rope_original_seq_len = if use_official_dsa {
-                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
-                    |_| {
-                        anyhow!(
-                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
-                            config.rope_parameters.original_max_position_embeddings
-                        )
-                    },
-                )?
-            } else {
-                0
-            };
-            let indexer_rows_before = state
-                .indexer
-                .as_ref()
-                .map(|s| s.compressed.seq_len)
-                .unwrap_or(0);
-            // Indexer keys: a second compressor over index_head_dim keys (no APE
-            // gate on the keys — `apply_rope = true`, head_dim = index_head_dim).
-            {
-                let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
-                    )
-                })?;
-                compressor_forward(
-                    ctx,
-                    config,
-                    &indexer.compressor,
-                    hidden,
-                    indexer_state,
-                    config.index_head_dim,
-                    compress_ratio,
-                    true,
-                    start_pos,
-                    start_pos_device,
-                    use_official_dsa,
-                    indexer_rope_original_seq_len,
-                    keepalive,
-                )?;
-            }
-            let indexer_rows_after = state
-                .indexer
-                .as_ref()
-                .map(|s| s.compressed.seq_len)
-                .unwrap_or(0);
-            let index_keys = &state
-                .indexer
-                .as_ref()
-                .expect("indexer state checked above")
-                .compressed;
-            let official = state.dsa_official.as_mut();
-            Some(csa_select(
-                ctx,
-                config,
-                layer_idx,
-                indexer,
-                hidden,
-                &c_q_normed,
-                index_keys,
-                official,
-                dsa_shared,
-                pool,
-                indexer_rows_before,
-                indexer_rows_after,
-                start_pos,
-                start_pos_device,
-                compress_ratio,
-                state.prefill_linear.as_mut(),
-                keepalive,
-            )?)
-        } else {
-            None
-        };
-
+        // ── 4b(fwd). CSA / HCA: hybrid windowed+compressed attention over the
+        // compressor pool (re-borrowed from `state`) + PREPARE's `selected`.
         let compressed = &state
             .compressor
             .as_ref()
-            .expect("compressor state checked above")
+            .ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+            })?
             .compressed;
         let compressed_count = compressed.seq_len;
         let compressed_capacity = compressed.data.len() / head_dim;
@@ -6777,7 +7289,7 @@ pub(crate) fn mla_attention(
 /// paths + the scalar fallback are preserved byte-for-byte; batched decode passes
 /// token_count=N to hit the prefill DeepGEMM branch (M=N amortizes the wo weight read).
 #[allow(clippy::too_many_arguments)]
-fn mla_oproj(
+pub(crate) fn mla_oproj(
     ctx: &DeviceContext,
     attention: &Dsv4Attention,
     state: &mut Dsv4LayerAttentionState,
