@@ -41,8 +41,13 @@ per-request throughput degrades ≈ 1/c — batched decode loses FlashMLA at the
   COMPUTE-bound (chunked prefill + mixed batching ARE default-on, `planner.rs`;
   c×prompt FLOPs on fixed GPUs), NOT a missing feature; only faster prefill
   kernels / more GPUs reduce it, so it is OUT of software-lever scope here;
-  (b) **`--dsv4-batched-decode` is
-  a no-op at long ctx** (ON≈OFF within noise at 32K/64K c=8); (c) slots clamp
+  (b) **`--dsv4-batched-decode` showed no effect — but it was INERT, not a no-op**
+  (⚠️ corrected 2026-06-14): the campaign ran under `--spec-type mtp`, which
+  *disables* the batched lane (`executor.rs:1563`), so both arms ran MTP-per-row.
+  The true batched lane (no-mtp) is **+48% @c=8** (45.6→67.6) at short ctx — the
+  flat-aggregate finding above is the MTP-per-row path, not the batched lane
+  ([Phase-A verify](../experience/wins/2026-06-14-dsv4-batched-flashmla-decode-phaseA.md));
+  no-mtp long-ctx scaling is unmeasured; (c) slots clamp
   8→6; MTP acceptance degrades with ctx (tok/step 1.80→1.22 at 32K→128K). The
   decode-lever acceptance bar: **aggregate must RISE with c**.
 
