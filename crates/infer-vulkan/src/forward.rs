@@ -15,6 +15,17 @@
 //! this lane delivers FINITE, sane logits end-to-end while we (separately) bring
 //! up the elementwise device kernels' push-constant contracts.
 //!
+//! Perf-parity Steps 3+4 (see `docs/plans/amd-vulkan-perf-parity.md`): the GEMV
+//! path no longer allocates scratch + round-trips per op. A **[`DeviceArena`]**
+//! of named (offset,len) sub-ranges (input activation, q8_1 quantized
+//! activation, f32 dst, the two fuse dummies) is allocated **once** on the model
+//! and bound through offset-aware ranged descriptors. The quantize+GEMV pair is
+//! recorded into a persistent **`CommandRecorder`** (one submit, one fence, no
+//! per-op `queue_wait_idle`) using pipelines built **once** by a persistent
+//! **`KernelCache`** (no per-dispatch SPIR-V re-read / pipeline rebuild). The
+//! host elementwise/norm/attention math stays AS-IS between GEMVs (Step 5 ports
+//! it to device kernels).
+//!
 //! Numeric contract distilled from the reference (all verified against the real
 //! 27B GGUF dims):
 //!   hidden=5120, layers=64 (LLL F interleave from `config.layer_types`),
@@ -44,10 +55,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use qwen35_spec::{LayerType, Qwen35Config};
 use vulkan_kernels::{
-    BLOCK_Q8_1_BYTES, Dispatch, KernelParams, Q8_1_X4_VALUES_PER_GROUP, gemv_dispatch, gemv_params,
-    q8_0_gemv_with_params, q8_1_quantize, q8_1_quantize_dispatch, q8_1_quantize_params,
+    BLOCK_Q8_1_BYTES, Kernel, KernelCache, Q8_1_X4_VALUES_PER_GROUP, gemv_dispatch, gemv_params,
+    q8_1_quantize_dispatch, q8_1_quantize_params, record_dispatch,
 };
-use vulkan_sys::{DeviceBuffer, VulkanContext};
+use vulkan_sys::{CommandRecorder, DescriptorSet, DeviceBuffer, VulkanContext};
 
 use crate::loader::Residency;
 use crate::loader::upload::{DeviceTensor, ResidentWeights};
@@ -112,35 +123,6 @@ impl Qwen35ForwardState {
     }
 }
 
-/// Reusable device scratch for the on-device GEMV path. One activation-quantize
-/// buffer + one f32 destination buffer, both grown to the largest shape seen.
-struct GemvScratch<'a> {
-    /// q8_1_x4 quantized activations (input vector). Sized for the widest GEMV
-    /// input (FFN down has 17408 cols).
-    quant: DeviceBuffer<'a>,
-    quant_cap_cols: usize,
-    /// f32 destination rows. Sized for the widest GEMV output (lm_head vocab).
-    dst: DeviceBuffer<'a>,
-    dst_cap_rows: usize,
-}
-
-impl<'a> GemvScratch<'a> {
-    fn new(ctx: &'a VulkanContext, max_cols: usize, max_rows: usize) -> Result<Self> {
-        let quant_bytes = q8_1_x4_bytes(max_cols);
-        let quant = DeviceBuffer::alloc(ctx, quant_bytes)
-            .map_err(|e| anyhow!("alloc gemv quant scratch ({quant_bytes} B): {e}"))?;
-        let dst_bytes = max_rows * std::mem::size_of::<f32>();
-        let dst = DeviceBuffer::alloc(ctx, dst_bytes)
-            .map_err(|e| anyhow!("alloc gemv dst scratch ({dst_bytes} B): {e}"))?;
-        Ok(Self {
-            quant,
-            quant_cap_cols: max_cols,
-            dst,
-            dst_cap_rows: max_rows,
-        })
-    }
-}
-
 /// Bytes for the q8_1_x4 quantized form of an `ncols`-element activation vector
 /// (the shader groups 128 values into one x4 super-block of 4×36 B).
 fn q8_1_x4_bytes(ncols: usize) -> usize {
@@ -148,15 +130,167 @@ fn q8_1_x4_bytes(ncols: usize) -> usize {
     num_x4 * 4 * BLOCK_Q8_1_BYTES
 }
 
+/// Round `n` up to the next multiple of `align` (a power-of-two device limit).
+fn align_up(n: usize, align: usize) -> usize {
+    if align == 0 {
+        return n;
+    }
+    n.div_ceil(align) * align
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DeviceArena — the per-GEMV scratch as named, offset-aligned sub-ranges of ONE
+// wide UMA buffer, allocated once on the model (perf-parity Step 3).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One `(offset, len)` named slot inside the arena's backing buffer.
+#[derive(Clone, Copy)]
+struct Slot {
+    offset: u64,
+    len: usize,
+}
+
+/// A single `DeviceLocal|HostVisible|HostCoherent` (UMA) buffer holding all the
+/// per-GEMV scratch slots, each aligned to `minStorageBufferOffsetAlignment` so
+/// every slot can be bound directly as a storage-buffer descriptor sub-range.
+///
+/// Allocated **once** on [`crate::model_qwen35::VulkanQwen35Model`] and sized to
+/// the widest GEMV the forward will run. This replaces the deleted `GemvScratch`
+/// and its per-call `DeviceBuffer::alloc`/`copy_to_host` churn: the host writes
+/// the input activation into `x_in` (UMA, no staging) and reads the result back
+/// from `dst`, while the quantize/GEMV dispatches read/write the slots in place.
+pub struct DeviceArena<'a> {
+    buffer: DeviceBuffer<'a>,
+    /// f32 input activation (widest GEMV input cols).
+    x_in: Slot,
+    /// q8_1_x4 quantized activation.
+    quant: Slot,
+    /// f32 destination rows (widest GEMV output rows).
+    dst: Slot,
+    /// 4-byte fuse-dummy bindings (3/4); only read when `fusion_flags != 0`.
+    fuse0: Slot,
+    fuse1: Slot,
+    /// Pre-sized caps so a GEMV can bail loud rather than silently corrupt.
+    max_cols: usize,
+    max_rows: usize,
+}
+
+impl<'a> DeviceArena<'a> {
+    /// Allocate the arena sized to the widest GEMV (`max_cols` input width,
+    /// `max_rows` output rows), aligning every slot to the device's storage
+    /// buffer offset granularity.
+    pub fn new(ctx: &'a VulkanContext, max_cols: usize, max_rows: usize) -> Result<Self> {
+        let align = ctx.min_storage_buffer_offset_alignment().max(1) as usize;
+        let x_in_len = max_cols * std::mem::size_of::<f32>();
+        let quant_len = q8_1_x4_bytes(max_cols);
+        let dst_len = max_rows * std::mem::size_of::<f32>();
+        let fuse_len = 4usize;
+
+        let mut cursor = 0u64;
+        let mut place = |len: usize| -> Slot {
+            let offset = cursor;
+            cursor += align_up(len, align) as u64;
+            Slot { offset, len }
+        };
+        let x_in = place(x_in_len);
+        let quant = place(quant_len);
+        let dst = place(dst_len);
+        let fuse0 = place(fuse_len);
+        let fuse1 = place(fuse_len);
+        let total = cursor as usize;
+
+        let buffer = DeviceBuffer::alloc_uma(ctx, total)
+            .map_err(|e| anyhow!("alloc GEMV device arena ({total} B): {e}"))?;
+        Ok(Self {
+            buffer,
+            x_in,
+            quant,
+            dst,
+            fuse0,
+            fuse1,
+            max_cols,
+            max_rows,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent decode resources: the arena + the compile-once KernelCache + the
+// record-many/submit-once CommandRecorder, all owned by the model and threaded
+// into the forward. ONE canonical flow — no transient launch path on decode.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The persistent per-token decode resources, built once in
+/// [`crate::model_qwen35::VulkanQwen35Model::load`] and borrowed mutably by each
+/// [`forward_token`] call. Bundling them lets the forward thread one `&mut` and
+/// keeps the lifetimes (`'a` = the model's `'static` context) in one place.
+pub struct DecodeResources<'a> {
+    pub arena: DeviceArena<'a>,
+    pub cache: KernelCache<'a>,
+    pub recorder: CommandRecorder<'a>,
+    /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
+    /// attribute time between the GPU GEMV submits and the surrounding host
+    /// prep/readback. Drained + printed via [`Self::take_profile`].
+    gemv_submit_ns: u128,
+    gemv_other_ns: u128,
+    gemv_count: u64,
+}
+
+impl<'a> DecodeResources<'a> {
+    pub fn new(ctx: &'a VulkanContext, config: &Qwen35Config) -> Result<Self> {
+        let (max_cols, max_rows) = widest_gemv(config);
+        let arena = DeviceArena::new(ctx, max_cols, max_rows)?;
+        let cache = KernelCache::new();
+        let recorder =
+            CommandRecorder::new(ctx).map_err(|e| anyhow!("create decode CommandRecorder: {e}"))?;
+        Ok(Self {
+            arena,
+            cache,
+            recorder,
+            gemv_submit_ns: 0,
+            gemv_other_ns: 0,
+            gemv_count: 0,
+        })
+    }
+
+    /// Drain the accumulated GEMV timing as
+    /// `(submit_secs, other_secs, gemv_count)` and reset the counters. `other`
+    /// is the host-side prep + descriptor build + readback around the submit.
+    pub fn take_profile(&mut self) -> (f64, f64, u64) {
+        let s = self.gemv_submit_ns as f64 / 1e9;
+        let o = self.gemv_other_ns as f64 / 1e9;
+        let n = self.gemv_count;
+        self.gemv_submit_ns = 0;
+        self.gemv_other_ns = 0;
+        self.gemv_count = 0;
+        (s, o, n)
+    }
+}
+
+/// Widest GEMV shapes for arena sizing: input cols max = FFN intermediate (down
+/// proj has the most input cols); output rows max = vocab (lm_head) or the
+/// gated q-proj `[query|gate]` width.
+fn widest_gemv(config: &Qwen35Config) -> (usize, usize) {
+    let h = config.hidden_size;
+    let max_cols = config.intermediate_size.max(h).max(config.vocab_size);
+    let max_rows = config
+        .vocab_size
+        .max(config.intermediate_size)
+        .max(2 * config.num_attention_heads * config.head_dim);
+    (max_cols, max_rows)
+}
+
 /// The on-device numeric forward for one token. Returns logits `[vocab]` f32.
 ///
 /// `state.seq_len` must equal `start_pos` (the uncached full-prefix contract).
 /// Mutates the per-slot caches / recurrent state in place and advances
-/// `state.seq_len`.
-pub fn forward_token(
-    ctx: &VulkanContext,
+/// `state.seq_len`. `res` carries the persistent arena/cache/recorder (built
+/// once at model load); every GEMV records into them.
+pub fn forward_token<'a>(
+    ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
     state: &mut Qwen35ForwardState,
     token: u32,
     start_pos: usize,
@@ -170,15 +304,6 @@ pub fn forward_token(
     }
     let h = config.hidden_size;
     let eps = config.rms_norm_eps;
-
-    // Widest GEMV shapes for scratch sizing: input cols max = FFN intermediate
-    // (down proj has 17408 input cols); output rows max = vocab (lm_head).
-    let max_cols = config.intermediate_size.max(h).max(config.vocab_size);
-    let max_rows = config
-        .vocab_size
-        .max(config.intermediate_size)
-        .max(2 * config.num_attention_heads * config.head_dim);
-    let mut scratch = GemvScratch::new(ctx, max_cols, max_rows)?;
 
     // ── Token embedding (host gather + dequant of one Q8_0 row). ──
     let mut hidden = weights
@@ -199,30 +324,14 @@ pub fn forward_token(
         let attn_out = match layer_type {
             LayerType::FullAttention => {
                 let out = full_attention(
-                    ctx,
-                    config,
-                    weights,
-                    state,
-                    &mut scratch,
-                    layer,
-                    full_idx,
-                    &normed,
-                    start_pos,
+                    ctx, config, weights, res, state, layer, full_idx, &normed, start_pos,
                 )?;
                 full_idx += 1;
                 out
             }
             LayerType::LinearAttention => {
-                let out = linear_attention(
-                    ctx,
-                    config,
-                    weights,
-                    state,
-                    &mut scratch,
-                    layer,
-                    linear_idx,
-                    &normed,
-                )?;
+                let out =
+                    linear_attention(ctx, config, weights, res, state, layer, linear_idx, &normed)?;
                 linear_idx += 1;
                 out
             }
@@ -234,10 +343,10 @@ pub fn forward_token(
         let mlp_in = rms_norm_weight(&post_sum, &post_norm_w, eps);
 
         // Dense FFN: down( silu(gate(x)) * up(x) ).
-        let gate = gemv_layer(ctx, weights, &mut scratch, layer, "ffn_gate", &mlp_in)?;
-        let up = gemv_layer(ctx, weights, &mut scratch, layer, "ffn_up", &mlp_in)?;
+        let gate = gemv_layer(ctx, weights, res, layer, "ffn_gate", &mlp_in)?;
+        let up = gemv_layer(ctx, weights, res, layer, "ffn_up", &mlp_in)?;
         let act = swiglu(&gate, &up);
-        let mlp_out = gemv_layer(ctx, weights, &mut scratch, layer, "ffn_down", &act)?;
+        let mlp_out = gemv_layer(ctx, weights, res, layer, "ffn_down", &act)?;
 
         // MLP residual add into the next layer's residual stream.
         hidden = add_vec(&post_sum, &mlp_out);
@@ -249,14 +358,7 @@ pub fn forward_token(
         .ok_or_else(|| anyhow!("missing output_norm.weight"))?;
     let final_norm_w = dequant_f32(final_norm, h)?;
     let normed = rms_norm_weight(&hidden, &final_norm_w, eps);
-    let logits = gemv_global(
-        ctx,
-        weights,
-        &mut scratch,
-        "output.weight",
-        &normed,
-        config.vocab_size,
-    )?;
+    let logits = gemv_global(ctx, weights, res, "output.weight", &normed)?;
 
     state.seq_len += 1;
     Ok(logits)
@@ -267,12 +369,12 @@ pub fn forward_token(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-fn full_attention(
-    ctx: &VulkanContext,
+fn full_attention<'a>(
+    ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
     state: &mut Qwen35ForwardState,
-    scratch: &mut GemvScratch<'_>,
     layer: usize,
     full_idx: usize,
     normed: &[f32],
@@ -289,9 +391,9 @@ fn full_attention(
     let pos = start_pos;
 
     // q_proj → [query|gate] per head (out = 2*nq*hd); k/v_proj → [nkv*hd].
-    let q_full = gemv_layer(ctx, weights, scratch, layer, "attn_q", normed)?; // 2*q_dim
-    let k_in = gemv_layer(ctx, weights, scratch, layer, "attn_k", normed)?; // kv_dim
-    let v_in = gemv_layer(ctx, weights, scratch, layer, "attn_v", normed)?; // kv_dim
+    let q_full = gemv_layer(ctx, weights, res, layer, "attn_q", normed)?; // 2*q_dim
+    let k_in = gemv_layer(ctx, weights, res, layer, "attn_k", normed)?; // kv_dim
+    let v_in = gemv_layer(ctx, weights, res, layer, "attn_v", normed)?; // kv_dim
 
     let q_norm = norm_weight(weights, layer, "attn_q_norm")?; // [hd]
     let k_norm = norm_weight(weights, layer, "attn_k_norm")?; // [hd]
@@ -370,7 +472,7 @@ fn full_attention(
     }
 
     // o_proj: [q_dim -> hidden].
-    gemv_layer(ctx, weights, scratch, layer, "attn_output", &attn)
+    gemv_layer(ctx, weights, res, layer, "attn_output", &attn)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,12 +484,12 @@ fn full_attention(
 // depthwise conv taps, the gated-delta state passes) — a range loop mirrors the
 // CUDA reference's index math one-to-one and is clearer than a zipped iterator.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn linear_attention(
-    ctx: &VulkanContext,
+fn linear_attention<'a>(
+    ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
     state: &mut Qwen35ForwardState,
-    scratch: &mut GemvScratch<'_>,
     layer: usize,
     linear_idx: usize,
     normed: &[f32],
@@ -404,10 +506,10 @@ fn linear_attention(
     let eps = config.rms_norm_eps;
 
     // in projections.
-    let qkv = gemv_layer(ctx, weights, scratch, layer, "attn_qkv", normed)?; // [qkv_dim]
-    let z = gemv_layer(ctx, weights, scratch, layer, "attn_gate", normed)?; // [v_dim_total]
-    let a_proj = gemv_layer(ctx, weights, scratch, layer, "ssm_alpha", normed)?; // [nv]
-    let b_proj = gemv_layer(ctx, weights, scratch, layer, "ssm_beta", normed)?; // [nv]
+    let qkv = gemv_layer(ctx, weights, res, layer, "attn_qkv", normed)?; // [qkv_dim]
+    let z = gemv_layer(ctx, weights, res, layer, "attn_gate", normed)?; // [v_dim_total]
+    let a_proj = gemv_layer(ctx, weights, res, layer, "ssm_alpha", normed)?; // [nv]
+    let b_proj = gemv_layer(ctx, weights, res, layer, "ssm_beta", normed)?; // [nv]
 
     // Depthwise conv1d over all qkv channels (kernel taps = [ring | x]), then
     // SiLU. Matches qwen35_ssm_conv.comp / conv1d.cu: the bf16-round of the
@@ -553,19 +655,20 @@ fn linear_attention(
     }
 
     // out_proj: [v_dim_total -> hidden].
-    gemv_layer(ctx, weights, scratch, layer, "ssm_out", &normed_out)
+    gemv_layer(ctx, weights, res, layer, "ssm_out", &normed_out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// On-device GEMV helpers (the proven q8_0 path).
+// On-device GEMV helpers (the proven q8_0 path), now recording the quantize+GEMV
+// pair into the persistent recorder/cache against arena sub-buffers.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run one quantized GEMV `y[out] = W[out,in] · x[in]` on the device for a
 /// per-layer weight tensor `blk.{layer}.{suffix}.weight`.
-fn gemv_layer(
-    ctx: &VulkanContext,
+fn gemv_layer<'a>(
+    ctx: &'a VulkanContext,
     weights: &ResidentWeights<'_>,
-    scratch: &mut GemvScratch<'_>,
+    res: &mut DecodeResources<'a>,
     layer: usize,
     suffix: &str,
     x: &[f32],
@@ -574,31 +677,35 @@ fn gemv_layer(
     let w = weights
         .get(&name)
         .ok_or_else(|| anyhow!("missing weight {name}"))?;
-    gemv_device(ctx, w, scratch, x, &name)
+    gemv_device(ctx, w, res, x, &name)
 }
 
-/// Run a GEMV for a global (non-layer) weight tensor with a known output width.
-fn gemv_global(
-    ctx: &VulkanContext,
+/// Run a GEMV for a global (non-layer) weight tensor.
+fn gemv_global<'a>(
+    ctx: &'a VulkanContext,
     weights: &ResidentWeights<'_>,
-    scratch: &mut GemvScratch<'_>,
+    res: &mut DecodeResources<'a>,
     name: &str,
     x: &[f32],
-    _expected_out: usize,
 ) -> Result<Vec<f32>> {
     let w = weights
         .get(name)
         .ok_or_else(|| anyhow!("missing weight {name}"))?;
-    gemv_device(ctx, w, scratch, x, name)
+    gemv_device(ctx, w, res, x, name)
 }
 
-/// Core GEMV: quantize `x` to q8_1_x4 on device, dispatch the Q8_0 GEMV, read
-/// back `[nrows]` f32. `nrows`/`ncols` are derived from the weight's GGUF dims
-/// (`dims = [in, out]`, row-major `[out, in]` bytes).
-fn gemv_device(
-    ctx: &VulkanContext,
+/// Core GEMV: write `x` into the arena's input slot, record the q8_1 quantize +
+/// Q8_0 GEMV pair (with a barrier between) into the persistent `CommandRecorder`
+/// from compile-once cached pipelines bound to the arena/weight sub-buffers,
+/// submit the pair ONCE, then read back `[nrows]` f32 from the arena dst slot.
+///
+/// No per-call `DeviceBuffer::alloc`, no per-op `queue_wait_idle`, no
+/// per-dispatch pipeline rebuild — the three perf-parity wins. `nrows`/`ncols`
+/// come from the weight's GGUF `gemv_dims` (`[in, out]`).
+fn gemv_device<'a>(
+    ctx: &'a VulkanContext,
     weight: &DeviceTensor<'_>,
-    scratch: &mut GemvScratch<'_>,
+    res: &mut DecodeResources<'a>,
     x: &[f32],
     name: &str,
 ) -> Result<Vec<f32>> {
@@ -615,73 +722,141 @@ fn gemv_device(
             weight.residency
         );
     }
-
-    // The scratch is pre-sized in `forward_token` to the widest GEMV shape, so
-    // every dispatch fits without reallocation (which would otherwise tie the
-    // scratch buffers' lifetime to this call's `ctx` borrow).
-    if ncols > scratch.quant_cap_cols {
+    if ncols > res.arena.max_cols {
         bail!(
-            "{name}: GEMV ncols {ncols} exceeds pre-sized quant scratch ({})",
-            scratch.quant_cap_cols
+            "{name}: GEMV ncols {ncols} exceeds pre-sized arena ({})",
+            res.arena.max_cols
         );
     }
-    if nrows > scratch.dst_cap_rows {
+    if nrows > res.arena.max_rows {
         bail!(
-            "{name}: GEMV nrows {nrows} exceeds pre-sized dst scratch ({})",
-            scratch.dst_cap_rows
+            "{name}: GEMV nrows {nrows} exceeds pre-sized arena ({})",
+            res.arena.max_rows
         );
     }
 
-    // 1. Upload + quantize the activation vector to q8_1_x4.
-    let quant_bytes = q8_1_x4_bytes(ncols);
+    let t_start = std::time::Instant::now();
+
+    // 1. Land the input activation into the arena's x_in slot (UMA, no alloc).
     let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let mut x_in = DeviceBuffer::alloc(ctx, x_bytes.len())
-        .map_err(|e| anyhow!("{name}: alloc gemv x input: {e}"))?;
-    x_in.copy_from_host(&x_bytes)
-        .map_err(|e| anyhow!("{name}: upload gemv x: {e}"))?;
-    // Zero the quant region we will write (the x4 grouping may round ncols up).
-    let zero = vec![0u8; quant_bytes];
-    scratch
-        .quant
-        .copy_from_host(&zero)
-        .map_err(|e| anyhow!("{name}: zero gemv quant: {e}"))?;
-    let qparams = q8_1_quantize_params(ncols as u32);
-    let qdispatch = q8_1_quantize_dispatch(ncols as u32);
-    q8_1_quantize(ctx, &[&x_in, &scratch.quant], qdispatch, &qparams)
-        .map_err(|e| anyhow!("{name}: q8_1_quantize dispatch: {e}"))?;
+    res.arena
+        .buffer
+        .copy_from_host_at(res.arena.x_in.offset, &x_bytes)
+        .map_err(|e| anyhow!("{name}: write gemv x into arena: {e}"))?;
 
-    // 2. Dispatch the Q8_0 GEMV. Bindings: [A weights, B q8_1_x4, D f32 dst,
-    //    Fuse0, Fuse1] (3/4 are dummies, fusion_flags=0).
+    let quant_bytes = q8_1_x4_bytes(ncols);
     let dst_bytes = nrows * std::mem::size_of::<f32>();
-    scratch
-        .dst
-        .copy_from_host(&vec![0u8; dst_bytes])
-        .map_err(|e| anyhow!("{name}: zero gemv dst: {e}"))?;
-    let mut f0 = DeviceBuffer::alloc(ctx, 4).map_err(|e| anyhow!("{name}: alloc fuse0: {e}"))?;
-    f0.copy_from_host(&[0u8; 4]).ok();
-    let mut f1 = DeviceBuffer::alloc(ctx, 4).map_err(|e| anyhow!("{name}: alloc fuse1: {e}"))?;
-    f1.copy_from_host(&[0u8; 4]).ok();
 
-    let params: KernelParams = gemv_params(ncols as u32, nrows as u32);
-    let dispatch: Dispatch = gemv_dispatch(nrows as u32);
-    q8_0_gemv_with_params(
-        ctx,
-        &[&weight.buffer, &scratch.quant, &scratch.dst, &f0, &f1],
-        dispatch,
-        &params,
-    )
-    .map_err(|e| anyhow!("{name}: q8_0 GEMV dispatch: {e}"))?;
+    // 2. Build the two cached pipelines (build-once on first use), then record
+    //    quantize -> barrier -> GEMV into ONE submit. The q8_1 shader fully
+    //    writes every covered x4 block (the rounded-up tail lanes are written as
+    //    0), and the GEMV writes every row < nrows, so no pre-zeroing is needed.
+    let q_spec = Kernel::QuantizeQ8_1.specialization_u32();
+    let q_push = q8_1_quantize_params(ncols as u32).to_le_bytes();
+    let q_groups = {
+        let d = q8_1_quantize_dispatch(ncols as u32);
+        [d.x, d.y, d.z]
+    };
 
-    // 3. Read back the f32 result rows.
+    let g_spec = Kernel::GemvQ8_0.specialization_u32();
+    let g_push = gemv_params(ncols as u32, nrows as u32).to_le_bytes();
+    let g_groups = {
+        let d = gemv_dispatch(nrows as u32);
+        [d.x, d.y, d.z]
+    };
+
+    // Build (or fetch) both pipelines up front so neither cache borrow overlaps
+    // a descriptor-set build. We hold raw handles via the cached references in
+    // sequence: get quantize, use it, then get gemv, use it.
+    let arena_buf = &res.arena.buffer;
+
+    // --- quantize dispatch ---
+    let q_set = {
+        let (q_pipeline, q_layout) = res
+            .cache
+            .get(ctx, Kernel::QuantizeQ8_1, q_spec, q_push.len() as u32, 2)
+            .map_err(|e| anyhow!("{name}: build q8_1_quantize pipeline: {e}"))?;
+        let q_layout_ptr = q_layout;
+        let set = DescriptorSet::storage_buffers_ranged(
+            ctx,
+            q_layout_ptr,
+            &[
+                (arena_buf, res.arena.x_in.offset, (ncols * 4) as u64),
+                (arena_buf, res.arena.quant.offset, quant_bytes as u64),
+            ],
+        )
+        .map_err(|e| anyhow!("{name}: bind q8_1 descriptor set: {e}"))?;
+        // Record while the pipeline borrow is live.
+        res.recorder
+            .begin()
+            .map_err(|e| anyhow!("{name}: recorder begin: {e}"))?;
+        record_dispatch(&mut res.recorder, q_pipeline, &set, &q_push, q_groups);
+        set
+    };
+    // Keep q_set alive until submit (the descriptor set must outlive the recorded
+    // dispatch that references it).
+    let _q_set = q_set;
+
+    // Barrier: GEMV reads the quantize's writes.
+    res.recorder.barrier();
+
+    // --- GEMV dispatch ---
+    let g_set = {
+        let (g_pipeline, g_layout) = res
+            .cache
+            .get(ctx, Kernel::GemvQ8_0, g_spec, g_push.len() as u32, 5)
+            .map_err(|e| anyhow!("{name}: build q8_0 GEMV pipeline: {e}"))?;
+        let set = DescriptorSet::storage_buffers_ranged(
+            ctx,
+            g_layout,
+            &[
+                // binding 0: weight (full range, offset 0) — resident, no re-upload.
+                (&weight.buffer, 0, weight.buffer.len() as u64),
+                // binding 1: q8_1_x4 activations.
+                (arena_buf, res.arena.quant.offset, quant_bytes as u64),
+                // binding 2: f32 dst rows.
+                (arena_buf, res.arena.dst.offset, dst_bytes as u64),
+                // bindings 3/4: fuse dummies (unread, fusion_flags=0).
+                (
+                    arena_buf,
+                    res.arena.fuse0.offset,
+                    res.arena.fuse0.len as u64,
+                ),
+                (
+                    arena_buf,
+                    res.arena.fuse1.offset,
+                    res.arena.fuse1.len as u64,
+                ),
+            ],
+        )
+        .map_err(|e| anyhow!("{name}: bind GEMV descriptor set: {e}"))?;
+        record_dispatch(&mut res.recorder, g_pipeline, &set, &g_push, g_groups);
+        set
+    };
+    let _g_set = g_set;
+
+    // 3. ONE submit + ONE fence wait for the quantize+GEMV pair.
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("{name}: submit gemv pair: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+
+    // 4. Read back the f32 result rows from the arena dst slot.
     let mut out_bytes = vec![0u8; dst_bytes];
-    scratch
-        .dst
-        .copy_to_host(&mut out_bytes[..])
-        .map_err(|e| anyhow!("{name}: read back gemv dst: {e}"))?;
+    res.arena
+        .buffer
+        .copy_to_host_at(res.arena.dst.offset, &mut out_bytes[..])
+        .map_err(|e| anyhow!("{name}: read back gemv dst from arena: {e}"))?;
     let out: Vec<f32> = out_bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
+
+    let total_ns = t_start.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    res.gemv_count += 1;
     Ok(out)
 }
 
