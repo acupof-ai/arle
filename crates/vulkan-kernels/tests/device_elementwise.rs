@@ -16,10 +16,56 @@
 #![cfg(feature = "vulkan")]
 
 use vulkan_kernels::{
-    Kernel, KernelCache, add_dispatch, add_params, launch_cached, rms_norm_dispatch,
-    rms_norm_params, scaled_add_dispatch, scaled_add_params, swiglu_dispatch, swiglu_params,
+    Kernel, KernelCache, add_dispatch, add_params, f16_kv_pack_dispatch, f16_kv_pack_params,
+    launch_cached, rms_norm_dispatch, rms_norm_params, scaled_add_dispatch, scaled_add_params,
+    swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{DeviceBuffer, VulkanContext};
+
+/// Round-to-nearest-even f32 -> f16 bit pattern. The exact host reference the
+/// device `f16_kv_pack` (hardware `float16_t(float)` cast) must match bit-for-bit;
+/// it is the same routine the KV cache contract was validated against.
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | (if mant != 0 { 0x0200 } else { 0 });
+    }
+    let mut e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let mant_with_implicit = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let mut m = mant_with_implicit >> shift;
+        let rem_mask = (1u32 << shift) - 1;
+        let rem = mant_with_implicit & rem_mask;
+        let halfway = 1u32 << (shift - 1);
+        if rem > halfway || (rem == halfway && (m & 1) == 1) {
+            m += 1;
+        }
+        return sign | m as u16;
+    }
+    let mut m = mant >> 13;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        m += 1;
+        if m == 0x0400 {
+            m = 0;
+            e += 1;
+            if e >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((e as u16) << 10) | m as u16
+}
 
 /// Deterministic xorshift PRNG so failures reproduce.
 struct Rng(u64);
@@ -205,5 +251,74 @@ fn elementwise_kernels_match_host_oracle() {
             &read_f32(&buf_acc, n),
             &want,
         );
+    }
+}
+
+/// Oracle-gate the `f16_kv_pack` shader (Step 2: device f16 KV-pack) against the
+/// host RNE f32->f16 conversion the KV cache contract was validated with. The
+/// device hardware `float16_t(float)` cast must produce the SAME f16 bit pattern
+/// for every value (full-attention K/V are well within f16 normal range), so the
+/// comparison is bit-for-bit. Widths cover one full-attention head row
+/// (head_dim=256) and a kv_dim-wide block (kv_heads*head_dim).
+#[test]
+fn f16_kv_pack_matches_host_rne_oracle() {
+    let ctx = match VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Vulkan device available ({e}); skipping f16_kv_pack oracle test");
+            return;
+        }
+    };
+    eprintln!("ARLE Vulkan f16_kv_pack proof on: {}", ctx.device_name());
+    let mut cache = KernelCache::new();
+    let mut rng = Rng(0xF16C_AFE0_1234_5678);
+
+    for &n in &[256usize, 1024] {
+        // Attention K/V magnitudes (post-rope / projection) span roughly [-8, 8];
+        // sample a comparable range plus a few exact-representable corner values.
+        let mut x: Vec<f32> = (0..n).map(|_| rng.next_f32() * 8.0).collect();
+        for (i, corner) in [0.0f32, 1.0, -1.0, 0.5, 65504.0, -65504.0]
+            .into_iter()
+            .enumerate()
+        {
+            if i < n {
+                x[i] = corner;
+            }
+        }
+        let want: Vec<u16> = x.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+        let buf_src = upload_f32(&ctx, &x);
+        // Destination is n f16 = 2n bytes.
+        let mut buf_dst = DeviceBuffer::alloc(&ctx, (n * 2).max(4)).expect("alloc f16 dst");
+        buf_dst
+            .copy_from_host(&vec![0u8; n * 2])
+            .expect("zero f16 dst");
+        let push = f16_kv_pack_params(n as u32).to_le_bytes();
+        let d = f16_kv_pack_dispatch(n as u32);
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::F16KvPack,
+            &[&buf_src, &buf_dst],
+            d,
+            &push,
+            Kernel::F16KvPack.specialization_u32(),
+        )
+        .expect("f16_kv_pack dispatch");
+
+        let mut bytes = vec![0u8; n * 2];
+        buf_dst.copy_to_host(&mut bytes).expect("read back f16 dst");
+        let got: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g, w,
+                "f16_kv_pack n={n}[{i}]: src {} -> device 0x{g:04x} vs host 0x{w:04x}",
+                x[i]
+            );
+        }
+        eprintln!("[f16_kv_pack n={n}] PASS (bit-identical to host RNE, n={n})");
     }
 }
