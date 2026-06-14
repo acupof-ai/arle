@@ -940,10 +940,11 @@ pub fn qwen36_router_gemv_params(n_out: u32, hidden: u32, apply_sigmoid: bool) -
     KernelParams::from_words(vec![n_out, hidden, u32::from(apply_sigmoid)])
 }
 
-/// Dispatch grid for `qwen36_router_gemv.comp`: one thread per output row
-/// (`local_size_x = 64`), `ceil(n_out/64)` workgroups.
+/// Dispatch grid for `qwen36_router_gemv.comp`: ONE workgroup per output row
+/// (`local_size_x = 64` lanes cooperate on the row's dot with coalesced reads),
+/// so `n_out` workgroups.
 pub fn qwen36_router_gemv_dispatch(n_out: u32) -> Dispatch {
-    Dispatch::x(n_out.div_ceil(64).max(1))
+    Dispatch::x(n_out.max(1))
 }
 
 /// Push-constant block for `qwen36_moe_weighted_accum.comp` = `{hidden, count,
