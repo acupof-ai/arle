@@ -15,7 +15,7 @@
 > **Gate before code**: this spans >5 files (infer-core, infer-seam, train/opd,
 > infer-cuda, cli) — Claude delivers the line-level spec below; **await ckl's go**.
 
-**Date**: 2026-06-14 · **Status**: approach-approved → awaiting plan sign-off → impl · **Driver**: ckl
+**Date**: 2026-06-14 · **Status**: approach-approved → awaiting plan sign-off → impl · **Driver**: ckl · **Issue**: [#90](https://github.com/cklxx/arle/issues/90) (phase-3 axis, Phase-0 off-critical-path)
 
 > **One line**: turn the OPD LoRA loop into a *teacher-free, self-improving* loop
 > that fires **at rollout time** — as the engine serves, each rollout *sequence*
@@ -423,6 +423,7 @@ Phase 0 (CUDA, inline G2 A1-EMA loop)   ← MECHANISM KEYSTONE, blocks all
 
 ## Cross-links
 
+- Tracking issue: [#90](https://github.com/cklxx/arle/issues/90) (phase-3); roadmap Phase-3 row + off-path note; umbrella [#55](https://github.com/cklxx/arle/issues/55); related [#64](https://github.com/cklxx/arle/issues/64) (OPD resume), [#71](https://github.com/cklxx/arle/issues/71) (AIPC/Metal port)
 - Strategy: [`2026-06-10-arle-master-strategy-v2.md`](../projects/2026-06-10-arle-master-strategy-v2.md) §3 Phase 3 #3/#5, D4, §5 ROCm/AIPC
 - OPD-only pivot (the distillation-not-RL line): [`2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)
 - Retired doctrine (data flow + verifier + reward-hack risk): [`agent-rl-self-evolving.md`](../projects/agent-rl-self-evolving.md)
