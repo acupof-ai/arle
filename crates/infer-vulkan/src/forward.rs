@@ -593,31 +593,42 @@ impl<'a> DecodeResources<'a> {
             CommandRecorder::new(ctx).map_err(|e| anyhow!("create decode CommandRecorder: {e}"))?;
 
         // One persistent layout + ring per decode binding count. A ring of N sets
-        // permits N live dispatches between resets. With the RESIDUAL-RESIDENT
-        // layer loop (Step 3) a WHOLE layer — input-norm + attention block + FFN —
-        // records into ONE submit, so each ring must cover the busiest single
-        // layer's cumulative dispatch count (not just one sub-block). The full
-        // layer dominates: ring3 sees `2*(n_heads+n_kv)` q/k-norm+rope-mate norms
-        // plus `n_heads` sigmoid gates plus the FFN's 4 elementwise ops; the linear
-        // layer's per-head gated-norm (`n_value_heads` rms_norm + 1 swiglu) is the
-        // other ring3 peak. ring2 sees the full layer's q/k/v/o quantizes + the
-        // `2*n_kv` f16 KV-packs + the FFN's 3 quantizes. Size each to the worst case
-        // plus generous headroom so a ring never wraps mid-layer (which would alias
-        // a still-in-flight descriptor set and corrupt the residual stream).
+        // permits N live dispatches before a slot is reused; `next_updated` wraps via
+        // `next % N` (vulkan-sys), so reusing a slot whose dispatch is still in flight
+        // SILENTLY aliases its descriptor set and corrupts the residual stream.
+        //
+        // WHOLE-TOKEN batching (perf-parity Lever B / Step 4): the residual-resident
+        // dense loop records EVERY layer into ONE command buffer and `submit_and_wait`s
+        // ONCE per token — eliminating the old per-layer fence-wait that idled the GPU
+        // 64×/token (~0.29 s of pure submit serialization). So every layer's dispatches
+        // are simultaneously in flight at the single submit, and each ring must cover
+        // the WHOLE TOKEN, not one layer. Size each ring to its per-layer worst case ×
+        // n_layers + headroom for the final norm/LM-head. Descriptor sets are tiny (≤7
+        // storage buffers each); ~20k of them is a few MB on the 96 GB box. The MoE path
+        // stays host-bridged (per-block submit) so it never needs the whole-token depth,
+        // but sharing the (over-sized) rings is harmless.
         let n_heads = config.num_attention_heads;
         let n_kv = config.num_key_value_heads;
         let n_vheads = config.linear_num_value_heads;
-        // ring3: full-layer (2*(nq+nkv) norms + nq gates + 4 FFN) vs linear-layer
-        // (nv rms_norm + 1 swiglu + 1 input-norm + 4 FFN). Take the max + headroom.
-        let ring3_full = 2 * (n_heads + n_kv) + n_heads + 8;
-        let ring3_linear = n_vheads + 8;
-        let ring3_size = (ring3_full.max(ring3_linear) + 16).max(64);
+        let n_layers = config.layer_types.len();
+        // Per-layer worst case per ring (full-layer vs linear-layer, take the max).
+        // ring3: full (2*(nq+nkv) q/k+rope-mate norms + nq sigmoid gates + 4 FFN) vs
+        // linear (nv rms_norm + 1 swiglu + 1 input-norm + 4 FFN).
+        let ring3_layer = (2 * (n_heads + n_kv) + n_heads + 8).max(n_vheads + 8) + 16;
         // ring5 (GEMV + RoPE): full-layer q/k/v/o GEMV (4) + `nq+nkv` rope + 3 FFN.
-        let ring5_size = (n_heads + n_kv + 16).max(48);
-        // ring2 (quantize + f16 pack): full-layer q/k/v/o quant (4) + `2*nkv` packs
-        // + 3 FFN quant. Headroom over the ~15 worst case.
-        let ring2_size = (2 * n_kv + 16).max(32);
-        let ring7_size = (n_heads + 4).max(8);
+        let ring5_layer = n_heads + n_kv + 16;
+        // ring2 (quantize + f16 pack): q/k/v/o quant + `2*nkv` KV-packs + 3 FFN quant.
+        let ring2_layer = 2 * n_kv + 16;
+        // ring7 (flash-attn): one dispatch per query head on a full-attention layer.
+        let ring7_layer = n_heads + 4;
+        // Whole-token depths: per-layer worst case × n_layers + slack for the final
+        // norm + LM-head GEMV recorded into the same token's last batch.
+        let ring3_size = (ring3_layer * n_layers + 32).max(64);
+        let ring5_size = (ring5_layer * n_layers + 32).max(48);
+        let ring2_size = (ring2_layer * n_layers + 32).max(32);
+        let ring7_size = (ring7_layer * n_layers + 16).max(8);
+        // ring4 (depthwise conv1d): one dispatch per LINEAR layer per token.
+        let ring4_size = (n_layers + 16).max(16);
         let mk = |binding_count: usize,
                   size: usize|
          -> Result<(DescriptorSetLayout<'a>, DescriptorSetRing<'a>)> {
@@ -629,7 +640,7 @@ impl<'a> DecodeResources<'a> {
         };
         let (l2, ring2) = mk(2, ring2_size)?;
         let (l3, ring3) = mk(3, ring3_size)?;
-        let (l4, ring4) = mk(4, 16)?;
+        let (l4, ring4) = mk(4, ring4_size)?;
         let (l5, ring5) = mk(5, ring5_size)?;
         let (l6, ring6) = mk(6, 16)?;
         let (l7, ring7) = mk(7, ring7_size)?;
@@ -857,14 +868,24 @@ fn forward_layers_resident<'a>(
     // Upload the token embedding into the resident hidden slot ONCE.
     res.arena.write_at(hid_off, embed)?;
 
+    // WHOLE-TOKEN batch (perf-parity Lever B / Step 4): open ONE command buffer,
+    // record EVERY layer (input-norm → attention → FFN, hidden state arena-resident
+    // throughout — no host bridge), then `submit_and_wait` ONCE at token end. This
+    // collapses the old 64 per-layer fence-wait GPU stalls into a single submit.
+    // The descriptor rings are sized to a whole token (see `DecodeResources::new`),
+    // so no slot is reused while its dispatch is still in flight. `ARLE_SUBMIT_CAP`
+    // (default: whole token) caps the per-batch dispatch count as a TDR safety valve;
+    // a flush at a layer boundary stays numerically identical because the `hid`
+    // hand-off across the flush is fence-ordered by the next `begin()`.
+    let cap = submit_dispatch_cap();
+    let t_record = std::time::Instant::now();
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("resident token begin: {e}"))?;
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
     for (layer, &layer_type) in config.layer_types.iter().enumerate() {
         let attn_norm = packed_or_f32_norm(weights, layer, "attn_norm")?;
-        let t_layer = std::time::Instant::now();
-        res.recorder
-            .begin()
-            .map_err(|e| anyhow!("layer[{layer}]: resident begin: {e}"))?;
         // input_layernorm: device rms_norm(hid) -> normed_resident.
         record_rms_norm(
             ctx,
@@ -896,15 +917,32 @@ fn forward_layers_resident<'a>(
         // FFN: post-add(hid + attn_off), post-norm, gate/up/swiglu/down, residual
         // add -> hid. The dense FFN's first op (post-add) reads attn_off + hid.
         record_fused_dense_ffn(ctx, config, weights, res, layer, hid_off, attn_off)?;
+        // Inter-layer barrier: the next layer's input-norm reads `hid`, which this
+        // layer's FFN residual-add just wrote (the per-layer submit used to enforce
+        // this ordering implicitly).
+        res.recorder.barrier();
 
-        let t_submit = std::time::Instant::now();
-        res.recorder
-            .submit_and_wait()
-            .map_err(|e| anyhow!("layer[{layer}]: resident submit: {e}"))?;
-        let submit_ns = t_submit.elapsed().as_nanos();
-        res.gemv_submit_ns += submit_ns;
-        res.gemv_other_ns += t_layer.elapsed().as_nanos().saturating_sub(submit_ns);
+        // TDR safety valve: if the open command buffer hit the dispatch cap, flush
+        // at this (clean) layer boundary and reopen. Default cap = whole token, so
+        // the common path records all layers and submits exactly once below.
+        if res.recorder.dispatches_in_batch() as usize >= cap {
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("layer[{layer}]: resident cap-flush submit: {e}"))?;
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("layer[{layer}]: resident cap-flush begin: {e}"))?;
+        }
     }
+
+    // Single submit for the whole token (or the final partial batch when capped).
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("resident token submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += t_record.elapsed().as_nanos().saturating_sub(submit_ns);
 
     // Read the resident hidden back once (for the final norm + LM head).
     res.arena.read_at(hid_off, h)
@@ -1435,7 +1473,14 @@ fn moe_dense_expert_submit<'a>(
         .begin()
         .map_err(|er| anyhow!("ffn_shexp: recorder begin: {er}"))?;
 
-    record_quantize_gemv(
+    // gate + up both project the SAME `h`-wide `mlp_in`. Quantize it once, then
+    // run gate/up as GEMV-only against the shared activation (disjoint dst slots,
+    // no inter-GEMV barrier). The down GEMV (below) reads the post-swiglu vector,
+    // a different input, so it keeps its own quantize.
+    let shexp_quant_off = res.arena.quant.offset;
+    record_quantize(ctx, res, "ffn_shexp_qin", h, mlp_in_off, shexp_quant_off)?;
+    res.recorder.barrier();
+    record_gemv_only(
         ctx,
         res,
         gate_w,
@@ -1444,11 +1489,10 @@ fn moe_dense_expert_submit<'a>(
         inter,
         0,
         g_len,
-        mlp_in_off,
+        shexp_quant_off,
         gate_off,
     )?;
-    res.recorder.barrier();
-    record_quantize_gemv(
+    record_gemv_only(
         ctx,
         res,
         up_w,
@@ -1457,7 +1501,7 @@ fn moe_dense_expert_submit<'a>(
         inter,
         0,
         u_len,
-        mlp_in_off,
+        shexp_quant_off,
         up_off,
     )?;
     res.recorder.barrier();
@@ -1614,8 +1658,18 @@ fn record_full_attention<'a>(
     }
     let kv_len = pos + 1;
     let x_in_off = normed_off;
+    // q/k/v all project the SAME `h`-wide normed input. Quantize it to q8_1 ONCE
+    // (into the shared `quant` slot), barrier, then run the three projections as
+    // GEMV-only dispatches reading that one activation — instead of re-quantizing
+    // the identical input three times. Cuts the per-layer attention quantize +
+    // barrier count from 3 to 1. The three GEMVs write disjoint dst slots
+    // (qkv_off / k_off / v_off) so they need no barriers between them; one
+    // trailing barrier separates them from the q/k norm that reads them.
+    let quant_off = res.arena.quant.offset;
+    record_quantize(ctx, res, "attn_qkv_qin", h, x_in_off, quant_off)?;
+    res.recorder.barrier();
     // q_proj -> attn_qkv (2*q_dim).
-    record_quantize_gemv(
+    record_gemv_only(
         ctx,
         res,
         q_w,
@@ -1624,12 +1678,11 @@ fn record_full_attention<'a>(
         2 * q_dim,
         0,
         q_w.buffer.len() as u64,
-        x_in_off,
+        quant_off,
         qkv_off,
     )?;
-    res.recorder.barrier();
     // k_proj -> attn_k (kv_dim).
-    record_quantize_gemv(
+    record_gemv_only(
         ctx,
         res,
         k_w,
@@ -1638,12 +1691,11 @@ fn record_full_attention<'a>(
         kv_dim,
         0,
         k_w.buffer.len() as u64,
-        x_in_off,
+        quant_off,
         k_off,
     )?;
-    res.recorder.barrier();
     // v_proj -> work[0] (kv_dim).
-    record_quantize_gemv(
+    record_gemv_only(
         ctx,
         res,
         v_w,
@@ -1652,7 +1704,7 @@ fn record_full_attention<'a>(
         kv_dim,
         0,
         v_w.buffer.len() as u64,
-        x_in_off,
+        quant_off,
         v_off,
     )?;
     res.recorder.barrier();
@@ -1873,6 +1925,25 @@ fn linear_attention_host_forced() -> bool {
         std::env::var("ARLE_LINEAR_HOST")
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false)
+    })
+}
+
+/// Max compute dispatches recorded into one command buffer before the
+/// residual-resident loop flushes (submit + re-begin) at the next layer boundary.
+/// Default `usize::MAX` = a whole token in ONE submit (the perf-parity target). A
+/// flush is numerically transparent — the `hid` hand-off is fence-ordered by the
+/// reopening `begin()` — so `ARLE_SUBMIT_CAP=<n>` is a pure TDR/latency safety
+/// valve (lower → more submits, smaller command buffers) with no effect on output.
+/// Cached after first read.
+fn submit_dispatch_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ARLE_SUBMIT_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(usize::MAX)
     })
 }
 
@@ -2660,6 +2731,71 @@ fn record_quantize_gemv<'a>(
     Ok(())
 }
 
+/// Record (no submit) ONLY the Q8_0/K-quant GEMV against an ALREADY-quantized
+/// q8_1_x4 activation at arena byte `quant_off`. This is the GEMV half of
+/// [`record_quantize_gemv`] with the quantize + its barrier dropped: when several
+/// projections share one input (q/k/v all read the normed input; gate+up both
+/// read `mlp_in`), the caller quantizes that input ONCE via [`record_quantize`],
+/// then issues each projection through this helper. That collapses the per-layer
+/// `3×(quantize+barrier)` for q/k/v (and `2×` for gate/up) down to a single
+/// quantize, matching the MoE fused path's "quantize the shared input once"
+/// scheduling. The GEMV numeric contract (13-uint `gemv_params`, 5-buffer ABI)
+/// is unchanged — only the redundant re-quantization is removed.
+///
+/// `ncols` MUST equal the width the activation at `quant_off` was quantized to
+/// (the shared input width); `quant_off` MUST hold a fresh q8_1_x4 of that input
+/// AND a barrier MUST already separate that quantize from this GEMV.
+#[allow(clippy::too_many_arguments)]
+fn record_gemv_only<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    weight: &DeviceTensor<'_>,
+    name: &str,
+    ncols: usize,
+    nrows: usize,
+    weight_offset: u64,
+    weight_len: u64,
+    quant_off: u64,
+    dst_off: u64,
+) -> Result<()> {
+    let quant_bytes = q8_1_x4_bytes(ncols);
+    let dst_bytes = nrows * std::mem::size_of::<f32>();
+    let fuse0 = (res.arena.fuse0.offset, res.arena.fuse0.len as u64);
+    let fuse1 = (res.arena.fuse1.offset, res.arena.fuse1.len as u64);
+
+    let gemv_kernel = gemv_kernel_for(weight, name)?;
+    let g_spec = gemv_kernel.specialization_u32();
+    let g_push = gemv_params(ncols as u32, nrows as u32).to_le_bytes();
+    let g_groups = {
+        let d = gemv_dispatch(nrows as u32);
+        [d.x, d.y, d.z]
+    };
+
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring5,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+
+    let (pipeline, _) = cache
+        .get(ctx, gemv_kernel, g_spec, g_push.len() as u32, 5)
+        .map_err(|e| anyhow!("{name}: build {gemv_kernel:?} GEMV pipeline: {e}"))?;
+    let set = ring5
+        .next_updated(&[
+            (&weight.buffer, weight_offset, weight_len),
+            (arena_buf, quant_off, quant_bytes as u64),
+            (arena_buf, dst_off, dst_bytes as u64),
+            (arena_buf, fuse0.0, fuse0.1),
+            (arena_buf, fuse1.0, fuse1.1),
+        ])
+        .map_err(|e| anyhow!("{name}: bind GEMV-only ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &g_push, g_groups);
+    Ok(())
+}
+
 /// `(ncols=in, nrows=out)` from a weight's recorded GGUF dims. GGUF stores
 /// `dims = [ne0=in, ne1=out]` and the bytes are row-major `[out, in]`, which is
 /// exactly the GEMV's `[nrows, ncols]` contract. The loader records these at
@@ -3371,8 +3507,14 @@ fn record_fused_dense_ffn<'a>(
         w1,
     )?;
     res.recorder.barrier();
+    // gate + up both project the SAME `mlp_in` (work1). Quantize it once, then run
+    // gate/up as GEMV-only against the shared activation (disjoint dst slots w2/w3,
+    // no inter-GEMV barrier) instead of re-quantizing the identical input twice.
+    let ffn_quant_off = res.arena.quant.offset;
+    record_quantize(ctx, res, "ffn_qin", gate_in, w1, ffn_quant_off)?;
+    res.recorder.barrier();
     // gate = ffn_gate · mlp_in(work1) -> work2
-    record_quantize_gemv(
+    record_gemv_only(
         ctx,
         res,
         gate_w,
@@ -3381,12 +3523,11 @@ fn record_fused_dense_ffn<'a>(
         gate_out,
         0,
         gate_w.buffer.len() as u64,
-        w1,
+        ffn_quant_off,
         w2,
     )?;
-    res.recorder.barrier();
     // up = ffn_up · mlp_in(work1) -> work3
-    record_quantize_gemv(
+    record_gemv_only(
         ctx,
         res,
         up_w,
@@ -3395,7 +3536,7 @@ fn record_fused_dense_ffn<'a>(
         gate_out,
         0,
         up_w.buffer.len() as u64,
-        w1,
+        ffn_quant_off,
         w3,
     )?;
     res.recorder.barrier();
