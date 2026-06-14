@@ -58,9 +58,10 @@ use vulkan_kernels::{
     BLOCK_Q8_1_BYTES, FlashAttentionSpec, Kernel, KernelCache, KernelParams,
     Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params, flash_attn_dispatch, flash_attn_params,
     gemv_dispatch, gemv_id_dispatch, gemv_id_params, gemv_params, q8_1_quantize_dispatch,
-    q8_1_quantize_params, rms_norm_dispatch, rms_norm_params, rope_neox_dispatch, rope_neox_params,
-    scaled_add_dispatch, scaled_add_params, sigmoid_mul_dispatch, sigmoid_mul_params,
-    swiglu_dispatch, swiglu_params,
+    q8_1_quantize_params, qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params,
+    qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params, rms_norm_dispatch, rms_norm_params,
+    rope_neox_dispatch, rope_neox_params, scaled_add_dispatch, scaled_add_params,
+    sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -138,6 +139,14 @@ fn align_up(n: usize, align: usize) -> usize {
         return n;
     }
     n.div_ceil(align) * align
+}
+
+/// Zero a UMA device buffer's first `len` bytes (host write through the mapped
+/// pointer — no staging). Used to reset the resident gated-delta + conv state.
+fn zero_device_buffer(buf: &mut DeviceBuffer<'_>, len: usize) -> Result<()> {
+    let zeros = vec![0u8; len];
+    buf.copy_from_host(&zeros)
+        .map_err(|e| anyhow!("zero device buffer ({len} B): {e}"))
 }
 
 /// f32 -> f16 (IEEE binary16) bit pattern, round-to-nearest-even. The device
@@ -362,6 +371,24 @@ pub struct DeviceArena<'a> {
     /// 8 bytes — the RoPE position (i32 at offset 0; also serves as the unread
     /// `uvec2` set-rows-indices dummy for binding 4).
     attn_pos: Slot,
+    // ── Linear-attention (gated-delta) slots. The conv1d + recurrent state
+    // update run device-resident against persistent state buffers; these slots
+    // hold the per-token activations the two serial shaders read/write. The raw
+    // in-proj `qkv` lands in `lin_xseq`; the depthwise conv writes
+    // `lin_qkv_conv`; the gated-delta reads it (+ the `lin_a`/`lin_b`
+    // projections) and writes `lin_out`. ──
+    /// f32 `[qkv_dim]` — the raw in-proj `[q|k|v]` (conv input `XSeq`).
+    lin_xseq: Slot,
+    /// f32 `[qkv_dim]` — the post-conv `silu(conv)` `[q|k|v]` (conv `OutSeq`,
+    /// gated-delta `Qkv` input).
+    lin_qkv_conv: Slot,
+    /// f32 `[nv]` — the `ssm_alpha` projection (gated-delta `AProj`).
+    lin_a: Slot,
+    /// f32 `[nv]` — the `ssm_beta` projection (gated-delta `BProj`).
+    lin_b: Slot,
+    /// f32 `[v_dim_total]` — the gated-delta recurrence output (`Output`),
+    /// read back for the gated RMSNorm + out-proj.
+    lin_out: Slot,
     /// Pre-sized caps so a GEMV can bail loud rather than silently corrupt.
     max_cols: usize,
     max_rows: usize,
@@ -412,6 +439,16 @@ impl<'a> DeviceArena<'a> {
         let attn_k_len = kv_dim * std::mem::size_of::<f32>();
         let attn_out_len = q_dim * std::mem::size_of::<f32>();
 
+        // Linear-attention (gated-delta) slot widths (f32). `qkv_dim` =
+        // `2*nk*kd + nv*vd`; `lin_out` is `nv*vd`.
+        let lin_qkv_dim = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let lin_nv = config.linear_num_value_heads;
+        let lin_vout = config.linear_num_value_heads * config.linear_value_head_dim;
+        let lin_xseq_len = lin_qkv_dim * std::mem::size_of::<f32>();
+        let lin_a_len = lin_nv.max(1) * std::mem::size_of::<f32>();
+        let lin_out_len = lin_vout.max(1) * std::mem::size_of::<f32>();
+
         let mut cursor = 0u64;
         let mut place = |len: usize| -> Slot {
             let offset = cursor;
@@ -440,6 +477,11 @@ impl<'a> DeviceArena<'a> {
         let attn_k = place(attn_k_len);
         let attn_out = place(attn_out_len);
         let attn_pos = place(8);
+        let lin_xseq = place(lin_xseq_len);
+        let lin_qkv_conv = place(lin_xseq_len);
+        let lin_a = place(lin_a_len);
+        let lin_b = place(lin_a_len);
+        let lin_out = place(lin_out_len);
         let total = cursor as usize;
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
@@ -465,6 +507,11 @@ impl<'a> DeviceArena<'a> {
             attn_k,
             attn_out,
             attn_pos,
+            lin_xseq,
+            lin_qkv_conv,
+            lin_a,
+            lin_b,
+            lin_out,
             max_cols,
             max_rows,
         })
@@ -539,15 +586,30 @@ pub struct DecodeResources<'a> {
     /// (perf-parity Step 5a). Reset per token via [`Self::reset_rings`].
     ring2: DescriptorSetRing<'a>,
     ring3: DescriptorSetRing<'a>,
+    /// 4-binding ring for the depthwise conv1d ([XSeq, ConvWeight, ConvState,
+    /// OutSeq]). One dispatch per linear layer.
+    ring4: DescriptorSetRing<'a>,
     ring5: DescriptorSetRing<'a>,
     /// 6-binding ring for the fused MoE `mul_mat_vec_id` ([A,B,D,F0,F1,IDS]).
     ring6: DescriptorSetRing<'a>,
-    /// 7-binding ring for flash-attn ([Q,K,V,M,S,O,MO]). The full-attn records one
-    /// per query head into one submit, so it is sized to `num_attention_heads`.
+    /// 7-binding ring for flash-attn ([Q,K,V,M,S,O,MO]) AND the gated-delta net
+    /// ([Qkv,BProj,AProj,DtBias,ALog,State,Output]). Both record one dispatch per
+    /// submit on the linear path; the full-attn records one per query head, so it
+    /// is sized to `num_attention_heads`.
     ring7: DescriptorSetRing<'a>,
     /// Per-slot full-attention KV cache (device-resident f16). RoPE is applied to
     /// K at write time; V is stored raw. flash-attn reads each head's plane.
     kv_cache: DeviceKvCache<'a>,
+    /// Persistent device-resident gated-delta linear-attention state, one block
+    /// per LINEAR layer (the conv ring + the recurrent S matrix). Resident across
+    /// tokens, read+written each token by the conv / gated-delta dispatches;
+    /// zeroed for a fresh generation via [`Self::reset_linear_state`]. Sized
+    /// `[n_linear * qkv_dim * (kernel-1)]` and `[n_linear * nv * kd * vd]` f32.
+    lin_conv_state: DeviceBuffer<'a>,
+    lin_gdr_state: DeviceBuffer<'a>,
+    /// Per-linear-layer byte strides into the two state buffers above.
+    lin_conv_stride: u64,
+    lin_gdr_stride: u64,
     /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
     /// attribute time between the GPU GEMV submits and the surrounding host
     /// prep/readback. Drained + printed via [`Self::take_profile`].
@@ -590,6 +652,7 @@ impl<'a> DecodeResources<'a> {
         };
         let (l2, ring2) = mk(2, 16)?;
         let (l3, ring3) = mk(3, ring3_size)?;
+        let (l4, ring4) = mk(4, 16)?;
         let (l5, ring5) = mk(5, ring5_size)?;
         let (l6, ring6) = mk(6, 16)?;
         let (l7, ring7) = mk(7, ring7_size)?;
@@ -602,21 +665,59 @@ impl<'a> DecodeResources<'a> {
             .count();
         let kv_cache = DeviceKvCache::new(ctx, n_full, n_kv, config.head_dim, KV_CACHE_MAX_SEQ)?;
 
+        // Persistent device-resident gated-delta state, one block per linear
+        // layer (conv ring + recurrent S matrix). Sized exactly like the host
+        // `Qwen35ForwardState` Vecs it replaces, but resident across tokens.
+        let n_linear = config.layer_types.len() - n_full;
+        let qkv_dim = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_per_layer = qkv_dim * config.linear_conv_kernel_dim.saturating_sub(1);
+        let gdr_per_layer = config.linear_num_value_heads
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let lin_conv_stride = (conv_per_layer * std::mem::size_of::<f32>()) as u64;
+        let lin_gdr_stride = (gdr_per_layer * std::mem::size_of::<f32>()) as u64;
+        // At least 4 bytes so a dense (no-linear-layer) config still allocs a
+        // valid buffer; the linear path never binds it then.
+        let conv_total = (lin_conv_stride * n_linear as u64).max(4);
+        let gdr_total = (lin_gdr_stride * n_linear as u64).max(4);
+        let mut lin_conv_state = DeviceBuffer::alloc_uma(ctx, conv_total as usize)
+            .map_err(|e| anyhow!("alloc linear conv state ({conv_total} B): {e}"))?;
+        let mut lin_gdr_state = DeviceBuffer::alloc_uma(ctx, gdr_total as usize)
+            .map_err(|e| anyhow!("alloc linear gdr state ({gdr_total} B): {e}"))?;
+        zero_device_buffer(&mut lin_conv_state, conv_total as usize)?;
+        zero_device_buffer(&mut lin_gdr_state, gdr_total as usize)?;
+
         Ok(Self {
             arena,
             cache,
             recorder,
-            _layouts: vec![l2, l3, l5, l6, l7],
+            _layouts: vec![l2, l3, l4, l5, l6, l7],
             ring2,
             ring3,
+            ring4,
             ring5,
             ring6,
             ring7,
             kv_cache,
+            lin_conv_state,
+            lin_gdr_state,
+            lin_conv_stride,
+            lin_gdr_stride,
             gemv_submit_ns: 0,
             gemv_other_ns: 0,
             gemv_count: 0,
         })
+    }
+
+    /// Zero the device-resident gated-delta + conv state for a fresh generation
+    /// (mirrors [`Qwen35ForwardState::reset`] for the on-device path).
+    pub fn reset_linear_state(&mut self) -> Result<()> {
+        let conv_len = self.lin_conv_state.len();
+        let gdr_len = self.lin_gdr_state.len();
+        zero_device_buffer(&mut self.lin_conv_state, conv_len)?;
+        zero_device_buffer(&mut self.lin_gdr_state, gdr_len)?;
+        Ok(())
     }
 
     /// Rewind every descriptor-set ring's round-robin cursor. Called once at the
@@ -625,6 +726,7 @@ impl<'a> DecodeResources<'a> {
     pub fn reset_rings(&mut self) {
         self.ring2.reset();
         self.ring3.reset();
+        self.ring4.reset();
         self.ring5.reset();
         self.ring6.reset();
         self.ring7.reset();
@@ -1387,11 +1489,46 @@ fn full_attention<'a>(
 // RMSNorm → out-proj. Transcribed from gated_delta_rule.cu / conv1d.cu.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Linear (gated-delta) layer dispatcher. The depthwise conv1d + the recurrent
+/// gated-delta state update run on-device by default (the two model-specific
+/// serial shaders, against device-resident conv-ring + S-matrix state). Set
+/// `ARLE_LINEAR_HOST=1` to fall back to the host-f32 oracle (`linear_attention_host`)
+/// — kept as the numeric ground truth and a fast escape hatch if the device path
+/// ever regresses.
+#[allow(clippy::too_many_arguments)]
+fn linear_attention<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    state: &mut Qwen35ForwardState,
+    layer: usize,
+    linear_idx: usize,
+    normed: &[f32],
+) -> Result<Vec<f32>> {
+    if linear_attention_host_forced() {
+        return linear_attention_host(ctx, config, weights, res, state, layer, linear_idx, normed);
+    }
+    linear_attention_device(ctx, config, weights, res, layer, linear_idx, normed)
+}
+
+/// `true` iff the host-f32 linear-attention oracle is force-selected via
+/// `ARLE_LINEAR_HOST` (any non-empty, non-`0` value). Cached after first read.
+fn linear_attention_host_forced() -> bool {
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("ARLE_LINEAR_HOST")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 // Several inner loops index sibling arrays by the same loop variable (the
 // depthwise conv taps, the gated-delta state passes) — a range loop mirrors the
 // CUDA reference's index math one-to-one and is clearer than a zipped iterator.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn linear_attention<'a>(
+fn linear_attention_host<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
@@ -1563,6 +1700,216 @@ fn linear_attention<'a>(
 
     // out_proj: [v_dim_total -> hidden].
     gemv_layer(ctx, weights, res, layer, "ssm_out", &normed_out)
+}
+
+/// On-device gated-delta linear-attention for one token. The depthwise conv1d +
+/// the recurrent gated-delta state update run on the two model-specific serial
+/// shaders against device-resident state (the conv ring + the `[v_head, key_dim,
+/// val_dim]` S matrix per linear layer), so the 48 linear layers no longer
+/// round-trip the conv/recurrence state to the host. Oracle-gated against
+/// [`linear_attention_host`] (the verified host-f32 path).
+///
+/// Flow: in-proj GEMVs (device) → upload raw `qkv` → record conv1d+SiLU (device,
+/// advances the resident ring) → record gated-delta recurrence (device,
+/// read+writes the resident S matrix) → read back the recurrence output → gated
+/// output RMSNorm × silu(z) (host f32, small) → out-proj GEMV (device).
+#[allow(clippy::too_many_arguments)]
+fn linear_attention_device<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    layer: usize,
+    linear_idx: usize,
+    normed: &[f32],
+) -> Result<Vec<f32>> {
+    let kd = config.linear_key_head_dim; // 128
+    let vd = config.linear_value_head_dim; // 128
+    let nk = config.linear_num_key_heads; // 16
+    let nv = config.linear_num_value_heads; // 48
+    let kernel = config.linear_conv_kernel_dim; // 4
+    let v_dim_total = nv * vd; // 6144
+    let qkv_dim = 2 * nk * kd + v_dim_total; // 10240
+    let eps = config.rms_norm_eps;
+
+    // ── in projections (already device GEMVs returning host Vecs). ──
+    let qkv = gemv_layer(ctx, weights, res, layer, "attn_qkv", normed)?; // [qkv_dim]
+    let z = gemv_layer(ctx, weights, res, layer, "attn_gate", normed)?; // [v_dim_total]
+    let a_proj = gemv_layer(ctx, weights, res, layer, "ssm_alpha", normed)?; // [nv]
+    let b_proj = gemv_layer(ctx, weights, res, layer, "ssm_beta", normed)?; // [nv]
+
+    // ── Land the per-token activations into the arena's linear slots (UMA). ──
+    res.arena.write_at(res.arena.lin_xseq.offset, &qkv)?;
+    res.arena.write_at(res.arena.lin_a.offset, &a_proj)?;
+    res.arena.write_at(res.arena.lin_b.offset, &b_proj)?;
+
+    // ── Resolve the F32-resident SSM weight buffers (bound directly). ──
+    let conv_w_buf = ssm_weight_buffer(weights, layer, "ssm_conv1d.weight", kernel * qkv_dim)?;
+    let a_log_buf = ssm_weight_buffer(weights, layer, "ssm_a", nv)?;
+    let dt_bias_buf = ssm_weight_buffer(weights, layer, "ssm_dt.bias", nv)?;
+
+    // Per-linear-layer state sub-ranges (resident across tokens).
+    let conv_off = res.lin_conv_stride * linear_idx as u64;
+    let conv_len = res.lin_conv_stride;
+    let gdr_off = res.lin_gdr_stride * linear_idx as u64;
+    let gdr_len = res.lin_gdr_stride;
+
+    // ── 1. Depthwise conv1d + SiLU (single token), advancing the resident ring.
+    let conv_push = qwen35_ssm_conv_params(qkv_dim as u32, 1, kernel as u32).to_le_bytes();
+    let conv_groups = {
+        let d = qwen35_ssm_conv_dispatch(qkv_dim as u32);
+        [d.x, d.y, d.z]
+    };
+    let xseq_off = res.arena.lin_xseq.offset;
+    let qkv_conv_off = res.arena.lin_qkv_conv.offset;
+    let xseq_len = (qkv_dim * std::mem::size_of::<f32>()) as u64;
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("linear[{layer}] conv begin: {e}"))?;
+    {
+        let DecodeResources {
+            cache,
+            recorder,
+            arena,
+            ring4,
+            lin_conv_state,
+            ..
+        } = res;
+        let arena_buf = &arena.buffer;
+        let (pipeline, _) = cache
+            .get(
+                ctx,
+                Kernel::Qwen35SsmConv,
+                Kernel::Qwen35SsmConv.specialization_u32(),
+                conv_push.len() as u32,
+                4,
+            )
+            .map_err(|e| anyhow!("linear[{layer}]: build conv pipeline: {e}"))?;
+        let set = ring4
+            .next_updated(&[
+                (arena_buf, xseq_off, xseq_len),          // 0: XSeq (raw qkv)
+                (conv_w_buf, 0, conv_w_buf.len() as u64), // 1: ConvWeight
+                (lin_conv_state, conv_off, conv_len),     // 2: ConvState (ring)
+                (arena_buf, qkv_conv_off, xseq_len),      // 3: OutSeq
+            ])
+            .map_err(|e| anyhow!("linear[{layer}]: bind conv set: {e}"))?;
+        recorder.dispatch_raw(pipeline, set, &conv_push, conv_groups);
+    }
+    let t_conv = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("linear[{layer}] conv submit: {e}"))?;
+    res.gemv_submit_ns += t_conv.elapsed().as_nanos();
+
+    // ── 2. Recurrent gated-delta state update (single token), read+writes the
+    //       resident S matrix. Reads `qkv_conv` (binding 0) + the a/b projections.
+    let gd_push =
+        qwen35_gated_delta_net_params(nk as u32, nv as u32, kd as u32, vd as u32, 1).to_le_bytes();
+    let gd_groups = {
+        let d = qwen35_gated_delta_net_dispatch(nv as u32);
+        [d.x, d.y, d.z]
+    };
+    let a_off = res.arena.lin_a.offset;
+    let b_off = res.arena.lin_b.offset;
+    let out_off = res.arena.lin_out.offset;
+    let a_len = (nv * std::mem::size_of::<f32>()) as u64;
+    let out_len = (v_dim_total * std::mem::size_of::<f32>()) as u64;
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("linear[{layer}] gdr begin: {e}"))?;
+    {
+        let DecodeResources {
+            cache,
+            recorder,
+            arena,
+            ring7,
+            lin_gdr_state,
+            ..
+        } = res;
+        let arena_buf = &arena.buffer;
+        let (pipeline, _) = cache
+            .get(
+                ctx,
+                Kernel::Qwen35GatedDeltaNet,
+                Kernel::Qwen35GatedDeltaNet.specialization_u32(),
+                gd_push.len() as u32,
+                7,
+            )
+            .map_err(|e| anyhow!("linear[{layer}]: build gated-delta pipeline: {e}"))?;
+        let set = ring7
+            .next_updated(&[
+                (arena_buf, qkv_conv_off, xseq_len),        // 0: Qkv (post-conv)
+                (arena_buf, b_off, a_len),                  // 1: BProj
+                (arena_buf, a_off, a_len),                  // 2: AProj
+                (dt_bias_buf, 0, dt_bias_buf.len() as u64), // 3: DtBias
+                (a_log_buf, 0, a_log_buf.len() as u64),     // 4: ALog (ssm_a)
+                (lin_gdr_state, gdr_off, gdr_len),          // 5: State (S matrix)
+                (arena_buf, out_off, out_len),              // 6: Output
+            ])
+            .map_err(|e| anyhow!("linear[{layer}]: bind gated-delta set: {e}"))?;
+        recorder.dispatch_raw(pipeline, set, &gd_push, gd_groups);
+    }
+    let t_gd = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("linear[{layer}] gdr submit: {e}"))?;
+    res.gemv_submit_ns += t_gd.elapsed().as_nanos();
+
+    // ── 3. Read back the recurrence output for the gated norm + out-proj. ──
+    let gdr_out = res.arena.read_at(out_off, v_dim_total)?;
+
+    // ── 4. Gated output RMSNorm × silu(z): per value head over val_dim, PLAIN f32
+    //       weight (broadcast across heads). Host f32 (small; matches the oracle).
+    let ssm_norm = dequant_f32(
+        weights
+            .get(&format!("blk.{layer}.ssm_norm.weight"))
+            .ok_or_else(|| anyhow!("missing blk.{layer}.ssm_norm.weight"))?,
+        vd,
+    )?;
+    let mut normed_out = vec![0.0f32; v_dim_total];
+    for vh in 0..nv {
+        let x = &gdr_out[vh * vd..vh * vd + vd];
+        let gate = &z[vh * vd..vh * vd + vd];
+        let mut sumsq = 0.0f32;
+        for &xv in x {
+            sumsq += xv * xv;
+        }
+        let inv = 1.0 / (sumsq / vd as f32 + eps).sqrt();
+        let out = &mut normed_out[vh * vd..vh * vd + vd];
+        for d in 0..vd {
+            out[d] = x[d] * inv * ssm_norm[d] * silu(gate[d]);
+        }
+    }
+
+    // ── 5. out_proj: [v_dim_total -> hidden] (device GEMV). ──
+    gemv_layer(ctx, weights, res, layer, "ssm_out", &normed_out)
+}
+
+/// Borrow an F32-resident SSM weight tensor's device buffer (`DequantF32`
+/// residency), checking it holds at least `len` f32. The conv1d weight, `ssm_a`,
+/// and `ssm_dt.bias` are stored on-device as plain f32 in the exact layout the
+/// `qwen35_*` shaders bind, so they bind directly with no host round-trip.
+fn ssm_weight_buffer<'b>(
+    weights: &'b ResidentWeights<'_>,
+    layer: usize,
+    suffix: &str,
+    len: usize,
+) -> Result<&'b DeviceBuffer<'b>> {
+    let name = format!("blk.{layer}.{suffix}");
+    let t = weights
+        .get(&name)
+        .ok_or_else(|| anyhow!("missing {name}"))?;
+    if !matches!(t.residency, Residency::DequantF32) {
+        bail!(
+            "{name}: expected F32-resident SSM weight, got {:?}",
+            t.residency
+        );
+    }
+    let want = len * std::mem::size_of::<f32>();
+    if t.buffer.len() < want {
+        bail!("{name}: F32 buffer {} B < {len} f32 needed", t.buffer.len());
+    }
+    Ok(&t.buffer)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

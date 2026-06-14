@@ -208,9 +208,15 @@ impl VulkanQwen36Model {
         })
     }
 
-    /// Reset the per-slot recurrent + KV state for a fresh generation.
+    /// Reset the per-slot recurrent + KV state for a fresh generation. Zeros both
+    /// the host `Qwen35ForwardState` and the device-resident gated-delta + conv
+    /// state (the on-device linear-attention path), so a fresh sequence starts
+    /// clean regardless of which path is selected.
     pub fn reset_state(&mut self) {
         self.state.reset();
+        if let Err(e) = self.decode.reset_linear_state() {
+            panic!("reset device linear state: {e}");
+        }
     }
 
     /// Drain the accumulated GEMV timing `(submit_secs, other_secs, gemv_count)`.

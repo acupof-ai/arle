@@ -56,7 +56,13 @@ void main() {
         return;
     }
 
-    const uint k_head = v_head * p.num_key_heads / p.num_value_heads;
+    // GQA key-head mapping: llama.cpp expands the key heads to value heads with
+    // `ggml_repeat`, which TILES rather than block-broadcasts — value head
+    // `v_head` reads key head `v_head % num_key_heads`, NOT
+    // `v_head * num_key_heads / num_value_heads`. The block-broadcast form
+    // scrambled every linear layer's q/k (see the host oracle in
+    // forward.rs::linear_attention).
+    const uint k_head = v_head % p.num_key_heads;
     const uint q_dim_total = p.key_dim * p.num_key_heads;
     const uint k_dim_total = q_dim_total;
     const uint qkv_stride = q_dim_total + k_dim_total + p.val_dim * p.num_value_heads;
@@ -78,7 +84,11 @@ void main() {
 
         const float a_val = a_proj[token * p.num_value_heads + v_head];
         const float b_val = b_proj[token * p.num_value_heads + v_head];
-        const float exp_g = exp(-exp(a_log[v_head]) * softplus(a_val + dt_bias[v_head]));
+        // GGUF `ssm_a` already stores A = -exp(A_log) (the converter pre-applied
+        // the -exp; verified negative on-box). So the log-decay is
+        // A * softplus(dt), NOT -exp(A) * softplus(dt). Matches the host oracle
+        // and llama.cpp delta-net-base.cpp (`g = ggml_exp(softplus * ssm_a)`).
+        const float exp_g = exp(a_log[v_head] * softplus(a_val + dt_bias[v_head]));
         const float beta = sigmoid(b_val);
 
         for (uint val = 0; val < p.val_dim; ++val) {
