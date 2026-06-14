@@ -613,6 +613,212 @@ mod real {
         }
     }
 
+    /// Records many compute dispatches into **one** primary command buffer and
+    /// submits them with a **single** `vkQueueSubmit` on a reused fence — the
+    /// `ggml-vulkan` decode sync model.
+    ///
+    /// This replaces the per-dispatch `CommandPool::one_shot_submit` drain
+    /// (alloc + record + submit(NULL fence) + `queue_wait_idle` + free, once per
+    /// op) on the forward path. `one_shot_submit` stays only for cold weight
+    /// upload; the hot per-token decode graph records here.
+    ///
+    /// Lifecycle: `begin()` → N × (`dispatch()` / `barrier()`) →
+    /// `submit_and_wait()`. The command buffer and fence are allocated once and
+    /// reused across tokens (the pool is created with
+    /// `RESET_COMMAND_BUFFER`, so `begin()` can reset the buffer in place).
+    pub struct CommandRecorder<'a> {
+        ctx: &'a VulkanContext,
+        pool: vk::CommandPool,
+        command_buffer: vk::CommandBuffer,
+        fence: vk::Fence,
+        /// True between `submit_and_wait()`'s `queue_submit` and the next
+        /// `begin()`'s fence wait — guards against re-recording a buffer whose
+        /// prior submission has not yet been waited on.
+        pending: bool,
+    }
+
+    impl<'a> CommandRecorder<'a> {
+        pub fn new(ctx: &'a VulkanContext) -> Result<Self> {
+            let pool_create = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(ctx.queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let pool = unsafe { ctx.device.create_command_pool(&pool_create, None) }
+                .map_err(|e| vk_error("creating Vulkan command pool", e))?;
+
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = match unsafe { ctx.device.allocate_command_buffers(&alloc) } {
+                Ok(buffers) => match buffers.first().copied() {
+                    Some(buffer) => buffer,
+                    None => {
+                        unsafe { ctx.device.destroy_command_pool(pool, None) };
+                        return Err(VulkanError::Runtime(
+                            "Vulkan command buffer allocation returned no buffers".to_string(),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    unsafe { ctx.device.destroy_command_pool(pool, None) };
+                    return Err(vk_error("allocating Vulkan command buffer", e));
+                }
+            };
+
+            let fence_create = vk::FenceCreateInfo::default();
+            let fence = match unsafe { ctx.device.create_fence(&fence_create, None) } {
+                Ok(fence) => fence,
+                Err(e) => {
+                    unsafe { ctx.device.destroy_command_pool(pool, None) };
+                    return Err(vk_error("creating Vulkan fence", e));
+                }
+            };
+
+            Ok(Self {
+                ctx,
+                pool,
+                command_buffer,
+                fence,
+                pending: false,
+            })
+        }
+
+        /// Open the buffer for a fresh batch. Waits for any prior submission's
+        /// fence (never re-record before the GPU is done — bugs there read as
+        /// numeric corruption), resets the fence, then resets + begins the
+        /// command buffer.
+        pub fn begin(&mut self) -> Result<()> {
+            if self.pending {
+                unsafe {
+                    self.ctx
+                        .device
+                        .wait_for_fences(&[self.fence], true, u64::MAX)
+                }
+                .map_err(|e| vk_error("waiting for Vulkan fence", e))?;
+                self.pending = false;
+            }
+            unsafe { self.ctx.device.reset_fences(&[self.fence]) }
+                .map_err(|e| vk_error("resetting Vulkan fence", e))?;
+            unsafe {
+                self.ctx
+                    .device
+                    .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+            }
+            .map_err(|e| vk_error("resetting Vulkan command buffer", e))?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe {
+                self.ctx
+                    .device
+                    .begin_command_buffer(self.command_buffer, &begin)
+            }
+            .map_err(|e| vk_error("beginning Vulkan command buffer", e))?;
+            Ok(())
+        }
+
+        /// Record one compute dispatch (bind pipeline + descriptor set, push
+        /// constants, dispatch) into the open buffer. No submit, no drain — this
+        /// is exactly the body of `one_shot_submit`'s closure as used on the
+        /// kernel path, minus the submit.
+        pub fn dispatch(
+            &mut self,
+            pipeline: &ComputePipeline<'_>,
+            set: &DescriptorSet<'_>,
+            push: &[u8],
+            groups: [u32; 3],
+        ) {
+            let device = &self.ctx.device;
+            let cmd = self.command_buffer;
+            unsafe {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.raw());
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.layout(),
+                    0,
+                    &[set.raw()],
+                    &[],
+                );
+                if !push.is_empty() {
+                    device.cmd_push_constants(
+                        cmd,
+                        pipeline.layout(),
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        push,
+                    );
+                }
+                device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+            }
+        }
+
+        /// Record a single compute→compute execution+memory barrier so a later
+        /// dispatch reads the writes of the earlier one. Mirrors
+        /// `ggml-vulkan.cpp:2717-2737` `ggml_vk_sync_buffers` (one
+        /// `vkCmdPipelineBarrier`, global `MemoryBarrier`, SHADER_WRITE →
+        /// SHADER_READ|SHADER_WRITE over the COMPUTE_SHADER stage).
+        pub fn barrier(&mut self) {
+            let memory_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            unsafe {
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[memory_barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+
+        /// End the buffer, submit it with **one** `vkQueueSubmit` **on the
+        /// fence** (no NULL fence, no `queue_wait_idle`), then wait the fence.
+        /// Mirrors `ggml-vulkan.cpp:2278-2355` (one submit) +
+        /// `2037-2067`/`13474-13485` (one fence wait per batch). A YIELD-spin
+        /// tail-latency variant can replace the blocking wait later.
+        pub fn submit_and_wait(&mut self) -> Result<()> {
+            unsafe { self.ctx.device.end_command_buffer(self.command_buffer) }
+                .map_err(|e| vk_error("ending Vulkan command buffer", e))?;
+            let command_buffers = [self.command_buffer];
+            let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            unsafe {
+                self.ctx
+                    .device
+                    .queue_submit(self.ctx.queue, &submits, self.fence)
+            }
+            .map_err(|e| vk_error("submitting Vulkan command buffer", e))?;
+            self.pending = true;
+            unsafe {
+                self.ctx
+                    .device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+            }
+            .map_err(|e| vk_error("waiting for Vulkan fence", e))?;
+            self.pending = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for CommandRecorder<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                // The fence guarantees the GPU is done with the buffer before we
+                // free its pool; only wait if a submission is still in flight.
+                if self.pending {
+                    let _ = self
+                        .ctx
+                        .device
+                        .wait_for_fences(&[self.fence], true, u64::MAX);
+                }
+                self.ctx.device.destroy_fence(self.fence, None);
+                self.ctx.device.destroy_command_pool(self.pool, None);
+            }
+        }
+    }
+
     pub struct ShaderModule<'a> {
         ctx: &'a VulkanContext,
         module: vk::ShaderModule,
@@ -914,8 +1120,8 @@ mod real {
 
 #[cfg(feature = "vulkan")]
 pub use real::{
-    CommandPool, ComputePipeline, DescriptorSet, DescriptorSetLayout, DeviceBuffer, ShaderModule,
-    VulkanContext, device_count, device_name, init,
+    CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
+    DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(not(feature = "vulkan"))]
@@ -985,6 +1191,16 @@ mod stub {
 
     impl<'a> CommandPool<'a> {
         pub fn create(_ctx: &'a VulkanContext) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+    }
+
+    pub struct CommandRecorder<'a> {
+        _marker: PhantomData<&'a VulkanContext>,
+    }
+
+    impl<'a> CommandRecorder<'a> {
+        pub fn new(_ctx: &'a VulkanContext) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
@@ -1059,8 +1275,8 @@ mod stub {
 
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
-    CommandPool, ComputePipeline, DescriptorSet, DescriptorSetLayout, DeviceBuffer, ShaderModule,
-    VulkanContext, device_count, device_name, init,
+    CommandPool, CommandRecorder, ComputePipeline, DescriptorSet, DescriptorSetLayout,
+    DeviceBuffer, ShaderModule, VulkanContext, device_count, device_name, init,
 };
 
 #[cfg(test)]
@@ -1122,5 +1338,236 @@ mod tests {
             panic!("D2H copy failed: {e}");
         }
         assert_eq!(src, back, "H2D/D2H roundtrip mismatch");
+    }
+
+    /// Find `glslc` the same way `vulkan-kernels/build.rs` does: explicit
+    /// `ARLE_VULKAN_GLSLC`, then `VULKAN_SDK/bin`, then `PATH`. Returns `None`
+    /// so the test can skip cleanly on a box without a shader compiler.
+    #[cfg(feature = "vulkan")]
+    fn find_glslc() -> Option<std::path::PathBuf> {
+        use std::path::{Path, PathBuf};
+        if let Some(path) = std::env::var_os("ARLE_VULKAN_GLSLC") {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        const NAMES: &[&str] = &["glslc", "glslc.exe"];
+        if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
+            let bin = Path::new(&sdk).join("bin");
+            for name in NAMES {
+                let path = bin.join(name);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths).find_map(|dir| {
+                NAMES
+                    .iter()
+                    .map(|name| dir.join(name))
+                    .find(|candidate| candidate.exists())
+            })
+        })
+    }
+
+    /// Compile a trivial "add a push-constant scalar to every element of an
+    /// in-place f32 buffer" compute shader to SPIR-V. One binding, one uint of
+    /// push (the count) + one int (the addend); a later dispatch reading an
+    /// earlier dispatch's writes is exactly the barrier-ordering we must prove.
+    #[cfg(feature = "vulkan")]
+    fn compile_add_shader(glslc: &std::path::Path) -> Option<Vec<u8>> {
+        const SRC: &str = r#"#version 450
+layout(local_size_x = 64) in;
+layout(push_constant) uniform Params { uint n; int addend; } p;
+layout(binding = 0) buffer Buf { int data[]; };
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) { return; }
+    data[i] = data[i] + p.addend;
+}
+"#;
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let src_path = dir.join(format!("arle_cmdrec_add_{pid}.comp"));
+        let spv_path = dir.join(format!("arle_cmdrec_add_{pid}.spv"));
+        std::fs::write(&src_path, SRC).ok()?;
+        let output = std::process::Command::new(glslc)
+            .arg("-O")
+            .arg("--target-env=vulkan1.2")
+            .arg("-fshader-stage=compute")
+            .arg("-o")
+            .arg(&spv_path)
+            .arg(&src_path)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_file(&src_path);
+        if !output.status.success() {
+            eprintln!(
+                "vulkan-sys CommandRecorder test: glslc failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        let bytes = std::fs::read(&spv_path).ok();
+        let _ = std::fs::remove_file(&spv_path);
+        bytes
+    }
+
+    /// Proves the new single-submit barrier-chained primitive:
+    ///   1. Record 3 `add(+k)` dispatches into ONE `CommandRecorder`, each
+    ///      separated by `barrier()`, and `submit_and_wait()` exactly ONCE.
+    ///      Because each dispatch reads the previous dispatch's writes in place,
+    ///      the result is correct only if the barriers serialize the chain.
+    ///   2. Reproduce the same chain with 3 sequential `one_shot_submit`s (each
+    ///      doing its own submit + `queue_wait_idle`) and assert byte-identical
+    ///      results — the new primitive matches the proven drain-per-op path.
+    /// One `submit_and_wait` call == one `vkQueueSubmit` for all 3 dispatches
+    /// (structurally guaranteed: `submit_and_wait` issues exactly one
+    /// `queue_submit`), versus 3 submits + 3 full `queue_wait_idle` drains in
+    /// the reference.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn command_recorder_chains_three_dispatches_with_one_submit() {
+        if init().is_err() {
+            eprintln!("CommandRecorder test: loader unavailable — skipping");
+            return;
+        }
+        match device_count() {
+            Ok(0) | Err(_) => {
+                eprintln!("CommandRecorder test: no devices — skipping");
+                return;
+            }
+            Ok(_) => {}
+        }
+        let ctx = match VulkanContext::create() {
+            Ok(ctx) => ctx,
+            Err(VulkanError::NoComputeDevice) => {
+                eprintln!("CommandRecorder test: no compute queue — skipping");
+                return;
+            }
+            Err(e) => panic!("failed to create Vulkan context: {e}"),
+        };
+        let Some(glslc) = find_glslc() else {
+            eprintln!("CommandRecorder test: glslc not found — skipping");
+            return;
+        };
+        let Some(spirv) = compile_add_shader(&glslc) else {
+            eprintln!("CommandRecorder test: shader compile failed — skipping");
+            return;
+        };
+
+        const N: usize = 256;
+        let initial: Vec<i32> = (0..N as i32).collect();
+        // Three addends applied in order; final value per element = i + 11.
+        const ADDENDS: [i32; 3] = [2, 4, 5];
+        let expected: Vec<i32> = initial.iter().map(|&v| v + 2 + 4 + 5).collect();
+
+        let bytes_of = |v: &[i32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        };
+        let ints_of = |b: &[u8]| -> Vec<i32> {
+            b.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+
+        let shader =
+            ShaderModule::from_spirv_bytes(&ctx, &spirv).expect("create add shader module");
+        let layout = DescriptorSetLayout::storage_buffers(&ctx, 1).expect("create DSL");
+        // push = { uint n; int addend; } = 8 bytes.
+        let push_bytes: u32 = 8;
+        let pipeline =
+            ComputePipeline::create_with_push_constants(&ctx, &shader, &[&layout], push_bytes)
+                .expect("create add pipeline");
+        let groups = [(N as u32).div_ceil(64), 1, 1];
+        let push_for = |addend: i32| -> Vec<u8> {
+            let mut p = Vec::with_capacity(8);
+            p.extend_from_slice(&(N as u32).to_le_bytes());
+            p.extend_from_slice(&addend.to_le_bytes());
+            p
+        };
+
+        // --- Path A: ONE CommandRecorder, 3 dispatches, barriers, ONE submit ---
+        let chained = {
+            let mut buf = DeviceBuffer::alloc(&ctx, N * 4).expect("alloc chained buf");
+            buf.copy_from_host(&bytes_of(&initial))
+                .expect("H2D chained");
+            let set = DescriptorSet::storage_buffers(&ctx, &layout, &[&buf]).expect("DS chained");
+            let mut rec = CommandRecorder::new(&ctx).expect("CommandRecorder::new");
+            rec.begin().expect("recorder begin");
+            for (idx, &addend) in ADDENDS.iter().enumerate() {
+                rec.dispatch(&pipeline, &set, &push_for(addend), groups);
+                if idx + 1 < ADDENDS.len() {
+                    rec.barrier();
+                }
+            }
+            // Exactly one submit for all three dispatches.
+            rec.submit_and_wait().expect("recorder submit_and_wait");
+            let mut back = vec![0u8; N * 4];
+            buf.copy_to_host(&mut back).expect("D2H chained");
+            ints_of(&back)
+        };
+
+        // --- Path B: 3 sequential one_shot_submits (drain per op) reference ---
+        let sequential = {
+            let mut buf = DeviceBuffer::alloc(&ctx, N * 4).expect("alloc seq buf");
+            buf.copy_from_host(&bytes_of(&initial)).expect("H2D seq");
+            let set = DescriptorSet::storage_buffers(&ctx, &layout, &[&buf]).expect("DS seq");
+            let pool = CommandPool::create(&ctx).expect("CommandPool::create");
+            for &addend in &ADDENDS {
+                let push = push_for(addend);
+                pool.one_shot_submit(|cmd| {
+                    let device = ctx.raw_device();
+                    unsafe {
+                        device.cmd_bind_pipeline(
+                            cmd,
+                            ash::vk::PipelineBindPoint::COMPUTE,
+                            pipeline.raw(),
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            cmd,
+                            ash::vk::PipelineBindPoint::COMPUTE,
+                            pipeline.layout(),
+                            0,
+                            &[set.raw()],
+                            &[],
+                        );
+                        device.cmd_push_constants(
+                            cmd,
+                            pipeline.layout(),
+                            ash::vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &push,
+                        );
+                        device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+                    }
+                    Ok(())
+                })
+                .expect("one_shot_submit");
+            }
+            let mut back = vec![0u8; N * 4];
+            buf.copy_to_host(&mut back).expect("D2H seq");
+            ints_of(&back)
+        };
+
+        assert_eq!(
+            chained, expected,
+            "barrier-chained result wrong — barriers did not serialize the in-place adds"
+        );
+        assert_eq!(
+            chained, sequential,
+            "single-submit chain != 3 sequential one_shot_submits"
+        );
+        eprintln!(
+            "CommandRecorder test: 3 barrier-chained dispatches via ONE submit_and_wait == 3 one_shot_submits ({} elems, +{} each elem)",
+            N,
+            ADDENDS.iter().sum::<i32>()
+        );
     }
 }
