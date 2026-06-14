@@ -1,0 +1,47 @@
+#version 450
+// ARLE Vulkan shader: pack one f32 head row into the f16 KV cache.
+//
+// The Qwen3.5 full-attention block writes each token's post-rope K row and raw
+// V row into a device-resident f16 KV cache (`DeviceKvCache`), which the
+// flash-attn kernel reads as `float16_t`. Previously the host read the roped K /
+// raw V back from the arena, converted to f16, and wrote the cache via the UMA
+// pointer — forcing a device->host->device round-trip BETWEEN the projection/rope
+// submit and the flash submit. This shader does that f32->f16 conversion ON THE
+// DEVICE, so the whole full-attention block (projections, q/k norm, rope, KV
+// pack, flash, gate) records into ONE submit with no mid-block readback.
+//
+// `src` (binding 0, f32) is the head row at the arena slot; `dst` (binding 1,
+// f16) is the cache plane sub-range bound at the exact `(layer, kv_head, pos)`
+// byte offset, so writing index `i` lands the row at the cached position. The
+// host computes the offset (same math as the prior host pack) and binds the
+// destination there. One f16 row = `head_dim` values; the host dispatches
+// `ceil(n / 256)` workgroups.
+//
+// Round-to-nearest-even f32->f16 is the hardware `float16_t(float)` cast, which
+// matches the host `f32_to_f16_bits` (RNE) the cache contract was validated
+// against to within the f16 ULP the flash kernel already tolerates.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n;
+} p;
+
+layout(binding = 0) readonly buffer A {
+    float src[];
+};
+
+layout(binding = 1) writeonly buffer D {
+    float16_t dst[];
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) {
+        return;
+    }
+    dst[idx] = float16_t(src[idx]);
+}

@@ -56,12 +56,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use qwen35_spec::{LayerType, Qwen35Config};
 use vulkan_kernels::{
     BLOCK_Q8_1_BYTES, FlashAttentionSpec, Kernel, KernelCache, KernelParams,
-    Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params, flash_attn_dispatch, flash_attn_params,
-    gemv_dispatch, gemv_id_dispatch, gemv_id_params, gemv_params, q8_1_quantize_dispatch,
-    q8_1_quantize_params, qwen35_gated_delta_net_dispatch, qwen35_gated_delta_net_params,
-    qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params, rms_norm_dispatch, rms_norm_params,
-    rope_neox_dispatch, rope_neox_params, scaled_add_dispatch, scaled_add_params,
-    sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
+    Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params, f16_kv_pack_dispatch, f16_kv_pack_params,
+    flash_attn_dispatch, flash_attn_params, gemv_dispatch, gemv_id_dispatch, gemv_id_params,
+    gemv_params, q8_1_quantize_dispatch, q8_1_quantize_params, qwen35_gated_delta_net_dispatch,
+    qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
+    rms_norm_dispatch, rms_norm_params, rope_neox_dispatch, rope_neox_params, scaled_add_dispatch,
+    scaled_add_params, sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -149,52 +149,6 @@ fn zero_device_buffer(buf: &mut DeviceBuffer<'_>, len: usize) -> Result<()> {
         .map_err(|e| anyhow!("zero device buffer ({len} B): {e}"))
 }
 
-/// f32 -> f16 (IEEE binary16) bit pattern, round-to-nearest-even. The device
-/// flash-attn reads K/V as `float16_t`, and the per-slot KV cache stores them
-/// f16, so the host stages each post-rope K row / V row through this before the
-/// UMA write. Matches the GPU's f16 conversion used in the oracle test.
-fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x007f_ffff;
-    if exp == 0xff {
-        return sign | 0x7c00 | (if mant != 0 { 0x0200 } else { 0 });
-    }
-    let mut e = exp - 127 + 15;
-    if e >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if e <= 0 {
-        if e < -10 {
-            return sign;
-        }
-        let mant_with_implicit = mant | 0x0080_0000;
-        let shift = (14 - e) as u32;
-        let mut m = mant_with_implicit >> shift;
-        let rem_mask = (1u32 << shift) - 1;
-        let rem = mant_with_implicit & rem_mask;
-        let halfway = 1u32 << (shift - 1);
-        if rem > halfway || (rem == halfway && (m & 1) == 1) {
-            m += 1;
-        }
-        return sign | m as u16;
-    }
-    let mut m = mant >> 13;
-    let rem = mant & 0x1fff;
-    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
-        m += 1;
-        if m == 0x0400 {
-            m = 0;
-            e += 1;
-            if e >= 0x1f {
-                return sign | 0x7c00;
-            }
-        }
-    }
-    sign | ((e as u16) << 10) | m as u16
-}
-
 /// Decode-time cap on the per-slot full-attention KV cache (positions). The full
 /// 32k context would need ~17 GB of f16 K+V across the 16 full layers; the decode
 /// path (prefill + a generation run) stays well under this, and a forward that
@@ -260,30 +214,20 @@ impl<'a> DeviceKvCache<'a> {
         plane_off + (pos * self.head_dim * std::mem::size_of::<u16>()) as u64
     }
 
-    /// Write one f32 K/V head row into the cache at `(full_idx, kv_head, pos)`,
-    /// converting to f16 (UMA, no staging buffer). `is_v` selects the V block.
-    fn write_row(
-        &mut self,
-        full_idx: usize,
-        kv_head: usize,
-        pos: usize,
-        row: &[f32],
-        is_v: bool,
-    ) -> Result<()> {
-        debug_assert_eq!(row.len(), self.head_dim);
+    /// Byte offset + byte length of one `(full_idx, kv_head, pos)` head row
+    /// `[head_dim]` f16 in the K (or V) block — the destination a device
+    /// `f16_kv_pack` dispatch binds to write this token's roped K / raw V without
+    /// a host readback — the same `[K block | V block]` × `[layer, kv_head, pos,
+    /// head_dim]` address math the host pack used, exposed so the on-device pack
+    /// lands the row at the identical cache position.
+    fn row_dst(&self, full_idx: usize, kv_head: usize, pos: usize, is_v: bool) -> (u64, u64) {
         let plane = if is_v {
             self.v_plane_off(full_idx, kv_head)
         } else {
             self.k_plane_off(full_idx, kv_head)
         };
         let off = self.pos_row_off(plane, pos);
-        let bytes: Vec<u8> = row
-            .iter()
-            .flat_map(|&v| f32_to_f16_bits(v).to_le_bytes())
-            .collect();
-        self.buffer.copy_from_host_at(off, &bytes).map_err(|e| {
-            anyhow!("write KV cache row (layer {full_idx}, kv_head {kv_head}, pos {pos}): {e}")
-        })
+        (off, (self.head_dim * std::mem::size_of::<u16>()) as u64)
     }
 }
 
@@ -389,6 +333,20 @@ pub struct DeviceArena<'a> {
     /// f32 `[v_dim_total]` — the gated-delta recurrence output (`Output`),
     /// read back for the gated RMSNorm + out-proj.
     lin_out: Slot,
+    // ── Residual-resident layer-loop slots (Step 3). The hidden state lives in
+    // `hid` device-resident across the WHOLE layer (input-norm → attention →
+    // residual-add → post-norm → FFN → residual-add): the embedding uploads it
+    // once, every sub-op reads/writes it on-device, and only the final `[vocab]`
+    // logits read back. The attention block writes its o_proj output into
+    // `attn_resident` so the FFN's post-add consumes it without a host hop. ──
+    /// f32 `[hidden]` — the resident hidden / residual stream.
+    hid: Slot,
+    /// f32 `[hidden]` — the attention block's o_proj output (consumed by the
+    /// FFN's post-attention residual add, device-resident).
+    attn_resident: Slot,
+    /// f32 `[hidden]` — the device-resident input/post RMSNorm output (the
+    /// attention block / FFN read it as their `normed` input).
+    normed_resident: Slot,
     /// Pre-sized caps so a GEMV can bail loud rather than silently corrupt.
     max_cols: usize,
     max_rows: usize,
@@ -482,6 +440,11 @@ impl<'a> DeviceArena<'a> {
         let lin_a = place(lin_a_len);
         let lin_b = place(lin_a_len);
         let lin_out = place(lin_out_len);
+        // Residual-resident layer-loop slots (Step 3), each hidden-wide f32.
+        let hid_len = config.hidden_size * std::mem::size_of::<f32>();
+        let hid = place(hid_len);
+        let attn_resident = place(hid_len);
+        let normed_resident = place(hid_len);
         let total = cursor as usize;
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
@@ -512,6 +475,9 @@ impl<'a> DeviceArena<'a> {
             lin_a,
             lin_b,
             lin_out,
+            hid,
+            attn_resident,
+            normed_resident,
             max_cols,
             max_rows,
         })
@@ -627,19 +593,30 @@ impl<'a> DecodeResources<'a> {
             CommandRecorder::new(ctx).map_err(|e| anyhow!("create decode CommandRecorder: {e}"))?;
 
         // One persistent layout + ring per decode binding count. A ring of N sets
-        // permits N live dispatches between resets; each GEMV pair / FFN sub-step
-        // submits + fence-waits before the next. The 3-binding ring is the busiest
-        // single-submit case: the full-attention per-head norm+rope records
-        // `2*(num_heads + num_kv_heads)` rms_norm/rope dispatches into ONE submit,
-        // so size it to cover that plus headroom. The 7-binding flash-attn ring
-        // records one dispatch per query head into one submit.
+        // permits N live dispatches between resets. With the RESIDUAL-RESIDENT
+        // layer loop (Step 3) a WHOLE layer — input-norm + attention block + FFN —
+        // records into ONE submit, so each ring must cover the busiest single
+        // layer's cumulative dispatch count (not just one sub-block). The full
+        // layer dominates: ring3 sees `2*(n_heads+n_kv)` q/k-norm+rope-mate norms
+        // plus `n_heads` sigmoid gates plus the FFN's 4 elementwise ops; the linear
+        // layer's per-head gated-norm (`n_value_heads` rms_norm + 1 swiglu) is the
+        // other ring3 peak. ring2 sees the full layer's q/k/v/o quantizes + the
+        // `2*n_kv` f16 KV-packs + the FFN's 3 quantizes. Size each to the worst case
+        // plus generous headroom so a ring never wraps mid-layer (which would alias
+        // a still-in-flight descriptor set and corrupt the residual stream).
         let n_heads = config.num_attention_heads;
         let n_kv = config.num_key_value_heads;
-        let ring3_size = (2 * (n_heads + n_kv) + 16).max(32);
-        // ring5 is shared by the GEMV (one dispatch/submit) and the full-attn
-        // per-head RoPE (`n_heads + n_kv` dispatches into ONE submit), so size it
-        // to cover the busier RoPE case.
-        let ring5_size = (n_heads + n_kv + 16).max(32);
+        let n_vheads = config.linear_num_value_heads;
+        // ring3: full-layer (2*(nq+nkv) norms + nq gates + 4 FFN) vs linear-layer
+        // (nv rms_norm + 1 swiglu + 1 input-norm + 4 FFN). Take the max + headroom.
+        let ring3_full = 2 * (n_heads + n_kv) + n_heads + 8;
+        let ring3_linear = n_vheads + 8;
+        let ring3_size = (ring3_full.max(ring3_linear) + 16).max(64);
+        // ring5 (GEMV + RoPE): full-layer q/k/v/o GEMV (4) + `nq+nkv` rope + 3 FFN.
+        let ring5_size = (n_heads + n_kv + 16).max(48);
+        // ring2 (quantize + f16 pack): full-layer q/k/v/o quant (4) + `2*nkv` packs
+        // + 3 FFN quant. Headroom over the ~15 worst case.
+        let ring2_size = (2 * n_kv + 16).max(32);
         let ring7_size = (n_heads + 4).max(8);
         let mk = |binding_count: usize,
                   size: usize|
@@ -650,7 +627,7 @@ impl<'a> DecodeResources<'a> {
                 .map_err(|e| anyhow!("build descriptor ring ({binding_count} bindings): {e}"))?;
             Ok((layout, ring))
         };
-        let (l2, ring2) = mk(2, 16)?;
+        let (l2, ring2) = mk(2, ring2_size)?;
         let (l3, ring3) = mk(3, ring3_size)?;
         let (l4, ring4) = mk(4, 16)?;
         let (l5, ring5) = mk(5, ring5_size)?;
@@ -825,13 +802,131 @@ pub fn forward_token<'a>(
     res.reset_rings();
 
     // ── Token embedding (host gather + dequant of one Q8_0 row). ──
-    let mut hidden = weights
+    let embed = weights
         .embedding
         .embed_row(token)
         .with_context(|| format!("embed token {token}"))?;
-    if hidden.len() != h {
-        bail!("embedding row width {} != hidden {h}", hidden.len());
+    if embed.len() != h {
+        bail!("embedding row width {} != hidden {h}", embed.len());
     }
+
+    // RESIDUAL-RESIDENT layer loop (Step 3): the DENSE path keeps the hidden state
+    // in the arena `hid` slot across each WHOLE layer (device input-norm →
+    // attention → residual-add → post-norm → FFN → residual-add) and submits ONCE
+    // per layer; only the final `[vocab]` logits read back. A model with any MoE
+    // layer, or the `ARLE_LINEAR_HOST` guard, takes the host-bridged path (the
+    // proven Step-1+2 flow), whose router/host-linear hops can't collapse into one
+    // submit. The DENSE 27B (the parity target) gets the full residual-resident win.
+    let any_moe = (0..config.layer_types.len()).any(|l| config.is_moe_layer(l));
+    let resident = !any_moe && !linear_attention_host_forced();
+    let hidden = if resident {
+        forward_layers_resident(ctx, config, weights, res, &embed, start_pos)?
+    } else {
+        forward_layers_host_bridged(ctx, config, weights, res, state, &embed, start_pos)?
+    };
+
+    // Final norm (plain RMSNorm) + LM head GEMV → logits, recorded into ONE submit:
+    // the rms_norm writes work[1], a barrier, then quantize+GEMV reads it against
+    // `output.weight`, and only the [vocab] logits read back.
+    let logits = final_norm_lm_head(ctx, weights, res, &hidden, eps)?;
+
+    state.seq_len += 1;
+    Ok(logits)
+}
+
+/// The RESIDUAL-RESIDENT dense layer loop (Step 3). The hidden state lives in the
+/// arena `hid` slot across the whole stack: the embedding uploads it once, every
+/// layer records input-norm → attention → residual-add → post-norm → FFN →
+/// residual-add into ONE submit reading/writing `hid` device-resident, and the
+/// final hidden reads back once (for the LM head). No per-layer host bridge — the
+/// residual stream never leaves the device between layers.
+fn forward_layers_resident<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    embed: &[f32],
+    start_pos: usize,
+) -> Result<Vec<f32>> {
+    let h = config.hidden_size;
+    let eps = config.rms_norm_eps;
+    let hid_off = res.arena.hid.offset;
+    let normed_off = res.arena.normed_resident.offset;
+    let attn_off = res.arena.attn_resident.offset;
+
+    // Upload the token embedding into the resident hidden slot ONCE.
+    res.arena.write_at(hid_off, embed)?;
+
+    let mut full_idx = 0usize;
+    let mut linear_idx = 0usize;
+    for (layer, &layer_type) in config.layer_types.iter().enumerate() {
+        let attn_norm = packed_or_f32_norm(weights, layer, "attn_norm")?;
+        let t_layer = std::time::Instant::now();
+        res.recorder
+            .begin()
+            .map_err(|e| anyhow!("layer[{layer}]: resident begin: {e}"))?;
+        // input_layernorm: device rms_norm(hid) -> normed_resident.
+        record_rms_norm(
+            ctx,
+            res,
+            &attn_norm.buffer,
+            "input_norm",
+            h,
+            eps,
+            hid_off,
+            normed_off,
+        )?;
+        res.recorder.barrier();
+        // attention block (full or linear): reads normed_resident, writes attn_off.
+        match layer_type {
+            LayerType::FullAttention => {
+                record_full_attention(
+                    ctx, config, weights, res, layer, full_idx, normed_off, attn_off, start_pos,
+                )?;
+                full_idx += 1;
+            }
+            LayerType::LinearAttention => {
+                record_linear_attention(
+                    ctx, config, weights, res, layer, linear_idx, normed_off, attn_off, None,
+                )?;
+                linear_idx += 1;
+            }
+        }
+        res.recorder.barrier();
+        // FFN: post-add(hid + attn_off), post-norm, gate/up/swiglu/down, residual
+        // add -> hid. The dense FFN's first op (post-add) reads attn_off + hid.
+        record_fused_dense_ffn(ctx, config, weights, res, layer, hid_off, attn_off)?;
+
+        let t_submit = std::time::Instant::now();
+        res.recorder
+            .submit_and_wait()
+            .map_err(|e| anyhow!("layer[{layer}]: resident submit: {e}"))?;
+        let submit_ns = t_submit.elapsed().as_nanos();
+        res.gemv_submit_ns += submit_ns;
+        res.gemv_other_ns += t_layer.elapsed().as_nanos().saturating_sub(submit_ns);
+    }
+
+    // Read the resident hidden back once (for the final norm + LM head).
+    res.arena.read_at(hid_off, h)
+}
+
+/// The host-bridged layer loop (the proven Step-1+2 flow): each attention/FFN
+/// block submits and reads back, with the residual stream carried host-side
+/// between layers. Used for MoE models (the router forces a host hop) and the
+/// `ARLE_LINEAR_HOST` guard. Numerically identical to the resident loop — every
+/// device op is the SAME record helper, just bracketed per block instead of per
+/// layer.
+fn forward_layers_host_bridged<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    state: &mut Qwen35ForwardState,
+    embed: &[f32],
+    start_pos: usize,
+) -> Result<Vec<f32>> {
+    let eps = config.rms_norm_eps;
+    let mut hidden = embed.to_vec();
 
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
@@ -856,11 +951,6 @@ pub fn forward_token<'a>(
             }
         };
 
-        // FFN. The DENSE swiglu MLP (qwen35) records post-attn add + post-norm +
-        // gate/up/swiglu/down + the MLP residual add as ONE device-resident
-        // barrier-chained submit (Step 5b: no host hop between the GEMVs). The
-        // sparse MoE (qwen35moe) keeps the host post-add/norm + per-expert path
-        // for now (its swiglu/add fusion is the next chunk).
         if config.is_moe_layer(layer) {
             let post_sum = add_vec(&hidden, &attn_out);
             let post_norm_w = norm_weight(weights, layer, "post_attention_norm")?;
@@ -868,17 +958,27 @@ pub fn forward_token<'a>(
             let mlp_out = moe_ffn(ctx, config, weights, res, layer, &mlp_in)?;
             hidden = add_vec(&post_sum, &mlp_out);
         } else {
-            hidden = fused_dense_ffn(ctx, config, weights, res, layer, &hidden, &attn_out)?;
+            // Device FFN reads host hidden/attn from slots, writes hid slot.
+            let hid_off = res.arena.hid.offset;
+            let attn_off = res.arena.attn_resident.offset;
+            res.arena.write_at(hid_off, &hidden)?;
+            res.arena.write_at(attn_off, &attn_out)?;
+            let t_start = std::time::Instant::now();
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("ffn[{layer}]: begin: {e}"))?;
+            record_fused_dense_ffn(ctx, config, weights, res, layer, hid_off, attn_off)?;
+            let t_submit = std::time::Instant::now();
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("ffn[{layer}]: submit: {e}"))?;
+            let submit_ns = t_submit.elapsed().as_nanos();
+            res.gemv_submit_ns += submit_ns;
+            res.gemv_other_ns += t_start.elapsed().as_nanos().saturating_sub(submit_ns);
+            hidden = res.arena.read_at(hid_off, config.hidden_size)?;
         }
     }
-
-    // Final norm (plain RMSNorm) + LM head GEMV → logits, recorded into ONE
-    // submit (was 2): the rms_norm writes work[0], a barrier, then quantize+GEMV
-    // reads work[0] against `output.weight`, and only the [vocab] logits read back.
-    let logits = final_norm_lm_head(ctx, weights, res, &hidden, eps)?;
-
-    state.seq_len += 1;
-    Ok(logits)
+    Ok(hidden)
 }
 
 /// Record the final plain RMSNorm + the LM-head GEMV into ONE submit and read
@@ -1434,17 +1534,26 @@ fn gemv_f32_host(weight: &DeviceTensor<'_>, x: &[f32], nrows: usize) -> Result<V
 // triple-loop and the per-element norm/rope/gate host math are gone.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Record (NO begin/submit) the WHOLE full-attention block device-resident into
+/// the caller's OPEN recorder (Step 3 residual-resident): reads the input-normed
+/// activation from arena byte `normed_off`, writes the o_proj output `[hidden]`
+/// to arena byte `out_off`. The whole block — 3 QKV projection GEMVs → per-head
+/// q/k RMSNorm → NeoX RoPE → DEVICE f16 KV-pack of roped K + raw V → per-head
+/// KV-cached flash-attn → per-head sigmoid gate → o_proj GEMV — records with NO
+/// host hop. The caller brackets it with `begin()`/`submit_and_wait()` and chains
+/// the FFN into the same submit, so the residual stream never leaves the device.
 #[allow(clippy::too_many_arguments)]
-fn full_attention<'a>(
+fn record_full_attention<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
     res: &mut DecodeResources<'a>,
     layer: usize,
     full_idx: usize,
-    normed: &[f32],
+    normed_off: u64,
+    out_off_param: u64,
     start_pos: usize,
-) -> Result<Vec<f32>> {
+) -> Result<()> {
     let h = config.hidden_size;
     let hd = config.head_dim;
     let nq = config.num_attention_heads;
@@ -1486,8 +1595,8 @@ fn full_attention<'a>(
     }
 
     // Arena slots: q_full ([query|gate] per head) -> attn_qkv, k_in -> attn_k,
-    // v_in -> work[0] (read back for the V cache). q/k normed+roped land in
-    // attn_q/attn_k.
+    // v_in -> work[0]. q/k normed+roped land in attn_q/attn_k; the gated flash
+    // output lands in attn_out, then the o_proj writes `out_off_param`.
     let qkv_off = res.arena.attn_qkv.offset;
     let q_off = res.arena.attn_q.offset;
     let k_off = res.arena.attn_k.offset;
@@ -1495,22 +1604,16 @@ fn full_attention<'a>(
     let out_off = res.arena.attn_out.offset;
     let f32_b = std::mem::size_of::<f32>() as u64;
 
-    // ── Submit 1: the 3 QKV projection GEMVs + per-head q/k RMSNorm + NeoX RoPE,
-    // ALL device-resident in ONE recorder/submit (was 3 GEMV submits + 1
-    // norm/rope submit = 4). normed lands in x_in once; gate/up-style barriers
-    // serialize the shared quant slot; the norms read the projection outputs. ──
-    // q head hh: rms_norm(q_full query half) -> attn_q head; then rope in place.
-    // k head hh: rms_norm(k_in head) -> attn_k head (in place); then rope.
-    let t_attn1 = std::time::Instant::now();
-    let normed_bytes: Vec<u8> = normed.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let x_in_off = res.arena.x_in.offset;
-    res.arena
-        .buffer
-        .copy_from_host_at(x_in_off, &normed_bytes)
-        .map_err(|e| anyhow!("full_attn[{layer}]: write normed into arena: {e}"))?;
-    res.recorder
-        .begin()
-        .map_err(|e| anyhow!("full_attn[{layer}]: attn1 begin: {e}"))?;
+    let o_w = packed_layer_weight(weights, layer, "attn_output")?;
+    let (ow_in, ow_out) = weight_dims(o_w, "attn_output")?;
+    if ow_in != q_dim {
+        bail!("full_attn[{layer}]: o_proj in-dim {ow_in} != q_dim {q_dim}");
+    }
+    if ow_out != h {
+        bail!("full_attn[{layer}]: o_proj out-dim {ow_out} != hidden {h}");
+    }
+    let kv_len = pos + 1;
+    let x_in_off = normed_off;
     // q_proj -> attn_qkv (2*q_dim).
     record_quantize_gemv(
         ctx,
@@ -1539,7 +1642,7 @@ fn full_attention<'a>(
         k_off,
     )?;
     res.recorder.barrier();
-    // v_proj -> work[0] (kv_dim); read back for the V cache.
+    // v_proj -> work[0] (kv_dim).
     record_quantize_gemv(
         ctx,
         res,
@@ -1594,33 +1697,18 @@ fn full_attention<'a>(
             kdst,
         )?;
     }
-    let t_submit = std::time::Instant::now();
-    res.recorder
-        .submit_and_wait()
-        .map_err(|e| anyhow!("full_attn[{layer}]: proj+norm/rope submit: {e}"))?;
-    let submit_ns = t_submit.elapsed().as_nanos();
-    res.gemv_submit_ns += submit_ns;
-    res.gemv_other_ns += t_attn1.elapsed().as_nanos().saturating_sub(submit_ns);
-
-    // Read back the post-rope K rows + raw V; write K (roped) + V (raw) into the
-    // device f16 KV cache at this position. K head hh -> kv_head hh; V head -> hh.
-    let k_roped = res.arena.read_at(k_off, kv_dim)?;
-    let v_in = res.arena.read_at(v_off, kv_dim)?;
+    // Barrier: the f16 KV-pack reads the roped K (attn_k) + raw V (work[0]).
+    res.recorder.barrier();
+    // DEVICE f16 KV-pack: roped K (attn_k) + raw V (work[0]) -> cache at `pos`.
     for kvh in 0..nkv {
-        res.kv_cache
-            .write_row(full_idx, kvh, pos, &k_roped[kvh * hd..kvh * hd + hd], false)?;
-        res.kv_cache
-            .write_row(full_idx, kvh, pos, &v_in[kvh * hd..kvh * hd + hd], true)?;
+        let ksrc = k_off + (kvh * hd) as u64 * f32_b;
+        let vsrc = v_off + (kvh * hd) as u64 * f32_b;
+        record_f16_kv_pack(ctx, res, "kv_pack_k", hd, ksrc, full_idx, kvh, pos, false)?;
+        record_f16_kv_pack(ctx, res, "kv_pack_v", hd, vsrc, full_idx, kvh, pos, true)?;
     }
-    let kv_len = pos + 1;
-
-    // ── Submit 2: per query head flash-attn (KV-cached) + sigmoid gate. ──
-    // gqa_ratio=1: each query head reads its kv head's plane directly. The
-    // gate is q_full's second half per head; sigmoid-mul folds it onto the flash
-    // output in place.
-    res.recorder
-        .begin()
-        .map_err(|e| anyhow!("full_attn[{layer}]: attn begin: {e}"))?;
+    // Barrier: flash reads the cache rows the pack just wrote (+ the roped Q).
+    res.recorder.barrier();
+    // gqa_ratio=1: each query head reads its kv head's plane directly.
     for hh in 0..nq {
         let kvh = hh / group;
         let qh_off = q_off + (hh * hd) as u64 * f32_b;
@@ -1642,23 +1730,67 @@ fn full_attention<'a>(
     }
     res.recorder.barrier();
     for hh in 0..nq {
-        // gate half of head hh in q_full: bytes [hh*2*hd+hd .. +hd].
+        // gate half of head hh in q_full: bytes [hh*2*hd+hd .. +hd]. Sigmoid-mul
+        // folds the per-head gate onto the flash output in place.
         let gate_off = qkv_off + (hh * 2 * hd + hd) as u64 * f32_b;
         let oh_off = out_off + (hh * hd) as u64 * f32_b;
         record_sigmoid_mul(ctx, res, "full_gate", hd, gate_off, oh_off, oh_off)?;
     }
+    // Barrier: the o_proj GEMV reads the gated attention output (attn_out).
+    res.recorder.barrier();
+    // o_proj: [q_dim -> hidden], chained into the SAME submit. The device KV
+    // cache already owns this token's K/V; only the o_proj result reads back.
+    record_quantize_gemv(
+        ctx,
+        res,
+        o_w,
+        "attn_output",
+        q_dim,
+        ow_out,
+        0,
+        o_w.buffer.len() as u64,
+        out_off,
+        out_off_param,
+    )?;
+    res.gemv_count += 1;
+    Ok(())
+}
+
+/// Standalone full-attention (host-bridged guard path): upload the host `normed`
+/// to a device slot, `begin()` → [`record_full_attention`] → `submit_and_wait()`,
+/// and read back the o_proj output `[hidden]`. Used by the MoE-layer path (whose
+/// router forces a host hop anyway) and the `ARLE_LINEAR_HOST` guard loop, so the
+/// residual-resident dense loop and this share ONE attention recorder body.
+#[allow(clippy::too_many_arguments)]
+fn full_attention<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    layer: usize,
+    full_idx: usize,
+    normed: &[f32],
+    start_pos: usize,
+) -> Result<Vec<f32>> {
+    let h = config.hidden_size;
+    let normed_off = res.arena.normed_resident.offset;
+    let out_off = res.arena.attn_resident.offset;
+    res.arena.write_at(normed_off, normed)?;
+    let t_start = std::time::Instant::now();
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("full_attn[{layer}]: begin: {e}"))?;
+    record_full_attention(
+        ctx, config, weights, res, layer, full_idx, normed_off, out_off, start_pos,
+    )?;
     let t_submit = std::time::Instant::now();
     res.recorder
         .submit_and_wait()
-        .map_err(|e| anyhow!("full_attn[{layer}]: attn submit: {e}"))?;
-    res.gemv_submit_ns += t_submit.elapsed().as_nanos();
-
-    // Read back the gated attention output → o_proj GEMV (the device KV cache
-    // already owns this token's K/V; the host needs only the gated activation).
-    let attn = res.arena.read_at(out_off, q_dim)?;
-
-    // o_proj: [q_dim -> hidden].
-    gemv_layer(ctx, weights, res, layer, "attn_output", &attn)
+        .map_err(|e| anyhow!("full_attn[{layer}]: submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += t_start.elapsed().as_nanos().saturating_sub(submit_ns);
+    res.arena.read_at(out_off, h)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1687,6 +1819,49 @@ fn linear_attention<'a>(
         return linear_attention_host(ctx, config, weights, res, state, layer, linear_idx, normed);
     }
     linear_attention_device(ctx, config, weights, res, layer, linear_idx, normed)
+}
+
+/// Standalone device gated-delta linear-attention (host-bridged guard path):
+/// upload the host `normed` to a device slot, `begin()` →
+/// [`record_linear_attention`] → `submit_and_wait()`, read back the out-proj
+/// output `[hidden]`. Used by the MoE-layer path and the host-bridged guard loop,
+/// so the residual-resident dense loop and this share ONE linear recorder body.
+fn linear_attention_device<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    layer: usize,
+    linear_idx: usize,
+    normed: &[f32],
+) -> Result<Vec<f32>> {
+    let h = config.hidden_size;
+    let normed_off = res.arena.normed_resident.offset;
+    let out_off = res.arena.attn_resident.offset;
+    res.arena.write_at(normed_off, normed)?;
+    let t_start = std::time::Instant::now();
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("linear[{layer}]: begin: {e}"))?;
+    record_linear_attention(
+        ctx,
+        config,
+        weights,
+        res,
+        layer,
+        linear_idx,
+        normed_off,
+        out_off,
+        Some(normed),
+    )?;
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("linear[{layer}]: submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += t_start.elapsed().as_nanos().saturating_sub(submit_ns);
+    res.arena.read_at(out_off, h)
 }
 
 /// `true` iff the host-f32 linear-attention oracle is force-selected via
@@ -1879,27 +2054,32 @@ fn linear_attention_host<'a>(
     gemv_layer(ctx, weights, res, layer, "ssm_out", &normed_out)
 }
 
-/// On-device gated-delta linear-attention for one token. The depthwise conv1d +
-/// the recurrent gated-delta state update run on the two model-specific serial
-/// shaders against device-resident state (the conv ring + the `[v_head, key_dim,
-/// val_dim]` S matrix per linear layer), so the 48 linear layers no longer
-/// round-trip the conv/recurrence state to the host. Oracle-gated against
-/// [`linear_attention_host`] (the verified host-f32 path).
+/// Record (NO begin/submit) the WHOLE linear (gated-delta) attention block
+/// device-resident into the caller's OPEN recorder (Step 3 residual-resident):
+/// reads the input-normed activation from arena byte `normed_off`, writes the
+/// out-proj output `[hidden]` to arena byte `out_off`. The depthwise conv1d + the
+/// recurrent gated-delta state update run on the two model-specific serial shaders
+/// against device-resident state (the conv ring + the `[v_head, key_dim, val_dim]`
+/// S matrix per linear layer); the gated output RMSNorm × silu(z) and the out-proj
+/// GEMV chain in too — ALL with no host hop. Oracle-gated against
+/// [`linear_attention_host`].
 ///
-/// Flow: in-proj GEMVs (device) → upload raw `qkv` → record conv1d+SiLU (device,
-/// advances the resident ring) → record gated-delta recurrence (device,
-/// read+writes the resident S matrix) → read back the recurrence output → gated
-/// output RMSNorm × silu(z) (host f32, small) → out-proj GEMV (device).
+/// `host_normed` is `Some` only when this layer's `ssm_alpha`/`ssm_beta`
+/// projections are F32-resident (the 35B MoE) — those tiny host dots stage into
+/// lin_a/lin_b before the caller's submit. On the dense path a/b are packed and
+/// `host_normed` is `None` (their GEMVs record device-resident).
 #[allow(clippy::too_many_arguments)]
-fn linear_attention_device<'a>(
+fn record_linear_attention<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
     res: &mut DecodeResources<'a>,
     layer: usize,
     linear_idx: usize,
-    normed: &[f32],
-) -> Result<Vec<f32>> {
+    normed_off: u64,
+    out_off_param: u64,
+    host_normed: Option<&[f32]>,
+) -> Result<()> {
     let kd = config.linear_key_head_dim; // 128
     let vd = config.linear_value_head_dim; // 128
     let nk = config.linear_num_key_heads; // 16
@@ -1908,25 +2088,14 @@ fn linear_attention_device<'a>(
     let v_dim_total = nv * vd; // 6144
     let qkv_dim = 2 * nk * kd + v_dim_total; // 10240
     let eps = config.rms_norm_eps;
+    let h = config.hidden_size;
 
-    // ── in projections + conv + gated-delta in ONE submit (was 6: qkv, gate,
-    // ssm_alpha, ssm_beta, conv, gdr). The packed in-proj GEMVs (qkv -> lin_xseq,
-    // gate z -> work[1]) record into the SAME open recorder as the conv (reads
-    // lin_xseq) and the gated-delta net (reads the conv output + a/b); a single
-    // `submit_and_wait` follows. The tiny ssm_alpha/beta projections are computed
-    // FIRST (host `gemv_layer` for F32-resident weights — the 35B MoE ships them
-    // F32 — or a device GEMV otherwise) and their values land in the lin_a/lin_b
-    // slots BEFORE the merged submit, so the gdr reads them within the one batch.
-    // normed lands in x_in once for the shared packed GEMVs. ──
     let qkv_w = packed_layer_weight(weights, layer, "attn_qkv")?;
     let gate_w = packed_layer_weight(weights, layer, "attn_gate")?;
     let (qkv_in, qkv_out) = weight_dims(qkv_w, "attn_qkv")?;
     let (gate_in, gate_out) = weight_dims(gate_w, "attn_gate")?;
-    if qkv_in != normed.len() || gate_in != normed.len() {
-        bail!(
-            "linear[{layer}]: in-proj in-dim qkv{qkv_in}/gate{gate_in} != normed {}",
-            normed.len()
-        );
+    if qkv_in != h || gate_in != h {
+        bail!("linear[{layer}]: in-proj in-dim qkv{qkv_in}/gate{gate_in} != hidden {h}");
     }
     if qkv_out != qkv_dim || gate_out != v_dim_total {
         bail!(
@@ -1937,9 +2106,8 @@ fn linear_attention_device<'a>(
 
     // a/b projections (`ssm_alpha`/`ssm_beta`, `[hidden -> nv]`) land in
     // lin_a/lin_b. When PACKED (dense configs) they record into the SAME merged
-    // submit as qkv/gate/conv/gdr — no separate GEMV submit (this is the big
-    // remaining linear-path win). When F32-resident (the 35B MoE ships them F32)
-    // they are tiny host dots staged into the slots before the submit.
+    // submit as qkv/gate/conv/gdr. When F32-resident (the 35B MoE) they are tiny
+    // host dots staged into the slots before the submit (needs `host_normed`).
     let a_w = weights
         .get(&format!("blk.{layer}.ssm_alpha.weight"))
         .ok_or_else(|| anyhow!("missing blk.{layer}.ssm_alpha.weight"))?;
@@ -1950,10 +2118,16 @@ fn linear_attention_device<'a>(
     let b_packed = matches!(b_w.residency, Residency::KeepQuant(_));
     // Pre-stage the F32 (host) a/b values before the merged submit.
     if !a_packed {
+        let normed = host_normed.ok_or_else(|| {
+            anyhow!("linear[{layer}]: F32 ssm_alpha needs host normed (resident path)")
+        })?;
         let a_proj = gemv_f32_host(a_w, normed, nv)?;
         res.arena.write_at(res.arena.lin_a.offset, &a_proj)?;
     }
     if !b_packed {
+        let normed = host_normed.ok_or_else(|| {
+            anyhow!("linear[{layer}]: F32 ssm_beta needs host normed (resident path)")
+        })?;
         let b_proj = gemv_f32_host(b_w, normed, nv)?;
         res.arena.write_at(res.arena.lin_b.offset, &b_proj)?;
     }
@@ -1978,18 +2152,9 @@ fn linear_attention_device<'a>(
     let qkv_conv_off = res.arena.lin_qkv_conv.offset;
     let xseq_len = (qkv_dim * std::mem::size_of::<f32>()) as u64;
 
-    // Land normed once for the packed in-proj GEMVs.
-    let lin_normed: Vec<u8> = normed.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let x_in_off = res.arena.x_in.offset;
-    res.arena
-        .buffer
-        .copy_from_host_at(x_in_off, &lin_normed)
-        .map_err(|e| anyhow!("linear[{layer}]: write normed into arena: {e}"))?;
-
-    let t_merged = std::time::Instant::now();
-    res.recorder
-        .begin()
-        .map_err(|e| anyhow!("linear[{layer}] in-proj+conv+gdr begin: {e}"))?;
+    // The input-normed activation is already device-resident at `normed_off`
+    // (the resident loop's device input-norm wrote it); the in-proj GEMVs read it.
+    let x_in_off = normed_off;
     // qkv -> lin_xseq (conv input).
     record_quantize_gemv(
         ctx,
@@ -2004,7 +2169,7 @@ fn linear_attention_device<'a>(
         xseq_off,
     )?;
     res.recorder.barrier();
-    // gate z -> work[1] (read back for the host gated norm).
+    // gate z -> work[1] (read by the device gated norm's swiglu).
     record_quantize_gemv(
         ctx,
         res,
@@ -2022,11 +2187,8 @@ fn linear_attention_device<'a>(
     // Packed a/b projections recorded into the SAME submit (-> lin_a / lin_b).
     if a_packed {
         let (a_in, a_out) = weight_dims(a_w, "ssm_alpha")?;
-        if a_in != normed.len() || a_out != nv {
-            bail!(
-                "linear[{layer}]: ssm_alpha dims [{a_in},{a_out}] != [{},{nv}]",
-                normed.len()
-            );
+        if a_in != h || a_out != nv {
+            bail!("linear[{layer}]: ssm_alpha dims [{a_in},{a_out}] != [{h},{nv}]");
         }
         record_quantize_gemv(
             ctx,
@@ -2045,11 +2207,8 @@ fn linear_attention_device<'a>(
     }
     if b_packed {
         let (b_in, b_out) = weight_dims(b_w, "ssm_beta")?;
-        if b_in != normed.len() || b_out != nv {
-            bail!(
-                "linear[{layer}]: ssm_beta dims [{b_in},{b_out}] != [{},{nv}]",
-                normed.len()
-            );
+        if b_in != h || b_out != nv {
+            bail!("linear[{layer}]: ssm_beta dims [{b_in},{b_out}] != [{h},{nv}]");
         }
         record_quantize_gemv(
             ctx,
@@ -2114,6 +2273,7 @@ fn linear_attention_device<'a>(
     let a_off = res.arena.lin_a.offset;
     let b_off = res.arena.lin_b.offset;
     let out_off = res.arena.lin_out.offset;
+    let z_slot_off = res.arena.work[1].offset; // gate z (written by the gate GEMV)
     let a_len = (nv * std::mem::size_of::<f32>()) as u64;
     let out_len = (v_dim_total * std::mem::size_of::<f32>()) as u64;
     {
@@ -2148,44 +2308,64 @@ fn linear_attention_device<'a>(
             .map_err(|e| anyhow!("linear[{layer}]: bind gated-delta set: {e}"))?;
         recorder.dispatch_raw(pipeline, set, &gd_push, gd_groups);
     }
-    let t_submit = std::time::Instant::now();
-    res.recorder
-        .submit_and_wait()
-        .map_err(|e| anyhow!("linear[{layer}] in-proj+conv+gdr submit: {e}"))?;
-    let submit_ns = t_submit.elapsed().as_nanos();
-    res.gemv_submit_ns += submit_ns;
-    res.gemv_other_ns += t_merged.elapsed().as_nanos().saturating_sub(submit_ns);
 
-    // ── 3. Read back the gate z (for the host gated norm) and the recurrence
-    //       output (for the gated norm + out-proj). ──
-    let z = res.arena.read_work(1, v_dim_total)?;
-    let gdr_out = res.arena.read_at(out_off, v_dim_total)?;
-
-    // ── 4. Gated output RMSNorm × silu(z): per value head over val_dim, PLAIN f32
-    //       weight (broadcast across heads). Host f32 (small; matches the oracle).
-    let ssm_norm = dequant_f32(
-        weights
-            .get(&format!("blk.{layer}.ssm_norm.weight"))
-            .ok_or_else(|| anyhow!("missing blk.{layer}.ssm_norm.weight"))?,
-        vd,
-    )?;
-    let mut normed_out = vec![0.0f32; v_dim_total];
+    // ── DEVICE GATED OUTPUT RMSNorm × silu(z) (Step 1: no z / recurrence-out
+    //    readback). Per value head over val_dim: `out = rms_norm(gdr_out_head) *
+    //    ssm_norm * silu(z_head)`. The PLAIN f32 `ssm_norm` weight (vd-wide,
+    //    broadcast across heads) binds directly to the device rms_norm, which the
+    //    per-head dispatch applies (`x*inv_rms*w`); the per-element `* silu(z)`
+    //    folds into a single SwiGLU pass (gate=z, up=normed) over the whole
+    //    [v_dim_total] block. All recorded into the SAME submit as conv+gdr, then
+    //    the out-proj GEMV is chained too — collapsing the linear path to ONE
+    //    submit and removing both readbacks (oracle: `linear_attention_host`). ──
+    let ssm_norm_buf = ssm_weight_buffer(weights, layer, "ssm_norm.weight", vd)?;
+    // rms_norm(gdr_out)*ssm_norm lands in the lin_qkv_conv slot (free after the
+    // conv→gdr chain consumed it; qkv_dim ≥ v_dim_total so it fits).
+    let gated_normed_off = res.arena.lin_qkv_conv.offset;
+    res.recorder.barrier(); // gated-norm reads the gdr Output written above.
     for vh in 0..nv {
-        let x = &gdr_out[vh * vd..vh * vd + vd];
-        let gate = &z[vh * vd..vh * vd + vd];
-        let mut sumsq = 0.0f32;
-        for &xv in x {
-            sumsq += xv * xv;
-        }
-        let inv = 1.0 / (sumsq / vd as f32 + eps).sqrt();
-        let out = &mut normed_out[vh * vd..vh * vd + vd];
-        for d in 0..vd {
-            out[d] = x[d] * inv * ssm_norm[d] * silu(gate[d]);
-        }
+        let src = out_off + (vh * vd) as u64 * std::mem::size_of::<f32>() as u64;
+        let dst = gated_normed_off + (vh * vd) as u64 * std::mem::size_of::<f32>() as u64;
+        record_rms_norm(ctx, res, ssm_norm_buf, "ssm_norm", vd, eps, src, dst)?;
     }
+    res.recorder.barrier(); // the swiglu reads every head's normed output + z.
+    // out = silu(z) * normed over [v_dim_total]; reuse lin_out for the result.
+    record_swiglu(
+        ctx,
+        res,
+        "ssm_gated",
+        v_dim_total,
+        z_slot_off,
+        gated_normed_off,
+        out_off,
+    )?;
+    res.recorder.barrier(); // out-proj GEMV reads the gated norm output.
 
-    // ── 5. out_proj: [v_dim_total -> hidden] (device GEMV). ──
-    gemv_layer(ctx, weights, res, layer, "ssm_out", &normed_out)
+    // ── out_proj: [v_dim_total -> hidden] (device GEMV), chained into the SAME
+    //    submit. Writes the layer's attention output `[hidden]` to `out_off_param`
+    //    (the residual-resident slot the FFN's post-add consumes). ──
+    let ssm_out_w = packed_layer_weight(weights, layer, "ssm_out")?;
+    let (so_in, so_out) = weight_dims(ssm_out_w, "ssm_out")?;
+    if so_in != v_dim_total {
+        bail!("linear[{layer}]: ssm_out in-dim {so_in} != v_dim_total {v_dim_total}");
+    }
+    if so_out != h {
+        bail!("linear[{layer}]: ssm_out out-dim {so_out} != hidden {h}");
+    }
+    record_quantize_gemv(
+        ctx,
+        res,
+        ssm_out_w,
+        "ssm_out",
+        v_dim_total,
+        so_out,
+        0,
+        ssm_out_w.buffer.len() as u64,
+        out_off,
+        out_off_param,
+    )?;
+    res.gemv_count += 1;
+    Ok(())
 }
 
 /// Borrow an F32-resident SSM weight tensor's device buffer (`DequantF32`
@@ -3015,6 +3195,61 @@ fn record_sigmoid_mul<'a>(
     Ok(())
 }
 
+/// Record (no submit) a device f16 KV-pack of ONE head row: read `head_dim` f32
+/// from arena byte `src_off`, write them as f16 into the device KV cache plane at
+/// `(full_idx, kv_head, pos)` (`is_v` selects the V block). Bindings 0=A(f32 src),
+/// 1=D(f16 dst) — a 2-binding layout, so it shares the decode `ring2` with the
+/// q8_1 quantize. Replaces the host readback+convert+UMA-write so the whole
+/// full-attention block records into ONE submit. Oracle:
+/// `f16_kv_pack_matches_host_rne_oracle`.
+#[allow(clippy::too_many_arguments)]
+fn record_f16_kv_pack<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    head_dim: usize,
+    src_off: u64,
+    full_idx: usize,
+    kv_head: usize,
+    pos: usize,
+    is_v: bool,
+) -> Result<()> {
+    let push = f16_kv_pack_params(head_dim as u32).to_le_bytes();
+    let groups = {
+        let d = f16_kv_pack_dispatch(head_dim as u32);
+        [d.x, d.y, d.z]
+    };
+    let src_bytes = (head_dim * std::mem::size_of::<f32>()) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring2,
+        kv_cache,
+        ..
+    } = res;
+    let (dst_off, dst_bytes) = kv_cache.row_dst(full_idx, kv_head, pos, is_v);
+    let arena_buf = &arena.buffer;
+    let kv_buf = &kv_cache.buffer;
+    let (pipeline, _) = cache
+        .get(
+            ctx,
+            Kernel::F16KvPack,
+            Kernel::F16KvPack.specialization_u32(),
+            push.len() as u32,
+            2,
+        )
+        .map_err(|e| anyhow!("{name}: build f16_kv_pack pipeline: {e}"))?;
+    let set = ring2
+        .next_updated(&[
+            (arena_buf, src_off, src_bytes), // 0: f32 src head row
+            (kv_buf, dst_off, dst_bytes),    // 1: f16 dst cache row
+        ])
+        .map_err(|e| anyhow!("{name}: bind f16_kv_pack ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
 /// Fetch a per-layer F32-resident norm weight tensor (`attn_q_norm` /
 /// `attn_k_norm`), erroring if missing or not F32-resident. The device rms_norm
 /// binds its `.buffer` directly (head_dim-wide, broadcast across heads).
@@ -3056,12 +3291,11 @@ fn packed_layer_weight<'w>(
     Ok(w)
 }
 
-/// The **fused dense FFN + post-attention norm + both residual adds**, recorded
-/// device-resident (perf-parity Step 5b). Given the layer's residual stream
-/// `hidden` and the attention output `attn_out` (both host f32 from the
-/// host-side attention this chunk does NOT port), this records — into ONE
-/// submit, threading arena slots with barriers and **no host round-trip between
-/// the GEMVs** — the sequence:
+/// Record (NO begin/submit) the **fused dense FFN + post-attention norm + both
+/// residual adds** device-resident into the caller's OPEN recorder (Step 3
+/// residual-resident). Reads the residual stream from arena byte `hid_off` and the
+/// attention output from `attn_off`, and writes the updated residual stream back
+/// to `hid_off`. The sequence:
 ///
 ///   post_sum = hidden + attn_out                        (device Add)
 ///   mlp_in   = rms_norm(post_sum, post_attention_norm)  (device RMSNorm)
@@ -3069,39 +3303,30 @@ fn packed_layer_weight<'w>(
 ///   up       = ffn_up   · mlp_in                        (device GEMV)
 ///   act      = silu(gate) * up                          (device SwiGLU)
 ///   mlp_out  = ffn_down · act                           (device GEMV)
-///   hidden'  = post_sum + mlp_out                        (device Add)
+///   hidden'  = post_sum + mlp_out                        (device Add → hid_off)
 ///
-/// and reads back ONLY `hidden'` ([hidden] f32) at the end. This removes the
-/// six device→host→device hops (two adds, one norm, swiglu, plus the per-GEMV
-/// readbacks of gate/up/down) the host path forced per dense layer.
+/// All on-device, no host hop. The caller chains the next layer's input-norm into
+/// the same residual-resident stream; only the FINAL `[vocab]` logits read back.
 ///
-/// Arena work-slot plan (4 slots; the live set peaks at {post_sum, mlp_in, gate,
-/// up} after the up-proj). Every slot is `max_cols`-wide so it holds a hidden-
-/// or ffn_inter-wide vector. A barrier separates every recorded op (consecutive
+/// Arena work-slot plan (4 scratch slots; the live set peaks at {post_sum, mlp_in,
+/// gate, up} after the up-proj). A barrier separates every recorded op (consecutive
 /// GEMVs also share the single `quant` slot, so the barrier is required):
 ///   work0 = post_sum (lives the whole FFN, consumed by the final add)
-///   work1 = mlp_in → (reused) act → (reused) hidden'
+///   work1 = mlp_in → (reused) act
 ///   work2 = gate   → (reused) mlp_out
 ///   work3 = up
-fn fused_dense_ffn<'a>(
+fn record_fused_dense_ffn<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
     weights: &ResidentWeights<'_>,
     res: &mut DecodeResources<'a>,
     layer: usize,
-    hidden: &[f32],
-    attn_out: &[f32],
-) -> Result<Vec<f32>> {
+    hid_off: u64,
+    attn_off: u64,
+) -> Result<()> {
     let h = config.hidden_size;
     let inter = config.intermediate_size;
     let eps = config.rms_norm_eps;
-    if hidden.len() != h || attn_out.len() != h {
-        bail!(
-            "fused_dense_ffn[{layer}]: hidden {} / attn_out {} != hidden {h}",
-            hidden.len(),
-            attn_out.len()
-        );
-    }
     if inter > res.arena.max_cols {
         bail!(
             "fused_dense_ffn[{layer}]: ffn intermediate {inter} exceeds arena ({})",
@@ -3126,23 +3351,13 @@ fn fused_dense_ffn<'a>(
 
     let _ = (down_in, down_out); // validated above
 
-    let t_start = std::time::Instant::now();
-
     let w0 = res.arena.work[0].offset; // post_sum (persists)
-    let w1 = res.arena.work[1].offset; // mlp_in -> act -> hidden'
+    let w1 = res.arena.work[1].offset; // mlp_in -> act
     let w2 = res.arena.work[2].offset; // gate -> mlp_out
     let w3 = res.arena.work[3].offset; // up
 
-    // Land the two add inputs into scratch slots work1 (=hidden) / work2 (=attn).
-    res.arena.write_work(1, hidden)?;
-    res.arena.write_work(2, attn_out)?;
-
-    res.recorder
-        .begin()
-        .map_err(|e| anyhow!("fused_dense_ffn[{layer}]: recorder begin: {e}"))?;
-
-    // post_sum = hidden(work1) + attn_out(work2) -> work0
-    record_add(ctx, res, "ffn_post_add", h, w1, w2, w0)?;
+    // post_sum = hidden(hid_off) + attn_out(attn_off) -> work0
+    record_add(ctx, res, "ffn_post_add", h, hid_off, attn_off, w0)?;
     res.recorder.barrier();
     // mlp_in = rms_norm(post_sum=work0) -> work1
     record_rms_norm(
@@ -3201,24 +3416,10 @@ fn fused_dense_ffn<'a>(
         w2,
     )?;
     res.recorder.barrier();
-    // hidden' = post_sum(work0) + mlp_out(work2) -> work1
-    record_add(ctx, res, "ffn_mlp_add", h, w0, w2, w1)?;
-
-    let t_submit = std::time::Instant::now();
-    res.recorder
-        .submit_and_wait()
-        .map_err(|e| anyhow!("fused_dense_ffn[{layer}]: submit: {e}"))?;
-    let submit_ns = t_submit.elapsed().as_nanos();
-
-    let out = res.arena.read_work(1, h)?;
-
-    // Attribute the three GEMVs' submit/host time into the same profile buckets
-    // the standalone GEMV path uses, so the breakdown stays comparable.
-    let total_ns = t_start.elapsed().as_nanos();
-    res.gemv_submit_ns += submit_ns;
-    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    // hidden' = post_sum(work0) + mlp_out(work2) -> hid_off (residual-resident)
+    record_add(ctx, res, "ffn_mlp_add", h, w0, w2, hid_off)?;
     res.gemv_count += 3;
-    Ok(out)
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

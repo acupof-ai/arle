@@ -110,6 +110,11 @@ pub enum Kernel {
     Dsv4Mhc,
     Dsv4OutputInverseRope,
     SwigluClamped,
+    /// Pack one f32 head row into the f16 KV cache (`out[i] = float16_t(in[i])`).
+    /// Lets the full-attention block write this token's roped K / raw V into the
+    /// device-resident f16 cache without a host readback, so the projection /
+    /// rope / pack / flash / gate record into ONE submit.
+    F16KvPack,
     Qwen35SsmConv,
     Qwen35GatedDeltaNet,
 }
@@ -173,6 +178,7 @@ impl Kernel {
         Self::Dsv4Mhc,
         Self::Dsv4OutputInverseRope,
         Self::SwigluClamped,
+        Self::F16KvPack,
         Self::Qwen35SsmConv,
         Self::Qwen35GatedDeltaNet,
     ];
@@ -212,6 +218,7 @@ impl Kernel {
             Kernel::Dsv4Mhc => "dsv4_mhc",
             Kernel::Dsv4OutputInverseRope => "dsv4_output_inverse_rope",
             Kernel::SwigluClamped => "swiglu_clamped",
+            Kernel::F16KvPack => "f16_kv_pack",
             Kernel::Qwen35SsmConv => "qwen35_ssm_conv",
             Kernel::Qwen35GatedDeltaNet => "qwen35_gated_delta_net",
         }
@@ -251,6 +258,7 @@ impl Kernel {
             | Kernel::Dsv4Mhc
             | Kernel::Dsv4OutputInverseRope
             | Kernel::SwigluClamped
+            | Kernel::F16KvPack
             | Kernel::Qwen35SsmConv
             | Kernel::Qwen35GatedDeltaNet => &[],
         }
@@ -777,6 +785,22 @@ pub fn sigmoid_mul_params(n: u32) -> KernelParams {
 /// `sigmoid_mul.comp` grid: one thread per element, `local_size_x = 256`, so
 /// `ceil(n / 256)` workgroups cover the row.
 pub fn sigmoid_mul_dispatch(n: u32) -> Dispatch {
+    Dispatch::x(n.div_ceil(256).max(1))
+}
+
+/// `f16_kv_pack.comp` (ARLE-local): pack `n` f32 values into f16
+/// (`dst[i] = float16_t(src[i])`). Bindings `0=A` (f32 src, read), `1=D` (f16
+/// dst, write) — a 2-binding layout, so it shares the decode `ring2` with the
+/// q8_1 quantize. The single push field is `[n (u32)]`. Writes one full-attention
+/// head row (`head_dim` f16) into the device KV cache plane bound at the
+/// `(layer, kv_head, pos)` byte offset, removing the host K/V readback+convert.
+pub fn f16_kv_pack_params(n: u32) -> KernelParams {
+    KernelParams::from_words(vec![n])
+}
+
+/// `f16_kv_pack.comp` grid: one thread per element, `local_size_x = 256`, so
+/// `ceil(n / 256)` workgroups cover the head row.
+pub fn f16_kv_pack_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
 
