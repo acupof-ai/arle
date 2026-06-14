@@ -29,9 +29,12 @@ gradient**. The bootstrap gradient must come from a λ>0 GKD CE self-anchor on
 the rollouts (`GkdSftAnchor::StudentRollout`); the EMA-KL term is the
 *steady-state stabilizer*, not the bootstrap. F defaults `--gkd-lambda 0.5`
 (the `opd.rs` `GkdLossConfig::default` λ=0.0 is wrong for cold start and is
-overridden at the F call site). The smoke run confirms gradients flow at λ=0.5:
+overridden at the F call site) **and hard-rejects `--gkd-lambda ≤ 0` (incl. NaN)
+at dispatch** so the no-op can't be reached even by an explicit flag (codex P2,
+`0b591c78`). The smoke run confirms gradients flow at λ=0.5:
 `arle train self-opd --smoke --steps 5` → loss `0.164029 → 0.163940`
-monotonically decreasing, exit 0.
+monotonically decreasing, exit 0; `--gkd-lambda 0` is rejected with a cold-start
+error, exit 1.
 
 ### Non-circular in-loop gate — held-out NLL on fixed reference text
 
@@ -41,6 +44,10 @@ signal is **held-out NLL** (forward-only mean next-token CE) on a *fixed*
 `--eval-ids` reference sequence (defaults to the prompt), measured with the
 tape off and its scratch dropped. `heldout_nll` runs every `--gate-every-n`
 steps; if NLL regresses past `--gate-regress-tol` (0.02), the step is reverted.
+A **non-finite gate NLL is treated as a regression → revert** (a `NaN > x`
+comparison is false, so without the guard the accept branch would store NaN as
+the baseline and permanently disable the gate; a non-finite *initial* baseline
+hard-errors — codex P2, `0b591c78`).
 The needle ladder (`scripts/needle_gate.py`, needs serving) stays the
 **external** pod acceptance gate — no serving endpoint exists inside the inline
 loop, so the in-loop gate had to be self-contained.
