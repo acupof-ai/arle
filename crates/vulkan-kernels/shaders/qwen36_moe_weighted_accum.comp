@@ -1,0 +1,40 @@
+#version 450
+// ARLE Vulkan shader: Qwen3.6 MoE device-weighted accumulate.
+//
+// `acc[i] = (init ? 0 : acc[i]) + Σ_{e<count} weights[e] · src[e*hidden + i]`.
+//
+// Replaces the host-constant per-expert `record_scaled_add` loop so the routed
+// experts' weighted mix uses the DEVICE weights produced by `qwen36_router_topk`
+// (routing never returns to host). One pass for the routed block (count = top_k,
+// init = 1 → starts from 0) and one for the shared expert (count = 1, init = 0,
+// weights[0] = the sigmoid gate → `acc += s · y_shared`). Each thread owns one
+// hidden index i and sums its column across the `count` expert outputs.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint hidden;  // output width (one thread per element)
+    uint count;   // number of expert outputs to mix
+    uint init;    // 1 = start from 0 (overwrite), 0 = accumulate into acc
+} p;
+
+layout(binding = 0) readonly buffer Src {
+    float src[]; // [count * hidden], expert-major
+};
+layout(binding = 1) readonly buffer Weights {
+    float weights[]; // [count]
+};
+layout(binding = 2) buffer Acc {
+    float acc[]; // [hidden], read+written
+};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.hidden) {
+        return;
+    }
+    float s = (p.init != 0u) ? 0.0 : acc[i];
+    for (uint e = 0u; e < p.count; ++e) {
+        s += weights[e] * src[e * p.hidden + i];
+    }
+    acc[i] = s;
+}

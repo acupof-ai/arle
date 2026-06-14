@@ -12,7 +12,9 @@
 #![cfg(feature = "vulkan")]
 
 use vulkan_kernels::{
-    Kernel, KernelCache, launch_cached, qwen36_router_topk_dispatch, qwen36_router_topk_params,
+    Kernel, KernelCache, launch_cached, qwen36_moe_weighted_accum_dispatch,
+    qwen36_moe_weighted_accum_params, qwen36_router_gemv_dispatch, qwen36_router_gemv_params,
+    qwen36_router_topk_dispatch, qwen36_router_topk_params,
 };
 use vulkan_sys::{DeviceBuffer, VulkanContext};
 
@@ -152,5 +154,136 @@ fn qwen36_router_topk_matches_host_oracle() {
             }
             eprintln!("[{label}] PASS ids+weights");
         }
+    }
+}
+
+/// Host reference for `qwen36_router_gemv`: `y[e] = Σ_c W[e,c]·x[c]`, transcribed
+/// from `gemv_f32_host` (forward.rs), optional sigmoid (shared-expert gate).
+fn host_router_gemv(x: &[f32], w: &[f32], n_out: usize, apply_sigmoid: bool) -> Vec<f32> {
+    let hidden = x.len();
+    (0..n_out)
+        .map(|e| {
+            let mut s = 0.0f32;
+            for c in 0..hidden {
+                s += w[e * hidden + c] * x[c];
+            }
+            if apply_sigmoid {
+                1.0 / (1.0 + (-s).exp())
+            } else {
+                s
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn qwen36_router_gemv_matches_host_oracle() {
+    let ctx = match VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Vulkan device available ({e}); skipping router_gemv oracle test");
+            return;
+        }
+    };
+    eprintln!("ARLE Vulkan router_gemv proof on: {}", ctx.device_name());
+    let mut cache = KernelCache::new();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+
+    // The real qwen36 router (256 experts × 2048 hidden), the shared-expert gate
+    // (n_out=1, sigmoid), and a small shape.
+    let configs = [
+        (256usize, 2048usize, false),
+        (1, 2048, true),
+        (8, 64, false),
+    ];
+    for &(n_out, hidden, sigmoid) in &configs {
+        let x: Vec<f32> = (0..hidden).map(|_| rng.next_f32()).collect();
+        // Scale weights down so the dot magnitude stays moderate (real router
+        // weights are small; keeps sigmoid off its saturated tails).
+        let w: Vec<f32> = (0..n_out * hidden).map(|_| rng.next_f32() * 0.05).collect();
+        let want = host_router_gemv(&x, &w, n_out, sigmoid);
+
+        let buf_x = upload_f32(&ctx, &x);
+        let buf_w = upload_f32(&ctx, &w);
+        let mut buf_y = zeroed(&ctx, n_out * 4);
+        let push = qwen36_router_gemv_params(n_out as u32, hidden as u32, sigmoid).to_le_bytes();
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::Qwen36RouterGemv,
+            &[&buf_x, &buf_w, &mut buf_y],
+            qwen36_router_gemv_dispatch(n_out as u32),
+            &push,
+            Kernel::Qwen36RouterGemv.specialization_u32(),
+        )
+        .expect("router_gemv dispatch");
+
+        let got = read_f32(&buf_y, n_out);
+        let label = format!("router_gemv n_out={n_out} hidden={hidden} sigmoid={sigmoid}");
+        for (e, (&g, &wv)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - wv).abs() < 1e-4 || (g - wv).abs() / wv.abs().max(1e-4) < 1e-4,
+                "{label}: y[{e}] got {g} vs want {wv}"
+            );
+        }
+        eprintln!("[{label}] PASS ({} rows)", n_out);
+    }
+}
+
+#[test]
+fn qwen36_moe_weighted_accum_matches_host_oracle() {
+    let ctx = match VulkanContext::create() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Vulkan device available ({e}); skipping weighted_accum oracle test");
+            return;
+        }
+    };
+    eprintln!("ARLE Vulkan weighted_accum proof on: {}", ctx.device_name());
+    let mut cache = KernelCache::new();
+    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+
+    // Routed (top-8, init from 0) and shared (count 1, accumulate into existing).
+    let configs = [(2048usize, 8usize, true), (2048, 1, false), (512, 8, true)];
+    for &(hidden, count, init) in &configs {
+        let src: Vec<f32> = (0..count * hidden).map(|_| rng.next_f32()).collect();
+        let weights: Vec<f32> = (0..count).map(|_| rng.next_f32().abs()).collect();
+        let acc0: Vec<f32> = (0..hidden).map(|_| rng.next_f32()).collect();
+
+        // Host reference.
+        let mut want = vec![0.0f32; hidden];
+        for (i, w) in want.iter_mut().enumerate() {
+            let mut s = if init { 0.0 } else { acc0[i] };
+            for e in 0..count {
+                s += weights[e] * src[e * hidden + i];
+            }
+            *w = s;
+        }
+
+        let buf_src = upload_f32(&ctx, &src);
+        let buf_w = upload_f32(&ctx, &weights);
+        let mut buf_acc = upload_f32(&ctx, &acc0);
+        let push =
+            qwen36_moe_weighted_accum_params(hidden as u32, count as u32, init).to_le_bytes();
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::Qwen36MoeWeightedAccum,
+            &[&buf_src, &buf_w, &mut buf_acc],
+            qwen36_moe_weighted_accum_dispatch(hidden as u32),
+            &push,
+            Kernel::Qwen36MoeWeightedAccum.specialization_u32(),
+        )
+        .expect("weighted_accum dispatch");
+
+        let got = read_f32(&buf_acc, hidden);
+        let label = format!("weighted_accum hidden={hidden} count={count} init={init}");
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-4 || (g - w).abs() / w.abs().max(1e-4) < 1e-4,
+                "{label}: acc[{i}] got {g} vs want {w}"
+            );
+        }
+        eprintln!("[{label}] PASS");
     }
 }
