@@ -1,25 +1,28 @@
 # Plan: Self-training LoRA OPD (SOPD) — on-device weight self-update
 
-> ⚠️ **DRAFT — ONE CANDIDATE, AWAITING ckl's DECISION.** Per ckl 2026-06-14:
-> survey peer technical options first (apples-to-apples), clarify all
-> current-state detail, size/hardware budgets, the extreme achievable state +
-> 训推一体, and only start once the simplest viable approach is clear. **The
-> survey has now landed:**
-> [`../research/2026-06-14-self-training-lora-options-survey.md`](../research/2026-06-14-self-training-lora-options-survey.md).
-> Its §6 recommends the *simplest-viable* composition = **A1 EMA self-teacher +
-> B1 vanilla LoRA + C1 fp hot-swap (自更新-first)**, with this doc's verifier-
-> selected best-of-N as the **A2 booster** and merge-then-requant (升级) as a
-> **separable later milestone** — NOT the bring-up keystone. Do not implement
-> until ckl selects an approach; if A1-first is chosen, demote the best-of-N
-> keystone here to a Phase-2 booster.
+> ✅ **APPROACH DECIDED (ckl 2026-06-14).** After the apples-to-apples
+> [survey](../research/2026-06-14-self-training-lora-options-survey.md) + three
+> Codex-review passes (9 findings, all fixed), ckl locked the first cut:
+> - **Timing = G2** (整句后更新 / per-sequence inline) — the update fires after each
+>   rollout *sequence* on the rollout path; **not** per-token G3, **not** offline batch.
+> - **Device/scope = CUDA + Qwen3.5-0.8B**, **自更新-only** (A1 EMA self-teacher) —
+>   prove the loop first. Metal is a **separate later port** (today the OPD driver is
+>   CUDA-gated, survey §1.3). best-of-N (A2) and 升级 (Phase 3) are **deferred
+>   boosters/milestones**, not the bring-up keystone.
+> - **Composition = A1 EMA (Axis A) + B1 LoRA q/v + C1 fp hot-swap + D1
+>   single-process + G2 inline + H1 base-neutral design**, brought up on the
+>   AttentionQv-wired Qwen3.5.
+> **Gate before code**: this spans >5 files (infer-core, infer-seam, train/opd,
+> infer-cuda, cli) — Claude delivers the line-level spec below; **await ckl's go**.
 
-**Date**: 2026-06-14 · **Status**: draft candidate (superseded-pending-survey) · **Driver**: ckl
+**Date**: 2026-06-14 · **Status**: approach-approved → awaiting plan sign-off → impl · **Driver**: ckl
 
-> **One line**: turn the OPD LoRA loop into a *teacher-free, self-improving,
-> on-device* loop — the model distills from itself (verifier-selected best-of-N
-> + EMA-anchor), updates a LoRA adapter, hot-swaps it into its own serving
-> engine, and periodically consolidates the adapter into a re-quantized base.
-> No external teacher checkpoint; runs on AIPC unified-memory silicon.
+> **One line**: turn the OPD LoRA loop into a *teacher-free, self-improving* loop
+> that fires **at rollout time** — as the engine serves, each rollout *sequence*
+> distills the student toward its own slow-EMA adapter (A1), updates the rank-r
+> LoRA, and hot-swaps it live; periodically the adapter consolidates into a
+> re-quantized base (升级). No external teacher; one process, one weight store
+> (训推一体). First cut on CUDA+Qwen3.5; AIPC/Metal is a later port.
 
 ## Strategic placement (honest)
 
@@ -88,75 +91,122 @@ serve path, and the upgrade/requant step.
 
 ---
 
-## Phase 0 — KEYSTONE: does teacher-free self-distillation lift capability?
+## Phase 0 — KEYSTONE: does the inline (G2) A1-EMA self-update loop run correctly and hold no-regression?
 
-**This gate decides whether the entire AIPC self-training line is alive.** Run
-on the pod (CUDA), cheap, off the Phase-1 critical path. **No external teacher.**
+**ckl's locked first cut.** CUDA + Qwen3.5-0.8B, 自更新-only, EMA self-teacher,
+update fires **after each rollout sequence** (G2) on the rollout path. This phase
+proves the **mechanism** — inline loop + prefix-cache correctness + rollback
+completeness + EMA anti-divergence + no-regression. The **capability-lift**
+question is Phase 0.5 (best-of-N booster), kept separate because best-of-N is
+batch-y and does not fit strict G2-inline. Run on the pod (CUDA), cheap, off the
+Phase-1 batched-lane critical path.
 
-### The self-distillation engine (net-new, but reuses GKD machinery)
+### The inline self-update step (net-new, reuses GKD machinery)
 
-Per prompt, per step:
-1. **Sample best-of-N** — student samples `N∈{4,8}` completions at `T>0` via the
-   infer engine (rollout exists greedy; add temperature). A **verifier**
-   (GSM8K exact-match, revived M3) scores each; pick the best trajectory `τ*`.
-   If none verify, skip the prompt (no signal) — log the skip rate.
-2. **Distill toward `τ*`** — set the OPD rollout = `τ*`, then the existing GKD
-   loss: `λ`·CE(student ‖ `τ*` tokens, `GkdSftAnchor::StudentRollout`) +
-   `(1−λ)`·KL(student ‖ **EMA-self-teacher** on `τ*`). The EMA term is the
-   anti-collapse regularizer; the CE-to-best-trajectory is the capability
-   signal (self-improvement / ReST/STaR-style, but distillation not RL).
-3. **EMA update** — after the AdamW step:
-   `θ_ema ← α·θ_ema + (1−α)·θ_student` over **adapter tensors only**
-   (`α=0.999`). Tiny elementwise op on rank-r A/B.
+Per served rollout sequence (G2):
+1. **Rollout** — student decodes the sequence via the infer engine (exists,
+   default-on, 4.99×; tape disabled, CUDA-graph + paged-KV).
+2. **Score + step (two-pass-inline — the bring-up choice)** — keep the fast
+   no-tape rollout, then recompute+step: set the OPD rollout = the just-served
+   tokens; the existing `backward_chunked_kl_rollout` computes
+   KL(student ‖ **EMA-self-teacher**) and steps AdamW on the **adapter only**.
+   *(Fused-single-pass — reuse the rollout's own logits/activations in one pass —
+   is a later perf option; it loses CUDA-graph speed, so bench before adopting.
+   Survey §7 Q4.)*
+3. **EMA update** — after the step: `θ_ema ← α·θ_ema + (1−α)·θ_student` over
+   **adapter tensors only** (`α≈0.999`). Tiny elementwise op on rank-r A/B. The
+   EMA *lag* makes the KL target non-degenerate (identical weights ⇒ KL=0 —
+   survey §5 / Codex pass-2) and is the online-update anti-divergence anchor
+   (mean-teacher).
+4. **Accepted-update bookkeeping (REQUIRED, not optional)** — bump the adapter
+   epoch and **invalidate/flush the prefix cache**. `RadixCache` is token-keyed
+   with no version and `enable_prefix_cache` is default-on, so a later request
+   sharing a token prefix would otherwise reuse KV computed under the *old*
+   adapter epoch (Codex pass-2/3). Bring-up = full flush on each accepted update;
+   production = epoch-tag pages, mismatch-is-miss (survey §7 Q10).
 
-### Net-new code (small)
+### Net-new code (small, concentrated)
 
 - `train/src/ema_self_teacher.rs` — `EmaSelfTeacher: TeacherForward`. Mirrors
   `InProcessTeacher` but forwards `base(frozen) + EMA-adapter` with tape
-  **disabled**. Shares the student's frozen base tensors in the same
-  `TensorStore` (zero extra base memory).
+  **disabled**. Shares the student's frozen base in the same `TensorStore` —
+  **adapter-only EMA, ~10 MB, zero extra base memory**.
 - EMA-update helper (~30 lines) over `adapter_name_map()` ids.
-- Best-of-N + verifier wrapper around the rollout call in `opd.rs`; verifier
-  trait + GSM8K exact-match impl (revive from retired `reward.rs` history).
+- **Adapter-epoch counter + prefix-cache invalidation hook** on accepted update —
+  designed base-neutral (H1: an `infer-seam`/`infer-core` hook, **not** a Qwen3.5
+  special-case), brought up on the wired Qwen3.5 path.
 - Wire `EmaSelfTeacher` as the `teacher` arg into `backward_chunked_kl_rollout`;
-  no change to the loss/backward code itself.
+  **no change to the loss/backward code itself.**
+- A **windowed needle-gate driver** — snapshot/revert on regress; cadence =
+  every N rollouts / wall-clock (survey §7 Q6).
 
-### Memory budget (any consumer card; the OOM blocker is gone)
+### Memory budget (CUDA, any consumer card; the OOM blocker is gone)
 
 | Component | Peak |
 |---|---:|
 | Qwen3.5-0.8B base (bf16, frozen, **shared** by student + EMA-teacher) | ~1.6 GB |
 | Student adapter (r=16, q/v) + AdamW moments | ~50 MB |
-| EMA-teacher adapter | ~10 MB |
-| Best-of-N rollout KV (infer engine, N parallel) | ~0.5 GB |
+| EMA-teacher adapter (adapter-only) | ~10 MB |
+| Rollout KV (infer engine) | ~0.4 GB |
 | OPD tape / activations | ~2 GB |
-| **Total** | **~4.2 GB** (fits 8 GB; one base, not two models) |
+| **Total** | **~4.1 GB** (one base, not two models) |
 
-### License-or-kill (explicit)
+### License-or-kill (explicit — mechanism keystone)
 
-- **PASS**: held-out GSM8K lift over the un-trained base, **multi-seed ≥5,
-  mean ± σ + Wilson 95% CI** (the 2026-05-28 rule — magnitude likely <5pp on a
-  small eval, so CI is mandatory), with the U-curve caveat (eval *every* saved
-  checkpoint; valley-then-recovery is the literature-default trajectory,
-  `wins/2026-05-22-distill-trajectory-valley-then-recovery.md`). Add a 2nd
-  capability dim (IFEval or a code-unit-test task) — single-task is not enough
-  to verdict (`wins/2026-05-22-opd-task-divergent-impact.md`).
-- **KILL**: no CI-separated lift on ≥2 dims after a recipe sweep (lr, N, λ, α)
-  → teacher-free self-distillation does not inject capability here. **Stop —
-  do not port to Metal / build quant-base serve / build upgrade.** The entire
-  AIPC self-training vision is dead without this.
-- **Reward-hack tripwire**: held-out verifier + manual trajectory spot-check;
-  if the in-loop verifier score rises while held-out falls, the model is gaming
-  its own judge — revert (drop adapter) and tighten the verifier.
+- **PASS**: the inline G2 loop runs end-to-end on CUDA+Qwen3.5; KL decreases;
+  **no regression** vs the un-trained base on the needle ladder + ≥1 held-out
+  capability dim (same-config-twice floor; NOT byte-identity — MoE
+  non-determinism); the **prefix-cache epoch invalidation is verified** (a
+  prefix-sharing request issued *after* an accepted update does NOT serve
+  stale-epoch KV — assert via a targeted test); rollback restores adapter +
+  AdamW + EMA cleanly. A measurable consistency/calibration gain is a **bonus,
+  not the bar** — A1-EMA's honest effect is consistency / skill-shaping, not new
+  knowledge (survey §5).
+- **KILL**: the inline loop cannot hold no-regression after a recipe sweep
+  (lr, α, λ, window N), or the prefix-cache/rollback machinery cannot be made
+  correct at acceptable cost → the rollout-time *inline* shape is not viable;
+  fall back to a periodic (near-online) cadence before porting anything.
+- **Reward-hack tripwire**: n/a for pure A1 EMA (no verifier/reward) — becomes
+  live in Phase 0.5.
+
+## Phase 0.5 — capability booster: best-of-N rejection self-distill (A2, gated on Phase 0)
+
+A1-EMA proves the loop and shapes consistency, but the *strong capability lift*
+(GSM8K / code) comes from injecting "which trajectory is actually correct" — that
+is **A2 best-of-N + verifier**, which is **batch-y** (N completions then a filter)
+and so runs as a **periodic booster** alongside the continuous A1 loop, **not**
+strictly inline. Per prompt batch: sample `N∈{4,8}` at `T>0`, a verifier (GSM8K
+exact-match, revived M3) picks `τ*`, distill via GKD `λ·CE(student ‖ τ*) +
+(1−λ)·KL(student ‖ EMA)`. This is the original capability keystone, now correctly
+placed **after** the inline mechanism is proven. Net-new: best-of-N + verifier
+wrapper around the rollout in `opd.rs`; verifier trait + GSM8K exact-match impl
+(revive from retired `reward.rs` history).
+
+- **PASS**: held-out lift over the base on **≥2 dims** (e.g. GSM8K + IFEval /
+  code-unit-test — single-task is not enough,
+  `wins/2026-05-22-opd-task-divergent-impact.md`), **multi-seed ≥5, mean ± σ +
+  Wilson 95% CI** (2026-05-28 rule; <5pp likely → CI mandatory), U-curve caveat
+  (eval *every* saved ckpt, `wins/2026-05-22-distill-trajectory-valley-then-recovery.md`).
+- **KILL**: no CI-separated lift on ≥2 dims after a sweep (lr, N, λ, α) →
+  teacher-free capability injection does not work here; the line is A1-consistency
+  only, not capability growth.
+- **Reward-hack tripwire**: held-out verifier + manual trajectory spot-check; if
+  in-loop verifier score rises while held-out falls, the model is gaming its own
+  judge — revert (drop adapter) and tighten the verifier.
 
 ---
 
-## Phase 1 — AIPC device port (Metal first; gated on Phase 0 PASS)
+## Phase 1 — AIPC device port (Metal; LATER, gated on Phase 0 PASS)
 
-LoRA-only collapses the device cost: backward needs only **adapter A/B matmul
+The AIPC/Mac payoff, but explicitly **after** the CUDA loop is proven (ckl's
+"先证 loop"). Today the OPD *driver* is CUDA-gated (survey §1.3), so this is a
+real port, not just speed work: `build_opd_store` (add a Metal arm),
+`InferStudent`/LoRA hot-swap (`#[cfg(metal)]`), and CLI `--backend metal`. LoRA-
+only then collapses the device cost: backward needs only **adapter A/B matmul
 bwd + KL bwd + frozen base forward** (the base forward already runs on the Metal
-infer executor). This is far less than the full M5.3b autograd op coverage.
+infer executor) — far less than full M5.3b autograd op coverage.
 
+- OPD-driver Metal port (`build_opd_store` / `InferStudent` / CLI `--backend metal`).
 - Metal `EmaSelfTeacher` + Metal `InferStudent` (mirror the CUDA ones on the
   existing Metal autograd backend + Metal infer executor).
 - Acceptance: Phase-0 loop converges on Metal (KL down + same GSM8K lift shape),
@@ -225,9 +275,10 @@ weights consolidate only after a demonstrable, held-out skill improvement.
 ## DAG / critical path
 
 ```
-Phase 0 (CUDA, EMA self-teacher + best-of-N verifier)   ← KEYSTONE, blocks all
-   │  PASS ↓                                                KILL ⇒ line dead
-   ├─▶ Phase 1 (Metal device port; HIP/Vulkan later)
+Phase 0 (CUDA, inline G2 A1-EMA loop)   ← MECHANISM KEYSTONE, blocks all
+   │  PASS ↓                               KILL ⇒ rollout-time inline shape not viable
+   ├─▶ Phase 0.5 (best-of-N A2 capability booster, periodic — the lift gate)
+   ├─▶ Phase 1 (Metal device port: OPD-driver port + EmaSelfTeacher; HIP/Vulkan later)
    ├─▶ Phase 2 (quant-base + fp-adapter serve)  ──┐
    │                                              ├─▶ Phase 3 (升级 / requant)
    └──────────────────────────────────────────────┘
