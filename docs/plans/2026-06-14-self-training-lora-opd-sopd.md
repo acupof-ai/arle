@@ -204,11 +204,14 @@ weights consolidate only after a demonstrable, held-out skill improvement.
   **served prefix-KV pages** (now computed under the *old* adapter epoch —
   `RadixCache` is token-keyed with no version, `enable_prefix_cache` default-on);
   (read-only, safe) the re-merge pristine base cache.
-  → rollback = restore student adapter + AdamW moments **and the EMA-teacher
-  adapter** from the last-good snapshot, **and invalidate/version the prefix cache
-  for the rejected epoch** (epoch-tag → mismatch-is-miss, or flush). Restoring only
-  the student adapter (as a naive first cut would) leaves the EMA teacher trained
-  against rejected state and serves stale-epoch KV — both silent correctness bugs.
+  → **on every accepted update** (gate pass): bump the adapter epoch and
+  invalidate/version the prefix cache — pre-update pages are stale *even when no
+  rollback occurs*, because the weights changed. Unconditional, not a rollback step.
+  → **on rollback** (gate fail): restore student adapter + AdamW moments **and the
+  EMA-teacher adapter** from the last-good snapshot, and invalidate the prefix cache
+  for the rejected epoch (epoch-tag → mismatch-is-miss, or flush). Restoring only the
+  student adapter (as a naive first cut would) leaves the EMA teacher trained against
+  rejected state and serves stale-epoch KV — both silent correctness bugs.
 - **Per upgrade**: base weights + quant scales; **AdamW moments are reset to zero
   (Phase 3)** — so they are mutated state on this cadence too.
   → rollback = restore pre-upgrade quantized base + the adapter that produced it

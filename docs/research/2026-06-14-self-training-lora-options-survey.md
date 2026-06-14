@@ -296,10 +296,10 @@ adapter on it.*
 
 > ⚠️ **These are back-of-envelope estimates (hypothesis per §0), not measured.** 4-bit base ≈
 > params×0.55 B (incl. scales/zeros). KV @4k ctx, bf16. Activation floor for batch=1, seq≈512
-> with recompute. Run `arle train estimate-memory --model <id> --lora-rank 16 --batch 1`
+> with recompute. Run `arle train estimate-memory --model <id> --lora-rank 16 --batch 1 --seq 512`
 > to convert any row to evidence before committing. *(The estimator reports a built-in LoRA count
-> from `--lora-rank` and an activation floor from `--batch`; there is **no** `--target`/`--seq`
-> flag today — a Q/V-only vs all-linear split needs that flag added first. Validation pre-req.)*
+> from `--lora-rank` and an activation floor from `--batch`/`--seq`; the **only** missing flag is
+> `--target` — a Q/V-only vs all-linear split needs that added first. Validation pre-req.)*
 
 | Model | Params | 4-bit base | KV @4k | Trainable blk (Qv r16) | Activation (b1,s512) | **Self-train peak** | Min HW (self-train) | Min HW (serve only) |
 |---|---|---:|---:|---:|---:|---:|---|---|
@@ -432,7 +432,7 @@ This is a **recommendation to decide on**, not an implementation plan:
 | B. PEFT | **B1 vanilla LoRA q/v** (exists) | none for 自更新 |
 | C. Quant | **C1 fp hot-swap** for 自更新 (exists); **C3 dense-merge+TurboQuant** for first 升级 | requant-on-schedule wiring (升级 only) |
 | D. Process | **D1 single-process** (exists) | none |
-| E. Device | **E2 Metal** (AIPC) / **E1 CUDA** (pod) | M5.3b op coverage for speed (works today, slow) |
+| E. Device | **E1 CUDA** = only lane wired today; **E2 Metal** = target | Metal needs the OPD-driver port (`build_opd_store`/`InferStudent`/CLI `--backend metal`) **+** M5.3b op coverage — *not just speed work* (§1.3, §Axis E); CUDA runs now |
 | F. Data | **F1 static jsonl** to bring up, design for **F2 skill-replay** | none for bring-up |
 | **G. Timing** | **G2 inline-per-rollout** (≈ existing `opd_step` shape); two-pass-inline first, fused later | loss+step fire on the rollout path, not a batch run |
 | **H. Base coupling** | **H1 seam-level** design; bring up on the wired model, keep the loop base-neutral | adapter-sync as a seam capability (today Qwen3.5-only) |
