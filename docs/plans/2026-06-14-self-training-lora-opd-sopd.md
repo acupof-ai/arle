@@ -306,6 +306,31 @@ wrapper around the rollout in `opd.rs`; verifier trait + GSM8K exact-match impl
   in-loop verifier score rises while held-out falls, the model is gaming its own
   judge — revert (drop adapter) and tighten the verifier.
 
+## Phase 0.6 ([#98](https://github.com/cklxx/arle/issues/98)) — open-ended generalization: rubric-graded self-distill (A5, gated on #93)
+
+#93's exact-match verifier only reaches *checkable* skills (math/code/tool-schema).
+Real agent skills (Phase 4) are **not** exact-match-verifiable, so #93 alone can
+never feed Phase 4. **A5 swaps the exact-match verifier for an auto-induced
+rubric** ([ROPD](../research/2026-06-14-rubric-opd.md), arXiv 2605.07396): a
+**Rubricator** induces a prompt-specific rubric by contrasting EMA-teacher vs
+student rollouts; a **blind Verifier** scores each criterion; best-of-N selects
+the rubric-best τ*; distill via the same GKD `λ·CE(student‖τ*) + (1−λ)·KL(student‖EMA)`.
+Same best-of-N **distillation** wrapper as #93 — only the scorer changes.
+**Hard constraint**: ROPD-as-published optimizes with **GRPO**; this phase adopts
+only the rubric *machinery* in **rejection/best-of-N** form (never the policy
+gradient — stays inside the 2026-05-18 pivot). Net-new: a rubric `TrajectoryScorer`
+impl (the trait #93 defines), Rubricator + blind Verifier prompts, structured
+parse via `xgrammar-sys`. No seam/kernel/scheduler change.
+
+- **PASS**: held-out lift on **≥2 open-ended dims** (IFEval + one agentic skill
+  task), multi-seed ≥5, mean ± σ + Wilson 95% CI (2026-05-28 rule); reward-hack
+  tripwire holds.
+- **KILL**: no CI-separated open-ended lift after a sweep, or rubric-gaming can't
+  be contained ⇒ fall back to A1/A2 (verifiable-only).
+- **Reward-hack** is *sharper* than #93 (soft rubric judge ⇒ more gameable):
+  mitigate with ROPD **blind scoring** + **EMA-as-judge** (lagged weights harder
+  to game) + the #93 held-out tripwire.
+
 ---
 
 ## Phase 1 ([#94](https://github.com/cklxx/arle/issues/94)) — AIPC device port (Metal; LATER, gated on Phase 0 PASS)
@@ -352,10 +377,13 @@ the pre-upgrade quantized base + adapter.
 Replace static GSM8K prompts with **live agent skill/tool trajectories**: the
 agent does real tasks using its skills → `(prompt, trajectory, outcome)` →
 verifier / self-judge → best-of-N selection (Phase 0 engine) → adapter
-self-distill. Net-new: a trajectory-emit channel from the agent/tools crate into
-the OPD data buffer (the retired doctrine's §0 data flow, minus GRPO). The
-"upgrade" gate (Phase 3) becomes the skill-acquisition checkpoint: the agent's
-weights consolidate only after a demonstrable, held-out skill improvement.
+self-distill. **The self-judge for non-verifiable skills is exactly #98's rubric
+Verifier** — Phase 4's open-ended trajectories have no exact-match answer, so
+Phase 0.6 (A5) is the scoring substrate this phase depends on. Net-new here: a
+trajectory-emit channel from the agent/tools crate into the OPD data buffer (the
+retired doctrine's §0 data flow, minus GRPO). The "upgrade" gate (Phase 3)
+becomes the skill-acquisition checkpoint: the agent's weights consolidate only
+after a demonstrable, held-out skill improvement.
 
 ---
 
@@ -398,7 +426,7 @@ Severity = correctness-impact × invisibility. The two HIGH risks are both
 | R5 | **Two-pass recompute loses CUDA-graph speed** | 0 | LOW | pass 3 (tape-on recompute) cannot replay the eager rollout's work | accept for the mechanism keystone; fused-single-pass is a *later* perf option, bench before adopting (survey §7 Q4) | n/a (perf, not correctness) |
 | R6 | **Graph-pointer staleness on live re-merge** | **4** | **HIGH** | `Engine::step` replays a captured decode graph that baked the old `full.q_proj` ptr; re-merge reassigns it with no auto re-capture (`qwen35.rs:2033`, `graph.rs`) | drop + force re-capture **inside** the re-merge control closure (`lib.rs:404-441`); or disable decode-graph while the online loop is active | needle after a live re-merge proves no corruption — Phase-4 PASS bar |
 | R7 | **Batch weight-version skew** | **4** | MED | a continuous batch mixing pre/post-merge weights | re-merge only at a drained batch via the existing control closure ("drains its work before dispatching", `lib.rs:404-441`) | mixed-epoch batch impossible by construction |
-| R8 | **Reward-hack (model games its own judge)** | **0.5** | MED | in-loop verifier score rises while held-out falls | held-out verifier + manual trajectory spot-check; revert + tighten on divergence | Phase-0.5 tripwire (already in that phase) |
+| R8 | **Reward-hack (model games its own judge)** | **0.5** | MED (→ **HIGH at A5/#98**: a soft rubric judge is more gameable than exact-match) | in-loop verifier score rises while held-out falls | held-out verifier + manual trajectory spot-check; revert + tighten on divergence; **A5 adds ROPD blind scoring + EMA-as-judge** | Phase-0.5 tripwire (exact-match) + Phase-0.6 blind-rubric tripwire |
 
 **Risk posture:** every Phase-0 risk is either gated by the existing
 correct-inference machinery (R1/R3/R4 → needle + canary) or by full buffer
@@ -413,17 +441,19 @@ is "should self-heal" — each row names the buffer and the explicit preconditio
 ```
 Phase 0 (CUDA, inline G2 A1-EMA loop)   ← MECHANISM KEYSTONE, blocks all
    │  PASS ↓                               KILL ⇒ rollout-time inline shape not viable
-   ├─▶ Phase 0.5 (best-of-N A2 capability booster, periodic — the lift gate)
-   ├─▶ Phase 1 (Metal device port: OPD-driver port + EmaSelfTeacher; HIP/Vulkan later)
-   ├─▶ Phase 2 (quant-base + fp-adapter serve)  ──┐
-   │                                              ├─▶ Phase 3 (升级 / requant)
-   └──────────────────────────────────────────────┘
-                                                   └─▶ Phase 4 (skills data engine)
+   ├─▶ Phase 0.5 (best-of-N A2 capability booster, periodic — verifiable lift gate)
+   │      └─▶ Phase 0.6 (A5 rubric-graded self-distill — open-ended generalization) ─┐
+   ├─▶ Phase 1 (Metal device port: OPD-driver port + EmaSelfTeacher; HIP/Vulkan later)│
+   ├─▶ Phase 2 (quant-base + fp-adapter serve)  ──┐                                   │
+   │                                              ├─▶ Phase 3 (升级 / requant)         │
+   └──────────────────────────────────────────────┘                                  │
+                                                   └─▶ Phase 4 (skills data engine) ◀─┘
 ```
 
 ## Cross-links
 
 - Tracking issue: [#90](https://github.com/cklxx/arle/issues/90) (phase-3); roadmap Phase-3 row + off-path note; umbrella [#55](https://github.com/cklxx/arle/issues/55); related [#64](https://github.com/cklxx/arle/issues/64) (OPD resume), [#71](https://github.com/cklxx/arle/issues/71) (AIPC/Metal port)
+- Rubric-graded A5 (Phase 0.6, [#98](https://github.com/cklxx/arle/issues/98)): [`2026-06-14-rubric-opd.md`](../research/2026-06-14-rubric-opd.md) — ROPD machinery in distillation form (never GRPO), the open-ended bridge #93 → #97
 - Strategy: [`2026-06-10-arle-master-strategy-v2.md`](../projects/2026-06-10-arle-master-strategy-v2.md) §3 Phase 3 #3/#5, D4, §5 ROCm/AIPC
 - OPD-only pivot (the distillation-not-RL line): [`2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)
 - Retired doctrine (data flow + verifier + reward-hack risk): [`agent-rl-self-evolving.md`](../projects/agent-rl-self-evolving.md)
