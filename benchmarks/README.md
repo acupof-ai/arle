@@ -25,6 +25,16 @@ wins: [2026-06-14-bench-metal-m4pro-local-model-ladder](../docs/experience/wins/
 | Qwen3.5-9B | 50.0 tok/s | 20.01 ms | 1448.8 ms |
 | Qwen3.6-35B-A3B · MoE (~3B active) | 85.3 tok/s | 11.73 ms | 1231.0 ms |
 
+Plus **DiffusionGemma-26B-A4B 4-bit** (block-diffusion, `ARLE_DIFFUSION_MAX_DENOISING_STEPS=4` fast path): **55.7 tok/s end-to-end** (it isn't autoregressive, so per-token decode/TPOT aren't comparable to the table above — e2e is the meaningful number).
+
+**Not served (fail closed)** — every other locally-cached checkpoint was attempted and rejected at validation; the Metal serve path is **Qwen3.5/3.6 family + DiffusionGemma** only:
+
+| Model | Why it fails closed |
+|---|---|
+| Qwen3.6-35B-A3B-**MTP**-4bit | weight-prefix mismatch — the MTP draft head changes the layout (`could not detect Qwen3.5 text weight prefix`) |
+| z-lab Qwen3.5-4B-DFlash · Qwen3.6-35B-A3B-DFlash | draft-only checkpoints, no standard tokenizer to load |
+| Qwen2.5-0.5B / 1.5B-bf16, Llama-3.2-1B-bf16, Qwen3-0.6B | non-Qwen3.5 family — `R3a Metal executor requires Qwen3.5 layer_types` (the 1.5B hung in init, killed at 120s) |
+
 ### CUDA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE)
 
 Recorded from the 2026-06-13 → 06-14 decode campaign wins entries (no local CUDA;

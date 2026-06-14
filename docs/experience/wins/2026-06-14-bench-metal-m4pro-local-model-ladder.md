@@ -59,6 +59,18 @@ All four served coherent completions (`/v1/completions`, exact 128 tokens via
 `ignore_eos`); served ids match the model dirs; no resource-guard rejections
 after a transient 37 GiB working-set settled to ~34 GiB free pre-run.
 
+## Supplement — every other locally-cached checkpoint (2026-06-14)
+`scripts/bench_local_metal_supplement.sh` attempted the remaining local models so
+coverage is measured, not assumed. One more **serves**: DiffusionGemma-26B-A4B-it-4bit
+(block-diffusion fast path, `ARLE_DIFFUSION_MAX_DENOISING_STEPS=4`) at **55.7 tok/s
+end-to-end** (≈ the support-matrix 60 tok/s claim; the AR two-point decode/TPOT are
+not physically meaningful for diffusion). The rest **fail closed** at validation:
+Qwen3.6-35B-A3B-**MTP**-4bit (`could not detect Qwen3.5 text weight prefix` — the MTP
+head moves the layout); z-lab Qwen3.5-4B / Qwen3.6-35B-A3B **DFlash** (draft-only,
+no tokenizer); Qwen2.5-0.5B/1.5B-bf16, Llama-3.2-1B-bf16, Qwen3-0.6B (`R3a Metal
+executor requires Qwen3.5 layer_types`). **Coverage boundary: Metal serve = Qwen3.5/3.6
+family + DiffusionGemma.** Recorded in the [snapshot](../../../benchmarks/snapshots/2026-06-14-metal-m4pro-ladder.json).
+
 ## Rule
 - **Front-door numbers get a wins entry or they don't ship.** Two cited headlines
   had no clean source; one was stale by a known regression. Audit-then-measure

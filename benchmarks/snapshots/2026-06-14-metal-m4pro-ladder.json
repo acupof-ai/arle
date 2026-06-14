@@ -19,6 +19,17 @@
     { "model": "Qwen3.5-0.8B-MLX-4bit",  "active_params": "0.8B",                 "decode_tok_s": 317.8, "tpot_ms": 3.15,  "ttft_ms": 168.5,  "e2e_tok_s": 225.3 },
     { "model": "Qwen3.5-4B-MLX-4bit",    "active_params": "4B",                   "decode_tok_s": 84.1,  "tpot_ms": 11.89, "ttft_ms": 820.3,  "e2e_tok_s": 54.9 },
     { "model": "Qwen3.5-9B-MLX-4bit",    "active_params": "9B",                   "decode_tok_s": 50.0,  "tpot_ms": 20.01, "ttft_ms": 1448.8, "e2e_tok_s": 32.1 },
-    { "model": "Qwen3.6-35B-A3B-4bit",   "active_params": "~3B active / 35B total (MoE)", "decode_tok_s": 85.3, "tpot_ms": 11.73, "ttft_ms": 1231.0, "e2e_tok_s": 47.1 }
-  ]
+    { "model": "Qwen3.6-35B-A3B-4bit",   "active_params": "~3B active / 35B total (MoE)", "decode_tok_s": 85.3, "tpot_ms": 11.73, "ttft_ms": 1231.0, "e2e_tok_s": 47.1 },
+    { "model": "diffusiongemma-26B-A4B-it-4bit", "active_params": "~4B active / 26B total (MoE, block-diffusion)", "class": "diffusion", "e2e_tok_s": 55.7, "ttft_ms": 1256.6, "decode_tok_s_approx": 121.8, "tpot_ms_approx": 8.21, "note": "ARLE_DIFFUSION_MAX_DENOISING_STEPS=4 fast path. Block-diffusion is not autoregressive, so the AR two-point decode_tok_s/tpot are approximations — use e2e_tok_s as the meaningful throughput." }
+  ],
+  "attempted_not_served": [
+    { "model": "mlx-community/Qwen3.6-35B-A3B-MTP-4bit", "reason": "engine build failed: could not detect Qwen3.5 text weight prefix (the MTP draft head changes the weight layout)" },
+    { "model": "z-lab/Qwen3.5-4B-DFlash", "reason": "tokenizer load failed — draft-only DFlash checkpoint has no standard tokenizer" },
+    { "model": "z-lab/Qwen3.6-35B-A3B-DFlash", "reason": "tokenizer load failed — draft-only DFlash checkpoint has no standard tokenizer" },
+    { "model": "mlx-community/Qwen2.5-0.5B-Instruct-bf16", "reason": "R3a Metal executor requires Qwen3.5 `layer_types` (non-Qwen3.5 family)" },
+    { "model": "mlx-community/Qwen2.5-1.5B-Instruct-bf16", "reason": "hung in metal init, killed at 120s (non-Qwen3.5 bf16)" },
+    { "model": "mlx-community/Llama-3.2-1B-Instruct-bf16", "reason": "R3a Metal executor requires Qwen3.5 `layer_types` (non-Qwen3.5 family)" },
+    { "model": "Qwen/Qwen3-0.6B", "reason": "R3a Metal executor requires Qwen3.5 `layer_types` (Qwen3, not Qwen3.5)" }
+  ],
+  "coverage": "Metal serve path = Qwen3.5/3.6 family (4-bit MLX) + DiffusionGemma; all other locally-cached checkpoints fail closed at config / weight-prefix / tokenizer validation."
 }
