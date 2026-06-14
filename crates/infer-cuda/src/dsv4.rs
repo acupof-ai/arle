@@ -1880,30 +1880,104 @@ impl Dsv4Model {
             // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
             // the copy-out below before attn_out is read by hc_post.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            // Phase A (#60): for the batched lane, build this layer's per-forward
-            // block_table + indices(b=N) + sched_meta(b=N) BEFORE the per-row
-            // loop. This validates the orphaned batched indices builder and the
-            // per-forward sched_meta on the pod (the cached-meta is b=1-only).
-            // CSA layers need per-row `selected` (only produced inside
-            // mla_attention), so the batched indices build is skipped for them in
-            // Phase A; Phase B collects `selected` and removes this guard.
-            // PHASE B: replace the per-row mla_attention loop below with one
-            //   gather → flashmla.sparse_decode_fwd_batched(b=N) → scatter, using
-            //   the indices/sched_meta built here. See
-            //   docs/plans/dsv4-batched-flashmla-decode.md.
-            if batched_attn_lane && layer.mode != DeepSeekV4AttentionMode::CompressedSparse {
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_meta");
+            // PHASE B (#60): the batched FlashMLA decode lane. For a batched-
+            // eligible layer (FlashMLA decode on AND mode != CSA — CSA's per-row
+            // `selected` keeps it on the per-row path) the per-row FlashMLA KERNEL
+            // launch is replaced by ONE `sparse_decode_fwd(b=N)`:
+            //   1. per row: PREPARE (wq/wkv+RoPE, HCA compressor) → pack KV into
+            //      the shared pool → gather this row's global-head Q into q_batched[r];
+            //   2. build_layer_batch_meta(b=N) (indices/sched_meta) → ONE batched fwd;
+            //   3. per row: slice the global-head output → local_attn → inverse-rope
+            //      + SW-window update (the cheap per-row tail) → O-LoRA into attn_out[r].
+            // The prepare/pack/finish/oproj loops stay per-row (cheap); only the
+            // attention kernel is batched (the 74k tiny gridX=1 launches — see
+            // docs/plans/dsv4-batched-flashmla-decode.md). CSA + non-batched layers
+            // fall through to the per-row `mla_attention` loop, byte-unchanged.
+            let use_batched_kernel =
+                batched_attn_lane && layer.mode != DeepSeekV4AttentionMode::CompressedSparse;
+            if use_batched_kernel {
+                let want_compressed = layer.mode == DeepSeekV4AttentionMode::HybridCompressed;
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
+                // ── 1. per-row PREPARE + pack + Q-gather.
+                let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
                 {
-                    let (layer_pool, _dsa, _flash) =
-                        kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                    for &row in slot_ids.iter().take(n) {
-                        slot_block_offsets.push(layer_pool.flashmla_slot_first_block(row)?);
+                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_prepare");
+                    for r in 0..n {
+                        let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                        ctx.stream
+                            .memcpy_dtod(&src, &mut normed_row.data)
+                            .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
+                        let (layer_pool, dsa_shared, flash_batch) =
+                            kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                        let flash_batch = flash_batch.ok_or_else(|| {
+                            anyhow!("DSv4 batched decode lane: batch scratch missing")
+                        })?;
+                        let slot = &mut slots[slot_ids[r]];
+                        slot_block_offsets.push(layer_pool.flashmla_slot_first_block(slot_ids[r])?);
+                        let row_prepared = crate::attention::mla_attention_prepare(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            &normed_row,
+                            &mut slot.attention[layer_idx],
+                            layer_pool,
+                            dsa_shared,
+                            start_positions[r],
+                            Some(&slot.start_pos_device),
+                            None,
+                            &self.tp,
+                            &mut keepalive,
+                        )?;
+                        // Pack this row's KV into the shared pool, then gather its
+                        // global-head Q into q_batched[r]. flash arena + pool +
+                        // batch scratch are disjoint (slots vs kv_adapter fields).
+                        let (flash, sw_window, compressed) =
+                            slot.attention[layer_idx].flashmla_pack_borrow(want_compressed)?;
+                        crate::attention::flashmla_decode_pack_row(
+                            &self.ctx,
+                            &self.config,
+                            layer.compress_ratio,
+                            flash,
+                            layer_pool,
+                            sw_window,
+                            &row_prepared.k_prepared,
+                            compressed,
+                            &slot.start_pos_device,
+                        )?;
+                        flash_batch.gather_q_row(
+                            &self.ctx,
+                            &self.config,
+                            &row_prepared.q_prepared,
+                            &self.tp,
+                            r,
+                            row_prepared.local_heads,
+                        )?;
+                        // Keep the prepared buffers alive to function return — the
+                        // batched fwd (after this loop) reads the gathered Q, and
+                        // the finish loop reads k_prepared/local_attn. Mirrors the
+                        // keepalive discipline of the per-row intermediates
+                        // (guards the disabled-event-tracking premature free).
+                        keepalive.keep_hidden(&row_prepared.q_prepared);
+                        keepalive.keep_hidden(&row_prepared.k_prepared);
+                        keepalive.keep_hidden(&row_prepared.local_attn);
+                        if let Some(sel) = row_prepared.selected.as_ref() {
+                            keepalive.keep_i32(sel);
+                        }
+                        prepared.push(row_prepared);
                     }
                 }
-                let (_layer_pool, _dsa, flash_batch) =
-                    kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                if let Some(flash_batch) = flash_batch {
+                // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
+                {
+                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_fwd");
+                    let (layer_pool, _dsa, flash_batch) =
+                        kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                    let flash_batch = flash_batch.ok_or_else(|| {
+                        anyhow!("DSv4 batched decode lane: batch scratch missing")
+                    })?;
                     flash_batch.build_layer_batch_meta(
                         &self.ctx,
                         &self.config,
@@ -1913,10 +1987,81 @@ impl Dsv4Model {
                         &start_positions[..n],
                         &slot_block_offsets,
                     )?;
+                    let sm_scale = prepared[0].sm_scale;
+                    flash_batch.decode_lane_fwd(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer_pool,
+                        layer_idx,
+                        n,
+                        sm_scale,
+                    )?;
                 }
-            }
-            {
-                let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
+                // ── 3. per-row slice-out → inverse-rope + SW-update → O-LoRA.
+                {
+                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_finish");
+                    for r in 0..n {
+                        // One mutable borrow of row r's prepared state; field
+                        // accesses below are disjoint (k_prepared/scalars `&`,
+                        // local_attn `&mut`) so the borrow checker splits them.
+                        let p = &mut prepared[r];
+                        {
+                            let (_layer_pool, _dsa, flash_batch) =
+                                kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                            let flash_batch = flash_batch.ok_or_else(|| {
+                                anyhow!("DSv4 batched decode lane: batch scratch missing")
+                            })?;
+                            flash_batch.slice_out_row(
+                                &self.ctx,
+                                &self.config,
+                                &self.tp,
+                                r,
+                                p.local_heads,
+                                &mut p.local_attn,
+                            )?;
+                        }
+                        let slot = &mut slots[slot_ids[r]];
+                        let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
+                        crate::attention::flashmla_decode_finish_row(
+                            &self.ctx,
+                            &self.config,
+                            sw_window,
+                            &p.k_prepared,
+                            &mut p.local_attn,
+                            start_positions[r],
+                            &slot.start_pos_device,
+                            p.local_heads,
+                            p.rope_base,
+                            p.original_seq_len,
+                            self.config.rope_parameters.factor,
+                            self.config.rope_parameters.beta_fast,
+                            self.config.rope_parameters.beta_slow,
+                        )?;
+                        // O-LoRA: local_attn[r] → reused attn_out_row scratch →
+                        // attn_out[r] (per-row; token=1; no per-row alloc). The
+                        // shared scratch is WAR-safe under stream ordering, like
+                        // the per-row lane below.
+                        crate::attention::mla_oproj(
+                            &self.ctx,
+                            &layer.attention,
+                            &mut slot.attention[layer_idx],
+                            &p.local_attn,
+                            1,
+                            &layer.attention.wo_a,
+                            &mut keepalive,
+                            &mut attn_out_row,
+                        )?;
+                        let mut dst = attn_out
+                            .data
+                            .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                        ctx.stream
+                            .memcpy_dtod(&attn_out_row.data, &mut dst)
+                            .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
+                    }
+                }
+            } else {
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_row");
                 for r in 0..n {
                     let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
                     ctx.stream
