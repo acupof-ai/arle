@@ -1269,16 +1269,12 @@ fn moe_ffn<'a>(
     if moe_in != h {
         bail!("ffn_gate_exps[{layer}] in-dim {moe_in} != hidden {h}");
     }
-    if !routes.is_empty() {
-        moe_routed_fused_submit(
-            ctx, res, gate_exps, up_exps, down_exps, h, moe_inter, &routes, mlp_in_off, acc_off,
-        )?;
-    }
 
     // ── Shared expert (present on qwen35moe): a dense swiglu MLP gated by a
-    // per-token sigmoid scalar from ffn_gate_inp_shexp. Recorded device-resident
-    // into one submit; the sigmoid scalar folds into its scaled-add. ──
-    if let Some(up_shexp) = weights.get(&format!("blk.{layer}.ffn_up_shexp.weight")) {
+    // per-token sigmoid scalar from ffn_gate_inp_shexp. Resolve its weights + the
+    // sigmoid gate `s` NOW (host) — `s` depends only on mlp_in, not on the routed
+    // output — so the routed and shared blocks record into ONE submit. ──
+    let shared = if let Some(up_shexp) = weights.get(&format!("blk.{layer}.ffn_up_shexp.weight")) {
         let gate_shexp = weights
             .get(&format!("blk.{layer}.ffn_gate_shexp.weight"))
             .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_shexp.weight"))?;
@@ -1295,35 +1291,71 @@ fn moe_ffn<'a>(
                 res.arena.max_cols
             );
         }
-
-        // Sigmoid gate: ffn_gate_inp_shexp is F32 [hidden → 1] (one scalar/token).
-        // Compute it on host (one F32 dot) and fold the sigmoid into the shared
-        // expert's scaled-add (`acc += s · y_shared`); default 1.0 if absent.
+        // Sigmoid gate: ffn_gate_inp_shexp is F32 [hidden → 1] (one scalar/token);
+        // folds into the shared expert's scaled-add (`acc += s · y_shared`),
+        // default 1.0 if absent.
         let s = if let Some(shgate) = weights.get(&format!("blk.{layer}.ffn_gate_inp_shexp.weight"))
         {
             sigmoid(gemv_f32_host(shgate, mlp_in, 1)?[0])
         } else {
             1.0
         };
+        Some((gate_shexp, up_shexp, down_shexp, sh_inter, s))
+    } else {
+        None
+    };
 
-        // The dense shared expert reuses work[2]/work[3] as its gate/up/act
-        // scratch (the fused routed path's moe_* slots are already consumed).
-        let sh_gate_off = res.arena.work[2].offset;
-        let sh_up_off = res.arena.work[3].offset;
-        moe_dense_expert_submit(
-            ctx,
-            res,
-            gate_shexp,
-            up_shexp,
-            down_shexp,
-            h,
-            sh_inter,
-            s,
-            mlp_in_off,
-            sh_gate_off,
-            sh_up_off,
-            acc_off,
-        )?;
+    // ── ONE submit per MoE layer: record the routed block then the shared block
+    // into the same recorder and submit once (was 2 submits/layer). They write
+    // disjoint arena slots (routed `moe_*`; shared `work[2]`/`work[3]`/`quant`)
+    // and share only `acc_off`, ordered by the barrier at the seam. ──
+    let have_routed = !routes.is_empty();
+    if have_routed || shared.is_some() {
+        let t_start = std::time::Instant::now();
+        res.recorder
+            .begin()
+            .map_err(|er| anyhow!("moe_ffn[{layer}]: recorder begin: {er}"))?;
+        let mut dispatches = 0u64;
+        if have_routed {
+            moe_routed_fused_record(
+                ctx, res, gate_exps, up_exps, down_exps, h, moe_inter, &routes, mlp_in_off, acc_off,
+            )?;
+            dispatches += 3;
+        }
+        if let Some((gate_shexp, up_shexp, down_shexp, sh_inter, s)) = shared {
+            // Seam: order the routed acc writes before the shared block's reads
+            // (the shared scaled-add reads acc_off the routed experts wrote).
+            if have_routed {
+                res.recorder.barrier();
+            }
+            // The dense shared expert reuses work[2]/work[3] as its gate/up
+            // scratch (disjoint from the routed path's moe_* slots).
+            let sh_gate_off = res.arena.work[2].offset;
+            let sh_up_off = res.arena.work[3].offset;
+            moe_dense_expert_record(
+                ctx,
+                res,
+                gate_shexp,
+                up_shexp,
+                down_shexp,
+                h,
+                sh_inter,
+                s,
+                mlp_in_off,
+                sh_gate_off,
+                sh_up_off,
+                acc_off,
+            )?;
+            dispatches += 3;
+        }
+        let t_submit = std::time::Instant::now();
+        res.recorder
+            .submit_and_wait()
+            .map_err(|er| anyhow!("moe_ffn[{layer}]: submit: {er}"))?;
+        let submit_ns = t_submit.elapsed().as_nanos();
+        res.gemv_submit_ns += submit_ns;
+        res.gemv_other_ns += t_start.elapsed().as_nanos().saturating_sub(submit_ns);
+        res.gemv_count += dispatches;
     }
 
     // Read the accumulator back once (the only host hop in the whole MoE FFN).
@@ -1331,7 +1363,9 @@ fn moe_ffn<'a>(
 }
 
 /// Record ALL top-k routed experts' `acc += Σ w_e · down_e(silu(gate_e·x)·up_e·x)`
-/// device-resident into ONE submit, using 3 FUSED `mul_mat_vec_id` dispatches
+/// device-resident into the caller's OPEN recorder (no begin/submit — `moe_ffn`
+/// brackets this and the shared-expert block in ONE submit), using 3 FUSED
+/// `mul_mat_vec_id` dispatches
 /// (the `mul_mat_vec_id` perf win — replaces the old per-expert 8×3 loop):
 ///
 ///   ids       := routed expert ids                       (host → moe_ids slot)
@@ -1351,7 +1385,7 @@ fn moe_ffn<'a>(
 /// super-blocks align per expert), so down's `ne11=top_k` indexes each expert's
 /// own activation row.
 #[allow(clippy::too_many_arguments)]
-fn moe_routed_fused_submit<'a>(
+fn moe_routed_fused_record<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,
     gate_exps: &DeviceTensor<'_>,
@@ -1400,11 +1434,6 @@ fn moe_routed_fused_submit<'a>(
     let up_off = res.arena.moe_up.offset;
     let act_quant_off = res.arena.moe_act_quant.offset;
     let down_off = res.arena.moe_down.offset;
-
-    let t_start = std::time::Instant::now();
-    res.recorder
-        .begin()
-        .map_err(|er| anyhow!("ffn_exps: recorder begin: {er}"))?;
 
     // q_in = quantize(mlp_in) — shared by the gate + up fused dispatches.
     record_quantize(ctx, res, "ffn_exps_qin", h, mlp_in_off, in_quant_off)?;
@@ -1501,26 +1530,18 @@ fn moe_routed_fused_submit<'a>(
             res.recorder.barrier();
         }
     }
-
-    let t_submit = std::time::Instant::now();
-    res.recorder
-        .submit_and_wait()
-        .map_err(|er| anyhow!("ffn_exps: submit: {er}"))?;
-    let submit_ns = t_submit.elapsed().as_nanos();
-    let total_ns = t_start.elapsed().as_nanos();
-    res.gemv_submit_ns += submit_ns;
-    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
-    // 3 fused GEMV dispatches stand in for the old top_k*3 per-expert GEMVs.
-    res.gemv_count += 3;
+    // Record-only: the caller (`moe_ffn`) brackets this with one
+    // `begin()`/`submit_and_wait()` shared with the shared-expert block.
     Ok(())
 }
 
 /// Record the shared (dense) expert's `acc += s · y_shared` device-resident into
-/// ONE submit: gate/up/swiglu/down over the whole `ffn_*_shexp` tensors, then the
-/// sigmoid-gated accumulate. `s` is the per-token sigmoid scalar (1.0 if no
-/// shared-router weight); it folds into the scaled-add.
+/// the caller's OPEN recorder (no begin/submit — `moe_ffn` submits it together
+/// with the routed-expert block): gate/up/swiglu/down over the whole
+/// `ffn_*_shexp` tensors, then the sigmoid-gated accumulate. `s` is the per-token
+/// sigmoid scalar (1.0 if no shared-router weight); it folds into the scaled-add.
 #[allow(clippy::too_many_arguments)]
-fn moe_dense_expert_submit<'a>(
+fn moe_dense_expert_record<'a>(
     ctx: &'a VulkanContext,
     res: &mut DecodeResources<'a>,
     gate_w: &DeviceTensor<'_>,
@@ -1537,11 +1558,6 @@ fn moe_dense_expert_submit<'a>(
     let g_len = gate_w.buffer.len() as u64;
     let u_len = up_w.buffer.len() as u64;
     let d_len = down_w.buffer.len() as u64;
-
-    let t_start = std::time::Instant::now();
-    res.recorder
-        .begin()
-        .map_err(|er| anyhow!("ffn_shexp: recorder begin: {er}"))?;
 
     // gate + up both project the SAME `h`-wide `mlp_in`. Quantize it once, then
     // run gate/up as GEMV-only against the shared activation (disjoint dst slots,
@@ -1599,16 +1615,7 @@ fn moe_dense_expert_submit<'a>(
     )?;
     res.recorder.barrier();
     record_scaled_add(ctx, res, "ffn_shexp_acc", h, s, acc_off, up_off, acc_off)?;
-
-    let t_submit = std::time::Instant::now();
-    res.recorder
-        .submit_and_wait()
-        .map_err(|er| anyhow!("ffn_shexp: submit: {er}"))?;
-    let submit_ns = t_submit.elapsed().as_nanos();
-    let total_ns = t_start.elapsed().as_nanos();
-    res.gemv_submit_ns += submit_ns;
-    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
-    res.gemv_count += 3;
+    // Record-only: `moe_ffn` submits this together with the routed-expert block.
     Ok(())
 }
 
