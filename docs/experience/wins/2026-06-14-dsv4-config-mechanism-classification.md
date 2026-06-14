@@ -66,10 +66,24 @@ debug (`*_DUMP`, `*_PROBE`, `STEP/STAGE_PROFILE`), tuning (`*_SMS`), log
 - Mac CUDARC typecheck (`infer-api`, `cuda,no-cuda`): clean. The `no-cuda` build
   takes `HAS_*=false` → exercises + compiles the **scalar fallback path** (the
   P1-fix path). No unexpected-cfg lint (check-cfg declared).
-- `codex review`: <PENDING — fill>.
-- Pod (full build) needle 512/6000 + B=1: PENDING the next full pod rebuild
-  (gated on syncing ckl's concurrent #88 Triton-deletion commit + this); expected
-  unchanged (byte-identical — cfgs on → same kernels).
+- `codex review`: clean (0 findings) after the P1 (prebuilt-path cfg) + P2
+  (DeepGEMM stub-vs-native → runtime probe) fixes.
+- Pod (full build) needle 512/6000 + B=1: **DONE 2026-06-14** — synced to clean
+  `7d660f66` via git bundle (ckl's #88 Triton WIP backed up + reset), rebuilt
+  (cuda-kernels recompiled, FlashMLA/DeepGEMM markers present). **Correctness
+  CLEAN**: needle exact retrieval at 512/2000/6000 (one 2000 partial = MoE
+  non-determinism, within the locked envelope). **Perf CLEAN, no regression**:
+  B=1 decode **forward floor 42.0 ms/step** (acceptance-independent; rock-solid
+  41.7–42.3 across factual/code/structured/creative prompts, <1.5% spread —
+  slightly better than the pre-refactor 42.7 ms/step). tok/s 43.2→55.6 swings
+  **entirely by MTP acceptance** (tok/step 1.82→2.34); code-prompt hits 55.6,
+  exceeding the 53.3 d2 chain-fold doc baseline. The apparent "42-45 vs 53.3 gap"
+  was a creative-writing-prompt low-acceptance artifact + cross-tree confound
+  (53.3 was measured on `/data01/build/arle-dsv4` with DeepEP), NOT a forward
+  regression. Confirms the refactor is byte-identical-behavior on the full build.
+- Two serve-interface facts surfaced (rewrite stack, not refactor-caused): DSv4
+  rejects `--kv-cache-dtype fp8` (it owns FP8 KV internally, #68 T3 flag is
+  dense-Qwen3-only); DSv4 slot cap is `INFER_DSV4_MAX_SEQ_LEN` env, no CLI flag.
 
 ## Coordination note
 Landed alongside ckl's concurrent `#88` commit (`23d6a0b8` — delete
