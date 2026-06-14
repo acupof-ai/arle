@@ -781,6 +781,69 @@ pub fn sigmoid_mul_dispatch(n: u32) -> Dispatch {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Qwen3.5 gated-delta linear-attention push-constant contracts (linear-attention
+// on-device port). The two model-specific serial shaders
+// (`qwen35_ssm_conv.comp`, `qwen35_gated_delta_net.comp`) replace the host
+// depthwise-conv1d + recurrent gated-delta routines in `infer-vulkan`'s
+// `linear_attention`. Both run ONE invocation per output lane (channel / value
+// head) with `local_size_x = 1` — serial fallbacks oracle-gated against the
+// host f32 routine, not throughput kernels.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Push-constant block for `qwen35_ssm_conv.comp` = `{num_channels, seq_len,
+/// kernel_size}` (3 `uint`s). Depthwise causal conv1d over all `qkv` channels:
+/// taps `[ring | x]` (ring = the previous `kernel-1` inputs per channel), then
+/// `silu(round_to_bf16(sum))`, then advances the per-channel ring in place.
+/// Bindings (in order): `0 = XSeq [seq_len*num_channels] f32` (row-major, token
+/// `t` at `t*num_channels`), `1 = ConvWeight [num_channels*kernel_size] f32`
+/// (row-major, channel `c` at `c*kernel_size`), `2 = ConvState
+/// [num_channels*(kernel-1)] f32` (the ring, read+written), `3 = OutSeq
+/// [seq_len*num_channels] f32`.
+pub fn qwen35_ssm_conv_params(num_channels: u32, seq_len: u32, kernel_size: u32) -> KernelParams {
+    KernelParams::from_words(vec![num_channels, seq_len, kernel_size])
+}
+
+/// Dispatch grid for `qwen35_ssm_conv.comp`: `local_size_x = 1`, one invocation
+/// per channel (`gl_GlobalInvocationID.x = c`), so `x = num_channels`.
+pub fn qwen35_ssm_conv_dispatch(num_channels: u32) -> Dispatch {
+    Dispatch::x(num_channels.max(1))
+}
+
+/// Push-constant block for `qwen35_gated_delta_net.comp` = `{num_key_heads,
+/// num_value_heads, key_dim, val_dim, seq_len}` (5 `uint`s). The recurrent
+/// gated-delta state update for one (or more) tokens: per value head it
+/// l2-normalizes q/k over `key_dim` (eps 1e-12), scales q by `1/sqrt(key_dim)`,
+/// decays the `[key_dim, val_dim]` state by `exp_g`, does the two-pass rank-1
+/// update, and writes `S^T q`. Bindings (in order): `0 = Qkv
+/// [seq_len*(2*nk*kd + nv*vd)] f32` (post-conv `[q|k|v]`, token-major),
+/// `1 = BProj [seq_len*nv] f32`, `2 = AProj [seq_len*nv] f32`, `3 = DtBias [nv]
+/// f32`, `4 = ALog [nv] f32` (the GGUF `ssm_a`, already `= -exp(A_log)`),
+/// `5 = State [nv*kd*vd] f32` (val contiguous, read+written), `6 = Output
+/// [seq_len*nv*vd] f32`.
+pub fn qwen35_gated_delta_net_params(
+    num_key_heads: u32,
+    num_value_heads: u32,
+    key_dim: u32,
+    val_dim: u32,
+    seq_len: u32,
+) -> KernelParams {
+    KernelParams::from_words(vec![
+        num_key_heads,
+        num_value_heads,
+        key_dim,
+        val_dim,
+        seq_len,
+    ])
+}
+
+/// Dispatch grid for `qwen35_gated_delta_net.comp`: `local_size_x = 1`, one
+/// invocation per value head (`gl_GlobalInvocationID.x = v_head`), so
+/// `x = num_value_heads`.
+pub fn qwen35_gated_delta_net_dispatch(num_value_heads: u32) -> Dispatch {
+    Dispatch::x(num_value_heads.max(1))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Flash-attention push-constant contract (full-attention on-device, Step 6).
 // `flash_attn.comp` (+ `flash_attn_base.glsl`) is the scalar/subgroup-shuffle
 // FA path llama.cpp uses for N==1 decode on RDNA (coopmat is NV/prefill). The
