@@ -149,12 +149,13 @@ fn build_pipeline<'a>(
         .map_err(|e| KernelError::Runtime(e.to_string()))?;
     let layout = DescriptorSetLayout::storage_buffers(ctx, binding_count)
         .map_err(|e| KernelError::Runtime(e.to_string()))?;
-    let pipeline = ComputePipeline::create_with_push_constants_and_specialization(
+    let pipeline = ComputePipeline::create_with_push_constants_specialization_and_subgroup_size(
         ctx,
         &shader,
         &[&layout],
         push_bytes,
         specialization_u32,
+        kernel.required_subgroup_size(),
     )
     .map_err(|e| KernelError::Runtime(e.to_string()))?;
     Ok((pipeline, layout))
