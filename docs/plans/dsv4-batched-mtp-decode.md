@@ -90,6 +90,7 @@ its rings), so correctness is inherited from the proven per-row path:
 | `flashmla.fp8_kv_comp_packed_rows` | restore to `fp8_packed_rows_before` | per slot |
 | `flashmla.fp8_kv_sw_bootstrapped` | restore to `fp8_bootstrapped_before` (P1-B) | per slot; false⇒force re-bootstrap |
 | accepted slots `[0..=accepted]` | left to the commit re-forward / fold (overwrites) | — |
+| `slot.spec_normed[layer_idx]` (commit-fold cache, **default ON**) | tree-verify persists this layer's attn-normed rows (`dsv4.rs:2707-2716`); `commit_accepted_fold` reads them | **codex P2**: batched verify's `normed` is the combined `[M,hidden]` buffer — must **scatter each slot's row block into the OWNING slot's `spec_normed`** (Stage 1's per-slot attention loop makes this natural: persist slot s's block to `slots[s].spec_normed`), OR disable fold for the batched path and commit via per-slot re-forward. Default-on fold reading the combined/wrong-slot buffer = silent wrong commit. |
 
 The DSv4-EAGLE-rollback anchor (2026-06-06: missed `pending_kv`/`prev_overlap` +
 `sw_window`+`fp8_kv_pool`) is already covered by the per-row capture/restore; batched
