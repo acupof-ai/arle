@@ -996,13 +996,22 @@ fn forward_layers_host_bridged<'a>(
     let eps = config.rms_norm_eps;
     let mut hidden = embed.to_vec();
 
+    // Wall-clock buckets (ARLE_PROFILE_LAYERS=1) to localize the host-bridged
+    // decode floor: attention vs moe_ffn vs host elementwise/norm. Each is the
+    // WALL time of that block (attention/moe include their device submits).
+    let profile = std::env::var("ARLE_PROFILE_LAYERS").is_ok();
+    let (mut t_attn, mut t_moe, mut t_host) = (0u128, 0u128, 0u128);
+
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
     for (layer, &layer_type) in config.layer_types.iter().enumerate() {
         // input_layernorm: plain RMSNorm (GGUF weight applied directly).
+        let t_h = std::time::Instant::now();
         let attn_norm = norm_weight(weights, layer, "attn_norm")?;
         let normed = rms_norm_weight(&hidden, &attn_norm, eps);
+        t_host += t_h.elapsed().as_nanos();
 
+        let t_a = std::time::Instant::now();
         let attn_out = match layer_type {
             LayerType::FullAttention => {
                 let out = full_attention(
@@ -1018,13 +1027,20 @@ fn forward_layers_host_bridged<'a>(
                 out
             }
         };
+        t_attn += t_a.elapsed().as_nanos();
 
         if config.is_moe_layer(layer) {
+            let t_h2 = std::time::Instant::now();
             let post_sum = add_vec(&hidden, &attn_out);
             let post_norm_w = norm_weight(weights, layer, "post_attention_norm")?;
             let mlp_in = rms_norm_weight(&post_sum, &post_norm_w, eps);
+            t_host += t_h2.elapsed().as_nanos();
+            let t_m = std::time::Instant::now();
             let mlp_out = moe_ffn(ctx, config, weights, res, layer, &mlp_in)?;
+            t_moe += t_m.elapsed().as_nanos();
+            let t_h3 = std::time::Instant::now();
             hidden = add_vec(&post_sum, &mlp_out);
+            t_host += t_h3.elapsed().as_nanos();
         } else {
             // Device FFN reads host hidden/attn from slots, writes hid slot.
             let hid_off = res.arena.hid.offset;
@@ -1043,8 +1059,23 @@ fn forward_layers_host_bridged<'a>(
             let submit_ns = t_submit.elapsed().as_nanos();
             res.gemv_submit_ns += submit_ns;
             res.gemv_other_ns += t_start.elapsed().as_nanos().saturating_sub(submit_ns);
+            t_attn += t_start.elapsed().as_nanos();
             hidden = res.arena.read_at(hid_off, config.hidden_size)?;
         }
+    }
+    if profile {
+        let router_ms = MOE_ROUTER_NS.with(|c| {
+            let v = c.get();
+            c.set(0);
+            v as f64 / 1e6
+        });
+        eprintln!(
+            "  HOST-BRIDGED PROFILE: attn {:.1}ms | moe_ffn {:.1}ms (of which HOST router gemv {:.1}ms) | host elementwise/norm {:.1}ms",
+            t_attn as f64 / 1e6,
+            t_moe as f64 / 1e6,
+            router_ms,
+            t_host as f64 / 1e6,
+        );
     }
     Ok(hidden)
 }
@@ -1138,6 +1169,13 @@ fn final_norm_lm_head<'a>(
 // norm_topk) + `llm_build_qwen35moe::build_layer_ffn` (shared expert mix).
 // ─────────────────────────────────────────────────────────────────────────────
 
+thread_local! {
+    /// Per-token accumulator (ns) for the HOST router GEMV in `moe_ffn`
+    /// (`ARLE_PROFILE_LAYERS` probe): isolates the F32 router `dequant_f32` +
+    /// matvec from the rest of `moe_ffn`. Drained by the host-bridged profile.
+    static MOE_ROUTER_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+}
+
 /// The sparse MoE FFN for one token. Returns the FFN output `[hidden]` to be
 /// residual-added by the caller (matching the dense path's `mlp_out`).
 ///
@@ -1198,7 +1236,9 @@ fn moe_ffn<'a>(
     let router = weights
         .get(&format!("blk.{layer}.ffn_gate_inp.weight"))
         .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_inp.weight"))?;
+    let t_router = std::time::Instant::now();
     let router_logits = gemv_f32_host(router, mlp_in, config.num_experts)?;
+    MOE_ROUTER_NS.with(|c| c.set(c.get() + t_router.elapsed().as_nanos()));
 
     let routes = qwen36_topk_routes(
         &router_logits,
@@ -1577,15 +1617,11 @@ fn moe_dense_expert_submit<'a>(
 /// routers (`ffn_gate_inp` → n_expert, `ffn_gate_inp_shexp` → 1), which are F32
 /// and too small to justify a device round-trip.
 fn gemv_f32_host(weight: &DeviceTensor<'_>, x: &[f32], nrows: usize) -> Result<Vec<f32>> {
-    if !matches!(weight.residency, Residency::DequantF32) {
-        bail!(
-            "{}: host F32 matvec expects F32-resident weight, got {:?}",
-            weight.name,
-            weight.residency
-        );
-    }
     let ncols = x.len();
-    let w = dequant_f32(weight, nrows * ncols)?;
+    // Borrow the weight from the cached host copy (zero-copy) — never read it
+    // back from the write-combined device buffer. This is the MoE router GEMV
+    // (`ffn_gate_inp`, run every layer every token); the read-back was ~1.5 s/tok.
+    let w = host_f32_values(weight, nrows * ncols)?;
     let mut y = vec![0.0f32; nrows];
     for (r, yr) in y.iter_mut().enumerate() {
         let row = &w[r * ncols..r * ncols + ncols];
@@ -3662,7 +3698,17 @@ fn norm_weight(weights: &ResidentWeights<'_>, layer: usize, suffix: &str) -> Res
 }
 
 /// Read a device-resident F32 tensor's first `len` elements to host.
-fn dequant_f32(t: &DeviceTensor<'_>, len: usize) -> Result<Vec<f32>> {
+/// Borrow a `DequantF32` tensor's first `len` values as a host f32 slice.
+///
+/// Prefers the cached host copy (`DeviceTensor::host_f32`, filled at upload) so
+/// the hot read-backs — the MoE router `ffn_gate_inp` (40×/token), the shared-
+/// expert sigmoid gate, the SSM conv/A_log/dt_bias/norm params — read CACHED
+/// RAM (~GB/s) instead of the write-combined device buffer (~50-300 MB/s
+/// uncached CPU reads). Re-reading the 2 MB F32 router from the WC buffer every
+/// layer every token was ~1.5 s/token of MoE decode. Falls back to a device
+/// `copy_to_host` only if the cache is absent (it never is for DequantF32
+/// loaded via `upload_plan`, but the read path stays correct regardless).
+fn host_f32_values<'t>(t: &'t DeviceTensor<'_>, len: usize) -> Result<std::borrow::Cow<'t, [f32]>> {
     if !matches!(t.residency, Residency::DequantF32) {
         bail!(
             "{}: expected F32-resident tensor, got {:?}",
@@ -3670,6 +3716,17 @@ fn dequant_f32(t: &DeviceTensor<'_>, len: usize) -> Result<Vec<f32>> {
             t.residency
         );
     }
+    if let Some(cached) = t.host_f32.as_deref() {
+        if cached.len() < len {
+            bail!(
+                "{}: cached F32 host copy {} f32 < {len} needed",
+                t.name,
+                cached.len()
+            );
+        }
+        return Ok(std::borrow::Cow::Borrowed(&cached[..len]));
+    }
+    // Fallback: read the device buffer back (slow — host-visible/write-combined).
     let want = len * std::mem::size_of::<f32>();
     if t.buffer.len() < want {
         bail!(
@@ -3682,8 +3739,15 @@ fn dequant_f32(t: &DeviceTensor<'_>, len: usize) -> Result<Vec<f32>> {
     t.buffer
         .copy_to_host(&mut bytes[..])
         .map_err(|e| anyhow!("{}: read back F32 tensor: {e}", t.name))?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    Ok(std::borrow::Cow::Owned(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    ))
+}
+
+/// Owned copy of a `DequantF32` tensor's first `len` values (cached-RAM source).
+fn dequant_f32(t: &DeviceTensor<'_>, len: usize) -> Result<Vec<f32>> {
+    Ok(host_f32_values(t, len)?.into_owned())
 }
