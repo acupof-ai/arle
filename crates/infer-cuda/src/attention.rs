@@ -1504,7 +1504,15 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let stride_kv_block_bytes = 64_i32 * bytes_per_token;
         let stride_q = (global_heads * head_dim) as i32; // per-row Q stride (s_q=1)
         let stride_o = stride_q;
-        let stride_indices = self.max_topk_unified as i32; // row stride of self.indices
+        // Reader pitch MUST equal the writer pitch: the batched indices builder
+        // (dsv4_flashmla_decode_build_indices.cu:210) writes row r at
+        // `r * shape.topk_unified` (this layer's actual topk, mode-dependent), NOT
+        // the scratch's allocated `max_topk_unified` (= max over ALL layers). Using
+        // max here made row r≥1 read `r*max` while the writer put it at
+        // `r*topk_unified` → garbled every row but row 0 (Phase-B correctness KILL,
+        // numdiff FIRST-EXCEEDANCE L0 row1). SGLang's invariant: builder pitch ==
+        // reader pitch by construction.
+        let stride_indices = shape.topk_unified as i32; // row stride of self.indices (writer pitch)
         let stride_lse = global_heads as i32;
         let (indices_ptr, indices_guard) = self.indices.device_ptr(&ctx.stream);
         let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);
