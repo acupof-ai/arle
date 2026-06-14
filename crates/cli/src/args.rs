@@ -482,6 +482,9 @@ pub(crate) enum TrainCommand {
     EstimateMemory(TrainEstimateMemoryArgs),
     /// On-policy distillation.
     Opd(TrainOpdArgs),
+    /// Self-training LoRA OPD (SOPD): the model self-updates its own LoRA
+    /// adapter against an EMA self-teacher, with snapshot/revert on regress.
+    SelfOpd(TrainSelfOpdArgs),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -625,6 +628,85 @@ pub(crate) enum OpdBackendArg {
     Auto,
     Cpu,
     Cuda,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Self-OPD (SOPD): inline self-training. The student samples a rollout,\nan EMA self-teacher (base + lagged EMA adapter) re-scores it, GKD blends a\nλ·CE self-anchor with (1−λ)·KL(student‖EMA), and the EMA adapter trails the\nstudent θ_ema ← α·θ_ema + (1−α)·θ_student. Every N steps a held-out NLL gate\nreverts {student, EMA, AdamW} together on regress.\n\nSmoke (no model load, embedded tiny Qwen3.5 config):\n  arle train self-opd --smoke --steps 5\n\nReal:\n  arle train self-opd --student-model <dir> --steps 20 --rollout-len 16 --gate-every-n 10"
+)]
+pub(crate) struct TrainSelfOpdArgs {
+    /// Student model directory in HF safetensors layout. Required unless --smoke.
+    #[arg(long, alias = "student")]
+    pub(crate) student_model: Option<PathBuf>,
+
+    /// Initial prompt token ids, comma-separated. Defaults to `1,3,8`.
+    #[arg(long, value_name = "IDS")]
+    pub(crate) prompt_ids: Option<String>,
+
+    /// Fixed held-out token-id sequence (comma-separated) for the no-regression
+    /// NLL gate. Defaults to the prompt ids when unset.
+    #[arg(long, value_name = "IDS")]
+    pub(crate) eval_ids: Option<String>,
+
+    /// Tokens to roll out greedily from the student per step.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) rollout_len: usize,
+
+    /// Total SOPD training steps.
+    #[arg(long, default_value_t = 5)]
+    pub(crate) steps: usize,
+
+    /// AdamW learning rate.
+    #[arg(long, default_value_t = 1.0e-4)]
+    pub(crate) lr: f32,
+
+    /// Gradient L2 norm clip threshold.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) grad_clip: f32,
+
+    /// EMA decay α for the self-teacher: θ_ema ← α·θ_ema + (1−α)·θ_student.
+    #[arg(long, default_value_t = 0.999)]
+    pub(crate) ema_alpha: f32,
+
+    /// GKD blend λ: loss = λ·CE(student‖its own rollout) + (1−λ)·KL(student‖EMA).
+    /// MUST be > 0 for cold start — at λ=0 with a fresh adapter the student, EMA,
+    /// and base coincide so the KL gradient is identically zero (dead on arrival).
+    #[arg(long, default_value_t = 0.5)]
+    pub(crate) gkd_lambda: f32,
+
+    /// Run the held-out NLL no-regression gate every N steps (0 disables it).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) gate_every_n: usize,
+
+    /// Relative held-out-NLL tolerance: revert the window if NLL rises above
+    /// baseline·(1 + tol).
+    #[arg(long, default_value_t = 0.02)]
+    pub(crate) gate_regress_tol: f32,
+
+    /// LoRA rank for the student/EMA adapters.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha for the student/EMA adapters.
+    #[arg(long, default_value_t = 32.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set: `attention-qv` (q/v only) or `all-linear`.
+    #[arg(long, default_value = "attention-qv")]
+    pub(crate) lora_target_set: String,
+
+    /// Smoke mode — embedded tiny Qwen3.5 config, no disk weights. The gate is
+    /// skipped (random tiny weights make held-out NLL meaningless).
+    #[arg(long, default_value_t = false)]
+    pub(crate) smoke: bool,
+
+    /// Compute backend for autograd (auto picks CUDA when built with cuda).
+    #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
+    pub(crate) backend: OpdBackendArg,
+
+    /// Render output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
 }
 
 #[cfg(test)]
