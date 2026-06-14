@@ -788,17 +788,33 @@ mod backend {
         let model_source = resolved.to_string_lossy().to_string();
         let mut scheduler = config.scheduler_config();
         scheduler.num_slots = 1;
+        scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
         scheduler.enable_prefix_cache = false;
         let page_size = config.page_size.max(1);
         let total_pages = config.total_pages.max(1);
         let low_impact = config.low_impact;
+        let resource_plan = infer_metal::plan_weight_only_resource_budget(
+            resolved,
+            infer_metal::MetalWeightOnlyResourceRequest {
+                low_impact,
+                memory_budget_bytes: config.memory_budget_bytes,
+                system_reserve_bytes: config.system_reserve_bytes,
+                allow_swap: config.allow_swap,
+            },
+        )?;
+        let cancel = shutdown.cancel_flag();
 
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
-                let loaded = infer_metal::MetalDiffusionGemmaModel::load(std::path::Path::new(
-                    &model_source,
-                ))?;
-                let executor = BufferedDiffusionExecutor::new(loaded.model, loaded.generation);
+                let loaded = infer_metal::MetalDiffusionGemmaModel::load_with_resource_plan(
+                    std::path::Path::new(&model_source),
+                    Some(resource_plan),
+                )?;
+                let executor = BufferedDiffusionExecutor::new_with_cancel(
+                    loaded.model,
+                    loaded.generation,
+                    cancel,
+                );
                 let kv = HostPagedKvPool::new(1, total_pages, page_size);
                 if low_impact {
                     let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
@@ -1243,8 +1259,9 @@ mod backend {
         // HIP serves DSv4 only: sliding-window ring + compressor running state
         // cannot honor a prefix-cache `start_pos > 0`, exactly like the CUDA
         // DSv4 arm (`build_cuda_engine`) — disable cross-request prefix reuse.
+        scheduler.num_slots = 1;
         scheduler.enable_prefix_cache = false;
-        let num_slots = config.num_slots;
+        let num_slots = 1;
         let max_seq_len = config.max_total_tokens;
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
@@ -1288,8 +1305,9 @@ mod backend {
         let tokenizer = OpenAiTokenizer::from_model_dir(&tokenizer_dir)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
 
-        let scheduler = config.scheduler_config();
-        let num_slots = config.num_slots;
+        let mut scheduler = config.scheduler_config();
+        scheduler.num_slots = 1;
+        let num_slots = 1;
         let max_seq_len = config.max_total_tokens;
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {

@@ -47,4 +47,7 @@ pub use mlx::{
 #[cfg(feature = "metal")]
 pub use model_source::resolve_model_path;
 #[cfg(feature = "metal")]
-pub use resource::{MetalResourcePlan, MetalResourceRequest, plan_resource_budget};
+pub use resource::{
+    MetalResourcePlan, MetalResourceRequest, MetalWeightOnlyResourceRequest, plan_resource_budget,
+    plan_weight_only_resource_budget,
+};
