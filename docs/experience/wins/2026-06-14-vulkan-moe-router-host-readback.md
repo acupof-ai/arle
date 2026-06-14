@@ -1,4 +1,4 @@
-# ARLE Vulkan MoE decode 1.97 → 0.056 s/token on the AMD Radeon 8060S
+# ARLE Vulkan MoE decode 1.97 → 0.033 s/token on the AMD Radeon 8060S
 
 ## Context
 
@@ -88,10 +88,71 @@ kernel:
    reasoning — the diagnosis, then the fix, then the number.
 
 **Net MoE: 1.97 → 0.056 s/token (35×), 93× → 2.65× of llama.cpp.** Coherent
-throughout. The wall now is genuinely GPU kernel efficiency: 2.62 GB/token at
-0.056 s = ~47 GB/s effective = ~21 % of roofline — the top-8 expert GEMVs are
-small `[2048×512]` Q4 matrices whose `mul_mat_vec_id` efficiency, not the
-architecture, is the remaining lever.
+throughout.
+
+## The remaining 2.65× is dispatch overhead — and naive fusion REGRESSES
+
+Localized with `ARLE_PROFILE_SECTIONS` (attn vs ffn) + an `ARLE_NO_BARRIER`
+ablation:
+
+- **It's dispatch-overhead bound, not bandwidth.** attn 0.39 ms ÷ ~10 dispatches
+  ≈ 39 µs/dispatch; ffn 0.79 ms ÷ ~18 ≈ 44 µs/dispatch — **~40 µs/dispatch, total
+  ≈ 40 µs × dispatch-count**. ~1120 dispatches/token ⇒ ~45 ms of the 56 ms. The
+  per-layer op chain is a *sequential* dependency chain, so each step's ~40 µs
+  (launch + the global compute→compute barrier's L2 flush) is fully exposed; the
+  dense 27B hides this behind big Q8 matrices, MoE's tiny Q4 experts can't.
+- **Barriers cost ~12 ms (21 %)** — `ARLE_NO_BARRIER` drops decode to 0.044 s
+  (garbage output) — but they're load-bearing (no-barrier ⇒ NaN), so the only
+  lever is fewer dispatches (fusion removes barriers proportionally).
+- **Naive fusion LOSES.** Fusing post-add + post-norm into one `add_rms_norm`
+  kernel *regressed* 0.056 → 0.059: the vendored llama.cpp `rms_norm`
+  (BLOCK_SIZE=512, unrolled `num_iters`, fused weight-multiply) is so optimized
+  that a naive single-workgroup fused replacement loses more in execution than
+  the one saved dispatch's ~40 µs. **Reverted.**
+
+**Rule:** to capture the dispatch-overhead headroom you must write fused kernels
+that *match* llama.cpp's per-kernel tuning — a naive fusion that drops a dispatch
+but executes slower is a net loss.
+
+## 2.65× → 1.55×: build the profiler, find the dismissed kernel
+
+The above (dispatch-overhead, fusion) was the wrong diagnosis, reached by
+*reasoning* over coarse measurements. The owner pushed back: *先搞清楚 然后再做*
+("understand clearly, THEN do") and *不要不懂装懂* ("don't fake understanding").
+Both microbench attempts (memory type; UMA-vs-device-local) were inconclusive
+because per-submit overhead drowned the µs-scale signal. So the real move was to
+build the missing tool: a **per-op GPU timestamp profiler** (`ARLE_GPU_TIMESTAMPS`,
+a VkQueryPool writing `vkCmdWriteTimestamp` after each dispatch, accumulated by
+category label) — the analogue of llama.cpp's `GGML_VK_PERF_LOGGER`, so the two
+per-op breakdowns compare directly.
+
+One run answered everything. Our breakdown (steady token, ~37 ms GPU):
+
+```
+topk   17.1 ms / 40 = 428 µs/op   ← 46% of GPU
+gemv   15.5 ms / 511 = 30 µs/op   ← healthy (llama.cpp's is 29 µs)
+linear  2.0 ms / 60 ; norm/swiglu/quant/add/...  all < 1 ms
+```
+
+The router **top-k kernel was 428 µs/call** vs llama.cpp's fused TOPK op at
+**7.5 µs** — 57× slower — because it was written **single-threaded**
+(`local_size_x = 1`), dismissed as "microseconds" since n_expert/top_k are tiny.
+A single GPU lane wastes the whole 64-wide wave: the *exact* `local_size_x=1`
+trap the gated-delta shaders hit earlier in this campaign, repeated. Rewritten
+as one 256-thread workgroup (parallel max / Σexp / top_k argmax-and-mask rounds,
+still oracle-gated): **0.056 → 0.033 s/token (30.5 tok/s) = 1.55× of llama.cpp**;
+**1.97 → 0.033 is ~60×**.
+
+After the fix our GPU op-sum (~20 ms) ≈ llama.cpp's (20.7 ms) — **GPU compute is
+at parity**. The residual wall gap (33 ms vs their 21 ms) is ~13 ms of host /
+submit-round-trip overhead (2 submits/token, logit readback, sampling), a
+different and smaller optimization.
+
+**Rule (the real one):** a kernel you dismiss as "negligible" can be the
+binding constraint — `local_size_x=1` is ~hundreds of µs, not µs. Don't reason
+about where time goes when you can *measure per-op*; if the tool to measure
+doesn't exist, building it is the highest-leverage move (here: one profiler run
+turned a stalled "2.65× slower, somewhere" into a one-line `local_size_x` fix).
 
 ## Rule
 
