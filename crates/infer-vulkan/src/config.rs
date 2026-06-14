@@ -92,7 +92,11 @@ pub fn qwen35_config_from_gguf(gguf: &GgufFile) -> Result<Qwen35Config> {
     // ── Core transformer dims. ────────────────────────────────────────────
     let num_hidden_layers = req_usize("block_count")?;
     let hidden_size = req_usize("embedding_length")?;
-    let intermediate_size = req_usize("feed_forward_length")?;
+    // Dense MLP width. The MoE GGUF (qwen35moe, all-sparse) ships NO
+    // `feed_forward_length` — every layer is a MoE FFN sized by the
+    // `expert_*` keys instead — so default it to 0 there (it's unused: the
+    // forward branches to the MoE path for every `is_moe_layer`).
+    let intermediate_size = gguf.get_usize(&key("feed_forward_length")).unwrap_or(0);
     let num_attention_heads = req_usize("attention.head_count")?;
     let num_key_value_heads = req_usize("attention.head_count_kv")?;
     let head_dim = req_usize("attention.key_length")?;
