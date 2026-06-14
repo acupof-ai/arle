@@ -51,6 +51,12 @@ pub(crate) struct Dsv4MlaKvArena {
 /// NoPE=448 / RoPE=64 shape (`dsv4_fp8_kv_pack` doc).
 const DSV4_FLASH_KV_BYTES_PER_TOKEN: usize = 584;
 const DSV4_FLASH_PAGE_BLOCK_SIZE: usize = 64;
+/// DEBUG numerical-diff harness (`INFER_DSV4_BATCHED_NUMDIFF`) exceedance
+/// threshold for `max|batched − per-row-reference|` of the RAW FlashMLA output.
+/// The reference shares the gathered Q + packed KV with the batch, so on a
+/// correct kernel the b=1 and b=N outputs agree to the bit; 0.05 ignores only
+/// the bf16 round-trip floor and flags any real per-row mis-attribution.
+const NUMDIFF_THRESH: f32 = 0.05;
 
 impl Dsv4MlaKvArena {
     fn from_config(config: &DeepSeekV4Config) -> Result<Self> {
@@ -1806,6 +1812,10 @@ impl Dsv4Model {
         let probe = std::env::var_os("INFER_DSV4_BATCH_PROBE").is_some()
             && self.tp.config().rank == 0
             && n >= 2;
+        // DEBUG numerical-diff harness gate (INFER_DSV4_BATCHED_NUMDIFF, default
+        // off): rank-0 only, batched lane only. Cheap (cached env check) when off.
+        let numdiff_on =
+            crate::attention::dsv4_batched_numdiff_enabled() && self.tp.config().rank == 0;
         let probe_rows = |label: &str, hs: &HiddenStates, layer_idx: usize| -> Result<()> {
             if !probe {
                 return Ok(());
@@ -1997,6 +2007,34 @@ impl Dsv4Model {
                         n,
                         sm_scale,
                     )?;
+                    // DEBUG numerical-diff harness (INFER_DSV4_BATCHED_NUMDIFF,
+                    // default off): for each row, recompute the KNOWN-CORRECT
+                    // per-row (b=1) FlashMLA reference over the SAME packed KV +
+                    // SAME gathered Q, then diff the RAW batched output (pre
+                    // out-slice / inverse-rope / O-LoRA / all-reduce) against it.
+                    // rank-0 only — mirrors the BATCH_PROBE gating. Read-only of
+                    // the pool/ring/slot (no re-pack, no double-mutation); writes
+                    // only the dedicated ref_* scratch.
+                    if numdiff_on {
+                        for r in 0..n {
+                            flash_batch.numdiff_row(
+                                &self.ctx,
+                                &self.config,
+                                &layer.attention,
+                                layer_pool,
+                                layer_idx,
+                                layer.mode,
+                                layer.compress_ratio,
+                                r,
+                                n,
+                                slot_ids[r],
+                                start_positions[r],
+                                slot_block_offsets[r],
+                                sm_scale,
+                                NUMDIFF_THRESH,
+                            )?;
+                        }
+                    }
                 }
                 // ── 3. per-row slice-out → inverse-rope + SW-update → O-LoRA.
                 {
@@ -2313,6 +2351,16 @@ impl Dsv4Model {
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
             probe_rows("moe", &stream, layer_idx)?;
+        }
+
+        // DEBUG numdiff harness: emit the one-line pinpoint summary (first
+        // smallest-layer/smallest-row exceedance) for this forward, then reset.
+        if numdiff_on {
+            if let (_layer_pool, _dsa, Some(flash_batch)) =
+                kv_adapter.layer_dsa_and_flashmla_batch_mut(0)?
+            {
+                flash_batch.numdiff_flush_summary();
+            }
         }
 
         for r in 0..n {
