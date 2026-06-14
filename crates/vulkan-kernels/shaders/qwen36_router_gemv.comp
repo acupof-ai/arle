@@ -1,14 +1,20 @@
 #version 450
 // ARLE Vulkan shader: Qwen3.6 MoE router / shared-gate F32 GEMV.
 //
-// Replaces the host `gemv_f32_host` for the MoE routers: `y[e] = Σ_c W[e,c]·x[c]`
-// for an F32 weight `[n_out, hidden]` (GGUF row-major [out, in]) × `[hidden]`
-// activation. The F32 router weight lives in a HOST_VISIBLE (write-combined)
-// buffer, so reading it back to host was ~50-300 MB/s = ~15 ms/token across the
-// 40 layers; on-device it reads at full device bandwidth (~µs). One thread per
-// output row e sums the `hidden`-wide dot in ascending-c order (matching the
-// host's serial sum). `apply_sigmoid` folds the shared-expert sigmoid gate
-// (n_out = 1) so its scalar comes out device-side ready.
+// `y[e] = Σ_c W[e,c]·x[c]` for an F32 weight `[n_out, hidden]` (GGUF row-major
+// [out, in]) × `[hidden]` activation, optional sigmoid (shared-expert gate).
+// Replaces the host `gemv_f32_host` for the MoE routers (+ the 35B linear-layer
+// ssm_alpha/ssm_beta F32 projections): the F32 router lives in a HOST_VISIBLE
+// (write-combined) buffer whose host read-back was ~50-300 MB/s.
+//
+// ONE WORKGROUP PER OUTPUT ROW (64 threads). Each thread strides the row's
+// `hidden` columns by `BLOCK` so the 64 lanes read CONTIGUOUS weight elements
+// per step (coalesced — the whole point: the naive one-thread-per-row version
+// had each lane stride `hidden` elements apart, one cache line per read), then a
+// shared-memory reduction sums the partials. The shared `x` is reused across all
+// rows (cached). `c` is summed in BLOCK-strided order, not strict ascending, so
+// the partial-sum grouping differs from the host's serial fold by a few ULP —
+// fine: routing is argmax-ish over softmax and oracle-gated.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
@@ -27,15 +33,30 @@ layout(binding = 2) writeonly buffer Output {
     float y[];
 };
 
+shared float partial[64];
+
 void main() {
-    const uint e = gl_GlobalInvocationID.x;
-    if (e >= p.n_out) {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.n_out) {
         return;
     }
-    const uint base = e * p.hidden;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * p.hidden;
     float sum = 0.0;
-    for (uint c = 0u; c < p.hidden; ++c) {
+    for (uint c = tid; c < p.hidden; c += gl_WorkGroupSize.x) {
         sum += w[base + c] * x[c];
     }
-    y[e] = (p.apply_sigmoid != 0u) ? (1.0 / (1.0 + exp(-sum))) : sum;
+    partial[tid] = sum;
+    barrier();
+    // Tree reduction over the 64 lanes.
+    for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        const float dot = partial[0];
+        y[row] = (p.apply_sigmoid != 0u) ? (1.0 / (1.0 + exp(-dot))) : dot;
+    }
 }
