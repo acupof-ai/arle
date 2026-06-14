@@ -335,7 +335,11 @@ impl TensorStore {
         Ok(evicted_bytes)
     }
 
-    pub(crate) fn set_requires_grad(&mut self, id: TensorId, requires_grad: bool) -> Result<()> {
+    /// Flip a tensor's `requires_grad` flag in place (host-side metadata only;
+    /// does not touch device residency). Used to freeze a parameter — e.g. the
+    /// SOPD EMA adapter, which is a frozen teacher param updated host-side, not
+    /// through autograd.
+    pub fn set_requires_grad(&mut self, id: TensorId, requires_grad: bool) -> Result<()> {
         self.raw_tensor_mut(id)?.requires_grad = requires_grad;
         Ok(())
     }

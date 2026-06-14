@@ -114,7 +114,27 @@ impl EmaSelfTeacher {
         let adapter_ids = pair_adapters(&model.adapter_name_map())?;
         let mut teacher = Self { model, adapter_ids };
         teacher.copy_from_student(student, store)?;
+        teacher.freeze_adapter(store)?;
         Ok(teacher)
+    }
+
+    /// Freeze the EMA adapter (`requires_grad = false`) for every pair.
+    ///
+    /// The EMA adapter is a frozen TEACHER parameter: it is never optimized
+    /// through autograd — [`Self::update`] blends it host-side — so it must not
+    /// carry `requires_grad = true`. `Qwen35Model::new_lora_from_base` builds
+    /// the adapter trainable (LoRA adapters init `requires_grad = true`,
+    /// `lora.rs`), so without this freeze the OPD step's
+    /// `validate_teacher_params` rejects the EMA model (every teacher param must
+    /// be frozen) before SOPD can run. The base parameters are already frozen
+    /// (shared from the student via `new_lora_from_base`), so the whole EMA
+    /// model reads as a valid frozen teacher once the adapter is frozen.
+    fn freeze_adapter(&self, store: &mut TensorStore) -> Result<()> {
+        for &(a, b) in &self.adapter_ids {
+            store.set_requires_grad(a, false)?;
+            store.set_requires_grad(b, false)?;
+        }
+        Ok(())
     }
 
     /// Pair the STUDENT's adapter `(lora_a, lora_b)` TensorIds in the same
@@ -275,6 +295,13 @@ impl EmaSelfTeacher {
         }
 
         let names = student_adapter_names(student);
+        // R2: clear the student adapter's optimizer moments BEFORE overlaying the
+        // snapshot. `import_state` only re-installs entries serialized in the
+        // snapshot; a rejected step that created moments absent from the snapshot
+        // (e.g. the first gated step, snapshotted before any moments existed)
+        // would otherwise leave stale m/v behind for the next accepted step.
+        let student_ids: Vec<TensorId> = names.iter().map(|(id, _)| *id).collect();
+        optimizer.clear_param_state(&student_ids);
         optimizer.import_state(&snapshot.adamw, &names)?;
         Ok(())
     }
@@ -429,6 +456,28 @@ mod tests {
                 store.to_host(eb)?,
                 "init lora_b must copy"
             );
+            // EMA adapter is a frozen teacher param (EMA-blended host-side, never
+            // autograd-optimized) — must be requires_grad=false so the OPD step's
+            // validate_teacher_params accepts the EMA model.
+            assert!(
+                !store.get(ea).expect("ema lora_a present").requires_grad,
+                "ema lora_a must be frozen"
+            );
+            assert!(
+                !store.get(eb).expect("ema lora_b present").requires_grad,
+                "ema lora_b must be frozen"
+            );
+        }
+        // The student adapter stays trainable — only the EMA copy is frozen.
+        for &(sa, sb) in student_pairs.iter() {
+            assert!(
+                store.get(sa).expect("student lora_a present").requires_grad,
+                "student lora_a must stay trainable"
+            );
+            assert!(
+                store.get(sb).expect("student lora_b present").requires_grad,
+                "student lora_b must stay trainable"
+            );
         }
 
         // Snapshot the pre-mutation EMA lora_b (zeros at init) of pair 0 for the
@@ -517,6 +566,69 @@ mod tests {
         );
         assert_eq!(store.to_host(e_a0)?, ema_a_snapshot, "ema lora_a restored");
         assert_eq!(store.to_host(e_b0)?, ema_b_snapshot, "ema lora_b restored");
+
+        Ok(())
+    }
+
+    /// R2 regression: a step REJECTED after the snapshot must not leave its
+    /// freshly-created AdamW moments behind. `import_state` only re-installs
+    /// snapshotted entries, so `restore` must clear the adapter's optimizer
+    /// state first — otherwise the next accepted step reuses stale m/v.
+    #[test]
+    fn restore_clears_rejected_step_optimizer_moments() -> TestResult {
+        let mut store = TensorStore::default();
+        let cfg = tiny_qwen35_config();
+        let lora = lora_config();
+        let target_set = LoraTargetSet::AttentionQv;
+
+        let student = Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, &mut store)?;
+        let mut ema = EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)?;
+
+        let student_pairs = EmaSelfTeacher::student_adapter_pairs(&student);
+        let (_s_a0, s_b0) = student_pairs[0];
+
+        let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+        // 1. Snapshot BEFORE the optimizer has any moments for the adapter — the
+        //    "first gated step" scenario from the P1 finding.
+        let snap = ema.snapshot(&student, &optimizer, &mut store)?;
+
+        // 2. A rejected step: attach a grad to the student adapter and step the
+        //    optimizer, which inserts AdamW moments for that id.
+        let b_len = store.to_host(s_b0)?.len();
+        let grad = store.from_slice(&vec![0.5_f32; b_len], &[b_len])?;
+        store
+            .tensors
+            .get_mut(s_b0)
+            .and_then(|slot| slot.as_mut())
+            .expect("student adapter tensor present")
+            .grad = Some(grad);
+        optimizer.step(&[s_b0], &mut store);
+        // sanity: the rejected step really created a moment entry.
+        assert_eq!(
+            optimizer.clear_param_state(&[s_b0]),
+            1,
+            "the rejected step must have created an AdamW moment"
+        );
+        // re-create it (the sanity check above consumed it) so `restore` has the
+        // stale moment to clear.
+        store
+            .tensors
+            .get_mut(s_b0)
+            .and_then(|slot| slot.as_mut())
+            .expect("student adapter tensor present")
+            .grad = Some(grad);
+        optimizer.step(&[s_b0], &mut store);
+
+        // 3. Restore must clear those moments (absent from the snapshot).
+        ema.restore(&snap, &student, &mut optimizer, &mut store)?;
+
+        // 4. Nothing left to remove → restore cleared the rejected moment.
+        assert_eq!(
+            optimizer.clear_param_state(&[s_b0]),
+            0,
+            "restore must clear adapter moments the snapshot did not contain"
+        );
 
         Ok(())
     }
