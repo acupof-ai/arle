@@ -13,7 +13,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/package_macos_metal_artifact.sh'
-      - 'benchmarks/metal_baseline.json'
+      - 'benchmarks/snapshots/**'
       - '.github/workflows/metal-ci.yml'
   pull_request:
     branches: [ main, master ]
@@ -24,7 +24,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/package_macos_metal_artifact.sh'
-      - 'benchmarks/metal_baseline.json'
+      - 'benchmarks/snapshots/**'
       - '.github/workflows/metal-ci.yml'
 
 env:
@@ -100,12 +100,21 @@ jobs:
           --no-default-features --features metal,no-cuda,cli
           -p agent-infer --bin arle --release
 
-      # Validate that the baseline JSON is well-formed.
+      # Validate that the baseline snapshots are well-formed JSON.
       # NOTE: Actually running benchmarks requires a model and a Metal GPU,
-      # so the CI job only validates that the binary compiles and the
-      # baseline JSON parses correctly.
-      - name: Validate baseline JSON
-        run: python3 -c "import json; json.load(open('benchmarks/metal_baseline.json'))"
+      # so the CI job only validates that the binary compiles and every
+      # baseline snapshot parses correctly.
+      - name: Validate baseline snapshots
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+          files = sorted(glob.glob('benchmarks/snapshots/*.json'))
+          if not files:
+              sys.exit('no benchmark snapshots found under benchmarks/snapshots/')
+          for f in files:
+              json.load(open(f))
+              print(f'ok {f}')
+          PY
 
       - name: Package macOS Metal artifact
         run: >
