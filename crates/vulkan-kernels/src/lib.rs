@@ -117,6 +117,10 @@ pub enum Kernel {
     F16KvPack,
     Qwen35SsmConv,
     Qwen35GatedDeltaNet,
+    /// Qwen3.6 MoE router top-k: n_expert F32 logits → top_k expert ids (i32) +
+    /// top_k weights (f32). Single-thread softmax-over-all → top-k by prob →
+    /// renorm, replacing the host `qwen36_topk_routes` so routing stays on-device.
+    Qwen36RouterTopk,
 }
 
 const SPEC_WORKGROUP_32: &[(u32, u32)] = &[(0, 32)];
@@ -187,6 +191,7 @@ impl Kernel {
         Self::Dsv4OutputInverseRope,
         Self::SwigluClamped,
         Self::F16KvPack,
+        Self::Qwen36RouterTopk,
         Self::Qwen35SsmConv,
         Self::Qwen35GatedDeltaNet,
     ];
@@ -229,6 +234,7 @@ impl Kernel {
             Kernel::F16KvPack => "f16_kv_pack",
             Kernel::Qwen35SsmConv => "qwen35_ssm_conv",
             Kernel::Qwen35GatedDeltaNet => "qwen35_gated_delta_net",
+            Kernel::Qwen36RouterTopk => "qwen36_router_topk",
         }
     }
 
@@ -268,7 +274,8 @@ impl Kernel {
             | Kernel::SwigluClamped
             | Kernel::F16KvPack
             | Kernel::Qwen35SsmConv
-            | Kernel::Qwen35GatedDeltaNet => &[],
+            | Kernel::Qwen35GatedDeltaNet
+            | Kernel::Qwen36RouterTopk => &[],
         }
     }
 
@@ -893,6 +900,21 @@ pub fn qwen35_gated_delta_net_params(
 /// the whole sequence, so the recurrence needs no shared memory or barriers.
 pub fn qwen35_gated_delta_net_dispatch(num_value_heads: u32) -> Dispatch {
     Dispatch::x(num_value_heads.max(1))
+}
+
+/// Push-constant block for `qwen36_router_topk.comp` = `{n_expert, top_k,
+/// norm_topk}` (3 `uint`s). Bindings (in order): `0 = Logits [n_expert] f32`
+/// (read), `1 = Ids [top_k] i32` (write), `2 = Weights [top_k] f32` (write).
+/// `norm_topk` is 1 to renormalize the kept weights to sum 1 (clamp F16-min).
+pub fn qwen36_router_topk_params(n_expert: u32, top_k: u32, norm_topk: bool) -> KernelParams {
+    KernelParams::from_words(vec![n_expert, top_k, u32::from(norm_topk)])
+}
+
+/// Dispatch grid for `qwen36_router_topk.comp`: ONE single-thread workgroup
+/// (`local_size_x = 1`). n_expert/top_k are tiny and the selection runs in the
+/// host's exact serial order, so a single invocation does the whole reduction.
+pub fn qwen36_router_topk_dispatch() -> Dispatch {
+    Dispatch { x: 1, y: 1, z: 1 }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

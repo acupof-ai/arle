@@ -1,0 +1,92 @@
+#version 450
+// ARLE Vulkan shader: Qwen3.6 MoE router top-k selection.
+//
+// Replaces the host `qwen36_topk_routes` (model_qwen36.rs) so MoE routing never
+// returns to the host: softmax-over-ALL experts, top-k by softmax prob, weights
+// = the selected probs (optionally renormalized to sum 1). It runs once per MoE
+// layer per token (tiny: n_expert ~256, top_k ~8), so ONE thread does the whole
+// reduction in the host's exact serial order — faithfulness beats throughput
+// here (the router GEMV + expert GEMVs dominate; this is microseconds).
+//
+// KEY FACT: softmax is monotonic, so top-k by prob == top-k by raw logit. The
+// kernel selects by logit (strict `>`, so equal logits keep the LOWER expert id
+// — matching the host's stable descending sort with ascending-id tiebreak),
+// then computes weights = exp(logit-max)/sum on the selected k and renorms.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n_expert;   // total experts (softmax + selection domain)
+    uint top_k;      // experts to keep per token
+    uint norm_topk;  // 1 = renormalize kept weights to sum 1 (clamp F16_MIN)
+} p;
+
+layout(binding = 0) readonly buffer Logits {
+    float logits[];
+};
+layout(binding = 1) writeonly buffer Ids {
+    int ids[];
+};
+layout(binding = 2) writeonly buffer Weights {
+    float weights[];
+};
+
+const float NEG_INF = -3.4e38;
+const float F16_MIN = 6.103516e-5; // 2^-14, matches llama.cpp ggml_clamp floor
+
+void main() {
+    // Single-thread kernel: only invocation 0 works.
+    if (gl_GlobalInvocationID.x != 0u) {
+        return;
+    }
+    uint n = p.n_expert;
+    uint k = min(p.top_k, n);
+    if (k == 0u || n == 0u) {
+        return;
+    }
+
+    // 1. softmax denominator over ALL experts, in the host's left-to-right order
+    //    (probs[i] = exp(logits[i]-max)/sum).
+    float maxv = NEG_INF;
+    for (uint i = 0u; i < n; ++i) {
+        maxv = max(maxv, logits[i]);
+    }
+    float sum = 0.0;
+    for (uint i = 0u; i < n; ++i) {
+        sum += exp(logits[i] - maxv);
+    }
+
+    // 2. select top-k by logit (== by prob). Each pass picks the highest-logit
+    //    expert not already chosen; strict `>` keeps the lower id on ties.
+    int sel[64]; // top_k cap (qwen36 top_k=8); 64 is generous headroom
+    for (uint j = 0u; j < k; ++j) {
+        int best = -1;
+        float best_logit = NEG_INF;
+        for (uint i = 0u; i < n; ++i) {
+            bool taken = false;
+            for (uint t = 0u; t < j; ++t) {
+                if (sel[t] == int(i)) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken && logits[i] > best_logit) {
+                best_logit = logits[i];
+                best = int(i);
+            }
+        }
+        sel[j] = best;
+    }
+
+    // 3 + 4. weights = selected softmax probs, optionally renormalized to sum 1.
+    float kept_sum = 0.0;
+    float w[64];
+    for (uint j = 0u; j < k; ++j) {
+        w[j] = exp(logits[sel[j]] - maxv) / sum;
+        kept_sum += w[j];
+    }
+    float denom = (p.norm_topk != 0u) ? max(kept_sum, F16_MIN) : 1.0;
+    for (uint j = 0u; j < k; ++j) {
+        ids[j] = sel[j];
+        weights[j] = w[j] / denom;
+    }
+}
