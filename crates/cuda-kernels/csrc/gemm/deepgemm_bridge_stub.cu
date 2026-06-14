@@ -112,4 +112,45 @@ extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
     CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }
+
+// Dense FP8 GEMM (a, sfa, b, sfb, d, m, n, k, sfa_aligned_m, stream).
+extern "C" CUresult dsv4_deepgemm_fp8_gemm_nt_cuda(
+    const unsigned char*,
+    const float*,
+    const unsigned char*,
+    const float*,
+    unsigned short*,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+// FP8 paged-MQA logits with fused KV-cache scale layout
+// (q, kv_cache_with_scale, weights, context_lens, block_table, schedule_meta,
+//  logits, 11×int dims, stream).
+extern "C" CUresult dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
+    const unsigned char*,
+    const unsigned char*,
+    const float*,
+    const int*,
+    const int*,
+    const int*,
+    float*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
 #endif

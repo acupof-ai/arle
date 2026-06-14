@@ -1893,6 +1893,21 @@ fn main() {
     let mut cu_files: Vec<PathBuf> = Vec::new();
     collect_cu_files(csrc_dir, &mut cu_files);
 
+    // custom_all_reduce.cu is a multi-GPU one-shot collective (sgl-kernel/vLLM
+    // lineage) consumed ONLY under the `nccl` feature — every `arle_car_*`
+    // reference lives in tp.rs `mod oneshot` (`#[cfg(all(cuda, nccl))]`) or the
+    // comm_bench example (`required-features = [cuda, nccl]`). Its bf16 path
+    // uses Ampere+ HW intrinsics (custom_all_reduce.cuh gates the bf16 scalar
+    // ops to `__CUDA_ARCH__ >= 800`), so a single-GPU sm_70 (V100) release —
+    // which never links the collective — would still fail to COMPILE the .cu
+    // (generic `upcast<bf16,N>` instantiates with no sm_70 bf16 overload).
+    // Skip it without nccl: the archive needs no custom-AR object, so the
+    // non-nccl V100/T1/Blackwell release binaries build clean.
+    if std::env::var_os("CARGO_FEATURE_NCCL").is_none() {
+        cu_files.retain(|p| p.file_name().and_then(|n| n.to_str()) != Some("custom_all_reduce.cu"));
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NCCL");
+
     // FlashMLA SM90 sparse prefill — vendored at `vendor/flashmla/` (pin
     // df022ebafb88578eab9f0300606ee765608d8b5c). Add the 5 .cu files needed
     // by ARLE's `arle_flashmla_shim.cu`: fwd.cu + 4 phase1 instantiations.
@@ -2102,7 +2117,31 @@ fn main() {
         {
             nvcc_args.push("-DARLE_DISABLE_MARLIN_SM70=1".to_string());
         }
-        nvcc_args.extend(arch_args.clone());
+        // FlashMLA (sparse prefill/decode) and FA3 hopper kernels use
+        // thread-block clusters + WGMMA that require the sm_90a arch variant.
+        // Compiling them for the rest of the global arch list (sm_80/86/89, or
+        // plain sm_90) hard-fails ("cannot specify max blocks per cluster").
+        // Force sm_90a-ONLY for these TUs, independent of TORCH_CUDA_ARCH_LIST,
+        // so a T1 release binary (8.0;8.6;8.9;9.0) carries FlashMLA-sm_90a
+        // alongside the full T1 arch set for every other kernel — the FlashMLA
+        // path is dispatched only on sm_90 hardware by the runtime gate
+        // (dsv4_flashmla_decode_enabled), dormant elsewhere. Mirrors upstream
+        // FlashMLA/FA3, which ship sm_90a-only.
+        let is_flashmla_kernel = cu_file.components().any(|c| c.as_os_str() == "flashmla");
+        let is_fa3_kernel = cu_file
+            .components()
+            .any(|c| c.as_os_str() == "flash-attention");
+        let is_sm90a_only = is_flashmla_kernel
+            || is_fa3_kernel
+            || matches!(
+                stem,
+                "arle_flashmla_shim" | "arle_flashmla_decode_shim" | "arle_fa3_shim"
+            );
+        if is_sm90a_only {
+            nvcc_args.push("-gencode=arch=compute_90a,code=sm_90a".to_string());
+        } else {
+            nvcc_args.extend(arch_args.clone());
+        }
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
         // Ensure `#include "common.cuh"` resolves from any domain subdir
         // (attention/, gemm/, kv/, quant/, misc/).
@@ -2144,12 +2183,13 @@ fn main() {
         // FlashMLA SM90 sparse prefill kernels + ARLE shim. Mirror
         // sgl-kernel/cmake/flashmla.cmake flags so we inherit upstream's
         // tuning. CUTLASS include is FlashMLA's vendored copy (NVIDIA
-        // CUTLASS tag 147f5673 from the FlashMLA submodule). Hopper-only
-        // gencode is already in `arch_args` for SM90 builds; the
-        // sm_90a-specific arch is also needed because FlashMLA's WGMMA
-        // primitives require the architecture variant.
-        let is_flashmla_kernel = cu_file.components().any(|c| c.as_os_str() == "flashmla");
-        if is_flashmla_kernel || stem == "arle_flashmla_shim" || stem == "arle_flashmla_decode_shim"
+        // CUTLASS tag 147f5673 from the FlashMLA submodule). The sm_90a
+        // gencode is set above (is_sm90a_only) — FlashMLA's WGMMA/cluster
+        // primitives require the arch variant and only sm_90a.
+        if is_sm90a_only
+            && (is_flashmla_kernel
+                || stem == "arle_flashmla_shim"
+                || stem == "arle_flashmla_decode_shim")
         {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
@@ -2157,7 +2197,6 @@ fn main() {
                 "--expt-extended-lambda".to_string(),
                 "--use_fast_math".to_string(),
                 "-Xcudafe=--diag_suppress=177".to_string(),
-                "-gencode=arch=compute_90a,code=sm_90a".to_string(),
                 format!("-I{}", flashmla_root.join("csrc").display()),
                 format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
                 format!(
@@ -2172,10 +2211,8 @@ fn main() {
         // impacted"; EXTENDED_MMA_SHAPES is required for FA3's WGMMA tiles.
         // DISABLE_{BACKWARD,LOCAL,APPENDKV} prune template combinations ARLE
         // never dispatches (causal/full only, KV written by ARLE's own prep).
-        let is_fa3_kernel = cu_file
-            .components()
-            .any(|c| c.as_os_str() == "flash-attention");
-        if is_fa3_kernel || stem == "arle_fa3_shim" {
+        // The sm_90a gencode is set above (is_sm90a_only).
+        if is_sm90a_only && (is_fa3_kernel || stem == "arle_fa3_shim") {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
@@ -2189,7 +2226,6 @@ fn main() {
                 "-DFLASHATTENTION_DISABLE_LOCAL".to_string(),
                 "-DFLASHATTENTION_DISABLE_APPENDKV".to_string(),
                 "-Xcudafe=--diag_suppress=177".to_string(),
-                "-gencode=arch=compute_90a,code=sm_90a".to_string(),
                 format!("-I{}", fa3_root.join("hopper").display()),
                 format!("-I{}", fa3_root.join("csrc/cutlass/include").display()),
             ]);
