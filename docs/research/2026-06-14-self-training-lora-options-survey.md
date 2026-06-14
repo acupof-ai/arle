@@ -146,8 +146,9 @@ A2. The 2026-05-18 OPD-only pivot retired GRPO/multi-turn-RL on an economic argu
 on the licensed side of that line precisely because the update is KL or CE, never a policy-gradient
 objective. ([agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md) is RETIRED; its
 data-flow shape — rollout→reward→loss→hot-swap — is reusable ONLY with a distillation loss.)
-**Reopening literal GRPO-ROPD = overturning the pivot's KILL evidence first (ckl's strategic call —
-[rubric-OPD analysis](2026-06-14-rubric-opd.md) §Path B).**
+**ckl decided Path A (2026-06-14, "只用他的策略") — rubric machinery in distillation form only; literal
+GRPO-ROPD is not pursued (reopening it = overturning the pivot's KILL evidence first, a separate explicit
+decision — [rubric-OPD analysis](2026-06-14-rubric-opd.md)).**
 
 ### Axis B — PEFT structural variant
 
