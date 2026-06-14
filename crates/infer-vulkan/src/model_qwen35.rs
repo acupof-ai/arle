@@ -240,6 +240,12 @@ pub struct VulkanQwen35Model {
     weights: crate::loader::upload::ResidentWeights<'static>,
     /// Per-slot recurrent + KV state for the (single-slot) numeric forward.
     state: crate::forward::Qwen35ForwardState,
+    /// Persistent decode resources (perf-parity Steps 3+4): the GEMV activation
+    /// arena, the compile-once `KernelCache`, and the record-many/submit-once
+    /// `CommandRecorder`. Built once in [`Self::load`] and threaded into every
+    /// `forward_token` so the hot path never re-allocs scratch, rebuilds a
+    /// pipeline, or drains the queue per op.
+    decode: crate::forward::DecodeResources<'static>,
 }
 
 #[cfg(feature = "vulkan")]
@@ -259,17 +265,26 @@ impl VulkanQwen35Model {
         let plan = crate::loader::plan_model(gguf, config.num_hidden_layers)?;
         let weights = crate::loader::upload::upload_plan(ctx, gguf, &plan)?;
         let state = crate::forward::Qwen35ForwardState::new(&config);
+        let decode = crate::forward::DecodeResources::new(ctx, &config)?;
         Ok(Self {
             config,
             ctx,
             weights,
             state,
+            decode,
         })
     }
 
     /// Reset the per-slot recurrent + KV state for a fresh generation.
     pub fn reset_state(&mut self) {
         self.state.reset();
+    }
+
+    /// Drain the accumulated GEMV timing `(submit_secs, other_secs, gemv_count)`
+    /// from the decode resources and reset it — lets a timed decode attribute
+    /// time between the GPU submits and the host prep/readback around them.
+    pub fn take_decode_profile(&mut self) -> (f64, f64, u64) {
+        self.decode.take_profile()
     }
 
     /// Number of device-resident weight tensors (token_embd is host-side and not
@@ -313,6 +328,7 @@ impl VulkanQwen35Model {
             self.ctx,
             &self.config,
             &self.weights,
+            &mut self.decode,
             &mut self.state,
             token,
             start_pos,
@@ -611,6 +627,11 @@ mod tests {
 
             let mut generated = Vec::new();
             let mut pos = prompt_ids.len();
+            // Time the decode loop (the perf-parity payoff): count generated
+            // tokens and the wall time spent in `forward_token`, then report
+            // s/token and tok/s vs the llama.cpp 27B bar (7.2 tok/s).
+            let decode_start = std::time::Instant::now();
+            let mut decode_tokens = 0usize;
             for _ in 0..max_new {
                 let next = argmax_of(&last_logits) as u32;
                 if Some(next) == eos {
@@ -625,7 +646,25 @@ mod tests {
                     last_logits.iter().all(|v| v.is_finite()),
                     "gen logits at pos {pos} contain NaN/Inf"
                 );
+                decode_tokens += 1;
                 pos += 1;
+            }
+            let elapsed = decode_start.elapsed().as_secs_f64();
+            if decode_tokens > 0 {
+                let spt = elapsed / decode_tokens as f64;
+                let tps = decode_tokens as f64 / elapsed;
+                eprintln!(
+                    "  DECODE PERF: {decode_tokens} tokens in {elapsed:.2}s = \
+                     {spt:.3} s/token = {tps:.3} tok/s (llama.cpp 27B = 7.2 tok/s / 0.139 s/token)"
+                );
+                let (submit_s, other_s, gemv_n) = model.take_decode_profile();
+                eprintln!(
+                    "  GEMV BREAKDOWN: {gemv_n} GEMVs, {submit_s:.2}s in submit_and_wait + \
+                     {other_s:.2}s host prep/readback ({:.2}s/token submit, {:.2}s/token other; \
+                     rest = host elementwise/norm)",
+                    submit_s / decode_tokens as f64,
+                    other_s / decode_tokens as f64,
+                );
             }
             generated
         };

@@ -271,6 +271,17 @@ mod real {
             self.pipeline_cache
         }
 
+        /// `minStorageBufferOffsetAlignment` (bytes) — every storage-buffer
+        /// descriptor offset (e.g. an arena slot's start) must be a multiple of
+        /// this. Queried from `vkPhysicalDeviceProperties.limits`.
+        pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_properties(self.physical_device)
+            };
+            props.limits.min_storage_buffer_offset_alignment
+        }
+
         /// Per-heap `(size_bytes, is_device_local)` for diagnostics / budgeting.
         pub fn memory_heaps(&self) -> Vec<(u64, bool)> {
             let props = unsafe {
@@ -412,6 +423,35 @@ mod real {
             )
         }
 
+        /// Allocate a UMA storage buffer: `DEVICE_LOCAL | HOST_VISIBLE |
+        /// HOST_COHERENT`. On the Strix Halo APU the big device-local heap is
+        /// host-mappable, so the GEMV activation arena lives here — the GPU reads
+        /// it at device-local speed while the host writes the input / reads the
+        /// result with zero staging. Falls back to a plain host-visible buffer if
+        /// the device exposes no device-local + host-visible memory type (keeps
+        /// non-UMA boxes working, just without the device-local win).
+        pub fn alloc_uma(ctx: &'a VulkanContext, len: usize) -> Result<Self> {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+            Self::alloc_with_usage(
+                ctx,
+                len,
+                usage,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    | vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .or_else(|_| {
+                Self::alloc_with_usage(
+                    ctx,
+                    len,
+                    usage,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+            })
+        }
+
         pub fn alloc_with_usage(
             ctx: &'a VulkanContext,
             len: usize,
@@ -476,14 +516,30 @@ mod real {
         }
 
         pub fn copy_from_host(&mut self, src: &[u8]) -> Result<()> {
-            assert!(src.len() <= self.len, "host slice exceeds Vulkan buffer");
+            self.copy_from_host_at(0, src)
+        }
+
+        pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
+            self.copy_to_host_at(0, dst)
+        }
+
+        /// Map `src.len()` bytes at byte `offset` and write `src` into them. The
+        /// arena uses this to land one GEMV's input activation into a named slot
+        /// with no per-call allocation (host-visible/UMA memory). `offset` need
+        /// not honor the storage-buffer alignment for the *map* itself, but the
+        /// caller binds the slot via an aligned descriptor offset.
+        pub fn copy_from_host_at(&mut self, offset: u64, src: &[u8]) -> Result<()> {
+            assert!(
+                offset as usize + src.len() <= self.len,
+                "host slice + offset exceeds Vulkan buffer"
+            );
             if src.is_empty() {
                 return Ok(());
             }
             let ptr = unsafe {
                 self.ctx.device.map_memory(
                     self.memory,
-                    0,
+                    offset,
                     src.len() as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )
@@ -496,15 +552,20 @@ mod real {
             Ok(())
         }
 
-        pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
-            assert!(dst.len() <= self.len, "host slice exceeds Vulkan buffer");
+        /// Map `dst.len()` bytes at byte `offset` and read them into `dst`. The
+        /// arena uses this to read one GEMV's result rows back from a named slot.
+        pub fn copy_to_host_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+            assert!(
+                offset as usize + dst.len() <= self.len,
+                "host slice + offset exceeds Vulkan buffer"
+            );
             if dst.is_empty() {
                 return Ok(());
             }
             let ptr = unsafe {
                 self.ctx.device.map_memory(
                     self.memory,
-                    0,
+                    offset,
                     dst.len() as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )
@@ -997,6 +1058,79 @@ mod real {
             Ok(Self { ctx, pool, set })
         }
 
+        /// Bind a descriptor set to **sub-ranges** of buffers: each entry is
+        /// `(buffer, offset_bytes, range_bytes)`. The shader sees each bound
+        /// range as starting at index 0 (Vulkan applies the descriptor offset),
+        /// so this is what threads an activation arena's named slots into the
+        /// per-GEMV bindings without a per-call allocation. Every `offset` MUST
+        /// honor the device's `minStorageBufferOffsetAlignment` (query via
+        /// [`VulkanContext::min_storage_buffer_offset_alignment`]) or the bind is
+        /// invalid. Unlike [`Self::storage_buffers`] (which hardcodes offset 0 /
+        /// full range), this is the ranged form the arena needs.
+        pub fn storage_buffers_ranged(
+            ctx: &'a VulkanContext,
+            layout: &DescriptorSetLayout<'_>,
+            buffers: &[(&DeviceBuffer<'_>, u64, u64)],
+        ) -> Result<Self> {
+            let descriptor_count = u32::try_from(buffers.len())
+                .map_err(|e| runtime_error("converting descriptor buffer count", e))?;
+            if descriptor_count == 0 {
+                return Err(VulkanError::Runtime(
+                    "descriptor set needs at least one storage buffer".to_string(),
+                ));
+            }
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(descriptor_count)];
+            let pool_create = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes);
+            let pool = unsafe { ctx.device.create_descriptor_pool(&pool_create, None) }
+                .map_err(|e| vk_error("creating Vulkan descriptor pool", e))?;
+            let layouts = [layout.raw()];
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            let sets = match unsafe { ctx.device.allocate_descriptor_sets(&alloc) } {
+                Ok(sets) => sets,
+                Err(e) => {
+                    unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
+                    return Err(vk_error("allocating Vulkan descriptor set", e));
+                }
+            };
+            let set = match sets.first().copied() {
+                Some(set) => set,
+                None => {
+                    unsafe { ctx.device.destroy_descriptor_pool(pool, None) };
+                    return Err(VulkanError::Runtime(
+                        "Vulkan descriptor allocation returned no sets".to_string(),
+                    ));
+                }
+            };
+            let infos: Vec<_> = buffers
+                .iter()
+                .map(|(buf, offset, range)| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buf.raw())
+                        .offset(*offset)
+                        .range(*range)
+                })
+                .collect();
+            let writes: Vec<_> = infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(idx as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+            Ok(Self { ctx, pool, set })
+        }
+
         pub fn raw(&self) -> vk::DescriptorSet {
             self.set
         }
@@ -1185,6 +1319,10 @@ mod stub {
         pub fn queue_family_index(&self) -> u32 {
             0
         }
+
+        pub fn min_storage_buffer_offset_alignment(&self) -> u64 {
+            0
+        }
     }
 
     pub struct DeviceBuffer<'a> {
@@ -1193,6 +1331,10 @@ mod stub {
 
     impl<'a> DeviceBuffer<'a> {
         pub fn alloc(_ctx: &'a VulkanContext, _len: usize) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn alloc_uma(_ctx: &'a VulkanContext, _len: usize) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
 
@@ -1208,7 +1350,15 @@ mod stub {
             Err(VULKAN_NOT_COMPILED)
         }
 
+        pub fn copy_from_host_at(&mut self, _offset: u64, _src: &[u8]) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
         pub fn copy_to_host(&self, _dst: &mut [u8]) -> Result<()> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn copy_to_host_at(&self, _offset: u64, _dst: &mut [u8]) -> Result<()> {
             Err(VULKAN_NOT_COMPILED)
         }
     }
@@ -1281,6 +1431,14 @@ mod stub {
             _ctx: &'a VulkanContext,
             _layout: &DescriptorSetLayout<'_>,
             _buffers: &[&DeviceBuffer<'_>],
+        ) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
+
+        pub fn storage_buffers_ranged(
+            _ctx: &'a VulkanContext,
+            _layout: &DescriptorSetLayout<'_>,
+            _buffers: &[(&DeviceBuffer<'_>, u64, u64)],
         ) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
