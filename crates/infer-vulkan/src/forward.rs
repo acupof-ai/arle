@@ -60,8 +60,11 @@ use vulkan_kernels::{
     flash_attn_dispatch, flash_attn_params, gemv_dispatch, gemv_id_dispatch, gemv_id_params,
     gemv_params, q8_1_quantize_dispatch, q8_1_quantize_params, qwen35_gated_delta_net_dispatch,
     qwen35_gated_delta_net_params, qwen35_ssm_conv_dispatch, qwen35_ssm_conv_params,
-    rms_norm_dispatch, rms_norm_params, rope_neox_dispatch, rope_neox_params, scaled_add_dispatch,
-    scaled_add_params, sigmoid_mul_dispatch, sigmoid_mul_params, swiglu_dispatch, swiglu_params,
+    qwen36_moe_weighted_accum_dispatch, qwen36_moe_weighted_accum_params,
+    qwen36_router_gemv_dispatch, qwen36_router_gemv_params, qwen36_router_topk_dispatch,
+    qwen36_router_topk_params, rms_norm_dispatch, rms_norm_params, rope_neox_dispatch,
+    rope_neox_params, scaled_add_dispatch, scaled_add_params, sigmoid_mul_dispatch,
+    sigmoid_mul_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -295,6 +298,15 @@ pub struct DeviceArena<'a> {
     moe_down: Slot,
     /// i32 `[top_k]` — the routed expert-id list (binding 5 of `mul_mat_vec_id`).
     moe_ids: Slot,
+    /// f32 `[n_expert]` — router logits (resident MoE: `qwen36_router_gemv` out,
+    /// `qwen36_router_topk` in). Zero-sized on a dense-only model.
+    moe_logits: Slot,
+    /// f32 `[top_k]` — the device routing weights (`qwen36_router_topk` out,
+    /// `qwen36_moe_weighted_accum` weights). Resident MoE keeps routing on-device.
+    moe_weights: Slot,
+    /// f32 `[1]` — the shared-expert sigmoid gate scalar (resident MoE:
+    /// `qwen36_router_gemv` sigmoid out, shared `qwen36_moe_weighted_accum` weight).
+    moe_shgate: Slot,
     /// MoE fused caps: top-k experts and the widest expert intermediate.
     moe_top_k: usize,
     moe_inter_cap: usize,
@@ -430,6 +442,11 @@ impl<'a> DeviceArena<'a> {
         let moe_act_quant = place(moe_act_quant_len);
         let moe_down = place(moe_down_len);
         let moe_ids = place(moe_top_k.max(1) * std::mem::size_of::<i32>());
+        // Resident-MoE routing slots: router logits [n_expert], device routing
+        // weights [top_k], shared-expert sigmoid gate [1]. Zero-ish on dense.
+        let moe_logits = place(config.num_experts.max(1) * std::mem::size_of::<f32>());
+        let moe_weights = place(moe_top_k.max(1) * std::mem::size_of::<f32>());
+        let moe_shgate = place(std::mem::size_of::<f32>());
         let attn_qkv = place(attn_qkv_len);
         let attn_q = place(attn_q_len);
         let attn_k = place(attn_k_len);
@@ -463,6 +480,9 @@ impl<'a> DeviceArena<'a> {
             moe_act_quant,
             moe_down,
             moe_ids,
+            moe_logits,
+            moe_weights,
+            moe_shgate,
             moe_top_k,
             moe_inter_cap,
             attn_qkv,
@@ -621,11 +641,22 @@ impl<'a> DecodeResources<'a> {
         let ring2_layer = 2 * n_kv + 16;
         // ring7 (flash-attn): one dispatch per query head on a full-attention layer.
         let ring7_layer = n_heads + 4;
-        // Whole-token depths: per-layer worst case × n_layers + slack for the final
-        // norm + LM-head GEMV recorded into the same token's last batch.
-        let ring3_size = (ring3_layer * n_layers + 32).max(64);
-        let ring5_size = (ring5_layer * n_layers + 32).max(48);
-        let ring2_size = (ring2_layer * n_layers + 32).max(32);
+        // Resident MoE FFN per-layer ring usage (the MoE path is now ALSO
+        // residual-resident / whole-token, so its dispatches share the token's
+        // single submit): ~10 ring3 (post-add/post-norm/router_gemv/topk/swiglu/
+        // weighted-accum ×2/shared-gate/mlp-add), ~3 ring6 (routed gate/up/down
+        // mul_mat_vec_id), ~3 ring2 (qin/qact/shared-down quant), ~3 ring5
+        // (shared gate/up/down GEMV). Add a generous per-MoE-layer allowance on
+        // top of the attention budget (descriptor sets are cheap). ring6 was a
+        // FIXED 16 (host-bridged MoE never needed whole-token depth) — it MUST
+        // now scale with the routed expert GEMVs or it silently aliases.
+        let n_moe = (0..n_layers).filter(|&l| config.is_moe_layer(l)).count();
+        // Whole-token depths: per-layer worst case × n_layers + the MoE FFN
+        // allowance + slack for the final norm + LM-head GEMV in the last batch.
+        let ring3_size = (ring3_layer * n_layers + 12 * n_moe + 32).max(64);
+        let ring5_size = (ring5_layer * n_layers + 4 * n_moe + 32).max(48);
+        let ring2_size = (ring2_layer * n_layers + 4 * n_moe + 32).max(32);
+        let ring6_size = (4 * n_moe + 16).max(16);
         let ring7_size = (ring7_layer * n_layers + 16).max(8);
         // ring4 (depthwise conv1d): one dispatch per LINEAR layer per token.
         let ring4_size = (n_layers + 16).max(16);
@@ -642,7 +673,7 @@ impl<'a> DecodeResources<'a> {
         let (l3, ring3) = mk(3, ring3_size)?;
         let (l4, ring4) = mk(4, ring4_size)?;
         let (l5, ring5) = mk(5, ring5_size)?;
-        let (l6, ring6) = mk(6, 16)?;
+        let (l6, ring6) = mk(6, ring6_size)?;
         let (l7, ring7) = mk(7, ring7_size)?;
 
         // Device KV cache for the full-attention layers.
@@ -821,15 +852,16 @@ pub fn forward_token<'a>(
         bail!("embedding row width {} != hidden {h}", embed.len());
     }
 
-    // RESIDUAL-RESIDENT layer loop (Step 3): the DENSE path keeps the hidden state
-    // in the arena `hid` slot across each WHOLE layer (device input-norm →
-    // attention → residual-add → post-norm → FFN → residual-add) and submits ONCE
-    // per layer; only the final `[vocab]` logits read back. A model with any MoE
-    // layer, or the `ARLE_LINEAR_HOST` guard, takes the host-bridged path (the
-    // proven Step-1+2 flow), whose router/host-linear hops can't collapse into one
-    // submit. The DENSE 27B (the parity target) gets the full residual-resident win.
+    // RESIDUAL-RESIDENT layer loop (Step 3): keep the hidden state in the arena
+    // `hid` slot across each WHOLE layer (device input-norm → attention →
+    // residual-add → post-norm → FFN → residual-add) and submit ONCE per token;
+    // only the final `[vocab]` logits read back. MoE layers now route on-device
+    // (router GEMV → top-k → fused experts → device-weighted accumulate), so they
+    // collapse into the same single submit — `ARLE_MOE_HOST=1` forces the proven
+    // host-bridged path as a fallback. `ARLE_LINEAR_HOST` always forces host.
     let any_moe = (0..config.layer_types.len()).any(|l| config.is_moe_layer(l));
-    let resident = !any_moe && !linear_attention_host_forced();
+    let moe_host_forced = any_moe && std::env::var("ARLE_MOE_HOST").is_ok();
+    let resident = !moe_host_forced && !linear_attention_host_forced();
     let hidden = if resident {
         forward_layers_resident(ctx, config, weights, res, &embed, start_pos)?
     } else {
@@ -885,6 +917,13 @@ fn forward_layers_resident<'a>(
     let profile = std::env::var("ARLE_PROFILE_LAYERS").is_ok();
     let mut full_ns: u128 = 0;
     let mut lin_ns: u128 = 0;
+    // Section probe (ARLE_PROFILE_SECTIONS=1): submit after the attention block
+    // and again after the FFN block, bucketing the two — to attribute the decode
+    // floor across attention vs FFN (the MoE FFN's expert GEMVs especially).
+    // Per-section serialization inflates the absolute but keeps the RATIO faithful.
+    let profile_sections = std::env::var("ARLE_PROFILE_SECTIONS").is_ok();
+    let mut attn_ns: u128 = 0;
+    let mut ffn_ns: u128 = 0;
     let t_record = std::time::Instant::now();
     res.recorder
         .begin()
@@ -915,21 +954,46 @@ fn forward_layers_resident<'a>(
             }
             LayerType::LinearAttention => {
                 record_linear_attention(
-                    ctx, config, weights, res, layer, linear_idx, normed_off, attn_off, None,
+                    ctx, config, weights, res, layer, linear_idx, normed_off, attn_off,
                 )?;
                 linear_idx += 1;
             }
         }
         res.recorder.barrier();
+        if profile_sections {
+            let t = std::time::Instant::now();
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("layer[{layer}]: section attn submit: {e}"))?;
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("layer[{layer}]: section attn begin: {e}"))?;
+            attn_ns += t.elapsed().as_nanos();
+        }
         // FFN: post-add(hid + attn_off), post-norm, gate/up/swiglu/down, residual
-        // add -> hid. The dense FFN's first op (post-add) reads attn_off + hid.
-        record_fused_dense_ffn(ctx, config, weights, res, layer, hid_off, attn_off)?;
+        // add -> hid. Dense FFN, or the residual-resident MoE FFN (router GEMV →
+        // on-device top-k → fused expert gather → device-weighted accumulate +
+        // shared expert) for MoE layers — both keep the residual stream resident.
+        if config.is_moe_layer(layer) {
+            record_fused_moe_ffn(ctx, config, weights, res, layer, hid_off, attn_off)?;
+        } else {
+            record_fused_dense_ffn(ctx, config, weights, res, layer, hid_off, attn_off)?;
+        }
         // Inter-layer barrier: the next layer's input-norm reads `hid`, which this
         // layer's FFN residual-add just wrote (the per-layer submit used to enforce
         // this ordering implicitly).
         res.recorder.barrier();
 
-        if profile {
+        if profile_sections {
+            let t = std::time::Instant::now();
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("layer[{layer}]: section ffn submit: {e}"))?;
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("layer[{layer}]: section ffn begin: {e}"))?;
+            ffn_ns += t.elapsed().as_nanos();
+        } else if profile {
             let t = std::time::Instant::now();
             res.recorder
                 .submit_and_wait()
@@ -962,6 +1026,16 @@ fn forward_layers_resident<'a>(
              linear {lm:.1}ms / {linear_idx} layers = {:.2}ms/layer",
             fm / full_idx.max(1) as f64,
             lm / linear_idx.max(1) as f64,
+        );
+    }
+    if profile_sections {
+        let n = (full_idx + linear_idx).max(1) as f64;
+        eprintln!(
+            "  SECTION PROFILE: attn {:.1}ms ({:.2}ms/layer) | ffn {:.1}ms ({:.2}ms/layer)",
+            attn_ns as f64 / 1e6,
+            attn_ns as f64 / 1e6 / n,
+            ffn_ns as f64 / 1e6,
+            ffn_ns as f64 / 1e6 / n,
         );
     }
 
@@ -1969,15 +2043,7 @@ fn linear_attention_device<'a>(
         .begin()
         .map_err(|e| anyhow!("linear[{layer}]: begin: {e}"))?;
     record_linear_attention(
-        ctx,
-        config,
-        weights,
-        res,
-        layer,
-        linear_idx,
-        normed_off,
-        out_off,
-        Some(normed),
+        ctx, config, weights, res, layer, linear_idx, normed_off, out_off,
     )?;
     let t_submit = std::time::Instant::now();
     res.recorder
@@ -2208,10 +2274,10 @@ fn linear_attention_host<'a>(
 /// GEMV chain in too — ALL with no host hop. Oracle-gated against
 /// [`linear_attention_host`].
 ///
-/// `host_normed` is `Some` only when this layer's `ssm_alpha`/`ssm_beta`
-/// projections are F32-resident (the 35B MoE) — those tiny host dots stage into
-/// lin_a/lin_b before the caller's submit. On the dense path a/b are packed and
-/// `host_normed` is `None` (their GEMVs record device-resident).
+/// `ssm_alpha`/`ssm_beta` record device-resident regardless of residency: packed
+/// (dense) via the quantized GEMV, F32-resident (35B MoE) via the F32
+/// `router_gemv` kernel. So the whole linear block — including the 35B MoE's F32
+/// a/b — records into the caller's submit with no host hop.
 #[allow(clippy::too_many_arguments)]
 fn record_linear_attention<'a>(
     ctx: &'a VulkanContext,
@@ -2222,7 +2288,6 @@ fn record_linear_attention<'a>(
     linear_idx: usize,
     normed_off: u64,
     out_off_param: u64,
-    host_normed: Option<&[f32]>,
 ) -> Result<()> {
     let kd = config.linear_key_head_dim; // 128
     let vd = config.linear_value_head_dim; // 128
@@ -2260,21 +2325,10 @@ fn record_linear_attention<'a>(
         .ok_or_else(|| anyhow!("missing blk.{layer}.ssm_beta.weight"))?;
     let a_packed = matches!(a_w.residency, Residency::KeepQuant(_));
     let b_packed = matches!(b_w.residency, Residency::KeepQuant(_));
-    // Pre-stage the F32 (host) a/b values before the merged submit.
-    if !a_packed {
-        let normed = host_normed.ok_or_else(|| {
-            anyhow!("linear[{layer}]: F32 ssm_alpha needs host normed (resident path)")
-        })?;
-        let a_proj = gemv_f32_host(a_w, normed, nv)?;
-        res.arena.write_at(res.arena.lin_a.offset, &a_proj)?;
-    }
-    if !b_packed {
-        let normed = host_normed.ok_or_else(|| {
-            anyhow!("linear[{layer}]: F32 ssm_beta needs host normed (resident path)")
-        })?;
-        let b_proj = gemv_f32_host(b_w, normed, nv)?;
-        res.arena.write_at(res.arena.lin_b.offset, &b_proj)?;
-    }
+    // a/b (`ssm_alpha`/`ssm_beta`, `[hidden -> nv]`) record device-resident into
+    // the merged submit below — packed via the quantized GEMV, F32-resident (35B
+    // MoE) via the F32 `router_gemv` kernel — so the linear block needs no host
+    // hop and the whole token stays in one submit.
 
     // ── Resolve the F32-resident SSM weight buffers (bound directly). ──
     let conv_w_buf = ssm_weight_buffer(weights, layer, "ssm_conv1d.weight", kernel * qkv_dim)?;
@@ -2328,44 +2382,74 @@ fn record_linear_attention<'a>(
     )?;
     res.recorder.barrier();
     res.gemv_count += 2;
-    // Packed a/b projections recorded into the SAME submit (-> lin_a / lin_b).
-    if a_packed {
+    // a/b projections recorded into the SAME submit (-> lin_a / lin_b): packed
+    // via the quantized GEMV, F32-resident (35B MoE) via the F32 router_gemv
+    // (`y[e] = Σ_c W[e,c]·normed[c]`, reading the device-resident normed input).
+    {
         let (a_in, a_out) = weight_dims(a_w, "ssm_alpha")?;
         if a_in != h || a_out != nv {
             bail!("linear[{layer}]: ssm_alpha dims [{a_in},{a_out}] != [{h},{nv}]");
         }
-        record_quantize_gemv(
-            ctx,
-            res,
-            a_w,
-            "ssm_alpha",
-            a_in,
-            nv,
-            0,
-            a_w.buffer.len() as u64,
-            x_in_off,
-            res.arena.lin_a.offset,
-        )?;
+        if a_packed {
+            record_quantize_gemv(
+                ctx,
+                res,
+                a_w,
+                "ssm_alpha",
+                a_in,
+                nv,
+                0,
+                a_w.buffer.len() as u64,
+                x_in_off,
+                res.arena.lin_a.offset,
+            )?;
+        } else {
+            record_router_gemv(
+                ctx,
+                res,
+                &a_w.buffer,
+                "ssm_alpha",
+                nv,
+                h,
+                false,
+                x_in_off,
+                res.arena.lin_a.offset,
+            )?;
+        }
         res.recorder.barrier();
         res.gemv_count += 1;
     }
-    if b_packed {
+    {
         let (b_in, b_out) = weight_dims(b_w, "ssm_beta")?;
         if b_in != h || b_out != nv {
             bail!("linear[{layer}]: ssm_beta dims [{b_in},{b_out}] != [{h},{nv}]");
         }
-        record_quantize_gemv(
-            ctx,
-            res,
-            b_w,
-            "ssm_beta",
-            b_in,
-            nv,
-            0,
-            b_w.buffer.len() as u64,
-            x_in_off,
-            res.arena.lin_b.offset,
-        )?;
+        if b_packed {
+            record_quantize_gemv(
+                ctx,
+                res,
+                b_w,
+                "ssm_beta",
+                b_in,
+                nv,
+                0,
+                b_w.buffer.len() as u64,
+                x_in_off,
+                res.arena.lin_b.offset,
+            )?;
+        } else {
+            record_router_gemv(
+                ctx,
+                res,
+                &b_w.buffer,
+                "ssm_beta",
+                nv,
+                h,
+                false,
+                x_in_off,
+                res.arena.lin_b.offset,
+            )?;
+        }
         res.recorder.barrier();
         res.gemv_count += 1;
     }
@@ -3633,6 +3717,461 @@ fn record_fused_dense_ffn<'a>(
     // hidden' = post_sum(work0) + mlp_out(work2) -> hid_off (residual-resident)
     record_add(ctx, res, "ffn_mlp_add", h, w0, w2, hid_off)?;
     res.gemv_count += 3;
+    Ok(())
+}
+
+/// Record (no submit) the F32 router / shared-gate GEMV `y[e] = Σ_c W[e,c]·x[c]`
+/// (optional sigmoid) into the OPEN recorder. Binding 0 = input (arena `in_off`,
+/// `hidden`-wide), 1 = F32 weight buffer `[n_out, hidden]`, 2 = output (arena
+/// `out_off`, `n_out`-wide). 3-binding → `ring3`.
+#[allow(clippy::too_many_arguments)]
+fn record_router_gemv<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    w_buf: &DeviceBuffer<'_>,
+    name: &str,
+    n_out: usize,
+    hidden: usize,
+    apply_sigmoid: bool,
+    in_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let spec = Kernel::Qwen36RouterGemv.specialization_u32();
+    let push = qwen36_router_gemv_params(n_out as u32, hidden as u32, apply_sigmoid).to_le_bytes();
+    let groups = {
+        let d = qwen36_router_gemv_dispatch(n_out as u32);
+        [d.x, d.y, d.z]
+    };
+    let in_row = (hidden * 4) as u64;
+    let out_row = (n_out * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::Qwen36RouterGemv, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build router_gemv pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, in_off, in_row),
+            (w_buf, 0, w_buf.len() as u64),
+            (arena_buf, out_off, out_row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind router_gemv ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) the router top-k: `[n_expert]` logits at `logits_off` →
+/// `[top_k]` expert ids (i32) at `ids_off` + `[top_k]` weights (f32) at
+/// `weights_off`. Single-thread kernel; all three buffers are arena. 3-binding →
+/// `ring3`.
+#[allow(clippy::too_many_arguments)]
+fn record_router_topk<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    n_expert: usize,
+    top_k: usize,
+    norm_topk: bool,
+    logits_off: u64,
+    ids_off: u64,
+    weights_off: u64,
+) -> Result<()> {
+    let spec = Kernel::Qwen36RouterTopk.specialization_u32();
+    let push = qwen36_router_topk_params(n_expert as u32, top_k as u32, norm_topk).to_le_bytes();
+    let groups = {
+        let d = qwen36_router_topk_dispatch();
+        [d.x, d.y, d.z]
+    };
+    let logits_row = (n_expert * 4) as u64;
+    let topk_row = (top_k * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::Qwen36RouterTopk, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build router_topk pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, logits_off, logits_row),
+            (arena_buf, ids_off, topk_row),
+            (arena_buf, weights_off, topk_row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind router_topk ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) the device-weighted accumulate `acc[i] = (init?0:acc[i]) +
+/// Σ_{e<count} weights[e]·src[e*hidden+i]`. `src` is `[count*hidden]` expert-major
+/// at `src_off`, `weights` is `[count]` at `weights_off`, `acc` is `[hidden]` at
+/// `acc_off`. All arena. 3-binding → `ring3`.
+#[allow(clippy::too_many_arguments)]
+fn record_weighted_accum<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    hidden: usize,
+    count: usize,
+    init: bool,
+    src_off: u64,
+    weights_off: u64,
+    acc_off: u64,
+) -> Result<()> {
+    let spec = Kernel::Qwen36MoeWeightedAccum.specialization_u32();
+    let push = qwen36_moe_weighted_accum_params(hidden as u32, count as u32, init).to_le_bytes();
+    let groups = {
+        let d = qwen36_moe_weighted_accum_dispatch(hidden as u32);
+        [d.x, d.y, d.z]
+    };
+    let src_row = (count * hidden * 4) as u64;
+    let weights_row = (count * 4) as u64;
+    let acc_row = (hidden * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(
+            ctx,
+            Kernel::Qwen36MoeWeightedAccum,
+            spec,
+            push.len() as u32,
+            3,
+        )
+        .map_err(|e| anyhow!("{name}: build weighted_accum pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, src_off, src_row),
+            (arena_buf, weights_off, weights_row),
+            (arena_buf, acc_off, acc_row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind weighted_accum ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) the WHOLE MoE FFN for one layer device-resident into the
+/// open recorder, mirroring [`record_fused_dense_ffn`]'s residual-resident
+/// contract (reads `hid_off` + `attn_off`, writes the residual sum back to
+/// `hid_off`) — but routed on-device: router GEMV → top-k → fused expert gather →
+/// device-weighted accumulate, plus the shared expert. Routing never returns to
+/// host, so the MoE token collapses into the dense path's ONE submit/token.
+///
+///   post_sum  = hid + attn                              -> work0
+///   mlp_in    = rms_norm(post_sum, post_attn_norm)      -> work1
+///   logits    = router_gemv(ffn_gate_inp, mlp_in)       -> moe_logits
+///   ids,w     = topk(softmax(logits))                   -> moe_ids, moe_weights
+///   q_in      = quantize(mlp_in)                        -> moe_in_quant
+///   gate/up   = ffn_*_exps[ids]·q_in  (fused id)        -> moe_gate, moe_up
+///   act       = silu(gate)*up                           -> moe_gate
+///   down      = ffn_down_exps[ids]·quantize(act)        -> moe_down [top_k,hidden]
+///   acc       = Σ_e w_e·down[e]   (init)                -> work2
+///   (shared)  acc += sigmoid(ffn_gate_inp_shexp·mlp_in)·shexp_swiglu(mlp_in)
+///   hidden'   = post_sum + acc                          -> hid_off
+fn record_fused_moe_ffn<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    layer: usize,
+    hid_off: u64,
+    attn_off: u64,
+) -> Result<()> {
+    let h = config.hidden_size;
+    let eps = config.rms_norm_eps;
+    let n_expert = config.num_experts;
+    let top_k = config.num_experts_per_tok;
+
+    let post_norm_w = weights
+        .get(&format!("blk.{layer}.post_attention_norm.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.post_attention_norm.weight"))?;
+    let router_w = weights
+        .get(&format!("blk.{layer}.ffn_gate_inp.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_inp.weight"))?;
+    let gate_exps = weights
+        .get(&format!("blk.{layer}.ffn_gate_exps.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_exps.weight"))?;
+    let up_exps = weights
+        .get(&format!("blk.{layer}.ffn_up_exps.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_up_exps.weight"))?;
+    let down_exps = weights
+        .get(&format!("blk.{layer}.ffn_down_exps.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_down_exps.weight"))?;
+    let (moe_in, moe_inter) = weight_dims(gate_exps, "ffn_gate_exps")?;
+    if moe_in != h {
+        bail!("fused_moe_ffn[{layer}]: ffn_gate_exps in-dim {moe_in} != hidden {h}");
+    }
+    if top_k > res.arena.moe_top_k {
+        bail!(
+            "fused_moe_ffn[{layer}]: top_k {top_k} exceeds arena cap {}",
+            res.arena.moe_top_k
+        );
+    }
+    if moe_inter > res.arena.moe_inter_cap {
+        bail!(
+            "fused_moe_ffn[{layer}]: expert intermediate {moe_inter} exceeds arena cap {}",
+            res.arena.moe_inter_cap
+        );
+    }
+    if !moe_inter.is_multiple_of(Q8_1_X4_VALUES_PER_GROUP as usize) {
+        bail!(
+            "fused_moe_ffn[{layer}]: expert intermediate {moe_inter} not a multiple of {}",
+            Q8_1_X4_VALUES_PER_GROUP
+        );
+    }
+
+    let w0 = res.arena.work[0].offset; // post_sum (persists to the final add)
+    let w1 = res.arena.work[1].offset; // mlp_in (router input + quantize source)
+    let acc = res.arena.work[2].offset; // expert accumulator
+    let in_quant = res.arena.moe_in_quant.offset;
+    let gate_off = res.arena.moe_gate.offset;
+    let up_off = res.arena.moe_up.offset;
+    let act_quant = res.arena.moe_act_quant.offset;
+    let down_off = res.arena.moe_down.offset;
+    let ids_off = res.arena.moe_ids.offset;
+    let logits_off = res.arena.moe_logits.offset;
+    let weights_off = res.arena.moe_weights.offset;
+    let shgate_off = res.arena.moe_shgate.offset;
+
+    // post_sum = hid + attn -> work0
+    record_add(ctx, res, "moe_post_add", h, hid_off, attn_off, w0)?;
+    res.recorder.barrier();
+    // mlp_in = rms_norm(post_sum) -> work1
+    record_rms_norm(
+        ctx,
+        res,
+        &post_norm_w.buffer,
+        "moe_post_norm",
+        h,
+        eps,
+        w0,
+        w1,
+    )?;
+    res.recorder.barrier();
+    // router logits = router_gemv(mlp_in) -> moe_logits
+    record_router_gemv(
+        ctx,
+        res,
+        &router_w.buffer,
+        "moe_router_gemv",
+        n_expert,
+        h,
+        false,
+        w1,
+        logits_off,
+    )?;
+    res.recorder.barrier();
+    // ids, weights = topk(softmax(logits)) -> moe_ids, moe_weights
+    record_router_topk(
+        ctx,
+        res,
+        "moe_topk",
+        n_expert,
+        top_k,
+        config.norm_topk_prob,
+        logits_off,
+        ids_off,
+        weights_off,
+    )?;
+    res.recorder.barrier();
+    // q_in = quantize(mlp_in) — shared by routed gate/up AND the shared expert.
+    record_quantize(ctx, res, "moe_qin", h, w1, in_quant)?;
+    res.recorder.barrier();
+    // gate/up = ffn_*_exps[ids]·q_in (fused id, ne11=1) -> moe_gate / moe_up
+    record_gemv_id(
+        ctx,
+        res,
+        gate_exps,
+        "ffn_gate_exps",
+        h,
+        moe_inter,
+        top_k,
+        1,
+        in_quant,
+        gate_off,
+        ids_off,
+    )?;
+    record_gemv_id(
+        ctx,
+        res,
+        up_exps,
+        "ffn_up_exps",
+        h,
+        moe_inter,
+        top_k,
+        1,
+        in_quant,
+        up_off,
+        ids_off,
+    )?;
+    res.recorder.barrier();
+    // act = silu(gate)*up over [top_k*inter] -> moe_gate
+    record_swiglu(
+        ctx,
+        res,
+        "moe_swiglu",
+        top_k * moe_inter,
+        gate_off,
+        up_off,
+        gate_off,
+    )?;
+    res.recorder.barrier();
+    // q_act = quantize(act) -> moe_act_quant
+    record_quantize(ctx, res, "moe_qact", top_k * moe_inter, gate_off, act_quant)?;
+    res.recorder.barrier();
+    // down = ffn_down_exps[ids]·q_act (fused id, ne11=top_k) -> moe_down
+    record_gemv_id(
+        ctx,
+        res,
+        down_exps,
+        "ffn_down_exps",
+        moe_inter,
+        h,
+        top_k,
+        top_k,
+        act_quant,
+        down_off,
+        ids_off,
+    )?;
+    res.recorder.barrier();
+    // acc = Σ_e weights[e]·down[e]  (init from 0) -> work2
+    record_weighted_accum(
+        ctx,
+        res,
+        "moe_routed_accum",
+        h,
+        top_k,
+        true,
+        down_off,
+        weights_off,
+        acc,
+    )?;
+    res.recorder.barrier();
+    let mut gemv_dispatches = 4u64; // router + gate/up/down
+
+    // ── Shared expert: acc += sigmoid(ffn_gate_inp_shexp·mlp_in)·shexp(mlp_in). ──
+    if let Some(up_shexp) = weights.get(&format!("blk.{layer}.ffn_up_shexp.weight")) {
+        let gate_shexp = weights
+            .get(&format!("blk.{layer}.ffn_gate_shexp.weight"))
+            .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_shexp.weight"))?;
+        let down_shexp = weights
+            .get(&format!("blk.{layer}.ffn_down_shexp.weight"))
+            .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_down_shexp.weight"))?;
+        let (sh_in, sh_inter) = weight_dims(gate_shexp, "ffn_gate_shexp")?;
+        if sh_in != h {
+            bail!("fused_moe_ffn[{layer}]: ffn_gate_shexp in-dim {sh_in} != hidden {h}");
+        }
+        if sh_inter > res.arena.moe_inter_cap {
+            bail!(
+                "fused_moe_ffn[{layer}]: shared intermediate {sh_inter} exceeds arena cap {}",
+                res.arena.moe_inter_cap
+            );
+        }
+        // shgate = sigmoid(ffn_gate_inp_shexp · mlp_in) -> moe_shgate (device).
+        let shrouter = weights
+            .get(&format!("blk.{layer}.ffn_gate_inp_shexp.weight"))
+            .ok_or_else(|| {
+                anyhow!(
+                    "fused_moe_ffn[{layer}]: shared expert present but ffn_gate_inp_shexp missing \
+                     (resident MoE needs the on-device gate; set ARLE_MOE_HOST=1 to fall back)"
+                )
+            })?;
+        record_router_gemv(
+            ctx,
+            res,
+            &shrouter.buffer,
+            "moe_shgate_gemv",
+            1,
+            h,
+            true,
+            w1,
+            shgate_off,
+        )?;
+        res.recorder.barrier();
+        // shared gate/up read the SAME q8_1(mlp_in) -> moe_gate / moe_up
+        record_gemv_only(
+            ctx,
+            res,
+            gate_shexp,
+            "ffn_gate_shexp",
+            h,
+            sh_inter,
+            0,
+            gate_shexp.buffer.len() as u64,
+            in_quant,
+            gate_off,
+        )?;
+        record_gemv_only(
+            ctx,
+            res,
+            up_shexp,
+            "ffn_up_shexp",
+            h,
+            sh_inter,
+            0,
+            up_shexp.buffer.len() as u64,
+            in_quant,
+            up_off,
+        )?;
+        res.recorder.barrier();
+        record_swiglu(
+            ctx,
+            res,
+            "moe_sh_swiglu",
+            sh_inter,
+            gate_off,
+            up_off,
+            gate_off,
+        )?;
+        res.recorder.barrier();
+        // y_shared = ffn_down_shexp · quantize(act) -> moe_down[0..hidden]
+        record_quantize_gemv(
+            ctx,
+            res,
+            down_shexp,
+            "ffn_down_shexp",
+            sh_inter,
+            h,
+            0,
+            down_shexp.buffer.len() as u64,
+            gate_off,
+            down_off,
+        )?;
+        res.recorder.barrier();
+        // acc += shgate · y_shared  (count=1, accumulate into the routed acc)
+        record_weighted_accum(
+            ctx,
+            res,
+            "moe_shared_accum",
+            h,
+            1,
+            false,
+            down_off,
+            shgate_off,
+            acc,
+        )?;
+        res.recorder.barrier();
+        gemv_dispatches += 4; // shgate + gate/up/down
+    }
+
+    // hidden' = post_sum(work0) + acc(work2) -> hid_off (residual-resident)
+    record_add(ctx, res, "moe_mlp_add", h, w0, acc, hid_off)?;
+    res.gemv_count += gemv_dispatches;
     Ok(())
 }
 
