@@ -1356,7 +1356,14 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             },
             mode_int,
             64,
-            shape.total_blocks,
+            // POOL-absolute offset bound (Phase-B correctness fix). `slot_block_offsets[r]`
+            // = slot_idx × shape.total_blocks is a POOL-absolute block offset (the pool
+            // packs `num_slots == max_batch` contiguous per-slot bands), so the batched
+            // kernel's `block_offset >= bound` guard must use the WHOLE-POOL block count,
+            // not the per-slot `total_blocks` — the per-slot bound masked every index of
+            // every row r≥1 to -1 (offset r*tb >= tb), yielding garbled decode (KILL
+            // errors/2026-06-14-dsv4-batched-flashmla-decode-phaseB-correctness-kill.md).
+            shape.total_blocks * self.max_batch,
         )?;
         drop(indices_guard);
         drop(start_guard);
