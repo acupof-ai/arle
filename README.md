@@ -84,7 +84,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 | Qwen3.5-9B | 50 tok/s | 20.0 ms | 1.45 s |
 | **Qwen3.6-35B-A3B** · MoE | **85 tok/s** | 11.7 ms | 1.23 s |
 
-<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="docs/experience/wins/2026-06-14-bench-metal-m4pro-local-model-ladder.md">how it's measured</a></sub>
+<sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="benchmarks/README.md">snapshot + method</a></sub>
 
 **NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8.
 
