@@ -67,6 +67,16 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
   `fp8_kv_pool` 环 slot(自愈仅 seq_len < sliding_window)。曾拿 byte-identity 当 EAGLE gate
   (违反自己的 MoE-非确定性 memory),把可能的非确定性误判成 bug。
 
+**实现门槛 — 简单才动手(skill [`understand-until-simple`](.claude/skills/understand-until-simple/SKILL.md))。**
+写任何实现代码前必须过这个门:① 拆到原子级(具体 **file:line / kernel / loop**,
+不是概念)② 实测取证(控制变量 profile / A-B,不是推断)③ 让实测**纠正**假设
+(load-bearing 的那个假设恰恰是必须测、不能猜的)④ 直到能用**一句话 + 一个实测
+数字**说清 fix + 点名下一道墙。**还在说"难 / 硬 / 复杂 / 多日"就是还没拆够 ——
+"难" 是没拆开的供词,不是问题的属性,继续拆。** 还原不到一句话 = 还没懂,禁止写码。
+实证:DSv4 batched decode(2026-06-14)曾被 hand-wave 成 "very hard 多日新基建",
+读代码 + 实测 step 分解后坍缩成 "一个 `dsv4.rs:1872` 的 per-row `for` 循环 → batch
+它 → ~2× aggregate,MoE 3.70× sub-linear 不卡" —— "难" 只是没拆。
+
 ---
 
 ## Project shape
