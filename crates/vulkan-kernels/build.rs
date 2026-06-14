@@ -84,6 +84,61 @@ const VENDORED: &[ShaderSpec] = &[
             ("ACC_TYPE", "float"),
         ],
     },
+    // Fused MoE expert GEMV (`mul_mat_vec_id`) — the same `mul_mat_vecq.comp`
+    // body compiled with `MUL_MAT_ID=1`, which swaps the batch-offset push tail
+    // for the expert-id contract (`nei0/ne11/expert_i1/nbi1` + a 6th `IDS`
+    // binding) so ONE dispatch runs a token through ALL its top-k routed experts
+    // (gl_WorkGroupID.y = expert slot, expert_id = data_ids[...]). Collapses the
+    // per-layer 8×3 per-expert GEMVs into 3 dispatches. The expert tensors in the
+    // 35B-A3B are Q4_K/Q5_K/Q6_K/Q8_0, so register those four DATA_A variants.
+    ShaderSpec {
+        name: "mul_mat_vec_id_q4_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_Q4_K", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_id_q5_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_Q5_K", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_id_q6_k",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_Q6_K", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
+    ShaderSpec {
+        name: "mul_mat_vec_id_q8_0",
+        source: "vendor/llama.cpp/vulkan-shaders/mul_mat_vecq.comp",
+        defines: &[
+            ("FLOAT_TYPE", "float"),
+            ("FLOAT_TYPEV2", "vec2"),
+            ("DATA_A_Q8_0", "1"),
+            ("D_TYPE", "float"),
+            ("ACC_TYPE", "float"),
+            ("MUL_MAT_ID", "1"),
+        ],
+    },
     ShaderSpec {
         name: "rms_norm",
         source: "vendor/llama.cpp/vulkan-shaders/rms_norm.comp",
