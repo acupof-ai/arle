@@ -282,7 +282,11 @@ impl Dsv4CudaExecutor {
         }
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
-        // attention per-slot). Frozen-KV is set inside the batched verify.
+        // attention per-slot tree-attn). When fold (default), the verify persists
+        // per-slot spec_normed so the commit avoids a per-slot re-forward — the
+        // fold is what makes per-row MTP fast; re-forward commit scales with c and
+        // erases the verify-batching win (errors/2026-06-15-...submode2-regression).
+        let fold = crate::dsv4::dsv4_mtp_commit_fold_enabled();
         let verified = self.model.forward_decode_batch_verify(
             &mut self.slots,
             &mut self.kv_adapter,
@@ -290,6 +294,7 @@ impl Dsv4CudaExecutor {
             &chains,
             start_positions,
             &scheds,
+            fold,
         )?;
         ensure!(
             verified.len() == n,
@@ -329,8 +334,9 @@ impl Dsv4CudaExecutor {
 
             // Truncate to the committed length, restore the rejected ring tail
             // (the draft's speculative layer-0 writes), then commit the accepted
-            // prefix via a per-slot re-forward (writes the accepted rings + sets
-            // the next hidden). Commit-fold intentionally not used (codex P2).
+            // prefix: FOLD (default — re-ingest the per-slot spec_normed the
+            // batched verify persisted; no re-forward, the cheap path per-row MTP
+            // uses) or RE-FORWARD (fallback when fold is disabled).
             self.model
                 .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
             self.model.restore_spec_ring_tail(
@@ -341,22 +347,35 @@ impl Dsv4CudaExecutor {
                 depth,
             )?;
             let accepted_tokens: Vec<u32> = tokens[1..=accepted].to_vec();
-            let mut prefix = Vec::with_capacity(accepted + 1);
-            prefix.push(tokens[0]);
-            prefix.extend_from_slice(&accepted_tokens);
-            let (_, mut re_hiddens) = self.model.forward_tokens_verify(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &prefix,
-                start_pos,
-                position,
-            )?;
-            let spec = &mut self.spec_slots[slot_idx];
-            spec.pending = Some(bonus);
-            spec.hidden = Some(re_hiddens.remove(accepted));
-            // Drop the batched verify hiddens for this slot (re-forward supplies
-            // the committed hidden; the batched ones are speculative).
-            hiddens.clear();
+            if fold {
+                let rows: Vec<usize> = (0..=accepted).collect();
+                self.model.commit_accepted_fold(
+                    &mut self.slots[slot_idx],
+                    &mut self.kv_adapter,
+                    &rows,
+                    start_pos,
+                )?;
+                let spec = &mut self.spec_slots[slot_idx];
+                spec.pending = Some(bonus);
+                // The batched verify's per-slot hidden at the accepted row is the
+                // next step's trunk (same as per-row fold's verify hidden).
+                spec.hidden = Some(hiddens.swap_remove(accepted));
+            } else {
+                let mut prefix = Vec::with_capacity(accepted + 1);
+                prefix.push(tokens[0]);
+                prefix.extend_from_slice(&accepted_tokens);
+                let (_, mut re_hiddens) = self.model.forward_tokens_verify(
+                    &mut self.slots[slot_idx],
+                    &mut self.kv_adapter,
+                    &prefix,
+                    start_pos,
+                    position,
+                )?;
+                let spec = &mut self.spec_slots[slot_idx];
+                spec.pending = Some(bonus);
+                spec.hidden = Some(re_hiddens.remove(accepted));
+                hiddens.clear();
+            }
 
             let mut slot_out = accepted_tokens;
             slot_out.push(bonus);
