@@ -6,76 +6,107 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ---
 
-## §0 第一原则 — SOLID(求真务实,追求极致)
+## §0 First principle — SOLID (truth-seeking, push to the extreme)
 
-**所有事必须 SOLID。不够 SOLID 就不断深入,不断突破。** 不是建议,是 quality bar。
+**Everything must be SOLID. Not SOLID enough → keep digging, keep breaking through.**
+Not a suggestion — the quality bar.
 
-- **推断 ≠ SOLID**:source survey、code grep、文档分析、callgraph 推断 都是 *hypothesis*,
-  不是 evidence。Evidence = 实测 nsys trace / bench 数字 / runtime log counter / 控制变量
-  对照实验。没有 evidence 不下结论,只标 hypothesis。
-- **混淆变量必须隔离**:一个实验同时改 N 个变量(buffer pool + scheduler clamp + KV format
-  + graph capture)→ 任何结果都 **不能归因**。每次只改一个变量,或显式跑控制实验隔离 confounder。
-- **Root cause 假设也要 license-or-kill**:license-or-kill 不只用在 fix 上,**root cause 推断**
-  本身也要 cheap experiment 验证(nsys 占比 / log 计数器 / source 二次读 / 实验对照)。
-  Root cause 错 → 所有 sub-experiment 全废。
-- **80% SOLID 不够**:发现 gap 必须深入到 95%+,或显式声明 "deferred,接受不确定性",**禁止
-  silent 放过**。
-- **写完先自检**:每份 plan / wins / errors / brief / 推荐落地前,先问"SOLID 吗?gap 在哪?
-  深入还是显式 deferred?"。不达标自我反思,继续深入。
-- **Framing 多角度交叉**:同一数据用不同 framing(per-NVTX-window vs per-wall-clock,
-  per-launch vs per-token,per-layer vs per-request)给出不同结论时,**wall-clock /
-  per-request framing 是 ground truth**。Narrow window 占比 X% 不等于实际 wall-clock 影响 X%。
-  License-or-kill 决策必须用 wall-clock framing,不用 narrow window framing 自欺。
+- **Inference ≠ SOLID**: source survey, code grep, doc analysis, callgraph
+  inference are all *hypothesis*, not evidence. Evidence = measured nsys trace /
+  bench numbers / runtime log counter / controlled-variable A/B. No evidence → no
+  conclusion; label it hypothesis.
+- **Confounders must be isolated**: one experiment changing N variables at once
+  (buffer pool + scheduler clamp + KV format + graph capture) → any result is
+  **unattributable**. Change one variable at a time, or run an explicit control to
+  isolate the confounder.
+- **Root-cause hypotheses also get license-or-kill**: license-or-kill is not just
+  for fixes — the **root-cause inference** itself needs a cheap experiment to
+  verify (nsys fraction / log counter / a second source read / A/B). Wrong root
+  cause → every sub-experiment is wasted.
+- **80% SOLID is not enough**: when you find a gap, dig to 95%+, or explicitly
+  declare "deferred, accepting the uncertainty". **No silent pass.**
+- **Self-check before shipping**: before any plan / wins / errors / brief /
+  recommendation lands, ask "Is this SOLID? Where's the gap? Dig, or explicitly
+  defer?". Below bar → reflect, keep digging.
+- **Cross-check framing from multiple angles**: when the same data yields
+  different conclusions under different framings (per-NVTX-window vs
+  per-wall-clock, per-launch vs per-token, per-layer vs per-request),
+  **wall-clock / per-request framing is ground truth**. A narrow-window X% share
+  ≠ the actual X% wall-clock impact. License-or-kill must use the wall-clock
+  framing — never deceive yourself with the narrow-window framing.
 
-实证 anchors:
-- **M_pf-graph Phase 0 KILL** (2026-05-08):errors entry 80% SOLID 仍栽,3 个 gap —
-  launch overhead 占比未 nsys 验证 / SGLang graph trigger 实计数未对照 / 4 变量同改未隔离
-  → strategic conclusion 全废。
-- **M_pf-graph v2 framing trap** (2026-05-08 EOD+19):nsys "55.7% of prefill window"
-  看似 PASS,但 191ms / 60s trace = 6.4ms per prefill / 1995ms TTFT = **0.32% wall-clock**,
-  远低于 10% kill 阈。**Lesson**:nsys "X% of NVTX window" 必须 cross-check "Y ms /
-  per-request total" framing,取保守者作 license-or-kill 基准。
+Empirical anchors:
+- **M_pf-graph Phase 0 KILL** (2026-05-08): the errors entry was 80% SOLID and
+  still fell — 3 gaps: launch-overhead share not nsys-verified / SGLang
+  graph-trigger count not measured against a control / 4 variables changed at once
+  → the strategic conclusion was wholly void.
+- **M_pf-graph v2 framing trap** (2026-05-08 EOD+19): nsys "55.7% of prefill
+  window" looked like a PASS, but 191ms / 60s trace = 6.4ms per prefill / 1995ms
+  TTFT = **0.32% wall-clock**, far below the 10% kill threshold. **Lesson**: nsys
+  "X% of NVTX window" must cross-check the "Y ms / per-request total" framing; take
+  the more conservative as the license-or-kill baseline.
 
 ---
 
-## §0.1 拆细到实现级 — 抽丝剥茧,事无巨细
+## §0.1 Decompose to the implementation level — unravel it, leave nothing out
 
-难/复杂的任务**不要被难度吓住**:抽丝剥茧拆成原子任务 → 画依赖 DAG(谁 block 谁)
-→ 算 critical path + 预算。粒度够细,方案自然就出来了。
+For a hard/complex task, **don't be intimidated by the difficulty**: unravel it
+into atomic tasks → draw the dependency DAG (who blocks whom) → compute the
+critical path + budget. Fine-grained enough, and the plan falls out on its own.
 
-- **细到实现级,不是原则级。** "预分配、别拷大 buffer" 是原则不是 spec;要到精确的
-  buffer / 尺寸 / 调用点 / 前置条件。**Claude 出行级 spec,executor 照抄**——自由发挥
-  会漏字段(实证:DSv4 rollback snapshot 第一版漏了 `sw_window` + `fp8_kv_pool` 两个 buffer)。
-- **状态变更必枚举每个 mutated buffer,逐个证明。** rollback / cache / scratch / fusion /
-  quant 都算:列出操作写的**每一个** device buffer,对每个给出处置 + **精确前置条件**,
-  不靠"应该自愈":① 被现有路径回滚(指名);② 自愈(写出前置——如环形 buffer 的投机写
-  **仅** seq_len < ring_size 自愈,超过则别名活跃 slot);③ 必须 snapshot/restore。
-  完整枚举才能暴露 partial-fix 漏掉的 gap。
-- **速度内联进正确性。** 预分配一次复用(禁 per-step alloc —— churn + disabled-event-
-  tracking premature-free);最小粒度拷(环只动一个 slot → 只存那一个 slot,不是整环);
-  整段塞进 opt-in 路径,default baseline byte-for-byte 不变,A/B 实测 baseline tok/s 不退。
-- **正确推理 ≠ 基线一致。** spec-decode / quant / kernel-swap 的 gate 是**正确推理**
-  (needle 取回 + same-config-twice 非确定性地板 + 自洽:新 kernel 自回归输出才是参照),
-  **不是** token-exact-vs-baseline(被 MoE run-to-run 非确定性 confound)。退化(循环)
-  prompt 不是有效测例。
-- **在干净基线上 root-cause。** 下一个 fix 的详设不在被 confound 的基线上做;先落地 +
-  隔离前置(broken s_q=K 跑在带 rollback bug 的基线上,垃圾被 confound,在脏基线细化即自欺)。
+- **Down to the implementation level, not the principle level.** "Pre-allocate,
+  don't copy big buffers" is a principle, not a spec; go to the exact buffer /
+  size / call site / precondition. **Claude produces the line-level spec, the
+  executor copies it verbatim** — free improvisation drops fields (empirical: the
+  DSv4 rollback snapshot's first version missed the `sw_window` + `fp8_kv_pool`
+  buffers).
+- **Every state change must enumerate each mutated buffer and prove each one.**
+  rollback / cache / scratch / fusion / quant all count: list **every** device
+  buffer the operation writes, and for each give the disposition + **exact
+  precondition** — never rely on "should self-heal": ① rolled back by an existing
+  path (name it); ② self-heals (write the precondition — e.g. a ring buffer's
+  speculative write self-heals **only** for seq_len < ring_size; beyond that it
+  aliases a live slot); ③ must snapshot/restore. Full enumeration is what exposes
+  the gap a partial fix missed.
+- **Inline speed into correctness.** Pre-allocate once and reuse (no per-step
+  alloc — churn + the disabled-event-tracking premature-free); copy at the
+  smallest grain (the ring moves one slot → store only that one slot, not the
+  whole ring); fold the whole thing into the opt-in path, the default baseline
+  stays byte-for-byte unchanged, A/B-verify the baseline tok/s doesn't regress.
+- **Correct inference ≠ baseline identity.** The gate for spec-decode / quant /
+  kernel-swap is **correct inference** (needle retrieval + the same-config-twice
+  non-determinism floor + self-consistency: the new kernel's own autoregressive
+  output is the reference), **not** token-exact-vs-baseline (confounded by MoE
+  run-to-run non-determinism). A degenerate (looping) prompt is not a valid test
+  case.
+- **Root-cause on a clean baseline.** Don't design the next fix's detail on a
+  confounded baseline; land + isolate the precondition first (a broken s_q=K
+  running on a baseline that still has the rollback bug → the garbage is
+  confounded; refining on a dirty baseline is self-deception).
 
-实证 anchor:
-- **DSv4 EAGLE rollback** (2026-06-06):`truncate_decode_len` 只还原 `compressed.seq_len`,
-  漏 `pending_kv`/`prev_overlap` → draft 撞压缩边界损坏;完整枚举才发现还漏 `sw_window` +
-  `fp8_kv_pool` 环 slot(自愈仅 seq_len < sliding_window)。曾拿 byte-identity 当 EAGLE gate
-  (违反自己的 MoE-非确定性 memory),把可能的非确定性误判成 bug。
+Empirical anchor:
+- **DSv4 EAGLE rollback** (2026-06-06): `truncate_decode_len` only restored
+  `compressed.seq_len`, missing `pending_kv`/`prev_overlap` → the draft corrupted
+  at the compression boundary; full enumeration then revealed it also missed the
+  `sw_window` + `fp8_kv_pool` ring slots (self-heals only for seq_len <
+  sliding_window). Byte-identity had been used as the EAGLE gate (violating my own
+  MoE-non-determinism memory), misjudging possible non-determinism as a bug.
 
-**实现门槛 — 简单才动手(skill [`understand-until-simple`](.claude/skills/understand-until-simple/SKILL.md))。**
-写任何实现代码前必须过这个门:① 拆到原子级(具体 **file:line / kernel / loop**,
-不是概念)② 实测取证(控制变量 profile / A-B,不是推断)③ 让实测**纠正**假设
-(load-bearing 的那个假设恰恰是必须测、不能猜的)④ 直到能用**一句话 + 一个实测
-数字**说清 fix + 点名下一道墙。**还在说"难 / 硬 / 复杂 / 多日"就是还没拆够 ——
-"难" 是没拆开的供词,不是问题的属性,继续拆。** 还原不到一句话 = 还没懂,禁止写码。
-实证:DSv4 batched decode(2026-06-14)曾被 hand-wave 成 "very hard 多日新基建",
-读代码 + 实测 step 分解后坍缩成 "一个 `dsv4.rs:1872` 的 per-row `for` 循环 → batch
-它 → ~2× aggregate,MoE 3.70× sub-linear 不卡" —— "难" 只是没拆。
+**Implementation gate — simple before you start (skill
+[`understand-until-simple`](.claude/skills/understand-until-simple/SKILL.md)).**
+Before writing ANY implementation code, clear this gate: ① decompose to the atomic
+level (a concrete **file:line / kernel / loop**, not a concept) ② get measured
+evidence (controlled-variable profile / A-B, not inference) ③ let the measurement
+**correct** your hypotheses (the load-bearing assumption is exactly the one you
+must measure, not guess) ④ until you can state the fix in **one sentence + one
+measured number** and name the next wall. **Still saying "hard / tough / complex /
+multi-day" means you haven't decomposed enough — "hard" is a confession of
+not-yet-decomposed, not a property of the problem; keep decomposing.** Can't
+compress it to one sentence = you don't understand it yet, no code.
+Empirical: DSv4 batched decode (2026-06-14) was hand-waved as "very hard,
+multi-day new infra"; reading the code + measuring the step decomposition
+collapsed it to "one per-row `for` loop at `dsv4.rs:1872` → batch it → ~2×
+aggregate, MoE 3.70× sub-linear doesn't cap" — the "hard" was just un-decomposed.
 
 ---
 
@@ -238,7 +269,7 @@ cross-cutting plans through **`Plan`**. Review runs through **`codex review`
 at the Bash tool** — a shell command, not a subagent.
 
 **DO NOT use `codex:codex-rescue` or `mcp__openmax__execute_with_codex` for
-execution** — both hang ("codex 会卡死", observed 2026-04-19). See
+execution** — both hang ("codex hangs", observed 2026-04-19). See
 `memory/feedback_codex_subagent_hangs.md`. The review-via-Bash path is
 unaffected.
 
