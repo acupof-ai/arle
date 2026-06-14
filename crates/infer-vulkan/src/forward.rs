@@ -732,6 +732,13 @@ impl<'a> DecodeResources<'a> {
         self.ring7.reset();
     }
 
+    /// Total `vkQueueSubmit` calls the decode recorder has issued — the
+    /// submits/token instrument. Snapshot before/after a decode run to get the
+    /// per-token submit count (perf-parity Step 4).
+    pub fn submit_count(&self) -> u64 {
+        self.recorder.submit_count()
+    }
+
     /// Drain the accumulated GEMV timing as
     /// `(submit_secs, other_secs, gemv_count)` and reset the counters. `other`
     /// is the host-side prep + descriptor build + readback around the submit.
@@ -773,6 +780,27 @@ fn widest_gemv(config: &Qwen35Config) -> (usize, usize) {
 /// Mutates the per-slot caches / recurrent state in place and advances
 /// `state.seq_len`. `res` carries the persistent arena/cache/recorder (built
 /// once at model load); every GEMV records into them.
+///
+/// **Submit batching (perf-parity Step 4).** A token's dispatches are recorded
+/// into the persistent [`CommandRecorder`] and submitted only at genuine
+/// device→host boundaries — collapsing the old per-op submit+fence round-trips
+/// (~600/token) to ~3-4 submits/layer (≈210/token for the 27B). Each batch is a
+/// device-resident block that ends where the host must read a value back. A FULL
+/// layer is 4 batches: (1) the 3 QKV projection GEMVs + per-head q/k RMSNorm +
+/// NeoX RoPE [read back roped K + raw V for the f16 KV cache]; (2) per-head
+/// flash-attn + the sigmoid gate [read back the gated activation]; (3) the o-proj
+/// GEMV; (4) the fused dense FFN (or the MoE FFN). A LINEAR layer is 3 batches:
+/// (1) the qkv/gate/(packed a,b) in-proj GEMVs + conv1d + the gated-delta
+/// recurrence [read back z + the recurrence output]; (2) the out-proj GEMV;
+/// (3) the FFN. End of token is 1 batch: the final RMSNorm + LM-head GEMV [read
+/// back logits].
+///
+/// No single batch exceeds ~60 tiny dispatches (the full-attn norm/rope batch is
+/// the widest), well under the ggml-vulkan ~100-node / APU-TDR cadence cap, so a
+/// command buffer never grows large enough to trip the watchdog — the submit
+/// boundaries ARE the cadence. The arena slots a batch writes are read back (or
+/// consumed by the next device op) before the next batch overwrites them; every
+/// in-batch dependency carries a `vkCmdPipelineBarrier`.
 pub fn forward_token<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
@@ -844,14 +872,95 @@ pub fn forward_token<'a>(
         }
     }
 
-    // Final norm (plain RMSNorm, on-device) + LM head GEMV → logits.
-    let final_norm = weights
-        .get("output_norm.weight")
-        .ok_or_else(|| anyhow!("missing output_norm.weight"))?;
-    let normed = rms_norm_device(ctx, res, &hidden, final_norm, eps, "final_norm")?;
-    let logits = gemv_global(ctx, weights, res, "output.weight", &normed)?;
+    // Final norm (plain RMSNorm) + LM head GEMV → logits, recorded into ONE
+    // submit (was 2): the rms_norm writes work[0], a barrier, then quantize+GEMV
+    // reads work[0] against `output.weight`, and only the [vocab] logits read back.
+    let logits = final_norm_lm_head(ctx, weights, res, &hidden, eps)?;
 
     state.seq_len += 1;
+    Ok(logits)
+}
+
+/// Record the final plain RMSNorm + the LM-head GEMV into ONE submit and read
+/// back only the `[vocab]` logits. `hidden` lands in work[0]; rms_norm writes
+/// work[1]; quantize(work[1]) -> quant; GEMV(output.weight) -> dst; the dst
+/// `[vocab]` rows read back. The end-of-token boundary is the only host
+/// dependency, so collapsing the standalone norm submit + the GEMV submit into
+/// one saves a submit/token (perf-parity Step 4).
+fn final_norm_lm_head<'a>(
+    ctx: &'a VulkanContext,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    hidden: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>> {
+    let h = hidden.len();
+    let norm_w = weights
+        .get("output_norm.weight")
+        .ok_or_else(|| anyhow!("missing output_norm.weight"))?;
+    if !matches!(norm_w.residency, Residency::DequantF32) {
+        bail!(
+            "final_norm: output_norm.weight must be F32-resident, got {:?}",
+            norm_w.residency
+        );
+    }
+    let lm_head = weights
+        .get("output.weight")
+        .ok_or_else(|| anyhow!("missing output.weight"))?;
+    let (lm_in, vocab) = weight_dims(lm_head, "output.weight")?;
+    if lm_in != h {
+        bail!("final_norm: lm_head in-dim {lm_in} != hidden {h}");
+    }
+    if vocab > res.arena.max_rows {
+        bail!(
+            "final_norm: vocab {vocab} exceeds arena rows ({})",
+            res.arena.max_rows
+        );
+    }
+
+    let in_off = res.arena.work[0].offset;
+    let normed_off = res.arena.work[1].offset;
+    let dst_off = res.arena.dst.offset;
+    res.arena.write_work(0, hidden)?;
+
+    let t_start = std::time::Instant::now();
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("final_norm: recorder begin: {e}"))?;
+    record_rms_norm(
+        ctx,
+        res,
+        &norm_w.buffer,
+        "final_norm",
+        h,
+        eps,
+        in_off,
+        normed_off,
+    )?;
+    res.recorder.barrier();
+    record_quantize_gemv(
+        ctx,
+        res,
+        lm_head,
+        "output.weight",
+        h,
+        vocab,
+        0,
+        lm_head.buffer.len() as u64,
+        normed_off,
+        dst_off,
+    )?;
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("final_norm: submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+
+    let logits = res.arena.read_at(dst_off, vocab)?;
+    let total_ns = t_start.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    res.gemv_count += 1;
     Ok(logits)
 }
 
@@ -1336,6 +1445,7 @@ fn full_attention<'a>(
     normed: &[f32],
     start_pos: usize,
 ) -> Result<Vec<f32>> {
+    let h = config.hidden_size;
     let hd = config.head_dim;
     let nq = config.num_attention_heads;
     let nkv = config.num_key_value_heads;
@@ -1354,32 +1464,96 @@ fn full_attention<'a>(
         );
     }
 
-    // q_proj → [query|gate] per head (out = 2*nq*hd); k/v_proj → [nkv*hd].
-    let q_full = gemv_layer(ctx, weights, res, layer, "attn_q", normed)?; // 2*q_dim
-    let k_in = gemv_layer(ctx, weights, res, layer, "attn_k", normed)?; // kv_dim
-    let v_in = gemv_layer(ctx, weights, res, layer, "attn_v", normed)?; // kv_dim
-
     // q/k RMSNorm weights are F32-resident device tensors (PLAIN per-head, head_dim
     // wide, broadcast across heads). Bind them directly into the device rms_norm.
     let q_norm = packed_or_f32_norm(weights, layer, "attn_q_norm")?;
     let k_norm = packed_or_f32_norm(weights, layer, "attn_k_norm")?;
+    let q_w = packed_layer_weight(weights, layer, "attn_q")?;
+    let k_w = packed_layer_weight(weights, layer, "attn_k")?;
+    let v_w = packed_layer_weight(weights, layer, "attn_v")?;
+    let (qw_in, qw_out) = weight_dims(q_w, "attn_q")?;
+    let (kw_in, kw_out) = weight_dims(k_w, "attn_k")?;
+    let (vw_in, vw_out) = weight_dims(v_w, "attn_v")?;
+    if qw_in != h || kw_in != h || vw_in != h {
+        bail!("full_attn[{layer}]: QKV in-dim q{qw_in}/k{kw_in}/v{vw_in} != hidden {h}");
+    }
+    if qw_out != 2 * q_dim || kw_out != kv_dim || vw_out != kv_dim {
+        bail!(
+            "full_attn[{layer}]: QKV out-dim q{qw_out}/k{kw_out}/v{vw_out} != expected \
+             {}/{kv_dim}/{kv_dim}",
+            2 * q_dim
+        );
+    }
 
-    // Land q_full ([query|gate] per head) and k_in into arena slots (UMA).
+    // Arena slots: q_full ([query|gate] per head) -> attn_qkv, k_in -> attn_k,
+    // v_in -> work[0] (read back for the V cache). q/k normed+roped land in
+    // attn_q/attn_k.
     let qkv_off = res.arena.attn_qkv.offset;
     let q_off = res.arena.attn_q.offset;
     let k_off = res.arena.attn_k.offset;
+    let v_off = res.arena.work[0].offset;
     let out_off = res.arena.attn_out.offset;
-    res.arena.write_at(qkv_off, &q_full)?;
-    res.arena.write_at(k_off, &k_in)?;
-
     let f32_b = std::mem::size_of::<f32>() as u64;
 
-    // ── Submit 1: per-head q/k RMSNorm + NeoX RoPE, all device-resident. ──
+    // ── Submit 1: the 3 QKV projection GEMVs + per-head q/k RMSNorm + NeoX RoPE,
+    // ALL device-resident in ONE recorder/submit (was 3 GEMV submits + 1
+    // norm/rope submit = 4). normed lands in x_in once; gate/up-style barriers
+    // serialize the shared quant slot; the norms read the projection outputs. ──
     // q head hh: rms_norm(q_full query half) -> attn_q head; then rope in place.
     // k head hh: rms_norm(k_in head) -> attn_k head (in place); then rope.
+    let t_attn1 = std::time::Instant::now();
+    let normed_bytes: Vec<u8> = normed.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let x_in_off = res.arena.x_in.offset;
+    res.arena
+        .buffer
+        .copy_from_host_at(x_in_off, &normed_bytes)
+        .map_err(|e| anyhow!("full_attn[{layer}]: write normed into arena: {e}"))?;
     res.recorder
         .begin()
-        .map_err(|e| anyhow!("full_attn[{layer}]: norm/rope begin: {e}"))?;
+        .map_err(|e| anyhow!("full_attn[{layer}]: attn1 begin: {e}"))?;
+    // q_proj -> attn_qkv (2*q_dim).
+    record_quantize_gemv(
+        ctx,
+        res,
+        q_w,
+        "attn_q",
+        h,
+        2 * q_dim,
+        0,
+        q_w.buffer.len() as u64,
+        x_in_off,
+        qkv_off,
+    )?;
+    res.recorder.barrier();
+    // k_proj -> attn_k (kv_dim).
+    record_quantize_gemv(
+        ctx,
+        res,
+        k_w,
+        "attn_k",
+        h,
+        kv_dim,
+        0,
+        k_w.buffer.len() as u64,
+        x_in_off,
+        k_off,
+    )?;
+    res.recorder.barrier();
+    // v_proj -> work[0] (kv_dim); read back for the V cache.
+    record_quantize_gemv(
+        ctx,
+        res,
+        v_w,
+        "attn_v",
+        h,
+        kv_dim,
+        0,
+        v_w.buffer.len() as u64,
+        x_in_off,
+        v_off,
+    )?;
+    res.recorder.barrier();
+    res.gemv_count += 3;
     for hh in 0..nq {
         // query half of head hh in q_full (stride 2*hd): bytes [hh*2*hd .. +hd].
         let qsrc = qkv_off + (hh * 2 * hd) as u64 * f32_b;
@@ -1423,12 +1597,15 @@ fn full_attention<'a>(
     let t_submit = std::time::Instant::now();
     res.recorder
         .submit_and_wait()
-        .map_err(|e| anyhow!("full_attn[{layer}]: norm/rope submit: {e}"))?;
-    res.gemv_submit_ns += t_submit.elapsed().as_nanos();
+        .map_err(|e| anyhow!("full_attn[{layer}]: proj+norm/rope submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += t_attn1.elapsed().as_nanos().saturating_sub(submit_ns);
 
-    // Read back the post-rope K rows; write K (roped) + V (raw) into the device
-    // f16 KV cache at this position. K head hh -> kv_head hh; V head hh -> hh.
+    // Read back the post-rope K rows + raw V; write K (roped) + V (raw) into the
+    // device f16 KV cache at this position. K head hh -> kv_head hh; V head -> hh.
     let k_roped = res.arena.read_at(k_off, kv_dim)?;
+    let v_in = res.arena.read_at(v_off, kv_dim)?;
     for kvh in 0..nkv {
         res.kv_cache
             .write_row(full_idx, kvh, pos, &k_roped[kvh * hd..kvh * hd + hd], false)?;
@@ -1732,16 +1909,54 @@ fn linear_attention_device<'a>(
     let qkv_dim = 2 * nk * kd + v_dim_total; // 10240
     let eps = config.rms_norm_eps;
 
-    // ── in projections (already device GEMVs returning host Vecs). ──
-    let qkv = gemv_layer(ctx, weights, res, layer, "attn_qkv", normed)?; // [qkv_dim]
-    let z = gemv_layer(ctx, weights, res, layer, "attn_gate", normed)?; // [v_dim_total]
-    let a_proj = gemv_layer(ctx, weights, res, layer, "ssm_alpha", normed)?; // [nv]
-    let b_proj = gemv_layer(ctx, weights, res, layer, "ssm_beta", normed)?; // [nv]
+    // ── in projections + conv + gated-delta in ONE submit (was 6: qkv, gate,
+    // ssm_alpha, ssm_beta, conv, gdr). The packed in-proj GEMVs (qkv -> lin_xseq,
+    // gate z -> work[1]) record into the SAME open recorder as the conv (reads
+    // lin_xseq) and the gated-delta net (reads the conv output + a/b); a single
+    // `submit_and_wait` follows. The tiny ssm_alpha/beta projections are computed
+    // FIRST (host `gemv_layer` for F32-resident weights — the 35B MoE ships them
+    // F32 — or a device GEMV otherwise) and their values land in the lin_a/lin_b
+    // slots BEFORE the merged submit, so the gdr reads them within the one batch.
+    // normed lands in x_in once for the shared packed GEMVs. ──
+    let qkv_w = packed_layer_weight(weights, layer, "attn_qkv")?;
+    let gate_w = packed_layer_weight(weights, layer, "attn_gate")?;
+    let (qkv_in, qkv_out) = weight_dims(qkv_w, "attn_qkv")?;
+    let (gate_in, gate_out) = weight_dims(gate_w, "attn_gate")?;
+    if qkv_in != normed.len() || gate_in != normed.len() {
+        bail!(
+            "linear[{layer}]: in-proj in-dim qkv{qkv_in}/gate{gate_in} != normed {}",
+            normed.len()
+        );
+    }
+    if qkv_out != qkv_dim || gate_out != v_dim_total {
+        bail!(
+            "linear[{layer}]: in-proj out-dim qkv{qkv_out}/gate{gate_out} != {qkv_dim}/{v_dim_total}"
+        );
+    }
+    let z_off = res.arena.work[1].offset;
 
-    // ── Land the per-token activations into the arena's linear slots (UMA). ──
-    res.arena.write_at(res.arena.lin_xseq.offset, &qkv)?;
-    res.arena.write_at(res.arena.lin_a.offset, &a_proj)?;
-    res.arena.write_at(res.arena.lin_b.offset, &b_proj)?;
+    // a/b projections (`ssm_alpha`/`ssm_beta`, `[hidden -> nv]`) land in
+    // lin_a/lin_b. When PACKED (dense configs) they record into the SAME merged
+    // submit as qkv/gate/conv/gdr — no separate GEMV submit (this is the big
+    // remaining linear-path win). When F32-resident (the 35B MoE ships them F32)
+    // they are tiny host dots staged into the slots before the submit.
+    let a_w = weights
+        .get(&format!("blk.{layer}.ssm_alpha.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ssm_alpha.weight"))?;
+    let b_w = weights
+        .get(&format!("blk.{layer}.ssm_beta.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.ssm_beta.weight"))?;
+    let a_packed = matches!(a_w.residency, Residency::KeepQuant(_));
+    let b_packed = matches!(b_w.residency, Residency::KeepQuant(_));
+    // Pre-stage the F32 (host) a/b values before the merged submit.
+    if !a_packed {
+        let a_proj = gemv_f32_host(a_w, normed, nv)?;
+        res.arena.write_at(res.arena.lin_a.offset, &a_proj)?;
+    }
+    if !b_packed {
+        let b_proj = gemv_f32_host(b_w, normed, nv)?;
+        res.arena.write_at(res.arena.lin_b.offset, &b_proj)?;
+    }
 
     // ── Resolve the F32-resident SSM weight buffers (bound directly). ──
     let conv_w_buf = ssm_weight_buffer(weights, layer, "ssm_conv1d.weight", kernel * qkv_dim)?;
@@ -1754,7 +1969,6 @@ fn linear_attention_device<'a>(
     let gdr_off = res.lin_gdr_stride * linear_idx as u64;
     let gdr_len = res.lin_gdr_stride;
 
-    // ── 1. Depthwise conv1d + SiLU (single token), advancing the resident ring.
     let conv_push = qwen35_ssm_conv_params(qkv_dim as u32, 1, kernel as u32).to_le_bytes();
     let conv_groups = {
         let d = qwen35_ssm_conv_dispatch(qkv_dim as u32);
@@ -1763,9 +1977,96 @@ fn linear_attention_device<'a>(
     let xseq_off = res.arena.lin_xseq.offset;
     let qkv_conv_off = res.arena.lin_qkv_conv.offset;
     let xseq_len = (qkv_dim * std::mem::size_of::<f32>()) as u64;
+
+    // Land normed once for the packed in-proj GEMVs.
+    let lin_normed: Vec<u8> = normed.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let x_in_off = res.arena.x_in.offset;
+    res.arena
+        .buffer
+        .copy_from_host_at(x_in_off, &lin_normed)
+        .map_err(|e| anyhow!("linear[{layer}]: write normed into arena: {e}"))?;
+
+    let t_merged = std::time::Instant::now();
     res.recorder
         .begin()
-        .map_err(|e| anyhow!("linear[{layer}] conv begin: {e}"))?;
+        .map_err(|e| anyhow!("linear[{layer}] in-proj+conv+gdr begin: {e}"))?;
+    // qkv -> lin_xseq (conv input).
+    record_quantize_gemv(
+        ctx,
+        res,
+        qkv_w,
+        "attn_qkv",
+        qkv_in,
+        qkv_dim,
+        0,
+        qkv_w.buffer.len() as u64,
+        x_in_off,
+        xseq_off,
+    )?;
+    res.recorder.barrier();
+    // gate z -> work[1] (read back for the host gated norm).
+    record_quantize_gemv(
+        ctx,
+        res,
+        gate_w,
+        "attn_gate",
+        gate_in,
+        v_dim_total,
+        0,
+        gate_w.buffer.len() as u64,
+        x_in_off,
+        z_off,
+    )?;
+    res.recorder.barrier();
+    res.gemv_count += 2;
+    // Packed a/b projections recorded into the SAME submit (-> lin_a / lin_b).
+    if a_packed {
+        let (a_in, a_out) = weight_dims(a_w, "ssm_alpha")?;
+        if a_in != normed.len() || a_out != nv {
+            bail!(
+                "linear[{layer}]: ssm_alpha dims [{a_in},{a_out}] != [{},{nv}]",
+                normed.len()
+            );
+        }
+        record_quantize_gemv(
+            ctx,
+            res,
+            a_w,
+            "ssm_alpha",
+            a_in,
+            nv,
+            0,
+            a_w.buffer.len() as u64,
+            x_in_off,
+            res.arena.lin_a.offset,
+        )?;
+        res.recorder.barrier();
+        res.gemv_count += 1;
+    }
+    if b_packed {
+        let (b_in, b_out) = weight_dims(b_w, "ssm_beta")?;
+        if b_in != normed.len() || b_out != nv {
+            bail!(
+                "linear[{layer}]: ssm_beta dims [{b_in},{b_out}] != [{},{nv}]",
+                normed.len()
+            );
+        }
+        record_quantize_gemv(
+            ctx,
+            res,
+            b_w,
+            "ssm_beta",
+            b_in,
+            nv,
+            0,
+            b_w.buffer.len() as u64,
+            x_in_off,
+            res.arena.lin_b.offset,
+        )?;
+        res.recorder.barrier();
+        res.gemv_count += 1;
+    }
+    // ── conv1d + SiLU (single token), advancing the resident ring; reads lin_xseq.
     {
         let DecodeResources {
             cache,
@@ -1795,11 +2096,12 @@ fn linear_attention_device<'a>(
             .map_err(|e| anyhow!("linear[{layer}]: bind conv set: {e}"))?;
         recorder.dispatch_raw(pipeline, set, &conv_push, conv_groups);
     }
-    let t_conv = std::time::Instant::now();
-    res.recorder
-        .submit_and_wait()
-        .map_err(|e| anyhow!("linear[{layer}] conv submit: {e}"))?;
-    res.gemv_submit_ns += t_conv.elapsed().as_nanos();
+    // Barrier: the gated-delta net (next dispatch) reads the conv's `lin_qkv_conv`
+    // output. conv + gdr now record into the SAME open recorder and submit ONCE
+    // (was 2 submits) — the conv ring (resident) is written by conv, the S matrix
+    // (resident) by gdr; both are distinct device buffers so the single submit is
+    // hazard-free with this one barrier.
+    res.recorder.barrier();
 
     // ── 2. Recurrent gated-delta state update (single token), read+writes the
     //       resident S matrix. Reads `qkv_conv` (binding 0) + the a/b projections.
@@ -1814,9 +2116,6 @@ fn linear_attention_device<'a>(
     let out_off = res.arena.lin_out.offset;
     let a_len = (nv * std::mem::size_of::<f32>()) as u64;
     let out_len = (v_dim_total * std::mem::size_of::<f32>()) as u64;
-    res.recorder
-        .begin()
-        .map_err(|e| anyhow!("linear[{layer}] gdr begin: {e}"))?;
     {
         let DecodeResources {
             cache,
@@ -1849,13 +2148,17 @@ fn linear_attention_device<'a>(
             .map_err(|e| anyhow!("linear[{layer}]: bind gated-delta set: {e}"))?;
         recorder.dispatch_raw(pipeline, set, &gd_push, gd_groups);
     }
-    let t_gd = std::time::Instant::now();
+    let t_submit = std::time::Instant::now();
     res.recorder
         .submit_and_wait()
-        .map_err(|e| anyhow!("linear[{layer}] gdr submit: {e}"))?;
-    res.gemv_submit_ns += t_gd.elapsed().as_nanos();
+        .map_err(|e| anyhow!("linear[{layer}] in-proj+conv+gdr submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += t_merged.elapsed().as_nanos().saturating_sub(submit_ns);
 
-    // ── 3. Read back the recurrence output for the gated norm + out-proj. ──
+    // ── 3. Read back the gate z (for the host gated norm) and the recurrence
+    //       output (for the gated norm + out-proj). ──
+    let z = res.arena.read_work(1, v_dim_total)?;
     let gdr_out = res.arena.read_at(out_off, v_dim_total)?;
 
     // ── 4. Gated output RMSNorm × silu(z): per value head over val_dim, PLAIN f32
@@ -1940,20 +2243,6 @@ fn gemv_layer<'a>(
         return gemv_f32_host(w, x, nrows);
     }
     gemv_device(ctx, w, res, x, &name)
-}
-
-/// Run a GEMV for a global (non-layer) weight tensor.
-fn gemv_global<'a>(
-    ctx: &'a VulkanContext,
-    weights: &ResidentWeights<'_>,
-    res: &mut DecodeResources<'a>,
-    name: &str,
-    x: &[f32],
-) -> Result<Vec<f32>> {
-    let w = weights
-        .get(name)
-        .ok_or_else(|| anyhow!("missing weight {name}"))?;
-    gemv_device(ctx, w, res, x, name)
 }
 
 /// Core GEMV: write `x` into the arena's input slot, record the q8_1 quantize +
@@ -2745,37 +3034,6 @@ fn packed_or_f32_norm<'w>(
         );
     }
     Ok(w)
-}
-
-/// Standalone device RMSNorm: write host `x` into a work slot, record + submit +
-/// read back. Oracle-gated drop-in for [`rms_norm_weight`] where the surrounding
-/// data lives on host (the final norm). `w` must be an F32-resident norm weight.
-fn rms_norm_device<'a>(
-    ctx: &'a VulkanContext,
-    res: &mut DecodeResources<'a>,
-    x: &[f32],
-    w: &DeviceTensor<'_>,
-    eps: f32,
-    name: &str,
-) -> Result<Vec<f32>> {
-    let n = x.len();
-    if !matches!(w.residency, Residency::DequantF32) {
-        bail!(
-            "{name}: rms_norm weight must be F32-resident, got {:?}",
-            w.residency
-        );
-    }
-    let in_off = res.arena.work[0].offset;
-    let out_off = res.arena.work[1].offset;
-    res.arena.write_work(0, x)?;
-    res.recorder
-        .begin()
-        .map_err(|e| anyhow!("{name}: recorder begin: {e}"))?;
-    record_rms_norm(ctx, res, &w.buffer, name, n, eps, in_off, out_off)?;
-    res.recorder
-        .submit_and_wait()
-        .map_err(|e| anyhow!("{name}: submit rms_norm: {e}"))?;
-    res.arena.read_work(1, n)
 }
 
 /// Fetch a per-layer packed-quant weight tensor, erroring if it is missing or
