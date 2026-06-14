@@ -199,14 +199,25 @@ weights consolidate only after a demonstrable, held-out skill improvement.
 
 ## Mutated state (rollback enumeration — every cadence, per §0.1)
 
-- **Per update step**: student adapter A/B; AdamW moment buffers; EMA-teacher
-  adapter; (read-only, safe) the re-merge pristine base cache.
-  → rollback = restore adapter + AdamW moments from last-good snapshot.
-- **Per upgrade**: base weights + quant scales (additionally).
-  → rollback = restore pre-upgrade quantized base + the adapter that produced
-  it. Snapshot before merge; never overwrite in place until the gate passes.
-- Base weights are **immutable** within a cadence, so no update can corrupt the
-  base — the strongest safety property LoRA-only buys.
+- **Per update step**: student adapter A/B; AdamW moment buffers; **EMA-teacher
+  adapter** (advanced by the EMA update — itself mutated state, not read-only);
+  **served prefix-KV pages** (now computed under the *old* adapter epoch —
+  `RadixCache` is token-keyed with no version, `enable_prefix_cache` default-on);
+  (read-only, safe) the re-merge pristine base cache.
+  → rollback = restore student adapter + AdamW moments **and the EMA-teacher
+  adapter** from the last-good snapshot, **and invalidate/version the prefix cache
+  for the rejected epoch** (epoch-tag → mismatch-is-miss, or flush). Restoring only
+  the student adapter (as a naive first cut would) leaves the EMA teacher trained
+  against rejected state and serves stale-epoch KV — both silent correctness bugs.
+- **Per upgrade**: base weights + quant scales; **AdamW moments are reset to zero
+  (Phase 3)** — so they are mutated state on this cadence too.
+  → rollback = restore pre-upgrade quantized base + the adapter that produced it
+  **+ the EMA-teacher adapter + the pre-reset AdamW moments** + invalidate the
+  prefix cache (base weights changed). Snapshot before merge; never overwrite in
+  place until the gate passes.
+- Base weights are **immutable** within the 自更新 cadence, so no update can corrupt
+  the base — the strongest safety property LoRA-only buys. (The 升级 cadence is the
+  one place the base mutates; that is why it needs the full snapshot above.)
 
 ## DAG / critical path
 
