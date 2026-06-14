@@ -1583,6 +1583,55 @@ impl Dsv4CudaExecutor {
                 && batch.positions.len() == batch.rows.len(),
             "DSv4 decode batch surface length mismatch"
         );
+        // Cross-slot batched MTP decode (batched-MTP Stage 1). Default OFF
+        // (`ARLE_DSV4_BATCHED_MTP`): when ON, spec is on, and the batch has
+        // `>= dsv4_batched_decode_min_rows()` rows, drive all N chains through
+        // ONE batched verify (MoE grouped over the verify rows, attention
+        // per-slot) instead of the per-row `spec_step` loop. With the env unset
+        // the per-row spec loop below runs (byte-identical reference / the
+        // B=1 / c<N path).
+        let spec_on = self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled();
+        if spec_on
+            && crate::dsv4::dsv4_batched_mtp_enabled()
+            && batch.rows.len() >= dsv4_batched_decode_min_rows()
+        {
+            for row in &batch.rows {
+                ensure!(
+                    row.params.is_greedy(),
+                    "DSv4 MTP greedy verify currently supports greedy sampling only"
+                );
+                let pending = self.spec_slots[row.slot].pending.ok_or_else(|| {
+                    anyhow::anyhow!("DSv4 MTP batched decode missing pending token")
+                })?;
+                ensure!(
+                    pending == row.last_token,
+                    "DSv4 MTP pending token {pending} != DecodeRow.last_token {} (slot {})",
+                    row.last_token,
+                    row.slot
+                );
+            }
+            let committed =
+                self.spec_step_batched(&batch.slot_ids, &batch.start_positions, &batch.positions)?;
+            ensure!(
+                committed.len() == batch.rows.len(),
+                "DSv4 batched MTP returned {} chains for {} rows",
+                committed.len(),
+                batch.rows.len()
+            );
+            let mut tokens = Vec::new();
+            for (&slot, chain) in batch.slot_ids.iter().zip(committed) {
+                for token in chain {
+                    tokens.push(SlotToken {
+                        slot,
+                        token,
+                        logprob: None,
+                        finish: None,
+                    });
+                }
+            }
+            return Ok(tokens);
+        }
+
         // True batched decode (layer-major driver, batched attention + grouped
         // MoE). Default ON at `rows >= dsv4_batched_decode_min_rows()` (N=4); below
         // the threshold and under `--spec-type mtp` the per-row loop below runs
@@ -1590,7 +1639,7 @@ impl Dsv4CudaExecutor {
         // non-spec path batches.
         if dsv4_batched_decode_enabled()
             && batch.rows.len() >= dsv4_batched_decode_min_rows()
-            && !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled())
+            && !spec_on
         {
             let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
             let out = self.model.forward_decode_batch(
