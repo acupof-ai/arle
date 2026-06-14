@@ -293,6 +293,12 @@ impl VulkanQwen35Model {
         self.decode.take_profile()
     }
 
+    /// Total `vkQueueSubmit` calls issued by the decode recorder so far — lets a
+    /// timed decode report submits/token (perf-parity Step 4).
+    pub fn decode_submit_count(&self) -> u64 {
+        self.decode.submit_count()
+    }
+
     /// Number of device-resident weight tensors (token_embd is host-side and not
     /// counted). Lets a load smoke-test assert the model actually landed.
     pub fn resident_tensor_count(&self) -> usize {
@@ -637,6 +643,7 @@ mod tests {
             // tokens and the wall time spent in `forward_token`, then report
             // s/token and tok/s vs the llama.cpp 27B bar (7.2 tok/s).
             let decode_start = std::time::Instant::now();
+            let submits_before = model.decode_submit_count();
             let mut decode_tokens = 0usize;
             for _ in 0..max_new {
                 let next = argmax_of(&last_logits) as u32;
@@ -664,12 +671,17 @@ mod tests {
                      {spt:.3} s/token = {tps:.3} tok/s (llama.cpp 27B = 7.2 tok/s / 0.139 s/token)"
                 );
                 let (submit_s, other_s, gemv_n) = model.take_decode_profile();
+                let submits = model.decode_submit_count() - submits_before;
                 eprintln!(
                     "  GEMV BREAKDOWN: {gemv_n} GEMVs, {submit_s:.2}s in submit_and_wait + \
                      {other_s:.2}s host prep/readback ({:.2}s/token submit, {:.2}s/token other; \
                      rest = host elementwise/norm)",
                     submit_s / decode_tokens as f64,
                     other_s / decode_tokens as f64,
+                );
+                eprintln!(
+                    "  SUBMITS: {submits} vkQueueSubmit over {decode_tokens} tokens = {:.1} submits/token",
+                    submits as f64 / decode_tokens as f64,
                 );
             }
             generated

@@ -760,6 +760,14 @@ mod real {
         /// `begin()`'s fence wait — guards against re-recording a buffer whose
         /// prior submission has not yet been waited on.
         pending: bool,
+        /// Number of dispatches recorded into the CURRENTLY-OPEN batch (reset by
+        /// `begin()`, read by the batch-cadence cap so a token's recorder can
+        /// submit before the command buffer trips the APU TDR watchdog).
+        dispatches_in_batch: u64,
+        /// Total `vkQueueSubmit` calls over the recorder's life — the submits/token
+        /// instrument. The forward loop snapshots this around a token to report the
+        /// per-token submit count (perf-parity Step 4).
+        submit_count: u64,
     }
 
     impl<'a> CommandRecorder<'a> {
@@ -805,7 +813,25 @@ mod real {
                 command_buffer,
                 fence,
                 pending: false,
+                dispatches_in_batch: 0,
+                submit_count: 0,
             })
+        }
+
+        /// Dispatches recorded into the currently-open batch (since the last
+        /// `begin()`). The forward loop checks this against a cadence cap and
+        /// flushes (submit + re-begin) before a single command buffer grows large
+        /// enough to trip the APU TDR watchdog (mirrors `ggml-vulkan`'s
+        /// `submitted_nodes >= 100` batch flush).
+        pub fn dispatches_in_batch(&self) -> u64 {
+            self.dispatches_in_batch
+        }
+
+        /// Total `vkQueueSubmit` calls over this recorder's lifetime — the
+        /// submits/token instrument. Snapshot before/after a token to get its
+        /// submit count.
+        pub fn submit_count(&self) -> u64 {
+            self.submit_count
         }
 
         /// Open the buffer for a fresh batch. Waits for any prior submission's
@@ -838,6 +864,7 @@ mod real {
                     .begin_command_buffer(self.command_buffer, &begin)
             }
             .map_err(|e| vk_error("beginning Vulkan command buffer", e))?;
+            self.dispatches_in_batch = 0;
             Ok(())
         }
 
@@ -889,6 +916,7 @@ mod real {
                 }
                 device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
+            self.dispatches_in_batch += 1;
         }
 
         /// Record a single compute→compute execution+memory barrier so a later
@@ -930,6 +958,7 @@ mod real {
             }
             .map_err(|e| vk_error("submitting Vulkan command buffer", e))?;
             self.pending = true;
+            self.submit_count += 1;
             unsafe {
                 self.ctx
                     .device
