@@ -55,10 +55,13 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use qwen35_spec::{LayerType, Qwen35Config};
 use vulkan_kernels::{
-    BLOCK_Q8_1_BYTES, Kernel, KernelCache, Q8_1_X4_VALUES_PER_GROUP, gemv_dispatch, gemv_params,
-    q8_1_quantize_dispatch, q8_1_quantize_params, record_dispatch,
+    BLOCK_Q8_1_BYTES, Kernel, KernelCache, Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params,
+    gemv_dispatch, gemv_params, q8_1_quantize_dispatch, q8_1_quantize_params, rms_norm_dispatch,
+    rms_norm_params, swiglu_dispatch, swiglu_params,
 };
-use vulkan_sys::{CommandRecorder, DescriptorSet, DeviceBuffer, VulkanContext};
+use vulkan_sys::{
+    CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
+};
 
 use crate::loader::Residency;
 use crate::loader::upload::{DeviceTensor, ResidentWeights};
@@ -160,6 +163,13 @@ struct Slot {
 /// and its per-call `DeviceBuffer::alloc`/`copy_to_host` churn: the host writes
 /// the input activation into `x_in` (UMA, no staging) and reads the result back
 /// from `dst`, while the quantize/GEMV dispatches read/write the slots in place.
+///
+/// Perf-parity Step 5b adds named **elementwise work slots** (`work0..work2`,
+/// each `max_cols` f32 wide) so the device RMSNorm / SwiGLU / residual-Add can
+/// read/write the arena directly. The dense FFN sub-sequence (norm → gate/up →
+/// swiglu → down → residual add) chains through these slots **device-resident**:
+/// only the FFN's host inputs land once and its single output reads back once,
+/// killing the per-GEMV host round-trip that dominated decode.
 pub struct DeviceArena<'a> {
     buffer: DeviceBuffer<'a>,
     /// f32 input activation (widest GEMV input cols).
@@ -168,9 +178,16 @@ pub struct DeviceArena<'a> {
     quant: Slot,
     /// f32 destination rows (widest GEMV output rows).
     dst: Slot,
-    /// 4-byte fuse-dummy bindings (3/4); only read when `fusion_flags != 0`.
+    /// 4-byte fuse-dummy bindings (3/4 of the GEMV; binding 3 of `add`); only
+    /// read when `fusion_flags != 0` / the RMS-add reduction is enabled (never).
     fuse0: Slot,
     fuse1: Slot,
+    /// General-purpose f32 elementwise work slots (each `max_cols` wide). The
+    /// device RMSNorm/SwiGLU/Add and the fused FFN thread their intermediate
+    /// activations through these without a host hop. Four slots is the fused
+    /// dense FFN's peak live set: {post_sum, mlp_in, gate, up} coexist after the
+    /// up-proj GEMV (before swiglu frees mlp_in/gate).
+    work: [Slot; 4],
     /// Pre-sized caps so a GEMV can bail loud rather than silently corrupt.
     max_cols: usize,
     max_rows: usize,
@@ -186,6 +203,10 @@ impl<'a> DeviceArena<'a> {
         let quant_len = q8_1_x4_bytes(max_cols);
         let dst_len = max_rows * std::mem::size_of::<f32>();
         let fuse_len = 4usize;
+        // Elementwise work slots: the widest single-vector activation a fused FFN
+        // op touches is `max_cols` f32 (the FFN intermediate). dst can also hold a
+        // hidden-wide vector, but max_cols already covers hidden.
+        let work_len = max_cols * std::mem::size_of::<f32>();
 
         let mut cursor = 0u64;
         let mut place = |len: usize| -> Slot {
@@ -198,6 +219,12 @@ impl<'a> DeviceArena<'a> {
         let dst = place(dst_len);
         let fuse0 = place(fuse_len);
         let fuse1 = place(fuse_len);
+        let work = [
+            place(work_len),
+            place(work_len),
+            place(work_len),
+            place(work_len),
+        ];
         let total = cursor as usize;
 
         let buffer = DeviceBuffer::alloc_uma(ctx, total)
@@ -209,9 +236,32 @@ impl<'a> DeviceArena<'a> {
             dst,
             fuse0,
             fuse1,
+            work,
             max_cols,
             max_rows,
         })
+    }
+
+    /// Map+write `data` (f32) into work slot `i` (UMA, no staging).
+    fn write_work(&mut self, i: usize, data: &[f32]) -> Result<()> {
+        debug_assert!(data.len() <= self.max_cols);
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let off = self.work[i].offset;
+        self.buffer
+            .copy_from_host_at(off, &bytes)
+            .map_err(|e| anyhow!("write arena work[{i}]: {e}"))
+    }
+
+    /// Read `len` f32 back from work slot `i` (UMA, no staging).
+    fn read_work(&self, i: usize, len: usize) -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; len * std::mem::size_of::<f32>()];
+        self.buffer
+            .copy_to_host_at(self.work[i].offset, &mut bytes[..])
+            .map_err(|e| anyhow!("read arena work[{i}]: {e}"))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 }
 
@@ -229,6 +279,19 @@ pub struct DecodeResources<'a> {
     pub arena: DeviceArena<'a>,
     pub cache: KernelCache<'a>,
     pub recorder: CommandRecorder<'a>,
+    /// Persistent storage-buffer descriptor-set layouts, one per binding count
+    /// used on the decode path (2 = q8_1 quantize, 3 = rms_norm / swiglu / add,
+    /// 5 = GEMV). Built once; the rings allocate their sets against them. Kept
+    /// alive (alongside the rings) so the layouts outlive the pipelines that were
+    /// built with the same binding-count layout in the `KernelCache`.
+    _layouts: Vec<DescriptorSetLayout<'a>>,
+    /// Round-robin descriptor-set rings keyed by binding count. Each
+    /// [`DescriptorSetRing::next_updated`] only runs `vkUpdateDescriptorSets` on a
+    /// pre-allocated set — no per-dispatch `VkDescriptorPool` create/destroy
+    /// (perf-parity Step 5a). Reset per token via [`Self::reset_rings`].
+    ring2: DescriptorSetRing<'a>,
+    ring3: DescriptorSetRing<'a>,
+    ring5: DescriptorSetRing<'a>,
     /// Lightweight per-call accumulators (nanoseconds) so a decode loop can
     /// attribute time between the GPU GEMV submits and the surrounding host
     /// prep/readback. Drained + printed via [`Self::take_profile`].
@@ -244,14 +307,48 @@ impl<'a> DecodeResources<'a> {
         let cache = KernelCache::new();
         let recorder =
             CommandRecorder::new(ctx).map_err(|e| anyhow!("create decode CommandRecorder: {e}"))?;
+
+        // One persistent layout + ring per decode binding count. A ring of N sets
+        // permits N live dispatches between resets; each GEMV pair / FFN sub-step
+        // submits + fence-waits before the next, so a modest ring (16) is ample
+        // even with the fused FFN recording several dispatches into one submit.
+        const RING_SIZE: usize = 16;
+        let mk =
+            |binding_count: usize| -> Result<(DescriptorSetLayout<'a>, DescriptorSetRing<'a>)> {
+                let layout =
+                    DescriptorSetLayout::storage_buffers(ctx, binding_count).map_err(|e| {
+                        anyhow!("build descriptor layout ({binding_count} bindings): {e}")
+                    })?;
+                let ring = DescriptorSetRing::new(ctx, &layout, binding_count, RING_SIZE).map_err(
+                    |e| anyhow!("build descriptor ring ({binding_count} bindings): {e}"),
+                )?;
+                Ok((layout, ring))
+            };
+        let (l2, ring2) = mk(2)?;
+        let (l3, ring3) = mk(3)?;
+        let (l5, ring5) = mk(5)?;
+
         Ok(Self {
             arena,
             cache,
             recorder,
+            _layouts: vec![l2, l3, l5],
+            ring2,
+            ring3,
+            ring5,
             gemv_submit_ns: 0,
             gemv_other_ns: 0,
             gemv_count: 0,
         })
+    }
+
+    /// Rewind every descriptor-set ring's round-robin cursor. Called once at the
+    /// start of each token so its dispatches reuse the rings from slot 0 (the
+    /// prior token's submissions have all fence-completed).
+    pub fn reset_rings(&mut self) {
+        self.ring2.reset();
+        self.ring3.reset();
+        self.ring5.reset();
     }
 
     /// Drain the accumulated GEMV timing as
@@ -314,6 +411,10 @@ pub fn forward_token<'a>(
     let h = config.hidden_size;
     let eps = config.rms_norm_eps;
 
+    // Rewind the descriptor-set rings for this token (the prior token's
+    // submissions have all fence-completed — every GEMV / FFN submit waits).
+    res.reset_rings();
+
     // ── Token embedding (host gather + dequant of one Q8_0 row). ──
     let mut hidden = weights
         .embedding
@@ -346,33 +447,27 @@ pub fn forward_token<'a>(
             }
         };
 
-        // Post-attention residual add + post_attention_layernorm (plain RMSNorm).
-        let post_sum = add_vec(&hidden, &attn_out);
-        let post_norm_w = norm_weight(weights, layer, "post_attention_norm")?;
-        let mlp_in = rms_norm_weight(&post_sum, &post_norm_w, eps);
-
-        // FFN: DENSE swiglu MLP (qwen35) or sparse MoE (qwen35moe). Branch on
-        // whether THIS layer is a MoE layer (decoder_sparse_step / mlp_only).
-        let mlp_out = if config.is_moe_layer(layer) {
-            moe_ffn(ctx, config, weights, res, layer, &mlp_in)?
+        // FFN. The DENSE swiglu MLP (qwen35) records post-attn add + post-norm +
+        // gate/up/swiglu/down + the MLP residual add as ONE device-resident
+        // barrier-chained submit (Step 5b: no host hop between the GEMVs). The
+        // sparse MoE (qwen35moe) keeps the host post-add/norm + per-expert path
+        // for now (its swiglu/add fusion is the next chunk).
+        if config.is_moe_layer(layer) {
+            let post_sum = add_vec(&hidden, &attn_out);
+            let post_norm_w = norm_weight(weights, layer, "post_attention_norm")?;
+            let mlp_in = rms_norm_weight(&post_sum, &post_norm_w, eps);
+            let mlp_out = moe_ffn(ctx, config, weights, res, layer, &mlp_in)?;
+            hidden = add_vec(&post_sum, &mlp_out);
         } else {
-            // Dense FFN: down( silu(gate(x)) * up(x) ).
-            let gate = gemv_layer(ctx, weights, res, layer, "ffn_gate", &mlp_in)?;
-            let up = gemv_layer(ctx, weights, res, layer, "ffn_up", &mlp_in)?;
-            let act = swiglu(&gate, &up);
-            gemv_layer(ctx, weights, res, layer, "ffn_down", &act)?
-        };
-
-        // MLP residual add into the next layer's residual stream.
-        hidden = add_vec(&post_sum, &mlp_out);
+            hidden = fused_dense_ffn(ctx, config, weights, res, layer, &hidden, &attn_out)?;
+        }
     }
 
-    // Final norm (plain RMSNorm) + LM head GEMV → logits.
+    // Final norm (plain RMSNorm, on-device) + LM head GEMV → logits.
     let final_norm = weights
         .get("output_norm.weight")
         .ok_or_else(|| anyhow!("missing output_norm.weight"))?;
-    let final_norm_w = dequant_f32(final_norm, h)?;
-    let normed = rms_norm_weight(&hidden, &final_norm_w, eps);
+    let normed = rms_norm_device(ctx, res, &hidden, final_norm, eps, "final_norm")?;
     let logits = gemv_global(ctx, weights, res, "output.weight", &normed)?;
 
     state.seq_len += 1;
@@ -965,108 +1060,30 @@ fn gemv_device_at<'a>(
 
     // 1. Land the input activation into the arena's x_in slot (UMA, no alloc).
     let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let x_in_off = res.arena.x_in.offset;
     res.arena
         .buffer
-        .copy_from_host_at(res.arena.x_in.offset, &x_bytes)
+        .copy_from_host_at(x_in_off, &x_bytes)
         .map_err(|e| anyhow!("{name}: write gemv x into arena: {e}"))?;
 
-    let quant_bytes = q8_1_x4_bytes(ncols);
-    let dst_bytes = nrows * std::mem::size_of::<f32>();
-
-    // 2. Build the two cached pipelines (build-once on first use), then record
-    //    quantize -> barrier -> GEMV into ONE submit. The q8_1 shader fully
-    //    writes every covered x4 block (the rounded-up tail lanes are written as
-    //    0), and the GEMV writes every row < nrows, so no pre-zeroing is needed.
-    let q_spec = Kernel::QuantizeQ8_1.specialization_u32();
-    let q_push = q8_1_quantize_params(ncols as u32).to_le_bytes();
-    let q_groups = {
-        let d = q8_1_quantize_dispatch(ncols as u32);
-        [d.x, d.y, d.z]
-    };
-
-    // Pick the GEMV kernel from the weight's packed quant type: the K-quant and
-    // Q8_0 `mul_mat_vecq_*` shaders all consume the SAME q8_1_x4 activation and
-    // the SAME 13-uint `gemv_params`; only the weight-decode shader differs. The
-    // dense 27B is Q8_0; the 35B-A3B experts are Q4_K (gate/up) + Q5_K (down)
-    // with Q8_0 shared experts.
-    let gemv_kernel = gemv_kernel_for(weight, name)?;
-    let g_spec = gemv_kernel.specialization_u32();
-    let g_push = gemv_params(ncols as u32, nrows as u32).to_le_bytes();
-    let g_groups = {
-        let d = gemv_dispatch(nrows as u32);
-        [d.x, d.y, d.z]
-    };
-
-    // Build (or fetch) both pipelines up front so neither cache borrow overlaps
-    // a descriptor-set build. We hold raw handles via the cached references in
-    // sequence: get quantize, use it, then get gemv, use it.
-    let arena_buf = &res.arena.buffer;
-
-    // --- quantize dispatch ---
-    let q_set = {
-        let (q_pipeline, q_layout) = res
-            .cache
-            .get(ctx, Kernel::QuantizeQ8_1, q_spec, q_push.len() as u32, 2)
-            .map_err(|e| anyhow!("{name}: build q8_1_quantize pipeline: {e}"))?;
-        let q_layout_ptr = q_layout;
-        let set = DescriptorSet::storage_buffers_ranged(
-            ctx,
-            q_layout_ptr,
-            &[
-                (arena_buf, res.arena.x_in.offset, (ncols * 4) as u64),
-                (arena_buf, res.arena.quant.offset, quant_bytes as u64),
-            ],
-        )
-        .map_err(|e| anyhow!("{name}: bind q8_1 descriptor set: {e}"))?;
-        // Record while the pipeline borrow is live.
-        res.recorder
-            .begin()
-            .map_err(|e| anyhow!("{name}: recorder begin: {e}"))?;
-        record_dispatch(&mut res.recorder, q_pipeline, &set, &q_push, q_groups);
-        set
-    };
-    // Keep q_set alive until submit (the descriptor set must outlive the recorded
-    // dispatch that references it).
-    let _q_set = q_set;
-
-    // Barrier: GEMV reads the quantize's writes.
-    res.recorder.barrier();
-
-    // --- GEMV dispatch ---
-    let g_set = {
-        let (g_pipeline, g_layout) = res
-            .cache
-            .get(ctx, gemv_kernel, g_spec, g_push.len() as u32, 5)
-            .map_err(|e| anyhow!("{name}: build {gemv_kernel:?} GEMV pipeline: {e}"))?;
-        let set = DescriptorSet::storage_buffers_ranged(
-            ctx,
-            g_layout,
-            &[
-                // binding 0: weight sub-range — resident expert slice (or whole
-                // 2-D tensor at offset 0), no re-upload.
-                (&weight.buffer, weight_offset, weight_len),
-                // binding 1: q8_1_x4 activations.
-                (arena_buf, res.arena.quant.offset, quant_bytes as u64),
-                // binding 2: f32 dst rows.
-                (arena_buf, res.arena.dst.offset, dst_bytes as u64),
-                // bindings 3/4: fuse dummies (unread, fusion_flags=0).
-                (
-                    arena_buf,
-                    res.arena.fuse0.offset,
-                    res.arena.fuse0.len as u64,
-                ),
-                (
-                    arena_buf,
-                    res.arena.fuse1.offset,
-                    res.arena.fuse1.len as u64,
-                ),
-            ],
-        )
-        .map_err(|e| anyhow!("{name}: bind GEMV descriptor set: {e}"))?;
-        record_dispatch(&mut res.recorder, g_pipeline, &set, &g_push, g_groups);
-        set
-    };
-    let _g_set = g_set;
+    // 2. Record quantize -> barrier -> GEMV into ONE submit, reading x from the
+    //    x_in slot and writing the result into the dst slot.
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("{name}: recorder begin: {e}"))?;
+    let dst_off = res.arena.dst.offset;
+    record_quantize_gemv(
+        ctx,
+        res,
+        weight,
+        name,
+        ncols,
+        nrows,
+        weight_offset,
+        weight_len,
+        x_in_off,
+        dst_off,
+    )?;
 
     // 3. ONE submit + ONE fence wait for the quantize+GEMV pair.
     let t_submit = std::time::Instant::now();
@@ -1076,6 +1093,7 @@ fn gemv_device_at<'a>(
     let submit_ns = t_submit.elapsed().as_nanos();
 
     // 4. Read back the f32 result rows from the arena dst slot.
+    let dst_bytes = nrows * std::mem::size_of::<f32>();
     let mut out_bytes = vec![0u8; dst_bytes];
     res.arena
         .buffer
@@ -1091,6 +1109,104 @@ fn gemv_device_at<'a>(
     res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
     res.gemv_count += 1;
     Ok(out)
+}
+
+/// Record (no submit) the q8_1 quantize + Q8_0/K-quant GEMV pair into the OPEN
+/// recorder: read the f32 input activation from arena byte `x_in_off`
+/// (`ncols` wide), quantize it into the `quant` slot, barrier, then GEMV the
+/// `[nrows, ncols]` weight sub-range into arena byte `dst_off` (`nrows` f32).
+///
+/// Descriptor sets come from the persistent [`DescriptorSetRing`]s (no per-call
+/// `VkDescriptorPool` churn — Step 5a); pipelines from the compile-once
+/// [`KernelCache`]. The caller `begin()`s the recorder and `submit_and_wait()`s
+/// after one or more recorded ops (the fused FFN records several before one
+/// submit). Field-level borrows keep cache/ring/recorder/arena disjoint.
+#[allow(clippy::too_many_arguments)]
+fn record_quantize_gemv<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    weight: &DeviceTensor<'_>,
+    name: &str,
+    ncols: usize,
+    nrows: usize,
+    weight_offset: u64,
+    weight_len: u64,
+    x_in_off: u64,
+    dst_off: u64,
+) -> Result<()> {
+    let quant_bytes = q8_1_x4_bytes(ncols);
+    let dst_bytes = nrows * std::mem::size_of::<f32>();
+    let quant_off = res.arena.quant.offset;
+    let fuse0 = (res.arena.fuse0.offset, res.arena.fuse0.len as u64);
+    let fuse1 = (res.arena.fuse1.offset, res.arena.fuse1.len as u64);
+
+    let q_spec = Kernel::QuantizeQ8_1.specialization_u32();
+    let q_push = q8_1_quantize_params(ncols as u32).to_le_bytes();
+    let q_groups = {
+        let d = q8_1_quantize_dispatch(ncols as u32);
+        [d.x, d.y, d.z]
+    };
+    // Pick the GEMV kernel from the weight's packed quant type: the K-quant and
+    // Q8_0 `mul_mat_vecq_*` shaders all consume the SAME q8_1_x4 activation and
+    // the SAME 13-uint `gemv_params`; only the weight-decode shader differs.
+    let gemv_kernel = gemv_kernel_for(weight, name)?;
+    let g_spec = gemv_kernel.specialization_u32();
+    let g_push = gemv_params(ncols as u32, nrows as u32).to_le_bytes();
+    let g_groups = {
+        let d = gemv_dispatch(nrows as u32);
+        [d.x, d.y, d.z]
+    };
+
+    // Disjoint field borrows: cache (pipeline), ring (set), recorder (record),
+    // arena.buffer (binding targets) are different fields of `res`.
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring2,
+        ring5,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+
+    // --- quantize dispatch (2 bindings) ---
+    {
+        let (pipeline, _) = cache
+            .get(ctx, Kernel::QuantizeQ8_1, q_spec, q_push.len() as u32, 2)
+            .map_err(|e| anyhow!("{name}: build q8_1_quantize pipeline: {e}"))?;
+        let set = ring2
+            .next_updated(&[
+                (arena_buf, x_in_off, (ncols * 4) as u64),
+                (arena_buf, quant_off, quant_bytes as u64),
+            ])
+            .map_err(|e| anyhow!("{name}: bind q8_1 ring set: {e}"))?;
+        recorder.dispatch_raw(pipeline, set, &q_push, q_groups);
+    }
+
+    // Barrier: GEMV reads the quantize's writes.
+    recorder.barrier();
+
+    // --- GEMV dispatch (5 bindings) ---
+    {
+        let (pipeline, _) = cache
+            .get(ctx, gemv_kernel, g_spec, g_push.len() as u32, 5)
+            .map_err(|e| anyhow!("{name}: build {gemv_kernel:?} GEMV pipeline: {e}"))?;
+        let set = ring5
+            .next_updated(&[
+                // binding 0: weight sub-range (resident expert slice / whole tensor).
+                (&weight.buffer, weight_offset, weight_len),
+                // binding 1: q8_1_x4 activations.
+                (arena_buf, quant_off, quant_bytes as u64),
+                // binding 2: f32 dst rows.
+                (arena_buf, dst_off, dst_bytes as u64),
+                // bindings 3/4: fuse dummies (unread, fusion_flags=0).
+                (arena_buf, fuse0.0, fuse0.1),
+                (arena_buf, fuse1.0, fuse1.1),
+            ])
+            .map_err(|e| anyhow!("{name}: bind GEMV ring set: {e}"))?;
+        recorder.dispatch_raw(pipeline, set, &g_push, g_groups);
+    }
+    Ok(())
 }
 
 /// `(ncols=in, nrows=out)` from a weight's recorded GGUF dims. GGUF stores
@@ -1121,6 +1237,363 @@ fn gemv_kernel_for(weight: &DeviceTensor<'_>, name: &str) -> Result<Kernel> {
         GgmlType::Q8_0 => Kernel::GemvQ8_0,
         other => bail!("{name}: no registered GEMV kernel for packed type {other:?}"),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// On-device elementwise / norm kernels (perf-parity Step 5b). RMSNorm, SwiGLU,
+// and residual-Add now run on the GPU through the already-compiled `rms_norm`,
+// `swiglu`, and `add` shaders, recorded through the persistent recorder + rings
+// against arena slots. Each replaces its host f32 counterpart only after a
+// device test confirms it matches the oracle within tolerance.
+//
+// Two layers: `record_*` (record into the OPEN recorder, no submit — for the
+// fused FFN that chains several ops device-resident before one submit) and the
+// standalone `*_device` (write host input -> begin -> record -> submit -> read
+// back — the simple, oracle-gateable form used where the surrounding data still
+// lives on host, e.g. the final norm and the MoE per-expert swiglu).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record (no submit) a plain RMSNorm `out[i] = in[i] * inv_rms * w[i]` over a
+/// `[ncols]` row: input from arena byte `in_off`, weight from the device tensor
+/// `w_buf` sub-range, output to arena byte `out_off`. Bindings 0=A(in), 1=B(w),
+/// 2=D(out); spec `do_multiply=1`; push = [`rms_norm_params`]; one workgroup.
+fn record_rms_norm<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    w_buf: &DeviceBuffer<'_>,
+    name: &str,
+    ncols: usize,
+    eps: f32,
+    in_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let spec = Kernel::RmsNorm.specialization_u32();
+    let push = rms_norm_params(ncols as u32, eps).to_le_bytes();
+    let groups = {
+        let d = rms_norm_dispatch();
+        [d.x, d.y, d.z]
+    };
+    let row = (ncols * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::RmsNorm, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build rms_norm pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, in_off, row),
+            (w_buf, 0, w_buf.len() as u64),
+            (arena_buf, out_off, row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind rms_norm ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) a SwiGLU `out[i] = silu(gate[i]) * up[i]` over `[n]`:
+/// gate from arena byte `gate_off`, up from `up_off`, output to `out_off`.
+/// Bindings 0=A(gate), 1=B(up), 2=D(out); mode=2 (split); push = [`swiglu_params`].
+fn record_swiglu<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    n: usize,
+    gate_off: u64,
+    up_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let spec = Kernel::SwiGlu.specialization_u32();
+    let push = swiglu_params(n as u32).to_le_bytes();
+    let groups = {
+        let d = swiglu_dispatch(n as u32);
+        [d.x, d.y, d.z]
+    };
+    let row = (n * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::SwiGlu, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build swiglu pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, gate_off, row),
+            (arena_buf, up_off, row),
+            (arena_buf, out_off, row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind swiglu ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Record (no submit) a residual Add `out[i] = a[i] + b[i]` over `[n]`: a from
+/// arena byte `a_off`, b from `b_off`, output to `out_off`. Bindings 0=A, 1=B,
+/// 2=D. The shader's binding-3 `PartialBuf` (the optional ADD_RMS reduction
+/// target) is dead-code-eliminated by `glslc -O` when built with `ADD_RMS=0`, so
+/// the pipeline has exactly 3 bindings — same `ring3` as rms_norm / swiglu.
+fn record_add<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    n: usize,
+    a_off: u64,
+    b_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let spec = Kernel::Add.specialization_u32();
+    let push = add_params(n as u32).to_le_bytes();
+    let groups = {
+        let d = add_dispatch(n as u32);
+        [d.x, d.y, d.z]
+    };
+    let row = (n * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::Add, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build add pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, a_off, row),
+            (arena_buf, b_off, row),
+            (arena_buf, out_off, row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind add ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
+/// Standalone device RMSNorm: write host `x` into a work slot, record + submit +
+/// read back. Oracle-gated drop-in for [`rms_norm_weight`] where the surrounding
+/// data lives on host (the final norm). `w` must be an F32-resident norm weight.
+fn rms_norm_device<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    x: &[f32],
+    w: &DeviceTensor<'_>,
+    eps: f32,
+    name: &str,
+) -> Result<Vec<f32>> {
+    let n = x.len();
+    if !matches!(w.residency, Residency::DequantF32) {
+        bail!(
+            "{name}: rms_norm weight must be F32-resident, got {:?}",
+            w.residency
+        );
+    }
+    let in_off = res.arena.work[0].offset;
+    let out_off = res.arena.work[1].offset;
+    res.arena.write_work(0, x)?;
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("{name}: recorder begin: {e}"))?;
+    record_rms_norm(ctx, res, &w.buffer, name, n, eps, in_off, out_off)?;
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("{name}: submit rms_norm: {e}"))?;
+    res.arena.read_work(1, n)
+}
+
+/// Fetch a per-layer packed-quant weight tensor, erroring if it is missing or
+/// F32-resident (the dense FFN weights are always packed quant).
+fn packed_layer_weight<'w>(
+    weights: &'w ResidentWeights<'_>,
+    layer: usize,
+    suffix: &str,
+) -> Result<&'w DeviceTensor<'w>> {
+    let name = format!("blk.{layer}.{suffix}.weight");
+    let w = weights
+        .get(&name)
+        .ok_or_else(|| anyhow!("missing weight {name}"))?;
+    if !matches!(w.residency, Residency::KeepQuant(_)) {
+        bail!(
+            "{name}: dense FFN GEMV expects packed quant, got {:?}",
+            w.residency
+        );
+    }
+    Ok(w)
+}
+
+/// The **fused dense FFN + post-attention norm + both residual adds**, recorded
+/// device-resident (perf-parity Step 5b). Given the layer's residual stream
+/// `hidden` and the attention output `attn_out` (both host f32 from the
+/// host-side attention this chunk does NOT port), this records — into ONE
+/// submit, threading arena slots with barriers and **no host round-trip between
+/// the GEMVs** — the sequence:
+///
+///   post_sum = hidden + attn_out                        (device Add)
+///   mlp_in   = rms_norm(post_sum, post_attention_norm)  (device RMSNorm)
+///   gate     = ffn_gate · mlp_in                        (device GEMV)
+///   up       = ffn_up   · mlp_in                        (device GEMV)
+///   act      = silu(gate) * up                          (device SwiGLU)
+///   mlp_out  = ffn_down · act                           (device GEMV)
+///   hidden'  = post_sum + mlp_out                        (device Add)
+///
+/// and reads back ONLY `hidden'` ([hidden] f32) at the end. This removes the
+/// six device→host→device hops (two adds, one norm, swiglu, plus the per-GEMV
+/// readbacks of gate/up/down) the host path forced per dense layer.
+///
+/// Arena work-slot plan (4 slots; the live set peaks at {post_sum, mlp_in, gate,
+/// up} after the up-proj). Every slot is `max_cols`-wide so it holds a hidden-
+/// or ffn_inter-wide vector. A barrier separates every recorded op (consecutive
+/// GEMVs also share the single `quant` slot, so the barrier is required):
+///   work0 = post_sum (lives the whole FFN, consumed by the final add)
+///   work1 = mlp_in → (reused) act → (reused) hidden'
+///   work2 = gate   → (reused) mlp_out
+///   work3 = up
+fn fused_dense_ffn<'a>(
+    ctx: &'a VulkanContext,
+    config: &Qwen35Config,
+    weights: &ResidentWeights<'_>,
+    res: &mut DecodeResources<'a>,
+    layer: usize,
+    hidden: &[f32],
+    attn_out: &[f32],
+) -> Result<Vec<f32>> {
+    let h = config.hidden_size;
+    let inter = config.intermediate_size;
+    let eps = config.rms_norm_eps;
+    if hidden.len() != h || attn_out.len() != h {
+        bail!(
+            "fused_dense_ffn[{layer}]: hidden {} / attn_out {} != hidden {h}",
+            hidden.len(),
+            attn_out.len()
+        );
+    }
+    if inter > res.arena.max_cols {
+        bail!(
+            "fused_dense_ffn[{layer}]: ffn intermediate {inter} exceeds arena ({})",
+            res.arena.max_cols
+        );
+    }
+
+    let post_norm_w = weights
+        .get(&format!("blk.{layer}.post_attention_norm.weight"))
+        .ok_or_else(|| anyhow!("missing blk.{layer}.post_attention_norm.weight"))?;
+    let gate_w = packed_layer_weight(weights, layer, "ffn_gate")?;
+    let up_w = packed_layer_weight(weights, layer, "ffn_up")?;
+    let down_w = packed_layer_weight(weights, layer, "ffn_down")?;
+    let (gate_in, gate_out) = weight_dims(gate_w, "ffn_gate")?;
+    let (down_in, down_out) = weight_dims(down_w, "ffn_down")?;
+    if gate_in != h || gate_out != inter || down_in != inter || down_out != h {
+        bail!(
+            "fused_dense_ffn[{layer}]: weight dims gate[{gate_in},{gate_out}] \
+             down[{down_in},{down_out}] disagree with hidden {h} / inter {inter}"
+        );
+    }
+
+    let _ = (down_in, down_out); // validated above
+
+    let t_start = std::time::Instant::now();
+
+    let w0 = res.arena.work[0].offset; // post_sum (persists)
+    let w1 = res.arena.work[1].offset; // mlp_in -> act -> hidden'
+    let w2 = res.arena.work[2].offset; // gate -> mlp_out
+    let w3 = res.arena.work[3].offset; // up
+
+    // Land the two add inputs into scratch slots work1 (=hidden) / work2 (=attn).
+    res.arena.write_work(1, hidden)?;
+    res.arena.write_work(2, attn_out)?;
+
+    res.recorder
+        .begin()
+        .map_err(|e| anyhow!("fused_dense_ffn[{layer}]: recorder begin: {e}"))?;
+
+    // post_sum = hidden(work1) + attn_out(work2) -> work0
+    record_add(ctx, res, "ffn_post_add", h, w1, w2, w0)?;
+    res.recorder.barrier();
+    // mlp_in = rms_norm(post_sum=work0) -> work1
+    record_rms_norm(
+        ctx,
+        res,
+        &post_norm_w.buffer,
+        "ffn_post_norm",
+        h,
+        eps,
+        w0,
+        w1,
+    )?;
+    res.recorder.barrier();
+    // gate = ffn_gate · mlp_in(work1) -> work2
+    record_quantize_gemv(
+        ctx,
+        res,
+        gate_w,
+        "ffn_gate",
+        gate_in,
+        gate_out,
+        0,
+        gate_w.buffer.len() as u64,
+        w1,
+        w2,
+    )?;
+    res.recorder.barrier();
+    // up = ffn_up · mlp_in(work1) -> work3
+    record_quantize_gemv(
+        ctx,
+        res,
+        up_w,
+        "ffn_up",
+        gate_in,
+        gate_out,
+        0,
+        up_w.buffer.len() as u64,
+        w1,
+        w3,
+    )?;
+    res.recorder.barrier();
+    // act = silu(gate=work2) * up(work3) -> work1 (mlp_in now dead)
+    record_swiglu(ctx, res, "ffn_swiglu", inter, w2, w3, w1)?;
+    res.recorder.barrier();
+    // mlp_out = ffn_down · act(work1) -> work2 (gate now dead)
+    record_quantize_gemv(
+        ctx,
+        res,
+        down_w,
+        "ffn_down",
+        down_in,
+        down_out,
+        0,
+        down_w.buffer.len() as u64,
+        w1,
+        w2,
+    )?;
+    res.recorder.barrier();
+    // hidden' = post_sum(work0) + mlp_out(work2) -> work1
+    record_add(ctx, res, "ffn_mlp_add", h, w0, w2, w1)?;
+
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|e| anyhow!("fused_dense_ffn[{layer}]: submit: {e}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+
+    let out = res.arena.read_work(1, h)?;
+
+    // Attribute the three GEMVs' submit/host time into the same profile buckets
+    // the standalone GEMV path uses, so the breakdown stays comparable.
+    let total_ns = t_start.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    res.gemv_count += 3;
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
