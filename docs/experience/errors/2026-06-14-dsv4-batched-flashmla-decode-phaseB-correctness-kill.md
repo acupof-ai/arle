@@ -59,6 +59,29 @@ KV/Q/accum). Prime suspects now: `sched_meta_for_batch(b=N)` tile-scheduler meta
 also code-read-airtight yet missed this) — needs controlled isolation: compare each
 row's batched output to its per-row-kernel reference for the SAME inputs.
 
+### Numerical pinpoint (2026-06-14, `INFER_DSV4_BATCHED_NUMDIFF` infra `1c4414dd`)
+Built a reusable numerical-diff harness (the confounded row-vs-row BATCH_PROBE is
+useless — concurrent HTTP isn't lockstep). It diffs the RAW batched kernel output
+vs a b=1 reference reading the SAME packed KV + SAME gathered `q_batched[r]`
+(pre-all-reduce). Result, DETERMINISTIC:
+```
+[numdiff] FIRST-EXCEEDANCE L0 row1 slot1 maxdiff=5.75 (thresh 0.05, ~115×)
+```
+**Invariant: row0 (canonical first position) ALWAYS correct; every row≥1 corrupt,
+position-dependent NOT slot-dependent** (c=4: row0 only corrupts once a higher slot
+slides into position 0 after a batch shrink). So the b=N kernel mis-attributes the
+per-row split-KV accumulator — only position 0 reads the right slice. Since the
+numdiff shares `q_batched[r]`+KV, a gather/pack bug is RULED OUT (would be diff≈0).
+And the per-row q/o/lse/indices strides + the accum split-strides are all correct
+(verified: stride_q=h_q*head_dim advances per row; accum is `[num_sm_parts+b]` with
+b folded via `num_splits`, not a stride). **⇒ Defect-2 is `num_splits(b=N)` /
+`sched_meta(b=N)` / the official FlashMLA b=N split-KV combine attribution — deep
+vendored-kernel, FIXABLE (SGLang runs b>1), not the Rust wiring.** Next: study the
+official FlashMLA b=N decode convention (arle-upstream-runtime-scan) — compare our
+`sched_meta_for_batch` + the shim's `[num_sm_parts+b]` combine to the official b=N
+usage; the bug is a deviation there. The numdiff infra will confirm the fix
+(FIRST-EXCEEDANCE must vanish + decode-read coherent at c≥2).
+
 ## Fix
 Stays gated OFF (main default byte-identical, safe). Next: root-cause the b=N
 corruption (decode greedy tokens at c=8, compare per-row output to the per-row-kernel
