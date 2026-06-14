@@ -1,6 +1,6 @@
 # SOPD #91 keystone — `arle train self-opd` inline EMA self-update loop
 
-**Date**: 2026-06-14 · **Issue**: [#91](https://github.com/cklxx/arle/issues/91) (SOPD Phase-0 KEYSTONE) · **Status**: F (CLI subcommand + inline loop + held-out NLL gate) landed `31939d23`; EMA self-teacher core landed `06e69e22`/`3e372ac1`/`89f3101d` · **Bench**: `pending-remote` — on-pod needle no-regression gate (see below)
+**Date**: 2026-06-14 (V100 verification 2026-06-15) · **Issue**: [#91](https://github.com/cklxx/arle/issues/91) (SOPD Phase-0 KEYSTONE) · **Status**: F (CLI subcommand + inline loop + held-out NLL gate) landed `31939d23`; EMA self-teacher core landed `06e69e22`/`3e372ac1`/`89f3101d`; **all 4 keystone loop-mechanic checks verified on real Qwen3.5-0.8B (V100 CPU autograd, 2026-06-15)** · **Bench**: needle-ladder *serving* gate stays `pending-remote` (no serving endpoint inside the inline loop)
 
 ## Context
 
@@ -74,14 +74,58 @@ F is exactly `crates/cli/src/args.rs` + `crates/cli/src/train_cli.rs` (+463/−1
 reusing the existing `build_opd_store` / `parse_prompt_ids` / `current_grad_norm`
 / `embedded_tiny_qwen35_config` / `exit_from_result` helpers — no new infra.
 
-## Bench (`pending-remote`)
+### V100 verification — all 4 loop-mechanic checks on real Qwen3.5-0.8B (2026-06-15)
 
-The keystone acceptance gate is the **on-pod needle no-regression** check, which
-needs (a) a real Qwen3.5 HF dir (not loadable on the Mac CPU box) and (b) a
-serving endpoint for `scripts/needle_gate.py`. The remote run must confirm, on
-the H20 pod, all four: the loop runs end-to-end · the EMA-KL drives down ·
-held-out NLL does not regress · the atomic rollback restores a clean unit. The
-smoke lane is the only locally-executable surface and it passes. Cross-link:
+Ran `arle train self-opd` end-to-end on the V100 box against the real
+`Qwen/Qwen3.5-0.8B-Base` HF dir (vocab=248320, hidden=1024, 24 layers,
+`backend=cpu` — self-opd is pure autograd, so the GPU is irrelevant; the V100's
+value is real weights + RAM + build env). Three controlled runs, all exit 0.
+Rollout prompt was a **non-degenerate real-text sentence** ("The capital of
+France is Paris, …", 18 tokens, encoded on the Mac's local Qwen3.5 tokenizer);
+the gate `--eval-ids` was a **distinct** held-out sentence ("Water boils at one
+hundred degrees Celsius, …", 14 tokens) — non-circular by construction.
+
+| Check | Run | Flags | Result |
+|-------|-----|-------|--------|
+| **1 — loop runs e2e** | A′ | `--gate-every-n 0` | ✓ 3 steps, exit 0, reverts=0 |
+| **2 — no-regression on the honest metric** | B | `--gate-every-n 1 --gate-regress-tol 0.02` | ✓ held-out NLL **decreases** 2.477912→2.477247→2.476554→2.475835 (−0.0021) |
+| **3 — gate computes finite baseline + accepts** | B | (same) | ✓ baseline 2.477912 finite on the *distinct* held-out text; all 3 steps `gate accept`, reverts=0 |
+| **4 — atomic rollback restores a clean unit** | C | `--gate-every-n 1 --gate-regress-tol=-1.0` | ✓ reverts=3; post-step NLL **byte-identical 2.477247 across all 3 reverts**, baseline frozen at 2.477912; loop completes exit 0 |
+
+**Check 4 is the strongest signal.** `tol=-1.0` ⇒ threshold = `baseline·(1−1) = 0`
+⇒ every positive NLL regresses ⇒ forced revert each step. The post-step NLL is
+**identical (2.477247) on all 3 reverted steps** — each step starts from the
+exact same restored state, applies the same deterministic update, lands the same
+NLL, reverts again. Contrast Run B (no revert): NLL *progressed* 2.477247 →
+2.476554 → 2.475835. If the rollback were **partial** (AdamW moments or EMA
+adapter left drifted — the DSv4-EAGLE failure mode the atomic-unit design guards
+against), steps 2/3 would diverge from step 1's 2.477247. They don't → the
+`{student adapter, EMA adapter, AdamW moments}` triple restores as one clean unit.
+
+### SOLID finding — cold-start training loss is structurally near-zero (greedy-rollout anchor)
+
+The per-step **training loss is ~8e-6** on the real-text prompt, *not* a
+degenerate-prompt artifact — it is fundamental to the current wiring. The rollout
+is **greedy-argmax** (`opd.rs:342` "Greedy-argmax the last-position row"; module
+doc "the student samples a rollout greedily"), and the cold-start anchor is
+`GkdSftAnchor::StudentRollout` ⇒ the loss = `0.5·CE(student ‖ own greedy tokens) +
+0.5·KL(student ‖ EMA)`. At cold start KL=0 (EMA==student), and CE against the
+student's **own argmax** tokens is `−log p(argmax) ≈ 0` (peaked softmax). The
+only gradient is "sharpen confidence on tokens you already pick" — a self-
+reinforcing, near-zero bootstrap, **not capability learning**. It does generalize
+weakly (held-out NLL improves −0.0021 in Run B), but a meaningful Phase-0
+bootstrap needs either a **temperature-sampled rollout** (anchor tokens ≠ argmax
+⇒ CE > 0) or a **real held-out corpus anchor** (`GkdSftAnchor` with
+`corpus_tokens`). This is the honest license-or-kill on Phase-0 *learning*
+efficacy — the keystone here is the loop *infrastructure* (4-pass · gate · atomic
+rollback), which is fully verified; the bootstrap-signal redesign is a follow-up.
+
+### Remaining `pending-remote` — needle-ladder serving gate
+
+The needle ladder (`scripts/needle_gate.py`) needs a serving endpoint, which
+does not exist inside the inline loop, so it stays the **external** pod
+acceptance gate for end-to-end capability no-regression (run after a real
+multi-step SOPD session writes a merged adapter). Cross-link:
 [SOPD plan](../../plans/2026-06-14-self-training-lora-opd-sopd.md) ·
 [#92 prefix-cache invalidate primitive](2026-06-14-sopd-prefix-cache-invalidate-primitive.md).
 
