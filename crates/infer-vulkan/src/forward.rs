@@ -57,7 +57,7 @@ use qwen35_spec::{LayerType, Qwen35Config};
 use vulkan_kernels::{
     BLOCK_Q8_1_BYTES, Kernel, KernelCache, Q8_1_X4_VALUES_PER_GROUP, add_dispatch, add_params,
     gemv_dispatch, gemv_params, q8_1_quantize_dispatch, q8_1_quantize_params, rms_norm_dispatch,
-    rms_norm_params, swiglu_dispatch, swiglu_params,
+    rms_norm_params, scaled_add_dispatch, scaled_add_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{
     CommandRecorder, DescriptorSetLayout, DescriptorSetRing, DeviceBuffer, VulkanContext,
@@ -490,6 +490,25 @@ pub fn forward_token<'a>(
 ///   shared = down_shexp( silu(gate_shexp·x) * up_shexp·x )
 ///            gated by sigmoid(ffn_gate_inp_shexp · x) if that router exists
 ///   ffn_out = routed + shared
+///
+/// Device-resident (perf-parity Step 5c): the router top-k stays on host (tiny —
+/// a softmax over the readback router logits), but every expert's per-element op
+/// — gate/up GEMV, SwiGLU, down GEMV, and the `acc += w_e · y_e` accumulate —
+/// runs **on the GPU** through the Step-5b `record_swiglu` / `record_scaled_add`
+/// helpers, threading arena work slots with **no host hop between the GEMVs**.
+/// One submit per expert (and one for the shared expert) batches its ~8
+/// barrier-chained dispatches; the accumulator lives in arena `work[0]`
+/// device-resident across every submit and reads back **once** at the end.
+///
+/// Arena work-slot plan (4 slots, the arena's full set):
+///   work[0] = acc     — Σ contributions, persists the whole FFN, read back once
+///   work[1] = mlp_in  — the FFN input x, persists (every expert + shared reads it)
+///   work[2] = gate → (reused) act      — per-expert transient
+///   work[3] = up   → (reused) y        — per-expert transient
+///
+/// The router weight scale `w_e` folds into the accumulate (`record_scaled_add`),
+/// not a separate scalar-multiply pass; the down GEMV's linearity makes
+/// `acc += w_e · down_e(act)` exact whether the scale is applied before or after.
 fn moe_ffn<'a>(
     ctx: &'a VulkanContext,
     config: &Qwen35Config,
@@ -501,10 +520,17 @@ fn moe_ffn<'a>(
     use crate::model_qwen36::qwen36_topk_routes;
 
     let h = config.hidden_size;
+    if mlp_in.len() != h {
+        bail!(
+            "moe_ffn[{layer}]: mlp_in width {} != hidden {h}",
+            mlp_in.len()
+        );
+    }
 
     // ── Router: F32 GEMV [hidden → n_expert]. The router weight is F32-resident
     // (DequantF32), not packed, so the quantized GEMV path does not apply — do
-    // the small matvec on the host (n_expert is tiny, e.g. 256). ──
+    // the small matvec on the host (n_expert is tiny, e.g. 256) and keep the
+    // softmax / top-k on host (the brief: router stays on host). ──
     let router = weights
         .get(&format!("blk.{layer}.ffn_gate_inp.weight"))
         .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_inp.weight"))?;
@@ -516,9 +542,20 @@ fn moe_ffn<'a>(
         config.norm_topk_prob,
     );
 
+    // Arena work-slot offsets (see the fn doc).
+    let acc_off = res.arena.work[0].offset;
+    let mlp_in_off = res.arena.work[1].offset;
+    let gate_off = res.arena.work[2].offset; // gate -> act
+    let up_off = res.arena.work[3].offset; // up   -> y
+
+    // Land mlp_in into its slot once (read by every expert + the shared expert)
+    // and zero the accumulator slot so the first scaled-add starts from 0.
+    res.arena.write_work(1, mlp_in)?;
+    res.arena.write_work(0, &vec![0.0f32; h])?;
+
     // ── Routed experts: slice each selected expert e out of the 3-D stacked
-    // ffn_*_exps tensors by byte offset and run the swiglu MLP, accumulating
-    // w_e · y_e. ──
+    // ffn_*_exps tensors by byte offset and run the swiglu MLP device-resident,
+    // accumulating `acc += w_e · y_e` on-device. ──
     let gate_exps = weights
         .get(&format!("blk.{layer}.ffn_gate_exps.weight"))
         .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_gate_exps.weight"))?;
@@ -528,27 +565,39 @@ fn moe_ffn<'a>(
     let down_exps = weights
         .get(&format!("blk.{layer}.ffn_down_exps.weight"))
         .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_down_exps.weight"))?;
+    let (moe_in, moe_inter) = weight_dims(gate_exps, "ffn_gate_exps")?;
+    if moe_in != h {
+        bail!("ffn_gate_exps[{layer}] in-dim {moe_in} != hidden {h}");
+    }
+    if moe_inter > res.arena.max_cols {
+        bail!(
+            "moe_ffn[{layer}]: expert intermediate {moe_inter} exceeds arena ({})",
+            res.arena.max_cols
+        );
+    }
 
-    let mut acc = vec![0.0f32; h];
     for route in &routes {
         let e = route.expert;
-        // gate_e, up_e: [hidden → moe_inter]; act = silu(gate)*up; down_e:
-        // [moe_inter → hidden].
-        let gate = gemv_expert(ctx, gate_exps, res, mlp_in, e, "ffn_gate_exps")?;
-        let up = gemv_expert(ctx, up_exps, res, mlp_in, e, "ffn_up_exps")?;
-        let act = swiglu(&gate, &up);
-        let y = gemv_expert(ctx, down_exps, res, &act, e, "ffn_down_exps")?;
-        if y.len() != h {
-            bail!("ffn_down_exps[{e}] out {} != hidden {h}", y.len());
-        }
-        let w = route.weight;
-        for (a, &yv) in acc.iter_mut().zip(&y) {
-            *a += w * yv;
-        }
+        moe_expert_submit(
+            ctx,
+            res,
+            gate_exps,
+            up_exps,
+            down_exps,
+            e,
+            h,
+            moe_inter,
+            route.weight,
+            mlp_in_off,
+            gate_off,
+            up_off,
+            acc_off,
+        )?;
     }
 
     // ── Shared expert (present on qwen35moe): a dense swiglu MLP gated by a
-    // per-token sigmoid scalar from ffn_gate_inp_shexp. ──
+    // per-token sigmoid scalar from ffn_gate_inp_shexp. Recorded device-resident
+    // into one submit; the sigmoid scalar folds into its scaled-add. ──
     if let Some(up_shexp) = weights.get(&format!("blk.{layer}.ffn_up_shexp.weight")) {
         let gate_shexp = weights
             .get(&format!("blk.{layer}.ffn_gate_shexp.weight"))
@@ -556,46 +605,242 @@ fn moe_ffn<'a>(
         let down_shexp = weights
             .get(&format!("blk.{layer}.ffn_down_shexp.weight"))
             .ok_or_else(|| anyhow!("missing blk.{layer}.ffn_down_shexp.weight"))?;
-
-        let gate = gemv_device(ctx, gate_shexp, res, mlp_in, "ffn_gate_shexp")?;
-        let up = gemv_device(ctx, up_shexp, res, mlp_in, "ffn_up_shexp")?;
-        let act = swiglu(&gate, &up);
-        let mut shared = gemv_device(ctx, down_shexp, res, &act, "ffn_down_shexp")?;
-        if shared.len() != h {
-            bail!("ffn_down_shexp out {} != hidden {h}", shared.len());
+        let (sh_in, sh_inter) = weight_dims(gate_shexp, "ffn_gate_shexp")?;
+        if sh_in != h {
+            bail!("ffn_gate_shexp[{layer}] in-dim {sh_in} != hidden {h}");
+        }
+        if sh_inter > res.arena.max_cols {
+            bail!(
+                "moe_ffn[{layer}]: shared expert intermediate {sh_inter} exceeds arena ({})",
+                res.arena.max_cols
+            );
         }
 
         // Sigmoid gate: ffn_gate_inp_shexp is F32 [hidden → 1] (one scalar/token).
-        if let Some(shgate) = weights.get(&format!("blk.{layer}.ffn_gate_inp_shexp.weight")) {
-            let g = gemv_f32_host(shgate, mlp_in, 1)?;
-            let s = sigmoid(g[0]);
-            for v in &mut shared {
-                *v *= s;
-            }
-        }
-        for (a, &sv) in acc.iter_mut().zip(&shared) {
-            *a += sv;
-        }
+        // Compute it on host (one F32 dot) and fold the sigmoid into the shared
+        // expert's scaled-add (`acc += s · y_shared`); default 1.0 if absent.
+        let s = if let Some(shgate) = weights.get(&format!("blk.{layer}.ffn_gate_inp_shexp.weight"))
+        {
+            sigmoid(gemv_f32_host(shgate, mlp_in, 1)?[0])
+        } else {
+            1.0
+        };
+
+        moe_dense_expert_submit(
+            ctx, res, gate_shexp, up_shexp, down_shexp, h, sh_inter, s, mlp_in_off, gate_off,
+            up_off, acc_off,
+        )?;
     }
 
-    Ok(acc)
+    // Read the accumulator back once (the only host hop in the whole MoE FFN).
+    res.arena.read_work(0, h)
 }
 
-/// GEMV for one expert slice `e` of a 3-D `ffn_*_exps` tensor. GGUF stores the
-/// stack as `[ne0=in, ne1=out, ne2=n_expert]` row-major (ne0 fastest), so
-/// expert `e` is the 2-D `[out, in]` matrix at byte offset `e · out ·
-/// row_bytes(in)`, length `out · row_bytes(in)`. `gemv_dims` on the 3-D tensor
-/// already carries `(in, out)` (its ne0/ne1), and the per-expert stride is a
-/// multiple of the quant block bytes (Q4_K 144 B / Q5_K 176 B per 256 cols),
-/// which clears the AMD storage-buffer offset granularity.
-fn gemv_expert<'a>(
+/// Record one routed expert's `acc += w_e · y_e` device-resident into ONE submit:
+/// gate/up GEMV (sliced from the stacked `ffn_*_exps` at expert `e`), SwiGLU,
+/// down GEMV, then the weighted accumulate — all barrier-chained against arena
+/// slots. `mlp_in_off`/`acc_off` are the persistent input/accumulator slots;
+/// `gate_off`/`up_off` are reused for the transient act/y.
+#[allow(clippy::too_many_arguments)]
+fn moe_expert_submit<'a>(
     ctx: &'a VulkanContext,
-    exps: &DeviceTensor<'_>,
     res: &mut DecodeResources<'a>,
-    x: &[f32],
+    gate_exps: &DeviceTensor<'_>,
+    up_exps: &DeviceTensor<'_>,
+    down_exps: &DeviceTensor<'_>,
     e: usize,
-    name: &str,
-) -> Result<Vec<f32>> {
+    h: usize,
+    inter: usize,
+    weight: f32,
+    mlp_in_off: u64,
+    gate_off: u64,
+    up_off: u64,
+    acc_off: u64,
+) -> Result<()> {
+    let (g_off, g_len) = expert_slice(gate_exps, e, "ffn_gate_exps")?;
+    let (u_off, u_len) = expert_slice(up_exps, e, "ffn_up_exps")?;
+    let (d_off, d_len) = expert_slice(down_exps, e, "ffn_down_exps")?;
+
+    let t_start = std::time::Instant::now();
+    res.recorder
+        .begin()
+        .map_err(|er| anyhow!("ffn_exps[{e}]: recorder begin: {er}"))?;
+
+    // gate = gate_e · mlp_in -> gate_off
+    record_quantize_gemv(
+        ctx,
+        res,
+        gate_exps,
+        "ffn_gate_exps",
+        h,
+        inter,
+        g_off,
+        g_len,
+        mlp_in_off,
+        gate_off,
+    )?;
+    res.recorder.barrier();
+    // up = up_e · mlp_in -> up_off
+    record_quantize_gemv(
+        ctx,
+        res,
+        up_exps,
+        "ffn_up_exps",
+        h,
+        inter,
+        u_off,
+        u_len,
+        mlp_in_off,
+        up_off,
+    )?;
+    res.recorder.barrier();
+    // act = silu(gate) * up -> gate_off (gate now dead)
+    record_swiglu(
+        ctx,
+        res,
+        "ffn_exps_swiglu",
+        inter,
+        gate_off,
+        up_off,
+        gate_off,
+    )?;
+    res.recorder.barrier();
+    // y = down_e · act -> up_off (up now dead)
+    record_quantize_gemv(
+        ctx,
+        res,
+        down_exps,
+        "ffn_down_exps",
+        inter,
+        h,
+        d_off,
+        d_len,
+        gate_off,
+        up_off,
+    )?;
+    res.recorder.barrier();
+    // acc += w_e · y -> acc_off
+    record_scaled_add(
+        ctx,
+        res,
+        "ffn_exps_acc",
+        h,
+        weight,
+        acc_off,
+        up_off,
+        acc_off,
+    )?;
+
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|er| anyhow!("ffn_exps[{e}]: submit: {er}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    let total_ns = t_start.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    res.gemv_count += 3;
+    Ok(())
+}
+
+/// Record the shared (dense) expert's `acc += s · y_shared` device-resident into
+/// ONE submit: gate/up/swiglu/down over the whole `ffn_*_shexp` tensors, then the
+/// sigmoid-gated accumulate. `s` is the per-token sigmoid scalar (1.0 if no
+/// shared-router weight); it folds into the scaled-add.
+#[allow(clippy::too_many_arguments)]
+fn moe_dense_expert_submit<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    gate_w: &DeviceTensor<'_>,
+    up_w: &DeviceTensor<'_>,
+    down_w: &DeviceTensor<'_>,
+    h: usize,
+    inter: usize,
+    s: f32,
+    mlp_in_off: u64,
+    gate_off: u64,
+    up_off: u64,
+    acc_off: u64,
+) -> Result<()> {
+    let g_len = gate_w.buffer.len() as u64;
+    let u_len = up_w.buffer.len() as u64;
+    let d_len = down_w.buffer.len() as u64;
+
+    let t_start = std::time::Instant::now();
+    res.recorder
+        .begin()
+        .map_err(|er| anyhow!("ffn_shexp: recorder begin: {er}"))?;
+
+    record_quantize_gemv(
+        ctx,
+        res,
+        gate_w,
+        "ffn_gate_shexp",
+        h,
+        inter,
+        0,
+        g_len,
+        mlp_in_off,
+        gate_off,
+    )?;
+    res.recorder.barrier();
+    record_quantize_gemv(
+        ctx,
+        res,
+        up_w,
+        "ffn_up_shexp",
+        h,
+        inter,
+        0,
+        u_len,
+        mlp_in_off,
+        up_off,
+    )?;
+    res.recorder.barrier();
+    record_swiglu(
+        ctx,
+        res,
+        "ffn_shexp_swiglu",
+        inter,
+        gate_off,
+        up_off,
+        gate_off,
+    )?;
+    res.recorder.barrier();
+    record_quantize_gemv(
+        ctx,
+        res,
+        down_w,
+        "ffn_down_shexp",
+        inter,
+        h,
+        0,
+        d_len,
+        gate_off,
+        up_off,
+    )?;
+    res.recorder.barrier();
+    record_scaled_add(ctx, res, "ffn_shexp_acc", h, s, acc_off, up_off, acc_off)?;
+
+    let t_submit = std::time::Instant::now();
+    res.recorder
+        .submit_and_wait()
+        .map_err(|er| anyhow!("ffn_shexp: submit: {er}"))?;
+    let submit_ns = t_submit.elapsed().as_nanos();
+    let total_ns = t_start.elapsed().as_nanos();
+    res.gemv_submit_ns += submit_ns;
+    res.gemv_other_ns += total_ns.saturating_sub(submit_ns);
+    res.gemv_count += 3;
+    Ok(())
+}
+
+/// Byte `(offset, len)` of expert slice `e` inside a 3-D stacked `ffn_*_exps`
+/// tensor `[ne0=in, ne1=out, ne2=n_expert]` (row-major, ne0 fastest): expert `e`
+/// is the 2-D `[out, in]` matrix at `e · out · row_bytes(in)`, length
+/// `out · row_bytes(in)`. The stride is a multiple of the quant block bytes
+/// (Q4_K 144 B / Q5_K 176 B / Q8_0 34 B per block), which clears the AMD storage-
+/// buffer offset granularity. Shared with the (now device-resident) MoE recorder.
+fn expert_slice(exps: &DeviceTensor<'_>, e: usize, name: &str) -> Result<(u64, u64)> {
     let (ncols, nrows) = weight_dims(exps, name)?;
     let ty = match exps.residency {
         Residency::KeepQuant(ty) => ty,
@@ -607,7 +852,13 @@ fn gemv_expert<'a>(
         as u64;
     let per_expert = nrows as u64 * row_bytes; // bytes for one [out, in] slice
     let offset = e as u64 * per_expert;
-    gemv_device_at(ctx, exps, res, x, name, ncols, nrows, offset, per_expert)
+    if offset + per_expert > exps.buffer.len() as u64 {
+        bail!(
+            "{name}: expert {e} slice [{offset}, +{per_expert}) exceeds buffer {}",
+            exps.buffer.len()
+        );
+    }
+    Ok((offset, per_expert))
 }
 
 /// Tiny F32 matvec on the host: `y[r] = Σ_c W[r,c] · x[c]` for an F32-resident
@@ -1380,6 +1631,53 @@ fn record_add<'a>(
     Ok(())
 }
 
+/// Record (no submit) a scaled residual Add `out[i] = a[i] + scale * b[i]` over
+/// `[n]`: accumulator `a` from arena byte `a_off`, addend `b` from `b_off`,
+/// output to `out_off` (may alias `a_off` — the shader reads both inputs at index
+/// `i` before writing `out[i]`, so in-place accumulate is safe). Bindings
+/// 0=A(acc), 1=B(addend), 2=D(out) — same `ring3` as add/rms_norm/swiglu.
+///
+/// Folds the MoE router weight `scale = w_e` into the per-expert accumulate
+/// (`acc += w_e * y_e`) so the whole MoE accumulate stays device-resident.
+fn record_scaled_add<'a>(
+    ctx: &'a VulkanContext,
+    res: &mut DecodeResources<'a>,
+    name: &str,
+    n: usize,
+    scale: f32,
+    a_off: u64,
+    b_off: u64,
+    out_off: u64,
+) -> Result<()> {
+    let spec = Kernel::ScaledAdd.specialization_u32();
+    let push = scaled_add_params(n as u32, scale).to_le_bytes();
+    let groups = {
+        let d = scaled_add_dispatch(n as u32);
+        [d.x, d.y, d.z]
+    };
+    let row = (n * 4) as u64;
+    let DecodeResources {
+        cache,
+        recorder,
+        arena,
+        ring3,
+        ..
+    } = res;
+    let arena_buf = &arena.buffer;
+    let (pipeline, _) = cache
+        .get(ctx, Kernel::ScaledAdd, spec, push.len() as u32, 3)
+        .map_err(|e| anyhow!("{name}: build scaled_add pipeline: {e}"))?;
+    let set = ring3
+        .next_updated(&[
+            (arena_buf, a_off, row),
+            (arena_buf, b_off, row),
+            (arena_buf, out_off, row),
+        ])
+        .map_err(|e| anyhow!("{name}: bind scaled_add ring set: {e}"))?;
+    recorder.dispatch_raw(pipeline, set, &push, groups);
+    Ok(())
+}
+
 /// Standalone device RMSNorm: write host `x` into a work slot, record + submit +
 /// read back. Oracle-gated drop-in for [`rms_norm_weight`] where the surrounding
 /// data lives on host (the final norm). `w` must be an F32-resident norm weight.
@@ -1640,11 +1938,6 @@ fn rope_neox(x: &[f32], pos: usize, half: usize, head_dim: usize, theta: f32) ->
     // dims >= rotary_dim already copied through by to_vec().
     let _ = head_dim;
     out
-}
-
-/// SwiGLU: `silu(gate) * up` elementwise.
-fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
-    gate.iter().zip(up).map(|(&g, &u)| silu(g) * u).collect()
 }
 
 fn add_vec(a: &[f32], b: &[f32]) -> Vec<f32> {

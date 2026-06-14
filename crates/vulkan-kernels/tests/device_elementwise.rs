@@ -17,7 +17,7 @@
 
 use vulkan_kernels::{
     Kernel, KernelCache, add_dispatch, add_params, launch_cached, rms_norm_dispatch,
-    rms_norm_params, swiglu_dispatch, swiglu_params,
+    rms_norm_params, scaled_add_dispatch, scaled_add_params, swiglu_dispatch, swiglu_params,
 };
 use vulkan_sys::{DeviceBuffer, VulkanContext};
 
@@ -158,5 +158,52 @@ fn elementwise_kernels_match_host_oracle() {
         )
         .expect("add dispatch");
         assert_close(&format!("add n={n}"), &read_f32(&buf_d, n), &want);
+    }
+
+    // ---- ScaledAdd: out[i] = a[i] + scale*b[i]. The MoE FFN accumulate folds
+    // the router weight `w_e` into this (`acc += w_e * y_e`) and aliases the
+    // accumulator (out == a), so test both a separate-dst and an in-place case.
+    for &n in &[256usize, 5120] {
+        let scale = 0.375f32;
+        let a: Vec<f32> = (0..n).map(|_| rng.next_f32() * 10.0).collect();
+        let b: Vec<f32> = (0..n).map(|_| rng.next_f32() * 10.0).collect();
+        let want: Vec<f32> = (0..n).map(|i| a[i] + scale * b[i]).collect();
+        let push = scaled_add_params(n as u32, scale).to_le_bytes();
+        let d = scaled_add_dispatch(n as u32);
+
+        // separate dst
+        let buf_a = upload_f32(&ctx, &a);
+        let buf_b = upload_f32(&ctx, &b);
+        let buf_d = upload_f32(&ctx, &vec![0.0f32; n]);
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::ScaledAdd,
+            &[&buf_a, &buf_b, &buf_d],
+            d,
+            &push,
+            Kernel::ScaledAdd.specialization_u32(),
+        )
+        .expect("scaled_add dispatch");
+        assert_close(&format!("scaled_add n={n}"), &read_f32(&buf_d, n), &want);
+
+        // in-place accumulate (out aliases a, the MoE acc pattern)
+        let buf_acc = upload_f32(&ctx, &a);
+        let buf_b2 = upload_f32(&ctx, &b);
+        launch_cached(
+            &mut cache,
+            &ctx,
+            Kernel::ScaledAdd,
+            &[&buf_acc, &buf_b2, &buf_acc],
+            d,
+            &push,
+            Kernel::ScaledAdd.specialization_u32(),
+        )
+        .expect("scaled_add in-place dispatch");
+        assert_close(
+            &format!("scaled_add in-place n={n}"),
+            &read_f32(&buf_acc, n),
+            &want,
+        );
     }
 }
