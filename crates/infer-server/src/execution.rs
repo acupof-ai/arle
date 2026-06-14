@@ -77,13 +77,16 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
     }
 }
 
-/// An out-of-band control closure run against the engine-thread-owned executor.
+/// An out-of-band control closure run against the engine-thread-owned `Engine`.
 ///
 /// The OPD control surface (raw-logits forward, weight offload/reload, student
-/// LoRA re-merge) reaches the thread-owned `&mut E` through these between steps,
-/// off the request hot path. The closure carries its own response channel, so the
-/// loop body only has to invoke it.
-pub(crate) type ControlMessage<E> = Box<dyn FnOnce(&mut E) + Send>;
+/// LoRA re-merge + prefix-cache invalidation) reaches the thread-owned
+/// `&mut Engine<E, K>` through these between steps, off the request hot path. The
+/// closure gets the whole engine (scheduler + RadixCache + executor), so a
+/// resident-weight re-merge can drop the now-stale prefix cache atomically in one
+/// message. The closure carries its own response channel, so the loop body only
+/// has to invoke it.
+pub(crate) type ControlMessage<E, K> = Box<dyn FnOnce(&mut Engine<E, K>) + Send>;
 
 /// One unit of frontend->engine work: a prompt plus a place to send back the
 /// engine-assigned handle and (later) the completion.
@@ -105,7 +108,7 @@ pub(crate) struct Submission {
 pub(crate) fn engine_loop<E, K>(
     engine: Engine<E, K>,
     submit_rx: Receiver<Submission>,
-    control_rx: Receiver<ControlMessage<E>>,
+    control_rx: Receiver<ControlMessage<E, K>>,
     counters: CounterHandle,
     shutdown: ServeShutdown,
 ) where
@@ -132,7 +135,7 @@ pub(crate) fn engine_loop<E, K>(
 fn engine_loop_with_tick_broadcaster<E, K>(
     mut engine: Engine<E, K>,
     submit_rx: Receiver<Submission>,
-    control_rx: Receiver<ControlMessage<E>>,
+    control_rx: Receiver<ControlMessage<E, K>>,
     counters: CounterHandle,
     shutdown: ServeShutdown,
     tick_broadcast: TickBroadcast<'_>,
@@ -278,13 +281,13 @@ fn engine_loop_with_tick_broadcaster<E, K>(
 /// blocking. Each closure carries its own response channel, so the loop only
 /// invokes it. A disconnected channel is benign (the frontend dropped its
 /// `ServeHandle`); the loop's normal shutdown path still runs.
-fn drain_control<E, K>(engine: &mut Engine<E, K>, control_rx: &Receiver<ControlMessage<E>>)
+fn drain_control<E, K>(engine: &mut Engine<E, K>, control_rx: &Receiver<ControlMessage<E, K>>)
 where
     E: BackendExecutor,
     K: KvPool,
 {
     while let Ok(closure) = control_rx.try_recv() {
-        closure(engine.executor_mut());
+        closure(engine);
     }
 }
 
