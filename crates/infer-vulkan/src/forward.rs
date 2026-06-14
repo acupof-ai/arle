@@ -878,6 +878,13 @@ fn forward_layers_resident<'a>(
     // a flush at a layer boundary stays numerically identical because the `hid`
     // hand-off across the flush is fence-ordered by the next `begin()`.
     let cap = submit_dispatch_cap();
+    // Per-layer-type GPU timing probe (ARLE_PROFILE_LAYERS=1): submit + wait after
+    // each layer and bucket the elapsed by attention kind, to attribute the decode
+    // floor across the full-attention vs gated-delta layers. Reintroduces per-layer
+    // serialization (faithful RATIO, inflated absolute); numerically identical.
+    let profile = std::env::var("ARLE_PROFILE_LAYERS").is_ok();
+    let mut full_ns: u128 = 0;
+    let mut lin_ns: u128 = 0;
     let t_record = std::time::Instant::now();
     res.recorder
         .begin()
@@ -922,10 +929,23 @@ fn forward_layers_resident<'a>(
         // this ordering implicitly).
         res.recorder.barrier();
 
-        // TDR safety valve: if the open command buffer hit the dispatch cap, flush
-        // at this (clean) layer boundary and reopen. Default cap = whole token, so
-        // the common path records all layers and submits exactly once below.
-        if res.recorder.dispatches_in_batch() as usize >= cap {
+        if profile {
+            let t = std::time::Instant::now();
+            res.recorder
+                .submit_and_wait()
+                .map_err(|e| anyhow!("layer[{layer}]: profile submit: {e}"))?;
+            res.recorder
+                .begin()
+                .map_err(|e| anyhow!("layer[{layer}]: profile begin: {e}"))?;
+            let dt = t.elapsed().as_nanos();
+            match layer_type {
+                LayerType::FullAttention => full_ns += dt,
+                LayerType::LinearAttention => lin_ns += dt,
+            }
+        } else if res.recorder.dispatches_in_batch() as usize >= cap {
+            // TDR safety valve: if the open command buffer hit the dispatch cap,
+            // flush at this (clean) layer boundary and reopen. Default cap = whole
+            // token, so the common path records all layers and submits once below.
             res.recorder
                 .submit_and_wait()
                 .map_err(|e| anyhow!("layer[{layer}]: resident cap-flush submit: {e}"))?;
@@ -933,6 +953,16 @@ fn forward_layers_resident<'a>(
                 .begin()
                 .map_err(|e| anyhow!("layer[{layer}]: resident cap-flush begin: {e}"))?;
         }
+    }
+    if profile && (full_idx + linear_idx) > 0 {
+        let fm = full_ns as f64 / 1e6;
+        let lm = lin_ns as f64 / 1e6;
+        eprintln!(
+            "  LAYER PROFILE: full-attn {fm:.1}ms / {full_idx} layers = {:.2}ms/layer | \
+             linear {lm:.1}ms / {linear_idx} layers = {:.2}ms/layer",
+            fm / full_idx.max(1) as f64,
+            lm / linear_idx.max(1) as f64,
+        );
     }
 
     // Single submit for the whole token (or the final partial batch when capped).
