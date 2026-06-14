@@ -1,0 +1,43 @@
+#version 450
+// ARLE Vulkan shader: per-element sigmoid gate `out[i] = sigmoid(a[i]) * b[i]`.
+//
+// The Qwen3.5 full-attention block applies a per-head sigmoid gate to the
+// attention output: `attn[h,d] *= sigmoid(gate[h,d])`, where `gate` is the
+// second half of the gated q-projection (`q_full`'s `[query|gate]` layout).
+// This replaces the host loop in `forward.rs::full_attention` so the gate runs
+// device-resident between the flash-attn output and the o-proj GEMV.
+//
+// Bindings mirror the elementwise family (0=A gate, 1=B value, 2=D out) so it
+// shares the 3-binding descriptor ring with add/rms_norm/swiglu/scaled_add.
+// `out` may alias `b` (the forward writes the gated result back over `attn`):
+// each thread reads a[i] and b[i] before writing out[i], so in-place is safe.
+//
+// One thread per element (256-wide workgroup); the host dispatches
+// `ceil(n / 256)` workgroups.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint n;
+} p;
+
+layout(binding = 0) readonly buffer A {
+    float gate[];
+};
+
+layout(binding = 1) readonly buffer B {
+    float val[];
+};
+
+layout(binding = 2) writeonly buffer D {
+    float out_data[];
+};
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) {
+        return;
+    }
+    const float s = 1.0 / (1.0 + exp(-gate[idx]));
+    out_data[idx] = s * val[idx];
+}
