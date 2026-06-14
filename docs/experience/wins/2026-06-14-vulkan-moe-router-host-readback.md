@@ -1,4 +1,4 @@
-# ARLE Vulkan MoE decode 1.97 → 0.085 s/token on the AMD Radeon 8060S
+# ARLE Vulkan MoE decode 1.97 → 0.056 s/token on the AMD Radeon 8060S
 
 ## Context
 
@@ -53,13 +53,45 @@ One field + one helper; no kernel, no submit-graph change.
 The prediction (~0.4 s) was conservative: the zero-copy borrow plus already-fast
 device expert GEMVs landed it at 0.085 s.
 
-## What is left (the remaining 4×, decomposed — not yet a wall)
+## Follow-up: residual-resident MoE port (0.085 → 0.056 s/token)
 
-Per-token after the fix: attn ~26 ms, moe_ffn ~39 ms (router 15 ms still on
-host + device experts ~24 ms), lm_head/sample/embed ~20 ms, **121 submits/token**
-(~37 ms in fence waits). Real levers, each now architecture work rather than a
-bug: (a) move the `[hidden→256]` router GEMV on-device (~12 ms), (b) collapse
-the 121 submits toward the dense path's single-submit-per-token batching.
+The router cache fixed the host-readback bug; the remaining gap was the
+host-bridged *architecture* — every MoE layer did host residual→norm→router→
+top-k with a device round-trip (~32 ms/token of host work + 121 submits). The
+dense path had already proven the cure (residual-resident, one submit/token), so
+the MoE got the same treatment, built incrementally with an oracle gate per new
+kernel:
+
+1. **Merge the two expert submits** (routed + shared) per layer: 121 → 81
+   submits, 0.085 → 0.080. Only +5% — `submit_and_wait` here is GPU-execution-
+   bound, not fence-overhead-bound (re-confirming the dense submit ablation).
+2. **On-device routing** — three new oracle-gated kernels: `qwen36_router_gemv`
+   (F32 `[n_expert,hidden]` GEMV), `qwen36_router_topk` (softmax→top-k→renorm,
+   replacing host `qwen36_topk_routes`), `qwen36_moe_weighted_accum` (device
+   weights). The crux (top-k) is a *single-thread* kernel that replicates the
+   host's exact serial order — it runs 40×/token but is microseconds, so
+   faithfulness beat throughput. The MoE test gates *coherence*, not byte-exact
+   ids, which made an on-device softmax tractable.
+3. **`record_fused_moe_ffn`** mirrors `record_fused_dense_ffn`'s residual
+   contract; `forward_layers_resident` branches `is_moe_layer`. The 35B linear
+   layers' F32 `ssm_alpha`/`ssm_beta` also moved on-device via `router_gemv`,
+   removing the last host-normed dependency. **Ring-sizing trap:** `ring6` (the
+   fused-expert GEMV ring) was a FIXED 16 — fine when MoE submitted per-block,
+   but a whole-token resident submit issues `3·n_moe` expert GEMVs and would
+   *silently alias*. Grew all rings to whole-token depth for `n_moe`. Result:
+   121 → **2 submits/token**, host work 0.032 → 0.018, **0.080 → 0.069**.
+4. **Coalesce `router_gemv`**: the first version was one thread per output row,
+   each striding `hidden` elements (uncoalesced — a cache line per read).
+   One-workgroup-per-row with 64 cooperating lanes reading contiguous columns:
+   **0.069 → 0.056 s/token** (~13 ms/token was uncoalesced reads). This was the
+   *measured confirmation* of the "GPU kernel efficiency is now the wall"
+   reasoning — the diagnosis, then the fix, then the number.
+
+**Net MoE: 1.97 → 0.056 s/token (35×), 93× → 2.65× of llama.cpp.** Coherent
+throughout. The wall now is genuinely GPU kernel efficiency: 2.62 GB/token at
+0.056 s = ~47 GB/s effective = ~21 % of roofline — the top-8 expert GEMVs are
+small `[2048×512]` Q4 matrices whose `mul_mat_vec_id` efficiency, not the
+architecture, is the remaining lever.
 
 ## Rule
 
