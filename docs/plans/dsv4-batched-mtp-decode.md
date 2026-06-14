@@ -110,6 +110,46 @@ proven per-slot one).
   prod prompt. License only if batched MTP > batched-dense (73.65) AND coherent.
 - Acceptance rate per row must match per-row MTP (~1.98) — a drop = a batched-draft bug.
 
+## Implementation spec (impl-level, from reading the verify path)
+
+The single-slot verify (`forward_tokens_stream_impl`, `dsv4.rs:2537`,
+`verify=Some(sched)`) runs attention in 3 sub-modes (`dsv4.rs:2650-2810`):
+1. **tree-attn batched lane** (`tree_meta` Some): ONE `mla_attention` over the chunk
+   with `Dsv4TreeAttnMeta` (per-row positions + branch indices), host start_pos, no
+   ring writes (`:2699-2736`).
+2. **per-row ring-replay** (`:2737-2791`): loop rows, device start_pos, each attends
+   its ancestor path's just-written KV (the needle-validated reference).
+3. decode (seq_len==1).
+
+MoE / HC / norm / head run over the whole `seq_len` chunk (token-independent).
+
+**The new function** `forward_decode_batch_verify` = generalize
+`forward_decode_batch_stream_impl` (`dsv4.rs:1717`) to **M = Σ_s (depth_s+1) rows
+grouped by slot**, layer-major:
+- per layer: **loop slots**, run that slot's verify attention (sub-mode 1 or 2, the
+  PROVEN single-slot path) writing into the combined `[M, hidden]` `attn_out` at slot
+  s's row block; then **batched MoE / HC / norm over all M rows** (the existing
+  batched-lane MoE, `:2200-2316`).
+- **Stage 1** = this restructure with per-slot attention (sub-mode 2 looped, or
+  sub-mode 1 per slot) — NO new attention kernel → no Phase-B-class risk; the win is
+  the MoE amortization over M rows.
+- **Stage 2** = make sub-mode 1 span N slots (one FlashMLA over M rows, a
+  `Dsv4TreeAttnMeta` with per-(slot,row) block-diagonal branch indices into each
+  slot's KV — extends the Phase A/B batched indices builder).
+
+`spec_step_batched(&slot_ids, &start_positions, &positions)`:
+1. loop s: `capture_spec_rings` (§buffers).
+2. batched draft: depth-sequential; per level call `mtp_forward_level` with N rows
+   (head math batches; Stage 1 loops the draft-layer attention per slot, Stage 2
+   batches it).
+3. `forward_decode_batch_verify` over the N chains → per-slot (argmax, hiddens).
+4. loop s: `longest_accepted_prefix` + bonus → `truncate_slot` →
+   `restore_spec_ring_tail` → commit (fold/re-forward) → set `spec_slots[s]`.
+
+Gated `ARLE_DSV4_BATCHED_MTP` (default OFF until pod-licensed); the executor gate
+(`executor.rs:1589`) routes spec + rows≥N to `spec_step_batched`, else the per-row
+loop (the B=1 / c<N reference).
+
 ## Out of scope
 
 - EPLB (separate track; decode is weight-read-bound → likely a prefill lever,
