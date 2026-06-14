@@ -224,6 +224,12 @@ impl VulkanQwen36Model {
         self.decode.take_profile()
     }
 
+    /// Total `vkQueueSubmit` calls issued by the decode recorder so far — lets a
+    /// timed decode report submits/token (perf-parity Step 4).
+    pub fn decode_submit_count(&self) -> u64 {
+        self.decode.submit_count()
+    }
+
     /// Number of device-resident weight tensors (token_embd is host-side).
     pub fn resident_tensor_count(&self) -> usize {
         self.weights.tensors.len()
@@ -399,6 +405,7 @@ mod tests {
             let mut generated = Vec::new();
             let mut pos = prompt_ids.len();
             let decode_start = std::time::Instant::now();
+            let submits_before = model.decode_submit_count();
             let mut decode_tokens = 0usize;
             for _ in 0..max_new {
                 let next = argmax_of(&last_logits) as u32;
@@ -432,6 +439,11 @@ mod tests {
                     gemv_n as f64 / decode_tokens as f64,
                     submit_s / decode_tokens as f64,
                     other_s / decode_tokens as f64,
+                );
+                let submits = model.decode_submit_count() - submits_before;
+                eprintln!(
+                    "  SUBMITS: {submits} vkQueueSubmit over {decode_tokens} tokens = {:.1} submits/token",
+                    submits as f64 / decode_tokens as f64,
                 );
             }
             generated
