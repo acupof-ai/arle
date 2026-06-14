@@ -203,7 +203,7 @@ phase that owns it.
 
 ---
 
-## Phase 0 — KEYSTONE: does the inline (G2) A1-EMA self-update loop run correctly and hold no-regression?
+## Phase 0 — KEYSTONE ([#91](https://github.com/cklxx/arle/issues/91) + prereq [#92](https://github.com/cklxx/arle/issues/92)): does the inline (G2) A1-EMA self-update loop run correctly and hold no-regression?
 
 **ckl's locked first cut.** CUDA + Qwen3.5-0.8B, 自更新-only, EMA self-teacher,
 update fires **after each rollout sequence** (G2) on the rollout path. This phase
@@ -281,7 +281,7 @@ Per served rollout sequence (G2):
 - **Reward-hack tripwire**: n/a for pure A1 EMA (no verifier/reward) — becomes
   live in Phase 0.5.
 
-## Phase 0.5 — capability booster: best-of-N rejection self-distill (A2, gated on Phase 0)
+## Phase 0.5 ([#93](https://github.com/cklxx/arle/issues/93)) — capability booster: best-of-N rejection self-distill (A2, gated on Phase 0)
 
 A1-EMA proves the loop and shapes consistency, but the *strong capability lift*
 (GSM8K / code) comes from injecting "which trajectory is actually correct" — that
@@ -308,7 +308,7 @@ wrapper around the rollout in `opd.rs`; verifier trait + GSM8K exact-match impl
 
 ---
 
-## Phase 1 — AIPC device port (Metal; LATER, gated on Phase 0 PASS)
+## Phase 1 ([#94](https://github.com/cklxx/arle/issues/94)) — AIPC device port (Metal; LATER, gated on Phase 0 PASS)
 
 The AIPC/Mac payoff, but explicitly **after** the CUDA loop is proven (ckl's
 "先证 loop"). Today the OPD *driver* is CUDA-gated (survey §1.3), so this is a
@@ -328,7 +328,7 @@ infer executor) — far less than full M5.3b autograd op coverage.
   impl — the *autograd* seam, not the inference `BackendExecutor`/`KvPool` seam
   that master-strategy-v2 #71 covers). Defer until Metal proves the loop.
 
-## Phase 2 — quantized-base + fp-adapter serve path (the AIPC serving shape)
+## Phase 2 ([#95](https://github.com/cklxx/arle/issues/95)) — quantized-base + fp-adapter serve path (the AIPC serving shape)
 
 On AIPC the served base is quantized (W4A8 / Q4_K). `merge_lora_proj` refuses a
 non-bf16 base, so the per-step hot-swap must become a **separate low-rank
@@ -336,7 +336,7 @@ path**: quant-base GEMM ‖ fp-adapter low-rank GEMM (standard quant+LoRA
 serving). Net-new in `infer-cuda` / `infer-metal` student forward. Gate:
 correct-inference (`needle_gate.py`) holds vs the bf16-merge reference.
 
-## Phase 3 — 升级 / streaming auto-quant (the `流式自动量化`)
+## Phase 3 ([#96](https://github.com/cklxx/arle/issues/96)) — 升级 / streaming auto-quant (the `流式自动量化`)
 
 Periodic consolidation: `merged_tensor()` folds the accumulated adapter into the
 base → **re-quantize the merged base** (net-new weight-requant primitive, reuse
@@ -347,7 +347,7 @@ across the requant boundary (NOT byte-identity — MoE non-determinism,
 `feedback_correct_inference_not_baseline_identity`). A failed gate reverts to
 the pre-upgrade quantized base + adapter.
 
-## Phase 4 — skills as the on-policy data engine (closes the self-evolving loop)
+## Phase 4 ([#97](https://github.com/cklxx/arle/issues/97); splits 4a live-serve safety / 4b skills data engine) — skills as the on-policy data engine (closes the self-evolving loop)
 
 Replace static GSM8K prompts with **live agent skill/tool trajectories**: the
 agent does real tasks using its skills → `(prompt, trajectory, outcome)` →
