@@ -33,6 +33,16 @@ interpolation; only c∈{1,4,8,16} were run).
 per-request throughput degrades ≈ 1/c — batched decode loses FlashMLA at the
 `seq_len==1` gate (→ per-row attention) and routed-MoE cost ∝ active_experts ∝ c.*
 
+- **Long context (32K/64K/128K) is WORSE — aggregate is FLAT (~1.0×), not 1.4×**
+  ([long-ctx campaign](../experience/wins/2026-06-14-dsv4-longctx-concurrency-serial-capped.md),
+  2026-06-14). Decode aggregate pins at ~44-48 tok/s for ALL c at every length;
+  per-request collapses 1/c. Three more findings there: (a) **TTFT is linear in
+  both length AND c** (prefill fully serial — 128K c=8 = 214s; a *separate*
+  additive lever, not in batched-decode scope); (b) **`--dsv4-batched-decode` is
+  a no-op at long ctx** (ON≈OFF within noise at 32K/64K c=8); (c) slots clamp
+  8→6; MTP acceptance degrades with ctx (tok/step 1.80→1.22 at 32K→128K). The
+  decode-lever acceptance bar: **aggregate must RISE with c**.
+
 **Lever ranking** (detail below): **#1 batched MLA decode** (wiring an existing
 SGLang-shape kernel, not new infra) → **#2 whole-step CUDA graph** (couples with
 #1) → **#3 MoE decode-kernel shape** (the fundamental ceiling) → **#4 DP-attention**
