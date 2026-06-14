@@ -298,6 +298,11 @@ const LOCAL: &[ShaderSpec] = &[
         defines: &[],
     },
     ShaderSpec {
+        name: "f16_kv_pack",
+        source: "crates/vulkan-kernels/shaders/f16_kv_pack.comp",
+        defines: &[],
+    },
+    ShaderSpec {
         name: "qwen35_ssm_conv",
         source: "crates/vulkan-kernels/shaders/qwen35_ssm_conv.comp",
         defines: &[],
