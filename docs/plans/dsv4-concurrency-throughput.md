@@ -6,6 +6,38 @@ concurrency baseline
 ([wins](../experience/wins/2026-06-13-dsv4-concurrency-baseline-serial-capped.md))
 + a study of SGLang's DeepSeek-MLA decode path (`/sgl-workspace/sglang`).
 
+## Latest performance (DSv4-Flash)
+
+8×H20, TP=8/EP=8, d2 chain-fold default-on. All numbers measured (no
+interpolation; only c∈{1,4,8,16} were run).
+
+- **B=1 single-stream best: 53.3 tok/s** (d2 chain-fold; 53.37/53.30/53.32 ×3,
+  σ≈0.04 — [chain-fold wins](../experience/wins/2026-06-13-dsv4-mtp-d2-chain-fold-53.md)).
+- **Concurrency cap (batched-decode lane, opt-in): aggregate rises only
+  44.4 → 62.0 tok/s for 16× the load = 1.40× ceiling** (per-request collapses
+  3.9 tok/s at c=16 —
+  [concurrency baseline](../experience/wins/2026-06-13-dsv4-concurrency-baseline-serial-capped.md)).
+  The default serve (batched off) is **flat ~53 tok/s** aggregate across c (per
+  request = agg / c) — pure serialization.
+
+| c | agg tok/s (batched ON) | per-req (batched ON) | agg tok/s (default) | per-req (default) |
+|---|---|---|---|---|
+| 1 | 44.4 | 44.4 | 53.3 | 53.3 |
+| 4 | 53.8 | 13.5 | 53.2 | 13.3 |
+| 8 | 57.4 | 7.2 | 53.2 | 6.6 |
+| 16 | **62.0** | 3.9 | 53.2 | 3.3 |
+
+![DSv4-Flash concurrency-scaling degradation curve](../assets/dsv4-concurrency-degradation.png)
+
+*Aggregate throughput barely scales (1.40× for 16× load, serial-capped) while
+per-request throughput degrades ≈ 1/c — batched decode loses FlashMLA at the
+`seq_len==1` gate (→ per-row attention) and routed-MoE cost ∝ active_experts ∝ c.*
+
+**Lever ranking** (detail below): **#1 batched MLA decode** (wiring an existing
+SGLang-shape kernel, not new infra) → **#2 whole-step CUDA graph** (couples with
+#1) → **#3 MoE decode-kernel shape** (the fundamental ceiling) → **#4 DP-attention**
+(orthogonal, removes the 2.7% collective floor only).
+
 ## The problem (measured)
 
 DSv4 concurrent decode barely scales: batched aggregate **1.40× for 16× load**
