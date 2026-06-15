@@ -216,7 +216,7 @@ mod backend {
     #[cfg(feature = "hip")]
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
-    use infer_metal::{MetalDiffusionGemmaModel, MetalExecutor, MetalKvPool};
+    use infer_metal::{MetalDiffusionGemmaModel, MetalExecutor, MetalGemma4Model, MetalKvPool};
     #[cfg(feature = "metal")]
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool};
     #[cfg(feature = "vulkan")]
@@ -251,6 +251,12 @@ mod backend {
                 BufferedDiffusionExecutor<MetalDiffusionGemmaModel>,
                 HostPagedKvPool,
             >,
+        ),
+        /// Metal Gemma4 backend. The Gemma4 MLX bridge owns generation and is
+        /// adapted to the shared autoregressive engine by a buffered executor.
+        #[cfg(feature = "metal")]
+        MetalGemma4(
+            ServeInferenceEngine<BufferedDiffusionExecutor<MetalGemma4Model>, HostPagedKvPool>,
         ),
         /// CUDA backend (Linux + NVIDIA). Structurally wired (typechecks); the
         /// real forward is lead-owned and not yet runnable.
@@ -335,6 +341,8 @@ mod backend {
                 Self::Metal(_) => "metal",
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(_) => "metal-diffusion-gemma",
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => "metal-gemma4",
                 #[cfg(feature = "cuda")]
                 Self::Cuda(_) => "cuda",
                 #[cfg(feature = "hip")]
@@ -364,6 +372,10 @@ mod backend {
                 }
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
                 #[cfg(feature = "hip")]
@@ -396,6 +408,10 @@ mod backend {
                 Self::MetalDiffusionGemma(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
+                    anyhow::bail!("offload_engine_weights is only available on CUDA")
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "vulkan")]
@@ -417,6 +433,10 @@ mod backend {
                 Self::Metal(_) => anyhow::bail!("reload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("reload_engine_weights is only available on CUDA")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")
                 }
                 #[cfg(feature = "hip")]
@@ -461,6 +481,13 @@ mod backend {
                         "student LoRA re-merge is CUDA-only; active backend is Metal DiffusionGemma"
                     )
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
+                    let _ = update;
+                    anyhow::bail!(
+                        "student LoRA re-merge is CUDA-only; active backend is Metal Gemma4"
+                    )
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => {
                     let _ = update;
@@ -492,6 +519,18 @@ mod backend {
                     infer_server::ServeShutdown::new(),
                 )?;
                 return Ok(Self::MetalDiffusionGemma(ServeInferenceEngine::new(
+                    model_id, tokenizer, serve,
+                )));
+            }
+            if infer_metal::model_dir_is_gemma4(&resolved) {
+                let (serve, tokenizer, model_id) = metal_gemma4_serve_handle(
+                    model_path,
+                    &resolved,
+                    config,
+                    &kv_ssd,
+                    infer_server::ServeShutdown::new(),
+                )?;
+                return Ok(Self::MetalGemma4(ServeInferenceEngine::new(
                     model_id, tokenizer, serve,
                 )));
             }
@@ -769,6 +808,11 @@ mod backend {
             )?;
             return Ok(infer_server::openai_router(serve, tokenizer, model_id));
         }
+        if infer_metal::model_dir_is_gemma4(&resolved) {
+            let (serve, tokenizer, model_id) =
+                metal_gemma4_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
+            return Ok(infer_server::openai_router(serve, tokenizer, model_id));
+        }
         let (serve, tokenizer, model_id) =
             metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
         Ok(infer_server::openai_router(serve, tokenizer, model_id))
@@ -823,6 +867,89 @@ mod backend {
                     std::path::Path::new(&model_source),
                     Some(resource_plan),
                 )?;
+                let executor = BufferedDiffusionExecutor::new_with_cancel(
+                    loaded.model,
+                    loaded.generation,
+                    cancel,
+                );
+                let kv = HostPagedKvPool::new(1, total_pages, page_size);
+                if low_impact {
+                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
+                        max_tokens: scheduler.chunked_prefill_size.max(1),
+                        max_micros: 20_000,
+                    })
+                    .with_yield_every_ticks(8);
+                    Ok(infer_core::Engine::with_config_and_governor(
+                        executor,
+                        kv,
+                        scheduler,
+                        Box::new(governor),
+                    ))
+                } else {
+                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                }
+            },
+            shutdown,
+        )?;
+        Ok((serve, tokenizer, model_id))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_gemma4_serve_handle(
+        model_path: &str,
+        resolved: &std::path::Path,
+        config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<(
+        ServeHandle<BufferedDiffusionExecutor<MetalGemma4Model>, HostPagedKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
+
+        if config.mtp_draft_tokens.is_some() {
+            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
+        }
+        anyhow::ensure!(
+            !kv_ssd.requested(),
+            "--kv-ssd-path: Gemma4 Metal owns no page-addressable KV tier store"
+        );
+
+        let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+        let model_source = resolved.to_string_lossy().to_string();
+        let mut scheduler = config.scheduler_config();
+        scheduler.num_slots = 1;
+        scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
+        scheduler.enable_prefix_cache = false;
+        let page_size = config.page_size.max(1);
+        let total_pages = config.total_pages.max(1);
+        let low_impact = config.low_impact;
+        let resource_plan = infer_metal::plan_weight_only_resource_budget(
+            resolved,
+            infer_metal::MetalWeightOnlyResourceRequest {
+                low_impact,
+                memory_budget_bytes: config.memory_budget_bytes,
+                system_reserve_bytes: config.system_reserve_bytes,
+                allow_swap: config.allow_swap,
+            },
+        )?;
+        let cancel = shutdown.cancel_flag();
+
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || {
+                let loaded = infer_metal::MetalGemma4Model::load_with_resource_plan(
+                    std::path::Path::new(&model_source),
+                    Some(resource_plan),
+                )?;
+                if loaded.image_token_id.is_some() {
+                    log::info!(
+                        "Gemma4 VLM ids detected: image_token_id={:?}, vision_soft_tokens_per_image={:?}; image embedding bridge is not enabled on this route",
+                        loaded.image_token_id,
+                        loaded.vision_soft_tokens_per_image
+                    );
+                }
                 let executor = BufferedDiffusionExecutor::new_with_cancel(
                     loaded.model,
                     loaded.generation,
@@ -1394,6 +1521,8 @@ mod backend {
                 Self::Metal(engine) => engine.model_id(),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(engine) => engine.model_id(),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.model_id(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.model_id(),
                 #[cfg(feature = "hip")]
@@ -1411,6 +1540,8 @@ mod backend {
                 Self::Metal(engine) => engine.complete(req),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(engine) => engine.complete(req),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.complete(req),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete(req),
                 #[cfg(feature = "hip")]
@@ -1432,6 +1563,8 @@ mod backend {
                 Self::Metal(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(engine) => engine.complete_stream(req, tx),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "hip")]
@@ -1449,6 +1582,8 @@ mod backend {
                 Self::Metal(engine) => engine.tokenize(text),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(engine) => engine.tokenize(text),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.tokenize(text),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.tokenize(text),
                 #[cfg(feature = "hip")]
@@ -1466,6 +1601,8 @@ mod backend {
                 Self::Metal(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(engine) => engine.render_chat_prompt(messages),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "hip")]
@@ -1483,6 +1620,8 @@ mod backend {
                 Self::Metal(engine) => engine.telemetry(),
                 #[cfg(feature = "metal")]
                 Self::MetalDiffusionGemma(engine) => engine.telemetry(),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.telemetry(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.telemetry(),
                 #[cfg(feature = "hip")]
