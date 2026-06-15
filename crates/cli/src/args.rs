@@ -144,6 +144,14 @@ pub(crate) enum OpdKlMaskArg {
     Full,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum LrScheduleArg {
+    /// Keep AdamW at the fixed --lr value for every step.
+    Fixed,
+    /// Linear warmup, then cosine decay to 10% of --lr.
+    Cosine,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct RenderArgs {
     /// Print the fully resolved execution plan without running the job.
@@ -680,6 +688,14 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = 1.0e-4)]
     pub(crate) lr: f32,
 
+    /// Learning-rate schedule for OPD optimizer steps.
+    #[arg(long, value_enum, default_value_t = LrScheduleArg::Fixed)]
+    pub(crate) lr_schedule: LrScheduleArg,
+
+    /// Warmup steps for --lr-schedule cosine. Defaults to ceil(3% of --steps).
+    #[arg(long)]
+    pub(crate) lr_warmup_steps: Option<usize>,
+
     /// Pure OPD has no SFT anchor; the only accepted value is 0.0.
     #[arg(long, default_value_t = 0.0)]
     pub(crate) gkd_lambda: f32,
@@ -795,6 +811,14 @@ pub(crate) struct TrainSelfOpdArgs {
     #[arg(long, default_value_t = 1.0e-4)]
     pub(crate) lr: f32,
 
+    /// Learning-rate schedule for SOPD optimizer steps.
+    #[arg(long, value_enum, default_value_t = LrScheduleArg::Fixed)]
+    pub(crate) lr_schedule: LrScheduleArg,
+
+    /// Warmup steps for --lr-schedule cosine. Defaults to ceil(3% of --steps).
+    #[arg(long)]
+    pub(crate) lr_warmup_steps: Option<usize>,
+
     /// Gradient L2 norm clip threshold.
     #[arg(long, default_value_t = 1.0)]
     pub(crate) grad_clip: f32,
@@ -854,7 +878,7 @@ pub(crate) struct TrainSelfOpdArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, CliCommand, OpdKlMaskArg, RunArgs, TrainCommand};
+    use super::{Args, CliCommand, LrScheduleArg, OpdKlMaskArg, RunArgs, TrainCommand};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -1147,6 +1171,10 @@ mod tests {
             "256",
             "--prompt-seed",
             "42",
+            "--lr-schedule",
+            "cosine",
+            "--lr-warmup-steps",
+            "300",
         ])
         .expect("pure OPD eval flags should parse");
         let Some(CliCommand::Train(train)) = args.command else {
@@ -1166,6 +1194,8 @@ mod tests {
         );
         assert_eq!(opd.prompt_max_tokens, 256);
         assert_eq!(opd.prompt_seed, 42);
+        assert_eq!(opd.lr_schedule, LrScheduleArg::Cosine);
+        assert_eq!(opd.lr_warmup_steps, Some(300));
         assert_eq!(opd.lora_rank, 16);
         assert_eq!(opd.lora_alpha, 32.0);
         assert_eq!(opd.lora_target_set, "attention-qv");
@@ -1190,6 +1220,8 @@ mod tests {
         assert!(opd.prompts_file.is_none());
         assert_eq!(opd.prompt_max_tokens, 512);
         assert_eq!(opd.prompt_seed, 0);
+        assert_eq!(opd.lr_schedule, LrScheduleArg::Fixed);
+        assert_eq!(opd.lr_warmup_steps, None);
     }
 
     #[test]
@@ -1204,6 +1236,10 @@ mod tests {
             "/tmp/self-opd-save",
             "--save-every",
             "3",
+            "--lr-schedule",
+            "cosine",
+            "--lr-warmup-steps",
+            "9",
         ])
         .expect("self-opd save flags should parse");
         let Some(CliCommand::Train(train)) = args.command else {
@@ -1218,6 +1254,8 @@ mod tests {
         );
         assert_eq!(opd.save_every, 3);
         assert_eq!(opd.kl_temperature, 1.0);
+        assert_eq!(opd.lr_schedule, LrScheduleArg::Cosine);
+        assert_eq!(opd.lr_warmup_steps, Some(9));
     }
 
     #[test]

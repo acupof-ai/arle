@@ -21,9 +21,9 @@ use train::{
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
-        KlDirectionArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg, PretrainPresetArg,
-        SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
-        TrainSelfOpdArgs,
+        KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
+        PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
+        TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -363,6 +363,78 @@ impl PromptSampler {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OpdLrSchedule {
+    mode: LrScheduleArg,
+    base_lr: f32,
+    min_lr: f32,
+    warmup_steps: u64,
+    total_steps: u64,
+}
+
+impl OpdLrSchedule {
+    fn new(
+        mode: LrScheduleArg,
+        base_lr: f32,
+        warmup_steps: Option<usize>,
+        total_steps: usize,
+    ) -> Result<Self> {
+        if mode == LrScheduleArg::Cosine && (!base_lr.is_finite() || base_lr < 0.0) {
+            bail!("--lr-schedule cosine requires a finite non-negative --lr, got {base_lr}");
+        }
+        let warmup_steps = warmup_steps.unwrap_or_else(|| default_cosine_warmup_steps(total_steps));
+        Ok(Self {
+            mode,
+            base_lr,
+            min_lr: base_lr * 0.1,
+            warmup_steps: warmup_steps as u64,
+            total_steps: total_steps as u64,
+        })
+    }
+
+    fn lr_at_step(self, step: u64) -> f32 {
+        match self.mode {
+            LrScheduleArg::Fixed => self.base_lr,
+            LrScheduleArg::Cosine => self.cosine_lr_at_step(step),
+        }
+    }
+
+    fn apply_to_optimizer(self, optimizer: &mut autograd::AdamW, step: u64) -> f32 {
+        let lr = self.lr_at_step(step);
+        if self.mode == LrScheduleArg::Cosine {
+            autograd::Optimizer::set_lr(optimizer, lr);
+        }
+        lr
+    }
+
+    fn cosine_lr_at_step(self, step: u64) -> f32 {
+        if self.warmup_steps > 0 && step < self.warmup_steps {
+            return self.base_lr * (step as f32 / self.warmup_steps as f32);
+        }
+        if self.total_steps <= self.warmup_steps {
+            return self.base_lr;
+        }
+        if self.total_steps > 0 && step >= self.total_steps - 1 {
+            return self.min_lr;
+        }
+        let decay_span = self.total_steps - self.warmup_steps - 1;
+        if decay_span == 0 {
+            return self.min_lr;
+        }
+        let progress = (step - self.warmup_steps) as f32 / decay_span as f32;
+        let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+        self.min_lr + (self.base_lr - self.min_lr) * cosine
+    }
+}
+
+fn default_cosine_warmup_steps(total_steps: usize) -> usize {
+    if total_steps == 0 {
+        0
+    } else {
+        total_steps.saturating_mul(3).div_ceil(100).max(1)
+    }
+}
+
 fn validate_token_ids(label: &str, ids: &[u32], vocab_size: usize) -> Result<()> {
     if ids.is_empty() {
         bail!("{label} must contain at least one token id");
@@ -492,6 +564,8 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     let prompt_source = load_opd_prompt_source(&args, student_dir, cfg.vocab_size)?;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let lr_schedule =
+        OpdLrSchedule::new(args.lr_schedule, args.lr, args.lr_warmup_steps, args.steps)?;
     let rollout_sampling = rollout_sampling_params(
         args.rollout_temperature,
         args.rollout_top_p,
@@ -531,6 +605,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     let mut gate_nlls: Vec<(usize, f32)> = Vec::new();
     let mut prompt_sampler = PromptSampler::new(args.prompt_seed);
     for step in 1..=args.steps {
+        let _step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let prompt_index = prompt_sampler.next_index(prompt_source.train_prompts.len());
         let prompt_ids = prompt_source.train_prompts[prompt_index].as_slice();
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
@@ -692,6 +767,8 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     let student_params = student.all_parameter_ids();
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let lr_schedule =
+        OpdLrSchedule::new(args.lr_schedule, args.lr, args.lr_warmup_steps, args.steps)?;
     let rollout_sampling = rollout_sampling_params(
         args.rollout_temperature,
         args.rollout_top_p,
@@ -718,6 +795,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     };
     let mut loss_sum = 0.0_f32;
     for step in 1..=args.steps {
+        let step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
             &student,
             &teacher_forward,
@@ -750,7 +828,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         step_metrics.push(OpdStepMetric {
             step,
             loss: outcome.loss,
-            lr: args.lr,
+            lr: step_lr,
             grad_norm,
             rollout_len: outcome.rollout_len,
         });
@@ -968,6 +1046,8 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     }
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let lr_schedule =
+        OpdLrSchedule::new(args.lr_schedule, args.lr, args.lr_warmup_steps, args.steps)?;
     let rollout_sampling = rollout_sampling_params(
         args.rollout_temperature,
         args.rollout_top_p,
@@ -1003,6 +1083,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     let mut reverts = 0usize;
     for step in 1..=args.steps {
+        let _step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
         let outcome = {
             let teacher = ema.as_teacher();
@@ -1192,6 +1273,8 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
         .collect();
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let lr_schedule =
+        OpdLrSchedule::new(args.lr_schedule, args.lr, args.lr_warmup_steps, args.steps)?;
     let rollout_sampling = rollout_sampling_params(
         args.rollout_temperature,
         args.rollout_top_p,
@@ -1207,6 +1290,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     for step in 1..=args.steps {
+        let _step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let outcome = {
             let teacher = ema.as_teacher();
             opd_step_with_teacher_forward_profiled_gkd_anchor(
@@ -2094,15 +2178,15 @@ impl SaveDtypeArg {
 mod tests {
     use std::fs;
 
-    use autograd::{Tape, Tensor, TensorStore};
+    use autograd::{AdamW, Optimizer, Tape, Tensor, TensorStore};
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
-        OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape, current_grad_norm,
-        embedded_tiny_qwen35_config, kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary,
-        validate_prompt_collection,
+        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
+        current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config, kl_mask_arg,
+        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
     };
-    use crate::args::OpdKlMaskArg;
+    use crate::args::{LrScheduleArg, OpdKlMaskArg};
 
     #[test]
     fn small_30m_preset_applies_expected_shape() {
@@ -2198,6 +2282,39 @@ mod tests {
             .err()
             .expect("out-of-vocab row should fail");
         assert!(err.to_string().contains("corpus[1] token ids must be < 10"));
+    }
+
+    #[test]
+    fn cosine_lr_schedule_hits_warmup_peak_and_final_floor() {
+        let schedule =
+            OpdLrSchedule::new(LrScheduleArg::Cosine, 1.0e-3, Some(3), 10).expect("schedule");
+
+        assert_eq!(schedule.lr_at_step(0), 0.0);
+        assert!((schedule.lr_at_step(3) - 1.0e-3).abs() < 1.0e-10);
+        assert!((schedule.lr_at_step(9) - 1.0e-4).abs() < 1.0e-10);
+        assert!((schedule.lr_at_step(10) - 1.0e-4).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn cosine_lr_schedule_defaults_warmup_to_three_percent() {
+        let schedule =
+            OpdLrSchedule::new(LrScheduleArg::Cosine, 1.0e-3, None, 10_000).expect("schedule");
+
+        assert_eq!(schedule.warmup_steps, 300);
+        assert_eq!(default_cosine_warmup_steps(1), 1);
+        assert_eq!(default_cosine_warmup_steps(0), 0);
+    }
+
+    #[test]
+    fn fixed_lr_schedule_does_not_mutate_adamw_lr() {
+        let schedule =
+            OpdLrSchedule::new(LrScheduleArg::Fixed, 0.5, Some(3), 10).expect("schedule");
+        let mut optimizer = AdamW::new(0.25, (0.9, 0.999), 1.0e-8, 0.0);
+
+        let returned = schedule.apply_to_optimizer(&mut optimizer, 7);
+
+        assert_eq!(returned, 0.5);
+        assert_eq!(optimizer.lr(), 0.25);
     }
 
     #[test]
