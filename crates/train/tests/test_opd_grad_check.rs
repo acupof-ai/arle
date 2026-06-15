@@ -4,7 +4,12 @@ use train::loss::{KlDirection, kl_distill_loss};
 const EPSILON: f32 = 1.0e-3;
 const MAX_REL_ERR: f32 = 1.0e-2;
 
-fn kl_loss_value(student_logits: &[f32], teacher_logits: &[f32], shape: &[usize]) -> f32 {
+fn kl_loss_value(
+    student_logits: &[f32],
+    teacher_logits: &[f32],
+    shape: &[usize],
+    direction: KlDirection,
+) -> f32 {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
     tape.set_enabled(false);
@@ -19,7 +24,7 @@ fn kl_loss_value(student_logits: &[f32], teacher_logits: &[f32], shape: &[usize]
         student,
         teacher,
         num_positions,
-        KlDirection::Forward,
+        direction,
         &mut store,
         &mut tape,
     )
@@ -31,6 +36,7 @@ fn kl_loss_student_grad(
     student_logits: &[f32],
     teacher_logits: &[f32],
     shape: &[usize],
+    direction: KlDirection,
 ) -> Vec<f32> {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
@@ -45,7 +51,7 @@ fn kl_loss_student_grad(
         student,
         teacher,
         num_positions,
-        KlDirection::Forward,
+        direction,
         &mut store,
         &mut tape,
     )
@@ -59,8 +65,7 @@ fn kl_loss_student_grad(
     store.to_host(grad).expect("gradient host value")
 }
 
-#[test]
-fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
+fn assert_kl_distill_loss_student_logits_grad_matches_finite_difference(direction: KlDirection) {
     let shape = [3, 4];
     let student_logits = vec![
         0.90, -0.10, 0.20, -0.40, -0.30, 0.80, 0.10, -1.00, 1.20, -0.40, 0.50, -0.80,
@@ -69,7 +74,7 @@ fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
         -0.40, 0.70, -0.20, 0.10, 0.40, -0.60, 0.90, -0.10, -0.70, 0.30, -0.50, 0.80,
     ];
 
-    let analytic = kl_loss_student_grad(&student_logits, &teacher_logits, &shape);
+    let analytic = kl_loss_student_grad(&student_logits, &teacher_logits, &shape, direction);
     assert_eq!(analytic.len(), student_logits.len());
 
     let mut max_rel_err = 0.0_f32;
@@ -80,8 +85,8 @@ fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
         let mut minus = student_logits.clone();
         minus[i] -= EPSILON;
 
-        let loss_plus = kl_loss_value(&plus, &teacher_logits, &shape);
-        let loss_minus = kl_loss_value(&minus, &teacher_logits, &shape);
+        let loss_plus = kl_loss_value(&plus, &teacher_logits, &shape, direction);
+        let loss_minus = kl_loss_value(&minus, &teacher_logits, &shape, direction);
         let finite_diff = (loss_plus - loss_minus) / (2.0 * EPSILON);
         let abs_err = (analytic[i] - finite_diff).abs();
         let denom = analytic[i].abs().max(finite_diff.abs()).max(1.0e-6);
@@ -93,16 +98,26 @@ fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
         }
     }
 
-    eprintln!("kl_distill_loss finite-diff max_relative_error={max_rel_err:.6}");
+    eprintln!("kl_distill_loss {direction:?} finite-diff max_relative_error={max_rel_err:.6}");
     assert!(
         max_rel_err < MAX_REL_ERR,
-        "finite-diff gradient check failed: max_rel_err={max_rel_err:.6} \
+        "{direction:?} finite-diff gradient check failed: max_rel_err={max_rel_err:.6} \
          at student_logits[{}], analytic={}, finite_diff={}, abs_err={}",
         worst.0,
         worst.1,
         worst.2,
         worst.3
     );
+}
+
+#[test]
+fn kl_distill_loss_student_logits_grad_matches_finite_difference() {
+    assert_kl_distill_loss_student_logits_grad_matches_finite_difference(KlDirection::Forward);
+}
+
+#[test]
+fn reverse_kl_distill_loss_student_logits_grad_matches_finite_difference() {
+    assert_kl_distill_loss_student_logits_grad_matches_finite_difference(KlDirection::Reverse);
 }
 
 #[test]
@@ -157,7 +172,12 @@ fn kl_distill_loss_wide_range_teacher_grad_matches_stable_reference() {
     let teacher_logits = vec![1000.0, 0.0, -1000.0, 500.0, -800.0, 800.0, 0.0, -400.0];
     let shape = [2, 4];
 
-    let grad = kl_loss_student_grad(&student_logits, &teacher_logits, &shape);
+    let grad = kl_loss_student_grad(
+        &student_logits,
+        &teacher_logits,
+        &shape,
+        KlDirection::Forward,
+    );
     let student_probs = stable_softmax_rows(&student_logits, shape[1]);
     let teacher_probs = stable_softmax_rows(&teacher_logits, shape[1]);
     let scale = 1.0_f64 / student_logits.len() as f64;

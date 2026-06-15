@@ -446,6 +446,42 @@ mod tests {
     }
 
     #[test]
+    fn chunked_kl_matches_baseline_reverse_and_student_grad() {
+        let shape = [1, 64, 1024];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 13);
+        let teacher_logits = deterministic_logits(len, 31);
+
+        let (baseline_loss, baseline_grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            None,
+            KlDirection::Reverse,
+        );
+        let (chunked_loss, chunked_grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            Some(8),
+            KlDirection::Reverse,
+        );
+
+        assert_close(
+            baseline_loss,
+            chunked_loss,
+            1.0e-5,
+            "reverse chunk_size=8 loss",
+        );
+        assert_slice_close(
+            &baseline_grad,
+            &chunked_grad,
+            1.0e-5,
+            "reverse chunk_size=8 student gradient",
+        );
+    }
+
+    #[test]
     fn chunked_kl_single_chunk_degenerates_to_baseline() {
         let shape = [1, 64, 1024];
         let len = shape.iter().product();
