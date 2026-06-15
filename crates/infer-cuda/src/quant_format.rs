@@ -545,4 +545,31 @@ mod tests {
             .expect("dense view");
         assert_eq!(view.format, QuantFormat::DenseBf16);
     }
+
+    #[test]
+    fn manifest_ignore_does_not_hide_real_fp8_sidecars() {
+        let mut tensors = BTreeMap::new();
+        let base = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+        let weight = format!("{base}.weight");
+        tensors.insert(weight.clone(), header(Dtype::F8_E4M3, &[8192, 2048]));
+        tensors.insert(
+            format!("{base}.weight_scale_inv"),
+            header(Dtype::BF16, &[64, 16]),
+        );
+        let manifest = QuantManifest {
+            ignore: vec!["model.language_model.layers.0.linear_attn".to_owned()],
+            ..QuantManifest::default()
+        };
+        let view = detect_quant_format(&weight, &tensors, Some(&manifest))
+            .unwrap()
+            .expect("FP8 view");
+        assert_eq!(
+            view.format,
+            QuantFormat::Fp8BlockScaled {
+                block_m: 128,
+                block_k: 128,
+                scale_apply: ScaleApply::Multiply,
+            }
+        );
+    }
 }

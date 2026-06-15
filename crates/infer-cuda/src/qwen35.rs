@@ -1048,15 +1048,15 @@ impl Qwen35Model {
                 })),
                 Qwen35AttentionTensorNames::Linear(lin) if tp_cfg.is_single() => {
                     Qwen35Attn::Linear(Box::new(LinearAttn {
-                        in_proj_qkv: loader.load_matrix(&ctx, &lin.in_proj_qkv)?,
-                        in_proj_z: loader.load_matrix(&ctx, &lin.in_proj_z)?,
+                        in_proj_qkv: loader.load_matrix_quant_aware(&ctx, &lin.in_proj_qkv)?,
+                        in_proj_z: loader.load_matrix_quant_aware(&ctx, &lin.in_proj_z)?,
                         in_proj_b: loader.load_matrix(&ctx, &lin.in_proj_b)?,
                         in_proj_a: loader.load_matrix(&ctx, &lin.in_proj_a)?,
                         conv1d_weight: loader.load_conv1d_vec(&ctx, &lin.conv1d_weight)?,
                         dt_bias: loader.load_vec_any(&ctx, &lin.dt_bias)?,
                         a_log: loader.load_f32_vec(&ctx, &lin.a_log)?,
                         norm_weight: loader.load_f32_vec(&ctx, &lin.norm)?,
-                        out_proj: loader.load_matrix(&ctx, &lin.out_proj)?,
+                        out_proj: loader.load_matrix_quant_aware(&ctx, &lin.out_proj)?,
                     }))
                 }
                 Qwen35AttentionTensorNames::Linear(lin) => {
@@ -1073,7 +1073,7 @@ impl Qwen35Model {
                         )?,
                         // z gate is v-head-major `[Vh*Vd]` (rms_norm_gated reads
                         // the gate at `head*Vd + d`).
-                        in_proj_z: loader.load_qkv_head_sharded(
+                        in_proj_z: loader.load_qkv_head_sharded_quant_aware(
                             &ctx,
                             &lin.in_proj_z,
                             local_linear_v_heads,
@@ -1125,7 +1125,7 @@ impl Qwen35Model {
                         norm_weight: loader.load_f32_vec(&ctx, &lin.norm)?,
                         // Row-parallel: input columns follow this rank's v heads;
                         // the forward all-reduces the partial sums.
-                        out_proj: loader.load_matrix_sharded(
+                        out_proj: loader.load_matrix_sharded_quant_aware(
                             &ctx,
                             &lin.out_proj,
                             infer_topo::ParallelLinearKind::Row,
