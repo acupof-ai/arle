@@ -655,6 +655,18 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = 1.0)]
     pub(crate) grad_clip: f32,
 
+    /// LoRA rank for the real-checkpoint student adapter.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha for the real-checkpoint student adapter.
+    #[arg(long, default_value_t = 32.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set: `attention-qv` (q/v only) or `all-linear`.
+    #[arg(long, default_value = "attention-qv")]
+    pub(crate) lora_target_set: String,
+
     /// Smoke mode — use the embedded tiny Qwen3.5 config instead of
     /// loading weights from disk. Useful for hardware smoke + CI gating.
     #[arg(long, default_value_t = false)]
@@ -1075,6 +1087,9 @@ mod tests {
         assert_eq!(opd.eval_ids.as_deref(), Some("1,2,3"));
         assert_eq!(opd.gate_every_n, 5);
         assert_eq!(opd.gkd_lambda, 0.0);
+        assert_eq!(opd.lora_rank, 16);
+        assert_eq!(opd.lora_alpha, 32.0);
+        assert_eq!(opd.lora_target_set, "attention-qv");
     }
 
     #[test]

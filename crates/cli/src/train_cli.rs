@@ -249,11 +249,12 @@ fn validate_pure_opd_gkd_lambda(gkd_lambda: f32) -> Result<()> {
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
+        lora::LoraConfig,
         opd::{
             GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
-        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
     };
 
     let student_dir = args
@@ -262,6 +263,11 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
     validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
     let teacher_dir = args.teacher_model.as_deref().unwrap_or(student_dir);
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
 
     let (mut store, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
@@ -277,9 +283,13 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         "[arle train opd] loading student from {}",
         student_dir.display()
     );
-    let student = load_qwen35_trainable_from_hf_dir(student_dir, &mut store)
-        .with_context(|| format!("load student from {}", student_dir.display()))?;
-    let student_params = student.all_parameter_ids();
+    let student = load_qwen35_lora_from_hf_dir(student_dir, lora, target_set, &mut store)
+        .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    let student_params: Vec<TensorId> = student
+        .all_parameter_ids()
+        .into_iter()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
     let cfg = student.config().clone();
 
     let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
@@ -398,6 +408,9 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "lr": args.lr,
             "gkd_lambda": args.gkd_lambda,
             "gate_every_n": args.gate_every_n,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "lora_target_set": args.lora_target_set,
             "final_nll_baseline": nll_baseline,
             "losses": losses,
             "gate_nlls": gate_nlls,
