@@ -261,11 +261,20 @@ impl Dsv4CudaExecutor {
         let mut t = std::time::Instant::now();
         let mut phase_ms = [0f64; 3];
 
-        // ── 1. Per-slot pre-draft ring capture + draft chain (depth-sequential).
-        // Stage 1: loop the PROVEN per-slot capture + per-slot draft (batching the
-        // draft across slots is a later refinement; per-slot is the safe path).
+        // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
+        // The ring capture is ALWAYS per-slot (cheap host-side snapshot, the
+        // PROVEN per-row call — never batched). The DRAFT is either:
+        //   - per-slot serial `draft_chain` (default — byte-identical to today), OR
+        //   - lever 2a: depth-sequential, slot-batched `mtp_forward_level_batched`
+        //     (gated `ARLE_DSV4_BATCHED_MTP_DRAFT`), amortizing the MTP-head MoE
+        //     over the N slots while the level loop stays sequential (chaining).
         let mut chains: Vec<Vec<u32>> = Vec::with_capacity(n);
         let mut scheds: Vec<SpecVerifySchedule> = Vec::with_capacity(n);
+
+        // Gather per-slot pending tokens + previous hidden (h_prev) BEFORE the
+        // draft, and snapshot each slot's draft rings pre-write.
+        let mut pendings: Vec<u32> = Vec::with_capacity(n);
+        let mut h_prevs: Vec<DeviceVec> = Vec::with_capacity(n);
         for s in 0..n {
             let slot_idx = slot_ids[s];
             let pending = self.spec_slots[slot_idx]
@@ -284,9 +293,68 @@ impl Dsv4CudaExecutor {
                 start_positions[s],
                 depth,
             )?;
-            let chain = self.draft_chain(slot_idx, pending, &hidden, depth, start_positions[s])?;
-            scheds.push(chain.verify_schedule(start_positions[s]));
-            chains.push(chain.tokens);
+            pendings.push(pending);
+            h_prevs.push(hidden);
+        }
+
+        if crate::dsv4::dsv4_batched_mtp_draft_enabled() {
+            // Lever 2a: per depth LEVEL, ONE batched MTP-head forward over the N
+            // slots' current draft tokens. The level loop is sequential (level
+            // i+1 chains from level i's per-slot stream + token); the N slots
+            // batch WITHIN each level. With N=1 / depth identical to the per-slot
+            // draft_chain (same head math, same per-slot attention, same chaining).
+            let mut tokens_per_slot: Vec<Vec<u32>> = pendings.iter().map(|&p| vec![p]).collect();
+            // h_prev[s] starts as the trunk hidden; updated to level i's stream.
+            let mut cur_hidden: Vec<DeviceVec> = h_prevs;
+            for level in 0..depth {
+                let rows: Vec<crate::dsv4::MtpDraftRow> = (0..n)
+                    .map(|s| crate::dsv4::MtpDraftRow {
+                        token: tokens_per_slot[s][level],
+                    })
+                    .collect();
+                let h_refs: Vec<&DeviceVec> = cur_hidden.iter().collect();
+                let positions: Vec<u64> = (0..n)
+                    .map(|s| (start_positions[s] + level) as u64)
+                    .collect();
+                let expanded = self.model.mtp_forward_level_batched(
+                    &mut self.slots,
+                    &mut self.kv_adapter,
+                    slot_ids,
+                    &rows,
+                    &h_refs,
+                    &positions,
+                )?;
+                ensure!(
+                    expanded.len() == n,
+                    "DSv4 batched MTP draft level {level} returned {} rows for {n} slots",
+                    expanded.len()
+                );
+                let mut next_hidden: Vec<DeviceVec> = Vec::with_capacity(n);
+                for (s, (candidate, stream)) in expanded.into_iter().enumerate() {
+                    tokens_per_slot[s].push(candidate);
+                    next_hidden.push(stream);
+                }
+                cur_hidden = next_hidden;
+            }
+            for s in 0..n {
+                let tokens = std::mem::take(&mut tokens_per_slot[s]);
+                let chain = DraftChain { tokens };
+                scheds.push(chain.verify_schedule(start_positions[s]));
+                chains.push(chain.tokens);
+            }
+        } else {
+            // Default: per-slot serial draft (byte-identical to today).
+            for s in 0..n {
+                let chain = self.draft_chain(
+                    slot_ids[s],
+                    pendings[s],
+                    &h_prevs[s],
+                    depth,
+                    start_positions[s],
+                )?;
+                scheds.push(chain.verify_schedule(start_positions[s]));
+                chains.push(chain.tokens);
+            }
         }
         if prof {
             let _ = self.model.ctx.sync();
