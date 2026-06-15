@@ -932,6 +932,12 @@ pub enum WeightFormat {
     Dsv4Fp8BlockScaled,
     /// DeepSeek V4 row-major packed FP4 E2M1 weights with FP8 E8M0 block scales.
     Dsv4Fp4BlockScaled,
+    /// ABI-generic row-major FP8 E4M3 weights with f32 block scales.
+    Fp8BlockScaled,
+    /// ABI-generic row-major FP8 E4M3 weights with one f32 scale per shard.
+    Fp8PerShard,
+    /// ABI-generic row-major packed FP4 E2M1 weights with FP8 group scales.
+    Fp4E2M1Group,
 }
 
 /// Shape/layout constraints expected by the matching CUDA kernels.
@@ -1012,6 +1018,27 @@ impl WeightFormat {
                 n_multiple: 1,
                 group_size: 0,
             },
+            Self::Fp8BlockScaled => WeightKernelAlignment {
+                weight_layout: "fp8_e4m3.row_major",
+                scale_layout: "f32[scale_rows, scale_cols]",
+                k_multiple: 1,
+                n_multiple: 1,
+                group_size: 0,
+            },
+            Self::Fp8PerShard => WeightKernelAlignment {
+                weight_layout: "fp8_e4m3.row_major",
+                scale_layout: "f32[shards]",
+                k_multiple: 1,
+                n_multiple: 1,
+                group_size: 0,
+            },
+            Self::Fp4E2M1Group => WeightKernelAlignment {
+                weight_layout: "fp4_e2m1.row_major.packed2",
+                scale_layout: "fp8_e4m3[row, k/group_size] + f32[global]",
+                k_multiple: group_size.max(16),
+                n_multiple: 1,
+                group_size,
+            },
         }
     }
 
@@ -1067,6 +1094,19 @@ impl WeightFormat {
                 );
                 Ok(())
             }
+            Self::Fp8BlockScaled | Self::Fp8PerShard => Ok(()),
+            Self::Fp4E2M1Group => {
+                ensure!(group_size > 0, "{self} requires group_size > 0");
+                ensure!(
+                    cols.is_multiple_of(2),
+                    "{self} requires cols % 2 == 0 for packed E2M1, got {cols}"
+                );
+                ensure!(
+                    cols.is_multiple_of(group_size),
+                    "{self} requires cols % group_size == 0, got cols={cols}, group_size={group_size}"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -1086,6 +1126,9 @@ impl std::fmt::Display for WeightFormat {
             Self::TurboQuant => f.write_str("turboquant"),
             Self::Dsv4Fp8BlockScaled => f.write_str("dsv4_fp8_block_scaled"),
             Self::Dsv4Fp4BlockScaled => f.write_str("dsv4_fp4_block_scaled"),
+            Self::Fp8BlockScaled => f.write_str("fp8_block_scaled"),
+            Self::Fp8PerShard => f.write_str("fp8_per_shard"),
+            Self::Fp4E2M1Group => f.write_str("fp4_e2m1_group"),
         }
     }
 }
@@ -1324,8 +1367,24 @@ pub struct DeviceMatrix {
     pub weight_format: WeightFormat,
     /// INT8 quantized weights (if quantized). When set, `data` is unused.
     pub qweight: Option<CudaSlice<i8>>,
+    /// ABI-generic unsigned quantized weights (FP8 bytes or packed FP4 bytes).
+    pub qweight_u8: Option<CudaSlice<u8>>,
     /// Per-group bf16 scales for quantized weights. Shape: [rows, cols/group_size].
     pub qscales: Option<CudaSlice<bf16>>,
+    /// ABI-generic FP8 E4M3 scale bytes.
+    pub qscale_fp8: Option<CudaSlice<u8>>,
+    /// ABI-generic direct f32 scale buffer.
+    pub scale_f32: Option<CudaSlice<f32>>,
+    /// ABI-generic secondary f32 scale buffer (activation metadata in v1).
+    pub scale2_f32: Option<CudaSlice<f32>>,
+    /// Number of rows in the ABI-generic scale matrix.
+    pub quant_scale_rows: usize,
+    /// Number of columns in the ABI-generic scale matrix.
+    pub quant_scale_cols: usize,
+    /// Weight block rows for block-scaled formats.
+    pub quant_block_m: usize,
+    /// Weight block columns/group size for block-scaled/group formats.
+    pub quant_block_k: usize,
     /// DeepSeek V4 block scales encoded as raw FP8 E8M0 bytes.
     pub dsv4_scales: Option<CudaSlice<u8>>,
     /// Number of rows in the DeepSeek V4 block-scale matrix.
@@ -1382,7 +1441,11 @@ type OptHostBuf<T> = Option<Vec<T>>;
 pub struct HostMatrixSnapshot {
     data: Vec<bf16>,
     qweight: OptHostBuf<i8>,
+    qweight_u8: OptHostBuf<u8>,
     qscales: OptHostBuf<bf16>,
+    qscale_fp8: OptHostBuf<u8>,
+    scale_f32: OptHostBuf<f32>,
+    scale2_f32: OptHostBuf<f32>,
     dsv4_scales: OptHostBuf<u8>,
     dsv4_deepgemm_weight: OptHostBuf<u8>,
     dsv4_deepgemm_scales: OptHostBuf<f32>,
@@ -1578,7 +1641,11 @@ impl DeviceMatrix {
         let snapshot = HostMatrixSnapshot {
             data,
             qweight: snapshot_opt_slice(ctx, &self.qweight, &mut freed)?,
+            qweight_u8: snapshot_opt_slice(ctx, &self.qweight_u8, &mut freed)?,
             qscales: snapshot_opt_slice(ctx, &self.qscales, &mut freed)?,
+            qscale_fp8: snapshot_opt_slice(ctx, &self.qscale_fp8, &mut freed)?,
+            scale_f32: snapshot_opt_slice(ctx, &self.scale_f32, &mut freed)?,
+            scale2_f32: snapshot_opt_slice(ctx, &self.scale2_f32, &mut freed)?,
             dsv4_scales: snapshot_opt_slice(ctx, &self.dsv4_scales, &mut freed)?,
             dsv4_deepgemm_weight,
             dsv4_deepgemm_scales,
@@ -1617,7 +1684,11 @@ impl DeviceMatrix {
             .map_err(|e| anyhow!("offload placeholder alloc failed: {e}"))?;
         self.data = placeholder;
         self.qweight = None;
+        self.qweight_u8 = None;
         self.qscales = None;
+        self.qscale_fp8 = None;
+        self.scale_f32 = None;
+        self.scale2_f32 = None;
         self.dsv4_scales = None;
         self.dsv4_deepgemm_cache = None;
         self.marlin_packed = None;
@@ -1649,7 +1720,11 @@ impl DeviceMatrix {
             .clone_htod(snapshot.data.as_slice())
             .map_err(|e| anyhow!("reload H2D copy (data) failed: {e}"))?;
         self.qweight = restore_opt_slice(ctx, &snapshot.qweight)?;
+        self.qweight_u8 = restore_opt_slice(ctx, &snapshot.qweight_u8)?;
         self.qscales = restore_opt_slice(ctx, &snapshot.qscales)?;
+        self.qscale_fp8 = restore_opt_slice(ctx, &snapshot.qscale_fp8)?;
+        self.scale_f32 = restore_opt_slice(ctx, &snapshot.scale_f32)?;
+        self.scale2_f32 = restore_opt_slice(ctx, &snapshot.scale2_f32)?;
         self.dsv4_scales = restore_opt_slice(ctx, &snapshot.dsv4_scales)?;
         self.dsv4_deepgemm_cache =
             restore_dsv4_deepgemm_cache(ctx, snapshot, self.rows, self.cols)?;
@@ -1681,7 +1756,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -1735,7 +1818,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::W8A16,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(qs),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -1797,7 +1888,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::W4A16,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(qs),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -1867,7 +1966,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::Dsv4Fp8BlockScaled,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: Some(scales),
             dsv4_scale_rows: scale_rows,
             dsv4_scale_cols: scale_cols,
@@ -1942,12 +2049,265 @@ impl DeviceMatrix {
             cols: logical_cols,
             weight_format: WeightFormat::Dsv4Fp4BlockScaled,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: Some(scales),
             dsv4_scale_rows: scale_rows,
             dsv4_scale_cols: scale_cols,
             dsv4_deepgemm_cache: None,
             group_size: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from ABI-generic FP8 E4M3 weights plus direct f32 block scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_fp8_block_scaled(
+        ctx: &DeviceContext,
+        weight_bytes: &[u8],
+        scale_f32: &[f32],
+        rows: usize,
+        cols: usize,
+        block_m: usize,
+        block_k: usize,
+    ) -> Result<Self> {
+        WeightFormat::Fp8BlockScaled.validate_shape(rows, cols, 0)?;
+        ensure!(block_m > 0, "Fp8BlockScaled requires block_m > 0");
+        ensure!(block_k > 0, "Fp8BlockScaled requires block_k > 0");
+        ensure!(
+            weight_bytes.len() == rows * cols,
+            "FP8 block-scaled weight bytes {} != expected {} for rows={rows} cols={cols}",
+            weight_bytes.len(),
+            rows * cols
+        );
+        let scale_rows = rows.div_ceil(block_m);
+        let scale_cols = cols.div_ceil(block_k);
+        ensure!(
+            scale_f32.len() == scale_rows * scale_cols,
+            "FP8 block-scaled scales {} != expected {}",
+            scale_f32.len(),
+            scale_rows * scale_cols
+        );
+
+        let qweight = ctx
+            .stream
+            .clone_htod(weight_bytes)
+            .map_err(|e| anyhow!("H2D FP8 block-scaled weight failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_htod(scale_f32)
+            .map_err(|e| anyhow!("H2D FP8 block-scaled scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::Fp8BlockScaled,
+            qweight: None,
+            qweight_u8: Some(qweight),
+            qscales: None,
+            qscale_fp8: None,
+            scale_f32: Some(scales),
+            scale2_f32: None,
+            quant_scale_rows: scale_rows,
+            quant_scale_cols: scale_cols,
+            quant_block_m: block_m,
+            quant_block_k: block_k,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
+            group_size: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from ABI-generic FP8 E4M3 weights plus direct f32 per-shard scales.
+    pub fn from_fp8_per_shard(
+        ctx: &DeviceContext,
+        weight_bytes: &[u8],
+        scale_f32: &[f32],
+        input_scale_f32: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        WeightFormat::Fp8PerShard.validate_shape(rows, cols, 0)?;
+        ensure!(
+            weight_bytes.len() == rows * cols,
+            "FP8 per-shard weight bytes {} != expected {} for rows={rows} cols={cols}",
+            weight_bytes.len(),
+            rows * cols
+        );
+        ensure!(
+            !scale_f32.is_empty(),
+            "FP8 per-shard weight scales must be non-empty"
+        );
+        ensure!(
+            !input_scale_f32.is_empty(),
+            "FP8 per-shard input scales must be non-empty"
+        );
+
+        let qweight = ctx
+            .stream
+            .clone_htod(weight_bytes)
+            .map_err(|e| anyhow!("H2D FP8 per-shard weight failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_htod(scale_f32)
+            .map_err(|e| anyhow!("H2D FP8 per-shard scales failed: {e}"))?;
+        let input_scales = ctx
+            .stream
+            .clone_htod(input_scale_f32)
+            .map_err(|e| anyhow!("H2D FP8 per-shard input scales failed: {e}"))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            weight_format: WeightFormat::Fp8PerShard,
+            qweight: None,
+            qweight_u8: Some(qweight),
+            qscales: None,
+            qscale_fp8: None,
+            scale_f32: Some(scales),
+            scale2_f32: Some(input_scales),
+            quant_scale_rows: scale_f32.len(),
+            quant_scale_cols: 1,
+            quant_block_m: 0,
+            quant_block_k: 0,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
+            group_size: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from packed FP4 E2M1 weights plus FP8 group scales and direct f32 globals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_fp4_e2m1_group(
+        ctx: &DeviceContext,
+        packed_bytes: &[u8],
+        scale_fp8: &[u8],
+        global_scale_f32: &[f32],
+        input_scale_f32: Option<&[f32]>,
+        rows: usize,
+        logical_cols: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        WeightFormat::Fp4E2M1Group.validate_shape(rows, logical_cols, group_size)?;
+        ensure!(
+            packed_bytes.len() == rows * logical_cols / 2,
+            "FP4 E2M1 packed bytes {} != expected {} for rows={rows} cols={logical_cols}",
+            packed_bytes.len(),
+            rows * logical_cols / 2
+        );
+        let scale_cols = logical_cols / group_size;
+        ensure!(
+            scale_fp8.len() == rows * scale_cols,
+            "FP4 E2M1 group scales {} != expected {}",
+            scale_fp8.len(),
+            rows * scale_cols
+        );
+        ensure!(
+            !global_scale_f32.is_empty(),
+            "FP4 E2M1 global scale must be non-empty"
+        );
+
+        let qweight = ctx
+            .stream
+            .clone_htod(packed_bytes)
+            .map_err(|e| anyhow!("H2D FP4 E2M1 weight failed: {e}"))?;
+        let qscale = ctx
+            .stream
+            .clone_htod(scale_fp8)
+            .map_err(|e| anyhow!("H2D FP4 E2M1 group scales failed: {e}"))?;
+        let global = ctx
+            .stream
+            .clone_htod(global_scale_f32)
+            .map_err(|e| anyhow!("H2D FP4 E2M1 global scales failed: {e}"))?;
+        let input = match input_scale_f32 {
+            Some(scales) => Some(
+                ctx.stream
+                    .clone_htod(scales)
+                    .map_err(|e| anyhow!("H2D FP4 E2M1 input scales failed: {e}"))?,
+            ),
+            None => None,
+        };
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {e}"))?;
+
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols: logical_cols,
+            weight_format: WeightFormat::Fp4E2M1Group,
+            qweight: None,
+            qweight_u8: Some(qweight),
+            qscales: None,
+            qscale_fp8: Some(qscale),
+            scale_f32: Some(global),
+            scale2_f32: input,
+            quant_scale_rows: rows,
+            quant_scale_cols: scale_cols,
+            quant_block_m: 1,
+            quant_block_k: group_size,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
+            dsv4_deepgemm_cache: None,
+            group_size,
             marlin_packed: None,
             marlin_scales: None,
             marlin_channel_scales: None,
@@ -2016,7 +2376,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::MarlinW4A8,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2139,7 +2507,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::W4A16,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2201,7 +2577,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::GgufQ6K,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(dummy_scales),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2263,7 +2647,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::GgufQ3K,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(dummy_scales),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2331,7 +2723,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::GgufQ4K,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(dummy_scales),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2393,7 +2793,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::GgufQ5K,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(dummy_scales),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2454,7 +2862,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::W2A16,
             qweight: Some(qw),
+            qweight_u8: None,
             qscales: Some(qs),
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2478,13 +2894,17 @@ impl DeviceMatrix {
     /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
         self.weight_format.is_quantized()
-            && (self.qweight.is_some() || self.tq_packed.is_some() || self.marlin_packed.is_some())
+            && (self.qweight.is_some()
+                || self.qweight_u8.is_some()
+                || self.tq_packed.is_some()
+                || self.marlin_packed.is_some())
     }
 
     /// Whether this matrix is plain BF16 with no packed side buffers.
     pub fn is_dense_bf16(&self) -> bool {
         self.weight_format == WeightFormat::DenseBf16
             && self.qweight.is_none()
+            && self.qweight_u8.is_none()
             && self.tq_packed.is_none()
     }
 
@@ -2563,7 +2983,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::TurboQuant,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2720,7 +3148,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2772,7 +3208,15 @@ impl DeviceMatrix {
             cols: src.cols,
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -2817,7 +3261,15 @@ impl DeviceMatrix {
                 cols,
                 weight_format: WeightFormat::DenseBf16,
                 qweight: None,
+                qweight_u8: None,
                 qscales: None,
+                qscale_fp8: None,
+                scale_f32: None,
+                scale2_f32: None,
+                quant_scale_rows: 0,
+                quant_scale_cols: 0,
+                quant_block_m: 0,
+                quant_block_k: 0,
                 dsv4_scales: None,
                 dsv4_scale_rows: 0,
                 dsv4_scale_cols: 0,
@@ -2859,7 +3311,15 @@ impl DeviceMatrix {
             cols,
             weight_format: WeightFormat::DenseBf16,
             qweight: None,
+            qweight_u8: None,
             qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
             dsv4_scales: None,
             dsv4_scale_rows: 0,
             dsv4_scale_cols: 0,
@@ -3014,6 +3474,35 @@ mod tests {
     }
 
     #[test]
+    fn resident_quant_abi_formats_validate_shapes() {
+        assert!(
+            WeightFormat::Fp8BlockScaled
+                .validate_shape(512, 2048, 0)
+                .is_ok()
+        );
+        assert!(
+            WeightFormat::Fp8PerShard
+                .validate_shape(512, 2048, 0)
+                .is_ok()
+        );
+        assert!(
+            WeightFormat::Fp4E2M1Group
+                .validate_shape(512, 2048, 16)
+                .is_ok()
+        );
+        assert!(
+            WeightFormat::Fp4E2M1Group
+                .validate_shape(512, 2049, 16)
+                .is_err()
+        );
+        assert!(
+            WeightFormat::Fp4E2M1Group
+                .validate_shape(512, 2048, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn kernel_alignment_names_scale_layout_explicitly() {
         let w4 = WeightFormat::W4A16.kernel_alignment(128);
         assert_eq!(w4.weight_layout, "wN.row_major.group_packed");
@@ -3024,6 +3513,14 @@ mod tests {
         assert_eq!(q4k.weight_layout, "gguf.qk.row_major.superblock256");
         assert_eq!(q4k.scale_layout, "embedded.superblock");
         assert_eq!(q4k.k_multiple, 256);
+
+        let fp4 = WeightFormat::Fp4E2M1Group.kernel_alignment(16);
+        assert_eq!(fp4.weight_layout, "fp4_e2m1.row_major.packed2");
+        assert_eq!(
+            fp4.scale_layout,
+            "fp8_e4m3[row, k/group_size] + f32[global]"
+        );
+        assert_eq!(fp4.k_multiple, 16);
     }
 
     fn copy_matrix_to_host(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Vec<bf16> {
