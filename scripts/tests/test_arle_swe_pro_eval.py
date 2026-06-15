@@ -96,9 +96,10 @@ class OfficialEvaluatorCommand(unittest.TestCase):
             redo=True,
         )
         joined = " ".join(cmd)
+        resolved_out = Path("/tmp/out").resolve()
         self.assertIn("/repo/SWE-bench_Pro-os/swe_bench_pro_eval.py", joined)
-        self.assertIn("--raw_sample_path=/tmp/out/raw_samples.csv", cmd)
-        self.assertIn("--patch_path=/tmp/out/patches.json", cmd)
+        self.assertIn(f"--raw_sample_path={resolved_out / 'raw_samples.csv'}", cmd)
+        self.assertIn(f"--patch_path={resolved_out / 'patches.json'}", cmd)
         self.assertIn("--scripts_dir=/repo/SWE-bench_Pro-os/run_scripts", cmd)
         self.assertIn("--use_local_docker", cmd)
         self.assertIn("--docker_platform=linux/amd64", cmd)
