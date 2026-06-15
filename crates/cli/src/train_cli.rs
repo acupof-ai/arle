@@ -21,8 +21,9 @@ use train::{
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
-        KlDirectionArg, ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs,
-        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
+        KlDirectionArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg, PretrainPresetArg,
+        SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
+        TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -331,12 +332,123 @@ fn maybe_save_full_student_checkpoint(
     Ok(Some(saved_dir))
 }
 
+struct OpdPromptSource {
+    train_prompts: Vec<Vec<u32>>,
+    eval_ids: Vec<u32>,
+    report_prompt_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptSampler {
+    state: u64,
+}
+
+impl PromptSampler {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    fn next_index(&mut self, len: usize) -> usize {
+        debug_assert!(len > 0);
+        if len <= 1 {
+            return 0;
+        }
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.state >> 32) as usize) % len
+    }
+}
+
+fn validate_token_ids(label: &str, ids: &[u32], vocab_size: usize) -> Result<()> {
+    if ids.is_empty() {
+        bail!("{label} must contain at least one token id");
+    }
+    if ids.iter().any(|&id| (id as usize) >= vocab_size) {
+        bail!("{label} token ids must be < {vocab_size} (student vocab size); got {ids:?}");
+    }
+    Ok(())
+}
+
+fn validate_prompt_collection(label: &str, prompts: &[Vec<u32>], vocab_size: usize) -> Result<()> {
+    if prompts.is_empty() {
+        bail!("{label} must contain at least one prompt");
+    }
+    for (idx, prompt) in prompts.iter().enumerate() {
+        validate_token_ids(&format!("{label}[{idx}]"), prompt, vocab_size)?;
+    }
+    Ok(())
+}
+
+fn load_opd_prompt_source(
+    args: &TrainOpdArgs,
+    student_dir: &Path,
+    vocab_size: usize,
+) -> Result<OpdPromptSource> {
+    if let Some(prompt_file) = args.prompts_file.as_deref() {
+        let loaded = train::prompts::load_jsonl_prompt_sets(
+            student_dir,
+            prompt_file,
+            args.prompt_max_tokens,
+            1,
+        )
+        .with_context(|| format!("load OPD prompt corpus from {}", prompt_file.display()))?;
+        validate_prompt_collection("--prompts-file train prompt", &loaded.train, vocab_size)?;
+        validate_prompt_collection("--prompts-file heldout prompt", &loaded.heldout, vocab_size)?;
+        let eval_ids = match args.eval_ids.as_deref() {
+            Some(raw) => {
+                let ids = parse_prompt_ids(Some(raw))?;
+                validate_token_ids("--eval-ids", &ids, vocab_size)?;
+                ids
+            }
+            None => loaded
+                .heldout
+                .first()
+                .cloned()
+                .unwrap_or_else(|| loaded.train[0].clone()),
+        };
+        eprintln!(
+            "[arle train opd] loaded prompt corpus {}: train={} heldout={} rows={} truncated={}",
+            prompt_file.display(),
+            loaded.train.len(),
+            loaded.heldout.len(),
+            loaded.jsonl_rows,
+            loaded.truncated_rows,
+        );
+        let report_prompt_ids = loaded.train[0].clone();
+        return Ok(OpdPromptSource {
+            train_prompts: loaded.train,
+            eval_ids,
+            report_prompt_ids,
+        });
+    }
+
+    let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
+    validate_token_ids("--prompt-ids", &prompt_ids, vocab_size)?;
+    let eval_ids = match args.eval_ids.as_deref() {
+        Some(raw) => {
+            let ids = parse_prompt_ids(Some(raw))?;
+            validate_token_ids("--eval-ids", &ids, vocab_size)?;
+            ids
+        }
+        None => prompt_ids.clone(),
+    };
+    Ok(OpdPromptSource {
+        train_prompts: vec![prompt_ids.clone()],
+        eval_ids,
+        report_prompt_ids: prompt_ids,
+    })
+}
+
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
@@ -377,23 +489,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .collect();
     let cfg = student.config().clone();
 
-    let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
-    if prompt_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
-        bail!(
-            "prompt token ids must be < {} (student vocab size); got {prompt_ids:?}",
-            cfg.vocab_size
-        );
-    }
-    let eval_ids = match args.eval_ids.as_deref() {
-        Some(raw) => parse_prompt_ids(Some(raw))?,
-        None => prompt_ids.clone(),
-    };
-    if eval_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
-        bail!(
-            "eval token ids must be < {} (student vocab size); got {eval_ids:?}",
-            cfg.vocab_size
-        );
-    }
+    let prompt_source = load_opd_prompt_source(&args, student_dir, cfg.vocab_size)?;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let rollout_sampling = rollout_sampling_params(
@@ -408,10 +504,16 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         grad_clip: args.grad_clip,
     };
     let kl_direction = kl_direction_arg(args.kl_direction);
+    let kl_mask = kl_mask_arg(args.kl_mask);
 
     let gate_on = args.gate_every_n > 0;
     let mut nll_baseline = if gate_on {
-        heldout_nll(&student, &eval_ids, cfg.vocab_size, &mut store)?
+        heldout_nll(
+            &student,
+            &prompt_source.eval_ids,
+            cfg.vocab_size,
+            &mut store,
+        )?
     } else {
         f32::INFINITY
     };
@@ -427,12 +529,15 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     let mut gate_nlls: Vec<(usize, f32)> = Vec::new();
+    let mut prompt_sampler = PromptSampler::new(args.prompt_seed);
     for step in 1..=args.steps {
+        let prompt_index = prompt_sampler.next_index(prompt_source.train_prompts.len());
+        let prompt_ids = prompt_source.train_prompts[prompt_index].as_slice();
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
         let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
             &student,
             &teacher_forward,
-            &prompt_ids,
+            prompt_ids,
             step_cfg.clone(),
             &student_params,
             &mut optimizer,
@@ -446,7 +551,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 kl_direction,
                 kl_temperature: args.kl_temperature,
                 logits_window_size: None,
-                kl_mask: OpdKlMask::Full,
+                kl_mask,
             },
             None,
             #[cfg(feature = "cuda")]
@@ -457,7 +562,12 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         losses.push(outcome.loss);
         let mut gate_nll = f32::NAN;
         if gate_on && step % args.gate_every_n == 0 {
-            gate_nll = heldout_nll(&student, &eval_ids, cfg.vocab_size, &mut store)?;
+            gate_nll = heldout_nll(
+                &student,
+                &prompt_source.eval_ids,
+                cfg.vocab_size,
+                &mut store,
+            )?;
             nll_baseline = gate_nll;
             gate_nlls.push((step, gate_nll));
         }
@@ -529,8 +639,8 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "final_nll_baseline": nll_baseline,
             "losses": losses,
             "gate_nlls": gate_nlls,
-            "prompt_ids": prompt_ids,
-            "eval_ids": eval_ids,
+            "prompt_ids": prompt_source.report_prompt_ids,
+            "eval_ids": prompt_source.eval_ids,
             "vocab_size": cfg.vocab_size,
             "hidden_size": cfg.hidden_size,
             "num_hidden_layers": cfg.num_hidden_layers,
@@ -555,13 +665,16 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35::Qwen35Model,
     };
 
     validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
+    if args.prompts_file.is_some() {
+        bail!("--prompts-file requires --student-model; smoke mode uses --prompt-ids");
+    }
     let cfg = embedded_tiny_qwen35_config();
     let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
     if prompt_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
@@ -591,6 +704,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         grad_clip: args.grad_clip,
     };
     let kl_direction = kl_direction_arg(args.kl_direction);
+    let kl_mask = kl_mask_arg(args.kl_mask);
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     let mut step_metrics: Vec<OpdStepMetric> = Vec::with_capacity(args.steps);
@@ -621,7 +735,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
                 kl_direction,
                 kl_temperature: args.kl_temperature,
                 logits_window_size: None,
-                kl_mask: OpdKlMask::Full,
+                kl_mask,
             },
             None,
             #[cfg(feature = "cuda")]
@@ -708,6 +822,13 @@ fn kl_direction_arg(arg: KlDirectionArg) -> train::loss::KlDirection {
     match arg {
         KlDirectionArg::Forward => train::loss::KlDirection::Forward,
         KlDirectionArg::Reverse => train::loss::KlDirection::Reverse,
+    }
+}
+
+fn kl_mask_arg(arg: OpdKlMaskArg) -> train::opd::OpdKlMask {
+    match arg {
+        OpdKlMaskArg::Completion => train::opd::OpdKlMask::CompletionOnly,
+        OpdKlMaskArg::Full => train::opd::OpdKlMask::Full,
     }
 }
 
@@ -1977,9 +2098,11 @@ mod tests {
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
-        OpdStepMetric, PretrainPresetArg, ScratchShape, current_grad_norm,
-        embedded_tiny_qwen35_config, maybe_save_full_student_checkpoint, opd_summary,
+        OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape, current_grad_norm,
+        embedded_tiny_qwen35_config, kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary,
+        validate_prompt_collection,
     };
+    use crate::args::OpdKlMaskArg;
 
     #[test]
     fn small_30m_preset_applies_expected_shape() {
@@ -2043,6 +2166,38 @@ mod tests {
             (norm - expected).abs() / expected < 1.0e-5,
             "grad_norm should be about {expected:e}, got {norm:e}"
         );
+    }
+
+    #[test]
+    fn prompt_sampler_is_deterministic_and_keeps_single_prompt_index_zero() {
+        let mut a = PromptSampler::new(7);
+        let mut b = PromptSampler::new(7);
+        let seq_a: Vec<usize> = (0..8).map(|_| a.next_index(3)).collect();
+        let seq_b: Vec<usize> = (0..8).map(|_| b.next_index(3)).collect();
+        assert_eq!(seq_a, seq_b);
+        assert!(seq_a.iter().any(|&idx| idx != 0));
+
+        let mut single = PromptSampler::new(7);
+        assert_eq!(single.next_index(1), 0);
+        assert_eq!(single.next_index(1), 0);
+    }
+
+    #[test]
+    fn kl_mask_arg_maps_completion_default_and_full_escape_hatch() {
+        assert_eq!(
+            kl_mask_arg(OpdKlMaskArg::Completion),
+            train::opd::OpdKlMask::CompletionOnly
+        );
+        assert_eq!(kl_mask_arg(OpdKlMaskArg::Full), train::opd::OpdKlMask::Full);
+    }
+
+    #[test]
+    fn validate_prompt_collection_rejects_out_of_vocab_corpus_rows() {
+        let prompts = vec![vec![1, 2], vec![3, 99]];
+        let err = validate_prompt_collection("corpus", &prompts, 10)
+            .err()
+            .expect("out-of-vocab row should fail");
+        assert!(err.to_string().contains("corpus[1] token ids must be < 10"));
     }
 
     #[test]
