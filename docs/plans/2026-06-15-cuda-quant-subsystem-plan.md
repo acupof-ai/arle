@@ -310,6 +310,83 @@ Files: none (produces a facts note appended to this plan).
 
 Exit: a one-page "format facts + budget" block with no remaining `?`.
 
+Result (2026-06-15, range-read safetensors headers only; no weight payloads
+downloaded):
+
+- Scope pinned for v1 implementation:
+  `Qwen/Qwen3.6-35B-A3B-FP8@95a723d08a9490559dae23d0cff1d9466213d989`
+  and
+  `RedHatAI/Qwen3.6-35B-A3B-NVFP4@e850c696e6d75f965367e816c16bc7dacd955ffa`.
+  `nvidia/Qwen3.6-35B-A3B-NVFP4` and
+  `unsloth/Qwen3.6-35B-A3B-NVFP4` were sampled as ABI variants only: nvidia
+  uses `.weight` + scalar `.weight_scale_2`/`.input_scale`, while
+  RedHat/unsloth use `.weight_packed` + `.weight_global_scale` /
+  `.input_global_scale`. Do not silently treat these as one loader ABI.
+- Shared config facts: 40 layers, hidden 2048, MoE intermediate 512,
+  256 routed experts, `num_experts_per_tok=8`. Language-model logical weights
+  excluding visual/MTP are 34.6606B params. Per-token full-weight-read active
+  set excluding the token-embedding table is 2.9465B logical params
+  (lm_head still counts; embedding full matrix does not).
+- Official FP8 main language files are `layers-0..39.safetensors` +
+  `outside.safetensors`. Header count: 62,636 tensors. Language resident
+  bytes, excluding the visual weights in `outside.safetensors`: **35.708 GB
+  / 33.26 GiB** = 33.617 GB `F8_E4M3` weights + 4.10 MB BF16
+  `weight_scale_inv` + 2.087 GB dense BF16 language weights. The text decode
+  weight-read estimate is **3.481 GB/token** → **~575 tok/s ceiling at
+  2.0 TB/s** before KV/attention/routing overhead.
+- Official FP8 scale ABI: every quantized language weight has a BF16
+  `.weight_scale_inv` with 128x128 block shape (examples:
+  `[2048,512] -> [16,4]`, `[512,2048] -> [4,16]`,
+  `[8192,2048] -> [64,16]`). Despite the suffix, the checkpoint's numeric
+  semantics are **direct multiply**, not divide: a range-read A/B against the
+  dense BF16 `Qwen/Qwen3.6-35B-A3B` tensor
+  `layers.0.mlp.experts.gate_up_proj[expert=0, gate, 0:128, 0:128]` gave
+  mean abs error `fp8 * scale = 6.09e-5` vs
+  `fp8 / scale = 2.30e5`. P2 stores this as a direct f32 multiplier after
+  BF16->f32 decode; do **not** pre-reciprocal it.
+- Official FP8 expert layout is split per expert, not stacked:
+  `model.language_model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight`.
+  Dense BF16 baseline uses stacked `experts.gate_up_proj` /
+  `experts.down_proj`, so loader tests must cover split-vs-stacked mapping.
+  FP8 quantizes full-attention projections, shared expert projections, and
+  routed experts. FP8 leaves norms, router `mlp.gate`, `shared_expert_gate`,
+  linear-attn state/norm/conv/small projections BF16, but
+  `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` are FP8.
+- RedHat NVFP4 main file is `model.safetensors`. Header count: 123,973
+  tensors. Language resident bytes: **22.444 GB / 20.90 GiB** =
+  16.305 GB packed U8 E2M1 weights + 2.038 GB `F8_E4M3` group scales +
+  0.247 MB F32 global scales + 4.100 GB dense BF16 language weights. The
+  text decode weight-read estimate is **3.785 GB/token** →
+  **~528 tok/s ceiling at 2.0 TB/s** before KV/attention/routing overhead.
+  This is lower than the draft table's 1.7 GB/token because RedHat keeps all
+  `linear_attn.*` projections BF16 and NVFP4 carries large per-group scales.
+- RedHat NVFP4 scale ABI: quantized weights are split per expert as
+  `.weight_packed` with two E2M1 values per byte, low nibble first. Shapes:
+  gate/up `[512,1024]` packed + `weight_scale [512,128]`; down
+  `[2048,256]` packed + `weight_scale [2048,32]`. Formula confirmed by the
+  same dense BF16 range-read A/B: `e2m1(weight) *
+  decode_e4m3(weight_scale) / weight_global_scale` is correct
+  (`mean_abs_err=2.43e-4` for the first 128x128 gate block); direct multiply
+  by `weight_global_scale=31104.0` is wrong. P2 should normalize this to a
+  direct multiplier by storing `1.0 / weight_global_scale` as f32 if the
+  kernel wants a multiply-only ABI. `input_global_scale` is activation
+  metadata; v1 reads/stores it but does not apply activation quantization.
+- RedHat NVFP4 ignore-list/header facts: all `linear_attn.*` weights are BF16,
+  router `mlp.gate` and `shared_expert_gate` are BF16, norms are BF16; full
+  attention projections, routed experts, and shared expert projections are
+  NVFP4. RedHat `model_mtp.safetensors` and `model_visual.safetensors` are
+  auxiliary and were not included in the first text-runtime resident budget.
+
+Implementation consequence: P2/P3 must support ABI aliases rather than one
+idealized NVFP4 naming convention:
+
+- FP8 official: `.weight` + BF16 `.weight_scale_inv`, 128x128, direct multiply.
+- NVFP4 RedHat/unsloth: `.weight_packed` + F8 `.weight_scale` + inverse F32
+  `.weight_global_scale`, low-nibble-first.
+- NVFP4 nvidia: `.weight` + F8 `.weight_scale` + scalar F32
+  `.weight_scale_2` / `.input_scale`; full-budget validation remains a
+  separate gate before enabling that repo id.
+
 ### P2 — Generic quant codec + ABI-named formats
 
 Files: `crates/infer-cuda/src/lib.rs`, `crates/infer-cuda/src/quant_format.rs`
