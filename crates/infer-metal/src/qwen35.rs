@@ -537,6 +537,18 @@ pub(crate) struct CppQwen35Model {
     raw: *mut std::ffi::c_void,
 }
 
+pub(crate) struct Qwen35VerifySummary {
+    pub(crate) matched_prefix_len: usize,
+    pub(crate) next_token: u32,
+}
+
+pub(crate) struct Qwen35GdrTape {
+    pub(crate) innovation_tape: MlxArray,
+    pub(crate) k: MlxArray,
+    pub(crate) g: MlxArray,
+    pub(crate) qkv: MlxArray,
+}
+
 impl Drop for CppQwen35Model {
     fn drop(&mut self) {
         unsafe {
@@ -935,5 +947,163 @@ impl CppQwen35Model {
             return Err(mlx::check_mlx_error().unwrap_err());
         }
         Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    pub(crate) fn set_tape_mode(&self, enabled: bool) {
+        unsafe {
+            mlx_sys::qwen35_set_tape_mode(self.raw, enabled);
+        }
+    }
+
+    pub(crate) fn set_capture_layers(&self, layer_ids: &[usize]) -> Result<()> {
+        let ids: Vec<i32> = layer_ids
+            .iter()
+            .map(|&id| i32::try_from(id).context("capture layer id does not fit in i32"))
+            .collect::<Result<Vec<_>>>()?;
+        unsafe {
+            mlx_sys::qwen35_set_capture_layers(self.raw, ids.as_ptr(), ids.len() as i32);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_capture_layers(&self) {
+        unsafe {
+            mlx_sys::qwen35_set_capture_layers(self.raw, std::ptr::null(), 0);
+        }
+    }
+
+    pub(crate) fn drain_captured_hidden(&self) -> Result<Vec<MlxArray>> {
+        let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(self.raw) };
+        anyhow::ensure!(
+            n_cap >= 0,
+            "Qwen3.5 captured-hidden count was negative: {n_cap}"
+        );
+        let mut out = Vec::with_capacity(n_cap as usize);
+        for idx in 0..n_cap {
+            let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+            let rc = unsafe { mlx_sys::qwen35_get_captured_hidden(self.raw, idx, &raw mut h_ptr) };
+            if rc != 0 {
+                return Err(mlx::check_mlx_error().unwrap_err());
+            }
+            anyhow::ensure!(
+                !h_ptr.is_null(),
+                "Qwen3.5 captured-hidden handle #{idx} was null"
+            );
+            out.push(unsafe { MlxArray::from_raw(h_ptr) });
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn drain_current_gdr_tapes(
+        &self,
+        expected_tape_count: usize,
+    ) -> Result<Vec<Qwen35GdrTape>> {
+        let mut out_tapes: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); expected_tape_count];
+        let mut out_k: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); expected_tape_count];
+        let mut out_g: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); expected_tape_count];
+        let mut out_qkv: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); expected_tape_count];
+        let count = unsafe {
+            mlx_sys::qwen35_read_and_clear_gdr_tapes(
+                self.raw,
+                out_tapes.as_mut_ptr(),
+                out_k.as_mut_ptr(),
+                out_g.as_mut_ptr(),
+                out_qkv.as_mut_ptr(),
+                expected_tape_count as i32,
+            )
+        };
+        if count < 0 {
+            return Err(mlx::check_mlx_error().unwrap_err());
+        }
+        anyhow::ensure!(
+            count as usize == expected_tape_count,
+            "Qwen3.5 DFlash expected {expected_tape_count} GDR tapes, got {count}"
+        );
+        let mut tapes = Vec::with_capacity(expected_tape_count);
+        for idx in 0..expected_tape_count {
+            anyhow::ensure!(
+                !out_tapes[idx].is_null()
+                    && !out_k[idx].is_null()
+                    && !out_g[idx].is_null()
+                    && !out_qkv[idx].is_null(),
+                "Qwen3.5 DFlash GDR tape #{idx} contained a null handle"
+            );
+            tapes.push(Qwen35GdrTape {
+                innovation_tape: unsafe { MlxArray::from_raw(out_tapes[idx]) },
+                k: unsafe { MlxArray::from_raw(out_k[idx]) },
+                g: unsafe { MlxArray::from_raw(out_g[idx]) },
+                qkv: unsafe { MlxArray::from_raw(out_qkv[idx]) },
+            });
+        }
+        Ok(tapes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_block_summary(
+        &self,
+        tokens: &MlxArray,
+        block_size: i32,
+        cache_pos: i32,
+        kv_caches: &mut [MlxArray],
+        gdr_states: &mut [MlxArray],
+        params: &infer_plan::SamplingParams,
+        suppress_token_id: Option<u32>,
+    ) -> Result<Qwen35VerifySummary> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut matched_prefix_len = 0i32;
+        let mut next_token = 0i32;
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_verify_block_summary(
+                self.raw,
+                tokens.as_raw(),
+                block_size,
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                params.temperature,
+                params.is_greedy(),
+                suppress_token_id.map_or(-1, |token_id| token_id as i32),
+                &raw mut matched_prefix_len,
+                &raw mut next_token,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            kv_caches[i] = unsafe { MlxArray::from_raw(ptr) };
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            gdr_states[i] = unsafe { MlxArray::from_raw(ptr) };
+        }
+        anyhow::ensure!(
+            (0..block_size).contains(&matched_prefix_len),
+            "Qwen3.5 DFlash verify summary returned matched_prefix_len={matched_prefix_len} for block_size={block_size}"
+        );
+        anyhow::ensure!(
+            next_token >= 0,
+            "Qwen3.5 DFlash verify summary returned negative next_token={next_token}"
+        );
+        Ok(Qwen35VerifySummary {
+            matched_prefix_len: matched_prefix_len as usize,
+            next_token: next_token as u32,
+        })
     }
 }
