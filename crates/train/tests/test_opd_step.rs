@@ -8,6 +8,7 @@ use autograd::{backend::Backend, backend_cuda::CudaBackend};
 use train::lora::LoraTargetSet;
 use train::{
     lora::LoraConfig,
+    loss::KlDirection,
     opd::{
         GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepConfig, OpdStepProfile, opd_step,
         opd_step_with_teacher_forward_profiled_gkd_anchor,
@@ -150,6 +151,7 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&corpus_tokens),
             kl_chunk_size: Some(2),
+            kl_direction: KlDirection::Forward,
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::Full,
         },
@@ -426,6 +428,7 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
@@ -805,6 +808,7 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },

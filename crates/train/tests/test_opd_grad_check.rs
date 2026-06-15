@@ -1,5 +1,5 @@
 use autograd::{AutogradError, Tape, Tensor, TensorStore};
-use train::loss::kl_distill_loss;
+use train::loss::{KlDirection, kl_distill_loss};
 
 const EPSILON: f32 = 1.0e-3;
 const MAX_REL_ERR: f32 = 1.0e-2;
@@ -15,8 +15,15 @@ fn kl_loss_value(student_logits: &[f32], teacher_logits: &[f32], shape: &[usize]
         Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
     );
     let num_positions = student_logits.len() / shape.last().copied().expect("vocab dim");
-    let loss =
-        kl_distill_loss(student, teacher, num_positions, &mut store, &mut tape).expect("kl loss");
+    let loss = kl_distill_loss(
+        student,
+        teacher,
+        num_positions,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect("kl loss");
     store.to_host(loss).expect("loss host value")[0]
 }
 
@@ -34,8 +41,15 @@ fn kl_loss_student_grad(
         Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
     );
     let num_positions = student_logits.len() / shape.last().copied().expect("vocab dim");
-    let loss =
-        kl_distill_loss(student, teacher, num_positions, &mut store, &mut tape).expect("kl loss");
+    let loss = kl_distill_loss(
+        student,
+        teacher,
+        num_positions,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect("kl loss");
     tape.backward(loss, &mut store).expect("backward");
 
     let grad = store
@@ -112,8 +126,15 @@ fn kl_distill_loss_stays_finite_for_wide_range_teacher_logits() {
         .expect("teacher logits"),
     );
 
-    let loss = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
-        .expect("wide-range teacher logits must not overflow");
+    let loss = kl_distill_loss(
+        student,
+        teacher,
+        2,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect("wide-range teacher logits must not overflow");
     let loss_value = store.to_host(loss).expect("loss host value")[0];
     assert!(loss_value.is_finite(), "loss must be finite: {loss_value}");
 
@@ -183,8 +204,15 @@ fn kl_distill_loss_rejects_mismatched_logit_shapes() {
     let teacher =
         store.alloc(Tensor::new(vec![0.0; 8], vec![2, 4], false).expect("teacher logits"));
 
-    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
-        .expect_err("mismatched logits must fail before softmax");
+    let err = kl_distill_loss(
+        student,
+        teacher,
+        2,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("mismatched logits must fail before softmax");
 
     let AutogradError::TapeInvariant(message) = err else {
         panic!("expected TapeInvariant, got {err:?}");
@@ -201,8 +229,15 @@ fn kl_distill_loss_rejects_missing_vocab_axis_with_hint() {
     let student = store.alloc(Tensor::new(vec![0.0], vec![], true).expect("student scalar"));
     let teacher = store.alloc(Tensor::new(vec![0.0], vec![], false).expect("teacher scalar"));
 
-    let err = kl_distill_loss(student, teacher, 1, &mut store, &mut tape)
-        .expect_err("rank-0 logits must fail before softmax");
+    let err = kl_distill_loss(
+        student,
+        teacher,
+        1,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("rank-0 logits must fail before softmax");
 
     let AutogradError::TapeInvariant(message) = err else {
         panic!("expected TapeInvariant, got {err:?}");
@@ -218,8 +253,15 @@ fn kl_distill_loss_rejects_zero_vocab_with_hint() {
     let student = store.alloc(Tensor::new(vec![], vec![2, 0], true).expect("student logits"));
     let teacher = store.alloc(Tensor::new(vec![], vec![2, 0], false).expect("teacher logits"));
 
-    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
-        .expect_err("zero-vocab logits must fail before softmax");
+    let err = kl_distill_loss(
+        student,
+        teacher,
+        2,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("zero-vocab logits must fail before softmax");
 
     let AutogradError::TapeInvariant(message) = err else {
         panic!("expected TapeInvariant, got {err:?}");
@@ -236,8 +278,15 @@ fn kl_distill_loss_rejects_teacher_logits_requiring_grad() {
     let student = store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], true).expect("student logits"));
     let teacher = store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], true).expect("teacher logits"));
 
-    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
-        .expect_err("teacher logits must be frozen");
+    let err = kl_distill_loss(
+        student,
+        teacher,
+        2,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("teacher logits must be frozen");
 
     let AutogradError::TapeInvariant(message) = err else {
         panic!("expected TapeInvariant, got {err:?}");
@@ -256,8 +305,15 @@ fn kl_distill_loss_rejects_student_logits_without_grad() {
     let teacher =
         store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], false).expect("teacher logits"));
 
-    let err = kl_distill_loss(student, teacher, 2, &mut store, &mut tape)
-        .expect_err("frozen student logits must fail before producing a no-grad loss");
+    let err = kl_distill_loss(
+        student,
+        teacher,
+        2,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("frozen student logits must fail before producing a no-grad loss");
 
     let AutogradError::TapeInvariant(message) = err else {
         panic!("expected TapeInvariant, got {err:?}");
@@ -275,8 +331,15 @@ fn kl_distill_loss_rejects_stale_num_positions() {
     let teacher =
         store.alloc(Tensor::new(vec![0.0; 6], vec![2, 3], false).expect("teacher logits"));
 
-    let err = kl_distill_loss(student, teacher, 1, &mut store, &mut tape)
-        .expect_err("stale num_positions must fail before softmax");
+    let err = kl_distill_loss(
+        student,
+        teacher,
+        1,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect_err("stale num_positions must fail before softmax");
 
     let AutogradError::TapeInvariant(message) = err else {
         panic!("expected TapeInvariant, got {err:?}");

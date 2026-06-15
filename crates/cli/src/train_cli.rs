@@ -20,8 +20,8 @@ use train::{
 use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
-        ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
+        KlDirectionArg, ModelFamilyArg, OpdBackendArg, PretrainPresetArg, SaveDtypeArg, TrainArgs,
+        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -217,7 +217,10 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
-        opd::{OpdStepConfig, opd_step},
+        opd::{
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
+        },
         qwen35_loader::load_qwen35_from_hf_dir,
     };
 
@@ -236,6 +239,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     );
     let teacher = load_qwen35_from_hf_dir(teacher_dir, &mut store)
         .with_context(|| format!("load teacher from {}", teacher_dir.display()))?;
+    let teacher_forward = train::teacher_infer::InProcessTeacher::new(&teacher);
     eprintln!(
         "[arle train opd] loading student from {}",
         student_dir.display()
@@ -265,18 +269,31 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         rollout_sampling,
         grad_clip: args.grad_clip,
     };
+    let kl_direction = kl_direction_arg(args.kl_direction);
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     for step in 1..=args.steps {
-        let outcome = opd_step(
+        let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
             &student,
-            &teacher,
+            &teacher_forward,
             &prompt_ids,
             step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,
             &mut tape,
+            GkdLossConfig {
+                lambda: 0.0,
+                sft_anchor: GkdSftAnchor::StudentRollout,
+                corpus_tokens: None,
+                kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                kl_direction,
+                logits_window_size: None,
+                kl_mask: OpdKlMask::Full,
+            },
+            #[cfg(feature = "cuda")]
+            None,
+            None,
         )
         .with_context(|| format!("opd step {step} failed"))?;
         losses.push(outcome.loss);
@@ -324,7 +341,10 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
-        opd::{OpdStepConfig, opd_step},
+        opd::{
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
+        },
         qwen35::Qwen35Model,
     };
 
@@ -340,6 +360,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     let (mut store, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
     let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).context("build smoke teacher")?;
+    let teacher_forward = train::teacher_infer::InProcessTeacher::new(&teacher);
     let student = Qwen35Model::new(&cfg, &mut store).context("build smoke student")?;
     let student_params = student.all_parameter_ids();
 
@@ -355,6 +376,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         rollout_sampling,
         grad_clip: args.grad_clip,
     };
+    let kl_direction = kl_direction_arg(args.kl_direction);
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     let mut step_metrics: Vec<OpdStepMetric> = Vec::with_capacity(args.steps);
@@ -368,15 +390,27 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     };
     let mut loss_sum = 0.0_f32;
     for step in 1..=args.steps {
-        let outcome = opd_step(
+        let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
             &student,
-            &teacher,
+            &teacher_forward,
             &prompt_ids,
             step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,
             &mut tape,
+            GkdLossConfig {
+                lambda: 0.0,
+                sft_anchor: GkdSftAnchor::StudentRollout,
+                corpus_tokens: None,
+                kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                kl_direction,
+                logits_window_size: None,
+                kl_mask: OpdKlMask::Full,
+            },
+            #[cfg(feature = "cuda")]
+            None,
+            None,
         )
         .with_context(|| format!("opd step {step} failed"))?;
         let grad_norm = current_grad_norm(&student_params, &store);
@@ -450,6 +484,13 @@ fn rollout_sampling_params(
             seed,
             ..SamplingParams::default()
         })
+    }
+}
+
+fn kl_direction_arg(arg: KlDirectionArg) -> train::loss::KlDirection {
+    match arg {
+        KlDirectionArg::Forward => train::loss::KlDirection::Forward,
+        KlDirectionArg::Reverse => train::loss::KlDirection::Reverse,
     }
 }
 
@@ -600,6 +641,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         rollout_sampling,
         grad_clip: args.grad_clip,
     };
+    let kl_direction = kl_direction_arg(args.kl_direction);
 
     let gate_on = args.gate_every_n > 0;
     let mut snap = ema
@@ -639,6 +681,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                     sft_anchor: GkdSftAnchor::StudentRollout,
                     corpus_tokens: None,
                     kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                    kl_direction,
                     logits_window_size: None,
                     kl_mask: OpdKlMask::CompletionOnly,
                 },
@@ -788,6 +831,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
         rollout_sampling,
         grad_clip: args.grad_clip,
     };
+    let kl_direction = kl_direction_arg(args.kl_direction);
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     for step in 1..=args.steps {
@@ -807,6 +851,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
                     sft_anchor: GkdSftAnchor::StudentRollout,
                     corpus_tokens: None,
                     kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                    kl_direction,
                     logits_window_size: None,
                     kl_mask: OpdKlMask::CompletionOnly,
                 },

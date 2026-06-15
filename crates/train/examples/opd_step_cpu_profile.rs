@@ -10,7 +10,7 @@ use autograd::{
 use qwen35_spec::{LayerType, Qwen35Config};
 use train::{
     grad_clip::clip_grad_norm,
-    loss::kl_distill_loss,
+    loss::{KlDirection, kl_distill_loss},
     opd::{OpdStepConfig, OpdStepOutcome},
     qwen35::Qwen35Model,
 };
@@ -187,6 +187,7 @@ fn profiled_opd_step<O: Optimizer>(
             student_logits,
             teacher_logits,
             rollout.len(),
+            KlDirection::Forward,
             store,
             tape,
         )?)

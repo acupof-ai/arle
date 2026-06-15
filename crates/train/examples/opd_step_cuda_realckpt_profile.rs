@@ -24,7 +24,7 @@ mod app {
     };
     use train::{
         grad_clip::clip_grad_norm,
-        loss::kl_distill_loss,
+        loss::{KlDirection, kl_distill_loss},
         opd::{OpdStepConfig, OpdStepOutcome},
         qwen35::{
             Qwen35AttentionForwardProfile, Qwen35KvCache, Qwen35LayerForwardProfile, Qwen35Model,
@@ -497,6 +497,7 @@ mod app {
                 student_logits,
                 teacher_logits,
                 rollout.len(),
+                KlDirection::Forward,
                 store,
                 tape,
             )?)
@@ -610,7 +611,14 @@ mod app {
         let teacher_logits = teacher.forward(store, tape, &rollout, &positions)?;
         tape.set_enabled(true);
         let student_logits = student.forward(store, tape, &rollout, &positions)?;
-        let loss = kl_distill_loss(student_logits, teacher_logits, rollout.len(), store, tape)?;
+        let loss = kl_distill_loss(
+            student_logits,
+            teacher_logits,
+            rollout.len(),
+            KlDirection::Forward,
+            store,
+            tape,
+        )?;
         let loss_value = store.to_host(loss)?[0];
         cleanup_after_backward(store, tape, student_model_params, &keep_extra);
         Ok(loss_value)
