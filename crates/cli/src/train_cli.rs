@@ -253,7 +253,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
-        qwen35_loader::load_qwen35_from_hf_dir,
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_trainable_from_hf_dir},
     };
 
     let student_dir = args
@@ -277,7 +277,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         "[arle train opd] loading student from {}",
         student_dir.display()
     );
-    let student = load_qwen35_from_hf_dir(student_dir, &mut store)
+    let student = load_qwen35_trainable_from_hf_dir(student_dir, &mut store)
         .with_context(|| format!("load student from {}", student_dir.display()))?;
     let student_params = student.all_parameter_ids();
     let cfg = student.config().clone();
