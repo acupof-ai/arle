@@ -4929,10 +4929,21 @@ pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
 /// MoE/HC/norm over all N verify chains (attention stays per-slot — Stage 1).
 /// bench/correctness pending pod-verify (license-or-kill per the bench spec).
 pub(crate) fn dsv4_batched_mtp_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_BATCHED_MTP").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    // Default ON (2026-06-15, multi-shape licensed): batched MTP decode wins +77-81%
+    // vs per-row MTP at c>=8 (per-row plateaus ~42-46 tok/s, can't sustain >7-8
+    // concurrent; batched scales to ~77 — short-prompt c=12 +81% and prod ~2400-tok
+    // c=8 +77%, both decode-read coherent, zero cross-slot contamination). The
+    // executor gate (`spec_on && this && rows >= dsv4_batched_decode_min_rows()`)
+    // engages it at c>=4 only; c<4 keeps the per-row MTP latency path. The marginal
+    // batched-draft sub-lever (`ARLE_DSV4_BATCHED_MTP_DRAFT`) stays OFF. Force the
+    // per-row reference with `ARLE_DSV4_BATCHED_MTP=0`.
+    match std::env::var("ARLE_DSV4_BATCHED_MTP") {
+        Ok(v) => !matches!(
+            v.as_str(),
+            "0" | "false" | "FALSE" | "no" | "off" | "OFF" | ""
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Lever 2a sub-gate: batch the per-slot DRAFT chain across N slots (one
