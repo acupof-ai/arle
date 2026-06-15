@@ -1847,6 +1847,32 @@ mod dsv4_gpu {
             total
         }
 
+        /// Exact requested device bytes summed from the LIVE slices (no
+        /// cfg/split/layer needed) — for the VRAM ledger. Mirrors the static
+        /// [`Self::device_bytes`] predictor, but reads the actual allocations so
+        /// the adapter can sum it without re-deriving config dims.
+        #[allow(dead_code)]
+        pub(crate) fn device_bytes_live(&self) -> usize {
+            let f32_sz = std::mem::size_of::<f32>();
+            let i32_sz = std::mem::size_of::<i32>();
+            let u32_sz = std::mem::size_of::<u32>();
+            self.route_indices.len() * i32_sz
+                + self.route_weights.len() * f32_sz
+                + self.token_ids.len() * u32_sz
+                + self.router_logits.device_bytes()
+                + self.counts.len() * i32_sz
+                + self.offsets.len() * i32_sz
+                + self.scan_total.len() * i32_sz
+                + self.packed_hidden.device_bytes()
+                + self.packed_route_slot.len() * i32_sz
+                + self.packed_weight.len() * f32_sz
+                + self.cursors.len() * i32_sz
+                + self.route_out.device_bytes()
+                + self.grouped.device_bytes_live()
+                + self.grouped_contig.device_bytes_live()
+                + self.shared.device_bytes_live()
+        }
+
         fn reset_routed(&mut self, ctx: &DeviceContext) -> Result<()> {
             ctx.stream
                 .memset_zeros(&mut self.counts)
@@ -1942,6 +1968,22 @@ mod dsv4_gpu {
                 active_experts,
             })
         }
+
+        /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
+        #[allow(dead_code)]
+        fn device_bytes_live(&self) -> usize {
+            let f32_sz = std::mem::size_of::<f32>();
+            let i32_sz = std::mem::size_of::<i32>();
+            self.input_fp8.len() // u8
+                + self.input_scales.len() * f32_sz
+                + self.w13_out.device_bytes()
+                + self.act_fp8.len() // u8
+                + self.act_scales.len() * f32_sz
+                + self.out_padded.device_bytes()
+                + self.out_compact.device_bytes()
+                + self.masked_m.len() * i32_sz
+                + self.active_experts.len() * i32_sz
+        }
     }
 
     impl Dsv4GroupedContiguousDecodeScratch {
@@ -2006,6 +2048,26 @@ mod dsv4_gpu {
                 active_counts,
             })
         }
+
+        /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
+        #[allow(dead_code)]
+        fn device_bytes_live(&self) -> usize {
+            let f32_sz = std::mem::size_of::<f32>();
+            let i32_sz = std::mem::size_of::<i32>();
+            self.input_fp8.len() // u8
+                + self.input_scales.len() * f32_sz
+                + self.w13_out.device_bytes()
+                + self.act_fp8.len() // u8
+                + self.act_scales.len() * f32_sz
+                + self.out.device_bytes()
+                + self.packed_hidden.device_bytes()
+                + self.packed_route_slot.len() * i32_sz
+                + self.packed_weight.len() * f32_sz
+                + self.m_indices.len() * i32_sz
+                + self.active_experts.len() * i32_sz
+                + self.active_offsets.len() * i32_sz
+                + self.active_counts.len() * i32_sz
+        }
     }
 
     impl Dsv4SharedDecodeScratch {
@@ -2050,6 +2112,23 @@ mod dsv4_gpu {
                 counts,
                 masked_m,
             })
+        }
+
+        /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
+        #[allow(dead_code)]
+        fn device_bytes_live(&self) -> usize {
+            let f32_sz = std::mem::size_of::<f32>();
+            let i32_sz = std::mem::size_of::<i32>();
+            self.input_fp8.len() // u8
+                + self.input_scales.len() * f32_sz
+                + self.w13_out.device_bytes()
+                + self.act_fp8.len() // u8
+                + self.act_scales.len() * f32_sz
+                + self.out.device_bytes()
+                + self.active_experts.len() * i32_sz
+                + self.active_offsets.len() * i32_sz
+                + self.counts.len() * i32_sz
+                + self.masked_m.len() * i32_sz
         }
     }
 

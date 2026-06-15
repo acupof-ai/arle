@@ -1288,13 +1288,97 @@ impl Dsv4CudaExecutor {
             model_path.as_ref(),
             mtp_draft_tokens,
         )?;
+        // [vram-probe] TEMP bit-exact VRAM attribution (remove after budget unification).
+        // Returns measured-used bytes (or None when mem_get_info fails) so the
+        // ledger can reconcile predicted device_bytes() against the measured used.
+        let mem_dbg = |tag: &str| -> Option<usize> {
+            match cudarc::driver::result::mem_get_info() {
+                Ok((free, total)) => {
+                    let used = total - free;
+                    log::info!(
+                        "[vram-probe] {tag}: used {}MB free {}MB",
+                        used >> 20,
+                        free >> 20
+                    );
+                    Some(used)
+                }
+                Err(_) => None,
+            }
+        };
+        let weights_used_at_model_load = mem_dbg("after model load (weights+experts)");
         // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
         // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
         let num_slots = model.kv_budget_num_slots(num_slots, max_seq_len)?;
         let kv_adapter = model.new_kv_adapter(max_seq_len, num_slots)?;
+        mem_dbg("after new_kv_adapter (KV pools)");
+        // [vram-ledger] PREDICTED adapter device bytes + per-component breakdown.
+        log::info!(
+            "[vram-ledger] adapter predicted {}MB; breakdown {:?}",
+            kv_adapter.device_bytes() >> 20,
+            kv_adapter
+                .device_bytes_breakdown()
+                .iter()
+                .map(|(name, bytes)| (*name, bytes >> 20))
+                .collect::<Vec<_>>()
+        );
         let mut slots = Vec::with_capacity(num_slots);
         for slot_idx in 0..num_slots {
             slots.push(model.new_slot_state(max_seq_len, slot_idx, &kv_adapter)?);
+            if slot_idx == 0 {
+                mem_dbg("after slot 0 (per-slot state)");
+                // [vram-ledger] PREDICTED slot-0 device bytes + per-component breakdown.
+                log::info!(
+                    "[vram-ledger] slot0 predicted {}MB; breakdown {:?}",
+                    slots[0].device_bytes() >> 20,
+                    slots[0]
+                        .device_bytes_breakdown()
+                        .iter()
+                        .map(|(name, bytes)| (*name, bytes >> 20))
+                        .collect::<Vec<_>>()
+                );
+                // [vram-ledger] Attribute the per-slot attention bulk to the exact
+                // buffer family, summed across all layers (every bit's source named).
+                log::info!(
+                    "[vram-ledger] slot0 attention sub-totals (Σ layers) {:?}",
+                    slots[0]
+                        .attention_breakdown_total()
+                        .iter()
+                        .map(|(name, bytes)| (*name, bytes >> 20))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let measured_used_after_all = mem_dbg("after all slots (build complete)");
+        // [vram-ledger] Reconcile PREDICTED cumulative device_bytes against the
+        // measured used. residual = measured_used
+        //   - (weights_used_at_model_load + adapter.device_bytes() + Σ slot.device_bytes()).
+        // The residual is everything NOT in the named-buffer ledger: CUDA context
+        // + library reservations + per-cudaMalloc allocation rounding across the
+        // ~258 tiny per-layer allocs/slot. A large residual points the gap there,
+        // a small one means the named buffers fully account for the slot cost.
+        let adapter_bytes = kv_adapter.device_bytes();
+        let slots_bytes: usize = slots.iter().map(|s| s.device_bytes()).sum();
+        log::info!(
+            "[vram-ledger] cumulative predicted: weights {}MB + adapter {}MB + Σ {} slots {}MB = {}MB",
+            weights_used_at_model_load.map_or(0, |b| b >> 20),
+            adapter_bytes >> 20,
+            num_slots,
+            slots_bytes >> 20,
+            (weights_used_at_model_load.unwrap_or(0) + adapter_bytes + slots_bytes) >> 20
+        );
+        if let (Some(measured), Some(weights)) =
+            (measured_used_after_all, weights_used_at_model_load)
+        {
+            let predicted_total = weights + adapter_bytes + slots_bytes;
+            // Saturating signed residual: usually positive (ctx/libs/rounding),
+            // but guard the rare measured < predicted (measurement skew).
+            let residual_mb = (measured as i64 - predicted_total as i64) >> 20;
+            log::info!(
+                "[vram-ledger] residual (ctx+libs+cudaMalloc rounding) = {residual_mb}MB \
+                 (measured used {}MB - predicted {}MB)",
+                measured >> 20,
+                predicted_total >> 20
+            );
         }
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
