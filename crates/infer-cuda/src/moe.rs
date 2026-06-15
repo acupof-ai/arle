@@ -289,6 +289,7 @@ mod gpu {
     use anyhow::{Result, ensure};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
+    use cuda_kernels::tensor::WeightFormat;
     use cuda_kernels::tensor::cache_ptr;
     use half::bf16;
     use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
@@ -810,7 +811,9 @@ mod gpu {
         // kernels keep the shape. `ARLE_QWEN35_MOE_DECODE_KERNEL=0` is the
         // same-binary A/B arm. Shape-constant pure kernel launches — decode
         // CUDA-graph capture-safe, same as the batch kernels.
-        let use_decode_kernels = total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
+        let routed_quant = weights.expert_weight_format.is_quantized();
+        let use_decode_kernels = !routed_quant
+            && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
             && hidden_dim.is_multiple_of(8)
             && moe_inter.is_multiple_of(8)
             && qwen35_moe_decode_kernel_enabled();
@@ -847,21 +850,19 @@ mod gpu {
             let up_out = scratch.up_out.get(ctx, moe_inter, total_routes)?;
             // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream.
             unsafe {
-                moe::moe_bf16_grouped_gemm_pair_batch(
-                    &weights.gate_ptrs,
-                    &weights.up_ptrs,
-                    cache_ptr(&packed_hidden.data, ctx),
-                    cache_ptr(&gate_out.data, ctx),
-                    cache_ptr(&up_out.data, ctx),
-                    cache_ptr(offsets, ctx),
+                grouped_pair_batch(
+                    ctx,
+                    weights,
+                    packed_hidden,
+                    gate_out,
+                    up_out,
+                    offsets,
                     counts_ptr,
-                    cache_ptr(expert_indices, ctx),
+                    expert_indices,
                     local_experts,
                     max_count,
                     moe_inter,
                     hidden_dim,
-                    ctx,
-                    ctx.stream.cu_stream(),
                 )?;
             }
             // silu_mul covers all `moe_inter * total_routes` elements; under
@@ -895,19 +896,18 @@ mod gpu {
         } else {
             // SAFETY: down weight table + act/expert_out valid on ctx.stream.
             unsafe {
-                moe::moe_bf16_grouped_gemm_batch(
-                    &weights.down_ptrs,
-                    cache_ptr(&act.data, ctx),
-                    cache_ptr(&expert_out.data, ctx),
-                    cache_ptr(offsets, ctx),
+                grouped_down_batch(
+                    ctx,
+                    weights,
+                    act,
+                    expert_out,
+                    offsets,
                     counts_ptr,
-                    cache_ptr(expert_indices, ctx),
+                    expert_indices,
                     local_experts,
                     max_count,
                     hidden_dim,
                     moe_inter,
-                    ctx,
-                    ctx.stream.cu_stream(),
                 )?;
             }
         }
@@ -1329,6 +1329,232 @@ mod gpu {
             moe_inter
         );
         Ok(())
+    }
+
+    fn fp8_grouped_shape(weight: &DeviceMatrix) -> Result<(usize, usize, usize, usize)> {
+        match weight.weight_format() {
+            WeightFormat::Fp8BlockScaled => {
+                ensure!(
+                    weight.quant_scale_rows > 0
+                        && weight.quant_scale_cols > 0
+                        && weight.quant_block_m > 0
+                        && weight.quant_block_k > 0,
+                    "FP8 block-scaled MoE weight missing scale metadata"
+                );
+                Ok((
+                    weight.quant_scale_rows,
+                    weight.quant_scale_cols,
+                    weight.quant_block_m,
+                    weight.quant_block_k,
+                ))
+            }
+            WeightFormat::Fp8PerShard => {
+                ensure!(
+                    weight.quant_scale_rows == 1 && weight.quant_scale_cols == 1,
+                    "FP8 per-shard MoE currently requires scalar scale, got {}x{}",
+                    weight.quant_scale_rows,
+                    weight.quant_scale_cols
+                );
+                Ok((1, 1, weight.rows, weight.cols))
+            }
+            other => anyhow::bail!("expected FP8 MoE weight, got {other}"),
+        }
+    }
+
+    fn opt_ptrs<'a>(
+        ptrs: &'a Option<cudarc::driver::CudaSlice<u64>>,
+        label: &str,
+    ) -> Result<&'a cudarc::driver::CudaSlice<u64>> {
+        ptrs.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.6 MoE missing {label} pointer table"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn grouped_pair_batch(
+        ctx: &DeviceContext,
+        weights: &MoeLayerWeights,
+        packed_hidden: &HiddenStates,
+        gate_out: &mut HiddenStates,
+        up_out: &mut HiddenStates,
+        offsets: &cudarc::driver::CudaSlice<i32>,
+        counts: RawDevicePtr<i32>,
+        expert_indices: &cudarc::driver::CudaSlice<i32>,
+        local_experts: usize,
+        max_count: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        match weights.expert_weight_format {
+            WeightFormat::DenseBf16 => unsafe {
+                moe::moe_bf16_grouped_gemm_pair_batch(
+                    &weights.gate_ptrs,
+                    &weights.up_ptrs,
+                    cache_ptr(&packed_hidden.data, ctx),
+                    cache_ptr(&gate_out.data, ctx),
+                    cache_ptr(&up_out.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts,
+                    cache_ptr(expert_indices, ctx),
+                    local_experts,
+                    max_count,
+                    n,
+                    k,
+                    ctx,
+                    ctx.stream.cu_stream(),
+                )
+            },
+            WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {
+                let first = weights
+                    .gate
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("FP8 MoE pair batch has no gate experts"))?;
+                let (scale_rows, scale_cols, block_m, block_k) = fp8_grouped_shape(first)?;
+                unsafe {
+                    moe::moe_fp8_block_scaled_grouped_gemv_pair_batch(
+                        &weights.gate_ptrs,
+                        opt_ptrs(&weights.gate_scale_ptrs, "gate FP8 scale")?,
+                        &weights.up_ptrs,
+                        opt_ptrs(&weights.up_scale_ptrs, "up FP8 scale")?,
+                        cache_ptr(&packed_hidden.data, ctx),
+                        cache_ptr(&gate_out.data, ctx),
+                        cache_ptr(&up_out.data, ctx),
+                        cache_ptr(offsets, ctx),
+                        counts,
+                        cache_ptr(expert_indices, ctx),
+                        local_experts,
+                        max_count,
+                        n,
+                        k,
+                        scale_rows,
+                        scale_cols,
+                        block_m,
+                        block_k,
+                        ctx,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            }
+            WeightFormat::Fp4E2M1Group => {
+                let first = weights
+                    .gate
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("FP4 MoE pair batch has no gate experts"))?;
+                unsafe {
+                    moe::moe_fp4_e2m1_grouped_gemv_pair_batch(
+                        &weights.gate_ptrs,
+                        opt_ptrs(&weights.gate_scale_ptrs, "gate FP4 scale")?,
+                        opt_ptrs(&weights.gate_global_ptrs, "gate FP4 global scale")?,
+                        &weights.up_ptrs,
+                        opt_ptrs(&weights.up_scale_ptrs, "up FP4 scale")?,
+                        opt_ptrs(&weights.up_global_ptrs, "up FP4 global scale")?,
+                        cache_ptr(&packed_hidden.data, ctx),
+                        cache_ptr(&gate_out.data, ctx),
+                        cache_ptr(&up_out.data, ctx),
+                        cache_ptr(offsets, ctx),
+                        counts,
+                        cache_ptr(expert_indices, ctx),
+                        local_experts,
+                        max_count,
+                        n,
+                        k,
+                        first.group_size,
+                        first.quant_scale_cols,
+                        ctx,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            }
+            other => anyhow::bail!("unsupported Qwen3.6 MoE pair format {other}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn grouped_down_batch(
+        ctx: &DeviceContext,
+        weights: &MoeLayerWeights,
+        act: &HiddenStates,
+        expert_out: &mut HiddenStates,
+        offsets: &cudarc::driver::CudaSlice<i32>,
+        counts: RawDevicePtr<i32>,
+        expert_indices: &cudarc::driver::CudaSlice<i32>,
+        local_experts: usize,
+        max_count: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        match weights.expert_weight_format {
+            WeightFormat::DenseBf16 => unsafe {
+                moe::moe_bf16_grouped_gemm_batch(
+                    &weights.down_ptrs,
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts,
+                    cache_ptr(expert_indices, ctx),
+                    local_experts,
+                    max_count,
+                    n,
+                    k,
+                    ctx,
+                    ctx.stream.cu_stream(),
+                )
+            },
+            WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {
+                let first = weights
+                    .down
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("FP8 MoE down batch has no down experts"))?;
+                let (scale_rows, scale_cols, block_m, block_k) = fp8_grouped_shape(first)?;
+                unsafe {
+                    moe::moe_fp8_block_scaled_grouped_gemv_batch(
+                        &weights.down_ptrs,
+                        opt_ptrs(&weights.down_scale_ptrs, "down FP8 scale")?,
+                        cache_ptr(&act.data, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(offsets, ctx),
+                        counts,
+                        cache_ptr(expert_indices, ctx),
+                        local_experts,
+                        max_count,
+                        n,
+                        k,
+                        scale_rows,
+                        scale_cols,
+                        block_m,
+                        block_k,
+                        ctx,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            }
+            WeightFormat::Fp4E2M1Group => {
+                let first = weights
+                    .down
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("FP4 MoE down batch has no down experts"))?;
+                unsafe {
+                    moe::moe_fp4_e2m1_grouped_gemv_batch(
+                        &weights.down_ptrs,
+                        opt_ptrs(&weights.down_scale_ptrs, "down FP4 scale")?,
+                        opt_ptrs(&weights.down_global_ptrs, "down FP4 global scale")?,
+                        cache_ptr(&act.data, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(offsets, ctx),
+                        counts,
+                        cache_ptr(expert_indices, ctx),
+                        local_experts,
+                        max_count,
+                        n,
+                        k,
+                        first.group_size,
+                        first.quant_scale_cols,
+                        ctx,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            }
+            other => anyhow::bail!("unsupported Qwen3.6 MoE down format {other}"),
+        }
     }
 }
 
