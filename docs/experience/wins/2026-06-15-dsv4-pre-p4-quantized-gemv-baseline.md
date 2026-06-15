@@ -20,9 +20,10 @@ and related image transitive crates. The built target is `infer-cuda` only; thos
 Build:
 
 ```bash
+DSV4_MODEL_ROOT=<remote DSv4 model root> \
 ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
 ARLE_CUDA_KERNEL_SET=dsv4_flash \
-ARLE_DSV4_MODEL_PATH=/data01/models/DeepSeek-V4-Flash \
+ARLE_DSV4_MODEL_PATH="$DSV4_MODEL_ROOT" \
 ARLE_DEEPGEMM_ROOT=/tmp/DeepGEMM \
 ARLE_DEEPGEMM_LIBRARY_ROOT=/tmp/DeepGEMM/deep_gemm \
 ARLE_DEEPGEMM_CUTLASS_INCLUDE=/tmp/DeepGEMM/third-party/cutlass/include \
@@ -34,7 +35,8 @@ cargo build --offline --release -p infer-cuda --features cuda,nccl,deepep \
 Run:
 
 ```bash
-INFER_DSV4_MODEL_PATH=/data01/models/DeepSeek-V4-Flash \
+DSV4_MODEL_ROOT=<remote DSv4 model root> \
+INFER_DSV4_MODEL_PATH="$DSV4_MODEL_ROOT" \
 INFER_DSV4_BATCH_DECODE_VALIDATE=2,4 \
 INFER_DSV4_MAX_NEW=8 \
 scripts/dsv4_multigpu_parity.sh
