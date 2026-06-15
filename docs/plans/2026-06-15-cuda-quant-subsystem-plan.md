@@ -2,7 +2,7 @@
 
 Date: 2026-06-15
 
-Status: implementation plan, not shipped.
+Status: P0-P5 partially shipped; P6/P7 loader and MoE wiring still pending.
 
 Goal: run `Qwen3.6-35B-A3B` FP8 and NVFP4 checkpoints on CUDA with the quantized
 representation **resident** in HBM. The CUDA forward path consumes the
@@ -464,6 +464,29 @@ Files: `crates/infer-cuda/src/ops.rs`
   call the new variants.
 - Fail closed: unsupported format/shape returns an error naming the exact matrix and
   format. No implicit dense fallback.
+
+Result (2026-06-15, P4/P5 tranche):
+
+- Added ABI-generic decode GEMV launchers in the existing
+  `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`, without opening a new
+  `.cu` file:
+  `gemv_fp8_block_scaled{,_batch}_cuda` for E4M3 weights with f32 block/per-shard
+  scales, and `gemv_fp4_e2m1_group{,_batch}_cuda` for packed E2M1 weights with
+  E4M3 group scales plus an f32 global multiplier.
+- Kept the DSv4 E8M0 symbols intact. DSv4 uses the existing
+  `dsv4_fp{8,4}_*` launchers; Qwen-format ABI entrypoints are separate symbols.
+- Split CUDA GEMV FFI tests out of
+  `crates/cuda-kernels/src/ffi/gemm.rs` into
+  `crates/cuda-kernels/src/ffi/gemm_tests.rs`.
+- Split resident quant linear dispatch out of `ops.rs` into
+  `crates/infer-cuda/src/ops/quant_linear.rs`. `gemv` and `gemm_batch` now branch
+  on `weight_format.is_quantized()` before dereferencing the dense dummy
+  `DeviceMatrix::data`.
+- H20 CUDA reference tests passed for FP8 block-scaled and FP4 group-scaled GEMV
+  against CPU references. DSv4 post-P4 parity matched the pre-P4 byte-parity
+  reference for batch decode validation at batch 2 and batch 4.
+- This is a correctness/build gate only. It is not yet a Qwen3.6 serve or
+  throughput claim because P6 loader wiring and P7 quant MoE routing remain open.
 
 ### P6 — Qwen3.6 linear load wiring
 
