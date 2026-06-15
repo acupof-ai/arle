@@ -94,11 +94,6 @@ impl ChatCompletionRequest {
                 "messages must contain at least one message",
             ));
         }
-        if self.messages.iter().any(ChatMessage::has_media_content) {
-            return Err(ApiError::bad_request(
-                "image/audio/video content parts are parsed, but VLM soft-token embeddings are not wired yet",
-            ));
-        }
         validate_common(self.stream, self.max_tokens)
     }
 
@@ -214,7 +209,7 @@ pub struct ChatContentPart {
 }
 
 impl ChatContentPart {
-    fn normalized_kind(&self) -> &str {
+    pub(crate) fn normalized_kind(&self) -> &str {
         match self.kind.as_str() {
             "image_url" | "input_image" => "image",
             "input_audio" => "audio",
@@ -510,6 +505,30 @@ impl ChatCompletionResponse {
             usage,
         }
     }
+
+    pub(crate) fn from_parts(
+        model: String,
+        content: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        finish: Option<&FinishReason>,
+    ) -> Self {
+        Self {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+            object: "chat.completion",
+            created: unix_time_secs(),
+            model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content,
+                },
+                finish_reason: finish_reason(finish).to_string(),
+            }],
+            usage: Usage::new(prompt_tokens, completion_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -682,6 +701,6 @@ mod tests {
         assert!(request.messages[0].has_media_content());
         let template = request.messages[0].template_content();
         assert_eq!(template[1]["type"], "image");
-        assert!(request.validate().is_err());
+        assert!(request.validate().is_ok());
     }
 }
