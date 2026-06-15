@@ -379,6 +379,12 @@ impl AgentSession {
         &self.messages
     }
 
+    pub fn append_plain_turn(&mut self, user_input: &str, assistant_text: &str) {
+        self.messages.push(Message::user(user_input));
+        self.messages
+            .push(Message::assistant(assistant_text, vec![]));
+    }
+
     pub fn run_turn<E: InferenceEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
         &mut self,
         engine: &mut E,

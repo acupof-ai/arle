@@ -72,7 +72,7 @@ pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended
 #[cfg(feature = "cuda")]
 pub use types::RawLogits;
 pub use types::{
-    CompletionOutput, CompletionRequest, CompletionStreamDelta, CompletionStreamError,
-    EngineTelemetry, FinishReason, InferenceEngine, PrefillPathStats, SamplingParams, SessionId,
-    TokenUsage,
+    ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
+    CompletionStreamError, EngineTelemetry, FinishReason, InferenceEngine, PrefillPathStats,
+    SamplingParams, SessionId, TokenUsage,
 };

@@ -18,14 +18,17 @@ use crate::args::RunArgs;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
     AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, AgentTurnCallbacks,
-    ToolExecutionMetadata, ToolExecutor, ToolPolicy,
+    AgentTurnResult, ContentBlock, MessageContent, SubTurnRecord, TerminalState, TokensRecord,
+    ToolExecutionMetadata, ToolExecutor, ToolPolicy, ToolUsage, TrajectoryMessage, TrajectoryRole,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_api::InferenceEngine;
+use infer_api::{
+    ChatPromptMessage, CompletionRequest, FinishReason, InferenceEngine, SamplingParams,
+};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -321,19 +324,27 @@ pub(crate) fn run_one_shot(
     );
 
     let tools = tool_definitions(tools_enabled);
-    let mut session = AgentSession::new();
-    let result = session.run_turn(
-        engine,
-        &prompt,
-        &tools,
-        &BuiltinToolExecutor,
-        &BuiltinToolPolicy,
-        AgentSettings {
-            max_turns,
-            max_tokens,
-            temperature,
-        },
-    )?;
+    let mut session = if is_direct_chat_backend(backend_name) {
+        AgentSession::with_system_prompt("")
+    } else {
+        AgentSession::new()
+    };
+    let result = if is_direct_chat_backend(backend_name) {
+        run_direct_chat_completion(engine, &mut session, &prompt, max_tokens, temperature)?
+    } else {
+        session.run_turn(
+            engine,
+            &prompt,
+            &tools,
+            &BuiltinToolExecutor,
+            &BuiltinToolPolicy,
+            AgentSettings {
+                max_turns,
+                max_tokens,
+                temperature,
+            },
+        )?
+    };
 
     if let Some(writer) = trace {
         writer.write_turn(engine.model_id(), backend_name, &prompt, &result);
@@ -365,6 +376,7 @@ pub(crate) fn run_one_shot(
 fn print_repl_banner(
     engine: &dyn InferenceEngine,
     backend_name: &str,
+    mode_name: &str,
     tools: &[ToolDefinition],
     max_turns: usize,
     max_tokens: usize,
@@ -374,7 +386,7 @@ fn print_repl_banner(
     println!("=== ARLE REPL ===");
     println!("Model: {}", engine.model_id());
     println!("Backend: {}", backend_name);
-    println!("Mode: agent");
+    println!("Mode: {}", mode_name);
     println!("Tools available: {}", tools.len());
     println!(
         "Max turns: {}, Max tokens: {}, Temperature: {}",
@@ -523,8 +535,17 @@ fn run_interactive_repl(
     tools_enabled: bool,
     trace: Option<&TraceWriter>,
 ) -> Result<()> {
-    let tools = tool_definitions(tools_enabled);
-    let mut session = AgentSession::new();
+    let direct_chat = is_direct_chat_backend(backend_name);
+    let tools = if direct_chat {
+        Vec::new()
+    } else {
+        tool_definitions(tools_enabled)
+    };
+    let mut session = if direct_chat {
+        AgentSession::with_system_prompt("")
+    } else {
+        AgentSession::new()
+    };
     let mut session_stats = SessionStats::default();
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
@@ -546,6 +567,7 @@ fn run_interactive_repl(
     print_repl_banner(
         engine,
         backend_name,
+        if direct_chat { "chat" } else { "agent" },
         &tools,
         max_turns,
         max_tokens,
@@ -628,10 +650,19 @@ fn run_piped_repl(
     tools_enabled: bool,
     trace: Option<&TraceWriter>,
 ) -> Result<()> {
-    let tools = tool_definitions(tools_enabled);
+    let direct_chat = is_direct_chat_backend(backend_name);
+    let tools = if direct_chat {
+        Vec::new()
+    } else {
+        tool_definitions(tools_enabled)
+    };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    let mut session = AgentSession::new();
+    let mut session = if direct_chat {
+        AgentSession::with_system_prompt("")
+    } else {
+        AgentSession::new()
+    };
     let mut session_stats = SessionStats::default();
 
     let (cancel, exit) = install_ctrlc_handler();
@@ -721,21 +752,203 @@ fn handle_repl_input(
         ));
     }
 
-    run_agent_turn(
-        engine,
-        backend_name,
-        tools,
-        session,
-        session_stats,
-        input,
-        max_turns,
-        max_tokens,
-        temperature,
-        cancel,
-        trace,
-    );
+    if is_direct_chat_backend(backend_name) {
+        run_direct_chat_turn(
+            engine,
+            backend_name,
+            session,
+            session_stats,
+            input,
+            max_tokens,
+            temperature,
+            trace,
+        );
+    } else {
+        run_agent_turn(
+            engine,
+            backend_name,
+            tools,
+            session,
+            session_stats,
+            input,
+            max_turns,
+            max_tokens,
+            temperature,
+            cancel,
+            trace,
+        );
+    }
 
     Ok(true)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn is_direct_chat_backend(backend_name: &str) -> bool {
+    backend_name == "metal-diffusion-gemma"
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn session_prompt_messages(session: &AgentSession, user_input: &str) -> Vec<ChatPromptMessage> {
+    let mut messages = Vec::new();
+    for message in session.messages() {
+        let role = message.role.as_str();
+        if role == "tool" || !message.tool_calls.is_empty() {
+            continue;
+        }
+        if role == "system" && message.content.trim().is_empty() {
+            continue;
+        }
+        messages.push(ChatPromptMessage::new(role, message.content.clone()));
+    }
+    messages.push(ChatPromptMessage::user(user_input));
+    messages
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn finish_reason_label(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn run_direct_chat_completion(
+    engine: &mut dyn InferenceEngine,
+    session: &mut AgentSession,
+    input: &str,
+    max_tokens: usize,
+    temperature: f32,
+) -> Result<AgentTurnResult> {
+    let prompt_messages = session_prompt_messages(session, input);
+    let prompt = engine.render_chat_prompt(&prompt_messages)?;
+    let started_at = Instant::now();
+    let output = engine.complete(CompletionRequest {
+        prompt: prompt.clone(),
+        max_tokens,
+        sampling: SamplingParams {
+            temperature,
+            ..SamplingParams::default()
+        },
+        // The checkpoint template and diffusion config own EOS handling. A
+        // ChatML stop string here is wrong for DiffusionGemma.
+        stop: None,
+        logprobs: false,
+        session_id: None,
+        trace_context: None,
+        cancel: None,
+    })?;
+    let decode_secs = started_at.elapsed().as_secs_f64();
+    let prompt_tokens = output.usage.prompt_tokens as u64;
+    let completion_tokens = output.usage.completion_tokens as u64;
+    let terminal_state = if output.text.trim().is_empty() {
+        TerminalState::EmptyNoProgress
+    } else {
+        TerminalState::Stop
+    };
+    let tokens = if output.prompt_token_ids.is_empty() || output.response_token_ids.is_empty() {
+        None
+    } else {
+        Some(TokensRecord {
+            prompt_ids: output.prompt_token_ids.clone(),
+            response_ids: output.response_token_ids.clone(),
+            response_mask: std::iter::repeat_n(1u8, output.response_token_ids.len()).collect(),
+        })
+    };
+    let messages = vec![
+        TrajectoryMessage {
+            role: TrajectoryRole::User,
+            content: MessageContent::Text(input.to_string()),
+            tool_use_id: None,
+            result_truncated: None,
+        },
+        TrajectoryMessage {
+            role: TrajectoryRole::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::Text {
+                text: output.text.clone(),
+            }]),
+            tool_use_id: None,
+            result_truncated: None,
+        },
+    ];
+    let sub_turns = vec![SubTurnRecord {
+        index: 0,
+        prompt_text: Some(prompt),
+        completion_text: output.text.clone(),
+        usage: ToolUsage {
+            prompt_tokens,
+            completion_tokens,
+        },
+        ttft_ms: None,
+        decode_secs,
+        finish_reason: finish_reason_label(output.finish_reason).to_string(),
+    }];
+    session.append_plain_turn(input, &output.text);
+    Ok(AgentTurnResult {
+        text: output.text,
+        tool_calls_executed: 0,
+        prompt_tokens,
+        completion_tokens,
+        max_turns_reached: false,
+        trace_events: Vec::new(),
+        time_to_first_token: None,
+        messages,
+        sub_turns,
+        terminal_state,
+        wall_secs: decode_secs,
+        tokens,
+    })
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn run_direct_chat_turn(
+    engine: &mut dyn InferenceEngine,
+    backend_name: &str,
+    session: &mut AgentSession,
+    session_stats: &mut SessionStats,
+    input: &str,
+    max_tokens: usize,
+    temperature: f32,
+    trace: Option<&TraceWriter>,
+) {
+    let start = Instant::now();
+    let color_on = io::stdout().is_terminal();
+    let mut spinner = ThinkingSpinner::new_with_label(io::stderr().is_terminal(), "denoising");
+    let mut tps_meter = crate::tps::TpsMeter::new();
+    spinner.start();
+    let result = run_direct_chat_completion(engine, session, input, max_tokens, temperature);
+    spinner.stop();
+    match result {
+        Ok(result) => {
+            let trimmed = result.text.trim();
+            if trimmed.is_empty() {
+                println!(
+                    "\x1b[2m(chat model produced an empty reply — finish_reason={}, completion_tokens={})\x1b[0m",
+                    result
+                        .sub_turns
+                        .last()
+                        .map(|turn| turn.finish_reason.as_str())
+                        .unwrap_or("unknown"),
+                    result.completion_tokens
+                );
+            } else if color_on {
+                println!("\x1b[1;34m{}\x1b[0m", trimmed);
+            } else {
+                println!("{trimmed}");
+            }
+            let elapsed = start.elapsed();
+            tps_meter.print_final(result.prompt_tokens, Some(result.completion_tokens), None);
+            session_stats.record_turn(result.prompt_tokens, result.completion_tokens, 0, elapsed);
+            if let Some(writer) = trace {
+                writer.write_turn(engine.model_id(), backend_name, input, &result);
+            }
+            println!();
+        }
+        Err(e) => {
+            eprintln!("\x1b[1;31mError: {e:#}\x1b[0m");
+            println!();
+        }
+    }
 }
 
 /// Animated "thinking…" spinner shown on stderr while the model is computing
@@ -750,6 +963,7 @@ fn handle_repl_input(
 struct ThinkingSpinner {
     bar: Option<indicatif::ProgressBar>,
     enabled: bool,
+    label: &'static str,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -757,7 +971,15 @@ impl ThinkingSpinner {
     /// `enabled` should be `io::stderr().is_terminal()`. When false every
     /// method is inert and `bar` stays `None`.
     fn new(enabled: bool) -> Self {
-        Self { bar: None, enabled }
+        Self::new_with_label(enabled, "thinking")
+    }
+
+    fn new_with_label(enabled: bool, label: &'static str) -> Self {
+        Self {
+            bar: None,
+            enabled,
+            label,
+        }
     }
 
     /// Create + steady-tick a spinner if enabled and none is currently active.
@@ -767,8 +989,9 @@ impl ThinkingSpinner {
             return;
         }
         let bar = indicatif::ProgressBar::new_spinner();
+        let template = format!("{{spinner:.cyan}} {}… {{elapsed}}", self.label);
         bar.set_style(
-            indicatif::ProgressStyle::with_template("{spinner:.cyan} thinking… {elapsed}")
+            indicatif::ProgressStyle::with_template(&template)
                 .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
         );
         bar.enable_steady_tick(Duration::from_millis(80));
@@ -1514,11 +1737,18 @@ mod tests {
     use super::{
         ReplCommand, SessionStats, ThinkingSpinner, brief_tool_args, brief_tool_result,
         count_export_turns, detect_family, format_iso8601_utc, format_tool_call_line,
-        handle_export_command, handle_models_command, parse_repl_command, render_history_markdown,
-        resolve_export_path, truncate_one_line,
+        handle_export_command, handle_models_command, is_direct_chat_backend, parse_repl_command,
+        render_history_markdown, resolve_export_path, run_direct_chat_completion,
+        truncate_one_line,
     };
+    use agent::AgentSession;
     use chat::ChatMessage;
+    use infer_api::{
+        ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
+        FinishReason, InferenceEngine, TokenUsage,
+    };
     use std::time::Duration;
+    use tokio::sync::mpsc::UnboundedSender;
 
     #[test]
     fn thinking_spinner_disabled_is_a_no_op() {
@@ -1537,6 +1767,72 @@ mod tests {
         assert!(spinner.bar.is_none());
         spinner.stop(); // idempotent / safe when none active
         assert!(spinner.bar.is_none());
+    }
+
+    struct FakeChatEngine {
+        rendered: String,
+    }
+
+    impl InferenceEngine for FakeChatEngine {
+        fn model_id(&self) -> &str {
+            "fake-diffusion"
+        }
+
+        fn complete(&mut self, req: CompletionRequest) -> anyhow::Result<CompletionOutput> {
+            assert_eq!(req.prompt, self.rendered);
+            assert!(
+                req.stop.is_none(),
+                "Diffusion direct chat must not use ChatML stop"
+            );
+            Ok(CompletionOutput {
+                text: "hi".to_string(),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::new(3, 2),
+                token_logprobs: Vec::new(),
+                prompt_token_ids: vec![1, 2, 3],
+                response_token_ids: vec![4, 5],
+            })
+        }
+
+        fn complete_stream(
+            &mut self,
+            _req: CompletionRequest,
+            _tx: UnboundedSender<CompletionStreamDelta>,
+        ) -> anyhow::Result<()> {
+            unreachable!("direct chat completion uses the non-streaming call")
+        }
+
+        fn tokenize(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+            Ok(text.bytes().map(u32::from).collect())
+        }
+
+        fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> anyhow::Result<String> {
+            assert_eq!(
+                messages.len(),
+                1,
+                "Diffusion direct chat should not inject a generic system prompt"
+            );
+            assert_eq!(messages.last().map(|m| m.role.as_str()), Some("user"));
+            Ok(self.rendered.clone())
+        }
+    }
+
+    #[test]
+    fn diffusion_backend_uses_direct_chat_template_path() {
+        assert!(is_direct_chat_backend("metal-diffusion-gemma"));
+        assert!(!is_direct_chat_backend("metal"));
+
+        let mut engine = FakeChatEngine {
+            rendered: "<bos><|turn>user\nSay hi<turn|>\n<|turn>model\n".to_string(),
+        };
+        let mut session = AgentSession::with_system_prompt("");
+        let result =
+            run_direct_chat_completion(&mut engine, &mut session, "Say hi", 8, 0.0).unwrap();
+
+        assert_eq!(result.text, "hi");
+        assert_eq!(result.prompt_tokens, 3);
+        assert_eq!(result.completion_tokens, 2);
+        assert_eq!(session.stats().conversation_messages, 2);
     }
 
     #[test]

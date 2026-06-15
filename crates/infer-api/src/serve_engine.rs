@@ -9,8 +9,8 @@ use infer_server::{OpenAiTokenizer, ServeHandle, StreamItem};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::types::{
-    CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry, FinishReason,
-    InferenceEngine, TokenUsage,
+    ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry,
+    FinishReason, InferenceEngine, TokenUsage,
 };
 
 /// Adapter over one running [`ServeHandle`] + its tokenizer, generic over the
@@ -270,6 +270,17 @@ where
         self.tokenizer
             .encode(text)
             .map_err(|err| anyhow!("tokenize failed: {err}"))
+    }
+
+    fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
+        let rows = messages
+            .iter()
+            .map(|message| infer_server::ChatMessage {
+                role: message.role.clone(),
+                content: Some(message.content.clone()),
+            })
+            .collect::<Vec<_>>();
+        self.tokenizer.render_chat(&rows)
     }
 
     fn telemetry(&self) -> EngineTelemetry {
