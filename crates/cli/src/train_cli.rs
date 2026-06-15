@@ -28,6 +28,29 @@ use crate::{
 
 const TRAIN_ENV_COMMANDS: &[&str] = &["train env", "train estimate-memory", "train opd"];
 
+fn opd_step_profile_enabled() -> bool {
+    std::env::var_os("ARLE_OPD_STEP_PROFILE").is_some()
+}
+
+fn print_opd_step_profile(step: usize, profile: &train::opd::OpdStepProfile) {
+    println!(
+        "opd_step_profile step={step} total_seconds={:.6} student_rollout_seconds={:.6} \
+         teacher_forward_seconds={:.6} student_forward_seconds={:.6} kl_loss_seconds={:.6} \
+         backward_seconds={:.6} optimizer_zero_grad_seconds={:.6} grad_clip_seconds={:.6} \
+         optimizer_step_seconds={:.6} post_step_cleanup_seconds={:.6}",
+        profile.total_seconds,
+        profile.student_rollout_seconds,
+        profile.teacher_forward_seconds,
+        profile.student_forward_seconds,
+        profile.kl_loss_seconds,
+        profile.backward_seconds,
+        profile.optimizer_zero_grad_seconds,
+        profile.grad_clip_seconds,
+        profile.optimizer_step_seconds,
+        profile.post_step_cleanup_seconds,
+    );
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct OpdStepMetric {
     step: usize,
@@ -273,6 +296,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     for step in 1..=args.steps {
+        let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
         let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
             &student,
             &teacher_forward,
@@ -293,7 +317,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             },
             #[cfg(feature = "cuda")]
             None,
-            None,
+            step_profile.as_mut(),
         )
         .with_context(|| format!("opd step {step} failed"))?;
         losses.push(outcome.loss);
@@ -304,6 +328,9 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 loss = outcome.loss,
                 rl = outcome.rollout_len,
             );
+            if let Some(profile) = step_profile.as_ref() {
+                print_opd_step_profile(step, profile);
+            }
         }
     }
 
@@ -665,6 +692,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
     let mut reverts = 0usize;
     for step in 1..=args.steps {
+        let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
         let outcome = {
             let teacher = ema.as_teacher();
             opd_step_with_teacher_forward_profiled_gkd_anchor(
@@ -687,7 +715,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                 },
                 #[cfg(feature = "cuda")]
                 None,
-                None,
+                step_profile.as_mut(),
             )
             .with_context(|| format!("self-opd step {step} failed"))?
         };
@@ -734,6 +762,9 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                     loss = outcome.loss,
                     rl = outcome.rollout_len,
                 );
+            }
+            if let Some(profile) = step_profile.as_ref() {
+                print_opd_step_profile(step, profile);
             }
         }
     }
