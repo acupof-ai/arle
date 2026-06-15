@@ -1041,7 +1041,7 @@ impl SafetensorLoader {
             (None, None, None)
         };
         let (gate_global_ptrs, up_global_ptrs, down_global_ptrs) =
-            if expert_weight_format == WeightFormat::Fp4E2M1Group {
+            if routed_quant && expert_weight_format == WeightFormat::Fp4E2M1Group {
                 let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
                 let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
                 let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
@@ -1112,6 +1112,9 @@ impl SafetensorLoader {
     }
 
     fn quant_view_for(&self, name: &str) -> Result<Option<QuantTensorView>> {
+        if self.quant_manifest.is_none() {
+            return Ok(None);
+        }
         let headers = self.tensor_headers()?;
         let mut candidates = vec![name.to_owned()];
         if let Some(base) = name.strip_suffix(".weight") {
@@ -2354,6 +2357,57 @@ pub(crate) struct OwnedTensor {
     pub(crate) dtype: Dtype,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpertQuantDispatchSignature {
+    rows: usize,
+    cols: usize,
+    quant_scale_rows: usize,
+    quant_scale_cols: usize,
+    quant_block_m: usize,
+    quant_block_k: usize,
+    group_size: usize,
+}
+
+impl ExpertQuantDispatchSignature {
+    fn from_matrix(matrix: &DeviceMatrix) -> Self {
+        Self {
+            rows: matrix.rows,
+            cols: matrix.cols,
+            quant_scale_rows: matrix.quant_scale_rows,
+            quant_scale_cols: matrix.quant_scale_cols,
+            quant_block_m: matrix.quant_block_m,
+            quant_block_k: matrix.quant_block_k,
+            group_size: matrix.group_size,
+        }
+    }
+}
+
+fn validate_expert_projection_dispatch_signature(
+    name: &str,
+    experts: &[DeviceMatrix],
+    format: WeightFormat,
+) -> Result<Option<ExpertQuantDispatchSignature>> {
+    let first = experts
+        .first()
+        .ok_or_else(|| anyhow!("MoE layer has no local {name} experts"))?;
+    let first_sig = ExpertQuantDispatchSignature::from_matrix(first);
+    for (idx, expert) in experts.iter().enumerate() {
+        ensure!(
+            expert.weight_format() == format,
+            "Qwen3.6 MoE {name} expert {idx} format {} != {format}",
+            expert.weight_format()
+        );
+        if format.is_quantized() {
+            let sig = ExpertQuantDispatchSignature::from_matrix(expert);
+            ensure!(
+                sig == first_sig,
+                "Qwen3.6 MoE {name} expert {idx} quant dispatch signature {sig:?} != {first_sig:?}"
+            );
+        }
+    }
+    Ok(format.is_quantized().then_some(first_sig))
+}
+
 fn routed_expert_weight_format(
     gate: &[DeviceMatrix],
     up: &[DeviceMatrix],
@@ -2373,14 +2427,14 @@ fn routed_expert_weight_format(
         ),
         "Qwen3.6 MoE routed expert format {first} is not supported"
     );
-    for (name, experts) in [("gate", gate), ("up", up), ("down", down)] {
-        for (idx, expert) in experts.iter().enumerate() {
-            ensure!(
-                expert.weight_format() == first,
-                "Qwen3.6 MoE {name} expert {idx} format {} != {first}",
-                expert.weight_format()
-            );
-        }
+    let gate_sig = validate_expert_projection_dispatch_signature("gate", gate, first)?;
+    let up_sig = validate_expert_projection_dispatch_signature("up", up, first)?;
+    let _down_sig = validate_expert_projection_dispatch_signature("down", down, first)?;
+    if let (Some(gate_sig), Some(up_sig)) = (gate_sig, up_sig) {
+        ensure!(
+            gate_sig == up_sig,
+            "Qwen3.6 MoE gate/up quant dispatch signature mismatch: gate={gate_sig:?} up={up_sig:?}"
+        );
     }
     Ok(first)
 }
