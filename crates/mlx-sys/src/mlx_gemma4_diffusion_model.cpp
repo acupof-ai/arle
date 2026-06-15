@@ -12,6 +12,8 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <numeric>
+#include <optional>
 #include <stdexcept>
 
 namespace {
@@ -51,10 +53,45 @@ array array_from_i32(const int32_t* data, int32_t len) {
     return array(std::move(buf), Shape{len}, int32);
 }
 
+size_t shape_size(const Shape& shape) {
+    size_t size = 1;
+    for (int dim : shape) {
+        if (dim < 0) {
+            throw std::invalid_argument("negative array shape");
+        }
+        size *= static_cast<size_t>(dim);
+    }
+    return size;
+}
+
+array array_from_i32(const int32_t* data, const Shape& shape) {
+    const size_t count = shape_size(shape);
+    if (count > 0 && data == nullptr) {
+        throw std::invalid_argument("non-empty int32 input has null data pointer");
+    }
+    auto buf = allocator::malloc(count * sizeof(int32_t));
+    if (count > 0) {
+        std::memcpy(buf.raw_ptr(), data, count * sizeof(int32_t));
+    }
+    return array(std::move(buf), shape, int32);
+}
+
 array array_from_f32(const std::vector<float>& data, const Shape& shape) {
     auto buf = allocator::malloc(data.size() * sizeof(float));
     if (!data.empty()) {
         std::memcpy(buf.raw_ptr(), data.data(), data.size() * sizeof(float));
+    }
+    return array(std::move(buf), shape, float32);
+}
+
+array array_from_f32(const float* data, const Shape& shape) {
+    const size_t count = shape_size(shape);
+    if (count > 0 && data == nullptr) {
+        throw std::invalid_argument("non-empty float input has null data pointer");
+    }
+    auto buf = allocator::malloc(count * sizeof(float));
+    if (count > 0) {
+        std::memcpy(buf.raw_ptr(), data, count * sizeof(float));
     }
     return array(std::move(buf), shape, float32);
 }
@@ -177,6 +214,67 @@ struct LayerWeights {
     array layer_scalar = array(1.0f);
 };
 
+struct ClipLinearWeight {
+    QWeight linear;
+    array input_min = array(0);
+    array input_max = array(0);
+    array output_min = array(0);
+    array output_max = array(0);
+    bool use_clipping = false;
+
+    array apply(const array& x) const {
+        auto y = x;
+        if (use_clipping) {
+            y = clip(y, std::optional<array>(input_min), std::optional<array>(input_max));
+        }
+        y = linear.apply(y);
+        if (use_clipping) {
+            y = clip(y, std::optional<array>(output_min), std::optional<array>(output_max));
+        }
+        return y;
+    }
+};
+
+struct VisionLayerWeights {
+    array input_ln = array(0);
+    ClipLinearWeight q_proj;
+    ClipLinearWeight k_proj;
+    ClipLinearWeight v_proj;
+    ClipLinearWeight o_proj;
+    array q_norm = array(0);
+    array k_norm = array(0);
+    array post_attn_ln = array(0);
+
+    array pre_ff_ln = array(0);
+    ClipLinearWeight gate_proj;
+    ClipLinearWeight up_proj;
+    ClipLinearWeight down_proj;
+    array post_ff_ln = array(0);
+};
+
+struct VisionWeights {
+    bool ready = false;
+    int image_token_id = -1;
+    int hidden_size = 0;
+    int intermediate_size = 0;
+    int num_layers = 0;
+    int num_heads = 0;
+    int num_kv_heads = 0;
+    int head_dim = 0;
+    int patch_size = 16;
+    int pooling_kernel_size = 3;
+    int default_output_length = 280;
+    int position_embedding_size = 10240;
+    float rope_theta = 100.0f;
+    float rms_eps = 1e-6f;
+    bool use_clipping = false;
+
+    QWeight patch_proj;
+    array position_table = array(0);
+    QWeight projection;
+    std::vector<VisionLayerWeights> layers;
+};
+
 struct SelfConditioningWeights {
     array pre_norm = array(0);
     QWeight gate_proj;
@@ -249,6 +347,7 @@ struct DiffusionGemmaModel {
     array per_layer_projection_norm = array(0);
     std::vector<LayerWeights> layers;
     SelfConditioningWeights self_conditioning;
+    VisionWeights vision;
 
     std::vector<int32_t> context_tokens;
     std::vector<LayerCache> layer_caches;
@@ -333,6 +432,210 @@ struct DiffusionGemmaModel {
                     hidden_size_per_layer_input,
                 }),
             1);
+    }
+
+    array slice_last_dim(const array& x, int start_last, int stop_last) const {
+        Shape start(x.ndim(), 0);
+        Shape stop = x.shape();
+        Shape strides(x.ndim(), 1);
+        start[x.ndim() - 1] = start_last;
+        stop[x.ndim() - 1] = stop_last;
+        return slice(x, start, stop, strides);
+    }
+
+    array rotate_half_last_dim(const array& x) const {
+        const int width = x.shape(x.ndim() - 1);
+        const int half = width / 2;
+        auto x1 = slice_last_dim(x, 0, half);
+        auto x2 = slice_last_dim(x, half, width);
+        return concatenate(std::vector<array>{-x2, x1}, -1);
+    }
+
+    array vision_rms(const array& x, const array& weight) const {
+        return fast::rms_norm(x, weight, vision.rms_eps);
+    }
+
+    array vision_rms_no_weight(const array& x) const {
+        return fast::rms_norm(x, std::nullopt, vision.rms_eps);
+    }
+
+    std::vector<int32_t> vision_position_vector(int patch_rows, int patch_cols) const {
+        std::vector<int32_t> positions;
+        positions.reserve(static_cast<size_t>(patch_rows) * patch_cols * 2);
+        for (int y = 0; y < patch_rows; ++y) {
+            for (int x = 0; x < patch_cols; ++x) {
+                positions.push_back(x);
+                positions.push_back(y);
+            }
+        }
+        return positions;
+    }
+
+    array vision_positions_2d(int patch_rows, int patch_cols) const {
+        auto positions = vision_position_vector(patch_rows, patch_cols);
+        return array_from_i32(positions.data(), Shape{1, patch_rows * patch_cols, 2});
+    }
+
+    array vision_position_embeddings(int patch_rows, int patch_cols) const {
+        const int len = patch_rows * patch_cols;
+        std::vector<int32_t> xs;
+        std::vector<int32_t> ys;
+        xs.reserve(static_cast<size_t>(len));
+        ys.reserve(static_cast<size_t>(len));
+        for (int y = 0; y < patch_rows; ++y) {
+            for (int x = 0; x < patch_cols; ++x) {
+                xs.push_back(x);
+                ys.push_back(y);
+            }
+        }
+        auto x_ids = array_from_i32(xs.data(), len);
+        auto y_ids = array_from_i32(ys.data(), len);
+        auto table_x = squeeze(
+            slice(
+                vision.position_table,
+                Shape{0, 0, 0},
+                Shape{1, vision.position_embedding_size, vision.hidden_size}),
+            0);
+        auto table_y = squeeze(
+            slice(
+                vision.position_table,
+                Shape{1, 0, 0},
+                Shape{2, vision.position_embedding_size, vision.hidden_size}),
+            0);
+        return expand_dims(take(table_x, x_ids, 0) + take(table_y, y_ids, 0), 0);
+    }
+
+    array vision_rope(const array& inputs, const array& positions) const {
+        const int head_dim = inputs.shape(inputs.ndim() - 1);
+        constexpr int ndim = 2;
+        const int channels_per_dim = 2 * (head_dim / (2 * ndim));
+        const int half_per_dim = channels_per_dim / 2;
+        std::vector<array> parts;
+        parts.reserve(ndim);
+        for (int d = 0; d < ndim; ++d) {
+            auto x_part = slice_last_dim(
+                inputs,
+                d * channels_per_dim,
+                (d + 1) * channels_per_dim);
+            auto freq = astype(arange(0, half_per_dim), float32);
+            auto exponents = array(2.0f / static_cast<float>(channels_per_dim)) * freq;
+            auto timescale = power(array(vision.rope_theta), exponents);
+            auto pos_d = slice(
+                positions,
+                Shape{0, 0, d},
+                Shape{positions.shape(0), positions.shape(1), d + 1});
+            auto sinusoid = astype(pos_d, float32) / timescale;
+            auto cos_d = astype(
+                concatenate(std::vector<array>{cos(sinusoid), cos(sinusoid)}, -1),
+                inputs.dtype());
+            auto sin_d = astype(
+                concatenate(std::vector<array>{sin(sinusoid), sin(sinusoid)}, -1),
+                inputs.dtype());
+            cos_d = expand_dims(cos_d, 2);
+            sin_d = expand_dims(sin_d, 2);
+            parts.push_back(x_part * cos_d + rotate_half_last_dim(x_part) * sin_d);
+        }
+        return concatenate(parts, -1);
+    }
+
+    array vision_patch_embeddings(const float* pixels, int height, int width) const {
+        const int p = vision.patch_size;
+        const int patch_rows = height / p;
+        const int patch_cols = width / p;
+        const int len = patch_rows * patch_cols;
+        auto pixel_values = array_from_f32(pixels, Shape{1, 3, height, width});
+        auto patches = reshape(pixel_values, Shape{1, 3, patch_rows, p, patch_cols, p});
+        patches = transpose(patches, {0, 2, 4, 3, 5, 1});
+        patches = reshape(patches, Shape{1, len, 3 * p * p});
+        patches = array(2.0f) * (patches - array(0.5f));
+        patches = astype(patches, vision.patch_proj.w.dtype());
+        return vision.patch_proj.apply(patches) + vision_position_embeddings(patch_rows, patch_cols);
+    }
+
+    array vision_attention(
+        const array& x,
+        const array& positions,
+        const VisionLayerWeights& layer) const {
+        const int batch = x.shape(0);
+        const int len = x.shape(1);
+        auto q = reshape(
+            layer.q_proj.apply(x),
+            Shape{batch, len, vision.num_heads, vision.head_dim});
+        auto k = reshape(
+            layer.k_proj.apply(x),
+            Shape{batch, len, vision.num_kv_heads, vision.head_dim});
+        auto v = reshape(
+            layer.v_proj.apply(x),
+            Shape{batch, len, vision.num_kv_heads, vision.head_dim});
+        q = vision_rms(q, layer.q_norm);
+        k = vision_rms(k, layer.k_norm);
+        v = vision_rms_no_weight(v);
+        q = transpose(vision_rope(q, positions), {0, 2, 1, 3});
+        k = transpose(vision_rope(k, positions), {0, 2, 1, 3});
+        v = transpose(v, {0, 2, 1, 3});
+        auto attn = fast::scaled_dot_product_attention(q, k, v, 1.0f, "");
+        auto flat = reshape(
+            transpose(attn, {0, 2, 1, 3}),
+            Shape{batch, len, vision.num_heads * vision.head_dim});
+        return layer.o_proj.apply(flat);
+    }
+
+    array vision_pool(const array& x, int patch_rows, int patch_cols, int soft_tokens) const {
+        const int k = vision.pooling_kernel_size;
+        if (patch_rows % k != 0 || patch_cols % k != 0) {
+            throw std::invalid_argument("Gemma4 vision patch grid is not divisible by pooling kernel");
+        }
+        const int pooled_rows = patch_rows / k;
+        const int pooled_cols = patch_cols / k;
+        const int expected = pooled_rows * pooled_cols;
+        if (soft_tokens != expected) {
+            throw std::invalid_argument("Gemma4 image soft-token count does not match patch grid");
+        }
+        auto grid = reshape(x, Shape{1, patch_rows, patch_cols, vision.hidden_size});
+        auto grouped = reshape(
+            grid,
+            Shape{1, pooled_rows, k, pooled_cols, k, vision.hidden_size});
+        auto pooled = mean(grouped, 4, false);
+        pooled = mean(pooled, 2, false);
+        pooled = reshape(pooled, Shape{1, soft_tokens, vision.hidden_size});
+        return pooled * array(std::sqrt(static_cast<float>(vision.hidden_size)));
+    }
+
+    array vision_encode_image(
+        const float* pixels,
+        int height,
+        int width,
+        int soft_tokens) const {
+        if (!vision.ready) {
+            throw std::runtime_error("Gemma4 vision weights are not registered");
+        }
+        if (pixels == nullptr || height <= 0 || width <= 0 || soft_tokens <= 0) {
+            throw std::invalid_argument("Gemma4 image input is invalid");
+        }
+        if (height % vision.patch_size != 0 || width % vision.patch_size != 0) {
+            throw std::invalid_argument("Gemma4 image dimensions must align to patch size");
+        }
+        const int patch_rows = height / vision.patch_size;
+        const int patch_cols = width / vision.patch_size;
+        auto x = vision_patch_embeddings(pixels, height, width);
+        auto positions = vision_positions_2d(patch_rows, patch_cols);
+        for (const auto& layer : vision.layers) {
+            auto residual = x;
+            auto h = vision_rms(x, layer.input_ln);
+            h = vision_attention(h, positions, layer);
+            h = vision_rms(h, layer.post_attn_ln);
+            x = residual + h;
+
+            residual = x;
+            h = vision_rms(x, layer.pre_ff_ln);
+            h = layer.down_proj.apply(geglu(layer.gate_proj.apply(h), layer.up_proj.apply(h)));
+            h = vision_rms(h, layer.post_ff_ln);
+            x = residual + h;
+        }
+        auto pooled = vision_pool(x, patch_rows, patch_cols, soft_tokens);
+        auto projected = vision.projection.apply(pooled);
+        projected = vision_rms_no_weight(projected);
+        return projected * array(std::sqrt(static_cast<float>(hidden_size)));
     }
 
     void reset_request_state() {
@@ -626,11 +929,12 @@ struct DiffusionGemmaModel {
         return rms_no_weight(x + signal);
     }
 
-    array encode_tokens_with_output(
-        const int32_t* tokens,
-        int len,
+    array encode_embeddings_with_output(
+        const array& token_ids,
+        const array& input_embeddings,
         std::vector<LayerCache>& caches,
         int offset) const {
+        const int len = token_ids.shape(0);
         if (len <= 0) {
             return array(0);
         }
@@ -640,8 +944,7 @@ struct DiffusionGemmaModel {
         if (caches.size() != layers.size()) {
             throw std::runtime_error("DiffusionGemma cache size mismatch");
         }
-        auto token_ids = array_from_i32(tokens, static_cast<int32_t>(len));
-        auto x = token_embeddings(token_ids);
+        auto x = input_embeddings;
         auto per_layer_inputs = per_layer_inputs_for_tokens(token_ids, x);
 
         for (size_t layer_idx = 0; layer_idx < layers.size(); ++layer_idx) {
@@ -681,6 +984,66 @@ struct DiffusionGemmaModel {
             x = x * layer.layer_scalar;
         }
         return x;
+    }
+
+    array encode_tokens_with_output(
+        const int32_t* tokens,
+        int len,
+        std::vector<LayerCache>& caches,
+        int offset) const {
+        if (len <= 0) {
+            return array(0);
+        }
+        auto token_ids = array_from_i32(tokens, static_cast<int32_t>(len));
+        return encode_embeddings_with_output(token_ids, token_embeddings(token_ids), caches, offset);
+    }
+
+    array encode_multimodal_tokens_with_output(
+        const int32_t* tokens,
+        int len,
+        const float* image_pixels,
+        int image_height,
+        int image_width,
+        int image_soft_tokens,
+        std::vector<LayerCache>& caches,
+        int offset) const {
+        if (len <= 0) {
+            return array(0);
+        }
+        auto token_ids = array_from_i32(tokens, static_cast<int32_t>(len));
+        auto x = token_embeddings(token_ids);
+        auto image_embeds =
+            vision_encode_image(image_pixels, image_height, image_width, image_soft_tokens);
+
+        std::vector<int32_t> ple_tokens(tokens, tokens + len);
+        int seen = 0;
+        for (int i = 0; i < len; ++i) {
+            if (tokens[i] != vision.image_token_id) {
+                continue;
+            }
+            if (seen >= image_soft_tokens) {
+                throw std::invalid_argument("Gemma4 prompt has more image tokens than image embeddings");
+            }
+            auto update = slice(
+                image_embeds,
+                Shape{0, seen, 0},
+                Shape{1, seen + 1, hidden_size});
+            update = reshape(update, Shape{1, hidden_size});
+            x = slice_update(
+                x,
+                update,
+                Shape{i, 0},
+                Shape{i + 1, hidden_size},
+                Shape{1, 1});
+            ple_tokens[static_cast<size_t>(i)] = 0;
+            seen += 1;
+        }
+        if (seen != image_soft_tokens) {
+            throw std::invalid_argument("Gemma4 prompt image token count does not match image embeddings");
+        }
+        auto ple_token_ids =
+            array_from_i32(ple_tokens.data(), static_cast<int32_t>(ple_tokens.size()));
+        return encode_embeddings_with_output(ple_token_ids, x, caches, offset);
     }
 
     void encode_tokens_into(
@@ -800,6 +1163,34 @@ struct DiffusionGemmaModel {
         return logits_from_hidden(hidden);
     }
 
+    array commit_multimodal_prompt_and_logits(
+        const int32_t* tokens,
+        int len,
+        const float* image_pixels,
+        int image_height,
+        int image_width,
+        int image_soft_tokens) {
+        if (len <= 0) {
+            throw std::invalid_argument("Gemma4 causal multimodal generate received empty prompt");
+        }
+        auto next_caches = layer_caches;
+        auto hidden = encode_multimodal_tokens_with_output(
+            tokens,
+            len,
+            image_pixels,
+            image_height,
+            image_width,
+            image_soft_tokens,
+            next_caches,
+            context_len);
+        layer_caches = std::move(next_caches);
+        context_tokens.insert(context_tokens.end(), tokens, tokens + len);
+        context_len += len;
+        self_conditioning_len = 0;
+        self_conditioning_embeds = array(0);
+        return logits_from_hidden(hidden);
+    }
+
     int32_t greedy_next_token(const array& logits) const {
         const int rows = logits.shape(0);
         if (rows <= 0) {
@@ -860,6 +1251,76 @@ struct DiffusionGemmaModel {
         while (static_cast<int>(output.size()) < max_new_tokens) {
             if (cancelled(cancel_fn, cancel_ctx)) {
                 throw std::runtime_error("Gemma4 causal generation cancelled");
+            }
+            const int32_t next = greedy_next_token(logits);
+            output.push_back(next);
+            const uint32_t next_u32 = static_cast<uint32_t>(next);
+            if (is_stop_token(next_u32, stop_ids, stop_ids_len)) {
+                result.finish = 1;
+                break;
+            }
+            if (static_cast<int>(output.size()) >= max_new_tokens) {
+                break;
+            }
+            logits = commit_tokens_and_logits(&next, 1);
+        }
+
+        for (size_t i = 0; i < output.size(); ++i) {
+            out_tokens[i] = static_cast<uint32_t>(output[i]);
+        }
+        result.tokens = static_cast<int>(output.size());
+        result.blocks = result.tokens;
+        result.steps = result.tokens;
+        return result;
+    }
+
+    DiffusionGenerateResult generate_causal_with_image_into(
+        const int32_t* prompt,
+        int prompt_len,
+        const float* image_pixels,
+        int image_height,
+        int image_width,
+        int image_soft_tokens,
+        int max_new_tokens,
+        uint64_t seed,
+        const uint32_t* stop_ids,
+        int stop_ids_len,
+        DiffusionCancelFn cancel_fn,
+        const void* cancel_ctx,
+        uint32_t* out_tokens) {
+        if (prompt_len <= 0 || prompt == nullptr) {
+            throw std::invalid_argument("Gemma4 causal image generate requires a non-empty prompt");
+        }
+        if (max_new_tokens < 0) {
+            throw std::invalid_argument("Gemma4 causal image generate received invalid max_new_tokens");
+        }
+        if (max_new_tokens > 0 && out_tokens == nullptr) {
+            throw std::invalid_argument("Gemma4 causal image generate output buffer is null");
+        }
+        if (stop_ids_len < 0 || (stop_ids_len > 0 && stop_ids == nullptr)) {
+            throw std::invalid_argument("Gemma4 causal image generate received invalid stop ids");
+        }
+
+        random::seed(seed);
+        reset_request_state();
+        if (cancelled(cancel_fn, cancel_ctx)) {
+            throw std::runtime_error("Gemma4 causal image generation cancelled");
+        }
+        auto logits = commit_multimodal_prompt_and_logits(
+            prompt,
+            prompt_len,
+            image_pixels,
+            image_height,
+            image_width,
+            image_soft_tokens);
+        std::vector<int32_t> output;
+        output.reserve(static_cast<size_t>(max_new_tokens));
+        DiffusionGenerateResult result;
+        result.finish = 0;
+
+        while (static_cast<int>(output.size()) < max_new_tokens) {
+            if (cancelled(cancel_fn, cancel_ctx)) {
+                throw std::runtime_error("Gemma4 causal image generation cancelled");
             }
             const int32_t next = greedy_next_token(logits);
             output.push_back(next);
@@ -1150,6 +1611,23 @@ QWeight make_affine(
     return weight;
 }
 
+ClipLinearWeight make_clip_linear(
+    DiffusionGemmaModel* model,
+    int32_t linear_id,
+    int32_t input_min_id,
+    int32_t input_max_id,
+    int32_t output_min_id,
+    int32_t output_max_id) {
+    ClipLinearWeight weight;
+    weight.linear = model->weight_by_id(linear_id);
+    weight.input_min = model->array_by_id(input_min_id);
+    weight.input_max = model->array_by_id(input_max_id);
+    weight.output_min = model->array_by_id(output_min_id);
+    weight.output_max = model->array_by_id(output_max_id);
+    weight.use_clipping = model->vision.use_clipping;
+    return weight;
+}
+
 int32_t catch_to_rc(const std::function<void()>& fn) {
     try {
         mlx_clear_error();
@@ -1257,6 +1735,163 @@ int32_t diffusion_gemma_set_per_layer_embeddings(
         m->hidden_size_per_layer_input = hidden_size_per_layer_input;
         m->vocab_size_per_layer_input = vocab_size_per_layer_input;
         m->has_per_layer_embeddings = true;
+    });
+}
+
+int32_t diffusion_gemma_set_vision_config(
+    void* model,
+    int32_t image_token_id,
+    int32_t hidden_size,
+    int32_t intermediate_size,
+    int32_t num_layers,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t patch_size,
+    int32_t pooling_kernel_size,
+    int32_t default_output_length,
+    int32_t position_embedding_size,
+    float rope_theta,
+    float rms_eps,
+    bool use_clipping,
+    int32_t patch_proj_id,
+    int32_t position_embedding_id,
+    int32_t vision_projection_id) {
+    return catch_to_rc([&]() {
+        auto* m = as_model(model);
+        if (image_token_id < 0 || hidden_size <= 0 || intermediate_size <= 0 ||
+            num_layers <= 0 || num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||
+            patch_size <= 0 || pooling_kernel_size <= 0 || default_output_length <= 0 ||
+            position_embedding_size <= 0) {
+            throw std::invalid_argument("Gemma4 vision config values must be positive");
+        }
+        m->vision.image_token_id = image_token_id;
+        m->vision.hidden_size = hidden_size;
+        m->vision.intermediate_size = intermediate_size;
+        m->vision.num_layers = num_layers;
+        m->vision.num_heads = num_heads;
+        m->vision.num_kv_heads = num_kv_heads;
+        m->vision.head_dim = head_dim;
+        m->vision.patch_size = patch_size;
+        m->vision.pooling_kernel_size = pooling_kernel_size;
+        m->vision.default_output_length = default_output_length;
+        m->vision.position_embedding_size = position_embedding_size;
+        m->vision.rope_theta = rope_theta;
+        m->vision.rms_eps = rms_eps;
+        m->vision.use_clipping = use_clipping;
+        m->vision.patch_proj = m->weight_by_id(patch_proj_id);
+        m->vision.position_table = m->array_by_id(position_embedding_id);
+        m->vision.projection = m->weight_by_id(vision_projection_id);
+        m->vision.layers.clear();
+        m->vision.ready = true;
+    });
+}
+
+int32_t diffusion_gemma_push_vision_layer(
+    void* model,
+    int32_t input_ln_id,
+    int32_t q_id,
+    int32_t q_input_min_id,
+    int32_t q_input_max_id,
+    int32_t q_output_min_id,
+    int32_t q_output_max_id,
+    int32_t k_id,
+    int32_t k_input_min_id,
+    int32_t k_input_max_id,
+    int32_t k_output_min_id,
+    int32_t k_output_max_id,
+    int32_t v_id,
+    int32_t v_input_min_id,
+    int32_t v_input_max_id,
+    int32_t v_output_min_id,
+    int32_t v_output_max_id,
+    int32_t o_id,
+    int32_t o_input_min_id,
+    int32_t o_input_max_id,
+    int32_t o_output_min_id,
+    int32_t o_output_max_id,
+    int32_t q_norm_id,
+    int32_t k_norm_id,
+    int32_t post_attn_ln_id,
+    int32_t pre_ff_ln_id,
+    int32_t gate_id,
+    int32_t gate_input_min_id,
+    int32_t gate_input_max_id,
+    int32_t gate_output_min_id,
+    int32_t gate_output_max_id,
+    int32_t up_id,
+    int32_t up_input_min_id,
+    int32_t up_input_max_id,
+    int32_t up_output_min_id,
+    int32_t up_output_max_id,
+    int32_t down_id,
+    int32_t down_input_min_id,
+    int32_t down_input_max_id,
+    int32_t down_output_min_id,
+    int32_t down_output_max_id,
+    int32_t post_ff_ln_id) {
+    return catch_to_rc([&]() {
+        auto* m = as_model(model);
+        if (!m->vision.ready) {
+            throw std::runtime_error("Gemma4 vision config must be registered before layers");
+        }
+        VisionLayerWeights layer;
+        layer.input_ln = m->array_by_id(input_ln_id);
+        layer.q_proj = make_clip_linear(
+            m,
+            q_id,
+            q_input_min_id,
+            q_input_max_id,
+            q_output_min_id,
+            q_output_max_id);
+        layer.k_proj = make_clip_linear(
+            m,
+            k_id,
+            k_input_min_id,
+            k_input_max_id,
+            k_output_min_id,
+            k_output_max_id);
+        layer.v_proj = make_clip_linear(
+            m,
+            v_id,
+            v_input_min_id,
+            v_input_max_id,
+            v_output_min_id,
+            v_output_max_id);
+        layer.o_proj = make_clip_linear(
+            m,
+            o_id,
+            o_input_min_id,
+            o_input_max_id,
+            o_output_min_id,
+            o_output_max_id);
+        layer.q_norm = m->array_by_id(q_norm_id);
+        layer.k_norm = m->array_by_id(k_norm_id);
+        layer.post_attn_ln = m->array_by_id(post_attn_ln_id);
+        layer.pre_ff_ln = m->array_by_id(pre_ff_ln_id);
+        layer.gate_proj = make_clip_linear(
+            m,
+            gate_id,
+            gate_input_min_id,
+            gate_input_max_id,
+            gate_output_min_id,
+            gate_output_max_id);
+        layer.up_proj = make_clip_linear(
+            m,
+            up_id,
+            up_input_min_id,
+            up_input_max_id,
+            up_output_min_id,
+            up_output_max_id);
+        layer.down_proj = make_clip_linear(
+            m,
+            down_id,
+            down_input_min_id,
+            down_input_max_id,
+            down_output_min_id,
+            down_output_max_id);
+        layer.post_ff_ln = m->array_by_id(post_ff_ln_id);
+        m->vision.layers.push_back(layer);
     });
 }
 
@@ -1389,6 +2024,10 @@ int32_t diffusion_gemma_finalize(void* model) {
         }
         if (m->requires_self_conditioning && !m->self_conditioning.ready) {
             throw std::runtime_error("DiffusionGemma self-conditioning weights not registered");
+        }
+        if (m->vision.ready &&
+            static_cast<int>(m->vision.layers.size()) != m->vision.num_layers) {
+            throw std::runtime_error("Gemma4 vision layer count does not match config");
         }
         m->layer_caches.assign(m->layers.size(), LayerCache{});
         m->finalized = true;
@@ -1575,6 +2214,47 @@ int32_t diffusion_gemma_generate_causal(
         auto result = m->generate_causal_into(
             prompt,
             prompt_len,
+            max_new_tokens,
+            seed,
+            stop_ids,
+            stop_ids_len,
+            cancel_fn,
+            cancel_ctx,
+            out_tokens);
+        *out_len = result.tokens;
+        *out_finish = result.finish;
+    });
+}
+
+int32_t diffusion_gemma_generate_causal_image(
+    void* model,
+    const int32_t* prompt,
+    int32_t prompt_len,
+    const float* image_pixels,
+    int32_t image_height,
+    int32_t image_width,
+    int32_t image_soft_tokens,
+    int32_t max_new_tokens,
+    uint64_t seed,
+    const uint32_t* stop_ids,
+    int32_t stop_ids_len,
+    DiffusionCancelFn cancel_fn,
+    const void* cancel_ctx,
+    uint32_t* out_tokens,
+    int32_t* out_len,
+    int32_t* out_finish) {
+    return catch_to_rc([&]() {
+        if (out_len == nullptr || out_finish == nullptr) {
+            throw std::invalid_argument("Gemma4 causal image generate outputs must be non-null");
+        }
+        auto* m = as_model(model);
+        auto result = m->generate_causal_with_image_into(
+            prompt,
+            prompt_len,
+            image_pixels,
+            image_height,
+            image_width,
+            image_soft_tokens,
             max_new_tokens,
             seed,
             stop_ids,

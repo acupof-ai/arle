@@ -7,7 +7,9 @@
 
 use std::cell::Cell;
 
-use infer_plan::{ForwardPlan, StepOutput};
+use infer_plan::{
+    DiffusionGenerateOutput, ForwardPlan, MultimodalImage, SamplingParams, StepOutput,
+};
 
 #[path = "allocator.rs"]
 mod allocator;
@@ -76,6 +78,18 @@ pub trait BackendExecutor {
     /// that do not expose model defaults keep their existing behavior.
     fn model_stop_token_ids(&self) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// Optional direct multimodal generation path for scalar backends whose
+    /// image/text fusion happens inside the backend-owned model wrapper.
+    fn generate_multimodal(
+        &mut self,
+        _prompt_tokens: &[u32],
+        _images: &[MultimodalImage],
+        _max_tokens: usize,
+        _sampling: &SamplingParams,
+    ) -> anyhow::Result<Option<DiffusionGenerateOutput>> {
+        Ok(None)
     }
 
     /// Maximum number of plan rows the backend can execute in one scheduler

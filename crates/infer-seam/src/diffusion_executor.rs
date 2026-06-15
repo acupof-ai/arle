@@ -6,7 +6,8 @@ use std::sync::{
 
 use infer_plan::{
     DiffusionBlockModel, DiffusionGenerateError, DiffusionGenerationConfig, FinishReason,
-    ForwardPlan, SlotToken, StepOutput, generate_diffusion_with_cancel,
+    ForwardPlan, MultimodalImage, SamplingParams, SlotToken, StepOutput,
+    generate_diffusion_with_cancel,
 };
 
 use crate::{BackendExecutor, KvPool, PollResult};
@@ -247,6 +248,21 @@ where
 
     fn model_stop_token_ids(&self) -> Vec<u32> {
         self.base_config.stop_token_ids.clone()
+    }
+
+    fn generate_multimodal(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[MultimodalImage],
+        max_tokens: usize,
+        sampling: &SamplingParams,
+    ) -> anyhow::Result<Option<infer_plan::DiffusionGenerateOutput>> {
+        let mut row_sampling = sampling.clone();
+        row_sampling.max_new_tokens = Some(max_tokens);
+        let config = Self::config_for_row(&self.base_config, &row_sampling);
+        self.model
+            .generate_multimodal_with_cancel(prompt_tokens, images, &config, self.cancel.as_deref())
+            .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
     fn max_rows_per_step(&self) -> usize {
