@@ -14,6 +14,8 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, ensure};
 use tokenizers::Tokenizer;
 
+#[cfg(test)]
+use crate::schema::ChatContent;
 use crate::schema::ChatMessage;
 
 /// How `render_chat` produces the prompt, resolved once at load time.
@@ -184,9 +186,10 @@ fn render_jinja(
     let rows: Vec<minijinja::Value> = messages
         .iter()
         .map(|m| {
+            let content = minijinja::Value::from_serialize(m.template_content());
             context! {
                 role => m.role.as_str(),
-                content => m.content.as_deref().unwrap_or(""),
+                content => content,
             }
         })
         .collect();
@@ -210,9 +213,7 @@ fn render_chatml(messages: &[ChatMessage]) -> Result<String> {
         out.push_str("<|im_start|>");
         out.push_str(role);
         out.push('\n');
-        if let Some(content) = message.content.as_deref() {
-            out.push_str(content);
-        }
+        out.push_str(&message.content_text());
         out.push_str("<|im_end|>\n");
     }
     out.push_str("<|im_start|>assistant\n");
@@ -230,23 +231,23 @@ fn render_deepseek_v4(messages: &[ChatMessage]) -> Result<String> {
     let mut out = String::from(DSV4_BOS);
     for (index, message) in messages.iter().enumerate() {
         let role = message.role.trim();
-        let content = message.content.as_deref().unwrap_or("");
+        let content = message.content_text();
         match role {
             "system" => {
                 ensure!(
                     index == 0,
                     "DeepSeek-V4 template: system message must be first"
                 );
-                out.push_str(content);
+                out.push_str(&content);
             }
             "user" => {
                 out.push_str(DSV4_USER);
-                out.push_str(content);
+                out.push_str(&content);
             }
             "assistant" => {
                 out.push_str(DSV4_ASSISTANT);
                 out.push_str(DSV4_THINK_END);
-                out.push_str(content);
+                out.push_str(&content);
                 out.push_str(DSV4_EOS);
             }
             other => anyhow::bail!(
@@ -367,7 +368,7 @@ mod tests {
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
-            content: Some(content.to_string()),
+            content: Some(ChatContent::Text(content.to_string())),
         }
     }
 
@@ -404,6 +405,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn jinja_receives_content_parts_as_sequences() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+            ]
+        }))
+        .unwrap();
+        let out = render_jinja(
+            "{%- for item in messages[0].content -%}{%- if item.type == 'text' -%}{{ item.text }}{%- elif item.type == 'image' -%}<|image|>{%- endif -%}{%- endfor -%}",
+            "",
+            "",
+            &[message],
+        )
+        .unwrap();
+        assert_eq!(out, "look<|image|>");
     }
 
     #[test]
@@ -564,11 +585,11 @@ mod real_checkpoint_tests {
             &[
                 ChatMessage {
                     role: "system".into(),
-                    content: Some("be brief".into()),
+                    content: Some(ChatContent::Text("be brief".into())),
                 },
                 ChatMessage {
                     role: "user".into(),
-                    content: Some("hi".into()),
+                    content: Some(ChatContent::Text("hi".into())),
                 },
             ],
         )
@@ -614,7 +635,7 @@ mod real_checkpoint_tests {
             &eos_token,
             &[ChatMessage {
                 role: "user".into(),
-                content: Some("hi".into()),
+                content: Some(ChatContent::Text("hi".into())),
             }],
         )
         .unwrap();

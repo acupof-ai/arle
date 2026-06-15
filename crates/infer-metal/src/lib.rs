@@ -18,6 +18,8 @@ mod dflash;
 #[cfg(feature = "metal")]
 mod diffusion_gemma;
 #[cfg(feature = "metal")]
+mod gemma4;
+#[cfg(feature = "metal")]
 mod loader;
 #[cfg(feature = "metal")]
 mod mlx;
@@ -33,7 +35,7 @@ mod weights;
 mod wired_limit;
 
 #[cfg(feature = "metal")]
-pub use config::model_dir_is_diffusion_gemma;
+pub use config::{model_dir_is_diffusion_gemma, model_dir_is_gemma4};
 #[cfg(feature = "metal")]
 pub use diffusion_gemma::{LoadedMetalDiffusionGemma, MetalDiffusionGemmaModel};
 pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
@@ -41,6 +43,8 @@ pub use executor::{MetalExecutor, MetalInflight, MetalKvCacheDtype};
 pub use executor::{
     default_t2_budget_bytes, paged_kv_read_fallbacks, paged_kv_read_hits, pipeline_fast_path_hits,
 };
+#[cfg(feature = "metal")]
+pub use gemma4::{LoadedMetalGemma4, MetalGemma4Model};
 pub use kv_pool::MetalKvPool;
 #[cfg(feature = "metal")]
 pub use mlx::{
