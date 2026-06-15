@@ -126,11 +126,11 @@ Per the speed-call update, the already-near-done greedy arm was allowed to finis
 | greedy first 20 | `2.371392 -> 2.363729 -> 2.356122 -> 2.348320 -> 2.339962` | `-0.031430` | `140.750` | `105.724 / 7.634 / 7.677 / 2.351 / 17.357` | baseline |
 | `--rollout-temperature 1.0` | `2.371392 -> 2.366468 -> 2.360371 -> 2.355478 -> 2.350288` | `-0.021104` | `141.756` | `106.619 / 7.595 / 7.743 / 2.345 / 17.446` | `+0.714%` |
 
-Training-loss lift was too small to license sampling: greedy mean loss
-`7.26e-6`, sampled mean loss `8.35e-6`. Sampled was `+0.010326` worse NLL at
-step 20 and only `+0.714%` slower, so the performance risk is acceptable but the
-directional quality read kills default sampling for this shape. Keep greedy
-default.
+Training-loss lift was too small to interpret quality: greedy mean loss
+`7.26e-6`, sampled mean loss `8.35e-6`. This is a barely-learning cold-start run,
+so the sampled-vs-greedy `+0.010326` NLL gap at step 20 is noise from a
+confounded setup, not a sampling-method verdict. The valid P0 fact from this
+run is performance only: temperature sampling added `+0.714%` s/step.
 
 Greedy full 50 for reference:
 `2.371392 -> 2.363729 -> 2.356122 -> 2.348320 -> 2.339962 -> 2.330731 -> 2.320419 -> 2.308982 -> 2.296615 -> 2.283705 -> 2.270887`;
@@ -149,9 +149,11 @@ GiB V100 CPU host.
 | reverse KL | `2.371392 -> 2.371391 -> 2.371389 -> 2.371389 -> 2.371387` | `-0.000005` | `140.195` | `104.973 / 7.838 / 7.607 / 10.364 / 17.010` | `-1.796%` |
 
 Reverse is now proven reachable on the fixed pure-KL `train opd` path. The
-directional NLL delta is effectively flat (`-0.000008` reverse vs forward at
-step 20), so this licenses the opt-in path only; it does not license a default
-flip or capability claim.
+forward-vs-reverse NLL read is confounded: teacher and student were the same
+checkpoint, so KL was approximately zero and the run had no meaningful
+teacher>student gradient. The `-0.000008` step-20 NLL delta is therefore a setup
+artifact, not evidence that reverse KL is flat, good, bad, or merely
+opt-in-only.
 
 ## Problems
 
@@ -164,6 +166,10 @@ flip or capability claim.
   was loaded frozen, then full-trainable real-checkpoint OPD was killed on V100
   (`rc=137`). The shipped real path uses a LoRA student, matching the viable
   self-OPD memory profile.
+- The V100 P0/P1 A/Bs are confounded directional reads, not capability verdicts:
+  P0 stayed near the cold-start `~8e-6` loss floor, and P1 used
+  teacher==student. A validated method failing in this setup would be our setup
+  failing, not the method.
 
 ## Learnings
 
@@ -177,9 +183,10 @@ flip or capability claim.
 
 - **Baseline:** [`2026-06-14-sopd-91-self-opd-subcommand-inline-loop.md`](2026-06-14-sopd-91-self-opd-subcommand-inline-loop.md)
 - **Delta:** defaults unchanged in smoke. V100 P0 sampling was `+0.714%`
-  s/step and worse held-out NLL; reverse KL was reachable and `-1.796%` s/step
-  vs forward in the pure-KL LoRA path, with flat directional NLL. Both remain
-  opt-in.
+  s/step; the NLL delta is not interpretable because the run barely learned.
+  Reverse KL was reachable after the fix and measured `-1.796%` s/step vs
+  forward; the NLL delta is not interpretable because teacher==student makes
+  KL approximately zero.
 
 ## Artefacts
 
@@ -197,5 +204,6 @@ flip or capability claim.
 - What changed in code: P0 added opt-in rollout sampling; P1 added opt-in
   reverse KL; fixes `3b9e311e`, `4879d598`, and `9315b63a` make reverse/pure-KL
   real runs reachable.
-- Follow-ups: run the rigorous multi-seed/full-step capability evaluation on
-  H20 during OPD-after-QAT; V100 results here are directional only.
+- Follow-ups: run the real capability test with a teacher>student gap
+  (4B -> 0.8B) on GPU during OPD-after-QAT; V100 results here are directional
+  setup/perf reads only.
