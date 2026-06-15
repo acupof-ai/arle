@@ -90,6 +90,7 @@ fn kl_distill_loss_drops_over_three_steps() {
             student_logits,
             teacher_logits,
             seq_len,
+            1.0,
             KlDirection::Forward,
             &mut store,
             &mut tape,
