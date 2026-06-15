@@ -78,19 +78,6 @@ impl Dsv4CudaExecutor {
             .ok_or_else(|| anyhow!("DSv4 MTP decode missing previous hidden"))?
             .clone();
 
-        // Step-phase profile (evidence probe): sync at phase boundaries and
-        // report host millis. Distorts overlap — measurement runs only.
-        let prof = std::env::var("ARLE_DSV4_MTP_STEP_PROFILE").as_deref() == Ok("1");
-        let mut t = std::time::Instant::now();
-        let mut phase_ms = [0f64; 4];
-        let mut lap = |i: usize, t: &mut std::time::Instant, model: &crate::dsv4::Dsv4Model| {
-            if prof {
-                let _ = model.ctx.sync();
-                phase_ms[i] = t.elapsed().as_secs_f64() * 1000.0;
-                *t = std::time::Instant::now();
-            }
-        };
-
         // Frozen-KV P1-2: snapshot the ring slots the draft will overwrite
         // BEFORE any speculative write (the draft writes the frozen target
         // layer's SW/FP8 ring; the batched verify itself is pure).
@@ -100,11 +87,9 @@ impl Dsv4CudaExecutor {
             start_pos,
             depth,
         )?;
-        lap(0, &mut t, &self.model);
 
         // 1. Draft the chain off the MTP head (depth sequential head passes).
         let chain = self.draft_chain(slot_idx, pending, &hidden, depth, start_pos)?;
-        lap(1, &mut t, &self.model);
 
         // 2. Verify the whole chain in ONE frozen forward.
         let sched = chain.verify_schedule(start_pos);
@@ -126,7 +111,6 @@ impl Dsv4CudaExecutor {
             argmax.len(),
             hiddens.len()
         );
-        lap(2, &mut t, &self.model);
 
         // 3. Accept the longest matching prefix; the argmax at the divergence
         //    is the free bonus token.
@@ -167,43 +151,20 @@ impl Dsv4CudaExecutor {
         )?;
 
         let accepted_tokens: Vec<u32> = chain.tokens[1..=accepted].to_vec();
-        let fold = crate::dsv4::dsv4_mtp_commit_fold_enabled()
-            && crate::dsv4::dsv4_mtp_tree_attn_enabled();
-        if fold {
-            let rows: Vec<usize> = (0..=accepted).collect();
-            self.model.commit_accepted_fold(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &rows,
-                start_pos,
-            )?;
+        // Commit the accepted prefix by folding the persisted verify rows (the
+        // tree-attn + commit-fold lanes are both always-on, so there is no
+        // re-forward fallback here).
+        let rows: Vec<usize> = (0..=accepted).collect();
+        self.model.commit_accepted_fold(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &rows,
+            start_pos,
+        )?;
+        {
             let spec = &mut self.spec_slots[slot_idx];
             spec.pending = Some(bonus);
             spec.hidden = Some(hiddens.swap_remove(accepted));
-        } else {
-            let mut prefix = Vec::with_capacity(accepted + 1);
-            prefix.push(chain.tokens[0]);
-            prefix.extend_from_slice(&accepted_tokens);
-            let (_, mut re_hiddens) = self.model.forward_tokens_verify(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &prefix,
-                start_pos,
-                position,
-            )?;
-            let spec = &mut self.spec_slots[slot_idx];
-            spec.pending = Some(bonus);
-            spec.hidden = Some(re_hiddens.remove(accepted));
-        }
-        if prof {
-            let _ = self.model.ctx.sync();
-            phase_ms[3] = t.elapsed().as_secs_f64() * 1000.0;
-            if self.model.tp.config().rank == 0 {
-                eprintln!(
-                    "[dsv4-mtp-prof] capture={:.2} draft={:.2} verify={:.2} commit={:.2} ms",
-                    phase_ms[0], phase_ms[1], phase_ms[2], phase_ms[3]
-                );
-            }
         }
 
         let mut out = accepted_tokens;
@@ -252,14 +213,6 @@ impl Dsv4CudaExecutor {
             positions.len()
         );
         let depth = self.spec_depth();
-
-        // Phase profile (measurement only, ARLE_DSV4_MTP_STEP_PROFILE=1): sync at
-        // boundaries + report host ms for draft / verify / commit, so the batched
-        // win is attributable (verify is batched across slots; draft + commit stay
-        // per-slot). The syncs distort overlap — profiling runs only.
-        let prof = std::env::var("ARLE_DSV4_MTP_STEP_PROFILE").as_deref() == Ok("1");
-        let mut t = std::time::Instant::now();
-        let mut phase_ms = [0f64; 3];
 
         // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
         // The ring capture is ALWAYS per-slot (cheap host-side snapshot, the
@@ -356,15 +309,10 @@ impl Dsv4CudaExecutor {
                 chains.push(chain.tokens);
             }
         }
-        if prof {
-            let _ = self.model.ctx.sync();
-            phase_ms[0] = t.elapsed().as_secs_f64() * 1000.0;
-            t = std::time::Instant::now();
-        }
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
-        // attention per-slot tree-attn). When fold (default), the verify persists
-        // per-slot spec_normed so the commit avoids a per-slot re-forward — the
+        // attention per-slot tree-attn). The verify persists per-slot spec_normed
+        // (fold is always on) so the commit avoids a per-slot re-forward — the
         // fold is what makes per-row MTP fast; re-forward commit scales with c and
         // erases the verify-batching win (errors/2026-06-15-...submode2-regression).
         let fold = crate::dsv4::dsv4_mtp_commit_fold_enabled();
@@ -382,11 +330,6 @@ impl Dsv4CudaExecutor {
             "DSv4 batched verify returned {} chains for {n} slots",
             verified.len()
         );
-        if prof {
-            let _ = self.model.ctx.sync();
-            phase_ms[1] = t.elapsed().as_secs_f64() * 1000.0;
-            t = std::time::Instant::now();
-        }
 
         // ── 3. Per-slot accept / commit / ring-restore. The batched verify above
         // is the amortized phase; the per-slot draft (phase 0) and per-slot commit
@@ -541,17 +484,6 @@ impl Dsv4CudaExecutor {
                 let mut slot_out = accepted_tokens;
                 slot_out.push(bonus);
                 out.push(slot_out);
-            }
-        }
-        if prof {
-            let _ = self.model.ctx.sync();
-            phase_ms[2] = t.elapsed().as_secs_f64() * 1000.0;
-            if self.model.tp.config().rank == 0 {
-                let total = phase_ms[0] + phase_ms[1] + phase_ms[2];
-                eprintln!(
-                    "[dsv4-mtp-batched-prof] n={n} depth={depth} draft={:.2} verify={:.2} commit={:.2} total={:.2} ms",
-                    phase_ms[0], phase_ms[1], phase_ms[2], total
-                );
             }
         }
         Ok(out)

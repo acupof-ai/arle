@@ -110,15 +110,6 @@ pub fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
     attention::set_dsv4_fused_wqkv_decode_override(enabled);
 }
 
-/// Process-local override for the DSv4 batched (`b = N`) FlashMLA decode lane
-/// (#60). `None` restores the `ARLE_DSV4_FLASHMLA_DECODE_BATCHED` env gate
-/// (default OFF). For resident A/B harnesses comparing the per-row vs batched
-/// n>1 decode lane after one model load.
-#[cfg(feature = "cuda")]
-pub fn set_dsv4_flashmla_decode_batched_override(enabled: Option<bool>) {
-    attention::set_dsv4_flashmla_decode_batched_override(enabled);
-}
-
 #[cfg(feature = "cuda")]
 pub fn reset_dsv4_linear_profile() {
     linear_profile::reset();
