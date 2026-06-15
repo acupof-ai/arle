@@ -88,9 +88,10 @@ impl GgufTokenizer {
             .map_err(|e| anyhow!("build BPE from GGUF vocab: {e}"))?;
 
         let mut tokenizer = Tokenizer::new(bpe);
-        // GPT-2 byte-level, Qwen-style: no extra prefix space, do not trim
-        // offsets (decode reverses the byte-level mapping). `add_bos_token` is
-        // false for this vocab, so we never prepend BOS automatically.
+        // GPT-2 byte-level, Qwen-style: no extra prefix space, trim offsets
+        // (the `trim_offsets = true` arg below; decode reverses the byte-level
+        // mapping). `add_bos_token` is false for this vocab, so we never prepend
+        // BOS automatically.
         tokenizer.with_pre_tokenizer(Some(ByteLevelPre::new(
             /* add_prefix_space */ false, /* trim_offsets */ true, true,
         )));

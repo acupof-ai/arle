@@ -1595,8 +1595,9 @@ mod tests {
 
     #[test]
     fn gemv_id_specialization_matches_plain_gemv() {
-        // The _id variants reuse the plain decode GEMV spec (BLOCK_SIZE=32,
-        // NUM_ROWS=1, NUM_COLS=1); only the push tail + the 6th binding differ.
+        // The _id variants reuse the plain decode GEMV spec (BLOCK_SIZE=64,
+        // NUM_ROWS=1, NUM_COLS=1 — i.e. SPEC_GEMV_K_Q8_1 = (0,64),(1,1),(2,1));
+        // only the push tail + the 6th binding differ.
         for k in [
             Kernel::GemvIdQ4K,
             Kernel::GemvIdQ5K,
