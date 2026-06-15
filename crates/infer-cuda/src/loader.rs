@@ -3,7 +3,7 @@
 //! Holds the BF16 safetensors loader, `CudaModel::from_safetensors` weight
 //! upload, the per-step paging metadata (`PageMeta`), and the BF16 config gate.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
+use cuda_kernels::tensor::WeightFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
@@ -19,6 +20,10 @@ use safetensors::{SafeTensors, tensor::Dtype};
 
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
 use crate::ops::{precompute_rope, upload_i32};
+use crate::quant_format::{
+    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
+    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
+};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
@@ -383,6 +388,8 @@ pub(crate) struct SafetensorLoader {
     base: PathBuf,
     shards: Vec<PathBuf>,
     weight_map: HashMap<String, usize>,
+    tensor_headers: std::cell::RefCell<Option<BTreeMap<String, TensorHeader>>>,
+    quant_manifest: Option<QuantManifest>,
     /// Read-once cache of shard bytes: without it, loading N tensors re-reads the
     /// whole shard N times (O(N × file_size) I/O). `Rc` so [`SharedTensor`] can
     /// expose a tensor's byte range zero-copy (no `to_vec` of the multi-GiB
@@ -394,8 +401,20 @@ pub(crate) struct SafetensorLoader {
     shard_cache: std::cell::RefCell<HashMap<usize, std::rc::Rc<Vec<u8>>>>,
 }
 
+#[derive(Clone, Debug)]
+enum QuantMatrixShard {
+    Full,
+    Rows(ShardingSpec),
+    Cols(ShardingSpec),
+}
+
 impl SafetensorLoader {
     pub(crate) fn new(base: &Path) -> Result<Self> {
+        let quant_manifest = if base.join("config.json").exists() {
+            read_quant_manifest(base)?
+        } else {
+            None
+        };
         let index_path = base.join("model.safetensors.index.json");
         if index_path.exists() {
             let content = fs::read_to_string(&index_path)
@@ -421,6 +440,8 @@ impl SafetensorLoader {
                 base: base.to_path_buf(),
                 shards,
                 weight_map,
+                tensor_headers: std::cell::RefCell::new(None),
+                quant_manifest,
                 shard_cache: std::cell::RefCell::new(HashMap::new()),
             });
         }
@@ -431,6 +452,8 @@ impl SafetensorLoader {
                 base: base.to_path_buf(),
                 shards: vec![single],
                 weight_map: HashMap::new(),
+                tensor_headers: std::cell::RefCell::new(None),
+                quant_manifest,
                 shard_cache: std::cell::RefCell::new(HashMap::new()),
             });
         }
@@ -450,6 +473,8 @@ impl SafetensorLoader {
             base: base.to_path_buf(),
             shards,
             weight_map: HashMap::new(),
+            tensor_headers: std::cell::RefCell::new(None),
+            quant_manifest,
             shard_cache: std::cell::RefCell::new(HashMap::new()),
         })
     }
@@ -628,6 +653,88 @@ impl SafetensorLoader {
             .with_context(|| format!("upload head-sharded tensor {name}"))
     }
 
+    /// Load a Qwen3.5/3.6 matrix as resident quant when the checkpoint exposes
+    /// a supported quant sidecar ABI; otherwise use the legacy BF16/F32 path.
+    pub(crate) fn load_matrix_quant_aware(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        match self.quant_view_for(name)? {
+            Some(view) => self.load_quant_or_dense_view(ctx, &view, QuantMatrixShard::Full),
+            None => self.load_matrix(ctx, name),
+        }
+    }
+
+    /// Quant-aware twin of [`Self::load_matrix_sharded`].
+    pub(crate) fn load_matrix_sharded_quant_aware(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        kind: infer_topo::ParallelLinearKind,
+        tp: &infer_topo::TpConfig,
+    ) -> Result<DeviceMatrix> {
+        let Some(view) = self.quant_view_for(name)? else {
+            return self.load_matrix_sharded(ctx, name, kind, tp);
+        };
+        ensure!(
+            view.logical_shape.len() == 2,
+            "{}: expected 2D quant-aware matrix, got {:?}",
+            view.name,
+            view.logical_shape
+        );
+        let (rows, cols) = (view.logical_shape[0], view.logical_shape[1]);
+        let shard = match kind {
+            infer_topo::ParallelLinearKind::Column => {
+                QuantMatrixShard::Rows(infer_topo::column_shard(rows, tp))
+            }
+            infer_topo::ParallelLinearKind::Row => {
+                QuantMatrixShard::Cols(infer_topo::row_shard(cols, tp))
+            }
+        };
+        self.load_quant_or_dense_view(ctx, &view, shard)
+    }
+
+    /// Quant-aware twin of [`Self::load_qkv_head_sharded`].
+    pub(crate) fn load_qkv_head_sharded_quant_aware(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        local_heads: usize,
+        head_dim: usize,
+        tp: &infer_topo::TpConfig,
+    ) -> Result<DeviceMatrix> {
+        let Some(view) = self.quant_view_for(name)? else {
+            return self.load_qkv_head_sharded(ctx, name, local_heads, head_dim, tp);
+        };
+        ensure!(
+            view.logical_shape.len() == 2,
+            "{}: expected 2D quant-aware QKV matrix, got {:?}",
+            view.name,
+            view.logical_shape
+        );
+        let total_rows = view.logical_shape[0];
+        let local_rows = local_heads * head_dim;
+        let offset = tp.rank * local_rows;
+        ensure!(
+            offset + local_rows <= total_rows,
+            "{}: head shard [{offset}, {}) exceeds rows {total_rows} \
+             (local_heads={local_heads}, head_dim={head_dim}, rank={})",
+            view.name,
+            offset + local_rows,
+            tp.rank
+        );
+        self.load_quant_or_dense_view(
+            ctx,
+            &view,
+            QuantMatrixShard::Rows(ShardingSpec {
+                offset,
+                size: local_rows,
+                total: total_rows,
+            }),
+        )
+    }
+
     /// Load this EP rank's MoE weights for one layer (routed gate/up/down +
     /// router gate + shared expert) and build the per-expert weight-pointer
     /// tables. Only the experts in
@@ -663,6 +770,7 @@ impl SafetensorLoader {
         let mut up = Vec::with_capacity(split.experts_per_rank);
         let mut down = Vec::with_capacity(split.experts_per_rank);
         let per_expert_probe = names.expert_gate_proj(split.local_expert_start);
+        let per_expert_quant_probe = self.quant_view_for(&per_expert_probe)?.is_some();
         // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
         // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
         // export too.
@@ -671,11 +779,11 @@ impl SafetensorLoader {
                 .into_iter()
                 .find(|name| self.has_tensor(name))
         };
-        if self.has_tensor(&per_expert_probe) {
+        if self.has_tensor(&per_expert_probe) || per_expert_quant_probe {
             for e in split.local_expert_start..split.local_expert_end() {
-                gate.push(self.load_matrix(ctx, &names.expert_gate_proj(e))?);
-                up.push(self.load_matrix(ctx, &names.expert_up_proj(e))?);
-                down.push(self.load_matrix(ctx, &names.expert_down_proj(e))?);
+                gate.push(self.load_matrix_quant_aware(ctx, &names.expert_gate_proj(e))?);
+                up.push(self.load_matrix_quant_aware(ctx, &names.expert_up_proj(e))?);
+                down.push(self.load_matrix_quant_aware(ctx, &names.expert_down_proj(e))?);
             }
         } else if let Some(gate_up_name) = resolve_stacked(&names.experts_stacked_gate_up_proj) {
             let down_name = resolve_stacked(&names.experts_stacked_down_proj).ok_or_else(|| {
@@ -801,25 +909,25 @@ impl SafetensorLoader {
         let router_gate = self.load_matrix(ctx, &names.router_gate)?;
         let (shared_gate, shared_up, shared_down) = if tp.is_single() {
             (
-                self.load_matrix(ctx, &names.shared_expert_gate_proj)?,
-                self.load_matrix(ctx, &names.shared_expert_up_proj)?,
-                self.load_matrix(ctx, &names.shared_expert_down_proj)?,
+                self.load_matrix_quant_aware(ctx, &names.shared_expert_gate_proj)?,
+                self.load_matrix_quant_aware(ctx, &names.shared_expert_up_proj)?,
+                self.load_matrix_quant_aware(ctx, &names.shared_expert_down_proj)?,
             )
         } else {
             (
-                self.load_matrix_sharded(
+                self.load_matrix_sharded_quant_aware(
                     ctx,
                     &names.shared_expert_gate_proj,
                     infer_topo::ParallelLinearKind::Column,
                     tp,
                 )?,
-                self.load_matrix_sharded(
+                self.load_matrix_sharded_quant_aware(
                     ctx,
                     &names.shared_expert_up_proj,
                     infer_topo::ParallelLinearKind::Column,
                     tp,
                 )?,
-                self.load_matrix_sharded(
+                self.load_matrix_sharded_quant_aware(
                     ctx,
                     &names.shared_expert_down_proj,
                     infer_topo::ParallelLinearKind::Row,
@@ -839,7 +947,10 @@ impl SafetensorLoader {
         // ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1) must degrade to the hand-kernel
         // path instead of erroring at the first MoE forward — probe once here
         // and skip the grouped caches so `use_deepgemm` self-disables.
-        let deepgemm_ready = crate::moe::qwen35_deepgemm_enabled()
+        let expert_weight_format = routed_expert_weight_format(&gate, &up, &down)?;
+        let routed_quant = expert_weight_format.is_quantized();
+        let deepgemm_ready = !routed_quant
+            && crate::moe::qwen35_deepgemm_enabled()
             && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
                 Ok(_) => true,
                 Err(err) => {
@@ -877,21 +988,92 @@ impl SafetensorLoader {
                 let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
                 let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
                 let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
-                (
-                    cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?,
-                    cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?,
-                    cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?,
-                )
+                if routed_quant {
+                    (
+                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &gate_refs)?,
+                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &up_refs)?,
+                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &down_refs)?,
+                    )
+                } else {
+                    (
+                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?,
+                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?,
+                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?,
+                    )
+                }
             }
         };
+        let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if routed_quant
+            && matches!(
+                expert_weight_format,
+                WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
+            ) {
+            let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
+            let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
+            let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
+            (
+                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                    ctx, &gate_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                    ctx, &up_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                    ctx, &down_refs,
+                )?),
+            )
+        } else if routed_quant && expert_weight_format == WeightFormat::Fp4E2M1Group {
+            let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
+            let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
+            let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
+            (
+                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                    ctx, &gate_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                    ctx, &up_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                    ctx, &down_refs,
+                )?),
+            )
+        } else {
+            (None, None, None)
+        };
+        let (gate_global_ptrs, up_global_ptrs, down_global_ptrs) =
+            if expert_weight_format == WeightFormat::Fp4E2M1Group {
+                let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
+                let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
+                let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
+                (
+                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                        ctx, &gate_refs,
+                    )?),
+                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                        ctx, &up_refs,
+                    )?),
+                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                        ctx, &down_refs,
+                    )?),
+                )
+            } else {
+                (None, None, None)
+            };
 
         Ok(MoeLayerWeights {
             gate,
             up,
             down,
+            expert_weight_format,
             gate_ptrs,
             up_ptrs,
             down_ptrs,
+            gate_scale_ptrs,
+            up_scale_ptrs,
+            down_scale_ptrs,
+            gate_global_ptrs,
+            up_global_ptrs,
+            down_global_ptrs,
             gate_grouped,
             up_grouped,
             down_grouped,
@@ -927,6 +1109,461 @@ impl SafetensorLoader {
             return self.weight_map.contains_key(name);
         }
         (0..self.shards.len()).any(|idx| self.shard_has_tensor(idx, name).unwrap_or(false))
+    }
+
+    fn quant_view_for(&self, name: &str) -> Result<Option<QuantTensorView>> {
+        let headers = self.tensor_headers()?;
+        let mut candidates = vec![name.to_owned()];
+        if let Some(base) = name.strip_suffix(".weight") {
+            candidates.push(format!("{base}.weight_packed"));
+        }
+        for candidate in candidates {
+            if !headers.contains_key(&candidate) {
+                continue;
+            }
+            reject_dsv4_e8m0_scale_abi(&candidate, &headers)?;
+            if let Some(view) =
+                detect_quant_format(&candidate, &headers, self.quant_manifest.as_ref())?
+            {
+                return Ok(Some(view));
+            }
+        }
+        Ok(None)
+    }
+
+    fn tensor_headers(&self) -> Result<BTreeMap<String, TensorHeader>> {
+        if let Some(headers) = self.tensor_headers.borrow().as_ref() {
+            return Ok(headers.clone());
+        }
+        let mut headers = BTreeMap::new();
+        for idx in 0..self.shards.len() {
+            let bytes = self.shard_bytes(idx)?;
+            let tensors = SafeTensors::deserialize(&bytes)
+                .with_context(|| format!("deserialize {}", self.shards[idx].display()))?;
+            for (name, view) in tensors.tensors() {
+                headers.insert(
+                    name,
+                    TensorHeader {
+                        dtype: view.dtype(),
+                        shape: view.shape().to_vec(),
+                    },
+                );
+            }
+        }
+        *self.tensor_headers.borrow_mut() = Some(headers.clone());
+        Ok(headers)
+    }
+
+    fn load_quant_or_dense_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: QuantMatrixShard,
+    ) -> Result<DeviceMatrix> {
+        match view.format {
+            QuantFormat::DenseBf16 => match shard {
+                QuantMatrixShard::Full => self.load_matrix(ctx, &view.name),
+                QuantMatrixShard::Rows(spec) => self.load_matrix_sharded_by_spec(
+                    ctx,
+                    &view.name,
+                    infer_topo::ParallelLinearKind::Column,
+                    &spec,
+                ),
+                QuantMatrixShard::Cols(spec) => self.load_matrix_sharded_by_spec(
+                    ctx,
+                    &view.name,
+                    infer_topo::ParallelLinearKind::Row,
+                    &spec,
+                ),
+            },
+            QuantFormat::DenseF32 => {
+                let tensor = self.load_raw_tensor(&view.name)?;
+                ensure!(
+                    tensor.shape.len() == 2,
+                    "{}: expected 2D F32 tensor, got {:?}",
+                    view.name,
+                    tensor.shape
+                );
+                let sharded =
+                    self.shard_raw_2d(&tensor.bytes, tensor.shape[0], tensor.shape[1], 4, &shard)?;
+                let owned = OwnedTensor {
+                    shape: vec![sharded.rows, sharded.cols],
+                    bytes: sharded.bytes,
+                    dtype: Dtype::F32,
+                };
+                DeviceMatrix::from_safetensors(
+                    ctx,
+                    Self::dsv4_bytes_to_bf16(&view.name, &owned)?.as_ref(),
+                    owned.shape[0],
+                    owned.shape[1],
+                )
+                .with_context(|| format!("upload dense F32 tensor {}", view.name))
+            }
+            QuantFormat::Fp8BlockScaled {
+                block_m,
+                block_k,
+                scale_apply,
+            } => self.load_fp8_block_scaled_view(ctx, view, &shard, block_m, block_k, scale_apply),
+            QuantFormat::Fp8PerShard { scale_apply } => {
+                self.load_fp8_per_shard_view(ctx, view, &shard, scale_apply)
+            }
+            QuantFormat::Fp4E2M1Group {
+                group_size,
+                global_scale_apply,
+            } => self.load_fp4_group_view(ctx, view, &shard, group_size, global_scale_apply),
+        }
+    }
+
+    fn load_matrix_sharded_by_spec(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        kind: infer_topo::ParallelLinearKind,
+        spec: &ShardingSpec,
+    ) -> Result<DeviceMatrix> {
+        const BF16_ELEM_SIZE: usize = 2;
+        let tensor = self.load_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D BF16 tensor, got shape {:?}",
+            tensor.shape
+        );
+        let sharded = match kind {
+            infer_topo::ParallelLinearKind::Column => crate::shard_slice::shard_column_parallel(
+                &tensor.bytes,
+                tensor.shape[0],
+                tensor.shape[1],
+                BF16_ELEM_SIZE,
+                spec,
+            )?,
+            infer_topo::ParallelLinearKind::Row => crate::shard_slice::shard_row_parallel(
+                &tensor.bytes,
+                tensor.shape[0],
+                tensor.shape[1],
+                BF16_ELEM_SIZE,
+                spec,
+            )?,
+        };
+        DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+            .with_context(|| format!("upload sharded tensor {name}"))
+    }
+
+    fn shard_raw_2d(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        cols: usize,
+        elem_size: usize,
+        shard: &QuantMatrixShard,
+    ) -> Result<crate::shard_slice::ShardedBytes> {
+        match shard {
+            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
+                bytes: bytes.to_vec(),
+                rows,
+                cols,
+            }),
+            QuantMatrixShard::Rows(spec) => {
+                crate::shard_slice::shard_column_parallel(bytes, rows, cols, elem_size, spec)
+            }
+            QuantMatrixShard::Cols(spec) => {
+                crate::shard_slice::shard_row_parallel(bytes, rows, cols, elem_size, spec)
+            }
+        }
+    }
+
+    fn load_fp8_block_scaled_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        block_m: usize,
+        block_k: usize,
+        scale_apply: ScaleApply,
+    ) -> Result<DeviceMatrix> {
+        let weight = self.load_raw_tensor(&view.name)?;
+        ensure!(
+            weight.dtype == Dtype::F8_E4M3 && weight.shape == view.logical_shape,
+            "{}: expected F8_E4M3 {:?}, got {:?} {:?}",
+            view.name,
+            view.logical_shape,
+            weight.dtype,
+            weight.shape
+        );
+        let rows = view.logical_shape[0];
+        let cols = view.logical_shape[1];
+        let weight_shard = self.shard_raw_2d(&weight.bytes, rows, cols, 1, shard)?;
+        let scale = self.load_raw_tensor(&view.scale_names[0])?;
+        let scale_elem = float_elem_size(&view.scale_names[0], scale.dtype)?;
+        let scale_rows = rows.div_ceil(block_m);
+        let scale_cols = cols.div_ceil(block_k);
+        ensure!(
+            scale.shape == [scale_rows, scale_cols],
+            "{}: scale shape {:?} != [{scale_rows}, {scale_cols}]",
+            view.scale_names[0],
+            scale.shape
+        );
+        let scale_shard = self.shard_fp8_block_scales(
+            &scale.bytes,
+            scale_elem,
+            rows,
+            cols,
+            block_m,
+            block_k,
+            shard,
+        )?;
+        let scales = tensor_bytes_to_f32(
+            &view.scale_names[0],
+            scale.dtype,
+            &scale_shard.bytes,
+            scale_apply,
+        )?;
+        DeviceMatrix::from_fp8_block_scaled(
+            ctx,
+            &weight_shard.bytes,
+            &scales,
+            weight_shard.rows,
+            weight_shard.cols,
+            block_m,
+            block_k,
+        )
+        .with_context(|| format!("upload FP8 block-scaled tensor {}", view.name))
+    }
+
+    fn shard_fp8_block_scales(
+        &self,
+        bytes: &[u8],
+        elem_size: usize,
+        rows: usize,
+        cols: usize,
+        block_m: usize,
+        block_k: usize,
+        shard: &QuantMatrixShard,
+    ) -> Result<crate::shard_slice::ShardedBytes> {
+        let scale_rows = rows.div_ceil(block_m);
+        let scale_cols = cols.div_ceil(block_k);
+        match shard {
+            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
+                bytes: bytes.to_vec(),
+                rows: scale_rows,
+                cols: scale_cols,
+            }),
+            QuantMatrixShard::Rows(spec) => {
+                ensure!(
+                    spec.offset.is_multiple_of(block_m)
+                        && (spec.end() == rows || spec.end().is_multiple_of(block_m)),
+                    "FP8 block row shard {:?} must align to block_m={block_m} for rows={rows}",
+                    spec.range()
+                );
+                let scale_spec = ShardingSpec {
+                    offset: spec.offset / block_m,
+                    size: spec.size.div_ceil(block_m),
+                    total: scale_rows,
+                };
+                crate::shard_slice::shard_column_parallel(
+                    bytes,
+                    scale_rows,
+                    scale_cols,
+                    elem_size,
+                    &scale_spec,
+                )
+            }
+            QuantMatrixShard::Cols(spec) => {
+                ensure!(
+                    spec.offset.is_multiple_of(block_k)
+                        && (spec.end() == cols || spec.end().is_multiple_of(block_k)),
+                    "FP8 block col shard {:?} must align to block_k={block_k} for cols={cols}",
+                    spec.range()
+                );
+                let scale_spec = ShardingSpec {
+                    offset: spec.offset / block_k,
+                    size: spec.size.div_ceil(block_k),
+                    total: scale_cols,
+                };
+                crate::shard_slice::shard_row_parallel(
+                    bytes,
+                    scale_rows,
+                    scale_cols,
+                    elem_size,
+                    &scale_spec,
+                )
+            }
+        }
+    }
+
+    fn load_fp8_per_shard_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        scale_apply: ScaleApply,
+    ) -> Result<DeviceMatrix> {
+        let weight = self.load_raw_tensor(&view.name)?;
+        ensure!(
+            weight.dtype == Dtype::F8_E4M3 && weight.shape == view.logical_shape,
+            "{}: expected F8_E4M3 {:?}, got {:?} {:?}",
+            view.name,
+            view.logical_shape,
+            weight.dtype,
+            weight.shape
+        );
+        let rows = view.logical_shape[0];
+        let cols = view.logical_shape[1];
+        let weight_shard = self.shard_raw_2d(&weight.bytes, rows, cols, 1, shard)?;
+        let scale = self.load_raw_tensor(&view.scale_names[0])?;
+        let input_scale = self.load_raw_tensor(&view.scale_names[1])?;
+        let scales = tensor_to_f32_vec(&view.scale_names[0], &scale, scale_apply)?;
+        let input_scales =
+            tensor_to_f32_vec(&view.scale_names[1], &input_scale, ScaleApply::Multiply)?;
+        ensure!(
+            scales.len() == 1 && input_scales.len() == 1,
+            "{}: FP8 per-shard dispatch currently requires scalar weight/input scales, got {}/{}",
+            view.name,
+            scales.len(),
+            input_scales.len()
+        );
+        DeviceMatrix::from_fp8_per_shard(
+            ctx,
+            &weight_shard.bytes,
+            &scales,
+            &input_scales,
+            weight_shard.rows,
+            weight_shard.cols,
+        )
+        .with_context(|| format!("upload FP8 per-shard tensor {}", view.name))
+    }
+
+    fn load_fp4_group_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        group_size: usize,
+        global_scale_apply: ScaleApply,
+    ) -> Result<DeviceMatrix> {
+        let weight = self.load_raw_tensor(&view.name)?;
+        let rows = view.logical_shape[0];
+        let cols = view.logical_shape[1];
+        ensure!(
+            weight.dtype == Dtype::U8 && weight.shape == [rows, cols / 2],
+            "{}: expected packed U8 [{rows}, {}], got {:?} {:?}",
+            view.name,
+            cols / 2,
+            weight.dtype,
+            weight.shape
+        );
+        let weight_shard =
+            self.shard_fp4_packed_weight(&weight.bytes, rows, cols, group_size, shard)?;
+        let scale = self.load_raw_tensor(&view.scale_names[0])?;
+        ensure!(
+            scale.dtype == Dtype::F8_E4M3 && scale.shape == [rows, cols / group_size],
+            "{}: expected FP8 group scale [{rows}, {}], got {:?} {:?}",
+            view.scale_names[0],
+            cols / group_size,
+            scale.dtype,
+            scale.shape
+        );
+        let scale_shard =
+            self.shard_fp4_group_scales(&scale.bytes, rows, cols, group_size, shard)?;
+        let global = self.load_raw_tensor(&view.scale_names[1])?;
+        let global_scales = tensor_to_f32_vec(&view.scale_names[1], &global, global_scale_apply)?;
+        ensure!(
+            global_scales.len() == 1,
+            "{}: FP4 global scale must be scalar, got {} values",
+            view.scale_names[1],
+            global_scales.len()
+        );
+        let input_scales = if view.scale_names.len() > 2 {
+            let input = self.load_raw_tensor(&view.scale_names[2])?;
+            Some(tensor_to_f32_vec(
+                &view.scale_names[2],
+                &input,
+                ScaleApply::Multiply,
+            )?)
+        } else {
+            None
+        };
+        DeviceMatrix::from_fp4_e2m1_group(
+            ctx,
+            &weight_shard.bytes,
+            &scale_shard.bytes,
+            &global_scales,
+            input_scales.as_deref(),
+            weight_shard.rows,
+            weight_shard.cols * 2,
+            group_size,
+        )
+        .with_context(|| format!("upload FP4 E2M1 tensor {}", view.name))
+    }
+
+    fn shard_fp4_packed_weight(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        logical_cols: usize,
+        group_size: usize,
+        shard: &QuantMatrixShard,
+    ) -> Result<crate::shard_slice::ShardedBytes> {
+        let packed_cols = logical_cols / 2;
+        match shard {
+            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
+                bytes: bytes.to_vec(),
+                rows,
+                cols: packed_cols,
+            }),
+            QuantMatrixShard::Rows(spec) => {
+                crate::shard_slice::shard_column_parallel(bytes, rows, packed_cols, 1, spec)
+            }
+            QuantMatrixShard::Cols(spec) => {
+                ensure!(
+                    spec.offset.is_multiple_of(group_size)
+                        && spec.size.is_multiple_of(group_size)
+                        && spec.offset.is_multiple_of(2)
+                        && spec.size.is_multiple_of(2),
+                    "FP4 col shard {:?} must align to group_size={group_size} and packed pairs",
+                    spec.range()
+                );
+                let packed_spec = ShardingSpec {
+                    offset: spec.offset / 2,
+                    size: spec.size / 2,
+                    total: logical_cols / 2,
+                };
+                crate::shard_slice::shard_row_parallel(bytes, rows, packed_cols, 1, &packed_spec)
+            }
+        }
+    }
+
+    fn shard_fp4_group_scales(
+        &self,
+        bytes: &[u8],
+        rows: usize,
+        logical_cols: usize,
+        group_size: usize,
+        shard: &QuantMatrixShard,
+    ) -> Result<crate::shard_slice::ShardedBytes> {
+        let scale_cols = logical_cols / group_size;
+        match shard {
+            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
+                bytes: bytes.to_vec(),
+                rows,
+                cols: scale_cols,
+            }),
+            QuantMatrixShard::Rows(spec) => {
+                crate::shard_slice::shard_column_parallel(bytes, rows, scale_cols, 1, spec)
+            }
+            QuantMatrixShard::Cols(spec) => {
+                ensure!(
+                    spec.offset.is_multiple_of(group_size) && spec.size.is_multiple_of(group_size),
+                    "FP4 scale col shard {:?} must align to group_size={group_size}",
+                    spec.range()
+                );
+                let scale_spec = ShardingSpec {
+                    offset: spec.offset / group_size,
+                    size: spec.size / group_size,
+                    total: scale_cols,
+                };
+                crate::shard_slice::shard_row_parallel(bytes, rows, scale_cols, 1, &scale_spec)
+            }
+        }
     }
 
     /// Read-once shard bytes: fill the cache on first touch, then hand out a
@@ -1060,6 +1697,58 @@ impl SharedTensor {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.shard[self.offset..self.offset + self.len]
     }
+}
+
+fn float_elem_size(name: &str, dtype: Dtype) -> Result<usize> {
+    match dtype {
+        Dtype::F32 => Ok(4),
+        Dtype::BF16 => Ok(2),
+        other => bail!("{name}: expected BF16/F32 scale tensor, got {other:?}"),
+    }
+}
+
+fn tensor_to_f32_vec(name: &str, tensor: &OwnedTensor, apply: ScaleApply) -> Result<Vec<f32>> {
+    tensor_bytes_to_f32(name, tensor.dtype, &tensor.bytes, apply)
+}
+
+fn tensor_bytes_to_f32(
+    name: &str,
+    dtype: Dtype,
+    bytes: &[u8],
+    apply: ScaleApply,
+) -> Result<Vec<f32>> {
+    let mut values = match dtype {
+        Dtype::F32 => {
+            ensure!(
+                bytes.len().is_multiple_of(4),
+                "{name}: F32 scale byte length {} is not divisible by 4",
+                bytes.len()
+            );
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        }
+        Dtype::BF16 => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "{name}: BF16 scale byte length {} is not divisible by 2",
+                bytes.len()
+            );
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect::<Vec<_>>()
+        }
+        other => bail!("{name}: expected BF16/F32 scale tensor, got {other:?}"),
+    };
+    if matches!(apply, ScaleApply::Divide) {
+        for value in &mut values {
+            ensure!(*value != 0.0, "{name}: divide-scale contains zero");
+            *value = 1.0 / *value;
+        }
+    }
+    Ok(values)
 }
 
 // DSv4 FP8/FP4 + E8M0 loaders. Loader-only milestone: reachable from
@@ -1665,6 +2354,37 @@ pub(crate) struct OwnedTensor {
     pub(crate) dtype: Dtype,
 }
 
+fn routed_expert_weight_format(
+    gate: &[DeviceMatrix],
+    up: &[DeviceMatrix],
+    down: &[DeviceMatrix],
+) -> Result<WeightFormat> {
+    let first = gate
+        .first()
+        .ok_or_else(|| anyhow!("MoE layer has no local gate experts"))?
+        .weight_format();
+    ensure!(
+        matches!(
+            first,
+            WeightFormat::DenseBf16
+                | WeightFormat::Fp8BlockScaled
+                | WeightFormat::Fp8PerShard
+                | WeightFormat::Fp4E2M1Group
+        ),
+        "Qwen3.6 MoE routed expert format {first} is not supported"
+    );
+    for (name, experts) in [("gate", gate), ("up", up), ("down", down)] {
+        for (idx, expert) in experts.iter().enumerate() {
+            ensure!(
+                expert.weight_format() == first,
+                "Qwen3.6 MoE {name} expert {idx} format {} != {first}",
+                expert.weight_format()
+            );
+        }
+    }
+    Ok(first)
+}
+
 /// This EP rank's loaded MoE weights for one sparse layer: per-expert
 /// gate/up/down stacks + their weight-pointer tables, the router gate, and the
 /// shared expert. Built by [`SafetensorLoader::load_moe_layer_experts`],
@@ -1677,9 +2397,16 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) gate: Vec<DeviceMatrix>,
     pub(crate) up: Vec<DeviceMatrix>,
     pub(crate) down: Vec<DeviceMatrix>,
+    pub(crate) expert_weight_format: WeightFormat,
     pub(crate) gate_ptrs: CudaSlice<u64>,
     pub(crate) up_ptrs: CudaSlice<u64>,
     pub(crate) down_ptrs: CudaSlice<u64>,
+    pub(crate) gate_scale_ptrs: Option<CudaSlice<u64>>,
+    pub(crate) up_scale_ptrs: Option<CudaSlice<u64>>,
+    pub(crate) down_scale_ptrs: Option<CudaSlice<u64>>,
+    pub(crate) gate_global_ptrs: Option<CudaSlice<u64>>,
+    pub(crate) up_global_ptrs: Option<CudaSlice<u64>>,
+    pub(crate) down_global_ptrs: Option<CudaSlice<u64>>,
     /// DeepGEMM grouped-B caches (`[groups, n, k]` contiguous row-major BF16,
     /// this rank's EP experts only). `Some` iff `ARLE_QWEN35_DEEPGEMM=1` at
     /// load; the default load path is byte-identical (fields stay `None`).

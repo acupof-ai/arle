@@ -998,10 +998,10 @@ impl Qwen35Model {
                 // Single GPU: full tensors, byte-identical to the pre-TP path.
                 Qwen35AttentionTensorNames::Full(full) if tp_cfg.is_single() => {
                     Qwen35Attn::Full(Box::new(FullAttn {
-                        q_proj: loader.load_matrix(&ctx, &full.q_proj)?,
-                        k_proj: loader.load_matrix(&ctx, &full.k_proj)?,
-                        v_proj: loader.load_matrix(&ctx, &full.v_proj)?,
-                        o_proj: loader.load_matrix(&ctx, &full.o_proj)?,
+                        q_proj: loader.load_matrix_quant_aware(&ctx, &full.q_proj)?,
+                        k_proj: loader.load_matrix_quant_aware(&ctx, &full.k_proj)?,
+                        v_proj: loader.load_matrix_quant_aware(&ctx, &full.v_proj)?,
+                        o_proj: loader.load_matrix_quant_aware(&ctx, &full.o_proj)?,
                         q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                         k_norm: loader.load_vec(&ctx, &full.k_norm)?,
                     }))
@@ -1012,21 +1012,21 @@ impl Qwen35Model {
                     // `head*2*HD + d`, the gate kernel at `head*2*HD + HD + d`),
                     // so a whole-head slice with per-head row block 2*head_dim
                     // carries each head's query rows AND its matching gate rows.
-                    q_proj: loader.load_qkv_head_sharded(
+                    q_proj: loader.load_qkv_head_sharded_quant_aware(
                         &ctx,
                         &full.q_proj,
                         local_q_heads,
                         m.head_dim * 2,
                         &tp_cfg,
                     )?,
-                    k_proj: loader.load_qkv_head_sharded(
+                    k_proj: loader.load_qkv_head_sharded_quant_aware(
                         &ctx,
                         &full.k_proj,
                         local_kv_heads,
                         m.head_dim,
                         &tp_cfg,
                     )?,
-                    v_proj: loader.load_qkv_head_sharded(
+                    v_proj: loader.load_qkv_head_sharded_quant_aware(
                         &ctx,
                         &full.v_proj,
                         local_kv_heads,
@@ -1035,7 +1035,7 @@ impl Qwen35Model {
                     )?,
                     // Row-parallel: each rank holds the o_proj input columns of
                     // its own heads; the forward all-reduces the partial sums.
-                    o_proj: loader.load_matrix_sharded(
+                    o_proj: loader.load_matrix_sharded_quant_aware(
                         &ctx,
                         &full.o_proj,
                         infer_topo::ParallelLinearKind::Row,
@@ -1148,28 +1148,30 @@ impl Qwen35Model {
             } else if tp_cfg.is_single() {
                 (
                     Some(DenseMlp {
-                        gate_proj: loader.load_matrix(&ctx, &names.common.mlp_gate_proj)?,
-                        up_proj: loader.load_matrix(&ctx, &names.common.mlp_up_proj)?,
-                        down_proj: loader.load_matrix(&ctx, &names.common.mlp_down_proj)?,
+                        gate_proj: loader
+                            .load_matrix_quant_aware(&ctx, &names.common.mlp_gate_proj)?,
+                        up_proj: loader.load_matrix_quant_aware(&ctx, &names.common.mlp_up_proj)?,
+                        down_proj: loader
+                            .load_matrix_quant_aware(&ctx, &names.common.mlp_down_proj)?,
                     }),
                     None,
                 )
             } else {
                 (
                     Some(DenseMlp {
-                        gate_proj: loader.load_matrix_sharded(
+                        gate_proj: loader.load_matrix_sharded_quant_aware(
                             &ctx,
                             &names.common.mlp_gate_proj,
                             infer_topo::ParallelLinearKind::Column,
                             &tp_cfg,
                         )?,
-                        up_proj: loader.load_matrix_sharded(
+                        up_proj: loader.load_matrix_sharded_quant_aware(
                             &ctx,
                             &names.common.mlp_up_proj,
                             infer_topo::ParallelLinearKind::Column,
                             &tp_cfg,
                         )?,
-                        down_proj: loader.load_matrix_sharded(
+                        down_proj: loader.load_matrix_sharded_quant_aware(
                             &ctx,
                             &names.common.mlp_down_proj,
                             infer_topo::ParallelLinearKind::Row,
