@@ -14,6 +14,8 @@ mod kv_pool;
 #[cfg(feature = "metal")]
 mod config;
 #[cfg(feature = "metal")]
+mod dflash;
+#[cfg(feature = "metal")]
 mod diffusion_gemma;
 #[cfg(feature = "metal")]
 mod loader;

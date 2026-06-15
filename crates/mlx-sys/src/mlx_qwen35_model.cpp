@@ -3135,6 +3135,7 @@ int32_t qwen35_compiled_verify_block(
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
         m->current_is_verify = true;
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -3154,6 +3155,7 @@ int32_t qwen35_compiled_verify_block(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return 0;
     } catch (const std::exception& e) {
@@ -3161,6 +3163,7 @@ int32_t qwen35_compiled_verify_block(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return -1;
     }
@@ -3210,6 +3213,7 @@ int32_t qwen35_compiled_verify_block_summary(
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
         m->current_is_verify = true;
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -3250,6 +3254,7 @@ int32_t qwen35_compiled_verify_block_summary(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return 0;
     } catch (const std::exception& e) {
@@ -3257,6 +3262,7 @@ int32_t qwen35_compiled_verify_block_summary(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return -1;
     }
@@ -3315,6 +3321,7 @@ int32_t qwen35_compiled_verify_block_batched(
         m->current_has_rope_offsets = true;
         m->current_rope_offsets = *to_arr(rope_offsets);
         m->current_is_verify = true;
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -3337,6 +3344,7 @@ int32_t qwen35_compiled_verify_block_batched(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return 0;
     } catch (const std::exception& e) {
@@ -3345,6 +3353,7 @@ int32_t qwen35_compiled_verify_block_batched(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return -1;
     }
@@ -3403,6 +3412,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
         m->current_has_rope_offsets = true;
         m->current_rope_offsets = *to_arr(rope_offsets);
         m->current_is_verify = true;
+        m->current_kv_cache_int8 = (n_kv == 6 * m->n_full_attn && m->n_full_attn > 0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -3431,6 +3441,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return 0;
     } catch (const std::exception& e) {
@@ -3439,6 +3450,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->current_kv_cache_int8 = false;
         m->clear_optional_batch_inputs();
         return -1;
     }
@@ -3834,19 +3846,26 @@ void qwen35_set_capture_final_hidden(void* model, bool enabled) {
 
 int32_t qwen35_get_captured_hidden_count(void* model) {
     auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
-    int total_out = 1 + 2 * m->n_full_attn + 2 * m->n_gdr;
+    int capture_count = static_cast<int>(m->capture_layer_ids.size())
+        + (m->capture_final_hidden ? 1 : 0);
+    if (capture_count <= 0) return 0;
     auto& outputs = m->prev_outputs;
-    if ((int)outputs.size() <= total_out) return 0;
-    return static_cast<int32_t>(outputs.size() - total_out);
+    if ((int)outputs.size() < capture_count) return 0;
+    return static_cast<int32_t>(capture_count);
 }
 
 /// Get a captured hidden state by index. Returns new array handle (caller must free).
 int32_t qwen35_get_captured_hidden(void* model, int32_t idx, mlx_array** out) {
     try {
         auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
-        int total_out = 1 + 2 * m->n_full_attn + 2 * m->n_gdr;
+        int capture_count = static_cast<int>(m->capture_layer_ids.size())
+            + (m->capture_final_hidden ? 1 : 0);
         auto& outputs = m->prev_outputs;
-        int hi = total_out + idx;
+        if (capture_count <= 0)
+            throw std::out_of_range("no captured hidden states are active");
+        if ((int)outputs.size() < capture_count)
+            throw std::out_of_range("captured hidden output tail is shorter than capture count");
+        int hi = static_cast<int>(outputs.size()) - capture_count + idx;
         if (hi < 0 || hi >= (int)outputs.size())
             throw std::out_of_range("captured hidden index out of range");
         *out = reinterpret_cast<mlx_array*>(new array(outputs[hi]));

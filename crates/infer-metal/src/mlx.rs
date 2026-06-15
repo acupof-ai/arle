@@ -244,6 +244,19 @@ impl MlxArray {
             std::slice::from_raw_parts(ptr, len)
         }
     }
+
+    pub fn as_slice_i32(&self) -> &[i32] {
+        unsafe {
+            let ptr = mlx_sys::mlx_array_data_int32(self.0);
+            let len = mlx_sys::mlx_array_size(self.0);
+            if ptr.is_null() && len > 0 {
+                panic_if_mlx_error("mlx_array_data_int32");
+                panic!("mlx_array_data_int32 returned null for non-empty array");
+            }
+            panic_if_mlx_error("mlx_array_data_int32");
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
 }
 
 macro_rules! binary_op {
@@ -255,6 +268,7 @@ macro_rules! binary_op {
 }
 
 binary_op!(add, mlx_add);
+binary_op!(matmul, mlx_matmul);
 
 pub fn reshape(a: &MlxArray, shape: &[i32]) -> MlxArray {
     mlx_array_from_raw_or_panic(
@@ -288,6 +302,13 @@ pub fn zeros(shape: &[i32], dtype: Dtype) -> MlxArray {
     )
 }
 
+pub fn take_axis(a: &MlxArray, indices: &MlxArray, axis: i32) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_take_axis(a.0, indices.0, axis) },
+        "mlx_take_axis",
+    )
+}
+
 pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxArray {
     assert_eq!(
         start.len(),
@@ -313,6 +334,28 @@ pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxA
     )
 }
 
+pub fn slice_update(src: &MlxArray, update: &MlxArray, start: &[i32], stop: &[i32]) -> MlxArray {
+    assert_eq!(
+        start.len(),
+        stop.len(),
+        "mlx_slice_update start/stop rank mismatch"
+    );
+    let strides = vec![1; start.len()];
+    mlx_array_from_raw_or_panic(
+        unsafe {
+            mlx_sys::mlx_slice_update(
+                src.0,
+                update.0,
+                start.as_ptr(),
+                stop.as_ptr(),
+                strides.as_ptr(),
+                start.len(),
+            )
+        },
+        "mlx_slice_update",
+    )
+}
+
 pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let raw: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     mlx_array_from_raw_or_panic(
@@ -325,6 +368,13 @@ pub fn argmax(a: &MlxArray) -> MlxArray {
     mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_argmax(a.0, false) }, "mlx_argmax")
 }
 
+pub fn argmax_axis(a: &MlxArray, axis: i32) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_argmax_axis(a.0, axis, false) },
+        "mlx_argmax_axis",
+    )
+}
+
 pub fn dequantize(
     weight: &MlxArray,
     scales: &MlxArray,
@@ -335,6 +385,25 @@ pub fn dequantize(
     mlx_array_from_raw_or_panic(
         unsafe { mlx_sys::mlx_dequantize(weight.0, scales.0, biases.0, group_size, bits) },
         "mlx_dequantize",
+    )
+}
+
+pub fn quantized_matmul(
+    x: &MlxArray,
+    weight: &MlxArray,
+    scales: &MlxArray,
+    biases: &MlxArray,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe {
+            mlx_sys::mlx_quantized_matmul(
+                x.0, weight.0, scales.0, biases.0, transpose, group_size, bits,
+            )
+        },
+        "mlx_quantized_matmul",
     )
 }
 

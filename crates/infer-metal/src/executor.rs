@@ -14,7 +14,7 @@ use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 #[cfg(feature = "metal")]
-use crate::{config, mlx, model_source, qwen35, wired_limit};
+use crate::{config, dflash, mlx, model_source, qwen35, wired_limit};
 
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
@@ -263,6 +263,24 @@ fn sample_inflight(
 }
 
 #[cfg(feature = "metal")]
+fn materialize_inflight_now(inflight: MetalInflight) -> anyhow::Result<StepOutput> {
+    match inflight {
+        MetalInflight::Ready(output) => Ok(output),
+        MetalInflight::Sampled { slot, sampled } => {
+            mlx::eval(&[&sampled]);
+            Ok(StepOutput {
+                tokens: vec![SlotToken {
+                    slot,
+                    token: sampled.item_i32() as u32,
+                    logprob: None,
+                    finish: None,
+                }],
+            })
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
 fn host_sampling_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -389,6 +407,7 @@ impl MetalExecutor {
         }
         eprintln!("[infer-metal] kv cache dtype = {}", kv_cache_dtype.label());
         let weights = qwen35::load_qwen35_metal_weights(resolved, &config)?;
+        let dflash = load_dflash_from_env(&config)?;
         Ok(Self {
             real: Some(RealMetalExecutor {
                 config,
@@ -398,6 +417,7 @@ impl MetalExecutor {
                 page_store: MetalPageStore::default(),
                 active_session_slot: None,
                 pending: None,
+                dflash,
             }),
         })
     }
@@ -489,16 +509,32 @@ impl BackendExecutor for MetalExecutor {
     }
 
     fn max_rows_per_step(&self) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.max_rows_per_step();
+        }
         1
     }
 
     fn max_live_requests(&self) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.max_live_requests();
+        }
         1
     }
 
     fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
+            if real.dflash.is_some() {
+                // DFlash decode needs the side-path target-hidden store plus
+                // draft KV state. The current prefix mirror has only target
+                // KV/GDR, so attaching it would enter decode without the
+                // DFlash state and fail after admission. Disable prefix reuse
+                // for the DFlash opt-in until those side-path snapshots exist.
+                return 0;
+            }
             return real.page_store.reusable_prefix_pages(block_ids);
         }
         block_ids.len()
@@ -575,10 +611,23 @@ struct RealMetalExecutor {
     active_session_slot: Option<usize>,
     /// Cross-step decode prequeue (see `pipeline_decode_enabled`).
     pending: Option<PendingStep>,
+    /// Opt-in single-request DFlash side path. When present, decode must route
+    /// through DFlash or fail; it must never silently fall back to target-only.
+    dflash: Option<dflash::MetalDflashRuntime>,
 }
 
 #[cfg(feature = "metal")]
 impl RealMetalExecutor {
+    fn max_rows_per_step(&self) -> usize {
+        self.dflash
+            .as_ref()
+            .map_or(1, |runtime| runtime.max_rows().max(1))
+    }
+
+    fn max_live_requests(&self) -> usize {
+        self.max_rows_per_step()
+    }
+
     /// Pre-build (JIT-compile) the prefill + decode MLX graphs at load so turn-0
     /// is not cold. After the steady-decode pipeline recovery
     /// (`wins/2026-06-04-metal-rewrite-decode-pipeline-recovery`), the residual
@@ -619,18 +668,134 @@ impl RealMetalExecutor {
     fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> anyhow::Result<MetalInflight> {
         let _guard = mlx_sys::mlx_guard();
         let row_count = plan.prefill_rows.len() + plan.decode_rows.len();
-        anyhow::ensure!(
-            row_count == 1,
-            "R3a MetalExecutor supports exactly one prefill or decode row, got {row_count}"
-        );
+        anyhow::ensure!(row_count > 0, "R3a MetalExecutor received an idle plan");
+        if !plan.prefill_rows.is_empty() && !plan.decode_rows.is_empty() {
+            if self.dflash.is_some() {
+                return self.submit_dflash_mixed_rows(&plan.prefill_rows, &plan.decode_rows, kv);
+            }
+            anyhow::bail!("R3a MetalExecutor does not support mixed prefill/decode plans");
+        }
 
-        if let Some(row) = plan.prefill_rows.first() {
+        if !plan.prefill_rows.is_empty() {
+            if self.dflash.is_some() && plan.prefill_rows.len() > 1 {
+                return self.submit_dflash_prefill_rows(&plan.prefill_rows, kv);
+            }
+            anyhow::ensure!(
+                plan.prefill_rows.len() == 1,
+                "R3a MetalExecutor supports exactly one prefill row, got {}",
+                plan.prefill_rows.len()
+            );
+            let row = &plan.prefill_rows[0];
             return self.submit_prefill(row, kv);
         }
-        if let Some(row) = plan.decode_rows.first() {
+
+        if !plan.decode_rows.is_empty() {
+            if self.dflash.is_some() {
+                return self.submit_dflash_decode_rows(&plan.decode_rows, kv);
+            }
+            anyhow::ensure!(
+                plan.decode_rows.len() == 1,
+                "R3a MetalExecutor supports exactly one target-only decode row, got {}",
+                plan.decode_rows.len()
+            );
+            let row = &plan.decode_rows[0];
             return self.submit_decode(row, kv);
         }
+
         anyhow::bail!("R3a MetalExecutor received a non-idle plan with no rows")
+    }
+
+    fn submit_dflash_prefill_rows(
+        &mut self,
+        rows: &[infer_plan::PrefillRow],
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<MetalInflight> {
+        self.preflight_dflash_prefill_rows(rows)?;
+        Ok(MetalInflight::Ready(
+            self.run_dflash_prefill_rows(rows, kv)?,
+        ))
+    }
+
+    fn submit_dflash_mixed_rows(
+        &mut self,
+        prefill_rows: &[infer_plan::PrefillRow],
+        decode_rows: &[infer_plan::DecodeRow],
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<MetalInflight> {
+        let runtime = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash mixed plan requested without a runtime"))?;
+        let row_count = prefill_rows.len() + decode_rows.len();
+        anyhow::ensure!(
+            row_count <= runtime.max_rows(),
+            "DFlash mixed plan received {row_count} rows but INFER_METAL_DFLASH_MAX_ROWS allows {}",
+            runtime.max_rows()
+        );
+        self.preflight_dflash_prefill_rows(prefill_rows)?;
+        self.preflight_dflash_decode_rows(decode_rows, kv)?;
+
+        log::info!(
+            "Metal DFlash scheduler-mixed lane live: prefill_rows={}, decode_rows={}",
+            prefill_rows.len(),
+            decode_rows.len()
+        );
+        let mut tokens = self.run_dflash_prefill_rows(prefill_rows, kv)?.tokens;
+        tokens.extend(self.run_dflash_decode_rows(decode_rows)?.tokens);
+        Ok(MetalInflight::Ready(StepOutput { tokens }))
+    }
+
+    fn preflight_dflash_prefill_rows(&self, rows: &[infer_plan::PrefillRow]) -> anyhow::Result<()> {
+        let runtime = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash prefill requested without a runtime"))?;
+        anyhow::ensure!(
+            rows.len() <= runtime.max_rows(),
+            "DFlash prefill received {} rows but INFER_METAL_DFLASH_MAX_ROWS allows {}",
+            rows.len(),
+            runtime.max_rows()
+        );
+        anyhow::ensure!(
+            self.active_session_slot.is_none(),
+            "DFlash batched prefill requires no active scalar session"
+        );
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            anyhow::ensure!(
+                seen.insert(row.slot),
+                "DFlash prefill received duplicate slot {} in one scheduler step",
+                row.slot
+            );
+            anyhow::ensure!(
+                !row.tokens.is_empty(),
+                "DFlash prefill row for slot {} must contain at least one token",
+                row.slot
+            );
+            anyhow::ensure!(
+                row.params.is_greedy(),
+                "Metal DFlash currently supports greedy sampling only; refusing prefill slot {}",
+                row.slot
+            );
+        }
+        Ok(())
+    }
+
+    fn run_dflash_prefill_rows(
+        &mut self,
+        rows: &[infer_plan::PrefillRow],
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<StepOutput> {
+        log::info!(
+            "Metal DFlash scheduler-prefill lane live: rows={} (serial prefill)",
+            rows.len()
+        );
+        let mut tokens = Vec::new();
+        for row in rows {
+            let output = materialize_inflight_now(self.submit_prefill(row, kv)?)?;
+            tokens.extend(output.tokens);
+        }
+        Ok(StepOutput { tokens })
     }
 
     fn submit_prefill(
@@ -686,12 +851,59 @@ impl RealMetalExecutor {
         self.active_session_slot = Some(row.slot);
         let token_values: Vec<i32> = row.tokens.iter().map(|&token| token as i32).collect();
         let token_arr = mlx::MlxArray::from_slice_i32(&token_values, &[token_values.len() as i32]);
-        let logits =
-            model.prefill_session(&token_arr, token_values.len() as i32, row.start_pos as i32)?;
+        let capture_dflash_hidden = self.dflash.is_some();
+        if let Some(runtime) = self.dflash.as_ref() {
+            model.set_capture_layers(runtime.target_layer_ids())?;
+        }
+        let logits = match model.prefill_session(
+            &token_arr,
+            token_values.len() as i32,
+            row.start_pos as i32,
+        ) {
+            Ok(logits) => logits,
+            Err(err) => {
+                if capture_dflash_hidden {
+                    model.clear_capture_layers();
+                }
+                return Err(err);
+            }
+        };
+        let dflash_hidden = if let Some(runtime) = self.dflash.as_ref() {
+            let captured = match model.drain_captured_hidden() {
+                Ok(captured) => captured,
+                Err(err) => {
+                    model.clear_capture_layers();
+                    return Err(err);
+                }
+            };
+            model.clear_capture_layers();
+            Some(dflash::build_target_hidden_from_captures(
+                &captured,
+                runtime.target_layer_ids().len(),
+                token_values.len() as i32,
+            )?)
+        } else {
+            None
+        };
         mlx::async_eval(&[&logits]);
         slot.cache_len = row.start_pos + row.tokens.len();
         slot.committed_len = slot.cache_len;
         slot.last_sampled = None;
+        if let Some(hidden) = dflash_hidden {
+            if row.start_pos == 0 {
+                slot.dflash_target_hidden = Some(hidden);
+                if let Some(runtime) = self.dflash.as_ref() {
+                    slot.dflash_draft_state = Some(
+                        runtime.new_draft_state(row.total_tokens + runtime.block_size() + 512),
+                    );
+                }
+            } else {
+                slot.dflash_target_hidden = Some(match slot.dflash_target_hidden.take() {
+                    Some(prev) => mlx::concatenate_axis(&[prev, hidden], 0),
+                    None => hidden,
+                });
+            }
+        }
         let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
@@ -707,6 +919,167 @@ impl RealMetalExecutor {
         self.pending = None;
 
         Ok(sample_inflight(row.slot, &logits, &row.params, position))
+    }
+
+    fn submit_dflash_decode_rows(
+        &mut self,
+        rows: &[infer_plan::DecodeRow],
+        kv: &mut dyn KvPool,
+    ) -> anyhow::Result<MetalInflight> {
+        self.pending = None;
+        self.preflight_dflash_decode_rows(rows, kv)?;
+        Ok(MetalInflight::Ready(self.run_dflash_decode_rows(rows)?))
+    }
+
+    fn run_dflash_decode_rows(
+        &mut self,
+        rows: &[infer_plan::DecodeRow],
+    ) -> anyhow::Result<StepOutput> {
+        let model = self.weights.cpp_model()?;
+        let block_size = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?
+            .block_size();
+        for row in rows {
+            let slot = self
+                .slots
+                .get_mut(&row.slot)
+                .ok_or_else(|| anyhow::anyhow!("DFlash decode missing slot {}", row.slot))?;
+            slot.ensure_kv_capacity(model, block_size)?;
+            if slot.session_active {
+                slot.drain_session(model)?;
+            }
+        }
+
+        if rows.len() > 1 {
+            log::info!(
+                "Metal DFlash scheduler-row lane live: rows={} (serial verified blocks)",
+                rows.len()
+            );
+        }
+
+        let mut tokens = Vec::new();
+        for row in rows {
+            let output = self.run_dflash_decode_row(row)?;
+            tokens.extend(output.tokens);
+        }
+        Ok(StepOutput { tokens })
+    }
+
+    fn preflight_dflash_decode_rows(
+        &mut self,
+        rows: &[infer_plan::DecodeRow],
+        kv: &dyn KvPool,
+    ) -> anyhow::Result<()> {
+        let runtime = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?;
+        anyhow::ensure!(
+            !rows.is_empty(),
+            "DFlash decode requires at least one decode row"
+        );
+        anyhow::ensure!(
+            rows.len() <= runtime.max_rows(),
+            "DFlash decode received {} rows but INFER_METAL_DFLASH_MAX_ROWS allows {}",
+            rows.len(),
+            runtime.max_rows()
+        );
+        anyhow::ensure!(
+            self.active_session_slot.is_none(),
+            "DFlash batched decode requires no active scalar session"
+        );
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            anyhow::ensure!(
+                seen.insert(row.slot),
+                "DFlash decode received duplicate slot {} in one scheduler step",
+                row.slot
+            );
+            anyhow::ensure!(
+                row.params.is_greedy(),
+                "Metal DFlash currently supports greedy sampling only; refusing slot {}",
+                row.slot
+            );
+            self.reset_slot_if_epoch_changed(row.slot, kv)?;
+        }
+        for row in rows {
+            let slot = self.slots.get(&row.slot).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DFlash decode for slot {} has no resident slot; prefix-cache-only DFlash is not wired",
+                    row.slot
+                )
+            })?;
+            anyhow::ensure!(
+                row.kv_seq_len == slot.committed_len && slot.committed_len == slot.cache_len,
+                "DFlash decode kv_seq_len mismatch for slot {}: plan={}, committed={}, metal_state={}",
+                row.slot,
+                row.kv_seq_len,
+                slot.committed_len,
+                slot.cache_len
+            );
+            anyhow::ensure!(
+                slot.dflash_target_hidden.is_some(),
+                "DFlash decode for slot {} has no target hidden feature store; prefix-cache-only DFlash is not wired",
+                row.slot
+            );
+            anyhow::ensure!(
+                slot.dflash_draft_state.is_some(),
+                "DFlash decode for slot {} has no draft cache state",
+                row.slot
+            );
+        }
+        Ok(())
+    }
+
+    fn run_dflash_decode_row(&mut self, row: &infer_plan::DecodeRow) -> anyhow::Result<StepOutput> {
+        let runtime = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash decode requested without a runtime"))?;
+        let qwen35::Qwen35Embedding::Dense(embed_tokens) = &self.weights.embedding;
+        let model = self.weights.cpp_model()?;
+        let slot = self
+            .slots
+            .get_mut(&row.slot)
+            .ok_or_else(|| anyhow::anyhow!("DFlash decode missing slot {}", row.slot))?;
+        let target_hidden = slot
+            .dflash_target_hidden
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DFlash decode for slot {} has no target hidden feature store; prefix-cache-only DFlash is not wired",
+                    row.slot
+                )
+            })?;
+        let draft_state = slot.dflash_draft_state.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "DFlash decode for slot {} has no draft cache state",
+                row.slot
+            )
+        })?;
+        let result = dflash::qwen35_speculative_block(
+            runtime,
+            row.slot,
+            row.last_token,
+            target_hidden,
+            embed_tokens,
+            &self.weights.lm_head,
+            &self.config,
+            model,
+            &row.params,
+            &mut slot.kv_flat,
+            &mut slot.gdr_flat,
+            &mut slot.cache_len,
+            draft_state,
+        )?;
+        let output = result.output;
+        slot.committed_len = slot.cache_len;
+        slot.dflash_target_hidden = Some(result.updated_target_hidden);
+        slot.last_sampled = None;
+        self.active_session_slot = None;
+        Ok(output)
     }
 
     fn submit_decode(
@@ -1825,6 +2198,10 @@ struct MetalSlotState {
     /// recent step issued on this slot — the input the next prequeue feeds into
     /// `step_session`. `None` outside pipeline mode.
     last_sampled: Option<mlx::MlxArray>,
+    /// DFlash target hidden feature store for the last committed target span.
+    dflash_target_hidden: Option<mlx::MlxArray>,
+    /// Per-slot draft-model KV cache. Separate from target K/V.
+    dflash_draft_state: Option<dflash::DFlashDraftState>,
 }
 
 #[cfg(feature = "metal")]
@@ -1869,6 +2246,8 @@ impl MetalSlotState {
             gdr_flat,
             session_active: false,
             last_sampled: None,
+            dflash_target_hidden: None,
+            dflash_draft_state: None,
         }
     }
 
@@ -1888,6 +2267,8 @@ impl MetalSlotState {
             gdr_flat,
             session_active: false,
             last_sampled: None,
+            dflash_target_hidden: None,
+            dflash_draft_state: None,
         }
     }
 
@@ -2122,6 +2503,39 @@ fn usize_to_i32(value: usize) -> anyhow::Result<i32> {
 fn round_up_capacity(tokens: usize) -> i32 {
     let tokens = tokens.max(1) as i32;
     ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
+}
+
+#[cfg(feature = "metal")]
+fn load_dflash_from_env(
+    config: &config::MetalModelConfig,
+) -> anyhow::Result<Option<dflash::MetalDflashRuntime>> {
+    let Ok(draft_model) = std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL") else {
+        return Ok(None);
+    };
+    let draft_model = draft_model.trim().to_string();
+    if draft_model.is_empty() {
+        return Ok(None);
+    }
+    let speculative_tokens = match std::env::var("INFER_METAL_DFLASH_TOKENS") {
+        Ok(value) if !value.trim().is_empty() => {
+            Some(value.trim().parse::<usize>().map_err(|err| {
+                anyhow::anyhow!("invalid INFER_METAL_DFLASH_TOKENS='{value}': {err}")
+            })?)
+        }
+        _ => None,
+    };
+    let max_rows = match std::env::var("INFER_METAL_DFLASH_MAX_ROWS") {
+        Ok(value) if !value.trim().is_empty() => value.trim().parse::<usize>().map_err(|err| {
+            anyhow::anyhow!("invalid INFER_METAL_DFLASH_MAX_ROWS='{value}': {err}")
+        })?,
+        _ => 4,
+    };
+    let options = dflash::MetalDflashOptions {
+        draft_model,
+        speculative_tokens,
+        max_rows,
+    };
+    dflash::MetalDflashRuntime::load(&options, config).map(Some)
 }
 
 #[cfg(feature = "metal")]
