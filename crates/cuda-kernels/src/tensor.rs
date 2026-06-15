@@ -3389,6 +3389,13 @@ impl HiddenStates {
             seq_len,
         })
     }
+
+    /// Exact requested device bytes this buffer owns:
+    /// `data.len() * size_of::<bf16>()`. Read-only accounting for the DSv4
+    /// VRAM ledger.
+    pub fn device_bytes(&self) -> usize {
+        self.data.len() * std::mem::size_of::<bf16>()
+    }
 }
 
 /// Cached raw CUDA device pointer for a pre-allocated buffer.

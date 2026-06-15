@@ -162,6 +162,18 @@ impl Dsv4CompressorState {
         self.compressed.seq_len = 0;
         Ok(())
     }
+
+    /// Exact requested device bytes owned by this compressor/indexer state:
+    /// Σ over the four bf16 partial-row buffers + the `compressed` HiddenStates.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let bf16 = std::mem::size_of::<half::bf16>();
+        self.pending_kv.len() * bf16
+            + self.pending_score.len() * bf16
+            + self.prev_overlap_kv.len() * bf16
+            + self.prev_overlap_score.len() * bf16
+            + self.compressed.device_bytes()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +263,27 @@ pub(crate) struct Dsv4KvAdapter {
     /// layer. Sized for `max_batch = num_slots` rows. Engaged only on the n>1
     /// batched lane when `dsv4_flashmla_decode_batched_enabled()`.
     flashmla_batch: Option<Dsv4FlashMlaDecodeBatchScratch>,
+    /// One shared SINGLE-ROW (`s_q = 1`) FlashMLA decode SCRATCH for ALL FlashMLA
+    /// layers and slots (#85 P3). Hoisted out of the per-(slot,layer)
+    /// `Dsv4FlashMlaDecodeState` — its 13 per-forward accumulator/staging buffers
+    /// (`o_accum` dominant at ~33.7 MB/layer) carry NO cross-call/cross-slot state
+    /// (overwritten before read each layer step, serial on `ctx.stream`), so one
+    /// instance sized for the worst-case layer shape serves every (slot, layer).
+    /// Gated by the SAME predicate as the per-slot state alloc
+    /// (`dsv4_flashmla_decode_alloc_enabled`); `None` ⇒ byte-identical to before.
+    flashmla_scratch: Option<Dsv4FlashMlaDecodeScratch>,
+    /// One shared FP8 prefill DeepGEMM linear (quantize→GEMM) staging scratch for
+    /// ALL layers and slots. Hoisted out of the per-slot `Dsv4LayerAttentionState`
+    /// (it was the biggest single per-(slot,layer) offender, ~30 MB/layer): the
+    /// scratch is M-chunk-bounded and fully overwritten from each chunk's
+    /// activations before read, carrying NO cross-call/cross-slot state (see the
+    /// SCRATCH verdict in `Dsv4LayerAttentionState::swap_out_image`). Sized by
+    /// `config` + `max_seq_len` only (no layer-specific dimensions), so a single
+    /// instance is valid for every layer and slot — DSv4 forward runs layers
+    /// sequentially and the engine runs one forward at a time, so it is reused,
+    /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
+    /// `moe_decode_shared`). `None` when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off.
+    prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
 pub(crate) struct Dsv4LayerKvLayout {
@@ -369,7 +402,10 @@ impl Dsv4KvAdapter {
         // single-row state) AND the build supports it; sized for max_batch =
         // num_slots. When OFF this stays None, so the n>1 default per-row lane
         // and the N=1 path are byte-identical to before.
-        let flashmla_batch = if dsv4_flashmla_decode_alloc_enabled()? {
+        // Build the per-layer FlashMLA decode shapes ONCE (shared by the batched
+        // scratch and the new single-row shared scratch). Both gate on the same
+        // `dsv4_flashmla_decode_alloc_enabled` predicate as the per-slot state.
+        let (flashmla_batch, flashmla_scratch) = if dsv4_flashmla_decode_alloc_enabled()? {
             let mut layer_shapes = Vec::with_capacity(layer_specs.len());
             for &(mode, compress_ratio, local_heads) in layer_specs {
                 layer_shapes.push(Dsv4FlashMlaDecodeShape::new(
@@ -382,11 +418,25 @@ impl Dsv4KvAdapter {
                     tp_world,
                 )?);
             }
-            Some(Dsv4FlashMlaDecodeBatchScratch::new(
+            let batch = Dsv4FlashMlaDecodeBatchScratch::new(ctx, config, num_slots, &layer_shapes)?;
+            // ONE model-wide single-row decode scratch (#85 P3), hoisted from the
+            // per-(slot,layer) state. Worst-case-sized across all FlashMLA layers.
+            let single = Dsv4FlashMlaDecodeScratch::new(ctx, config, &layer_shapes)?;
+            (Some(batch), Some(single))
+        } else {
+            (None, None)
+        };
+        // ONE model-wide FP8 prefill DeepGEMM linear scratch (hoisted from the
+        // per-slot `Dsv4LayerAttentionState`). Same gate the per-slot alloc used.
+        // Sized by `config` + `max_seq_len` only (no layer-specific dims), so a
+        // single instance serves every layer and slot; layers run sequentially
+        // and the engine runs one forward at a time, so it is never aliased
+        // concurrently. OFF by default → byte-identical to the disabled path.
+        let prefill_linear = if dsv4_fp8_linear_deepgemm_enabled()? {
+            Some(Dsv4PrefillDeepGemmLinearScratch::new(
                 ctx,
                 config,
-                num_slots,
-                &layer_shapes,
+                max_seq_len,
             )?)
         } else {
             None
@@ -399,28 +449,126 @@ impl Dsv4KvAdapter {
             moe_decode_shared,
             shared_expert_out,
             flashmla_batch,
+            flashmla_scratch,
+            prefill_linear,
         })
     }
 
-    /// Split-borrow accessor: one layer's KV layout plus the model-wide shared
-    /// DSA scratch (disjoint fields, so both can be `&mut` at once).
+    /// Exact requested device bytes owned by the model-wide KV adapter: the
+    /// per-layer KV layouts (the FlashMLA FP8 latent pools + DSA key caches,
+    /// sized for ALL slots — the dominant DSv4 KV byte sink) + the four
+    /// model-wide shared scratches. `slot_epochs`/`num_slots` are host-only.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
+    }
+
+    /// Per-component byte breakdown for the VRAM ledger log. `layers` collapses
+    /// to one summed entry (per-layer detail would be 40+ rows); the four
+    /// shared scratches are itemized.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
+        let layers_bytes: usize = self.layers.iter().map(|l| l.device_bytes()).sum();
+        vec![
+            ("layers(kv_pool+dsa_cache)", layers_bytes),
+            (
+                "dsa_shared",
+                self.dsa_shared.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "moe_decode_shared",
+                self.moe_decode_shared
+                    .as_ref()
+                    .map_or(0, |s| s.device_bytes_live()),
+            ),
+            (
+                "shared_expert_out",
+                self.shared_expert_out
+                    .as_ref()
+                    .map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "flashmla_batch",
+                self.flashmla_batch.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "flashmla_scratch",
+                self.flashmla_scratch
+                    .as_ref()
+                    .map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "prefill_linear",
+                self.prefill_linear.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+        ]
+    }
+
+    /// Split-borrow accessor: one layer's KV layout, the model-wide shared DSA
+    /// scratch, the model-wide single-row FlashMLA decode scratch, AND the
+    /// model-wide shared FP8 prefill DeepGEMM linear scratch (all disjoint
+    /// fields, so all can be `&mut` at once). The FlashMLA scratch is `None`
+    /// when FlashMLA decode is disabled at the build/override level (same gate
+    /// as the per-slot state); the prefill scratch is `None` when
+    /// `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn layer_and_dsa_shared_mut(
         &mut self,
         layer_idx: usize,
-    ) -> Result<(&mut Dsv4LayerKvLayout, Option<&mut Dsv4DsaSharedScratch>)> {
+    ) -> Result<(
+        &mut Dsv4LayerKvLayout,
+        Option<&mut Dsv4DsaSharedScratch>,
+        Option<&mut Dsv4FlashMlaDecodeScratch>,
+        Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    )> {
         let len = self.layers.len();
         let layer = self
             .layers
             .get_mut(layer_idx)
             .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
-        Ok((layer, self.dsa_shared.as_mut()))
+        Ok((
+            layer,
+            self.dsa_shared.as_mut(),
+            self.flashmla_scratch.as_mut(),
+            self.prefill_linear.as_mut(),
+        ))
+    }
+
+    /// Split-borrow accessor for the commit-fold path: one layer's KV layout +
+    /// the model-wide single-row FlashMLA decode scratch (both disjoint fields).
+    /// The fold's FP8 SW ring pack reuses the shared scratch's `sw_bulk_*`
+    /// buffers. `None` for the scratch when FlashMLA decode is disabled.
+    pub(crate) fn layer_and_flashmla_scratch_mut(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(
+        &mut Dsv4LayerKvLayout,
+        Option<&mut Dsv4FlashMlaDecodeScratch>,
+    )> {
+        let len = self.layers.len();
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
+        Ok((layer, self.flashmla_scratch.as_mut()))
+    }
+
+    /// `&mut` accessor for the model-wide shared FP8 prefill DeepGEMM linear
+    /// scratch alone (mirrors `dsa_shared`/`flashmla_batch` accessors). `None`
+    /// when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
+    #[allow(dead_code)]
+    pub(crate) fn prefill_linear_mut(&mut self) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
+        self.prefill_linear.as_mut()
     }
 
     /// Split-borrow accessor for the batched (`b = N`) FlashMLA decode lane
-    /// (#60): one layer's KV layout, the model-wide shared DSA scratch, AND the
-    /// model-wide batched-decode scratch (all disjoint fields). `None` for the
-    /// batched scratch when the build/override disabled FlashMLA decode — the
-    /// caller then takes the per-row lane.
+    /// (#60): one layer's KV layout, the model-wide shared DSA scratch, the
+    /// model-wide batched-decode scratch, AND the model-wide shared FP8 prefill
+    /// DeepGEMM linear scratch (all disjoint fields). `None` for the batched
+    /// scratch when the build/override disabled FlashMLA decode — the caller
+    /// then takes the per-row lane; `None` for the prefill scratch when
+    /// `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn layer_dsa_and_flashmla_batch_mut(
         &mut self,
         layer_idx: usize,
@@ -428,6 +576,8 @@ impl Dsv4KvAdapter {
         &mut Dsv4LayerKvLayout,
         Option<&mut Dsv4DsaSharedScratch>,
         Option<&mut Dsv4FlashMlaDecodeBatchScratch>,
+        Option<&mut Dsv4FlashMlaDecodeScratch>,
+        Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     )> {
         let len = self.layers.len();
         let layer = self
@@ -438,6 +588,8 @@ impl Dsv4KvAdapter {
             layer,
             self.dsa_shared.as_mut(),
             self.flashmla_batch.as_mut(),
+            self.flashmla_scratch.as_mut(),
+            self.prefill_linear.as_mut(),
         ))
     }
 
@@ -653,6 +805,18 @@ impl Dsv4LayerKvLayout {
             dsa_slot_bytes,
             num_slots,
         })
+    }
+
+    /// Exact requested device bytes owned by this ONE layer's KV layout (sized
+    /// for ALL slots): the shared FlashMLA FP8 latent `TokenKVPool` (the
+    /// dominant DSv4 KV byte sink) + the shared DSA key-cache band. The
+    /// `flashmla_page_table` / scalar shape fields are host-only.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.flashmla_kv_pool
+            .as_ref()
+            .map_or(0, |p| p.device_bytes())
+            + self.dsa_key_cache.as_ref().map_or(0, |s| s.len())
     }
 
     fn slot_range(
@@ -886,22 +1050,14 @@ pub(crate) struct Dsv4FlashMlaDecodeState {
     topk_unified: usize,
     fp8_kv_sw_bootstrapped: bool,
     fp8_kv_comp_packed_rows: usize,
-    sw_bulk_block_ids: CudaSlice<i32>,
-    sw_bulk_rows: CudaSlice<i32>,
-    one_block_id: CudaSlice<i32>,
-    one_row: CudaSlice<i32>,
-    comp_block_ids: CudaSlice<i32>,
-    comp_rows: CudaSlice<i32>,
-    indices: CudaSlice<i32>,
+    // CONSTANT-after-init scheduler metadata + slot-shape constants. The 13
+    // per-forward SCRATCH buffers (`sw_bulk_*`/`one_*`/`comp_*`/`indices`/
+    // `lse_*`/`o_accum`/`tp_*`) were hoisted to the model-wide
+    // [`Dsv4FlashMlaDecodeScratch`] (#85 P3) — they carry no cross-call/cross-slot
+    // state, so one shared instance serves every (slot, layer).
     topk_length: CudaSlice<i32>,
-    lse_out: CudaSlice<f32>,
-    lse_accum: CudaSlice<f32>,
-    o_accum: CudaSlice<f32>,
     sched_meta: CudaSlice<i32>,
     num_splits: CudaSlice<i32>,
-    tp_gathered_q: CudaSlice<half::bf16>,
-    tp_packed_q: CudaSlice<half::bf16>,
-    tp_full_out: CudaSlice<half::bf16>,
     num_sm_parts: i32,
     fixed_overhead_num_blocks: i32,
     block_size_topk: i32,
@@ -958,18 +1114,11 @@ impl Dsv4FlashMlaDecodeState {
             .map_err(|e| anyhow!("DSv4 FlashMLA decode meta failed: {e}"))?;
         }
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
-        let h_q_d = shape
-            .h_q
-            .checked_mul(config.head_dim)
-            .ok_or_else(|| anyhow!("DSv4 FlashMLA h_q*d overflow"))?;
-        let accum_rows = num_sm_parts_max + 1;
-        let sw_slots = config.sliding_window;
-        let comp_slots = if mode == DeepSeekV4AttentionMode::SlidingWindow {
-            1
-        } else {
-            max_seq_len.div_ceil(compress_ratio).max(1)
-        };
 
+        // SCRATCH buffers (`sw_bulk_*`/`one_*`/`comp_*`/`indices`/`lse_*`/`o_accum`/
+        // `tp_*`) are NO LONGER allocated here — they live in the model-wide
+        // [`Dsv4FlashMlaDecodeScratch`] (#85 P3). Only the slot-shape constants +
+        // CONSTANT-after-init scheduler metadata remain per (slot, layer).
         let mut state = Self {
             slot_idx,
             fp8_kv_pool_len: range.len(),
@@ -979,22 +1128,9 @@ impl Dsv4FlashMlaDecodeState {
             topk_unified: shape.topk_unified,
             fp8_kv_sw_bootstrapped: false,
             fp8_kv_comp_packed_rows: 0,
-            sw_bulk_block_ids: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
-            sw_bulk_rows: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
-            one_block_id: ctx.stream.alloc_zeros::<i32>(1)?,
-            one_row: ctx.stream.alloc_zeros::<i32>(1)?,
-            comp_block_ids: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
-            comp_rows: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
-            indices: ctx.stream.alloc_zeros::<i32>(shape.topk_unified)?,
             topk_length: ctx.stream.alloc_zeros::<i32>(1)?,
-            lse_out: ctx.stream.alloc_zeros::<f32>(shape.h_q)?,
-            lse_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * shape.h_q)?,
-            o_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q_d)?,
             sched_meta: ctx.stream.alloc_zeros::<i32>(num_sm_parts_max * 8)?,
             num_splits: ctx.stream.alloc_zeros::<i32>(2)?,
-            tp_gathered_q: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
-            tp_packed_q: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
-            tp_full_out: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
             num_sm_parts,
             fixed_overhead_num_blocks,
             block_size_topk,
@@ -1045,6 +1181,176 @@ impl Dsv4FlashMlaDecodeState {
         self.fp8_kv_comp_packed_rows = 0;
         pool.reset_flashmla_slot(ctx, self)?;
         Ok(())
+    }
+
+    /// Exact requested device bytes owned by this per-(slot,layer) FlashMLA
+    /// decode state. After the #85 P3 hoist this is only the CONSTANT-after-init
+    /// scheduler metadata (`topk_length`/`sched_meta`/`num_splits`); the 13
+    /// per-forward SCRATCH buffers live in the model-wide
+    /// [`Dsv4FlashMlaDecodeScratch`]. The FP8 KV pool pages it reads through the
+    /// slot block table are NOT owned here — they live in
+    /// [`Dsv4LayerKvLayout::flashmla_kv_pool`] and are summed there once.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        self.topk_length.len() * i32_sz
+            + self.sched_meta.len() * i32_sz
+            + self.num_splits.len() * i32_sz
+    }
+}
+
+/// Model-wide (one instance, NOT per-slot/per-layer) per-forward SCRATCH for the
+/// SINGLE-ROW (`s_q = 1`) FlashMLA sparse decode lane (#85 P3). These are the
+/// per-step accumulators / staging buffers that the single-row pack + decode +
+/// TP path overwrite-before-read every layer step; they carry NO cross-call or
+/// cross-slot state (the SCRATCH verdict in `Dsv4LayerAttentionState::swap_out_image`).
+/// They were wrongly allocated PER (slot, layer) inside `Dsv4FlashMlaDecodeState`
+/// — `o_accum` alone is `(num_sm_parts+1) × h_q × head_dim × f32 ≈ 33.7 MB/layer`,
+/// so 43 FlashMLA layers cost ~1392 MB PER SLOT. DSv4 runs its layers
+/// sequentially and the engine runs one forward at a time, so ONE shared instance
+/// suffices (exactly like `dsa_shared`/`flashmla_batch`/`prefill_linear`): the
+/// single-row decode loop overwrites the shared scratch before reading every
+/// iteration, serial on `ctx.stream`. Hoisting drops per-slot from ~1466 MB to
+/// ~74 MB.
+///
+/// Every buffer is sized for the WORST CASE across all FlashMLA layer shapes
+/// (the per-mode `topk_unified` / compressed-row span differ by layer; `h_q` is
+/// uniform 64/128). `num_sm_parts` depends only on `(h_q, s_q=1, model)` — the
+/// same FFI meta the single-row state queried — so it is computed once.
+pub(crate) struct Dsv4FlashMlaDecodeScratch {
+    /// `[sliding_window]` i32 — SW bulk pack block-ids (ring-identity constants),
+    /// written immediately before their single read in `flashmla_pack_sw_ring`.
+    sw_bulk_block_ids: CudaSlice<i32>,
+    /// `[sliding_window]` i32 — SW bulk pack row offsets (same lifecycle).
+    sw_bulk_rows: CudaSlice<i32>,
+    /// `[1]` i32 — one-token SW pack block-id, device-written from `start_pos`
+    /// at the top of every `flashmla_pack_one_sw_token` before its single read.
+    one_block_id: CudaSlice<i32>,
+    /// `[1]` i32 — one-token SW pack row offset (same lifecycle).
+    one_row: CudaSlice<i32>,
+    /// `[max comp_slots]` i32 — compressed-delta bulk pack block-ids, H2D-written
+    /// immediately before their single read in `flashmla_pack_compressed_delta`.
+    /// Sized `max(comp_blocks × 64) over layers` (`.max(1)`) — a shape-derived
+    /// upper bound on each layer's `comp_slots = max_seq_len.div_ceil(ratio)`.
+    comp_block_ids: CudaSlice<i32>,
+    /// `[max comp_slots]` i32 — compressed-delta bulk pack row offsets (same).
+    comp_rows: CudaSlice<i32>,
+    /// `[max topk_unified]` i32 — the unified sparse indices the build-indices
+    /// kernel writes each decode step before the sparse-decode kernel reads them.
+    indices: CudaSlice<i32>,
+    /// `[h_q]` f32 — decode-kernel LSE output, fully overwritten per launch.
+    lse_out: CudaSlice<f32>,
+    /// `[(num_sm_parts+1) × h_q]` f32 — split-KV LSE accumulator (same lifecycle).
+    lse_accum: CudaSlice<f32>,
+    /// `[(num_sm_parts+1) × h_q × head_dim]` f32 — split-KV O accumulator. The
+    /// dominant byte sink; fully overwritten per launch before read.
+    o_accum: CudaSlice<f32>,
+    /// `[h_q × head_dim]` bf16 — TP all-gather landing buffer for the global-head
+    /// Q (TP path only), written each decode step before read.
+    tp_gathered_q: CudaSlice<half::bf16>,
+    /// `[h_q × head_dim]` bf16 — repacked global-head Q (TP path), written each step.
+    tp_packed_q: CudaSlice<half::bf16>,
+    /// `[h_q × head_dim]` bf16 — full global-head fwd output staging (TP path),
+    /// written by the fwd then read by the out-slice each step.
+    tp_full_out: CudaSlice<half::bf16>,
+}
+
+impl Dsv4FlashMlaDecodeScratch {
+    /// Allocate the ONE model-wide single-row FlashMLA decode scratch, each
+    /// buffer sized for the worst case across `layer_shapes` (every FlashMLA
+    /// layer's decode shape). All shapes must share `h_q`.
+    fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        layer_shapes: &[Dsv4FlashMlaDecodeShape],
+    ) -> Result<Self> {
+        ensure!(
+            !layer_shapes.is_empty(),
+            "DSv4 single-row FlashMLA decode scratch needs at least one layer shape"
+        );
+        let h_q = layer_shapes[0].h_q;
+        ensure!(
+            layer_shapes.iter().all(|s| s.h_q == h_q),
+            "DSv4 single-row FlashMLA decode scratch requires a uniform h_q across layers"
+        );
+        let head_dim = config.head_dim;
+        let h_q_d = h_q
+            .checked_mul(head_dim)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA scratch h_q*d overflow"))?;
+        // `sw_*` are config-constant (`sliding_window`) like the per-slot alloc.
+        let sw_slots = config.sliding_window;
+        // Worst-case compressed-row span: `comp_blocks * page_block_size` is a
+        // shape-derived upper bound on each layer's `comp_slots` (the per-slot
+        // alloc used `max_seq_len.div_ceil(ratio)`, and `comp_blocks =
+        // compressed_rows.div_ceil(64)` ⇒ `comp_blocks*64 ≥ comp_slots`). SW
+        // layers have `comp_blocks=0`; the `.max(1)` matches the per-slot floor.
+        let comp_slots = layer_shapes
+            .iter()
+            .map(|s| s.comp_blocks * 64)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let max_topk_unified = layer_shapes
+            .iter()
+            .map(|s| s.topk_unified)
+            .max()
+            .unwrap_or(0);
+        // num_sm_parts depends only on (h_q, s_q=1, model) — uniform across
+        // layers; same call the single-row state + batch scratch use.
+        let mut num_sm_parts = 0_i32;
+        let mut fixed_overhead_num_blocks = 0_i32;
+        let mut block_size_topk = 0_i32;
+        unsafe {
+            ffi::arle_flashmla_sm90_sparse_decode_get_meta(
+                h_q as i32,
+                DSV4_FLASHMLA_S_Q as i32,
+                DSV4_FLASHMLA_MODEL1,
+                &mut num_sm_parts,
+                &mut fixed_overhead_num_blocks,
+                &mut block_size_topk,
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 single-row FlashMLA scratch meta failed: {e}"))?;
+        }
+        let num_sm_parts_max = (num_sm_parts as usize).max(256);
+        let accum_rows = num_sm_parts_max + 1;
+        Ok(Self {
+            sw_bulk_block_ids: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
+            sw_bulk_rows: ctx.stream.alloc_zeros::<i32>(sw_slots)?,
+            one_block_id: ctx.stream.alloc_zeros::<i32>(1)?,
+            one_row: ctx.stream.alloc_zeros::<i32>(1)?,
+            comp_block_ids: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
+            comp_rows: ctx.stream.alloc_zeros::<i32>(comp_slots)?,
+            indices: ctx.stream.alloc_zeros::<i32>(max_topk_unified)?,
+            lse_out: ctx.stream.alloc_zeros::<f32>(h_q)?,
+            lse_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q)?,
+            o_accum: ctx.stream.alloc_zeros::<f32>(accum_rows * h_q_d)?,
+            tp_gathered_q: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
+            tp_packed_q: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
+            tp_full_out: ctx.stream.alloc_zeros::<half::bf16>(h_q_d)?,
+        })
+    }
+
+    /// Exact requested device bytes owned by this ONE model-wide single-row
+    /// FlashMLA decode scratch.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let f32_sz = std::mem::size_of::<f32>();
+        let bf16 = std::mem::size_of::<half::bf16>();
+        self.sw_bulk_block_ids.len() * i32_sz
+            + self.sw_bulk_rows.len() * i32_sz
+            + self.one_block_id.len() * i32_sz
+            + self.one_row.len() * i32_sz
+            + self.comp_block_ids.len() * i32_sz
+            + self.comp_rows.len() * i32_sz
+            + self.indices.len() * i32_sz
+            + self.lse_out.len() * f32_sz
+            + self.lse_accum.len() * f32_sz
+            + self.o_accum.len() * f32_sz
+            + self.tp_gathered_q.len() * bf16
+            + self.tp_packed_q.len() * bf16
+            + self.tp_full_out.len() * bf16
     }
 }
 
@@ -1211,6 +1517,27 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             fixed_overhead_num_blocks,
             block_size_topk,
         })
+    }
+
+    /// Exact requested device bytes owned by this ONE model-wide batched
+    /// FlashMLA decode scratch (`layer_shapes` is host-only metadata, excluded).
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let f32_sz = std::mem::size_of::<f32>();
+        let bf16 = std::mem::size_of::<half::bf16>();
+        self.indices.len() * i32_sz
+            + self.topk_length.len() * i32_sz
+            + self.start_pos.len() * i32_sz
+            + self.slot_block_offsets.len() * i32_sz
+            + self.lse_out.len() * f32_sz
+            + self.lse_accum.len() * f32_sz
+            + self.o_accum.len() * f32_sz
+            + self.sched_meta.len() * i32_sz
+            + self.num_splits.len() * i32_sz
+            + self.q_batched.len() * bf16
+            + self.out_batched.len() * bf16
+            + self.tp_gathered_q.len() * bf16
     }
 
     /// Upload the per-row decode positions + slot→pool block offsets for an
@@ -1783,9 +2110,22 @@ impl Dsv4FusedWqkvDecodeScratch {
             head_dim,
         })
     }
+
+    /// Exact requested device bytes owned by this fused-wqkv decode scratch.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let f32_sz = std::mem::size_of::<f32>();
+        self.input_fp8.len() // u8
+            + self.input_scales.len() * f32_sz
+            + self.qkv_raw.device_bytes()
+            + self.active_experts.len() * i32_sz
+            + self.active_offsets.len() * i32_sz
+            + self.active_counts.len() * i32_sz
+    }
 }
 
-struct Dsv4PrefillDeepGemmLinearScratch {
+pub(crate) struct Dsv4PrefillDeepGemmLinearScratch {
     input_fp8: CudaSlice<u8>,
     input_scales: CudaSlice<f32>,
     qkv_raw: HiddenStates,
@@ -1859,6 +2199,20 @@ impl Dsv4PrefillDeepGemmLinearScratch {
             q_lora_rank,
             head_dim,
         })
+    }
+
+    /// Exact requested device bytes owned by this ONE model-wide FP8 prefill
+    /// DeepGEMM linear staging scratch.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let f32_sz = std::mem::size_of::<f32>();
+        self.input_fp8.len() // u8
+            + self.input_scales.len() * f32_sz
+            + self.qkv_raw.device_bytes()
+            + self.active_experts.len() * i32_sz
+            + self.active_offsets.len() * i32_sz
+            + self.active_counts.len() * i32_sz
     }
 }
 
@@ -1938,6 +2292,15 @@ impl Dsv4DsaOfficialState {
         self.packed_rows = 0;
         pool.reset_dsa_slot(ctx, self)?;
         Ok(())
+    }
+
+    /// Exact requested device bytes owned by this per-(slot,CSA-layer) DSA
+    /// state: the `rotated_keys` bf16 mirror only. The slot's `dsa_key_cache`
+    /// band is owned by [`Dsv4LayerKvLayout::dsa_key_cache`] (summed there once),
+    /// not here.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.rotated_keys.len() * std::mem::size_of::<half::bf16>()
     }
 }
 
@@ -2092,6 +2455,27 @@ impl Dsv4DsaSharedScratch {
             num_sms,
         })
     }
+
+    /// Exact requested device bytes owned by this ONE model-wide shared DSA
+    /// selector scratch: Σ over its 10 `CudaSlice` fields. (The standalone
+    /// [`dsv4_dsa_shared_scratch_bytes`] predicts the same total from config
+    /// dims for the KV budget; this sums the live slices for the ledger.)
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let f32_sz = std::mem::size_of::<f32>();
+        let i64_sz = std::mem::size_of::<i64>();
+        self.cache_locs.len() * i64_sz
+            + self.q_fp8.len() // u8
+            + self.weights.len() * f32_sz
+            + self.context_lens.len() * i32_sz
+            + self.positions.len() * i32_sz
+            + self.page_table_identity.len() * i32_sz
+            + self.freqs_cis.len() * f32_sz
+            + self.sched_meta.len() * i32_sz
+            + self.logits.len() * f32_sz
+            + self.raw_indices.len() * i32_sz
+    }
 }
 
 /// Device bytes of the ONE [`Dsv4DsaSharedScratch`] (per model, NOT per slot).
@@ -2225,7 +2609,6 @@ pub(crate) struct Dsv4LayerAttentionState {
     indexer: Option<Dsv4CompressorState>,
     flashmla: Option<Dsv4FlashMlaDecodeState>,
     fused_wqkv: Option<Dsv4FusedWqkvDecodeScratch>,
-    prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
     dsa_official: Option<Dsv4DsaOfficialState>,
 }
 
@@ -2288,6 +2671,14 @@ pub(crate) struct Dsv4SpecRingSnapshot {
 }
 
 impl Dsv4SpecRingSnapshot {
+    /// Exact requested device bytes owned by this per-(slot,layer) spec-ring
+    /// snapshot: the bf16 `sw_slots` + the optional `u8` `fp8_slots`.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.sw_slots.len() * std::mem::size_of::<half::bf16>()
+            + self.fp8_slots.as_ref().map_or(0, |s| s.len())
+    }
+
     /// `(logical ring block, data offset in block, scale offset in block)` for
     /// one draft token's FP8 SW ring slot. Recovered verbatim from the deleted
     /// `Dsv4LayerAttentionSnapshot::fp8_sw_offsets` (git 7f305a1e). The block id
@@ -2646,15 +3037,6 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
-        let prefill_linear = if dsv4_fp8_linear_deepgemm_enabled()? {
-            Some(Dsv4PrefillDeepGemmLinearScratch::new(
-                ctx,
-                config,
-                max_seq_len,
-            )?)
-        } else {
-            None
-        };
         let dsa_official =
             if mode == DeepSeekV4AttentionMode::CompressedSparse && dsv4_dsa_official_enabled()? {
                 Some(Dsv4DsaOfficialState::new(
@@ -2674,9 +3056,53 @@ impl Dsv4LayerAttentionState {
             indexer,
             flashmla,
             fused_wqkv,
-            prefill_linear,
             dsa_official,
         })
+    }
+
+    /// Exact requested device bytes owned by this per-(slot,layer) attention
+    /// state: `sw_window_cache` + each `Option` sub-struct's `device_bytes()`.
+    /// `prefill_linear` was hoisted out to the adapter (#85) and is summed
+    /// there; the FlashMLA FP8 KV pool pages live in `Dsv4LayerKvLayout`.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.sw_window_cache.len() * std::mem::size_of::<half::bf16>()
+            + self.compressor.as_ref().map_or(0, |s| s.device_bytes())
+            + self.indexer.as_ref().map_or(0, |s| s.device_bytes())
+            + self.flashmla.as_ref().map_or(0, |s| s.device_bytes())
+            + self.fused_wqkv.as_ref().map_or(0, |s| s.device_bytes())
+            + self.dsa_official.as_ref().map_or(0, |s| s.device_bytes())
+    }
+
+    /// Per-component byte breakdown for the VRAM ledger log.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            (
+                "sw_window_cache",
+                self.sw_window_cache.len() * std::mem::size_of::<half::bf16>(),
+            ),
+            (
+                "compressor",
+                self.compressor.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "indexer",
+                self.indexer.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "flashmla",
+                self.flashmla.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "fused_wqkv",
+                self.fused_wqkv.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "dsa_official",
+                self.dsa_official.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+        ]
     }
 
     pub(crate) fn reset(
@@ -2725,25 +3151,18 @@ impl Dsv4LayerAttentionState {
     ///   - shared FP8 pool pages (the slot's `flashmla_page_table` into the
     ///     packed `TokenKVPool`): SNAPSHOT via `copy_pages_to_host` (every
     ///     page; perf TODO: written extent is `seq_len`-derived).
-    ///   - `sw_bulk_block_ids`/`sw_bulk_rows`: SCRATCH — written only in
-    ///     `flashmla_pack_sw_ring` (ring-identity constants) immediately before
-    ///     their single read in the same call; never read elsewhere.
-    ///   - `one_block_id`/`one_row`: SCRATCH — device-written from
-    ///     `start_pos_device` at the top of every `flashmla_pack_one_sw_token`
-    ///     before their single read in the same call.
-    ///   - `comp_block_ids`/`comp_rows`: SCRATCH — H2D-written immediately
-    ///     before their single read inside `flashmla_pack_compressed_delta`.
-    ///   - `indices`: SCRATCH — the unified top-k select writes it each decode
-    ///     step before the sparse-decode kernel reads it in the same step.
     ///   - `topk_length`/`sched_meta`/`num_splits`: CONSTANT-after-init
     ///     (`init_constant_sched_meta` — slot-shape constants, written once).
-    ///   - `lse_out`/`lse_accum`/`o_accum`: SCRATCH — decode-kernel split
-    ///     accumulators/outputs, fully overwritten per launch before read.
-    ///   - `tp_gathered_q`/`tp_packed_q`/`tp_full_out`: SCRATCH — per-step Q
-    ///     gather/output staging, written each decode step before read.
     ///   - `slot_idx`/`fp8_kv_pool_len`/`sw_blocks`/`comp_blocks`/
     ///     `max_compressed_keys`/`topk_unified`/`num_sm_parts`/
     ///     `fixed_overhead_num_blocks`/`block_size_topk`: CONSTANT-after-init.
+    ///   - The 13 per-forward SCRATCH buffers (`sw_bulk_block_ids`/`sw_bulk_rows`,
+    ///     `one_block_id`/`one_row`, `comp_block_ids`/`comp_rows`, `indices`,
+    ///     `lse_out`/`lse_accum`/`o_accum`, `tp_gathered_q`/`tp_packed_q`/
+    ///     `tp_full_out`) were hoisted to the model-wide
+    ///     [`Dsv4FlashMlaDecodeScratch`] (#85 P3) — overwritten before read each
+    ///     layer step, NO cross-call/cross-slot state, so NOT per-slot and NOT
+    ///     snapshotted (mirrors the `Dsv4DsaSharedScratch` verdict below).
     /// - `fused_wqkv` ([`Dsv4FusedWqkvDecodeScratch`]): SCRATCH — `input_fp8`/
     ///   `input_scales`/`qkv_raw` are quantize→GEMM staging overwritten from
     ///   the step's activations before every read; `active_experts`/
@@ -2756,10 +3175,10 @@ impl Dsv4LayerAttentionState {
     ///   not provably re-read → uncertain → snapshot full, always safe), and
     ///   the shared `dsa_key_cache` band (`dsa_slot_range(slot_idx)`), which
     ///   the paged-MQA logits kernel reads in full every step.
-    /// - [`Dsv4DsaSharedScratch`] (adapter-level, NOT per-slot): NO SNAPSHOT —
-    ///   its doc proves "contents carry NO cross-call state" (per-forward
-    ///   scratch overwritten before read + config constants), shared across
-    ///   every slot and layer.
+    /// - [`Dsv4DsaSharedScratch`] / [`Dsv4FlashMlaDecodeScratch`] (adapter-level,
+    ///   NOT per-slot): NO SNAPSHOT — their docs prove "contents carry NO
+    ///   cross-call state" (per-forward scratch overwritten before read + config
+    ///   constants), shared across every slot and layer.
     pub(crate) fn swap_out_image(
         &self,
         ctx: &DeviceContext,
@@ -3305,6 +3724,11 @@ pub(crate) fn commit_layer_fold(
     mode: DeepSeekV4AttentionMode,
     compress_ratio: usize,
     state: &mut Dsv4LayerAttentionState,
+    // Model-wide shared single-row FlashMLA decode scratch (#85 P3): the FP8 SW
+    // ring fold reuses its `sw_bulk_*` buffers. `Some` whenever this layer has a
+    // FlashMLA arena (same gate); the fold only touches it inside the FlashMLA
+    // `if let Some(flash)` branch below.
+    flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
     pool: &mut Dsv4LayerKvLayout,
     gathered: &HiddenStates,
     start_pos: usize,
@@ -3449,6 +3873,9 @@ pub(crate) fn commit_layer_fold(
     // ── FP8 SW ring pack for the accepted positions (table-routed strided
     // pack, mirrors flashmla_pack_sw_ring's math for m explicit slots).
     if let Some(flash) = &mut state.flashmla {
+        let scratch = flashmla_scratch.ok_or_else(|| {
+            anyhow!("DSv4 commit fold: FlashMLA arena present but shared decode scratch missing")
+        })?;
         let page_block_size = 64;
         let mut block_ids = Vec::with_capacity(m);
         let mut rows = Vec::with_capacity(m);
@@ -3465,10 +3892,10 @@ pub(crate) fn commit_layer_fold(
             }
         }
         ctx.stream
-            .memcpy_htod(&block_ids, &mut flash.sw_bulk_block_ids)
+            .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
             .map_err(|e| anyhow!("DSv4 commit fold FP8 block_ids H2D failed: {e}"))?;
         ctx.stream
-            .memcpy_htod(&rows, &mut flash.sw_bulk_rows)
+            .memcpy_htod(&rows, &mut scratch.sw_bulk_rows)
             .map_err(|e| anyhow!("DSv4 commit fold FP8 rows H2D failed: {e}"))?;
         let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
         let pool_buf = pool.flashmla_pool_data_mut()?;
@@ -3480,8 +3907,8 @@ pub(crate) fn commit_layer_fold(
             nope_ptr,
             rope_ptr,
             pool_ptr,
-            &flash.sw_bulk_block_ids,
-            &flash.sw_bulk_rows,
+            &scratch.sw_bulk_block_ids,
+            &scratch.sw_bulk_rows,
             m,
             page_block_size,
             config.head_dim,
@@ -5020,6 +5447,7 @@ fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
 fn flashmla_pack_sw_ring(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
+    scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
     window_cache: &CudaSlice<half::bf16>,
     config: &DeepSeekV4Config,
@@ -5047,10 +5475,10 @@ fn flashmla_pack_sw_ring(
         }
     }
     ctx.stream
-        .memcpy_htod(&block_ids, &mut flash.sw_bulk_block_ids)
+        .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
         .map_err(|e| anyhow!("DSv4 FlashMLA SW block_ids H2D failed: {e}"))?;
     ctx.stream
-        .memcpy_htod(&rows, &mut flash.sw_bulk_rows)
+        .memcpy_htod(&rows, &mut scratch.sw_bulk_rows)
         .map_err(|e| anyhow!("DSv4 FlashMLA SW rows H2D failed: {e}"))?;
     let (window_ptr, _wg) = window_cache.device_ptr(&ctx.stream);
     let pool_buf = pool.flashmla_pool_data_mut()?;
@@ -5062,8 +5490,8 @@ fn flashmla_pack_sw_ring(
         nope_ptr,
         rope_ptr,
         pool_ptr,
-        &flash.sw_bulk_block_ids,
-        &flash.sw_bulk_rows,
+        &scratch.sw_bulk_block_ids,
+        &scratch.sw_bulk_rows,
         sliding_window,
         page_block_size,
         config.head_dim,
@@ -5076,13 +5504,14 @@ fn flashmla_pack_sw_ring(
 fn flashmla_pack_one_sw_token(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
+    scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
     k_prepared: &HiddenStates,
     start_pos_device: &CudaSlice<i32>,
     config: &DeepSeekV4Config,
 ) -> Result<()> {
-    let (bid_ptr, bid_guard) = flash.one_block_id.device_ptr_mut(&ctx.stream);
-    let (row_ptr, row_guard) = flash.one_row.device_ptr_mut(&ctx.stream);
+    let (bid_ptr, bid_guard) = scratch.one_block_id.device_ptr_mut(&ctx.stream);
+    let (row_ptr, row_guard) = scratch.one_row.device_ptr_mut(&ctx.stream);
     let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
     flash_kv::dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
         ctx,
@@ -5114,8 +5543,8 @@ fn flashmla_pack_one_sw_token(
         nope_ptr,
         rope_ptr,
         pool_ptr,
-        &flash.one_block_id,
-        &flash.one_row,
+        &scratch.one_block_id,
+        &scratch.one_row,
         1,
         64,
         config.head_dim,
@@ -5126,6 +5555,7 @@ fn flashmla_pack_one_sw_token(
 fn flashmla_pack_compressed_delta(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
+    scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
     compressed: Option<&HiddenStates>,
     start_pos_device: &CudaSlice<i32>,
@@ -5189,10 +5619,10 @@ fn flashmla_pack_compressed_delta(
         rows.push((row % 64) as i32);
     }
     ctx.stream
-        .memcpy_htod(&block_ids, &mut flash.comp_block_ids)
+        .memcpy_htod(&block_ids, &mut scratch.comp_block_ids)
         .map_err(|e| anyhow!("DSv4 FlashMLA compressed block_ids H2D failed: {e}"))?;
     ctx.stream
-        .memcpy_htod(&rows, &mut flash.comp_rows)
+        .memcpy_htod(&rows, &mut scratch.comp_rows)
         .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
 
     let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
@@ -5215,8 +5645,8 @@ fn flashmla_pack_compressed_delta(
         nope_ptr,
         rope_ptr,
         pool_ptr,
-        &flash.comp_block_ids,
-        &flash.comp_rows,
+        &scratch.comp_block_ids,
+        &scratch.comp_rows,
         n,
         64,
         config.head_dim,
@@ -5734,6 +6164,7 @@ fn try_flashmla_decode_attention(
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
     flash: &mut Dsv4FlashMlaDecodeState,
+    scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
@@ -5777,18 +6208,27 @@ fn try_flashmla_decode_attention(
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring");
-        flashmla_pack_sw_ring(ctx, flash, pool, sw_window_cache, config)?;
+        flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)?;
     }
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one");
-        flashmla_pack_one_sw_token(ctx, flash, pool, k_prepared, start_pos_device, config)?;
+        flashmla_pack_one_sw_token(
+            ctx,
+            flash,
+            scratch,
+            pool,
+            k_prepared,
+            start_pos_device,
+            config,
+        )?;
     }
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed");
         flashmla_pack_compressed_delta(
             ctx,
             flash,
+            scratch,
             pool,
             compressed,
             start_pos_device,
@@ -5808,7 +6248,7 @@ fn try_flashmla_decode_attention(
     } else {
         0
     };
-    let (indices_ptr, indices_guard) = flash.indices.device_ptr_mut(&ctx.stream);
+    let (indices_ptr, indices_guard) = scratch.indices.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_build_indices");
@@ -5849,16 +6289,16 @@ fn try_flashmla_decode_attention(
     let pool_view = pool_buf.slice(pool_range);
     let (pool_ptr, pool_guard) = pool_view.device_ptr(&ctx.stream);
     let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
-    let (lse_out_ptr, lse_guard) = flash.lse_out.device_ptr_mut(&ctx.stream);
-    let (lse_accum_ptr, lse_accum_guard) = flash.lse_accum.device_ptr_mut(&ctx.stream);
-    let (o_accum_ptr, o_accum_guard) = flash.o_accum.device_ptr_mut(&ctx.stream);
-    let (indices_ptr, indices_guard) = flash.indices.device_ptr(&ctx.stream);
+    let (lse_out_ptr, lse_guard) = scratch.lse_out.device_ptr_mut(&ctx.stream);
+    let (lse_accum_ptr, lse_accum_guard) = scratch.lse_accum.device_ptr_mut(&ctx.stream);
+    let (o_accum_ptr, o_accum_guard) = scratch.o_accum.device_ptr_mut(&ctx.stream);
+    let (indices_ptr, indices_guard) = scratch.indices.device_ptr(&ctx.stream);
     let (topk_ptr, topk_guard) = flash.topk_length.device_ptr(&ctx.stream);
     let (sched_ptr, sched_guard) = flash.sched_meta.device_ptr(&ctx.stream);
     let (splits_ptr, splits_guard) = flash.num_splits.device_ptr(&ctx.stream);
 
     let q_for_flashmla = if tp_world > 1 {
-        let (gather_ptr, gather_guard) = flash.tp_gathered_q.device_ptr_mut(&ctx.stream);
+        let (gather_ptr, gather_guard) = scratch.tp_gathered_q.device_ptr_mut(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather");
             unsafe {
@@ -5871,7 +6311,7 @@ fn try_flashmla_decode_attention(
             }
         }
         drop(gather_guard);
-        let (packed_ptr, packed_guard) = flash.tp_packed_q.device_ptr_mut(&ctx.stream);
+        let (packed_ptr, packed_guard) = scratch.tp_packed_q.device_ptr_mut(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack");
             unsafe {
@@ -5911,7 +6351,7 @@ fn try_flashmla_decode_attention(
     };
 
     let flash_out_ptr = if tp_world > 1 {
-        let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr_mut(&ctx.stream);
+        let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr_mut(&ctx.stream);
         drop(full_out_guard);
         full_out_ptr as *mut ffi::Half
     } else {
@@ -5976,7 +6416,7 @@ fn try_flashmla_decode_attention(
     }
 
     if tp_world > 1 {
-        let (full_out_ptr, full_out_guard) = flash.tp_full_out.device_ptr(&ctx.stream);
+        let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice");
             unsafe {
@@ -6054,6 +6494,7 @@ pub(crate) fn flashmla_decode_pack_row(
     config: &DeepSeekV4Config,
     compress_ratio: usize,
     flash: &mut Dsv4FlashMlaDecodeState,
+    scratch: &mut Dsv4FlashMlaDecodeScratch,
     pool: &mut Dsv4LayerKvLayout,
     sw_window_cache: &CudaSlice<half::bf16>,
     k_prepared: &HiddenStates,
@@ -6062,17 +6503,26 @@ pub(crate) fn flashmla_decode_pack_row(
 ) -> Result<()> {
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring_batched");
-        flashmla_pack_sw_ring(ctx, flash, pool, sw_window_cache, config)?;
+        flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)?;
     }
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one_batched");
-        flashmla_pack_one_sw_token(ctx, flash, pool, k_prepared, start_pos_device, config)?;
+        flashmla_pack_one_sw_token(
+            ctx,
+            flash,
+            scratch,
+            pool,
+            k_prepared,
+            start_pos_device,
+            config,
+        )?;
     }
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed_batched");
         flashmla_pack_compressed_delta(
             ctx,
             flash,
+            scratch,
             pool,
             compressed,
             start_pos_device,
@@ -6433,6 +6883,15 @@ pub(crate) fn mla_attention(
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
+    // Model-wide shared single-row FlashMLA decode scratch (#85 P3, hoisted off
+    // the per-(slot,layer) state). `Some` whenever FlashMLA decode is allocated
+    // (same gate as the per-slot state); consumed only on the single-row decode
+    // FlashMLA path inside the fwd.
+    flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
+    // Model-wide shared FP8 prefill DeepGEMM linear scratch (hoisted off the
+    // per-slot state). `Some` only when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is on AND
+    // the caller threads it. `None` on the decode (token_count==1) graph lane.
+    mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     // Spec tree-verify chunk: per-row positions + branch topology. Routes the
@@ -6445,7 +6904,8 @@ pub(crate) fn mla_attention(
 ) -> Result<()> {
     // Single-row + chunked-prefill callers: PREPARE then FWD back-to-back, in
     // the exact original order — byte-identical to the pre-split body. Only the
-    // batched decode lane (#60) calls the two halves separately.
+    // batched decode lane (#60) calls the two halves separately. The shared
+    // prefill scratch reborrows across PREPARE (consumed first) into FWD.
     let prepared = mla_attention_prepare(
         ctx,
         config,
@@ -6457,6 +6917,7 @@ pub(crate) fn mla_attention(
         state,
         pool,
         dsa_shared,
+        prefill_shared.as_deref_mut(),
         start_pos,
         start_pos_device,
         tree,
@@ -6472,6 +6933,8 @@ pub(crate) fn mla_attention(
         layer_idx,
         state,
         pool,
+        flashmla_scratch,
+        prefill_shared,
         start_pos,
         start_pos_device,
         tree,
@@ -6499,6 +6962,11 @@ pub(crate) fn mla_attention_prepare(
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
+    // Model-wide shared FP8 prefill DeepGEMM linear scratch (hoisted off the
+    // per-slot state). `Some` only when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is on AND
+    // the caller threads it (the prefill projection lanes). `None` on the decode
+    // (token_count==1) graph/batched lanes, which never take a prefill branch.
+    mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     // Tree-verify chunk positions feed the RoPE prepare (siblings share absolute
@@ -6601,7 +7069,7 @@ pub(crate) fn mla_attention_prepare(
     } else if token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()? {
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
-        let scratch = state.prefill_linear.as_mut().ok_or_else(|| {
+        let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
             anyhow!(
                 "ARLE_DSV4_FP8_LINEAR_DEEPGEMM=1 but prefill fused wqkv scratch was not allocated"
             )
@@ -6624,7 +7092,7 @@ pub(crate) fn mla_attention_prepare(
             .as_ref()
             .filter(|_| dsv4_prefill_proj_deepgemm_enabled())
         {
-            let scratch = state.prefill_linear.as_mut().ok_or_else(|| {
+            let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
                 anyhow!("DSv4 prefill wq_b DeepGEMM requested but prefill scratch not allocated")
             })?;
             crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
@@ -6878,7 +7346,7 @@ pub(crate) fn mla_attention_prepare(
                 start_pos,
                 start_pos_device,
                 compress_ratio,
-                state.prefill_linear.as_mut(),
+                prefill_shared,
                 keepalive,
             )?)
         } else {
@@ -6917,6 +7385,13 @@ fn mla_attention_fwd(
     layer_idx: usize,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
+    // Model-wide shared single-row FlashMLA decode scratch (#85 P3). `Some`
+    // whenever FlashMLA decode is allocated (same gate as the per-slot state);
+    // consumed only on the single-row decode FlashMLA path below.
+    flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
+    // Model-wide shared FP8 prefill DeepGEMM linear scratch, forwarded to the
+    // O-LoRA `mla_oproj` (its token_count>1 prefill DeepGEMM lane gates on it).
+    prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     tree: Option<&Dsv4TreeAttnMeta>,
@@ -7001,6 +7476,11 @@ fn mla_attention_fwd(
                 let flash = state.flashmla.as_mut().ok_or_else(|| {
                     anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
                 })?;
+                let scratch = flashmla_scratch.ok_or_else(|| {
+                    anyhow!(
+                        "ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing"
+                    )
+                })?;
                 try_flashmla_decode_attention(
                     ctx,
                     config,
@@ -7013,6 +7493,7 @@ fn mla_attention_fwd(
                     None,
                     &mut state.sw_window_cache,
                     flash,
+                    scratch,
                     pool,
                     start_pos,
                     start_pos_device,
@@ -7156,6 +7637,9 @@ fn mla_attention_fwd(
             let flash = state.flashmla.as_mut().ok_or_else(|| {
                 anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
             })?;
+            let scratch = flashmla_scratch.ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+            })?;
             try_flashmla_decode_attention(
                 ctx,
                 config,
@@ -7168,6 +7652,7 @@ fn mla_attention_fwd(
                 Some(compressed),
                 &mut state.sw_window_cache,
                 flash,
+                scratch,
                 pool,
                 start_pos,
                 start_pos_device,
@@ -7289,6 +7774,7 @@ fn mla_attention_fwd(
         ctx,
         attention,
         state,
+        prefill_shared,
         &local_attn,
         token_count,
         keepalive,
@@ -7307,6 +7793,11 @@ pub(crate) fn mla_oproj(
     ctx: &DeviceContext,
     attention: &Dsv4Attention,
     state: &mut Dsv4LayerAttentionState,
+    // Model-wide shared FP8 prefill DeepGEMM linear scratch (hoisted off the
+    // per-slot state). `Some` only when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is on AND
+    // the caller threads it; the prefill wo_a/wo_b DeepGEMM lane (token_count>1)
+    // gates on it. `None` on the decode (token_count==1) graph/batched lanes.
+    mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     local_attn: &HiddenStates,
     token_count: usize,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -7353,7 +7844,7 @@ pub(crate) fn mla_oproj(
         && dsv4_prefill_proj_deepgemm_enabled()
         && attention.wo_a_deepgemm.is_some()
         && attention.wo_b_deepgemm.is_some()
-        && state.prefill_linear.is_some()
+        && prefill_shared.is_some()
     {
         // Prefill wo_a/wo_b (M=token_count) → DeepGEMM, off the scalar fp8_gemv
         // (same lever as prefill wq_b; reuses the prefill FP8 scratch).
@@ -7367,9 +7858,8 @@ pub(crate) fn mla_oproj(
             .expect("wo prefill gate checked");
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         {
-            let scratch = state
-                .prefill_linear
-                .as_mut()
+            let scratch = prefill_shared
+                .as_deref_mut()
                 .expect("wo prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
                 prefill_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent)
@@ -7379,10 +7869,7 @@ pub(crate) fn mla_oproj(
         keepalive.keep_hidden(&latent);
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         {
-            let scratch = state
-                .prefill_linear
-                .as_mut()
-                .expect("wo prefill gate checked");
+            let scratch = prefill_shared.expect("wo prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
                 prefill_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out)
             })?;
