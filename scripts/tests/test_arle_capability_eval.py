@@ -150,6 +150,32 @@ class TaskRunnerRegistry(unittest.TestCase):
             self.assertTrue(callable(fn), f"runner {task!r} not callable")
 
 
+class ReproducibilityMetadata(unittest.TestCase):
+    def test_seed_list_parser(self):
+        self.assertIsNone(eval_mod._parse_seed_list(None))
+        self.assertEqual(eval_mod._parse_seed_list("0,1, 2"), [0, 1, 2])
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            eval_mod._parse_seed_list(" , ")
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            eval_mod._parse_seed_list("1,1")
+
+    def test_fingerprint_is_order_sensitive_and_stable(self):
+        records = [{"id": "a", "answer": 1}, {"id": "b", "answer": 2}]
+        same_records_different_key_order = [{"answer": 1, "id": "a"}, {"answer": 2, "id": "b"}]
+        reordered = [{"id": "b", "answer": 2}, {"id": "a", "answer": 1}]
+        self.assertEqual(
+            eval_mod._fingerprint_records(records),
+            eval_mod._fingerprint_records(same_records_different_key_order),
+        )
+        self.assertNotEqual(eval_mod._fingerprint_records(records), eval_mod._fingerprint_records(reordered))
+        self.assertTrue(eval_mod._fingerprint_records(records).startswith("sha256:"))
+
+    def test_final_result_contract_pins_engine_owned_candidate(self):
+        self.assertEqual(eval_mod.FINAL_RESULT_CONTRACT["candidate_source"], "ARLE inference output")
+        self.assertTrue(eval_mod.FINAL_RESULT_CONTRACT["no_model_judge"])
+        self.assertTrue(eval_mod.FINAL_RESULT_CONTRACT["grader_may_not_rewrite_candidate"])
+
+
 class ClientFactory(unittest.TestCase):
     """build_client validates required args per backend without trying to actually
     connect / load a model."""
