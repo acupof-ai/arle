@@ -171,6 +171,44 @@ impl TokenUsage {
     }
 }
 
+/// Backend-native chat rendering input.
+///
+/// This is intentionally smaller than the OpenAI wire type: CLI/agent callers
+/// only need role + text content, while HTTP continues to own tools and other
+/// request-shape details. Backends with checkpoint chat templates override
+/// [`InferenceEngine::render_chat_prompt`]; the default remains ChatML for
+/// legacy autoregressive paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatPromptMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatPromptMessage {
+    #[must_use]
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+}
+
 /// One streamed delta (legacy `CompletionStreamDelta`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompletionStreamDelta {
@@ -293,6 +331,32 @@ pub trait InferenceEngine: Send {
     /// errors (object-safety); treat `Err(_)` as "unavailable", never empty `Vec`.
     fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
         Err(anyhow!("backend does not expose tokenize()"))
+    }
+
+    /// Render chat messages using the backend's native chat template.
+    ///
+    /// The default keeps the historical Qwen-style ChatML prompt for engines
+    /// that have not exposed a checkpoint template yet. Template-aware
+    /// [`ServeInferenceEngine`](crate::ServeInferenceEngine) instances override
+    /// this to use the tokenizer's checkpoint template.
+    fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
+        if messages.is_empty() {
+            return Err(anyhow!("messages must contain at least one message"));
+        }
+        let mut out = String::new();
+        for message in messages {
+            let role = message.role.trim();
+            if role.is_empty() {
+                return Err(anyhow!("message role must not be empty"));
+            }
+            out.push_str("<|im_start|>");
+            out.push_str(role);
+            out.push('\n');
+            out.push_str(&message.content);
+            out.push_str("<|im_end|>\n");
+        }
+        out.push_str("<|im_start|>assistant\n");
+        Ok(out)
     }
 
     /// Backend-agnostic engine-level telemetry snapshot.
