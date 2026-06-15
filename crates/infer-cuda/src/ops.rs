@@ -9,6 +9,9 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
+#[path = "ops/quant_linear.rs"]
+mod quant_linear;
+
 pub(crate) fn precompute_rope(
     ctx: &DeviceContext,
     head_dim: usize,
@@ -139,6 +142,9 @@ pub(crate) fn gemm_batch(
         x.seq_len,
         out.seq_len
     );
+    if weight.weight_format.is_quantized() {
+        return quant_linear::gemm_batch(ctx, weight, x, out);
+    }
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
@@ -171,6 +177,9 @@ pub(crate) fn gemv(
         x.len,
         out.len
     );
+    if weight.weight_format.is_quantized() {
+        return quant_linear::gemv(ctx, weight, x, out);
+    }
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
