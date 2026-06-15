@@ -3057,6 +3057,7 @@ mod dsv4_gpu {
                 &packed_hidden,
                 &counts,
                 &offsets,
+                1,
                 swiglu_limit,
                 keepalive,
             )?;
