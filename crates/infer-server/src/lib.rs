@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
@@ -180,6 +180,10 @@ pub enum CollectTimeout {
     Pending(RequestTicket),
     /// The engine thread closed before delivering the completion.
     Closed(RequestHandle),
+}
+
+fn submit_trace_enabled() -> bool {
+    std::env::var_os("ARLE_SERVE_SUBMIT_TRACE").is_some()
 }
 
 impl<E, K> ServeHandle<E, K>
@@ -335,6 +339,7 @@ where
             self.release_live_request();
             return Err(anyhow!("engine thread closed; cannot submit"));
         }
+        let trace_start = submit_trace_enabled().then(Instant::now);
         let handle = match handle_rx.recv() {
             Ok(handle) => handle,
             Err(_) => {
@@ -344,6 +349,15 @@ where
                 ));
             }
         };
+        if let Some(start) = trace_start {
+            let wait_ms = start.elapsed().as_secs_f64() * 1000.0;
+            log::info!(
+                "[serve-submit] mode=blocking handle={} wait_ms={wait_ms:.1} live={} max_live={}",
+                handle.id(),
+                self.live_requests.load(Ordering::Acquire),
+                self.max_live_requests
+            );
+        }
         Ok(RequestTicket {
             handle,
             completion_rx,
@@ -385,6 +399,7 @@ where
             self.release_live_request();
             return Err(anyhow!("engine thread closed; cannot submit"));
         }
+        let trace_start = submit_trace_enabled().then(Instant::now);
         let handle = match handle_rx.recv() {
             Ok(handle) => handle,
             Err(_) => {
@@ -394,6 +409,15 @@ where
                 ));
             }
         };
+        if let Some(start) = trace_start {
+            let wait_ms = start.elapsed().as_secs_f64() * 1000.0;
+            log::info!(
+                "[serve-submit] mode=streaming handle={} wait_ms={wait_ms:.1} live={} max_live={}",
+                handle.id(),
+                self.live_requests.load(Ordering::Acquire),
+                self.max_live_requests
+            );
+        }
         Ok((
             RequestTicket {
                 handle,

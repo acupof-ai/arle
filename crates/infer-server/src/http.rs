@@ -36,7 +36,7 @@ use crate::{RequestTicket, ServeHandle, StreamItem};
 struct HttpState<E: BackendExecutor, K: KvPool> {
     model: String,
     tokenizer: Mutex<OpenAiTokenizer>,
-    serve: Mutex<ServeHandle<E, K>>,
+    serve: ServeHandle<E, K>,
 }
 
 /// Build an axum router exposing non-streaming OpenAI v1 completions.
@@ -52,7 +52,7 @@ where
     let state = Arc::new(HttpState {
         model: model.into(),
         tokenizer: Mutex::new(tokenizer),
-        serve: Mutex::new(serve),
+        serve,
     });
     Router::new()
         .route("/v1/completions", post(completions::<E, K>))
@@ -85,11 +85,7 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    let counters = state
-        .serve
-        .lock()
-        .map_err(|_| ApiError::internal("serve lock poisoned"))?
-        .counters();
+    let counters = state.serve.counters();
     Ok(Json(StatsResponse::from_counters(counters)))
 }
 
@@ -102,11 +98,7 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    let counters = state
-        .serve
-        .lock()
-        .map_err(|_| ApiError::internal("serve lock poisoned"))?
-        .counters();
+    let counters = state.serve.counters();
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -216,13 +208,7 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    let ticket = {
-        let serve = state
-            .serve
-            .lock()
-            .map_err(|_| ApiError::internal("serve lock poisoned"))?;
-        serve.submit(prompt_tokens, max_tokens, sampling)?
-    };
+    let ticket = state.serve.submit(prompt_tokens, max_tokens, sampling)?;
     ticket.collect().map_err(ApiError::from)
 }
 
@@ -242,13 +228,9 @@ where
         .lock()
         .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?
         .clone();
-    let (ticket, stream_rx) = {
-        let serve = state
-            .serve
-            .lock()
-            .map_err(|_| ApiError::internal("serve lock poisoned"))?;
-        serve.submit_streaming(prompt_tokens, max_tokens, sampling)?
-    };
+    let (ticket, stream_rx) = state
+        .serve
+        .submit_streaming(prompt_tokens, max_tokens, sampling)?;
     let model = state.model.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(16);
 
@@ -419,15 +401,9 @@ where
     E: BackendExecutor + 'static,
     K: KvPool + 'static,
 {
-    let output = {
-        let serve = state
-            .serve
-            .lock()
-            .map_err(|_| ApiError::internal("serve lock poisoned"))?;
-        serve.run_on_executor(move |executor| {
-            executor.generate_multimodal(&prompt_tokens, &images, max_tokens, &sampling)
-        })?
-    }?;
+    let output = state.serve.run_on_executor(move |executor| {
+        executor.generate_multimodal(&prompt_tokens, &images, max_tokens, &sampling)
+    })??;
     output.ok_or_else(|| {
         ApiError::bad_request("image content requires a backend with Gemma4 VLM support")
     })

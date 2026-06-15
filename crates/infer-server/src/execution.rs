@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use infer_core::{
     CompletedRequest, Engine, KvTierStats, PrefixCacheStats, RequestHandle, RequestOptions,
@@ -61,6 +61,10 @@ pub struct CounterSnapshot {
 /// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
 /// it each tick, the frontend reads it.
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
+
+fn submit_trace_enabled() -> bool {
+    std::env::var_os("ARLE_SERVE_SUBMIT_TRACE").is_some()
+}
 
 /// Publish the engine's current counters to the shared snapshot.
 fn publish_counters<E: BackendExecutor, K: KvPool>(
@@ -150,6 +154,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
     // observer installed below; entries are removed when their `Done` is emitted.
     let streamers: Streamers = Rc::new(RefCell::new(HashMap::new()));
     let mut submit_open = true;
+    let trace_submit = submit_trace_enabled();
 
     // Forward each committed token to its request's live stream (if any). Runs on
     // the engine thread inside `engine.step()`, so it shares `streamers` via the
@@ -238,8 +243,18 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             }
             tick_seq += 1;
         }
+        let admitted = drained.len();
         for submission in drained {
             admit_submission(&mut engine, &mut pending, &streamers, submission);
+        }
+        if trace_submit && admitted != 0 {
+            log::info!(
+                "[serve-engine] admitted={} active={} waiting={} pending={}",
+                admitted,
+                engine.active_count(),
+                engine.waiting_count(),
+                pending.len()
+            );
         }
         publish_counters(&engine, &counters);
 
@@ -247,6 +262,10 @@ fn engine_loop_with_tick_broadcaster<E, K>(
         //    Looping here (rather than one tick per outer pass) keeps latency low
         //    without re-checking the submit channel between every micro-step.
         if !engine.is_idle() {
+            let step_start = trace_submit.then(Instant::now);
+            let active_before = engine.active_count();
+            let waiting_before = engine.waiting_count();
+            let pending_before = pending.len();
             if let Err(err) = engine.step() {
                 log::error!("infer-server engine step failed: {err}");
                 // Drop all back-channels so collectors observe the failure as a
@@ -255,6 +274,15 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                 return;
             }
             deliver_completions(&engine, &mut pending, &streamers);
+            if let Some(start) = step_start {
+                let step_ms = start.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "[serve-engine] step_ms={step_ms:.1} active_before={active_before} waiting_before={waiting_before} pending_before={pending_before} active_after={} waiting_after={} pending_after={}",
+                    engine.active_count(),
+                    engine.waiting_count(),
+                    pending.len()
+                );
+            }
             publish_counters(&engine, &counters);
             continue;
         }
