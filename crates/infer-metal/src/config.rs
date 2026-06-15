@@ -421,6 +421,10 @@ fn diffusion_generation_from_config(
         .or(config.eos_token_id.as_ref())
         .map(parse_eos_field)
         .filter(|ids| !ids.is_empty())
+        // Diffusion-Gemma default stop/EOS token-id set when the config carries
+        // none: 1 = `<eos>`, 106 = `<end_of_turn>`, 50 = the model's extra stop
+        // id (mirrors the same fallback in `infer-plan`'s
+        // `DiffusionGenerationConfig::diffusion_gemma`).
         .unwrap_or_else(|| vec![1, 106, 50]);
     Ok(generation)
 }

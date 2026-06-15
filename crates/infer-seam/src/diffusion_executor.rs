@@ -28,8 +28,9 @@ struct SlotState {
 /// autoregressive [`BackendExecutor`] seam.
 ///
 /// The shared `Engine` still sees one token per step. Internally, the adapter
-/// accumulates chunked prompt-prefill rows, runs [`generate_diffusion`] once on
-/// the final prompt chunk, returns the first generated token from that prefill
+/// accumulates chunked prompt-prefill rows, runs
+/// [`generate_diffusion_with_cancel`] once on the final prompt chunk, returns
+/// the first generated token from that prefill
 /// step, then serves the remaining generated tokens from a per-slot buffer on
 /// subsequent decode rows. The wrapped model only needs to implement
 /// [`DiffusionBlockModel`].

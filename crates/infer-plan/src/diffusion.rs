@@ -66,6 +66,9 @@ impl DiffusionGenerationConfig {
             max_denoising_steps: DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
             max_new_tokens,
             vocab_size,
+            // Diffusion-Gemma default stop/EOS token-id set: 1 = `<eos>`,
+            // 106 = `<end_of_turn>`, 50 = the model's extra stop id (same
+            // fallback as `infer-metal`'s config loader).
             stop_token_ids: vec![1, 106, 50],
             pad_token_id: 0,
             entropy_bound: DEFAULT_DIFFUSION_ENTROPY_BOUND,

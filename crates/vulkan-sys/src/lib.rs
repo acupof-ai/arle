@@ -757,19 +757,6 @@ mod real {
         }
     }
 
-    /// Records many compute dispatches into **one** primary command buffer and
-    /// submits them with a **single** `vkQueueSubmit` on a reused fence — the
-    /// `ggml-vulkan` decode sync model.
-    ///
-    /// This replaces the per-dispatch `CommandPool::one_shot_submit` drain
-    /// (alloc + record + submit(NULL fence) + `queue_wait_idle` + free, once per
-    /// op) on the forward path. `one_shot_submit` stays only for cold weight
-    /// upload; the hot per-token decode graph records here.
-    ///
-    /// Lifecycle: `begin()` → N × (`dispatch()` / `barrier()`) →
-    /// `submit_and_wait()`. The command buffer and fence are allocated once and
-    /// reused across tokens (the pool is created with
-    /// `RESET_COMMAND_BUFFER`, so `begin()` can reset the buffer in place).
     /// Per-dispatch GPU timestamp profiler (ARLE_GPU_TIMESTAMPS=1). Writes a
     /// `vkCmdWriteTimestamp` after each dispatch; the delta between consecutive
     /// timestamps is that dispatch's GPU time, accumulated by category label.
@@ -786,6 +773,19 @@ mod real {
         totals: std::collections::HashMap<&'static str, (u64, u128)>,
     }
 
+    /// Records many compute dispatches into **one** primary command buffer and
+    /// submits them with a **single** `vkQueueSubmit` on a reused fence — the
+    /// `ggml-vulkan` decode sync model.
+    ///
+    /// This replaces the per-dispatch `CommandPool::one_shot_submit` drain
+    /// (alloc + record + submit(NULL fence) + `queue_wait_idle` + free, once per
+    /// op) on the forward path. `one_shot_submit` stays only for cold weight
+    /// upload; the hot per-token decode graph records here.
+    ///
+    /// Lifecycle: `begin()` → N × (`dispatch()` / `barrier()`) →
+    /// `submit_and_wait()`. The command buffer and fence are allocated once and
+    /// reused across tokens (the pool is created with
+    /// `RESET_COMMAND_BUFFER`, so `begin()` can reset the buffer in place).
     pub struct CommandRecorder<'a> {
         ctx: &'a VulkanContext,
         pool: vk::CommandPool,
@@ -1407,10 +1407,12 @@ mod real {
     /// slot — no object creation, no destruction.
     ///
     /// The ring's `binding_count` is fixed at construction (the layout binds that
-    /// many storage buffers). A token's GEMV dispatches all share the same two
-    /// binding counts (2 for the q8_1 quantize, 5 for the GEMV), so one ring per
-    /// binding count covers the whole decode. Call [`Self::reset`] at the start of
-    /// each token to rewind the round-robin index.
+    /// many storage buffers). A decode token's dispatches span several distinct
+    /// binding counts, so the consumer builds one ring per binding count it uses
+    /// (`infer-vulkan`'s `forward.rs` builds six: binding counts 2..=7), each
+    /// sized to hold a whole token's worth of live dispatches at that binding
+    /// count. Call [`Self::reset`] at the start of each token to rewind the
+    /// round-robin index.
     pub struct DescriptorSetRing<'a> {
         ctx: &'a VulkanContext,
         pool: vk::DescriptorPool,
@@ -1470,8 +1472,9 @@ mod real {
         }
 
         /// Rewind the round-robin cursor. Call once per token so a token's
-        /// dispatches reuse the ring from slot 0 (the prior token's submissions
-        /// have completed — the decode `CommandRecorder` fence-waits per GEMV).
+        /// dispatches reuse the ring from slot 0 (the prior token's single
+        /// per-token submit has completed — the decode `CommandRecorder`
+        /// fence-waits the whole batch before the next token records).
         pub fn reset(&mut self) {
             self.next = 0;
         }
@@ -1480,8 +1483,10 @@ mod real {
         /// next ring slot via one `vkUpdateDescriptorSets` and return its raw
         /// `VkDescriptorSet`. No pool / set creation. The caller must record the
         /// dispatch that uses this set BEFORE the slot is reused (a ring of size N
-        /// allows N live dispatches between `reset`s); the decode path submits +
-        /// fence-waits each GEMV pair, so N=4 is ample.
+        /// allows N live dispatches between `reset`s). The decode path batches a
+        /// whole token into ONE submit, so the ring must hold every live dispatch
+        /// of that token at this binding count; the caller (`forward.rs`) sizes
+        /// each ring accordingly (≥64), not 4.
         pub fn next_updated(
             &mut self,
             buffers: &[(&DeviceBuffer<'_>, u64, u64)],
