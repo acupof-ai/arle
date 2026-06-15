@@ -1,19 +1,22 @@
-//! Numeric single-token forward for the **dense Qwen3.5/3.6 27B** (`arch =
-//! qwen35`, dense FFN) on the Vulkan device.
+//! Numeric whole-token forward for the **Qwen3.5/3.6** family (`arch =
+//! qwen35` / `qwen36`) on the Vulkan device — both the dense-FFN variant and
+//! the MoE variant (qwen36 router / top-k / per-expert fused `mul_mat_vec_id`
+//! + weighted accumulate).
 //!
-//! Design (correctness first; see the AGENTS brief): the heavy matmuls — every
-//! projection, the dense FFN, and the LM head — run **on the GPU** through the
-//! PROVEN quantized GEMV (`q8_0_gemv_with_params` fed by `q8_1_quantize`,
-//! validated in `vulkan-kernels/tests/device_gemv.rs`). The lighter
-//! per-element / reduction ops (RMSNorm, RoPE, attention softmax, the per-head
-//! sigmoid gate, SwiGLU, depthwise conv1d, the gated-delta recurrence, residual
-//! add) run **on the host in f32**, transcribed line-for-line from the
+//! Design: the **default path records every op on-device**. The heavy matmuls —
+//! every projection, the dense FFN or the fused MoE experts, and the LM head —
+//! run on the GPU through the PROVEN quantized GEMV (`q8_0_gemv_with_params` fed
+//! by `q8_1_quantize`, validated in `vulkan-kernels/tests/device_gemv.rs`). The
+//! lighter per-element / reduction ops (RMSNorm, RoPE, attention softmax, the
+//! per-head sigmoid gate, SwiGLU, depthwise conv1d, the gated-delta recurrence,
+//! MoE router / top-k / weighted accumulate, residual add) also run as device
+//! dispatches, threaded through device-resident scratch slots so a whole token
+//! stays on-device. The numerics are transcribed line-for-line from the
 //! authoritative CUDA reference (`crates/infer-cuda/src/qwen35.rs` +
 //! `crates/cuda-kernels/csrc/{attention/prefill_attention_hd256.cu,
-//! misc/gated_delta_rule.cu, misc/conv1d.cu, misc/norm.cu}`). f32 host math is
-//! strictly more accurate than the bf16 device path and is trivially finite, so
-//! this lane delivers FINITE, sane logits end-to-end while we (separately) bring
-//! up the elementwise device kernels' push-constant contracts.
+//! misc/gated_delta_rule.cu, misc/conv1d.cu, misc/norm.cu}`). A host f32
+//! fallback remains for ops whose device kernel is absent, but it is not the
+//! default lane.
 //!
 //! Perf-parity Steps 3+4 (see `docs/plans/amd-vulkan-perf-parity.md`): the GEMV
 //! path no longer allocates scratch + round-trips per op. A **[`DeviceArena`]**
@@ -4277,7 +4280,6 @@ fn norm_weight(weights: &ResidentWeights<'_>, layer: usize, suffix: &str) -> Res
     dequant_f32(t, len)
 }
 
-/// Read a device-resident F32 tensor's first `len` elements to host.
 /// Borrow a `DequantF32` tensor's first `len` values as a host f32 slice.
 ///
 /// Prefers the cached host copy (`DeviceTensor::host_f32`, filled at upload) so
