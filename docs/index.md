@@ -91,6 +91,7 @@ live in this file.
 | Benchmark and trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) | `guidellm` is the canonical e2e benchmark path. |
 | Canonical e2e bench tool + parameter set | [plans/guidellm-integration.md](plans/guidellm-integration.md) | Wrapper script `scripts/bench_guidellm.sh` uses these params verbatim. |
 | Capability and agent-code evals | [eval.md](eval.md) | MMLU and SWE-bench Pro workflows; ARLE engine owns the candidate answer/patch, deterministic graders own only scoring. |
+| OPD/QAT capability curve + serving blocker | [opd-capability-curve.md](opd-capability-curve.md) | Δ-vs-baseline curve driver (`scripts/opd_capability_curve.py`) over the eval lanes; the exact adapter-serving blocker (file:line) + smallest fix for the non-baseline curve points. |
 | OPD mainline execution queue | [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Historical artifact ledger; superseded by master strategy v2 Phase 3 (OPD GPU work queued behind Phase 1–2). |
 | Contributor operating contract | [../AGENTS.md](../AGENTS.md) | Use with the canonical docs above. |
 
