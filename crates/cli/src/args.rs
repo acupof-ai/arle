@@ -655,6 +655,26 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = 1.0)]
     pub(crate) grad_clip: f32,
 
+    /// LoRA rank for the real-checkpoint student adapter.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha for the real-checkpoint student adapter.
+    #[arg(long, default_value_t = 32.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set: `attention-qv` (q/v only) or `all-linear`.
+    #[arg(long, default_value = "attention-qv")]
+    pub(crate) lora_target_set: String,
+
+    /// Directory where servable full-materialized OPD checkpoints are written.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_checkpoint: Option<PathBuf>,
+
+    /// Save a servable full checkpoint every N steps (0 = final checkpoint only).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) save_every: usize,
+
     /// Smoke mode — use the embedded tiny Qwen3.5 config instead of
     /// loading weights from disk. Useful for hardware smoke + CI gating.
     #[arg(long, default_value_t = false)]
@@ -768,6 +788,14 @@ pub(crate) struct TrainSelfOpdArgs {
     /// LoRA target set: `attention-qv` (q/v only) or `all-linear`.
     #[arg(long, default_value = "attention-qv")]
     pub(crate) lora_target_set: String,
+
+    /// Directory where servable full-materialized SOPD checkpoints are written.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_checkpoint: Option<PathBuf>,
+
+    /// Save a servable full checkpoint every N steps (0 = final checkpoint only).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) save_every: usize,
 
     /// Smoke mode — embedded tiny Qwen3.5 config, no disk weights. The gate is
     /// skipped (random tiny weights make held-out NLL meaningless).
@@ -1064,6 +1092,10 @@ mod tests {
             "5",
             "--gkd-lambda",
             "0.0",
+            "--save-checkpoint",
+            "/tmp/opd-save",
+            "--save-every",
+            "5",
         ])
         .expect("pure OPD eval flags should parse");
         let Some(CliCommand::Train(train)) = args.command else {
@@ -1075,6 +1107,41 @@ mod tests {
         assert_eq!(opd.eval_ids.as_deref(), Some("1,2,3"));
         assert_eq!(opd.gate_every_n, 5);
         assert_eq!(opd.gkd_lambda, 0.0);
+        assert_eq!(opd.lora_rank, 16);
+        assert_eq!(opd.lora_alpha, 32.0);
+        assert_eq!(opd.lora_target_set, "attention-qv");
+        assert_eq!(
+            opd.save_checkpoint.as_deref(),
+            Some(std::path::Path::new("/tmp/opd-save"))
+        );
+        assert_eq!(opd.save_every, 5);
+    }
+
+    #[test]
+    fn accepts_train_self_opd_save_checkpoint_flags() {
+        let args = Args::try_parse_from([
+            "arle",
+            "train",
+            "self-opd",
+            "--student-model",
+            "models/qwen",
+            "--save-checkpoint",
+            "/tmp/self-opd-save",
+            "--save-every",
+            "3",
+        ])
+        .expect("self-opd save flags should parse");
+        let Some(CliCommand::Train(train)) = args.command else {
+            panic!("expected train command");
+        };
+        let TrainCommand::SelfOpd(opd) = train.command else {
+            panic!("expected train self-opd command");
+        };
+        assert_eq!(
+            opd.save_checkpoint.as_deref(),
+            Some(std::path::Path::new("/tmp/self-opd-save"))
+        );
+        assert_eq!(opd.save_every, 3);
     }
 
     #[test]

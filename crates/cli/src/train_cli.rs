@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -246,14 +247,99 @@ fn validate_pure_opd_gkd_lambda(gkd_lambda: f32) -> Result<()> {
     )
 }
 
+struct OpdCheckpointSources {
+    config_path: PathBuf,
+    tokenizer_path: PathBuf,
+    generation_config_path: PathBuf,
+}
+
+fn checkpoint_sources(model_dir: &Path) -> Result<OpdCheckpointSources> {
+    let config_path = model_dir.join("config.json");
+    if !config_path.is_file() {
+        bail!(
+            "cannot save OPD checkpoint: source config.json is missing at {}",
+            config_path.display()
+        );
+    }
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    if !tokenizer_path.is_file() {
+        bail!(
+            "cannot save OPD checkpoint: source tokenizer.json is missing at {}",
+            tokenizer_path.display()
+        );
+    }
+    Ok(OpdCheckpointSources {
+        config_path,
+        tokenizer_path,
+        generation_config_path: model_dir.join("generation_config.json"),
+    })
+}
+
+fn should_save_step_checkpoint(step: usize, total_steps: usize, save_every: usize) -> bool {
+    step == total_steps || (save_every > 0 && step.is_multiple_of(save_every))
+}
+
+fn maybe_save_full_student_checkpoint(
+    label: &str,
+    save_checkpoint: Option<&Path>,
+    save_every: usize,
+    step: usize,
+    total_steps: usize,
+    model_dir: &Path,
+    student: &train::qwen35::Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut autograd::Tape,
+) -> Result<Option<PathBuf>> {
+    let Some(out_dir) = save_checkpoint else {
+        return Ok(None);
+    };
+    if !should_save_step_checkpoint(step, total_steps, save_every) {
+        return Ok(None);
+    }
+
+    use train::qwen35_checkpoint::{
+        ConfigJsonSource, GenerationConfigSource, Qwen35StepCheckpoint, Qwen35StudentWeights,
+        save_qwen35_student_checkpoint,
+    };
+
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create OPD checkpoint root {}", out_dir.display()))?;
+    let started = Instant::now();
+    let sources = checkpoint_sources(model_dir)?;
+    let saved_dir = save_qwen35_student_checkpoint(
+        Qwen35StepCheckpoint {
+            out_dir,
+            step,
+            tokenizer_path: Some(&sources.tokenizer_path),
+            config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
+            generation_config: GenerationConfigSource::CopyOrSynthesize {
+                source_path: &sources.generation_config_path,
+                fallback_config_path: &sources.config_path,
+            },
+        },
+        student,
+        store,
+        tape,
+        Qwen35StudentWeights::FullMaterialized { bf16: true },
+    )
+    .with_context(|| format!("save {label} full-materialized checkpoint at step {step}"))?;
+    println!(
+        "checkpoint_saved kind=full_materialized mode={label} step={step} dir={} seconds={:.6}",
+        saved_dir.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(Some(saved_dir))
+}
+
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
+        lora::LoraConfig,
         opd::{
             GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
             opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
-        qwen35_loader::load_qwen35_from_hf_dir,
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
     };
 
     let student_dir = args
@@ -262,6 +348,11 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
     validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
     let teacher_dir = args.teacher_model.as_deref().unwrap_or(student_dir);
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
 
     let (mut store, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
@@ -277,9 +368,13 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         "[arle train opd] loading student from {}",
         student_dir.display()
     );
-    let student = load_qwen35_from_hf_dir(student_dir, &mut store)
-        .with_context(|| format!("load student from {}", student_dir.display()))?;
-    let student_params = student.all_parameter_ids();
+    let student = load_qwen35_lora_from_hf_dir(student_dir, lora, target_set, &mut store)
+        .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    let student_params: Vec<TensorId> = student
+        .all_parameter_ids()
+        .into_iter()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
     let cfg = student.config().clone();
 
     let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
@@ -385,6 +480,31 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 print_opd_step_profile(step, profile);
             }
         }
+        maybe_save_full_student_checkpoint(
+            "opd",
+            args.save_checkpoint.as_deref(),
+            args.save_every,
+            step,
+            args.steps,
+            student_dir,
+            &student,
+            &mut store,
+            &mut tape,
+        )?;
+    }
+
+    if args.steps == 0 {
+        maybe_save_full_student_checkpoint(
+            "opd",
+            args.save_checkpoint.as_deref(),
+            args.save_every,
+            0,
+            0,
+            student_dir,
+            &student,
+            &mut store,
+            &mut tape,
+        )?;
     }
 
     if args.json {
@@ -398,6 +518,11 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "lr": args.lr,
             "gkd_lambda": args.gkd_lambda,
             "gate_every_n": args.gate_every_n,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "lora_target_set": args.lora_target_set,
+            "save_checkpoint": args.save_checkpoint.as_ref().map(|path| path.display().to_string()),
+            "save_every": args.save_every,
             "final_nll_baseline": nll_baseline,
             "losses": losses,
             "gate_nlls": gate_nlls,
@@ -826,6 +951,31 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                 print_opd_step_profile(step, profile);
             }
         }
+        maybe_save_full_student_checkpoint(
+            "self-opd",
+            args.save_checkpoint.as_deref(),
+            args.save_every,
+            step,
+            args.steps,
+            student_dir,
+            &student,
+            &mut store,
+            &mut tape,
+        )?;
+    }
+
+    if args.steps == 0 {
+        maybe_save_full_student_checkpoint(
+            "self-opd",
+            args.save_checkpoint.as_deref(),
+            args.save_every,
+            0,
+            0,
+            student_dir,
+            &student,
+            &mut store,
+            &mut tape,
+        )?;
     }
 
     if args.json {
@@ -848,6 +998,8 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
             "lora_target_set": args.lora_target_set,
+            "save_checkpoint": args.save_checkpoint.as_ref().map(|path| path.display().to_string()),
+            "save_every": args.save_every,
             "vocab_size": vocab,
             "hidden_size": cfg.hidden_size,
             "num_hidden_layers": cfg.num_hidden_layers,
@@ -1807,9 +1959,15 @@ impl SaveDtypeArg {
 
 #[cfg(test)]
 mod tests {
-    use autograd::{Tensor, TensorStore};
+    use std::fs;
 
-    use super::{OpdStepMetric, PretrainPresetArg, ScratchShape, current_grad_norm, opd_summary};
+    use autograd::{Tape, Tensor, TensorStore};
+    use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
+
+    use super::{
+        OpdStepMetric, PretrainPresetArg, ScratchShape, current_grad_norm,
+        embedded_tiny_qwen35_config, maybe_save_full_student_checkpoint, opd_summary,
+    };
 
     #[test]
     fn small_30m_preset_applies_expected_shape() {
@@ -1873,5 +2031,76 @@ mod tests {
             (norm - expected).abs() / expected < 1.0e-5,
             "grad_norm should be about {expected:e}, got {norm:e}"
         );
+    }
+
+    #[test]
+    fn cli_full_materialized_checkpoint_is_loadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+
+        let cfg = embedded_tiny_qwen35_config();
+        let config = serde_json::json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "text_config": {
+                "hidden_size": cfg.hidden_size,
+                "intermediate_size": cfg.intermediate_size,
+                "num_hidden_layers": cfg.num_hidden_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_key_value_heads,
+                "head_dim": cfg.head_dim,
+                "vocab_size": cfg.vocab_size,
+                "rms_norm_eps": cfg.rms_norm_eps,
+                "layer_types": cfg
+                    .layer_types
+                    .iter()
+                    .map(|_| "full_attention")
+                    .collect::<Vec<_>>(),
+                "linear_conv_kernel_dim": cfg.linear_conv_kernel_dim,
+                "linear_key_head_dim": cfg.linear_key_head_dim,
+                "linear_num_key_heads": cfg.linear_num_key_heads,
+                "linear_num_value_heads": cfg.linear_num_value_heads,
+                "linear_value_head_dim": cfg.linear_value_head_dim,
+                "rope_parameters": {
+                    "rope_theta": cfg.rope_theta,
+                    "partial_rotary_factor": cfg.partial_rotary_factor,
+                },
+                "eos_token_id": cfg.eos_token_id,
+                "bos_token_id": cfg.bos_token_id,
+                "tie_word_embeddings": cfg.tie_word_embeddings,
+                "max_position_embeddings": cfg.rope_cache_len_hint,
+            },
+            "torch_dtype": "bfloat16",
+        });
+        fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_vec_pretty(&config).expect("config json"),
+        )
+        .expect("write config");
+        fs::write(model_dir.join("tokenizer.json"), "{}\n").expect("write tokenizer");
+
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = Qwen35Model::new(&cfg, &mut store).expect("student");
+        let saved = maybe_save_full_student_checkpoint(
+            "test",
+            Some(tmp.path()),
+            1,
+            1,
+            1,
+            &model_dir,
+            &student,
+            &mut store,
+            &mut tape,
+        )
+        .expect("save checkpoint")
+        .expect("checkpoint should save");
+
+        let mut loaded_store = TensorStore::default();
+        let loaded =
+            load_qwen35_from_hf_dir(&saved, &mut loaded_store).expect("saved checkpoint loads");
+        assert_eq!(loaded.config().vocab_size, cfg.vocab_size);
+        assert!(saved.join("model.safetensors").is_file());
+        assert!(saved.join("tokenizer.json").is_file());
     }
 }
