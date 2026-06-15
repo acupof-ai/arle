@@ -37,7 +37,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -77,7 +77,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [package]
 name = "agent-infer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 publish = false
