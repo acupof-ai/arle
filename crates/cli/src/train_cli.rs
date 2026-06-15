@@ -237,6 +237,15 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn validate_pure_opd_gkd_lambda(gkd_lambda: f32) -> Result<()> {
+    if gkd_lambda == 0.0 && gkd_lambda.is_finite() {
+        return Ok(());
+    }
+    bail!(
+        "`arle train opd` is the pure-KL OPD path; --gkd-lambda must be exactly 0.0, got {gkd_lambda}"
+    )
+}
+
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
@@ -251,6 +260,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .student_model
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
+    validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
     let teacher_dir = args.teacher_model.as_deref().unwrap_or(student_dir);
 
     let (mut store, backend_label) = build_opd_store(args.backend)?;
@@ -279,6 +289,16 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             cfg.vocab_size
         );
     }
+    let eval_ids = match args.eval_ids.as_deref() {
+        Some(raw) => parse_prompt_ids(Some(raw))?,
+        None => prompt_ids.clone(),
+    };
+    if eval_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
+        bail!(
+            "eval token ids must be < {} (student vocab size); got {eval_ids:?}",
+            cfg.vocab_size
+        );
+    }
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let rollout_sampling = rollout_sampling_params(
@@ -294,7 +314,24 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     };
     let kl_direction = kl_direction_arg(args.kl_direction);
 
+    let gate_on = args.gate_every_n > 0;
+    let mut nll_baseline = if gate_on {
+        heldout_nll(&student, &eval_ids, cfg.vocab_size, &mut store)?
+    } else {
+        f32::INFINITY
+    };
+    if gate_on && !nll_baseline.is_finite() {
+        bail!(
+            "initial held-out NLL is non-finite ({nll_baseline}); cannot establish \
+             an OPD evaluation baseline"
+        );
+    }
+    if gate_on && !args.json {
+        println!("gate baseline_nll {nll_baseline:.6}");
+    }
+
     let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    let mut gate_nlls: Vec<(usize, f32)> = Vec::new();
     for step in 1..=args.steps {
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
         let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
@@ -321,13 +358,29 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         )
         .with_context(|| format!("opd step {step} failed"))?;
         losses.push(outcome.loss);
+        let mut gate_nll = f32::NAN;
+        if gate_on && step % args.gate_every_n == 0 {
+            gate_nll = heldout_nll(&student, &eval_ids, cfg.vocab_size, &mut store)?;
+            nll_baseline = gate_nll;
+            gate_nlls.push((step, gate_nll));
+        }
         if !args.json {
-            println!(
-                "step {step}/{total} loss {loss:.6} rollout_len {rl}",
-                total = args.steps,
-                loss = outcome.loss,
-                rl = outcome.rollout_len,
-            );
+            if gate_on && step % args.gate_every_n == 0 {
+                println!(
+                    "step {step}/{total} loss {loss:.6} rollout_len {rl} gate observe nll \
+                     {gate_nll:.6} baseline {nll_baseline:.6}",
+                    total = args.steps,
+                    loss = outcome.loss,
+                    rl = outcome.rollout_len,
+                );
+            } else {
+                println!(
+                    "step {step}/{total} loss {loss:.6} rollout_len {rl}",
+                    total = args.steps,
+                    loss = outcome.loss,
+                    rl = outcome.rollout_len,
+                );
+            }
             if let Some(profile) = step_profile.as_ref() {
                 print_opd_step_profile(step, profile);
             }
@@ -343,8 +396,13 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "steps": args.steps,
             "rollout_len": args.rollout_len,
             "lr": args.lr,
+            "gkd_lambda": args.gkd_lambda,
+            "gate_every_n": args.gate_every_n,
+            "final_nll_baseline": nll_baseline,
             "losses": losses,
+            "gate_nlls": gate_nlls,
             "prompt_ids": prompt_ids,
+            "eval_ids": eval_ids,
             "vocab_size": cfg.vocab_size,
             "hidden_size": cfg.hidden_size,
             "num_hidden_layers": cfg.num_hidden_layers,
@@ -375,6 +433,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         qwen35::Qwen35Model,
     };
 
+    validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
     let cfg = embedded_tiny_qwen35_config();
     let prompt_ids = parse_prompt_ids(args.prompt_ids.as_deref())?;
     if prompt_ids.iter().any(|&id| (id as usize) >= cfg.vocab_size) {
