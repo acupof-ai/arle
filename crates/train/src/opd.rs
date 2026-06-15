@@ -24,6 +24,7 @@ use autograd::{
     AutogradError, BackwardOp, BackwardProfile, Device, Tape, TensorId, TensorStore,
     optim::Optimizer,
 };
+use infer_plan::{SamplingParams, sample_token};
 use std::{
     collections::HashSet,
     sync::{
@@ -160,10 +161,12 @@ pub enum OpdError {
 
 pub type Result<T> = std::result::Result<T, OpdError>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct OpdStepConfig {
     /// Tokens to roll out greedily from the student starting from the prompt.
     pub rollout_len: usize,
+    /// Optional rollout sampling. `None` keeps the existing greedy argmax path.
+    pub rollout_sampling: Option<SamplingParams>,
     /// Gradient L2 norm clip threshold.
     pub grad_clip: f32,
 }
@@ -347,6 +350,8 @@ fn greedy_next_token(
     seq_len: usize,
     vocab: usize,
     store: &mut TensorStore,
+    sampling: Option<&SamplingParams>,
+    position: u64,
 ) -> Result<u32> {
     let host = store.to_host(logits_id)?;
     if seq_len == 0 || vocab == 0 {
@@ -372,6 +377,19 @@ fn greedy_next_token(
     }
     let last_row_start = (seq_len - 1) * vocab;
     let row = &host[last_row_start..last_row_start + vocab];
+    if let Some(params) = sampling {
+        for (i, &v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(OpdError::InvalidInput(format!(
+                    "OPD rollout logits contain non-finite value at last-row vocab index {i}: {v}. \
+                     Hint: check student forward numerics, checkpoint dtype conversion, and \
+                     learning-rate stability before sampling the next token."
+                )));
+            }
+        }
+        return Ok(sample_token(row, params, position));
+    }
+
     let mut best_idx: usize = 0;
     let mut best_val: f32 = f32::NEG_INFINITY;
     for (i, &v) in row.iter().enumerate() {
@@ -394,6 +412,8 @@ fn device_argmax_token(
     logits_id: TensorId,
     vocab: usize,
     store: &mut TensorStore,
+    sampling: Option<&SamplingParams>,
+    position: u64,
 ) -> Result<TensorId> {
     if vocab == 0 {
         return Err(OpdError::InvalidInput(
@@ -424,9 +444,32 @@ fn device_argmax_token(
         return Err(OpdError::InvalidInput(format!(
             "OPD device rollout expects exactly one logits row, got {rows}. \
              Hint: rollout KV cache should return only the final next-token \
-             logits row."
+            logits row."
         )));
     }
+    if let Some(params) = sampling {
+        let host = store.to_host(logits_id)?;
+        if host.len() != vocab {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD sampled device rollout logits length mismatch: got {}, expected vocab={vocab}. \
+                 Hint: rollout KV cache should return exactly one final next-token row.",
+                host.len()
+            )));
+        }
+        for (i, &v) in host.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(OpdError::InvalidInput(format!(
+                    "OPD sampled device rollout logits contain non-finite value at vocab index {i}: {v}. \
+                     Hint: check student forward numerics before sampling the next token."
+                )));
+            }
+        }
+        let sampled = sample_token(&host, params, position);
+        let token_id = store.from_slice(&[sampled as f32], &[1])?;
+        store.ensure_device(token_id)?;
+        return Ok(token_id);
+    }
+
     store.ensure_device(logits_id)?;
     let logits_handle = store
         .get(logits_id)
@@ -568,6 +611,7 @@ fn rollout_full_forward(
     rollout: &mut Vec<u32>,
     rollout_len: usize,
     vocab: usize,
+    sampling: Option<&SamplingParams>,
     store: &mut TensorStore,
     tape: &mut Tape,
     base_keep: &HashSet<TensorId>,
@@ -577,7 +621,14 @@ fn rollout_full_forward(
         let logits = student
             .forward(store, tape, rollout, &positions)
             .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
-        let next = greedy_next_token(logits, rollout.len(), vocab, store)?;
+        let next = greedy_next_token(
+            logits,
+            rollout.len(),
+            vocab,
+            store,
+            sampling,
+            rollout.len() as u64,
+        )?;
         rollout.push(next);
         if should_retain_rollout_step(step, rollout_len) {
             store.retain_ids(base_keep);
@@ -717,7 +768,7 @@ fn validate_logits_shape(stage: &str, shape: &[usize], seq_len: usize, vocab: us
     )))
 }
 
-fn validate_step_config(cfg: OpdStepConfig) -> Result<()> {
+fn validate_step_config(cfg: &OpdStepConfig) -> Result<()> {
     if cfg.grad_clip >= 0.0 && cfg.grad_clip.is_finite() {
         return Ok(());
     }
@@ -1822,7 +1873,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         *profile = OpdStepProfile::default();
     }
     let total_started = Instant::now();
-    validate_step_config(cfg)?;
+    validate_step_config(&cfg)?;
     validate_gkd_loss_config(gkd_config)?;
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
@@ -1919,11 +1970,12 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 .map_err(|err| {
                     OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
                 })?;
+            let rollout_sampling = cfg.rollout_sampling.as_ref();
             for _ in 0..cfg.rollout_len {
                 let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
                 let next = ctx
                     .student
-                    .decode_next_token(&rollout, &positions)
+                    .decode_next_token(&rollout, &positions, rollout_sampling, rollout.len() as u64)
                     .map_err(|err| {
                         OpdError::InvalidInput(format!("infer student decode failed: {err}"))
                     })?;
@@ -1942,9 +1994,14 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             false
         };
 
+        let rollout_sampling = cfg.rollout_sampling.as_ref();
+
         if infer_handled {
             // rollout already produced via the infer engine.
-        } else if use_rollout_kv_cache && use_device_rollout_argmax(store, cfg.rollout_len, vocab) {
+        } else if use_rollout_kv_cache
+            && rollout_sampling.is_none()
+            && use_device_rollout_argmax(store, cfg.rollout_len, vocab)
+        {
             let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
             let mut generated_tokens = if cfg.rollout_len == 0 {
                 None
@@ -1984,7 +2041,13 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                     )
                     .map_err(|err| map_qwen35_forward_error("student rollout", err))?
                 };
-                let next_token = device_argmax_token(logits, vocab, store)?;
+                let next_token = device_argmax_token(
+                    logits,
+                    vocab,
+                    store,
+                    None,
+                    (prompt_ids.len() + step) as u64,
+                )?;
                 if let Some(buffer_id) = generated_tokens {
                     generated_tokens = Some(write_rollout_token(
                         buffer_id,
@@ -2043,7 +2106,14 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                     &mut rollout_cache,
                 )
                 .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
-                let next = greedy_next_token(logits, logits_seq_len, vocab, store)?;
+                let next = greedy_next_token(
+                    logits,
+                    logits_seq_len,
+                    vocab,
+                    store,
+                    rollout_sampling,
+                    rollout.len() as u64,
+                )?;
                 rollout.push(next);
                 if should_retain_rollout_step(step, cfg.rollout_len) {
                     retain_rollout_step_tensors(
@@ -2062,6 +2132,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 &mut rollout,
                 cfg.rollout_len,
                 vocab,
+                rollout_sampling,
                 store,
                 tape,
                 &rollout_keep_base,
@@ -2340,7 +2411,7 @@ mod tests {
         let logits =
             store.alloc(Tensor::new(vec![0.0; 8], vec![1, 2, 4], false).expect("logits tensor"));
 
-        let err = greedy_next_token(logits, 1, 4, &mut store)
+        let err = greedy_next_token(logits, 1, 4, &mut store, None, 0)
             .expect_err("extra logits rows must be rejected");
 
         let OpdError::InvalidInput(message) = err else {
@@ -2359,7 +2430,7 @@ mod tests {
                 .expect("logits tensor"),
         );
 
-        let err = greedy_next_token(logits, 1, 4, &mut store)
+        let err = greedy_next_token(logits, 1, 4, &mut store, None, 0)
             .expect_err("NaN logits must not silently sample token 0");
 
         let OpdError::InvalidInput(message) = err else {
@@ -2502,8 +2573,9 @@ mod tests {
     #[test]
     fn validate_step_config_rejects_non_finite_grad_clip() {
         for grad_clip in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let err = validate_step_config(OpdStepConfig {
+            let err = validate_step_config(&OpdStepConfig {
                 rollout_len: 1,
+                rollout_sampling: None,
                 grad_clip,
             })
             .expect_err("non-finite OPD grad_clip must not silently disable clipping");
@@ -2519,8 +2591,9 @@ mod tests {
 
     #[test]
     fn validate_step_config_rejects_negative_grad_clip() {
-        let err = validate_step_config(OpdStepConfig {
+        let err = validate_step_config(&OpdStepConfig {
             rollout_len: 1,
+            rollout_sampling: None,
             grad_clip: -1.0,
         })
         .expect_err("negative OPD grad_clip must not silently disable clipping");

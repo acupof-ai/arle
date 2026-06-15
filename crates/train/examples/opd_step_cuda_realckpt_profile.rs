@@ -260,6 +260,7 @@ mod app {
         let mut optimizer = AdamW::new_with_device(LR, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
         let step_cfg = OpdStepConfig {
             rollout_len,
+            rollout_sampling: None,
             grad_clip: GRAD_CLIP,
         };
 
@@ -284,7 +285,7 @@ mod app {
             &student,
             &teacher,
             PROMPT_IDS,
-            step_cfg,
+            step_cfg.clone(),
             &student_model_params,
             &mut store,
             &mut tape,
@@ -327,7 +328,7 @@ mod app {
             &student,
             &teacher,
             PROMPT_IDS,
-            step_cfg,
+            step_cfg.clone(),
             &student_model_params,
             &student_trainable_params,
             &mut optimizer,

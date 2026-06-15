@@ -365,6 +365,7 @@ pub mod app {
             AdamW::new_with_device(args.learning_rate, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
         let step_config = OpdStepConfig {
             rollout_len: args.rollout_len,
+            rollout_sampling: None,
             grad_clip: GRAD_CLIP,
         };
 
@@ -426,7 +427,7 @@ pub mod app {
                 &student,
                 &teacher,
                 prompt,
-                step_config,
+                step_config.clone(),
                 &student_trainable_params,
                 &mut optimizer,
                 &mut store,

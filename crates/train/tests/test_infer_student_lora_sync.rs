@@ -189,7 +189,8 @@ fn rollout_agreement(
     let mut agree = 0usize;
     for _ in 0..ROLLOUT_TOKENS {
         let positions: Vec<u32> = (0..infer_seq.len() as u32).collect();
-        let infer_tok = student.decode_next_token(&infer_seq, &positions)?;
+        let infer_tok =
+            student.decode_next_token(&infer_seq, &positions, None, infer_seq.len() as u64)?;
         let train_tok = train_next_token(train_model, store, &train_seq, vocab, keep)?;
         if infer_tok == train_tok {
             agree += 1;
