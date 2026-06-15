@@ -163,13 +163,13 @@ impl RealCudaExecutor {
         )))
     }
 
-    pub(crate) fn from_qwen35_moe_safetensors(
+    pub(crate) fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
-            Qwen35CudaExecutor::from_qwen35_moe_safetensors(model_path, num_slots, total_pages)?,
+            Qwen35CudaExecutor::from_qwen35_safetensors(model_path, num_slots, total_pages)?,
         )))
     }
 
@@ -2001,7 +2001,7 @@ impl std::fmt::Debug for Qwen35CudaExecutor {
 }
 
 impl Qwen35CudaExecutor {
-    pub(crate) fn from_qwen35_moe_safetensors(
+    pub(crate) fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
@@ -2017,10 +2017,7 @@ impl Qwen35CudaExecutor {
         // The host CudaKvPool pages the logical seq budget; size each slot's
         // contiguous full-attn cache to the same token budget.
         let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
-        let model = crate::qwen35::Qwen35Model::from_qwen35_moe_safetensors(
-            model_path.as_ref(),
-            max_seq_len,
-        )?;
+        let model = crate::qwen35::Qwen35Model::from_safetensors(model_path.as_ref(), max_seq_len)?;
         // Dynamic KV mem budget (unified with DSv4 via the infer-seam kernel):
         // clamp num_slots to what post-weights free VRAM affords. Qwen3.5/3.6
         // previously admitted the requested count as-is → OOM at large

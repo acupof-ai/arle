@@ -89,8 +89,8 @@ impl Default for EngineLoadConfig {
 pub(crate) enum CudaModelKind {
     /// Dense Qwen3 (BF16).
     Qwen3Dense,
-    /// Qwen3.5 / 3.6 MoE (BF16).
-    Qwen3Moe,
+    /// Qwen3.5 / 3.6 hybrid dense-or-MoE (BF16).
+    Qwen35,
     /// DeepSeek-V4-Flash (multi-GPU only).
     Dsv4,
     /// DiffusionGemma/Gemma4 block-diffusion checkpoint. Not a CUDA AR path.
@@ -122,11 +122,12 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
         return CudaModelKind::DiffusionGemma;
     }
     let expert_count = |key: &str| v.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
+    let is_qwen35 = matches!(model_type, "qwen3_5" | "qwen3_5_moe") || arch_contains("Qwen3_5");
     let is_moe = arch_contains("Moe")
         || expert_count("num_experts") > 0
         || expert_count("n_routed_experts") > 0;
-    if is_moe {
-        CudaModelKind::Qwen3Moe
+    if is_qwen35 || is_moe {
+        CudaModelKind::Qwen35
     } else {
         CudaModelKind::Qwen3Dense
     }
@@ -147,11 +148,23 @@ mod classify_tests {
         );
         assert_eq!(
             classify_cuda_model(&json!({"architectures": ["Qwen3MoeForCausalLM"]})),
-            CudaModelKind::Qwen3Moe
+            CudaModelKind::Qwen35
+        );
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5"})
+            ),
+            CudaModelKind::Qwen35
+        );
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["Qwen3_5MoeForConditionalGeneration"], "model_type": "qwen3_5_moe"})
+            ),
+            CudaModelKind::Qwen35
         );
         assert_eq!(
             classify_cuda_model(&json!({"model_type": "qwen3", "num_experts": 128})),
-            CudaModelKind::Qwen3Moe
+            CudaModelKind::Qwen35
         );
         assert_eq!(
             classify_cuda_model(
@@ -860,7 +873,7 @@ mod backend {
     pub fn cuda_model_takes_multiproc_serve(model_path: &str) -> bool {
         matches!(
             detect_cuda_model_kind(model_path),
-            Ok(CudaModelKind::Dsv4 | CudaModelKind::Qwen3Moe)
+            Ok(CudaModelKind::Dsv4 | CudaModelKind::Qwen35)
         )
     }
 
@@ -900,7 +913,7 @@ mod backend {
         let ps = page_size.max(1);
         let capacity_tokens = match kind {
             CudaModelKind::Qwen3Dense => config.total_pages.saturating_mul(ps),
-            CudaModelKind::Qwen3Moe => config
+            CudaModelKind::Qwen35 => config
                 .total_pages
                 .saturating_mul(ps)
                 .saturating_mul(num_slots.max(1)),
@@ -1014,7 +1027,7 @@ mod backend {
         // disabled for them and every request resets at `start_pos == 0`. Only
         // pure full-attention Qwen3-dense keeps it. (Default stays on — see
         // `SchedulerConfig::enable_prefix_cache`.)
-        if matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen3Moe) {
+        if matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen35) {
             scheduler.enable_prefix_cache = false;
         }
         // The 64-token `chunked_prefill_size` default is a Metal-interactivity
@@ -1025,7 +1038,7 @@ mod backend {
         // for the same KV-read volume (KV bytes read are chunk-invariant).
         // Floor the CUDA Qwen kinds at 2048, mirroring the DSv4 override below;
         // an explicitly larger configured chunk is preserved. (audit QW-KV-07)
-        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen3Moe) {
+        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35) {
             scheduler.chunked_prefill_size = scheduler.chunked_prefill_size.max(2048);
         }
         // DSv4 prefill activation scratch is bounded by the query-chunk size
@@ -1059,14 +1072,12 @@ mod backend {
                 config.total_pages,
                 kv_dtype,
             )?,
-            // Qwen3Moe clamps `num_slots` to free HBM inside the constructor
+            // Qwen35 clamps `num_slots` to free HBM inside the constructor
             // (`Qwen35Model::kv_budget_num_slots`, unified with DSv4 via the
             // infer-seam budget kernel) — no longer the #60 OOM risk.
-            CudaModelKind::Qwen3Moe => CudaExecutor::from_qwen35_moe_safetensors(
-                model_path,
-                num_slots,
-                config.total_pages,
-            )?,
+            CudaModelKind::Qwen35 => {
+                CudaExecutor::from_qwen35_safetensors(model_path, num_slots, config.total_pages)?
+            }
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the
             // environment during construction (`INFER_TP_RANK` /
