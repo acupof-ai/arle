@@ -250,6 +250,54 @@ impl TokenKVPool {
         self.storage_bytes_for_tokens(self.page_size)
     }
 
+    /// Exact requested device bytes this pool owns: Σ over every `CudaSlice<T>`
+    /// field of `slice.len() * size_of::<T>()`. This is the *requested* byte
+    /// count, NOT the cudaMalloc-rounded physical reservation. Covers the
+    /// per-layer K/V data planes, per-token scales (FP8/INT8), per-token norms
+    /// (TurboQuant), the 1-layer bf16 work buffers, the split-KV attention
+    /// workspace, and the KIVI per-channel K scale tables.
+    ///
+    /// `tq_k_state`/`tq_v_state` (TurboQuant rotation/codebook device buffers)
+    /// are NOT summed here — they are always `None` for the DSv4 FlashMLA pool
+    /// (`KVFormat::PackedBytes`, single-plane) and the DSv4 ledger this method
+    /// feeds never exercises TurboQuant.
+    pub fn device_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for s in &self.k_data {
+            total += s.len(); // u8
+        }
+        for s in &self.v_data {
+            total += s.len(); // u8
+        }
+        for s in &self.k_scales {
+            total += s.len() * std::mem::size_of::<f32>();
+        }
+        for s in &self.v_scales {
+            total += s.len() * std::mem::size_of::<f32>();
+        }
+        if let Some(buf) = &self.k_static_scales {
+            for s in buf {
+                total += s.len() * std::mem::size_of::<f32>();
+            }
+        }
+        for s in &self.k_norms {
+            total += s.len() * std::mem::size_of::<u16>();
+        }
+        for s in &self.v_norms {
+            total += s.len() * std::mem::size_of::<u16>();
+        }
+        if let Some(s) = &self.k_work {
+            total += s.len(); // u8
+        }
+        if let Some(s) = &self.v_work {
+            total += s.len(); // u8
+        }
+        if let Some(s) = &self.int8_attn_workspace {
+            total += s.len(); // u8
+        }
+        total
+    }
+
     /// Whether this pool stores one packed record per token in the K plane
     /// only (`v_data` and all scale/norm buffers are empty).
     fn is_single_plane(&self) -> bool {
