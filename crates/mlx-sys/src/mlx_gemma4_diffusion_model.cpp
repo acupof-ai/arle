@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -20,6 +21,20 @@ using DiffusionCancelFn = int32_t (*)(const void*);
 
 bool cancelled(DiffusionCancelFn cancel_fn, const void* cancel_ctx) {
     return cancel_fn != nullptr && cancel_fn(cancel_ctx) != 0;
+}
+
+bool env_flag_default_on(const char* name) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return true;
+    }
+    return std::strcmp(raw, "0") != 0 &&
+           std::strcmp(raw, "false") != 0 &&
+           std::strcmp(raw, "FALSE") != 0 &&
+           std::strcmp(raw, "off") != 0 &&
+           std::strcmp(raw, "OFF") != 0 &&
+           std::strcmp(raw, "no") != 0 &&
+           std::strcmp(raw, "NO") != 0;
 }
 
 array array_from_i32(const int32_t* data, int32_t len) {
@@ -633,11 +648,27 @@ struct DiffusionGemmaModel {
         const void* cancel_ctx,
         uint32_t* out_tokens) {
         using Clock = std::chrono::steady_clock;
-        const bool profile = std::getenv("ARLE_DIFFUSION_CPP_PROFILE") != nullptr;
-        const auto t0 = Clock::now();
+        const bool profile = env_flag_default_on("ARLE_DIFFUSION_CPP_PROFILE");
+        const auto now = [&]() -> Clock::time_point {
+            return profile ? Clock::now() : Clock::time_point{};
+        };
+        const auto elapsed_ms = [&](Clock::time_point start) -> double {
+            if (!profile) {
+                return 0.0;
+            }
+            return std::chrono::duration<double, std::milli>(
+                Clock::now() - start).count();
+        };
+        const auto t0 = now();
         double prefill_ms = 0.0;
         double denoise_ms = 0.0;
+        double denoise_forward_encode_ms = 0.0;
+        double denoise_accept_encode_ms = 0.0;
+        double denoise_scalar_sync_ms = 0.0;
+        double denoise_selfcond_encode_ms = 0.0;
         double final_ms = 0.0;
+        double final_eval_ms = 0.0;
+        int scalar_syncs = 0;
         if (prompt_len < 0 || (prompt_len > 0 && prompt == nullptr)) {
             throw std::invalid_argument("DiffusionGemma generate received invalid prompt");
         }
@@ -653,7 +684,7 @@ struct DiffusionGemmaModel {
 
         random::seed(seed);
         reset_request_state();
-        const auto prefill_start = Clock::now();
+        const auto prefill_start = now();
         if (cancelled(cancel_fn, cancel_ctx)) {
             throw std::runtime_error("DiffusionGemma generation cancelled");
         }
@@ -675,8 +706,7 @@ struct DiffusionGemmaModel {
                 eval(cache_arrays);
             }
         }
-        prefill_ms = std::chrono::duration<double, std::milli>(
-            Clock::now() - prefill_start).count();
+        prefill_ms = elapsed_ms(prefill_start);
 
         DiffusionGenerateResult result;
         result.finish = 0;
@@ -697,16 +727,18 @@ struct DiffusionGemmaModel {
                 if (cancelled(cancel_fn, cancel_ctx)) {
                     throw std::runtime_error("DiffusionGemma generation cancelled");
                 }
-                const auto step_start = Clock::now();
+                const auto step_start = now();
                 const int remaining_steps = std::max(max_steps - step, 1);
                 const float schedule_temperature =
                     t_min + (t_max - t_min) *
                     (static_cast<float>(remaining_steps) / static_cast<float>(max_steps));
+                const auto forward_encode_start = now();
                 auto logits = forward_logits_from_ids(current_canvas);
                 if (schedule_temperature > 0.0f) {
                     logits = logits / array(schedule_temperature);
                 }
                 auto argmax_tokens = astype(argmax(logits, -1, false), int32);
+                denoise_forward_encode_ms += elapsed_ms(forward_encode_start);
                 const bool forced = step + 1 >= max_steps;
                 result.steps += 1;
 
@@ -717,11 +749,11 @@ struct DiffusionGemmaModel {
 
                 if (forced) {
                     result.forced += 1;
-                    denoise_ms += std::chrono::duration<double, std::milli>(
-                        Clock::now() - step_start).count();
+                    denoise_ms += elapsed_ms(step_start);
                     break;
                 }
 
+                const auto accept_encode_start = now();
                 auto probs_entropy = entropy_probs(logits);
                 auto probs = probs_entropy[0];
                 auto entropy = probs_entropy[1];
@@ -730,6 +762,8 @@ struct DiffusionGemmaModel {
                 current_canvas = where(acceptance, argmax_tokens, renoise);
 
                 auto mean_entropy = mean(entropy);
+                denoise_accept_encode_ms += elapsed_ms(accept_encode_start);
+                const auto scalar_sync_start = now();
                 bool stable = false;
                 if (static_cast<int>(history.size()) >= stable_need) {
                     stable = true;
@@ -741,23 +775,27 @@ struct DiffusionGemmaModel {
                     }
                 }
                 bool confident = mean_entropy.item<float>() < confidence_threshold;
+                denoise_scalar_sync_ms += elapsed_ms(scalar_sync_start);
+                scalar_syncs += 1;
+                const auto selfcond_encode_start = now();
                 update_self_conditioning(probs);
+                denoise_selfcond_encode_ms += elapsed_ms(selfcond_encode_start);
                 if (stable && confident) {
                     result.adaptive += 1;
-                    denoise_ms += std::chrono::duration<double, std::milli>(
-                        Clock::now() - step_start).count();
+                    denoise_ms += elapsed_ms(step_start);
                     break;
                 }
-                denoise_ms += std::chrono::duration<double, std::milli>(
-                    Clock::now() - step_start).count();
+                denoise_ms += elapsed_ms(step_start);
             }
 
-            const auto final_start = Clock::now();
+            const auto final_start = now();
             if (history.empty()) {
                 throw std::runtime_error("DiffusionGemma generated no denoise canvas");
             }
             auto final_canvas = contiguous(history.back());
+            const auto final_eval_start = now();
             eval({final_canvas});
+            final_eval_ms += elapsed_ms(final_eval_start);
             const auto* final_ptr = final_canvas.data<int32_t>();
             int commit_len = valid_len;
             bool stopped = false;
@@ -783,6 +821,7 @@ struct DiffusionGemmaModel {
             }
             output.insert(output.end(), commit_tokens.begin(), commit_tokens.end());
             result.blocks += 1;
+            final_ms += elapsed_ms(final_start);
             if (stopped) {
                 result.finish = 1;
                 break;
@@ -790,8 +829,6 @@ struct DiffusionGemmaModel {
             if (result.blocks > max_new_tokens) {
                 break;
             }
-            final_ms += std::chrono::duration<double, std::milli>(
-                Clock::now() - final_start).count();
         }
 
         if (static_cast<int>(output.size()) > max_new_tokens) {
@@ -802,8 +839,7 @@ struct DiffusionGemmaModel {
         }
         result.tokens = static_cast<int>(output.size());
         if (profile) {
-            const double total_ms = std::chrono::duration<double, std::milli>(
-                Clock::now() - t0).count();
+            const double total_ms = elapsed_ms(t0);
             std::cerr
                 << "diffusion cpp profile: prompt_tokens=" << prompt_len
                 << " generated_tokens=" << result.tokens
@@ -811,7 +847,13 @@ struct DiffusionGemmaModel {
                 << " steps=" << result.steps
                 << " prefill_ms=" << prefill_ms
                 << " denoise_ms=" << denoise_ms
+                << " denoise_forward_encode_ms=" << denoise_forward_encode_ms
+                << " denoise_accept_encode_ms=" << denoise_accept_encode_ms
+                << " denoise_scalar_sync_ms=" << denoise_scalar_sync_ms
+                << " denoise_selfcond_encode_ms=" << denoise_selfcond_encode_ms
+                << " scalar_syncs=" << scalar_syncs
                 << " final_commit_ms=" << final_ms
+                << " final_eval_ms=" << final_eval_ms
                 << " total_ms=" << total_ms
                 << std::endl;
         }

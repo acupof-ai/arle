@@ -136,6 +136,28 @@ MLX_MAX_MB_PER_BUFFER=200 \
   --port 8765 -- --max-running-requests 16
 ```
 
+### DiffusionGemma Metal diagnostics
+
+`ARLE_DIFFUSION_CPP_PROFILE` controls the C++/MLX DiffusionGemma per-request
+profile line. It is **default-on** for Metal DiffusionGemma so every request
+reports the actual split between prompt prefill, denoise work, host scalar sync,
+self-conditioning, and final canvas commit. Set it to `0`, `false`, `off`, or
+`no` to suppress the line for clean operator logs or pure wall-clock benchmarks.
+
+`ARLE_DIFFUSION_MAX_DENOISING_STEPS=N` overrides the checkpoint's max denoise
+step budget for explicit speed/quality profiles. Lower values can improve
+output tok/s but are not a quality-preserving default unless separately gated.
+
+```bash
+ARLE_DIFFUSION_CPP_PROFILE=0 ./target/release/arle \
+  --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --max-tokens 64 --non-interactive run --prompt "Say hi" --no-tools
+
+ARLE_DIFFUSION_MAX_DENOISING_STEPS=4 ./target/release/arle serve \
+  --backend metal \
+  --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit
+```
+
 ### `AGENT_INFER_GDR_METAL_KERNEL`
 
 Influence Metal GDR kernel path selection.
