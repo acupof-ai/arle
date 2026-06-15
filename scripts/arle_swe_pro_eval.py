@@ -318,6 +318,8 @@ def build_official_eval_command(
     block_network: bool = False,
     redo: bool = False,
 ) -> list[str]:
+    eval_repo = eval_repo.resolve()
+    output = output.resolve()
     cmd = [
         python,
         str(eval_repo / "swe_bench_pro_eval.py"),
@@ -435,7 +437,7 @@ def main(argv: list[str]) -> int:
         print("[swe-pro] " + " ".join(cmd), flush=True)
         if args.dry_run:
             return 0
-        completed = subprocess.run(cmd, check=False)
+        completed = subprocess.run(cmd, check=False, cwd=args.eval_repo)
         return completed.returncode
 
     parser.error(f"unknown command {args.command}")
