@@ -888,14 +888,13 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["mode"], "doctor");
-        assert_eq!(
-            value["status"],
-            if snapshot.info.compiled_backend.supports_inference() {
-                "ok"
-            } else {
-                "warn"
-            }
-        );
+        let checks = value["checks"].as_array().expect("checks array");
+        let expected_status = if checks.iter().any(|check| check["status"] != "ok") {
+            "warn"
+        } else {
+            "ok"
+        };
+        assert_eq!(value["status"], expected_status);
         assert_eq!(
             value["compiled_backend"],
             snapshot.info.compiled_backend.name()
