@@ -493,16 +493,17 @@ Result (2026-06-15, P4/P5 tranche):
 Files: `crates/infer-cuda/src/qwen35.rs`
 
 Drive `from_safetensors_with_tp` from the Qwen3.6 `QuantWeightMap`, not a hand list.
-The dispositions are **grounded in the RedHatAI NVFP4 recipe ignore-list**, not guessed:
+The dispositions are grounded in checkpoint headers plus the RedHatAI NVFP4
+recipe ignore-list; FP8 and NVFP4 differ for linear attention, so do not reuse
+one format's ignore-list as the other's truth:
 
 - **Quantize** (route through `load_quant_matrix{,_sharded}`, `load_quant_qkv_head_sharded`):
   full-attention `q/k/v/o_proj`, MoE routed experts (stacked `experts.gate_up_proj` /
-  `experts.down_proj`), shared-expert up/down.
-- **Keep BF16/F32** (recipe ignores these): `embed_tokens`, `lm_head`, router
-  `mlp.gate`, `shared_expert_gate`, **all `linear_attn.*`** (`in_proj_{qkv,z,b,a}`,
-  `out_proj`, `A_log`, `dt_bias`, `conv1d`), and norms.
-
-Confirm the ignore-list against the *FP8* checkpoint too in P1 (it may differ from NVFP4).
+  `experts.down_proj`), shared-expert up/down, and FP8
+  `linear_attn.{in_proj_qkv,in_proj_z,out_proj}`.
+- **Keep BF16/F32**: `embed_tokens`, `lm_head`, router `mlp.gate`,
+  `shared_expert_gate`, `linear_attn.{in_proj_b,in_proj_a,A_log,dt_bias,conv1d}`,
+  norms, and all NVFP4 `linear_attn.*` weights when the checkpoint keeps them dense.
 
 Sharding rules: BF16/F32 dense may reuse byte-slice helpers; FP8 row/col sharding
 slices weight **and** scale together; NVFP4 row sharding slices packed columns +

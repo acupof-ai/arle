@@ -27,8 +27,11 @@ quant experts.
   detection, and row/column/head-aware quant sharding for FP8 block-scaled,
   FP8 per-shard, FP4 E2M1 group, dense BF16, and dense F32 tensors.
 - Switched Qwen3.6 attention q/k/v/o and dense MLP gate/up/down loaders to the
-  quant-aware path while leaving embeddings, lm_head, routers, gates, norms,
-  and linear attention on the dense path.
+  quant-aware path. Follow-up remote serve reachability showed the official FP8
+  checkpoint also quantizes `linear_attn.{in_proj_qkv,in_proj_z,out_proj}`, so
+  those linear-attention projections now load through the same resident quant
+  matrix path while embeddings, lm_head, routers, gates, norms, conv1d, and
+  linear-attn small vectors stay dense.
 - Routed MoE now records one expert `WeightFormat` plus scale/global pointer
   tables. Quant experts bypass the BF16 decode-fused and DeepGEMM paths and use
   the matching resident grouped GEMV wrapper.
@@ -62,9 +65,10 @@ Results:
 - NVFP4 conversion script self-test, including float8 safetensors write/read:
   passed.
 
-Pending remote gate:
+Remote gate status:
 
-- CUDA feature compile on the clean remote sync at `/data01/arle-build`.
+- CUDA feature compile on a clean remote sync passed with the narrow kernel-set
+  build used for the FP8 serve smoke.
 - Qwen3.6 FP8 serve smoke from `/data01/models/Qwen3.6-35B-A3B-FP8`.
 - NVFP4 serve smoke after generating or downloading a checkpoint. If HF download
   is slow, generate it from a dense Qwen3.6 checkpoint:
@@ -82,10 +86,10 @@ python3 scripts/qwen36_dense_to_nvfp4.py \
 - The grouped quant MoE kernel is a correctness/reachability kernel, not the
   final performance kernel. It deliberately avoids claiming "industry best"
   until a same-binary remote A/B measures the competing kernels.
-- Remote CUDA compile on `/data01/arle-build` reached `cuda-kernels` but was
-  blocked by environment/toolchain gates unrelated to this patch: default build
-  failed in vendor FlashMLA with `__nv_fp8_e8m0`/inline asm errors; retry with
-  `ARLE_CUDA_DISABLE_FLASHMLA=1` then failed because TileLang was not installed.
+- The first FP8 serve attempt failed before readiness because the single-rank
+  linear-attention loader still used BF16-only `load_matrix` for
+  `linear_attn.in_proj_qkv.weight`, which the official FP8 checkpoint stores as
+  `F8_E4M3`. That is a reachability gap, not a numeric verdict.
 - NVFP4 checkpoint availability is remote-network dependent; use the conversion
   script above when HF download is slow, then run the serve/needle/guidellm gates
   on Colab or the CUDA host.
