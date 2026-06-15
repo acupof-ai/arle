@@ -31,6 +31,13 @@ sub-lever (`ARLE_DSV4_BATCHED_MTP_DRAFT`, lever 2a, +2% noise-floor) stays OFF. 
 production `--spec-type mtp` serve now batches decode at c>=4 by default → +77% @c=8.**
 Multi-shape licensed: short c=12 +81% + prod ~2400-tok c=8 +77%, both coherent.
 
+**Default-engage confirmed**: served with `ARLE_DSV4_BATCHED_MTP` UNSET (the default) +
+`--spec-type mtp` + sustained c=8 → `[dsv4-mtp-batched]` fired **547×** (per-row 334 = the
+c<4 ramp/straggler phases). The flip engages by default under sustained concurrency.
+(A short-gen needle check `max_tokens=12` showed 0 batched lines — too short to form a
+rows>=4 decode wave; the gate correctly stays per-row at c<4. The flip helps SUSTAINED
+high-concurrency decode, which is the production serving regime.)
+
 ## The full arc (this session)
 per-row MTP (gated batched lane disabled) → batched lane wired (Phase A/B FlashMLA,
 +58% vs per-row at c=8) → batched MTP (the 理想态): correct-but-regress (sub-mode2 attn
