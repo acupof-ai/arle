@@ -121,6 +121,12 @@ pub(crate) enum PretrainPresetArg {
     Small30m,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum KlDirectionArg {
+    Forward,
+    Reverse,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct RenderArgs {
     /// Print the fully resolved execution plan without running the job.
@@ -620,6 +626,10 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long)]
     pub(crate) rollout_seed: Option<u64>,
 
+    /// KL objective direction: forward = KL(teacher||student), reverse = KL(student||teacher).
+    #[arg(long, value_enum, default_value_t = KlDirectionArg::Forward)]
+    pub(crate) kl_direction: KlDirectionArg,
+
     /// Total OPD training steps.
     #[arg(long, default_value_t = 5)]
     pub(crate) steps: usize,
@@ -698,6 +708,10 @@ pub(crate) struct TrainSelfOpdArgs {
     /// Optional deterministic rollout sampling seed.
     #[arg(long)]
     pub(crate) rollout_seed: Option<u64>,
+
+    /// KL objective direction: forward = KL(teacher||student), reverse = KL(student||teacher).
+    #[arg(long, value_enum, default_value_t = KlDirectionArg::Forward)]
+    pub(crate) kl_direction: KlDirectionArg,
 
     /// Total SOPD training steps.
     #[arg(long, default_value_t = 5)]

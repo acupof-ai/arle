@@ -1,6 +1,6 @@
 use autograd::{Tape, Tensor, TensorStore, optim::AdamW};
 use train::{
-    loss::kl_distill_loss,
+    loss::{KlDirection, kl_distill_loss},
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
     trainer::{clip_grad_norm, retained_param_and_grad_ids},
 };
@@ -90,6 +90,7 @@ fn kl_distill_loss_drops_over_three_steps() {
             student_logits,
             teacher_logits,
             seq_len,
+            KlDirection::Forward,
             &mut store,
             &mut tape,
         )

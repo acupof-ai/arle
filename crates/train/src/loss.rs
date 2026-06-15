@@ -5,6 +5,13 @@ use autograd::{
 
 pub const DEFAULT_KL_CHUNK_SIZE: usize = 32;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum KlDirection {
+    #[default]
+    Forward,
+    Reverse,
+}
+
 pub fn cross_entropy_loss(
     logits_id: TensorId,
     targets: &[usize],
@@ -36,22 +43,37 @@ pub fn kl_distill_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
     num_positions: usize,
+    direction: KlDirection,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
     validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
-    let teacher_probs = softmax(teacher_logits, store, tape)?;
-    let student_log_probs = log_softmax(student_logits, store, tape)?;
-    let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
-    // `mean` reduces across all dims (positions × vocab). The KL gradient
-    // direction is identical to the `sum / num_positions` form up to a
-    // constant `1/vocab` rescale; AdamW absorbs the constant via its
-    // adaptive learning rate. Using `mean` here matches the existing
-    // CE-loss backward path (which `cross_entropy_loss` exercises), so we
-    // pick up the same device-resident fast paths instead of routing
-    // through `sum_backward`'s untested scalar broadcast.
-    let avg = mean(weighted, store, tape)?;
-    mul_scalar(avg, -1.0, store, tape)
+    match direction {
+        KlDirection::Forward => {
+            let teacher_probs = softmax(teacher_logits, store, tape)?;
+            let student_log_probs = log_softmax(student_logits, store, tape)?;
+            let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
+            // `mean` reduces across all dims (positions × vocab). The KL gradient
+            // direction is identical to the `sum / num_positions` form up to a
+            // constant `1/vocab` rescale; AdamW absorbs the constant via its
+            // adaptive learning rate. Using `mean` here matches the existing
+            // CE-loss backward path (which `cross_entropy_loss` exercises), so we
+            // pick up the same device-resident fast paths instead of routing
+            // through `sum_backward`'s untested scalar broadcast.
+            let avg = mean(weighted, store, tape)?;
+            mul_scalar(avg, -1.0, store, tape)
+        }
+        KlDirection::Reverse => {
+            let student_probs = softmax(student_logits, store, tape)?;
+            let student_log_probs = log_softmax(student_logits, store, tape)?;
+            let teacher_log_probs = log_softmax(teacher_logits, store, tape)?;
+            let q_logq = mul(student_probs, student_log_probs, store, tape)?;
+            let q_logp = mul(student_probs, teacher_log_probs, store, tape)?;
+            let neg_q_logp = mul_scalar(q_logp, -1.0, store, tape)?;
+            let elem = add(q_logq, neg_q_logp, store, tape)?;
+            mean(elem, store, tape)
+        }
+    }
 }
 
 /// Chunked sibling of [`kl_distill_loss`] that preserves the baseline
@@ -67,6 +89,7 @@ pub fn kl_distill_loss_chunked(
     teacher_logits: TensorId,
     num_positions: usize,
     chunk_size: usize,
+    direction: KlDirection,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -110,10 +133,24 @@ pub fn kl_distill_loss_chunked(
 
         let teacher_chunk = slice(teacher_logits, &starts, &ends, store, tape)?;
         let student_chunk = slice(student_logits, &starts, &ends, store, tape)?;
-        let teacher_probs = softmax(teacher_chunk, store, tape)?;
-        let student_log_probs = log_softmax(student_chunk, store, tape)?;
-        let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
-        let chunk_avg = mean(weighted, store, tape)?;
+        let chunk_avg = match direction {
+            KlDirection::Forward => {
+                let teacher_probs = softmax(teacher_chunk, store, tape)?;
+                let student_log_probs = log_softmax(student_chunk, store, tape)?;
+                let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
+                mean(weighted, store, tape)?
+            }
+            KlDirection::Reverse => {
+                let student_probs = softmax(student_chunk, store, tape)?;
+                let student_log_probs = log_softmax(student_chunk, store, tape)?;
+                let teacher_log_probs = log_softmax(teacher_chunk, store, tape)?;
+                let q_logq = mul(student_probs, student_log_probs, store, tape)?;
+                let q_logp = mul(student_probs, teacher_log_probs, store, tape)?;
+                let neg_q_logp = mul_scalar(q_logp, -1.0, store, tape)?;
+                let elem = add(q_logq, neg_q_logp, store, tape)?;
+                mean(elem, store, tape)?
+            }
+        };
         let weighted_chunk = mul_scalar(chunk_avg, chunk_weight, store, tape)?;
         total = Some(match total {
             Some(previous) => add(previous, weighted_chunk, store, tape)?,
@@ -124,7 +161,10 @@ pub fn kl_distill_loss_chunked(
     let total = total.ok_or(AutogradError::TapeInvariant(
         "kl_distill_loss_chunked: no chunks were produced",
     ))?;
-    mul_scalar(total, -1.0, store, tape)
+    match direction {
+        KlDirection::Forward => mul_scalar(total, -1.0, store, tape),
+        KlDirection::Reverse => Ok(total),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +276,7 @@ mod tests {
         teacher_logits: &[f32],
         shape: &[usize],
         chunk_size: Option<usize>,
+        direction: KlDirection,
     ) -> (f32, Vec<f32>) {
         let mut store = TensorStore::default();
         let mut tape = Tape::new();
@@ -253,10 +294,18 @@ mod tests {
                 teacher,
                 num_positions,
                 chunk_size,
+                direction,
                 &mut store,
                 &mut tape,
             ),
-            None => kl_distill_loss(student, teacher, num_positions, &mut store, &mut tape),
+            None => kl_distill_loss(
+                student,
+                teacher,
+                num_positions,
+                direction,
+                &mut store,
+                &mut tape,
+            ),
         }
         .expect("kl loss");
         let loss_value = store.to_host(loss).expect("loss host value")[0];
@@ -298,6 +347,73 @@ mod tests {
         );
     }
 
+    fn loss_value(
+        student_logits: &[f32],
+        teacher_logits: &[f32],
+        shape: &[usize],
+        direction: KlDirection,
+    ) -> f32 {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = store.alloc(
+            Tensor::new(student_logits.to_vec(), shape.to_vec(), true).expect("student logits"),
+        );
+        let teacher = store.alloc(
+            Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
+        );
+        let vocab = shape.last().copied().expect("vocab dim");
+        let num_positions = student_logits.len() / vocab;
+        let loss = kl_distill_loss(
+            student,
+            teacher,
+            num_positions,
+            direction,
+            &mut store,
+            &mut tape,
+        )
+        .expect("kl loss");
+        store.to_host(loss).expect("loss host value")[0]
+    }
+
+    fn reference_reverse_kl_mean(
+        student_logits: &[f32],
+        teacher_logits: &[f32],
+        vocab: usize,
+    ) -> f64 {
+        student_logits
+            .chunks_exact(vocab)
+            .zip(teacher_logits.chunks_exact(vocab))
+            .flat_map(|(student_row, teacher_row)| {
+                let student_log_probs = reference_log_softmax(student_row);
+                let teacher_log_probs = reference_log_softmax(teacher_row);
+                student_log_probs
+                    .into_iter()
+                    .zip(teacher_log_probs)
+                    .map(|(student_log_prob, teacher_log_prob)| {
+                        student_log_prob.exp() * (student_log_prob - teacher_log_prob)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .sum::<f64>()
+            / student_logits.len() as f64
+    }
+
+    fn reference_log_softmax(row: &[f32]) -> Vec<f64> {
+        let max_value = row
+            .iter()
+            .copied()
+            .map(f64::from)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let denom = row
+            .iter()
+            .map(|&value| (f64::from(value) - max_value).exp())
+            .sum::<f64>();
+        let log_denom = denom.ln();
+        row.iter()
+            .map(|&value| f64::from(value) - max_value - log_denom)
+            .collect()
+    }
+
     #[test]
     fn chunked_kl_matches_baseline_forward_and_student_grad() {
         let shape = [1, 64, 1024];
@@ -305,10 +421,20 @@ mod tests {
         let student_logits = deterministic_logits(len, 3);
         let teacher_logits = deterministic_logits(len, 11);
 
-        let (baseline_loss, baseline_grad) =
-            loss_and_student_grad(&student_logits, &teacher_logits, &shape, None);
-        let (chunked_loss, chunked_grad) =
-            loss_and_student_grad(&student_logits, &teacher_logits, &shape, Some(8));
+        let (baseline_loss, baseline_grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            None,
+            KlDirection::Forward,
+        );
+        let (chunked_loss, chunked_grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            Some(8),
+            KlDirection::Forward,
+        );
 
         assert_close(baseline_loss, chunked_loss, 1.0e-5, "chunk_size=8 loss");
         assert_slice_close(
@@ -326,10 +452,20 @@ mod tests {
         let student_logits = deterministic_logits(len, 5);
         let teacher_logits = deterministic_logits(len, 17);
 
-        let (baseline_loss, baseline_grad) =
-            loss_and_student_grad(&student_logits, &teacher_logits, &shape, None);
-        let (chunked_loss, chunked_grad) =
-            loss_and_student_grad(&student_logits, &teacher_logits, &shape, Some(64));
+        let (baseline_loss, baseline_grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            None,
+            KlDirection::Forward,
+        );
+        let (chunked_loss, chunked_grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            Some(64),
+            KlDirection::Forward,
+        );
 
         assert_close(baseline_loss, chunked_loss, 1.0e-5, "single-chunk loss");
         assert_slice_close(
@@ -347,7 +483,13 @@ mod tests {
         let student_logits = deterministic_logits(len, 7);
         let teacher_logits = deterministic_logits(len, 23);
 
-        let (loss, grad) = loss_and_student_grad(&student_logits, &teacher_logits, &shape, Some(1));
+        let (loss, grad) = loss_and_student_grad(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            Some(1),
+            KlDirection::Forward,
+        );
 
         assert!(loss.is_finite(), "chunk_size=1 loss must be finite");
         assert_eq!(grad.len(), len);
@@ -368,5 +510,56 @@ mod tests {
         assert_eq!(full_tensor_bytes / chunked_tensor_bytes, 8);
         assert_eq!(full_tensor_bytes * 2, 1_017_118_720);
         assert_eq!(chunked_tensor_bytes * 2, 127_139_840);
+    }
+
+    #[test]
+    fn reverse_kl_matches_hand_computed_two_row_reference() {
+        let shape = [2, 4];
+        let student_logits = vec![0.3, -0.7, 1.2, 0.0, -0.2, 0.9, 0.1, -1.1];
+        let teacher_logits = vec![-0.4, 0.6, 0.2, -0.1, 1.3, -0.8, 0.4, 0.0];
+
+        let actual = loss_value(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            KlDirection::Reverse,
+        );
+        let expected = reference_reverse_kl_mean(&student_logits, &teacher_logits, shape[1]);
+
+        assert_close(actual, expected as f32, 1.0e-5, "reverse KL reference");
+    }
+
+    #[test]
+    fn reverse_kl_identical_logits_is_zero() {
+        let shape = [2, 4];
+        let logits = vec![0.3, -0.7, 1.2, 0.0, -0.2, 0.9, 0.1, -1.1];
+
+        let actual = loss_value(&logits, &logits, &shape, KlDirection::Reverse);
+
+        assert!(
+            actual.abs() <= 1.0e-6,
+            "identical-logit reverse KL should be zero, got {actual:.10e}"
+        );
+    }
+
+    #[test]
+    fn reverse_kl_random_finite_logits_is_non_negative() {
+        let shape = [3, 4];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 29);
+        let teacher_logits = deterministic_logits(len, 41);
+
+        let actual = loss_value(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            KlDirection::Reverse,
+        );
+
+        assert!(actual.is_finite(), "reverse KL must be finite");
+        assert!(
+            actual >= -1.0e-6,
+            "reverse KL should be non-negative within numerical tolerance, got {actual:.10e}"
+        );
     }
 }
