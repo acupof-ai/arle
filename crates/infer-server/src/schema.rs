@@ -94,6 +94,11 @@ impl ChatCompletionRequest {
                 "messages must contain at least one message",
             ));
         }
+        if self.stream.unwrap_or(false) {
+            return Err(ApiError::bad_request(
+                "chat stream=true is deferred in R5 tranche 2",
+            ));
+        }
         validate_common(self.stream, self.max_tokens)
     }
 
@@ -240,12 +245,7 @@ impl ChatContentPart {
     }
 }
 
-fn validate_common(stream: Option<bool>, max_tokens: Option<usize>) -> Result<(), ApiError> {
-    if stream.unwrap_or(false) {
-        return Err(ApiError::bad_request(
-            "stream=true is deferred in R5 tranche 2",
-        ));
-    }
+fn validate_common(_stream: Option<bool>, max_tokens: Option<usize>) -> Result<(), ApiError> {
     if matches!(max_tokens, Some(0)) {
         return Err(ApiError::bad_request(
             "max_tokens must be greater than zero",
@@ -702,5 +702,28 @@ mod tests {
         let template = request.messages[0].template_content();
         assert_eq!(template[1]["type"], "image");
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn text_completions_allow_streaming_for_guidellm() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "prompt": "hello",
+            "stream": true,
+            "max_tokens": 1
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn chat_streaming_still_fails_closed() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "max_tokens": 1
+        }))
+        .unwrap();
+        let err = request.validate().expect_err("chat stream should be gated");
+        assert!(err.message.contains("chat stream=true is deferred"));
     }
 }
