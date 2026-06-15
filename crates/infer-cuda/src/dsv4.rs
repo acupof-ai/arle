@@ -4381,10 +4381,10 @@ impl Dsv4Model {
         Ok(out)
     }
 
-    /// Batched lm_head: `[m, hidden] → [m, vocab]`. FP8/FP4 block-scaled use
-    /// the batched GEMM path directly; dense BF16 falls back to per-row GEMV.
+    /// Batched lm_head: `[m, hidden] → [m, vocab]` — ONE GEMM for every weight
+    /// format (`dsv4_linear`: bf16 → cuBLAS gemm_batch, FP8/FP4 → mla_linear),
+    /// weight read once for all `m` rows.
     fn lm_head_project_batch(&self, x: &HiddenStates, out: &mut HiddenStates) -> Result<()> {
-        use cuda_kernels::tensor::WeightFormat;
         ensure!(
             self.lm_head.cols == x.hidden_dim
                 && self.lm_head.rows == out.hidden_dim
@@ -4397,32 +4397,12 @@ impl Dsv4Model {
             out.hidden_dim,
             out.seq_len
         );
-        match self.lm_head.weight_format {
-            WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
-                crate::attention::mla_linear(&self.ctx, &self.lm_head, x, out)
-            }
-            WeightFormat::DenseBf16 => {
-                let mut x_row = DeviceVec::zeros(&self.ctx, x.hidden_dim)?;
-                let mut out_row = DeviceVec::zeros(&self.ctx, out.hidden_dim)?;
-                for r in 0..x.seq_len {
-                    let src = x.data.slice(r * x.hidden_dim..(r + 1) * x.hidden_dim);
-                    self.ctx
-                        .stream
-                        .memcpy_dtod(&src, &mut x_row.data)
-                        .map_err(|e| anyhow!("DSv4 lm_head row copy-in failed: {e}"))?;
-                    crate::ops::gemv(&self.ctx, &self.lm_head, &x_row, &mut out_row)?;
-                    let mut dst = out
-                        .data
-                        .slice_mut(r * out.hidden_dim..(r + 1) * out.hidden_dim);
-                    self.ctx
-                        .stream
-                        .memcpy_dtod(&out_row.data, &mut dst)
-                        .map_err(|e| anyhow!("DSv4 lm_head row copy-out failed: {e}"))?;
-                }
-                Ok(())
-            }
-            other => anyhow::bail!("DSv4 lm_head unsupported weight format {other:?}"),
-        }
+        // ONE batched GEMM for every weight format (bf16 → cuBLAS gemm_batch,
+        // FP8/FP4 → mla_linear) — the lm_head weight is read ONCE for all `m` rows.
+        // The old bf16 path looped a per-row GEMV, re-reading the whole ~1 GB bf16
+        // lm_head weight PER ROW — at a c=16×depth verify that was ~48× the HBM
+        // traffic and the #1 decode GPU kernel (nsys: gemv_handwritten 19%, 558µs).
+        crate::attention::dsv4_linear(&self.ctx, &self.lm_head, x, out)
     }
 
     /// Batched device argmax over `[m, vocab]` logits — one launch, one
