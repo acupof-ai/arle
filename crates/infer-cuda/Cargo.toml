@@ -41,7 +41,12 @@ cuda = [
     "dep:serde_json",
     "cuda-kernels/cuda",
 ]
-no-cuda = ["cuda-kernels/no-cuda"]
+no-cuda = [
+    "dep:safetensors",
+    "dep:serde",
+    "dep:serde_json",
+    "cuda-kernels/no-cuda",
+]
 # Multi-rank NCCL collectives for the TP communicator (`tp::TpComm::Nccl`).
 # Implies `cuda`; the real NCCL wiring is H20-gated and lands later — declaring
 # the feature here makes the `cfg(feature = "nccl")` gate in `tp.rs` a known cfg.

@@ -46,6 +46,11 @@ mod paged_kv_table;
 // demoted prefix-KV pages, CPU-testable without nvcc.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 mod kv_tier;
+// Not cuda-gated under the explicit `no-cuda` feature: host-only resident
+// weight-quant checkpoint ABI detection and numeric codecs.
+#[cfg(any(feature = "cuda", feature = "no-cuda"))]
+#[allow(dead_code)]
+mod quant_format;
 // DSv4 hyper-connections (`hc_mult > 1`): the wide residual stream wrap. cuda-
 // gated (device kernels + DSv4 weight matrices).
 #[cfg(feature = "cuda")]
