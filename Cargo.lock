@@ -1676,6 +1676,7 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "tokio",
+ "tokio-stream",
  "uuid",
 ]
 
