@@ -36,7 +36,10 @@ use std::{
 
 use crate::{
     grad_clip::clip_grad_norm,
-    loss::{DEFAULT_KL_CHUNK_SIZE, cross_entropy_loss, kl_distill_loss, kl_distill_loss_chunked},
+    loss::{
+        DEFAULT_KL_CHUNK_SIZE, KlDirection, cross_entropy_loss, kl_distill_loss,
+        kl_distill_loss_chunked,
+    },
     qwen35::{
         Qwen35Error, Qwen35KvCache, Qwen35Model, SequenceWindow, forward_rollout_cached,
         forward_rollout_cached_device_token,
@@ -209,6 +212,7 @@ pub struct GkdLossConfig<'a> {
     pub sft_anchor: GkdSftAnchor,
     pub corpus_tokens: Option<&'a [u32]>,
     pub kl_chunk_size: Option<usize>,
+    pub kl_direction: KlDirection,
     pub logits_window_size: Option<usize>,
     pub kl_mask: OpdKlMask,
 }
@@ -220,6 +224,7 @@ impl Default for GkdLossConfig<'_> {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: Some(DEFAULT_KL_CHUNK_SIZE),
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
         }
@@ -832,6 +837,7 @@ fn kl_distill_loss_for_config(
     teacher_logits: TensorId,
     num_positions: usize,
     kl_chunk_size: Option<usize>,
+    kl_direction: KlDirection,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -841,12 +847,20 @@ fn kl_distill_loss_for_config(
             teacher_logits,
             num_positions,
             chunk_size,
+            kl_direction,
             store,
             tape,
         )
         .map_err(OpdError::from),
-        None => kl_distill_loss(student_logits, teacher_logits, num_positions, store, tape)
-            .map_err(OpdError::from),
+        None => kl_distill_loss(
+            student_logits,
+            teacher_logits,
+            num_positions,
+            kl_direction,
+            store,
+            tape,
+        )
+        .map_err(OpdError::from),
     }
 }
 
@@ -1109,6 +1123,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         teacher_kl,
         kl_range.len(),
         chunk_size,
+        KlDirection::Forward,
         store,
         tape,
     )
@@ -1558,6 +1573,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
                 teacher_logits.tensor_id,
                 window.len(),
                 gkd_config.kl_chunk_size,
+                gkd_config.kl_direction,
                 store,
                 tape,
             )?;
@@ -2325,6 +2341,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             teacher_kl_logits,
             kl_range.len(),
             gkd_config.kl_chunk_size,
+            gkd_config.kl_direction,
             store,
             tape,
         )?;
@@ -2394,6 +2411,8 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
 #[cfg(test)]
 mod tests {
     use autograd::{AutogradError, Tape, Tensor, TensorStore};
+
+    use crate::loss::KlDirection;
 
     use super::{
         GkdLossConfig, GkdSftAnchor, KlLogitRange, OpdError, OpdKlMask, OpdStepConfig,
@@ -2627,6 +2646,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: None,
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2642,6 +2662,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&[]),
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2656,6 +2677,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: None,
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2665,6 +2687,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::CorpusTruth,
             corpus_tokens: Some(&[1, 2]),
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2678,6 +2701,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: Some(0),
+            kl_direction: KlDirection::Forward,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2698,6 +2722,7 @@ mod tests {
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
             kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
             logits_window_size: Some(0),
             kl_mask: OpdKlMask::Full,
         })
@@ -2752,8 +2777,16 @@ mod tests {
             Tensor::new(vec![0.4, 0.3, 0.2, 0.1], vec![1, 2, 2], false).expect("teacher logits"),
         );
 
-        let loss = kl_distill_loss_for_config(student, teacher, 2, Some(1), &mut store, &mut tape)
-            .expect("chunked KL config should run");
+        let loss = kl_distill_loss_for_config(
+            student,
+            teacher,
+            2,
+            Some(1),
+            KlDirection::Forward,
+            &mut store,
+            &mut tape,
+        )
+        .expect("chunked KL config should run");
         let value = store.to_host(loss).expect("loss host")[0];
         assert!(value.is_finite(), "chunked KL loss must be finite");
     }
