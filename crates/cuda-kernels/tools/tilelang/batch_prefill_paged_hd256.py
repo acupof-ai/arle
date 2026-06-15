@@ -1,6 +1,6 @@
 """TileLang batch prefill HD256 paged attention.
 
-HD256, BF16, causal, page_size=16. One kernel is AOT-specialized per
+HD256, BF16 I/O, causal, page_size=16. One kernel is AOT-specialized per
 (num_q_heads, num_kv_heads) pair in SUPPORTED_HEADS — keeping these as
 compile-time constants gives TileLang the freedom to specialize codegen
 per shape instead of paying for runtime parameterization. Add a new
@@ -8,12 +8,10 @@ Qwen3.5 size by extending the lockstep lists in this module,
 cuda-kernels/build.rs, cuda-kernels/src/ffi/attention.rs, and
 infer/src/ops/attention.rs.
 
-Runs under the canonical `--features cuda` TileLang path. Mirror twin of
-`batch_prefill_paged_hd128.py`; the deltas vs HD128 are:
+Mirror twin of `batch_prefill_paged_hd128.py`; the deltas vs HD128 are:
 
   1. `HEAD_DIM = 256` (was 128).
-  2. `SM_SCALE = 1.0 / sqrt(256)` (folded into the kernel via
-     `1.0 / math.sqrt(HEAD_DIM)`).
+  2. `SM_SCALE = 1.0 / sqrt(256)` (folded in via `1.0 / math.sqrt(HEAD_DIM)`).
   3. `SUPPORTED_HEADS` covers the Qwen3.5 full-attention head configs:
        (8, 2)   — Qwen3.5-0.8B
        (16, 2)  — Qwen3.6 MoE 30B-A3B
@@ -25,26 +23,20 @@ Runs under the canonical `--features cuda` TileLang path. Mirror twin of
        V tile : BLOCK_N * HEAD_DIM * 2 * stages = 32 * 256 * 2 * 2 = 32 KB
        total  ≈ 96 KB, fits the sm_89 100 KB cap with the same
        `MAX_DYNAMIC_SHARED_SIZE_BYTES` lift the HD128 wrapper already
-       performs (see gen_tilelang_aot.py's wrapper template).
-     The HD128 equivalent (BLOCK_N=64) totals ~48 KB, so HD256 doubles
-     per-element cost and we reclaim it by halving BLOCK_N.
-  5. `BLOCK_M = 64`, `NUM_STAGES = 2`, `NUM_THREADS = 128`,
-     `PAGE_SIZE = 16` unchanged. PAGE_SIZE is a KV-pool-shape decision
-     and is independent of head_dim.
-  6. Causal mask, GemmWarpPolicy.FullRow on both Q@K and P@V, and the
-     bf16-narrow `p_bf16` rebuffer between softmax and P@V are
-     line-for-line the same as HD128 — these are the upstream
-     `tile-ai/tilelang/examples/flash_attention/example_gqa_*` patterns
-     that the L4 floor wins entry (2026-04-26) explicitly told us to
-     mirror.
-  7. Runtime int32 args (`batch_size`, `max_qlen`) and the symbolic
-     shape vars (`total_q_tokens`, `batch_size_plus_one`, `num_pages`,
-     `total_pages`) are identical to HD128, so `gen_tilelang_aot.py`'s
-     `WRAPPER_FILL_RULES` / `TENSOR_NAME_TO_USER_INPUT` already cover
-     this kernel — no wrapper changes required.
+       performs (see gen_tilelang_aot.py's wrapper template). fp16 GEMM
+       operands on sm<80 are also 2 bytes, so the budget is unchanged.
 
-Tile / pipeline tunables (inherited Hopper-friendly defaults; the
-H100 spike per docs/plans/tilelang-integration.md §6 will retune):
+sm_70 (Volta) variant: identical strategy to `batch_prefill_paged_hd128.py`.
+I/O stays bf16 (runtime ABI); on sm<80 the GEMM operands are fed fp16 so the
+gemms route to TileLang's stock Volta tensor-core path (GemmMMASm70 /
+mma.sync) instead of the scalar cuda.fma fallback whose per-output fragment
+layout triggers the LayoutInference m_prev/scale_i conflict. The PV operand A
+is fed from shared on sm<80. sm>=80 keeps the byte-identical bf16 fragment
+path. This replaces the earlier `SM70_FORCE_TWO_KV_TILES` band-aid, which only
+worked around the broken fma-fallback lowering and is no longer needed once the
+gemms take the MMA path.
+
+Tile / pipeline tunables:
   BLOCK_M = 64    q-tile rows
   BLOCK_N = 32    kv-tile cols (= PAGE_SIZE * 2)
   NUM_STAGES = 2
@@ -63,7 +55,6 @@ BLOCK_M = 64
 BLOCK_N = 32
 NUM_STAGES = 2
 NUM_THREADS = 128
-SM70_FORCE_TWO_KV_TILES = os.environ.get("ARLE_TILELANG_CUDA_ARCH") == "70"
 
 # (num_q_heads, num_kv_heads) configurations the Phase 0 build emits.
 # Mirrors the Qwen3.5 HD256 family at the time of writing. Extend here +
@@ -86,6 +77,20 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
     dtype = "bfloat16"
     accum_dtype = "float32"
     index_dtype = "int32"
+
+    # See batch_prefill_paged_hd128.py for the full rationale. sm<80 feeds the
+    # GEMMs fp16 so dispatch picks kCudaMMA (GemmMMASm70), not the scalar
+    # kCudaFMA fallback; accum stays f32. Trace-time no-op on sm>=80 → the
+    # bf16 AST stays byte-identical to the repo kernel.
+    sm_arch = int(os.environ.get("ARLE_TILELANG_CUDA_ARCH", "90"))
+    gemm_dtype = "float16" if sm_arch < 80 else "bfloat16"
+
+    # bf16->fp16 routes through f32: a direct cast lowers to an ambiguous
+    # CUTLASS user-defined conversion nvcc rejects; bf16->f32->fp16 is unique.
+    def to_gemm(x):
+        if gemm_dtype == dtype:
+            return x
+        return T.cast(T.cast(x, accum_dtype), gemm_dtype)
 
     @T.prim_func
     def kernel(
@@ -113,9 +118,9 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             batch_size,
             threads=NUM_THREADS,
         ) as (bx, by, bz):
-            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), dtype)
-            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
-            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
+            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), gemm_dtype)
+            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
+            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
             acc_o = T.alloc_fragment((BLOCK_M, HEAD_DIM), accum_dtype)
             scores = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
             m_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
@@ -144,70 +149,31 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 src = q_start + row
                 q_tile[i, d] = T.if_then_else(
                     row < qlen,
-                    Q[src, by * HEAD_DIM + d],
-                    T.cast(0, dtype),
+                    to_gemm(Q[src, by * HEAD_DIM + d]),
+                    T.cast(0, gemm_dtype),
                 )
 
-            kv_loop_tiles = T.ceildiv(kv_total_len, BLOCK_N)
-            if SM70_FORCE_TWO_KV_TILES:
-                # Volta lowering from the patched TileLang BF16->FP16 fallback
-                # fails for HD256 prefill when the causal window fits in one
-                # KV tile. A second masked tile keeps the loop shape on the
-                # working lowering path without changing visible attention.
-                kv_loop_tiles = kv_loop_tiles + T.if_then_else(kv_loop_tiles == 1, 1, 0)
-
-            for kn in T.Pipelined(kv_loop_tiles, num_stages=NUM_STAGES):
+            for kn in T.Pipelined(T.ceildiv(kv_total_len, BLOCK_N), num_stages=NUM_STAGES):
                 col0 = kn * BLOCK_N
-                if SM70_FORCE_TWO_KV_TILES:
-                    page_idx_j = T.alloc_fragment((BLOCK_N,), index_dtype)
-                    in_page_j = T.alloc_fragment((BLOCK_N,), index_dtype)
-                    valid_j = T.alloc_fragment((BLOCK_N,), index_dtype)
-
-                    for j in T.Parallel(BLOCK_N):
-                        abs_col = col0 + j
-                        page_local = abs_col // PAGE_SIZE
-                        in_page_j[j] = abs_col % PAGE_SIZE
-                        valid_col = ((abs_col - PAGE_SIZE) < kv_total_len) and (
-                            page_local < num_kv_pages
-                        )
-                        valid_j[j] = T.if_then_else(valid_col, 1, 0)
-                        page_idx_j[j] = T.if_then_else(
-                            valid_col,
-                            KV_indices[kv_page_start + page_local],
-                            0,
-                        )
-                    for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
-                        is_valid = valid_j[j] != 0
-                        k_tile[j, d] = T.if_then_else(
-                            is_valid,
-                            K_pool[page_idx_j[j], kv_head, in_page_j[j], d],
-                            T.cast(0, dtype),
-                        )
-                        v_tile[j, d] = T.if_then_else(
-                            is_valid,
-                            V_pool[page_idx_j[j], kv_head, in_page_j[j], d],
-                            T.cast(0, dtype),
-                        )
-                else:
-                    for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
-                        abs_col = col0 + j
-                        page_local = abs_col // PAGE_SIZE
-                        in_page = abs_col % PAGE_SIZE
-                        page_idx = T.if_then_else(
-                            abs_col < kv_total_len,
-                            KV_indices[kv_page_start + page_local],
-                            0,
-                        )
-                        k_tile[j, d] = T.if_then_else(
-                            abs_col < kv_total_len,
-                            K_pool[page_idx, kv_head, in_page, d],
-                            T.cast(0, dtype),
-                        )
-                        v_tile[j, d] = T.if_then_else(
-                            abs_col < kv_total_len,
-                            V_pool[page_idx, kv_head, in_page, d],
-                            T.cast(0, dtype),
-                        )
+                for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
+                    abs_col = col0 + j
+                    page_local = abs_col // PAGE_SIZE
+                    in_page = abs_col % PAGE_SIZE
+                    page_idx = T.if_then_else(
+                        abs_col < kv_total_len,
+                        KV_indices[kv_page_start + page_local],
+                        0,
+                    )
+                    k_tile[j, d] = T.if_then_else(
+                        abs_col < kv_total_len,
+                        to_gemm(K_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
+                    )
+                    v_tile[j, d] = T.if_then_else(
+                        abs_col < kv_total_len,
+                        to_gemm(V_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
+                    )
 
                 T.clear(scores)
                 T.gemm(q_tile, k_tile, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
@@ -217,17 +183,8 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     row = row0 + i
                     col = col0 + j
-                    if SM70_FORCE_TWO_KV_TILES:
-                        # TileLang's Volta vectorized lowering shifts the
-                        # column predicate by one 16-token page. Express the
-                        # source predicate in the opposite direction so the
-                        # generated guard remains the intended `col < len` /
-                        # causal diagonal test for short contexts.
-                        in_bounds = (row < qlen) and (valid_j[j] != 0)
-                        causal = (col - PAGE_SIZE) <= kv_offset + row
-                    else:
-                        in_bounds = (row < qlen) and (col < kv_total_len)
-                        causal = col <= kv_offset + row
+                    in_bounds = (row < qlen) and (col < kv_total_len)
+                    causal = col <= kv_offset + row
                     scores[i, j] = T.if_then_else(
                         in_bounds and causal,
                         scores[i, j] * sm_scale,
@@ -260,13 +217,19 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                # Narrow the f32 softmax output to bf16 to match v_tile
-                # before the P @ V matmul (standard FlashAttention-2
-                # pattern). TileLang 0.1.9's gemm asserts A.dtype ==
-                # B.dtype; older versions auto-cast silently.
-                p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
-                T.copy(p, p_bf16)
-                T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                # PV operand A. sm_80+: bf16 fragment (byte-identical to repo).
+                # sm<80 Volta MMA (GemmMMASm70): feed A from SHARED — mirrors
+                # the QK gemm (both operands shared) which already lowers
+                # cleanly; the f32->fp16 MMA-operand-A fragment relayout the
+                # Volta path can't infer is sidestepped.
+                if gemm_dtype != dtype:
+                    p_shared = T.alloc_shared((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_shared)
+                    T.gemm(p_shared, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                else:
+                    p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_bf16)
+                    T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 row = row0 + i
