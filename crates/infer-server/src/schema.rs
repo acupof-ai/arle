@@ -94,6 +94,11 @@ impl ChatCompletionRequest {
                 "messages must contain at least one message",
             ));
         }
+        if self.messages.iter().any(ChatMessage::has_media_content) {
+            return Err(ApiError::bad_request(
+                "image/audio/video content parts are parsed, but VLM soft-token embeddings are not wired yet",
+            ));
+        }
         validate_common(self.stream, self.max_tokens)
     }
 
@@ -119,7 +124,125 @@ impl ChatCompletionRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: Option<String>,
+    pub content: Option<ChatContent>,
+}
+
+impl ChatMessage {
+    #[must_use]
+    pub fn content_text(&self) -> String {
+        self.content
+            .as_ref()
+            .map_or_else(String::new, ChatContent::to_text)
+    }
+
+    #[must_use]
+    pub fn has_media_content(&self) -> bool {
+        self.content
+            .as_ref()
+            .is_some_and(ChatContent::has_media_content)
+    }
+
+    #[must_use]
+    pub(crate) fn template_content(&self) -> serde_json::Value {
+        self.content.as_ref().map_or(
+            serde_json::Value::String(String::new()),
+            ChatContent::to_template_value,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl ChatContent {
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| {
+                    if part.kind == "text" {
+                        part.text.as_deref()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    #[must_use]
+    pub fn has_media_content(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Parts(parts) => parts.iter().any(ChatContentPart::is_media),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn to_template_value(&self) -> serde_json::Value {
+        match self {
+            Self::Text(text) => serde_json::Value::String(text.clone()),
+            Self::Parts(parts) => serde_json::Value::Array(
+                parts
+                    .iter()
+                    .map(ChatContentPart::to_template_value)
+                    .collect(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input_image: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ChatContentPart {
+    fn normalized_kind(&self) -> &str {
+        match self.kind.as_str() {
+            "image_url" | "input_image" => "image",
+            "input_audio" => "audio",
+            other => other,
+        }
+    }
+
+    fn is_media(&self) -> bool {
+        matches!(self.normalized_kind(), "image" | "audio" | "video")
+    }
+
+    fn to_template_value(&self) -> serde_json::Value {
+        let mut object = self.extra.clone();
+        object.insert(
+            "type".to_string(),
+            serde_json::Value::String(self.normalized_kind().to_string()),
+        );
+        if let Some(text) = &self.text {
+            object.insert("text".to_string(), serde_json::Value::String(text.clone()));
+        }
+        if let Some(image_url) = &self.image_url {
+            object.insert("image_url".to_string(), image_url.clone());
+        }
+        if let Some(input_image) = &self.input_image {
+            object.insert("input_image".to_string(), input_image.clone());
+        }
+        serde_json::Value::Object(object)
+    }
 }
 
 fn validate_common(stream: Option<bool>, max_tokens: Option<usize>) -> Result<(), ApiError> {
@@ -541,5 +664,24 @@ mod tests {
         assert_eq!(v["kv_tier"]["demoted_pages"], 0);
         assert_eq!(v["ssd_recall"]["available"], false);
         assert!(v["ssd_recall"]["recall_rate"].is_null());
+    }
+
+    #[test]
+    fn chat_content_parts_parse_text_and_image() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(request.messages[0].content_text(), "what is this?");
+        assert!(request.messages[0].has_media_content());
+        let template = request.messages[0].template_content();
+        assert_eq!(template[1]["type"], "image");
+        assert!(request.validate().is_err());
     }
 }

@@ -418,10 +418,24 @@ unsafe extern "C" {
         lm_head_id: i32,
         final_norm_id: i32,
     );
+    pub fn diffusion_gemma_set_requires_self_conditioning(
+        model: *mut std::ffi::c_void,
+        required: bool,
+    ) -> i32;
+    pub fn diffusion_gemma_set_per_layer_embeddings(
+        model: *mut std::ffi::c_void,
+        embed_id: i32,
+        projection_id: i32,
+        norm_id: i32,
+        num_layers: i32,
+        hidden_size_per_layer_input: i32,
+        vocab_size_per_layer_input: i32,
+    ) -> i32;
     #[allow(clippy::too_many_arguments)]
     pub fn diffusion_gemma_push_layer(
         model: *mut std::ffi::c_void,
         is_full_attention: bool,
+        kv_shared_layer_index: i32,
         num_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -452,6 +466,13 @@ unsafe extern "C" {
         layer_scalar_id: i32,
         num_experts: i32,
         top_k: i32,
+    ) -> i32;
+    pub fn diffusion_gemma_set_layer_ple(
+        model: *mut std::ffi::c_void,
+        layer_index: i32,
+        gate_id: i32,
+        projection_id: i32,
+        norm_id: i32,
     ) -> i32;
     pub fn diffusion_gemma_set_self_conditioning(
         model: *mut std::ffi::c_void,
@@ -507,6 +528,20 @@ unsafe extern "C" {
         out_steps: *mut i32,
         out_forced: *mut i32,
         out_adaptive: *mut i32,
+    ) -> i32;
+    pub fn diffusion_gemma_generate_causal(
+        model: *mut std::ffi::c_void,
+        prompt: *const i32,
+        prompt_len: i32,
+        max_new_tokens: i32,
+        seed: u64,
+        stop_ids: *const u32,
+        stop_ids_len: i32,
+        cancel_fn: Option<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
+        cancel_ctx: *const std::ffi::c_void,
+        out_tokens: *mut u32,
+        out_len: *mut i32,
+        out_finish: *mut i32,
     ) -> i32;
 
     // === Compiled Qwen3.5 model ===

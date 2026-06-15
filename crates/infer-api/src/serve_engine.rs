@@ -277,7 +277,7 @@ where
             .iter()
             .map(|message| infer_server::ChatMessage {
                 role: message.role.clone(),
-                content: Some(message.content.clone()),
+                content: Some(infer_server::ChatContent::Text(message.content.clone())),
             })
             .collect::<Vec<_>>();
         self.tokenizer.render_chat(&rows)

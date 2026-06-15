@@ -107,12 +107,55 @@ pub(crate) struct MetalDiffusionGemmaConfig {
     pub(crate) generation: DiffusionGenerationConfig,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MetalGemma4Config {
+    pub(crate) text: gemma_spec::Gemma4TextConfig,
+    pub(crate) generation: DiffusionGenerationConfig,
+    pub(crate) image_token_id: Option<u32>,
+    pub(crate) vision_soft_tokens_per_image: Option<usize>,
+}
+
 pub(crate) fn load_diffusion_gemma_config(model_dir: &Path) -> Result<MetalDiffusionGemmaConfig> {
     let path = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     let value: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
     diffusion_gemma_config_from_value(&value)
+}
+
+pub(crate) fn load_gemma4_config(model_dir: &Path) -> Result<MetalGemma4Config> {
+    let path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
+    let root = value
+        .as_object()
+        .context("config.json root must be a JSON object")?;
+    let text_config = root
+        .get("text_config")
+        .and_then(serde_json::Value::as_object);
+    let model = text_config.unwrap_or(root);
+    anyhow::ensure!(
+        is_gemma4_config(root, model) && !is_diffusion_gemma_config(root, model),
+        "config.json is not a normal Gemma4 autoregressive checkpoint"
+    );
+    let text = gemma_spec::Gemma4TextConfig::from_json_value(&value)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    let generation = gemma4_generation_from_config(model_dir, root, model, &text)?;
+    let image_token_id = root
+        .get("image_token_id")
+        .and_then(serde_json::Value::as_u64)
+        .map(|id| id as u32);
+    let vision_soft_tokens_per_image = root
+        .get("vision_soft_tokens_per_image")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize);
+    Ok(MetalGemma4Config {
+        text,
+        generation,
+        image_token_id,
+        vision_soft_tokens_per_image,
+    })
 }
 
 pub fn model_dir_is_diffusion_gemma(model_dir: &Path) -> bool {
@@ -131,6 +174,24 @@ pub fn model_dir_is_diffusion_gemma(model_dir: &Path) -> bool {
         .and_then(serde_json::Value::as_object);
     let model = text_config.unwrap_or(root);
     is_diffusion_gemma_config(root, model)
+}
+
+pub fn model_dir_is_gemma4(model_dir: &Path) -> bool {
+    let path = model_dir.join("config.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    let text_config = root
+        .get("text_config")
+        .and_then(serde_json::Value::as_object);
+    let model = text_config.unwrap_or(root);
+    is_gemma4_config(root, model) && !is_diffusion_gemma_config(root, model)
 }
 
 /// Load a safetensors Qwen3.5/Qwen3.6 config for the clean Metal executor.
@@ -161,8 +222,9 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     }
     if is_gemma4_config(root, model) {
         anyhow::bail!(
-            "Gemma4 Metal loading is not wired yet: infer-metal still lacks the MLX \
-             Gemma4 forward path and weight mapping"
+            "Gemma4 cannot be loaded by the Qwen Metal executor: use the \
+             infer-api MetalGemma4 route, which owns the Gemma4 MLX forward path \
+             and weight mapping"
         );
     }
 
@@ -429,6 +491,39 @@ fn diffusion_generation_from_config(
     Ok(generation)
 }
 
+fn gemma4_generation_from_config(
+    model_dir: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+    text_config: &serde_json::Map<String, serde_json::Value>,
+    text: &gemma_spec::Gemma4TextConfig,
+) -> Result<DiffusionGenerationConfig> {
+    let vocab_size =
+        u32::try_from(text.vocab_size).context("Gemma4 vocab_size does not fit in u32")?;
+    let generation_json = match std::fs::read_to_string(model_dir.join("generation_config.json")) {
+        Ok(content) => Some(
+            serde_json::from_str::<serde_json::Value>(&content)
+                .context("generation_config.json parse")?,
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let max_new_tokens = generation_json
+        .as_ref()
+        .and_then(|value| value.get("max_new_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(512, |n| n as usize);
+    let mut generation = DiffusionGenerationConfig::diffusion_gemma(max_new_tokens, vocab_size);
+    generation.canvas_length = 1;
+    generation.max_denoising_steps = 1;
+    generation.pad_token_id = generation_json
+        .as_ref()
+        .and_then(|value| value.get("pad_token_id"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |n| n as u32);
+    generation.stop_token_ids = resolve_stop_token_ids(model_dir, root, text_config)?;
+    Ok(generation)
+}
+
 fn is_diffusion_gemma_config(
     root: &serde_json::Map<String, serde_json::Value>,
     model: &serde_json::Map<String, serde_json::Value>,
@@ -487,7 +582,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{diffusion_gemma_config_from_value, is_diffusion_gemma_config, is_gemma4_config};
+    use super::{
+        diffusion_gemma_config_from_value, is_diffusion_gemma_config, is_gemma4_config,
+        load_gemma4_config, model_dir_is_gemma4,
+    };
 
     fn diffusion_gemma_value() -> serde_json::Value {
         json!({
@@ -622,6 +720,60 @@ mod tests {
         assert!(message.contains("DiffusionGemma cannot be loaded by the autoregressive"));
         assert!(message.contains("hidden_size=2816"));
         assert!(message.contains("canvas=256"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gemma4_config_lowers_ar_generation_and_vlm_ids() {
+        let value = json!({
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "eos_token_id": [1, 106, 50],
+            "image_token_id": 258880,
+            "vision_soft_tokens_per_image": 280,
+            "text_config": {
+                "vocab_size": 262144,
+                "hidden_size": 1536,
+                "intermediate_size": 4096,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "max_position_embeddings": 32768,
+                "initializer_range": 0.02,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 1024,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention"
+                ],
+                "global_head_dim": 512,
+                "hidden_size_per_layer_input": 256,
+                "vocab_size_per_layer_input": 262144,
+                "num_kv_shared_layers": 3
+            }
+        });
+        let dir = temp_model_dir_with_config(&value);
+        std::fs::write(
+            dir.join("generation_config.json"),
+            r#"{"eos_token_id": [1, 106, 50], "pad_token_id": 0, "max_new_tokens": 64}"#,
+        )
+        .unwrap();
+
+        assert!(model_dir_is_gemma4(&dir));
+        let parsed = load_gemma4_config(&dir).unwrap();
+        assert_eq!(parsed.generation.max_new_tokens, 64);
+        assert_eq!(parsed.generation.canvas_length, 1);
+        assert_eq!(parsed.generation.max_denoising_steps, 1);
+        assert_eq!(parsed.generation.stop_token_ids, vec![1, 106, 50]);
+        assert_eq!(parsed.image_token_id, Some(258_880));
+        assert_eq!(parsed.vision_soft_tokens_per_image, Some(280));
+        assert_eq!(parsed.text.kv_shared_source_layer(5), Some(2));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -54,7 +54,7 @@ pub use multiproc_relay::{
     WireRequest, broadcast_tick, set_tick_broadcaster, tick_broadcaster_installed,
 };
 pub use schema::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionRequest,
+    ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatMessage, CompletionRequest,
     CompletionResponse,
 };
 pub use tokenizer::OpenAiTokenizer;

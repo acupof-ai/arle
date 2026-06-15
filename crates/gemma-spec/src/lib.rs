@@ -133,6 +133,10 @@ pub struct Gemma4TextConfig {
     #[serde(default)]
     pub global_head_dim: Option<usize>,
     #[serde(default)]
+    pub swa_num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    pub swa_head_dim: Option<usize>,
+    #[serde(default)]
     pub attention_k_eq_v: bool,
     #[serde(default)]
     pub num_kv_shared_layers: usize,
@@ -144,9 +148,9 @@ pub struct Gemma4TextConfig {
     pub use_double_wide_mlp: bool,
     #[serde(default)]
     pub num_experts: Option<usize>,
-    #[serde(default)]
+    #[serde(default, alias = "num_experts_per_tok")]
     pub top_k_experts: Option<usize>,
-    #[serde(default)]
+    #[serde(default, alias = "expert_intermediate_size")]
     pub moe_intermediate_size: Option<usize>,
 }
 
@@ -233,6 +237,15 @@ impl Gemma4TextConfig {
         Ok(())
     }
 
+    pub fn local_kv_heads(&self) -> usize {
+        self.swa_num_key_value_heads
+            .unwrap_or(self.num_key_value_heads)
+    }
+
+    pub fn local_attention_head_dim(&self) -> usize {
+        self.swa_head_dim.unwrap_or(self.head_dim)
+    }
+
     pub fn is_global_layer(&self, layer_idx: usize) -> bool {
         self.layer_types
             .get(layer_idx)
@@ -248,9 +261,53 @@ impl Gemma4TextConfig {
         self.global_head_dim.unwrap_or(self.head_dim)
     }
 
+    pub fn attention_head_dim_for_layer(&self, layer_idx: usize) -> usize {
+        if self.is_global_layer(layer_idx) {
+            self.global_attention_head_dim()
+        } else {
+            self.local_attention_head_dim()
+        }
+    }
+
+    pub fn kv_heads_for_layer(&self, layer_idx: usize) -> usize {
+        if self.is_global_layer(layer_idx) {
+            self.global_kv_heads()
+        } else {
+            self.local_kv_heads()
+        }
+    }
+
     pub fn has_per_layer_embeddings(&self) -> bool {
         self.vocab_size_per_layer_input.unwrap_or(0) > 0
             && self.hidden_size_per_layer_input.unwrap_or(0) > 0
+    }
+
+    pub fn first_kv_shared_layer_idx(&self) -> usize {
+        self.num_hidden_layers
+            .saturating_sub(self.num_kv_shared_layers)
+    }
+
+    pub fn is_kv_shared_layer(&self, layer_idx: usize) -> bool {
+        self.num_kv_shared_layers > 0 && layer_idx >= self.first_kv_shared_layer_idx()
+    }
+
+    pub fn kv_shared_source_layer(&self, layer_idx: usize) -> Option<usize> {
+        if !self.is_kv_shared_layer(layer_idx) {
+            return None;
+        }
+        let first_shared = self.first_kv_shared_layer_idx();
+        let target = *self.layer_types.get(layer_idx)?;
+        self.layer_types[..first_shared]
+            .iter()
+            .rposition(|kind| *kind == target)
+    }
+
+    pub fn layer_intermediate_size(&self, layer_idx: usize) -> usize {
+        if self.use_double_wide_mlp && self.is_kv_shared_layer(layer_idx) {
+            self.intermediate_size.saturating_mul(2)
+        } else {
+            self.intermediate_size
+        }
     }
 
     pub fn uses_moe_block(&self) -> bool {
@@ -341,6 +398,49 @@ mod tests {
         assert!(cfg.has_per_layer_embeddings());
         assert_eq!(cfg.global_kv_heads(), 1);
         assert_eq!(cfg.global_attention_head_dim(), 512);
+    }
+
+    #[test]
+    fn derives_gemma4_ple_and_kv_share_contract() {
+        let cfg = Gemma4TextConfig::from_json_str(
+            r#"{
+                "vocab_size": 262144,
+                "hidden_size": 1536,
+                "intermediate_size": 4096,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "max_position_embeddings": 32768,
+                "initializer_range": 0.02,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 1024,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention"
+                ],
+                "global_head_dim": 512,
+                "hidden_size_per_layer_input": 256,
+                "vocab_size_per_layer_input": 262144,
+                "num_kv_shared_layers": 3,
+                "use_double_wide_mlp": true
+            }"#,
+        )
+        .unwrap();
+        assert!(cfg.has_per_layer_embeddings());
+        assert_eq!(cfg.first_kv_shared_layer_idx(), 3);
+        assert_eq!(cfg.kv_shared_source_layer(3), Some(1));
+        assert_eq!(cfg.kv_shared_source_layer(4), Some(1));
+        assert_eq!(cfg.kv_shared_source_layer(5), Some(2));
+        assert_eq!(cfg.attention_head_dim_for_layer(0), 256);
+        assert_eq!(cfg.attention_head_dim_for_layer(5), 512);
+        assert_eq!(cfg.layer_intermediate_size(2), 4096);
+        assert_eq!(cfg.layer_intermediate_size(3), 8192);
     }
 
     #[test]

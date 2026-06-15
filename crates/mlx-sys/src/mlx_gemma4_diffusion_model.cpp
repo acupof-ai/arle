@@ -133,6 +133,7 @@ struct QWeight {
 
 struct LayerWeights {
     bool is_full_attention = false;
+    int kv_shared_layer_index = -1;
     int num_heads = 0;
     int num_kv_heads = 0;
     int head_dim = 0;
@@ -167,6 +168,11 @@ struct LayerWeights {
     QWeight expert_down;
     int num_experts = 0;
     int top_k = 0;
+
+    bool has_ple = false;
+    QWeight per_layer_input_gate;
+    QWeight per_layer_projection;
+    array post_per_layer_input_norm = array(0);
 
     array layer_scalar = array(1.0f);
 };
@@ -234,6 +240,13 @@ struct DiffusionGemmaModel {
     array embed_tokens = array(0);
     QWeight lm_head;
     array final_norm = array(0);
+    bool requires_self_conditioning = false;
+    bool has_per_layer_embeddings = false;
+    int hidden_size_per_layer_input = 0;
+    int vocab_size_per_layer_input = 0;
+    QWeight embed_per_layer;
+    QWeight per_layer_model_projection;
+    array per_layer_projection_norm = array(0);
     std::vector<LayerWeights> layers;
     SelfConditioningWeights self_conditioning;
 
@@ -267,6 +280,61 @@ struct DiffusionGemmaModel {
         return fast::rms_norm(x, std::nullopt, rms_eps);
     }
 
+    array token_embeddings(const array& token_ids) const {
+        return take(embed_tokens, token_ids, 0) *
+               array(std::sqrt(static_cast<float>(hidden_size)));
+    }
+
+    array logits_from_hidden(const array& x) const {
+        auto y = rms(x, final_norm);
+        auto logits = lm_head.apply(y);
+        return softcap_logits(logits, final_logit_softcap);
+    }
+
+    array per_layer_inputs_for_tokens(const array& token_ids, const array& input_embeds) const {
+        if (!has_per_layer_embeddings) {
+            return array(0);
+        }
+        auto safe_ids = where(
+            less(token_ids, array(vocab_size_per_layer_input, int32)),
+            token_ids,
+            zeros_like(token_ids));
+        auto embeds = take(embed_per_layer.w, safe_ids, 0) *
+                      array(std::sqrt(static_cast<float>(hidden_size_per_layer_input)));
+        embeds = reshape(
+            embeds,
+            Shape{
+                token_ids.shape(0),
+                static_cast<int>(layers.size()),
+                hidden_size_per_layer_input,
+            });
+
+        auto projected = per_layer_model_projection.apply(input_embeds) *
+                         array(1.0f / std::sqrt(static_cast<float>(hidden_size)));
+        projected = reshape(
+            projected,
+            Shape{
+                input_embeds.shape(0),
+                static_cast<int>(layers.size()),
+                hidden_size_per_layer_input,
+            });
+        projected = rms(projected, per_layer_projection_norm);
+        return (projected + embeds) * array(1.0f / std::sqrt(2.0f));
+    }
+
+    array per_layer_slice(const array& per_layer_inputs, int layer_idx) const {
+        return squeeze(
+            slice(
+                per_layer_inputs,
+                Shape{0, layer_idx, 0},
+                Shape{
+                    per_layer_inputs.shape(0),
+                    layer_idx + 1,
+                    hidden_size_per_layer_input,
+                }),
+            1);
+    }
+
     void reset_request_state() {
         context_tokens.clear();
         context_len = 0;
@@ -282,6 +350,29 @@ struct DiffusionGemmaModel {
         const LayerWeights& layer) const {
         const int key_len = retained_past_len + query_len;
         const int first_key_abs = absolute_offset - retained_past_len;
+        std::vector<float> mask(static_cast<size_t>(query_len) * key_len, -1.0e9f);
+        for (int i = 0; i < query_len; ++i) {
+            const int q_pos = absolute_offset + i;
+            for (int j = 0; j < key_len; ++j) {
+                const int key_pos = first_key_abs + j;
+                bool allowed = key_pos <= q_pos;
+                if (allowed && !layer.is_full_attention && layer.sliding_window > 0) {
+                    allowed = q_pos < key_pos + layer.sliding_window;
+                }
+                if (allowed) {
+                    mask[static_cast<size_t>(i) * key_len + j] = 0.0f;
+                }
+            }
+        }
+        return array_from_f32(mask, Shape{1, 1, query_len, key_len});
+    }
+
+    array build_encoder_mask_for_keys(
+        int query_len,
+        int key_len,
+        int first_key_abs,
+        int absolute_offset,
+        const LayerWeights& layer) const {
         std::vector<float> mask(static_cast<size_t>(query_len) * key_len, -1.0e9f);
         for (int i = 0; i < query_len; ++i) {
             const int q_pos = absolute_offset + i;
@@ -370,6 +461,33 @@ struct DiffusionGemmaModel {
         cache.values = v_full;
         cache.len = full_len;
 
+        auto flat = reshape(transpose(attn, {0, 2, 1, 3}), {1, s, nh * hd});
+        auto out = layer.o_proj.apply(flat);
+        return reshape(out, {s, hidden_size});
+    }
+
+    array attention_encode_shared(
+        const array& x,
+        const LayerWeights& layer,
+        const LayerCache& shared_cache,
+        int offset) const {
+        const int s = x.shape(0);
+        const int nh = layer.num_heads;
+        const int hd = layer.head_dim;
+        if (shared_cache.len <= 0) {
+            throw std::runtime_error("Gemma4 KV-shared layer has empty donor cache");
+        }
+        auto proj = project_attention(x, layer, offset);
+        const int key_len = shared_cache.len;
+        const int first_key_abs = offset + s - key_len;
+        auto mask = build_encoder_mask_for_keys(s, key_len, first_key_abs, offset, layer);
+        auto attn = fast::scaled_dot_product_attention(
+            proj.q,
+            shared_cache.keys,
+            shared_cache.values,
+            1.0f,
+            "",
+            mask);
         auto flat = reshape(transpose(attn, {0, 2, 1, 3}), {1, s, nh * hd});
         auto out = layer.o_proj.apply(flat);
         return reshape(out, {s, hidden_size});
@@ -508,13 +626,13 @@ struct DiffusionGemmaModel {
         return rms_no_weight(x + signal);
     }
 
-    void encode_tokens_into(
+    array encode_tokens_with_output(
         const int32_t* tokens,
         int len,
         std::vector<LayerCache>& caches,
         int offset) const {
         if (len <= 0) {
-            return;
+            return array(0);
         }
         if (!finalized) {
             throw std::runtime_error("DiffusionGemma model was not finalized");
@@ -523,13 +641,22 @@ struct DiffusionGemmaModel {
             throw std::runtime_error("DiffusionGemma cache size mismatch");
         }
         auto token_ids = array_from_i32(tokens, static_cast<int32_t>(len));
-        auto x = take(embed_tokens, token_ids, 0) * array(std::sqrt(static_cast<float>(hidden_size)));
+        auto x = token_embeddings(token_ids);
+        auto per_layer_inputs = per_layer_inputs_for_tokens(token_ids, x);
 
         for (size_t layer_idx = 0; layer_idx < layers.size(); ++layer_idx) {
             const auto& layer = layers[layer_idx];
             auto residual = x;
             auto h = rms(x, layer.input_ln);
-            h = attention_encode(h, layer, caches[layer_idx], offset);
+            if (layer.kv_shared_layer_index >= 0) {
+                const int donor = layer.kv_shared_layer_index;
+                if (donor < 0 || donor >= static_cast<int>(caches.size())) {
+                    throw std::runtime_error("Gemma4 KV-shared donor index is out of range");
+                }
+                h = attention_encode_shared(h, layer, caches[static_cast<size_t>(donor)], offset);
+            } else {
+                h = attention_encode(h, layer, caches[layer_idx], offset);
+            }
             h = rms(h, layer.post_attn_ln);
             x = h + residual;
 
@@ -543,8 +670,28 @@ struct DiffusionGemmaModel {
                 h = h1 + rms(m, layer.post_ff2_ln);
             }
             h = rms(h, layer.post_ff_ln);
-            x = (h + residual) * layer.layer_scalar;
+            x = h + residual;
+            if (layer.has_ple && has_per_layer_embeddings) {
+                auto ple = per_layer_slice(per_layer_inputs, static_cast<int>(layer_idx));
+                auto gate = gelu_tanh(layer.per_layer_input_gate.apply(x));
+                auto contribution = layer.per_layer_projection.apply(gate * ple);
+                contribution = rms(contribution, layer.post_per_layer_input_norm);
+                x = x + contribution;
+            }
+            x = x * layer.layer_scalar;
         }
+        return x;
+    }
+
+    void encode_tokens_into(
+        const int32_t* tokens,
+        int len,
+        std::vector<LayerCache>& caches,
+        int offset) const {
+        if (len <= 0) {
+            return;
+        }
+        encode_tokens_with_output(tokens, len, caches, offset);
     }
 
     array forward_logits_from_ids(const array& token_ids) {
@@ -558,12 +705,15 @@ struct DiffusionGemmaModel {
         if (layer_caches.size() != layers.size()) {
             throw std::runtime_error("DiffusionGemma cache was not initialized");
         }
-        auto x = take(embed_tokens, token_ids, 0) * array(std::sqrt(static_cast<float>(hidden_size)));
+        auto x = token_embeddings(token_ids);
+        auto per_layer_inputs = per_layer_inputs_for_tokens(token_ids, x);
         x = apply_self_conditioning(x, valid_len);
 
         for (size_t layer_idx = 0; layer_idx < layers.size(); ++layer_idx) {
             const auto& layer = layers[layer_idx];
-            const auto& cache = layer_caches[layer_idx];
+            const auto& cache = layer.kv_shared_layer_index >= 0
+                                    ? layer_caches[static_cast<size_t>(layer.kv_shared_layer_index)]
+                                    : layer_caches[layer_idx];
             auto residual = x;
             auto h = rms(x, layer.input_ln);
             h = attention_decode(h, layer, cache, context_len);
@@ -580,12 +730,18 @@ struct DiffusionGemmaModel {
                 h = h1 + rms(m, layer.post_ff2_ln);
             }
             h = rms(h, layer.post_ff_ln);
-            x = (h + residual) * layer.layer_scalar;
+            x = h + residual;
+            if (layer.has_ple && has_per_layer_embeddings) {
+                auto ple = per_layer_slice(per_layer_inputs, static_cast<int>(layer_idx));
+                auto gate = gelu_tanh(layer.per_layer_input_gate.apply(x));
+                auto contribution = layer.per_layer_projection.apply(gate * ple);
+                contribution = rms(contribution, layer.post_per_layer_input_norm);
+                x = x + contribution;
+            }
+            x = x * layer.layer_scalar;
         }
 
-        x = rms(x, final_norm);
-        auto logits = lm_head.apply(x);
-        return softcap_logits(logits, final_logit_softcap);
+        return logits_from_hidden(x);
     }
 
     array forward_logits(const int32_t* canvas, int canvas_len, int valid_len) {
@@ -628,6 +784,103 @@ struct DiffusionGemmaModel {
         context_len += len;
         self_conditioning_len = 0;
         self_conditioning_embeds = array(0);
+    }
+
+    array commit_tokens_and_logits(const int32_t* tokens, int len) {
+        if (len <= 0) {
+            throw std::invalid_argument("Gemma4 causal generate received empty token commit");
+        }
+        auto next_caches = layer_caches;
+        auto hidden = encode_tokens_with_output(tokens, len, next_caches, context_len);
+        layer_caches = std::move(next_caches);
+        context_tokens.insert(context_tokens.end(), tokens, tokens + len);
+        context_len += len;
+        self_conditioning_len = 0;
+        self_conditioning_embeds = array(0);
+        return logits_from_hidden(hidden);
+    }
+
+    int32_t greedy_next_token(const array& logits) const {
+        const int rows = logits.shape(0);
+        if (rows <= 0) {
+            throw std::runtime_error("Gemma4 causal logits are empty");
+        }
+        auto last = slice(
+            logits,
+            Shape{rows - 1, 0},
+            Shape{rows, logits.shape(logits.ndim() - 1)});
+        auto token = contiguous(astype(argmax(last, -1, false), int32));
+        eval({token});
+        return token.data<int32_t>()[0];
+    }
+
+    bool is_stop_token(uint32_t token, const uint32_t* stop_ids, int stop_ids_len) const {
+        for (int i = 0; i < stop_ids_len; ++i) {
+            if (token == stop_ids[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    DiffusionGenerateResult generate_causal_into(
+        const int32_t* prompt,
+        int prompt_len,
+        int max_new_tokens,
+        uint64_t seed,
+        const uint32_t* stop_ids,
+        int stop_ids_len,
+        DiffusionCancelFn cancel_fn,
+        const void* cancel_ctx,
+        uint32_t* out_tokens) {
+        if (prompt_len <= 0 || prompt == nullptr) {
+            throw std::invalid_argument("Gemma4 causal generate requires a non-empty prompt");
+        }
+        if (max_new_tokens < 0) {
+            throw std::invalid_argument("Gemma4 causal generate received invalid max_new_tokens");
+        }
+        if (max_new_tokens > 0 && out_tokens == nullptr) {
+            throw std::invalid_argument("Gemma4 causal generate output buffer is null");
+        }
+        if (stop_ids_len < 0 || (stop_ids_len > 0 && stop_ids == nullptr)) {
+            throw std::invalid_argument("Gemma4 causal generate received invalid stop ids");
+        }
+
+        random::seed(seed);
+        reset_request_state();
+        if (cancelled(cancel_fn, cancel_ctx)) {
+            throw std::runtime_error("Gemma4 causal generation cancelled");
+        }
+        auto logits = commit_tokens_and_logits(prompt, prompt_len);
+        std::vector<int32_t> output;
+        output.reserve(static_cast<size_t>(max_new_tokens));
+        DiffusionGenerateResult result;
+        result.finish = 0;
+
+        while (static_cast<int>(output.size()) < max_new_tokens) {
+            if (cancelled(cancel_fn, cancel_ctx)) {
+                throw std::runtime_error("Gemma4 causal generation cancelled");
+            }
+            const int32_t next = greedy_next_token(logits);
+            output.push_back(next);
+            const uint32_t next_u32 = static_cast<uint32_t>(next);
+            if (is_stop_token(next_u32, stop_ids, stop_ids_len)) {
+                result.finish = 1;
+                break;
+            }
+            if (static_cast<int>(output.size()) >= max_new_tokens) {
+                break;
+            }
+            logits = commit_tokens_and_logits(&next, 1);
+        }
+
+        for (size_t i = 0; i < output.size(); ++i) {
+            out_tokens[i] = static_cast<uint32_t>(output[i]);
+        }
+        result.tokens = static_cast<int>(output.size());
+        result.blocks = result.tokens;
+        result.steps = result.tokens;
+        return result;
     }
 
     DiffusionGenerateResult generate_into(
@@ -974,9 +1227,43 @@ void diffusion_gemma_set_embed(
     }());
 }
 
+int32_t diffusion_gemma_set_requires_self_conditioning(void* model, bool required) {
+    return catch_to_rc([&]() {
+        auto* m = as_model(model);
+        m->requires_self_conditioning = required;
+    });
+}
+
+int32_t diffusion_gemma_set_per_layer_embeddings(
+    void* model,
+    int32_t embed_id,
+    int32_t projection_id,
+    int32_t norm_id,
+    int32_t num_layers,
+    int32_t hidden_size_per_layer_input,
+    int32_t vocab_size_per_layer_input) {
+    return catch_to_rc([&]() {
+        auto* m = as_model(model);
+        if (num_layers <= 0 || hidden_size_per_layer_input <= 0 ||
+            vocab_size_per_layer_input <= 0) {
+            throw std::invalid_argument("Gemma4 PLE config must be positive");
+        }
+        m->embed_per_layer = m->weight_by_id(embed_id);
+        if (!m->embed_per_layer.is_dense) {
+            throw std::invalid_argument("Gemma4 PLE embed must be registered dense/dequantized");
+        }
+        m->per_layer_model_projection = m->weight_by_id(projection_id);
+        m->per_layer_projection_norm = m->array_by_id(norm_id);
+        m->hidden_size_per_layer_input = hidden_size_per_layer_input;
+        m->vocab_size_per_layer_input = vocab_size_per_layer_input;
+        m->has_per_layer_embeddings = true;
+    });
+}
+
 int32_t diffusion_gemma_push_layer(
     void* model,
     bool is_full_attention,
+    int32_t kv_shared_layer_index,
     int32_t num_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
@@ -1011,6 +1298,7 @@ int32_t diffusion_gemma_push_layer(
         auto* m = as_model(model);
         LayerWeights layer;
         layer.is_full_attention = is_full_attention;
+        layer.kv_shared_layer_index = kv_shared_layer_index;
         layer.num_heads = num_heads;
         layer.num_kv_heads = num_kv_heads;
         layer.head_dim = head_dim;
@@ -1052,6 +1340,25 @@ int32_t diffusion_gemma_push_layer(
     });
 }
 
+int32_t diffusion_gemma_set_layer_ple(
+    void* model,
+    int32_t layer_index,
+    int32_t gate_id,
+    int32_t projection_id,
+    int32_t norm_id) {
+    return catch_to_rc([&]() {
+        auto* m = as_model(model);
+        if (layer_index < 0 || layer_index >= static_cast<int32_t>(m->layers.size())) {
+            throw std::invalid_argument("Gemma4 PLE layer index is out of range");
+        }
+        auto& layer = m->layers[static_cast<size_t>(layer_index)];
+        layer.per_layer_input_gate = m->weight_by_id(gate_id);
+        layer.per_layer_projection = m->weight_by_id(projection_id);
+        layer.post_per_layer_input_norm = m->array_by_id(norm_id);
+        layer.has_ple = true;
+    });
+}
+
 int32_t diffusion_gemma_set_self_conditioning(
     void* model,
     int32_t pre_norm_id,
@@ -1080,7 +1387,7 @@ int32_t diffusion_gemma_finalize(void* model) {
         if (m->embed_tokens.ndim() != 2 || m->final_norm.ndim() == 0) {
             throw std::runtime_error("DiffusionGemma embed/final norm not registered");
         }
-        if (!m->self_conditioning.ready) {
+        if (m->requires_self_conditioning && !m->self_conditioning.ready) {
             throw std::runtime_error("DiffusionGemma self-conditioning weights not registered");
         }
         m->layer_caches.assign(m->layers.size(), LayerCache{});
@@ -1244,6 +1551,39 @@ int32_t diffusion_gemma_generate(
         *out_steps = result.steps;
         *out_forced = result.forced;
         *out_adaptive = result.adaptive;
+    });
+}
+
+int32_t diffusion_gemma_generate_causal(
+    void* model,
+    const int32_t* prompt,
+    int32_t prompt_len,
+    int32_t max_new_tokens,
+    uint64_t seed,
+    const uint32_t* stop_ids,
+    int32_t stop_ids_len,
+    DiffusionCancelFn cancel_fn,
+    const void* cancel_ctx,
+    uint32_t* out_tokens,
+    int32_t* out_len,
+    int32_t* out_finish) {
+    return catch_to_rc([&]() {
+        if (out_len == nullptr || out_finish == nullptr) {
+            throw std::invalid_argument("Gemma4 causal generate outputs must be non-null");
+        }
+        auto* m = as_model(model);
+        auto result = m->generate_causal_into(
+            prompt,
+            prompt_len,
+            max_new_tokens,
+            seed,
+            stop_ids,
+            stop_ids_len,
+            cancel_fn,
+            cancel_ctx,
+            out_tokens);
+        *out_len = result.tokens;
+        *out_finish = result.finish;
     });
 }
 
