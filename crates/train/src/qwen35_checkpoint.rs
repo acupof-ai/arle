@@ -1234,6 +1234,7 @@ mod tests {
             &[1, 3, 8],
             OpdStepConfig {
                 rollout_len: 1,
+                rollout_sampling: None,
                 grad_clip: 1.0,
             },
             &student_params,

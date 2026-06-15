@@ -20,6 +20,7 @@ fn run_opd_loss_bits(seed: u64, lr: f32, prompt_ids: &[u32]) -> TestResult<Vec<u
     let mut optimizer = AdamW::new(lr, (0.9, 0.999), 1.0e-8, 0.0);
     let step_cfg = OpdStepConfig {
         rollout_len: 2,
+        rollout_sampling: None,
         grad_clip: 1.0,
     };
     let mut loss_bits = Vec::with_capacity(3);
@@ -28,7 +29,7 @@ fn run_opd_loss_bits(seed: u64, lr: f32, prompt_ids: &[u32]) -> TestResult<Vec<u
             &student,
             &teacher,
             prompt_ids,
-            step_cfg,
+            step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,

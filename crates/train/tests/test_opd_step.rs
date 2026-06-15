@@ -138,6 +138,7 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
         &prompt_ids,
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -191,6 +192,7 @@ fn opd_step_runs_end_to_end() {
         &prompt_ids,
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -254,6 +256,7 @@ fn opd_step_falls_back_to_full_rollout_for_hybrid_student() {
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -281,6 +284,7 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
     let prompt_ids: Vec<u32> = vec![1, 3, 8];
     let step_cfg = OpdStepConfig {
         rollout_len: 2,
+        rollout_sampling: None,
         grad_clip: 1.0,
     };
 
@@ -290,7 +294,7 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
             &student,
             &teacher,
             &prompt_ids,
-            step_cfg,
+            step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,
@@ -350,6 +354,7 @@ fn opd_step_updates_student_without_mutating_teacher() {
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -409,6 +414,7 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
         &[1],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -488,6 +494,7 @@ fn opd_step_with_lora_adapter_params_retains_frozen_student_base() {
     let prompt_ids: Vec<u32> = vec![1, 3, 8];
     let step_cfg = OpdStepConfig {
         rollout_len: 1,
+        rollout_sampling: None,
         grad_clip: 1.0,
     };
 
@@ -496,7 +503,7 @@ fn opd_step_with_lora_adapter_params_retains_frozen_student_base() {
             &student,
             &teacher,
             &prompt_ids,
-            step_cfg,
+            step_cfg.clone(),
             &adapter_params,
             &mut optimizer,
             &mut store,
@@ -558,6 +565,7 @@ fn lora_opd_step_cuda_matches_cpu_loss() {
             &[1, 3, 8],
             OpdStepConfig {
                 rollout_len: 2,
+                rollout_sampling: None,
                 grad_clip: 1.0,
             },
             &adapter_params,
@@ -597,6 +605,7 @@ fn opd_step_rejects_empty_prompt_with_actionable_error() {
         &[],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -630,6 +639,7 @@ fn opd_step_rejects_prompt_token_outside_student_vocab() {
         &[1, 16],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -669,6 +679,7 @@ fn opd_step_rejects_teacher_student_vocab_mismatch() {
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -704,6 +715,7 @@ fn opd_step_rejects_trainable_teacher_model() {
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
@@ -745,6 +757,7 @@ fn opd_step_rejects_teacher_param_mixed_into_student_params() {
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 2,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &mixed_params,
@@ -780,6 +793,7 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
         &[1, 3, 8],
         OpdStepConfig {
             rollout_len: 0,
+            rollout_sampling: None,
             grad_clip: 1.0,
         },
         &student_params,
