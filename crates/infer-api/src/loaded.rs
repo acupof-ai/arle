@@ -208,7 +208,7 @@ mod backend {
     use crate::serve_engine::ServeInferenceEngine;
     use crate::types::{
         ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
-        EngineTelemetry, InferenceEngine,
+        EngineTelemetry, InferenceEngine, MultimodalChatRequest,
     };
 
     #[cfg(feature = "cuda")]
@@ -1550,6 +1550,28 @@ mod backend {
                 Self::Vulkan(engine) => engine.complete(req),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.complete(req),
+            }
+        }
+
+        fn complete_multimodal_chat(
+            &mut self,
+            req: MultimodalChatRequest,
+        ) -> Result<CompletionOutput> {
+            match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(engine) => engine.complete_multimodal_chat(req),
             }
         }
 
