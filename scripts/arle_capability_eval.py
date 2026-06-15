@@ -31,6 +31,7 @@ Tasks deferred:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -40,6 +41,42 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+SCRIPT_SCHEMA_VERSION = "arle-capability-eval-v2"
+DEFAULT_DATASET_REVISION = "main"
+
+
+FINAL_RESULT_CONTRACT = {
+    "candidate_source": "ARLE inference output",
+    "scoring_policy": "deterministic extractor + exact-match grader",
+    "no_model_judge": True,
+    "grader_may_not_rewrite_candidate": True,
+}
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _fingerprint_records(records: list[dict]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json_bytes(records)).hexdigest()
+
+
+def _parse_seed_list(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    seeds: list[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        seeds.append(int(item))
+    if not seeds:
+        raise ValueError("--seeds must contain at least one integer")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("--seeds must not contain duplicates")
+    return seeds
 
 
 # ───────────────────────── HTTP client ──────────────────────────
@@ -249,6 +286,7 @@ def run_mmlu(
     output_dir: Path,
     debug_samples: int = 5,
     seed: int | None = None,
+    dataset_revision: str = DEFAULT_DATASET_REVISION,
 ) -> dict:
     """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
     to <output_dir>/mmlu_debug.json so future extractor fixes can target
@@ -269,8 +307,8 @@ def run_mmlu(
 
     # MMLU has a `dev` split (5 shots per subject) and `test` split (eval).
     print("[mmlu] loading dataset...", flush=True)
-    ds_test = load_dataset("cais/mmlu", "all", split="test")
-    ds_dev = load_dataset("cais/mmlu", "all", split="dev")
+    ds_test = load_dataset("cais/mmlu", "all", split="test", revision=dataset_revision)
+    ds_dev = load_dataset("cais/mmlu", "all", split="dev", revision=dataset_revision)
 
     # Build per-subject dev pools for the 5-shot prompt.
     dev_by_subject: dict[str, list[dict]] = {}
@@ -287,6 +325,15 @@ def run_mmlu(
             random.Random(f"mmlu-{seed}-{subj}").shuffle(subj_pool)
         pool.extend(subj_pool[:n_per_subject])
     pool = pool[:n_samples]
+    sample_fingerprint = _fingerprint_records([
+        {
+            "subject": ex["subject"],
+            "question": ex["question"],
+            "choices": list(ex["choices"]),
+            "answer": int(ex["answer"]),
+        }
+        for ex in pool
+    ])
     seed_tag = f" seed={seed}" if seed is not None else ""
     print(f"[mmlu] sampling {len(pool)} questions across {len(subjects)} subjects{seed_tag}", flush=True)
 
@@ -371,6 +418,19 @@ def run_mmlu(
     report = {
         "task": "mmlu",
         "status": "ok",
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "final_result_contract": FINAL_RESULT_CONTRACT,
+        "dataset": {
+            "name": "cais/mmlu",
+            "config": "all",
+            "split": "test",
+            "revision": dataset_revision,
+            "sample_fingerprint": sample_fingerprint,
+        },
+        "prompting": {
+            "shots": 5,
+            "answer_format": "A/B/C/D letter extracted from ARLE completion text",
+        },
         "n_samples": len(pool),
         "n_scored": scored,
         "n_invalid": invalid,
@@ -427,6 +487,7 @@ def run_gsm8k(
     debug_samples: int = 5,
     n_shots: int = 8,
     seed: int | None = None,
+    dataset_revision: str = DEFAULT_DATASET_REVISION,
 ) -> dict:
     try:
         from datasets import load_dataset
@@ -438,8 +499,8 @@ def run_gsm8k(
         }
 
     print("[gsm8k] loading dataset...", flush=True)
-    ds_test = load_dataset("openai/gsm8k", "main", split="test")
-    ds_train = load_dataset("openai/gsm8k", "main", split="train") if n_shots > 0 else []
+    ds_test = load_dataset("openai/gsm8k", "main", split="test", revision=dataset_revision)
+    ds_train = load_dataset("openai/gsm8k", "main", split="train", revision=dataset_revision) if n_shots > 0 else []
     shot_examples = list(ds_train.select(range(min(n_shots, len(ds_train))))) if n_shots > 0 else []
     few_shot = "\n".join(_gsm8k_format_shot(ex) for ex in shot_examples)
     if few_shot:
@@ -448,6 +509,13 @@ def run_gsm8k(
     if seed is not None:
         random.Random(f"gsm8k-{seed}").shuffle(indices)
     pool = [ds_test[i] for i in indices[: min(n_samples, len(ds_test))]]
+    sample_fingerprint = _fingerprint_records([
+        {
+            "question": ex["question"],
+            "answer": ex["answer"],
+        }
+        for ex in pool
+    ])
     seed_tag = f" seed={seed}" if seed is not None else ""
     print(f"[gsm8k] running {len(pool)} problems with {len(shot_examples)} shots{seed_tag}", flush=True)
 
@@ -501,6 +569,19 @@ def run_gsm8k(
     report = {
         "task": "gsm8k",
         "status": "ok",
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "final_result_contract": FINAL_RESULT_CONTRACT,
+        "dataset": {
+            "name": "openai/gsm8k",
+            "config": "main",
+            "split": "test",
+            "revision": dataset_revision,
+            "sample_fingerprint": sample_fingerprint,
+        },
+        "prompting": {
+            "shots": len(shot_examples),
+            "answer_format": "numeric answer extracted from ARLE completion text",
+        },
         "n_samples": len(pool),
         "n_scored": scored,
         "n_invalid": invalid,
@@ -527,6 +608,61 @@ TASK_RUNNERS = {
 }
 
 
+def _run_suite_once(args: argparse.Namespace, client, requested: list[str], output_dir: Path, seed: int | None) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "final_result_contract": FINAL_RESULT_CONTRACT,
+        "backend": args.backend,
+        "base_url": args.base_url if args.backend == "arle" else None,
+        "model_path": args.model_path if args.backend == "hf" else None,
+        "model_id": args.model_id,
+        "gsm8k_shots": args.gsm8k_shots,
+        "seed": seed,
+        "dataset_revisions": {
+            "mmlu": args.mmlu_revision,
+            "gsm8k": args.gsm8k_revision,
+        },
+        "tasks": {},
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    for task in requested:
+        print(f"\n========== {task} ==========", flush=True)
+        if task == "gsm8k":
+            report = run_gsm8k(
+                client,
+                args.n_samples,
+                output_dir,
+                n_shots=args.gsm8k_shots,
+                seed=seed,
+                dataset_revision=args.gsm8k_revision,
+            )
+        elif task == "mmlu":
+            report = run_mmlu(
+                client,
+                args.n_samples,
+                output_dir,
+                seed=seed,
+                dataset_revision=args.mmlu_revision,
+            )
+        else:
+            report = TASK_RUNNERS[task](client, args.n_samples, output_dir, seed=seed)
+        summary["tasks"][task] = report
+
+    summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
+
+
+def _print_summary(summary: dict) -> None:
+    print("\n========== summary ==========", flush=True)
+    for task, report in summary["tasks"].items():
+        if report["status"] == "ok":
+            print(f"  {task}: {report['accuracy']:.3f} ({report['n_correct']}/{report['n_scored']})")
+        else:
+            print(f"  {task}: {report['status']} - {report.get('reason', '')}")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--backend", choices=["arle", "hf"], default="arle",
@@ -547,6 +683,13 @@ def main(argv: list[str]) -> int:
                         help="if set, shuffle per-subject MMLU pool and GSM8K test pool before "
                              "sampling. Distinct seeds give independent draws for variance estimation. "
                              "Default unset = original deterministic ordering, reproduces older runs.")
+    parser.add_argument("--seeds", default=None,
+                        help="comma-separated seed list. When set, writes seed_<N>/ subdirectories "
+                             "compatible with scripts/analyze_multi_seed.py.")
+    parser.add_argument("--mmlu-revision", default=os.environ.get("ARLE_MMLU_REVISION", DEFAULT_DATASET_REVISION),
+                        help="Hugging Face revision for cais/mmlu")
+    parser.add_argument("--gsm8k-revision", default=os.environ.get("ARLE_GSM8K_REVISION", DEFAULT_DATASET_REVISION),
+                        help="Hugging Face revision for openai/gsm8k")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
@@ -560,32 +703,54 @@ def main(argv: list[str]) -> int:
         print(f"unknown tasks: {unknown}. supported: {list(TASK_RUNNERS)}", file=sys.stderr)
         return 2
 
-    summary = {
+    try:
+        seeds = _parse_seed_list(args.seeds)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if seeds is not None and args.seed is not None:
+        print("--seed and --seeds are mutually exclusive", file=sys.stderr)
+        return 2
+
+    if seeds is None:
+        summary = _run_suite_once(args, client, requested, args.output, args.seed)
+        _print_summary(summary)
+        return 0
+
+    aggregate = {
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "final_result_contract": FINAL_RESULT_CONTRACT,
+        "mode": "multi_seed",
+        "seeds": seeds,
         "backend": args.backend,
         "base_url": args.base_url if args.backend == "arle" else None,
         "model_path": args.model_path if args.backend == "hf" else None,
         "model_id": args.model_id,
-        "gsm8k_shots": args.gsm8k_shots,
-        "seed": args.seed,
-        "tasks": {},
+        "dataset_revisions": {
+            "mmlu": args.mmlu_revision,
+            "gsm8k": args.gsm8k_revision,
+        },
+        "tasks": requested,
+        "per_seed": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    for task in requested:
-        print(f"\n========== {task} ==========", flush=True)
-        if task == "gsm8k":
-            report = run_gsm8k(client, args.n_samples, args.output, n_shots=args.gsm8k_shots, seed=args.seed)
-        else:
-            report = TASK_RUNNERS[task](client, args.n_samples, args.output, seed=args.seed)
-        summary["tasks"][task] = report
-
-    summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
-    print("\n========== summary ==========", flush=True)
-    for task, report in summary["tasks"].items():
-        if report["status"] == "ok":
-            print(f"  {task}: {report['accuracy']:.3f} ({report['n_correct']}/{report['n_scored']})")
-        else:
-            print(f"  {task}: {report['status']} — {report.get('reason', '')}")
+    for seed in seeds:
+        print(f"\n========== seed {seed} ==========", flush=True)
+        seed_dir = args.output / f"seed_{seed}"
+        summary = _run_suite_once(args, client, requested, seed_dir, seed)
+        aggregate["per_seed"][str(seed)] = {
+            task: {
+                "status": report["status"],
+                "accuracy": report.get("accuracy"),
+                "n_correct": report.get("n_correct"),
+                "n_scored": report.get("n_scored"),
+                "n_invalid": report.get("n_invalid"),
+            }
+            for task, report in summary["tasks"].items()
+        }
+        _print_summary(summary)
+    aggregate["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    (args.output / "summary.json").write_text(json.dumps(aggregate, indent=2))
     return 0
 
 
