@@ -1135,6 +1135,14 @@ int32_t diffusion_gemma_commit(void* model, const int32_t* tokens, int32_t len) 
     });
 }
 
+// Runs one denoise pass over `canvas` and fills the per-position outputs.
+// `out_sampled` and `out_argmax` are BOTH set to the greedy argmax token
+// (`sampled_tokens = argmax_tokens` below): no stochastic sampling is performed.
+// `temperature` only scales the logits before the entropy/softmax computation
+// (it does not introduce randomness), and the `step` argument is currently
+// ignored.
+// NOTE: contract says temperature-sampled; current impl is greedy argmax —
+// maintainer to reconcile.
 int32_t diffusion_gemma_predict_canvas(
     void* model,
     const int32_t* canvas,
