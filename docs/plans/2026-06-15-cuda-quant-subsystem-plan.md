@@ -559,10 +559,14 @@ prefill is compute-bound; a CUDA-core dequant GEMM (~3.9 TFLOP/s class per
   from-scratch port.
 - Option B: accept CUDA-core dequant batch GEMM, decode-residency-only.
 
-Decision gate: a same-binary, same-shape A/B of quant prefill vs BF16 prefill at the
-SLO prompt length. Ship whichever wins; if neither beats "model does not fit in
-BF16", the quant path stands on residency alone and that is stated explicitly. No
-default flip without this measured A/B (per CLAUDE.md license-or-kill on wall-clock).
+Decision gate: a same-binary, same-shape A/B of quant prefill/decode vs BF16 at
+the SLO prompt length. The dated bench entry must include Delta% for output
+tok/s, TTFT, ITL, and peak VRAM. Ship whichever wins; if resident quant beats
+neither throughput nor peak VRAM on any binding shape, the result is
+KILL/iterate. If BF16 cannot fit a binding shape, residency may be the license,
+but that must be stated as a memory win with the measured VRAM table. No default
+flip, "best kernel", or throughput claim without this measured A/B (per
+CLAUDE.md license-or-kill on wall-clock).
 
 ## Tests
 
@@ -640,8 +644,19 @@ scripts/bench_guidellm.sh qwen36-cuda-native-quant-a100 \
   non-determinism confounds).
 - FP8 and NVFP4 each pass serve + curl + the needle gate; MMLU-50 / SWE-Pro limit-3 are
   **plumbing checks only** (the pipe works), never a capability claim.
-- No throughput claim until `guidellm` completes; no default prefill-path flip without
-  the P8 A/B.
+- **Perf gate is REQUIRED, not optional.** Correctness only licenses the next
+  experiment. After coherent FP8 serve output, run a same-binary, same-shape
+  `scripts/bench_guidellm.sh` A/B: BF16 Qwen3.6 baseline vs resident FP8 quant,
+  wall-clock framing per `docs/bench-and-trace-spec.md`, and report Delta% for
+  output tok/s, TTFT, ITL, and peak VRAM. Quant must beat BF16 on tok/s OR
+  peak-VRAM on at least one binding shape. If it beats neither, verdict is
+  KILL/iterate, not support/default.
+- The current grouped quant-GEMV is a correctness kernel only. It must be A/B'd
+  against adopt-first routes (DeepGEMM / CUTLASS / Marlin / vendor, aligned to
+  SGLang where applicable) before any "best kernel" or default claim. Hand-rolled
+  kernels stay provisional unless an explicit measured gap licenses them.
+- No throughput claim until `guidellm` completes; no default prefill-path flip
+  without the P8 A/B and the BF16-vs-quant Delta% table.
 
 ## Commit Policy
 
