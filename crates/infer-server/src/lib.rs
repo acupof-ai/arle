@@ -41,6 +41,7 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 mod execution;
 mod http;
 mod metrics;
+pub mod multimodal;
 pub mod multiproc_relay;
 mod schema;
 mod tokenizer;
@@ -54,8 +55,8 @@ pub use multiproc_relay::{
     WireRequest, broadcast_tick, set_tick_broadcaster, tick_broadcaster_installed,
 };
 pub use schema::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatMessage, CompletionRequest,
-    CompletionResponse,
+    ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatContentPart, ChatMessage,
+    CompletionRequest, CompletionResponse,
 };
 pub use tokenizer::OpenAiTokenizer;
 

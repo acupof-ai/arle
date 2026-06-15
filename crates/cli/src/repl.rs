@@ -22,12 +22,13 @@ use agent::{
     ToolExecutionMetadata, ToolExecutor, ToolPolicy, ToolUsage, TrajectoryMessage, TrajectoryRole,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_api::{
-    ChatPromptMessage, CompletionRequest, FinishReason, InferenceEngine, SamplingParams,
+    ChatPromptImage, ChatPromptMessage, CompletionRequest, FinishReason, InferenceEngine,
+    MultimodalChatRequest, SamplingParams,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
@@ -47,6 +48,9 @@ use crate::trace::TraceWriter;
 const REPL_PROMPT: &str = "\x1b[1;35m> \x1b[0m";
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+const MAX_CLI_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Serialize)]
 struct OneShotOutput {
     model_id: String,
@@ -55,6 +59,7 @@ struct OneShotOutput {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    image_count: usize,
     tool_calls_executed: usize,
     max_turns_reached: bool,
 }
@@ -75,6 +80,7 @@ enum ReplCommand {
     /// `&mut dyn InferenceEngine` threaded through `run_repl`). When N is
     /// supplied we print a friendly pointer to restart with `--model-path`.
     Models(Option<usize>),
+    Image(String),
     /// `/export` → default path; `/export <path>` → explicit path/dir.
     Export(String),
     Exit,
@@ -322,6 +328,11 @@ pub(crate) fn run_one_shot(
         !prompt.trim().is_empty(),
         "one-shot prompt is empty; pass --prompt or pipe non-empty stdin to --stdin"
     );
+    anyhow::ensure!(
+        run_args.image.is_empty() || supports_cli_images(backend_name),
+        "--image requires a VLM chat backend; current backend is {backend_name}"
+    );
+    let images = resolve_run_images(run_args)?;
 
     let tools = tool_definitions(tools_enabled);
     let mut session = if is_direct_chat_backend(backend_name) {
@@ -330,8 +341,19 @@ pub(crate) fn run_one_shot(
         AgentSession::new()
     };
     let result = if is_direct_chat_backend(backend_name) {
-        run_direct_chat_completion(engine, &mut session, &prompt, max_tokens, temperature)?
+        run_direct_chat_completion(
+            engine,
+            &mut session,
+            &prompt,
+            &images,
+            max_tokens,
+            temperature,
+        )?
     } else {
+        anyhow::ensure!(
+            images.is_empty(),
+            "--image requires a direct VLM chat backend; current backend is {backend_name}"
+        );
         session.run_turn(
             engine,
             &prompt,
@@ -359,6 +381,7 @@ pub(crate) fn run_one_shot(
         total_tokens: result
             .prompt_tokens
             .saturating_add(result.completion_tokens),
+        image_count: images.len(),
         tool_calls_executed: result.tool_calls_executed,
         max_turns_reached: result.max_turns_reached,
     };
@@ -546,6 +569,7 @@ fn run_interactive_repl(
     } else {
         AgentSession::new()
     };
+    let mut pending_images = Vec::new();
     let mut session_stats = SessionStats::default();
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
@@ -591,6 +615,7 @@ fn run_interactive_repl(
                     backend_name,
                     &tools,
                     &mut session,
+                    &mut pending_images,
                     &mut session_stats,
                     input,
                     max_turns,
@@ -663,6 +688,7 @@ fn run_piped_repl(
     } else {
         AgentSession::new()
     };
+    let mut pending_images = Vec::new();
     let mut session_stats = SessionStats::default();
 
     let (cancel, exit) = install_ctrlc_handler();
@@ -682,6 +708,7 @@ fn run_piped_repl(
                     backend_name,
                     &tools,
                     &mut session,
+                    &mut pending_images,
                     &mut session_stats,
                     input,
                     max_turns,
@@ -721,12 +748,102 @@ fn resolve_one_shot_prompt(run_args: &RunArgs) -> Result<String> {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn resolve_run_images(run_args: &RunArgs) -> Result<Vec<ChatPromptImage>> {
+    run_args
+        .image
+        .iter()
+        .map(|source| load_cli_image(source))
+        .collect()
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn load_cli_image(source: &str) -> Result<ChatPromptImage> {
+    let source = source.trim();
+    anyhow::ensure!(!source.is_empty(), "image source must not be empty");
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return load_remote_cli_image(source);
+    }
+    let path = source.strip_prefix("file://").unwrap_or(source);
+    load_local_cli_image(source, Path::new(path))
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn load_remote_cli_image(source: &str) -> Result<ChatPromptImage> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("arle-cli/0.1")
+        .build()
+        .context("build HTTP client failed")?;
+    let response = client
+        .get(source)
+        .send()
+        .with_context(|| format!("fetch image {source} failed"))?
+        .error_for_status()
+        .with_context(|| format!("fetch image {source} returned an error status"))?;
+    if let Some(len) = response.content_length() {
+        anyhow::ensure!(
+            len <= MAX_CLI_IMAGE_BYTES as u64,
+            "image {source} is too large: {len} bytes > {MAX_CLI_IMAGE_BYTES}"
+        );
+    }
+    let mime_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .filter(|value| !value.is_empty());
+    let data = response
+        .bytes()
+        .with_context(|| format!("read image {source} response failed"))?
+        .to_vec();
+    anyhow::ensure!(
+        data.len() <= MAX_CLI_IMAGE_BYTES,
+        "image {source} is too large: {} bytes > {MAX_CLI_IMAGE_BYTES}",
+        data.len()
+    );
+    Ok(ChatPromptImage::new(source.to_string(), data).with_mime_type(mime_type))
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn load_local_cli_image(source: &str, path: &Path) -> Result<ChatPromptImage> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("stat image {} failed", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "image {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_CLI_IMAGE_BYTES as u64,
+        "image {} is too large: {} bytes > {MAX_CLI_IMAGE_BYTES}",
+        path.display(),
+        metadata.len()
+    );
+    let data =
+        std::fs::read(path).with_context(|| format!("read image {} failed", path.display()))?;
+    let mime_type = guess_image_mime(path).map(str::to_string);
+    Ok(ChatPromptImage::new(source.to_string(), data).with_mime_type(mime_type))
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn guess_image_mime(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn handle_repl_input(
     engine: &mut dyn InferenceEngine,
     backend_name: &str,
     tools: &[ToolDefinition],
     session: &mut AgentSession,
+    pending_images: &mut Vec<ChatPromptImage>,
     session_stats: &mut SessionStats,
     input: &str,
     max_turns: usize,
@@ -745,6 +862,7 @@ fn handle_repl_input(
             backend_name,
             tools,
             session,
+            pending_images,
             session_stats,
             max_turns,
             max_tokens,
@@ -753,17 +871,34 @@ fn handle_repl_input(
     }
 
     if is_direct_chat_backend(backend_name) {
+        if !pending_images.is_empty() && !supports_cli_images(backend_name) {
+            eprintln!(
+                "\x1b[1;31mError: pending images require a VLM chat backend; current backend is {backend_name}\x1b[0m"
+            );
+            println!();
+            return Ok(true);
+        }
+        let images = pending_images.clone();
+        pending_images.clear();
         run_direct_chat_turn(
             engine,
             backend_name,
             session,
             session_stats,
             input,
+            &images,
             max_tokens,
             temperature,
             trace,
         );
     } else {
+        if !pending_images.is_empty() {
+            eprintln!(
+                "\x1b[1;31mError: pending images require a direct VLM chat backend; current backend is {backend_name}\x1b[0m"
+            );
+            println!();
+            return Ok(true);
+        }
         run_agent_turn(
             engine,
             backend_name,
@@ -784,11 +919,20 @@ fn handle_repl_input(
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn is_direct_chat_backend(backend_name: &str) -> bool {
-    backend_name == "metal-diffusion-gemma"
+    matches!(backend_name, "metal-diffusion-gemma" | "metal-gemma4")
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn session_prompt_messages(session: &AgentSession, user_input: &str) -> Vec<ChatPromptMessage> {
+fn supports_cli_images(backend_name: &str) -> bool {
+    backend_name == "metal-gemma4"
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn session_prompt_messages(
+    session: &AgentSession,
+    user_input: &str,
+    images: &[ChatPromptImage],
+) -> Vec<ChatPromptMessage> {
     let mut messages = Vec::new();
     for message in session.messages() {
         let role = message.role.as_str();
@@ -800,7 +944,10 @@ fn session_prompt_messages(session: &AgentSession, user_input: &str) -> Vec<Chat
         }
         messages.push(ChatPromptMessage::new(role, message.content.clone()));
     }
-    messages.push(ChatPromptMessage::user(user_input));
+    messages.push(ChatPromptMessage::user_with_images(
+        user_input,
+        images.to_vec(),
+    ));
     messages
 }
 
@@ -817,27 +964,37 @@ fn run_direct_chat_completion(
     engine: &mut dyn InferenceEngine,
     session: &mut AgentSession,
     input: &str,
+    images: &[ChatPromptImage],
     max_tokens: usize,
     temperature: f32,
 ) -> Result<AgentTurnResult> {
-    let prompt_messages = session_prompt_messages(session, input);
+    let prompt_messages = session_prompt_messages(session, input, images);
     let prompt = engine.render_chat_prompt(&prompt_messages)?;
     let started_at = Instant::now();
-    let output = engine.complete(CompletionRequest {
-        prompt: prompt.clone(),
-        max_tokens,
-        sampling: SamplingParams {
-            temperature,
-            ..SamplingParams::default()
-        },
-        // The checkpoint template and diffusion config own EOS handling. A
-        // ChatML stop string here is wrong for DiffusionGemma.
-        stop: None,
-        logprobs: false,
-        session_id: None,
-        trace_context: None,
-        cancel: None,
-    })?;
+    let sampling = SamplingParams {
+        temperature,
+        ..SamplingParams::default()
+    };
+    let output = if images.is_empty() {
+        engine.complete(CompletionRequest {
+            prompt: prompt.clone(),
+            max_tokens,
+            sampling,
+            // The checkpoint template and diffusion config own EOS handling. A
+            // ChatML stop string here is wrong for DiffusionGemma.
+            stop: None,
+            logprobs: false,
+            session_id: None,
+            trace_context: None,
+            cancel: None,
+        })?
+    } else {
+        engine.complete_multimodal_chat(MultimodalChatRequest {
+            messages: prompt_messages.clone(),
+            max_tokens,
+            sampling,
+        })?
+    };
     let decode_secs = started_at.elapsed().as_secs_f64();
     let prompt_tokens = output.usage.prompt_tokens as u64;
     let completion_tokens = output.usage.completion_tokens as u64;
@@ -907,6 +1064,7 @@ fn run_direct_chat_turn(
     session: &mut AgentSession,
     session_stats: &mut SessionStats,
     input: &str,
+    images: &[ChatPromptImage],
     max_tokens: usize,
     temperature: f32,
     trace: Option<&TraceWriter>,
@@ -916,7 +1074,8 @@ fn run_direct_chat_turn(
     let mut spinner = ThinkingSpinner::new_with_label(io::stderr().is_terminal(), "denoising");
     let mut tps_meter = crate::tps::TpsMeter::new();
     spinner.start();
-    let result = run_direct_chat_completion(engine, session, input, max_tokens, temperature);
+    let result =
+        run_direct_chat_completion(engine, session, input, images, max_tokens, temperature);
     spinner.stop();
     match result {
         Ok(result) => {
@@ -1233,6 +1392,7 @@ fn parse_repl_command(input: &str) -> Option<ReplCommand> {
             }
         }
         "/stats" => Some(ReplCommand::Stats),
+        "/image" => Some(ReplCommand::Image(arg.to_string())),
         "/save" => Some(ReplCommand::Save(arg.to_string())),
         "/load" => Some(ReplCommand::Load(arg.to_string())),
         "/export" => Some(ReplCommand::Export(arg.to_string())),
@@ -1249,6 +1409,7 @@ fn execute_repl_command(
     backend_name: &str,
     tools: &[ToolDefinition],
     session: &mut AgentSession,
+    pending_images: &mut Vec<ChatPromptImage>,
     session_stats: &mut SessionStats,
     max_turns: usize,
     max_tokens: usize,
@@ -1293,6 +1454,11 @@ fn execute_repl_command(
                 temperature,
                 tools.len(),
             );
+            println!();
+            true
+        }
+        ReplCommand::Image(arg) => {
+            handle_image_command(backend_name, pending_images, &arg);
             println!();
             true
         }
@@ -1342,6 +1508,57 @@ fn execute_repl_command(
             eprintln!("\x1b[1;31mError: unknown command {command}. Type /help.\x1b[0m");
             println!();
             true
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn handle_image_command(backend_name: &str, pending_images: &mut Vec<ChatPromptImage>, arg: &str) {
+    match arg.trim() {
+        "" => {
+            eprintln!("\x1b[1;31mError: usage: /image <path-or-url>|list|clear\x1b[0m");
+        }
+        "clear" => {
+            pending_images.clear();
+            println!("\x1b[2m(cleared pending images)\x1b[0m");
+        }
+        "list" => {
+            if pending_images.is_empty() {
+                println!("\x1b[2m(no pending images)\x1b[0m");
+            } else {
+                for (idx, image) in pending_images.iter().enumerate() {
+                    let mime = image.mime_type.as_deref().unwrap_or("unknown");
+                    println!(
+                        "\x1b[2m({}: {} bytes, {mime}) {}\x1b[0m",
+                        idx + 1,
+                        image.data.len(),
+                        image.source
+                    );
+                }
+            }
+        }
+        source => {
+            if !supports_cli_images(backend_name) {
+                eprintln!(
+                    "\x1b[1;31mError: /image requires a VLM chat backend; current backend is {backend_name}\x1b[0m"
+                );
+                return;
+            }
+            match load_cli_image(source) {
+                Ok(image) => {
+                    let mime = image.mime_type.as_deref().unwrap_or("unknown").to_string();
+                    let bytes = image.data.len();
+                    let source = image.source.clone();
+                    pending_images.push(image);
+                    println!(
+                        "\x1b[2m(attached image {}: {bytes} bytes, {mime}; it will be sent with the next message)\x1b[0m",
+                        source
+                    );
+                }
+                Err(err) => {
+                    eprintln!("\x1b[1;31mError: {err:#}\x1b[0m");
+                }
+            }
         }
     }
 }
@@ -1680,6 +1897,8 @@ fn print_repl_help() {
     println!("  /tools           Show available built-in tools");
     println!("  /model           Show the active model and backend");
     println!("  /models [N]      List local models; /models <N> shows switch hint");
+    println!("  /image <src>     Attach an image path or URL to the next chat turn");
+    println!("  /image list|clear  Show or clear pending images");
     println!("  /stats           Show session token/throughput rollup");
     println!("  /save <path>     Save the current agent session to JSON");
     println!("  /load <path>     Load a saved agent session JSON");
@@ -1820,6 +2039,7 @@ mod tests {
     #[test]
     fn diffusion_backend_uses_direct_chat_template_path() {
         assert!(is_direct_chat_backend("metal-diffusion-gemma"));
+        assert!(is_direct_chat_backend("metal-gemma4"));
         assert!(!is_direct_chat_backend("metal"));
 
         let mut engine = FakeChatEngine {
@@ -1827,7 +2047,7 @@ mod tests {
         };
         let mut session = AgentSession::with_system_prompt("");
         let result =
-            run_direct_chat_completion(&mut engine, &mut session, "Say hi", 8, 0.0).unwrap();
+            run_direct_chat_completion(&mut engine, &mut session, "Say hi", &[], 8, 0.0).unwrap();
 
         assert_eq!(result.text, "hi");
         assert_eq!(result.prompt_tokens, 3);
@@ -1899,6 +2119,12 @@ mod tests {
         assert_eq!(
             parse_repl_command("/export /tmp/out.md"),
             Some(ReplCommand::Export("/tmp/out.md".to_string()))
+        );
+        assert_eq!(
+            parse_repl_command("/image https://example.com/cat.jpg"),
+            Some(ReplCommand::Image(
+                "https://example.com/cat.jpg".to_string()
+            ))
         );
     }
 

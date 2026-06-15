@@ -285,7 +285,7 @@ pub(crate) struct ModelDownloadArgs {
 #[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
 #[command(
     group(ArgGroup::new("run_input").args(["prompt", "stdin"])),
-    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/model run --stdin --json < prompt.txt\n  arle --model-path /path/to/model run --no-tools --prompt \"No tool execution\""
+    after_help = "Output:\n  Plain text is written to stdout by default.\n  `--json` emits one machine-readable document with model, backend, usage, and tool-call stats.\n\nExamples:\n  arle --model-path /path/to/model run\n  arle --model-path /path/to/model run --prompt \"Summarize this repo\"\n  arle --model-path /path/to/gemma4 run --prompt \"What is in this image?\" --image https://example.com/cat.jpg\n  arle --model-path /path/to/model run --stdin --json < prompt.txt\n  arle --model-path /path/to/model run --no-tools --prompt \"No tool execution\""
 )]
 pub(crate) struct RunArgs {
     /// Run a single prompt and exit.
@@ -295,6 +295,11 @@ pub(crate) struct RunArgs {
     /// Read one prompt from stdin, run it, and exit.
     #[arg(long, default_value_t = false)]
     pub(crate) stdin: bool,
+
+    /// Attach an image to the one-shot prompt. Accepts a local path or http(s) URL.
+    /// Repeat to attach multiple images. Interactive REPL uses `/image <path-or-url>`.
+    #[arg(long = "image", value_name = "PATH_OR_URL")]
+    pub(crate) image: Vec<String>,
 
     /// Render one-shot output as JSON for scripts and CI.
     #[arg(long, default_value_t = false, requires = "run_input")]
@@ -919,6 +924,7 @@ mod tests {
             RunArgs {
                 prompt: Some("hello".to_string()),
                 stdin: false,
+                image: Vec::new(),
                 json: false,
                 no_tools: false,
             }
@@ -935,6 +941,31 @@ mod tests {
         assert!(run.stdin);
         assert!(run.json);
         assert!(run.prompt.is_none());
+    }
+
+    #[test]
+    fn accepts_run_image() {
+        let args = Args::try_parse_from([
+            "arle",
+            "run",
+            "--prompt",
+            "describe",
+            "--image",
+            "https://example.com/cat.jpg",
+            "--image",
+            "/tmp/local.png",
+        ])
+        .expect("run image should parse");
+        let Some(CliCommand::Run(run)) = args.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            run.image,
+            vec![
+                "https://example.com/cat.jpg".to_string(),
+                "/tmp/local.png".to_string()
+            ]
+        );
     }
 
     #[test]

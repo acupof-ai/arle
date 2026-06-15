@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::types::{
     ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry,
-    FinishReason, InferenceEngine, TokenUsage,
+    FinishReason, InferenceEngine, MultimodalChatRequest, TokenUsage,
 };
 
 /// Adapter over one running [`ServeHandle`] + its tokenizer, generic over the
@@ -98,6 +98,57 @@ where
             response_token_ids,
         })
     }
+
+    fn run_multimodal_chat(&self, req: &MultimodalChatRequest) -> Result<CompletionOutput> {
+        if req.messages.is_empty() {
+            anyhow::bail!("messages must contain at least one message");
+        }
+        let mut images = Vec::new();
+        for message in &req.messages {
+            for image in &message.images {
+                let prepared = infer_server::multimodal::preprocess_gemma4_image(&image.data)
+                    .map_err(|err| anyhow!("preprocess image {} failed: {err}", image.source))?;
+                images.push(prepared);
+            }
+        }
+        let server_messages = server_chat_messages(req.messages.as_slice());
+        anyhow::ensure!(
+            !images.is_empty(),
+            "multimodal chat request must include at least one image"
+        );
+        let prompt = self
+            .tokenizer
+            .render_chat(&server_messages)
+            .map_err(|err| anyhow!("render multimodal chat prompt failed: {err}"))?;
+        let prompt = infer_server::multimodal::expand_gemma4_image_markers(&prompt, &images)
+            .map_err(|err| anyhow!("expand image prompt markers failed: {err}"))?;
+        let prompt_token_ids = self
+            .tokenizer
+            .encode(&prompt)
+            .map_err(|err| anyhow!("tokenize prompt failed: {err}"))?;
+        let exec_prompt = prompt_token_ids.clone();
+        let exec_images = images;
+        let sampling = req.sampling.clone();
+        let max_tokens = req.max_tokens;
+        let output = self.serve.run_on_executor(move |executor| {
+            executor.generate_multimodal(&exec_prompt, &exec_images, max_tokens, &sampling)
+        })??;
+        let output =
+            output.ok_or_else(|| anyhow!("backend does not expose multimodal chat completion"))?;
+        let response_token_ids = output.generated_tokens;
+        let text = self
+            .tokenizer
+            .decode(&response_token_ids)
+            .map_err(|err| anyhow!("decode generated tokens failed: {err}"))?;
+        Ok(CompletionOutput {
+            text,
+            finish_reason: FinishReason::from_plan(&output.finish),
+            usage: TokenUsage::new(prompt_token_ids.len(), response_token_ids.len()),
+            token_logprobs: Vec::new(),
+            prompt_token_ids,
+            response_token_ids,
+        })
+    }
 }
 
 /// OPD-teacher raw-logits surface (CUDA only).
@@ -161,6 +212,10 @@ where
 
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
         self.run(&req)
+    }
+
+    fn complete_multimodal_chat(&mut self, req: MultimodalChatRequest) -> Result<CompletionOutput> {
+        self.run_multimodal_chat(&req)
     }
 
     fn complete_stream(
@@ -273,13 +328,7 @@ where
     }
 
     fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
-        let rows = messages
-            .iter()
-            .map(|message| infer_server::ChatMessage {
-                role: message.role.clone(),
-                content: Some(infer_server::ChatContent::Text(message.content.clone())),
-            })
-            .collect::<Vec<_>>();
+        let rows = server_chat_messages(messages);
         self.tokenizer.render_chat(&rows)
     }
 
@@ -298,6 +347,43 @@ where
             ..EngineTelemetry::default()
         }
     }
+}
+
+fn server_chat_messages(messages: &[ChatPromptMessage]) -> Vec<infer_server::ChatMessage> {
+    messages
+        .iter()
+        .map(|message| infer_server::ChatMessage {
+            role: message.role.clone(),
+            content: Some(server_chat_content(message)),
+        })
+        .collect()
+}
+
+fn server_chat_content(message: &ChatPromptMessage) -> infer_server::ChatContent {
+    if message.images.is_empty() {
+        return infer_server::ChatContent::Text(message.content.clone());
+    }
+    let mut parts =
+        Vec::with_capacity(message.images.len() + usize::from(!message.content.is_empty()));
+    if !message.content.is_empty() {
+        parts.push(infer_server::ChatContentPart {
+            kind: "text".to_string(),
+            text: Some(message.content.clone()),
+            image_url: None,
+            input_image: None,
+            extra: serde_json::Map::new(),
+        });
+    }
+    for _ in &message.images {
+        parts.push(infer_server::ChatContentPart {
+            kind: "image".to_string(),
+            text: None,
+            image_url: None,
+            input_image: None,
+            extra: serde_json::Map::new(),
+        });
+    }
+    infer_server::ChatContent::Parts(parts)
 }
 
 /// Truncate at the first occurrence of any non-empty stop string, returning the

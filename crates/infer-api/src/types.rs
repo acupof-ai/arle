@@ -109,6 +109,39 @@ pub struct CompletionRequest {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// Raw image bytes attached to a backend-native chat message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatPromptImage {
+    pub source: String,
+    pub mime_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+impl ChatPromptImage {
+    #[must_use]
+    pub fn new(source: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            source: source.into(),
+            mime_type: None,
+            data,
+        }
+    }
+
+    #[must_use]
+    pub fn with_mime_type(mut self, mime_type: impl Into<Option<String>>) -> Self {
+        self.mime_type = mime_type.into();
+        self
+    }
+}
+
+/// A multimodal chat request for backends that expose image soft-token support.
+#[derive(Debug)]
+pub struct MultimodalChatRequest {
+    pub messages: Vec<ChatPromptMessage>,
+    pub max_tokens: usize,
+    pub sampling: SamplingParams,
+}
+
 /// Why generation stopped (the legacy 2-state public shape;
 /// [`from_plan`](FinishReason::from_plan) maps the rewrite's `Abort` -> `Stop`).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,6 +215,7 @@ impl TokenUsage {
 pub struct ChatPromptMessage {
     pub role: String,
     pub content: String,
+    pub images: Vec<ChatPromptImage>,
 }
 
 impl ChatPromptMessage {
@@ -190,7 +224,14 @@ impl ChatPromptMessage {
         Self {
             role: role.into(),
             content: content.into(),
+            images: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<ChatPromptImage>) -> Self {
+        self.images = images;
+        self
     }
 
     #[must_use]
@@ -201,6 +242,11 @@ impl ChatPromptMessage {
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
         Self::new("user", content)
+    }
+
+    #[must_use]
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ChatPromptImage>) -> Self {
+        Self::user(content).with_images(images)
     }
 
     #[must_use]
@@ -319,6 +365,16 @@ pub trait InferenceEngine: Send {
 
     /// Run a complete generation synchronously and return the full output.
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput>;
+
+    /// Run a backend-native multimodal chat completion.
+    fn complete_multimodal_chat(
+        &mut self,
+        _req: MultimodalChatRequest,
+    ) -> Result<CompletionOutput> {
+        Err(anyhow!(
+            "backend does not expose multimodal chat completion"
+        ))
+    }
 
     /// Run a generation, streaming token deltas through `tx` as produced.
     fn complete_stream(
