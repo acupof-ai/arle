@@ -1,14 +1,19 @@
-"""TileLang batch prefill HD128 paged attention (BF16, causal, page_size=16).
+"""TileLang batch prefill HD128 paged attention (BF16 I/O, causal, page_size=16).
 
-One kernel is AOT-specialized per (num_q_heads, num_kv_heads) in SUPPORTED_HEADS
-(compile-time constants → per-shape codegen). Add a head config by extending the
-lockstep lists here + build.rs + ffi/attention.rs + infer/src/ops/attention.rs.
+sm_70 (Volta) variant: I/O tensors stay bf16 (runtime ABI), but the GEMM
+operands are fed in fp16 on sm<80 so the gemms route to TileLang's stock Volta
+tensor-core path (GemmMMASm70 / mma.sync) instead of the scalar cuda.fma
+fallback. The fma fallback's per-output _linear_fragment layout diverges between
+scores(64x64) and acc_o(64x128) → the LayoutInference m_prev/scale_i conflict.
+The MMA path reconciles both layouts exactly like sm_80+, so the conflict
+vanishes and we get real tensor cores. sm>=80 keeps the byte-identical bf16 path.
 
-Tile tunables (Hopper defaults, docs/plans/tilelang-integration.md §6):
-BLOCK_M=64 q-tile rows, BLOCK_N=64 kv-tile cols, NUM_STAGES=2, NUM_THREADS=128.
+One kernel is AOT-specialized per (num_q_heads, num_kv_heads) in SUPPORTED_HEADS.
+Tile tunables: BLOCK_M=64, BLOCK_N=64, NUM_STAGES=2, NUM_THREADS=128.
 """
 
 import math
+import os
 
 import tilelang
 import tilelang.language as T
@@ -20,8 +25,6 @@ BLOCK_N = 64
 NUM_STAGES = 2
 NUM_THREADS = 128
 
-# (num_q_heads, num_kv_heads) the build emits. Extend here + build.rs + the
-# FFI/Rust dispatch arms in lockstep.
 SUPPORTED_HEADS = (
     (16, 8),
     (32, 8),
@@ -38,9 +41,26 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
     log2e = 1.4426950408889634
 
-    dtype = "bfloat16"
+    dtype = "bfloat16"  # I/O ABI: model weights + KV pool are bf16
     accum_dtype = "float32"
     index_dtype = "int32"
+
+    # bf16 tensor cores require sm_80+. On Volta/Turing (sm<80) feed the GEMMs
+    # fp16 so AllowVoltaMma passes and dispatch picks kCudaMMA (GemmMMASm70),
+    # not the scalar kCudaFMA fallback. fp16 has 10-bit mantissa (vs bf16's 7);
+    # range ±65504 is ample for RMSNorm-bounded q/k/v activations; accum stays f32.
+    sm_arch = int(os.environ.get("ARLE_TILELANG_CUDA_ARCH", "90"))
+    gemm_dtype = "float16" if sm_arch < 80 else "bfloat16"
+
+    # Trace-time no-op when gemm_dtype == dtype → sm_80+ AST stays byte-identical
+    # to the repo kernel; only sm<80 inserts the bf16->fp16 operand cast. The
+    # cast routes through f32: a direct bf16->fp16 cast lowers to an ambiguous
+    # user-defined conversion (__nv_bfloat16 -> cutlass::half_t has >1 path) that
+    # nvcc rejects; bf16->f32->fp16 has a unique conversion at each step.
+    def to_gemm(x):
+        if gemm_dtype == dtype:
+            return x
+        return T.cast(T.cast(x, accum_dtype), gemm_dtype)
 
     @T.prim_func
     def kernel(
@@ -52,22 +72,18 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
         KV_indices: T.Tensor((T.symbolic("total_pages"),), index_dtype),
         KV_last_page_len: T.Tensor((T.symbolic("batch_size"),), index_dtype),
         Output: T.Tensor((T.symbolic("total_q_tokens"), num_q_heads * HEAD_DIM), dtype),
-        # TileLang 0.1.9 can't use T.symbolic in grid extents (must come from a
-        # tensor shape or scalar arg), so batch/max_qlen are int32 scalars.
         batch_size: T.int32,
         max_qlen: T.int32,
     ):
-        # Grid: (q_tile_blocks, num_q_heads, batch_size). Each block = BLOCK_M q
-        # rows of one request/head; KV pages walked via KV_indices.
         with T.Kernel(
             T.ceildiv(max_qlen, BLOCK_M),
             num_q_heads,
             batch_size,
             threads=NUM_THREADS,
         ) as (bx, by, bz):
-            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), dtype)
-            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
-            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
+            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), gemm_dtype)
+            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
+            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
             acc_o = T.alloc_fragment((BLOCK_M, HEAD_DIM), accum_dtype)
             scores = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
             m_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
@@ -83,14 +99,11 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             num_kv_pages = kv_page_end - kv_page_start
             last_page_len = KV_last_page_len[bz]
             kv_total_len = (num_kv_pages - 1) * PAGE_SIZE + last_page_len
-            kv_offset = kv_total_len - qlen  # hoisted: also feeds the causal bound
+            kv_offset = kv_total_len - qlen
 
             row0 = bx * BLOCK_M
             kv_head = by // gqa_group
 
-            # Causal-bound KV loop: a Q-tile attends at most to KV col
-            # `kv_offset + min(row0+BLOCK_M, qlen)`, clamped to kv_total_len. Drops
-            # ~35-50% of per-tile work vs an unbounded loop on cold 4096-in prefill.
             q_rows_in_tile = T.if_then_else(
                 row0 + BLOCK_M < qlen, row0 + BLOCK_M, qlen
             )
@@ -108,18 +121,10 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 src = q_start + row
                 q_tile[i, d] = T.if_then_else(
                     row < qlen,
-                    Q[src, by * HEAD_DIM + d],
-                    T.cast(0, dtype),
+                    to_gemm(Q[src, by * HEAD_DIM + d]),
+                    T.cast(0, gemm_dtype),
                 )
 
-            # Page lookup stays INLINE in the (j, d) copy loop. Hoisting it to
-            # (BLOCK_N,) fragments (526515bd) lowers to a half-warpgroup
-            # predicated region `if (tid >> 6 == 0)` containing a
-            # __syncthreads(): threads 64-127 skip it and arrive at the wgmma
-            # block's barrier instead → barrier slip → partial-warpgroup
-            # wgmma.mma_async → device spin on sm_90a. The duplicate divmod is
-            # the price of correctness. See
-            # errors/2026-06-04-tilelang-hd128-prefill-wgmma-hang-sm90a.md.
             for kn in T.Pipelined(T.ceildiv(kv_visible_end, BLOCK_N), num_stages=NUM_STAGES):
                 col0 = kn * BLOCK_N
                 for j, d in T.Parallel(BLOCK_N, HEAD_DIM):
@@ -133,19 +138,18 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     )
                     k_tile[j, d] = T.if_then_else(
                         abs_col < kv_total_len,
-                        K_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
+                        to_gemm(K_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
                     )
                     v_tile[j, d] = T.if_then_else(
                         abs_col < kv_total_len,
-                        V_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
+                        to_gemm(V_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
                     )
 
                 T.clear(scores)
                 T.gemm(q_tile, k_tile, scores, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                # Causal mask: q's absolute pos = kv_offset + row.
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     row = row0 + i
                     col = col0 + j
@@ -161,18 +165,11 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 m_new = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 p = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
                 T.copy(m_i, m_prev)
-                # clear=True is load-bearing: clear=False leaves m_new uninit, and
-                # codegen's `max(m_new[i], m_new_clear[i])` then leaks stack garbage
-                # (incl. NaN) → short-qlen NaN regression. See
-                # docs/experience/errors/2026-04-28-tilelang-prefill-short-qlen-nan.md.
                 T.reduce_max(scores, m_new, dim=1, clear=True)
                 for i in T.Parallel(BLOCK_M):
                     m_new[i] = T.max(m_prev[i], m_new[i])
                 for i, j in T.Parallel(BLOCK_M, BLOCK_N):
                     p[i, j] = T.exp2((scores[i, j] - m_new[i]) * log2e)
-                # Hoist per-row alpha to a fragment + rescale acc_o as a 2D
-                # T.Parallel: the nested T.serial(HEAD_DIM) form trips TileLang
-                # 0.1.9's LayoutInferencer (`loop_var_to_thread ... inner var d`).
                 scale_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
                 for i in T.Parallel(BLOCK_M):
                     scale_i[i] = T.exp2((m_prev[i] - m_new[i]) * log2e)
@@ -184,11 +181,20 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                # Narrow f32 softmax to bf16 to match v_tile before P @ V (gemm
-                # asserts A.dtype == B.dtype in TileLang 0.1.9).
-                p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
-                T.copy(p, p_bf16)
-                T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                # PV operand A. sm_80+: bf16 fragment (byte-identical to repo).
+                # sm<80 Volta MMA (GemmMMASm70): feed A from SHARED — the f32
+                # accumulator->fp16 MMA-operand-A fragment relayout isn't inferred
+                # on the Volta path (p/p_bf16 conflict), but a fragment->shared
+                # store + shared-operand gemm is, and mirrors the QK gemm (both
+                # operands shared) which already lowers cleanly.
+                if gemm_dtype != dtype:
+                    p_shared = T.alloc_shared((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_shared)
+                    T.gemm(p_shared, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                else:
+                    p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_bf16)
+                    T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 row = row0 + i
@@ -201,5 +207,4 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
 
 
 def get_kernel(num_q_heads: int, num_kv_heads: int):
-    """Entry point for gen_tilelang_aot.py. One specialization per call."""
     return _make_kernel(num_q_heads, num_kv_heads)
