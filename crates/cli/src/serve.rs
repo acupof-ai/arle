@@ -400,11 +400,19 @@ fn resolve_engine_config(
     }
     config.allow_swap = serve_args.allow_swap;
 
+    // A user-supplied --max-prompt-tokens above the total is a genuine
+    // contradiction and stays a hard error. The built-in default cap, however,
+    // must never trip on its own: `--max-total-tokens N` alone (with the prompt
+    // cap left at its default) clamps the prompt cap down to N instead of
+    // erroring — the API scheduler clamps identically (infer-api loaded.rs).
     if config.max_prompt_tokens > config.max_total_tokens {
-        return Err(format!(
-            "--max-prompt-tokens ({}) must be <= --max-total-tokens ({})",
-            config.max_prompt_tokens, config.max_total_tokens
-        ));
+        if serve_args.max_prompt_tokens.is_some() {
+            return Err(format!(
+                "--max-prompt-tokens ({}) must be <= --max-total-tokens ({})",
+                config.max_prompt_tokens, config.max_total_tokens
+            ));
+        }
+        config.max_prompt_tokens = config.max_total_tokens;
     }
 
     if !matches!(backend, ServeBackend::Hip | ServeBackend::Vulkan) {
@@ -532,6 +540,62 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert!(config.options.enable_cuda_graph);
+    }
+
+    #[test]
+    fn max_total_tokens_alone_clamps_default_prompt_cap() {
+        if skip_if_no_backend() {
+            return;
+        }
+        // Regression: `--max-total-tokens N` below the built-in prompt-cap
+        // default (e.g. 32768) used to trip `--max-prompt-tokens must be <=
+        // --max-total-tokens`. The default cap must clamp down silently instead.
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--max-total-tokens",
+            "4096",
+        ]);
+        let config =
+            resolve_config(&args, &serve).expect("must not error on lone --max-total-tokens");
+        assert_eq!(config.options.engine_config.max_total_tokens, 4096);
+        assert!(
+            config.options.engine_config.max_prompt_tokens
+                <= config.options.engine_config.max_total_tokens,
+            "prompt cap {} must be clamped to <= total cap {}",
+            config.options.engine_config.max_prompt_tokens,
+            config.options.engine_config.max_total_tokens,
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_cap_above_total_still_errors() {
+        if skip_if_no_backend() {
+            return;
+        }
+        // A user-supplied prompt cap above the total is a genuine contradiction
+        // and must stay a hard error (only the default cap is auto-clamped).
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--max-prompt-tokens",
+            "8000",
+            "--max-total-tokens",
+            "4096",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("explicit contradiction must error");
+        assert!(
+            err.contains("must be <= --max-total-tokens"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
