@@ -54,6 +54,10 @@ pub enum PromptLoadError {
     },
     #[error("prompts file {path} line {line} has empty text")]
     EmptyPromptText { path: PathBuf, line: usize },
+    #[error("prompts file {path} line {line} needs either text or prompt_ids")]
+    MissingPrompt { path: PathBuf, line: usize },
+    #[error("prompts file {path} line {line} has empty prompt_ids")]
+    EmptyPromptIds { path: PathBuf, line: usize },
     #[error("prompts file {path} line {line} has non-positive max_tokens {max_tokens}")]
     InvalidRowMaxTokens {
         path: PathBuf,
@@ -70,6 +74,8 @@ pub enum PromptLoadError {
     EmptyTokenizedPrompt { path: PathBuf, line: usize },
     #[error("prompts file {path} line {line} has empty completion text")]
     EmptyCompletionText { path: PathBuf, line: usize },
+    #[error("prompts file {path} line {line} has empty completion_ids")]
+    EmptyCompletionIds { path: PathBuf, line: usize },
     #[error("prompts file {path} line {line} has non-positive completion_max_tokens {max_tokens}")]
     InvalidCompletionMaxTokens {
         path: PathBuf,
@@ -96,13 +102,18 @@ pub enum PromptLoadError {
 
 #[derive(Debug, Deserialize)]
 struct JsonlPrompt {
-    text: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    prompt_ids: Option<Vec<u32>>,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     completion: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    completion_ids: Option<Vec<u32>>,
     #[serde(default)]
     completion_max_tokens: Option<usize>,
 }
@@ -161,12 +172,6 @@ pub fn load_jsonl_prompt_sets(
                 source,
             }
         })?;
-        if record.text.trim().is_empty() {
-            return Err(PromptLoadError::EmptyPromptText {
-                path: prompt_file.to_path_buf(),
-                line: line_no,
-            });
-        }
         let max_tokens = record.max_tokens.unwrap_or(default_max_tokens);
         if max_tokens == 0 {
             return Err(PromptLoadError::InvalidRowMaxTokens {
@@ -176,28 +181,71 @@ pub fn load_jsonl_prompt_sets(
             });
         }
 
-        let encoding = tokenizer
-            .encode(record.text.as_str(), false)
-            .map_err(|err| PromptLoadError::TokenizePrompt {
-                path: prompt_file.to_path_buf(),
-                line: line_no,
-                message: err.to_string(),
+        let mut ids = if let Some(prompt_ids) = record.prompt_ids {
+            if prompt_ids.is_empty() {
+                return Err(PromptLoadError::EmptyPromptIds {
+                    path: prompt_file.to_path_buf(),
+                    line: line_no,
+                });
+            }
+            prompt_ids
+        } else if let Some(text) = record.text.as_ref() {
+            if text.trim().is_empty() {
+                return Err(PromptLoadError::EmptyPromptText {
+                    path: prompt_file.to_path_buf(),
+                    line: line_no,
+                });
+            }
+            let encoding = tokenizer.encode(text.as_str(), false).map_err(|err| {
+                PromptLoadError::TokenizePrompt {
+                    path: prompt_file.to_path_buf(),
+                    line: line_no,
+                    message: err.to_string(),
+                }
             })?;
-        let mut ids = encoding.get_ids().to_vec();
-        if ids.is_empty() {
-            return Err(PromptLoadError::EmptyTokenizedPrompt {
+            let ids = encoding.get_ids().to_vec();
+            if ids.is_empty() {
+                return Err(PromptLoadError::EmptyTokenizedPrompt {
+                    path: prompt_file.to_path_buf(),
+                    line: line_no,
+                });
+            }
+            ids
+        } else {
+            return Err(PromptLoadError::MissingPrompt {
                 path: prompt_file.to_path_buf(),
                 line: line_no,
             });
-        }
+        };
         if ids.len() > max_tokens {
             ids.truncate(max_tokens);
             truncated_rows += 1;
         }
         prompts.push(ids);
 
-        let completion_text = record.completion.as_ref().or(record.target.as_ref());
-        if let Some(completion_text) = completion_text {
+        if let Some(mut completion_ids) = record.completion_ids {
+            if completion_ids.is_empty() {
+                return Err(PromptLoadError::EmptyCompletionIds {
+                    path: prompt_file.to_path_buf(),
+                    line: line_no,
+                });
+            }
+            let completion_max_tokens = record.completion_max_tokens.unwrap_or(max_tokens);
+            if completion_max_tokens == 0 {
+                return Err(PromptLoadError::InvalidCompletionMaxTokens {
+                    path: prompt_file.to_path_buf(),
+                    line: line_no,
+                    max_tokens: completion_max_tokens,
+                });
+            }
+            if completion_ids.len() > completion_max_tokens {
+                completion_ids.truncate(completion_max_tokens);
+                truncated_completion_rows += 1;
+            }
+            completion_rows += 1;
+            completions.push(Some(completion_ids));
+        } else if let Some(completion_text) = record.completion.as_ref().or(record.target.as_ref())
+        {
             if completion_text.trim().is_empty() {
                 return Err(PromptLoadError::EmptyCompletionText {
                     path: prompt_file.to_path_buf(),
@@ -343,6 +391,29 @@ mod tests {
         );
         assert_eq!(loaded.heldout_completions, vec![Some(vec![4])]);
         assert_eq!(loaded.completion_rows, 2);
+        assert_eq!(loaded.truncated_completion_rows, 1);
+    }
+
+    #[test]
+    fn load_jsonl_prompt_sets_accepts_token_id_rows() {
+        let dir = tempdir().expect("tempdir");
+        write_wordlevel_tokenizer(&dir.path().join("tokenizer.json"), ["alpha"], ["<eos>"])
+            .expect("tokenizer");
+        let prompts = dir.path().join("prompts.jsonl");
+        let mut file = File::create(&prompts).expect("create prompts");
+        writeln!(
+            file,
+            r#"{{"prompt_ids":[11,12,13],"completion_ids":[21,22,23],"completion_max_tokens":2}}"#
+        )
+        .expect("write");
+        writeln!(file, r#"{{"prompt_ids":[31,32],"max_tokens":1}}"#).expect("write");
+
+        let loaded = load_jsonl_prompt_sets(dir.path(), &prompts, 8, 1).expect("load");
+        assert_eq!(loaded.train, vec![vec![11, 12, 13]]);
+        assert_eq!(loaded.heldout, vec![vec![31]]);
+        assert_eq!(loaded.train_completions, vec![Some(vec![21, 22])]);
+        assert_eq!(loaded.heldout_completions, vec![None]);
+        assert_eq!(loaded.truncated_rows, 1);
         assert_eq!(loaded.truncated_completion_rows, 1);
     }
 }

@@ -135,6 +135,15 @@ pub(crate) enum KlDirectionArg {
     Reverse,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum OpdKlMaskArg {
+    /// Mask prompt-prefix rows and train only on sampled completion rows.
+    #[value(name = "completion", alias = "completion-only")]
+    Completion,
+    /// Include prompt-prefix and completion rows in the KL objective.
+    Full,
+}
+
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct RenderArgs {
     /// Print the fully resolved execution plan without running the job.
@@ -609,6 +618,18 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_name = "IDS")]
     pub(crate) prompt_ids: Option<String>,
 
+    /// Prompt corpus JSONL. Each row may contain `text` or tokenized `prompt_ids`.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) prompts_file: Option<PathBuf>,
+
+    /// Max tokens per prompt row when loading --prompts-file.
+    #[arg(long, default_value_t = 512)]
+    pub(crate) prompt_max_tokens: usize,
+
+    /// Deterministic prompt-corpus sampling seed for --prompts-file.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prompt_seed: u64,
+
     /// Fixed held-out token-id sequence (comma-separated) for periodic NLL
     /// observation. Defaults to the prompt ids when unset.
     #[arg(long, value_name = "IDS")]
@@ -646,6 +667,10 @@ pub(crate) struct TrainOpdArgs {
     /// KL softening temperature (>0). Values other than 1.0 are pure-OPD only.
     #[arg(long, default_value_t = 1.0, value_parser = parse_positive_temperature)]
     pub(crate) kl_temperature: f32,
+
+    /// KL token mask. Completion-only matches the validated GKD/OPD recipe.
+    #[arg(long, value_enum, default_value_t = OpdKlMaskArg::Completion)]
+    pub(crate) kl_mask: OpdKlMaskArg,
 
     /// Total OPD training steps.
     #[arg(long, default_value_t = 5)]
@@ -829,7 +854,7 @@ pub(crate) struct TrainSelfOpdArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, CliCommand, RunArgs, TrainCommand};
+    use super::{Args, CliCommand, OpdKlMaskArg, RunArgs, TrainCommand};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -1114,6 +1139,14 @@ mod tests {
             "5",
             "--kl-temperature",
             "2.0",
+            "--kl-mask",
+            "full",
+            "--prompts-file",
+            "examples/opd/prompts.jsonl",
+            "--prompt-max-tokens",
+            "256",
+            "--prompt-seed",
+            "42",
         ])
         .expect("pure OPD eval flags should parse");
         let Some(CliCommand::Train(train)) = args.command else {
@@ -1126,6 +1159,13 @@ mod tests {
         assert_eq!(opd.gate_every_n, 5);
         assert_eq!(opd.gkd_lambda, 0.0);
         assert_eq!(opd.kl_temperature, 2.0);
+        assert_eq!(opd.kl_mask, OpdKlMaskArg::Full);
+        assert_eq!(
+            opd.prompts_file.as_deref(),
+            Some(std::path::Path::new("examples/opd/prompts.jsonl"))
+        );
+        assert_eq!(opd.prompt_max_tokens, 256);
+        assert_eq!(opd.prompt_seed, 42);
         assert_eq!(opd.lora_rank, 16);
         assert_eq!(opd.lora_alpha, 32.0);
         assert_eq!(opd.lora_target_set, "attention-qv");
@@ -1134,6 +1174,22 @@ mod tests {
             Some(std::path::Path::new("/tmp/opd-save"))
         );
         assert_eq!(opd.save_every, 5);
+    }
+
+    #[test]
+    fn train_opd_defaults_to_completion_kl_mask() {
+        let args = Args::try_parse_from(["arle", "train", "opd", "--student-model", "models/qwen"])
+            .expect("train opd should parse");
+        let Some(CliCommand::Train(train)) = args.command else {
+            panic!("expected train command");
+        };
+        let TrainCommand::Opd(opd) = train.command else {
+            panic!("expected train opd command");
+        };
+        assert_eq!(opd.kl_mask, OpdKlMaskArg::Completion);
+        assert!(opd.prompts_file.is_none());
+        assert_eq!(opd.prompt_max_tokens, 512);
+        assert_eq!(opd.prompt_seed, 0);
     }
 
     #[test]
