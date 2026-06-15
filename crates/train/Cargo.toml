@@ -39,6 +39,7 @@ qwen35-spec = { path = "../qwen35-spec" }
 deepseek-spec = { path = "../deepseek-spec" }
 chat = { path = "../chat" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
+infer-plan = { path = "../infer-plan" }
 
 [dev-dependencies]
 tempfile = "3"

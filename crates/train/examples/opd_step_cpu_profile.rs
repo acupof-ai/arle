@@ -236,6 +236,7 @@ fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
     let mut optimizer = AdamW::new(LR, (0.9, 0.999), 1.0e-8, 0.0);
     let step_cfg = OpdStepConfig {
         rollout_len: ROLLOUT_LEN,
+        rollout_sampling: None,
         grad_clip: 1.0,
     };
 
@@ -248,7 +249,7 @@ fn run_once() -> AnyResult<(f64, f32, f32, PhaseTotals)> {
             &student,
             &teacher,
             PROMPT_IDS,
-            step_cfg,
+            step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,

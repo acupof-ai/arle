@@ -24,6 +24,8 @@ use anyhow::{Result, anyhow, bail};
 use autograd::{Backend, TensorId, TensorStore};
 #[cfg(feature = "cuda")]
 use infer_api::{LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
+#[cfg(feature = "cuda")]
+use infer_plan::{SamplingParams, sample_token};
 
 #[cfg(feature = "cuda")]
 use crate::lora::LoraConfig;
@@ -80,14 +82,20 @@ impl InferStudent {
         engine.reload_engine_weights()
     }
 
-    /// Run a single greedy forward over `input_ids` (with absolute `positions`)
-    /// and return the argmax token over the **last** position's logits.
+    /// Run a single forward over `input_ids` (with absolute `positions`) and
+    /// return the next token over the **last** position's logits.
     ///
     /// The infer engine's `forward_token_logits` is stateless from the caller's
     /// POV: it accepts the full token sequence + contiguous positions each call
     /// (matching how `InferTeacher` drives it). The rollout loop therefore
     /// passes the growing full sequence with `positions = 0..len` each step.
-    pub fn decode_next_token(&self, input_ids: &[u32], positions: &[u32]) -> Result<u32> {
+    pub fn decode_next_token(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        sampling: Option<&SamplingParams>,
+        position: u64,
+    ) -> Result<u32> {
         if input_ids.is_empty() {
             bail!("InferStudent requires a non-empty token sequence");
         }
@@ -129,8 +137,11 @@ impl InferStudent {
         let vocab = raw_logits.vocab_size();
         let seq_len = raw_logits.seq_len();
         let last_row = &host[(seq_len - 1) * vocab..seq_len * vocab];
-        let token = argmax(last_row)?;
-        Ok(token as u32)
+        let token = match sampling {
+            None => argmax(last_row)? as u32,
+            Some(params) => sample_token(last_row, params, position),
+        };
+        Ok(token)
     }
 
     /// Per-step student LoRA sync (OPD P2).

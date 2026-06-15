@@ -39,6 +39,7 @@ agent = { path = "../agent" }
 autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }
 infer-api = { path = "../infer-api" }
+infer-plan = { path = "../infer-plan" }
 infer-util = { path = "../infer-util" }
 deepseek-spec = { path = "../deepseek-spec" }
 qwen3-spec = { path = "../qwen3-spec" }

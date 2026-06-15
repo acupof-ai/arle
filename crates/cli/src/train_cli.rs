@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use autograd::{TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use indicatif::{ProgressBar, ProgressStyle};
+use infer_plan::SamplingParams;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
@@ -253,8 +254,15 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     }
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let rollout_sampling = rollout_sampling_params(
+        args.rollout_temperature,
+        args.rollout_top_p,
+        args.rollout_top_k,
+        args.rollout_seed,
+    );
     let step_cfg = OpdStepConfig {
         rollout_len: args.rollout_len,
+        rollout_sampling,
         grad_clip: args.grad_clip,
     };
 
@@ -264,7 +272,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             &student,
             &teacher,
             &prompt_ids,
-            step_cfg,
+            step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,
@@ -336,8 +344,15 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     let student_params = student.all_parameter_ids();
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let rollout_sampling = rollout_sampling_params(
+        args.rollout_temperature,
+        args.rollout_top_p,
+        args.rollout_top_k,
+        args.rollout_seed,
+    );
     let step_cfg = OpdStepConfig {
         rollout_len: args.rollout_len,
+        rollout_sampling,
         grad_clip: args.grad_clip,
     };
 
@@ -357,7 +372,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
             &student,
             &teacher,
             &prompt_ids,
-            step_cfg,
+            step_cfg.clone(),
             &student_params,
             &mut optimizer,
             &mut store,
@@ -416,6 +431,25 @@ fn parse_lora_target_set(raw: &str) -> Result<train::lora::LoraTargetSet> {
         "attention-qv" | "attention_qv" | "qv" => Ok(LoraTargetSet::AttentionQv),
         "all-linear" | "all_linear" | "all" => Ok(LoraTargetSet::AllLinear),
         other => bail!("unknown --lora-target-set {other:?} (expected attention-qv or all-linear)"),
+    }
+}
+
+fn rollout_sampling_params(
+    temperature: f32,
+    top_p: f32,
+    top_k: i32,
+    seed: Option<u64>,
+) -> Option<SamplingParams> {
+    if temperature == 0.0 {
+        None
+    } else {
+        Some(SamplingParams {
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            ..SamplingParams::default()
+        })
     }
 }
 
@@ -555,8 +589,15 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     }
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let rollout_sampling = rollout_sampling_params(
+        args.rollout_temperature,
+        args.rollout_top_p,
+        args.rollout_top_k,
+        args.rollout_seed,
+    );
     let step_cfg = OpdStepConfig {
         rollout_len: args.rollout_len,
+        rollout_sampling,
         grad_clip: args.grad_clip,
     };
 
@@ -588,7 +629,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                 &student,
                 &teacher,
                 &prompt_ids,
-                step_cfg,
+                step_cfg.clone(),
                 &student_trainable,
                 &mut optimizer,
                 &mut store,
@@ -736,8 +777,15 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
         .collect();
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let rollout_sampling = rollout_sampling_params(
+        args.rollout_temperature,
+        args.rollout_top_p,
+        args.rollout_top_k,
+        args.rollout_seed,
+    );
     let step_cfg = OpdStepConfig {
         rollout_len: args.rollout_len,
+        rollout_sampling,
         grad_clip: args.grad_clip,
     };
 
@@ -749,7 +797,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
                 &student,
                 &teacher,
                 &prompt_ids,
-                step_cfg,
+                step_cfg.clone(),
                 &student_trainable,
                 &mut optimizer,
                 &mut store,
