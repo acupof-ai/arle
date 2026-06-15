@@ -81,6 +81,9 @@ Remote gate status:
   - Raw completion, needle prompt: exact `ARLE-FP8-NEEDLE-738291`.
 - Qwen3.6 FP8 perf gate, same binary A/B vs BF16 baseline: memory PASS,
   throughput FAIL on c=1, 512-in/32-out.
+- Required iso-VRAM concurrency sweep: DEFERRED by serving-thread saturation.
+  High-c attempts produced no clean guidellm JSON beyond the c=1 A/B below and
+  are not an FP8-vs-BF16 aggregate throughput verdict.
 - NVFP4 serve smoke after generating or downloading a checkpoint. If HF download
   is slow, generate it from a dense Qwen3.6 checkpoint:
 
@@ -123,6 +126,57 @@ license PASS. FP8 does not beat BF16 on tok/s, TTFT, or ITL; throughput license
 FAIL and the grouped quant-GEMV remains a correctness kernel pending the
 adopt-first kernel A/B.
 
+Iso-VRAM slot-fit follow-up (2026-06-16): the original c=1 shape is the wrong
+shape for FP8's memory value, so the next gate attempted to compare aggregate
+tok/s at the concurrency unlocked by the lower resident footprint. Scheduler
+capacity was pinned with `--total-pages 40 --page-size 16 --max-total-tokens 640
+--max-prompt-tokens 640` (512 input / 32 output workload, H20 GPU0). Qwen KV
+allocation follows total pages and page size, not `--max-total-tokens` alone.
+
+| Path | Effective slots | Slot-fit log | Idle/resident VRAM |
+|---|---:|---|---:|
+| BF16 | 375 | `requested 999 ... affordable 375 ... clamping num_slots to 375` | 94,445 MiB |
+| FP8 resident | 764 | `requested 999 ... affordable 764 ... clamping num_slots to 764` | 91,149 MiB |
+
+Slot license: FP8 fits 2.04x as many 640-token slots as BF16 (764 / 375) under
+the same H20 VRAM budget. That is the memory-to-concurrency opportunity. It is
+not yet a throughput win because the high-concurrency sweep hit a serving cap
+before it produced clean guidellm JSON.
+
+Invalid high-c attempts:
+
+| Attempt | Requested c-points | Outcome | Verdict |
+|---|---|---|---|
+| FP8 iso-VRAM sweep | 1,2,4,8,16,32,64,128,256,512,764 | final high-c phase ran >46 min, `/v1/stats` hit 10s timeouts then TCP connect timeouts, no `benchmarks.json`; wrapper peak GPU0 VRAM 91,311 MiB | invalid |
+| FP8 segmented sweep | 1,2,4,8,16,32,64,128,256 | final high-c phase ran >46 min, no `benchmarks.json` | invalid |
+| FP8 bounded sweep | 1,2,4,8,16,32,64 | stopped after the serving-saturation reframe, no `benchmarks.json` | invalid |
+
+High-c caveat: these runs are serving-bound, not quant-kernel-bound. Since both
+BF16 and FP8 would queue behind the same saturated serving/control path, the
+numbers would confound the FP8-vs-BF16 aggregate comparison. The only clean
+guidellm JSON currently available remains the c=1 A/B table above.
+
+Serving saturation root-cause hypothesis: `infer-server` keeps the engine front
+door behind a global `Mutex<ServeHandle>` in `HttpState`. `/v1/stats` and
+`/metrics` take that mutex just to read counters, while `/v1/completions` holds
+the same mutex across `ServeHandle::submit(_streaming)`. Submit sends a
+`Submission` to the engine thread, then blocks on `handle_rx.recv()` until the
+engine assigns a request handle. The engine loop only drains `submit_rx` at the
+top of each outer iteration, then runs one full `engine.step()` and continues;
+under high-c CUDA steps, handle assignment latency grows and HTTP handlers pile
+up on the same mutex. The observed `/v1/stats` 10s timeout localizes this as
+ingress/control-plane starvation, not an FP8 numeric or kernel-performance
+verdict.
+
+Next throughput lever: decouple stats and submission from the global serve
+mutex before rerunning the iso-VRAM sweep. Minimum fix shape: expose the shared
+counter snapshot directly to `/v1/stats`/`/metrics`; make request submission a
+short-lock or cloneable sender path that never waits for handle assignment while
+holding the HTTP state mutex; then add admission/backpressure instrumentation and
+rerun BF16-vs-FP8 at the effective slot counts above. Only after that sweep is
+clean should P8 run the adopt-first kernel A/B (DeepGEMM / CUTLASS / Marlin /
+vendor) for per-request throughput.
+
 The first attempted canonical 4096-in/256-out c=1 run is invalid for perf:
 `--max-seconds 60` expired before a request completed, so guidellm reported
 `no successful requests recorded`. Do not use that run for a throughput verdict.
@@ -135,6 +189,10 @@ The first attempted canonical 4096-in/256-out c=1 run is invalid for perf:
 - On the measured 512-in/32-out c=1 shape, FP8 is much slower than BF16 even
   though it uses much less memory. That is acceptable only as a memory license;
   it is a kill/iterate signal for throughput.
+- The iso-VRAM high-c sweep is currently confounded by serving-thread
+  saturation. `/v1/stats` timing out while requests are in flight means the
+  serving/control plane is stuck behind its own submit path; do not spend more
+  hours on c=64+ sweeps until that bottleneck is fixed.
 - The first FP8 serve attempt failed before readiness because the single-rank
   linear-attention loader still used BF16-only `load_matrix` for
   `linear_attn.in_proj_qkv.weight`, which the official FP8 checkpoint stores as
