@@ -601,6 +601,11 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_name = "IDS")]
     pub(crate) prompt_ids: Option<String>,
 
+    /// Fixed held-out token-id sequence (comma-separated) for periodic NLL
+    /// observation. Defaults to the prompt ids when unset.
+    #[arg(long, value_name = "IDS")]
+    pub(crate) eval_ids: Option<String>,
+
     /// Tokens to roll out greedily from the student per step.
     #[arg(long, default_value_t = 8)]
     pub(crate) rollout_len: usize,
@@ -637,6 +642,14 @@ pub(crate) struct TrainOpdArgs {
     /// AdamW learning rate.
     #[arg(long, default_value_t = 1.0e-4)]
     pub(crate) lr: f32,
+
+    /// Pure OPD has no SFT anchor; the only accepted value is 0.0.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) gkd_lambda: f32,
+
+    /// Observe held-out NLL every N steps (0 disables it).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) gate_every_n: usize,
 
     /// Gradient L2 norm clip threshold.
     #[arg(long, default_value_t = 1.0)]
@@ -772,7 +785,7 @@ pub(crate) struct TrainSelfOpdArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, CliCommand, RunArgs};
+    use super::{Args, CliCommand, RunArgs, TrainCommand};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -1035,6 +1048,33 @@ mod tests {
     #[test]
     fn rejects_retired_train_test_stub() {
         assert!(Args::try_parse_from(["arle", "train", "test"]).is_err());
+    }
+
+    #[test]
+    fn accepts_train_opd_eval_gate_and_explicit_zero_gkd_lambda() {
+        let args = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--eval-ids",
+            "1,2,3",
+            "--gate-every-n",
+            "5",
+            "--gkd-lambda",
+            "0.0",
+        ])
+        .expect("pure OPD eval flags should parse");
+        let Some(CliCommand::Train(train)) = args.command else {
+            panic!("expected train command");
+        };
+        let TrainCommand::Opd(opd) = train.command else {
+            panic!("expected train opd command");
+        };
+        assert_eq!(opd.eval_ids.as_deref(), Some("1,2,3"));
+        assert_eq!(opd.gate_every_n, 5);
+        assert_eq!(opd.gkd_lambda, 0.0);
     }
 
     #[test]
