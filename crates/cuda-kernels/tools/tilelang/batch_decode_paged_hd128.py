@@ -6,12 +6,21 @@ template (deltas: HEAD_DIM=128, SM_SCALE=1/sqrt(128), the HD128 SUPPORTED_HEADS)
 Tile tunables and the int32 scalar args mirror HD256 (so gen_tilelang_aot.py's
 WRAPPER_FILL_RULES works unchanged).
 
+sm_70 (Volta) variant: identical strategy to the prefill kernels. I/O stays
+bf16 (runtime ABI); on sm<80 the GEMM operands are fed fp16 so the gemms route
+to TileLang's stock Volta tensor-core path (GemmMMASm70 / mma.sync) instead of
+the scalar cuda.fma fallback whose per-output fragment layout triggers the
+LayoutInference m_prev/scale_i conflict. The PV operand A is fed from shared on
+sm<80. sm>=80 keeps the byte-identical bf16 fragment path. The split_merge
+kernel has no GEMM (pure f32 partial merge) and needs no gate.
+
 Tile tunables: BLOCK_M=64, BLOCK_N=16 (=PAGE_SIZE), NUM_STAGES=2, NUM_THREADS=128,
 no causal mask. Shared-mem ~32 KB double-buffered (Q 16 KB + 2*(K 4 KB + V 4 KB)),
 well under every SM target's cap.
 """
 
 import math
+import os
 
 import tilelang
 import tilelang.language as T
@@ -47,6 +56,19 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
     accum_dtype = "float32"
     index_dtype = "int32"
 
+    # sm<80 feeds the GEMMs fp16 so dispatch picks kCudaMMA (GemmMMASm70), not
+    # the scalar kCudaFMA fallback; accum stays f32. Trace-time no-op on sm>=80
+    # → the bf16 AST stays byte-identical to the repo kernel. The bf16->fp16
+    # cast routes through f32 (direct bf16->fp16 is an ambiguous CUTLASS
+    # conversion nvcc rejects). See batch_prefill_paged_hd128.py for details.
+    sm_arch = int(os.environ.get("ARLE_TILELANG_CUDA_ARCH", "90"))
+    gemm_dtype = "float16" if sm_arch < 80 else "bfloat16"
+
+    def to_gemm(x):
+        if gemm_dtype == dtype:
+            return x
+        return T.cast(T.cast(x, accum_dtype), gemm_dtype)
+
     @T.prim_func
     def kernel(
         # Q layout for decode: one row per request, no Q_indptr needed.
@@ -71,9 +93,9 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             batch_size,
             threads=NUM_THREADS,
         ) as (bx, by, bz):
-            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), dtype)
-            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
-            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
+            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), gemm_dtype)
+            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
+            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
             acc_o = T.alloc_fragment((BLOCK_M, HEAD_DIM), accum_dtype)
             scores = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
             m_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
@@ -99,8 +121,8 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 q_tile[i, d] = T.if_then_else(
                     i == 0,
-                    Q[bz, by * HEAD_DIM + d],
-                    T.cast(0, dtype),
+                    to_gemm(Q[bz, by * HEAD_DIM + d]),
+                    T.cast(0, gemm_dtype),
                 )
 
             for kn in T.Pipelined(T.ceildiv(kv_total_len, BLOCK_N), num_stages=NUM_STAGES):
@@ -116,13 +138,13 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                     )
                     k_tile[j, d] = T.if_then_else(
                         abs_col < kv_total_len,
-                        K_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
+                        to_gemm(K_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
                     )
                     v_tile[j, d] = T.if_then_else(
                         abs_col < kv_total_len,
-                        V_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
+                        to_gemm(V_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
                     )
 
                 T.clear(scores)
@@ -164,11 +186,16 @@ def _make_kernel(num_q_heads: int, num_kv_heads: int):
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                # Narrow f32 softmax to bf16 to match v_tile (gemm asserts
-                # A.dtype == B.dtype).
-                p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
-                T.copy(p, p_bf16)
-                T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                # PV operand A. sm_80+: bf16 fragment (byte-identical to repo).
+                # sm<80 Volta MMA: feed A from shared (mirrors the QK gemm).
+                if gemm_dtype != dtype:
+                    p_shared = T.alloc_shared((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_shared)
+                    T.gemm(p_shared, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                else:
+                    p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_bf16)
+                    T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             # One output row per (request, head); padded rows dropped.
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
@@ -193,6 +220,15 @@ def _make_split_partial_kernel(num_q_heads: int, num_kv_heads: int):
     dtype = "bfloat16"
     accum_dtype = "float32"
     index_dtype = "int32"
+
+    # See _make_kernel / batch_prefill_paged_hd128.py for the sm_70 rationale.
+    sm_arch = int(os.environ.get("ARLE_TILELANG_CUDA_ARCH", "90"))
+    gemm_dtype = "float16" if sm_arch < 80 else "bfloat16"
+
+    def to_gemm(x):
+        if gemm_dtype == dtype:
+            return x
+        return T.cast(T.cast(x, accum_dtype), gemm_dtype)
 
     @T.prim_func
     def kernel(
@@ -226,9 +262,9 @@ def _make_split_partial_kernel(num_q_heads: int, num_kv_heads: int):
             num_splits,
             threads=NUM_THREADS,
         ) as (bx, by, bz):
-            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), dtype)
-            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
-            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), dtype)
+            q_tile = T.alloc_shared((BLOCK_M, HEAD_DIM), gemm_dtype)
+            k_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
+            v_tile = T.alloc_shared((BLOCK_N, HEAD_DIM), gemm_dtype)
             acc_o = T.alloc_fragment((BLOCK_M, HEAD_DIM), accum_dtype)
             scores = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
             m_i = T.alloc_fragment((BLOCK_M,), accum_dtype)
@@ -256,8 +292,8 @@ def _make_split_partial_kernel(num_q_heads: int, num_kv_heads: int):
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 q_tile[i, d] = T.if_then_else(
                     i == 0,
-                    Q[bx, by * HEAD_DIM + d],
-                    T.cast(0, dtype),
+                    to_gemm(Q[bx, by * HEAD_DIM + d]),
+                    T.cast(0, gemm_dtype),
                 )
 
             for kn in T.Pipelined(T.ceildiv(kv_chunk_len, BLOCK_N), num_stages=NUM_STAGES):
@@ -273,13 +309,13 @@ def _make_split_partial_kernel(num_q_heads: int, num_kv_heads: int):
                     )
                     k_tile[j, d] = T.if_then_else(
                         abs_col < kv_chunk_end,
-                        K_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
+                        to_gemm(K_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
                     )
                     v_tile[j, d] = T.if_then_else(
                         abs_col < kv_chunk_end,
-                        V_pool[page_idx, kv_head, in_page, d],
-                        T.cast(0, dtype),
+                        to_gemm(V_pool[page_idx, kv_head, in_page, d]),
+                        T.cast(0, gemm_dtype),
                     )
 
                 T.clear(scores)
@@ -319,9 +355,16 @@ def _make_split_partial_kernel(num_q_heads: int, num_kv_heads: int):
                 for i in T.Parallel(BLOCK_M):
                     l_i[i] = l_i[i] + row_sum[i]
                     m_i[i] = m_new[i]
-                p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), dtype)
-                T.copy(p, p_bf16)
-                T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                # PV operand A. sm_80+: bf16 fragment (byte-identical to repo).
+                # sm<80 Volta MMA: feed A from shared (mirrors the QK gemm).
+                if gemm_dtype != dtype:
+                    p_shared = T.alloc_shared((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_shared)
+                    T.gemm(p_shared, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                else:
+                    p_bf16 = T.alloc_fragment((BLOCK_M, BLOCK_N), gemm_dtype)
+                    T.copy(p, p_bf16)
+                    T.gemm(p_bf16, v_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, d in T.Parallel(BLOCK_M, HEAD_DIM):
                 if i == 0:
