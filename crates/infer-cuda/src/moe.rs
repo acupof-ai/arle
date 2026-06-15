@@ -2283,7 +2283,7 @@ mod dsv4_gpu {
             let (b, _g2) = w2.weight.device_ptr(&ctx.stream);
             let (c, _gs13) = w13.scales.device_ptr(&ctx.stream);
             let (d, _gs2) = w2.scales.device_ptr(&ctx.stream);
-            (a as u64, b as u64, c as u64, d as u64)
+            (a, b, c, d)
         };
         let wstride13 = (2 * i_dim * h) as u64;
         let half_off = (i_dim * h) as u64;

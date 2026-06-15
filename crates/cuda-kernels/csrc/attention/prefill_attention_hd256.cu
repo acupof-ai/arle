@@ -1,16 +1,16 @@
 #include "common.cuh"
 
-#define HD256 256
-#define THREADS_HD256 256
-#define NUM_WARPS_HD256 (THREADS_HD256 / WARP_SIZE)
+#define MAX_HEAD_DIM 256
+#define THREADS_HEAD_DIM 256
+#define NUM_WARPS_HEAD_DIM (THREADS_HEAD_DIM / WARP_SIZE)
 
-__device__ __forceinline__ __nv_bfloat16 rms_norm_elem_offset_hd256(
+__device__ __forceinline__ __nv_bfloat16 rms_norm_elem_offset(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
     float w = 1.0f + __bfloat162float(weight);
     return __float2bfloat16(__bfloat162float(x) * rms_inv * w);
 }
 
-__device__ __forceinline__ void apply_rope_pair_hd256(
+__device__ __forceinline__ void apply_rope_pair(
     __nv_bfloat16& x0, __nv_bfloat16& x1,
     __nv_bfloat16 cos_val, __nv_bfloat16 sin_val) {
     float fx0 = __bfloat162float(x0);
@@ -21,17 +21,18 @@ __device__ __forceinline__ void apply_rope_pair_hd256(
     x1 = __float2bfloat16(fx0 * fs + fx1 * fc);
 }
 
-__global__ void prefill_qk_norm_rope_hd256_kernel(
+__global__ void prefill_qk_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,  // [q_full_dim, seq_len]
     const __nv_bfloat16* __restrict__ k_batch,       // [kv_dim, seq_len]
-    const __nv_bfloat16* __restrict__ q_norm_weight, // [HD256]
-    const __nv_bfloat16* __restrict__ k_norm_weight, // [HD256]
+    const __nv_bfloat16* __restrict__ q_norm_weight, // [head_dim]
+    const __nv_bfloat16* __restrict__ k_norm_weight, // [head_dim]
     const __nv_bfloat16* __restrict__ cos_cache,     // [max_seq * rotary_dim]
     const __nv_bfloat16* __restrict__ sin_cache,
     __nv_bfloat16* __restrict__ q_batch_out,         // [q_dim, seq_len]
-    __nv_bfloat16* __restrict__ k_cache,             // [num_kvheads * max_seq_len * HD256]
+    __nv_bfloat16* __restrict__ k_cache,             // [num_kvheads * max_seq_len * head_dim]
     int num_q_heads,
     int num_kv_heads,
+    int head_dim,
     int seq_len,
     const int* __restrict__ start_pos_ptr,           // GPU-resident for CUDA Graph safety
     int rotary_dim,
@@ -45,14 +46,17 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
 
     bool is_q = head_global < num_q_heads;
     int head_local = is_q ? head_global : (head_global - num_q_heads);
-    int q_full_dim = num_q_heads * HD256 * 2;
-    int q_dim = num_q_heads * HD256;
-    int kv_dim = num_kv_heads * HD256;
+    int q_full_dim = num_q_heads * head_dim * 2;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    bool active = d < head_dim;
 
     int src_offset = is_q
-        ? token * q_full_dim + head_local * 2 * HD256 + d
-        : token * kv_dim + head_local * HD256 + d;
-    __nv_bfloat16 x = is_q ? q_full_batch[src_offset] : k_batch[src_offset];
+        ? token * q_full_dim + head_local * 2 * head_dim + d
+        : token * kv_dim + head_local * head_dim + d;
+    __nv_bfloat16 x = active
+        ? (is_q ? q_full_batch[src_offset] : k_batch[src_offset])
+        : __float2bfloat16(0.0f);
     const __nv_bfloat16* norm_w = is_q ? q_norm_weight : k_norm_weight;
 
     float sq = __bfloat162float(x);
@@ -61,21 +65,23 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
 
     int warp_id = d / WARP_SIZE;
     int lane_id = d % WARP_SIZE;
-    __shared__ float warp_sums[NUM_WARPS_HD256];
+    __shared__ float warp_sums[NUM_WARPS_HEAD_DIM];
     __shared__ float inv_rms;
-    __shared__ __nv_bfloat16 smem[HD256];
+    __shared__ __nv_bfloat16 smem[MAX_HEAD_DIM];
 
     if (lane_id == 0) warp_sums[warp_id] = sq_sum;
     __syncthreads();
 
     if (d == 0) {
         float total = 0.0f;
-        for (int i = 0; i < NUM_WARPS_HD256; i++) total += warp_sums[i];
-        inv_rms = 1.0f / sqrtf(total / HD256 + rms_eps);
+        for (int i = 0; i < NUM_WARPS_HEAD_DIM; i++) total += warp_sums[i];
+        inv_rms = 1.0f / sqrtf(total / head_dim + rms_eps);
     }
     __syncthreads();
 
-    smem[d] = rms_norm_elem_offset_hd256(x, inv_rms, norm_w[d]);
+    if (active) {
+        smem[d] = rms_norm_elem_offset(x, inv_rms, norm_w[d]);
+    }
     __syncthreads();
 
     int pos = start_pos + token;
@@ -84,7 +90,7 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
     if (d < half_rotary) {
         __nv_bfloat16 lo = smem[d];
         __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair_hd256(
+        apply_rope_pair(
             lo,
             hi,
             cos_cache[pos * rotary_dim + d],
@@ -92,31 +98,32 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
         );
 
         if (is_q) {
-            int dst = token * q_dim + head_local * HD256;
+            int dst = token * q_dim + head_local * head_dim;
             q_batch_out[dst + d] = lo;
             q_batch_out[dst + d + half_rotary] = hi;
         } else {
-            int dst = head_local * max_seq_len * HD256 + pos * HD256;
+            int dst = head_local * max_seq_len * head_dim + pos * head_dim;
             k_cache[dst + d] = lo;
             k_cache[dst + d + half_rotary] = hi;
         }
     }
 
-    if (d >= rotary_dim) {
+    if (active && d >= rotary_dim) {
         if (is_q) {
-            int dst = token * q_dim + head_local * HD256;
+            int dst = token * q_dim + head_local * head_dim;
             q_batch_out[dst + d] = smem[d];
         } else {
-            int dst = head_local * max_seq_len * HD256 + pos * HD256;
+            int dst = head_local * max_seq_len * head_dim + pos * head_dim;
             k_cache[dst + d] = smem[d];
         }
     }
 }
 
-__global__ void prefill_v_cache_write_hd256_kernel(
+__global__ void prefill_v_cache_write_kernel(
     const __nv_bfloat16* __restrict__ v_batch,  // [kv_dim, seq_len]
-    __nv_bfloat16* __restrict__ v_cache,        // [num_kvheads * max_seq_len * HD256]
+    __nv_bfloat16* __restrict__ v_cache,        // [num_kvheads * max_seq_len * head_dim]
     int num_kv_heads,
+    int head_dim,
     int seq_len,
     const int* __restrict__ start_pos_ptr,      // GPU-resident
     int max_seq_len
@@ -125,30 +132,32 @@ __global__ void prefill_v_cache_write_hd256_kernel(
     int kv_head = blockIdx.x;
     int token = blockIdx.y;
     int d = threadIdx.x;
+    if (d >= head_dim) return;
 
-    int kv_dim = num_kv_heads * HD256;
-    int src = token * kv_dim + kv_head * HD256 + d;
-    int dst = kv_head * max_seq_len * HD256 + (start_pos + token) * HD256 + d;
+    int kv_dim = num_kv_heads * head_dim;
+    int src = token * kv_dim + kv_head * head_dim + d;
+    int dst = kv_head * max_seq_len * head_dim + (start_pos + token) * head_dim + d;
     v_cache[dst] = v_batch[src];
 }
 
-__global__ void attention_gate_batch_hd256_kernel(
+__global__ void attention_gate_batch_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,  // [q_full_dim, seq_len]
     __nv_bfloat16* __restrict__ attn_out,            // [q_dim, seq_len]
     int num_q_heads,
+    int head_dim,
     int seq_len
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_dim = num_q_heads * HD256;
+    int q_dim = num_q_heads * head_dim;
     int total = q_dim * seq_len;
     if (idx >= total) return;
 
     int token = idx / q_dim;
     int q_offset = idx - token * q_dim;
-    int q_head = q_offset / HD256;
-    int dim = q_offset % HD256;
+    int q_head = q_offset / head_dim;
+    int dim = q_offset % head_dim;
     int q_full_dim = q_dim * 2;
-    int gate_idx = token * q_full_dim + q_head * 2 * HD256 + HD256 + dim;
+    int gate_idx = token * q_full_dim + q_head * 2 * head_dim + head_dim + dim;
 
     float gate = __bfloat162float(q_full_batch[gate_idx]);
     float sig_gate = 1.0f / (1.0f + expf(-gate));
@@ -171,6 +180,7 @@ cudaError_t prefill_attention_hd256_prep_cuda(
     __nv_bfloat16* v_cache,
     int num_q_heads,
     int num_kv_heads,
+    int head_dim,
     int seq_len,
     const int* start_pos_ptr,
     int rotary_dim,
@@ -178,8 +188,17 @@ cudaError_t prefill_attention_hd256_prep_cuda(
     int max_seq_len,
     cudaStream_t stream
 ) {
+    if (num_q_heads <= 0 || num_kv_heads <= 0 || (head_dim != 128 && head_dim != 256) ||
+        seq_len < 0 || start_pos_ptr == nullptr || rotary_dim <= 0 ||
+        rotary_dim > head_dim || (rotary_dim % 2) != 0 || max_seq_len < seq_len ||
+        (num_q_heads % num_kv_heads) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (seq_len == 0) {
+        return cudaSuccess;
+    }
     dim3 prep_grid(num_q_heads + num_kv_heads, seq_len);
-    prefill_qk_norm_rope_hd256_kernel<<<prep_grid, THREADS_HD256, 0, stream>>>(
+    prefill_qk_norm_rope_kernel<<<prep_grid, THREADS_HEAD_DIM, 0, stream>>>(
         q_full_batch,
         k_batch,
         q_norm_weight,
@@ -190,6 +209,7 @@ cudaError_t prefill_attention_hd256_prep_cuda(
         k_cache,
         num_q_heads,
         num_kv_heads,
+        head_dim,
         seq_len,
         start_pos_ptr,
         rotary_dim,
@@ -198,10 +218,11 @@ cudaError_t prefill_attention_hd256_prep_cuda(
     );
 
     dim3 v_grid(num_kv_heads, seq_len);
-    prefill_v_cache_write_hd256_kernel<<<v_grid, THREADS_HD256, 0, stream>>>(
+    prefill_v_cache_write_kernel<<<v_grid, THREADS_HEAD_DIM, 0, stream>>>(
         v_batch,
         v_cache,
         num_kv_heads,
+        head_dim,
         seq_len,
         start_pos_ptr,
         max_seq_len
@@ -213,16 +234,24 @@ cudaError_t attention_gate_batch_hd256_cuda(
     const __nv_bfloat16* q_full_batch,
     __nv_bfloat16* attn_out,
     int num_q_heads,
+    int head_dim,
     int seq_len,
     cudaStream_t stream
 ) {
-    int total = num_q_heads * HD256 * seq_len;
+    if (num_q_heads <= 0 || (head_dim != 128 && head_dim != 256) || seq_len < 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (seq_len == 0) {
+        return cudaSuccess;
+    }
+    int total = num_q_heads * head_dim * seq_len;
     int block = 256;
     int grid = (total + block - 1) / block;
-    attention_gate_batch_hd256_kernel<<<grid, block, 0, stream>>>(
+    attention_gate_batch_kernel<<<grid, block, 0, stream>>>(
         q_full_batch,
         attn_out,
         num_q_heads,
+        head_dim,
         seq_len
     );
     return cudaGetLastError();
