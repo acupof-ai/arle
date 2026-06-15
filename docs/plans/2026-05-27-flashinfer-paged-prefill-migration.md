@@ -214,10 +214,11 @@ the FlashInfer kernels. Concrete handling:
 - `crates/cuda-kernels/build.rs` already gates per-SM cubin emission
   via `TORCH_CUDA_ARCH_LIST` (see `docs/plans/sm-coverage.md`).
   FlashInfer cubins emit only for sm_80+ tiers.
-- For sm_70 (V100): `infer/src/ops/attention.rs` dispatches to the
-  existing `nonpaged_prefill_attention.cu` contig path, which already
-  works on V100 with the `scripts/sm70_tilelang.patch` FMA fallback
-  (currently used by the V100 audit).
+- For sm_70 (V100): the contig attention path works on V100.
+  (This plan predates the 2026-06-15 fp16-MMA fix: sm_70 TileLang
+  attention now reaches Volta tensor cores via the in-kernel fp16-MMA
+  gate, and the `scripts/sm70_tilelang.patch` cuda.fma fallback once
+  referenced here was dropped — see the V100 sm_70 wins entry.)
 - Paged-pool memory efficiency loss on V100 is acceptable —
   V100 is not a production T1 SKU (it's a P2 legacy-validation tier
   per `sm-coverage.md`).
