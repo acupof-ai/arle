@@ -5029,9 +5029,11 @@ pub(crate) fn dsv4_batched_mtp_enabled() -> bool {
     // concurrent; batched scales to ~77 — short-prompt c=12 +81% and prod ~2400-tok
     // c=8 +77%, both decode-read coherent, zero cross-slot contamination). The
     // executor gate (`spec_on && this && rows >= dsv4_batched_decode_min_rows()`)
-    // engages it at c>=4 only; c<4 keeps the per-row MTP latency path. The marginal
-    // batched-draft sub-lever (`ARLE_DSV4_BATCHED_MTP_DRAFT`) stays OFF. Force the
-    // per-row reference with `ARLE_DSV4_BATCHED_MTP=0`.
+    // engages it at c>=4 only; c<4 keeps the per-row MTP latency path. The
+    // batched-draft sub-lever (`ARLE_DSV4_BATCHED_MTP_DRAFT`) is now default-ON
+    // too (licensed +6.8% c=8 / +11.1% c=16, `04176b60`; its earlier "marginal"
+    // verdict predated the cuBLAS lm_head fix). Force the per-row reference with
+    // `ARLE_DSV4_BATCHED_MTP=0`.
     match std::env::var("ARLE_DSV4_BATCHED_MTP") {
         Ok(v) => !matches!(
             v.as_str(),
