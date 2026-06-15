@@ -253,18 +253,18 @@ impl CudaExecutor {
         })
     }
 
-    /// Build the real CUDA executor for a single-GPU BF16 Qwen3.5/3.6 MoE
-    /// checkpoint (all experts local). BF16 only; the W4/4-bit canonical needs
-    /// the W4 grouped-GEMM follow-up.
+    /// Build the real CUDA executor for a BF16 Qwen3.5/3.6 hybrid dense-or-MoE
+    /// checkpoint. BF16 only; the W4/4-bit canonical needs the W4 grouped-GEMM
+    /// follow-up.
     #[cfg(feature = "cuda")]
-    pub fn from_qwen35_moe_safetensors(
+    pub fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
-                executor::RealCudaExecutor::from_qwen35_moe_safetensors(
+                executor::RealCudaExecutor::from_qwen35_safetensors(
                     model_path,
                     num_slots,
                     total_pages,

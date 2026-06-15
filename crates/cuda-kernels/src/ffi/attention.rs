@@ -57,6 +57,7 @@ unsafe extern "C" {
         v_cache: *mut Half,
         num_q_heads: i32,
         num_kv_heads: i32,
+        head_dim: i32,
         seq_len: i32,
         start_pos_ptr: *const i32,
         rotary_dim: i32,
@@ -91,6 +92,7 @@ unsafe extern "C" {
         q_full_batch: *const Half,
         attn_out: *mut Half,
         num_q_heads: i32,
+        head_dim: i32,
         seq_len: i32,
         stream: CUstream,
     ) -> CUresult;
