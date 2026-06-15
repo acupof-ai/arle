@@ -524,8 +524,18 @@ def parse_target(target: str):
             parsed["arch"] = token.split("=", 1)[1]
             continue
         raise ValueError(f"unsupported TileLang AOT target option {token!r} in {target!r}")
-    import tilelang
-    return tilelang.tvm.target.Target(parsed)
+    # TVM ships bundled inside tilelang; `import tilelang` injects the bundled
+    # 3rdparty/tvm/python onto sys.path. Different tilelang builds surface it
+    # differently: some expose the `tilelang.tvm` submodule, the from-source
+    # 0.1.11+cuda wheel only exposes top-level `tvm` (no `tilelang.tvm`). Try
+    # the submodule first (keeps older envs byte-identical), then fall back to
+    # top-level tvm so the V100 from-source lane and CI both resolve a Target.
+    import tilelang  # noqa: F401 — side effect: registers the bundled tvm path
+    try:
+        import tilelang.tvm as _tvm
+    except ImportError:
+        import tvm as _tvm
+    return _tvm.target.Target(parsed)
 
 
 def compile_kernel(prim_func, target, pass_configs=None):
