@@ -679,6 +679,62 @@ impl Dsv4SlotState {
         })
     }
 
+    /// Exact requested device bytes owned by this ONE slot: the per-layer
+    /// attention states + the per-layer spec-ring snapshots + the per-layer
+    /// spec-normed commit-fold scratch + the `start_pos_device` scalar.
+    ///
+    /// EXCLUDED (and why):
+    /// - `decode_graph`: `None` at slot construction (lazy, captured on the
+    ///   first decode step — well after engine-build reconciliation). Its
+    ///   captured CUDA-graph internal allocations are opaque to a byte sum.
+    /// - `deepep_ll_scratch`: lives behind `#[cfg(feature = "deepep")]` and is
+    ///   only `Some` when the NVSHMEM LL transport is booted; sized off-band.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
+    }
+
+    /// Per-component byte breakdown for the VRAM ledger log. The per-layer
+    /// `attention` Vec collapses to one summed entry (40+ layers); the spec
+    /// scratches are itemized.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes_breakdown(&self) -> Vec<(&'static str, usize)> {
+        let attention_bytes: usize = self.attention.iter().map(|s| s.device_bytes()).sum();
+        let spec_rings_bytes: usize = self
+            .spec_rings
+            .as_ref()
+            .map_or(0, |rings| rings.iter().map(|r| r.device_bytes()).sum());
+        let spec_normed_bytes: usize = self
+            .spec_normed
+            .as_ref()
+            .map_or(0, |cache| cache.iter().map(|h| h.device_bytes()).sum());
+        vec![
+            ("attention(per-layer)", attention_bytes),
+            ("spec_rings", spec_rings_bytes),
+            ("spec_normed", spec_normed_bytes),
+            (
+                "start_pos_device",
+                self.start_pos_device.len() * std::mem::size_of::<i32>(),
+            ),
+        ]
+    }
+
+    /// Sub-struct byte totals summed across ALL attention layers (sw_window /
+    /// compressor / indexer / flashmla / fused_wqkv / dsa_official). The
+    /// [vram-ledger] uses this to attribute the per-slot `attention(per-layer)`
+    /// bulk to the exact buffer family — every bit's source named.
+    #[allow(dead_code)]
+    pub(crate) fn attention_breakdown_total(&self) -> Vec<(&'static str, usize)> {
+        let mut totals: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for layer in &self.attention {
+            for (name, bytes) in layer.device_bytes_breakdown() {
+                *totals.entry(name).or_insert(0) += bytes;
+            }
+        }
+        totals.into_iter().collect()
+    }
+
     /// Snapshot the K+1 speculative-verify ring slots across all attention layers
     /// BEFORE the frozen depth-K verify forward. No-op when spec decode is off
     /// (`spec_rings` is `None`), so the executor can call unconditionally. Mirrors
@@ -1329,7 +1385,8 @@ impl Dsv4Model {
                         .map_err(|e| anyhow!("DSv4 commit fold gather failed: {e}"))?;
                 }
             }
-            let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+            let (layer_pool, flashmla_scratch) =
+                kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
             crate::attention::commit_layer_fold(
                 &self.ctx,
                 &self.config,
@@ -1337,6 +1394,7 @@ impl Dsv4Model {
                 layer.mode,
                 layer.compress_ratio,
                 &mut slot.attention[layer_idx],
+                flashmla_scratch,
                 layer_pool,
                 &gathered,
                 start_pos,
@@ -1438,7 +1496,8 @@ impl Dsv4Model {
                 gathered.seq_len = m;
                 // Resolve the layer pool, THEN take this slot's mutable ring
                 // (sequenced borrows — mirrors forward_decode_batch_verify).
-                let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+                let (layer_pool, flashmla_scratch) =
+                    kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
                 let slot = &mut slots[slot_idx];
                 crate::attention::commit_layer_fold(
                     &self.ctx,
@@ -1447,6 +1506,7 @@ impl Dsv4Model {
                     layer.mode,
                     layer.compress_ratio,
                     &mut slot.attention[layer_idx],
+                    flashmla_scratch,
                     layer_pool,
                     &gathered,
                     start_positions[s],
@@ -1945,10 +2005,13 @@ impl Dsv4Model {
                         ctx.stream
                             .memcpy_dtod(&src, &mut normed_row.data)
                             .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                        let (layer_pool, dsa_shared, flash_batch) =
+                        let (layer_pool, dsa_shared, flash_batch, flashmla_scratch, prefill_shared) =
                             kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
                         let flash_batch = flash_batch.ok_or_else(|| {
                             anyhow!("DSv4 batched decode lane: batch scratch missing")
+                        })?;
+                        let flashmla_scratch = flashmla_scratch.ok_or_else(|| {
+                            anyhow!("DSv4 batched decode lane: single-row decode scratch missing")
                         })?;
                         let slot = &mut slots[slot_ids[r]];
                         slot_block_offsets.push(layer_pool.flashmla_slot_first_block(slot_ids[r])?);
@@ -1963,6 +2026,7 @@ impl Dsv4Model {
                             &mut slot.attention[layer_idx],
                             layer_pool,
                             dsa_shared,
+                            prefill_shared,
                             start_positions[r],
                             Some(&slot.start_pos_device),
                             None,
@@ -1979,6 +2043,7 @@ impl Dsv4Model {
                             &self.config,
                             layer.compress_ratio,
                             flash,
+                            flashmla_scratch,
                             layer_pool,
                             sw_window,
                             &row_prepared.k_prepared,
@@ -2010,7 +2075,7 @@ impl Dsv4Model {
                 // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
                 {
                     let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_fwd");
-                    let (layer_pool, _dsa, flash_batch) =
+                    let (layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
                     let flash_batch = flash_batch.ok_or_else(|| {
                         anyhow!("DSv4 batched decode lane: batch scratch missing")
@@ -2044,7 +2109,7 @@ impl Dsv4Model {
                         // local_attn `&mut`) so the borrow checker splits them.
                         let p = &mut prepared[r];
                         {
-                            let (_layer_pool, _dsa, flash_batch) =
+                            let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
                                 kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
                             let flash_batch = flash_batch.ok_or_else(|| {
                                 anyhow!("DSv4 batched decode lane: batch scratch missing")
@@ -2083,6 +2148,9 @@ impl Dsv4Model {
                             &self.ctx,
                             &layer.attention,
                             &mut slot.attention[layer_idx],
+                            // Decode (token_count=1): the prefill DeepGEMM lane is
+                            // never taken, so the shared scratch is not needed.
+                            None,
                             &p.local_attn,
                             1,
                             &mut keepalive,
@@ -2103,7 +2171,7 @@ impl Dsv4Model {
                     ctx.stream
                         .memcpy_dtod(&src, &mut normed_row.data)
                         .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                    let (layer_pool, dsa_shared) =
+                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     let slot = &mut slots[slot_ids[r]];
                     crate::attention::mla_attention(
@@ -2117,6 +2185,8 @@ impl Dsv4Model {
                         &mut slot.attention[layer_idx],
                         layer_pool,
                         dsa_shared,
+                        flashmla_scratch,
+                        prefill_shared,
                         start_positions[r],
                         Some(&slot.start_pos_device),
                         None,
@@ -2581,7 +2651,7 @@ impl Dsv4Model {
                                     anyhow!("DSv4 batched verify spec_normed persist failed: {e}")
                                 })?;
                         }
-                        let (layer_pool, dsa_shared) =
+                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         let slot = &mut slots[slot_ids[s]];
                         crate::attention::mla_attention(
@@ -2595,6 +2665,8 @@ impl Dsv4Model {
                             &mut slot.attention[layer_idx],
                             layer_pool,
                             dsa_shared,
+                            flashmla_scratch,
+                            prefill_shared,
                             start_positions[s],
                             None,
                             Some(&tree_metas[s]),
@@ -3100,7 +3172,8 @@ impl Dsv4Model {
                         .memcpy_dtod(&src, &mut dst)
                         .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
                 }
-                let (layer_pool, dsa_shared) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                    kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 crate::attention::mla_attention(
                     &self.ctx,
                     &self.config,
@@ -3112,6 +3185,8 @@ impl Dsv4Model {
                     &mut slot.attention[layer_idx],
                     layer_pool,
                     dsa_shared,
+                    flashmla_scratch,
+                    prefill_shared,
                     start_pos,
                     None,
                     Some(meta),
@@ -3133,7 +3208,7 @@ impl Dsv4Model {
                 let normed_row = normed_row.as_mut().expect("per-token verify scratch");
                 let attn_out_row = attn_out_row.as_mut().expect("per-token verify scratch");
                 let verify_pos_dev = verify_pos_dev.as_mut().expect("per-token verify scratch");
-                let (layer_pool, mut dsa_shared) =
+                let (layer_pool, mut dsa_shared, mut flashmla_scratch, mut prefill_shared) =
                     kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 for r in 0..seq_len {
                     let pos_r = sched.positions[r];
@@ -3159,6 +3234,8 @@ impl Dsv4Model {
                         &mut slot.attention[layer_idx],
                         layer_pool,
                         dsa_shared.as_deref_mut(),
+                        flashmla_scratch.as_deref_mut(),
+                        prefill_shared.as_deref_mut(),
                         pos_r,
                         Some(&*verify_pos_dev),
                         None,
@@ -3177,7 +3254,7 @@ impl Dsv4Model {
             } else {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn");
                 crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
-                    let (layer_pool, dsa_shared) =
+                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     crate::attention::mla_attention(
                         &self.ctx,
@@ -3190,6 +3267,8 @@ impl Dsv4Model {
                         &mut slot.attention[layer_idx],
                         layer_pool,
                         dsa_shared,
+                        flashmla_scratch,
+                        prefill_shared,
                         start_pos,
                         start_pos_device,
                         None,
@@ -3671,7 +3750,7 @@ impl Dsv4Model {
             let mut attn_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
             keepalive.keep_hidden(&normed_row);
             keepalive.keep_hidden(&attn_row);
-            let (layer_pool, mut dsa_shared) =
+            let (layer_pool, mut dsa_shared, mut flashmla_scratch, mut prefill_shared) =
                 kv_adapter.layer_and_dsa_shared_mut(target_layer_idx)?;
             for (r, _row) in rows.iter().enumerate() {
                 let src = attn_normed
@@ -3691,6 +3770,8 @@ impl Dsv4Model {
                     &mut slot.attention[target_layer_idx],
                     layer_pool,
                     dsa_shared.as_deref_mut(),
+                    flashmla_scratch.as_deref_mut(),
+                    prefill_shared.as_deref_mut(),
                     position as usize,
                     Some(&pos_dev),
                     None,
@@ -4013,7 +4094,7 @@ impl Dsv4Model {
                 // pattern forward_decode_batch_verify uses inside its slot loop):
                 // resolve the kv_adapter layer FIRST, then take the mutable slot
                 // borrow, so the two borrows don't collide.
-                let (layer_pool, dsa_shared) =
+                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
                     kv_adapter.layer_and_dsa_shared_mut(target_layer_idx)?;
                 let slot = &mut slots[slot_ids[s]];
                 crate::attention::mla_attention(
@@ -4027,6 +4108,8 @@ impl Dsv4Model {
                     &mut slot.attention[target_layer_idx],
                     layer_pool,
                     dsa_shared,
+                    flashmla_scratch,
+                    prefill_shared,
                     positions[s] as usize,
                     Some(&pos_devs[s]),
                     None,
@@ -4347,7 +4430,8 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let attn_pool = kv_adapter.layer_mut(layer_idx)?;
+                    let (attn_pool, flashmla_scratch) =
+                        kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
                     attn_graph.run_or_capture(|| {
                         crate::ops::embedding_batch(
                             &self.ctx,
@@ -4390,6 +4474,10 @@ impl Dsv4Model {
                             attn_state,
                             attn_pool,
                             None,
+                            flashmla_scratch,
+                            // Decode-only graph capture (token_count=1): the
+                            // prefill DeepGEMM lane is never taken.
+                            None,
                             start_pos,
                             Some(&slot.start_pos_device),
                             None,
@@ -4411,7 +4499,8 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let attn_pool = kv_adapter.layer_mut(layer_idx)?;
+                    let (attn_pool, flashmla_scratch) =
+                        kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
                     attn_graph.run_or_capture(|| {
                         crate::ops::add_batch(
                             &self.ctx,
@@ -4456,6 +4545,10 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
+                            None,
+                            flashmla_scratch,
+                            // Decode-only graph capture (token_count=1): the
+                            // prefill DeepGEMM lane is never taken.
                             None,
                             start_pos,
                             Some(&slot.start_pos_device),
