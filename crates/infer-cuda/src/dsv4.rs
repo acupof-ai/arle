@@ -3923,6 +3923,349 @@ impl Dsv4Model {
         Ok(out)
     }
 
+    /// Lever 2a — ONE batched MTP-head forward over N SLOTS (one current draft
+    /// token + h_prev + position per slot). The depth chain is sequential
+    /// (level i+1 chains from level i's per-slot stream); within a level the N
+    /// slots are independent → batched here, amortizing the MTP layer's
+    /// `dsv4_moe_forward` over the N slots (the win — verify-class amortization).
+    ///
+    /// Relation to `mtp_forward_level` (single slot, `m` sibling rows sharing one
+    /// ring/position): this is the orthogonal batching axis — N slots, ONE row
+    /// each, each slot its OWN ring + position. The head math (embed / enorm /
+    /// e_proj / hnorm / h_proj / stream-combine), MoE / shared / all-reduce, and
+    /// head_hc + lm_head + argmax all batch over the N rows exactly as
+    /// `mtp_forward_level` already batches over `m`; ONLY the attention differs —
+    /// a PER-SLOT loop (each slot's `attention[target_layer]` ring at its own
+    /// `positions[s]`), mirroring `forward_decode_batch_verify`'s per-slot
+    /// attention loop (no cross-slot aliasing).
+    ///
+    /// §0.1 mutated buffers (full enumeration):
+    /// - Combined head/attn/moe scratch (embeddings, e_proj/h_proj, stream,
+    ///   normed, attn_out, moe_out, shared, ffn_stream, head_normed, logits) —
+    ///   SCRATCH `[N, *]`, freed at fn end (held by `keepalive`).
+    /// - Per-slot `slots[slot_ids[s]].attention[target_layer]` ring: WRITTEN by
+    ///   each slot's `mla_attention` at `positions[s]` (one row/slot). Looped per
+    ///   slot — no cross-slot aliasing. These speculative draft-layer ring writes
+    ///   are snapshotted PRE-DRAFT by the caller's `capture_spec_rings` and the
+    ///   rejected tail restored by `restore_spec_ring_tail` (caller owns that).
+    /// - Per-slot h_prev STREAMS: returned as the `DeviceVec` half of each
+    ///   `(token, stream)` — the caller chains level i+1 from this per slot.
+    /// - `slots[s].seq_len` / `spec_normed` / committed KV: NOT touched (the
+    ///   draft attention writes the speculative ring tail only; commit is the
+    ///   caller's separate fold / re-forward).
+    pub(crate) fn mtp_forward_level_batched(
+        &self,
+        slots: &mut [Dsv4SlotState],
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_ids: &[usize],
+        rows: &[MtpDraftRow],
+        h_prevs: &[&DeviceVec],
+        positions: &[u64],
+    ) -> Result<Vec<(u32, DeviceVec)>> {
+        ensure!(
+            self.spec_decode_on,
+            "DSv4 MTP forward called while spec decode is off (need --spec-type mtp / \
+             --mtp-draft-tokens, or ARLE_DSV4_SPEC_DECODE=1)"
+        );
+        ensure!(
+            !dsv4_use_deepep_transport()?,
+            "DSv4 MTP Phase 1 supports allreduce transport only"
+        );
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("ARLE_DSV4_SPEC_DECODE=1 but DSv4 MTP head is not loaded"))?;
+        let n = slot_ids.len();
+        ensure!(
+            n > 0 && rows.len() == n && h_prevs.len() == n && positions.len() == n,
+            "DSv4 batched MTP level shape mismatch (slots {n}, rows {}, h_prevs {}, positions {})",
+            rows.len(),
+            h_prevs.len(),
+            positions.len()
+        );
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_dim = hidden_size * hc_mult;
+        for h in h_prevs {
+            ensure!(
+                h.len == stream_dim,
+                "DSv4 MTP h_prev len {} != stream dim {stream_dim}",
+                h.len
+            );
+        }
+        let eps = self.config.rms_norm_eps;
+        let ctx = &self.ctx;
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        let m = n; // batch dimension: one row per slot
+
+        // ── h' = e_proj(enorm(emb(token))) + h_proj(hnorm(h_prev)), batched over N.
+        let token_ids_host: Vec<i32> = rows.iter().map(|r| r.token as i32).collect();
+        let token_ids = crate::ops::upload_i32(ctx, &token_ids_host)?;
+        // SAFETY: embedding_batch writes the full [m, hidden_size] buffer.
+        let mut emb = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids, &mut emb)?;
+        let mut emb_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::ops::rms_norm_batch(ctx, &emb, &mtp.enorm, eps, &mut emb_normed)?;
+        let mut e_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::attention::dsv4_linear(ctx, &mtp.e_proj, &emb_normed, &mut e_proj)?;
+
+        // Gather h_prev streams into [m * hc_mult, hidden] (a stream is hc_mult
+        // consecutive hidden rows, token-major) — one per slot.
+        let mut h_prev_batch = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
+        for (r, h) in h_prevs.iter().enumerate() {
+            let mut dst = h_prev_batch
+                .data
+                .slice_mut(r * stream_dim..(r + 1) * stream_dim);
+            ctx.stream
+                .memcpy_dtod(&h.data, &mut dst)
+                .map_err(|e| anyhow!("DSv4 MTP h_prev D2D gather failed: {e}"))?;
+        }
+        let mut h_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
+        crate::ops::rms_norm_batch(ctx, &h_prev_batch, &mtp.hnorm, eps, &mut h_normed)?;
+        let mut h_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
+        crate::attention::dsv4_linear(ctx, &mtp.h_proj, &h_normed, &mut h_proj)?;
+
+        let mut stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
+        {
+            let (e_ptr, _ge) = e_proj.data.device_ptr(&ctx.stream);
+            let (h_ptr, _gh) = h_proj.data.device_ptr(&ctx.stream);
+            let (out_ptr, _go) = stream.data.device_ptr_mut(&ctx.stream);
+            let row_h = (hidden_size * 2) as u64;
+            let row_s = (stream_dim * 2) as u64;
+            for r in 0..m as u64 {
+                // SAFETY: per-row slices of buffers sized above.
+                unsafe {
+                    ffi::dsv4_mtp_add_eproj_hproj_cuda(
+                        (e_ptr + r * row_h) as *const ffi::Half,
+                        (h_ptr + r * row_s) as *const ffi::Half,
+                        (out_ptr + r * row_s) as *mut ffi::Half,
+                        hidden_size as i32,
+                        hc_mult as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+        }
+        keepalive.keep_hidden(&e_proj);
+        keepalive.keep_hidden(&h_proj);
+        keepalive.keep_hidden(&stream);
+
+        // ── ONE MTP transformer layer over the N-slot batch; attention PER SLOT
+        // into the slot's OWN target-layer ring at its OWN position (mirrors
+        // forward_decode_batch_verify's per-slot attention loop). The frozen-KV
+        // target layer is SW-only (compress_ratio forced 0), so the draft is a
+        // plain 1-row decode-attention at positions[s].
+        let layer = &mtp.layer;
+        let target_layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
+        let local_width = layer.attention.wq_b.rows;
+        ensure!(
+            local_width.is_multiple_of(self.config.head_dim),
+            "DSv4 MTP attention local width {local_width} is not a multiple of head_dim {}",
+            self.config.head_dim
+        );
+        for &slot_id in slot_ids {
+            ensure!(
+                target_layer_idx < slots[slot_id].attention.len(),
+                "DSv4 MTP frozen-KV target layer {target_layer_idx} outside slot {slot_id} \
+                 attention len {}",
+                slots[slot_id].attention.len()
+            );
+        }
+        // Per-slot device start_pos (one H2D per slot, mirroring the single-slot
+        // path's `pos_dev`). Kept alive for the whole attention loop.
+        let mut pos_devs = Vec::with_capacity(n);
+        for &pos in positions {
+            pos_devs.push(
+                ctx.stream
+                    .clone_htod(&[pos as i32])
+                    .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?,
+            );
+        }
+
+        let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
+        let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::hc::mhc_pre_rms_norm(
+            ctx,
+            &stream,
+            &attn_mhc.pre,
+            &layer.attn_norm,
+            eps,
+            hidden_size,
+            hc_mult,
+            &mut attn_normed,
+        )?;
+        keepalive.keep_hidden(&attn_normed);
+        // SAFETY: each [s..s+1) row block of attn_out is written by the copy-out
+        // below before attn_out is read by hc_post.
+        let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        {
+            let _nvtx = crate::nvtx::range("dsv4/mtp_draft_attn_per_slot");
+            let mut normed_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+            let mut attn_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+            keepalive.keep_hidden(&normed_row);
+            keepalive.keep_hidden(&attn_row);
+            for s in 0..n {
+                let src = attn_normed
+                    .data
+                    .slice(s * hidden_size..(s + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&src, &mut normed_row.data)
+                    .map_err(|e| anyhow!("DSv4 MTP batched attn copy-in failed: {e}"))?;
+                // Borrow the layer pool + dsa shared per slot (the SAME borrow
+                // pattern forward_decode_batch_verify uses inside its slot loop):
+                // resolve the kv_adapter layer FIRST, then take the mutable slot
+                // borrow, so the two borrows don't collide.
+                let (layer_pool, dsa_shared) =
+                    kv_adapter.layer_and_dsa_shared_mut(target_layer_idx)?;
+                let slot = &mut slots[slot_ids[s]];
+                crate::attention::mla_attention(
+                    ctx,
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                    layer.compress_ratio,
+                    target_layer_idx,
+                    &normed_row,
+                    &mut slot.attention[target_layer_idx],
+                    layer_pool,
+                    dsa_shared,
+                    positions[s] as usize,
+                    Some(&pos_devs[s]),
+                    None,
+                    &self.tp,
+                    &mut attn_row,
+                    &mut keepalive,
+                )?;
+                let mut dst = attn_out
+                    .data
+                    .slice_mut(s * hidden_size..(s + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&attn_row.data, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 MTP batched attn copy-out failed: {e}"))?;
+            }
+        }
+        self.tp.all_reduce_sum(ctx, &mut attn_out)?;
+        let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
+        crate::hc::hc_post(
+            ctx,
+            &attn_out,
+            &stream,
+            &attn_mhc.post,
+            &attn_mhc.comb,
+            hidden_size,
+            hc_mult,
+            &mut attn_stream,
+        )?;
+        keepalive.keep_hidden(&attn_out);
+        keepalive.keep_hidden(&attn_stream);
+
+        // ── MoE half over the N-slot batch (the amortized win — same grouped
+        // forward as the single-slot path, now N rows instead of 1).
+        let ffn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)?;
+        let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::hc::mhc_pre_rms_norm(
+            ctx,
+            &attn_stream,
+            &ffn_mhc.pre,
+            &layer.ffn_norm,
+            eps,
+            hidden_size,
+            hc_mult,
+            &mut ffn_normed,
+        )?;
+        keepalive.keep_hidden(&ffn_normed);
+        let level_tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+        let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::moe::dsv4_moe_forward(
+            self,
+            &layer.moe,
+            &level_tokens,
+            &ffn_normed,
+            &mut moe_out,
+            None,
+            &mut keepalive,
+        )?;
+        self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::moe::dsv4_shared_expert_forward(
+            ctx,
+            &ctx.stream,
+            &layer.moe,
+            &ffn_normed,
+            &mut shared,
+            self.config.swiglu_limit,
+            None,
+            &mut keepalive,
+        )?;
+        let mut moe_with_shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        crate::ops::add_batch(ctx, &moe_out, &shared, &mut moe_with_shared)?;
+        let mut ffn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
+        crate::hc::hc_post(
+            ctx,
+            &moe_with_shared,
+            &attn_stream,
+            &ffn_mhc.post,
+            &ffn_mhc.comb,
+            hidden_size,
+            hc_mult,
+            &mut ffn_stream,
+        )?;
+        keepalive.keep_hidden(&moe_out);
+        keepalive.keep_hidden(&shared);
+        keepalive.keep_hidden(&moe_with_shared);
+        keepalive.keep_hidden(&ffn_stream);
+
+        // ── Head: per-row HC fold + norm, batched lm_head, device argmax.
+        let mut head_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
+        {
+            let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
+            let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
+            for r in 0..m {
+                crate::hc::head_hidden_from_stream(
+                    ctx,
+                    &self.config,
+                    &mtp.head_hc,
+                    &ffn_stream,
+                    r,
+                    &mut last_hidden,
+                )?;
+                crate::ops::rms_norm_vec(ctx, &last_hidden, &mtp.norm, eps, &mut last_normed)?;
+                let mut dst = head_normed
+                    .data
+                    .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                ctx.stream
+                    .memcpy_dtod(&last_normed.data, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 MTP head row copy failed: {e}"))?;
+            }
+        }
+        keepalive.keep_hidden(&head_normed);
+        let mut logits = unsafe { HiddenStates::uninit(ctx, self.lm_head.rows, m)? };
+        self.lm_head_project_batch(&head_normed, &mut logits)?;
+        keepalive.keep_hidden(&logits);
+        let candidates = self.mtp_argmax_batch(&logits)?;
+        std::hint::black_box(keepalive.len());
+        drop(keepalive);
+
+        // Split the level stream into per-slot owned vecs (each slot chains the
+        // next level from its OWN row only — no cross-slot aliasing).
+        ensure!(
+            candidates.len() == n,
+            "DSv4 batched MTP level produced {} tokens for {n} slots",
+            candidates.len()
+        );
+        let mut out = Vec::with_capacity(n);
+        for (r, cand) in candidates.into_iter().enumerate() {
+            let mut row_stream = DeviceVec::zeros(ctx, stream_dim)?;
+            let src = ffn_stream.data.slice(r * stream_dim..(r + 1) * stream_dim);
+            ctx.stream
+                .memcpy_dtod(&src, &mut row_stream.data)
+                .map_err(|e| anyhow!("DSv4 MTP stream row split failed: {e}"))?;
+            out.push((cand, row_stream));
+        }
+        Ok(out)
+    }
+
     /// Batched lm_head: `[m, hidden] → [m, vocab]`. FP8/FP4 block-scaled use
     /// the batched GEMM path directly; dense BF16 falls back to per-row GEMV.
     fn lm_head_project_batch(&self, x: &HiddenStates, out: &mut HiddenStates) -> Result<()> {
@@ -4588,6 +4931,20 @@ pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
 pub(crate) fn dsv4_batched_mtp_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_BATCHED_MTP").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Lever 2a sub-gate: batch the per-slot DRAFT chain across N slots (one
+/// `mtp_forward_level_batched` per depth level instead of N × single-slot
+/// `mtp_forward_level`), amortizing the MTP-head MoE over the N slots. Default
+/// OFF — with the env unset `spec_step_batched` keeps the proven per-slot
+/// `draft_chain` loop (byte-identical to today), so the A/B isolates lever 2a
+/// alone. Only consulted on the batched path (`ARLE_DSV4_BATCHED_MTP=1`).
+/// bench/correctness pending pod-verify (license-or-kill per the bench spec).
+pub(crate) fn dsv4_batched_mtp_draft_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_BATCHED_MTP_DRAFT").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
