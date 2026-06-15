@@ -37,6 +37,14 @@ fn parse_temperature(value: &str) -> Result<f32, String> {
     Ok(parsed)
 }
 
+fn parse_positive_temperature(value: &str) -> Result<f32, String> {
+    let parsed = parse_temperature(value)?;
+    if parsed <= 0.0 {
+        return Err("temperature must be > 0.0".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum TracePromptsMode {
     On,
@@ -635,6 +643,10 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_enum, default_value_t = KlDirectionArg::Forward)]
     pub(crate) kl_direction: KlDirectionArg,
 
+    /// KL softening temperature (>0). Values other than 1.0 are pure-OPD only.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_temperature)]
+    pub(crate) kl_temperature: f32,
+
     /// Total OPD training steps.
     #[arg(long, default_value_t = 5)]
     pub(crate) steps: usize,
@@ -745,6 +757,10 @@ pub(crate) struct TrainSelfOpdArgs {
     /// KL objective direction: forward = KL(teacher||student), reverse = KL(student||teacher).
     #[arg(long, value_enum, default_value_t = KlDirectionArg::Forward)]
     pub(crate) kl_direction: KlDirectionArg,
+
+    /// KL softening temperature (>0). Values other than 1.0 are pure-OPD only.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_temperature)]
+    pub(crate) kl_temperature: f32,
 
     /// Total SOPD training steps.
     #[arg(long, default_value_t = 5)]
@@ -1096,6 +1112,8 @@ mod tests {
             "/tmp/opd-save",
             "--save-every",
             "5",
+            "--kl-temperature",
+            "2.0",
         ])
         .expect("pure OPD eval flags should parse");
         let Some(CliCommand::Train(train)) = args.command else {
@@ -1107,6 +1125,7 @@ mod tests {
         assert_eq!(opd.eval_ids.as_deref(), Some("1,2,3"));
         assert_eq!(opd.gate_every_n, 5);
         assert_eq!(opd.gkd_lambda, 0.0);
+        assert_eq!(opd.kl_temperature, 2.0);
         assert_eq!(opd.lora_rank, 16);
         assert_eq!(opd.lora_alpha, 32.0);
         assert_eq!(opd.lora_target_set, "attention-qv");
@@ -1142,6 +1161,23 @@ mod tests {
             Some(std::path::Path::new("/tmp/self-opd-save"))
         );
         assert_eq!(opd.save_every, 3);
+        assert_eq!(opd.kl_temperature, 1.0);
+    }
+
+    #[test]
+    fn rejects_train_opd_non_positive_kl_temperature() {
+        let err = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--kl-temperature",
+            "0",
+        ])
+        .err()
+        .expect("zero KL temperature should be rejected");
+        assert!(err.to_string().contains("temperature must be > 0.0"));
     }
 
     #[test]

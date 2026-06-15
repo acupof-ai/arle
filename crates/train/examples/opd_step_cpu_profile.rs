@@ -187,6 +187,7 @@ fn profiled_opd_step<O: Optimizer>(
             student_logits,
             teacher_logits,
             rollout.len(),
+            1.0,
             KlDirection::Forward,
             store,
             tape,

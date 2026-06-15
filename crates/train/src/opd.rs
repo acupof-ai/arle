@@ -213,6 +213,7 @@ pub struct GkdLossConfig<'a> {
     pub corpus_tokens: Option<&'a [u32]>,
     pub kl_chunk_size: Option<usize>,
     pub kl_direction: KlDirection,
+    pub kl_temperature: f32,
     pub logits_window_size: Option<usize>,
     pub kl_mask: OpdKlMask,
 }
@@ -225,6 +226,7 @@ impl Default for GkdLossConfig<'_> {
             corpus_tokens: None,
             kl_chunk_size: Some(DEFAULT_KL_CHUNK_SIZE),
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
         }
@@ -798,6 +800,24 @@ fn validate_gkd_lambda(gkd_lambda: f32) -> Result<()> {
 
 fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
     validate_gkd_lambda(config.lambda)?;
+    if !config.kl_temperature.is_finite() || config.kl_temperature <= 0.0 {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD KL temperature must be finite and > 0.0, got {}. Hint: use \
+             --kl-temperature 1.0 for the baseline KL loss or a positive value \
+             for pure-OPD temperature softening.",
+            config.kl_temperature
+        )));
+    }
+    if config.kl_temperature != 1.0 && config.lambda > 0.0 {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD KL temperature is a pure-OPD lever only: got \
+             kl_temperature={} with gkd_lambda={}. The SFT anchor is deliberately \
+             1/vocab-scale-matched to the KL term, so T^2 KL compensation would \
+             silently reweight the (1-lambda)KL + lambda*SFT blend. Set \
+             --gkd-lambda 0.0 or --kl-temperature 1.0.",
+            config.kl_temperature, config.lambda
+        )));
+    }
     if config.kl_chunk_size == Some(0) {
         return Err(OpdError::InvalidInput(
             "OPD KL chunk size must be > 0 when set. Hint: pass \
@@ -838,6 +858,7 @@ fn kl_distill_loss_for_config(
     num_positions: usize,
     kl_chunk_size: Option<usize>,
     kl_direction: KlDirection,
+    kl_temperature: f32,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -847,6 +868,7 @@ fn kl_distill_loss_for_config(
             teacher_logits,
             num_positions,
             chunk_size,
+            kl_temperature,
             kl_direction,
             store,
             tape,
@@ -856,6 +878,7 @@ fn kl_distill_loss_for_config(
             student_logits,
             teacher_logits,
             num_positions,
+            kl_temperature,
             kl_direction,
             store,
             tape,
@@ -973,6 +996,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     chunk_size: usize,
     kl_mask: OpdKlMask,
     kl_direction: KlDirection,
+    kl_temperature: f32,
     student_model_params: &[TensorId],
     keep_extra: &HashSet<TensorId>,
     store: &mut TensorStore,
@@ -1124,6 +1148,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         teacher_kl,
         kl_range.len(),
         chunk_size,
+        kl_temperature,
         kl_direction,
         store,
         tape,
@@ -1575,6 +1600,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
                 window.len(),
                 gkd_config.kl_chunk_size,
                 gkd_config.kl_direction,
+                gkd_config.kl_temperature,
                 store,
                 tape,
             )?;
@@ -1764,7 +1790,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
 /// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
 /// 3. Forward `student` on the full rollout (tape enabled).
-/// 4. `kl_distill_loss(student_logits, teacher_logits, rollout.len(), …)`.
+/// 4. `kl_distill_loss(student_logits, teacher_logits, rollout.len(), 1.0, …)`.
 /// 5. Backward + grad-clip + optimizer step.
 /// 6. Clear ephemeral tensors so the next step starts from a clean store.
 pub fn opd_step<O: Optimizer>(
@@ -2219,6 +2245,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 chunk_size,
                 gkd_config.kl_mask,
                 gkd_config.kl_direction,
+                gkd_config.kl_temperature,
                 &student_model_params,
                 &keep_extra,
                 store,
@@ -2344,6 +2371,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             kl_range.len(),
             gkd_config.kl_chunk_size,
             gkd_config.kl_direction,
+            gkd_config.kl_temperature,
             store,
             tape,
         )?;
@@ -2649,6 +2677,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2665,6 +2694,7 @@ mod tests {
             corpus_tokens: Some(&[]),
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2680,6 +2710,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2690,6 +2721,7 @@ mod tests {
             corpus_tokens: Some(&[1, 2]),
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2704,6 +2736,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: Some(0),
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -2718,6 +2751,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_gkd_loss_config_rejects_temperature_with_sft_blend() {
+        let err = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.5,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 2.0,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
+        })
+        .expect_err("KL temperature must not silently reweight GKD SFT blend");
+
+        let OpdError::InvalidInput(message) = err else {
+            panic!("expected InvalidInput, got {err:?}");
+        };
+        assert!(message.contains("pure-OPD"));
+        assert!(message.contains("1/vocab"));
+        assert!(message.contains("T^2"));
+        assert!(message.contains("--gkd-lambda 0.0"));
+
+        validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 2.0,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
+        })
+        .expect("KL temperature should be accepted for pure OPD");
+    }
+
+    #[test]
     fn validate_gkd_loss_config_rejects_zero_logits_window_size() {
         let err = validate_gkd_loss_config(GkdLossConfig {
             lambda: 0.0,
@@ -2725,6 +2793,7 @@ mod tests {
             corpus_tokens: None,
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
             logits_window_size: Some(0),
             kl_mask: OpdKlMask::Full,
         })
@@ -2785,6 +2854,7 @@ mod tests {
             2,
             Some(1),
             KlDirection::Forward,
+            1.0,
             &mut store,
             &mut tape,
         )

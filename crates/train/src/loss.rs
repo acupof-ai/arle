@@ -43,11 +43,17 @@ pub fn kl_distill_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
     num_positions: usize,
+    temperature: f32,
     direction: KlDirection,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
     validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
+    validate_kl_temperature(temperature)?;
+    let inv_temperature = 1.0 / temperature;
+    let temperature_sq = temperature * temperature;
+    let teacher_logits = mul_scalar(teacher_logits, inv_temperature, store, tape)?;
+    let student_logits = mul_scalar(student_logits, inv_temperature, store, tape)?;
     match direction {
         KlDirection::Forward => {
             let teacher_probs = softmax(teacher_logits, store, tape)?;
@@ -61,7 +67,7 @@ pub fn kl_distill_loss(
             // pick up the same device-resident fast paths instead of routing
             // through `sum_backward`'s untested scalar broadcast.
             let avg = mean(weighted, store, tape)?;
-            mul_scalar(avg, -1.0, store, tape)
+            mul_scalar(avg, -temperature_sq, store, tape)
         }
         KlDirection::Reverse => {
             let student_probs = softmax(student_logits, store, tape)?;
@@ -71,7 +77,8 @@ pub fn kl_distill_loss(
             let q_logp = mul(student_probs, teacher_log_probs, store, tape)?;
             let neg_q_logp = mul_scalar(q_logp, -1.0, store, tape)?;
             let elem = add(q_logq, neg_q_logp, store, tape)?;
-            mean(elem, store, tape)
+            let avg = mean(elem, store, tape)?;
+            mul_scalar(avg, temperature_sq, store, tape)
         }
     }
 }
@@ -89,11 +96,15 @@ pub fn kl_distill_loss_chunked(
     teacher_logits: TensorId,
     num_positions: usize,
     chunk_size: usize,
+    temperature: f32,
     direction: KlDirection,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let shape = validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
+    validate_kl_temperature(temperature)?;
+    let inv_temperature = 1.0 / temperature;
+    let temperature_sq = temperature * temperature;
     if chunk_size == 0 {
         return Err(AutogradError::TapeInvariant(
             "kl_distill_loss_chunked: chunk_size must be > 0. \
@@ -133,6 +144,8 @@ pub fn kl_distill_loss_chunked(
 
         let teacher_chunk = slice(teacher_logits, &starts, &ends, store, tape)?;
         let student_chunk = slice(student_logits, &starts, &ends, store, tape)?;
+        let teacher_chunk = mul_scalar(teacher_chunk, inv_temperature, store, tape)?;
+        let student_chunk = mul_scalar(student_chunk, inv_temperature, store, tape)?;
         let chunk_avg = match direction {
             KlDirection::Forward => {
                 let teacher_probs = softmax(teacher_chunk, store, tape)?;
@@ -162,9 +175,20 @@ pub fn kl_distill_loss_chunked(
         "kl_distill_loss_chunked: no chunks were produced",
     ))?;
     match direction {
-        KlDirection::Forward => mul_scalar(total, -1.0, store, tape),
-        KlDirection::Reverse => Ok(total),
+        KlDirection::Forward => mul_scalar(total, -temperature_sq, store, tape),
+        KlDirection::Reverse => mul_scalar(total, temperature_sq, store, tape),
     }
+}
+
+fn validate_kl_temperature(temperature: f32) -> Result<()> {
+    if temperature.is_finite() && temperature > 0.0 {
+        return Ok(());
+    }
+    Err(AutogradError::TapeInvariant(
+        "kl_distill_loss: temperature must be finite and > 0.0. \
+         Hint: use 1.0 for baseline KL or a positive value for opt-in \
+         pure-OPD temperature softening.",
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +302,24 @@ mod tests {
         chunk_size: Option<usize>,
         direction: KlDirection,
     ) -> (f32, Vec<f32>) {
+        loss_and_student_grad_with_temperature(
+            student_logits,
+            teacher_logits,
+            shape,
+            chunk_size,
+            1.0,
+            direction,
+        )
+    }
+
+    fn loss_and_student_grad_with_temperature(
+        student_logits: &[f32],
+        teacher_logits: &[f32],
+        shape: &[usize],
+        chunk_size: Option<usize>,
+        temperature: f32,
+        direction: KlDirection,
+    ) -> (f32, Vec<f32>) {
         let mut store = TensorStore::default();
         let mut tape = Tape::new();
         let student = store.alloc(
@@ -294,6 +336,7 @@ mod tests {
                 teacher,
                 num_positions,
                 chunk_size,
+                temperature,
                 direction,
                 &mut store,
                 &mut tape,
@@ -302,12 +345,63 @@ mod tests {
                 student,
                 teacher,
                 num_positions,
+                temperature,
                 direction,
                 &mut store,
                 &mut tape,
             ),
         }
         .expect("kl loss");
+        let loss_value = store.to_host(loss).expect("loss host value")[0];
+        tape.backward(loss, &mut store).expect("backward");
+
+        let grad = store
+            .get(student)
+            .and_then(|tensor| tensor.grad)
+            .expect("student logits gradient");
+        let grad_values = store.to_host(grad).expect("gradient host value");
+        (loss_value, grad_values)
+    }
+
+    fn untempered_loss_and_student_grad(
+        student_logits: &[f32],
+        teacher_logits: &[f32],
+        shape: &[usize],
+        direction: KlDirection,
+    ) -> (f32, Vec<f32>) {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let student = store.alloc(
+            Tensor::new(student_logits.to_vec(), shape.to_vec(), true).expect("student logits"),
+        );
+        let teacher = store.alloc(
+            Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
+        );
+        let loss = match direction {
+            KlDirection::Forward => {
+                let teacher_probs = softmax(teacher, &mut store, &mut tape).expect("teacher probs");
+                let student_log_probs =
+                    log_softmax(student, &mut store, &mut tape).expect("student log probs");
+                let weighted =
+                    mul(teacher_probs, student_log_probs, &mut store, &mut tape).expect("weighted");
+                let avg = mean(weighted, &mut store, &mut tape).expect("mean");
+                mul_scalar(avg, -1.0, &mut store, &mut tape).expect("forward loss")
+            }
+            KlDirection::Reverse => {
+                let student_probs = softmax(student, &mut store, &mut tape).expect("student probs");
+                let student_log_probs =
+                    log_softmax(student, &mut store, &mut tape).expect("student log probs");
+                let teacher_log_probs =
+                    log_softmax(teacher, &mut store, &mut tape).expect("teacher log probs");
+                let q_logq =
+                    mul(student_probs, student_log_probs, &mut store, &mut tape).expect("q log q");
+                let q_logp =
+                    mul(student_probs, teacher_log_probs, &mut store, &mut tape).expect("q log p");
+                let neg_q_logp = mul_scalar(q_logp, -1.0, &mut store, &mut tape).expect("-q log p");
+                let elem = add(q_logq, neg_q_logp, &mut store, &mut tape).expect("reverse elem");
+                mean(elem, &mut store, &mut tape).expect("reverse loss")
+            }
+        };
         let loss_value = store.to_host(loss).expect("loss host value")[0];
         tape.backward(loss, &mut store).expect("backward");
 
@@ -367,6 +461,7 @@ mod tests {
             student,
             teacher,
             num_positions,
+            1.0,
             direction,
             &mut store,
             &mut tape,
@@ -533,6 +628,94 @@ mod tests {
             grad.iter().all(|value| value.is_finite()),
             "chunk_size=1 gradient must be finite"
         );
+    }
+
+    #[test]
+    fn kl_temperature_one_is_byte_identical_to_untempered_forward_and_reverse() {
+        let shape = [2, 3, 5];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 37);
+        let teacher_logits = deterministic_logits(len, 43);
+
+        for direction in [KlDirection::Forward, KlDirection::Reverse] {
+            let (baseline_loss, baseline_grad) = untempered_loss_and_student_grad(
+                &student_logits,
+                &teacher_logits,
+                &shape,
+                direction,
+            );
+            let (temperature_one_loss, temperature_one_grad) =
+                loss_and_student_grad_with_temperature(
+                    &student_logits,
+                    &teacher_logits,
+                    &shape,
+                    None,
+                    1.0,
+                    direction,
+                );
+
+            assert_eq!(
+                temperature_one_loss.to_bits(),
+                baseline_loss.to_bits(),
+                "temperature=1.0 loss must be byte-identical for {direction:?}"
+            );
+            assert_eq!(
+                temperature_one_grad.len(),
+                baseline_grad.len(),
+                "temperature=1.0 gradient len mismatch for {direction:?}"
+            );
+            for (idx, (&actual, &expected)) in temperature_one_grad
+                .iter()
+                .zip(baseline_grad.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "temperature=1.0 grad[{idx}] must be byte-identical for {direction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_kl_matches_baseline_with_temperature() {
+        let shape = [1, 17, 31];
+        let len = shape.iter().product();
+        let student_logits = deterministic_logits(len, 47);
+        let teacher_logits = deterministic_logits(len, 53);
+
+        for direction in [KlDirection::Forward, KlDirection::Reverse] {
+            let (baseline_loss, baseline_grad) = loss_and_student_grad_with_temperature(
+                &student_logits,
+                &teacher_logits,
+                &shape,
+                None,
+                2.0,
+                direction,
+            );
+            let (chunked_loss, chunked_grad) = loss_and_student_grad_with_temperature(
+                &student_logits,
+                &teacher_logits,
+                &shape,
+                Some(5),
+                2.0,
+                direction,
+            );
+
+            assert_close(
+                baseline_loss,
+                chunked_loss,
+                1.0e-5,
+                &format!("temperature=2 chunked loss {direction:?}"),
+            );
+            assert_slice_close(
+                &baseline_grad,
+                &chunked_grad,
+                1.0e-5,
+                &format!("temperature=2 chunked student gradient {direction:?}"),
+            );
+        }
     }
 
     #[test]
