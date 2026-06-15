@@ -248,6 +248,11 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                     trace_writer.as_ref(),
                 )?
             }
+            Some(run_args) if !run_args.image.is_empty() => {
+                anyhow::bail!(
+                    "run --image requires --prompt or --stdin; in REPL use /image <path-or-url>"
+                )
+            }
             Some(run_args) => repl::run_repl(
                 &mut engine,
                 &backend_name,
