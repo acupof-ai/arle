@@ -67,6 +67,19 @@ host loop runs once (was N×); the fold compute stays per-slot but launches batc
    doesn't make this a wash (the verify won big because its MoE COMPUTE batched; here the
    draft/commit compute is small + per-slot — is the launch/loop amortization enough?).
 
+## Code-read resolution (2026-06-15, before codex)
+- **DRAFT amortizes a real MoE → GOOD ROI.** `mtp_forward_level` (dsv4.rs) is a FULL
+  transformer layer: `mla_attention` + `dsv4_moe_forward` (weight-read-bound) + shared
+  expert + all-reduce. So batching the draft over N slots amortizes the MoE — the SAME
+  reason the verify won. Draft 15.5ms (n=4, fully serial today) → expect a verify-class
+  amortization. **This is the bulk of lever 2's win.**
+- **COMMIT is attention/KV-only → MODEST ROI.** `commit_layer_fold` (attention.rs:3670)
+  = compressor/indexer ingestion + ring-K writes, **no MoE**. Batching only amortizes
+  launches + the 60-layer host loop; the per-slot compressor compute stays per-slot.
+  Commit 18.5ms → smaller gain. **Do the draft first (MoE win); commit is the follow-on.**
+- Revised priority: **2a = batched draft (MoE-amortizing, verify-class win); 2b =
+  batched commit (launch/loop amortization, modest).** Measure 2a alone before 2b.
+
 ## Verification
 decode-read coherence c≥4 + needle + matched A/B (lever-2 vs lever-1-only, same binary,
 `ARLE_DSV4_BATCHED_MTP_LEVER2` sub-gate) @c=8/12. Phase profile re-run to confirm
