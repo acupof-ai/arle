@@ -58,3 +58,14 @@ node 192.168.12.61 (8×H20, isolated from eic-test): build on .62 (1.95.0
 toolchain), nc-transfer binary to .61, serve + `scripts/dsv4_concurrent_probe.py`
 c-sweep + needle. Stage attribution: the per-step-vs-batch slope is the metric
 (`ARLE_DSV4_MTP_STEP_PROFILE` verify-ms-vs-n, or nsys rank-0 short window).
+
+## R1 measured (2026-06-16, decode-phase probe, spec-off, short-prompt+256-decode, c=64→n=22)
+| stage | n=5 | n=22 | scaling | verdict |
+|---|---|---|---|---|
+| csa_attn (else per-row `mla_attention`, ~21 CSA layers) | 28ms | **119.6ms** | ~linear 5.5ms/row | **#1 — batch this** |
+| sw_attn (batched lane prepare+fwd+finish, ~20 SW layers) | 17ms | 67ms | ~linear 3ms/row | #2 (prepare/finish per-row) |
+| moe | 30ms | 47ms | **sub-linear** (1.57×/4.4×) | OK, amortizes — not the target |
+Attention = ~80% of step, ~linear in n; MoE amortizes. Also: decode batch capped ~n=22 at c=64 (scheduler/stagger; secondary).
+
+## R2 plan (CSA → existing batched lane, NOT a from-scratch kernel)
+The batched-index infra for CSA already exists but is orphaned: `build_indices_batched(selected_ptr)` (attention.rs) takes the CSA per-row topk `selected`; `decode_lane_fwd` is the batched sparse attention. The per-row `mla_attention_prepare` already produces `Dsv4MlaPrepared.selected` for CSA. Increment: drop the `layer.mode != CompressedSparse` gate (dsv4.rs:1994), feed each row's `selected` into `build_indices_batched`, route CSA's compressed-cache pack/read through the batched lane. Per-row prepare (indexer topk) + finish stay per-row for now; the sparse-attention KERNEL batches → expect csa_attn ~119→~70ms (matches SW). R3 = batch the per-row prepare projection GEMMs (m=1→m=N) for all layers.
