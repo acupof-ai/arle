@@ -5043,15 +5043,19 @@ pub(crate) fn dsv4_batched_mtp_enabled() -> bool {
 
 /// Lever 2a sub-gate: batch the per-slot DRAFT chain across N slots (one
 /// `mtp_forward_level_batched` per depth level instead of N × single-slot
-/// `mtp_forward_level`), amortizing the MTP-head MoE over the N slots. Default
-/// OFF — with the env unset `spec_step_batched` keeps the proven per-slot
-/// `draft_chain` loop (byte-identical to today), so the A/B isolates lever 2a
-/// alone. Only consulted on the batched path (`ARLE_DSV4_BATCHED_MTP=1`).
-/// bench/correctness pending pod-verify (license-or-kill per the bench spec).
+/// `mtp_forward_level`). The per-slot draft fires N× (m=1) lm_head GEMMs per
+/// step — each re-reads the full ~1 GB bf16 vocab weight; batching collapses
+/// them to ONE (m=N) cuBLAS GEMM (one weight read). Default ON (2026-06-15):
+/// licensed +6.8% @c=8 / +11.1% @c=16 (same-binary A/B, cross-contam=0) once
+/// `5d6eb0da` made the batched lm_head a real GEMM — the earlier "marginal"
+/// verdict was measured while `lm_head_project_batch` still looped per-row, so
+/// batching the slots saved nothing on the lm_head. Opt out with
+/// `ARLE_DSV4_BATCHED_MTP_DRAFT=0` (falls back to the proven per-slot
+/// `draft_chain`). Only consulted on the batched path (`ARLE_DSV4_BATCHED_MTP=1`).
 pub(crate) fn dsv4_batched_mtp_draft_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ARLE_DSV4_BATCHED_MTP_DRAFT").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
     )
 }
 
