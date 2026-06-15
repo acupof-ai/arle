@@ -212,6 +212,63 @@ fn opd_step_runs_end_to_end() {
     );
 }
 
+fn pure_chunked_kl_opd_loss(direction: KlDirection) -> f32 {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let teacher = InProcessTeacher::new(&teacher);
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+
+    opd_step_with_teacher_forward_profiled_gkd_anchor(
+        &student,
+        &teacher,
+        &[1, 3, 8],
+        OpdStepConfig {
+            rollout_len: 0,
+            rollout_sampling: None,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+        GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: Some(1),
+            kl_direction: direction,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::Full,
+        },
+        #[cfg(feature = "cuda")]
+        None,
+        None,
+    )
+    .expect("pure chunked KL OPD step runs")
+    .loss
+}
+
+#[test]
+fn opd_step_pure_chunked_kl_honors_reverse_direction() {
+    let forward = pure_chunked_kl_opd_loss(KlDirection::Forward);
+    let reverse = pure_chunked_kl_opd_loss(KlDirection::Reverse);
+
+    assert!(
+        forward > 1.0e-4,
+        "forward KL surrogate should retain teacher entropy constant, got {forward:.10e}"
+    );
+    assert!(
+        reverse.abs() <= 1.0e-6,
+        "identical teacher/student reverse KL should be zero, got {reverse:.10e}; \
+         this catches the pure chunked rollout path hardcoding Forward"
+    );
+}
+
 #[test]
 fn opd_backward_profile_env_preserves_windowed_gkd_loss() {
     let _guard = OPD_BACKWARD_PROFILE_ENV_LOCK
