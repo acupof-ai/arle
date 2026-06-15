@@ -194,6 +194,26 @@ The numeric decode tables (`decode_f8_e4m3fn`, `decode_fp4_e2m1`) are pure Rust,
 authored once, and **shared** by loader-side scale validation and kernel reference
 tests — one source of truth for E4M3/E2M1.
 
+### Scale-decode ABI × kernel FFI (line-level — author before P4)
+
+The existing GEMV FFI is single-level, 1-byte scale, `decode_e8m0` baked in:
+`dsv4_fp8_gemv_batch_cuda(weight:*u8, scales:*u8, input:*Half, output:*mut Half, B, N, K, scale_rows, scale_cols, stream)`.
+"Parameterize the scale-decode" therefore **changes the FFI signature per ABI** — it is
+not just a device-function swap. Each row is one kernel instantiation + one launcher:
+
+| ScaleAbi | weight | scale buffer | `scale_rows × scale_cols` | decode | apply | global arg | FFI launcher |
+|----------|--------|--------------|---------------------------|--------|-------|-----------|--------------|
+| `E8M0Block` (DSv4) | u8 E4M3 / packed E2M1 | `*u8` (1B) | `N/blk_m × K/blk_k` (2D) | `decode_e8m0` | × | — | existing `dsv4_fp{8,4}_*` (unchanged) |
+| `Fp32InvBlock` (Qwen FP8, 128²) | u8 E4M3 | `*f32` (4B) | `N/128 × K/128` (2D) | identity-f32 | **÷** *(or pre-reciprocal at load → ×)* | — | **new** `gemv_fp8_blockinv_*` |
+| `Fp8PerShard` (ModelOpt FP8) | u8 E4M3 | `*f32` (4B) | `shards × 1` | identity-f32 | × | — | reuse `gemv_fp8_blockinv_*` (scale_cols=1) |
+| `Fp8E4M3Group+Global` (NVFP4) | u8 (2× E2M1) | `*u8` E4M3 (1B) | `N × K/16` (1D group along K) | `decode_e4m3` | × | **`*f32` scalar/per-shard** | **new** `gemv_fp4_group_*` |
+
+Locked in P1/P2: **pre-reciprocal the FP8 inverse-block scale at load** so the kernel
+always multiplies (one apply-op for every ABI) — confirm no precision loss vs ÷.
+`Fp8PerShard` is `Fp32InvBlock` with `scale_cols=1`, so it needs no new kernel. NVFP4's
+`global` is one extra pointer arg; the rest reuses the FP4 kernel body. The `*_pair_batch`
+(gate+up) and `*_route_gemv_*` (MoE) variants take the same per-ABI treatment.
+
 ## Generic subsystem & model onboarding (the "通用 / 无缝接入" axis)
 
 The variation axis across DSv4 / Qwen-FP8 / Qwen-NVFP4 / INT-affine is the **scale
@@ -230,7 +250,28 @@ a new model:**
    format; TP-shard alignment rejects).
 4. Run §Verification Gates. A model whose ABIs already exist needs only steps 1–3.
 
+## Opt-in & activation policy (baseline stays byte-identical)
+
+- **Auto-selected, not a manual flag.** The quant path is chosen from the checkpoint's
+  `quantization_config` at load. A non-quant (BF16) checkpoint takes the existing path
+  **byte-for-byte unchanged** — no quant code on its hot path. Kill-switch
+  `ARLE_DISABLE_RESIDENT_QUANT=1` makes the loader reject a quant checkpoint (fail closed)
+  rather than silently materialize — there is no BF16-materialize fallback.
+- **v1 is weight-only.** Weights dequant inside the operator; **activations stay BF16**
+  (`input_scale` is read + stored but not applied). This is the correctness-safe superset:
+  BF16 activations × dequant-BF16 weights is *more* precise than the calibrated W4A4/W8A8,
+  so it is the numerical reference. The executor must **not** implement dynamic activation
+  quantization in v1 — a kernel that would need it fails closed naming the tensor.
+- True activation quant (to reach FP8/FP4 tensor cores) is a Blackwell/`sm_90+` lane,
+  explicitly deferred.
+
 ## File-Level Implementation
+
+Dependency DAG / critical path: **P1 blocks everything** (no ABI assumption survives it),
+then `P2 → P3 → P4 → P5 → P6`; `P7` follows P4 (reuses the P4 ScaleAbi kernels) and `P8`
+follows P6 (needs a working quant forward to A/B against). P2 (pure-Rust codec/registry)
+and the P3 `WeightFormat`/`DeviceMatrix` scaffolding parallelize once P1 lands; the kernel
+work (P4) is the long pole. P0 is done.
 
 ### P0 — Restore a compiling tree (done 2026-06-15)
 
@@ -256,7 +297,14 @@ Files: none (produces a facts note appended to this plan).
 - Read the real Qwen3.6 FP8 and NVFP4 checkpoint safetensors headers + each
   `config.json` `quantization_config`. Enumerate every `*.weight`, `*.weight_scale*`
   tensor: dtype, shape, scale block/group shape, inverse-or-direct, per-shard-or-scalar.
-- Resolve every open item in §Format Contracts. No assumption survives into P2.
+- **Expert-tensor layout (blocks P3/P6/P7).** Record the exact rank/shape of
+  `experts.gate_up_proj` / `experts.down_proj` (fused `[E, 2·I_moe, H]` or split? row-major?)
+  and **whether the matching `weight_scale*` tensors are stacked per-expert `[E, …]`** — the
+  per-expert slice must cut weight and scale together on the E axis.
+- **Both ignore-lists.** Record the un-quantized tensor set for FP8 *and* NVFP4 separately
+  (they may differ); this is the P6 `QuantWeightMap` ground truth.
+- Resolve every open item in §Format Contracts, incl. the inverse-vs-÷ / pre-reciprocal
+  decision in the §Scale-decode ABI table. No assumption survives into P2.
 - Confirm the §Budget numbers: exact total/active param count, exact scale overhead,
   exact resident bytes per format, recomputed decode ceiling.
 
@@ -366,11 +414,21 @@ contract is added.)
 
 OPD/LoRA: `remerge_student_lora` fails closed for resident quant matrices in v1.
 
+Instrumentation (feeds Hard Acceptance): the loader accumulates resident bytes per
+`WeightFormat` plus a `dense_materialized_weight_bytes` total (must stay 0 for quant
+ckpts), logged once at engine-ready. This is the runtime proof that no dense BF16
+expansion happened — not an inference.
+
 ### P7 — MoE: extend `moe_bf16_grouped_gemm_*`
 
 Files: `crates/infer-cuda/src/moe.rs`, `crates/infer-cuda/src/loader.rs`,
 `crates/cuda-kernels/csrc/gemm/moe_grouped_gemm.cu`
 
+- **R-band selector (mirror the BF16 one in `moe.rs`, do not invent).** The quant path
+  reuses the existing routed-row thresholds: `R ≤ 256` → quant `route_gemv` decode
+  (+ `pair_batch` for gate/up); `R > 256` → quant grouped GEMM; the `R ≥ 1024` DeepGEMM
+  band is **disabled** for quant (Hopper FP8-tensor-core lane, not A100). Confirm the 256
+  crossover still holds for the quant kernels in the P7 A/B.
 - **Decode-shape routed experts**: route through the **already-existing**
   `dsv4_fp{8,4}_route_gemv_*` / `*_pair_batch` family in `quantized_gemv.cu` — same
   P4 `ScaleAbi` parameterization (these are the kernels `moe.rs:30`'s "W4 follow-up"
@@ -418,6 +476,14 @@ Pure (CPU, `--features no-cuda`):
   `Fp4E2M1Group`; TP shard rejects unaligned NVFP4 column shards
 - **round-trip**: kernel-reference dequant == loader-validation dequant, sharing the
   P2 LUT (catches a divergent second table)
+- fixture helper `fake_quant_safetensors(format, shape, scales)` — writes a minimal
+  safetensors + `quantization_config` with the sibling scale tensors, so the loader tests
+  above run with no real checkpoint.
+
+DSv4 regression (the byte-identity proof for P4): **before** touching `quantized_gemv.cu`,
+capture greedy decode for a fixed prompt + fixed seed on a DSv4 FP8 checkpoint into a
+committed reference; the P4 acceptance re-runs it and asserts byte-equality (the E8M0
+instantiation must be untouched).
 
 Kernel (A100):
 
@@ -466,12 +532,16 @@ scripts/bench_guidellm.sh qwen36-cuda-native-quant-a100 \
 - Serve log prints resident bytes by format: FP8, NVFP4, BF16.
 - `strings target/release/arle | grep -E 'gemv_fp8|gemv_fp4|route_gemv|marlin.*fp4'`
   finds the linked quant kernels.
-- DSv4 regression: post-P4 output byte-identical to pre-P4 (the E8M0 path unchanged).
-- FP8 checkpoint passes serve + curl smoke + MMLU-50 plumbing.
-- NVFP4 checkpoint passes serve + curl smoke + MMLU-50 plumbing.
-- No throughput claim until `guidellm` completes; no default prefill-path flip
-  without the P8 A/B.
-- No capability claim from MMLU-50 or SWE Pro limit-3 (plumbing only).
+- DSv4 regression: post-P4 output byte-identical to pre-P4 (the E8M0 path unchanged),
+  via the saved fixed-prompt fixed-seed greedy reference captured before P4 (see §Tests).
+- **Correctness gate = `scripts/needle_gate.py`**, not MMLU: needle ladder ×3 same-config
+  repeats inside the baseline envelope for FP8 and NVFP4 (per CLAUDE.md KV-parity gate —
+  needle + same-config-twice + self-consistency, NOT byte-vs-BF16, which MoE
+  non-determinism confounds).
+- FP8 and NVFP4 each pass serve + curl + the needle gate; MMLU-50 / SWE-Pro limit-3 are
+  **plumbing checks only** (the pipe works), never a capability claim.
+- No throughput claim until `guidellm` completes; no default prefill-path flip without
+  the P8 A/B.
 
 ## Commit Policy
 
