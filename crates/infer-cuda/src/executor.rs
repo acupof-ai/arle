@@ -958,65 +958,6 @@ pub(crate) struct Dsv4CudaExecutor {
     /// byte-budget cap (CudaKvTierStore reuse) is the follow-up tracked in
     /// docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md.
     slot_swap_store: std::collections::BTreeMap<u64, Dsv4SlotSwapEntry>,
-    /// `ARLE_DSV4_STEP_PROFILE=1` evidence probe (measurement runs only):
-    /// per plain-decode step, `fwd` = `forward_tokens` wall (GPU forward +
-    /// NCCL spin + sampling D2H) and `gap` = host time between this step's
-    /// entry and the previous step's exit (engine scheduler / detok / HTTP /
-    /// lockstep IPC — everything above the executor). Rolling report every
-    /// 100 steps names which side of the executor boundary holds a TPOT gap.
-    step_profile: Option<StepProfileProbe>,
-}
-
-struct StepProfileProbe {
-    last_exit: Option<std::time::Instant>,
-    fwd_ms: Vec<f64>,
-    gap_ms: Vec<f64>,
-}
-
-impl StepProfileProbe {
-    fn from_env() -> Option<Self> {
-        (std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1")).then(|| {
-            // Arm the per-stage collector too when its env is set — the serve
-            // path has no other driver for it (only the parity example had).
-            crate::set_dsv4_stage_profile_active(true);
-            StepProfileProbe {
-                last_exit: None,
-                fwd_ms: Vec::with_capacity(128),
-                gap_ms: Vec::with_capacity(128),
-            }
-        })
-    }
-
-    fn record(&mut self, entry: std::time::Instant, exit: std::time::Instant) {
-        if let Some(prev) = self.last_exit {
-            self.gap_ms.push((entry - prev).as_secs_f64() * 1000.0);
-        }
-        self.fwd_ms.push((exit - entry).as_secs_f64() * 1000.0);
-        self.last_exit = Some(exit);
-        if self.fwd_ms.len() >= 100 {
-            let stats = |v: &mut Vec<f64>| {
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let med = v[v.len() / 2];
-                let mean = v.iter().sum::<f64>() / v.len() as f64;
-                (mean, med)
-            };
-            let wall_ms: f64 = self.fwd_ms.iter().sum();
-            let (fm, fp50) = stats(&mut self.fwd_ms);
-            let (gm, gp50) = stats(&mut self.gap_ms);
-            eprintln!(
-                "[step-profile] n=100 fwd mean={fm:.3}ms p50={fp50:.3}ms | gap mean={gm:.3}ms p50={gp50:.3}ms | period~{:.3}ms",
-                fm + gm
-            );
-            // Per-stage attribution rides the same flush when
-            // ARLE_DSV4_STAGE_PROFILE is also set (host_ms names the launch
-            // knife per labeled stage; rank-0 print only).
-            crate::print_dsv4_stage_profile("decode", 100, wall_ms);
-            crate::reset_dsv4_stage_profile();
-            crate::set_dsv4_stage_profile_active(true);
-            self.fwd_ms.clear();
-            self.gap_ms.clear();
-        }
-    }
 }
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
@@ -1291,11 +1232,10 @@ fn validate_dsv4_prefill_kv_view(
     Ok(())
 }
 
-/// Opt-in for the layer-major batched DSv4 decode path. CLI-fronted as
-/// `arle serve --dsv4-batched-decode` (serve.rs exports the env pre-spawn so
-/// multiproc workers inherit it); setting the env var directly remains a
-/// harness shim. Default OFF keeps the per-row decode loop as the
-/// byte-identical correctness reference.
+/// Gate for the layer-major batched DSv4 decode path. Default ON since the
+/// 2026-06-15 N=4 flip (see the in-body note), so the `arle serve
+/// --dsv4-batched-decode` CLI flag is now a no-op — the lane is on by default.
+/// Force the per-row byte-identical reference with `INFER_DSV4_BATCHED_DECODE=0`.
 fn dsv4_batched_decode_enabled() -> bool {
     // Default ON (2026-06-15 N=4 flip): the no-MTP decode path auto-batches at
     // `rows >= dsv4_batched_decode_min_rows()`. `--spec-type` defaults to None, so
@@ -1369,7 +1309,6 @@ impl Dsv4CudaExecutor {
             mtp_accepts: 0,
             mtp_rejects: 0,
             slot_swap_store: std::collections::BTreeMap::new(),
-            step_profile: StepProfileProbe::from_env(),
         })
     }
 
@@ -1514,7 +1453,6 @@ impl Dsv4CudaExecutor {
         position: u64,
     ) -> Result<Vec<u32>> {
         if !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled()) {
-            let entry = std::time::Instant::now();
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1523,9 +1461,6 @@ impl Dsv4CudaExecutor {
                 params,
                 position,
             )?;
-            if let Some(probe) = self.step_profile.as_mut() {
-                probe.record(entry, std::time::Instant::now());
-            }
             self.model.dump_mtp_rollback_state(
                 &self.slots[slot_idx],
                 "nonspec_after_forward",

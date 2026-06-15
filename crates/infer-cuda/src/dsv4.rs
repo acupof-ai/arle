@@ -51,12 +51,6 @@ pub(crate) struct Dsv4MlaKvArena {
 /// NoPE=448 / RoPE=64 shape (`dsv4_fp8_kv_pack` doc).
 const DSV4_FLASH_KV_BYTES_PER_TOKEN: usize = 584;
 const DSV4_FLASH_PAGE_BLOCK_SIZE: usize = 64;
-/// DEBUG numerical-diff harness (`INFER_DSV4_BATCHED_NUMDIFF`) exceedance
-/// threshold for `max|batched − per-row-reference|` of the RAW FlashMLA output.
-/// The reference shares the gathered Q + packed KV with the batch, so on a
-/// correct kernel the b=1 and b=N outputs agree to the bit; 0.05 ignores only
-/// the bf16 round-trip floor and flags any real per-row mis-attribution.
-const NUMDIFF_THRESH: f32 = 0.05;
 
 impl Dsv4MlaKvArena {
     fn from_config(config: &DeepSeekV4Config) -> Result<Self> {
@@ -1555,22 +1549,11 @@ impl Dsv4Model {
             );
         }
 
-        // ARLE_DSV4_STEP_PROFILE inner decomposition (decode only, rank 0):
-        // `layers` = stream_impl wall — pure host launch time of the whole
-        // layer stack (no sync inside), so layers ≈ fwd means the host can't
-        // feed the GPU fast enough; `tail` = lm_head + sampling wall, which
-        // contains the only sync and absorbs whatever the GPU still owes.
-        let prof = seq_len == 1
-            && self.tp.config().rank == 0
-            && std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1");
-        let t0 = std::time::Instant::now();
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
-        let t_layers = t0.elapsed();
         if let Some(out) = last_hidden_out {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
-        let t1 = std::time::Instant::now();
         let token = self.forward_stream_last_token(
             &stream,
             seq_len,
@@ -1579,22 +1562,6 @@ impl Dsv4Model {
             None,
             &mut keepalive,
         )?;
-        if prof {
-            static ACC: std::sync::Mutex<(f64, f64, u32)> = std::sync::Mutex::new((0.0, 0.0, 0));
-            let mut acc = ACC.lock().unwrap();
-            acc.0 += t_layers.as_secs_f64() * 1000.0;
-            acc.1 += t1.elapsed().as_secs_f64() * 1000.0;
-            acc.2 += 1;
-            if acc.2 >= 100 {
-                eprintln!(
-                    "[step-profile-inner] n={} layers-launch mean={:.3}ms tail(lm_head+sample) mean={:.3}ms",
-                    acc.2,
-                    acc.0 / acc.2 as f64,
-                    acc.1 / acc.2 as f64
-                );
-                *acc = (0.0, 0.0, 0);
-            }
-        }
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
@@ -1641,7 +1608,7 @@ impl Dsv4Model {
 
         // Batched verify: ONE multi-row forward amortizes the weight read
         // (proven +63%). The ONLY path that can express a tree schedule.
-        if dsv4_mtp_batched_verify_enabled() && tokens.len() >= 2 {
+        if tokens.len() >= 2 {
             let stream_dim = self.config.hidden_size * self.config.hc_mult;
             // `hiddens[j]` = row j's MTP stream; `argmax[j]` = the target's
             // argmax AFTER `tokens[j]` (so `argmax[i]` is exactly what an
@@ -1727,10 +1694,13 @@ impl Dsv4Model {
             return Ok((argmax, hiddens));
         }
 
+        // Single-token fallback (tokens.len() < 2): a tree schedule can only be
+        // expressed by the batched verify above, so this per-row path must be a
+        // chain.
         ensure!(
             sched.is_chain(),
-            "DSv4 spec tree verify requires the batched verify path \
-             (ARLE_DSV4_MTP_BATCHED_VERIFY disabled?)"
+            "DSv4 spec tree verify requires the batched verify path (single-token \
+             fallback only handles chain schedules)"
         );
         let mut argmax_tokens = Vec::with_capacity(tokens.len());
         let mut hiddens = Vec::with_capacity(tokens.len());
@@ -1922,63 +1892,6 @@ impl Dsv4Model {
         keepalive.keep_hidden(&attn_out_row);
         // MoE/shared are now grouped over [N] (Phase 6a) — no per-row MoE scratch.
 
-        // Localization probe: all rows have identical inputs, so every intermediate
-        // must be row-identical. Print the first (layer, half) where rows diverge.
-        let probe = std::env::var_os("INFER_DSV4_BATCH_PROBE").is_some()
-            && self.tp.config().rank == 0
-            && n >= 2;
-        // DEBUG numerical-diff harness gate (INFER_DSV4_BATCHED_NUMDIFF, default
-        // off): rank-0 only, batched lane only. Cheap (cached env check) when off.
-        let numdiff_on =
-            crate::attention::dsv4_batched_numdiff_enabled() && self.tp.config().rank == 0;
-        let probe_rows = |label: &str, hs: &HiddenStates, layer_idx: usize| -> Result<()> {
-            if !probe {
-                return Ok(());
-            }
-            // FULL-VECTOR max-abs-diff of each row vs row0. All rows share an
-            // identical prompt, so at decode step 1 every element must be
-            // bit-identical. elem0-only is blind: hc_pre mixes hc_mult lanes and
-            // rms_norm reduces over the whole hidden vector, so a divergence at
-            // ANY element propagates. This finds the true first (layer, stage,
-            // element) of divergence.
-            let dim = hs.hidden_dim;
-            let host: Vec<half::bf16> = self
-                .ctx
-                .stream
-                .clone_dtoh(&hs.data)
-                .map_err(|e| anyhow!("DSv4 batch probe D2H failed: {e}"))?;
-            let mut global_max = 0.0f32;
-            let mut worst_r = 0usize;
-            let mut worst_i = 0usize;
-            let per_row: Vec<String> = (1..n)
-                .map(|r| {
-                    let mut m = 0.0f32;
-                    for i in 0..dim {
-                        let d = (host[r * dim + i].to_f32() - host[i].to_f32()).abs();
-                        if d > m {
-                            m = d;
-                        }
-                        if d > global_max {
-                            global_max = d;
-                            worst_r = r;
-                            worst_i = i;
-                        }
-                    }
-                    format!("{m:.6}")
-                })
-                .collect();
-            // Report the first 3 layers always (to confirm clean baseline), plus
-            // any later stage that diverges above bf16 round-trip noise.
-            if (layer_idx < 3 && start_positions[0] == 5) || global_max > 1e-4 {
-                eprintln!(
-                    "[batch-vdiff] start_pos={} L{layer_idx} {label}: maxdiff_vs_row0=[{}] worst(r={worst_r},i={worst_i})={global_max:.6}",
-                    start_positions[0],
-                    per_row.join(", "),
-                );
-            }
-            Ok(())
-        };
-
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
@@ -1999,7 +1912,6 @@ impl Dsv4Model {
                 &mut normed,
             )?;
             keepalive.keep_hidden(&normed);
-            probe_rows("norm_in", &normed, layer_idx)?;
 
             // ── Attention: per-row independent single-token MLA into row r.
             // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
@@ -2122,34 +2034,6 @@ impl Dsv4Model {
                         n,
                         sm_scale,
                     )?;
-                    // DEBUG numerical-diff harness (INFER_DSV4_BATCHED_NUMDIFF,
-                    // default off): for each row, recompute the KNOWN-CORRECT
-                    // per-row (b=1) FlashMLA reference over the SAME packed KV +
-                    // SAME gathered Q, then diff the RAW batched output (pre
-                    // out-slice / inverse-rope / O-LoRA / all-reduce) against it.
-                    // rank-0 only — mirrors the BATCH_PROBE gating. Read-only of
-                    // the pool/ring/slot (no re-pack, no double-mutation); writes
-                    // only the dedicated ref_* scratch.
-                    if numdiff_on {
-                        for r in 0..n {
-                            flash_batch.numdiff_row(
-                                &self.ctx,
-                                &self.config,
-                                &layer.attention,
-                                layer_pool,
-                                layer_idx,
-                                layer.mode,
-                                layer.compress_ratio,
-                                r,
-                                n,
-                                slot_ids[r],
-                                start_positions[r],
-                                slot_block_offsets[r],
-                                sm_scale,
-                                NUMDIFF_THRESH,
-                            )?;
-                        }
-                    }
                 }
                 // ── 3. per-row slice-out → inverse-rope + SW-update → O-LoRA.
                 {
@@ -2201,7 +2085,6 @@ impl Dsv4Model {
                             &mut slot.attention[layer_idx],
                             &p.local_attn,
                             1,
-                            &layer.attention.wo_a,
                             &mut keepalive,
                             &mut attn_out_row,
                         )?;
@@ -2255,10 +2138,6 @@ impl Dsv4Model {
                 }
             }
             keepalive.keep_hidden(&attn_out);
-            // Probe the RAW per-row attention output (pre all-reduce, pre hc_post):
-            // this is a per-row single-column kernel, so identical inputs MUST give
-            // bit-identical rows. Divergence here = real logic bug, not numerics.
-            probe_rows("attn_raw", &attn_out, layer_idx)?;
             // Row-parallel O-LoRA: one all-reduce over [N, hidden]. NOT bit-identical
             // to N per-row all-reduces: NCCL tiles a [hidden,N] message differently
             // than N×[hidden,1], so identical-input rows pick up ~1 bf16 ULP of
@@ -2267,9 +2146,6 @@ impl Dsv4Model {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
             }
-            // Probe POST-all-reduce (pre hc_post): isolates the all-reduce as the
-            // divergence seed vs the per-token hc_post (which cannot cross rows).
-            probe_rows("attn_ar", &attn_out, layer_idx)?;
             // SAFETY: hc_post writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             crate::hc::hc_post(
@@ -2284,7 +2160,6 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
-            probe_rows("attn", &stream, layer_idx)?;
 
             // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
             let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
@@ -2419,18 +2294,12 @@ impl Dsv4Model {
                     &mut keepalive,
                 )?;
                 keepalive.keep_hidden(&moe_out);
-                // Probe the RAW per-row MoE output (pre all-reduce): like attn_raw,
-                // the per-row single-token MoE must be bit-identical across
-                // identical rows. (allreduce arm only — the deepep arm's pre-gather
-                // buffer is owned-cols-sparse by construction.)
-                probe_rows("moe_raw", &moe_out, layer_idx)?;
                 // Routed experts are EP-sharded → sum, then add the replicated
                 // shared expert once per rank. One all-reduce over [N, hidden].
                 let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
             }
             keepalive.keep_hidden(&moe_out);
-            probe_rows("moe_ar", &moe_out, layer_idx)?;
             // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path,
             // decode_scratch=None) — one batched SwiGLU GEMM pair, replacing the
             // per-row loop + N host syncs.
@@ -2465,17 +2334,6 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
-            probe_rows("moe", &stream, layer_idx)?;
-        }
-
-        // DEBUG numdiff harness: emit the one-line pinpoint summary (first
-        // smallest-layer/smallest-row exceedance) for this forward, then reset.
-        if numdiff_on {
-            if let (_layer_pool, _dsa, Some(flash_batch)) =
-                kv_adapter.layer_dsa_and_flashmla_batch_mut(0)?
-            {
-                flash_batch.numdiff_flush_summary();
-            }
         }
 
         for r in 0..n {
@@ -2989,21 +2847,6 @@ impl Dsv4Model {
         let eps = self.config.rms_norm_eps;
         let ctx = &self.ctx;
 
-        // Tail decomposition (decode hunt): backlog-drain sync + per-op laps.
-        let tprof = seq_len == 1
-            && self.tp.config().rank == 0
-            && std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1");
-        let mut tail_ms = [0f64; 5];
-        let mut tlap = std::time::Instant::now();
-        let mut lapf = |i: usize, tlap: &mut std::time::Instant| {
-            if tprof {
-                let _ = self.ctx.sync();
-                tail_ms[i] = tlap.elapsed().as_secs_f64() * 1000.0;
-                *tlap = std::time::Instant::now();
-            }
-        };
-        lapf(0, &mut tlap);
-
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
         // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
@@ -3017,7 +2860,6 @@ impl Dsv4Model {
                 &mut last_hidden,
             )
         })?;
-        lapf(1, &mut tlap);
         keepalive.keep_hidden(stream);
         keepalive.keep_vec(&last_hidden);
         if let Some(out) = last_hidden_out {
@@ -3037,39 +2879,15 @@ impl Dsv4Model {
         crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
             crate::ops::rms_norm_vec(ctx, &last_hidden, &self.norm, eps, &mut last_normed)
         })?;
-        lapf(2, &mut tlap);
         keepalive.keep_vec(&last_normed);
         let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
         crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
             self.lm_head_project(&last_normed, &mut logits)
         })?;
         keepalive.keep_vec(&logits);
-        lapf(3, &mut tlap);
         let token = crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
             crate::executor::sample_cuda_token(ctx, &logits, params, position)
         })?;
-        if tprof {
-            tail_ms[4] = tlap.elapsed().as_secs_f64() * 1000.0;
-            static TACC: std::sync::Mutex<([f64; 5], u32)> = std::sync::Mutex::new(([0.0; 5], 0));
-            let mut acc = TACC.lock().unwrap();
-            for i in 0..5 {
-                acc.0[i] += tail_ms[i];
-            }
-            acc.1 += 1;
-            if acc.1 >= 100 {
-                let n = acc.1 as f64;
-                eprintln!(
-                    "[step-profile-tail] n={} backlog={:.3} head_hc={:.3} head_norm={:.3} lm_head={:.3} sample={:.3} ms",
-                    acc.1,
-                    acc.0[0] / n,
-                    acc.0[1] / n,
-                    acc.0[2] / n,
-                    acc.0[3] / n,
-                    acc.0[4] / n
-                );
-                *acc = ([0.0; 5], 0);
-            }
-        }
         Ok(token)
     }
 
@@ -3217,11 +3035,10 @@ impl Dsv4Model {
         } else {
             (None, None, None)
         };
-        // Tree-verify chunks default to the BATCHED tree-attention lane: one
+        // Tree-verify chunks take the BATCHED tree-attention lane: one
         // FlashMLA sparse forward per layer with per-row positions + branch
         // indices, zero ring writes (the kill of the per-row launch cost —
-        // fast-path plan P1). `ARLE_DSV4_MTP_TREE_ATTN=0` falls back to the
-        // per-row ring-replay lane (the needle-validated reference).
+        // fast-path plan P1).
         // CHAIN-shaped spec verifies take this lane too under the commit fold
         // (ckl's minimal scheme: top-1 chain prediction, candidates checked by
         // comparison only — no wide rows) — but ONLY when the schedule carries
@@ -3229,12 +3046,7 @@ impl Dsv4Model {
         // selftests) has empty ancestors and MUST stay per-row, both for the
         // attention prefix and because the commit re-forward must WRITE rings.
         let tree_meta = match verify {
-            Some(sched)
-                if seq_len > 1
-                    && dsv4_mtp_tree_attn_enabled()
-                    && sched.ancestors.iter().skip(1).all(|a| !a.is_empty())
-                    && (!sched.is_chain() || dsv4_mtp_commit_fold_enabled()) =>
-            {
+            Some(sched) if seq_len > 1 && sched.ancestors.iter().skip(1).all(|a| !a.is_empty()) => {
                 Some(crate::attention::Dsv4TreeAttnMeta::new(
                     &self.ctx,
                     &sched.positions,
@@ -3243,14 +3055,8 @@ impl Dsv4Model {
             }
             _ => None,
         };
-        // Step-profile sub-buckets (decode hunt): pure-host launch wall of the
-        // attention half vs the MoE half, summed across layers. Plain Instant
-        // arithmetic — no syncs, no events, no measurable distortion.
-        let mut prof_attn_ms = 0f64;
-        let mut prof_moe_ms = 0f64;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
-            let prof_t0 = std::time::Instant::now();
             // ── Attention half: HC-wrap MLA attention.
             let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
                 crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
@@ -3282,19 +3088,17 @@ impl Dsv4Model {
                 // mla_attention (FlashMLA sparse fwd inside), host start_pos,
                 // no ring writes, no per-row replay.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_tree_batch");
-                // P2 commit fold: persist this layer's attn-normed rows so the
-                // commit can re-ingest the accepted prefix without a second
-                // full forward.
-                if dsv4_mtp_commit_fold_enabled() {
-                    if let Some(cache) = slot.spec_normed.as_mut() {
-                        let rows = seq_len * hidden_size;
-                        let src = normed.data.slice(0..rows);
-                        let mut dst = cache[layer_idx].data.slice_mut(0..rows);
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(&src, &mut dst)
-                            .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
-                    }
+                // P2 commit fold (always on): persist this layer's attn-normed
+                // rows so the commit can re-ingest the accepted prefix without a
+                // second full forward.
+                if let Some(cache) = slot.spec_normed.as_mut() {
+                    let rows = seq_len * hidden_size;
+                    let src = normed.data.slice(0..rows);
+                    let mut dst = cache[layer_idx].data.slice_mut(0..rows);
+                    self.ctx
+                        .stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
                 }
                 let (layer_pool, dsa_shared) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 crate::attention::mla_attention(
@@ -3425,8 +3229,6 @@ impl Dsv4Model {
             })?;
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
-            prof_attn_ms += prof_t0.elapsed().as_secs_f64() * 1000.0;
-            let prof_t1 = std::time::Instant::now();
 
             // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
             let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
@@ -3723,26 +3525,6 @@ impl Dsv4Model {
             drop(nvtx_shared_hc);
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
-            prof_moe_ms += prof_t1.elapsed().as_secs_f64() * 1000.0;
-        }
-        if seq_len == 1
-            && self.tp.config().rank == 0
-            && std::env::var("ARLE_DSV4_STEP_PROFILE").as_deref() == Ok("1")
-        {
-            static SUB: std::sync::Mutex<(f64, f64, u32)> = std::sync::Mutex::new((0.0, 0.0, 0));
-            let mut sub = SUB.lock().unwrap();
-            sub.0 += prof_attn_ms;
-            sub.1 += prof_moe_ms;
-            sub.2 += 1;
-            if sub.2 >= 100 {
-                eprintln!(
-                    "[step-profile-sub] n={} attn-half host mean={:.3}ms moe-half host mean={:.3}ms",
-                    sub.2,
-                    sub.0 / sub.2 as f64,
-                    sub.1 / sub.2 as f64
-                );
-                *sub = (0.0, 0.0, 0);
-            }
         }
 
         slot.seq_len += seq_len;
@@ -4987,32 +4769,11 @@ pub(crate) fn dsv4_spec_decode_enabled() -> bool {
     )
 }
 
-/// Batch the MTP verify over [pending, draft] in one 2-token forward (amortizes the
-/// 149GB weight read). Default ON: validated 2026-06-08 on the TP=8 pod — with the
-/// executor batched-reject, the FULL spec decode is BYTE-IDENTICAL to non-spec on
-/// needle AND capital while running +61/+70% (needle 39.9→64.2, capital 38.2→65.0
-/// tok/s; decode ~27→~16ms). The earlier col1 "divergence" was a selftest artifact
-/// (the bonus on a forced-reject draft, which real decode discards) + the per-token
-/// reject mis-applied to the batched path; both resolved. Only matters when
-/// ARLE_DSV4_SPEC_DECODE is on. Locked default-on (licensed; pure scheduling over
-/// already-compiled kernels — no build dependency, not an A/B knob).
-pub(crate) fn dsv4_mtp_batched_verify_enabled() -> bool {
-    true
-}
-
-/// Batched tree-attention verify lane (fast-path plan P1): locked default-on
-/// (licensed; the per-row ring-replay reference lane stays in code as the
-/// non-tree-chunk path, just no longer env-selectable).
-pub(crate) fn dsv4_mtp_tree_attn_enabled() -> bool {
-    true
-}
-
 /// P2 commit fold (fast-path plan): commit the accepted prefix from persisted
-/// verify rows instead of a second full forward. **Default ON** — licensed
+/// verify rows instead of a second full forward. **Always on** — licensed
 /// 2026-06-13 on the FP8+NUMA base: d2 chain-fold needle 512/2048/6000 PASS
-/// (same envelope) + 53.3 tok/s B=1 (+20% vs 44.5 no-spec). Opt out with
-/// `ARLE_DSV4_MTP_COMMIT_FOLD=0`. Requires the batched tree lane (default ON;
-/// the persist hook lives there), so the gate is `fold && tree_attn`.
+/// (same envelope) + 53.3 tok/s B=1 (+20% vs 44.5 no-spec). The batched tree
+/// lane that holds the persist hook is always on too, so this is unconditional.
 pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
     true
 }
