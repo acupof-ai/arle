@@ -32,6 +32,8 @@ KL_DIRECTION="${KL_DIRECTION:-forward}"
 KL_TEMPERATURE="${KL_TEMPERATURE:-1.0}"
 KL_MASK="${KL_MASK:-completion}"
 LR="${LR:-2e-5}"
+LR_SCHEDULE="${LR_SCHEDULE:-cosine}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-}"
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
@@ -85,6 +87,10 @@ fi
 [[ "$STEPS" =~ ^[0-9]+$ ]] || die "STEPS must be an integer"
 [[ "$SAVE_EVERY" =~ ^[0-9]+$ ]] || die "SAVE_EVERY must be an integer"
 [[ "$STEPS" -gt 0 ]] || die "STEPS must be > 0 for the capability run"
+if [[ -z "$LR_WARMUP_STEPS" ]]; then
+  LR_WARMUP_STEPS=$(((STEPS * 3 + 99) / 100))
+fi
+[[ "$LR_WARMUP_STEPS" =~ ^[0-9]+$ ]] || die "LR_WARMUP_STEPS must be an integer"
 
 if [[ "$BUILD_ARLE" == "1" && "$ARLE_BIN" == "$ROOT/target/release/arle" ]]; then
   log "building arle release CUDA binary"
@@ -96,6 +102,7 @@ log "run_root=$RUN_ROOT"
 log "student=$STUDENT_MODEL"
 log "teacher=$TEACHER_MODEL"
 log "prompts=$PROMPTS_FILE"
+log "lr_schedule=$LR_SCHEDULE warmup_steps=$LR_WARMUP_STEPS"
 log "checkpoints=$CHECKPOINT_DIR"
 
 write_manifest() {
@@ -203,6 +210,8 @@ if [[ "$RUN_TRAIN" == "1" ]]; then
     --kl-mask "$KL_MASK"
     --gkd-lambda 0.0
     --lr "$LR"
+    --lr-schedule "$LR_SCHEDULE"
+    --lr-warmup-steps "$LR_WARMUP_STEPS"
     --grad-clip "$GRAD_CLIP"
     --lora-rank "$LORA_RANK"
     --lora-alpha "$LORA_ALPHA"
