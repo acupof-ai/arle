@@ -28,6 +28,10 @@ use crate::tp::TpRuntime;
 
 const DSV4_FLASHMLA_MODEL1: i32 = 1;
 const DSV4_FLASHMLA_S_Q: usize = 1;
+/// Packed bytes per token the FlashMLA sparse-FP8 decode reads for the canonical
+/// MODEL1 NoPE=448 / RoPE=64 shape (validated against `kv_arena.bytes_per_token`
+/// in `Dsv4FlashMlaDecodeState::new`).
+const DSV4_FLASH_KV_BYTES_PER_TOKEN_I32: i32 = 584;
 const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
 const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
 const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
@@ -36,13 +40,12 @@ static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVE
 static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 
 /// Batched (`b = N`) FlashMLA sparse decode lane (#60, the #1 concurrency
-/// lever). Default OFF: the n>1 decode path keeps the byte-identical per-row
-/// `try_flashmla_decode_attention` loop until the pod licenses the batched
-/// kernel on a c-sweep (correctness ladder + aggregate-rises-with-c). When ON,
-/// the n>1 lane routes attention through ONE `sparse_decode_fwd(b=N)` over the
-/// shared KV pool (the per-row pack ops stay a loop — each writes one slot's KV
-/// into the unified pool). N=1 is unaffected (always the cached-meta single-row
-/// path).
+/// lever). Default ON since 2026-06-15; opt out with
+/// `ARLE_DSV4_FLASHMLA_DECODE_BATCHED=0`. The n>1 lane routes attention through
+/// ONE `sparse_decode_fwd(b=N)` over the shared KV pool (the per-row pack ops
+/// stay a loop — each writes one slot's KV into the unified pool); the per-row
+/// `try_flashmla_decode_attention` loop remains the opt-out reference. N=1 is
+/// unaffected (always the cached-meta single-row path).
 static DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 
 pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
@@ -61,15 +64,6 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
         None => DSV4_FLASHMLA_OVERRIDE_ENV,
     };
     DSV4_FUSED_WQKV_DECODE_OVERRIDE.store(value, Ordering::Relaxed);
-}
-
-pub(crate) fn set_dsv4_flashmla_decode_batched_override(enabled: Option<bool>) {
-    let value = match enabled {
-        Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
-        Some(false) => DSV4_FLASHMLA_OVERRIDE_OFF,
-        None => DSV4_FLASHMLA_OVERRIDE_ENV,
-    };
-    DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
 static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
@@ -1119,12 +1113,6 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     /// mode), indexed by layer. The batched build_indices / fwd read the
     /// engaged layer's shape; stored here so the dsv4 loop needs only `layer_idx`.
     layer_shapes: Vec<Dsv4FlashMlaDecodeShape>,
-    /// DEBUG-ONLY numerical-diff reference scratch (`INFER_DSV4_BATCHED_NUMDIFF`),
-    /// lazily allocated on first use so the default path pays nothing. Holds the
-    /// dedicated `ref_*` buffers a per-row `b=1` reference fwd writes — kept
-    /// SEPARATE from the live batched `indices`/`sched_meta`/`out_batched` so the
-    /// numdiff never perturbs the batched lane's own state. See [`Self::numdiff_row`].
-    numdiff: Option<Dsv4NumDiffRefScratch>,
     max_batch: usize,
     max_topk_unified: usize,
     /// Global heads (64/128); PHASE B: row stride `h_q*head_dim` of the
@@ -1132,53 +1120,9 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     h_q: usize,
     /// PHASE B: `h_q_d` row stride component.
     head_dim: usize,
-    /// `num_sm_parts + max_batch` — total split rows in the shared accum scratch
-    /// (sizes `lse_accum`/`o_accum` at construction; kept for the alloc rationale).
-    #[allow(dead_code)]
-    accum_splits_max: usize,
     num_sm_parts: i32,
     fixed_overhead_num_blocks: i32,
     block_size_topk: i32,
-}
-
-/// DEBUG-ONLY (`INFER_DSV4_BATCHED_NUMDIFF`) scratch for the per-row `b=1`
-/// FlashMLA reference fwd. Every buffer mirrors the matching live batched buffer
-/// but is sized for ONE row, so the numdiff reference can run a `b=1` decode over
-/// the SAME packed KV + SAME gathered Q WITHOUT touching the live batched
-/// `indices`/`sched_meta`/`num_splits`/`out_batched` (which still hold the b=N
-/// state). All read-only of the pool/ring/slot; the only writes land here.
-///
-/// §0.1 buffer enumeration (every mutated device buffer + disposition):
-/// - `ref_indices` `[max_topk_unified]` i32 — written by the `b=1` indices build
-///   each numdiff_row; consumed by the reference fwd. Scratch-only, never read by
-///   the production path.
-/// - `ref_topk_length` `[1]` i32 — written by the `b=1` indices build; read by
-///   sched_meta. Scratch-only.
-/// - `ref_sched_meta` `[num_sm_parts_max*8]` i32 — written by `b=1` sched_meta;
-///   read by the reference fwd. Scratch-only.
-/// - `ref_num_splits` `[2]` i32 — written by `b=1` sched_meta; read by the fwd.
-/// - `ref_lse_out` `[h_q]` f32, `ref_lse_accum` `[(num_sm_parts_max+1)*h_q]` f32,
-///   `ref_o_accum` `[(num_sm_parts_max+1)*h_q*head_dim]` f32 — split-KV accums
-///   the reference fwd writes. Scratch-only.
-/// - `ref_out` `[h_q*head_dim]` bf16 — the reference global-head output the host
-///   diff reads. Scratch-only.
-/// - `ref_start_pos` / `ref_block_off` `[1]` i32 — re-upload row r's
-///   `start_pos[r]` / `slot_block_offsets[r]` into element 0 so the `b=1` builder
-///   sees this row at batch-index 0. Scratch-only.
-struct Dsv4NumDiffRefScratch {
-    ref_indices: CudaSlice<i32>,
-    ref_topk_length: CudaSlice<i32>,
-    ref_start_pos: CudaSlice<i32>,
-    ref_block_off: CudaSlice<i32>,
-    ref_sched_meta: CudaSlice<i32>,
-    ref_num_splits: CudaSlice<i32>,
-    ref_lse_out: CudaSlice<f32>,
-    ref_lse_accum: CudaSlice<f32>,
-    ref_o_accum: CudaSlice<f32>,
-    ref_out: CudaSlice<half::bf16>,
-    /// First (smallest-layer, then smallest-row) exceedance seen this forward —
-    /// the pinpoint summary line. `(layer, row, slot, start_pos, maxdiff, worst_i)`.
-    first_exceedance: Option<(usize, usize, usize, usize, f32, usize)>,
 }
 
 impl Dsv4FlashMlaDecodeBatchScratch {
@@ -1259,14 +1203,10 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 .stream
                 .alloc_zeros::<half::bf16>(max_batch * tp_gather_cols)?,
             layer_shapes: layer_shapes.to_vec(),
-            // DEBUG numdiff scratch: lazily allocated on first numdiff_row call
-            // (gated by INFER_DSV4_BATCHED_NUMDIFF). None in the default path.
-            numdiff: None,
             max_batch,
             max_topk_unified,
             h_q,
             head_dim,
-            accum_splits_max,
             num_sm_parts,
             fixed_overhead_num_blocks,
             block_size_topk,
@@ -1500,7 +1440,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         );
         let global_heads = shape.h_q;
         let head_dim = config.head_dim;
-        let bytes_per_token = 584_i32;
+        let bytes_per_token = DSV4_FLASH_KV_BYTES_PER_TOKEN_I32;
         let stride_kv_block_bytes = 64_i32 * bytes_per_token;
         let stride_q = (global_heads * head_dim) as i32; // per-row Q stride (s_q=1)
         let stride_o = stride_q;
@@ -1789,315 +1729,6 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         self.sparse_decode_fwd_batched(
             ctx, n, config, &shape, q_ptr, pool_ptr, sink_ptr, out_ptr, sm_scale,
         )
-    }
-
-    /// DEBUG-ONLY (`INFER_DSV4_BATCHED_NUMDIFF`) numerical diff for row `r`.
-    ///
-    /// Re-computes the KNOWN-CORRECT per-row (`b=1`) FlashMLA reference output
-    /// for row `r` over the IDENTICAL inputs the batched fwd just consumed — the
-    /// already-packed shared KV pool, the already-gathered `q_batched[r]`, the
-    /// attn sink — building this row's `b=1` indices/sched_meta into the dedicated
-    /// `ref_*` scratch (never the live batched buffers), then diffs the batched
-    /// raw global-head output `out_batched[r]` against the reference `ref_out`.
-    ///
-    /// The diff is taken on the RAW FlashMLA kernel output — BEFORE the per-row
-    /// TP out-slice, inverse-rope, O-LoRA, and the attention all-reduce — so NO
-    /// legitimate all-reduce-tiling drift can confound it. Q was all-gathered once
-    /// in the batched pack loop and is shared by both sides (both read
-    /// `q_batched[r]`), so on identical packed KV the `b=1` and `b=N` kernels must
-    /// agree to the bit; any `maxdiff > thresh` is the per-row mis-attribution
-    /// (the `b=N` split-KV scheduler reading the wrong row's KV/indices).
-    ///
-    /// Read-only of the pool/ring/slot: it calls ONLY the indices builder,
-    /// sched_meta, and the sparse fwd — never `flashmla_pack_*` or
-    /// `update_bf16_sw_window`. Returns `(maxdiff, worst_i)` and records the
-    /// first (smallest layer, then row) exceedance for the pinpoint summary.
-    ///
-    /// CSA is NOT routed through the batched lane, so `selected_ptr` is always 0
-    /// here (matching the lane's mode guard).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn numdiff_row(
-        &mut self,
-        ctx: &DeviceContext,
-        config: &DeepSeekV4Config,
-        attention: &Dsv4Attention,
-        pool: &mut Dsv4LayerKvLayout,
-        layer_idx: usize,
-        mode: DeepSeekV4AttentionMode,
-        compress_ratio: usize,
-        r: usize,
-        n: usize,
-        slot_id: usize,
-        start_pos: usize,
-        slot_block_offset: usize,
-        sm_scale: f32,
-        thresh: f32,
-    ) -> Result<(f32, usize)> {
-        ensure!(
-            r < n && n <= self.max_batch,
-            "DSv4 numdiff row {r}/{n} invalid"
-        );
-        let shape = self.layer_shape(layer_idx)?;
-        let d = self.h_q_d();
-        let h_q = self.h_q;
-        let num_sm_parts_max = (self.num_sm_parts as usize).max(256);
-        // Lazily allocate the ref scratch on first use (gated by the caller's
-        // env check); the default path never reaches here, so this allocation is
-        // debug-only and happens at most once.
-        if self.numdiff.is_none() {
-            self.numdiff = Some(Dsv4NumDiffRefScratch {
-                ref_indices: ctx.stream.alloc_zeros::<i32>(self.max_topk_unified)?,
-                ref_topk_length: ctx.stream.alloc_zeros::<i32>(1)?,
-                ref_start_pos: ctx.stream.alloc_zeros::<i32>(1)?,
-                ref_block_off: ctx.stream.alloc_zeros::<i32>(1)?,
-                ref_sched_meta: ctx.stream.alloc_zeros::<i32>(num_sm_parts_max * 8)?,
-                ref_num_splits: ctx.stream.alloc_zeros::<i32>(2)?,
-                ref_lse_out: ctx.stream.alloc_zeros::<f32>(h_q)?,
-                ref_lse_accum: ctx
-                    .stream
-                    .alloc_zeros::<f32>((num_sm_parts_max + 1) * h_q)?,
-                ref_o_accum: ctx.stream.alloc_zeros::<f32>((num_sm_parts_max + 1) * d)?,
-                ref_out: ctx.stream.alloc_zeros::<half::bf16>(d)?,
-                first_exceedance: None,
-            });
-        }
-
-        // ── 1. b=1 indices/sched_meta for row r into the ref scratch. Upload row
-        // r's position/block-offset into element 0 of the one-element ref buffers
-        // so the batched indices builder (called with b=1) sees this row at index 0.
-        let start_i32 = i32::try_from(start_pos)
-            .map_err(|_| anyhow!("DSv4 numdiff start_pos {start_pos} overflows i32"))?;
-        let off_i32 = i32::try_from(slot_block_offset)
-            .map_err(|_| anyhow!("DSv4 numdiff block offset {slot_block_offset} overflows i32"))?;
-        let mode_int = flashmla_mode_int(mode);
-        let nd = self
-            .numdiff
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 numdiff scratch missing"))?;
-        ctx.stream
-            .memcpy_htod(&[start_i32], &mut nd.ref_start_pos)
-            .map_err(|e| anyhow!("DSv4 numdiff start_pos H2D failed: {e}"))?;
-        ctx.stream
-            .memcpy_htod(&[off_i32], &mut nd.ref_block_off)
-            .map_err(|e| anyhow!("DSv4 numdiff block-offset H2D failed: {e}"))?;
-        // build_indices(b=1) → ref_indices / ref_topk_length.
-        {
-            let (indices_ptr, indices_guard) = nd.ref_indices.device_ptr_mut(&ctx.stream);
-            let (start_ptr, start_guard) = nd.ref_start_pos.device_ptr(&ctx.stream);
-            let (off_ptr, off_guard) = nd.ref_block_off.device_ptr(&ctx.stream);
-            let (topk_ptr, topk_guard) = nd.ref_topk_length.device_ptr_mut(&ctx.stream);
-            flash_kv::dsv4_flashmla_decode_build_indices_batched_raw(
-                ctx,
-                indices_ptr,
-                start_ptr,
-                off_ptr,
-                0, // CSA-only selected; CSA is not on the batched lane.
-                topk_ptr,
-                1,
-                shape.sw_blocks,
-                config.sliding_window,
-                shape.max_compressed_keys,
-                if mode == DeepSeekV4AttentionMode::SlidingWindow {
-                    1
-                } else {
-                    compress_ratio
-                },
-                mode_int,
-                64,
-                shape.total_blocks,
-            )?;
-            drop(indices_guard);
-            drop(start_guard);
-            drop(off_guard);
-            drop(topk_guard);
-        }
-        // sched_meta(b=1) → ref_sched_meta / ref_num_splits.
-        {
-            let topk = i32::try_from(shape.topk_unified)
-                .map_err(|_| anyhow!("DSv4 numdiff topk {} overflows i32", shape.topk_unified))?;
-            let (topk_ptr, topk_guard) = nd.ref_topk_length.device_ptr(&ctx.stream);
-            let (sched_ptr, sched_guard) = nd.ref_sched_meta.device_ptr_mut(&ctx.stream);
-            let (splits_ptr, splits_guard) = nd.ref_num_splits.device_ptr_mut(&ctx.stream);
-            unsafe {
-                ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
-                    1,
-                    1,
-                    self.block_size_topk,
-                    self.fixed_overhead_num_blocks,
-                    topk,
-                    0,
-                    topk_ptr as *const i32,
-                    std::ptr::null(),
-                    sched_ptr as *mut i32,
-                    splits_ptr as *mut i32,
-                    self.num_sm_parts,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 numdiff sched_meta failed: {e}"))?;
-            }
-            drop(topk_guard);
-            drop(sched_guard);
-            drop(splits_guard);
-        }
-
-        // ── 2. b=1 reference fwd reading q_batched[r] + the SAME pool + sink,
-        // writing ref_out. Resolve the q_batched[r] / pool / sink raw ptrs (the
-        // reference reads them; no mutation), then the ref-scratch output ptrs.
-        let bytes_per_token = 584_i32;
-        let stride_kv_block_bytes = 64_i32 * bytes_per_token;
-        let global_heads = shape.h_q;
-        let head_dim = config.head_dim;
-        let stride_q = (global_heads * head_dim) as i32;
-        let stride_o = stride_q;
-        let stride_indices = self.max_topk_unified as i32;
-        let stride_lse = global_heads as i32;
-        ensure!(
-            attention.attn_sink_f32.len() >= global_heads,
-            "DSv4 numdiff attn_sink_f32 len {} < global heads {global_heads}",
-            attention.attn_sink_f32.len(),
-        );
-        let (sink_ptr, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
-        let sink_ptr = sink_ptr as *const f32;
-        drop(sink_guard);
-        // Row r's gathered Q is the [r*d, (r+1)*d) slice of q_batched (read-only).
-        let q_view = self.q_batched.slice(r * d..(r + 1) * d);
-        let (q_ptr, q_guard) = q_view.device_ptr(&ctx.stream);
-        let q_ptr = q_ptr as *const ffi::Half;
-        drop(q_guard);
-        let pool_ptr = {
-            let pool_buf = pool.flashmla_pool_data()?;
-            let (pool_ptr, pool_guard) = pool_buf.device_ptr(&ctx.stream);
-            let pool_ptr = pool_ptr as *const ffi::Half;
-            drop(pool_guard);
-            pool_ptr
-        };
-        let nd = self
-            .numdiff
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 numdiff scratch missing"))?;
-        {
-            let (indices_ptr, indices_guard) = nd.ref_indices.device_ptr(&ctx.stream);
-            let (topk_ptr, topk_guard) = nd.ref_topk_length.device_ptr(&ctx.stream);
-            let (sched_ptr, sched_guard) = nd.ref_sched_meta.device_ptr(&ctx.stream);
-            let (splits_ptr, splits_guard) = nd.ref_num_splits.device_ptr(&ctx.stream);
-            let (out_ptr, out_guard) = nd.ref_out.device_ptr_mut(&ctx.stream);
-            let (lse_out_ptr, lse_guard) = nd.ref_lse_out.device_ptr_mut(&ctx.stream);
-            let (lse_accum_ptr, lse_accum_guard) = nd.ref_lse_accum.device_ptr_mut(&ctx.stream);
-            let (o_accum_ptr, o_accum_guard) = nd.ref_o_accum.device_ptr_mut(&ctx.stream);
-            unsafe {
-                ffi::arle_flashmla_sm90_sparse_decode_fwd(
-                    q_ptr,
-                    pool_ptr,
-                    indices_ptr as *const i32,
-                    topk_ptr as *const i32,
-                    sink_ptr,
-                    out_ptr as *mut ffi::Half,
-                    lse_out_ptr as *mut f32,
-                    lse_accum_ptr as *mut f32,
-                    o_accum_ptr as *mut f32,
-                    sched_ptr as *const i32,
-                    splits_ptr as *const i32,
-                    1,
-                    1,
-                    global_heads as i32,
-                    1,
-                    head_dim as i32,
-                    head_dim as i32,
-                    (shape.sw_blocks + shape.comp_blocks) as i32,
-                    64,
-                    stride_indices,
-                    self.num_sm_parts,
-                    DSV4_FLASHMLA_MODEL1,
-                    sm_scale,
-                    stride_q,
-                    stride_q,
-                    head_dim as i32,
-                    stride_kv_block_bytes,
-                    bytes_per_token,
-                    stride_indices,
-                    stride_indices,
-                    stride_lse,
-                    1,
-                    stride_o,
-                    stride_o,
-                    head_dim as i32,
-                    // b=1 split-KV accum strides (same mapping as the batched fwd).
-                    stride_lse,
-                    stride_lse,
-                    stride_o,
-                    stride_o,
-                    head_dim as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 numdiff reference fwd failed: {e}"))?;
-            }
-            drop(indices_guard);
-            drop(topk_guard);
-            drop(sched_guard);
-            drop(splits_guard);
-            drop(out_guard);
-            drop(lse_guard);
-            drop(lse_accum_guard);
-            drop(o_accum_guard);
-        }
-
-        // ── 3. Host diff: batched out_batched[r] vs ref_out (raw bf16 output).
-        let batched_host: Vec<half::bf16> = ctx
-            .stream
-            .clone_dtoh(&self.out_batched.slice(r * d..(r + 1) * d))
-            .map_err(|e| anyhow!("DSv4 numdiff batched D2H failed: {e}"))?;
-        let nd = self
-            .numdiff
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 numdiff scratch missing"))?;
-        let ref_host: Vec<half::bf16> = ctx
-            .stream
-            .clone_dtoh(&nd.ref_out)
-            .map_err(|e| anyhow!("DSv4 numdiff ref D2H failed: {e}"))?;
-        let mut maxdiff = 0.0f32;
-        let mut worst_i = 0usize;
-        for i in 0..d {
-            let diff = (batched_host[i].to_f32() - ref_host[i].to_f32()).abs();
-            if diff > maxdiff {
-                maxdiff = diff;
-                worst_i = i;
-            }
-        }
-        if maxdiff > thresh {
-            eprintln!(
-                "[numdiff] L{layer_idx} row{r} slot{slot_id} start_pos={start_pos} \
-                 maxdiff={maxdiff:.6} worst_i={worst_i}"
-            );
-            // First (smallest layer, then smallest row) exceedance = the pinpoint.
-            let better = match nd.first_exceedance {
-                None => true,
-                Some((l0, r0, ..)) => layer_idx < l0 || (layer_idx == l0 && r < r0),
-            };
-            if better {
-                nd.first_exceedance = Some((layer_idx, r, slot_id, start_pos, maxdiff, worst_i));
-            }
-        }
-        Ok((maxdiff, worst_i))
-    }
-
-    /// DEBUG-ONLY: emit the one-line pinpoint summary of the first
-    /// (smallest-layer, then smallest-row) numdiff exceedance seen so far, then
-    /// reset it. Call once per decode forward after the layer loop. No-op when no
-    /// exceedance was recorded (or the numdiff scratch was never allocated).
-    pub(crate) fn numdiff_flush_summary(&mut self) {
-        if let Some(nd) = self.numdiff.as_mut() {
-            if let Some((layer, row, slot, start_pos, maxdiff, worst_i)) =
-                nd.first_exceedance.take()
-            {
-                eprintln!(
-                    "[numdiff] FIRST-EXCEEDANCE L{layer} row{row} slot{slot} \
-                     start_pos={start_pos} maxdiff={maxdiff:.6} worst_i={worst_i} \
-                     (smallest layer, then smallest row — the pinpoint)"
-                );
-            }
-        }
     }
 }
 
@@ -5187,21 +4818,6 @@ pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
     }
 }
 
-/// Debug-only numerical-diff harness gate (default OFF). When set, the batched
-/// decode lane additionally computes — for each row — the KNOWN-CORRECT per-row
-/// (`b=1`) FlashMLA reference output over the SAME already-packed KV + SAME
-/// gathered Q, then logs `max|batched − reference|` per (layer, row). It exists
-/// to root-cause the row≥1 corruption ("defect 2") with a deterministic
-/// reference, replacing the confounded row-vs-row `INFER_DSV4_BATCH_PROBE`
-/// (concurrent HTTP rows do not share lockstep histories, so row-vs-row diverges
-/// even on the correct per-row path). Read once and cached — zero per-step cost
-/// when unset. Only meaningful with the batched lane on
-/// (`ARLE_DSV4_FLASHMLA_DECODE_BATCHED=1` + `ARLE_DSV4_FLASHMLA_DECODE=1`).
-pub(crate) fn dsv4_batched_numdiff_enabled() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| std::env::var_os("INFER_DSV4_BATCHED_NUMDIFF").is_some())
-}
-
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     // Default ON: vendored FlashMLA sparse prefill replaces the scalar
     // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
@@ -6302,7 +5918,7 @@ fn try_flashmla_decode_attention(
         out_ptr as *mut ffi::Half
     };
 
-    let bytes_per_token = 584_i32;
+    let bytes_per_token = DSV4_FLASH_KV_BYTES_PER_TOKEN_I32;
     let stride_kv_block_bytes = 64_i32 * bytes_per_token;
     let stride_q = (global_heads * config.head_dim) as i32;
     let stride_o = stride_q;
@@ -6760,21 +6376,6 @@ fn run_fused_wqkv_decode(
     Ok((c_q_normed, q_raw, kv_normed))
 }
 
-/// One DSv4 MLA attention block (SlidingWindow / CompressedSparse /
-/// HybridCompressed, dispatched on `mode` / `compress_ratio`).
-///
-/// `hidden` is the post-attn-LN input `[hidden_size, token_count]`;
-/// `state` holds this layer's per-slot bf16 sliding-window ring plus compressor
-/// pending/compressed pools. `start_pos` is the absolute position of `hidden`'s
-/// first token (0 for a fresh prefill). Writes `[hidden_size, token_count]` into
-/// `out` (the O-LoRA output, pre-TP-all-reduce — the model layer-loop owns the
-/// row-parallel sum). FlashMLA-FP8 decode stays gated (perf path).
-///
-/// `tp_rank` is this rank's tensor-parallel index. The per-head `attn_sink`
-/// vector is loaded WHOLE on every rank (no TP slice), so the SW/hybrid kernels
-/// must skip to this rank's head block via `sink_offset = tp_rank * local_heads`
-/// — otherwise every non-zero rank reads rank-0's sink logits and the attention
-/// output diverges by a small head-dependent margin (multi-GPU only).
 /// Prepared-but-not-attended MLA state, the boundary between `mla_attention`'s
 /// per-row PREPARE half (wq/wkv proj + RoPE + — for CSA/HCA — compressor /
 /// indexer / `selected`) and its FWD half (the FlashMLA decode kernel + the
@@ -6805,6 +6406,21 @@ pub(crate) struct Dsv4MlaPrepared {
     pub(crate) start_pos_i32: i32,
 }
 
+/// One DSv4 MLA attention block (SlidingWindow / CompressedSparse /
+/// HybridCompressed, dispatched on `mode` / `compress_ratio`).
+///
+/// `hidden` is the post-attn-LN input `[hidden_size, token_count]`;
+/// `state` holds this layer's per-slot bf16 sliding-window ring plus compressor
+/// pending/compressed pools. `start_pos` is the absolute position of `hidden`'s
+/// first token (0 for a fresh prefill). Writes `[hidden_size, token_count]` into
+/// `out` (the O-LoRA output, pre-TP-all-reduce — the model layer-loop owns the
+/// row-parallel sum). FlashMLA-FP8 decode stays gated (perf path).
+///
+/// `tp_rank` is this rank's tensor-parallel index. The per-head `attn_sink`
+/// vector is loaded WHOLE on every rank (no TP slice), so the SW/hybrid kernels
+/// must skip to this rank's head block via `sink_offset = tp_rank * local_heads`
+/// — otherwise every non-zero rank reads rank-0's sink logits and the attention
+/// output diverges by a small head-dependent margin (multi-GPU only).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mla_attention(
     ctx: &DeviceContext,
@@ -6901,8 +6517,7 @@ pub(crate) fn mla_attention_prepare(
 
     let head_dim = config.head_dim;
     let token_count = hidden.seq_len;
-    let wq_b_active = &attention.wq_b;
-    let local_width = wq_b_active.rows;
+    let local_width = attention.wq_b.rows;
     ensure!(
         head_dim > 0 && local_width.is_multiple_of(head_dim),
         "DSv4 MLA local q width {local_width} is not a multiple of head_dim {head_dim}"
@@ -6971,8 +6586,7 @@ pub(crate) fn mla_attention_prepare(
     // ── 1+2. Q/KV LoRA. Decode uses the existing B=1 fused (`wq_a | wkv`)
     // path. Prefill can opt into the same fused weight cache via
     // ARLE_DSV4_FP8_LINEAR_DEEPGEMM; the default branch below preserves the
-    // scalar reference order exactly. Replicated decode forces the plain arm:
-    // the fused/DeepGEMM scratches and weight caches are shard-shaped.
+    // scalar reference order exactly.
     let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
     let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
@@ -7045,7 +6659,7 @@ pub(crate) fn mla_attention_prepare(
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
         let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-            dsv4_linear(ctx, wq_b_active, &c_q_normed, &mut q_raw)
+            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
         })?;
         drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
@@ -7327,11 +6941,10 @@ fn mla_attention_fwd(
     } = prepared;
     let head_dim = config.head_dim;
     let rope = &config.rope_parameters;
-    let wo_a_active = &attention.wo_a;
     ensure!(
-        wo_a_active.cols == local_width,
+        attention.wo_a.cols == local_width,
         "DSv4 MLA wo_a cols {} != local attention width {local_width}",
-        wo_a_active.cols
+        attention.wo_a.cols
     );
     ensure!(
         attention.wo_b.rows == out.hidden_dim && out.seq_len == token_count,
@@ -7678,7 +7291,6 @@ fn mla_attention_fwd(
         state,
         &local_attn,
         token_count,
-        wo_a_active,
         keepalive,
         out,
     )
@@ -7697,12 +7309,11 @@ pub(crate) fn mla_oproj(
     state: &mut Dsv4LayerAttentionState,
     local_attn: &HiddenStates,
     token_count: usize,
-    wo_a_active: &DeviceMatrix,
     keepalive: &mut Dsv4ForwardKeepalive,
     out: &mut HiddenStates,
 ) -> Result<()> {
     // SAFETY: dsv4_linear writes the full latent buffer.
-    let mut latent = unsafe { HiddenStates::uninit(ctx, wo_a_active.rows, token_count)? };
+    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
     let wo_dg = token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
@@ -7780,7 +7391,7 @@ pub(crate) fn mla_oproj(
     } else {
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_linear(ctx, wo_a_active, local_attn, &mut latent)
+            dsv4_linear(ctx, &attention.wo_a, local_attn, &mut latent)
         })?;
         drop(nvtx_wo_a);
         keepalive.keep_hidden(&latent);

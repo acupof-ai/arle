@@ -2214,10 +2214,11 @@ mod dsv4_gpu {
     /// the contiguous DeepGEMM lane's weight-once GEMM amortizes better.
     const DSV4_DECODE_GEMV_MAX_ROUTES: usize = 8;
 
-    /// Per-expert pointer tables + UE8M0-re-encoded block scales for the
-    /// decode-band grouped-GEMV MoE lane. Built once per layer on first use;
-    /// `None` if any f32 scale is not an exact power of two (UE8M0 encode
-    /// would be lossy → the DeepGEMM contiguous lane stays).
+    /// Per-expert pointer tables over the layer's f32 block-scale buffers for the
+    /// decode-band grouped-GEMM MoE lane. Built once per layer on first use; the
+    /// scale pointers index directly into the existing f32 DeepGEMM scale buffers
+    /// (no re-encoding). The build is infallible for a well-shaped layer — the
+    /// call site maps any error to `None` and falls back to the contiguous lane.
     pub(crate) struct Dsv4GemvTables {
         gate_w: CudaSlice<u64>,
         gate_s: CudaSlice<u64>,
@@ -2232,10 +2233,7 @@ mod dsv4_gpu {
         sc2: usize,
     }
 
-    fn build_gemv_tables(
-        ctx: &DeviceContext,
-        layer: &Dsv4MoeLayer,
-    ) -> Result<Option<Dsv4GemvTables>> {
+    fn build_gemv_tables(ctx: &DeviceContext, layer: &Dsv4MoeLayer) -> Result<Dsv4GemvTables> {
         let g = layer.num_groups;
         let h = layer.hidden_dim;
         let i_dim = layer.intermediate;
@@ -2310,7 +2308,7 @@ mod dsv4_gpu {
                 .clone_htod(v)
                 .map_err(|e| anyhow::anyhow!("GEMV tables: pointer-table H2D failed: {e}"))
         };
-        Ok(Some(Dsv4GemvTables {
+        Ok(Dsv4GemvTables {
             gate_w: h2d(&gate_w)?,
             gate_s: h2d(&gate_s)?,
             up_w: h2d(&up_w)?,
@@ -2319,14 +2317,14 @@ mod dsv4_gpu {
             w2_s: h2d(&w2_s)?,
             sc13,
             sc2,
-        }))
+        })
     }
 
-    /// Decode-band routed-MoE forward via grouped w8a16 GEMV: compact pack
-    /// (no alignment — GEMV has no per-tile group contract), one pair-GEMV
-    /// pass for the fused-w13 gate/up halves, clamped SwiGLU, one w2 GEMV,
-    /// then the same scatter/combine tail as the contiguous lane. Zero pad
-    /// rows and zero activation-quantize work: at B=1 this removes the
+    /// Decode-band routed-MoE forward via grouped w8a16 GEMM (warp-per-row,
+    /// `dsv4_fp8_grouped_swiglu_decode` + `dsv4_fp8_grouped_down_decode`):
+    /// compact pack (no pad rows), one fused gate/up pass with clamped SwiGLU,
+    /// one w2 pass, then the same scatter/combine tail as the contiguous lane.
+    /// Zero pad rows and zero activation-quantize work: at B=1 this removes the
     /// grouped lane's padding tax entirely (the −23% regression's residual
     /// after the 64-align fix).
     #[allow(clippy::too_many_arguments)]
@@ -2527,7 +2525,7 @@ mod dsv4_gpu {
         // HBM, errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
         if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
             let tables = layer.gemv_tables.get_or_init(|| {
-                build_gemv_tables(ctx, layer).unwrap_or_else(|e| {
+                build_gemv_tables(ctx, layer).map(Some).unwrap_or_else(|e| {
                     log::warn!("DSv4 GEMV decode lane table build failed: {e}");
                     None
                 })
