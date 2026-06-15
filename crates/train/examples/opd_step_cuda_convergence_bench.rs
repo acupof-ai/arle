@@ -175,6 +175,7 @@ mod app {
                 &mut optimizer,
                 &mut store,
                 &mut tape,
+                None,
             )?;
             losses.push(outcome.loss as f64);
 

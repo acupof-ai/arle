@@ -35,6 +35,7 @@ use std::{
 };
 
 use crate::{
+    causal_lm::live_tensor_ids,
     grad_clip::clip_grad_norm,
     loss::{
         DEFAULT_KL_CHUNK_SIZE, KlDirection, cross_entropy_loss, kl_distill_loss,
@@ -643,6 +644,243 @@ fn rollout_full_forward(
     }
     store.retain_ids(base_keep);
     Ok(())
+}
+
+fn validate_token_ids(context: &str, tokens: &[u32], vocab: usize) -> Result<()> {
+    if let Some((index, token_id)) = tokens
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, token_id)| token_id as usize >= vocab)
+    {
+        return Err(OpdError::InvalidInput(format!(
+            "{context} token id {token_id} at {context}[{index}] is outside \
+             student.config().vocab_size={vocab}. Hint: verify the tokenizer and \
+             student model directory match before running OPD. See \
+             docs/projects/2026-05-18-opd-only-pivot.md."
+        )));
+    }
+    Ok(())
+}
+
+fn validate_forced_rollout(
+    forced_rollout: &[u32],
+    prompt_ids: &[u32],
+    rollout_len: usize,
+    vocab: usize,
+) -> Result<()> {
+    let expected_len = prompt_ids
+        .len()
+        .checked_add(rollout_len)
+        .ok_or_else(|| OpdError::InvalidInput("OPD forced_rollout length overflow".to_owned()))?;
+    if forced_rollout.len() != expected_len {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD forced_rollout length mismatch: got {}, expected {} \
+             (= prompt_len {} + rollout_len {}). Hint: pass the full selected \
+             prompt-plus-rollout trajectory.",
+            forced_rollout.len(),
+            expected_len,
+            prompt_ids.len(),
+            rollout_len
+        )));
+    }
+    if !forced_rollout.starts_with(prompt_ids) {
+        return Err(OpdError::InvalidInput(
+            "OPD forced_rollout must start with the exact prompt_ids prefix. \
+             Hint: select whole candidate trajectories; do not splice response \
+             suffixes into a different prompt."
+                .to_owned(),
+        ));
+    }
+    validate_token_ids("forced_rollout", forced_rollout, vocab)
+}
+
+pub fn student_rollout_only(
+    student: &Qwen35Model,
+    prompt_ids: &[u32],
+    rollout_len: usize,
+    sampling: Option<&SamplingParams>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<Vec<u32>> {
+    let vocab = student.config().vocab_size;
+    if prompt_ids.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "student_rollout_only requires a non-empty prompt_ids slice. Hint: \
+             pass at least one BOS/chat token; the rollout helper does not \
+             synthesize prompts."
+                .to_owned(),
+        ));
+    }
+    if vocab == 0 {
+        return Err(OpdError::InvalidInput(
+            "student_rollout_only requires student.config().vocab_size > 0.".to_owned(),
+        ));
+    }
+    validate_rollout_shape(prompt_ids.len(), rollout_len, vocab)?;
+    validate_token_ids("prompt_ids", prompt_ids, vocab)?;
+    let rollout_keep_base = live_tensor_ids(store);
+    student_rollout_only_with_keep(
+        student,
+        prompt_ids,
+        rollout_len,
+        sampling,
+        &rollout_keep_base,
+        store,
+        tape,
+    )
+}
+
+fn student_rollout_only_with_keep(
+    student: &Qwen35Model,
+    prompt_ids: &[u32],
+    rollout_len: usize,
+    sampling: Option<&SamplingParams>,
+    rollout_keep_base: &HashSet<TensorId>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<Vec<u32>> {
+    tape.entries.clear();
+    tape.set_enabled(false);
+    let mut rollout: Vec<u32> = prompt_ids.to_vec();
+    let vocab = student.config().vocab_size;
+    let use_rollout_kv_cache = student.supports_rollout_kv_cache();
+
+    if use_rollout_kv_cache
+        && sampling.is_none()
+        && use_device_rollout_argmax(store, rollout_len, vocab)
+    {
+        let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + rollout_len);
+        let mut generated_tokens = if rollout_len == 0 {
+            None
+        } else {
+            let handle = store.backend().zeros(&[rollout_len])?;
+            Some(store.alloc_device_tensor(vec![rollout_len], handle)?)
+        };
+        let mut current_device_token: Option<TensorId> = None;
+        for step in 0..rollout_len {
+            let logits = if step == 0 {
+                let positions = (0..prompt_ids.len() as u32).collect::<Vec<_>>();
+                forward_rollout_cached(
+                    student,
+                    store,
+                    tape,
+                    prompt_ids,
+                    &positions,
+                    &mut rollout_cache,
+                )
+                .map_err(|err| map_qwen35_forward_error("student rollout", err))?
+            } else {
+                let token_id = current_device_token.ok_or_else(|| {
+                    OpdError::InvalidInput(
+                        "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
+                         non-empty prompt before calling student_rollout_only."
+                            .to_owned(),
+                    )
+                })?;
+                let position = (prompt_ids.len() + step - 1) as u32;
+                forward_rollout_cached_device_token(
+                    student,
+                    store,
+                    tape,
+                    token_id,
+                    position,
+                    &mut rollout_cache,
+                )
+                .map_err(|err| map_qwen35_forward_error("student rollout", err))?
+            };
+            let next_token =
+                device_argmax_token(logits, vocab, store, None, (prompt_ids.len() + step) as u64)?;
+            if let Some(buffer_id) = generated_tokens {
+                generated_tokens = Some(write_rollout_token(
+                    buffer_id,
+                    next_token,
+                    rollout_len,
+                    step,
+                    store,
+                )?);
+            }
+            current_device_token = Some(next_token);
+            if should_retain_rollout_step(step, rollout_len) {
+                retain_rollout_step_tensors(
+                    store,
+                    rollout_keep_base,
+                    &rollout_cache,
+                    current_device_token,
+                    generated_tokens,
+                );
+            }
+        }
+        if let Some(buffer_id) = generated_tokens {
+            rollout.extend(read_generated_rollout_tokens(
+                buffer_id,
+                rollout_len,
+                vocab,
+                store,
+            )?);
+        }
+        store.retain_ids(rollout_keep_base);
+    } else if use_rollout_kv_cache {
+        let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + rollout_len);
+        for step in 0..rollout_len {
+            let (input_ids, positions, logits_seq_len) = if step == 0 {
+                (
+                    rollout.clone(),
+                    (0..rollout.len() as u32).collect::<Vec<_>>(),
+                    1,
+                )
+            } else {
+                let last = *rollout.last().ok_or_else(|| {
+                    OpdError::InvalidInput(
+                        "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
+                         non-empty prompt before calling student_rollout_only."
+                            .to_owned(),
+                    )
+                })?;
+                let position = (rollout.len() - 1) as u32;
+                (vec![last], vec![position], 1)
+            };
+            let logits = forward_rollout_cached(
+                student,
+                store,
+                tape,
+                &input_ids,
+                &positions,
+                &mut rollout_cache,
+            )
+            .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
+            let next = greedy_next_token(
+                logits,
+                logits_seq_len,
+                vocab,
+                store,
+                sampling,
+                rollout.len() as u64,
+            )?;
+            rollout.push(next);
+            if should_retain_rollout_step(step, rollout_len) {
+                retain_rollout_step_tensors(store, rollout_keep_base, &rollout_cache, None, None);
+            }
+        }
+        store.retain_ids(rollout_keep_base);
+    } else {
+        rollout_full_forward(
+            student,
+            &mut rollout,
+            rollout_len,
+            vocab,
+            sampling,
+            store,
+            tape,
+            rollout_keep_base,
+        )?;
+    }
+
+    debug_assert!(
+        tape.entries.is_empty(),
+        "student_rollout_only must keep rollout candidates off the backward tape"
+    );
+    Ok(rollout)
 }
 
 fn validate_student_params(student_params: &[TensorId], store: &TensorStore) -> Result<()> {
@@ -1787,7 +2025,8 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
 }
 
 /// Run one OPD step:
-/// 1. Greedy-rollout `cfg.rollout_len` tokens from `student` starting from `prompt_ids`.
+/// 1. Roll out `cfg.rollout_len` tokens from `student` starting from `prompt_ids`,
+///    or use a whole `forced_rollout` trajectory selected by an external scorer.
 /// 2. Forward `teacher` on the full rollout (tape disabled).
 /// 3. Forward `student` on the full rollout (tape enabled).
 /// 4. `kl_distill_loss(student_logits, teacher_logits, rollout.len(), 1.0, …)`.
@@ -1802,6 +2041,7 @@ pub fn opd_step<O: Optimizer>(
     optimizer: &mut O,
     store: &mut TensorStore,
     tape: &mut Tape,
+    forced_rollout: Option<&[u32]>,
 ) -> Result<OpdStepOutcome> {
     let teacher = InProcessTeacher::new(teacher);
     opd_step_with_teacher_forward(
@@ -1813,6 +2053,7 @@ pub fn opd_step<O: Optimizer>(
         optimizer,
         store,
         tape,
+        forced_rollout,
     )
 }
 
@@ -1825,6 +2066,7 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
     optimizer: &mut O,
     store: &mut TensorStore,
     tape: &mut Tape,
+    forced_rollout: Option<&[u32]>,
 ) -> Result<OpdStepOutcome> {
     opd_step_with_teacher_forward_profiled(
         student,
@@ -1835,6 +2077,7 @@ pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
         optimizer,
         store,
         tape,
+        forced_rollout,
         None,
     )
 }
@@ -1848,6 +2091,7 @@ pub fn opd_step_with_teacher_forward_profiled<O: Optimizer, T: TeacherForward + 
     optimizer: &mut O,
     store: &mut TensorStore,
     tape: &mut Tape,
+    forced_rollout: Option<&[u32]>,
     profile: Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
     opd_step_with_teacher_forward_profiled_gkd(
@@ -1860,6 +2104,7 @@ pub fn opd_step_with_teacher_forward_profiled<O: Optimizer, T: TeacherForward + 
         store,
         tape,
         0.0,
+        forced_rollout,
         profile,
     )
 }
@@ -1874,6 +2119,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
     store: &mut TensorStore,
     tape: &mut Tape,
     gkd_lambda: f32,
+    forced_rollout: Option<&[u32]>,
     profile: Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
     opd_step_with_teacher_forward_profiled_gkd_anchor(
@@ -1889,6 +2135,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
             lambda: gkd_lambda,
             ..GkdLossConfig::default()
         },
+        forced_rollout,
         #[cfg(feature = "cuda")]
         None,
         profile,
@@ -1908,6 +2155,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
     store: &mut TensorStore,
     tape: &mut Tape,
     gkd_config: GkdLossConfig<'_>,
+    forced_rollout: Option<&[u32]>,
     #[cfg(feature = "cuda")] infer_rollout: Option<InferRolloutCtx<'_>>,
     profile: Option<&mut OpdStepProfile>,
 ) -> Result<OpdStepOutcome> {
@@ -1945,19 +2193,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
              docs/projects/2026-05-18-opd-only-pivot.md."
         )));
     }
-    if let Some((index, token_id)) = prompt_ids
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|&(_, token_id)| token_id as usize >= vocab)
-    {
-        return Err(OpdError::InvalidInput(format!(
-            "OPD prompt token id {token_id} at prompt_ids[{index}] is outside \
-             student.config().vocab_size={vocab}. Hint: verify the tokenizer and \
-             student model directory match before running OPD. See \
-            docs/projects/2026-05-18-opd-only-pivot.md."
-        )));
-    }
+    validate_token_ids("prompt_ids", prompt_ids, vocab)?;
     let teacher_params = teacher.parameter_ids().to_vec();
     let student_model_params = student.all_parameter_ids();
     if !teacher_params.is_empty() {
@@ -1970,217 +2206,98 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
     rollout_keep_base.extend(keep_extra.iter().copied());
 
     let result = (|| {
-        // 1. Greedy rollout — tape disabled, no backward graph for sample tokens.
+        // 1. Student rollout — tape disabled, no backward graph for sample tokens.
         let phase_started = Instant::now();
-        tape.entries.clear();
-        tape.set_enabled(false);
-        let mut rollout: Vec<u32> = prompt_ids.to_vec();
-        let use_rollout_kv_cache = student.supports_rollout_kv_cache();
-
-        // P3 infer-engine rollout (opt-in): mirror the train LoRA into the
-        // infer student once per step, then greedily decode `rollout_len`
-        // tokens via the infer engine. Produces the same `rollout: Vec<u32>`
-        // the train-crate path would, so downstream KL/backward is unchanged.
-        // When the flag/ctx is absent, `infer_handled` stays false and the
-        // train-crate rollout chain below runs as the A/B baseline.
-        #[cfg(not(feature = "cuda"))]
-        let infer_handled = false;
         #[cfg(feature = "cuda")]
         let engine_offload = engine_offload_mode();
         #[cfg(not(feature = "cuda"))]
         let engine_offload = EngineOffloadMode::Off;
 
-        #[cfg(feature = "cuda")]
-        let infer_handled = if let Some(ctx) = infer_rollout.as_ref() {
-            // OPD engine time-share: the rollout student may have been
-            // offloaded to host RAM during the previous step's backward.
-            // Reload it before the LoRA sync (which re-merges resident base
-            // weights) and the rollout decode. Fence the train backend first
-            // so the previous step's optimizer/cleanup pool ops are ordered
-            // ahead of the reload's pool allocations (same cross-context
-            // ordering reason as the teacher reload fence).
-            if engine_offload.offloads_student() {
-                store
-                    .backend()
-                    .device_synchronize()
-                    .map_err(OpdError::from)?;
-                ctx.student.reload_engine_weights().map_err(|err| {
-                    OpdError::InvalidInput(format!("infer student reload failed: {err}"))
-                })?;
-            }
-            ctx.student
-                .sync_lora_from_store(store, &student.adapter_name_map(), ctx.lora_config)
-                .map_err(|err| {
-                    OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
-                })?;
-            let rollout_sampling = cfg.rollout_sampling.as_ref();
-            for _ in 0..cfg.rollout_len {
-                let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
-                let next = ctx
-                    .student
-                    .decode_next_token(&rollout, &positions, rollout_sampling, rollout.len() as u64)
-                    .map_err(|err| {
-                        OpdError::InvalidInput(format!("infer student decode failed: {err}"))
-                    })?;
-                rollout.push(next);
-            }
+        store.retain_ids(&rollout_keep_base);
+        let rollout = if let Some(forced_rollout) = forced_rollout {
+            tape.entries.clear();
+            tape.set_enabled(false);
+            validate_forced_rollout(forced_rollout, prompt_ids, cfg.rollout_len, vocab)?;
             store.retain_ids(&rollout_keep_base);
-            // NB: the infer student engine is idle after the rollout, but we do
-            // NOT offload it here. Offloading mid-step (before the teacher
-            // forward) churns the shared device memory pool while the teacher
-            // forward allocates from it, racing the async frees → illegal
-            // address. Instead both idle engines are offloaded together AFTER
-            // the teacher scores, just before the student backward (see
-            // `backward_chunked_kl_rollout`), on a quiesced device.
-            true
+            forced_rollout.to_vec()
         } else {
-            false
-        };
-
-        let rollout_sampling = cfg.rollout_sampling.as_ref();
-
-        if infer_handled {
-            // rollout already produced via the infer engine.
-        } else if use_rollout_kv_cache
-            && rollout_sampling.is_none()
-            && use_device_rollout_argmax(store, cfg.rollout_len, vocab)
-        {
-            let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
-            let mut generated_tokens = if cfg.rollout_len == 0 {
-                None
+            let rollout_sampling = cfg.rollout_sampling.as_ref();
+            // P3 infer-engine rollout (opt-in): mirror the train LoRA into the
+            // infer student once per step, then decode `rollout_len` tokens via
+            // the infer engine. Produces the same `rollout: Vec<u32>` the
+            // train-crate helper would, so downstream KL/backward is unchanged.
+            // When the flag/ctx is absent, the public train-crate helper runs
+            // as the A/B baseline.
+            #[cfg(feature = "cuda")]
+            if let Some(ctx) = infer_rollout.as_ref() {
+                let mut rollout: Vec<u32> = prompt_ids.to_vec();
+                // OPD engine time-share: the rollout student may have been
+                // offloaded to host RAM during the previous step's backward.
+                // Reload it before the LoRA sync (which re-merges resident base
+                // weights) and the rollout decode. Fence the train backend first
+                // so the previous step's optimizer/cleanup pool ops are ordered
+                // ahead of the reload's pool allocations (same cross-context
+                // ordering reason as the teacher reload fence).
+                if engine_offload.offloads_student() {
+                    store
+                        .backend()
+                        .device_synchronize()
+                        .map_err(OpdError::from)?;
+                    ctx.student.reload_engine_weights().map_err(|err| {
+                        OpdError::InvalidInput(format!("infer student reload failed: {err}"))
+                    })?;
+                }
+                ctx.student
+                    .sync_lora_from_store(store, &student.adapter_name_map(), ctx.lora_config)
+                    .map_err(|err| {
+                        OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
+                    })?;
+                for _ in 0..cfg.rollout_len {
+                    let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
+                    let next = ctx
+                        .student
+                        .decode_next_token(
+                            &rollout,
+                            &positions,
+                            rollout_sampling,
+                            rollout.len() as u64,
+                        )
+                        .map_err(|err| {
+                            OpdError::InvalidInput(format!("infer student decode failed: {err}"))
+                        })?;
+                    rollout.push(next);
+                }
+                store.retain_ids(&rollout_keep_base);
+                // NB: the infer student engine is idle after the rollout, but we do
+                // NOT offload it here. Offloading mid-step (before the teacher
+                // forward) churns the shared device memory pool while the teacher
+                // forward allocates from it, racing the async frees → illegal
+                // address. Instead both idle engines are offloaded together AFTER
+                // the teacher scores, just before the student backward (see
+                // `backward_chunked_kl_rollout`), on a quiesced device.
+                rollout
             } else {
-                let handle = store.backend().zeros(&[cfg.rollout_len])?;
-                Some(store.alloc_device_tensor(vec![cfg.rollout_len], handle)?)
-            };
-            let mut current_device_token: Option<TensorId> = None;
-            for step in 0..cfg.rollout_len {
-                let logits = if step == 0 {
-                    let positions = (0..prompt_ids.len() as u32).collect::<Vec<_>>();
-                    forward_rollout_cached(
-                        student,
-                        store,
-                        tape,
-                        prompt_ids,
-                        &positions,
-                        &mut rollout_cache,
-                    )
-                    .map_err(|err| map_qwen35_forward_error("student rollout", err))?
-                } else {
-                    let token_id = current_device_token.ok_or_else(|| {
-                        OpdError::InvalidInput(
-                            "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
-                             non-empty prompt before calling opd_step."
-                                .to_owned(),
-                        )
-                    })?;
-                    let position = (prompt_ids.len() + step - 1) as u32;
-                    forward_rollout_cached_device_token(
-                        student,
-                        store,
-                        tape,
-                        token_id,
-                        position,
-                        &mut rollout_cache,
-                    )
-                    .map_err(|err| map_qwen35_forward_error("student rollout", err))?
-                };
-                let next_token = device_argmax_token(
-                    logits,
-                    vocab,
-                    store,
-                    None,
-                    (prompt_ids.len() + step) as u64,
-                )?;
-                if let Some(buffer_id) = generated_tokens {
-                    generated_tokens = Some(write_rollout_token(
-                        buffer_id,
-                        next_token,
-                        cfg.rollout_len,
-                        step,
-                        store,
-                    )?);
-                }
-                current_device_token = Some(next_token);
-                if should_retain_rollout_step(step, cfg.rollout_len) {
-                    retain_rollout_step_tensors(
-                        store,
-                        &rollout_keep_base,
-                        &rollout_cache,
-                        current_device_token,
-                        generated_tokens,
-                    );
-                }
-            }
-            if let Some(buffer_id) = generated_tokens {
-                rollout.extend(read_generated_rollout_tokens(
-                    buffer_id,
-                    cfg.rollout_len,
-                    vocab,
-                    store,
-                )?);
-            }
-            store.retain_ids(&rollout_keep_base);
-        } else if use_rollout_kv_cache {
-            let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + cfg.rollout_len);
-            for step in 0..cfg.rollout_len {
-                let (input_ids, positions, logits_seq_len) = if step == 0 {
-                    (
-                        rollout.clone(),
-                        (0..rollout.len() as u32).collect::<Vec<_>>(),
-                        1,
-                    )
-                } else {
-                    let last = *rollout.last().ok_or_else(|| {
-                        OpdError::InvalidInput(
-                            "OPD rollout cache cannot decode from an empty rollout. Hint: pass a \
-                             non-empty prompt before calling opd_step."
-                                .to_owned(),
-                        )
-                    })?;
-                    let position = (rollout.len() - 1) as u32;
-                    (vec![last], vec![position], 1)
-                };
-                let logits = forward_rollout_cached(
+                student_rollout_only(
                     student,
+                    prompt_ids,
+                    cfg.rollout_len,
+                    rollout_sampling,
                     store,
                     tape,
-                    &input_ids,
-                    &positions,
-                    &mut rollout_cache,
-                )
-                .map_err(|err| map_qwen35_forward_error("student rollout", err))?;
-                let next = greedy_next_token(
-                    logits,
-                    logits_seq_len,
-                    vocab,
-                    store,
-                    rollout_sampling,
-                    rollout.len() as u64,
-                )?;
-                rollout.push(next);
-                if should_retain_rollout_step(step, cfg.rollout_len) {
-                    retain_rollout_step_tensors(
-                        store,
-                        &rollout_keep_base,
-                        &rollout_cache,
-                        None,
-                        None,
-                    );
-                }
+                )?
             }
-            store.retain_ids(&rollout_keep_base);
-        } else {
-            rollout_full_forward(
-                student,
-                &mut rollout,
-                cfg.rollout_len,
-                vocab,
-                rollout_sampling,
-                store,
-                tape,
-                &rollout_keep_base,
-            )?;
-        }
+            #[cfg(not(feature = "cuda"))]
+            {
+                student_rollout_only(
+                    student,
+                    prompt_ids,
+                    cfg.rollout_len,
+                    rollout_sampling,
+                    store,
+                    tape,
+                )?
+            }
+        };
         record_profile(&mut profile, |profile| {
             profile.student_rollout_seconds += phase_started.elapsed().as_secs_f64();
         });

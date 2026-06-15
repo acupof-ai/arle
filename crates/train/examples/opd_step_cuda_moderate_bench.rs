@@ -175,6 +175,7 @@ mod app {
                 &mut optimizer,
                 &mut store,
                 &mut tape,
+                None,
             )
             .expect("opd_step");
             losses.push(outcome.loss);

@@ -432,6 +432,7 @@ pub mod app {
                 &mut optimizer,
                 &mut store,
                 &mut tape,
+                None,
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
             let safety_first_step_max_seconds = args.safety_first_step_max_seconds;
