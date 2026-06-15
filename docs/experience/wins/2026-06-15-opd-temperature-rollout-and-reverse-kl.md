@@ -1,10 +1,11 @@
-# OPD temperature rollout + reverse-KL scaffold — smoke gate, CPU/no-cuda, 2026-06-15
+# OPD temperature rollout + reverse-KL — smoke + V100 directional A/B, 2026-06-15
 
-## SLO-shape probed? N — tiny smoke only
+## SLO-shape probed? N — V100 directional only
 
-This entry records mechanism bring-up for two opt-in OPD knobs. No SLO workload
-or capability run was performed locally; the real Qwen3.5-0.8B A/B stays
-`pending-remote` below. No default flip is licensed by this entry.
+This entry records mechanism bring-up for two opt-in OPD knobs plus a directional
+V100 CPU A/B on real Qwen3.5-0.8B. This is not a capability run; the full-step
+multi-seed capability gate stays reserved for the H20 OPD-after-QAT phase. No
+default flip is licensed by this entry.
 
 ## Roofline check
 
@@ -18,9 +19,10 @@ matched V100 runs below.
 
 ## Goal
 
-Expose two unresolved SOPD levers without perturbing defaults: temperature
+Expose two unresolved OPD levers without perturbing defaults: temperature
 sampling for rollout support, and reverse KL for the steady-state distillation
-objective.
+objective. Quantify the V100 s/step cost because the OPD budget is steps/hour
+bound.
 
 ## Hypothesis
 
@@ -44,13 +46,18 @@ target/release/arle train self-opd --smoke --steps 5 --kl-direction reverse
 
 ## Environment
 
-- **Backend:** CPU autograd smoke (`--features cpu,no-cuda,cli`).
-- **Model:** embedded tiny Qwen3.5 config for smoke; real Qwen3.5-0.8B is pending remote.
+- **Backend:** CPU autograd (`--features cpu,no-cuda,cli`).
+- **Model:** embedded tiny Qwen3.5 config for smoke; V100 A/B used
+  `/home/chenkailun.c/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B-Base`.
 - **Hardware:** local Mac CPU for smoke; CUDA typecheck via `cuda,no-cuda`.
-- **Commits:** P0 `b092f4aa`, P1 `6dddf310`; smoke rerun on current main `68a331a0`.
+- **V100 run dir:** `/home/chenkailun.c/opd-v100-verify-5b08140f-20260615-233320`.
+- **Commits:** reverse-KL routing fix `3b9e311e`; profile surface `037eef89`;
+  pure-OPD eval surface `5b08140f`; real `train opd` LoRA student fix
+  `9315b63a`.
 - **Feature set:** `cargo build --release --no-default-features --features cpu,no-cuda,cli`.
 - **Non-default flags / env vars:** `--rollout-temperature 1.0 --rollout-seed 42`,
-  `--kl-direction reverse`; `CUDARC_CUDA_VERSION=12080` for CUDA-Rust typecheck.
+  `--kl-direction reverse`, `--gkd-lambda 0.0`, `ARLE_OPD_STEP_PROFILE=1`;
+  `CUDARC_CUDA_VERSION=12080` for CUDA-Rust typecheck.
 - **Server launch:** n/a.
 
 ## Results — smoke evidence
@@ -101,46 +108,50 @@ New reverse-KL unit tests:
 | `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib` | PASS |
 | `git diff --check` | PASS |
 
-## Pending Remote A/B
+## Results — V100 directional A/B
 
-Run on the V100 box with real `Qwen/Qwen3.5-0.8B-Base`, CPU autograd, matching
-the 2026-06-14 SOPD verification protocol. Token IDs below were encoded from
-`models/Qwen3.5-0.8B/tokenizer.json`.
+Prompt IDs:
+`760,6511,314,9338,369,11751,11,321,279,242476,300,21262,12965,303,1141,3990,13`.
+Held-out IDs:
+`27336,85895,506,799,7493,11995,59275,506,9117,2119,13`.
 
-```bash
-ssh v100 <<'EOF'
-set -euo pipefail
-cd ~/code/agent-infer
-git fetch origin
-git checkout main
-git pull --ff-only
-cargo build --release --no-default-features --features cpu,no-cuda,cli
+Per the speed-call update, the already-near-done greedy arm was allowed to finish
+50 steps; the fair P0 comparison uses its first 20 steps. Remaining arms ran
+20 steps with `--gate-every-n 5`.
 
-MODEL=${MODEL:-/home/ckl/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B-Base}
-PROMPT_IDS=760,6511,314,9338,369,11751,11,321,279,6511,314,9564,369,19241,13
-EVAL_IDS=27336,85895,506,799,7493,11995,59275,11,321,90162,506,6942,11995,59275,13
-COMMON="--student-model ${MODEL} --backend cpu --steps 20 --rollout-len 16 --prompt-ids ${PROMPT_IDS} --eval-ids ${EVAL_IDS} --gate-every-n 1 --gate-regress-tol 0.02 --json"
+### P0 — greedy vs sampled rollout
 
-target/release/arle train self-opd ${COMMON} \
-  > /tmp/sopd-p0-greedy.json
-target/release/arle train self-opd ${COMMON} \
-  --rollout-temperature 1.0 --rollout-seed 42 \
-  > /tmp/sopd-p0-temp1-seed42.json
+| Arm | Held-out NLL trajectory | Final vs baseline | Mean s/step | Phase means: rollout / teacher / student / KL / backward | s/step delta |
+|---|---|---:|---:|---|---:|
+| greedy first 20 | `2.371392 -> 2.363729 -> 2.356122 -> 2.348320 -> 2.339962` | `-0.031430` | `140.750` | `105.724 / 7.634 / 7.677 / 2.351 / 17.357` | baseline |
+| `--rollout-temperature 1.0` | `2.371392 -> 2.366468 -> 2.360371 -> 2.355478 -> 2.350288` | `-0.021104` | `141.756` | `106.619 / 7.595 / 7.743 / 2.345 / 17.446` | `+0.714%` |
 
-target/release/arle train self-opd ${COMMON} --kl-direction forward \
-  > /tmp/sopd-p1-forward.json
-target/release/arle train self-opd ${COMMON} --kl-direction reverse \
-  > /tmp/sopd-p1-reverse.json
-EOF
-```
+Training-loss lift was too small to license sampling: greedy mean loss
+`7.26e-6`, sampled mean loss `8.35e-6`. Sampled was `+0.010326` worse NLL at
+step 20 and only `+0.714%` slower, so the performance risk is acceptable but the
+directional quality read kills default sampling for this shape. Keep greedy
+default.
 
-P0 license: the temperature run must improve held-out NLL by a clear margin over
-greedy and lift the training-loss magnitude above the real-prompt ~8e-6 cold
-start floor; otherwise kill the lever and keep greedy default.
+Greedy full 50 for reference:
+`2.371392 -> 2.363729 -> 2.356122 -> 2.348320 -> 2.339962 -> 2.330731 -> 2.320419 -> 2.308982 -> 2.296615 -> 2.283705 -> 2.270887`;
+mean `140.908 s/step`.
 
-P1 license: compare forward vs reverse on held-out NLL/capability. A default
-flip needs full MMLU multi-seed >=5 with mean +/- sigma and Wilson 95% CI per
-the 2026-05-28 rule. Until that gate passes, both knobs remain opt-in.
+### P1 — forward vs reverse pure KL
+
+Final pure `train opd` uses a LoRA student (`rank=16`, `alpha=32`,
+`attention-qv`) because a full-trainable real-checkpoint probe reached baseline
+NLL then was killed with `rc=137` after 216s before step 1 completed on the 31
+GiB V100 CPU host.
+
+| Arm | Held-out NLL trajectory | Final vs baseline | Mean s/step | Phase means: rollout / teacher / student / KL / backward | s/step delta |
+|---|---|---:|---:|---|---:|
+| forward KL | `2.371392 -> 2.371392 -> 2.371391 -> 2.371392 -> 2.371395` | `+0.000003` | `142.759` | `107.476 / 8.039 / 7.676 / 10.201 / 17.032` | baseline |
+| reverse KL | `2.371392 -> 2.371391 -> 2.371389 -> 2.371389 -> 2.371387` | `-0.000005` | `140.195` | `104.973 / 7.838 / 7.607 / 10.364 / 17.010` | `-1.796%` |
+
+Reverse is now proven reachable on the fixed pure-KL `train opd` path. The
+directional NLL delta is effectively flat (`-0.000008` reverse vs forward at
+step 20), so this licenses the opt-in path only; it does not license a default
+flip or capability claim.
 
 ## Problems
 
@@ -149,6 +160,10 @@ the 2026-05-28 rule. Until that gate passes, both knobs remain opt-in.
 - P0/P1 public config/signature changes required mechanical updates in direct
   loss tests and profile/example harnesses so old forward behavior still
   compiles and stays explicit.
+- The first real `train opd` attempt exposed two independent gaps: the student
+  was loaded frozen, then full-trainable real-checkpoint OPD was killed on V100
+  (`rc=137`). The shipped real path uses a LoRA student, matching the viable
+  self-OPD memory profile.
 
 ## Learnings
 
@@ -161,8 +176,10 @@ the 2026-05-28 rule. Until that gate passes, both knobs remain opt-in.
 ## Delta Vs Baseline
 
 - **Baseline:** [`2026-06-14-sopd-91-self-opd-subcommand-inline-loop.md`](2026-06-14-sopd-91-self-opd-subcommand-inline-loop.md)
-- **Delta:** defaults unchanged in smoke; new sampled/reverse paths are opt-in
-  and pending real Qwen3.5-0.8B A/B.
+- **Delta:** defaults unchanged in smoke. V100 P0 sampling was `+0.714%`
+  s/step and worse held-out NLL; reverse KL was reachable and `-1.796%` s/step
+  vs forward in the pure-KL LoRA path, with flat directional NLL. Both remain
+  opt-in.
 
 ## Artefacts
 
@@ -170,13 +187,15 @@ the 2026-05-28 rule. Until that gate passes, both knobs remain opt-in.
   `/tmp/arle-p1-final-self-opd-sampled-seed42.txt`,
   `/tmp/arle-p1-final-self-opd-sampled-seed43.txt`,
   `/tmp/arle-p1-final-self-opd-reverse.txt`.
-- Remote outputs: pending `/tmp/sopd-p0-*.json`, `/tmp/sopd-p1-*.json` on V100.
+- V100 logs:
+  `/home/chenkailun.c/opd-v100-verify-5b08140f-20260615-233320/logs/ab1_greedy.log`,
+  `ab1_sampled20.log`, `ab2_forward20_lora.log`, `ab2_reverse20_lora.log`,
+  `ab2_forward_probe2_fixed.log`.
 
 ## Notes
 
-- What changed in code: P0 `b092f4aa` adds opt-in rollout sampling; P1
-  `6dddf310` adds opt-in reverse KL.
-- Suspected cause of any regression: n/a locally; remote A/B may expose quality
-  regressions from mode-seeking reverse KL.
-- Follow-ups: run the V100 A/B above before making any quality or default-flag
-  claim.
+- What changed in code: P0 added opt-in rollout sampling; P1 added opt-in
+  reverse KL; fixes `3b9e311e`, `4879d598`, and `9315b63a` make reverse/pure-KL
+  real runs reachable.
+- Follow-ups: run the rigorous multi-seed/full-step capability evaluation on
+  H20 during OPD-after-QAT; V100 results here are directional only.
