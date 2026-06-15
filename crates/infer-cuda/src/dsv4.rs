@@ -1355,6 +1355,121 @@ impl Dsv4Model {
         Ok(())
     }
 
+    /// Lever 2b: batched commit fold — ONE pass over the 60 layers shared across
+    /// all `slot_ids`, instead of N × `commit_accepted_fold` (each its own
+    /// 60-layer host loop). Per layer, FOR EACH slot we gather that slot's
+    /// accepted rows from its OWN `spec_normed[layer_idx]` into a per-slot scratch
+    /// and call `commit_layer_fold` writing that slot's OWN `attention[layer_idx]`
+    /// ring (per-slot dispatch within the shared layer loop — the 60-layer host
+    /// loop is the amortization; the fold compute itself stays per-slot because
+    /// `commit_layer_fold` is attention/KV-only, one ring per slot). After the
+    /// layer loop, each slot's `seq_len` is advanced.
+    ///
+    /// `accepted_per_slot[s]` is the count of accepted draft tokens for slot `s`
+    /// (ragged across slots); slot `s` folds rows `0..=accepted_per_slot[s]`
+    /// (`m_s = accepted_per_slot[s] + 1`, the +1 being the pending/root row).
+    ///
+    /// §0.1 mutated-buffer enumeration (per slot `s`, all `slot_ids`):
+    /// - `slots[slot_ids[s]].spec_normed[layer_idx]` — READ only (gather source;
+    ///   the batched verify persisted it; never written here).
+    /// - `slots[slot_ids[s]].attention[layer_idx]` ring — WRITTEN by that slot's
+    ///   own `commit_layer_fold` (compressor/indexer ingest + SW ring K
+    ///   re-derive). Per-slot ring, no cross-slot aliasing: `kv_adapter` pool +
+    ///   `&mut slots[..]` are re-resolved per slot inside the layer loop, mirroring
+    ///   `forward_decode_batch_verify`.
+    /// - `slots[slot_ids[s]].seq_len` — SET to `start_positions[s] + m_s` after
+    ///   the layer loop (same advance `commit_accepted_fold` does per slot).
+    /// - per-slot gather scratch `[max_m, hidden]` — SCRATCH (uninit, written by
+    ///   the gather memcpy before read, `seq_len` re-pointed per slot).
+    /// - MoE / router / expert state — UNTOUCHED (`commit_layer_fold` is
+    ///   attention-only; no MoE here, mirroring the per-slot fold).
+    ///
+    /// Allreduce transport only (matches the batched-verify constraint that
+    /// persisted `spec_normed`).
+    pub(crate) fn commit_accepted_fold_batched(
+        &self,
+        slots: &mut [Dsv4SlotState],
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_ids: &[usize],
+        accepted_per_slot: &[usize],
+        start_positions: &[usize],
+    ) -> Result<()> {
+        let n = slot_ids.len();
+        ensure!(n > 0, "DSv4 batched commit fold requires at least one slot");
+        ensure!(
+            accepted_per_slot.len() == n && start_positions.len() == n,
+            "DSv4 batched commit fold surface length mismatch (slots {n}, accepted {}, starts {})",
+            accepted_per_slot.len(),
+            start_positions.len()
+        );
+        let hidden_size = self.config.hidden_size;
+        // Per-slot fold row count: accepted draft tokens + the root/pending row.
+        let m_per_slot: Vec<usize> = accepted_per_slot.iter().map(|&a| a + 1).collect();
+        let max_m = *m_per_slot.iter().max().unwrap_or(&1);
+
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        // ONE gather scratch sized to the widest slot, reused across layers AND
+        // slots (`seq_len` re-pointed per slot for the ragged counts).
+        // SAFETY: the first `m_s` rows are written by the gather memcpy below
+        // before `commit_layer_fold` reads them.
+        let mut gathered = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_m)? };
+        keepalive.keep_hidden(&gathered);
+
+        // ── ONE pass over the 60 layers, shared across all slots (the
+        // amortization). Per layer, dispatch each slot's own fold.
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            for s in 0..n {
+                let slot_idx = slot_ids[s];
+                let m = m_per_slot[s];
+                // Gather THIS slot's accepted rows (0..m, root first) from its OWN
+                // persisted `spec_normed[layer_idx]` into the shared scratch's
+                // first `m` rows — read-only on the slot, no aliasing.
+                {
+                    let cache = slots[slot_idx].spec_normed.as_ref().ok_or_else(|| {
+                        anyhow!("DSv4 batched commit fold without persisted verify rows")
+                    })?;
+                    for row in 0..m {
+                        let src = cache[layer_idx]
+                            .data
+                            .slice(row * hidden_size..(row + 1) * hidden_size);
+                        let mut dst = gathered
+                            .data
+                            .slice_mut(row * hidden_size..(row + 1) * hidden_size);
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(&src, &mut dst)
+                            .map_err(|e| anyhow!("DSv4 batched commit fold gather failed: {e}"))?;
+                    }
+                }
+                gathered.seq_len = m;
+                // Resolve the layer pool, THEN take this slot's mutable ring
+                // (sequenced borrows — mirrors forward_decode_batch_verify).
+                let layer_pool = kv_adapter.layer_mut(layer_idx)?;
+                let slot = &mut slots[slot_idx];
+                crate::attention::commit_layer_fold(
+                    &self.ctx,
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                    layer.compress_ratio,
+                    &mut slot.attention[layer_idx],
+                    layer_pool,
+                    &gathered,
+                    start_positions[s],
+                    &mut keepalive,
+                )?;
+            }
+        }
+        std::hint::black_box(keepalive.len());
+        drop(keepalive);
+
+        // Advance each slot's length (same as the per-slot fold's final step).
+        for s in 0..n {
+            slots[slot_ids[s]].seq_len = start_positions[s] + m_per_slot[s];
+        }
+        Ok(())
+    }
+
     pub(crate) fn dump_mtp_rollback_state(
         &self,
         slot: &Dsv4SlotState,
@@ -4956,6 +5071,22 @@ pub(crate) fn dsv4_batched_mtp_enabled() -> bool {
 pub(crate) fn dsv4_batched_mtp_draft_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_BATCHED_MTP_DRAFT").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Lever 2b sub-gate: fold the per-slot commit phase into ONE pass over the 60
+/// layers shared across all slots (one host layer loop, the per-slot
+/// `commit_layer_fold` dispatched within it) instead of N × full
+/// `commit_accepted_fold` (each its own 60-layer loop). Default OFF — with the
+/// env unset `spec_step_batched` keeps the proven per-slot `commit_accepted_fold`
+/// loop (byte-identical to today), so the A/B isolates lever 2b alone. Only
+/// consulted on the batched fold-commit path (`ARLE_DSV4_BATCHED_MTP=1` +
+/// `dsv4_mtp_commit_fold_enabled()`).
+/// bench/correctness pending pod-verify (license-or-kill per the bench spec).
+pub(crate) fn dsv4_batched_mtp_commit_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_BATCHED_MTP_COMMIT").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
