@@ -638,8 +638,7 @@ pub fn cuda_qwen35_engine_from_model_path(
     let mut config = SchedulerConfig::for_slots(1);
     config.max_prompt_tokens = 32_768;
     config.max_total_tokens = 65_536;
-    let executor =
-        infer_cuda::CudaExecutor::from_qwen35_moe_safetensors(model_path, 1, total_pages)?;
+    let executor = infer_cuda::CudaExecutor::from_qwen35_safetensors(model_path, 1, total_pages)?;
     let engine = Engine::with_config(
         executor,
         infer_cuda::CudaKvPool::new(1, total_pages, 16),
