@@ -7,8 +7,15 @@ multi-seed confidence intervals. The grading contract is owned by
 [`eval.md`](eval.md): the candidate artifact is ARLE inference output, the
 scorer is deterministic, no judge-repair.
 
-This doc pins (a) how the three eval lanes run, (b) the one structural blocker
-that stops every non-baseline curve point today, and (c) the smallest fix.
+This doc pins (a) how the three eval lanes run, (b) the historical structural
+blocker that stopped every non-baseline curve point, and (c) the runbook for the
+H20 teacher>student curve.
+
+**Status 2026-06-16.** Option B has landed: `arle train opd` / `self-opd`
+accept `--save-checkpoint <DIR>` + `--save-every <N>` and write
+full-materialized `step_NNNNNN/` HF dirs that `arle serve --model-path` loads
+unchanged. The blocker section below is retained as the design record. The
+ready-to-fire H20 script is [`scripts/h20_teacher_student_opd_curve.sh`](../scripts/h20_teacher_student_opd_curve.sh).
 
 ## Lanes — exact commands
 
@@ -112,11 +119,11 @@ sanitized instance (`repo`, `base_commit`, `problem_statement`, `requirements`,
 An instance is resolved only when every `FAIL_TO_PASS` and `PASS_TO_PASS` test
 passes inside the instance image.
 
-## The serving blocker (pins the non-baseline curve points)
+## The serving blocker (historical Option-B design record)
 
-**Symptom.** The curve's baseline point (the base HF model) serves and evals
-today. Every OPD/QAT *checkpoint* point cannot be served, so the curve has
-exactly one point.
+**Symptom.** Before Option B landed, the curve's baseline point (the base HF
+model) served and evaled, but every OPD/QAT *checkpoint* point could not be
+served, so the curve had exactly one point.
 
 **Root cause — two gaps, both confirmed in source:**
 
@@ -148,9 +155,9 @@ exactly one point.
    CLI handlers `run_opd` / `run_self_opd` (`crates/cli/src/train_cli.rs:226`,`:583`)
    **save no checkpoint at all** — they print losses/metrics and exit.
 
-So today: nothing the curve can serve is ever written. The merge path that would
-produce a servable dir exists but is unreachable from the CLI, and the one path
-that does write only writes adapter-only.
+Before the CLI save fix: nothing the curve could serve was ever written. The
+merge path that would produce a servable dir existed but was unreachable from
+the CLI, and the one path that did write only wrote adapter-only.
 
 ### Smallest fix — pick ONE (both are small, option B is smallest)
 
@@ -207,7 +214,32 @@ size matters for the curve cadence.
 manifest in, `curve.json` + a Δ-vs-baseline table out. It reuses
 `arle_capability_eval.py` (MMLU/GSM8K) and `arle_swe_pro_eval.py` (SWE-bench Pro)
 by subprocess and `analyze_multi_seed.py` for CI — it reimplements no eval logic.
-It works against the **base model today** (the baseline reference point);
-checkpoint points slot in once the serving blocker above is fixed (Option B makes
-each `step_NNNNNN/` a `model_path` point with no driver change). See
+It works against an already-running baseline serve (`base_url`) and against
+checkpoint dirs (`model_path`) that it launches and tears down itself. Option B
+makes each `step_NNNNNN/` a `model_path` point with no driver change. See
 `--help` and `--dry-run`.
+
+## H20 teacher>student runbook (prepared, QAT-gated)
+
+The capability verdict must come from a teacher>student run, not the
+teacher==student or cold-start V100 probes. The prepared lane is:
+
+```bash
+ARLE_ROOT=/data01/build/arle \
+STUDENT_MODEL=/data01/models/Qwen3.5-0.8B-Base \
+TEACHER_MODEL=/data01/models/Qwen3.5-4B \
+bash scripts/h20_teacher_student_opd_curve.sh
+```
+
+Defaults: 10k pure-KL OPD steps, rollout_len=8, lr=2e-5, LoRA r16/alpha32 on
+attention q/v, `--save-checkpoint $RUN_ROOT/checkpoints`,
+`--save-every 2000`, then `scripts/opd_capability_curve.py` over MMLU+GSM8K
+with `n_samples=500` and seeds `0,1,2,3,4`. The generated manifest lists
+`base-0p8b`, each `opd-step-NNNNNN` full checkpoint, and the optional
+`teacher-4b-upper` point. Outputs land under
+`bench-output/h20-opd-teacher-student-*/{curve_manifest.json,checkpoints/,curve/curve.json,logs/}`.
+
+This script is not a local smoke. It requires an H20 by default and is intended
+for the post-QAT remote slot. Set env overrides only to change the controlled
+run shape; setting `STUDENT_MODEL == TEACHER_MODEL` is rejected because it
+recreates the confounded no-gradient setup.
