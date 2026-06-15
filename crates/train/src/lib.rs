@@ -38,6 +38,8 @@ pub mod teacher_infer;
 pub mod tokenizer;
 #[path = "trainer.rs"]
 pub mod trainer;
+#[path = "trajectory_scorer.rs"]
+pub mod trajectory_scorer;
 
 pub use causal_lm::CausalLm;
 pub use grad_accum::GradAccumulator;
