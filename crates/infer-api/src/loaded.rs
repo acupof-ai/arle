@@ -945,7 +945,7 @@ mod backend {
                 )?;
                 if loaded.image_token_id.is_some() {
                     log::info!(
-                        "Gemma4 VLM ids detected: image_token_id={:?}, vision_soft_tokens_per_image={:?}; image embedding bridge is not enabled on this route",
+                        "Gemma4 VLM ids detected: image_token_id={:?}, vision_soft_tokens_per_image={:?}; Metal image soft-token bridge enabled",
                         loaded.image_token_id,
                         loaded.vision_soft_tokens_per_image
                     );

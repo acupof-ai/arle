@@ -113,6 +113,24 @@ pub(crate) struct MetalGemma4Config {
     pub(crate) generation: DiffusionGenerationConfig,
     pub(crate) image_token_id: Option<u32>,
     pub(crate) vision_soft_tokens_per_image: Option<usize>,
+    pub(crate) vision: Option<MetalGemma4VisionConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MetalGemma4VisionConfig {
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) patch_size: usize,
+    pub(crate) pooling_kernel_size: usize,
+    pub(crate) default_output_length: usize,
+    pub(crate) position_embedding_size: usize,
+    pub(crate) rope_theta: f32,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) use_clipped_linears: bool,
 }
 
 pub(crate) fn load_diffusion_gemma_config(model_dir: &Path) -> Result<MetalDiffusionGemmaConfig> {
@@ -150,12 +168,67 @@ pub(crate) fn load_gemma4_config(model_dir: &Path) -> Result<MetalGemma4Config> 
         .get("vision_soft_tokens_per_image")
         .and_then(serde_json::Value::as_u64)
         .map(|n| n as usize);
+    let vision = gemma4_vision_config_from_root(root, vision_soft_tokens_per_image)?;
     Ok(MetalGemma4Config {
         text,
         generation,
         image_token_id,
         vision_soft_tokens_per_image,
+        vision,
     })
+}
+
+fn gemma4_vision_config_from_root(
+    root: &serde_json::Map<String, serde_json::Value>,
+    root_soft_tokens: Option<usize>,
+) -> Result<Option<MetalGemma4VisionConfig>> {
+    let Some(vision) = root
+        .get("vision_config")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let get_usize = |key: &str, default: usize| -> usize {
+        vision
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map_or(default, |n| n as usize)
+    };
+    let get_f32 = |key: &str, default: f32| -> f32 {
+        vision
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .map_or(default, |n| n as f32)
+    };
+    let rope_theta = vision
+        .get("rope_parameters")
+        .and_then(|value| value.get("rope_theta"))
+        .and_then(serde_json::Value::as_f64)
+        .map_or(100.0, |n| n as f32);
+    let hidden_size = get_usize("hidden_size", 768);
+    let num_attention_heads = get_usize("num_attention_heads", 12);
+    anyhow::ensure!(
+        num_attention_heads > 0,
+        "Gemma4 vision num_attention_heads must be positive"
+    );
+    Ok(Some(MetalGemma4VisionConfig {
+        hidden_size,
+        intermediate_size: get_usize("intermediate_size", hidden_size * 4),
+        num_hidden_layers: get_usize("num_hidden_layers", 0),
+        num_attention_heads,
+        num_key_value_heads: get_usize("num_key_value_heads", num_attention_heads),
+        head_dim: get_usize("head_dim", hidden_size / num_attention_heads),
+        patch_size: get_usize("patch_size", 16),
+        pooling_kernel_size: get_usize("pooling_kernel_size", 3),
+        default_output_length: get_usize("default_output_length", root_soft_tokens.unwrap_or(280)),
+        position_embedding_size: get_usize("position_embedding_size", 10240),
+        rope_theta,
+        rms_norm_eps: get_f32("rms_norm_eps", 1e-6),
+        use_clipped_linears: vision
+            .get("use_clipped_linears")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    }))
 }
 
 pub fn model_dir_is_diffusion_gemma(model_dir: &Path) -> bool {
@@ -731,6 +804,21 @@ mod tests {
             "eos_token_id": [1, 106, 50],
             "image_token_id": 258880,
             "vision_soft_tokens_per_image": 280,
+            "vision_config": {
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_hidden_layers": 16,
+                "num_attention_heads": 12,
+                "num_key_value_heads": 12,
+                "head_dim": 64,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "default_output_length": 280,
+                "position_embedding_size": 10240,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": {"rope_theta": 100.0},
+                "use_clipped_linears": true
+            },
             "text_config": {
                 "vocab_size": 262144,
                 "hidden_size": 1536,
@@ -773,6 +861,11 @@ mod tests {
         assert_eq!(parsed.generation.stop_token_ids, vec![1, 106, 50]);
         assert_eq!(parsed.image_token_id, Some(258_880));
         assert_eq!(parsed.vision_soft_tokens_per_image, Some(280));
+        let vision = parsed.vision.unwrap();
+        assert_eq!(vision.hidden_size, 768);
+        assert_eq!(vision.num_hidden_layers, 16);
+        assert_eq!(vision.default_output_length, 280);
+        assert!(vision.use_clipped_linears);
         assert_eq!(parsed.text.kv_shared_source_layer(5), Some(2));
         let _ = std::fs::remove_dir_all(dir);
     }

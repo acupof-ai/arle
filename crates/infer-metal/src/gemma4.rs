@@ -7,9 +7,10 @@ use anyhow::{Context, Result};
 use infer_plan::{
     DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateOutput,
     DiffusionGenerateStats, DiffusionGenerationConfig, DiffusionModelError, FinishReason,
+    MultimodalImage,
 };
 
-use crate::config::MetalGemma4Config;
+use crate::config::{MetalGemma4Config, MetalGemma4VisionConfig};
 use crate::diffusion_gemma::{QuantRegistry, rope_for_layer};
 use crate::loader::{
     TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
@@ -93,6 +94,21 @@ impl DiffusionBlockModel for MetalGemma4Model {
             i32_tokens(prompt_tokens).map_err(|err| DiffusionModelError::new(err.to_string()))?;
         self.cpp
             .generate(&tokens, config, cancel)
+            .map(Some)
+            .map_err(|err| DiffusionModelError::new(err.to_string()))
+    }
+
+    fn generate_multimodal_with_cancel(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[MultimodalImage],
+        config: &DiffusionGenerationConfig,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
+        let tokens =
+            i32_tokens(prompt_tokens).map_err(|err| DiffusionModelError::new(err.to_string()))?;
+        self.cpp
+            .generate_multimodal(&tokens, images, config, cancel)
             .map(Some)
             .map_err(|err| DiffusionModelError::new(err.to_string()))
     }
@@ -240,6 +256,88 @@ impl CppGemma4Model {
             trace: Vec::new(),
         })
     }
+
+    fn generate_multimodal(
+        &mut self,
+        prompt: &[i32],
+        images: &[MultimodalImage],
+        config: &DiffusionGenerationConfig,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<DiffusionGenerateOutput> {
+        anyhow::ensure!(
+            images.len() == 1,
+            "Gemma4 Metal VLM currently supports exactly one image per request"
+        );
+        let image = &images[0];
+        anyhow::ensure!(
+            image.channels == 3,
+            "Gemma4 Metal VLM image input must be RGB"
+        );
+        anyhow::ensure!(
+            image.pixels.len() == image.channels * image.height * image.width,
+            "Gemma4 Metal VLM image buffer shape mismatch"
+        );
+        let max_new_tokens =
+            i32::try_from(config.max_new_tokens).context("max_new_tokens does not fit in i32")?;
+        let height = i32::try_from(image.height).context("image height does not fit in i32")?;
+        let width = i32::try_from(image.width).context("image width does not fit in i32")?;
+        let soft_tokens = i32::try_from(image.soft_token_count)
+            .context("image soft token count does not fit in i32")?;
+        let mut tokens = vec![0u32; config.max_new_tokens];
+        let mut out_len = 0i32;
+        let mut out_finish = 0i32;
+        let (cancel_fn, cancel_ctx) = if let Some(flag) = cancel {
+            (
+                Some(gemma4_cancelled as unsafe extern "C" fn(*const std::ffi::c_void) -> i32),
+                flag as *const AtomicBool as *const std::ffi::c_void,
+            )
+        } else {
+            (None, std::ptr::null())
+        };
+        self.check_rc(unsafe {
+            mlx_sys::diffusion_gemma_generate_causal_image(
+                self.raw,
+                prompt.as_ptr(),
+                prompt.len() as i32,
+                image.pixels.as_ptr(),
+                height,
+                width,
+                soft_tokens,
+                max_new_tokens,
+                config.seed,
+                config.stop_token_ids.as_ptr(),
+                config.stop_token_ids.len() as i32,
+                cancel_fn,
+                cancel_ctx,
+                tokens.as_mut_ptr(),
+                &mut out_len,
+                &mut out_finish,
+            )
+        })?;
+        let len = usize::try_from(out_len).context("negative Gemma4 output length")?;
+        anyhow::ensure!(
+            len <= tokens.len(),
+            "Gemma4 output length {} exceeds buffer {}",
+            len,
+            tokens.len()
+        );
+        tokens.truncate(len);
+        let finish = if out_finish == 1 {
+            FinishReason::Stop
+        } else {
+            FinishReason::Length
+        };
+        Ok(DiffusionGenerateOutput {
+            generated_tokens: tokens,
+            finish,
+            stats: DiffusionGenerateStats {
+                blocks: len,
+                denoise_steps: len,
+                ..DiffusionGenerateStats::default()
+            },
+            trace: Vec::new(),
+        })
+    }
 }
 
 struct CppGemma4Builder {
@@ -289,9 +387,153 @@ impl CppGemma4Builder {
             let layer_prefix = format!("{prefix}.layers.{layer_idx}");
             self.push_layer(text, tensors, quant, &layer_prefix, layer_idx)?;
         }
+        if let Some(vision) = &parsed.vision {
+            let image_token_id = parsed
+                .image_token_id
+                .context("Gemma4 vision_config present but image_token_id is missing")?;
+            self.set_vision(vision, image_token_id, tensors, quant)?;
+        }
 
         self.check_rc(unsafe { mlx_sys::diffusion_gemma_finalize(self.raw) })?;
         Ok(())
+    }
+
+    fn set_vision(
+        &mut self,
+        vision: &MetalGemma4VisionConfig,
+        image_token_id: u32,
+        tensors: &TensorMap,
+        quant: &QuantRegistry,
+    ) -> Result<()> {
+        let patch_proj_id =
+            self.add_proj(tensors, quant, "vision_tower.patch_embedder.input_proj")?;
+        let position_id = self.add_dense_name(
+            tensors,
+            "vision_tower.patch_embedder.position_embedding_table",
+        )?;
+        let projection_id = self.add_proj(tensors, quant, "embed_vision.embedding_projection")?;
+        self.check_rc(unsafe {
+            mlx_sys::diffusion_gemma_set_vision_config(
+                self.raw,
+                image_token_id as i32,
+                vision.hidden_size as i32,
+                vision.intermediate_size as i32,
+                vision.num_hidden_layers as i32,
+                vision.num_attention_heads as i32,
+                vision.num_key_value_heads as i32,
+                vision.head_dim as i32,
+                vision.patch_size as i32,
+                vision.pooling_kernel_size as i32,
+                vision.default_output_length as i32,
+                vision.position_embedding_size as i32,
+                vision.rope_theta,
+                vision.rms_norm_eps,
+                vision.use_clipped_linears,
+                patch_proj_id,
+                position_id,
+                projection_id,
+            )
+        })?;
+        for layer_idx in 0..vision.num_hidden_layers {
+            self.push_vision_layer(tensors, quant, layer_idx)?;
+        }
+        Ok(())
+    }
+
+    fn push_vision_layer(
+        &mut self,
+        tensors: &TensorMap,
+        quant: &QuantRegistry,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let prefix = format!("vision_tower.encoder.layers.{layer_idx}");
+        let attn = format!("{prefix}.self_attn");
+        let mlp = format!("{prefix}.mlp");
+        let input_ln_id =
+            self.add_dense_name(tensors, &format!("{prefix}.input_layernorm.weight"))?;
+        let q_id = self.add_proj(tensors, quant, &format!("{attn}.q_proj.linear"))?;
+        let q_clip = self.add_clip(tensors, &format!("{attn}.q_proj"))?;
+        let k_id = self.add_proj(tensors, quant, &format!("{attn}.k_proj.linear"))?;
+        let k_clip = self.add_clip(tensors, &format!("{attn}.k_proj"))?;
+        let v_id = self.add_proj(tensors, quant, &format!("{attn}.v_proj.linear"))?;
+        let v_clip = self.add_clip(tensors, &format!("{attn}.v_proj"))?;
+        let o_id = self.add_proj(tensors, quant, &format!("{attn}.o_proj.linear"))?;
+        let o_clip = self.add_clip(tensors, &format!("{attn}.o_proj"))?;
+        let q_norm_id = self.add_dense_name(tensors, &format!("{attn}.q_norm.weight"))?;
+        let k_norm_id = self.add_dense_name(tensors, &format!("{attn}.k_norm.weight"))?;
+        let post_attn_ln_id = self.add_dense_name(
+            tensors,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        )?;
+        let pre_ff_ln_id = self.add_dense_name(
+            tensors,
+            &format!("{prefix}.pre_feedforward_layernorm.weight"),
+        )?;
+        let gate_id = self.add_proj(tensors, quant, &format!("{mlp}.gate_proj.linear"))?;
+        let gate_clip = self.add_clip(tensors, &format!("{mlp}.gate_proj"))?;
+        let up_id = self.add_proj(tensors, quant, &format!("{mlp}.up_proj.linear"))?;
+        let up_clip = self.add_clip(tensors, &format!("{mlp}.up_proj"))?;
+        let down_id = self.add_proj(tensors, quant, &format!("{mlp}.down_proj.linear"))?;
+        let down_clip = self.add_clip(tensors, &format!("{mlp}.down_proj"))?;
+        let post_ff_ln_id = self.add_dense_name(
+            tensors,
+            &format!("{prefix}.post_feedforward_layernorm.weight"),
+        )?;
+        self.check_rc(unsafe {
+            mlx_sys::diffusion_gemma_push_vision_layer(
+                self.raw,
+                input_ln_id,
+                q_id,
+                q_clip[0],
+                q_clip[1],
+                q_clip[2],
+                q_clip[3],
+                k_id,
+                k_clip[0],
+                k_clip[1],
+                k_clip[2],
+                k_clip[3],
+                v_id,
+                v_clip[0],
+                v_clip[1],
+                v_clip[2],
+                v_clip[3],
+                o_id,
+                o_clip[0],
+                o_clip[1],
+                o_clip[2],
+                o_clip[3],
+                q_norm_id,
+                k_norm_id,
+                post_attn_ln_id,
+                pre_ff_ln_id,
+                gate_id,
+                gate_clip[0],
+                gate_clip[1],
+                gate_clip[2],
+                gate_clip[3],
+                up_id,
+                up_clip[0],
+                up_clip[1],
+                up_clip[2],
+                up_clip[3],
+                down_id,
+                down_clip[0],
+                down_clip[1],
+                down_clip[2],
+                down_clip[3],
+                post_ff_ln_id,
+            )
+        })
+    }
+
+    fn add_clip(&mut self, tensors: &TensorMap, base: &str) -> Result<[i32; 4]> {
+        Ok([
+            self.add_dense_name(tensors, &format!("{base}.input_min"))?,
+            self.add_dense_name(tensors, &format!("{base}.input_max"))?,
+            self.add_dense_name(tensors, &format!("{base}.output_min"))?,
+            self.add_dense_name(tensors, &format!("{base}.output_max"))?,
+        ])
     }
 
     fn push_layer(

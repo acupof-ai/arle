@@ -57,6 +57,19 @@ pub struct DiffusionGenerationConfig {
     pub seed: u64,
 }
 
+/// Host-side image payload for backends that expose a backend-owned VLM path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultimodalImage {
+    /// RGB pixels in channel-first `[3, height, width]` order, already converted
+    /// to `0..1` float values and resized to the model processor's patch grid.
+    pub pixels: Vec<f32>,
+    pub channels: usize,
+    pub height: usize,
+    pub width: usize,
+    /// Number of soft-token embeddings the vision tower emits after pooling.
+    pub soft_token_count: usize,
+}
+
 impl DiffusionGenerationConfig {
     /// DiffusionGemma defaults from the public model config.
     #[must_use]
@@ -184,6 +197,17 @@ pub trait DiffusionBlockModel {
         _cancel: Option<&AtomicBool>,
     ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
         self.generate(prompt_tokens, config)
+    }
+
+    /// Optional backend-owned multimodal fast path.
+    fn generate_multimodal_with_cancel(
+        &mut self,
+        _prompt_tokens: &[u32],
+        _images: &[MultimodalImage],
+        _config: &DiffusionGenerationConfig,
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
+        Ok(None)
     }
 
     /// Start a request with the exact generation config selected by the engine.
