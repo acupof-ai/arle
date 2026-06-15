@@ -159,6 +159,7 @@ mod app {
         };
         let step_cfg = OpdStepConfig {
             rollout_len: ROLLOUT_LEN,
+            rollout_sampling: None,
             grad_clip: 1.0,
         };
 
@@ -169,7 +170,7 @@ mod app {
                 &student,
                 &teacher,
                 PROMPT_IDS,
-                step_cfg,
+                step_cfg.clone(),
                 &student_params,
                 &mut optimizer,
                 &mut store,

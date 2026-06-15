@@ -87,7 +87,7 @@ fn infer_student_zero_lora_rollout_latency() -> TestResult {
     for _ in 0..ROLLOUT_TOKENS {
         let positions: Vec<u32> = (0..sequence.len() as u32).collect();
         let step_start = Instant::now();
-        let next = student.decode_next_token(&sequence, &positions)?;
+        let next = student.decode_next_token(&sequence, &positions, None, sequence.len() as u64)?;
         let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
         per_token_ms.push(step_ms);
         sequence.push(next);

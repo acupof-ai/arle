@@ -823,6 +823,7 @@ mod app {
                 prompt,
                 OpdStepConfig {
                     rollout_len: args.rollout_len,
+                    rollout_sampling: None,
                     grad_clip: GRAD_CLIP,
                 },
                 student_trainable_params,

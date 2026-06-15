@@ -599,6 +599,27 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = 8)]
     pub(crate) rollout_len: usize,
 
+    /// Rollout sampling temperature (0.0 = greedy argmax).
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_parser = parse_temperature,
+        allow_hyphen_values = true
+    )]
+    pub(crate) rollout_temperature: f32,
+
+    /// Rollout nucleus sampling threshold (1.0 disables top-p filtering).
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) rollout_top_p: f32,
+
+    /// Rollout top-k filter (0 disables top-k filtering).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) rollout_top_k: i32,
+
+    /// Optional deterministic rollout sampling seed.
+    #[arg(long)]
+    pub(crate) rollout_seed: Option<u64>,
+
     /// Total OPD training steps.
     #[arg(long, default_value_t = 5)]
     pub(crate) steps: usize,
@@ -656,6 +677,27 @@ pub(crate) struct TrainSelfOpdArgs {
     /// Tokens to roll out greedily from the student per step.
     #[arg(long, default_value_t = 8)]
     pub(crate) rollout_len: usize,
+
+    /// Rollout sampling temperature (0.0 = greedy argmax).
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_parser = parse_temperature,
+        allow_hyphen_values = true
+    )]
+    pub(crate) rollout_temperature: f32,
+
+    /// Rollout nucleus sampling threshold (1.0 disables top-p filtering).
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) rollout_top_p: f32,
+
+    /// Rollout top-k filter (0 disables top-k filtering).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) rollout_top_k: i32,
+
+    /// Optional deterministic rollout sampling seed.
+    #[arg(long)]
+    pub(crate) rollout_seed: Option<u64>,
 
     /// Total SOPD training steps.
     #[arg(long, default_value_t = 5)]
