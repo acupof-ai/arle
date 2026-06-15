@@ -4,6 +4,13 @@ ARLE evals are runtime-owned: the candidate answer or patch must be produced by
 the ARLE inference engine, and the grader may only score that artifact. The
 grader must not repair, rewrite, or judge-improve the model output.
 
+For the OPD/QAT **capability curve** (run the suite below at successive
+checkpoints, Δ-vs-baseline with multi-seed CI) and the one serving blocker that
+gates non-baseline curve points, see
+[opd-capability-curve.md](opd-capability-curve.md). The driver
+(`scripts/opd_capability_curve.py`) reuses the per-task evaluators here by
+subprocess — it adds no new scorer.
+
 ## Result Contract
 
 Every eval run must preserve three artifacts:
