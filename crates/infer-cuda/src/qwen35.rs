@@ -8,8 +8,8 @@
 //!     This carries a per-slot recurrent state (`[V*K*V_head]` f32) + conv ring
 //!     (`[qkv_dim*(kernel-1)]` bf16) ACROSS prefill and decode steps.
 //!   - `FullAttention` (periodic): standard GQA with a per-head sigmoid gate on
-//!     the q_proj output (`q_proj` rows = `heads*head_dim*2`), HD256 / kv2, on a
-//!     contiguous per-slot K/V cache.
+//!     the q_proj output (`q_proj` rows = `heads*head_dim*2`), head_dim 128/256,
+//!     on a contiguous per-slot K/V cache.
 //!
 //! Like [`crate::dsv4`], this model OWNS its KV state (no [`PagedKVPool`]) and
 //! runs the uncached full-prefix correctness path: full-attn layers recompute
@@ -258,7 +258,7 @@ impl Qwen35SlotState {
 /// | `mlp_out`     | `[H, S]`        | dense: down `gemm_cuda` beta=0; MoE: combine kernel writes all, then gated-add RMWs |
 /// | `full.q_full` | `[2*Hq*D, S]`   | `gemm_cuda` beta=0 |
 /// | `full.k_batch`/`v_batch` | `[Hkv*D, S]` | `gemm_cuda` beta=0 |
-/// | `full.q_prepped` | `[Hq*D, S]`  | HD256 prep writes every (token, head, d): RoPE pair covers `[0, rotary)`, the `d >= rotary` branch covers the rest |
+/// | `full.q_prepped` | `[Hq*D, S]`  | full-attn prep writes every (token, head, d): RoPE pair covers `[0, rotary)`, the `d >= rotary` branch covers the rest |
 /// | `full.attn_heads`| `[Hq*D, S]`  | nonpaged attention writes every (token, head, d) from register accumulators; the gate kernel then RMWs in place |
 /// | `linear.qkv`/`z`/`b_proj`/`a_proj` | `[*, S]` | `gemm_cuda` beta=0 |
 /// | `linear.qkv_conv` | `[QKV, S]`  | conv1d prefill writes every (channel, t) |
@@ -276,7 +276,7 @@ impl Qwen35SlotState {
 #[derive(Default)]
 pub(crate) struct Qwen35Workspace {
     token_ids: SliceSlot<i32>,
-    /// GPU-resident `start_pos` for the HD256 prep kernel — uploaded once per
+    /// GPU-resident `start_pos` for the full-attn prep kernel — uploaded once per
     /// forward (the value is identical for every full-attn layer in the call;
     /// the old path uploaded one identical buffer per layer). The decode graph
     /// also reads it from the devpos attention kernel, so it is the single
@@ -725,6 +725,27 @@ impl std::fmt::Debug for Qwen35Model {
     }
 }
 
+fn validate_qwen35_cuda_config(m: &Qwen35Config) -> Result<()> {
+    ensure!(
+        matches!(m.head_dim, 128 | 256),
+        "clean CUDA Qwen3.5 hybrid path supports full-attention head_dim 128/256, got {}",
+        m.head_dim
+    );
+    ensure!(
+        m.num_attention_heads.is_multiple_of(m.num_key_value_heads),
+        "Qwen3.5 num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+        m.num_attention_heads,
+        m.num_key_value_heads
+    );
+    ensure!(
+        m.linear_key_head_dim == 128 && m.linear_value_head_dim == 128,
+        "clean CUDA Qwen3.5 gated-delta path supports linear key/value dim 128/128, got {}/{}",
+        m.linear_key_head_dim,
+        m.linear_value_head_dim
+    );
+    Ok(())
+}
+
 impl Qwen35Model {
     fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
@@ -860,42 +881,27 @@ impl Qwen35Model {
         Ok(planned)
     }
 
-    /// Load a BF16 Qwen3.5/3.6 HYBRID MoE checkpoint, resolving the TP runtime
-    /// from the environment (single-GPU when no TP env is set).
+    /// Load a BF16 Qwen3.5/3.6 hybrid dense-or-MoE checkpoint, resolving the TP
+    /// runtime from the environment (single-GPU when no TP env is set).
     ///
     /// `max_seq_len` sizes the per-slot full-attn contiguous K/V cache.
-    pub(crate) fn from_qwen35_moe_safetensors(
-        model_path: &Path,
-        max_seq_len: usize,
-    ) -> Result<Self> {
+    pub(crate) fn from_safetensors(model_path: &Path, max_seq_len: usize) -> Result<Self> {
         let tp = crate::loader::build_tp_runtime()?;
-        Self::from_qwen35_moe_safetensors_with_tp(model_path, max_seq_len, tp)
+        Self::from_safetensors_with_tp(model_path, max_seq_len, tp)
     }
 
     /// Load with an explicit [`crate::tp::TpRuntime`] (tests inject a single-GPU
     /// runtime — mirrors the dense loader's `from_safetensors_with_tp`).
-    pub(crate) fn from_qwen35_moe_safetensors_with_tp(
+    pub(crate) fn from_safetensors_with_tp(
         model_path: &Path,
         max_seq_len: usize,
         tp: crate::tp::TpRuntime,
     ) -> Result<Self> {
         let m = Qwen35Config::from_model_dir(model_path)
             .map_err(|e| anyhow!("load Qwen3.5 config from {}: {e}", model_path.display()))?;
-        ensure!(
-            m.is_moe(),
-            "from_qwen35_moe_safetensors requires a MoE checkpoint (num_experts > 0)"
-        );
-        ensure!(
-            m.head_dim == 256 && m.num_attention_heads == 16 && m.num_key_value_heads == 2,
-            "clean CUDA Qwen3.5 hybrid path only wires the HD256 q16/kv2 TileLang \
-             full-attention kernels (the only HD256 SUPPORTED_HEADS that cover \
-             Qwen3.6-35B-A3B); got heads={} kv_heads={} head_dim={}",
-            m.num_attention_heads,
-            m.num_key_value_heads,
-            m.head_dim
-        );
+        validate_qwen35_cuda_config(&m)?;
         // Full attention here is the GATED q_proj variant (Qwen3.5/3.6); the
-        // HD256 prep+gate kernels assume it. Vanilla un-gated Qwen3 would need
+        // prep+gate kernels assume it. Vanilla un-gated Qwen3 would need
         // the dense path, not this loader.
         ensure!(
             m.full_attn_gated,
@@ -916,7 +922,7 @@ impl Qwen35Model {
         let world = tp_cfg.world_size;
         // Per-rank GQA head counts. `head_shard` requires both counts divide the
         // world size (kv_heads=2 caps Qwen3.6-35B at TP∈{1,2}), keeping every
-        // rank's attention shape uniform — the HD256 kernels and the all-reduce
+        // rank's attention shape uniform — the full-attn kernels and the all-reduce
         // both rely on it.
         let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
             (m.num_attention_heads, m.num_key_value_heads)
@@ -957,10 +963,18 @@ impl Qwen35Model {
             );
         }
 
-        let moe_config = crate::moe_config::moe_config_from_qwen35(&m)?;
-        // EP mirrors TP: each rank owns `num_experts / world` whole experts
-        // (`ExpertSplit::new` rejects an indivisible expert count loudly).
-        let split = if tp_cfg.is_single() {
+        let moe_config = if m.is_moe() {
+            Some(crate::moe_config::moe_config_from_qwen35(&m)?)
+        } else {
+            None
+        };
+        // EP mirrors TP for MoE: each rank owns `num_experts / world` whole
+        // experts (`ExpertSplit::new` rejects an indivisible expert count
+        // loudly). Dense Qwen3.5 has no expert-owned buffers; keep an inert
+        // split so the struct layout stays uniform.
+        let split = if !m.is_moe() {
+            ExpertSplit::single(0)
+        } else if tp_cfg.is_single() {
             ExpertSplit::single(m.num_experts)
         } else {
             ExpertSplit::new(m.num_experts, world, tp_cfg.rank)
@@ -1028,7 +1042,7 @@ impl Qwen35Model {
                         &tp_cfg,
                     )?,
                     // q/k_norm are `[head_dim]`, broadcast across heads by the
-                    // HD256 prep kernel — replicated.
+                    // full-attention prep kernel — replicated.
                     q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                     k_norm: loader.load_vec(&ctx, &full.k_norm)?,
                 })),
@@ -1187,7 +1201,7 @@ impl Qwen35Model {
              positions beyond the table would read out of bounds"
         );
         // PARTIAL RoPE: the table must be built over `rotary_dim` (= head_dim ×
-        // partial_rotary_factor, 64 on Qwen3.6), not head_dim — the HD256 prep
+        // partial_rotary_factor, 64 on Qwen3.6), not head_dim — the prep
         // kernel indexes `cos_cache[pos * rotary_dim + d]` and expects inv_freq
         // computed over rotary_dim dims (`precompute_rope` is generic over its
         // dim arg and emits the half-duplicated stride-dim layout it reads).
@@ -1204,7 +1218,7 @@ impl Qwen35Model {
             norm,
             cos_cache,
             sin_cache,
-            moe_config: Some(moe_config),
+            moe_config,
             tp,
             local_q_heads,
             local_kv_heads,
@@ -2063,7 +2077,7 @@ impl Qwen35Model {
 
     /// Gated full attention over the contiguous per-slot K/V cache (uncached
     /// recompute over `[0, start_pos+seq_len)` each call) into `out`
-    /// (`[hidden, seq]`, beta=0 o_proj GEMM). HD256 prep fuses q/k RMSNorm +
+    /// (`[hidden, seq]`, beta=0 o_proj GEMM). The prep kernel fuses q/k RMSNorm +
     /// RoPE + cache write; the gate kernel applies the per-head sigmoid gate
     /// carried in `q_full`. `start_pos_dev` is the forward-level GPU-resident
     /// `start_pos` (identical for every layer of one call).
@@ -2145,6 +2159,7 @@ impl Qwen35Model {
                     vc_ptr as *mut ffi::Half,
                     self.local_q_heads as i32,
                     self.local_kv_heads as i32,
+                    c.head_dim as i32,
                     seq_len as i32,
                     sp_ptr as *const i32,
                     c.rotary_dim as i32,
@@ -2190,7 +2205,7 @@ impl Qwen35Model {
                         self.ctx.stream.cu_stream(),
                     )
                     .result()?;
-                } else if qwen35_fa3_enabled() {
+                } else if c.head_dim == 256 && qwen35_fa3_enabled() {
                     // FA3 fwd over the SAME buffers the in-tree kernel uses:
                     // q/out token-major [S, h, 256] (HD256 prep layout),
                     // cache head-major [h_k, max_seq, 256]. Passing the
@@ -2252,12 +2267,13 @@ impl Qwen35Model {
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per HD256 prep.
+            // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per full-attn prep.
             unsafe {
                 ffi::attention_gate_batch_hd256_cuda(
                     qf_ptr as *const ffi::Half,
                     o_ptr as *mut ffi::Half,
                     self.local_q_heads as i32,
+                    c.head_dim as i32,
                     seq_len as i32,
                     self.ctx.stream.cu_stream(),
                 )
@@ -2792,7 +2808,7 @@ impl Qwen35Model {
     /// rows (the GEMM amortizes), then a PER-ROW loop over the existing
     /// single-row prep + devpos-attention + gate kernels against each row's
     /// contiguous per-slot cache (DSv4 `dsv4.rs` Step-A pattern). Unlike
-    /// DSv4's copy-in/copy-out, the HD256 kernels index strictly
+    /// DSv4's copy-in/copy-out, the full-attn kernels index strictly
     /// `token * dim + ...` from their base pointers with the position read
     /// from a device scalar, so at `seq_len == 1` a column-offset pointer
     /// (`base + r*dim`) and a per-row position pointer (`positions + r`)
@@ -2885,6 +2901,7 @@ impl Qwen35Model {
                         vc_ptr as *mut ffi::Half,
                         self.local_q_heads as i32,
                         self.local_kv_heads as i32,
+                        c.head_dim as i32,
                         1, // seq_len: one new token per row
                         pos_r as *const i32,
                         c.rotary_dim as i32,
@@ -2912,6 +2929,7 @@ impl Qwen35Model {
                         qf_r as *const ffi::Half,
                         ao_r as *mut ffi::Half,
                         self.local_q_heads as i32,
+                        c.head_dim as i32,
                         1, // seq_len
                         self.ctx.stream.cu_stream(),
                     )
@@ -3321,4 +3339,60 @@ fn rms_norm_offset_vec(
         .result()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qwen35_dense_4b_config() -> Qwen35Config {
+        Qwen35Config {
+            hidden_size: 2560,
+            intermediate_size: 9216,
+            num_hidden_layers: 2,
+            vocab_size: 248_320,
+            rms_norm_eps: 1e-6,
+            stop_token_ids: vec![151_645],
+            bos_token_id: None,
+            eos_token_id: 151_645,
+            tie_word_embeddings: true,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_num_value_heads: 32,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 1_000_000.0,
+            rope_scaling: None,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 128,
+            rope_cache_len_hint: Some(32_768),
+            layer_types: vec![LayerType::FullAttention, LayerType::LinearAttention],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: vec![],
+            full_attn_gated: true,
+        }
+    }
+
+    #[test]
+    fn cuda_qwen35_guard_accepts_dense_hybrid_4b_shape() {
+        let cfg = qwen35_dense_4b_config();
+        cfg.validate().unwrap();
+        validate_qwen35_cuda_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn cuda_qwen35_guard_rejects_unknown_full_attention_head_dim() {
+        let mut cfg = qwen35_dense_4b_config();
+        cfg.head_dim = 64;
+        cfg.rotary_dim = 64;
+        assert!(validate_qwen35_cuda_config(&cfg).is_err());
+    }
 }
