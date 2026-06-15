@@ -132,6 +132,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The default ubuntu-22.04 runner has ~14 GB free on /, and this job's
+      # chain is unusually disk-heavy: CUDA toolkit 12.8 (~4 GB) + torch cu129
+      # (~6 GB extracted) + a from-source TileLang/TVM build (clone + compile,
+      # ~8-10 GB). v0.2.1-rc1 OOD'd ("No space left on device") at the torch
+      # download. Reclaim the preinstalled SDKs ARLE never uses (Android, GHC,
+      # .NET, CodeQL, boost) to free ~25-30 GB BEFORE the CUDA/torch installs.
+      # T1 + Blackwell don't need this (no from-source build) so they're left
+      # untouched.
+      - name: Free up disk space
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /usr/share/dotnet /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/share/swift || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean || true
+          echo "after:"; df -h / | tail -1
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
