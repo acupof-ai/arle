@@ -1,4 +1,4 @@
-# Qwen3.6 CUDA Native Quant Plan
+# CUDA Native Weight Quant Subsystem Plan
 
 Date: 2026-06-15
 
@@ -39,6 +39,13 @@ So quant buys ~2–4× decode headroom **and** is the only way the model fits. T
 pair of numbers is the entire license. P1 confirms the exact param count, active
 set, and scale overhead before any kernel is written.
 
+A100 phase split (do not read the NVFP4 decode ceiling as a global throughput claim):
+the ceilings above are **decode GEMV** (memory-bound — NVFP4's 4-bit read is genuinely
+fewer bytes, so it can beat FP8 here; measure). **Prefill GEMM is different**: A100 has
+no FP4 MMA, so NVFP4 runs through the Marlin-FP4 fallback (dequant→FP16 MMA), which vLLM
+reports as **≈ FP8 throughput — memory savings only, no prefill speedup**. Net: NVFP4's
+A100 value is residency (+ a possible decode-bandwidth edge), not prefill compute.
+
 A100 hardware reality: A100 is `sm_80`. It has **no** Hopper/Blackwell FP8/FP4
 tensor-core MMA. In this plan "native" means *resident checkpoint-native quant
 buffers consumed directly by ARLE CUDA kernels that dequantize inside the
@@ -51,9 +58,10 @@ distinction drives the decode-vs-prefill split below.
 The previous load-time BF16 materialization idea is rejected — it solves neither
 residency nor weight bandwidth.
 
-A second WIP (currently in `loader.rs`, see Blockers) re-implemented exactly that
-rejected approach (`materialize_qwen35_fp8_to_bf16`, `materialize_qwen35_nvfp4_to_bf16`).
-It is deleted in P0.
+A now-deleted WIP in `loader.rs` re-implemented exactly that rejected approach
+(`materialize_qwen35_fp8_to_bf16`, `materialize_qwen35_nvfp4_to_bf16`). P0 removed
+it and restored the CUDA/no-cuda typecheck; future work starts from the native
+resident path below.
 
 The accepted first version:
 
@@ -75,14 +83,26 @@ extends it instead of duplicating it.
 
 Already in-tree and relevant:
 
+- **The FP8 + FP4 dequant-GEMV kernels already exist** in `quantized_gemv.cu`
+  (CUDA-core, no arch gate → A100-viable). `:50` `DSV4_FP4_E2M1_LUT`, `:249`
+  `dsv4_decode_fp8_e4m3`, `:259` `dsv4_decode_fp4_e2m1`;
+  `dsv4_fp8_gemv{,_batch,_batch_tiled}_kernel`, `dsv4_fp4_gemv{,_batch,_batch_tiled}_kernel`;
+  and the **MoE grouped/routed family** `dsv4_fp{8,4}_{grouped,route}_gemv_batch_cuda`
+  + `_pair_batch_cuda`. They compute generic `decode(weight) * scale` — **the only
+  model-specific line is the scale fetch `dsv4_decode_e8m0(scales[...])`**. Weight
+  decode, block indexing (`block_h`/`block_w`), batch tiling, warp reduction are all
+  generic. This is the load-bearing finding: the Qwen quant path is not new kernels,
+  it is parameterizing the scale-decode of these.
 - **Marlin stack, vendored from vLLM/Neural-Magic** (`csrc/gemm/marlin_pf8/`,
   "Adapted from IST-DASLab/marlin", Apache-2.0): `marlin_kernel.cu`,
-  `marlin_repack.cu`, `marlin_w4a8_kernel.cu`, `marlin_w4_fp8_kernel.cu`,
-  `quantized_gemv.cu`, `quantized_gemv_mma.cu`.
-  - Caveat: `marlin_w4_fp8_kernel.cu` is **`sm_89`-only** and is **INT4-weight
-    (GPTQ U4B8) + FP8-activation**, not FP8-weight. It serves neither A100 nor the
-    Official-FP8-weight case as-is.
-  - `quantized_gemv.cu` has no arch gate → CUDA-core, A100-viable.
+  `marlin_repack.cu`, `marlin_w4a8_kernel.cu`, `marlin_w4_fp8_kernel.cu`.
+  - `marlin_template.h` carries the **full NVFP4 GEMM path**: `kFE2M1f` weight +
+    `kFE4M3fn` group scale + `global_scale` (`:254,:300,:327,:351,:1655`), FP4→FP16/BF16
+    dequant in `dequant.h:400+`. But `marlin_w4_fp8_kernel.cu` only **instantiates** the
+    `sm_89` W4A8 shape (`global_scale=nullptr`) — the NVFP4 kernel exists in template,
+    just uninstantiated. (This is exactly vLLM's A100 NVFP4-Marlin fallback path.)
+  - So the genuine prefill-GEMM gap is *instantiating* a vendored template for `sm_80`,
+    not writing a kernel.
 - **`csrc/gemm/moe_grouped_gemm.cu`** — its own header states it is the Qwen3.5/3.6
   single-GPU MoE path (permute → grouped GEMM → combine), `sm_70`-safe CUDA-core,
   and that "**W4 nibble-decode variant is an explicit follow-up (the Qwen3.6
@@ -119,24 +139,18 @@ DSv4 FP8 dispatches through DeepGEMM + `dsv4_grouped_gemm.cu` + `dsv4_fp8_decode
 
 ## Current Blockers
 
-1. `crates/infer-cuda/src/loader.rs` has an incomplete WIP (the rejected
-   BF16-materialization path) that does not compile. It references 8 undefined
-   symbols — confirmed: `QWEN35_FP8_BLOCK`, `QWEN35_NVFP4_GROUP`,
-   `qwen35_weight_prefix`, `tensor_to_f32_vec`, `materialize_fp8_blocks_to_bf16`,
-   `materialize_fp8_scalar_to_bf16`, `materialize_nvfp4_to_bf16`,
-   `tensor_scalar_f32` (0 definitions each).
-2. The WIP functions are unreachable from the real load path. `qwen35.rs` still
+1. `qwen35.rs` still
    calls BF16-only `load_matrix`, `load_matrix_sharded`, `load_qkv_head_sharded`,
    and the BF16 MoE loader.
-3. `load_linear_qkv_sharded` / `load_conv1d_sharded` in `qwen35.rs` read raw BF16
+2. `load_linear_qkv_sharded` / `load_conv1d_sharded` in `qwen35.rs` read raw BF16
    bytes directly. The qkv helper must become quant-aware; conv/norm/bias stay
    strict BF16/F32.
-4. Qwen3.6 MoE stacked experts are the critical path (they dominate both residency
+3. Qwen3.6 MoE stacked experts are the critical path (they dominate both residency
    and decode bandwidth). Production experts ship stacked/fused tensors
    (`experts.gate_up_proj`, `experts.down_proj`); a dense-2D-only loader is
    insufficient.
-5. Unrelated dirty files (Gemma/Metal work in `git status`) stay untouched. Stage
-   by explicit path only.
+4. Stage by explicit path only. Do not mix this plan's native-quant work with
+   unrelated backend or release changes.
 
 ## Format Contracts
 
@@ -180,9 +194,45 @@ The numeric decode tables (`decode_f8_e4m3fn`, `decode_fp4_e2m1`) are pure Rust,
 authored once, and **shared** by loader-side scale validation and kernel reference
 tests — one source of truth for E4M3/E2M1.
 
+## Generic subsystem & model onboarding (the "通用 / 无缝接入" axis)
+
+The variation axis across DSv4 / Qwen-FP8 / Qwen-NVFP4 / INT-affine is the **scale
+ABI**, not the model and not the weight element type (the kernels already prove this:
+one `decode(weight) * scale` body, only `dsv4_decode_e8m0` is model-specific). The
+subsystem is layered so a new model touches only the top layer:
+
+1. **Numeric codec (pure, model-free)** — decode LUTs E4M3 / E2M1 / E8M0 / INT4/8,
+   asserted byte-identical to the CUDA LUTs by a round-trip test.
+2. **ScaleAbi (the real variation)** — the kernels gain this as a parameter, replacing
+   the hardcoded `dsv4_decode_e8m0`: `E8M0Block{block_m,block_k}` (DSv4) ·
+   `Fp32InvBlock{block_m,block_k}` (Qwen Official FP8, `w / s_block`) ·
+   `Fp8E4M3Group{group}+Fp32Global` (NVFP4 two-level) · `Bf16AffineGroup{group}`
+   (W4A16/W8A16 `(q-zp)*s`).
+3. **Resident `WeightFormat` = storage × ScaleAbi**, ABI-named (§Format Contracts).
+
+Above these, a **model adapter is data, not code**:
+
+```rust
+pub struct QuantWeightMap { pub model: &'static str, pub rules: Vec<QuantRule> }
+pub struct QuantRule { pub pattern: TensorPattern, pub disposition: Disposition }
+// Disposition ∈ { KeepBf16, KeepF32, Quant { role, format } }
+// role        ∈ { Dense, ShardCol, ShardRow, QkvHead, StackedExpert }
+```
+
+DSv4 and Qwen3.6 register one `QuantWeightMap` each over the same kernels. **Onboarding
+a new model:**
+
+1. Dump its checkpoint header + `quantization_config`; classify each tensor →
+   keep-BF16 / keep-F32 / quant(role, format, scale ABI). Note the ignore-list.
+2. Map each scale ABI to a layer-2 `ScaleAbi`. **New ABI → add it to layers 1–2 + one
+   kernel instantiation; otherwise zero kernel work.**
+3. Author the `QuantWeightMap` (data) + loader tests (fake safetensors → expected
+   format; TP-shard alignment rejects).
+4. Run §Verification Gates. A model whose ABIs already exist needs only steps 1–3.
+
 ## File-Level Implementation
 
-### P0 — Restore a compiling tree
+### P0 — Restore a compiling tree (done 2026-06-15)
 
 Files: `crates/infer-cuda/src/loader.rs`
 
@@ -195,6 +245,9 @@ Exit gate:
 CUDARC_CUDA_VERSION=12060 cargo check -p infer-api --release \
   --no-default-features --features cuda,no-cuda --lib
 ```
+
+Result: passed locally on 2026-06-15 after deleting the rejected BF16
+materialization WIP.
 
 ### P1 — Checkpoint inspection + budget (BLOCKING, no code)
 
@@ -264,14 +317,17 @@ DSv4 constructors and DeepGEMM caches unchanged.
 
 Files: `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`, `crates/cuda-kernels/src/ffi/gemm.rs`
 
-- Add E4M3 block/per-shard and E2M1 group **dequant-then-dot** variants to the
-  existing CUDA-core GEMV (A100-viable, weight-read-bound — the bandwidth win is here).
-- FFI: `fp8_block_gemv_cuda`, `fp8_per_shard_gemv_cuda`, `fp4_e2m1_gemv_cuda` (or one
-  entry dispatching on a format tag, matching the file's existing convention).
+- **Parameterize, don't add.** Lift the hardcoded `dsv4_decode_e8m0(scale)` in the
+  existing `dsv4_fp{8,4}_gemv_*` kernels into a `ScaleAbi` scale-decode policy (template
+  param or `__device__` functor) covering E8M0 / Fp32InvBlock / Fp8E4M3Group+Global.
+  **The DSv4 (E8M0) instantiation must stay byte-identical** (regression-gated).
+- Add the Qwen instantiations + generic-named launchers in `ffi/gemm.rs`
+  (`gemv_fp8_*`, `gemv_fp4_*`, or one tag-dispatched entry, matching file convention).
 - Kernel rule: no full-matrix BF16 side buffer; tile/register/shared dequant only;
   FP32 accumulate, BF16 output.
 
-This is the immediate eval path (decode). Do **not** open a new `.cu` file.
+This is the immediate eval path (decode) and is A100-viable today (CUDA-core, no arch
+gate). Do **not** open a new `.cu` file.
 
 ### P5 — Operator dispatch
 
@@ -288,19 +344,25 @@ Files: `crates/infer-cuda/src/ops.rs`
 
 Files: `crates/infer-cuda/src/qwen35.rs`
 
-Route every matrix load in `from_safetensors_with_tp` through the quant-aware
-loader helpers (ABI-named, e.g. `load_quant_matrix`, `load_quant_matrix_sharded`,
-`load_quant_qkv_head_sharded`): `embed_tokens`, `lm_head`, attention
-`q/k/v/o_proj`, linear-attn `in_proj_{qkv,z,b,a}` + `out_proj`, dense MLP
-`gate/up/down_proj`, MoE routed experts + router gate + shared expert.
+Drive `from_safetensors_with_tp` from the Qwen3.6 `QuantWeightMap`, not a hand list.
+The dispositions are **grounded in the RedHatAI NVFP4 recipe ignore-list**, not guessed:
+
+- **Quantize** (route through `load_quant_matrix{,_sharded}`, `load_quant_qkv_head_sharded`):
+  full-attention `q/k/v/o_proj`, MoE routed experts (stacked `experts.gate_up_proj` /
+  `experts.down_proj`), shared-expert up/down.
+- **Keep BF16/F32** (recipe ignores these): `embed_tokens`, `lm_head`, router
+  `mlp.gate`, `shared_expert_gate`, **all `linear_attn.*`** (`in_proj_{qkv,z,b,a}`,
+  `out_proj`, `A_log`, `dt_bias`, `conv1d`), and norms.
+
+Confirm the ignore-list against the *FP8* checkpoint too in P1 (it may differ from NVFP4).
 
 Sharding rules: BF16/F32 dense may reuse byte-slice helpers; FP8 row/col sharding
 slices weight **and** scale together; NVFP4 row sharding slices packed columns +
 scale groups together; NVFP4 column sharding must be group-aligned else fail closed;
 stacked-expert slicing works on packed dims, never a materialized dense shape.
 
-Keep strict BF16/F32 for: norms, `dt_bias`, `A_log`, conv1d weights (unless a
-checkpoint proves quantized conv exists and a kernel contract is added).
+(conv1d stays BF16 unless a checkpoint proves quantized conv exists and a kernel
+contract is added.)
 
 OPD/LoRA: `remerge_student_lora` fails closed for resident quant matrices in v1.
 
@@ -309,9 +371,13 @@ OPD/LoRA: `remerge_student_lora` fails closed for resident quant matrices in v1.
 Files: `crates/infer-cuda/src/moe.rs`, `crates/infer-cuda/src/loader.rs`,
 `crates/cuda-kernels/csrc/gemm/moe_grouped_gemm.cu`
 
-- Add E4M3 / E2M1-group **nibble/byte-decode** variants to the two
-  `moe_bf16_grouped_gemm_*` call sites (the path `moe.rs:30` already prescribes).
-  Same grouping/permute/combine; the only change is the per-element decode in the MAC.
+- **Decode-shape routed experts**: route through the **already-existing**
+  `dsv4_fp{8,4}_route_gemv_*` / `*_pair_batch` family in `quantized_gemv.cu` — same
+  P4 `ScaleAbi` parameterization (these are the kernels `moe.rs:30`'s "W4 follow-up"
+  pointed at; they exist, they just decode E8M0 today).
+- **Prefill-shape (large R)**: add the E4M3/E2M1-group decode to the
+  `moe_bf16_grouped_gemm_*` call sites (same grouping/permute/combine; only the
+  per-element decode in the MAC changes).
 - Extend `MoeLayerWeights` to carry resident quant expert matrices.
 - Route routed **and** shared expert through the same quant dispatch.
 - Disable the Hopper DeepGEMM grouped lane when experts are resident quant (it is a
@@ -329,8 +395,10 @@ This is the only part with real kernel risk and is isolated accordingly. A100
 prefill is compute-bound; a CUDA-core dequant GEMM (~3.9 TFLOP/s class per
 `moe.rs`) likely **loses** to BF16 + tensor cores.
 
-- Option A: port the vendored Marlin mixed-input mainloop from `sm_89` to `sm_80`,
-  swapping the dequant step to the E4M3 / E2M1 LUT.
+- Option A: **instantiate the already-vendored Marlin NVFP4 template** (`kFE2M1f` +
+  `kFE4M3fn` + `global_scale`, present in `marlin_template.h`) for `sm_80`, plus the
+  FP8-weight Marlin shape. This *is* vLLM's A100 fallback — instantiation, not a
+  from-scratch port.
 - Option B: accept CUDA-core dequant batch GEMM, decode-residency-only.
 
 Decision gate: a same-binary, same-shape A/B of quant prefill vs BF16 prefill at the
@@ -396,8 +464,9 @@ scripts/bench_guidellm.sh qwen36-cuda-native-quant-a100 \
 - `nvidia-smi` resident memory is incompatible with full dense BF16 residency and
   is consistent with the P1 budget table for the served format.
 - Serve log prints resident bytes by format: FP8, NVFP4, BF16.
-- `strings target/release/arle | grep -E 'fp8_block_gemv|fp4_e2m1_gemv|moe_.*_decode'`
+- `strings target/release/arle | grep -E 'gemv_fp8|gemv_fp4|route_gemv|marlin.*fp4'`
   finds the linked quant kernels.
+- DSv4 regression: post-P4 output byte-identical to pre-P4 (the E8M0 path unchanged).
 - FP8 checkpoint passes serve + curl smoke + MMLU-50 plumbing.
 - NVFP4 checkpoint passes serve + curl smoke + MMLU-50 plumbing.
 - No throughput claim until `guidellm` completes; no default prefill-path flip
@@ -412,12 +481,11 @@ stub naming the exact remote gate.
 
 Tranches (stage by explicit path; do not stage unrelated dirty files):
 
-1. P0 compile restoration.
-2. P1 facts note (docs-exempt from bench entry).
-3. P2/P3 codec + resident ABI + pure tests.
-4. P4/P5 decode kernels + op dispatch.
-5. P6/P7 linear + MoE wiring.
-6. P8 prefill A/B + A100 eval evidence entry.
+1. P1 facts note (docs-exempt from bench entry).
+2. P2/P3 codec + resident ABI + pure tests.
+3. P4/P5 decode kernels + op dispatch.
+4. P6/P7 linear + MoE wiring.
+5. P8 prefill A/B + A100 eval evidence entry.
 
 ## Cross-Review Notes
 
@@ -436,14 +504,22 @@ required before declaring support; MMLU-50 and SWE Pro limit-3 are plumbing chec
 
 SOLID:
 
-- WIP confirmed non-compiling (8 undefined symbols, 0 definitions each) → P0 real.
+- Historical WIP confirmed non-compiling (8 undefined symbols, 0 definitions each);
+  P0 deleted it and the CUDA/no-cuda typecheck now passes.
 - Existing Marlin/`quantized_gemv`/`moe_bf16_grouped_gemm_*` confirmed in-tree;
   `moe.rs:30` + `moe_grouped_gemm.cu` header confirm the 4-bit-MoE follow-up is the
   intended extension point.
 - `WeightFormat` already carries DSv4 + W*A16 + Marlin + GGUF variants; ABI-naming
   avoids a second per-model axis.
+- The FP8 **and** FP4 dequant-GEMV + routed-MoE-GEMV kernels already exist in
+  `quantized_gemv.cu`; `dsv4_decode_e8m0` is the **sole** model-specific line → the
+  Qwen path is scale-ABI parameterization, not new kernels.
+- The Marlin **NVFP4** GEMM is already in `marlin_template.h` (`kFE2M1f`+`kFE4M3fn`+
+  `global_scale`), uninstantiated → P8 is an `sm_80` instantiation, not a port.
+- Checkpoints real: `Qwen/…-FP8` (block 128), `nvidia/RedHatAI/unsloth …-NVFP4`;
+  `qwen3_5_moe` rides `qwen35.rs`; the NVFP4 recipe ignore-list grounds the P6 map.
 - A100 = `sm_80`, no FP8/FP4 MMA; `marlin_w4_fp8_kernel.cu` is `sm_89` + W4A8 →
-  cannot serve A100 FP8-weight as-is.
+  cannot serve A100 FP8-weight as-is; vLLM-confirmed NVFP4-on-A100 ≈ FP8 (residency win).
 
 Hypothesis until measured:
 
