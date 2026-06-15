@@ -1921,6 +1921,17 @@ mod stub {
         ) -> Result<Self> {
             Err(VULKAN_NOT_COMPILED)
         }
+
+        pub fn create_with_push_constants_specialization_and_subgroup_size(
+            _ctx: &'a VulkanContext,
+            _shader: &ShaderModule<'_>,
+            _descriptor_layouts: &[&DescriptorSetLayout<'_>],
+            _push_constant_bytes: u32,
+            _specialization_u32: &[(u32, u32)],
+            _required_subgroup_size: Option<u32>,
+        ) -> Result<Self> {
+            Err(VULKAN_NOT_COMPILED)
+        }
     }
 }
 
