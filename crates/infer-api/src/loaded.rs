@@ -194,8 +194,8 @@ mod backend {
     use super::EngineLoadConfig;
     use crate::serve_engine::ServeInferenceEngine;
     use crate::types::{
-        CompletionOutput, CompletionRequest, CompletionStreamDelta, EngineTelemetry,
-        InferenceEngine,
+        ChatPromptMessage, CompletionOutput, CompletionRequest, CompletionStreamDelta,
+        EngineTelemetry, InferenceEngine,
     };
 
     #[cfg(feature = "cuda")]
@@ -1446,6 +1446,23 @@ mod backend {
                 Self::Vulkan(engine) => engine.tokenize(text),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
                 Self::Cpu(engine) => engine.tokenize(text),
+            }
+        }
+
+        fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
+            match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(engine) => engine.render_chat_prompt(messages),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.render_chat_prompt(messages),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.render_chat_prompt(messages),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.render_chat_prompt(messages),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.render_chat_prompt(messages),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(engine) => engine.render_chat_prompt(messages),
             }
         }
 

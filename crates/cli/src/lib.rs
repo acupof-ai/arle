@@ -283,6 +283,12 @@ fn resolve_max_tokens(model_path: &str, requested: usize) -> usize {
     if requested > 0 {
         return requested;
     }
+    if let Some(n) = read_model_generation_max_tokens(model_path) {
+        log::info!(
+            "max-tokens: auto-resolved to {n} from {model_path}/config.json (generation_config.max_new_tokens)"
+        );
+        return n;
+    }
     match read_model_max_context(model_path) {
         Some(n) => {
             log::info!(
@@ -329,13 +335,60 @@ fn peek_model_architecture(model_source: &str) -> Option<String> {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_arch_from_dir(dir: &std::path::Path) -> Option<String> {
-    let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
-    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let cfg = read_model_config_from_dir(dir)?;
     cfg.get("architectures")
         .and_then(|a| a.as_array())
         .and_then(|a| a.first())
         .and_then(|s| s.as_str())
         .map(str::to_string)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn read_model_config(model_path: &str) -> Option<serde_json::Value> {
+    if let Some(cfg) = read_model_config_from_dir(std::path::Path::new(model_path)) {
+        return Some(cfg);
+    }
+
+    let (org, repo) = model_path.split_once('/')?;
+    let cache_root = hub_discovery::hub_cache_root()?;
+    let repo_dir = cache_root.join(format!("models--{org}--{repo}"));
+    let snapshots = std::fs::read_dir(repo_dir.join("snapshots")).ok()?;
+    for entry in snapshots.flatten() {
+        if let Some(cfg) = read_model_config_from_dir(&entry.path()) {
+            return Some(cfg);
+        }
+    }
+    None
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn read_model_config_from_dir(dir: &std::path::Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn read_model_generation_max_tokens(model_path: &str) -> Option<usize> {
+    let cfg = read_model_config(model_path)?;
+    let model_type = cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let arch_is_diffusion = cfg
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .is_some_and(|archs| {
+            archs
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|name| name.contains("DiffusionGemma") || name.contains("Gemma4"))
+        });
+    if !(matches!(model_type, "diffusion_gemma" | "gemma4") || arch_is_diffusion) {
+        return None;
+    }
+    cfg.get("generation_config")
+        .and_then(|v| v.get("max_new_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| cfg.get("canvas_length").and_then(|v| v.as_u64()))
+        .map(|n| n as usize)
+        .filter(|&n| n > 0)
 }
 
 /// Best-effort lookup of the model's context length. Tries, in order,
@@ -344,9 +397,7 @@ fn read_arch_from_dir(dir: &std::path::Path) -> Option<String> {
 /// Returns `None` for any failure (missing path, bad JSON, missing field).
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn read_model_max_context(model_path: &str) -> Option<usize> {
-    let cfg_path = std::path::Path::new(model_path).join("config.json");
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
-    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let cfg = read_model_config(model_path)?;
     cfg.get("max_position_embeddings")
         .and_then(|v| v.as_u64())
         .or_else(|| cfg.get("context_length").and_then(|v| v.as_u64()))
@@ -357,7 +408,7 @@ fn read_model_max_context(model_path: &str) -> Option<usize> {
 #[cfg(test)]
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod resolve_tests {
-    use super::{read_model_max_context, resolve_max_tokens};
+    use super::{read_model_generation_max_tokens, read_model_max_context, resolve_max_tokens};
     use std::io::Write;
 
     fn write_config(json: &str) -> tempfile::TempDir {
@@ -378,6 +429,24 @@ mod resolve_tests {
     fn auto_pulls_max_position_embeddings_from_config() {
         let dir = write_config(r#"{"max_position_embeddings": 262144, "other": "x"}"#);
         assert_eq!(resolve_max_tokens(dir.path().to_str().unwrap(), 0), 262_144);
+    }
+
+    #[test]
+    fn auto_uses_diffusion_generation_cap_before_context() {
+        let dir = write_config(
+            r#"{
+              "architectures": ["DiffusionGemmaForBlockDiffusion"],
+              "model_type": "diffusion_gemma",
+              "canvas_length": 256,
+              "max_position_embeddings": 262144,
+              "generation_config": {"max_new_tokens": 192}
+            }"#,
+        );
+        assert_eq!(
+            read_model_generation_max_tokens(dir.path().to_str().unwrap()),
+            Some(192)
+        );
+        assert_eq!(resolve_max_tokens(dir.path().to_str().unwrap(), 0), 192);
     }
 
     #[test]
