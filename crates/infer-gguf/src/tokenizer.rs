@@ -182,14 +182,16 @@ fn i32_array(g: &GgufFile, key: &str) -> Result<Vec<i32>> {
 mod tests {
     use super::*;
 
-    const MODEL: &str = r"C:\Users\Asus\models\qwen3.6\Qwen3.6-27B-Q8_0.gguf";
-
     /// Round-trips ASCII + Chinese through the GGUF-embedded vocab. Skips
     /// cleanly when the on-box 27B GGUF is absent.
     #[test]
     #[ignore = "needs the on-box Qwen3.6-27B GGUF"]
     fn gguf_tokenizer_roundtrips() {
-        let path = std::path::Path::new(MODEL);
+        let Ok(model) = std::env::var("INFER_GGUF_TEST_MODEL") else {
+            eprintln!("skip: set INFER_GGUF_TEST_MODEL to the on-box Qwen3.6-27B GGUF path");
+            return;
+        };
+        let path = std::path::Path::new(&model);
         if !path.exists() {
             eprintln!("skip: {} not present", path.display());
             return;
