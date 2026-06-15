@@ -448,6 +448,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 logits_window_size: None,
                 kl_mask: OpdKlMask::Full,
             },
+            None,
             #[cfg(feature = "cuda")]
             None,
             step_profile.as_mut(),
@@ -622,6 +623,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
                 logits_window_size: None,
                 kl_mask: OpdKlMask::Full,
             },
+            None,
             #[cfg(feature = "cuda")]
             None,
             None,
@@ -902,6 +904,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                     logits_window_size: None,
                     kl_mask: OpdKlMask::CompletionOnly,
                 },
+                None,
                 #[cfg(feature = "cuda")]
                 None,
                 step_profile.as_mut(),
@@ -1104,6 +1107,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
                     logits_window_size: None,
                     kl_mask: OpdKlMask::CompletionOnly,
                 },
+                None,
                 #[cfg(feature = "cuda")]
                 None,
                 None,

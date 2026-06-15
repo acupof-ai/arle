@@ -93,6 +93,7 @@ fn run_once() -> (f64, f32, f32) {
             &mut optimizer,
             &mut store,
             &mut tape,
+            None,
         )
         .expect("opd_step");
         first_loss.get_or_insert(outcome.loss);

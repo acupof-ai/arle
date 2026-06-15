@@ -218,6 +218,7 @@ mod app {
                 &mut optimizer,
                 &mut store,
                 &mut tape,
+                None,
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
             losses.push(outcome.loss as f64);

@@ -11,10 +11,11 @@ use train::{
     loss::KlDirection,
     opd::{
         GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepConfig, OpdStepProfile, opd_step,
-        opd_step_with_teacher_forward_profiled_gkd_anchor,
+        opd_step_with_teacher_forward_profiled_gkd_anchor, student_rollout_only,
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
     teacher_infer::InProcessTeacher,
+    trajectory_scorer::{ExactMatchScorer, TrajectoryScorer, select_best},
 };
 
 fn live_tensor_count(store: &TensorStore) -> usize {
@@ -34,6 +35,23 @@ fn perturb_student_params(store: &mut TensorStore, params: &[TensorId]) {
             *value += offset * 1.0e-4;
         }
     }
+}
+
+fn student_param_snapshot(store: &TensorStore, params: &[TensorId]) -> Vec<(TensorId, Vec<f32>)> {
+    params
+        .iter()
+        .copied()
+        .map(|id| {
+            (
+                id,
+                store
+                    .get(id)
+                    .expect("student parameter survives cleanup")
+                    .data
+                    .clone(),
+            )
+        })
+        .collect()
 }
 
 fn tiny_qwen35_config() -> Qwen35Config {
@@ -156,6 +174,7 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::Full,
         },
+        None,
         #[cfg(feature = "cuda")]
         None,
         Some(&mut profile),
@@ -202,6 +221,7 @@ fn opd_step_runs_end_to_end() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect("opd_step runs without panic");
 
@@ -247,6 +267,7 @@ fn pure_chunked_kl_opd_loss(direction: KlDirection) -> f32 {
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
+        None,
         #[cfg(feature = "cuda")]
         None,
         None,
@@ -324,6 +345,7 @@ fn opd_step_falls_back_to_full_rollout_for_hybrid_student() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect("hybrid OPD step should full-forward rollout instead of requiring KV cache");
 
@@ -360,6 +382,7 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
             &mut optimizer,
             &mut store,
             &mut tape,
+            None,
         )
         .expect("opd_step runs without panic");
         assert!(outcome.loss.is_finite());
@@ -373,6 +396,96 @@ fn opd_step_prunes_ephemeral_tensors_between_steps() {
     assert_eq!(
         live_counts[2], live_counts[0],
         "third step should not accumulate rollout/forward temporaries, got {live_counts:?}"
+    );
+}
+
+fn run_forced_winner_step(
+    with_loser_candidate: bool,
+) -> (Vec<(TensorId, Vec<f32>)>, Option<usize>) {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    perturb_student_params(&mut store, &student_params);
+
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let winner_rollout: Vec<u32> = vec![1, 3, 8, 4, 5];
+    let selected_rollout = if with_loser_candidate {
+        let live_before_loser = live_tensor_count(&store);
+        let loser_rollout =
+            student_rollout_only(&student, &prompt_ids, 2, None, &mut store, &mut tape)
+                .expect("loser candidate rollout should generate");
+        assert_eq!(
+            live_tensor_count(&store),
+            live_before_loser,
+            "loser candidate rollout must retain zero extra device tensors"
+        );
+        assert!(
+            tape.entries.is_empty(),
+            "loser candidate rollout must stay off the backward tape"
+        );
+
+        let rollouts = vec![loser_rollout, winner_rollout.clone()];
+        let scorer = ExactMatchScorer::new(winner_rollout.clone());
+        let scores = scorer
+            .score(&prompt_ids, &rollouts, &mut store, &mut tape)
+            .expect("exact-match scoring should not fail");
+        let selected = select_best(&rollouts, &scores);
+        assert_eq!(
+            selected, 1,
+            "exact-match scorer should select the reference"
+        );
+        rollouts[selected].clone()
+    } else {
+        winner_rollout
+    };
+
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let outcome = opd_step(
+        &student,
+        &teacher,
+        &prompt_ids,
+        OpdStepConfig {
+            rollout_len: 2,
+            rollout_sampling: None,
+            grad_clip: 1.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+        Some(&selected_rollout),
+    )
+    .expect("forced-rollout OPD step should run");
+    assert_eq!(outcome.rollout_len, selected_rollout.len());
+    assert!(outcome.loss.is_finite());
+
+    (
+        student_param_snapshot(&store, &student_params),
+        with_loser_candidate.then_some(live_tensor_count(&store)),
+    )
+}
+
+#[test]
+fn loser_candidate_rollout_does_not_reach_backward_path() {
+    let (with_loser_params, with_loser_live) = run_forced_winner_step(true);
+    let (control_params, control_live) = run_forced_winner_step(false);
+
+    assert!(
+        with_loser_live.is_some(),
+        "candidate path should record the post-step live tensor count"
+    );
+    assert_eq!(
+        control_live, None,
+        "control path must not run the loser candidate pre-pass"
+    );
+    assert_eq!(
+        with_loser_params, control_params,
+        "discarded candidate rollout must not leave retained tensors or tape \
+         entries that alter the selected trajectory's backward update"
     );
 }
 
@@ -422,6 +535,7 @@ fn opd_step_updates_student_without_mutating_teacher() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect("opd_step should update a perturbed student against a frozen teacher");
     assert!(outcome.loss.is_finite());
@@ -492,6 +606,7 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
+        None,
         #[cfg(feature = "cuda")]
         None,
         None,
@@ -571,6 +686,7 @@ fn opd_step_with_lora_adapter_params_retains_frozen_student_base() {
             &mut optimizer,
             &mut store,
             &mut tape,
+            None,
         )
         .expect("LoRA adapter-only opd_step should retain base weights");
         assert!(outcome.loss.is_finite());
@@ -635,6 +751,7 @@ fn lora_opd_step_cuda_matches_cpu_loss() {
             &mut optimizer,
             &mut store,
             &mut tape,
+            None,
         )
         .expect("LoRA OPD step should run")
         .loss
@@ -675,6 +792,7 @@ fn opd_step_rejects_empty_prompt_with_actionable_error() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect_err("empty prompt should be rejected before rollout");
 
@@ -709,6 +827,7 @@ fn opd_step_rejects_prompt_token_outside_student_vocab() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect_err("out-of-vocab prompt token should be rejected before rollout");
 
@@ -749,6 +868,7 @@ fn opd_step_rejects_teacher_student_vocab_mismatch() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect_err("vocab mismatch should be rejected before rollout");
 
@@ -785,6 +905,7 @@ fn opd_step_rejects_trainable_teacher_model() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect_err("trainable teacher should be rejected before rollout");
 
@@ -827,6 +948,7 @@ fn opd_step_rejects_teacher_param_mixed_into_student_params() {
         &mut optimizer,
         &mut store,
         &mut tape,
+        None,
     )
     .expect_err("teacher parameter ids must not be accepted as student params");
 
@@ -873,6 +995,7 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
+        None,
         #[cfg(feature = "cuda")]
         None,
         None,

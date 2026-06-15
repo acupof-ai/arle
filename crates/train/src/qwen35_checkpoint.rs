@@ -1241,6 +1241,7 @@ mod tests {
             &mut optimizer,
             &mut opd_store,
             &mut opd_tape,
+            None,
         )
         .expect("trainable reload should run one OPD step");
 

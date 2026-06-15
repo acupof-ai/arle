@@ -34,6 +34,7 @@ fn run_opd_loss_bits(seed: u64, lr: f32, prompt_ids: &[u32]) -> TestResult<Vec<u
             &mut optimizer,
             &mut store,
             &mut tape,
+            None,
         )?;
         assert!(outcome.loss.is_finite(), "loss must be finite");
         loss_bits.push(outcome.loss.to_bits());

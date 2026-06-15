@@ -840,6 +840,7 @@ mod app {
                     logits_window_size: args.logits_window_size,
                     kl_mask: args.opd_kl_mask,
                 },
+                None,
                 infer_rollout,
                 Some(&mut profile),
             )?;
