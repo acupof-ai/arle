@@ -56,15 +56,38 @@ c=8 both configs already get broad batching (batched-FlashMLA + natural GEMM/MoE
 batch), so the lever's marginal gain narrows to +5% (77.6 vs 74.0). Consistent with
 "gain ∝ n until other batched paths saturate."
 
-## MTP arm (measured prior sessions on a gcc≥10 host — NOT re-measurable on .62)
+## MTP arm — MEASURED on .61 (gcc-13), root cause of the .62 "hang" confirmed
 
-The table above is **no-MTP** because the MTP-head deepgemm JIT hangs on .62's
-forced `clang++-11` (the box has only gcc-8.3 + clang-11/7 — no c++20 compiler
-better than clang-11; enumerated 2026-06-16). So the MTP numbers below are the
-**existing measured results from the proper build host**, cited as-is. They are
-on **different prompt length / num-slots / base / session**, so they are **NOT a
-same-config A/B against the .62 no-MTP table** — read them as the MTP lane's own
-measured envelope, not a row-by-row delta vs the clean table.
+The `.62` MTP-head deepgemm JIT does NOT hang because of MTP — it hangs because
+`.62` has only gcc-8.3 + clang-11/7 (no c++20 compiler better than clang-11;
+enumerated 2026-06-16) and the forced `-ccbin clang++-11` chokes on the MTP-head
+shapes. **On `.61` (glibc 2.39, gcc-13.3 default host compiler, no clang forcing),
+MTP serves in 136s with zero new JIT** (cache stayed 33, jit procs=0, 8 workers
+alive). So "MTP can't be tested" was a `.62`-toolchain artifact, **confirmed by
+direct test**: gcc-13 compiles what clang-11 hangs on.
+
+**`.61` same-binary same-session A/B (commit `2f021c0`, profiling OFF, gcc-13,
+num-slots 64, ~28-tok prompt, max_tokens=128):**
+
+| c | no-MTP | MTP | Δ |
+|---|--------|-----|---|
+| 1 | 43.4 | 47.9 | **+10%** |
+| 2 | 43.6 | 48.1 | +10% |
+| 4 | 67.2 | 48.1 | **−28%** |
+| 8 | 73.5 | 79.1 | +8% |
+
+MTP **+10% @c=1** (B=1), but **−28% @c=4**: MTP is flat ~48 c1→c4 then jumps to
+79 @c8, while no-MTP scales c4→67. On this binary (`2f021c0`, NOT my
+`3e3e50e0`+compressor-batch) the MTP lane looks per-row-plateaued at low c and
+only the c=8 batched wave passes no-MTP — consistent with the per-row-MTP-plateau
+finding ([[2026-06-15-dsv4-batched-mtp-prod-shape-flip]]). The `2f021c0` no-MTP
+column matches the .62 OFF column at c1/2/8 (43/44/74) but diverges at c4 (67 vs
+44) → `2f021c0` carries a c4 batched-decode path my OFF build lacks. So this is a
+clean MTP-vs-no-MTP A/B **on the .61 binary**, NOT cross-comparable to the .62
+compressor-batch table above.
+
+**Prior-session MTP envelope** (different base/prompt/slots — cross-reference, not
+a row-by-row delta):
 
 **B=1 (single-stream), same-session ×3 ([[2026-06-13-dsv4-mtp-d2-chain-fold-53]]):**
 
@@ -88,9 +111,10 @@ sub-lever default-on adds +6.8%@c8/+11.1%@c16 after the batched lm_head fix,
 MTP**, not vs no-MTP: per-row MTP plateaus ~42–46 (sequential per-slot spec_step);
 batched runs one amortized wave → scales to ~77.
 
-**To get a clean same-session MTP-vs-no-MTP c1–8 A/B:** build+serve on a gcc≥10 host
-(MTP-head deepgemm JIT compiles there) — the documented next-step blocker, not a
-runtime regression.
+**Done above** — the clean same-session MTP-vs-no-MTP c1–8 A/B now exists, on `.61`
+(gcc-13). The remaining gap is a single-host run of *my* `3e3e50e0`+compressor-batch
+binary WITH MTP on `.61` (the `.62` build can't serve MTP at all), to get a
+compressor-batch × MTP combined number on one binary.
 
 ## Problems / caveats
 - **Single sweep per c — the c=4 +58% vs c=8 +5% non-monotonicity is not yet
@@ -104,7 +128,13 @@ runtime regression.
   step is ∝ n. Next lever = compute/comm overlap on the batched lane.
 
 ## Rule
-A committed bench number whose launcher had `DECODE_PHASE_TIME`/`LINEAR_PROFILE`
-is profiling-contaminated (per-step sync, −25–35%) and is NOT a throughput
-baseline — re-measure profiling-OFF before citing. Always state the bench's
-profiling state in the config block.
+- A committed bench number whose launcher had `DECODE_PHASE_TIME`/`LINEAR_PROFILE`
+  is profiling-contaminated (per-step sync, −25–35%) and is NOT a throughput
+  baseline — re-measure profiling-OFF before citing. Always state the bench's
+  profiling state in the config block.
+- **A serve that "hangs / can't load MTP" on a box with only clang-11 is a JIT
+  host-compiler artifact, not a model/code failure.** DSv4's deepgemm bridge needs
+  `-std=c++20`; gcc-8.3 is too old → clang-11 forced on `.62` hangs the MTP-head
+  shapes. The fix is the toolchain: `.61` (gcc-13.3) serves MTP in 136s, no hang.
+  Verify "X can't run here" against a second host before declaring it a property of
+  X — the `.62`/`.61` split is the controlled experiment.
