@@ -25,6 +25,7 @@
 //! points for FP8 (`dsv4_fp8_grouped_gemm`) / 4-bit (Qwen3.6-4bit q4k) are inside
 //! [`crate::moe::moe_forward`]'s two `moe_bf16_grouped_gemm_*` calls — a follow-up.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -247,23 +248,45 @@ pub enum StudentLoraProjection {
     MlpGate,
     MlpUp,
     MlpDown,
+    MoeRouter,
+    MoeSharedGate,
+    MoeSharedUp,
+    MoeSharedDown,
+    MoeSharedExpertGate,
+    MoeExpertGate { expert_idx: usize },
+    MoeExpertUp { expert_idx: usize },
+    MoeExpertDown { expert_idx: usize },
 }
 
 impl StudentLoraProjection {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> Cow<'static, str> {
         match self {
-            Self::FullQ => "self_attn.q_proj",
-            Self::FullK => "self_attn.k_proj",
-            Self::FullV => "self_attn.v_proj",
-            Self::FullO => "self_attn.o_proj",
-            Self::LinearQkv => "self_attn.in_proj_qkv",
-            Self::LinearZ => "self_attn.in_proj_z",
-            Self::LinearB => "self_attn.in_proj_b",
-            Self::LinearA => "self_attn.in_proj_a",
-            Self::LinearOut => "self_attn.out_proj",
-            Self::MlpGate => "mlp.gate_proj",
-            Self::MlpUp => "mlp.up_proj",
-            Self::MlpDown => "mlp.down_proj",
+            Self::FullQ => Cow::Borrowed("self_attn.q_proj"),
+            Self::FullK => Cow::Borrowed("self_attn.k_proj"),
+            Self::FullV => Cow::Borrowed("self_attn.v_proj"),
+            Self::FullO => Cow::Borrowed("self_attn.o_proj"),
+            Self::LinearQkv => Cow::Borrowed("self_attn.in_proj_qkv"),
+            Self::LinearZ => Cow::Borrowed("self_attn.in_proj_z"),
+            Self::LinearB => Cow::Borrowed("self_attn.in_proj_b"),
+            Self::LinearA => Cow::Borrowed("self_attn.in_proj_a"),
+            Self::LinearOut => Cow::Borrowed("self_attn.out_proj"),
+            Self::MlpGate => Cow::Borrowed("mlp.gate_proj"),
+            Self::MlpUp => Cow::Borrowed("mlp.up_proj"),
+            Self::MlpDown => Cow::Borrowed("mlp.down_proj"),
+            Self::MoeRouter => Cow::Borrowed("mlp.gate"),
+            Self::MoeSharedGate => Cow::Borrowed("mlp.shared_expert.gate_proj"),
+            Self::MoeSharedUp => Cow::Borrowed("mlp.shared_expert.up_proj"),
+            Self::MoeSharedDown => Cow::Borrowed("mlp.shared_expert.down_proj"),
+            Self::MoeSharedExpertGate => Cow::Borrowed("mlp.shared_expert_gate"),
+            Self::MoeExpertGate { expert_idx } => {
+                Cow::Owned(format!("mlp.experts.{expert_idx}.gate_proj"))
+            }
+            Self::MoeExpertUp { expert_idx } => {
+                Cow::Owned(format!("mlp.experts.{expert_idx}.up_proj"))
+            }
+            Self::MoeExpertDown { expert_idx } => {
+                Cow::Owned(format!("mlp.experts.{expert_idx}.down_proj"))
+            }
         }
     }
 }
@@ -2469,7 +2492,7 @@ impl Qwen35Model {
         let label = projection.label();
         let base = {
             let matrix = self.lora_matrix(layer_idx, projection)?;
-            clone_matrix_to_host(&self.ctx, matrix, layer_idx, label)?
+            clone_matrix_to_host(&self.ctx, matrix, layer_idx, label.as_ref())?
         };
         self.lora_base.insert(key, base);
         Ok(())
@@ -2551,11 +2574,9 @@ impl Qwen35Model {
                     .get(&key)
                     .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight missing"))?
                     .clone();
-                let uploaded =
-                    DeviceMatrix::from_host(&self.ctx, &base, rows, cols).map_err(|e| {
-                        anyhow!("layer {layer_idx} {label}: restore base weight failed: {e}")
-                    })?;
-                *self.lora_matrix_mut(layer_idx, projection)? = uploaded;
+                let ctx = self.ctx.clone();
+                let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+                upload_matrix_in_place(&ctx, matrix, &base, layer_idx, label.as_ref())?;
             }
             return Ok(());
         }
@@ -2581,11 +2602,22 @@ impl Qwen35Model {
             }
         }
 
-        let uploaded = DeviceMatrix::from_host(&self.ctx, &merged, rows, cols)
-            .map_err(|e| anyhow!("layer {layer_idx} {label}: upload merged weight failed: {e}"))?;
-        *self.lora_matrix_mut(layer_idx, projection)? = uploaded;
+        let ctx = self.ctx.clone();
+        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+        upload_matrix_in_place(&ctx, matrix, &merged, layer_idx, label.as_ref())?;
         self.lora_dirty.insert(key);
         Ok(())
+    }
+
+    fn local_expert_idx(&self, global_expert: usize) -> Result<usize> {
+        ensure!(
+            self.expert_split.owns(global_expert),
+            "Qwen3.6 LoRA sync expert {global_expert} is not local to this rank \
+             (local range {}..{})",
+            self.expert_split.local_expert_start,
+            self.expert_split.local_expert_end()
+        );
+        Ok(global_expert - self.expert_split.local_expert_start)
     }
 
     fn lora_matrix(
@@ -2647,6 +2679,51 @@ impl Qwen35Model {
                     StudentLoraProjection::MlpUp => &dense.up_proj,
                     StudentLoraProjection::MlpDown => &dense.down_proj,
                     _ => unreachable!("mlp projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::MoeRouter
+            | StudentLoraProjection::MoeSharedGate
+            | StudentLoraProjection::MoeSharedUp
+            | StudentLoraProjection::MoeSharedDown
+            | StudentLoraProjection::MoeSharedExpertGate => {
+                let moe = layer.moe.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
+                        projection.label()
+                    )
+                })?;
+                Ok(match projection {
+                    StudentLoraProjection::MoeRouter => &moe.router_gate,
+                    StudentLoraProjection::MoeSharedGate => &moe.shared_gate,
+                    StudentLoraProjection::MoeSharedUp => &moe.shared_up,
+                    StudentLoraProjection::MoeSharedDown => &moe.shared_down,
+                    StudentLoraProjection::MoeSharedExpertGate => &moe.shared_gate_router,
+                    _ => unreachable!("shared MoE projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::MoeExpertGate { expert_idx }
+            | StudentLoraProjection::MoeExpertUp { expert_idx }
+            | StudentLoraProjection::MoeExpertDown { expert_idx } => {
+                let local_idx = self.local_expert_idx(expert_idx)?;
+                let moe = layer.moe.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
+                        projection.label()
+                    )
+                })?;
+                let experts = match projection {
+                    StudentLoraProjection::MoeExpertGate { .. } => &moe.gate,
+                    StudentLoraProjection::MoeExpertUp { .. } => &moe.up,
+                    StudentLoraProjection::MoeExpertDown { .. } => &moe.down,
+                    _ => unreachable!("expert MoE projection arm checked above"),
+                };
+                experts.get(local_idx).ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} expert matrix is not resident as a per-expert \
+                         BF16 DeviceMatrix; grouped/FP8 MoE LoRA sync is not supported by this \
+                         re-merge path",
+                        projection.label()
+                    )
                 })
             }
         }
@@ -2711,6 +2788,58 @@ impl Qwen35Model {
                     StudentLoraProjection::MlpUp => &mut dense.up_proj,
                     StudentLoraProjection::MlpDown => &mut dense.down_proj,
                     _ => unreachable!("mlp projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::MoeRouter
+            | StudentLoraProjection::MoeSharedGate
+            | StudentLoraProjection::MoeSharedUp
+            | StudentLoraProjection::MoeSharedDown
+            | StudentLoraProjection::MoeSharedExpertGate => {
+                let moe = layer.moe.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
+                        projection.label()
+                    )
+                })?;
+                Ok(match projection {
+                    StudentLoraProjection::MoeRouter => &mut moe.router_gate,
+                    StudentLoraProjection::MoeSharedGate => &mut moe.shared_gate,
+                    StudentLoraProjection::MoeSharedUp => &mut moe.shared_up,
+                    StudentLoraProjection::MoeSharedDown => &mut moe.shared_down,
+                    StudentLoraProjection::MoeSharedExpertGate => &mut moe.shared_gate_router,
+                    _ => unreachable!("shared MoE projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::MoeExpertGate { expert_idx }
+            | StudentLoraProjection::MoeExpertUp { expert_idx }
+            | StudentLoraProjection::MoeExpertDown { expert_idx } => {
+                let local_start = self.expert_split.local_expert_start;
+                let local_end = self.expert_split.local_expert_end();
+                ensure!(
+                    (local_start..local_end).contains(&expert_idx),
+                    "Qwen3.6 LoRA sync expert {expert_idx} is not local to this rank \
+                     (local range {local_start}..{local_end})"
+                );
+                let local_idx = expert_idx - local_start;
+                let moe = layer.moe.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
+                        projection.label()
+                    )
+                })?;
+                let experts = match projection {
+                    StudentLoraProjection::MoeExpertGate { .. } => &mut moe.gate,
+                    StudentLoraProjection::MoeExpertUp { .. } => &mut moe.up,
+                    StudentLoraProjection::MoeExpertDown { .. } => &mut moe.down,
+                    _ => unreachable!("expert MoE projection arm checked above"),
+                };
+                experts.get_mut(local_idx).ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} expert matrix is not resident as a per-expert \
+                         BF16 DeviceMatrix; grouped/FP8 MoE LoRA sync is not supported by this \
+                         re-merge path",
+                        projection.label()
+                    )
                 })
             }
         }
@@ -4192,6 +4321,37 @@ fn clone_matrix_to_host(
         matrix.rows * matrix.cols
     );
     Ok(host)
+}
+
+/// Upload a dense BF16 LoRA-merged matrix into the existing allocation.
+///
+/// Keeping the device address stable matters for MoE expert pointer tables and
+/// CUDA graph capture: those tables reference resident matrices by pointer.
+fn upload_matrix_in_place(
+    ctx: &DeviceContext,
+    matrix: &mut DeviceMatrix,
+    data: &[bf16],
+    layer_idx: usize,
+    label: &str,
+) -> Result<()> {
+    ensure!(
+        matrix.is_dense_bf16(),
+        "layer {layer_idx} {label}: LoRA re-merge requires dense BF16; got {:?}",
+        matrix.weight_format()
+    );
+    ensure!(
+        data.len() == matrix.rows * matrix.cols && data.len() == matrix.data.len(),
+        "layer {layer_idx} {label}: merged len {} != resident matrix {}x{} / data len {}",
+        data.len(),
+        matrix.rows,
+        matrix.cols,
+        matrix.data.len()
+    );
+    let mut dst = matrix.data.slice_mut(0..data.len());
+    ctx.stream
+        .memcpy_htod(data, &mut dst)
+        .map_err(|e| anyhow!("layer {layer_idx} {label}: in-place LoRA upload failed: {e}"))?;
+    Ok(())
 }
 
 /// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.

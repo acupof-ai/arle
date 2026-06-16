@@ -1027,7 +1027,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         alpha: args.lora_alpha,
     };
 
-    let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
+    let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
 
     eprintln!(
@@ -1060,6 +1060,15 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     if eval_ids.iter().any(|&id| (id as usize) >= vocab) {
         bail!("eval token ids must be < {vocab} (student vocab size); got {eval_ids:?}");
     }
+    #[cfg(feature = "cuda")]
+    let infer_student = load_opd_infer_student(
+        student_dir,
+        prompt_ids.len() + args.rollout_len + 32,
+        train_backend.clone(),
+        vocab,
+    )?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = &train_backend;
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let lr_schedule =
@@ -1101,6 +1110,13 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
     for step in 1..=args.steps {
         let _step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
+        #[cfg(feature = "cuda")]
+        let infer_rollout = infer_student
+            .as_ref()
+            .map(|student| train::opd::InferRolloutCtx {
+                student,
+                lora_config: lora,
+            });
         let outcome = {
             let teacher = ema.as_teacher();
             opd_step_with_teacher_forward_profiled_gkd_anchor(
@@ -1124,7 +1140,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
                 },
                 None,
                 #[cfg(feature = "cuda")]
-                None,
+                infer_rollout,
                 step_profile.as_mut(),
             )
             .with_context(|| format!("self-opd step {step} failed"))?
