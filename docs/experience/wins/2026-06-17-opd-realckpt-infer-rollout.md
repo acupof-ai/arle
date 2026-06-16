@@ -12,6 +12,12 @@ path. Teacher scoring and differentiable student forward/backward remain in
 autograd for that example; the production CLI still uses the existing
 `InferTeacher` route.
 
+The production full-recipe runtime verdict is already recorded in
+[`2026-06-17-opd-infer-rollout-f999-full-recipe-verdict.md`](2026-06-17-opd-infer-rollout-f999-full-recipe-verdict.md):
+the 250-step run completed, the step-250 checkpoint passed the needle smoke, and
+the capability curve was a recipe/objective issue rather than a rollout-runtime
+blocker.
+
 ## What Worked
 
 - `opd_step_cuda_realckpt_train.rs` now loads an `InferStudent` for LoRA mode,
