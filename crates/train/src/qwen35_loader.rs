@@ -698,10 +698,10 @@ fn load_qwen35_from_hf_dir_inner(
     // 3) Qwen35Config → fresh model. The load mode controls whether loaded
     //    slots remain frozen for teachers/eval or trainable for OPD students.
     let mut model = match mode {
-        LoadMode::FrozenEval => Qwen35Model::new_for_eval(&cfg, store)?,
+        LoadMode::FrozenEval => Qwen35Model::new_for_checkpoint_load(&cfg, store)?,
         LoadMode::TrainableStudent => Qwen35Model::new(&cfg, store)?,
         LoadMode::LoraStudent { lora, target_set } => {
-            Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, store)?
+            Qwen35Model::new_with_lora_targets_for_checkpoint_load(&cfg, lora, target_set, store)?
         }
     };
     if !matches!(mode, LoadMode::FrozenEval) && opd_gradient_checkpointing_enabled() {

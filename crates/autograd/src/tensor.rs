@@ -93,6 +93,28 @@ impl Tensor {
             dirty: Dirty::Host,
         })
     }
+
+    /// Metadata-only tensor slot for checkpoint loaders.
+    ///
+    /// The shape/grad metadata is available immediately, but no host or device
+    /// value exists until the loader installs a real `DeviceHandle` or replaces
+    /// the slot with materialized host data. Treat it as `Dirty::Device` so any
+    /// accidental pre-load use fails through the existing missing-handle guard
+    /// instead of silently reading an empty host buffer.
+    pub fn unmaterialized(shape: Vec<usize>, requires_grad: bool) -> Result<Self> {
+        let size = shape_size(&shape);
+        let strides = contiguous_strides(&shape);
+        Ok(Self {
+            data: Vec::new(),
+            shape,
+            strides,
+            size,
+            requires_grad,
+            grad: None,
+            device_handle: None,
+            dirty: Dirty::Device,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -286,6 +308,12 @@ impl TensorStore {
             let tensor = self.tensor(id)?;
             (tensor.dirty.clone(), tensor.device_handle.is_some())
         };
+
+        if dirty == Dirty::Device && !has_handle {
+            return Err(AutogradError::TapeInvariant(
+                "device-resident tensor missing device handle",
+            ));
+        }
 
         if has_handle && dirty != Dirty::Host {
             return Ok(());
@@ -695,6 +723,32 @@ mod tests {
         assert_eq!(tensor.data.capacity(), 0);
         assert_eq!(
             store.to_host(id).expect("read back evicted tensor"),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn unmaterialized_tensor_fails_loud_until_handle_is_installed() {
+        let mut store = TensorStore::default();
+        let id =
+            store.alloc(Tensor::unmaterialized(vec![2, 2], false).expect("unmaterialized tensor"));
+
+        let tensor = store.get(id).expect("tensor exists");
+        assert_eq!(tensor.shape, vec![2, 2]);
+        assert_eq!(tensor.size, 4);
+        assert_eq!(tensor.dirty, Dirty::Device);
+        assert!(tensor.data.is_empty());
+        assert!(tensor.device_handle.is_none());
+        assert_eq!(store.live_host_bytes(), 0);
+
+        assert!(store.ensure_device(id).is_err());
+        assert!(store.to_host(id).is_err());
+
+        store
+            .replace_device_handle(id, DeviceHandle::Cpu(vec![1.0, 2.0, 3.0, 4.0]))
+            .expect("install loaded handle");
+        assert_eq!(
+            store.to_host(id).expect("read back installed handle"),
             vec![1.0, 2.0, 3.0, 4.0]
         );
     }
