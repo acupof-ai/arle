@@ -15,7 +15,7 @@ mod app {
 
     use anyhow::{Context, Result, bail};
     use autograd::{
-        Backend, Tape, Tensor, TensorId, TensorStore,
+        Backend, BackwardProfile, Tape, Tensor, TensorId, TensorStore,
         backend_cuda::CudaBackend,
         ops::{mul, sum},
     };
@@ -38,6 +38,7 @@ mod app {
         tokens: Vec<u32>,
         mode: GateMode,
         layer: usize,
+        profile_backward: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +61,8 @@ mod app {
         }
         println!(
             "qwen36_fp8_lora_fd_gate_start model={} device={} rank={} alpha={:.6} \
-             target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={}",
+             target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={} \
+             profile_backward={}",
             args.model.display(),
             args.device,
             args.lora.rank,
@@ -70,7 +72,8 @@ mod app {
             args.eps,
             args.tokens,
             args.mode.label(),
-            args.layer
+            args.layer,
+            args.profile_backward
         );
 
         let backend = Arc::new(
@@ -115,11 +118,19 @@ mod app {
             gate_input.probe,
         )?;
         let loss_base = scalar_host(&mut store, loss)?;
-        let grads = tape.backward(loss, &mut store)?;
+        let (grads, backward_profile) = if args.profile_backward {
+            let (grads, profile) = tape.backward_profiled(loss, &mut store)?;
+            (grads, Some(profile))
+        } else {
+            (tape.backward(loss, &mut store)?, None)
+        };
         backend
             .device_synchronize()
             .context("synchronize after analytic backward")?;
         let analytic_elapsed = analytic_started.elapsed();
+        if let Some(profile) = &backward_profile {
+            print_backward_profile(profile);
+        }
 
         let selected = select_target_probe(&student, &grads, &mut store, &args)?;
         store.retain_ids(&keep);
@@ -205,6 +216,7 @@ mod app {
         let mut tokens = vec![1_u32, 3, 8];
         let mut mode = GateMode::MlpLayer;
         let mut layer = 0usize;
+        let mut profile_backward = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -241,13 +253,14 @@ mod app {
                         .parse()
                         .context("parse --layer")?;
                 }
+                "--profile-backward" => profile_backward = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_fd_gate \
                          --release --features cuda -- [--model DIR] [--device N] \
                          [--rank N] [--alpha F] [--target-set all-linear] \
                          [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
-                         [--mode mlp-layer|full-model] [--layer N]"
+                         [--mode mlp-layer|full-model] [--layer N] [--profile-backward]"
                     );
                     std::process::exit(0);
                 }
@@ -273,6 +286,7 @@ mod app {
             tokens,
             mode,
             layer,
+            profile_backward,
         })
     }
 
@@ -558,6 +572,57 @@ mod app {
         let analytic = f64::from(analytic);
         let numeric = f64::from(numeric);
         (analytic - numeric).abs() / analytic.abs().max(numeric.abs()).max(1.0e-12)
+    }
+
+    fn print_backward_profile(profile: &BackwardProfile) {
+        let total_seconds = secs(profile.total_duration);
+        let op_seconds = secs(profile.total_op_duration());
+        println!(
+            "qwen36_fp8_lora_fd_backward_profile total_seconds={total_seconds:.6} \
+             op_seconds={op_seconds:.6} prelude_seconds={:.6} merge_grad_seconds={:.6} \
+             op_kinds={} site_kinds={}",
+            secs(profile.prelude_duration),
+            secs(profile.merge_grad_duration),
+            profile.op_totals.len(),
+            profile.site_totals.len()
+        );
+
+        let mut op_rows = profile.op_totals.iter().collect::<Vec<_>>();
+        op_rows.sort_by(|(_, left), (_, right)| right.duration.cmp(&left.duration));
+        for (rank, (op, stats)) in op_rows.into_iter().take(16).enumerate() {
+            let seconds = secs(stats.duration);
+            let pct_total = pct(seconds, total_seconds);
+            println!(
+                "qwen36_fp8_lora_fd_backward_profile_op rank={} op={} count={} \
+                 seconds={seconds:.6} pct_total={pct_total:.3}",
+                rank + 1,
+                op.name(),
+                stats.count
+            );
+        }
+
+        let mut site_rows = profile.site_totals.iter().collect::<Vec<_>>();
+        site_rows.sort_by(|(_, left), (_, right)| right.duration.cmp(&left.duration));
+        for (rank, ((op, site), stats)) in site_rows.into_iter().take(16).enumerate() {
+            let seconds = secs(stats.duration);
+            let pct_total = pct(seconds, total_seconds);
+            println!(
+                "qwen36_fp8_lora_fd_backward_profile_site rank={} op={} site={} count={} \
+                 seconds={seconds:.6} pct_total={pct_total:.3}",
+                rank + 1,
+                op.name(),
+                site,
+                stats.count
+            );
+        }
+    }
+
+    fn pct(seconds: f64, total_seconds: f64) -> f64 {
+        if total_seconds == 0.0 {
+            0.0
+        } else {
+            seconds / total_seconds * 100.0
+        }
     }
 
     fn secs(duration: Duration) -> f64 {
