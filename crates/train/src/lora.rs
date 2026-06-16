@@ -116,11 +116,51 @@ impl LinearWithLora {
         lora: Option<LoraConfig>,
         store: &mut TensorStore,
     ) -> Result<Self> {
-        let weight = normal_parameter(
+        Self::new_internal(
+            base_name,
+            in_features,
+            out_features,
+            base_requires_grad,
+            lora,
+            true,
+            store,
+        )
+    }
+
+    pub(crate) fn new_with_unmaterialized_base(
+        base_name: &'static str,
+        in_features: usize,
+        out_features: usize,
+        base_requires_grad: bool,
+        lora: Option<LoraConfig>,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        Self::new_internal(
+            base_name,
+            in_features,
+            out_features,
+            base_requires_grad,
+            lora,
+            false,
+            store,
+        )
+    }
+
+    fn new_internal(
+        base_name: &'static str,
+        in_features: usize,
+        out_features: usize,
+        base_requires_grad: bool,
+        lora: Option<LoraConfig>,
+        materialize_frozen_base: bool,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        let weight = base_parameter(
             base_name,
             &[out_features, in_features],
             0.02,
             base_requires_grad,
+            materialize_frozen_base,
             store,
         )?;
         let lora = match lora {
@@ -302,6 +342,21 @@ fn normal_parameter(
         }
     }
     Ok(store.alloc(Tensor::new(data, shape.to_vec(), requires_grad)?))
+}
+
+fn base_parameter(
+    name: &'static str,
+    shape: &[usize],
+    std: f32,
+    requires_grad: bool,
+    materialize_frozen_base: bool,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    if requires_grad || materialize_frozen_base {
+        return normal_parameter(name, shape, std, requires_grad, store);
+    }
+    let _ = name;
+    Ok(store.alloc(Tensor::unmaterialized(shape.to_vec(), false)?))
 }
 
 fn zeros_parameter(
