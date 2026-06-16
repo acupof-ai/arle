@@ -298,7 +298,23 @@ switch must include at least one probe at:
 Single-row entry header `SLO-shape probed?` (Y/N + workload) is
 mandatory. N → defaults to deferred, never PASS, never default-flip.
 
-### 7.8 Bench reports 0 successful → CHECK SERVER LOG FIRST
+### 7.8 DSv4 throughput baselines must be profiling-OFF
+
+Codified from the 2026-06-16 DSv4 c1-8 baseline correction: launching a
+throughput run with `ARLE_DSV4_DECODE_PHASE_TIME=1` and/or
+`ARLE_DSV4_LINEAR_PROFILE=1` inserts per-step `cudaStreamSynchronize`
+work and understated tok/s by about 25-35%. Those knobs are valid for
+diagnosis, not for baseline throughput claims.
+
+**Rule:** every DSv4 throughput/latency baseline must state profiling
+state in the command/environment block. Baselines and default-flip
+evidence require profiling OFF: no `ARLE_DSV4_DECODE_PHASE_TIME`, no
+`ARLE_DSV4_LINEAR_PROFILE`, and no equivalent sync-profile guard. The
+canonical `scripts/bench_guidellm.sh` wrapper fail-fast checks those two
+env vars; override with `ARLE_ALLOW_PROFILED_BENCH=1` only for an
+explicitly labeled profiling-contaminated diagnostic run.
+
+### 7.9 Bench reports 0 successful → CHECK SERVER LOG FIRST
 
 Codified from the 2026-05-10 PF8.5 v3-v10 cascade (skill
 `kernel-optimization` v1.12.0 #34b): when guidellm or any other
@@ -402,6 +418,7 @@ governs how reality becomes a trustworthy record.**
 - [ ] §1 wins entry committed (profile? also §8 skeleton + bench anchor)
 - [ ] Env pinned: GPU, driver, commit sha, features, weights
 - [ ] §3 internal sources cited (service trace, envelope log if vs reference)
+- [ ] DSv4 throughput state pinned: profiling OFF, or explicitly labeled contaminated
 - [ ] Raw artefacts in bench-output/<date>-<label>/; sha256 cited
 - [ ] §5 watch-list reviewed
 - [ ] §6 stopping rules satisfied (or iteration rationale stated)
