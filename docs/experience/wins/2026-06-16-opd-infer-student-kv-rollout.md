@@ -133,6 +133,24 @@ step 2/2 loss 0.000012 rollout_len 308
 opd_step_profile step=2 total_seconds=65.282445 student_rollout_seconds=1.197390 teacher_forward_seconds=20.080001 student_forward_seconds=7.669110 kl_loss_seconds=7.750132 backward_seconds=36.179129
 ```
 
+Current full-recipe all-linear 250-step run (same corrected GSM8K prompt
+corpus, rollout-256, all-linear r32/alpha64) was started on `.62` GPU2 from a
+fresh `86678c24` source snapshot. The older libssl1.1 `target-opd-*` binaries
+were no longer runnable in the current pod image (`libssl.so.1.1` missing), so
+the run uses a freshly built target-opd binary linked to the pod's OpenSSL 3
+runtime rather than `/data01/arle-clean`.
+
+```text
+tmux=opd_track1_alllinear_r256_250_86678c24
+run=/data01/arle-opd-runs/opd-track1-alllinear-r256-250-86678c24-20260616-160115
+binary=/data01/arle-target-opd-track1-example/release/arle
+source=/data01/arle-opd-runs/agent-infer-track1-953182a8-example
+step 1/250 loss 2.742942 rollout_len 328
+opd_step_profile step=1 total_seconds=88.492180 student_rollout_seconds=1.187512 teacher_forward_seconds=33.623830 student_forward_seconds=8.567812 kl_loss_seconds=8.696979 backward_seconds=44.882772
+step 2/250 loss 3.042609 rollout_len 308
+opd_step_profile step=2 total_seconds=66.556390 student_rollout_seconds=1.108200 teacher_forward_seconds=19.841534 student_forward_seconds=7.655881 kl_loss_seconds=7.738039 backward_seconds=37.787993
+```
+
 ## Delta
 
 | Metric | Before | After | Verdict |

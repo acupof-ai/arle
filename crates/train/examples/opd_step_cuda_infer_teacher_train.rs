@@ -38,21 +38,22 @@ mod app {
         time::{Duration, Instant},
     };
 
-    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Backend, Tape, TensorId, TensorStore};
+    use autograd::{Backend, Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
+        LoraAdapterConfig, LoraConfig, LoraTargetSet,
         infer_student::InferStudent,
-        loss::{kl_distill_loss, kl_distill_loss_chunked, KlDirection, DEFAULT_KL_CHUNK_SIZE},
+        loss::{DEFAULT_KL_CHUNK_SIZE, KlDirection, kl_distill_loss, kl_distill_loss_chunked},
         opd::{
-            infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
             GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
+            infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35Model, SequenceWindow},
         qwen35_checkpoint::{
-            save_named_qwen35_student_checkpoint, save_qwen35_student_checkpoint, ConfigJsonSource,
-            GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
-            Qwen35StudentWeights,
+            ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
+            Qwen35StudentWeights, save_named_qwen35_student_checkpoint,
+            save_qwen35_student_checkpoint,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
         teacher_infer::{
@@ -60,7 +61,6 @@ mod app {
             TeacherRoute,
         },
         trainer::extend_keep_with_params_and_grads,
-        LoraAdapterConfig, LoraConfig, LoraTargetSet,
     };
 
     const DEFAULT_QWEN35_08B_DIR: &str =
