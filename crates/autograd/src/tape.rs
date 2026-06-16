@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -121,6 +123,9 @@ pub enum SavedContext {
         k: TensorId,
         v: TensorId,
     },
+    CheckpointCtx {
+        function_id: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,6 +157,7 @@ pub enum BackwardOp {
     LinearAttention,
     CausalSdpaRecompute,
     AllReduceSum,
+    Checkpoint,
 }
 
 impl BackwardOp {
@@ -184,6 +190,7 @@ impl BackwardOp {
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
+            BackwardOp::Checkpoint => "Checkpoint",
         }
     }
 }
@@ -258,10 +265,24 @@ impl TapeEntry {
 
 pub(crate) type GradPairs = SmallVec<[(TensorId, TensorId); 2]>;
 
-#[derive(Debug, Default)]
+pub(crate) type CheckpointFn =
+    Arc<dyn Fn(&mut TensorStore, &mut Tape, &[TensorId]) -> Result<TensorId> + Send + Sync>;
+
+#[derive(Default)]
 pub struct Tape {
     pub entries: Vec<TapeEntry>,
     pub enabled: bool,
+    checkpoint_fns: Vec<CheckpointFn>,
+}
+
+impl fmt::Debug for Tape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tape")
+            .field("entries", &self.entries)
+            .field("enabled", &self.enabled)
+            .field("checkpoint_fns_len", &self.checkpoint_fns.len())
+            .finish()
+    }
 }
 
 impl Tape {
@@ -269,6 +290,7 @@ impl Tape {
         Self {
             entries: Vec::new(),
             enabled: true,
+            checkpoint_fns: Vec::new(),
         }
     }
 
@@ -282,12 +304,18 @@ impl Tape {
         self.enabled = enabled;
     }
 
+    pub(crate) fn register_checkpoint_fn(&mut self, checkpoint_fn: CheckpointFn) -> usize {
+        let function_id = self.checkpoint_fns.len();
+        self.checkpoint_fns.push(checkpoint_fn);
+        function_id
+    }
+
     pub fn backward(
         &mut self,
         loss_id: TensorId,
         store: &mut TensorStore,
     ) -> Result<HashMap<TensorId, TensorId>> {
-        self.backward_impl(loss_id, store, None)
+        self.backward_impl(loss_id, store, None, true)
     }
 
     pub fn backward_profiled(
@@ -296,8 +324,16 @@ impl Tape {
         store: &mut TensorStore,
     ) -> Result<(HashMap<TensorId, TensorId>, BackwardProfile)> {
         let mut profile = BackwardProfile::default();
-        let grads = self.backward_impl(loss_id, store, Some(&mut profile))?;
+        let grads = self.backward_impl(loss_id, store, Some(&mut profile), true)?;
         Ok((grads, profile))
+    }
+
+    fn backward_collect_only(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+    ) -> Result<HashMap<TensorId, TensorId>> {
+        self.backward_impl(loss_id, store, None, false)
     }
 
     fn backward_impl(
@@ -305,6 +341,7 @@ impl Tape {
         loss_id: TensorId,
         store: &mut TensorStore,
         mut profile: Option<&mut BackwardProfile>,
+        accumulate_into_store: bool,
     ) -> Result<HashMap<TensorId, TensorId>> {
         let total_started = profile.is_some().then(Instant::now);
         let was_enabled = self.enabled;
@@ -371,6 +408,7 @@ impl Tape {
             if store
                 .get(loss_id)
                 .is_some_and(|tensor| tensor.requires_grad)
+                && accumulate_into_store
             {
                 store.accumulate_grad(loss_id, loss_grad_id)?;
             }
@@ -441,6 +479,9 @@ impl Tape {
                     BackwardOp::AllReduceSum => {
                         ops::all_reduce_sum_backward(&entry, output_grad_id, store)?
                     }
+                    BackwardOp::Checkpoint => {
+                        self.checkpoint_backward(&entry, output_grad_id, store)?
+                    }
                 };
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
                     sync_profile_boundary(store)?;
@@ -456,7 +497,7 @@ impl Tape {
                 }
                 let merge_started = profile.is_some().then(Instant::now);
                 for (input_id, grad_id) in input_grads {
-                    merge_grad(&mut grads, input_id, grad_id, store)?;
+                    merge_grad(&mut grads, input_id, grad_id, store, accumulate_into_store)?;
                 }
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), merge_started) {
                     sync_profile_boundary(store)?;
@@ -472,6 +513,56 @@ impl Tape {
             profile.total_duration += started.elapsed();
         }
         result
+    }
+
+    fn checkpoint_backward(
+        &mut self,
+        entry: &TapeEntry,
+        output_grad_id: TensorId,
+        store: &mut TensorStore,
+    ) -> Result<GradPairs> {
+        let SavedContext::CheckpointCtx { function_id } = entry.saved else {
+            return Err(AutogradError::TapeInvariant(
+                "checkpoint backward missing saved context",
+            ));
+        };
+        let checkpoint_fn = self
+            .checkpoint_fns
+            .get(function_id)
+            .ok_or(AutogradError::TapeInvariant(
+                "checkpoint backward missing replay function",
+            ))?
+            .clone();
+
+        let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+        let result = (|| {
+            let mut inner_tape = Tape::new();
+            let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
+            let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
+            let loss = ops::sum(weighted, store, &mut inner_tape)?;
+            let inner_grads = inner_tape.backward_collect_only(loss, store)?;
+
+            let mut grads = GradPairs::new();
+            let mut keep = HashSet::new();
+            for &input_id in &entry.input_ids {
+                if let Some(&grad_id) = inner_grads.get(&input_id) {
+                    grads.push((input_id, grad_id));
+                    keep.insert(grad_id);
+                }
+            }
+            Ok((grads, keep))
+        })();
+
+        match result {
+            Ok((grads, keep)) => {
+                store.free_new_except(&live_before, &keep)?;
+                Ok(grads)
+            }
+            Err(err) => {
+                let _ = store.free_new_except(&live_before, &HashSet::new());
+                Err(err)
+            }
+        }
     }
 }
 
@@ -516,6 +607,7 @@ fn merge_grad(
     tensor_id: TensorId,
     new_grad_id: TensorId,
     store: &mut TensorStore,
+    accumulate_into_store: bool,
 ) -> Result<()> {
     if let Some(existing_grad_id) = grads.get(&tensor_id).copied() {
         let expected = store.tensor(existing_grad_id)?.shape.clone();
@@ -576,6 +668,7 @@ fn merge_grad(
     if store
         .get(tensor_id)
         .is_some_and(|tensor| tensor.requires_grad)
+        && accumulate_into_store
     {
         store.accumulate_grad(tensor_id, new_grad_id)?;
     }
@@ -667,5 +760,77 @@ mod tests {
             profile.site_totals[&(BackwardOp::MatmulBT, "unit.matmul_bt")].count,
             1
         );
+    }
+
+    #[test]
+    fn checkpoint_forward_records_single_entry_and_frees_segment_temporaries() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+        let w = store.alloc(Tensor::new(vec![0.5, -2.0], vec![2], true).expect("create w"));
+        let mut tape = Tape::new();
+
+        let y = ops::checkpoint(vec![x, w], &mut store, &mut tape, |store, tape, inputs| {
+            let prod = ops::mul(inputs[0], inputs[1], store, tape)?;
+            ops::mul(prod, prod, store, tape)
+        })
+        .expect("checkpoint forward");
+
+        assert_eq!(tape.entries.len(), 1);
+        assert_eq!(tape.entries[0].op, BackwardOp::Checkpoint);
+        assert_eq!(tape.entries[0].output_id, y);
+        assert_eq!(
+            store.live_tensor_count(),
+            3,
+            "only x, w, and checkpoint output should remain live"
+        );
+    }
+
+    #[test]
+    fn checkpoint_backward_matches_plain_gradients() {
+        fn run(checkpointed: bool) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut store = TensorStore::default();
+            let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+            let w = store.alloc(Tensor::new(vec![0.5, -2.0], vec![2], true).expect("create w"));
+            let mut tape = Tape::new();
+
+            let y = if checkpointed {
+                ops::checkpoint(vec![x, w], &mut store, &mut tape, |store, tape, inputs| {
+                    let prod = ops::mul(inputs[0], inputs[1], store, tape)?;
+                    ops::mul(prod, prod, store, tape)
+                })
+                .expect("checkpoint forward")
+            } else {
+                let prod = ops::mul(x, w, &mut store, &mut tape).expect("prod");
+                ops::mul(prod, prod, &mut store, &mut tape).expect("square")
+            };
+            let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+            let grads = tape.backward(loss, &mut store).expect("backward");
+            let x_grad = store
+                .to_host(*grads.get(&x).expect("x grad"))
+                .expect("x grad host");
+            let w_grad = store
+                .to_host(*grads.get(&w).expect("w grad"))
+                .expect("w grad host");
+            let x_stored = store
+                .get(x)
+                .and_then(|tensor| tensor.grad)
+                .expect("x stored grad");
+            let w_stored = store
+                .get(w)
+                .and_then(|tensor| tensor.grad)
+                .expect("w stored grad");
+            let x_stored = store.to_host(x_stored).expect("x stored host");
+            let w_stored = store.to_host(w_stored).expect("w stored host");
+            (x_grad, w_grad, x_stored, w_stored)
+        }
+
+        let plain = run(false);
+        let checkpointed = run(true);
+        assert_eq!(checkpointed.0, plain.0);
+        assert_eq!(checkpointed.1, plain.1);
+        assert_eq!(checkpointed.2, plain.2);
+        assert_eq!(checkpointed.3, plain.3);
+        assert_eq!(checkpointed.0, vec![1.0, -24.0]);
+        assert_eq!(checkpointed.1, vec![4.0, -36.0]);
     }
 }

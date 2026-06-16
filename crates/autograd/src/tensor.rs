@@ -149,6 +149,43 @@ impl TensorStore {
         Ok(())
     }
 
+    pub fn live_ids(&self) -> Vec<TensorId> {
+        self.tensors
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+            .collect()
+    }
+
+    pub fn live_tensor_count(&self) -> usize {
+        self.tensors.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub fn live_host_bytes(&self) -> usize {
+        self.tensors
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|tensor| tensor.data.len() * std::mem::size_of::<f32>())
+            .sum()
+    }
+
+    pub fn free_new_except(
+        &mut self,
+        live_before: &HashSet<TensorId>,
+        keep: &HashSet<TensorId>,
+    ) -> Result<usize> {
+        let to_free = self
+            .live_ids()
+            .into_iter()
+            .filter(|id| !live_before.contains(id) && !keep.contains(id))
+            .collect::<Vec<_>>();
+        let freed = to_free.len();
+        for id in to_free {
+            self.free(id)?;
+        }
+        Ok(freed)
+    }
+
     pub fn retain_ids(&mut self, keep: &HashSet<TensorId>) {
         for (id, slot) in self.tensors.iter_mut().enumerate() {
             if keep.contains(&id) || slot.is_none() {

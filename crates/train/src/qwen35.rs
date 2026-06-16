@@ -8,8 +8,9 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, add, all_reduce_sum, causal_sdpa_recompute,
-        causal_sdpa_with_q_start, embedding, linear_attention_core, matmul_bt_with_site, mul,
-        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        causal_sdpa_with_q_start, checkpoint, embedding, linear_attention_core,
+        matmul_bt_with_site, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice,
+        transpose,
     },
 };
 use half::bf16;
@@ -447,6 +448,42 @@ fn qwen35_parity_bf16_round(id: TensorId, store: &mut TensorStore) -> Result<Ten
 }
 
 impl Qwen35Layer {
+    fn checkpoint_input_ids(&self, hidden: TensorId) -> Vec<TensorId> {
+        let mut ids = Vec::new();
+        ids.push(hidden);
+        ids.push(self.input_layernorm);
+        ids.push(self.post_attention_layernorm);
+        collect_linear_ids(&self.mlp.gate_proj, &mut ids);
+        collect_linear_ids(&self.mlp.up_proj, &mut ids);
+        collect_linear_ids(&self.mlp.down_proj, &mut ids);
+        match &self.self_attn {
+            Qwen35Attention::Full(attn) => {
+                collect_linear_ids(&attn.q_proj, &mut ids);
+                collect_linear_ids(&attn.k_proj, &mut ids);
+                collect_linear_ids(&attn.v_proj, &mut ids);
+                collect_linear_ids(&attn.o_proj, &mut ids);
+                ids.push(attn.q_norm);
+                ids.push(attn.k_norm);
+            }
+            Qwen35Attention::Linear(attn) => {
+                collect_linear_ids(&attn.in_proj_qkv, &mut ids);
+                collect_linear_ids(&attn.in_proj_z, &mut ids);
+                collect_linear_ids(&attn.in_proj_b, &mut ids);
+                collect_linear_ids(&attn.in_proj_a, &mut ids);
+                collect_linear_ids(&attn.out_proj, &mut ids);
+                ids.push(attn.conv1d_weight);
+                ids.push(attn.dt_bias);
+                ids.push(attn.a_log);
+                ids.push(attn.norm);
+            }
+        }
+        let mut params = ids.split_off(1);
+        params.sort_unstable();
+        params.dedup();
+        ids.extend(params);
+        ids
+    }
+
     fn forward(
         &self,
         x: TensorId,
@@ -1159,6 +1196,7 @@ pub struct Qwen35Model {
     param_names: HashMap<&'static str, TensorId>,
     adapter_names: HashMap<&'static str, TensorId>,
     param_ids: Vec<TensorId>,
+    gradient_checkpointing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1185,6 +1223,14 @@ impl Qwen35Model {
 
     pub fn tensor_parallel(&self) -> Qwen35TensorParallelConfig {
         self.tp
+    }
+
+    pub fn gradient_checkpointing(&self) -> bool {
+        self.gradient_checkpointing
+    }
+
+    pub fn set_gradient_checkpointing(&mut self, enabled: bool) {
+        self.gradient_checkpointing = enabled;
     }
 
     pub fn supports_rollout_kv_cache(&self) -> bool {
@@ -1408,6 +1454,7 @@ impl Qwen35Model {
     ) -> Result<Self> {
         let mut model =
             Self::new_with_lora_targets_and_tp(&base.config, lora, target_set, base.tp, store)?;
+        model.gradient_checkpointing = base.gradient_checkpointing;
         model.share_base_parameters_from(base)?;
 
         let keep = base
@@ -1797,6 +1844,7 @@ impl Qwen35Model {
             param_names,
             adapter_names,
             param_ids,
+            gradient_checkpointing: false,
         })
     }
 
@@ -2188,7 +2236,24 @@ impl Qwen35Model {
             tape,
         )?;
         for layer in &self.layers {
-            hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
+            hidden = if self.gradient_checkpointing && tape.enabled {
+                let layer = layer.clone();
+                let cfg = self.config.clone();
+                let tp = self.tp;
+                let cos_id = cos;
+                let sin_id = sin;
+                let input_ids = layer.checkpoint_input_ids(hidden);
+                checkpoint(input_ids, store, tape, move |store, tape, inputs| {
+                    let hidden = *inputs.first().ok_or(AutogradError::TapeInvariant(
+                        "qwen35 checkpoint missing hidden input",
+                    ))?;
+                    layer
+                        .forward(hidden, &cfg, tp, cos_id, sin_id, store, tape)
+                        .map_err(qwen35_to_autograd)
+                })?
+            } else {
+                layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?
+            };
         }
         qwen35_rmsnorm(
             hidden,
@@ -2726,6 +2791,11 @@ fn lora_for_name(
     lora.filter(|_| target_set.includes(base_name))
 }
 
+fn collect_linear_ids(linear: &LinearWithLora, ids: &mut Vec<TensorId>) {
+    ids.extend(linear.parameter_name_map().values().copied());
+    ids.extend(linear.adapter_name_map().values().copied());
+}
+
 fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
 }
@@ -3257,10 +3327,18 @@ fn leak_name(name: String) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    #[cfg(feature = "cuda")]
+    use std::{env, sync::Arc};
 
-    use autograd::{Tape, TensorId, TensorStore};
+    #[cfg(feature = "cuda")]
+    use autograd::backend_cuda::CudaBackend;
+    use autograd::{
+        BackwardOp, Tape, TensorId, TensorStore,
+        ops::{mul, sum},
+    };
 
     use super::{LayerType, Qwen35Config, Qwen35KvCache, Qwen35Model};
+    use crate::lora::{LoraConfig, LoraTargetSet};
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -3302,6 +3380,48 @@ mod tests {
 
     fn logits_host(store: &mut TensorStore, logits: TensorId) -> TestResult<Vec<f32>> {
         Ok(store.to_host(logits)?)
+    }
+
+    fn squared_logits_loss(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> TestResult<TensorId> {
+        let logits = model.forward(store, tape, tokens, positions)?;
+        let sq = mul(logits, logits, store, tape)?;
+        Ok(sum(sq, store, tape)?)
+    }
+
+    fn squared_logits_loss_value(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> TestResult<f32> {
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let logits = model.forward(store, &mut tape, tokens, positions)?;
+        let host = store.to_host(logits)?;
+        Ok(host.iter().map(|value| value * value).sum())
+    }
+
+    fn set_tensor_element(
+        store: &mut TensorStore,
+        tensor_id: TensorId,
+        index: usize,
+        value: f32,
+    ) -> TestResult {
+        let tensor = store
+            .get_mut(tensor_id)
+            .ok_or_else(|| format!("missing tensor {tensor_id}"))?;
+        let slot = tensor
+            .data
+            .get_mut(index)
+            .ok_or_else(|| format!("tensor {tensor_id} missing index {index}"))?;
+        *slot = value;
+        Ok(())
     }
 
     fn greedy_next(host: &[f32], seq_len: usize, vocab: usize) -> u32 {
@@ -3405,6 +3525,102 @@ mod tests {
                 "window row {local_pos} must match full logits slice; max_abs={max_abs}"
             );
         }
+        Ok(())
+    }
+
+    fn run_qwen35_checkpoint_lora_fd_gate(
+        store: &mut TensorStore,
+    ) -> TestResult<(&'static str, usize, f32, f32, f32)> {
+        let cfg = tiny_qwen35_config(8);
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let mut model =
+            Qwen35Model::new_with_lora_targets(&cfg, lora, LoraTargetSet::AllLinear, store)?;
+        model.set_gradient_checkpointing(true);
+        assert!(model.gradient_checkpointing());
+
+        let tokens = [1_u32, 3, 8];
+        let positions = [0_u32, 1, 2];
+        let mut tape = Tape::new();
+        let loss = squared_logits_loss(&model, store, &mut tape, &tokens, &positions)?;
+        let checkpoint_entries = tape
+            .entries
+            .iter()
+            .filter(|entry| entry.op == BackwardOp::Checkpoint)
+            .count();
+        assert_eq!(
+            checkpoint_entries, cfg.num_hidden_layers,
+            "one checkpoint entry per transformer layer is required"
+        );
+        let grads = tape.backward(loss, store)?;
+
+        let mut best: Option<(&'static str, TensorId, usize, f32)> = None;
+        let mut adapters = model.adapter_name_map().into_iter().collect::<Vec<_>>();
+        adapters.sort_by_key(|(name, _)| *name);
+        for (name, tensor_id) in adapters {
+            let Some(&grad_id) = grads.get(&tensor_id) else {
+                continue;
+            };
+            let grad = store.to_host(grad_id)?;
+            for (index, &value) in grad.iter().enumerate() {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, _, current)| value.abs() > current.abs())
+                {
+                    best = Some((name, tensor_id, index, value));
+                }
+            }
+        }
+
+        let (name, tensor_id, index, analytic) =
+            best.ok_or("checkpointed LoRA backward produced no adapter gradients")?;
+        assert!(
+            analytic.abs() > 1.0e-8,
+            "finite-diff probe gradient is too small for a relative gate: {name}[{index}]={analytic}"
+        );
+        let base_value = store
+            .to_host(tensor_id)?
+            .get(index)
+            .copied()
+            .ok_or("probe tensor index missing")?;
+        let eps = 1.0e-3_f32;
+        set_tensor_element(store, tensor_id, index, base_value + eps)?;
+        let loss_plus = squared_logits_loss_value(&model, store, &tokens, &positions)?;
+        set_tensor_element(store, tensor_id, index, base_value - eps)?;
+        let loss_minus = squared_logits_loss_value(&model, store, &tokens, &positions)?;
+        set_tensor_element(store, tensor_id, index, base_value)?;
+
+        let numeric = (loss_plus - loss_minus) / (2.0 * eps);
+        let rel_err = (analytic - numeric).abs() / numeric.abs().max(analytic.abs()).max(1.0e-12);
+        eprintln!(
+            "qwen35_checkpoint_fd name={name} index={index} eps={eps:.1e} analytic={analytic:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e}"
+        );
+        assert!(
+            rel_err <= 1.0e-2,
+            "checkpointed LoRA finite diff failed for {name}[{index}]: analytic={analytic:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e}"
+        );
+        Ok((name, index, analytic, numeric, rel_err))
+    }
+
+    #[test]
+    fn qwen35_gradient_checkpointing_lora_finite_diff_gate() -> TestResult {
+        let mut store = TensorStore::default();
+        run_qwen35_checkpoint_lora_fd_gate(&mut store)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn qwen35_gradient_checkpointing_lora_cuda_finite_diff_gate() -> TestResult {
+        let ordinal = env::var("ARLE_CUDA_TEST_DEVICE")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(0);
+        let backend = Arc::new(CudaBackend::new(ordinal)?);
+        let mut store = TensorStore::with_backend(backend);
+        run_qwen35_checkpoint_lora_fd_gate(&mut store)?;
         Ok(())
     }
 }

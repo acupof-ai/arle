@@ -44,7 +44,7 @@
 
 use std::{
     collections::HashMap,
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -574,6 +574,12 @@ enum LoadMode {
     },
 }
 
+fn opd_gradient_checkpointing_enabled() -> bool {
+    env::var("ARLE_OPD_GRADIENT_CHECKPOINTING")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
 fn load_qwen35_from_hf_dir_inner(
     dir: &Path,
     store: &mut TensorStore,
@@ -618,13 +624,16 @@ fn load_qwen35_from_hf_dir_inner(
 
     // 3) Qwen35Config → fresh model. The load mode controls whether loaded
     //    slots remain frozen for teachers/eval or trainable for OPD students.
-    let model = match mode {
+    let mut model = match mode {
         LoadMode::FrozenEval => Qwen35Model::new_for_eval(&cfg, store)?,
         LoadMode::TrainableStudent => Qwen35Model::new(&cfg, store)?,
         LoadMode::LoraStudent { lora, target_set } => {
             Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, store)?
         }
     };
+    if !matches!(mode, LoadMode::FrozenEval) && opd_gradient_checkpointing_enabled() {
+        model.set_gradient_checkpointing(true);
+    }
     let param_map = model.param_name_map();
 
     // 4) Preflight every tensor before writing any checkpoint data into the
