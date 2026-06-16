@@ -59,6 +59,14 @@ pub(crate) fn upload_i32(ctx: &DeviceContext, values: &[i32]) -> Result<CudaSlic
         .map_err(|e| anyhow!("H2D i32 upload failed: {e}"))
 }
 
+/// Upload a host `&[u64]` to device (e.g. an array of device pointers for a
+/// pointer-array batched kernel). Mirrors [`upload_i32`].
+pub(crate) fn upload_u64(ctx: &DeviceContext, values: &[u64]) -> Result<CudaSlice<u64>> {
+    ctx.stream
+        .clone_htod(values)
+        .map_err(|e| anyhow!("H2D u64 upload failed: {e}"))
+}
+
 pub(crate) fn embedding_batch(
     ctx: &DeviceContext,
     embed: &DeviceMatrix,
