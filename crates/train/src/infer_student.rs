@@ -215,8 +215,10 @@ impl InferStudent {
         // Collect per-layer A/B from the train store, keyed by absolute layer
         // index and projection. BTreeMap gives deterministic update ordering.
         let mut layers: HashMap<usize, PartialLayer> = HashMap::new();
+        let mut unsupported = Vec::new();
         for (&name, &tensor_id) in adapter_map {
             let Some((layer_idx, projection, which)) = parse_adapter_name(name) else {
+                unsupported.push(name);
                 continue;
             };
             let shape = store
@@ -246,6 +248,16 @@ impl InferStudent {
             }
         }
 
+        if !unsupported.is_empty() {
+            unsupported.sort_unstable();
+            bail!(
+                "LoRA sync: unsupported adapter tensor name(s): {}. \
+                 Hint: extend InferStudent::parse_adapter_name before using infer-engine rollout \
+                 for this LoRA target set.",
+                unsupported.join(", ")
+            );
+        }
+
         if layers.is_empty() {
             bail!(
                 "LoRA sync: no supported adapters found in adapter_map ({} entries)",
@@ -261,8 +273,9 @@ impl InferStudent {
             let partial = layers.remove(&layer_idx).expect("layer present");
             let mut projections = Vec::with_capacity(partial.projections.len());
             for (projection, partial_proj) in partial.projections {
+                let label = projection.label();
                 let matrices =
-                    partial_proj.into_matrices(lora_config.rank, layer_idx, projection.label())?;
+                    partial_proj.into_matrices(lora_config.rank, layer_idx, label.as_ref())?;
                 projections.push(StudentLoraProjectionUpdate {
                     projection,
                     matrices,
@@ -381,6 +394,23 @@ fn parse_adapter_name(name: &str) -> Option<(usize, StudentLoraProjection, Which
         ("mlp", "gate_proj") => StudentLoraProjection::MlpGate,
         ("mlp", "up_proj") => StudentLoraProjection::MlpUp,
         ("mlp", "down_proj") => StudentLoraProjection::MlpDown,
+        ("mlp", "gate") => StudentLoraProjection::MoeRouter,
+        ("mlp", "shared_expert_gate") => StudentLoraProjection::MoeSharedExpertGate,
+        ("mlp", "shared_expert") => match *parts.get(layers_pos + 4)? {
+            "gate_proj" => StudentLoraProjection::MoeSharedGate,
+            "up_proj" => StudentLoraProjection::MoeSharedUp,
+            "down_proj" => StudentLoraProjection::MoeSharedDown,
+            _ => return None,
+        },
+        ("mlp", "experts") => {
+            let expert_idx: usize = parts.get(layers_pos + 4)?.parse().ok()?;
+            match *parts.get(layers_pos + 5)? {
+                "gate_proj" => StudentLoraProjection::MoeExpertGate { expert_idx },
+                "up_proj" => StudentLoraProjection::MoeExpertUp { expert_idx },
+                "down_proj" => StudentLoraProjection::MoeExpertDown { expert_idx },
+                _ => return None,
+            }
+        }
         _ => return None,
     };
     Some((layer_idx, projection, which))
@@ -475,6 +505,38 @@ mod tests {
             (
                 format!("{prefix}.mlp.down_proj.weight.lora_a"),
                 StudentLoraProjection::MlpDown,
+            ),
+            (
+                format!("{prefix}.mlp.gate.weight.lora_a"),
+                StudentLoraProjection::MoeRouter,
+            ),
+            (
+                format!("{prefix}.mlp.shared_expert.gate_proj.weight.lora_a"),
+                StudentLoraProjection::MoeSharedGate,
+            ),
+            (
+                format!("{prefix}.mlp.shared_expert.up_proj.weight.lora_a"),
+                StudentLoraProjection::MoeSharedUp,
+            ),
+            (
+                format!("{prefix}.mlp.shared_expert.down_proj.weight.lora_a"),
+                StudentLoraProjection::MoeSharedDown,
+            ),
+            (
+                format!("{prefix}.mlp.shared_expert_gate.weight.lora_a"),
+                StudentLoraProjection::MoeSharedExpertGate,
+            ),
+            (
+                format!("{prefix}.mlp.experts.13.gate_proj.weight.lora_a"),
+                StudentLoraProjection::MoeExpertGate { expert_idx: 13 },
+            ),
+            (
+                format!("{prefix}.mlp.experts.13.up_proj.weight.lora_a"),
+                StudentLoraProjection::MoeExpertUp { expert_idx: 13 },
+            ),
+            (
+                format!("{prefix}.mlp.experts.13.down_proj.weight.lora_b"),
+                StudentLoraProjection::MoeExpertDown { expert_idx: 13 },
             ),
         ];
 

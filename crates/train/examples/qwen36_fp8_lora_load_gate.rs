@@ -5,12 +5,19 @@
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 mod app {
-    use std::{env, path::PathBuf, sync::Arc, time::Instant};
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::Instant,
+    };
 
     use anyhow::{Context, Result, bail};
     use autograd::{Backend, TensorId, TensorStore, backend_cuda::CudaBackend};
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
-        LoraConfig, LoraTargetSet, qwen35::Qwen35Model, qwen35_loader::load_qwen35_lora_from_hf_dir,
+        LoraConfig, LoraTargetSet, infer_student::InferStudent, qwen35::Qwen35Model,
+        qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
 
     const DEFAULT_MODEL_DIR: &str = "/data01/models/Qwen3.6-35B-A3B-FP8";
@@ -21,6 +28,9 @@ mod app {
         device: usize,
         lora: LoraConfig,
         target_set: LoraTargetSet,
+        sync_infer: bool,
+        infer_model: PathBuf,
+        perturb_adapter: Option<String>,
     }
 
     pub fn main() -> Result<()> {
@@ -84,6 +94,33 @@ mod app {
             adapter_count
         );
 
+        if args.sync_infer {
+            if let Some(name) = args.perturb_adapter.as_deref() {
+                perturb_adapter(&mut store, &student, name)?;
+            }
+            let infer_started = Instant::now();
+            let infer_student = load_infer_student(
+                &args.infer_model,
+                backend.clone(),
+                cfg.vocab_size,
+                args.model.display().to_string(),
+            )?;
+            let infer_load_seconds = infer_started.elapsed().as_secs_f64();
+            let sync_started = Instant::now();
+            infer_student
+                .sync_lora_from_store(&mut store, &student.adapter_name_map(), args.lora)
+                .context("sync LoRA into infer student")?;
+            backend
+                .device_synchronize()
+                .context("synchronize after infer LoRA sync")?;
+            let sync_seconds = sync_started.elapsed().as_secs_f64();
+            println!(
+                "qwen36_fp8_lora_sync_gate_result infer_load_seconds={infer_load_seconds:.6} \
+                 sync_seconds={sync_seconds:.6} perturb_adapter={}",
+                args.perturb_adapter.as_deref().unwrap_or("none")
+            );
+        }
+
         Ok(())
     }
 
@@ -98,6 +135,10 @@ mod app {
         let mut rank = 8usize;
         let mut alpha = 16.0f32;
         let mut target_set = LoraTargetSet::AllLinear;
+        let mut sync_infer = false;
+        let mut infer_model = model.clone();
+        let mut perturb_adapter =
+            Some("model.language_model.layers.0.mlp.experts.0.up_proj.weight.lora_b".to_string());
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -123,10 +164,22 @@ mod app {
                 "--target-set" => {
                     target_set = parse_target_set(&next_arg("--target-set", &mut args)?)?;
                 }
+                "--sync-infer" => {
+                    sync_infer = true;
+                }
+                "--infer-model" => {
+                    infer_model = PathBuf::from(next_arg("--infer-model", &mut args)?);
+                }
+                "--perturb-adapter" => {
+                    let raw = next_arg("--perturb-adapter", &mut args)?;
+                    perturb_adapter = if raw == "none" { None } else { Some(raw) };
+                }
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_load_gate --release --features cuda -- \
-                         [--model DIR] [--device N] [--rank N] [--alpha F] [--target-set all-linear|attention-qv]"
+                         [--model DIR] [--device N] [--rank N] [--alpha F] \
+                         [--target-set all-linear|attention-qv] [--sync-infer] \
+                         [--infer-model DIR] [--perturb-adapter NAME|none]"
                     );
                     std::process::exit(0);
                 }
@@ -142,6 +195,9 @@ mod app {
             device,
             lora: LoraConfig { rank, alpha },
             target_set,
+            sync_infer,
+            infer_model,
+            perturb_adapter,
         })
     }
 
@@ -162,6 +218,60 @@ mod app {
         ids.iter()
             .filter_map(|id| store.get(*id).map(|tensor| tensor.size))
             .sum()
+    }
+
+    fn perturb_adapter(
+        store: &mut TensorStore,
+        student: &Qwen35Model,
+        adapter_name: &str,
+    ) -> Result<()> {
+        let adapters = student.adapter_name_map();
+        let id = *adapters
+            .get(adapter_name)
+            .with_context(|| format!("adapter {adapter_name} not found"))?;
+        let tensor = store
+            .get_mut(id)
+            .with_context(|| format!("adapter tensor {adapter_name} id {id:?} missing"))?;
+        let slot = tensor
+            .data
+            .first_mut()
+            .with_context(|| format!("adapter tensor {adapter_name} is empty"))?;
+        *slot = 1.0e-3;
+        tensor.device_handle = None;
+        println!("qwen36_fp8_lora_sync_gate_perturbed adapter={adapter_name} value={slot:.6e}");
+        Ok(())
+    }
+
+    fn load_infer_student(
+        model: &Path,
+        train_backend: Arc<dyn Backend>,
+        vocab_size: usize,
+        label: String,
+    ) -> Result<InferStudent> {
+        let max_seq_len = 512usize;
+        let page_size = 16usize;
+        let engine = LoadedInferenceEngine::load_with_config(
+            model
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("infer model path is not valid UTF-8"))?,
+            true,
+            EngineLoadConfig {
+                num_slots: 1,
+                page_size,
+                total_pages: max_seq_len.div_ceil(page_size),
+                max_prompt_tokens: max_seq_len,
+                max_total_tokens: max_seq_len,
+                chunked_prefill_size: max_seq_len,
+                ..EngineLoadConfig::default()
+            },
+        )
+        .with_context(|| format!("load infer rollout student from {}", model.display()))?;
+        println!("qwen36_fp8_lora_sync_gate_infer_loaded model={label}");
+        Ok(InferStudent::new(
+            Arc::new(Mutex::new(engine)),
+            train_backend,
+            vocab_size,
+        ))
     }
 }
 
