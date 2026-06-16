@@ -566,9 +566,45 @@ fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usi
 
 const ROLLOUT_RETAIN_INTERVAL: usize = 2;
 
+static ROLLOUT_RETAIN_INTERVAL_RUNTIME: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ARLE_OPD_ROLLOUT_RETAIN_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(ROLLOUT_RETAIN_INTERVAL)
+});
+
+static ROLLOUT_PROGRESS_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("ARLE_OPD_ROLLOUT_PROGRESS").is_some());
+
+static ROLLOUT_PROGRESS_INTERVAL: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ARLE_OPD_ROLLOUT_PROGRESS_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(16)
+});
+
 fn should_retain_rollout_step(step: usize, rollout_len: usize) -> bool {
     let completed_steps = step + 1;
-    completed_steps.is_multiple_of(ROLLOUT_RETAIN_INTERVAL) || completed_steps == rollout_len
+    completed_steps.is_multiple_of(*ROLLOUT_RETAIN_INTERVAL_RUNTIME)
+        || completed_steps == rollout_len
+}
+
+fn maybe_log_rollout_progress(path: &str, step: usize, rollout_len: usize, started: &Instant) {
+    if !*ROLLOUT_PROGRESS_ENABLED {
+        return;
+    }
+    let completed_steps = step + 1;
+    if completed_steps.is_multiple_of(*ROLLOUT_PROGRESS_INTERVAL) || completed_steps == rollout_len
+    {
+        eprintln!(
+            "opd_rollout_progress path={path} step={completed_steps}/{rollout_len} \
+             elapsed_seconds={:.3} retain_interval={}",
+            started.elapsed().as_secs_f64(),
+            *ROLLOUT_RETAIN_INTERVAL_RUNTIME
+        );
+    }
 }
 
 fn retain_rollout_step_tensors(
@@ -624,6 +660,7 @@ fn rollout_full_forward(
     tape: &mut Tape,
     base_keep: &HashSet<TensorId>,
 ) -> Result<()> {
+    let rollout_started = Instant::now();
     for step in 0..rollout_len {
         let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
         let logits = student
@@ -641,6 +678,7 @@ fn rollout_full_forward(
         if should_retain_rollout_step(step, rollout_len) {
             store.retain_ids(base_keep);
         }
+        maybe_log_rollout_progress("full-forward", step, rollout_len, &rollout_started);
     }
     store.retain_ids(base_keep);
     Ok(())
@@ -755,6 +793,7 @@ fn student_rollout_only_with_keep(
             Some(store.alloc_device_tensor(vec![rollout_len], handle)?)
         };
         let mut current_device_token: Option<TensorId> = None;
+        let rollout_started = Instant::now();
         for step in 0..rollout_len {
             let logits = if step == 0 {
                 let positions = (0..prompt_ids.len() as u32).collect::<Vec<_>>();
@@ -786,8 +825,13 @@ fn student_rollout_only_with_keep(
                 )
                 .map_err(|err| map_qwen35_forward_error("student rollout", err))?
             };
-            let next_token =
-                device_argmax_token(logits, vocab, store, None, (prompt_ids.len() + step) as u64)?;
+            let next_token = device_argmax_token(
+                logits,
+                vocab,
+                store,
+                sampling,
+                (prompt_ids.len() + step) as u64,
+            )?;
             if let Some(buffer_id) = generated_tokens {
                 generated_tokens = Some(write_rollout_token(
                     buffer_id,
@@ -807,6 +851,7 @@ fn student_rollout_only_with_keep(
                     generated_tokens,
                 );
             }
+            maybe_log_rollout_progress("device-token", step, rollout_len, &rollout_started);
         }
         if let Some(buffer_id) = generated_tokens {
             rollout.extend(read_generated_rollout_tokens(
@@ -819,6 +864,7 @@ fn student_rollout_only_with_keep(
         store.retain_ids(rollout_keep_base);
     } else if use_rollout_kv_cache {
         let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + rollout_len);
+        let rollout_started = Instant::now();
         for step in 0..rollout_len {
             let (input_ids, positions, logits_seq_len) = if step == 0 {
                 (
@@ -858,6 +904,7 @@ fn student_rollout_only_with_keep(
             if should_retain_rollout_step(step, rollout_len) {
                 retain_rollout_step_tensors(store, rollout_keep_base, &rollout_cache, None, None);
             }
+            maybe_log_rollout_progress("host-token", step, rollout_len, &rollout_started);
         }
         store.retain_ids(rollout_keep_base);
     } else {
