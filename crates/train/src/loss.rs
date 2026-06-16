@@ -35,10 +35,20 @@ pub fn cross_entropy_loss(
 /// and minimise the soft cross-entropy `-sum_v t_p * log s_p`.
 ///
 /// `num_positions` is validated against `logits.numel() / vocab` so a stale
-/// rollout length does not silently train against the wrong tensor shape. The
-/// current numeric path uses the existing mean-over-all-logits normalization
-/// (`positions * vocab`), which is a constant `1 / vocab` rescale of
-/// `sum_v / num_positions`; changing that scale is an OPD semantics decision.
+/// rollout length does not silently train against the wrong tensor shape.
+///
+/// Normalization = **`batchmean`** (sum over vocab, mean over positions):
+/// `sum_v / num_positions`, the mathematically-correct KL reduction PyTorch's
+/// `KLDivLoss` documents (`reduction='mean'`, i.e. dividing by `positions *
+/// vocab` too, is the form PyTorch warns is *not* the correct KL). The earlier
+/// `mean`-over-all-logits path was a constant `1 / vocab` (≈1/152k) rescale of
+/// this; that is **not** absorbed by AdamW, because the per-parameter gradient
+/// second moment `sqrt(v_hat)` is then pushed near/below `eps=1e-8`, so AdamW
+/// degenerates from adaptive normalization to `eps`-dominated scaled-SGD and the
+/// effective LR collapses by up to ~vocab×; it also makes `--grad-clip` never
+/// fire and the displayed loss `1/vocab` too small. We multiply the `mean` by
+/// `vocab` to recover `batchmean` while keeping the tested `mul_scalar`+`mean`
+/// fast path (no `sum_backward` scalar-broadcast).
 pub fn kl_distill_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
@@ -48,7 +58,8 @@ pub fn kl_distill_loss(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
+    let shape = validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
+    let vocab_scale = shape.vocab as f32;
     validate_kl_temperature(temperature)?;
     let inv_temperature = 1.0 / temperature;
     let temperature_sq = temperature * temperature;
@@ -59,15 +70,14 @@ pub fn kl_distill_loss(
             let teacher_probs = softmax(teacher_logits, store, tape)?;
             let student_log_probs = log_softmax(student_logits, store, tape)?;
             let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
-            // `mean` reduces across all dims (positions × vocab). The KL gradient
-            // direction is identical to the `sum / num_positions` form up to a
-            // constant `1/vocab` rescale; AdamW absorbs the constant via its
-            // adaptive learning rate. Using `mean` here matches the existing
-            // CE-loss backward path (which `cross_entropy_loss` exercises), so we
-            // pick up the same device-resident fast paths instead of routing
-            // through `sum_backward`'s untested scalar broadcast.
+            // `mean` reduces across all dims (positions × vocab); multiplying by
+            // `vocab` recovers the `batchmean` reduction (`sum_v / positions`)
+            // while reusing the tested `mul_scalar`+`mean` device path instead of
+            // `sum_backward`'s untested scalar broadcast. The `1/vocab` factor is
+            // NOT optimizer-invariant (see fn doc): it would push the gradient
+            // below AdamW `eps` and collapse the effective LR.
             let avg = mean(weighted, store, tape)?;
-            mul_scalar(avg, -temperature_sq, store, tape)
+            mul_scalar(avg, -temperature_sq * vocab_scale, store, tape)
         }
         KlDirection::Reverse => {
             let student_probs = softmax(student_logits, store, tape)?;
@@ -78,7 +88,7 @@ pub fn kl_distill_loss(
             let neg_q_logp = mul_scalar(q_logp, -1.0, store, tape)?;
             let elem = add(q_logq, neg_q_logp, store, tape)?;
             let avg = mean(elem, store, tape)?;
-            mul_scalar(avg, temperature_sq, store, tape)
+            mul_scalar(avg, temperature_sq * vocab_scale, store, tape)
         }
     }
 }
@@ -174,9 +184,13 @@ pub fn kl_distill_loss_chunked(
     let total = total.ok_or(AutogradError::TapeInvariant(
         "kl_distill_loss_chunked: no chunks were produced",
     ))?;
+    // Multiply by `vocab` so the chunked path matches the `batchmean`
+    // (`sum_v / positions`) scale of `kl_distill_loss`; each `chunk_avg` is a
+    // `mean` over (positions × vocab), so the recovered scale is identical.
+    let vocab_scale = shape.vocab as f32;
     match direction {
-        KlDirection::Forward => mul_scalar(total, -temperature_sq, store, tape),
-        KlDirection::Reverse => mul_scalar(total, temperature_sq, store, tape),
+        KlDirection::Forward => mul_scalar(total, -temperature_sq * vocab_scale, store, tape),
+        KlDirection::Reverse => mul_scalar(total, temperature_sq * vocab_scale, store, tape),
     }
 }
 
@@ -198,6 +212,7 @@ struct KlDistillShape {
     seq_axis: usize,
     seq_len: usize,
     prefix_positions: usize,
+    vocab: usize,
 }
 
 fn validate_kl_distill_inputs(
@@ -278,6 +293,7 @@ fn validate_kl_distill_inputs(
         seq_axis,
         seq_len,
         prefix_positions,
+        vocab,
     })
 }
 
@@ -377,6 +393,11 @@ mod tests {
         let teacher = store.alloc(
             Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
         );
+        // Mirror `kl_distill_loss`'s `batchmean` scale: `mean` over (positions ×
+        // vocab) then `* vocab` to recover `sum_v / positions`. -1.0 * vocab and
+        // +1.0 * vocab match the real path's `-temperature_sq * vocab_scale` /
+        // `temperature_sq * vocab_scale` at temperature == 1.0 byte-for-byte.
+        let vocab = shape.last().copied().expect("vocab dim") as f32;
         let loss = match direction {
             KlDirection::Forward => {
                 let teacher_probs = softmax(teacher, &mut store, &mut tape).expect("teacher probs");
@@ -385,7 +406,7 @@ mod tests {
                 let weighted =
                     mul(teacher_probs, student_log_probs, &mut store, &mut tape).expect("weighted");
                 let avg = mean(weighted, &mut store, &mut tape).expect("mean");
-                mul_scalar(avg, -1.0, &mut store, &mut tape).expect("forward loss")
+                mul_scalar(avg, -1.0 * vocab, &mut store, &mut tape).expect("forward loss")
             }
             KlDirection::Reverse => {
                 let student_probs = softmax(student, &mut store, &mut tape).expect("student probs");
@@ -399,7 +420,8 @@ mod tests {
                     mul(student_probs, teacher_log_probs, &mut store, &mut tape).expect("q log p");
                 let neg_q_logp = mul_scalar(q_logp, -1.0, &mut store, &mut tape).expect("-q log p");
                 let elem = add(q_logq, neg_q_logp, &mut store, &mut tape).expect("reverse elem");
-                mean(elem, &mut store, &mut tape).expect("reverse loss")
+                let avg = mean(elem, &mut store, &mut tape).expect("reverse mean");
+                mul_scalar(avg, vocab, &mut store, &mut tape).expect("reverse loss")
             }
         };
         let loss_value = store.to_host(loss).expect("loss host value")[0];
@@ -413,31 +435,42 @@ mod tests {
         (loss_value, grad_values)
     }
 
+    /// Relative slack added on top of the absolute floor `eps`. The chunked vs
+    /// non-chunked equivalence is a *relative* property (different summation
+    /// order over softmax-of-1024 rows leaves ~2e-5 relative noise); since the
+    /// `batchmean` rescale multiplies the loss/grad magnitude by `vocab`, a pure
+    /// absolute bound is scale-fragile. Tolerance = `eps + REL_TOL * |rhs|`.
+    const REL_TOL: f32 = 2.0e-4;
+
     fn assert_close(lhs: f32, rhs: f32, eps: f32, label: &str) {
         let abs = (lhs - rhs).abs();
+        let tol = eps + REL_TOL * rhs.abs();
         assert!(
-            abs <= eps,
-            "{label} mismatch: lhs={lhs:.10e} rhs={rhs:.10e} abs={abs:.3e} eps={eps:.3e}"
+            abs <= tol,
+            "{label} mismatch: lhs={lhs:.10e} rhs={rhs:.10e} abs={abs:.3e} tol={tol:.3e}"
         );
     }
 
     fn assert_slice_close(lhs: &[f32], rhs: &[f32], eps: f32, label: &str) {
         assert_eq!(lhs.len(), rhs.len(), "{label} length mismatch");
-        let mut worst = (0usize, 0.0_f32, 0.0_f32, 0.0_f32);
+        let mut worst = (0usize, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
         for (i, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
             let abs = (a - b).abs();
-            if abs > worst.3 {
-                worst = (i, a, b, abs);
+            let tol = eps + REL_TOL * b.abs();
+            // track the largest abs-over-tol violation, not the largest abs
+            let slack = abs - tol;
+            if slack > worst.4 {
+                worst = (i, a, b, abs, slack);
             }
         }
         assert!(
-            worst.3 <= eps,
-            "{label} mismatch at {}: lhs={:.10e} rhs={:.10e} abs={:.3e} eps={:.3e}",
+            worst.4 <= 0.0,
+            "{label} mismatch at {}: lhs={:.10e} rhs={:.10e} abs={:.3e} slack={:.3e}",
             worst.0,
             worst.1,
             worst.2,
             worst.3,
-            eps
+            worst.4
         );
     }
 
@@ -490,7 +523,9 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .sum::<f64>()
-            / student_logits.len() as f64
+            // `batchmean`: sum over vocab, mean over positions (= len / vocab),
+            // matching `kl_distill_loss`'s `vocab`-rescaled normalization.
+            / (student_logits.len() / vocab) as f64
     }
 
     fn reference_log_softmax(row: &[f32]) -> Vec<f64> {

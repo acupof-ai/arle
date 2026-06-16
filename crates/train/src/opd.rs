@@ -1568,11 +1568,13 @@ fn next_token_sft_loss_from_logits(
         store,
         tape,
     )?;
-    let token_mean_ce = cross_entropy_loss(shifted_logits, &targets, store, tape)?;
-    // `kl_distill_loss` intentionally uses mean over positions * vocab.
-    // Scale the hard-label CE to the same internal normalization before
-    // mixing, otherwise lambda=0.3 would dominate KL by roughly vocab_size.
-    mul_scalar(token_mean_ce, 1.0 / vocab as f32, store, tape).map_err(OpdError::from)
+    // `cross_entropy_loss` is already per-position (`mean` over the one gathered
+    // target logit per position), which matches `kl_distill_loss`'s `batchmean`
+    // (`sum_v / positions`) scale. No `1/vocab` rescale: both the KL and the
+    // hard-label CE are per-position, so `--gkd-lambda` blends them at face
+    // value. (Pre-batchmean-fix this was scaled by `1/vocab` to match the old
+    // mean-over-positions*vocab KL; that compensation is removed with the fix.)
+    cross_entropy_loss(shifted_logits, &targets, store, tape).map_err(OpdError::from)
 }
 
 fn shifted_rollout_sft_loss(
@@ -3054,7 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn shifted_rollout_sft_loss_uses_kl_internal_vocab_scale() {
+    fn shifted_rollout_sft_loss_is_per_position_ce() {
         let mut store = TensorStore::default();
         let mut tape = Tape::new();
         let logits = store.alloc(
@@ -3074,11 +3076,12 @@ mod tests {
             .expect("shifted sft loss");
         let value = store.to_host(loss).expect("loss host")[0];
 
-        // Manual CE over positions 0..1, then divided by vocab=4 to match
-        // the current KL internal normalization.
+        // Per-position CE (mean over positions 0..1, NO `1/vocab`): now matches
+        // the `batchmean` KL scale so `--gkd-lambda` blends KL and CE at face
+        // value.
         let ce0 = (0.0f32.exp() + 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln() - 2.0;
         let ce1 = (4.0f32.exp() + 3.0f32.exp() + 2.0f32.exp() + 1.0f32.exp()).ln() - 3.0;
-        let expected = ((ce0 + ce1) * 0.5) / 4.0;
+        let expected = (ce0 + ce1) * 0.5;
         assert!(
             (value - expected).abs() < 1.0e-6,
             "got {value}, expected {expected}"
@@ -3109,7 +3112,9 @@ mod tests {
 
         let ce0 = (0.0f32.exp() + 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln() - 3.0;
         let ce1 = (4.0f32.exp() + 3.0f32.exp() + 2.0f32.exp() + 1.0f32.exp()).ln() - 3.0;
-        let expected = ((ce0 + ce1) * 0.5) / 4.0;
+        // Per-position CE (mean over 2 positions, NO `1/vocab`) — see
+        // `shifted_rollout_sft_loss_is_per_position_ce`.
+        let expected = (ce0 + ce1) * 0.5;
         assert!(
             (value - expected).abs() < 1.0e-6,
             "got {value}, expected {expected}"
