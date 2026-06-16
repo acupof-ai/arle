@@ -604,21 +604,25 @@ pub(crate) fn moe_grouped_linear_backward(
         in_dim,
     )?;
     let packed_input_shape = vec![experts_len, max_rows, in_dim];
-    let packed_weight_t = pack_grouped_weight_t(&experts, out_dim, in_dim, store)?;
-    let packed_weight_t_shape = vec![experts_len, in_dim, out_dim];
     let grad_out_shape = vec![experts_len, max_rows, out_dim];
 
-    let (grad_packed_input_base, grad_packed_weight_t) = grouped_matmul_backward(
-        store,
-        &packed_input,
-        &packed_input_shape,
-        &packed_weight_t,
-        &packed_weight_t_shape,
-        &upstream.data,
-        &grad_out_shape,
-        need_input_grad,
-        need_weight_grad,
-    )?;
+    let (grad_packed_input_base, grad_packed_weight_t) = if need_input_grad || need_weight_grad {
+        let packed_weight_t = pack_grouped_weight_t(&experts, out_dim, in_dim, store)?;
+        let packed_weight_t_shape = vec![experts_len, in_dim, out_dim];
+        grouped_matmul_backward(
+            store,
+            &packed_input,
+            &packed_input_shape,
+            &packed_weight_t,
+            &packed_weight_t_shape,
+            &upstream.data,
+            &grad_out_shape,
+            need_input_grad,
+            need_weight_grad,
+        )?
+    } else {
+        (None, None)
+    };
 
     let mut grad_packed_input = need_input_grad.then(|| vec![0.0_f32; packed_input.len()]);
     if let (Some(dst), Some(src)) = (grad_packed_input.as_mut(), grad_packed_input_base.as_ref()) {
@@ -1339,6 +1343,9 @@ fn grouped_matmul_backward(
     need_grad_a: bool,
     need_grad_b: bool,
 ) -> Result<OptionalMatmulGrads> {
+    if !need_grad_a && !need_grad_b {
+        return Ok((None, None));
+    }
     let a_handle = store.backend().upload(a, a_shape)?;
     let b_handle = store.backend().upload(b, b_shape)?;
     let grad_handle = store.backend().upload(grad_out, grad_out_shape)?;
