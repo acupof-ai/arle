@@ -38,22 +38,21 @@ mod app {
         time::{Duration, Instant},
     };
 
-    use autograd::{Backend, Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
+    use autograd::{backend_cuda::CudaBackend, optim::AdamW, Backend, Tape, TensorId, TensorStore};
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
-        LoraAdapterConfig, LoraConfig, LoraTargetSet,
         infer_student::InferStudent,
-        loss::{DEFAULT_KL_CHUNK_SIZE, KlDirection, kl_distill_loss, kl_distill_loss_chunked},
+        loss::{kl_distill_loss, kl_distill_loss_chunked, KlDirection, DEFAULT_KL_CHUNK_SIZE},
         opd::{
-            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
             infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
+            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
         },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35Model, SequenceWindow},
         qwen35_checkpoint::{
-            ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
-            Qwen35StudentWeights, save_named_qwen35_student_checkpoint,
-            save_qwen35_student_checkpoint,
+            save_named_qwen35_student_checkpoint, save_qwen35_student_checkpoint, ConfigJsonSource,
+            GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StepCheckpoint,
+            Qwen35StudentWeights,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
         teacher_infer::{
@@ -61,6 +60,7 @@ mod app {
             TeacherRoute,
         },
         trainer::extend_keep_with_params_and_grads,
+        LoraAdapterConfig, LoraConfig, LoraTargetSet,
     };
 
     const DEFAULT_QWEN35_08B_DIR: &str =
@@ -252,14 +252,6 @@ mod app {
         // the prior temp-PEFT-dir + `INFER_LORA_PATH` juggling is gone (P4
         // infra hardening — see `infer/src/model/qwen35/weights.rs`).
         let infer_student = if infer_rollout_flag_enabled() {
-            if args.lora_target_set != LoraTargetSet::AttentionQv {
-                return Err(
-                    "the infer rollout path requires --lora-target-set attention-qv (the infer \
-                     merge path only carries q/v adapters on full-attention layers); pass \
-                     ARLE_OPD_INFER_ROLLOUT=0 to fall back to the train-crate rollout"
-                        .into(),
-                );
-            }
             let infer_student_load_started = Instant::now();
             let engine = load_infer_engine(
                 &args.student_model,
@@ -312,7 +304,7 @@ mod app {
                 student_load_seconds,
                 0.0,
                 infer_student.as_ref(),
-                || RuntimeTeacherProfile::default(),
+                RuntimeTeacherProfile::default,
                 |prompt| multi_teacher.selected_teacher_id(prompt).to_owned(),
             );
         }
@@ -367,7 +359,7 @@ mod app {
                 student_load_seconds,
                 teacher_load_seconds,
                 infer_student.as_ref(),
-                || RuntimeTeacherProfile::default(),
+                RuntimeTeacherProfile::default,
                 |_| "in-process".to_owned(),
             );
         }
@@ -405,6 +397,7 @@ mod app {
         )
     }
 
+    #[allow(clippy::exit)]
     fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         let mut teacher_model = PathBuf::from(DEFAULT_QWEN35_08B_DIR);
         let mut student_model = PathBuf::from(DEFAULT_QWEN35_08B_DIR);
@@ -697,7 +690,7 @@ mod app {
             .train_completions
             .iter()
             .enumerate()
-            .find(|(_, completion)| completion.as_ref().map_or(true, |tokens| tokens.is_empty()))
+            .find(|(_, completion)| completion.as_ref().is_none_or(|tokens| tokens.is_empty()))
         {
             return Err(format!(
                 "--sft-anchor corpus-truth requires non-empty completion/target tokens for every training row; missing train index {index}"

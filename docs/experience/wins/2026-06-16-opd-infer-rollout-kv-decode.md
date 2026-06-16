@@ -13,11 +13,12 @@ the serving scheduler token-generation path for prompt-plus-rollout generation.
 That keeps a KV slot alive and performs incremental decode. Teacher scoring and
 student train forward/backward still use the OPD autograd path.
 
-The infer rollout path is guarded to `--lora-target-set attention-qv` for now.
-The current infer-side LoRA remerge only syncs full-attention q/v adapters, so
-running `all-linear` would desynchronize the rollout policy from the trained
-student. This entry licenses the rollout-speed seam, not the final all-linear
-capability verdict.
+This entry originally licensed the rollout-speed seam on the first
+`attention-qv` path. The all-linear limitation was removed later the same day:
+infer-side LoRA remerge now syncs full-attention q/k/v/o, linear-attention
+qkv/z/b/a/out, and dense MLP gate/up/down projections. The current all-linear
+runtime gate is recorded in
+[`2026-06-16-opd-infer-student-kv-rollout.md`](2026-06-16-opd-infer-student-kv-rollout.md).
 
 Measured on .62 GPU1 with Qwen3.5-4B teacher, Qwen3.5-0.8B student, GSM8K
 question-only prompts, rollout_len=256, temperature=1.0:
