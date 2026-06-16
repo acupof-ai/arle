@@ -56,6 +56,42 @@ c=8 both configs already get broad batching (batched-FlashMLA + natural GEMM/MoE
 batch), so the lever's marginal gain narrows to +5% (77.6 vs 74.0). Consistent with
 "gain ∝ n until other batched paths saturate."
 
+## MTP arm (measured prior sessions on a gcc≥10 host — NOT re-measurable on .62)
+
+The table above is **no-MTP** because the MTP-head deepgemm JIT hangs on .62's
+forced `clang++-11` (the box has only gcc-8.3 + clang-11/7 — no c++20 compiler
+better than clang-11; enumerated 2026-06-16). So the MTP numbers below are the
+**existing measured results from the proper build host**, cited as-is. They are
+on **different prompt length / num-slots / base / session**, so they are **NOT a
+same-config A/B against the .62 no-MTP table** — read them as the MTP lane's own
+measured envelope, not a row-by-row delta vs the clean table.
+
+**B=1 (single-stream), same-session ×3 ([[2026-06-13-dsv4-mtp-d2-chain-fold-53]]):**
+
+| arm | B=1 tok/s |
+|-----|-----------|
+| no-spec base | 44.5 |
+| **MTP d2 chain-fold (default-on)** | **52.8–53.3 (×3, σ≈0.04), +18–20%** |
+
+**Concurrency — batched MTP (default-on at c≥4), prod ~2400-tok shape, num-slots 16,
+same-session ([[2026-06-15-dsv4-batched-mtp-prod-shape-flip]]):**
+
+| c | batched MTP | per-row MTP | Δ |
+|---|-------------|-------------|---|
+| 4 | 47.9 | 41.7 | — |
+| 8 | **76.7** | 43.4 | **+77%** |
+| 12 | 78.7 | 46.1 | +71% |
+
+(Short-prompt c=12 +81%, [[2026-06-15-dsv4-batched-mtp-fold-win]]; batched-MTP-draft
+sub-lever default-on adds +6.8%@c8/+11.1%@c16 after the batched lm_head fix,
+[[2026-06-15-dsv4-batched-mtp-draft-default-on]].) The Δ here is **batched vs per-row
+MTP**, not vs no-MTP: per-row MTP plateaus ~42–46 (sequential per-slot spec_step);
+batched runs one amortized wave → scales to ~77.
+
+**To get a clean same-session MTP-vs-no-MTP c1–8 A/B:** build+serve on a gcc≥10 host
+(MTP-head deepgemm JIT compiles there) — the documented next-step blocker, not a
+runtime regression.
+
 ## Problems / caveats
 - **Single sweep per c — the c=4 +58% vs c=8 +5% non-monotonicity is not yet
   pinned to a CI.** The direction (lever helps at c≥4) is solid and matches the
