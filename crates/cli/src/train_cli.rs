@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use autograd::{TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,7 +13,7 @@ use infer_plan::SamplingParams;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
-    model_family::{ModelFamily, resolve_model_family},
+    model_family::{resolve_model_family, ModelFamily},
     tokenizer::ChatTokenizer,
 };
 
@@ -299,8 +299,8 @@ fn maybe_save_full_student_checkpoint(
     }
 
     use train::qwen35_checkpoint::{
-        ConfigJsonSource, GenerationConfigSource, Qwen35StepCheckpoint, Qwen35StudentWeights,
-        save_qwen35_student_checkpoint,
+        save_qwen35_student_checkpoint, ConfigJsonSource, GenerationConfigSource,
+        Qwen35StepCheckpoint, Qwen35StudentWeights,
     };
 
     fs::create_dir_all(out_dir)
@@ -516,12 +516,12 @@ fn load_opd_prompt_source(
 }
 
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdStepConfig,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
     };
@@ -737,11 +737,11 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 }
 
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdStepConfig,
         },
         qwen35::Qwen35Model,
     };
@@ -990,13 +990,13 @@ fn heldout_nll(
 }
 
 fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdKlMask, OpdStepConfig,
         },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
@@ -1235,13 +1235,13 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
 }
 
 fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdKlMask, OpdStepConfig,
         },
         qwen35::Qwen35Model,
     };
@@ -2182,9 +2182,9 @@ mod tests {
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
-        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
         current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config, kl_mask_arg,
-        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
+        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection, OpdLrSchedule,
+        OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
     };
     use crate::args::{LrScheduleArg, OpdKlMaskArg};
 
