@@ -66,7 +66,10 @@ pub use infer_server::{
 #[cfg(feature = "nccl")]
 pub use infer_cuda::mint_nccl_unique_id_hex;
 #[cfg(feature = "cuda")]
-pub use infer_cuda::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
+pub use infer_cuda::{
+    StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate,
+    StudentLoraUpdate,
+};
 #[cfg(feature = "metal")]
 pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes;
 #[cfg(feature = "cuda")]

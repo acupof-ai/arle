@@ -2724,16 +2724,15 @@ impl Qwen35CudaExecutor {
         &self.model.ctx
     }
 
-    /// Fold a fresh student LoRA update into the resident q/v projection weights
+    /// Fold a fresh student LoRA update into the resident projection weights
     /// (OPD per-step re-merge). Delegates to [`crate::qwen35::Qwen35Model`].
     pub(crate) fn remerge_student_lora(
         &mut self,
         update: crate::qwen35::StudentLoraUpdate,
     ) -> Result<()> {
         self.ensure_not_collective("remerge_student_lora")?;
-        // The merge REPLACES q/v `DeviceMatrix` buffers (new device
-        // addresses); captured decode graphs bake the old ones — drop and
-        // recapture lazily.
+        // The merge REPLACES `DeviceMatrix` buffers (new device addresses);
+        // captured decode graphs bake the old ones — drop and recapture lazily.
         self.decode_graph = None;
         self.model.remerge_student_lora(update)
     }

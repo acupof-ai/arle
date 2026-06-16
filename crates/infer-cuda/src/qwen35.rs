@@ -39,7 +39,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
 use half::bf16;
 use infer_plan::SamplingParams;
 use infer_topo::TpConfig;
-use qwen35_spec::{LayerType, Qwen35AttentionTensorNames, Qwen35Config};
+use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35Config};
 use safetensors::tensor::Dtype;
 
 use crate::executor::sample_cuda_token_scratched;
@@ -217,8 +217,8 @@ fn qwen35_gdr_chunked_enabled() -> bool {
     })
 }
 
-/// Raw (un-scaled) LoRA A/B matrices for one full-attention q/v projection,
-/// pushed from the train crate's OPD student loop for the per-step re-merge.
+/// Raw (un-scaled) LoRA A/B matrices for one student projection, pushed from
+/// the train crate's OPD student loop for the per-step re-merge.
 ///
 /// `a` is row-major `[rank, in_features]`, `b` is row-major
 /// `[out_features, rank]` — the PEFT on-disk convention (mirrors the legacy
@@ -233,14 +233,53 @@ pub struct StudentLoraMatrices {
     pub out_features: usize,
 }
 
-/// One full-attention layer's optional q/v adapter for the in-memory re-merge
-/// sync. `layer_idx` is the absolute model-layer index (must name a
-/// full-attention layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StudentLoraProjection {
+    FullQ,
+    FullK,
+    FullV,
+    FullO,
+    LinearQkv,
+    LinearZ,
+    LinearB,
+    LinearA,
+    LinearOut,
+    MlpGate,
+    MlpUp,
+    MlpDown,
+}
+
+impl StudentLoraProjection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FullQ => "self_attn.q_proj",
+            Self::FullK => "self_attn.k_proj",
+            Self::FullV => "self_attn.v_proj",
+            Self::FullO => "self_attn.o_proj",
+            Self::LinearQkv => "self_attn.in_proj_qkv",
+            Self::LinearZ => "self_attn.in_proj_z",
+            Self::LinearB => "self_attn.in_proj_b",
+            Self::LinearA => "self_attn.in_proj_a",
+            Self::LinearOut => "self_attn.out_proj",
+            Self::MlpGate => "mlp.gate_proj",
+            Self::MlpUp => "mlp.up_proj",
+            Self::MlpDown => "mlp.down_proj",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StudentLoraProjectionUpdate {
+    pub projection: StudentLoraProjection,
+    pub matrices: StudentLoraMatrices,
+}
+
+/// One model layer's LoRA adapters for the in-memory re-merge sync.
+/// `layer_idx` is the absolute model-layer index.
 #[derive(Debug, Clone)]
 pub struct StudentLoraLayer {
     pub layer_idx: usize,
-    pub q_proj: Option<StudentLoraMatrices>,
-    pub v_proj: Option<StudentLoraMatrices>,
+    pub projections: Vec<StudentLoraProjectionUpdate>,
 }
 
 /// A full LoRA update pushed from the train crate into the infer student
@@ -829,21 +868,21 @@ pub(crate) struct Qwen35Model {
     /// forwarded through until reloaded.
     offloaded: Option<Box<OffloadedWeights>>,
     /// Pristine base-weight cache for the per-step student LoRA re-merge, keyed
-    /// by absolute (full-attention) layer index. Populated lazily on the first
+    /// by absolute layer index plus projection. Populated lazily on the first
     /// [`Qwen35Model::remerge_student_lora`] call (before any merge mutates the
     /// resident weights) so every re-merge recomputes `W = base + scale·B·A`
     /// from the *original* checkpoint weight, never from an already-merged one.
-    /// Each entry is `(q_proj base bf16, v_proj base bf16)` row-major host copies.
-    lora_base: HashMap<usize, LoraBaseWeights>,
+    lora_base: HashMap<LoraBaseKey, Vec<bf16>>,
+    /// Projections whose resident device matrix currently includes a non-zero
+    /// LoRA delta. Lets all-zero adapter steps skip weight uploads unless they
+    /// need to restore a previously merged projection back to base.
+    lora_dirty: HashSet<LoraBaseKey>,
 }
 
-/// Pristine host copies of one full-attention layer's q/v projection weights,
-/// captured on the first re-merge so subsequent merges start from the original
-/// checkpoint values, not the previously-merged ones.
-#[derive(Debug, Clone, Default)]
-struct LoraBaseWeights {
-    q_proj: Option<Vec<bf16>>,
-    v_proj: Option<Vec<bf16>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LoraBaseKey {
+    layer_idx: usize,
+    projection: StudentLoraProjection,
 }
 
 /// Host-resident snapshot of one transformer block's device weight buffers,
@@ -1663,6 +1702,7 @@ impl Qwen35Model {
             max_seq_len,
             offloaded: None,
             lora_base: HashMap::new(),
+            lora_dirty: HashSet::new(),
         })
     }
 
@@ -2370,18 +2410,22 @@ impl Qwen35Model {
 
     /// Per-step student LoRA re-merge (OPD P2).
     ///
-    /// Folds a fresh [`StudentLoraUpdate`] into the resident full-attention
-    /// q/v projection weights in place. On the first call the pristine base
-    /// weight of every touched projection is cached host-side; each call then
-    /// recomputes `W = base + (alpha/rank)·(B·A)` from that pristine base — so
-    /// re-merging never compounds onto an already-merged weight.
+    /// Folds a fresh [`StudentLoraUpdate`] into the resident student projection
+    /// weights in place. On the first call the pristine base weight of every
+    /// touched projection is cached host-side; each call then recomputes
+    /// `W = base + (alpha/rank)·(B·A)` from that pristine base — so re-merging
+    /// never compounds onto an already-merged weight.
     ///
-    /// `A` is `[rank, in]`, `B` is `[out, rank]`, matching the legacy disk
-    /// loader / `infer/src/model/qwen35/lora.rs` contract. The forward path
-    /// recomputes attention from these resident matrices every step, so the
-    /// merged weight is picked up by the next `forward_tokens` automatically.
+    /// `A` is `[rank, in]`, `B` is `[out, rank]`, matching the train-side
+    /// `LinearWithLora` contract. The next `forward_tokens` picks up the merged
+    /// resident matrices automatically.
     pub(crate) fn remerge_student_lora(&mut self, update: StudentLoraUpdate) -> Result<()> {
         ensure!(update.rank > 0, "student LoRA update has rank=0");
+        ensure!(
+            self.tp.is_single(),
+            "student LoRA re-merge is currently single-GPU only; got TP world_size={}",
+            self.tp.config().world_size
+        );
         let scale = update.alpha / update.rank as f32;
         let num_layers = self.config.num_hidden_layers;
 
@@ -2392,60 +2436,42 @@ impl Qwen35Model {
                 "student LoRA references layer {layer_idx} but model has {num_layers} layers"
             );
             ensure!(
-                self.config.layer_types[layer_idx] == LayerType::FullAttention,
-                "student LoRA layer {layer_idx} is not a full-attention layer; \
-                 the OPD q/v adapter merge only targets gated full-attention projections"
+                !layer.projections.is_empty(),
+                "student LoRA layer {layer_idx} carries no projection updates"
             );
 
-            // Cache the pristine base weights for this layer once, before the
-            // first merge mutates them. Split-borrow safe: we read the resident
-            // q/v `DeviceMatrix` (immutable) into host, then later overwrite.
-            self.ensure_lora_base_cached(layer_idx, layer)?;
-
-            if let Some(q) = &layer.q_proj {
-                self.merge_lora_proj(layer_idx, q, scale, /* is_q = */ true)?;
-            }
-            if let Some(v) = &layer.v_proj {
-                self.merge_lora_proj(layer_idx, v, scale, /* is_q = */ false)?;
+            for projection in &layer.projections {
+                self.merge_lora_proj(
+                    layer_idx,
+                    projection.projection,
+                    &projection.matrices,
+                    scale,
+                )?;
             }
         }
         self.ctx.sync()?;
         Ok(())
     }
 
-    /// Capture pristine host copies of this layer's q/v base weights on first
-    /// touch (only for the projections the update actually carries).
+    /// Capture a pristine host copy of one base weight on first touch.
     fn ensure_lora_base_cached(
         &mut self,
         layer_idx: usize,
-        layer: &StudentLoraLayer,
+        projection: StudentLoraProjection,
     ) -> Result<()> {
-        let attn = match &self.layers[layer_idx].attn {
-            Qwen35Attn::Full(full) => full,
-            Qwen35Attn::Linear(_) => {
-                // Guarded by the caller's FullAttention check; defensive only.
-                return Err(anyhow!(
-                    "student LoRA layer {layer_idx} resolved to a linear-attention block"
-                ));
-            }
+        let key = LoraBaseKey {
+            layer_idx,
+            projection,
         };
-        let entry = self.lora_base.entry(layer_idx).or_default();
-        if layer.q_proj.is_some() && entry.q_proj.is_none() {
-            entry.q_proj = Some(clone_matrix_to_host(
-                &self.ctx,
-                &attn.q_proj,
-                layer_idx,
-                "q_proj",
-            )?);
+        if self.lora_base.contains_key(&key) {
+            return Ok(());
         }
-        if layer.v_proj.is_some() && entry.v_proj.is_none() {
-            entry.v_proj = Some(clone_matrix_to_host(
-                &self.ctx,
-                &attn.v_proj,
-                layer_idx,
-                "v_proj",
-            )?);
-        }
+        let label = projection.label();
+        let base = {
+            let matrix = self.lora_matrix(layer_idx, projection)?;
+            clone_matrix_to_host(&self.ctx, matrix, layer_idx, label)?
+        };
+        self.lora_base.insert(key, base);
         Ok(())
     }
 
@@ -2454,42 +2480,45 @@ impl Qwen35Model {
     fn merge_lora_proj(
         &mut self,
         layer_idx: usize,
+        projection: StudentLoraProjection,
         adapter: &StudentLoraMatrices,
         scale: f32,
-        is_q: bool,
     ) -> Result<()> {
-        let label = if is_q { "q_proj" } else { "v_proj" };
-        // Pull the pristine base + the resident matrix shape under split borrows.
-        let base = {
-            let cached = self
-                .lora_base
-                .get(&layer_idx)
-                .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight not cached"))?;
-            let base = if is_q { &cached.q_proj } else { &cached.v_proj };
-            base.clone()
-                .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight missing"))?
+        let label = projection.label();
+        let key = LoraBaseKey {
+            layer_idx,
+            projection,
         };
 
-        let attn = match &self.layers[layer_idx].attn {
-            Qwen35Attn::Full(full) => full,
-            Qwen35Attn::Linear(_) => {
-                return Err(anyhow!(
-                    "student LoRA layer {layer_idx} resolved to a linear-attention block"
-                ));
-            }
+        let adapter_is_zero = adapter.b.iter().all(|&value| value == 0.0);
+        if adapter_is_zero && !self.lora_dirty.contains(&key) {
+            return Ok(());
+        }
+
+        self.ensure_lora_base_cached(layer_idx, projection)?;
+
+        // Pull the pristine base length + the resident matrix shape under split borrows.
+        let base_len = {
+            let cached = self
+                .lora_base
+                .get(&key)
+                .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight not cached"))?;
+            cached.len()
         };
-        let matrix = if is_q { &attn.q_proj } else { &attn.v_proj };
+
+        let (rows, cols) = {
+            let matrix = self.lora_matrix(layer_idx, projection)?;
+            ensure!(
+                matrix.is_dense_bf16(),
+                "layer {layer_idx} {label}: LoRA re-merge requires dense BF16 base weights; got {:?}",
+                matrix.weight_format()
+            );
+            (matrix.rows, matrix.cols)
+        };
         ensure!(
-            matrix.is_dense_bf16(),
-            "layer {layer_idx} {label}: LoRA re-merge requires dense BF16 base weights; got {:?}",
-            matrix.weight_format()
-        );
-        let rows = matrix.rows;
-        let cols = matrix.cols;
-        ensure!(
-            base.len() == rows * cols,
+            base_len == rows * cols,
             "layer {layer_idx} {label}: cached base len {} != rows*cols {}",
-            base.len(),
+            base_len,
             rows * cols
         );
         ensure!(
@@ -2515,6 +2544,28 @@ impl Qwen35Model {
             rows * adapter.rank
         );
 
+        if adapter_is_zero {
+            if self.lora_dirty.remove(&key) {
+                let base = self
+                    .lora_base
+                    .get(&key)
+                    .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight missing"))?
+                    .clone();
+                let uploaded =
+                    DeviceMatrix::from_host(&self.ctx, &base, rows, cols).map_err(|e| {
+                        anyhow!("layer {layer_idx} {label}: restore base weight failed: {e}")
+                    })?;
+                *self.lora_matrix_mut(layer_idx, projection)? = uploaded;
+            }
+            return Ok(());
+        }
+
+        let base = self
+            .lora_base
+            .get(&key)
+            .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight missing"))?
+            .clone();
+
         // W[r, c] = base[r, c] + scale · Σ_k B[r, k] · A[k, c].
         let rank = adapter.rank;
         let mut merged = vec![bf16::ZERO; rows * cols];
@@ -2532,17 +2583,137 @@ impl Qwen35Model {
 
         let uploaded = DeviceMatrix::from_host(&self.ctx, &merged, rows, cols)
             .map_err(|e| anyhow!("layer {layer_idx} {label}: upload merged weight failed: {e}"))?;
-        match &mut self.layers[layer_idx].attn {
-            Qwen35Attn::Full(full) => {
-                if is_q {
-                    full.q_proj = uploaded;
-                } else {
-                    full.v_proj = uploaded;
-                }
-            }
-            Qwen35Attn::Linear(_) => unreachable!("FullAttention checked above"),
-        }
+        *self.lora_matrix_mut(layer_idx, projection)? = uploaded;
+        self.lora_dirty.insert(key);
         Ok(())
+    }
+
+    fn lora_matrix(
+        &self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+    ) -> Result<&DeviceMatrix> {
+        let layer = &self.layers[layer_idx];
+        match projection {
+            StudentLoraProjection::FullQ
+            | StudentLoraProjection::FullK
+            | StudentLoraProjection::FullV
+            | StudentLoraProjection::FullO => {
+                let Qwen35Attn::Full(full) = &layer.attn else {
+                    return Err(anyhow!(
+                        "layer {layer_idx} {} requires a full-attention layer",
+                        projection.label()
+                    ));
+                };
+                Ok(match projection {
+                    StudentLoraProjection::FullQ => &full.q_proj,
+                    StudentLoraProjection::FullK => &full.k_proj,
+                    StudentLoraProjection::FullV => &full.v_proj,
+                    StudentLoraProjection::FullO => &full.o_proj,
+                    _ => unreachable!("full projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::LinearQkv
+            | StudentLoraProjection::LinearZ
+            | StudentLoraProjection::LinearB
+            | StudentLoraProjection::LinearA
+            | StudentLoraProjection::LinearOut => {
+                let Qwen35Attn::Linear(lin) = &layer.attn else {
+                    return Err(anyhow!(
+                        "layer {layer_idx} {} requires a linear-attention layer",
+                        projection.label()
+                    ));
+                };
+                Ok(match projection {
+                    StudentLoraProjection::LinearQkv => &lin.in_proj_qkv,
+                    StudentLoraProjection::LinearZ => &lin.in_proj_z,
+                    StudentLoraProjection::LinearB => &lin.in_proj_b,
+                    StudentLoraProjection::LinearA => &lin.in_proj_a,
+                    StudentLoraProjection::LinearOut => &lin.out_proj,
+                    _ => unreachable!("linear projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::MlpGate
+            | StudentLoraProjection::MlpUp
+            | StudentLoraProjection::MlpDown => {
+                let dense = layer.mlp.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} requires a dense MLP layer; MoE student LoRA sync is not supported",
+                        projection.label()
+                    )
+                })?;
+                Ok(match projection {
+                    StudentLoraProjection::MlpGate => &dense.gate_proj,
+                    StudentLoraProjection::MlpUp => &dense.up_proj,
+                    StudentLoraProjection::MlpDown => &dense.down_proj,
+                    _ => unreachable!("mlp projection arm checked above"),
+                })
+            }
+        }
+    }
+
+    fn lora_matrix_mut(
+        &mut self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+    ) -> Result<&mut DeviceMatrix> {
+        let layer = &mut self.layers[layer_idx];
+        match projection {
+            StudentLoraProjection::FullQ
+            | StudentLoraProjection::FullK
+            | StudentLoraProjection::FullV
+            | StudentLoraProjection::FullO => {
+                let Qwen35Attn::Full(full) = &mut layer.attn else {
+                    return Err(anyhow!(
+                        "layer {layer_idx} {} requires a full-attention layer",
+                        projection.label()
+                    ));
+                };
+                Ok(match projection {
+                    StudentLoraProjection::FullQ => &mut full.q_proj,
+                    StudentLoraProjection::FullK => &mut full.k_proj,
+                    StudentLoraProjection::FullV => &mut full.v_proj,
+                    StudentLoraProjection::FullO => &mut full.o_proj,
+                    _ => unreachable!("full projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::LinearQkv
+            | StudentLoraProjection::LinearZ
+            | StudentLoraProjection::LinearB
+            | StudentLoraProjection::LinearA
+            | StudentLoraProjection::LinearOut => {
+                let Qwen35Attn::Linear(lin) = &mut layer.attn else {
+                    return Err(anyhow!(
+                        "layer {layer_idx} {} requires a linear-attention layer",
+                        projection.label()
+                    ));
+                };
+                Ok(match projection {
+                    StudentLoraProjection::LinearQkv => &mut lin.in_proj_qkv,
+                    StudentLoraProjection::LinearZ => &mut lin.in_proj_z,
+                    StudentLoraProjection::LinearB => &mut lin.in_proj_b,
+                    StudentLoraProjection::LinearA => &mut lin.in_proj_a,
+                    StudentLoraProjection::LinearOut => &mut lin.out_proj,
+                    _ => unreachable!("linear projection arm checked above"),
+                })
+            }
+            StudentLoraProjection::MlpGate
+            | StudentLoraProjection::MlpUp
+            | StudentLoraProjection::MlpDown => {
+                let dense = layer.mlp.as_mut().ok_or_else(|| {
+                    anyhow!(
+                        "layer {layer_idx} {} requires a dense MLP layer; MoE student LoRA sync is not supported",
+                        projection.label()
+                    )
+                })?;
+                Ok(match projection {
+                    StudentLoraProjection::MlpGate => &mut dense.gate_proj,
+                    StudentLoraProjection::MlpUp => &mut dense.up_proj,
+                    StudentLoraProjection::MlpDown => &mut dense.down_proj,
+                    _ => unreachable!("mlp projection arm checked above"),
+                })
+            }
+        }
     }
 
     /// Dense SwiGLU MLP into `out` (`[hidden, seq]`). Every stage fully
@@ -3861,7 +4032,7 @@ fn load_linear_qkv_sharded(
     m: &Qwen35Config,
     tp: &TpConfig,
 ) -> Result<DeviceMatrix> {
-    let tensor = loader.load_raw_tensor(name)?;
+    let tensor = loader.borrow_raw_tensor(name)?;
     ensure!(
         tensor.dtype == Dtype::BF16,
         "{name}: expected BF16 fused qkv projection, got {:?}",
@@ -3874,7 +4045,7 @@ fn load_linear_qkv_sharded(
         tensor.shape
     );
     let sharded = crate::shard_slice::shard_head_blocks_column_parallel(
-        &tensor.bytes,
+        tensor.bytes(),
         tensor.shape[1],
         2,
         &linear_qkv_head_blocks(m),
@@ -3895,7 +4066,7 @@ fn load_conv1d_sharded(
     m: &Qwen35Config,
     tp: &TpConfig,
 ) -> Result<DeviceVec> {
-    let tensor = loader.load_raw_tensor(name)?;
+    let tensor = loader.borrow_raw_tensor(name)?;
     ensure!(
         tensor.dtype == Dtype::BF16,
         "{name}: expected BF16 conv1d weight, got {:?}",
@@ -3918,7 +4089,7 @@ fn load_conv1d_sharded(
         tensor.shape
     );
     let sharded = crate::shard_slice::shard_head_blocks_column_parallel(
-        &tensor.bytes,
+        tensor.bytes(),
         kernel,
         2,
         &linear_qkv_head_blocks(m),
@@ -3938,13 +4109,13 @@ fn load_v_head_vec_sharded(
     total_v_heads: usize,
     tp: &TpConfig,
 ) -> Result<DeviceVec> {
-    let tensor = loader.load_raw_tensor(name)?;
+    let tensor = loader.borrow_raw_tensor(name)?;
     ensure!(
         tensor.shape.len() == 1 && tensor.shape[0] == total_v_heads,
         "{name}: expected 1D [{total_v_heads}] per-v-head vector, got shape {:?}",
         tensor.shape
     );
-    let bf16_bytes = SafetensorLoader::dsv4_bytes_to_bf16(name, &tensor)?;
+    let bf16_bytes = SafetensorLoader::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes())?;
     let (start, len) = v_head_shard_range(name, total_v_heads, tp)?;
     DeviceVec::from_safetensors(ctx, &bf16_bytes[start * 2..(start + len) * 2])
         .map_err(|e| anyhow!("upload sharded per-v-head vec {name}: {e}"))
@@ -3960,7 +4131,7 @@ fn load_v_head_f32_sharded(
     total_v_heads: usize,
     tp: &TpConfig,
 ) -> Result<CudaSlice<f32>> {
-    let tensor = loader.load_raw_tensor(name)?;
+    let tensor = loader.borrow_raw_tensor(name)?;
     ensure!(
         tensor.shape.len() == 1 && tensor.shape[0] == total_v_heads,
         "{name}: expected 1D [{total_v_heads}] per-v-head tensor, got shape {:?}",
@@ -3968,12 +4139,12 @@ fn load_v_head_f32_sharded(
     );
     let host: Vec<f32> = match tensor.dtype {
         Dtype::F32 => tensor
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         Dtype::BF16 => tensor
-            .bytes
+            .bytes()
             .chunks_exact(2)
             .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
