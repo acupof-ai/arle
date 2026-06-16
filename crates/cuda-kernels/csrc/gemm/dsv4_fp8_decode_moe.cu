@@ -3,12 +3,9 @@
 // The FP8 analog of moe_grouped_gemm.cu's BF16 `*_decode` kernels: compact
 // (work scales with REAL routed rows, never padded to a 64/128 tile), 16-byte
 // vectorized weight loads (uint4 = 16 FP8 e4m3), each expert's weights read
-// exactly once per ≤8-row activation chunk, and per-route correct (a warp owns
-// one output row — there is no per-tile single-group contract to violate, so
-// no alignment padding). This is the regression endgame: it removes the
-// contiguous DeepGEMM lane's pad-row tax at B=1 decode without the scalar
-// grouped-GEMV bandwidth penalty (uint4 weight loads ≈ 80% HBM vs the 1-byte
-// GEMV's 25% — see errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
+// exactly once per ≤8-row activation chunk, and per-route correct. A warp owns
+// one gate/up row at the tuned B=1 point; there is no per-tile single-group
+// contract to violate, so no alignment padding.
 //
 // w8a16: activations stay BF16, weights are FP8 e4m3 with **f32** 128×128
 // block scales (DSv4 MoE expert caches store f32 block scales, NOT UE8M0 —
@@ -53,15 +50,9 @@
 #define FP8D_THREADS (FP8D_WARPS * FP8D_WARP_SIZE)
 #define FP8D_ACT_TILE 8   // activation rows per chunk (grid.y)
 #define FP8D_VEC 16       // FP8 e4m3 elements per 16-byte (uint4) load
+#define FP8D_SWIGLU_ROW_TILE 1 // gate/up rows per warp; >1 hurt B=1 occupancy in the probe
 #define FP8D_ROW_TILE 4   // weight rows per warp (down kernel only)
 #define FP8D_SCALE_BLK 128
-
-static __device__ __forceinline__ float fp8d_e4m3(uint8_t bits) {
-    if ((bits & 0x7f) == 0) return 0.0f;
-    __nv_fp8_e4m3 v;
-    v.__x = bits;
-    return static_cast<float>(v);
-}
 
 static __device__ __forceinline__ float fp8d_warp_reduce_sum(float val) {
 #pragma unroll
@@ -89,16 +80,32 @@ fp8d_dot16(float acc, const uint8_t* __restrict__ w, float scale,
     const uint4 x1 = *reinterpret_cast<const uint4*>(xp + 8);   // bf16[8..16)
     const __nv_bfloat16* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
     const __nv_bfloat16* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const float xv = __bfloat162float(i < 8 ? xb0[i] : xb1[i - 8]);
-        acc += (fp8d_e4m3(w[i]) * scale) * xv;
-    }
-    return acc;
+    const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(w);
+    const float4 wf0 = static_cast<float4>(w4[0]);
+    const float4 wf1 = static_cast<float4>(w4[1]);
+    const float4 wf2 = static_cast<float4>(w4[2]);
+    const float4 wf3 = static_cast<float4>(w4[3]);
+    float sum = wf0.x * __bfloat162float(xb0[0])
+        + wf0.y * __bfloat162float(xb0[1])
+        + wf0.z * __bfloat162float(xb0[2])
+        + wf0.w * __bfloat162float(xb0[3])
+        + wf1.x * __bfloat162float(xb0[4])
+        + wf1.y * __bfloat162float(xb0[5])
+        + wf1.z * __bfloat162float(xb0[6])
+        + wf1.w * __bfloat162float(xb0[7])
+        + wf2.x * __bfloat162float(xb1[0])
+        + wf2.y * __bfloat162float(xb1[1])
+        + wf2.z * __bfloat162float(xb1[2])
+        + wf2.w * __bfloat162float(xb1[3])
+        + wf3.x * __bfloat162float(xb1[4])
+        + wf3.y * __bfloat162float(xb1[5])
+        + wf3.z * __bfloat162float(xb1[6])
+        + wf3.w * __bfloat162float(xb1[7]);
+    return acc + scale * sum;
 }
 
-// Fused gate+up+SwiGLU decode grouped GEMM: each warp owns one output row of
-// N (= moe intermediate), reads that row of the gate and up FP8 matrices once,
+// Fused gate+up+SwiGLU decode grouped GEMM: each warp owns one tuned row tile of
+// N (= moe intermediate), reads those gate/up FP8 rows once,
 // and writes act = silu(gate·x) * (up·x) directly for the ≤8 routed rows.
 // N = intermediate, K = hidden. scale geometry: [N/128, K/128] for both
 // gate and up (scale_cols = K/128).
@@ -123,8 +130,9 @@ __global__ void dsv4_fp8_grouped_swiglu_decode_kernel(
     if (chunk_base >= expert_M) return;
     const int warp = threadIdx.x / FP8D_WARP_SIZE;
     const int lane = threadIdx.x % FP8D_WARP_SIZE;
-    const int row = blockIdx.x * FP8D_WARPS + warp;
-    if (row >= N) return;
+    const int row_base =
+        (blockIdx.x * FP8D_WARPS + warp) * FP8D_SWIGLU_ROW_TILE;
+    if (row_base >= N) return;
     const int tile_raw = expert_M - chunk_base;
     const int tile = tile_raw < FP8D_ACT_TILE ? tile_raw : FP8D_ACT_TILE;
     const int expert_idx =
@@ -135,31 +143,53 @@ __global__ void dsv4_fp8_grouped_swiglu_decode_kernel(
     const auto* wu = reinterpret_cast<const uint8_t*>(weight_up_ptrs[expert_idx]);
     const auto* sg = reinterpret_cast<const float*>(scale_gate_ptrs[expert_idx]);
     const auto* su = reinterpret_cast<const float*>(scale_up_ptrs[expert_idx]);
-    const uint8_t* gate_row = wg + (int64_t)row * K;
-    const uint8_t* up_row = wu + (int64_t)row * K;
-    const int scale_row_off = (row / FP8D_SCALE_BLK) * scale_cols;
+    const int rows = N - row_base < FP8D_SWIGLU_ROW_TILE
+        ? N - row_base : FP8D_SWIGLU_ROW_TILE;
 
-    float acc_g[FP8D_ACT_TILE];
-    float acc_u[FP8D_ACT_TILE];
+    float acc_g[FP8D_ACT_TILE][FP8D_SWIGLU_ROW_TILE];
+    float acc_u[FP8D_ACT_TILE][FP8D_SWIGLU_ROW_TILE];
 #pragma unroll
-    for (int b = 0; b < FP8D_ACT_TILE; ++b) { acc_g[b] = 0.0f; acc_u[b] = 0.0f; }
+    for (int b = 0; b < FP8D_ACT_TILE; ++b)
+#pragma unroll
+        for (int r = 0; r < FP8D_SWIGLU_ROW_TILE; ++r) {
+            acc_g[b][r] = 0.0f;
+            acc_u[b][r] = 0.0f;
+        }
 
     const int kv = K / FP8D_VEC; // launcher enforces K % 16 == 0
     for (int v = lane; v < kv; v += FP8D_WARP_SIZE) {
         const int k = v * FP8D_VEC;
         const int sc = k / FP8D_SCALE_BLK;
-        const float scale_g = sg[scale_row_off + sc];
-        const float scale_u = su[scale_row_off + sc];
-        const uint4 wg4 = *reinterpret_cast<const uint4*>(gate_row + k);
-        const uint4 wu4 = *reinterpret_cast<const uint4*>(up_row + k);
-        const uint8_t* wgb = reinterpret_cast<const uint8_t*>(&wg4);
-        const uint8_t* wub = reinterpret_cast<const uint8_t*>(&wu4);
+        uint4 wg4[FP8D_SWIGLU_ROW_TILE];
+        uint4 wu4[FP8D_SWIGLU_ROW_TILE];
+        float scale_g[FP8D_SWIGLU_ROW_TILE];
+        float scale_u[FP8D_SWIGLU_ROW_TILE];
+#pragma unroll
+        for (int r = 0; r < FP8D_SWIGLU_ROW_TILE; ++r) {
+            if (r < rows) {
+                const int row = row_base + r;
+                wg4[r] = *reinterpret_cast<const uint4*>(wg + (int64_t)row * K + k);
+                wu4[r] = *reinterpret_cast<const uint4*>(wu + (int64_t)row * K + k);
+                const int scale_row_off = (row / FP8D_SCALE_BLK) * scale_cols;
+                scale_g[r] = sg[scale_row_off + sc];
+                scale_u[r] = su[scale_row_off + sc];
+            }
+        }
 #pragma unroll
         for (int b = 0; b < FP8D_ACT_TILE; ++b) {
             if (b < tile) {
                 const __nv_bfloat16* xp = input + (int64_t)(route_base + b) * K + k;
-                acc_g[b] = fp8d_dot16(acc_g[b], wgb, scale_g, xp);
-                acc_u[b] = fp8d_dot16(acc_u[b], wub, scale_u, xp);
+#pragma unroll
+                for (int r = 0; r < FP8D_SWIGLU_ROW_TILE; ++r) {
+                    if (r < rows) {
+                        acc_g[b][r] = fp8d_dot16(
+                            acc_g[b][r], reinterpret_cast<const uint8_t*>(&wg4[r]),
+                            scale_g[r], xp);
+                        acc_u[b][r] = fp8d_dot16(
+                            acc_u[b][r], reinterpret_cast<const uint8_t*>(&wu4[r]),
+                            scale_u[r], xp);
+                    }
+                }
             }
         }
     }
@@ -167,14 +197,22 @@ __global__ void dsv4_fp8_grouped_swiglu_decode_kernel(
 #pragma unroll
     for (int b = 0; b < FP8D_ACT_TILE; ++b) {
         if (b < tile) {
-            acc_g[b] = fp8d_warp_reduce_sum(acc_g[b]);
-            acc_u[b] = fp8d_warp_reduce_sum(acc_u[b]);
+#pragma unroll
+            for (int r = 0; r < FP8D_SWIGLU_ROW_TILE; ++r) {
+                if (r < rows) {
+                    acc_g[b][r] = fp8d_warp_reduce_sum(acc_g[b][r]);
+                    acc_u[b][r] = fp8d_warp_reduce_sum(acc_u[b][r]);
+                }
+            }
         }
     }
     if (lane == 0) {
         for (int b = 0; b < tile; ++b) {
-            act[(int64_t)(route_base + b) * N + row] =
-                __float2bfloat16(fp8d_swiglu_clamped(acc_g[b], acc_u[b], limit));
+            for (int r = 0; r < rows; ++r) {
+                act[(int64_t)(route_base + b) * N + row_base + r] =
+                    __float2bfloat16(fp8d_swiglu_clamped(
+                        acc_g[b][r], acc_u[b][r], limit));
+            }
         }
     }
 }
