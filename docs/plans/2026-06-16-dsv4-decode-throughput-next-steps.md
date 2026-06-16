@@ -10,9 +10,10 @@ DSv4 code-mess audit are recorded in one place. Verification lane = `.62`
 **OFF** (NO `ARLE_DSV4_DECODE_PHASE_TIME` / `ARLE_DSV4_LINEAR_PROFILE` — each adds a
 per-step `cudaStreamSynchronize` that kills async overlap and **understates tok/s
 by ~25–35%**), all opt gates ON, MTP on; fixed prompt + `max_tokens=128`,
-c ∈ {1,2,4,8(,…)}, metric = aggregate output tok/s. `scripts/sweep` (to be
-committed). guidellm not on .62; streaming `/v1/completions` → HTTP 400, so
-non-streaming for now (no TTFT/ITL).
+c ∈ {1,2,4,8(,…)}, metric = aggregate output tok/s. `scripts/dsv4_c_sweep.py`
+now has repeat/median/spread support; `scripts/bench_dsv4_trace_http.py` uses
+text `/v1/completions` SSE for TTFT/ITL capture. guidellm still needs pod-side
+install if we want the canonical bench wrapper there.
 
 **c1–8 baseline (clean, profiling OFF) — re-measured as a same-session A/B
 ([[2026-06-16-dsv4-c1-8-baseline-clean-ab]]):**
@@ -65,11 +66,10 @@ serve host; `.62` (clang-11) cannot serve MTP.**
 
 1. **MTP enablement — the biggest single lever (~1.7×, B=1 53 per
    `2026-06-13-dsv4-mtp-d2-chain-fold-53`).** Two-part finding on this build:
-   - **Head load:** `--spec-type mtp --mtp-draft-tokens 2` alone logged "MTP draft
-     head deferred." Adding **`ARLE_DSV4_SPEC_DECODE=1`** flips it to "loading base
-     layers plus mtp.0 draft head" — so that env is required to LOAD the head
-     (the `--mtp-draft-tokens`→`spec_decode_on` path at dsv4.rs:967 did not load it;
-     wiring gap worth fixing so the flag alone loads the head).
+   - **Head load fixed in the cleanup pass:** `--spec-type mtp` is now
+     self-sufficient, the MTP draft head log reports the effective loader state,
+     and the default draft depth is d2. `ARLE_DSV4_SPEC_DECODE` remains only a
+     backwards-compatible env fallback, not a required companion to the flag.
    - **NOT a crash — the head-load deepgemm-JIT hangs/pathologically-slow
      (RESOLVED diagnosis, isolated on a CLEAN origin/main build).** Built clean
      origin/main on .62 from an scp'd 18.5MB source bundle (`/data01/arle-clean`,
@@ -85,8 +85,7 @@ serve host; `.62` (clang-11) cannot serve MTP.**
      likely a **.62-toolchain artifact**, not a real origin/main MTP regression.
      TO GET THE REAL ~53: build+serve MTP on a proper build host (gcc≥10, no
      clang-11 JIT workaround), where the MTP-head deepgemm JIT compiles normally.
-     Also: wire `--spec-type mtp` to auto-set `ARLE_DSV4_SPEC_DECODE` (head-load
-     gate). Transfer note: `scp` via jumpbox (18.5MB one-shot) >> base64 chunks.
+     Transfer note: `scp` via jumpbox (18.5MB one-shot) >> base64 chunks.
 2. **Compute/comm overlap for the BATCHED (n>1) lane.** Existing
    `ARLE_DSV4_COMM_OVERLAP` is `seq_len==1` ONLY (overlaps shared-expert compute
    w/ routed-MoE all-reduce; has the consumer `wait_event` via
@@ -106,7 +105,9 @@ serve host; `.62` (clang-11) cannot serve MTP.**
 
 - **22k LOC** across dsv4.rs (5.7k) / attention.rs (10.6k) / moe.rs (5.5k) —
   inherent (most complex model), but the hot files are huge.
-- **42 `ARLE_DSV4_*` env gates** = real sprawl. Buckets to prune (per the
+- **`ARLE_DSV4_*` env-gate sprawl** = real. First cleanup pass deleted the
+  MTP rollback/attention/CSA/K/V/tail/probe dump paths and the strict
+  tree-verify machinery; remaining buckets to prune (per the
   `f342c24f` classification compile→cfg / proven→locked / experiment→env):
   - **Debug/dump (consolidate under ONE gate or delete):** ATTN_DUMP, CSA_DUMP,
     KNEW_DUMP, TAIL_DUMP, MTP_ROLLBACK_DUMP(_LAYER), DSA_LOGITS_PROBE(_LIMIT/_SMS),

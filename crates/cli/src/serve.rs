@@ -10,8 +10,8 @@
 use std::{env, process::ExitCode};
 
 use infer_api::{
-    EngineLoadConfig, KvCacheDtype, ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions,
-    ServeSpecType, serve_http,
+    DEFAULT_MTP_DRAFT_TOKENS, EngineLoadConfig, KvCacheDtype, ServeHttpOptions, ServeKvSsdOptions,
+    ServeSpecOptions, ServeSpecType, serve_http,
 };
 
 use crate::{
@@ -209,7 +209,8 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     // `mtp_draft_tokens=None` and skips the MTP-head load. (serve_http re-applies the
     // same lowering idempotently for the single-proc path.)
     if spec.spec_type == ServeSpecType::Mtp {
-        engine_config.mtp_draft_tokens = Some(spec.mtp_draft_tokens.unwrap_or(1));
+        engine_config.mtp_draft_tokens =
+            Some(spec.mtp_draft_tokens.unwrap_or(DEFAULT_MTP_DRAFT_TOKENS));
     }
 
     let options = ServeHttpOptions {
@@ -1051,7 +1052,10 @@ mod tests {
         let config = resolve_config(&args, &serve).expect("CUDA accepts checkpoint-native MTP");
         assert_eq!(config.backend, ServeBackend::Cuda);
         assert_eq!(config.options.spec.spec_type, ServeSpecType::Mtp);
-        assert_eq!(config.options.engine_config.mtp_draft_tokens, Some(1));
+        assert_eq!(
+            config.options.engine_config.mtp_draft_tokens,
+            Some(DEFAULT_MTP_DRAFT_TOKENS)
+        );
     }
 
     #[test]

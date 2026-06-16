@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run DSv4 HTTP benchmarks and collect request_trace summaries.
+"""Run DSv4 HTTP benchmarks through `/v1/completions` SSE.
 
 The server emits one structured log line per completed request:
 
@@ -77,7 +77,7 @@ def request_stream(
     payload = json.dumps(
         {
             "model": model,
-            "messages": [{"role": "user", "content": case.prompt}],
+            "prompt": case.prompt,
             "max_tokens": case.max_tokens,
             "temperature": 0,
             "ignore_eos": case.ignore_eos,
@@ -97,7 +97,7 @@ def request_stream(
     try:
         conn.request(
             "POST",
-            "/v1/chat/completions",
+            "/v1/completions",
             body=payload,
             headers={"Content-Type": "application/json"},
         )
@@ -122,8 +122,7 @@ def request_stream(
             if chunk.get("usage"):
                 usage = chunk["usage"]
             for choice in chunk.get("choices", []):
-                delta = choice.get("delta") or {}
-                content = delta.get("content") or ""
+                content = choice.get("text") or ""
                 if content:
                     if first_content_at is None:
                         first_content_at = time.time()
@@ -141,6 +140,7 @@ def request_stream(
     decode_window_s = None if ttft_s is None else max(total_s - ttft_s, 0.0)
     return {
         "label": case.label,
+        "endpoint": "/v1/completions",
         "status": status,
         "error": error,
         "max_tokens": case.max_tokens,
