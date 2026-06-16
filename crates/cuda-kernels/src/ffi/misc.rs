@@ -277,6 +277,21 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    /// Pointer-array batched SW-window write: ONE launch over `n` rows whose
+    /// `k_prepared` (`k_arr[r]`) and SW ring cache (`cache_arr[r]`) buffers are
+    /// NOT contiguous. Each row writes its single new key into its own ring at
+    /// slot `start_pos[r] % sliding_window`. Replaces n single-row
+    /// [`dsv4_update_window_cache_start_pos_ptr_cuda`] calls (byte-identical).
+    pub fn dsv4_update_window_cache_batched_ptr_cuda(
+        k_arr: *const *const super::Half,
+        cache_arr: *const *mut super::Half,
+        n: i32,
+        start_pos: *const i32,
+        sliding_window: i32,
+        head_dim: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_compressor_update_cuda(
         kv_raw: *const super::Half,
         score_raw: *const super::Half,
@@ -318,6 +333,40 @@ unsafe extern "C" {
         compressed: *mut super::Half,
         num_tokens: i32,
         start_pos: *const i32,
+        head_dim: i32,
+        ratio: i32,
+        width: i32,
+        overlap: i32,
+        eps: f32,
+        rope_dim: i32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Batched decode compressor update: ONE `<<<n, BLOCK>>>` launch replacing n
+    /// per-row [`dsv4_compressor_update_start_pos_ptr_cuda`] calls. Each row `r`
+    /// reads its per-slot ring-state buffers from the host-gathered device
+    /// pointer arrays (`*_arr[r]`) and its decode position from `start_pos_arr[r]`.
+    /// `kv_raw`/`score_raw` are the batched m=N prepass outputs `[width, n]`
+    /// (token-major). `ape`/`norm` are the SHARED compressor weights. Math is
+    /// byte-identical to n single-row launches.
+    pub fn dsv4_compressor_update_batched_start_pos_ptr_cuda(
+        kv_raw: *const super::Half,
+        score_raw: *const super::Half,
+        ape: *const super::Half,
+        norm: *const super::Half,
+        pending_kv_arr: *const *mut super::Half,
+        pending_score_arr: *const *mut super::Half,
+        prev_overlap_kv_arr: *const *mut super::Half,
+        prev_overlap_score_arr: *const *mut super::Half,
+        compressed_arr: *const *mut super::Half,
+        n: i32,
+        num_tokens: i32,
+        start_pos_arr: *const i32,
         head_dim: i32,
         ratio: i32,
         width: i32,
@@ -436,6 +485,27 @@ unsafe extern "C" {
     pub fn arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
         out: *mut super::Half,
         token_count: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        start_pos: *const i32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Pointer-array batched output inverse-RoPE: ONE launch over `n` rows whose
+    /// `local_attn` buffers are NOT contiguous. `out_arr[r]` is row `r`'s
+    /// `[local_width, 1]` buffer base, `start_pos[r]` its absolute decode
+    /// position. Replaces n single-row
+    /// [`arle_dsv4_output_inverse_rope_start_pos_ptr_cuda`] calls; per-row math
+    /// byte-identical.
+    pub fn arle_dsv4_output_inverse_rope_batched_ptr_cuda(
+        out_arr: *const *mut super::Half,
+        n: i32,
         local_heads: i32,
         head_dim: i32,
         rope_dim: i32,
