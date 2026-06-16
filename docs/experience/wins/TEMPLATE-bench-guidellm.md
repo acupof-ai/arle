@@ -47,6 +47,7 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model 
 - **Commit:** <short sha>
 - **Feature set:** `cargo build --release <features>`
 - **Non-default flags / env vars:** <list or "none">
+- **Profiling state:** <OFF for throughput baseline | contaminated: exact profiling env/trace wrapper>
 - **Server launch:** `scripts/start_infer.sh <model> <port>` (or equivalent)
 
 ## Canonical params (DO NOT CHANGE PER-RUN)
