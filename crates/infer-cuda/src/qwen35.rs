@@ -32,8 +32,9 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;
+use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::tensor::{HostMatrixSnapshot, offload_raw_slice, reload_raw_slice};
+use cuda_kernels::tensor::{HostMatrixSnapshot, cache_ptr, offload_raw_slice, reload_raw_slice};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
 use half::bf16;
 use infer_plan::SamplingParams;
@@ -43,7 +44,10 @@ use safetensors::tensor::Dtype;
 
 use crate::executor::sample_cuda_token_scratched;
 use crate::loader::SafetensorLoader;
-use crate::moe::{MoeForwardScratch, moe_forward_into};
+use crate::moe::{
+    DEEPGEMM_CONTIG_ALIGN, MoeForwardScratch, QWEN35_DEEPGEMM_MIN_ROUTES, deepgemm_contig_rows_cap,
+    moe_forward_into,
+};
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
     add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul,
@@ -900,6 +904,139 @@ impl Qwen35Model {
             self.ctx.sync()?;
         }
         Ok((warmed, warm_m))
+    }
+
+    /// Warm the Qwen FP8 routed-MoE grouped DeepGEMM JIT for the CUDA default
+    /// prefill chunk. The helper only launches the two JIT-backed grouped GEMMs;
+    /// pack/requant kernels are static CUDA kernels and do not need JIT warmup.
+    pub(crate) fn warm_fp8_deepgemm_grouped_prefill(&self) -> Result<(usize, usize, usize, usize)> {
+        let warm_tokens = self.max_seq_len.min(2048);
+        let topk = self.config.num_experts_per_tok;
+        let mut seen = HashSet::new();
+        let mut warmed = 0usize;
+        let mut min_rows = usize::MAX;
+        let mut max_rows = 0usize;
+        for warm_tokens in [warm_tokens, warm_tokens.saturating_sub(16)] {
+            let warm_routes = warm_tokens.saturating_mul(topk);
+            if warm_routes < QWEN35_DEEPGEMM_MIN_ROUTES {
+                continue;
+            }
+            for layer in &self.layers {
+                let Some(moe) = &layer.moe else {
+                    continue;
+                };
+                let (Some(w13), Some(down)) = (&moe.w13_fp8_grouped, &moe.down_fp8_grouped) else {
+                    continue;
+                };
+                let rows = deepgemm_contig_rows_cap(warm_routes, w13.groups, DEEPGEMM_CONTIG_ALIGN);
+                let key = (w13.groups, w13.rows, w13.cols, down.rows, down.cols, rows);
+                if seen.insert(key) {
+                    Self::warm_fp8_deepgemm_grouped_pair(&self.ctx, w13, down, rows)?;
+                    min_rows = min_rows.min(rows);
+                    max_rows = max_rows.max(rows);
+                    warmed += 2;
+                }
+            }
+        }
+        if warmed > 0 {
+            self.ctx.sync()?;
+        }
+        if warmed == 0 {
+            min_rows = 0;
+        }
+        Ok((warmed, self.max_seq_len.min(2048), min_rows, max_rows))
+    }
+
+    fn warm_fp8_deepgemm_grouped_pair(
+        ctx: &DeviceContext,
+        w13: &crate::loader::MoeFp8ExpertGroup,
+        down: &crate::loader::MoeFp8ExpertGroup,
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            w13.groups == down.groups && w13.cols == down.rows && w13.rows == 2 * down.cols,
+            "Qwen FP8 grouped DeepGEMM warm shape mismatch: w13={}x{} g={} down={}x{} g={}",
+            w13.rows,
+            w13.cols,
+            w13.groups,
+            down.rows,
+            down.cols,
+            down.groups
+        );
+        ensure!(
+            rows.is_multiple_of(DEEPGEMM_CONTIG_ALIGN),
+            "Qwen FP8 grouped DeepGEMM warm rows {rows} not aligned to {DEEPGEMM_CONTIG_ALIGN}"
+        );
+        cuda_moe::dsv4_deepgemm_native_preflight()?;
+
+        let hidden = w13.cols;
+        let intermediate = down.cols;
+        let scale_stride_m = rows.div_ceil(4) * 4;
+        let hidden_scale_cols = hidden.div_ceil(128);
+        let inter_scale_cols = intermediate.div_ceil(128);
+        let input_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(rows * hidden)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm input alloc failed: {e}"))?;
+        let input_scales = ctx
+            .stream
+            .alloc_zeros::<f32>(scale_stride_m * hidden_scale_cols)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm input scale alloc failed: {e}"))?;
+        let w13_out = ctx
+            .stream
+            .alloc_zeros::<bf16>(rows * w13.rows)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm w13 output alloc failed: {e}"))?;
+        let act_fp8 = ctx
+            .stream
+            .alloc_zeros::<u8>(rows * intermediate)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm act alloc failed: {e}"))?;
+        let act_scales = ctx
+            .stream
+            .alloc_zeros::<f32>(scale_stride_m * inter_scale_cols)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm act scale alloc failed: {e}"))?;
+        let out = ctx
+            .stream
+            .alloc_zeros::<bf16>(rows * hidden)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm output alloc failed: {e}"))?;
+        let m_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(rows)
+            .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm m_indices alloc failed: {e}"))?;
+        let stream = ctx.stream.cu_stream();
+
+        unsafe {
+            cuda_moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                cache_ptr(&input_fp8, ctx),
+                cache_ptr(&input_scales, ctx),
+                cache_ptr(&w13.weight, ctx),
+                cache_ptr(&w13.scales, ctx),
+                cache_ptr(&w13_out, ctx),
+                cache_ptr(&m_indices, ctx),
+                w13.groups,
+                rows,
+                w13.rows,
+                hidden,
+                scale_stride_m,
+                DEEPGEMM_CONTIG_ALIGN,
+                stream,
+            )?;
+            cuda_moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                cache_ptr(&act_fp8, ctx),
+                cache_ptr(&act_scales, ctx),
+                cache_ptr(&down.weight, ctx),
+                cache_ptr(&down.scales, ctx),
+                cache_ptr(&out, ctx),
+                cache_ptr(&m_indices, ctx),
+                down.groups,
+                rows,
+                hidden,
+                intermediate,
+                scale_stride_m,
+                DEEPGEMM_CONTIG_ALIGN,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Per-slot device-memory cost (bytes) at this rank's local shard widths:
