@@ -19,6 +19,48 @@ latency/ALU-bound, so halving weight bytes did not pay back the scalar FP8
 decode tax. The fix reduces that tax by using four-wide FP8 conversion and
 folding the block scale outside the per-element FMA.
 
+## Step 0 decode-graph recheck
+
+After this patch, a load-bearing recheck tested whether the remaining
+~22 ms/token was mostly eager host launch overhead. It was not.
+
+Evidence: `/tmp/arle-step0-nsys-eager-full/trace.sqlite`, Qwen3.6 FP8,
+4K prompt, c=1, graph env unset, no `ARLE_QWEN35_*_PROFILE`.
+
+| Component | Mean ms/token | Share |
+| --- | ---: | ---: |
+| attention/KV kernels | 13.0965 | 57.0% |
+| dense GEMV/norm kernels | 2.5912 | 11.3% |
+| MoE kernels | 4.0415 | 17.6% |
+| linear-attention kernels | 0.6421 | 2.8% |
+| sampling | 0.0798 | 0.3% |
+| other kernels | 0.6374 | 2.8% |
+| total GPU kernel active | 21.0885 | 91.8% |
+| inter-kernel gap / CPU idle remainder | 1.8762 | 8.2% |
+
+The same trace saw 1194 kernel launches/token and no CUDA graph runtime events.
+So graph was definitely off, but the measured wall was not 97% host launch gap.
+
+Graph A/B then used the same rebuilt binary and same shell:
+`/tmp/arle-step0-graph-ab-1781596033`.
+
+| Mode | max1 wall | max257 wall | Completion tokens | Slope ITL |
+| --- | ---: | ---: | ---: | ---: |
+| eager | 1.5997 s | 7.3568 s | 1 -> 257 | 22.489 ms |
+| `ARLE_QWEN35_DECODE_GRAPH=1` | 1.6003 s | 6.9368 s | 1 -> 257 | 20.846 ms |
+| graph delta | +0.0% | -5.7% | same | -7.3% |
+
+Graph correctness passed: `/tmp/arle-step0-graph-needle-1781596452/result.json`
+retrieved `BLUE-73-MANGO` under graph-on, and server logs showed one capture plus
+100+ replays with no fallback. Graph is correct and modestly faster, but this is
+below the documented >=10% default-flip threshold and is not the 4-10x lever the
+host-launch-only hypothesis predicted.
+
+Current conclusion: do not spend the next tranche on a MoE/dense GEMV roofline
+rewrite by default. The measured c=1 decode wall is dominated by full-attention
+KV work plus many tiny kernel/sync boundaries; that needs its own RCA before a
+new optimization target is licensed.
+
 ## Goal
 
 Optimization: make Qwen3.6 FP8 c=1 decode no slower than BF16 after the fused
@@ -100,9 +142,10 @@ This meets the requested c=1 decode gate: FP8 ITL is now below BF16.
   clamped slots. After killing the serves, all H20s still reported about 45 GB
   used with no visible ARLE/guidellm process, so a high-c sweep would be
   confounded by pod state. No high-c throughput verdict is recorded here.
-- The kernels are still not HBM-saturated. This patch fixes the immediate FP8
-  decode regression by cutting scalar dequant overhead; it does not finish the
-  larger bandwidth-bound decode-kernel rewrite.
+- The kernels are still not HBM-saturated, but the later Step 0 trace shows a
+  MoE/dense GEMV roofline rewrite is not the next load-bearing lever for c=1
+  ITL. The remaining wall is mostly attention/KV plus tiny-kernel orchestration,
+  not the FP8 dequant path alone.
 
 ## Learnings
 
