@@ -3,32 +3,34 @@
 //! Holds the BF16 safetensors loader, `CudaModel::from_safetensors` weight
 //! upload, the per-step paging metadata (`PageMeta`), and the BF16 config gate.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use cuda_kernels::KVFormat;
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cuda_kernels::tensor::WeightFormat;
+use cuda_kernels::KVFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
-use safetensors::{SafeTensors, tensor::Dtype};
+use safetensors::{tensor::Dtype, SafeTensors};
 
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
 use crate::ops::{precompute_rope, upload_i32};
 use crate::quant_format::{
-    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
-    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
+    detect_quant_format, read_quant_manifest, reject_dsv4_e8m0_scale_abi, QuantFormat,
+    QuantManifest, QuantTensorView, ScaleApply, TensorHeader,
 };
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
+const DEFAULT_SHARD_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 impl CudaModel {
     pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
@@ -393,15 +395,15 @@ pub(crate) struct SafetensorLoader {
     weight_map: HashMap<String, usize>,
     tensor_headers: std::cell::RefCell<Option<Rc<BTreeMap<String, TensorHeader>>>>,
     quant_manifest: Option<QuantManifest>,
-    /// Current-shard byte cache: without it, loading N tensors from one layer
-    /// re-reads the whole shard N times (O(N × file_size) I/O). It is bounded to
-    /// the most recent shard so cold load does not retain every layer shard in
-    /// host RSS. `Rc` lets [`SharedTensor`] expose a tensor's byte range zero-copy
-    /// while the cache entry itself can be evicted on the next shard.
+    /// Bounded shard byte cache: without it, loading tensors that alternate
+    /// across two shards re-reads multi-GiB files on every tensor touch. `Rc`
+    /// lets [`SharedTensor`] expose a tensor's byte range zero-copy while the
+    /// cache entry itself can be evicted after the layer no longer needs it.
     /// `Rc<Vec<u8>>` over clippy's `Rc<[u8]>`: the conversion would copy the
     /// multi-GiB shard once more — the exact copy this cache exists to avoid.
     #[allow(clippy::rc_buffer)]
-    shard_cache: std::cell::RefCell<HashMap<usize, std::rc::Rc<Vec<u8>>>>,
+    shard_cache: std::cell::RefCell<ShardByteCache>,
+    shard_meta_cache: std::cell::RefCell<HashMap<usize, Rc<BTreeMap<String, ShardTensorMeta>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +428,87 @@ struct DirectFp8MoeRouted {
     down: MoeFp8ExpertGroup,
     gate_up_quant_signature: ExpertQuantDispatchSignature,
     down_quant_signature: ExpertQuantDispatchSignature,
+}
+
+#[allow(clippy::rc_buffer)]
+struct ShardByteCache {
+    entries: HashMap<usize, Rc<Vec<u8>>>,
+    order: VecDeque<usize>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl ShardByteCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
+    fn get(&mut self, idx: usize) -> Option<Rc<Vec<u8>>> {
+        let bytes = Rc::clone(self.entries.get(&idx)?);
+        self.touch(idx);
+        Some(bytes)
+    }
+
+    #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
+    fn insert(&mut self, idx: usize, bytes: Rc<Vec<u8>>) -> Vec<(usize, usize)> {
+        if let Some(old) = self.entries.remove(&idx) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+            self.remove_order(idx);
+        }
+
+        let incoming = bytes.len();
+        let mut evicted = Vec::new();
+        while !self.entries.is_empty() && self.bytes.saturating_add(incoming) > self.max_bytes {
+            let Some(old_idx) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&old_idx) {
+                self.bytes = self.bytes.saturating_sub(old.len());
+                evicted.push((old_idx, old.len()));
+            }
+        }
+
+        self.bytes = self.bytes.saturating_add(incoming);
+        self.order.push_back(idx);
+        self.entries.insert(idx, bytes);
+        evicted
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn remove_order(&mut self, idx: usize) {
+        if let Some(pos) = self.order.iter().position(|&entry| entry == idx) {
+            self.order.remove(pos);
+        }
+    }
+
+    fn touch(&mut self, idx: usize) {
+        self.remove_order(idx);
+        self.order.push_back(idx);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ShardTensorMeta {
+    shape: Vec<usize>,
+    dtype: Dtype,
+    offset: usize,
+    len: usize,
+}
+
+fn shard_cache_bytes_limit() -> usize {
+    env::var("ARLE_CUDA_SHARD_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SHARD_CACHE_BYTES)
 }
 
 impl SafetensorLoader {
@@ -463,7 +546,10 @@ impl SafetensorLoader {
                 weight_map,
                 tensor_headers: std::cell::RefCell::new(None),
                 quant_manifest,
-                shard_cache: std::cell::RefCell::new(HashMap::new()),
+                shard_cache: std::cell::RefCell::new(
+                    ShardByteCache::new(shard_cache_bytes_limit()),
+                ),
+                shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
             };
             loader.log_startup_phase(
                 "new.index",
@@ -486,7 +572,10 @@ impl SafetensorLoader {
                 weight_map: HashMap::new(),
                 tensor_headers: std::cell::RefCell::new(None),
                 quant_manifest,
-                shard_cache: std::cell::RefCell::new(HashMap::new()),
+                shard_cache: std::cell::RefCell::new(
+                    ShardByteCache::new(shard_cache_bytes_limit()),
+                ),
+                shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
             };
             loader.log_startup_phase(
                 "new.single",
@@ -516,7 +605,8 @@ impl SafetensorLoader {
             weight_map: HashMap::new(),
             tensor_headers: std::cell::RefCell::new(None),
             quant_manifest,
-            shard_cache: std::cell::RefCell::new(HashMap::new()),
+            shard_cache: std::cell::RefCell::new(ShardByteCache::new(shard_cache_bytes_limit())),
+            shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
         };
         loader.log_startup_phase(
             "new.scan",
@@ -2103,33 +2193,90 @@ impl SafetensorLoader {
         }
     }
 
-    /// Current-shard bytes: fill the cache on first touch, then hand out a
-    /// cheap `Rc` clone (no `RefCell` guard escapes, so nested loads that fill
-    /// OTHER shards never hit a `BorrowMutError`). Loading a different shard
+    /// Shard bytes: fill the bounded LRU on first touch, then hand out a cheap
+    /// `Rc` clone (no `RefCell` guard escapes, so nested loads that fill other
+    /// shards never hit a `BorrowMutError`). Loading beyond the byte budget
     /// evicts older entries; outstanding [`SharedTensor`] borrows keep their
     /// shard alive through their own `Rc`.
     #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
-    fn shard_bytes(&self, idx: usize) -> Result<std::rc::Rc<Vec<u8>>> {
+    fn shard_bytes(&self, idx: usize) -> Result<Rc<Vec<u8>>> {
         let path = self
             .shards
             .get(idx)
             .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
-        if let Some(bytes) = self.shard_cache.borrow().get(&idx) {
-            return Ok(std::rc::Rc::clone(bytes));
+        if let Some(bytes) = self.shard_cache.borrow_mut().get(idx) {
+            return Ok(bytes);
         }
         let t0 = Instant::now();
-        let bytes =
-            std::rc::Rc::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
+        let bytes = Rc::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
         let mut cache = self.shard_cache.borrow_mut();
-        cache.clear();
-        cache.insert(idx, std::rc::Rc::clone(&bytes));
+        let evicted = cache.insert(idx, Rc::clone(&bytes));
         drop(cache);
+        for (evicted_idx, evicted_bytes) in evicted {
+            self.log_startup_phase(
+                "shard_cache_evict",
+                Instant::now(),
+                format_args!("idx={evicted_idx} bytes={evicted_bytes}"),
+            );
+        }
         self.log_startup_phase(
             "shard_read",
             t0,
             format_args!("idx={idx} bytes={} path={}", bytes.len(), path.display()),
         );
         Ok(bytes)
+    }
+
+    #[allow(clippy::rc_buffer)] // shares the shard cache's Rc without copying
+    fn shard_tensor_metas(
+        &self,
+        idx: usize,
+        shard: &Rc<Vec<u8>>,
+    ) -> Result<Rc<BTreeMap<String, ShardTensorMeta>>> {
+        if let Some(metas) = self.shard_meta_cache.borrow().get(&idx) {
+            return Ok(Rc::clone(metas));
+        }
+        let t0 = Instant::now();
+        let path = &self.shards[idx];
+        let tensors = SafeTensors::deserialize(shard)
+            .with_context(|| format!("deserialize {}", path.display()))?;
+        let base = shard.as_ptr() as usize;
+        let mut metas = BTreeMap::new();
+        for (name, view) in tensors.tensors() {
+            let data = view.data();
+            let offset = data.as_ptr() as usize - base;
+            let len = data.len();
+            ensure!(
+                offset + len <= shard.len(),
+                "{name}: tensor byte range [{offset}, {}) exceeds shard size {}",
+                offset + len,
+                shard.len()
+            );
+            metas.insert(
+                name,
+                ShardTensorMeta {
+                    shape: view.shape().to_vec(),
+                    dtype: view.dtype(),
+                    offset,
+                    len,
+                },
+            );
+        }
+        let metas = Rc::new(metas);
+        self.shard_meta_cache
+            .borrow_mut()
+            .insert(idx, Rc::clone(&metas));
+        self.log_startup_phase(
+            "shard_deserialize",
+            t0,
+            format_args!(
+                "idx={idx} tensors={} bytes={} path={}",
+                metas.len(),
+                shard.len(),
+                path.display()
+            ),
+        );
+        Ok(metas)
     }
 
     fn load_tensor_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
@@ -2173,31 +2320,23 @@ impl SafetensorLoader {
     fn borrow_raw_from_shard(&self, idx: usize, name: &str) -> Result<SharedTensor> {
         let shard = self.shard_bytes(idx)?;
         let path = &self.shards[idx];
-        let tensors = SafeTensors::deserialize(&shard)
-            .with_context(|| format!("deserialize {}", path.display()))?;
-        let view = tensors
-            .tensor(name)
+        let metas = self.shard_tensor_metas(idx, &shard)?;
+        let meta = metas
+            .get(name)
             .with_context(|| format!("find tensor {name} in {}", path.display()))?;
-        let shape = view.shape().to_vec();
-        let dtype = view.dtype();
-        let data = view.data();
-        // `view.data()` borrows from `shard`'s allocation; record its range so
-        // the `Rc`-owning SharedTensor can re-slice it without the borrow.
-        let base = shard.as_ptr() as usize;
-        let offset = data.as_ptr() as usize - base;
-        let len = data.len();
         ensure!(
-            offset + len <= shard.len(),
-            "{name}: tensor byte range [{offset}, {}) exceeds shard size {}",
-            offset + len,
+            meta.offset + meta.len <= shard.len(),
+            "{name}: tensor byte range [{}, {}) exceeds shard size {}",
+            meta.offset,
+            meta.offset + meta.len,
             shard.len()
         );
         Ok(SharedTensor {
-            shape,
-            dtype,
+            shape: meta.shape.clone(),
+            dtype: meta.dtype,
             shard,
-            offset,
-            len,
+            offset: meta.offset,
+            len: meta.len,
         })
     }
 
