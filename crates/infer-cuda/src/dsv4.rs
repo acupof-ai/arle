@@ -2175,6 +2175,47 @@ impl Dsv4Model {
                     ctx.stream.synchronize().ok();
                     proj_ms += t.elapsed().as_secs_f64() * 1000.0;
                 }
+                // ── 0b. Opt-in batched (m=N) compressor/indexer projection
+                // pre-pass (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF). The
+                // per-row m=1 `compressor_forward` wkv/wgate GEMVs re-read the full
+                // weight per decode row (~54% of the decode step, DEAD-LINEAR in n);
+                // batch them into one DeepGEMM m=N (weight read ONCE) over the SAME
+                // `normed` batch the proj pre-pass used, reusing the model-wide
+                // shared FP8 prefill DeepGEMM scratch (called sequentially, after the
+                // proj batch released its borrow). Each row then reads its `[width,1]`
+                // column slice in the loop below; the per-slot state update stays
+                // per-row. `None` (gate off / caches absent) → byte-identical per-row
+                // GEMV path. Touches NO slot state.
+                let compressor_batch_enabled =
+                    crate::attention::dsv4_decode_compressor_batch_enabled()?;
+                let (compressor_kv_score, indexer_kv_score) = if compressor_batch_enabled {
+                    // `dsv4_linear` (bf16 → cublasLt) needs no FP8/deepgemm scratch.
+                    let main = match layer.attention.compressor.as_ref() {
+                        Some(compressor) => crate::attention::compressor_batch_prepass(
+                            &self.ctx,
+                            compressor,
+                            &normed,
+                            &mut keepalive,
+                        )?,
+                        None => None,
+                    };
+                    let indexer = if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
+                        match layer.attention.indexer.as_ref() {
+                            Some(indexer) => crate::attention::compressor_batch_prepass(
+                                &self.ctx,
+                                &indexer.compressor,
+                                &normed,
+                                &mut keepalive,
+                            )?,
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    (main, indexer)
+                } else {
+                    (None, None)
+                };
                 let _compidx_t = if phase_time {
                     ctx.stream.synchronize().ok();
                     Some(std::time::Instant::now())
@@ -2271,6 +2312,42 @@ impl Dsv4Model {
                         } else {
                             None
                         };
+                        // Slice this row's `[width,1]` column out of the batched
+                        // compressor/indexer pre-pass outputs (gate ON). Mirrors the
+                        // q_prepared_owned slice convention above: a fresh owned
+                        // [width,1] bf16 buffer per row, filled by a single dtod copy,
+                        // referenced (not consumed) by the precomputed struct so it
+                        // outlives the prepare call. `None` (gate off / no batch) →
+                        // byte-identical per-row GEMV path.
+                        let slice_row = |src: &HiddenStates| -> Result<HiddenStates> {
+                            let width = src.hidden_dim;
+                            // SAFETY: the dtod copy fills the full buffer before read.
+                            let mut row_buf = unsafe { HiddenStates::uninit(&self.ctx, width, 1)? };
+                            let col = src.data.slice(r * width..(r + 1) * width);
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(&col, &mut row_buf.data)
+                                .map_err(|e| {
+                                    anyhow!("DSv4 batched compressor slice copy failed: {e}")
+                                })?;
+                            Ok(row_buf)
+                        };
+                        let comp_main_row = match compressor_kv_score.as_ref() {
+                            Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
+                            None => None,
+                        };
+                        let comp_indexer_row = match indexer_kv_score.as_ref() {
+                            Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
+                            None => None,
+                        };
+                        let compressor_precomputed = comp_main_row.as_ref().map(|(kv, score)| {
+                            crate::attention::Dsv4CompressorPrecomputed {
+                                main: (kv, score),
+                                indexer: comp_indexer_row
+                                    .as_ref()
+                                    .map(|(ikv, iscore)| (ikv as &_, iscore as &_)),
+                            }
+                        });
                         let row_prepared = crate::attention::mla_attention_prepare_compressed_only(
                             &self.ctx,
                             &self.config,
@@ -2289,6 +2366,7 @@ impl Dsv4Model {
                             start_positions[r],
                             Some(&slot.start_pos_device),
                             batched_gather,
+                            compressor_precomputed,
                             &mut keepalive,
                         )?;
                         // Pack this row's KV into the shared pool, then gather its
