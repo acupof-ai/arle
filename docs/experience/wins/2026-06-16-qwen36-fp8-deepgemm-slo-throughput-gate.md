@@ -1,4 +1,4 @@
-# Qwen3.6 FP8 DeepGEMM SLO throughput gate: memory pass, throughput pathologically slow
+# Qwen3.6 FP8 DeepGEMM SLO throughput gate: cold-JIT TTFT fixed, memory pass
 
 ## SLO-shape probed? Y
 
@@ -78,9 +78,54 @@ same VRAM budget. The raw-throughput result remains an unrooted implementation
 bug until a stage breakdown proves otherwise.
 
 Follow-up: `2026-06-16-qwen36-fp8-dense-deepgemm-cold-jit-fix.md` root-caused
-and fixed the 12x cold-JIT part of this regression. The first 4K FP8 request
-dropped to about 2.73s, but still does not beat the BF16 1.97s smoke, so the
-throughput gate remains not passed.
+the dense-projection part of the cold-JIT regression. The grouped-prefill
+microbench (`2026-06-16-qwen36-fp8-grouped-prefill-microbench.md`) then showed
+the remaining grouped MoE part: fresh DeepGEMM cache paid about 7s of grouped
+GEMM JIT for the 2048/2032-token prefill chunks, while cached grouped execution
+was only about 2.3-3.4ms. Commit `06d36eba` warms dense + grouped JIT shapes at
+serve startup.
+
+## Post-warmup verification
+
+Re-ran the c=1 SLO shape after `06d36eba` with a fresh FP8 JIT cache. Serve log
+confirmed boot-time warmup before the server opened:
+
+```text
+Qwen3.5 FP8 dense DeepGEMM warmed 5 projection shape(s) at M=2048
+Qwen3.5 FP8 grouped DeepGEMM warmed 4 GEMM shape(s) at tokens<=2048 rows=49024..49152
+```
+
+Run params:
+
+- Remote tree: `/data01/arle-qwenfp8-smoke`.
+- Binary: `/data01/arle-qwenfp8-smoke/target/release/arle`.
+- Hardware: NVIDIA H20 GPU2.
+- Serve shape: `--num-slots 8 --total-pages 272 --page-size 16
+  --max-total-tokens 4352 --max-prompt-tokens 4096`.
+- Workload: guidellm concurrent c=1, `data-samples=4`,
+  `prompt_tokens=4095` (server usage 4096), `output_tokens=256`,
+  `--max-seconds 120`, no warmup/cooldown.
+
+Metric below uses completed output tokens divided by raw benchmark wall
+duration for `out tok/s`; latency columns are guidellm completed-request
+medians.
+
+| Backend | ok/inc | wall duration s | out tok/s | TTFT ms | ITL ms | request latency s |
+|---|---:|---:|---:|---:|---:|---:|
+| FP8 warm-JIT | 4/0 | 79.8 | 12.83 | 1732.6 | 71.4 | 19.9 |
+| BF16 baseline | 4/0 | 31.4 | 32.61 | 1760.6 | 23.7 | 7.8 |
+| FP8 delta | - | +154.1% | -60.7% | -1.6% | +201.3% | +155.1% |
+
+Verdict update: the 20.7s FP8 TTFT was an ARLE implementation bug: cold
+DeepGEMM JIT on the request path. It is fixed; post-warmup FP8 TTFT is
+1.73s, matching the BF16 1.76s SLO prefill latency. The SLO-shape memory/slot
+license remains valid.
+
+Do not claim a raw throughput/default win from this run. At 256 generated
+tokens, FP8 still has much slower decode ITL (71.4ms vs 23.7ms) and lower
+c=1 output throughput (12.83 vs 32.61 tok/s). The closed issue is the
+pathological prefill TTFT regression, not a BF16-beating c=1 decode-throughput
+result.
 
 ## Artifacts
 
@@ -92,6 +137,14 @@ throughput gate remains not passed.
   `/data01/arle-qwenfp8-smoke/bench-output/qwen36-bf16-slo-4096x256-c1-8/benchmark.json`
 - BF16 CSV:
   `/data01/arle-qwenfp8-smoke/bench-output/qwen36-bf16-slo-4096x256-c1-8/benchmark.csv`
+- Post-warmup FP8 JSON:
+  `/data01/arle-qwenfp8-smoke/bench-output/qwen36-fp8-warmjit-slo-4096x256-c1-20260616-123026/benchmark.json`
+- Post-warmup FP8 CSV:
+  `/data01/arle-qwenfp8-smoke/bench-output/qwen36-fp8-warmjit-slo-4096x256-c1-20260616-123026/benchmark.csv`
+- Post-warmup BF16 JSON:
+  `/data01/arle-qwenfp8-smoke/bench-output/qwen36-bf16-slo-4096x256-c1-20260616-123337/benchmark.json`
+- Post-warmup BF16 CSV:
+  `/data01/arle-qwenfp8-smoke/bench-output/qwen36-bf16-slo-4096x256-c1-20260616-123337/benchmark.csv`
 
 ## Rule
 
