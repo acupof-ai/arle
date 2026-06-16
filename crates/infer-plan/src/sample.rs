@@ -48,6 +48,10 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
     // Temperature-scaled, numerically stable softmax over all candidates.
     let inv_t = 1.0 / params.temperature;
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if params.top_k <= 0 && params.top_p >= 1.0 && params.min_p <= 0.0 {
+        return sample_unfiltered_temperature(logits, inv_t, max, params, position);
+    }
+
     let mut cand: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
@@ -109,6 +113,40 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
         }
     }
     cand.last().map_or(0, |(idx, _)| *idx)
+}
+
+fn sample_unfiltered_temperature(
+    logits: &[f32],
+    inv_t: f32,
+    max: f32,
+    params: &SamplingParams,
+    position: u64,
+) -> u32 {
+    let mut total = 0.0f32;
+    for &logit in logits {
+        total += ((logit - max) * inv_t).exp();
+    }
+    if !total.is_finite() || total <= 0.0 {
+        return argmax_logit(logits);
+    }
+
+    let bits = splitmix64(
+        params
+            .seed
+            .unwrap_or(0)
+            .wrapping_add(position)
+            .wrapping_add(1),
+    );
+    let unit = (bits >> 40) as f32 / (1u32 << 24) as f32; // [0, 1)
+    let target = unit * total;
+    let mut acc = 0.0;
+    for (idx, &logit) in logits.iter().enumerate() {
+        acc += ((logit - max) * inv_t).exp();
+        if target < acc {
+            return idx as u32;
+        }
+    }
+    logits.len().saturating_sub(1) as u32
 }
 
 #[cfg(test)]
@@ -173,6 +211,36 @@ mod sampler_tests {
         // Advancing position changes the stream (not stuck on one token).
         let draws: Vec<u32> = (0..32).map(|pos| sample_token(&logits, &p, pos)).collect();
         assert!(draws.iter().any(|&t| t != draws[0]));
+    }
+
+    #[test]
+    fn unfiltered_temperature_sampling_uses_full_distribution() {
+        let logits = vec![0.0, 0.5, 1.0, 1.5];
+        let p = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: Some(11),
+            ..SamplingParams::default()
+        };
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+        let total: f32 = weights.iter().sum();
+        for position in 0..16 {
+            let bits = splitmix64(p.seed.unwrap().wrapping_add(position).wrapping_add(1));
+            let target = ((bits >> 40) as f32 / (1u32 << 24) as f32) * total;
+            let mut acc = 0.0;
+            let mut expected = weights.len() as u32 - 1;
+            for (idx, weight) in weights.iter().enumerate() {
+                acc += *weight;
+                if target < acc {
+                    expected = idx as u32;
+                    break;
+                }
+            }
+            assert_eq!(sample_token(&logits, &p, position), expected);
+        }
     }
 
     #[test]
