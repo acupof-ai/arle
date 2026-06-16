@@ -27,13 +27,13 @@ use train::{
 };
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const DEFAULT_EPS: f32 = 1.0e-3;
+const DEFAULT_EPS: f32 = 2.0e-3;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const REL_TOL: f32 = 1.0e-2;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const PROBE_RANK: usize = 0;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const PROBE_INDEX: usize = 3;
+const PROBE_INDEX: usize = 8;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const PROBE_SUFFIX: &str = ".layers.0.mlp.down_proj.weight.lora_b";
 
