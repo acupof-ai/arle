@@ -391,6 +391,11 @@ fn parse_adapter_name(name: &str) -> Option<(usize, StudentLoraProjection, Which
         ("self_attn", "in_proj_b") => StudentLoraProjection::LinearB,
         ("self_attn", "in_proj_a") => StudentLoraProjection::LinearA,
         ("self_attn", "out_proj") => StudentLoraProjection::LinearOut,
+        ("linear_attn", "in_proj_qkv") => StudentLoraProjection::LinearQkv,
+        ("linear_attn", "in_proj_z") => StudentLoraProjection::LinearZ,
+        ("linear_attn", "in_proj_b") => StudentLoraProjection::LinearB,
+        ("linear_attn", "in_proj_a") => StudentLoraProjection::LinearA,
+        ("linear_attn", "out_proj") => StudentLoraProjection::LinearOut,
         ("mlp", "gate_proj") => StudentLoraProjection::MlpGate,
         ("mlp", "up_proj") => StudentLoraProjection::MlpUp,
         ("mlp", "down_proj") => StudentLoraProjection::MlpDown,
@@ -492,6 +497,26 @@ mod tests {
             ),
             (
                 format!("{prefix}.self_attn.out_proj.weight.lora_a"),
+                StudentLoraProjection::LinearOut,
+            ),
+            (
+                format!("{prefix}.linear_attn.in_proj_qkv.weight.lora_a"),
+                StudentLoraProjection::LinearQkv,
+            ),
+            (
+                format!("{prefix}.linear_attn.in_proj_z.weight.lora_a"),
+                StudentLoraProjection::LinearZ,
+            ),
+            (
+                format!("{prefix}.linear_attn.in_proj_b.weight.lora_a"),
+                StudentLoraProjection::LinearB,
+            ),
+            (
+                format!("{prefix}.linear_attn.in_proj_a.weight.lora_a"),
+                StudentLoraProjection::LinearA,
+            ),
+            (
+                format!("{prefix}.linear_attn.out_proj.weight.lora_b"),
                 StudentLoraProjection::LinearOut,
             ),
             (

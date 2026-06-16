@@ -9,20 +9,26 @@ pub mod app {
         collections::HashSet,
         env,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::Instant,
     };
 
     use autograd::{Tape, TensorId, TensorStore, backend_cuda::CudaBackend, optim::AdamW};
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
         LoraConfig, LoraTargetSet,
-        opd::{OpdStepConfig, opd_step},
+        infer_student::InferStudent,
+        opd::{
+            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
+            infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
+        },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
         qwen35_loader::{
             load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir,
             load_qwen35_trainable_from_hf_dir,
         },
+        teacher_infer::InProcessTeacher,
         trainer::extend_keep_with_params_and_grads,
     };
 
@@ -361,6 +367,17 @@ pub mod app {
             PERTURB_SEED,
             PERTURB_SCALE,
         );
+        let infer_student = if let Some(lora) = student_mode.lora_config() {
+            load_infer_rollout_student(
+                &model_dirs.student,
+                args.prompt_max_tokens + args.rollout_len + 32,
+                cuda_backend.clone() as Arc<dyn autograd::Backend>,
+                student.config().vocab_size,
+                lora,
+            )?
+        } else {
+            None
+        };
         let mut optimizer =
             AdamW::new_with_device(args.learning_rate, (0.9, 0.999), 1.0e-8, 0.0, cuda_backend);
         let step_config = OpdStepConfig {
@@ -368,6 +385,7 @@ pub mod app {
             rollout_sampling: None,
             grad_clip: GRAD_CLIP,
         };
+        let teacher_forward = InProcessTeacher::new(&teacher);
 
         println!(
             "model_summary student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} student_base_shared_with_teacher={} teacher_hidden={} teacher_intermediate={} teacher_layers={} teacher_vocab={} teacher_num_heads={} teacher_num_kv_heads={} teacher_head_dim={} student_hidden={} student_intermediate={} student_layers={} student_vocab={} student_num_heads={} student_num_kv_heads={} student_head_dim={} student_tie_word_embeddings={} student_rope_theta={} teacher_param_elements={} student_model_elements={} student_trainable_elements={} teacher_load_seconds={teacher_load_seconds:.6} student_load_seconds={student_load_seconds:.6}",
@@ -423,16 +441,35 @@ pub mod app {
             let prompt_index = (step - 1) % prompts.train.len();
             let prompt = prompts.train[prompt_index].as_slice();
             let step_started = Instant::now();
-            let outcome = opd_step(
+            let infer_rollout = infer_student.as_ref().map(|student| InferRolloutCtx {
+                student,
+                lora_config: student_mode
+                    .lora_config()
+                    .expect("infer rollout student is only loaded for LoRA mode"),
+            });
+            let mut profile = OpdStepProfile::default();
+            let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
                 &student,
-                &teacher,
+                &teacher_forward,
                 prompt,
                 step_config.clone(),
                 &student_trainable_params,
                 &mut optimizer,
                 &mut store,
                 &mut tape,
+                GkdLossConfig {
+                    lambda: 0.0,
+                    sft_anchor: GkdSftAnchor::StudentRollout,
+                    corpus_tokens: None,
+                    kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
+                    kl_direction: train::loss::KlDirection::Forward,
+                    kl_temperature: 1.0,
+                    logits_window_size: None,
+                    kl_mask: OpdKlMask::CompletionOnly,
+                },
                 None,
+                infer_rollout,
+                Some(&mut profile),
             )?;
             let elapsed = step_started.elapsed().as_secs_f64();
             let safety_first_step_max_seconds = args.safety_first_step_max_seconds;
@@ -449,8 +486,18 @@ pub mod app {
             step_seconds.push(elapsed);
             if step <= 5 || step % 10 == 0 || eval_steps.contains(&step) {
                 println!(
-                    "train_step step={step} prompt_index={prompt_index} prompt={prompt:?} loss={:.12e} rollout_len={} step_seconds={elapsed:.6}",
-                    outcome.loss, outcome.rollout_len
+                    "train_step step={step} prompt_index={prompt_index} prompt={prompt:?} \
+                     loss={:.12e} rollout_len={} step_seconds={elapsed:.6} \
+                     student_rollout_seconds={:.6} teacher_forward_seconds={:.6} \
+                     student_forward_seconds={:.6} kl_loss_seconds={:.6} \
+                     backward_seconds={:.6}",
+                    outcome.loss,
+                    outcome.rollout_len,
+                    profile.student_rollout_seconds,
+                    profile.teacher_forward_seconds,
+                    profile.student_forward_seconds,
+                    profile.kl_loss_seconds,
+                    profile.backward_seconds,
                 );
             }
             if eval_steps.contains(&step) {
@@ -518,6 +565,59 @@ pub mod app {
         let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
         let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
         left == right
+    }
+
+    fn load_infer_rollout_student(
+        student_dir: &Path,
+        max_seq_len: usize,
+        train_backend: Arc<dyn autograd::Backend>,
+        vocab_size: usize,
+        lora: LoraConfig,
+    ) -> AnyResult<Option<InferStudent>> {
+        if !infer_rollout_flag_enabled() {
+            println!("infer_student_disabled env=ARLE_OPD_INFER_ROLLOUT=0");
+            return Ok(None);
+        }
+
+        let started = Instant::now();
+        let engine = load_infer_engine(student_dir, max_seq_len)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "infer_student_loaded seconds={elapsed:.6} student_model={} max_seq_len={} \
+             lora_rank={} lora_alpha={:.6}",
+            student_dir.display(),
+            max_seq_len.max(128),
+            lora.rank,
+            lora.alpha,
+        );
+        Ok(Some(InferStudent::new(
+            Arc::new(Mutex::new(engine)),
+            train_backend,
+            vocab_size,
+        )))
+    }
+
+    fn load_infer_engine(
+        model_dir: &Path,
+        max_seq_len: usize,
+    ) -> anyhow::Result<LoadedInferenceEngine> {
+        let max_seq_len = max_seq_len.max(128);
+        let page_size = 16usize;
+        LoadedInferenceEngine::load_with_config(
+            model_dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("model path is not valid UTF-8"))?,
+            true,
+            EngineLoadConfig {
+                num_slots: 1,
+                page_size,
+                total_pages: max_seq_len.div_ceil(page_size),
+                max_prompt_tokens: max_seq_len,
+                max_total_tokens: max_seq_len,
+                chunked_prefill_size: max_seq_len,
+                ..EngineLoadConfig::default()
+            },
+        )
     }
 
     fn resolve_training_args(student_mode: StudentMode) -> AnyResult<Option<TrainingArgs>> {
