@@ -528,6 +528,36 @@ mod tests {
             / (student_logits.len() / vocab) as f64
     }
 
+    /// Independent f64 reference for the FORWARD path. The production forward
+    /// loss minimizes the soft cross-entropy `-sum_v t_p * log s_p` (the `-H(t)`
+    /// term is dropped, see `kl_distill_loss` doc), reduced `batchmean` (sum over
+    /// vocab, mean over positions). Recomputed from scratch (softmax the teacher,
+    /// log_softmax the student) so it does NOT reuse the production
+    /// `-1.0 * vocab` construction — this is the independent forward check the
+    /// suite previously lacked (only `reference_reverse_kl_mean` existed).
+    fn reference_forward_kl_mean(
+        student_logits: &[f32],
+        teacher_logits: &[f32],
+        vocab: usize,
+    ) -> f64 {
+        student_logits
+            .chunks_exact(vocab)
+            .zip(teacher_logits.chunks_exact(vocab))
+            .map(|(student_row, teacher_row)| {
+                let student_log_probs = reference_log_softmax(student_row);
+                let teacher_log_probs = reference_log_softmax(teacher_row);
+                student_log_probs
+                    .into_iter()
+                    .zip(teacher_log_probs)
+                    .map(|(student_log_prob, teacher_log_prob)| {
+                        -teacher_log_prob.exp() * student_log_prob
+                    })
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / (student_logits.len() / vocab) as f64
+    }
+
     fn reference_log_softmax(row: &[f32]) -> Vec<f64> {
         let max_value = row
             .iter()
@@ -781,6 +811,27 @@ mod tests {
         let expected = reference_reverse_kl_mean(&student_logits, &teacher_logits, shape[1]);
 
         assert_close(actual, expected as f32, 1.0e-5, "reverse KL reference");
+    }
+
+    #[test]
+    fn forward_kl_matches_hand_computed_reference() {
+        // Independent absolute-value check for the FORWARD batchmean path,
+        // closing the audit-found test gap (forward previously rested only on
+        // chunked-equivalence + byte-identity to a helper that reused the same
+        // `-1.0 * vocab` construction = self-consistency, not independence).
+        let shape = [2, 4];
+        let student_logits = vec![0.3, -0.7, 1.2, 0.0, -0.2, 0.9, 0.1, -1.1];
+        let teacher_logits = vec![-0.4, 0.6, 0.2, -0.1, 1.3, -0.8, 0.4, 0.0];
+
+        let actual = loss_value(
+            &student_logits,
+            &teacher_logits,
+            &shape,
+            KlDirection::Forward,
+        );
+        let expected = reference_forward_kl_mean(&student_logits, &teacher_logits, shape[1]);
+
+        assert_close(actual, expected as f32, 1.0e-5, "forward KL reference");
     }
 
     #[test]
