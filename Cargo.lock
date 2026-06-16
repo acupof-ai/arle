@@ -3643,6 +3643,7 @@ dependencies = [
  "autograd",
  "base64 0.22.1",
  "chat",
+ "cuda-kernels",
  "deepseek-spec",
  "half",
  "hf-hub",
