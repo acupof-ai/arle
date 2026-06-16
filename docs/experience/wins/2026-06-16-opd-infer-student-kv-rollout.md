@@ -107,6 +107,32 @@ early: step 1 rollout=1.844086s, step 2 rollout=1.773307s,
        step 3 rollout=1.748096s
 ```
 
+Clean follow-up all-linear runtime gate on `.62` used a fresh `3ef96951` source
+tree plus only the all-linear sync patch, excluding unrelated local `loss.rs`
+and loader mmap dirty hunks:
+
+```text
+source=/data01/arle-opd-runs/agent-infer-alllinear-sync-3ef96951-work
+binary=/data01/arle-opd-runs/target-opd-alllinear-sync-3ef96951/release/arle
+gpu=1
+build=CUDA_HOME=/usr/local/cuda CUDARC_CUDA_VERSION=12090 cargo build --release --features cuda -p agent-infer
+build_result=pass wall=4m00s
+```
+
+All-linear rollout-256 probes:
+
+```text
+run=/data01/arle-opd-runs/opd-alllinear-sync-r256-probe-3ef96951-20260616-223907
+step 1/1 loss 0.000003 rollout_len 328
+opd_step_profile step=1 total_seconds=86.239966 student_rollout_seconds=1.300164 teacher_forward_seconds=32.421836 student_forward_seconds=8.586466 kl_loss_seconds=8.702474 backward_seconds=43.722809
+
+run=/data01/arle-opd-runs/opd-alllinear-sync-r256-probe2-3ef96951-20260616-224715
+step 1/2 loss 0.000003 rollout_len 328
+opd_step_profile step=1 total_seconds=85.071850 student_rollout_seconds=1.307183 teacher_forward_seconds=32.165360 student_forward_seconds=8.513436 kl_loss_seconds=8.630292 backward_seconds=42.875463
+step 2/2 loss 0.000012 rollout_len 308
+opd_step_profile step=2 total_seconds=65.282445 student_rollout_seconds=1.197390 teacher_forward_seconds=20.080001 student_forward_seconds=7.669110 kl_loss_seconds=7.750132 backward_seconds=36.179129
+```
+
 ## Delta
 
 | Metric | Before | After | Verdict |
@@ -118,11 +144,9 @@ early: step 1 rollout=1.844086s, step 2 rollout=1.773307s,
 
 ## Problems
 
-- Dense Qwen3.5 all-linear LoRA remerge is compiled and unit-covered locally,
-  but the remote all-linear serve/train smoke is still pending. A clean selected
-  source sync reached final link on `.62`; linking failed because the
-  `/data01/prebuilt-kernels` archive lacks current DSv4/TurboQuant/MoE CUDA
-  symbols. The completed remote runtime gate in this entry is attention-qv.
+- Dense Qwen3.5 all-linear LoRA remerge is now covered by the clean `.62`
+  all-linear 1-step and 2-step probes above. This is still an integration/speed
+  gate, not a capability verdict.
 - MoE student adapter remerge is not covered by this path. The projection
   resolver fails loud when a dense MLP projection is requested on a MoE layer.
 - The old `target-opd-*` binaries on `.62` still depend on `libssl.so.1.1`.
