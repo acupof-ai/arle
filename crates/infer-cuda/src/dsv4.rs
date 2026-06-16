@@ -2020,6 +2020,14 @@ impl Dsv4Model {
         // PREPARE sub-split: batched projection pre-pass vs per-row compressor/indexer.
         // These sum ≈ prep_ms. Only touched when phase_time.
         let (mut proj_ms, mut compidx_ms) = (0f64, 0f64);
+        // compidx sub-split (coarse): the whole per-row prepare loop (compressor +
+        // Hadamard rotate + cache writes + indexer GEMM + per-row gathers — all
+        // fused inside the single `mla_attention_prepare_compressed_only` call, so
+        // writes vs gemm-gather are NOT separable without touching the callee) vs
+        // the ONE batched `csa_select_official_batched` READ (logits + topk). These
+        // two sum ≈ compidx_ms + the previously-untimed batched read. Only touched
+        // when phase_time.
+        let (mut perrow_ms, mut batchedread_ms) = (0f64, 0f64);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
@@ -2334,7 +2342,15 @@ impl Dsv4Model {
                 }
                 if let Some(t) = _compidx_t {
                     ctx.stream.synchronize().ok();
-                    compidx_ms += t.elapsed().as_secs_f64() * 1000.0;
+                    // `_compidx_t` brackets exactly the per-row prepare loop above
+                    // (compressor + Hadamard rotate + cache writes + indexer GEMM +
+                    // per-row gathers, all fused inside
+                    // `mla_attention_prepare_compressed_only`). Attribute this to the
+                    // coarse `perrow_ms`; the batched READ is timed separately below
+                    // and both fold into `compidx_ms` so the split sums to compidx.
+                    let dt = t.elapsed().as_secs_f64() * 1000.0;
+                    perrow_ms += dt;
+                    compidx_ms += dt;
                 }
                 if let Some(t) = _prep_t {
                     ctx.stream.synchronize().ok();
@@ -2346,6 +2362,12 @@ impl Dsv4Model {
                 // Runs AFTER all N rows' DSA caches are populated (per-row cache
                 // writes happened in the prepare loop) and BEFORE
                 // `build_layer_batch_meta` reads `selected_batched`.
+                let _batchedread_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if use_batched_dsa_select {
                     let q_i_batch = dsa_q_i_batch.take().expect("batched DSA staging q present");
                     let weights_batch = dsa_weights_batch
@@ -2407,6 +2429,15 @@ impl Dsv4Model {
                         flash_batch.selected_batched_mut(),
                         &mut keepalive,
                     )?;
+                }
+                if let Some(t) = _batchedread_t {
+                    ctx.stream.synchronize().ok();
+                    // The ONE batched `csa_select_official_batched` READ (logits +
+                    // topk). Folds into `compidx_ms` so the coarse split
+                    // (perrow + batchedread) sums to the full PREPARE-tail compidx.
+                    let dt = t.elapsed().as_secs_f64() * 1000.0;
+                    batchedread_ms += dt;
+                    compidx_ms += dt;
                 }
                 // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
                 let _fwd_t = if phase_time {
@@ -2794,12 +2825,14 @@ impl Dsv4Model {
         }
         if phase_time {
             log::info!(
-                "[decode-phase] n={n} csa_attn={:.1}ms sw_attn={:.1}ms (prep={:.1} [proj={:.1} compidx={:.1}] fwd={:.1} finish={:.1}) moe={:.1}ms",
+                "[decode-phase] n={n} csa_attn={:.1}ms sw_attn={:.1}ms (prep={:.1} [proj={:.1} compidx={:.1} compidx_split=[perrow={:.1} read={:.1}]] fwd={:.1} finish={:.1}) moe={:.1}ms",
                 csa_ms,
                 sw_ms,
                 prep_ms,
                 proj_ms,
                 compidx_ms,
+                perrow_ms,
+                batchedread_ms,
                 fwd_ms,
                 finish_ms,
                 moe_ms
