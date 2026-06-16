@@ -46,6 +46,9 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
 
+#[cfg(not(feature = "no-cuda"))]
+const CUBLASLT_BF16_GEMMEX_MIN_N: usize = 32;
+
 /// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
 /// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
 /// safe to share across threads.
@@ -298,6 +301,44 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    fn cublaslt_bf16_gemm_n(rows: usize) -> usize {
+        if rows == 0 {
+            0
+        } else {
+            rows.max(CUBLASLT_BF16_GEMMEX_MIN_N)
+        }
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn checked_bf16_len(rows: usize, cols: usize, op: &'static str) -> Result<usize> {
+        rows.checked_mul(cols)
+            .ok_or(AutogradError::TapeInvariant(op))
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn maybe_pad_bf16_gemm_n(
+        &self,
+        src: &CudaSlice<u16>,
+        rows: usize,
+        cols: usize,
+        padded_rows: usize,
+        op: &'static str,
+    ) -> Result<Option<CudaSlice<u16>>> {
+        if padded_rows == rows {
+            return Ok(None);
+        }
+        let padded_len = Self::checked_bf16_len(padded_rows, cols, op)?;
+        let mut padded = self
+            .stream
+            .alloc_zeros::<u16>(padded_len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (bf16 pad)"))?;
+        self.stream
+            .memcpy_dtod(src, &mut padded)
+            .map_err(|_| AutogradError::TapeInvariant("cuda D2D copy failed (bf16 pad)"))?;
+        Ok(Some(padded))
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
     fn cuda_slice<'a>(
         &self,
         handle: &'a DeviceHandle,
@@ -455,42 +496,71 @@ impl CudaBackend {
         let k = a_shape[1];
         let n = b_shape[0];
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
-        let mut c_bf16 = self
-            .stream
-            .alloc_zeros::<u16>(m * n)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        if m == 0 || n == 0 || k == 0 {
+            let c_bf16 = self
+                .stream
+                .alloc_zeros::<u16>(m * n)
+                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            let c = self.import_local_bf16_as_f32(&c_bf16, m * n)?;
+            return Ok((c, out_shape));
+        }
 
         let alpha = 1.0_f32;
         let beta = 0.0_f32;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 matmul_bt K exceeds i32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 matmul_bt N exceeds i32"))?;
+        let padded_m = Self::cublaslt_bf16_gemm_n(m);
+        let padded_m_i32 = i32::try_from(padded_m)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 matmul_bt padded M exceeds i32"))?;
+        let padded_a = self.maybe_pad_bf16_gemm_n(
+            &a_bf16,
+            m,
+            k,
+            padded_m,
+            "bf16 matmul_bt padded lhs length overflow",
+        )?;
+        let a_for_gemm = padded_a.as_ref().unwrap_or(&a_bf16);
+        let c_len =
+            Self::checked_bf16_len(padded_m, n, "bf16 matmul_bt padded output length overflow")?;
+        let mut c_bf16 = self
+            .stream
+            .alloc_zeros::<u16>(c_len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
-            let (a_ptr, _a_guard) = a_bf16.device_ptr(&self.stream);
+            let (a_ptr, _a_guard) = a_for_gemm.device_ptr(&self.stream);
             let (c_ptr, _c_guard) = c_bf16.device_ptr_mut(&self.stream);
 
             // Same row-major cuBLAS trick as the f32 path: swap operands so the
             // column-major output view is the row-major [M, N] buffer. Operand B
             // is stored as BF16; the activation is rounded to BF16 on-device,
             // accumulated in FP32, and converted back to FP32 for downstream
-            // autograd ops.
+            // autograd ops. CUDA 12.9 cuBLASLt can SIGFPE inside
+            // AlgoGetHeuristic for BF16 large-M skinny-N shapes such as
+            // lm_head [vocab, hidden] x [hidden, 8]. Padding the cuBLAS N
+            // dimension with zero activation rows avoids that heuristic bug;
+            // only the real row prefix is returned.
             unsafe {
                 cublas_result::gemm_ex(
                     *self.blas.handle(),
                     cublasOperation_t::CUBLAS_OP_T,
                     cublasOperation_t::CUBLAS_OP_N,
-                    n as i32,
-                    m as i32,
-                    k as i32,
+                    n_i32,
+                    padded_m_i32,
+                    k_i32,
                     (&alpha) as *const f32 as *const _,
                     b_ptr as *const _,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                    k as i32,
+                    k_i32,
                     a_ptr as *const _,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                    k as i32,
+                    k_i32,
                     (&beta) as *const f32 as *const _,
                     c_ptr as *mut _,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                    n as i32,
+                    n_i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                 )
@@ -530,39 +600,65 @@ impl CudaBackend {
         let n = a_shape[1];
         let k = b_shape[1];
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
-        let mut c_bf16 = self
-            .stream
-            .alloc_zeros::<u16>(m * k)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        if m == 0 || n == 0 || k == 0 {
+            let c_bf16 = self
+                .stream
+                .alloc_zeros::<u16>(m * k)
+                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            let c = self.import_local_bf16_as_f32(&c_bf16, m * k)?;
+            return Ok((c, out_shape));
+        }
 
         let alpha = 1.0_f32;
         let beta = 0.0_f32;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 matmul N exceeds i32"))?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 matmul K exceeds i32"))?;
+        let padded_m = Self::cublaslt_bf16_gemm_n(m);
+        let padded_m_i32 = i32::try_from(padded_m)
+            .map_err(|_| AutogradError::TapeInvariant("bf16 matmul padded M exceeds i32"))?;
+        let padded_a = self.maybe_pad_bf16_gemm_n(
+            &a_bf16,
+            m,
+            n,
+            padded_m,
+            "bf16 matmul padded lhs length overflow",
+        )?;
+        let a_for_gemm = padded_a.as_ref().unwrap_or(&a_bf16);
+        let c_len =
+            Self::checked_bf16_len(padded_m, k, "bf16 matmul padded output length overflow")?;
+        let mut c_bf16 = self
+            .stream
+            .alloc_zeros::<u16>(c_len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
-            let (a_ptr, _a_guard) = a_bf16.device_ptr(&self.stream);
+            let (a_ptr, _a_guard) = a_for_gemm.device_ptr(&self.stream);
             let (c_ptr, _c_guard) = c_bf16.device_ptr_mut(&self.stream);
 
             // Row-major C[M,K] = A[M,N] @ B[N,K], using cuBLAS's column-major
-            // view as C_col[K,M] = B_col[K,N] @ A_col[N,M].
+            // view as C_col[K,M] = B_col[K,N] @ A_col[N,M]. See
+            // `matmul_bt_device_f32_bf16` for the skinny-N padding rationale.
             unsafe {
                 cublas_result::gemm_ex(
                     *self.blas.handle(),
                     cublasOperation_t::CUBLAS_OP_N,
                     cublasOperation_t::CUBLAS_OP_N,
-                    k as i32,
-                    m as i32,
-                    n as i32,
+                    k_i32,
+                    padded_m_i32,
+                    n_i32,
                     (&alpha) as *const f32 as *const _,
                     b_ptr as *const _,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                    k as i32,
+                    k_i32,
                     a_ptr as *const _,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                    n as i32,
+                    n_i32,
                     (&beta) as *const f32 as *const _,
                     c_ptr as *mut _,
                     cublas_sys::cudaDataType_t::CUDA_R_16BF,
-                    k as i32,
+                    k_i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                 )
