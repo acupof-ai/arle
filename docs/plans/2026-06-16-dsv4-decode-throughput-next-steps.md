@@ -34,12 +34,23 @@ artifact — NOT a regression. Confirmed: clean no-MTP c1=43 ≈ expected ~44.)
      layers plus mtp.0 draft head" — so that env is required to LOAD the head
      (the `--mtp-draft-tokens`→`spec_decode_on` path at dsv4.rs:967 did not load it;
      wiring gap worth fixing so the flag alone loads the head).
-   - **Verify still crashes:** even with the head loaded, the serve dies on the
-     first request (`srv GONE`) — the MTP **verify forward** crashes at runtime.
-     ISOLATE NEXT: my campaign (decode-forward changes vs the seq_len>1 verify) vs
-     ckl's parallel commits vs the build — build MTP on the pre-campaign tree and
-     test. NOT a throughput regression (no-MTP is clean 43 tok/s c=1); an
-     MTP-verify-path bug.
+   - **NOT a crash — the head-load deepgemm-JIT hangs/pathologically-slow
+     (RESOLVED diagnosis, isolated on a CLEAN origin/main build).** Built clean
+     origin/main on .62 from an scp'd 18.5MB source bundle (`/data01/arle-clean`,
+     no franken). MTP head load: 8 workers stay ALIVE, no CUDA error/panic, but it
+     never reaches "serving" in >14 min — the deepgemm JIT for the MTP head's
+     expert shapes stalls at 16 cached kernels (cache stops growing). The earlier
+     "crashes" were my short poll windows timing out on this slow/hung load.
+     **NOT my campaign** (clean tree; it's the loader/deepgemm-JIT, not the decode
+     path) and **NOT a throughput regression** (no-MTP clean = 43 tok/s c=1).
+     **Prime suspect: the clang-11 deepgemm-JIT host compiler** I had to force on
+     .62 (`-ccbin clang++-11`, because gcc-8.3 can't do the bridge's `-std=c++20`)
+     — it likely chokes/hangs on the MTP head's specific shapes. So this is most
+     likely a **.62-toolchain artifact**, not a real origin/main MTP regression.
+     TO GET THE REAL ~53: build+serve MTP on a proper build host (gcc≥10, no
+     clang-11 JIT workaround), where the MTP-head deepgemm JIT compiles normally.
+     Also: wire `--spec-type mtp` to auto-set `ARLE_DSV4_SPEC_DECODE` (head-load
+     gate). Transfer note: `scp` via jumpbox (18.5MB one-shot) >> base64 chunks.
 2. **Compute/comm overlap for the BATCHED (n>1) lane.** Existing
    `ARLE_DSV4_COMM_OVERLAP` is `seq_len==1` ONLY (overlaps shared-expert compute
    w/ routed-MoE all-reduce; has the consumer `wait_event` via
