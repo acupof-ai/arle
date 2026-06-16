@@ -69,3 +69,15 @@ Attention = ~80% of step, ~linear in n; MoE amortizes. Also: decode batch capped
 
 ## R2 plan (CSA → existing batched lane, NOT a from-scratch kernel)
 The batched-index infra for CSA already exists but is orphaned: `build_indices_batched(selected_ptr)` (attention.rs) takes the CSA per-row topk `selected`; `decode_lane_fwd` is the batched sparse attention. The per-row `mla_attention_prepare` already produces `Dsv4MlaPrepared.selected` for CSA. Increment: drop the `layer.mode != CompressedSparse` gate (dsv4.rs:1994), feed each row's `selected` into `build_indices_batched`, route CSA's compressed-cache pack/read through the batched lane. Per-row prepare (indexer topk) + finish stay per-row for now; the sparse-attention KERNEL batches → expect csa_attn ~119→~70ms (matches SW). R3 = batch the per-row prepare projection GEMMs (m=1→m=N) for all layers.
+
+## R2 done + license-or-kill (2026-06-16): CORRECT but +7%, hypothesis corrected
+Wired CSA into the batched lane (gate + want_compressed + per-row `selected`→`build_indices_batched`; SW/HCA byte-identical; `decode_lane_fwd`/pack were CSA-ready — pure wiring, no new kernel). **needle 8/8 exact** (correct). But phase timing: csa_attn 119.6→0, sw_attn 67→**173** (absorbed CSA) → total attention 186.6→173.4ms = **−7% only**; c=8 throughput 66.3→65.7 (flat).
+**Adversarial conclusion: the attention KERNEL was NOT the bottleneck — the per-row PREPARE is.** The 173ms is per-row `mla_attention_prepare` (wq_b/wkv_b projection GEMMs @ m=1 × 43 layers × N rows + indexer/compressor) + per-row finish, which R2 didn't touch.
+**Also: R2 only batches the NON-spec path (`forward_decode_batch_stream_impl`); production is spec-on (MTP verify path) where CSA is still per-row** → R2 is production-inert until the verify path is batched too.
+
+## Remaining levers (measured, multi-week — each a build+pod+needle cycle)
+1. **Batch the per-row prepare projection GEMMs** (wq_b/wkv_b m=1→m=N, weight-read amortized ×N — the canonical decode win, like the lm_head batch). The dominant 173ms. Applies to ALL layers + both paths.
+2. **Apply the batched-attention + batched-prepare to the MTP verify path** (production is spec-on).
+3. **Lift the decode-batch cap** (n≈22 at c=64 — scheduler/stagger; needed to reach n~97 for SGLang parity).
+4. (later) batch the per-slot compressor/indexer scatter; per-row finish.
+R2 (CSA in batched lane) is the correct foundation for #1 (CSA prepare batches with the rest). SGLang 1297@c97 needs all of 1-3.

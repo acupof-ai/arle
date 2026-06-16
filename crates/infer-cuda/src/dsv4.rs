@@ -1868,6 +1868,9 @@ impl Dsv4Model {
         start_positions: &[usize],
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         let n = slot_ids.len();
+        // Opt-in decode-phase timing probe (env-gated). When unset: zero behavior
+        // change, zero extra syncs. Pure instrumentation — see ARLE_DSV4_DECODE_PHASE_TIME.
+        let phase_time = std::env::var_os("ARLE_DSV4_DECODE_PHASE_TIME").is_some();
         for r in 0..n {
             let slot = &slots[slot_ids[r]];
             ensure!(
@@ -1952,6 +1955,9 @@ impl Dsv4Model {
         keepalive.keep_hidden(&attn_out_row);
         // MoE/shared are now grouped over [N] (Phase 6a) — no per-row MoE scratch.
 
+        // Decode-phase timing accumulators (only ever touched when phase_time).
+        let (mut csa_ms, mut sw_ms, mut moe_ms) = (0f64, 0f64, 0f64);
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
@@ -1978,22 +1984,35 @@ impl Dsv4Model {
             // the copy-out below before attn_out is read by hc_post.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             // PHASE B (#60): the batched FlashMLA decode lane. For a batched-
-            // eligible layer (FlashMLA decode on AND mode != CSA — CSA's per-row
-            // `selected` keeps it on the per-row path) the per-row FlashMLA KERNEL
-            // launch is replaced by ONE `sparse_decode_fwd(b=N)`:
-            //   1. per row: PREPARE (wq/wkv+RoPE, HCA compressor) → pack KV into
-            //      the shared pool → gather this row's global-head Q into q_batched[r];
-            //   2. build_layer_batch_meta(b=N) (indices/sched_meta) → ONE batched fwd;
+            // eligible layer (FlashMLA decode on, ALL modes) the per-row FlashMLA
+            // KERNEL launch is replaced by ONE `sparse_decode_fwd(b=N)`:
+            //   1. per row: PREPARE (wq/wkv+RoPE, compressor, CSA indexer top-k
+            //      `selected`) → pack KV into the shared pool → gather this row's
+            //      global-head Q into q_batched[r]; for CSA also gather this row's
+            //      `selected` into selected_batched[r];
+            //   2. build_layer_batch_meta(b=N) (indices/sched_meta; CSA feeds the
+            //      gathered `selected` ptr) → ONE batched fwd;
             //   3. per row: slice the global-head output → local_attn → inverse-rope
             //      + SW-window update (the cheap per-row tail) → O-LoRA into attn_out[r].
             // The prepare/pack/finish/oproj loops stay per-row (cheap); only the
             // attention kernel is batched (the 74k tiny gridX=1 launches — see
-            // docs/plans/dsv4-batched-flashmla-decode.md). CSA + non-batched layers
-            // fall through to the per-row `mla_attention` loop, byte-unchanged.
-            let use_batched_kernel =
-                batched_attn_lane && layer.mode != DeepSeekV4AttentionMode::CompressedSparse;
+            // docs/plans/dsv4-batched-flashmla-decode.md). Non-batched (FlashMLA
+            // decode off) layers fall through to the per-row `mla_attention` loop,
+            // byte-unchanged. SW/HCA index builds are byte-identical (selected_ptr
+            // stays 0); only CSA passes the gathered per-row top-k.
+            let use_batched_kernel = batched_attn_lane;
             if use_batched_kernel {
-                let want_compressed = layer.mode == DeepSeekV4AttentionMode::HybridCompressed;
+                let _sw_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                // CSA (cr 1..=15) and HCA (cr≥16) both pack + attend the compressed
+                // pool; only pure SW (cr=0) has no compressor. Byte-identical to the
+                // old `== HybridCompressed` for the SW/HCA modes that already ran here.
+                let want_compressed = layer.mode != DeepSeekV4AttentionMode::SlidingWindow;
+                let is_csa = layer.mode == DeepSeekV4AttentionMode::CompressedSparse;
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
                 // ── 1. per-row PREPARE + pack + Q-gather.
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
@@ -2058,6 +2077,19 @@ impl Dsv4Model {
                             r,
                             row_prepared.local_heads,
                         )?;
+                        // CSA only: gather this row's indexer top-k `selected`
+                        // (`[index_topk]` i32, == this layer's max_compressed_keys)
+                        // into the contiguous `selected_batched[r * index_topk..]`,
+                        // so the ONE batched index build can read it per row
+                        // (`selected + row * max_compressed_keys`). SW/HCA skip this
+                        // (selected is None) and the batched build sees selected_ptr=0
+                        // — byte-identical to the prior SW/HCA-only lane.
+                        if is_csa {
+                            let sel = row_prepared.selected.as_ref().ok_or_else(|| {
+                                anyhow!("DSv4 batched CSA decode: row {r} missing indexer selected")
+                            })?;
+                            flash_batch.gather_selected_row(&self.ctx, sel, r)?;
+                        }
                         // Keep the prepared buffers alive to function return — the
                         // batched fwd (after this loop) reads the gathered Q, and
                         // the finish loop reads k_prepared/local_attn. Mirrors the
@@ -2080,6 +2112,9 @@ impl Dsv4Model {
                     let flash_batch = flash_batch.ok_or_else(|| {
                         anyhow!("DSv4 batched decode lane: batch scratch missing")
                     })?;
+                    // For CSA, build_layer_batch_meta sources the per-row top-k from
+                    // the internal `selected_batched` buffer the prepare loop just
+                    // filled (`[n, index_topk]`); SW/HCA pass selected_ptr=0 inside.
                     flash_batch.build_layer_batch_meta(
                         &self.ctx,
                         &self.config,
@@ -2164,7 +2199,17 @@ impl Dsv4Model {
                             .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
                     }
                 }
+                if let Some(t) = _sw_t {
+                    ctx.stream.synchronize().ok();
+                    sw_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
             } else {
+                let _csa_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_row");
                 for r in 0..n {
                     let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
@@ -2206,6 +2251,10 @@ impl Dsv4Model {
                     // shared {normed,attn_out}_row scratch before row r+1's writes
                     // (WAR resolved by stream order). The sync was debug isolation.
                 }
+                if let Some(t) = _csa_t {
+                    ctx.stream.synchronize().ok();
+                    csa_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
             }
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: one all-reduce over [N, hidden]. NOT bit-identical
@@ -2232,6 +2281,12 @@ impl Dsv4Model {
             stream = attn_stream;
 
             // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
+            let _moe_t = if phase_time {
+                ctx.stream.synchronize().ok();
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
             keepalive.keep_f32(&mhc.pre);
             keepalive.keep_f32(&mhc.post);
@@ -2404,10 +2459,22 @@ impl Dsv4Model {
             )?;
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            if let Some(t) = _moe_t {
+                ctx.stream.synchronize().ok();
+                moe_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
         }
 
         for r in 0..n {
             slots[slot_ids[r]].seq_len += 1;
+        }
+        if phase_time {
+            log::info!(
+                "[decode-phase] n={n} csa_attn={:.1}ms sw_attn={:.1}ms moe={:.1}ms",
+                csa_ms,
+                sw_ms,
+                moe_ms
+            );
         }
         Ok((stream, keepalive))
     }

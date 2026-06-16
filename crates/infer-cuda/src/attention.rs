@@ -1415,6 +1415,17 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     /// tp_gather_cols)` slice per row (one row's allgather at a time), then
     /// repacks the global Q into `q_batched[r]`.
     tp_gathered_q: CudaSlice<half::bf16>,
+    /// `[max_batch, csa_topk]` i32 — CSA ONLY: the prepare loop gathers each
+    /// row's indexer top-k `selected` (`[index_topk]`) into row r, then the ONE
+    /// batched index build reads `selected + row * max_compressed_keys`
+    /// (== `index_topk` for CSA). Disjoint from `indices`/`q_batched`/etc.
+    /// `csa_topk == 0` (zero-len alloc, never read) when the model has no CSA
+    /// layer; SW/HCA never touch this buffer (their `selected_ptr` stays 0).
+    selected_batched: CudaSlice<i32>,
+    /// CSA per-row `selected` length (= `config.index_topk` = a CSA layer's
+    /// `max_compressed_keys`); the row stride of `selected_batched`. 0 if the
+    /// model has no CSA layer.
+    csa_topk: usize,
     /// Per-layer decode shape (`topk_unified`/`sw_blocks`/`comp_blocks`/… per
     /// mode), indexed by layer. The batched build_indices / fwd read the
     /// engaged layer's shape; stored here so the dsv4 loop needs only `layer_idx`.
@@ -1508,6 +1519,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             tp_gathered_q: ctx
                 .stream
                 .alloc_zeros::<half::bf16>(max_batch * tp_gather_cols)?,
+            // CSA per-row top-k gather buffer. `config.index_topk` is the single
+            // config-level top-k width every CSA layer uses (== a CSA layer's
+            // `max_compressed_keys`), so one fixed row stride serves all CSA
+            // layers. Sized `max_batch * index_topk` (≈ slots × 512 × 4B, tiny).
+            // For a model with no DSA/CSA layer index_topk is 0 → a zero-len alloc
+            // that is never read (SW/HCA pass selected_ptr=0).
+            selected_batched: ctx
+                .stream
+                .alloc_zeros::<i32>(max_batch * config.index_topk)?,
+            csa_topk: config.index_topk,
             layer_shapes: layer_shapes.to_vec(),
             max_batch,
             max_topk_unified,
@@ -1538,6 +1559,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             + self.q_batched.len() * bf16
             + self.out_batched.len() * bf16
             + self.tp_gathered_q.len() * bf16
+            + self.selected_batched.len() * i32_sz
     }
 
     /// Upload the per-row decode positions + slot→pool block offsets for an
@@ -1588,11 +1610,49 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
+    /// CSA ONLY: gather row `r`'s indexer top-k `selected` into the contiguous
+    /// `selected_batched[r * csa_topk ..]` band the batched index build reads
+    /// (`selected + row * max_compressed_keys`, max_compressed_keys == csa_topk
+    /// for CSA). `selected` is `[index_topk]` i32 (decode seq_len=1); its length
+    /// must equal `csa_topk` (the single config top-k width). A single per-row
+    /// `memcpy_dtod` on `ctx.stream` — stream-ordered before the index build that
+    /// reads the buffer. Disjoint from `indices`/`q_batched`/etc.
+    pub(crate) fn gather_selected_row(
+        &mut self,
+        ctx: &DeviceContext,
+        selected: &CudaSlice<i32>,
+        r: usize,
+    ) -> Result<()> {
+        ensure!(
+            r < self.max_batch,
+            "DSv4 batched CSA selected gather row {r} exceeds max_batch {}",
+            self.max_batch
+        );
+        ensure!(
+            self.csa_topk > 0,
+            "DSv4 batched CSA selected gather: csa_topk is 0 (model has no CSA layer)"
+        );
+        ensure!(
+            selected.len() == self.csa_topk,
+            "DSv4 batched CSA selected gather: row {r} selected len {} != csa_topk {}",
+            selected.len(),
+            self.csa_topk
+        );
+        let mut dst = self
+            .selected_batched
+            .slice_mut(r * self.csa_topk..(r + 1) * self.csa_topk);
+        ctx.stream
+            .memcpy_dtod(selected, &mut dst)
+            .map_err(|e| anyhow!("DSv4 batched CSA selected gather D2D failed: {e}"))?;
+        Ok(())
+    }
+
     /// Phase A convenience: build a layer's complete per-forward batched
     /// metadata — `upload_row_meta(n)` → `build_indices_batched(b=N)` →
     /// `sched_meta_for_batch(b=N)` — using the layer's STORED decode shape
-    /// (`self.layer_shapes[layer_idx]`, the exact per-mode shape). For SW/HCA
-    /// only (CSA needs per-row `selected`; the caller guards on mode in Phase A).
+    /// (`self.layer_shapes[layer_idx]`, the exact per-mode shape). SW/HCA pass
+    /// `selected_ptr=0`; CSA sources the per-row top-k from `self.selected_batched`
+    /// (which the prepare loop filled this forward via `gather_selected_row`).
     /// Leaves `self.indices`/`topk_length`/`sched_meta`/`num_splits` populated
     /// for this layer, ready for `sparse_decode_fwd_batched`.
     pub(crate) fn build_layer_batch_meta(
@@ -1613,7 +1673,25 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             )
         })?;
         self.upload_row_meta(ctx, start_positions, slot_block_offsets)?;
-        self.build_indices_batched(ctx, n, mode, compress_ratio, config, &shape, 0)?;
+        // CSA: feed the gathered per-row top-k buffer; SW/HCA: selected_ptr=0
+        // (byte-identical to the prior SW/HCA-only batched index build). The kernel
+        // asserts `mode==CSA ⟹ selected != null` (build_indices.cu:318), so the CSA
+        // ptr must be live here — `gather_selected_row` ran for every row in prepare.
+        let selected_ptr = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+            ensure!(
+                self.csa_topk == shape.max_compressed_keys,
+                "DSv4 batched CSA: csa_topk {} != layer {layer_idx} max_compressed_keys {} \
+                 (gather row stride would mismatch the kernel read stride)",
+                self.csa_topk,
+                shape.max_compressed_keys
+            );
+            let (ptr, guard) = self.selected_batched.device_ptr(&ctx.stream);
+            drop(guard);
+            ptr
+        } else {
+            0
+        };
+        self.build_indices_batched(ctx, n, mode, compress_ratio, config, &shape, selected_ptr)?;
         self.sched_meta_for_batch(ctx, n, shape.topk_unified)?;
         Ok(())
     }
