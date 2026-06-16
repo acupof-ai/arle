@@ -15,8 +15,9 @@
 use crate::{
     AutogradError,
     backend::{
-        CudaBf16Storage, CudaStorage, matmul_bt_output_shape, matmul_output_shape,
-        validate_broadcast, validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes,
+        CudaBf16Storage, CudaFp8BlockScaledStorage, CudaStorage, dequantize_fp8_block_scaled_host,
+        matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
+        validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes, validate_fp8_block_scaled,
         validate_qwen_decode_prepare_kv_shapes, validate_qwen_decode_prepare_q_shapes,
     },
 };
@@ -32,7 +33,7 @@ use crate::{
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{KernelCache, launch_1d, launch_rows};
+use self::kernels::{KernelCache, launch_1d, launch_2d, launch_rows};
 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
 use cuda_kernels::collective::{CollectiveBackend, DType, NcclBackend, ReduceOp};
 #[cfg(not(feature = "no-cuda"))]
@@ -242,6 +243,59 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    fn upload_fp8_bytes_slice(&self, host: &[u8], shape: &[usize]) -> Result<CudaSlice<u8>> {
+        let size = shape_size(shape);
+        if host.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+
+        self.stream.clone_htod(host).map_err(|err| {
+            let bytes = host.len();
+            AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "cuda fp8 htod copy failed: shape={shape:?} len={} bytes={} err={err:?}",
+                    host.len(),
+                    bytes
+                )
+                .into_boxed_str(),
+            ))
+        })
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn cuda_fp8_block_scaled_storage<'a>(
+        &self,
+        storage: &'a CudaFp8BlockScaledStorage,
+    ) -> Result<(
+        &'a CudaSlice<u8>,
+        &'a CudaSlice<f32>,
+        usize,
+        usize,
+        usize,
+        usize,
+    )> {
+        let weight = storage.weight();
+        let scales = storage.scales();
+        if weight.context() != self.stream.context() || scales.context() != self.stream.context() {
+            return Err(AutogradError::TapeInvariant(
+                "cuda fp8 block-scaled handle from different context/ordinal",
+            ));
+        }
+        Ok((
+            weight,
+            scales,
+            storage.rows(),
+            storage.cols(),
+            storage.block_m(),
+            storage.block_k(),
+        ))
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
     fn copy_bf16_device_ptr_to_local(
         &self,
         src_device_ptr: u64,
@@ -405,6 +459,17 @@ impl CudaBackend {
                 "embedding_from_f32_ids" => "cuda backend cannot use bf16 handle for f32 token ids",
                 _ => "cuda backend cannot operate on a bf16 handle on this f32-only path",
             })),
+            DeviceHandle::CudaFp8BlockScaled(_) => Err(AutogradError::TapeInvariant(match op {
+                "matmul" => {
+                    "cuda backend cannot matmul a fp8 block-scaled handle on this f32-only path"
+                }
+                "matmul_bt" => {
+                    "cuda backend cannot use fp8 block-scaled handle as lhs on this matmul_bt path"
+                }
+                _ => {
+                    "cuda backend cannot operate on a fp8 block-scaled handle on this f32-only path"
+                }
+            })),
             DeviceHandle::Cpu(_) => Err(AutogradError::TapeInvariant(match op {
                 "add" => "cuda backend cannot add a cpu device handle",
                 "matmul" => "cuda backend cannot matmul a cpu device handle",
@@ -422,7 +487,10 @@ impl CudaBackend {
     #[cfg(not(feature = "no-cuda"))]
     fn validate_cuda_handle_kind(&self, handle: &DeviceHandle) -> Result<()> {
         match handle {
-            DeviceHandle::Cpu(_) | DeviceHandle::Cuda(_) | DeviceHandle::CudaBf16(_) => Ok(()),
+            DeviceHandle::Cpu(_)
+            | DeviceHandle::Cuda(_)
+            | DeviceHandle::CudaBf16(_)
+            | DeviceHandle::CudaFp8BlockScaled(_) => Ok(()),
             #[cfg(feature = "metal")]
             DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
                 "cuda backend cannot evaluate a metal device handle",
@@ -722,6 +790,150 @@ impl CudaBackend {
         let c = self.import_local_bf16_as_f32(&c_bf16, m * k)?;
         Ok((c, out_shape))
     }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn matmul_bt_device_f32_fp8_block_scaled(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        storage: &CudaFp8BlockScaledStorage,
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        let (weight, scales, rows, cols, block_m, block_k) =
+            self.cuda_fp8_block_scaled_storage(storage)?;
+        let b_shape = [rows, cols];
+        if a.len() != shape_size(a_shape) || weight.len() != shape_size(&b_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend fp8 matmul_bt handle size does not match shape",
+            ));
+        }
+        let out_shape = matmul_bt_output_shape(a_shape, &b_shape)?;
+        if a_shape.len() != 2 {
+            return Err(AutogradError::InvalidRank {
+                expected: "both operands must be rank-2",
+                got: a_shape.len(),
+            });
+        }
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = rows;
+        let scale_cols = cols.div_ceil(block_k);
+        if scales.len() != rows.div_ceil(block_m) * scale_cols {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend fp8 matmul_bt scale shape mismatch",
+            ));
+        }
+        let mut c = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt M exceeds i32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt N exceeds i32"))?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt K exceeds i32"))?;
+        let block_m_i32 = i32::try_from(block_m)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt block_m exceeds i32"))?;
+        let block_k_i32 = i32::try_from(block_k)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt block_k exceeds i32"))?;
+        let scale_cols_i32 = i32::try_from(scale_cols)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt scale_cols exceeds i32"))?;
+        launch_2d(
+            &self.stream,
+            self.kernels.function("fp8_block_scaled_matmul_bt_f32")?,
+            m,
+            n,
+            256,
+            0,
+            |mut builder| {
+                builder
+                    .arg(a)
+                    .arg(weight)
+                    .arg(scales)
+                    .arg(&mut c)
+                    .arg(&m_i32)
+                    .arg(&n_i32)
+                    .arg(&k_i32)
+                    .arg(&block_m_i32)
+                    .arg(&block_k_i32)
+                    .arg(&scale_cols_i32);
+                builder
+            },
+        )?;
+        Ok((c, out_shape))
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn matmul_device_f32_fp8_block_scaled(
+        &self,
+        a: &CudaSlice<f32>,
+        a_shape: &[usize],
+        storage: &CudaFp8BlockScaledStorage,
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        let (weight, scales, rows, cols, block_m, block_k) =
+            self.cuda_fp8_block_scaled_storage(storage)?;
+        let b_shape = [rows, cols];
+        if a.len() != shape_size(a_shape) || weight.len() != shape_size(&b_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend fp8 matmul handle size does not match shape",
+            ));
+        }
+        let out_shape = matmul_output_shape(a_shape, &b_shape)?;
+        if a_shape.len() != 2 {
+            return Err(AutogradError::InvalidRank {
+                expected: "both operands must be rank-2",
+                got: a_shape.len(),
+            });
+        }
+        let m = a_shape[0];
+        let n = a_shape[1];
+        let k = cols;
+        let scale_cols = cols.div_ceil(block_k);
+        if scales.len() != rows.div_ceil(block_m) * scale_cols {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend fp8 matmul scale shape mismatch",
+            ));
+        }
+        let mut c = self
+            .stream
+            .alloc_zeros::<f32>(m * k)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul M exceeds i32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul N exceeds i32"))?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul K exceeds i32"))?;
+        let block_m_i32 = i32::try_from(block_m)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul block_m exceeds i32"))?;
+        let block_k_i32 = i32::try_from(block_k)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul block_k exceeds i32"))?;
+        let scale_cols_i32 = i32::try_from(scale_cols)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul scale_cols exceeds i32"))?;
+        launch_2d(
+            &self.stream,
+            self.kernels.function("fp8_block_scaled_matmul_f32")?,
+            m,
+            k,
+            256,
+            0,
+            |mut builder| {
+                builder
+                    .arg(a)
+                    .arg(weight)
+                    .arg(scales)
+                    .arg(&mut c)
+                    .arg(&m_i32)
+                    .arg(&n_i32)
+                    .arg(&k_i32)
+                    .arg(&block_m_i32)
+                    .arg(&block_k_i32)
+                    .arg(&scale_cols_i32);
+                builder
+            },
+        )?;
+        Ok((c, out_shape))
+    }
 }
 
 impl Backend for CudaBackend {
@@ -775,6 +987,36 @@ impl Backend for CudaBackend {
             Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(
                 self.upload_bf16_bits_slice(host, shape)?,
             )))
+        }
+    }
+
+    fn upload_fp8_block_scaled(
+        &self,
+        weight: &[u8],
+        scales: &[f32],
+        shape: &[usize],
+        block_m: usize,
+        block_k: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (weight, scales, shape, block_m, block_k);
+            todo!("GPU required: cuda fp8 block-scaled upload is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            validate_fp8_block_scaled(weight, scales, shape, block_m, block_k)?;
+            Ok(DeviceHandle::CudaFp8BlockScaled(
+                CudaFp8BlockScaledStorage::new(
+                    self.upload_fp8_bytes_slice(weight, shape)?,
+                    self.upload_slice(scales, &[scales.len()])?,
+                    shape[0],
+                    shape[1],
+                    block_m,
+                    block_k,
+                ),
+            ))
         }
     }
 
@@ -861,6 +1103,30 @@ impl Backend for CudaBackend {
                         .into_iter()
                         .map(crate::backend::bf16_bits_to_f32)
                         .collect())
+                }
+                DeviceHandle::CudaFp8BlockScaled(storage) => {
+                    let (weight, scales, rows, cols, block_m, block_k) =
+                        self.cuda_fp8_block_scaled_storage(storage)?;
+                    let mut host_weight = vec![0u8; weight.len()];
+                    let mut host_scales = vec![0.0f32; scales.len()];
+                    self.stream
+                        .memcpy_dtoh(weight, &mut host_weight)
+                        .map_err(|_| AutogradError::TapeInvariant("cuda fp8 dtoh copy failed"))?;
+                    self.stream
+                        .memcpy_dtoh(scales, &mut host_scales)
+                        .map_err(|_| {
+                            AutogradError::TapeInvariant("cuda fp8 scales dtoh copy failed")
+                        })?;
+                    self.stream
+                        .synchronize()
+                        .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+                    dequantize_fp8_block_scaled_host(
+                        &host_weight,
+                        &host_scales,
+                        &[rows, cols],
+                        block_m,
+                        block_k,
+                    )
                 }
                 #[cfg(feature = "metal")]
                 DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
@@ -953,6 +1219,23 @@ impl Backend for CudaBackend {
                     ));
                 }
                 let (c, out_shape) = self.matmul_bt_device_f32_bf16(d_a, a_shape, d_b, b_shape)?;
+                return Ok((DeviceHandle::Cuda(CudaStorage::new(c)), out_shape));
+            }
+            if let DeviceHandle::CudaFp8BlockScaled(storage) = b {
+                let (weight, _, rows, cols, _, _) = self.cuda_fp8_block_scaled_storage(storage)?;
+                if b_shape != [rows, cols] {
+                    return Err(AutogradError::ShapeMismatch {
+                        expected: vec![rows, cols],
+                        got: b_shape.to_vec(),
+                    });
+                }
+                if d_a.len() != shape_size(a_shape) || weight.len() != shape_size(b_shape) {
+                    return Err(AutogradError::TapeInvariant(
+                        "cuda backend fp8 matmul_bt handle size does not match shape",
+                    ));
+                }
+                let (c, out_shape) =
+                    self.matmul_bt_device_f32_fp8_block_scaled(d_a, a_shape, storage)?;
                 return Ok((DeviceHandle::Cuda(CudaStorage::new(c)), out_shape));
             }
 
@@ -3724,6 +4007,22 @@ fn cuda_matmul_bt_backward_device(
                 }
                 backend.matmul_device_f32_bf16(d_g, grad_out_shape, d_b, b_shape)?
             }
+            DeviceHandle::CudaFp8BlockScaled(storage) => {
+                let (weight, _, rows, cols, _, _) =
+                    backend.cuda_fp8_block_scaled_storage(storage)?;
+                if b_shape != [rows, cols] {
+                    return Err(AutogradError::ShapeMismatch {
+                        expected: vec![rows, cols],
+                        got: b_shape.to_vec(),
+                    });
+                }
+                if weight.len() != shape_size(b_shape) {
+                    return Err(AutogradError::TapeInvariant(
+                        "cuda fp8 matmul_bt_backward_device handle size does not match shape",
+                    ));
+                }
+                backend.matmul_device_f32_fp8_block_scaled(d_g, grad_out_shape, storage)?
+            }
             DeviceHandle::Cpu(_) => {
                 return Err(AutogradError::TapeInvariant(
                     "cuda matmul_bt_backward_device requires cuda handles",
@@ -4430,6 +4729,11 @@ fn cuda_embedding_device(
                 },
             )?;
         }
+        DeviceHandle::CudaFp8BlockScaled(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding a fp8 block-scaled device handle",
+            ));
+        }
         DeviceHandle::Cpu(_) => {
             return Err(AutogradError::TapeInvariant(
                 "cuda backend cannot embedding a cpu device handle",
@@ -4538,6 +4842,11 @@ fn cuda_embedding_from_f32_ids_device(
                     builder
                 },
             )?;
+        }
+        DeviceHandle::CudaFp8BlockScaled(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend cannot embedding_from_f32_ids a fp8 block-scaled device handle",
+            ));
         }
         DeviceHandle::Cpu(_) => {
             return Err(AutogradError::TapeInvariant(
