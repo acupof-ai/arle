@@ -7,26 +7,30 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::ops::Deref;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::rc::Rc;
+use std::slice;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use cuda_kernels::KVFormat;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cuda_kernels::tensor::WeightFormat;
-use cuda_kernels::KVFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{SafeTensors, tensor::Dtype};
 
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
 use crate::ops::{precompute_rope, upload_i32};
 use crate::quant_format::{
-    detect_quant_format, read_quant_manifest, reject_dsv4_e8m0_scale_abi, QuantFormat,
-    QuantManifest, QuantTensorView, ScaleApply, TensorHeader,
+    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
+    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
 };
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
@@ -395,13 +399,10 @@ pub(crate) struct SafetensorLoader {
     weight_map: HashMap<String, usize>,
     tensor_headers: std::cell::RefCell<Option<Rc<BTreeMap<String, TensorHeader>>>>,
     quant_manifest: Option<QuantManifest>,
-    /// Bounded shard byte cache: without it, loading tensors that alternate
-    /// across two shards re-reads multi-GiB files on every tensor touch. `Rc`
+    /// Bounded mmap shard cache: without it, loading tensors that alternate
+    /// across two shards re-opens multi-GiB files on every tensor touch. `Rc`
     /// lets [`SharedTensor`] expose a tensor's byte range zero-copy while the
     /// cache entry itself can be evicted after the layer no longer needs it.
-    /// `Rc<Vec<u8>>` over clippy's `Rc<[u8]>`: the conversion would copy the
-    /// multi-GiB shard once more — the exact copy this cache exists to avoid.
-    #[allow(clippy::rc_buffer)]
     shard_cache: std::cell::RefCell<ShardByteCache>,
     shard_meta_cache: std::cell::RefCell<HashMap<usize, Rc<BTreeMap<String, ShardTensorMeta>>>>,
 }
@@ -430,9 +431,8 @@ struct DirectFp8MoeRouted {
     down_quant_signature: ExpertQuantDispatchSignature,
 }
 
-#[allow(clippy::rc_buffer)]
 struct ShardByteCache {
-    entries: HashMap<usize, Rc<Vec<u8>>>,
+    entries: HashMap<usize, Rc<ShardBytes>>,
     order: VecDeque<usize>,
     bytes: usize,
     max_bytes: usize,
@@ -448,15 +448,13 @@ impl ShardByteCache {
         }
     }
 
-    #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
-    fn get(&mut self, idx: usize) -> Option<Rc<Vec<u8>>> {
+    fn get(&mut self, idx: usize) -> Option<Rc<ShardBytes>> {
         let bytes = Rc::clone(self.entries.get(&idx)?);
         self.touch(idx);
         Some(bytes)
     }
 
-    #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
-    fn insert(&mut self, idx: usize, bytes: Rc<Vec<u8>>) -> Vec<(usize, usize)> {
+    fn insert(&mut self, idx: usize, bytes: Rc<ShardBytes>) -> Vec<(usize, usize)> {
         if let Some(old) = self.entries.remove(&idx) {
             self.bytes = self.bytes.saturating_sub(old.len());
             self.remove_order(idx);
@@ -493,6 +491,83 @@ impl ShardByteCache {
     fn touch(&mut self, idx: usize) {
         self.remove_order(idx);
         self.order.push_back(idx);
+    }
+}
+
+struct ShardBytes {
+    mmap: MmapShard,
+}
+
+impl ShardBytes {
+    fn map(path: &Path) -> Result<Self> {
+        Ok(Self {
+            mmap: MmapShard::map(path)?,
+        })
+    }
+}
+
+impl Deref for ShardBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.mmap.as_slice()
+    }
+}
+
+struct MmapShard {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl MmapShard {
+    fn map(path: &Path) -> Result<Self> {
+        let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let len: usize = file
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?
+            .len()
+            .try_into()
+            .with_context(|| format!("{} is too large to mmap on this host", path.display()))?;
+        ensure!(len > 0, "{} is empty", path.display());
+        ensure!(
+            len <= isize::MAX as usize,
+            "{} length {len} exceeds mmap addressable range",
+            path.display()
+        );
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("mmap {}", path.display()));
+        }
+        Ok(Self {
+            ptr: NonNull::new(mapped.cast::<u8>()).expect("mmap returned null but not MAP_FAILED"),
+            len,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for MmapShard {
+    fn drop(&mut self) {
+        let rc = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        if rc != 0 {
+            log::warn!(
+                "munmap failed for safetensors shard mapping: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 }
 
@@ -635,13 +710,13 @@ impl SafetensorLoader {
     }
 
     pub(crate) fn load_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
-        let tensor = self.load_tensor(name)?;
+        let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
             tensor.shape.len() == 1,
             "{name}: expected 1D BF16 tensor, got shape {:?}",
             tensor.shape
         );
-        DeviceVec::from_safetensors(ctx, &tensor.bytes)
+        DeviceVec::from_safetensors(ctx, tensor.bytes())
             .with_context(|| format!("upload tensor {name}"))
     }
 
@@ -691,23 +766,23 @@ impl SafetensorLoader {
     /// flat `[qkv_dim*kernel]` [`DeviceVec`] (the conv1d kernel's channel-major
     /// ABI). The singleton middle dim is squeezed by the flat byte upload.
     pub(crate) fn load_conv1d_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
-        let tensor = self.load_tensor(name)?;
+        let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
             !tensor.shape.is_empty(),
             "{name}: expected conv1d tensor, got rank-0"
         );
-        DeviceVec::from_safetensors(ctx, &tensor.bytes)
+        DeviceVec::from_safetensors(ctx, tensor.bytes())
             .with_context(|| format!("upload conv1d {name}"))
     }
 
     pub(crate) fn load_matrix(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceMatrix> {
-        let tensor = self.load_tensor(name)?;
+        let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D BF16 tensor, got shape {:?}",
             tensor.shape
         );
-        DeviceMatrix::from_safetensors(ctx, &tensor.bytes, tensor.shape[0], tensor.shape[1])
+        DeviceMatrix::from_safetensors(ctx, tensor.bytes(), tensor.shape[0], tensor.shape[1])
             .with_context(|| format!("upload tensor {name}"))
     }
 
@@ -722,7 +797,7 @@ impl SafetensorLoader {
         tp: &infer_topo::TpConfig,
     ) -> Result<DeviceMatrix> {
         const BF16_ELEM_SIZE: usize = 2;
-        let tensor = self.load_tensor(name)?;
+        let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D BF16 tensor, got shape {:?}",
@@ -733,7 +808,7 @@ impl SafetensorLoader {
             infer_topo::ParallelLinearKind::Column => {
                 let spec = infer_topo::column_shard(rows, tp);
                 crate::shard_slice::shard_column_parallel(
-                    &tensor.bytes,
+                    tensor.bytes(),
                     rows,
                     cols,
                     BF16_ELEM_SIZE,
@@ -743,7 +818,7 @@ impl SafetensorLoader {
             infer_topo::ParallelLinearKind::Row => {
                 let spec = infer_topo::row_shard(cols, tp);
                 crate::shard_slice::shard_row_parallel(
-                    &tensor.bytes,
+                    tensor.bytes(),
                     rows,
                     cols,
                     BF16_ELEM_SIZE,
@@ -775,7 +850,7 @@ impl SafetensorLoader {
         tp: &infer_topo::TpConfig,
     ) -> Result<DeviceMatrix> {
         const BF16_ELEM_SIZE: usize = 2;
-        let tensor = self.load_tensor(name)?;
+        let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D BF16 tensor, got shape {:?}",
@@ -798,7 +873,7 @@ impl SafetensorLoader {
             total: total_rows,
         };
         let sharded = crate::shard_slice::shard_column_parallel(
-            &tensor.bytes,
+            tensor.bytes(),
             rows,
             cols,
             BF16_ELEM_SIZE,
@@ -1634,21 +1709,6 @@ impl SafetensorLoader {
         Ok(())
     }
 
-    fn load_tensor(&self, name: &str) -> Result<OwnedTensor> {
-        if let Some(&idx) = self.weight_map.get(name) {
-            return self.load_tensor_from_shard(idx, name);
-        }
-        for idx in 0..self.shards.len() {
-            if let Ok(tensor) = self.load_tensor_from_shard(idx, name) {
-                return Ok(tensor);
-            }
-        }
-        Err(anyhow!(
-            "tensor {name} not found in safetensors under {}",
-            self.base.display()
-        ))
-    }
-
     /// Whether `name` exists in the checkpoint: weight-map lookup when an
     /// index is present, otherwise each shard header is parsed (from the
     /// read-once byte cache). Used to probe which routed-expert layout a MoE
@@ -1849,7 +1909,7 @@ impl SafetensorLoader {
         spec: &ShardingSpec,
     ) -> Result<DeviceMatrix> {
         const BF16_ELEM_SIZE: usize = 2;
-        let tensor = self.load_tensor(name)?;
+        let tensor = self.borrow_bf16_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D BF16 tensor, got shape {:?}",
@@ -1857,14 +1917,14 @@ impl SafetensorLoader {
         );
         let sharded = match kind {
             infer_topo::ParallelLinearKind::Column => crate::shard_slice::shard_column_parallel(
-                &tensor.bytes,
+                tensor.bytes(),
                 tensor.shape[0],
                 tensor.shape[1],
                 BF16_ELEM_SIZE,
                 spec,
             )?,
             infer_topo::ParallelLinearKind::Row => crate::shard_slice::shard_row_parallel(
-                &tensor.bytes,
+                tensor.bytes(),
                 tensor.shape[0],
                 tensor.shape[1],
                 BF16_ELEM_SIZE,
@@ -2193,13 +2253,12 @@ impl SafetensorLoader {
         }
     }
 
-    /// Shard bytes: fill the bounded LRU on first touch, then hand out a cheap
+    /// Shard bytes: mmap into the bounded LRU on first touch, then hand out a cheap
     /// `Rc` clone (no `RefCell` guard escapes, so nested loads that fill other
     /// shards never hit a `BorrowMutError`). Loading beyond the byte budget
     /// evicts older entries; outstanding [`SharedTensor`] borrows keep their
     /// shard alive through their own `Rc`.
-    #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
-    fn shard_bytes(&self, idx: usize) -> Result<Rc<Vec<u8>>> {
+    fn shard_bytes(&self, idx: usize) -> Result<Rc<ShardBytes>> {
         let path = self
             .shards
             .get(idx)
@@ -2208,7 +2267,7 @@ impl SafetensorLoader {
             return Ok(bytes);
         }
         let t0 = Instant::now();
-        let bytes = Rc::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
+        let bytes = Rc::new(ShardBytes::map(path)?);
         let mut cache = self.shard_cache.borrow_mut();
         let evicted = cache.insert(idx, Rc::clone(&bytes));
         drop(cache);
@@ -2220,25 +2279,24 @@ impl SafetensorLoader {
             );
         }
         self.log_startup_phase(
-            "shard_read",
+            "shard_mmap",
             t0,
             format_args!("idx={idx} bytes={} path={}", bytes.len(), path.display()),
         );
         Ok(bytes)
     }
 
-    #[allow(clippy::rc_buffer)] // shares the shard cache's Rc without copying
     fn shard_tensor_metas(
         &self,
         idx: usize,
-        shard: &Rc<Vec<u8>>,
+        shard: &Rc<ShardBytes>,
     ) -> Result<Rc<BTreeMap<String, ShardTensorMeta>>> {
         if let Some(metas) = self.shard_meta_cache.borrow().get(&idx) {
             return Ok(Rc::clone(metas));
         }
         let t0 = Instant::now();
         let path = &self.shards[idx];
-        let tensors = SafeTensors::deserialize(shard)
+        let tensors = SafeTensors::deserialize(&shard[..])
             .with_context(|| format!("deserialize {}", path.display()))?;
         let base = shard.as_ptr() as usize;
         let mut metas = BTreeMap::new();
@@ -2277,16 +2335,6 @@ impl SafetensorLoader {
             ),
         );
         Ok(metas)
-    }
-
-    fn load_tensor_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
-        let tensor = self.load_raw_from_shard(idx, name)?;
-        ensure!(
-            tensor.dtype == Dtype::BF16,
-            "{name}: R6 clean CUDA path accepts BF16 only, got {:?}",
-            tensor.dtype
-        );
-        Ok(tensor)
     }
 
     /// Dtype-agnostic shard read (DSv4 FP8/FP4/E8M0). Same read-once cache as the
@@ -2370,13 +2418,12 @@ impl SafetensorLoader {
     }
 }
 
-/// A tensor whose bytes alias the loader's read-once shard cache (`Rc` share,
+/// A tensor whose bytes alias the loader's mmap shard cache (`Rc` share,
 /// zero host copies). [`Self::bytes`] yields the tensor's exact byte range.
 pub(crate) struct SharedTensor {
     pub(crate) shape: Vec<usize>,
     pub(crate) dtype: Dtype,
-    #[allow(clippy::rc_buffer)] // shares the shard cache's Rc — see shard_cache
-    shard: std::rc::Rc<Vec<u8>>,
+    shard: std::rc::Rc<ShardBytes>,
     offset: usize,
     len: usize,
 }
