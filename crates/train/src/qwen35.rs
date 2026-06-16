@@ -1333,7 +1333,7 @@ pub struct Qwen35Model {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Qwen35InitMode {
     ScratchTrain,
-    LoraOrFrozen,
+    LoraOrFrozen { materialize_frozen_base: bool },
 }
 
 impl Qwen35Model {
@@ -1518,7 +1518,25 @@ impl Qwen35Model {
             None,
             LoraTargetSet::AllLinear,
             Qwen35TensorParallelConfig::single(),
-            Qwen35InitMode::LoraOrFrozen,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: true,
+            },
+            store,
+        )
+    }
+
+    pub(crate) fn new_for_checkpoint_load(
+        cfg: &Qwen35Config,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        Self::new_internal(
+            cfg,
+            None,
+            LoraTargetSet::AllLinear,
+            Qwen35TensorParallelConfig::single(),
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: false,
+            },
             store,
         )
     }
@@ -1533,7 +1551,9 @@ impl Qwen35Model {
             lora,
             LoraTargetSet::AllLinear,
             Qwen35TensorParallelConfig::single(),
-            Qwen35InitMode::LoraOrFrozen,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: true,
+            },
             store,
         )
     }
@@ -1549,7 +1569,27 @@ impl Qwen35Model {
             Some(lora),
             target_set,
             Qwen35TensorParallelConfig::single(),
-            Qwen35InitMode::LoraOrFrozen,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: true,
+            },
+            store,
+        )
+    }
+
+    pub(crate) fn new_with_lora_targets_for_checkpoint_load(
+        cfg: &Qwen35Config,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        Self::new_internal(
+            cfg,
+            Some(lora),
+            target_set,
+            Qwen35TensorParallelConfig::single(),
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: false,
+            },
             store,
         )
     }
@@ -1567,7 +1607,9 @@ impl Qwen35Model {
             Some(lora),
             target_set,
             tp,
-            Qwen35InitMode::LoraOrFrozen,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: true,
+            },
             store,
         )
     }
@@ -1602,7 +1644,7 @@ impl Qwen35Model {
     ) -> Result<Self> {
         match mode {
             Qwen35InitMode::ScratchTrain => cfg.validate_train_scratch_contract()?,
-            Qwen35InitMode::LoraOrFrozen => cfg.validate_train_lora_or_frozen_contract()?,
+            Qwen35InitMode::LoraOrFrozen { .. } => cfg.validate_train_lora_or_frozen_contract()?,
         }
         tp.validate(cfg)?;
         let mut param_names = HashMap::new();
@@ -1617,13 +1659,20 @@ impl Qwen35Model {
                 }
             };
         let base_requires_grad = matches!(mode, Qwen35InitMode::ScratchTrain) && lora.is_none();
+        let materialize_frozen_base = match mode {
+            Qwen35InitMode::ScratchTrain => true,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base,
+            } => materialize_frozen_base,
+        };
 
         let embed_tokens_name = cfg.embed_tokens_tensor_name();
-        let embed_tokens = normal_parameter(
+        let embed_tokens = normal_or_unmaterialized_parameter(
             embed_tokens_name,
             &[cfg.vocab_size, cfg.hidden_size],
             0.02,
             base_requires_grad,
+            materialize_frozen_base,
             store,
         )?;
         register_named(&mut param_names, embed_tokens_name, embed_tokens);
@@ -1632,11 +1681,12 @@ impl Qwen35Model {
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
         } else {
-            normal_parameter(
+            normal_or_unmaterialized_parameter(
                 lm_head_name,
                 &[cfg.vocab_size, cfg.hidden_size],
                 0.02,
                 base_requires_grad,
+                materialize_frozen_base,
                 store,
             )?
         };
@@ -1649,10 +1699,11 @@ impl Qwen35Model {
             let post_attention_layernorm_name =
                 leak_name(names.common.post_attention_layernorm.clone());
 
-            let input_layernorm = ones_parameter(
+            let input_layernorm = ones_or_unmaterialized_parameter(
                 input_layernorm_name,
                 &[cfg.hidden_size],
                 base_requires_grad,
+                materialize_frozen_base,
                 store,
             )?;
             let mlp = if cfg.is_moe_layer(layer_idx) {
@@ -1671,6 +1722,7 @@ impl Qwen35Model {
                     &moe_names,
                     cfg,
                     base_requires_grad,
+                    materialize_frozen_base,
                     lora,
                     lora_target_set,
                     store,
@@ -1680,36 +1732,40 @@ impl Qwen35Model {
                 let up_proj_name = leak_name(names.common.mlp_up_proj);
                 let down_proj_name = leak_name(names.common.mlp_down_proj);
                 Qwen35Mlp::Dense(Box::new(Qwen35DenseMlp {
-                    gate_proj: LinearWithLora::new(
+                    gate_proj: linear_with_base_init(
                         gate_proj_name,
                         cfg.hidden_size,
                         tp.local_intermediate_size(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, gate_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?,
-                    up_proj: LinearWithLora::new(
+                    up_proj: linear_with_base_init(
                         up_proj_name,
                         cfg.hidden_size,
                         tp.local_intermediate_size(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, up_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?,
-                    down_proj: LinearWithLora::new(
+                    down_proj: linear_with_base_init(
                         down_proj_name,
                         tp.local_intermediate_size(cfg)?,
                         cfg.hidden_size,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, down_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?,
                 }))
             };
-            let post_attention_layernorm = ones_parameter(
+            let post_attention_layernorm = ones_or_unmaterialized_parameter(
                 post_attention_layernorm_name,
                 &[cfg.hidden_size],
                 base_requires_grad,
+                materialize_frozen_base,
                 store,
             )?;
 
@@ -1735,42 +1791,56 @@ impl Qwen35Model {
                     let q_norm_name = leak_name(attn_names.q_norm);
                     let k_norm_name = leak_name(attn_names.k_norm);
 
-                    let q_proj = LinearWithLora::new(
+                    let q_proj = linear_with_base_init(
                         q_proj_name,
                         cfg.hidden_size,
                         tp.full_attn_q_proj_dim(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, q_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let k_proj = LinearWithLora::new(
+                    let k_proj = linear_with_base_init(
                         k_proj_name,
                         cfg.hidden_size,
                         tp.full_attn_kv_dim(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, k_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let v_proj = LinearWithLora::new(
+                    let v_proj = linear_with_base_init(
                         v_proj_name,
                         cfg.hidden_size,
                         tp.full_attn_kv_dim(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, v_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let o_proj = LinearWithLora::new(
+                    let o_proj = linear_with_base_init(
                         o_proj_name,
                         tp.full_attn_q_dim(cfg)?,
                         cfg.hidden_size,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, o_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let q_norm =
-                        ones_parameter(q_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
-                    let k_norm =
-                        ones_parameter(k_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
+                    let q_norm = ones_or_unmaterialized_parameter(
+                        q_norm_name,
+                        &[cfg.head_dim],
+                        base_requires_grad,
+                        materialize_frozen_base,
+                        store,
+                    )?;
+                    let k_norm = ones_or_unmaterialized_parameter(
+                        k_norm_name,
+                        &[cfg.head_dim],
+                        base_requires_grad,
+                        materialize_frozen_base,
+                        store,
+                    )?;
 
                     register_linear(
                         &mut param_names,
@@ -1819,71 +1889,80 @@ impl Qwen35Model {
                     let norm_name = leak_name(attn_names.norm);
                     let out_proj_name = leak_name(attn_names.out_proj);
 
-                    let in_proj_qkv = LinearWithLora::new(
+                    let in_proj_qkv = linear_with_base_init(
                         in_proj_qkv_name,
                         cfg.hidden_size,
                         cfg.linear_attn_qkv_dim(),
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, in_proj_qkv_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let in_proj_z = LinearWithLora::new(
+                    let in_proj_z = linear_with_base_init(
                         in_proj_z_name,
                         cfg.hidden_size,
                         cfg.linear_attn_z_dim(),
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, in_proj_z_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let in_proj_b = LinearWithLora::new(
+                    let in_proj_b = linear_with_base_init(
                         in_proj_b_name,
                         cfg.hidden_size,
                         cfg.linear_num_value_heads,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, in_proj_b_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let in_proj_a = LinearWithLora::new(
+                    let in_proj_a = linear_with_base_init(
                         in_proj_a_name,
                         cfg.hidden_size,
                         cfg.linear_num_value_heads,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, in_proj_a_name),
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let conv1d_weight = normal_parameter(
+                    let conv1d_weight = normal_or_unmaterialized_parameter(
                         conv1d_weight_name,
                         &[cfg.linear_attn_qkv_dim(), cfg.linear_conv_kernel_dim],
                         0.02,
                         base_requires_grad,
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let dt_bias = normal_parameter(
+                    let dt_bias = normal_or_unmaterialized_parameter(
                         dt_bias_name,
                         &[cfg.linear_num_value_heads],
                         0.02,
                         base_requires_grad,
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let a_log = normal_parameter(
+                    let a_log = normal_or_unmaterialized_parameter(
                         a_log_name,
                         &[cfg.linear_num_value_heads],
                         0.02,
                         base_requires_grad,
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let norm = ones_parameter(
+                    let norm = ones_or_unmaterialized_parameter(
                         norm_name,
                         &[cfg.linear_value_head_dim],
                         base_requires_grad,
+                        materialize_frozen_base,
                         store,
                     )?;
-                    let out_proj = LinearWithLora::new(
+                    let out_proj = linear_with_base_init(
                         out_proj_name,
                         cfg.linear_attn_z_dim(),
                         cfg.hidden_size,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, out_proj_name),
+                        materialize_frozen_base,
                         store,
                     )?;
 
@@ -1945,10 +2024,11 @@ impl Qwen35Model {
         }
 
         let final_norm_name = cfg.norm_tensor_name();
-        let final_norm = ones_parameter(
+        let final_norm = ones_or_unmaterialized_parameter(
             final_norm_name,
             &[cfg.hidden_size],
             base_requires_grad,
+            materialize_frozen_base,
             store,
         )?;
         register_named(&mut param_names, final_norm_name, final_norm);
@@ -2027,7 +2107,9 @@ impl Qwen35Model {
             self.lora,
             self.lora_target_set,
             self.tp,
-            Qwen35InitMode::LoraOrFrozen,
+            Qwen35InitMode::LoraOrFrozen {
+                materialize_frozen_base: true,
+            },
             store,
         )
         .expect("clone_frozen should preserve config");
@@ -2845,10 +2927,41 @@ fn register_linear(
     }
 }
 
+fn linear_with_base_init(
+    base_name: &'static str,
+    in_features: usize,
+    out_features: usize,
+    base_requires_grad: bool,
+    lora: Option<LoraConfig>,
+    materialize_frozen_base: bool,
+    store: &mut TensorStore,
+) -> Result<LinearWithLora> {
+    if materialize_frozen_base || base_requires_grad {
+        Ok(LinearWithLora::new(
+            base_name,
+            in_features,
+            out_features,
+            base_requires_grad,
+            lora,
+            store,
+        )?)
+    } else {
+        Ok(LinearWithLora::new_with_unmaterialized_base(
+            base_name,
+            in_features,
+            out_features,
+            base_requires_grad,
+            lora,
+            store,
+        )?)
+    }
+}
+
 fn new_sparse_mlp(
     names: &Qwen35MoeTensorNames,
     cfg: &Qwen35Config,
     base_requires_grad: bool,
+    materialize_frozen_base: bool,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
     store: &mut TensorStore,
@@ -2865,72 +2978,80 @@ fn new_sparse_mlp(
         let up_proj_name = leak_name(names.expert_up_proj(expert_idx));
         let down_proj_name = leak_name(names.expert_down_proj(expert_idx));
         experts.push(Qwen35SparseExpert {
-            gate_proj: LinearWithLora::new(
+            gate_proj: linear_with_base_init(
                 gate_proj_name,
                 cfg.hidden_size,
                 cfg.moe_intermediate_size,
                 base_requires_grad,
                 lora_for_name(lora, lora_target_set, gate_proj_name),
+                materialize_frozen_base,
                 store,
             )?,
-            up_proj: LinearWithLora::new(
+            up_proj: linear_with_base_init(
                 up_proj_name,
                 cfg.hidden_size,
                 cfg.moe_intermediate_size,
                 base_requires_grad,
                 lora_for_name(lora, lora_target_set, up_proj_name),
+                materialize_frozen_base,
                 store,
             )?,
-            down_proj: LinearWithLora::new(
+            down_proj: linear_with_base_init(
                 down_proj_name,
                 cfg.moe_intermediate_size,
                 cfg.hidden_size,
                 base_requires_grad,
                 lora_for_name(lora, lora_target_set, down_proj_name),
+                materialize_frozen_base,
                 store,
             )?,
         });
     }
 
     Ok(Qwen35SparseMlp {
-        router_gate: LinearWithLora::new(
+        router_gate: linear_with_base_init(
             router_gate_name,
             cfg.hidden_size,
             cfg.num_experts,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, router_gate_name),
+            materialize_frozen_base,
             store,
         )?,
-        shared_gate_proj: LinearWithLora::new(
+        shared_gate_proj: linear_with_base_init(
             shared_gate_proj_name,
             cfg.hidden_size,
             cfg.shared_expert_intermediate_size,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_gate_proj_name),
+            materialize_frozen_base,
             store,
         )?,
-        shared_up_proj: LinearWithLora::new(
+        shared_up_proj: linear_with_base_init(
             shared_up_proj_name,
             cfg.hidden_size,
             cfg.shared_expert_intermediate_size,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_up_proj_name),
+            materialize_frozen_base,
             store,
         )?,
-        shared_down_proj: LinearWithLora::new(
+        shared_down_proj: linear_with_base_init(
             shared_down_proj_name,
             cfg.shared_expert_intermediate_size,
             cfg.hidden_size,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_down_proj_name),
+            materialize_frozen_base,
             store,
         )?,
-        shared_expert_gate: LinearWithLora::new(
+        shared_expert_gate: linear_with_base_init(
             shared_expert_gate_name,
             cfg.hidden_size,
             1,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_expert_gate_name),
+            materialize_frozen_base,
             store,
         )?,
         experts,
@@ -3716,6 +3837,22 @@ fn normal_parameter(
     Ok(store.alloc(Tensor::new(data, shape.to_vec(), requires_grad)?))
 }
 
+fn normal_or_unmaterialized_parameter(
+    name: &'static str,
+    shape: &[usize],
+    std: f32,
+    requires_grad: bool,
+    materialize_frozen_base: bool,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    if requires_grad || materialize_frozen_base {
+        normal_parameter(name, shape, std, requires_grad, store)
+    } else {
+        let _ = name;
+        Ok(store.alloc(Tensor::unmaterialized(shape.to_vec(), false)?))
+    }
+}
+
 fn ones_parameter(
     name: &'static str,
     shape: &[usize],
@@ -3728,6 +3865,21 @@ fn ones_parameter(
         shape.to_vec(),
         requires_grad,
     )?))
+}
+
+fn ones_or_unmaterialized_parameter(
+    name: &'static str,
+    shape: &[usize],
+    requires_grad: bool,
+    materialize_frozen_base: bool,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    if requires_grad || materialize_frozen_base {
+        ones_parameter(name, shape, requires_grad, store)
+    } else {
+        let _ = name;
+        Ok(store.alloc(Tensor::unmaterialized(shape.to_vec(), false)?))
+    }
 }
 
 fn seed_from_name(name: &str) -> u64 {
@@ -4065,6 +4217,55 @@ mod tests {
             ),
             "shared expert LoRA-B must be trainable"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn qwen36_checkpoint_load_constructor_keeps_frozen_base_unmaterialized() -> TestResult {
+        let mut store = TensorStore::default();
+        let cfg = tiny_qwen36_moe_config(8);
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let model = Qwen35Model::new_with_lora_targets_for_checkpoint_load(
+            &cfg,
+            lora,
+            LoraTargetSet::AllLinear,
+            &mut store,
+        )?;
+        let params = model.param_name_map();
+        let adapters = model.adapter_name_map();
+        let base_name = "model.language_model.layers.0.mlp.experts.0.up_proj.weight";
+        let adapter_name = "model.language_model.layers.0.mlp.experts.0.up_proj.weight.lora_b";
+        let base = *params
+            .get(base_name)
+            .ok_or_else(|| format!("missing base tensor {base_name}"))?;
+        let adapter = *adapters
+            .get(adapter_name)
+            .ok_or_else(|| format!("missing adapter tensor {adapter_name}"))?;
+
+        let base_tensor = store
+            .get(base)
+            .ok_or_else(|| format!("missing tensor {base}"))?;
+        assert_eq!(
+            base_tensor.shape,
+            vec![cfg.moe_intermediate_size, cfg.hidden_size]
+        );
+        assert_eq!(base_tensor.dirty, autograd::tensor::Dirty::Device);
+        assert!(base_tensor.data.is_empty());
+        assert!(base_tensor.device_handle.is_none());
+        assert!(!base_tensor.requires_grad);
+
+        let adapter_tensor = store
+            .get(adapter)
+            .ok_or_else(|| format!("missing tensor {adapter}"))?;
+        assert!(adapter_tensor.requires_grad);
+        assert_eq!(
+            adapter_tensor.data.len(),
+            cfg.moe_intermediate_size * lora.rank
+        );
+        assert_eq!(adapter_tensor.dirty, autograd::tensor::Dirty::Host);
         Ok(())
     }
 
