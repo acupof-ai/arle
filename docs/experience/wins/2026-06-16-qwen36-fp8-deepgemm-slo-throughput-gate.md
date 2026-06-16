@@ -77,6 +77,11 @@ Keep the memory/slot result: FP8 fits about 2.1x the long-shape slots in the
 same VRAM budget. The raw-throughput result remains an unrooted implementation
 bug until a stage breakdown proves otherwise.
 
+Follow-up: `2026-06-16-qwen36-fp8-dense-deepgemm-cold-jit-fix.md` root-caused
+and fixed the 12x cold-JIT part of this regression. The first 4K FP8 request
+dropped to about 2.73s, but still does not beat the BF16 1.97s smoke, so the
+throughput gate remains not passed.
+
 ## Artifacts
 
 - FP8 JSON:
