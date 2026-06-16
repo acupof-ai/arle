@@ -57,3 +57,34 @@ None yet — needs a dedicated layer-probe session.
   into the FIRST real-model session, not after feature work stacks on top.
 - When TP=N output is garbage, run TP=1 with the same binary+checkpoint before
   touching shard math — one control kills (or convicts) the entire axis.
+
+## Update 2026-06-17 — hypothesis narrowing (code-level, pre-probe)
+
+Driven as the F2 gate for the OPD 9B+teacher work (the 35B-A3B-as-OPD-teacher
+needs a *coherent* forward). Narrowed from the 3 open hypotheses; the prime
+suspect is now the **gated-delta / linear-attention layer forward on CUDA**.
+
+CLEARED as suspects (evidence):
+- **gate_up split order** (hyp 1): CUDA splits the stacked expert as
+  `gate = rows[0, mi)`, `up = rows[mi, 2mi)` (`loader.rs:1094-1124`) — gate-first,
+  the HF-standard layout. Not the bug.
+- **Config nesting / rope parameterization** (hyp 2a): the real config nests rope
+  under `text_config.rope_parameters` (`rope_theta=1e7`, `partial_rotary_factor=0.25`,
+  `mrope_interleaved`, `mrope_section=[11,11,10]`). qwen35-spec parses it
+  correctly: `lib.rs:838 rope_theta = rope_parameters.rope_theta` (=1e7),
+  `rotary_dim = head_dim(256) * 0.25 = 64` (`lib.rs:757`). The hardcoded
+  `1_000_000.0` at `qwen35.rs:4273` is a test fixture, not the load path. mRoPE
+  sections reduce to standard 1D RoPE for text-only positions. Not the bug.
+
+PRIME SUSPECT (hyp 2b — the gated-delta semantics the doc flagged):
+- `text_config.layer_types` = **30× `linear_attention` + 10× `full_attention`**
+  (`full_attention_interval=4`); **layer 0 is `linear_attention`**. Both CUDA
+  (`qwen35.rs`, 38 gated-delta refs) and Metal (`infer-metal/src/qwen35.rs`)
+  implement it, but CUDA is garbage and Metal is coherent → a **subtle CUDA
+  gated-delta divergence** (A_log/dt semantics, the conv1d, the delta-rule
+  recurrence, or `attn_output_gate=True` on the full-attn layers).
+
+DECISIVE NEXT (measurement, not more grep): a **layer-0 activation probe,
+CUDA vs Metal**, same prompt + weights — layer 0 is `linear_attention`, so it
+tests the gated-delta path immediately and localizes the first divergent op in
+one run. This is the dedicated probe session the original Fix line called for.
