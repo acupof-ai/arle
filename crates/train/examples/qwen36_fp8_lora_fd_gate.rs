@@ -1,0 +1,589 @@
+#![cfg_attr(
+    not(all(feature = "cuda", not(feature = "no-cuda"))),
+    allow(dead_code, unused_imports)
+)]
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+mod app {
+    use std::{
+        collections::HashSet,
+        env,
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use anyhow::{Context, Result, bail};
+    use autograd::{
+        Backend, Tape, Tensor, TensorId, TensorStore,
+        backend_cuda::CudaBackend,
+        ops::{mul, sum},
+    };
+    use train::{
+        LoraConfig, LoraTargetSet, qwen35::Qwen35Model, qwen35_loader::load_qwen35_lora_from_hf_dir,
+    };
+
+    const DEFAULT_MODEL_DIR: &str = "/data01/models/Qwen3.6-35B-A3B-FP8";
+    const DEFAULT_TARGET_ADAPTER: &str =
+        "model.language_model.layers.0.mlp.shared_expert.up_proj.weight.lora_b";
+
+    #[derive(Debug)]
+    struct Args {
+        model: PathBuf,
+        device: usize,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        target_adapter: String,
+        eps: f32,
+        tokens: Vec<u32>,
+        mode: GateMode,
+        layer: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GateMode {
+        MlpLayer,
+        FullModel,
+    }
+
+    struct GateInput {
+        hidden: Option<TensorId>,
+        probe: TensorId,
+    }
+
+    pub fn main() -> Result<()> {
+        let args = parse_args()?;
+        if args.target_set != LoraTargetSet::AllLinear {
+            bail!(
+                "finite-diff gate requires --target-set all-linear so the default Qwen3.6 adapter exists"
+            );
+        }
+        println!(
+            "qwen36_fp8_lora_fd_gate_start model={} device={} rank={} alpha={:.6} \
+             target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={}",
+            args.model.display(),
+            args.device,
+            args.lora.rank,
+            args.lora.alpha,
+            args.target_set.label(),
+            args.target_adapter,
+            args.eps,
+            args.tokens,
+            args.mode.label(),
+            args.layer
+        );
+
+        let backend = Arc::new(
+            CudaBackend::new(args.device)
+                .with_context(|| format!("init CUDA backend device {}", args.device))?,
+        );
+        let mut store = TensorStore::with_backend(backend.clone());
+        let load_started = Instant::now();
+        let student =
+            load_qwen35_lora_from_hf_dir(&args.model, args.lora, args.target_set, &mut store)
+                .with_context(|| format!("load LoRA student from {}", args.model.display()))?;
+        backend
+            .device_synchronize()
+            .context("synchronize after student load")?;
+        let load_elapsed = load_started.elapsed();
+
+        let positions = (0..args.tokens.len() as u32).collect::<Vec<_>>();
+        let keep_before_probe = student
+            .all_parameter_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        let gate_input = make_gate_input(&student, &mut store, &args, &positions)?;
+        let mut keep = keep_before_probe;
+        if let Some(hidden) = gate_input.hidden {
+            keep.insert(hidden);
+        }
+        keep.insert(gate_input.probe);
+        store.retain_ids(&keep);
+
+        let analytic_started = Instant::now();
+        let mut tape = Tape::new();
+        let loss = weighted_logits_loss(
+            &student,
+            &mut store,
+            &mut tape,
+            args.mode,
+            args.layer,
+            &args.tokens,
+            &positions,
+            gate_input.hidden,
+            gate_input.probe,
+        )?;
+        let loss_base = scalar_host(&mut store, loss)?;
+        let grads = tape.backward(loss, &mut store)?;
+        backend
+            .device_synchronize()
+            .context("synchronize after analytic backward")?;
+        let analytic_elapsed = analytic_started.elapsed();
+
+        let selected = select_target_probe(&student, &grads, &mut store, &args)?;
+        store.retain_ids(&keep);
+
+        let original = tensor_value(&mut store, selected.target, selected.index)?;
+        let plus_started = Instant::now();
+        set_tensor_value(
+            &mut store,
+            selected.target,
+            selected.index,
+            original + args.eps,
+        )?;
+        let loss_plus = loss_value(&student, &mut store, &args, &positions, &gate_input)?;
+        backend
+            .device_synchronize()
+            .context("synchronize after plus finite diff")?;
+        let plus_elapsed = plus_started.elapsed();
+        store.retain_ids(&keep);
+
+        let minus_started = Instant::now();
+        set_tensor_value(
+            &mut store,
+            selected.target,
+            selected.index,
+            original - args.eps,
+        )?;
+        let loss_minus = loss_value(&student, &mut store, &args, &positions, &gate_input)?;
+        backend
+            .device_synchronize()
+            .context("synchronize after minus finite diff")?;
+        let minus_elapsed = minus_started.elapsed();
+        set_tensor_value(&mut store, selected.target, selected.index, original)?;
+        store.retain_ids(&keep);
+
+        let numeric = (loss_plus - loss_minus) / (2.0 * args.eps);
+        let rel_err = rel_err(selected.analytic, numeric);
+        let live_host_mib = store.live_host_bytes() as f64 / (1024.0 * 1024.0);
+        println!(
+            "qwen36_fp8_lora_fd_gate_result load_seconds={:.6} analytic_seconds={:.6} \
+             plus_seconds={:.6} minus_seconds={:.6} live_host_mib={live_host_mib:.1} \
+             mode={} layer={} target={} index={} eps={:.1e} loss_base={:.9e} loss_minus={:.9e} \
+             loss_plus={:.9e} analytic={:.9e} numeric={:.9e} rel_err={:.3e}",
+            secs(load_elapsed),
+            secs(analytic_elapsed),
+            secs(plus_elapsed),
+            secs(minus_elapsed),
+            args.mode.label(),
+            args.layer,
+            selected.name,
+            selected.index,
+            args.eps,
+            loss_base,
+            loss_minus,
+            loss_plus,
+            selected.analytic,
+            numeric,
+            rel_err
+        );
+        if rel_err > 1.0e-2 {
+            bail!(
+                "Qwen3.6 FP8 LoRA finite diff failed: target={} analytic={:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e}",
+                selected.name,
+                selected.analytic
+            );
+        }
+        println!("qwen36_fp8_lora_fd_gate PASS");
+        Ok(())
+    }
+
+    fn parse_args() -> Result<Args> {
+        let mut model = env::var_os("ARLE_QWEN36_FP8_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
+        let mut device = env::var("ARLE_CUDA_TEST_DEVICE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut rank = 8usize;
+        let mut alpha = 16.0f32;
+        let mut target_set = LoraTargetSet::AllLinear;
+        let mut target_adapter = DEFAULT_TARGET_ADAPTER.to_string();
+        let mut eps = 1.0e-3_f32;
+        let mut tokens = vec![1_u32, 3, 8];
+        let mut mode = GateMode::MlpLayer;
+        let mut layer = 0usize;
+
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--model" => model = PathBuf::from(next_arg("--model", &mut args)?),
+                "--device" => {
+                    device = next_arg("--device", &mut args)?
+                        .parse()
+                        .context("parse --device")?;
+                }
+                "--rank" => {
+                    rank = next_arg("--rank", &mut args)?
+                        .parse()
+                        .context("parse --rank")?;
+                }
+                "--alpha" => {
+                    alpha = next_arg("--alpha", &mut args)?
+                        .parse()
+                        .context("parse --alpha")?;
+                }
+                "--target-set" => {
+                    target_set = parse_target_set(&next_arg("--target-set", &mut args)?)?
+                }
+                "--target-adapter" => target_adapter = next_arg("--target-adapter", &mut args)?,
+                "--eps" => {
+                    eps = next_arg("--eps", &mut args)?
+                        .parse()
+                        .context("parse --eps")?;
+                }
+                "--tokens" => tokens = parse_tokens(&next_arg("--tokens", &mut args)?)?,
+                "--mode" => mode = parse_mode(&next_arg("--mode", &mut args)?)?,
+                "--layer" => {
+                    layer = next_arg("--layer", &mut args)?
+                        .parse()
+                        .context("parse --layer")?;
+                }
+                "-h" | "--help" => {
+                    println!(
+                        "usage: cargo run -p train --example qwen36_fp8_lora_fd_gate \
+                         --release --features cuda -- [--model DIR] [--device N] \
+                         [--rank N] [--alpha F] [--target-set all-linear] \
+                         [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
+                         [--mode mlp-layer|full-model] [--layer N]"
+                    );
+                    std::process::exit(0);
+                }
+                other => bail!("unknown argument {other:?}"),
+            }
+        }
+        if rank == 0 || !alpha.is_finite() || alpha <= 0.0 {
+            bail!("rank must be >0 and alpha must be positive finite");
+        }
+        if !eps.is_finite() || eps <= 0.0 {
+            bail!("--eps must be positive finite");
+        }
+        if tokens.is_empty() {
+            bail!("--tokens must contain at least one token id");
+        }
+        Ok(Args {
+            model,
+            device,
+            lora: LoraConfig { rank, alpha },
+            target_set,
+            target_adapter,
+            eps,
+            tokens,
+            mode,
+            layer,
+        })
+    }
+
+    fn next_arg(flag: &'static str, args: &mut impl Iterator<Item = String>) -> Result<String> {
+        args.next()
+            .with_context(|| format!("{flag} requires a value"))
+    }
+
+    fn parse_target_set(raw: &str) -> Result<LoraTargetSet> {
+        match raw {
+            "all-linear" | "all_linear" | "all" => Ok(LoraTargetSet::AllLinear),
+            "attention-qv" | "attention_qv" | "qv" => Ok(LoraTargetSet::AttentionQv),
+            other => bail!("unknown target set {other:?}"),
+        }
+    }
+
+    fn parse_tokens(raw: &str) -> Result<Vec<u32>> {
+        raw.split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    bail!("empty token in --tokens {raw:?}");
+                }
+                trimmed
+                    .parse::<u32>()
+                    .with_context(|| format!("parse token {trimmed:?}"))
+            })
+            .collect()
+    }
+
+    fn parse_mode(raw: &str) -> Result<GateMode> {
+        match raw {
+            "mlp-layer" | "mlp" => Ok(GateMode::MlpLayer),
+            "full-model" | "full" => Ok(GateMode::FullModel),
+            other => bail!("unknown mode {other:?}"),
+        }
+    }
+
+    impl GateMode {
+        fn label(self) -> &'static str {
+            match self {
+                Self::MlpLayer => "mlp-layer",
+                Self::FullModel => "full-model",
+            }
+        }
+    }
+
+    struct SelectedProbe {
+        name: String,
+        target: TensorId,
+        index: usize,
+        analytic: f32,
+    }
+
+    fn select_target_probe(
+        model: &Qwen35Model,
+        grads: &std::collections::HashMap<TensorId, TensorId>,
+        store: &mut TensorStore,
+        args: &Args,
+    ) -> Result<SelectedProbe> {
+        if args.target_adapter == "auto:routed-up" {
+            return select_auto_routed_up_probe(model, grads, store, args.layer);
+        }
+        let target = *model
+            .adapter_name_map()
+            .get(args.target_adapter.as_str())
+            .with_context(|| format!("adapter {} not found", args.target_adapter))?;
+        let grad_id = *grads
+            .get(&target)
+            .with_context(|| format!("missing gradient for {}", args.target_adapter))?;
+        let grad = store.to_host(grad_id)?;
+        let index = largest_nonzero_index(&grad).with_context(|| {
+            format!(
+                "gradient for {} has no non-zero element",
+                args.target_adapter
+            )
+        })?;
+        Ok(SelectedProbe {
+            name: args.target_adapter.clone(),
+            target,
+            index,
+            analytic: grad[index],
+        })
+    }
+
+    fn select_auto_routed_up_probe(
+        model: &Qwen35Model,
+        grads: &std::collections::HashMap<TensorId, TensorId>,
+        store: &mut TensorStore,
+        layer: usize,
+    ) -> Result<SelectedProbe> {
+        let prefix = format!("model.language_model.layers.{layer}.mlp.experts.");
+        let mut candidates = model
+            .adapter_name_map()
+            .into_iter()
+            .filter(|(name, _)| {
+                name.starts_with(&prefix) && name.ends_with(".up_proj.weight.lora_b")
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(name, _)| *name);
+
+        let mut best: Option<SelectedProbe> = None;
+        for (name, target) in candidates {
+            let Some(&grad_id) = grads.get(&target) else {
+                continue;
+            };
+            let grad = store.to_host(grad_id)?;
+            let Some(index) = largest_nonzero_index(&grad) else {
+                continue;
+            };
+            let analytic = grad[index];
+            let replace = best
+                .as_ref()
+                .is_none_or(|current| analytic.abs() > current.analytic.abs());
+            if replace {
+                best = Some(SelectedProbe {
+                    name: name.to_string(),
+                    target,
+                    index,
+                    analytic,
+                });
+            }
+        }
+        best.with_context(|| {
+            format!("auto:routed-up found no non-zero routed expert up_proj LoRA-B gradient in layer {layer}")
+        })
+    }
+
+    fn make_gate_input(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        args: &Args,
+        positions: &[u32],
+    ) -> Result<GateInput> {
+        let hidden = match args.mode {
+            GateMode::MlpLayer => Some(store.alloc(Tensor::new(
+                deterministic_vec(
+                    args.tokens.len() * model.config().hidden_size,
+                    0x4781_9f20_aa11_0017,
+                    0.02,
+                ),
+                vec![1, args.tokens.len(), model.config().hidden_size],
+                false,
+            )?)),
+            GateMode::FullModel => None,
+        };
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let output = forward_gate_output(
+            model,
+            store,
+            &mut tape,
+            args.mode,
+            args.layer,
+            &args.tokens,
+            positions,
+            hidden,
+        )?;
+        let shape = store
+            .get(output)
+            .context("gate output tensor missing")?
+            .shape
+            .clone();
+        let size = store
+            .get(output)
+            .context("gate output tensor missing")?
+            .size;
+        let probe = deterministic_vec(size, 0x8d12_ba11_cafe_f00d, 0.01);
+        let probe = store.alloc(Tensor::new(probe, shape, false)?);
+        store.free(output).ok();
+        Ok(GateInput { hidden, probe })
+    }
+
+    fn forward_gate_output(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        mode: GateMode,
+        layer: usize,
+        tokens: &[u32],
+        positions: &[u32],
+        hidden: Option<TensorId>,
+    ) -> Result<TensorId> {
+        match mode {
+            GateMode::MlpLayer => {
+                let hidden = hidden.context("mlp-layer mode missing hidden input")?;
+                Ok(model.forward_mlp_for_diagnostics(
+                    layer,
+                    hidden,
+                    1,
+                    tokens.len(),
+                    store,
+                    tape,
+                )?)
+            }
+            GateMode::FullModel => Ok(model.forward(store, tape, tokens, positions)?),
+        }
+    }
+
+    fn weighted_logits_loss(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        mode: GateMode,
+        layer: usize,
+        tokens: &[u32],
+        positions: &[u32],
+        hidden: Option<TensorId>,
+        probe: TensorId,
+    ) -> Result<TensorId> {
+        let output =
+            forward_gate_output(model, store, tape, mode, layer, tokens, positions, hidden)?;
+        let weighted = mul(output, probe, store, tape)?;
+        Ok(sum(weighted, store, tape)?)
+    }
+
+    fn loss_value(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        args: &Args,
+        positions: &[u32],
+        input: &GateInput,
+    ) -> Result<f32> {
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let loss = weighted_logits_loss(
+            model,
+            store,
+            &mut tape,
+            args.mode,
+            args.layer,
+            &args.tokens,
+            positions,
+            input.hidden,
+            input.probe,
+        )?;
+        scalar_host(store, loss)
+    }
+
+    fn scalar_host(store: &mut TensorStore, id: TensorId) -> Result<f32> {
+        let values = store.to_host(id)?;
+        values
+            .first()
+            .copied()
+            .with_context(|| format!("tensor {id} is empty"))
+    }
+
+    fn largest_nonzero_index(values: &[f32]) -> Option<usize> {
+        values
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.abs() > 1.0e-9)
+            .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+            .map(|(idx, _)| idx)
+    }
+
+    fn tensor_value(store: &mut TensorStore, id: TensorId, index: usize) -> Result<f32> {
+        store
+            .to_host(id)?
+            .get(index)
+            .copied()
+            .with_context(|| format!("tensor {id} missing index {index}"))
+    }
+
+    fn set_tensor_value(
+        store: &mut TensorStore,
+        id: TensorId,
+        index: usize,
+        value: f32,
+    ) -> Result<()> {
+        let tensor = store
+            .get_mut(id)
+            .with_context(|| format!("missing tensor {id}"))?;
+        let slot = tensor
+            .data
+            .get_mut(index)
+            .with_context(|| format!("tensor {id} missing index {index}"))?;
+        *slot = value;
+        Ok(())
+    }
+
+    fn rel_err(analytic: f32, numeric: f32) -> f64 {
+        let analytic = f64::from(analytic);
+        let numeric = f64::from(numeric);
+        (analytic - numeric).abs() / analytic.abs().max(numeric.abs()).max(1.0e-12)
+    }
+
+    fn secs(duration: Duration) -> f64 {
+        duration.as_secs_f64()
+    }
+
+    fn deterministic_vec(len: usize, mut state: u64, scale: f32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let bits = ((state >> 32) as u32) as f32 / u32::MAX as f32;
+                (bits * 2.0 - 1.0) * scale
+            })
+            .collect()
+    }
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn main() -> anyhow::Result<()> {
+    app::main()
+}
+
+#[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
+fn main() {
+    eprintln!(
+        "qwen36_fp8_lora_fd_gate requires a real CUDA build: \
+         cargo run -p train --example qwen36_fp8_lora_fd_gate --release --features cuda"
+    );
+}

@@ -2684,6 +2684,25 @@ impl Qwen35Model {
         )
     }
 
+    #[doc(hidden)]
+    pub fn forward_mlp_for_diagnostics(
+        &self,
+        layer_idx: usize,
+        hidden: TensorId,
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let layer = self
+            .layers
+            .get(layer_idx)
+            .ok_or(Qwen35Error::InvalidConfig(
+                "diagnostic MLP layer index out of range",
+            ))?;
+        layer.forward_mlp(hidden, &self.config, self.tp, batch, seq_len, store, tape)
+    }
+
     pub fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
         self.param_names.clone()
     }
