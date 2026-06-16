@@ -380,6 +380,7 @@ impl Dsv4KvAdapter {
                     config,
                     first_cr,
                     max_seq_len,
+                    num_slots,
                 )?)
             }
             _ => None,
@@ -1647,6 +1648,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
+    /// Mutable handle to the `[max_batch, csa_topk]` CSA per-row top-k buffer the
+    /// batched index build reads (`selected + row * csa_topk`). The batched CSA
+    /// select (`csa_select_official_batched`, #60) writes the N rows here directly,
+    /// replacing the per-row `gather_selected_row` copies. The buffer's row stride
+    /// (`csa_topk`) equals `config.index_topk`, so the batched select's
+    /// `out_selected` row stride matches.
+    pub(crate) fn selected_batched_mut(&mut self) -> &mut CudaSlice<i32> {
+        &mut self.selected_batched
+    }
+
     /// Phase A convenience: build a layer's complete per-forward batched
     /// metadata — `upload_row_meta(n)` → `build_indices_batched(b=N)` →
     /// `sched_meta_for_batch(b=N)` — using the layer's STORED decode shape
@@ -2411,6 +2422,29 @@ pub(crate) struct Dsv4DsaSharedScratch {
     sched_meta: CudaSlice<i32>,
     logits: CudaSlice<f32>,
     raw_indices: CudaSlice<i32>,
+    // ── N-row BATCHED-DECODE scratch (#60). DISJOINT from the single-forward
+    // query-tile buffers above: the batched decode select (`csa_select_official_batched`)
+    // batches the READ side (logits + topk) of N decode rows into ONE
+    // `batch_size=N` DeepGEMM paged-MQA call, instead of N `batch_size=1` calls.
+    // Sized by `decode_max_batch == num_slots` (one decode row per slot). All are
+    // overwritten-before-read each forward and stream-ordered; never aliased with
+    // the single-row / prefill `q_fp8`/`weights`/`logits`/etc. buffers, so the
+    // single-row path is byte-identical.
+    decode_max_batch: usize,
+    q_fp8_batch: CudaSlice<u8>,
+    weights_batch: CudaSlice<f32>,
+    context_lens_batch: CudaSlice<i32>,
+    positions_batch: CudaSlice<i32>,
+    logits_batch: CudaSlice<f32>,
+    raw_indices_batch: CudaSlice<i32>,
+    block_table_batch: CudaSlice<i32>,
+    // N-row identity page-table for the batched topk. The topk launch validator
+    // (dsv4_dsa_official.cu:621) rejects `page_table_stride <= 0`, so stride=0 is
+    // illegal; we replicate the identity `[0..num_pages)` block `num_slots` times
+    // and pass stride=num_pages. Each row then reads identity `[0..num_pages)` —
+    // `page_to_slot(identity,i)=i` — byte-equivalent to the single-row path's
+    // slot-relative mapping (which reads `page_table_identity[0..num_pages)` at bid=0).
+    page_table_identity_batch: CudaSlice<i32>,
     max_tokens: usize,
     query_tile: usize,
     query_chunk: usize,
@@ -2428,6 +2462,7 @@ impl Dsv4DsaSharedScratch {
         config: &DeepSeekV4Config,
         compress_ratio: usize,
         max_seq_len: usize,
+        num_slots: usize,
     ) -> Result<Self> {
         ensure!(
             config.index_head_dim == 128,
@@ -2481,6 +2516,27 @@ impl Dsv4DsaSharedScratch {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(78);
+        // ── N-row batched-decode scratch sizing (#60). `decode_max_batch` is one
+        // decode row per slot. All buffers are overwritten-before-read each forward.
+        let decode_max_batch = num_slots.max(1);
+        let q_fp8_batch_elems = decode_max_batch
+            .checked_mul(config.index_n_heads)
+            .and_then(|v| v.checked_mul(config.index_head_dim))
+            .ok_or_else(|| anyhow!("DSv4 official DSA batched q scratch size overflow"))?;
+        let logits_batch_elems = decode_max_batch
+            .checked_mul(logits_stride)
+            .ok_or_else(|| anyhow!("DSv4 official DSA batched logits scratch size overflow"))?;
+        let block_table_batch_elems = decode_max_batch
+            .checked_mul(num_pages)
+            .ok_or_else(|| anyhow!("DSv4 official DSA batched block table size overflow"))?;
+        // N-row identity page-table: the `[0..num_pages)` identity block replicated
+        // `decode_max_batch` times (stride=num_pages), so every row's topk reads
+        // the same identity block (stride>0 required by the launch validator).
+        let mut page_table_batch_h = Vec::with_capacity(block_table_batch_elems);
+        for _ in 0..decode_max_batch {
+            page_table_batch_h
+                .extend((0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")));
+        }
         Ok(Self {
             cache_locs: ctx
                 .stream
@@ -2522,6 +2578,38 @@ impl Dsv4DsaSharedScratch {
                 .stream
                 .alloc_zeros::<i32>(query_chunk * config.index_topk)
                 .map_err(|e| anyhow!("DSv4 official DSA raw indices alloc failed: {e}"))?,
+            decode_max_batch,
+            q_fp8_batch: ctx
+                .stream
+                .alloc_zeros::<u8>(q_fp8_batch_elems)
+                .map_err(|e| anyhow!("DSv4 official DSA batched q fp8 alloc failed: {e}"))?,
+            weights_batch: ctx
+                .stream
+                .alloc_zeros::<f32>(decode_max_batch * config.index_n_heads)
+                .map_err(|e| anyhow!("DSv4 official DSA batched weights alloc failed: {e}"))?,
+            context_lens_batch: ctx
+                .stream
+                .alloc_zeros::<i32>(decode_max_batch)
+                .map_err(|e| anyhow!("DSv4 official DSA batched context lens alloc failed: {e}"))?,
+            positions_batch: ctx
+                .stream
+                .alloc_zeros::<i32>(decode_max_batch)
+                .map_err(|e| anyhow!("DSv4 official DSA batched positions alloc failed: {e}"))?,
+            logits_batch: ctx
+                .stream
+                .alloc_zeros::<f32>(logits_batch_elems)
+                .map_err(|e| anyhow!("DSv4 official DSA batched logits alloc failed: {e}"))?,
+            raw_indices_batch: ctx
+                .stream
+                .alloc_zeros::<i32>(decode_max_batch * config.index_topk)
+                .map_err(|e| anyhow!("DSv4 official DSA batched raw indices alloc failed: {e}"))?,
+            block_table_batch: ctx
+                .stream
+                .alloc_zeros::<i32>(block_table_batch_elems)
+                .map_err(|e| anyhow!("DSv4 official DSA batched block table alloc failed: {e}"))?,
+            page_table_identity_batch: ctx.stream.clone_htod(&page_table_batch_h).map_err(|e| {
+                anyhow!("DSv4 official DSA batched page table identity upload failed: {e}")
+            })?,
             max_tokens,
             query_tile,
             query_chunk,
@@ -2535,9 +2623,11 @@ impl Dsv4DsaSharedScratch {
     }
 
     /// Exact requested device bytes owned by this ONE model-wide shared DSA
-    /// selector scratch: Σ over its 10 `CudaSlice` fields. (The standalone
-    /// [`dsv4_dsa_shared_scratch_bytes`] predicts the same total from config
-    /// dims for the KV budget; this sums the live slices for the ledger.)
+    /// selector scratch: Σ over its `CudaSlice` fields (single-forward query-tile
+    /// buffers + the N-row batched-decode buffers). (The standalone
+    /// [`dsv4_dsa_shared_scratch_bytes`] predicts the batch-INDEPENDENT part for
+    /// the KV budget; the batched part is folded into the per-slot budget term
+    /// since it scales with `num_slots`.)
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let i32_sz = std::mem::size_of::<i32>();
@@ -2553,6 +2643,14 @@ impl Dsv4DsaSharedScratch {
             + self.sched_meta.len() * i32_sz
             + self.logits.len() * f32_sz
             + self.raw_indices.len() * i32_sz
+            + self.q_fp8_batch.len() // u8
+            + self.weights_batch.len() * f32_sz
+            + self.context_lens_batch.len() * i32_sz
+            + self.positions_batch.len() * i32_sz
+            + self.logits_batch.len() * f32_sz
+            + self.raw_indices_batch.len() * i32_sz
+            + self.block_table_batch.len() * i32_sz
+            + self.page_table_identity_batch.len() * i32_sz
     }
 }
 
@@ -2595,6 +2693,43 @@ pub(crate) fn dsv4_dsa_shared_scratch_bytes(
         .saturating_add(page_table)
         .saturating_add(freqs_cis)
         .saturating_add(raw_indices)
+}
+
+/// Per-SLOT device bytes of the N-row batched-decode scratch inside the ONE
+/// [`Dsv4DsaSharedScratch`] (the buffers sized by `decode_max_batch == num_slots`).
+/// MUST mirror [`Dsv4DsaSharedScratch::new`]'s `*_batch` allocations. This is a
+/// per-slot term (NOT a fixed subtraction): `decode_max_batch == num_slots`, so
+/// the total batched-scratch cost is `num_slots * (this)`. It is fed into
+/// `kv_budget_num_slots`'s per-slot budget rather than `dsv4_dsa_shared_scratch_bytes`
+/// — putting it in the fixed subtraction would be CIRCULAR (the budget computes
+/// `num_slots` FROM that subtraction).
+pub(crate) fn dsv4_dsa_batched_scratch_bytes_per_slot(
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    max_seq_len: usize,
+) -> usize {
+    let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
+    let num_pages = cc.div_ceil(64).max(1);
+    let logits_stride = cc.div_ceil(256) * 256;
+    // q_fp8_batch (u8) + weights_batch (f32) + context_lens_batch (i32) +
+    // positions_batch (i32) + logits_batch (f32) + raw_indices_batch (i32) +
+    // block_table_batch (i32) + page_table_identity_batch (i32), all per ONE row.
+    let q_fp8 = config.index_n_heads.saturating_mul(config.index_head_dim);
+    let weights = config.index_n_heads.saturating_mul(4);
+    let context_lens = 4usize;
+    let positions = 4usize;
+    let logits = logits_stride.saturating_mul(4);
+    let raw_indices = config.index_topk.saturating_mul(4);
+    let block_table = num_pages.saturating_mul(4);
+    let page_table_identity = num_pages.saturating_mul(4);
+    q_fp8
+        .saturating_add(weights)
+        .saturating_add(context_lens)
+        .saturating_add(positions)
+        .saturating_add(logits)
+        .saturating_add(raw_indices)
+        .saturating_add(block_table)
+        .saturating_add(page_table_identity)
 }
 
 /// Device bytes of ONE per-(slot, CSA-layer) [`Dsv4DsaOfficialState`] — the
@@ -7425,6 +7560,8 @@ pub(crate) fn mla_attention_prepare(
                 start_pos_device,
                 compress_ratio,
                 prefill_shared,
+                // Prefill / single-row path: no batched gather (byte-identical).
+                None,
                 keepalive,
             )?)
         } else {
@@ -7728,6 +7865,12 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    // Batched-decode lane (#60): when `Some`, the CSA per-row READ/SELECT is
+    // skipped (cache writes still run), this row's q_i/weights are gathered into
+    // the N-row staging and key_count captured, and the returned `selected` is
+    // `None` (the batched select fills selected_batched). `None` → byte-identical
+    // single-row CSA prepare.
+    batched_gather: Option<Dsv4DsaBatchedGather<'_>>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
     let head_dim = config.head_dim;
@@ -7847,7 +7990,12 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 .expect("indexer state checked above")
                 .compressed;
             let official = state.dsa_official.as_mut();
-            Some(csa_select(
+            // In the batched-decode lane (`batched_gather` Some) `csa_select`
+            // does cache writes + gather and returns an empty buffer → `selected`
+            // is `None` here (the batched select fills `selected_batched`). The
+            // single-row path keeps the real per-row `selected`.
+            let is_batched = batched_gather.is_some();
+            let sel = csa_select(
                 ctx,
                 config,
                 layer_idx,
@@ -7867,8 +8015,10 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 // never taken (gated on c_q_normed.seq_len>1), so the shared
                 // prefill scratch is not needed.
                 None,
+                batched_gather,
                 keepalive,
-            )?)
+            )?;
+            if is_batched { None } else { Some(sel) }
         } else {
             None
         }
@@ -8580,9 +8730,35 @@ fn compressor_forward(
     Ok(())
 }
 
+/// Batched-decode gather sink threaded into [`csa_select`] / [`mla_attention_prepare_compressed_only`]
+/// for row `r` of the N-row batched-decode lane (#60). When present, `csa_select`
+/// does the per-row CACHE WRITES only (skips the per-row read/select), gathers
+/// this row's bf16 indexer query (`q_i`) and gating weights into the N-row staging
+/// buffers at row offset `r`, and captures this row's exact `key_count` — so the
+/// ONE batched `csa_select_official_batched` after the prepare loop produces
+/// byte-equivalent context_lens. `selected` is then `None` (the batched select
+/// writes directly into `selected_batched`).
+pub(crate) struct Dsv4DsaBatchedGather<'a> {
+    /// N-row staging for indexer query, shape `[local_index_heads*index_head_dim, n]`.
+    pub(crate) q_i_batch: &'a mut HiddenStates,
+    /// N-row staging for gating weights, shape `[local_index_heads, n]`.
+    pub(crate) weights_batch: &'a mut HiddenStates,
+    /// Row index in `[0, n)` to gather into.
+    pub(crate) row: usize,
+    /// Per-row captured `key_count` (push exactly one per call), for the batched
+    /// context_lens (`min(key_count_r, abs_pos_r/ratio)`).
+    pub(crate) key_counts: &'a mut Vec<i32>,
+}
+
 /// CSA top-k block selection: project the index query (`wq_b`) + per-head gating
 /// (`weights_proj`), then `dsv4_csa_select_cuda` scores each compressed-key block
 /// and writes the top-`index_topk` block ids per token into `[seq * index_topk]`.
+///
+/// When `batched_gather` is `Some`, the per-row READ/SELECT is SKIPPED: only the
+/// per-row cache writes run (via `csa_select_official` cache-writes-only mode),
+/// this row's `q_i`/`weights` are gathered into the N-row staging, and the row's
+/// `key_count` is captured — the batched lane runs ONE `csa_select_official_batched`
+/// afterward. When `None`, behavior is byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 fn csa_select(
     ctx: &DeviceContext,
@@ -8601,6 +8777,7 @@ fn csa_select(
     start_pos_device: Option<&CudaSlice<i32>>,
     ratio: usize,
     prefill_scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    batched_gather: Option<Dsv4DsaBatchedGather<'_>>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
     // SAFETY: dsv4_linear writes the full index-query buffer.
@@ -8673,6 +8850,83 @@ fn csa_select(
     };
     let score_scale =
         (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
+
+    // ── Batched-decode lane (#60): per-row CACHE WRITES only, then gather this
+    // row's q_i/weights into the N-row staging + capture key_count. The READ
+    // (logits + topk) is deferred to ONE `csa_select_official_batched` after all
+    // N rows' caches are populated. Requires the official DSA path (per-slot
+    // `official` + shared scratch). Never reached on the single-row / prefill
+    // path (batched_gather stays None there → byte-identical below).
+    if let Some(gather) = batched_gather {
+        let official = official.ok_or_else(|| {
+            anyhow!("DSv4 batched DSA gather requires official per-slot DSA state")
+        })?;
+        let shared = dsa_shared
+            .ok_or_else(|| anyhow!("DSv4 batched DSA gather requires shared DSA scratch"))?;
+        // Cache writes only (block (a) of csa_select_official); returns None.
+        csa_select_official(
+            ctx,
+            config,
+            &q_i,
+            &weights,
+            keys,
+            official,
+            shared,
+            pool,
+            indexer_rows_before,
+            indexer_rows_after,
+            key_count,
+            start_pos,
+            start_pos_device,
+            layer_idx,
+            ratio,
+            local_index_heads,
+            score_scale,
+            /* cache_writes_only */ true,
+            keepalive,
+        )?;
+        // Gather this row's q_i/weights (bf16) into the N-row staging at row r.
+        // q_i is `[local_index_heads*index_head_dim, 1]`, weights `[local_index_heads, 1]`.
+        let r = gather.row;
+        let q_width = q_i.data.len();
+        let w_width = weights.data.len();
+        ensure!(
+            gather.q_i_batch.data.len() >= (r + 1) * q_width
+                && gather.weights_batch.data.len() >= (r + 1) * w_width,
+            "DSv4 batched DSA staging too small for row {r} (q {} w {})",
+            q_width,
+            w_width
+        );
+        {
+            let mut dst = gather
+                .q_i_batch
+                .data
+                .slice_mut(r * q_width..(r + 1) * q_width);
+            ctx.stream
+                .memcpy_dtod(&q_i.data, &mut dst)
+                .map_err(|e| anyhow!("DSv4 batched DSA q_i gather D2D failed: {e}"))?;
+        }
+        {
+            let mut dst = gather
+                .weights_batch
+                .data
+                .slice_mut(r * w_width..(r + 1) * w_width);
+            ctx.stream
+                .memcpy_dtod(&weights.data, &mut dst)
+                .map_err(|e| anyhow!("DSv4 batched DSA weights gather D2D failed: {e}"))?;
+        }
+        gather.key_counts.push(
+            i32::try_from(key_count)
+                .map_err(|_| anyhow!("DSv4 batched DSA key_count {key_count} overflows i32"))?,
+        );
+        // No per-row selected: the batched select writes selected_batched directly.
+        // Return an empty buffer the caller maps to `selected: None`.
+        return ctx
+            .stream
+            .alloc_zeros::<i32>(0)
+            .map_err(|e| anyhow!("DSv4 batched DSA empty selected alloc failed: {e}"));
+    }
+
     if let Some(official) = official {
         let graph_replay = start_pos_device.is_some()
             && matches!(
@@ -8708,6 +8962,7 @@ fn csa_select(
                 ratio,
                 local_index_heads,
                 score_scale,
+                /* cache_writes_only */ false,
                 keepalive,
             )? {
                 return Ok(selected);
@@ -8828,9 +9083,21 @@ fn csa_select_official(
     ratio: usize,
     local_index_heads: usize,
     score_scale: f32,
+    // Batched-decode lane (#60): run block (a) (per-row CACHE WRITES) only, then
+    // return `Ok(None)` BEFORE the per-row read/select (b)-(f). The READ is
+    // deferred to ONE `csa_select_official_batched`. The single-row / prefill path
+    // passes `false` → byte-identical behavior.
+    cache_writes_only: bool,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Option<CudaSlice<i32>>> {
-    if start_pos_device.is_some()
+    // The graph-replay early-return (the captured decode-graph closures don't
+    // carry the read scratch) applies ONLY to the single-row READ path. The
+    // batched-decode cache-writes-only mode (#60) is the eager N>1 lane and is
+    // NEVER graph-captured; it MUST run the per-row cache writes unconditionally,
+    // so it bypasses this early-return (the deferred batched READ depends on the
+    // caches being populated this step).
+    if !cache_writes_only
+        && start_pos_device.is_some()
         && matches!(
             std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
             Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
@@ -8942,6 +9209,12 @@ fn csa_select_official(
             }
         }
         official.packed_rows = indexer_rows_after;
+    }
+
+    // Batched-decode lane (#60): the per-row CACHE WRITES (block (a)) are done;
+    // the per-row READ/SELECT (b)-(f) is deferred to ONE `csa_select_official_batched`.
+    if cache_writes_only {
+        return Ok(None);
     }
 
     let token_count = q_i.seq_len;
@@ -9238,6 +9511,274 @@ fn csa_select_official(
         }
     }
     Ok(Some(selected))
+}
+
+/// BATCHED CSA select over N decode rows (#60). Mirrors blocks (b)-(f) of
+/// [`csa_select_official`] but batches the READ side (paged-MQA logits + topk)
+/// of all N rows into ONE `batch_size=N` DeepGEMM call, replacing N
+/// `batch_size=1` calls. The PER-ROW CACHE WRITES (hadamard rotate +
+/// fused_store + `packed_rows` advance — block (a) of `csa_select_official`)
+/// stay per-row and have ALREADY run before this is called (via
+/// `csa_select`→`csa_select_official` in cache-write-only mode). This fn does NOT
+/// touch any per-slot cache state; the read side reads the shared DSA key pool by
+/// the per-row block_table band.
+///
+/// Never graph-replayed (the batched lane is eager, N>1), so unlike
+/// `csa_select_official` it does NOT early-return on `ARLE_DSV4_DECODE_GRAPH`.
+///
+/// `context_lens_host` / `positions_host` are captured ON HOST during the per-row
+/// prepare (`context_lens[r] = min(key_count_r, abs_pos_r/ratio)`,
+/// `positions[r] = abs_pos_r`) — byte-equivalent VALUES to the single-row GPU
+/// `dsv4_dsa_fill_context_lens_positions_start_pos_cuda` fill, since each row's
+/// exact `key_count_r` is captured rather than assumed uniform.
+///
+/// Mutated device buffers (ALL stream-ordered, overwritten-before-read each
+/// forward; per-slot cache state is UNTOUCHED by this read side):
+///   - `shared.q_fp8_batch`         [N*heads*head_dim u8]  — fused Q quant out
+///   - `shared.weights_batch`       [N*heads f32]          — fused weights out
+///   - `shared.context_lens_batch`  [N i32]                — H2D from host
+///   - `shared.positions_batch`     [N i32]                — H2D from host
+///   - `shared.block_table_batch`   [N*num_pages i32]      — H2D per-row bands
+///   - `shared.logits_batch`        [N*logits_stride f32]  — paged-MQA logits
+///   - `shared.raw_indices_batch`   [N*index_topk i32]     — topk raw out
+///   - `shared.sched_meta`          [(num_sms+1)*2 i32]    — batch-independent size
+///   - `out_selected` [N*index_topk i32] — topk slot-relative indices (the
+///     FlashMLA batch scratch's `selected_batched`; written here BEFORE
+///     `build_layer_batch_meta` reads it)
+///   - `shared.page_table_identity_batch` is READ-ONLY (identity).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn csa_select_official_batched(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    q_i_batch: &HiddenStates,
+    weights_batch: &HiddenStates,
+    shared: &mut Dsv4DsaSharedScratch,
+    pool: &Dsv4LayerKvLayout,
+    n: usize,
+    slot_ids: &[usize],
+    context_lens_host: &[i32],
+    positions_host: &[i32],
+    local_index_heads: usize,
+    score_scale: f32,
+    out_selected: &mut CudaSlice<i32>,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    ensure!(
+        n > 0 && n <= shared.decode_max_batch,
+        "DSv4 batched DSA n {} outside [1, decode_max_batch {}]",
+        n,
+        shared.decode_max_batch
+    );
+    ensure!(
+        local_index_heads == shared.num_heads && config.index_head_dim == shared.head_dim,
+        "DSv4 batched DSA shape mismatch local_heads={} official_heads={} dim={} official_dim={}",
+        local_index_heads,
+        shared.num_heads,
+        config.index_head_dim,
+        shared.head_dim
+    );
+    ensure!(
+        q_i_batch.seq_len == n && weights_batch.seq_len == n,
+        "DSv4 batched DSA staging seq_len q={} w={} != n {}",
+        q_i_batch.seq_len,
+        weights_batch.seq_len,
+        n
+    );
+    ensure!(
+        slot_ids.len() == n && context_lens_host.len() == n && positions_host.len() == n,
+        "DSv4 batched DSA host arrays slot_ids={} lens={} pos={} != n {}",
+        slot_ids.len(),
+        context_lens_host.len(),
+        positions_host.len(),
+        n
+    );
+    ensure!(
+        q_i_batch.hidden_dim == local_index_heads * config.index_head_dim,
+        "DSv4 batched DSA q width {} != local_index_heads {} * index_head_dim {}",
+        q_i_batch.hidden_dim,
+        local_index_heads,
+        config.index_head_dim
+    );
+    ensure!(
+        weights_batch.hidden_dim == local_index_heads,
+        "DSv4 batched DSA weights width {} != local_index_heads {}",
+        weights_batch.hidden_dim,
+        local_index_heads
+    );
+    ensure!(
+        out_selected.len() >= n * config.index_topk,
+        "DSv4 batched DSA out_selected len {} < n {} * index_topk {}",
+        out_selected.len(),
+        n,
+        config.index_topk
+    );
+
+    let num_pages = shared.num_pages;
+
+    // (b1) per-row block_table band: row r → slot r's DSA band = `num_pages`
+    // contiguous blocks based at `slot_idx * num_pages` (alignment proven in the
+    // brief: dsa_slot_bytes = num_pages*64*(index_head_dim+4), block base =
+    // slot_idx*num_pages, total pool blocks = num_slots*num_pages). H2D into
+    // `block_table_batch[0..n*num_pages]`, block_table_stride = num_pages.
+    {
+        let mut block_table_h = Vec::with_capacity(n * num_pages);
+        for &slot_idx in slot_ids.iter() {
+            let base = slot_idx
+                .checked_mul(num_pages)
+                .ok_or_else(|| anyhow!("DSv4 batched DSA block table base overflow"))?;
+            for b in 0..num_pages {
+                block_table_h.push(
+                    i32::try_from(base + b)
+                        .map_err(|_| anyhow!("DSv4 batched DSA block id overflows i32"))?,
+                );
+            }
+        }
+        let mut bt = shared.block_table_batch.slice_mut(0..n * num_pages);
+        ctx.stream
+            .memcpy_htod(&block_table_h, &mut bt)
+            .map_err(|e| anyhow!("DSv4 batched DSA block_table H2D failed: {e}"))?;
+    }
+
+    // (b2) context_lens / positions: H2D the host-captured byte-equivalent values.
+    {
+        let mut lens = shared.context_lens_batch.slice_mut(0..n);
+        ctx.stream
+            .memcpy_htod(context_lens_host, &mut lens)
+            .map_err(|e| anyhow!("DSv4 batched DSA context_lens H2D failed: {e}"))?;
+        let mut pos = shared.positions_batch.slice_mut(0..n);
+        ctx.stream
+            .memcpy_htod(positions_host, &mut pos)
+            .map_err(|e| anyhow!("DSv4 batched DSA positions H2D failed: {e}"))?;
+    }
+
+    // (c) fused Q indexer rope+hadamard+quant over the N gathered rows.
+    {
+        let (q_ptr, _qg) = q_i_batch.data.device_ptr(&ctx.stream);
+        let (q_fp8_ptr, _qfg) = shared.q_fp8_batch.device_ptr_mut(&ctx.stream);
+        let (w_ptr, _wg) = weights_batch.data.device_ptr(&ctx.stream);
+        let (weights_out_ptr, _wog) = shared.weights_batch.device_ptr_mut(&ctx.stream);
+        let (freqs_ptr, _fg) = shared.freqs_cis.device_ptr(&ctx.stream);
+        let positions = shared.positions_batch.slice(0..n);
+        let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
+                q_ptr as *const ffi::Half,
+                q_fp8_ptr as *mut u8,
+                w_ptr as *const ffi::Half,
+                weights_out_ptr as *mut f32,
+                score_scale,
+                freqs_ptr as *const f32,
+                positions_ptr as *const i32,
+                i32::try_from(n)?,
+                i32::try_from(local_index_heads)?,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    // (d) paged-MQA logits scheduling metadata for the N-row batch. sched_meta is
+    // sized `(num_sms+1)*2` — batch-INDEPENDENT — but the kernel reads all N
+    // context_lens to partition KV across SMs, so pass batch_size=n.
+    unsafe {
+        cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
+            cache_ptr(&shared.context_lens_batch, ctx),
+            cache_ptr(&shared.sched_meta, ctx),
+            n,
+            1,
+            64,
+            shared.num_sms,
+            ctx.stream.cu_stream(),
+        )
+        .map_err(|e| anyhow!("DSv4 batched DSA metadata failed: {e}"))?;
+    }
+
+    // (e) fused paged FP8 MQA logits → logits_batch (N rows). The KV cache base
+    // is the WHOLE shared DSA pool (NOT a per-slot slice); per-row routing is via
+    // the block_table bands above. num_kv_blocks = decode_max_batch * num_pages
+    // (TOTAL pool blocks); max_context_len = num_pages*64 (each row's band).
+    {
+        let cache_pool = pool
+            .dsa_key_cache
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 batched DSA shared key-cache missing"))?;
+        let (q_ptr, _qg) = shared.q_fp8_batch.device_ptr(&ctx.stream);
+        let (cache_ptr_u8, _kg) = cache_pool.device_ptr(&ctx.stream);
+        let (weights_ptr, _wg) = shared.weights_batch.device_ptr(&ctx.stream);
+        let lens = shared.context_lens_batch.slice(0..n);
+        let (lens_ptr, _lg) = lens.device_ptr(&ctx.stream);
+        let block_table = shared.block_table_batch.slice(0..n * num_pages);
+        let (block_ptr, _bg) = block_table.device_ptr(&ctx.stream);
+        let (sched_ptr, _sg) = shared.sched_meta.device_ptr(&ctx.stream);
+        let (logits_ptr, _og) = shared.logits_batch.device_ptr_mut(&ctx.stream);
+        let num_kv_blocks = shared
+            .decode_max_batch
+            .checked_mul(num_pages)
+            .ok_or_else(|| anyhow!("DSv4 batched DSA num_kv_blocks overflow"))?;
+        unsafe {
+            ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
+                q_ptr as *const u8,
+                cache_ptr_u8 as *const u8,
+                weights_ptr as *const f32,
+                lens_ptr as *const i32,
+                block_ptr as *const i32,
+                sched_ptr as *const i32,
+                logits_ptr as *mut f32,
+                i32::try_from(n)?,
+                1,
+                i32::try_from(local_index_heads)?,
+                i32::try_from(config.index_head_dim)?,
+                i32::try_from(num_kv_blocks)?,
+                64,
+                i32::try_from(num_pages * 64)?,
+                i32::try_from(shared.logits_stride)?,
+                i32::try_from(num_pages)?,
+                i32::try_from(64 * (config.index_head_dim + std::mem::size_of::<f32>()))?,
+                i32::try_from(shared.num_sms)?,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 batched DSA paged logits failed: {e}"))?;
+        }
+    }
+
+    // (f) topk transform: read logits_batch (per-row stride logits_stride), write
+    // the N rows of `out_selected` (slot-relative indices) and `raw_indices_batch`.
+    // The page_table is the N-row identity (stride=num_pages, validator rejects 0);
+    // each row reads identity `[0..num_pages)` → `page_to_slot(identity,i)=i`,
+    // byte-equivalent to the single-row path's slot-relative mapping.
+    {
+        let lens = shared.context_lens_batch.slice(0..n);
+        let (logits_ptr, _lg) = shared.logits_batch.device_ptr(&ctx.stream);
+        let (lens_ptr, _csg) = lens.device_ptr(&ctx.stream);
+        let page_table = shared.page_table_identity_batch.slice(0..n * num_pages);
+        let (page_ptr, _ptg) = page_table.device_ptr(&ctx.stream);
+        let mut sel = out_selected.slice_mut(0..n * config.index_topk);
+        let (sel_ptr, _seg) = sel.device_ptr_mut(&ctx.stream);
+        let mut raw = shared.raw_indices_batch.slice_mut(0..n * config.index_topk);
+        let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
+                logits_ptr as *const f32,
+                lens_ptr as *const i32,
+                page_ptr as *const i32,
+                sel_ptr as *mut i32,
+                raw_ptr as *mut i32,
+                i64::try_from(shared.logits_stride)?,
+                i64::try_from(num_pages)?,
+                i64::try_from(config.index_topk)?,
+                i32::try_from(n)?,
+                i32::try_from(config.index_topk)?,
+                64,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    keepalive.keep_u8(&shared.q_fp8_batch);
+    keepalive.keep_f32(&shared.weights_batch);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
