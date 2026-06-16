@@ -1244,10 +1244,24 @@ impl Dsv4Model {
                 }
             }
         }
+        // The N-row batched-decode DSA scratch (`*_batch` buffers inside the ONE
+        // shared scratch) is sized by `decode_max_batch == num_slots`, so it is a
+        // per-SLOT cost (NOT a fixed subtraction — that would be circular, since
+        // num_slots is derived from this budget). One term per slot (the scratch
+        // is one shared instance, not per CSA layer), gated on a CSA layer existing.
+        let dsa_batched_per_slot = match (official_on, csa_cr) {
+            (true, Some(cr)) => crate::attention::dsv4_dsa_batched_scratch_bytes_per_slot(
+                &self.config,
+                cr,
+                max_seq_len,
+            ),
+            _ => 0,
+        };
         let per_slot = arena_per_slot
             .saturating_mul(PER_SLOT_OVERHEAD_X)
             .saturating_add(dsa_rotated_per_slot)
-            .saturating_add(state_caches_per_slot);
+            .saturating_add(state_caches_per_slot)
+            .saturating_add(dsa_batched_per_slot);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
                 // Neutral budget kernel (infer-seam): floor(free × fraction) −
@@ -2062,7 +2076,40 @@ impl Dsv4Model {
                 // old `== HybridCompressed` for the SW/HCA modes that already ran here.
                 let want_compressed = layer.mode != DeepSeekV4AttentionMode::SlidingWindow;
                 let is_csa = layer.mode == DeepSeekV4AttentionMode::CompressedSparse;
+                // BATCHED CSA-SELECT (#60): when this CSA layer runs on the
+                // official DSA path AND the shared scratch is present, defer the
+                // per-row READ (paged-MQA logits + topk) into ONE batch_size=N
+                // call after the prepare loop. The per-row CACHE WRITES still run
+                // inside the prepare loop. When off (non-official DSA, or scratch
+                // absent), the existing per-row `csa_select_official` +
+                // `gather_selected_row` path runs byte-identically.
+                let use_batched_dsa_select = is_csa
+                    && crate::attention::dsv4_dsa_official_enabled()?
+                    && kv_adapter
+                        .layer_dsa_and_flashmla_batch_mut(layer_idx)?
+                        .1
+                        .is_some();
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
+                // N-row staging for the batched CSA select: each row's indexer
+                // query (`q_i`, bf16 `[local_index_heads*index_head_dim, n]`) and
+                // gating weights (bf16 `[local_index_heads, n]`), gathered during
+                // the per-row prepare, read once by `csa_select_official_batched`.
+                // Allocated per-layer (overwritten before the batched select reads
+                // it); tiny (~n*128*128*2B). Plus per-row captured key_count.
+                let (mut dsa_q_i_batch, mut dsa_weights_batch, mut dsa_key_counts) =
+                    if use_batched_dsa_select {
+                        let index_heads = self.config.index_n_heads;
+                        let q_width = index_heads * self.config.index_head_dim;
+                        // SAFETY: each row's slice is fully written by the per-row
+                        // gather (memcpy_dtod) before the batched select reads it.
+                        let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
+                        let w_b = unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
+                        keepalive.keep_hidden(&q_b);
+                        keepalive.keep_hidden(&w_b);
+                        (Some(q_b), Some(w_b), Some(Vec::<i32>::with_capacity(n)))
+                    } else {
+                        (None, None, None)
+                    };
                 // ── 1. per-row PREPARE + pack + Q-gather.
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
@@ -2186,6 +2233,28 @@ impl Dsv4Model {
                         })?;
                         let slot = &mut slots[slot_ids[r]];
                         slot_block_offsets.push(layer_pool.flashmla_slot_first_block(slot_ids[r])?);
+                        // Batched CSA select: thread this row's gather sink (q_i /
+                        // weights staging + key_count capture). `csa_select` then
+                        // runs cache writes only and returns `selected: None`; the
+                        // ONE `csa_select_official_batched` after the loop fills
+                        // `selected_batched`. When not batching DSA, `None` →
+                        // byte-identical per-row select.
+                        let batched_gather = if use_batched_dsa_select {
+                            Some(crate::attention::Dsv4DsaBatchedGather {
+                                q_i_batch: dsa_q_i_batch
+                                    .as_mut()
+                                    .expect("batched DSA staging q present"),
+                                weights_batch: dsa_weights_batch
+                                    .as_mut()
+                                    .expect("batched DSA staging weights present"),
+                                row: r,
+                                key_counts: dsa_key_counts
+                                    .as_mut()
+                                    .expect("batched DSA key_counts present"),
+                            })
+                        } else {
+                            None
+                        };
                         let row_prepared = crate::attention::mla_attention_prepare_compressed_only(
                             &self.ctx,
                             &self.config,
@@ -2203,6 +2272,7 @@ impl Dsv4Model {
                             dsa_shared,
                             start_positions[r],
                             Some(&slot.start_pos_device),
+                            batched_gather,
                             &mut keepalive,
                         )?;
                         // Pack this row's KV into the shared pool, then gather its
@@ -2237,7 +2307,12 @@ impl Dsv4Model {
                         // (`selected + row * max_compressed_keys`). SW/HCA skip this
                         // (selected is None) and the batched build sees selected_ptr=0
                         // — byte-identical to the prior SW/HCA-only lane.
-                        if is_csa {
+                        //
+                        // When the batched DSA select is engaged, `selected` is
+                        // None (the per-row read was deferred); `selected_batched`
+                        // is filled by the ONE `csa_select_official_batched` after
+                        // this loop, so skip the per-row gather here.
+                        if is_csa && !use_batched_dsa_select {
                             let sel = row_prepared.selected.as_ref().ok_or_else(|| {
                                 anyhow!("DSv4 batched CSA decode: row {r} missing indexer selected")
                             })?;
@@ -2264,6 +2339,74 @@ impl Dsv4Model {
                 if let Some(t) = _prep_t {
                     ctx.stream.synchronize().ok();
                     prep_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
+                // ── 1b. ONE batched CSA select (#60): the per-row READ (paged-MQA
+                // logits + topk) for all N rows in ONE batch_size=N call, writing
+                // directly into the FlashMLA batch scratch's `selected_batched`.
+                // Runs AFTER all N rows' DSA caches are populated (per-row cache
+                // writes happened in the prepare loop) and BEFORE
+                // `build_layer_batch_meta` reads `selected_batched`.
+                if use_batched_dsa_select {
+                    let q_i_batch = dsa_q_i_batch.take().expect("batched DSA staging q present");
+                    let weights_batch = dsa_weights_batch
+                        .take()
+                        .expect("batched DSA staging weights present");
+                    let key_counts = dsa_key_counts
+                        .take()
+                        .expect("batched DSA key_counts present");
+                    ensure!(
+                        key_counts.len() == n,
+                        "DSv4 batched CSA select: captured {} key_counts != n {}",
+                        key_counts.len(),
+                        n
+                    );
+                    let ratio = layer.compress_ratio;
+                    ensure!(
+                        ratio > 0,
+                        "DSv4 batched CSA select: CSA layer must have compress_ratio>0"
+                    );
+                    // Byte-equivalent to the single-row GPU fill:
+                    //   context_lens[r] = min(key_count_r, abs_pos_r / ratio)
+                    //   positions[r]    = abs_pos_r   (abs_pos_r = start_positions[r])
+                    let mut context_lens_host = Vec::with_capacity(n);
+                    let mut positions_host = Vec::with_capacity(n);
+                    for r in 0..n {
+                        let abs_pos = i32::try_from(start_positions[r]).map_err(|_| {
+                            anyhow!(
+                                "DSv4 batched CSA abs_pos {} overflows i32",
+                                start_positions[r]
+                            )
+                        })?;
+                        let avail = (abs_pos / ratio as i32).min(key_counts[r]);
+                        context_lens_host.push(avail);
+                        positions_host.push(abs_pos);
+                    }
+                    let local_index_heads = self.config.index_n_heads;
+                    let score_scale = (self.config.index_head_dim as f32).powf(-0.5)
+                        * (self.config.index_n_heads as f32).powf(-0.5);
+                    let (layer_pool, dsa_shared, flash_batch, _flashmla_scratch, _prefill) =
+                        kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                    let dsa_shared = dsa_shared.ok_or_else(|| {
+                        anyhow!("DSv4 batched CSA select: shared DSA scratch missing")
+                    })?;
+                    let flash_batch = flash_batch
+                        .ok_or_else(|| anyhow!("DSv4 batched CSA select: batch scratch missing"))?;
+                    crate::attention::csa_select_official_batched(
+                        &self.ctx,
+                        &self.config,
+                        &q_i_batch,
+                        &weights_batch,
+                        dsa_shared,
+                        layer_pool,
+                        n,
+                        &slot_ids[..n],
+                        &context_lens_host,
+                        &positions_host,
+                        local_index_heads,
+                        score_scale,
+                        flash_batch.selected_batched_mut(),
+                        &mut keepalive,
+                    )?;
                 }
                 // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
                 let _fwd_t = if phase_time {
