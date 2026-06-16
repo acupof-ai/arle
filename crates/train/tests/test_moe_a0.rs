@@ -123,7 +123,8 @@ fn run_moe_lora_and_router_gradients_match_finite_difference(
 
     for (name, param_id) in checked {
         let len = store.get(param_id).expect("param exists").size;
-        for index in 0..len {
+        let analytic_values = &analytic[&param_id];
+        for (index, &analytic_f32) in analytic_values.iter().enumerate().take(len) {
             let original = store.get(param_id).expect("param exists").data[index];
             set_param_value(&mut store, param_id, index, original + eps);
             let plus = forward_output(&moe, input, &mut store)?;
@@ -144,7 +145,7 @@ fn run_moe_lora_and_router_gradients_match_finite_difference(
                 })
                 .sum::<f64>()
                 / (2.0 * f64::from(eps));
-            let analytic_value = f64::from(analytic[&param_id][index]);
+            let analytic_value = f64::from(analytic_f32);
             let abs = (analytic_value - numeric).abs();
             let denom = analytic_value.abs().max(numeric.abs());
             if denom < relative_floor {
