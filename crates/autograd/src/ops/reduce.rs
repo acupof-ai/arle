@@ -164,6 +164,31 @@ pub(crate) fn sum_backward(
             "sum backward missing saved shape",
         ));
     };
+    let device_path_ok = {
+        let output_grad = store.tensor(output_grad_id)?;
+        output_grad.dirty != Dirty::Host && output_grad.device_handle.is_some()
+    };
+    if device_path_ok {
+        let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+        if upstream_shape != Vec::<usize>::new() {
+            return Err(AutogradError::ShapeMismatch {
+                expected: Vec::new(),
+                got: upstream_shape,
+            });
+        }
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store
+            .backend()
+            .sum_backward_device(&upstream_handle, shape)?;
+        let grad_id = store.alloc_device_tensor(shape.clone(), grad_handle)?;
+        return Ok(smallvec![(a, grad_id)]);
+    }
+
     let output_grad = store.tensor(output_grad_id)?;
     if output_grad.shape != Vec::<usize>::new() || output_grad.data.len() != 1 {
         return Err(AutogradError::ShapeMismatch {

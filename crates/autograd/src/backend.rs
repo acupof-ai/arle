@@ -8,7 +8,7 @@
 //! The trait is additive — future ops land as new methods with CPU
 //! fallbacks so a backend does not need to implement every op day one.
 
-use crate::Result;
+use crate::{AutogradError, Result};
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ pub enum Device {
     Metal,
     Cuda,
 }
+
+pub type CausalSdpaHostGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
 
 #[cfg(feature = "metal")]
 #[derive(Debug, Clone)]
@@ -763,6 +765,25 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         };
         let value = upstream_host[0] * inv;
         let grad = vec![value; elem_count];
+        self.upload(&grad, output_shape)
+    }
+
+    /// Device-resident backward for `sum(x)`: broadcast the rank-0
+    /// upstream scalar across the original input shape.
+    fn sum_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        output_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let upstream_host = self.readback(upstream_grad)?;
+        if upstream_host.len() != 1 {
+            return Err(crate::AutogradError::ShapeMismatch {
+                expected: Vec::new(),
+                got: vec![upstream_host.len()],
+            });
+        }
+        let elem_count = shape_size(output_shape);
+        let grad = vec![upstream_host[0]; elem_count];
         self.upload(&grad, output_shape)
     }
 
@@ -3286,6 +3307,128 @@ pub fn cpu_concat_axis2(
     }
 
     Ok((out, out_shape))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_causal_sdpa_recompute_backward(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    upstream: &[f32],
+    shape: &[usize],
+    need_grad_q: bool,
+    need_grad_k: bool,
+    need_grad_v: bool,
+) -> Result<CausalSdpaHostGradTriplet> {
+    if shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: shape.len(),
+        });
+    }
+    let expected = shape_size(shape);
+    for len in [q.len(), k.len(), v.len(), upstream.len()] {
+        if len != expected {
+            return Err(AutogradError::DataLengthMismatch {
+                len,
+                shape: shape.to_vec(),
+                size: expected,
+            });
+        }
+    }
+
+    let batch = shape[0];
+    let heads = shape[1];
+    let seq_len = shape[2];
+    let head_dim = shape[3];
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut grad_q = need_grad_q.then(|| vec![0.0; q.len()]);
+    let mut grad_k = need_grad_k.then(|| vec![0.0; k.len()]);
+    let mut grad_v = need_grad_v.then(|| vec![0.0; v.len()]);
+    let mut scores = vec![0.0_f32; seq_len];
+    let mut probs = vec![0.0_f32; seq_len];
+    let mut d_probs = vec![0.0_f32; seq_len];
+
+    for b in 0..batch {
+        for h in 0..heads {
+            for row in 0..seq_len {
+                let mut max_score = f32::NEG_INFINITY;
+                for col in 0..=row {
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += q[offset4(b, h, row, d, heads, seq_len, head_dim)]
+                            * k[offset4(b, h, col, d, heads, seq_len, head_dim)];
+                    }
+                    let score = dot * scale;
+                    scores[col] = score;
+                    max_score = max_score.max(score);
+                }
+
+                let mut denom = 0.0_f32;
+                for col in 0..=row {
+                    let p = (scores[col] - max_score).exp();
+                    probs[col] = p;
+                    denom += p;
+                }
+                for prob in probs.iter_mut().take(row + 1) {
+                    *prob /= denom;
+                }
+
+                for col in 0..=row {
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += upstream[offset4(b, h, row, d, heads, seq_len, head_dim)]
+                            * v[offset4(b, h, col, d, heads, seq_len, head_dim)];
+                    }
+                    d_probs[col] = dot;
+                }
+
+                let mut softmax_dot = 0.0_f32;
+                for col in 0..=row {
+                    softmax_dot += d_probs[col] * probs[col];
+                }
+
+                for col in 0..=row {
+                    let d_score = probs[col] * (d_probs[col] - softmax_dot);
+                    if let Some(grad_v) = grad_v.as_mut() {
+                        for d in 0..head_dim {
+                            grad_v[offset4(b, h, col, d, heads, seq_len, head_dim)] += probs[col]
+                                * upstream[offset4(b, h, row, d, heads, seq_len, head_dim)];
+                        }
+                    }
+                    if let Some(grad_q) = grad_q.as_mut() {
+                        for d in 0..head_dim {
+                            grad_q[offset4(b, h, row, d, heads, seq_len, head_dim)] += scale
+                                * d_score
+                                * k[offset4(b, h, col, d, heads, seq_len, head_dim)];
+                        }
+                    }
+                    if let Some(grad_k) = grad_k.as_mut() {
+                        for d in 0..head_dim {
+                            grad_k[offset4(b, h, col, d, heads, seq_len, head_dim)] += scale
+                                * d_score
+                                * q[offset4(b, h, row, d, heads, seq_len, head_dim)];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((grad_q, grad_k, grad_v))
+}
+
+#[inline]
+fn offset4(
+    batch: usize,
+    head: usize,
+    token: usize,
+    dim: usize,
+    heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+) -> usize {
+    (((batch * heads + head) * seq_len + token) * head_dim) + dim
 }
 
 /// CPU reference for decode-time GQA causal attention.
