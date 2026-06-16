@@ -294,6 +294,37 @@ __device__ __forceinline__ float fp8_f32_block_scale(
     return scales[sr * scale_cols + sc];
 }
 
+__device__ __forceinline__ float fp8_f32_dot16(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ x)
+{
+    const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight);
+    const float4 wf0 = static_cast<float4>(w4[0]);
+    const float4 wf1 = static_cast<float4>(w4[1]);
+    const float4 wf2 = static_cast<float4>(w4[2]);
+    const float4 wf3 = static_cast<float4>(w4[3]);
+    const uint4 x0 = *reinterpret_cast<const uint4*>(x);
+    const uint4 x1 = *reinterpret_cast<const uint4*>(x + 8);
+    const auto* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
+    const auto* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
+    return wf0.x * __bfloat162float(xb0[0])
+        + wf0.y * __bfloat162float(xb0[1])
+        + wf0.z * __bfloat162float(xb0[2])
+        + wf0.w * __bfloat162float(xb0[3])
+        + wf1.x * __bfloat162float(xb0[4])
+        + wf1.y * __bfloat162float(xb0[5])
+        + wf1.z * __bfloat162float(xb0[6])
+        + wf1.w * __bfloat162float(xb0[7])
+        + wf2.x * __bfloat162float(xb1[0])
+        + wf2.y * __bfloat162float(xb1[1])
+        + wf2.z * __bfloat162float(xb1[2])
+        + wf2.w * __bfloat162float(xb1[3])
+        + wf3.x * __bfloat162float(xb1[4])
+        + wf3.y * __bfloat162float(xb1[5])
+        + wf3.z * __bfloat162float(xb1[6])
+        + wf3.w * __bfloat162float(xb1[7]);
+}
+
 __device__ __forceinline__ float fp4_e2m1_group_scale(
     const uint8_t* __restrict__ scales,
     const float* __restrict__ global_scales,
@@ -780,10 +811,23 @@ __global__ void fp8_f32_block_gemv_batch_kernel(
 
     const __nv_bfloat16* x = input + batch_idx * K;
     float sum = 0.0f;
-    for (int k = tid_in_row; k < K; k += threads_per_row) {
-        const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
-            * fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
-        sum += w * __bfloat162float(x[k]);
+    // Qwen FP8 decode uses K/block_k aligned to 16, so one block scale covers
+    // each vector dot and the scalar fallback stays available for odd shapes.
+    if ((K % 16) == 0 && (block_k % 16) == 0) {
+        const int kv = K / 16;
+        const uint8_t* weight_row = weight + (int64_t)row * K;
+        for (int v = tid_in_row; v < kv; v += threads_per_row) {
+            const int k = v * 16;
+            const float scale =
+                fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+            sum += scale * fp8_f32_dot16(weight_row + k, x + k);
+        }
+    } else {
+        for (int k = tid_in_row; k < K; k += threads_per_row) {
+            const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
+                * fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+            sum += w * __bfloat162float(x[k]);
+        }
     }
 
     sum = warp_reduce_sum(sum);
