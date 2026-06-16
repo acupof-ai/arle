@@ -14,6 +14,8 @@ typedef struct {
     const void* v;
     void* o;
     float* softmax_lse;
+    float* out_accum;
+    float* softmax_lse_accum;
     int* tile_count_semaphore;
     int seqlen_q;
     int seqlen_k;
@@ -30,6 +32,7 @@ typedef struct {
     long long o_head_stride;
     float softmax_scale;
     int is_causal;
+    int num_splits;
 } ArleFa3FwdHd256Args;
 
 cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,

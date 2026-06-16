@@ -148,6 +148,46 @@ fn qwen35_fa3_enabled() -> bool {
     })
 }
 
+/// `ARLE_QWEN35_FA3_DECODE=1`: route single-token full-attention decode through
+/// the vendored FA3 split-KV + PackGQA path. Default OFF until the 4K/c=1
+/// needle + ITL gate licenses it. This path uses a host `seqlen_k` launch
+/// parameter, so keep it out of the whole-step decode graph for now.
+fn qwen35_fa3_decode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = matches!(
+            std::env::var("ARLE_QWEN35_FA3_DECODE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        );
+        if !on {
+            return false;
+        }
+        let graph_on = matches!(
+            std::env::var("ARLE_QWEN35_DECODE_GRAPH").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        );
+        if graph_on {
+            log::info!(
+                "ARLE_QWEN35_FA3_DECODE ignored while ARLE_QWEN35_DECODE_GRAPH=1; \
+                 FA3 split decode uses host seqlen_k and is not graph-replay safe"
+            );
+            return false;
+        }
+        qwen35_fa3_enabled()
+    })
+}
+
+fn qwen35_fa3_decode_splits() -> usize {
+    static SPLITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SPLITS.get_or_init(|| {
+        std::env::var("ARLE_QWEN35_FA3_DECODE_SPLITS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(2, 256)
+    })
+}
+
 /// `ARLE_QWEN35_GDR_CHUNKED=1`: route GDN prefill chunks (`seq_len > 1`)
 /// through the FlashQLA chunked kernels (TileLang AOT, sm_90a) instead of
 /// the serial `gated_delta_rule_prefill_recurrent` kernel (28.0% of prefill
@@ -385,6 +425,12 @@ pub(crate) struct FullAttnScratch {
     /// the persistent-scheduler semaphore (1 i32, zeroed by the shim per
     /// launch).
     fa3_lse: SliceSlot<f32>,
+    /// FA3 split-decode scratch (`ARLE_QWEN35_FA3_DECODE`): fp32 partial
+    /// outputs `[splits, b=1, local_q_heads, seq_len, head_dim]`.
+    fa3_oaccum: SliceSlot<f32>,
+    /// FA3 split-decode scratch: fp32 partial LSE
+    /// `[splits, b=1, local_q_heads, seq_len]`.
+    fa3_lseaccum: SliceSlot<f32>,
     fa3_semaphore: SliceSlot<i32>,
 }
 
@@ -2480,6 +2526,8 @@ impl Qwen35Model {
             q_prepped,
             attn_heads,
             fa3_lse,
+            fa3_oaccum,
+            fa3_lseaccum,
             fa3_semaphore,
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
@@ -2573,7 +2621,56 @@ impl Qwen35Model {
                 seq_len,
                 || {
                     unsafe {
-                        if seq_len == 1 {
+                        if seq_len == 1 && c.head_dim == 256 && qwen35_fa3_decode_enabled() {
+                            // FA3 split-KV decode mirrors SGLang/FlashInfer's
+                            // flash-decoding shape: split the 4K KV sweep into
+                            // multiple KV ranges, then combine partial softmax
+                            // states. Default stays on the devpos kernel; this
+                            // opt-in path is not decode-graph-safe because
+                            // FA3 takes host seqlen_k as a launch parameter.
+                            let splits = qwen35_fa3_decode_splits();
+                            let lse = fa3_lse.get(&self.ctx, self.local_q_heads * seq_len)?;
+                            let oaccum = fa3_oaccum.get(
+                                &self.ctx,
+                                splits * self.local_q_heads * seq_len * c.head_dim,
+                            )?;
+                            let lseaccum = fa3_lseaccum
+                                .get(&self.ctx, splits * self.local_q_heads * seq_len)?;
+                            let sem = fa3_semaphore.get(&self.ctx, 1)?;
+                            let (lse_ptr, _g4) = lse.device_ptr_mut(&self.ctx.stream);
+                            let (oaccum_ptr, _g5) = oaccum.device_ptr_mut(&self.ctx.stream);
+                            let (lseaccum_ptr, _g6) = lseaccum.device_ptr_mut(&self.ctx.stream);
+                            let (sem_ptr, _g7) = sem.device_ptr_mut(&self.ctx.stream);
+                            let head_dim = c.head_dim as i64;
+                            let args = ffi::ArleFa3FwdHd256Args {
+                                q: q_ptr as *const ffi::Half,
+                                k: kc_ptr as *const ffi::Half,
+                                v: vc_ptr as *const ffi::Half,
+                                o: o_ptr as *mut ffi::Half,
+                                softmax_lse: lse_ptr as *mut f32,
+                                out_accum: oaccum_ptr as *mut f32,
+                                softmax_lse_accum: lseaccum_ptr as *mut f32,
+                                tile_count_semaphore: sem_ptr as *mut i32,
+                                seqlen_q: seq_len as i32,
+                                seqlen_k: kv_len as i32,
+                                num_heads: self.local_q_heads as i32,
+                                num_heads_k: self.local_kv_heads as i32,
+                                head_dim: c.head_dim as i32,
+                                q_row_stride: q_dim as i64,
+                                k_row_stride: head_dim,
+                                v_row_stride: head_dim,
+                                o_row_stride: q_dim as i64,
+                                q_head_stride: head_dim,
+                                k_head_stride: max_seq_len as i64 * head_dim,
+                                v_head_stride: max_seq_len as i64 * head_dim,
+                                o_head_stride: head_dim,
+                                softmax_scale: sm_scale,
+                                is_causal: 0,
+                                num_splits: splits as i32,
+                            };
+                            ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
+                                .result()?;
+                        } else if seq_len == 1 {
                             let (sp_ptr, _g4) = start_pos_dev.device_ptr(&self.ctx.stream);
                             ffi::nonpaged_prefill_attention_devpos_cuda(
                                 q_ptr as *const ffi::Half,
@@ -2609,6 +2706,8 @@ impl Qwen35Model {
                                 v: vc_ptr as *const ffi::Half,
                                 o: o_ptr as *mut ffi::Half,
                                 softmax_lse: lse_ptr as *mut f32,
+                                out_accum: std::ptr::null_mut(),
+                                softmax_lse_accum: std::ptr::null_mut(),
                                 tile_count_semaphore: sem_ptr as *mut i32,
                                 seqlen_q: seq_len as i32,
                                 seqlen_k: kv_len as i32,
@@ -2625,6 +2724,7 @@ impl Qwen35Model {
                                 o_head_stride: head_dim,
                                 softmax_scale: sm_scale,
                                 is_causal: 1,
+                                num_splits: 1,
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
@@ -3302,6 +3402,8 @@ impl Qwen35Model {
             attn_heads,
             // Batched decode stays on the devpos kernel; FA3 scratch unused.
             fa3_lse: _,
+            fa3_oaccum: _,
+            fa3_lseaccum: _,
             fa3_semaphore: _,
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;

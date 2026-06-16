@@ -6,7 +6,8 @@
 // Step-1 scope (docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md):
 //   - b=1, contiguous q/o, contiguous slot KV viewed at exact seqlen_k
 //     (no seqused_k => is_varlen=false => no prepare_varlen machinery),
-//   - num_splits=1 (no oaccum/combine), pack_gqa=false,
+//   - num_splits=1 for prefill; opt-in decode may pass num_splits>1
+//     (out_accum + softmax_lse_accum + combine), which forces PackGQA,
 //   - causal bottom-right alignment (chunked-prefill semantics), with the
 //     upstream seqlen_q==1 causal->non-causal demotion (hdim 256 branch).
 // The split + packgqa + paged instantiations are vendored and compiled so the
@@ -20,6 +21,10 @@
 #include <cutlass/numeric_types.h>
 
 #include "flash.h"
+
+template <typename T, typename Tpartial, int kBlockK>
+void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream,
+                          bool enable_pdl);
 
 namespace {
 
@@ -50,6 +55,8 @@ typedef struct {
     const void* v;
     void* o;                    // bf16, seqlen_q x h x d view
     float* softmax_lse;         // fp32 [h * seqlen_q] scratch
+    float* out_accum;           // fp32 [splits, b=1, h, seqlen_q, d], split only
+    float* softmax_lse_accum;   // fp32 [splits, b=1, h, seqlen_q], split only
     int* tile_count_semaphore;  // device i32 scratch (>= 1 element)
     int seqlen_q;
     int seqlen_k;
@@ -66,6 +73,7 @@ typedef struct {
     long long o_head_stride;
     float softmax_scale;
     int is_causal;
+    int num_splits;  // 1 = direct fwd; >1 = split-KV + combine (<=256)
 } ArleFa3FwdHd256Args;
 
 cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
@@ -155,18 +163,20 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     params.num_pages = 0;
     params.pagedkv_tma = false;
 
-    params.num_splits = 1;
-    params.pack_gqa = false;
+    params.num_splits = a->num_splits <= 1 ? 1 : a->num_splits;
+    if (params.num_splits > 256) return cudaErrorInvalidValue;
+    // Upstream always enables PackGQA for split to avoid rereading the same KV
+    // head for each GQA query head.
+    params.pack_gqa = params.num_splits > 1;
 
     // Scheduler template selectors (flash_api.cpp:993-994).
     params.varlen_sort_batches = true;  // !is_local
     params.head_swizzle = params.is_causal;
 
-    // Non-varlen, num_splits==1, arch>=90: the persistent scheduler needs a
-    // zeroed semaphore iff causal (flash_api.cpp:990-991). The kernel leaves
-    // it non-zero, so zero it every launch (the api allocates+zeroes a fresh
-    // tensor per call; we reuse one buffer + memset).
-    if (params.is_causal) {
+    // Non-varlen, sm90: upstream needs a zeroed semaphore for causal
+    // non-split. The split decode path also passes it through combine, so keep
+    // one reusable zeroed device i32 for both cases.
+    if (params.is_causal || params.num_splits > 1) {
         if (a->tile_count_semaphore == nullptr) return cudaErrorInvalidValue;
         cudaError_t st =
             cudaMemsetAsync(a->tile_count_semaphore, 0, sizeof(int), stream);
@@ -181,6 +191,38 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     params.num_m_blocks_ptr = nullptr;
     params.varlen_batch_idx_ptr = nullptr;
     params.num_nheads_in_l2_ptr = nullptr;
+
+    if (params.num_splits > 1) {
+        if (a->out_accum == nullptr || a->softmax_lse_accum == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+        // Match flash_api_stable.cpp's non-varlen split allocation:
+        // out_accum [splits, batch=1, h, seqlen_q, dv] contiguous,
+        // lse_accum [splits, batch=1, h, seqlen_q] contiguous.
+        params.is_fp32 = false;
+        params.oaccum_ptr = a->out_accum;
+        params.softmax_lseaccum_ptr = a->softmax_lse_accum;
+        params.oaccum_split_stride =
+            static_cast<int64_t>(a->num_heads) * a->seqlen_q * a->head_dim;
+        params.oaccum_batch_stride = params.oaccum_split_stride;
+        params.oaccum_head_stride =
+            static_cast<int64_t>(a->seqlen_q) * a->head_dim;
+        params.oaccum_row_stride = a->head_dim;
+        params.lseaccum_split_stride =
+            static_cast<int64_t>(a->num_heads) * a->seqlen_q;
+        params.lseaccum_batch_stride = params.lseaccum_split_stride;
+        params.lseaccum_head_stride = a->seqlen_q;
+
+        run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/true,
+                     /*PagedKVNonTMA=*/false, /*Has_softcap=*/false,
+                     /*PackGQA=*/true>(params, stream);
+        cudaError_t st = cudaGetLastError();
+        if (st != cudaSuccess) return st;
+        params.is_bf16 = true;
+        run_mha_fwd_combine_<cutlass::bfloat16_t, float, 128>(
+            params, stream, true /*enable_pdl*/);
+        return cudaGetLastError();
+    }
 
     run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/false,
                  /*PagedKVNonTMA=*/false, /*Has_softcap=*/false,
