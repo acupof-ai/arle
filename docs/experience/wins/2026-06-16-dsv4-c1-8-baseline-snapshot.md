@@ -1,5 +1,13 @@
 # DSv4 8×H20 decode c1–8 baseline snapshot (all default optimizations ON)
 
+> **⚠️ SUPERSEDED — this table is profiling-CONTAMINATED.** It was served via
+> `serve_bench_62.sh`, which exports `ARLE_DSV4_DECODE_PHASE_TIME=1` +
+> `ARLE_DSV4_LINEAR_PROFILE=1` — each decode step pays a `cudaStreamSynchronize`,
+> understating tok/s ~25–35% (the "c1=31.9" was the artifact ckl flagged).
+> **Use the clean profiling-OFF re-measure instead:**
+> [[2026-06-16-dsv4-c1-8-baseline-clean-ab]] (clean c1≈44, not 31.9). Kept here
+> for the record; do NOT cite these numbers as a baseline.
+
 ## Goal
 Record the standing **baseline = current best config (all default DSv4 decode
 optimizations ON)** at low concurrency (c=1..8), so the next change (compute/comm
