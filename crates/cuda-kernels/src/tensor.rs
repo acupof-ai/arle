@@ -1257,6 +1257,38 @@ impl Dsv4Fp8DeepGemmWeightCache {
         Ok(cache)
     }
 
+    pub fn from_fp8_block_scaled_weight(
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+    ) -> Result<Self> {
+        let mut cache = Self::uninit(ctx, weight.rows, weight.cols)?;
+        cache.fill_from_fp8_block_scaled_weight(ctx, weight, 0)?;
+        Ok(cache)
+    }
+
+    pub fn from_fp8_block_scaled_weight_pair_rows(
+        ctx: &DeviceContext,
+        first: &DeviceMatrix,
+        second: &DeviceMatrix,
+    ) -> Result<Self> {
+        ensure!(
+            first.cols == second.cols,
+            "DeepGEMM FP8 fused cache needs matching K: first={} second={}",
+            first.cols,
+            second.cols
+        );
+        ensure!(
+            first.rows.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M),
+            "DeepGEMM FP8 fused cache needs first row count aligned to {}, got {}",
+            DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+            first.rows
+        );
+        let mut cache = Self::uninit(ctx, first.rows + second.rows, first.cols)?;
+        cache.fill_from_fp8_block_scaled_weight(ctx, first, 0)?;
+        cache.fill_from_fp8_block_scaled_weight(ctx, second, first.rows)?;
+        Ok(cache)
+    }
+
     pub fn fill_from_dsv4_weight(
         &mut self,
         ctx: &DeviceContext,
@@ -1270,6 +1302,110 @@ impl Dsv4Fp8DeepGemmWeightCache {
             dst_row_offset,
             dst_row_offset / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
         )
+    }
+
+    pub fn fill_from_fp8_block_scaled_weight(
+        &mut self,
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+        dst_row_offset: usize,
+    ) -> Result<()> {
+        ensure!(
+            weight.weight_format == WeightFormat::Fp8BlockScaled,
+            "DeepGEMM FP8 cache needs FP8 block-scaled weights, got {}",
+            weight.weight_format
+        );
+        ensure!(
+            weight.quant_block_m == DSV4_DEEPGEMM_FP8_SCALE_GRAN_M
+                && weight.quant_block_k == DSV4_DEEPGEMM_FP8_SCALE_GRAN_K,
+            "DeepGEMM FP8 cache needs 128x128 block scales, got {}x{}",
+            weight.quant_block_m,
+            weight.quant_block_k
+        );
+        ensure!(
+            weight.cols == self.cols,
+            "DeepGEMM FP8 cache K mismatch: source={} cache={}",
+            weight.cols,
+            self.cols
+        );
+        ensure!(
+            dst_row_offset + weight.rows <= self.rows,
+            "DeepGEMM FP8 cache row range overflow: offset={} src={} cache={}",
+            dst_row_offset,
+            weight.rows,
+            self.rows
+        );
+        ensure!(
+            dst_row_offset.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M),
+            "DeepGEMM FP8 cache row offset must be {}-aligned, got {}",
+            DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+            dst_row_offset
+        );
+        let src_scale_rows = weight.rows.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M);
+        let src_scale_cols = weight.cols.div_ceil(DSV4_DEEPGEMM_FP8_SCALE_GRAN_K);
+        ensure!(
+            weight.quant_scale_rows == src_scale_rows && weight.quant_scale_cols == src_scale_cols,
+            "DeepGEMM FP8 cache scale shape {}x{} != expected {}x{}",
+            weight.quant_scale_rows,
+            weight.quant_scale_cols,
+            src_scale_rows,
+            src_scale_cols
+        );
+        ensure!(
+            self.scale_cols == src_scale_cols,
+            "DeepGEMM FP8 cache scale K mismatch: source={} cache={}",
+            src_scale_cols,
+            self.scale_cols
+        );
+        let dst_scale_row_offset = dst_row_offset / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M;
+        ensure!(
+            dst_scale_row_offset + src_scale_rows <= self.scale_rows,
+            "DeepGEMM FP8 cache scale row overflow: offset={} src={} cache={}",
+            dst_scale_row_offset,
+            src_scale_rows,
+            self.scale_rows
+        );
+
+        let src_weight = weight
+            .qweight_u8
+            .as_ref()
+            .ok_or_else(|| anyhow!("DeepGEMM FP8 cache source missing FP8 weight bytes"))?;
+        let src_scales = weight
+            .scale_f32
+            .as_ref()
+            .ok_or_else(|| anyhow!("DeepGEMM FP8 cache source missing f32 block scales"))?;
+        ensure!(
+            src_weight.len() == weight.rows * weight.cols,
+            "DeepGEMM FP8 cache source weight len {} != expected {}",
+            src_weight.len(),
+            weight.rows * weight.cols
+        );
+        ensure!(
+            src_scales.len() == src_scale_rows * src_scale_cols,
+            "DeepGEMM FP8 cache source scale len {} != expected {}",
+            src_scales.len(),
+            src_scale_rows * src_scale_cols
+        );
+
+        {
+            let src = src_weight.slice(0..src_weight.len());
+            let weight_start = dst_row_offset * self.cols;
+            let weight_end = weight_start + src_weight.len();
+            let mut dst = self.weight.slice_mut(weight_start..weight_end);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("DeepGEMM FP8 cache weight D2D failed: {e}"))?;
+        }
+        {
+            let src = src_scales.slice(0..src_scales.len());
+            let scale_start = dst_scale_row_offset * self.scale_cols;
+            let scale_end = scale_start + src_scales.len();
+            let mut dst = self.scales.slice_mut(scale_start..scale_end);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("DeepGEMM FP8 cache scale D2D failed: {e}"))?;
+        }
+        Ok(())
     }
 }
 

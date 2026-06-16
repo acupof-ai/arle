@@ -191,11 +191,27 @@ const char* non_empty_env(const char* name, const char* fallback) {
 }
 
 std::filesystem::path cuda_home_path() {
+  const char* arle_jit_cuda_home = std::getenv("ARLE_DEEPGEMM_JIT_CUDA_HOME");
+  if (arle_jit_cuda_home != nullptr && arle_jit_cuda_home[0] != '\0') {
+    return arle_jit_cuda_home;
+  }
+  const char* dg_jit_cuda_home = std::getenv("DG_JIT_CUDA_HOME");
+  if (dg_jit_cuda_home != nullptr && dg_jit_cuda_home[0] != '\0') {
+    return dg_jit_cuda_home;
+  }
   const char* cuda_home = std::getenv("CUDA_HOME");
   if (cuda_home != nullptr && cuda_home[0] != '\0') return cuda_home;
   const char* cuda_path = std::getenv("CUDA_PATH");
   if (cuda_path != nullptr && cuda_path[0] != '\0') return cuda_path;
   return ARLE_DEEPGEMM_DEFAULT_CUDA_HOME;
+}
+
+std::filesystem::path nvcc_ccbin_path() {
+  const char* dg_ccbin = std::getenv("DG_JIT_NVCC_CCBIN");
+  if (dg_ccbin != nullptr && dg_ccbin[0] != '\0') return dg_ccbin;
+  const char* nvcc_ccbin = std::getenv("NVCC_CCBIN");
+  if (nvcc_ccbin != nullptr && nvcc_ccbin[0] != '\0') return nvcc_ccbin;
+  return {};
 }
 
 std::filesystem::path deepgemm_library_root_path() {
@@ -340,6 +356,7 @@ PreflightReport deepgemm_preflight_report() {
   const auto cuda_home = cuda_home_path();
   const auto nvcc = cuda_home / "bin" / "nvcc";
   const auto cuobjdump = cuda_home / "bin" / "cuobjdump";
+  const auto nvcc_ccbin = nvcc_ccbin_path();
   const auto cutlass_include = deepgemm_cutlass_include_path(source_root);
   const auto deepgemm_include = library_root / "include";
   const auto deepgemm_header =
@@ -365,6 +382,9 @@ PreflightReport deepgemm_preflight_report() {
   if (!path_is_regular_file(cuobjdump)) {
     missing.push_back("cuobjdump=" + cuobjdump.string());
   }
+  if (!nvcc_ccbin.empty() && !path_is_regular_file(nvcc_ccbin)) {
+    missing.push_back("nvcc_ccbin=" + nvcc_ccbin.string());
+  }
 
   std::ostringstream out;
   out << "library_root=" << library_root
@@ -372,6 +392,7 @@ PreflightReport deepgemm_preflight_report() {
       << " cutlass_include=" << cutlass_include
       << " cuda_home=" << cuda_home
       << " nvcc=" << nvcc
+      << " nvcc_ccbin=" << (nvcc_ccbin.empty() ? "<default>" : nvcc_ccbin.string())
       << " cuobjdump=" << cuobjdump
       << " jit_cache=" << cache_root();
   if (missing.empty()) {
@@ -1231,6 +1252,7 @@ void compile_with_nvcc(
   const auto source_root = deepgemm_source_root_path(library_root);
   const auto cuda_home = cuda_home_path();
   const auto nvcc = cuda_home / "bin" / "nvcc";
+  const auto nvcc_ccbin = nvcc_ccbin_path();
   const auto cutlass_include = deepgemm_cutlass_include_path(source_root);
 
   std::ostringstream command;
@@ -1259,7 +1281,11 @@ void compile_with_nvcc(
           << " --diag-suppress=39,161,174,177,186,940"
           << " --ptxas-options=--register-usage-level=10"
           << " --compiler-options=-fPIC,-O3,-Wno-deprecated-declarations,-Wno-abi"
-          << " --gpu-architecture=sm_" << arch_flag(major, minor, 12, 9)
+          << " --gpu-architecture=sm_" << arch_flag(major, minor, 12, 9);
+  if (!nvcc_ccbin.empty()) {
+    command << " -ccbin=" << shell_quote(nvcc_ccbin);
+  }
+  command
           << " -I" << shell_quote(library_root / "include")
           << " -I" << shell_quote(cutlass_include)
           << " -I" << shell_quote(cuda_home / "include");

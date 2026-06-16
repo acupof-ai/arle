@@ -947,20 +947,23 @@ impl SafetensorLoader {
         // ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1) must degrade to the hand-kernel
         // path instead of erroring at the first MoE forward — probe once here
         // and skip the grouped caches so `use_deepgemm` self-disables.
-        let expert_weight_format = routed_expert_weight_format(&gate, &up, &down)?;
+        let (expert_weight_format, gate_sig, down_sig) =
+            routed_expert_weight_format(&gate, &up, &down)?;
         let routed_quant = expert_weight_format.is_quantized();
-        let deepgemm_ready = !routed_quant
-            && crate::moe::qwen35_deepgemm_enabled()
+        let deepgemm_native_ready = crate::moe::qwen35_deepgemm_enabled()
             && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
                 Ok(_) => true,
                 Err(err) => {
                     log::warn!(
                         "Qwen3.5 DeepGEMM MoE disabled: native bridge unavailable ({err}); \
-                         falling back to the hand grouped kernels"
+                             falling back to the hand grouped kernels"
                     );
                     false
                 }
             };
+        let deepgemm_ready = !routed_quant && deepgemm_native_ready;
+        let fp8_deepgemm_ready =
+            expert_weight_format == WeightFormat::Fp8BlockScaled && deepgemm_native_ready;
         let (gate_grouped, up_grouped, down_grouped) = if deepgemm_ready {
             let gate_g = MoeExpertGroup::concat(ctx, &gate)?;
             let up_g = MoeExpertGroup::concat(ctx, &up)?;
@@ -976,14 +979,42 @@ impl SafetensorLoader {
         } else {
             (None, None, None)
         };
+        let (w13_fp8_grouped, down_fp8_grouped) = if fp8_deepgemm_ready {
+            let w13_g = MoeFp8ExpertGroup::concat_pair_rows(
+                ctx,
+                &gate,
+                &up,
+                moe_intermediate_size,
+                hidden_size,
+            )?;
+            let down_g = MoeFp8ExpertGroup::concat(ctx, &down, hidden_size, moe_intermediate_size)?;
+            // The grouped caches now own the resident FP8 expert bytes. Sync
+            // before dropping sources because cudarc event tracking is disabled
+            // and the D2D concats above are async on the compute stream.
+            ctx.sync()?;
+            (Some(w13_g), Some(down_g))
+        } else {
+            (None, None)
+        };
 
         // Per-expert weight-pointer tables (one device pointer per owned
         // expert) — built from the per-expert matrices on the default path,
         // or from the grouped buffer offsets on the DeepGEMM path.
-        let (gate_ptrs, up_ptrs, down_ptrs) = match (&gate_grouped, &up_grouped, &down_grouped) {
-            (Some(g), Some(u), Some(d)) => {
+        let (gate_ptrs, up_ptrs, down_ptrs) = match (
+            &gate_grouped,
+            &up_grouped,
+            &down_grouped,
+            &w13_fp8_grouped,
+            &down_fp8_grouped,
+        ) {
+            (Some(g), Some(u), Some(d), _, _) => {
                 (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
             }
+            (None, None, None, Some(w13), Some(down_g)) => (
+                w13.qweight_ptr_table(ctx, 0)?,
+                w13.qweight_ptr_table(ctx, moe_intermediate_size)?,
+                down_g.qweight_ptr_table(ctx, 0)?,
+            ),
             _ => {
                 let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
                 let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
@@ -1003,11 +1034,24 @@ impl SafetensorLoader {
                 }
             }
         };
-        let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if routed_quant
+        let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if fp8_deepgemm_ready {
+            let w13 = w13_fp8_grouped
+                .as_ref()
+                .ok_or_else(|| anyhow!("FP8 DeepGEMM w13 cache missing after build"))?;
+            let down_g = down_fp8_grouped
+                .as_ref()
+                .ok_or_else(|| anyhow!("FP8 DeepGEMM down cache missing after build"))?;
+            (
+                Some(w13.scale_ptr_table(ctx, 0)?),
+                Some(w13.scale_ptr_table(ctx, moe_intermediate_size)?),
+                Some(down_g.scale_ptr_table(ctx, 0)?),
+            )
+        } else if routed_quant
             && matches!(
                 expert_weight_format,
                 WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
-            ) {
+            )
+        {
             let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
             let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
             let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
@@ -1059,12 +1103,19 @@ impl SafetensorLoader {
             } else {
                 (None, None, None)
             };
+        if fp8_deepgemm_ready {
+            gate.clear();
+            up.clear();
+            down.clear();
+        }
 
         Ok(MoeLayerWeights {
             gate,
             up,
             down,
             expert_weight_format,
+            gate_up_quant_signature: gate_sig,
+            down_quant_signature: down_sig,
             gate_ptrs,
             up_ptrs,
             down_ptrs,
@@ -1077,6 +1128,8 @@ impl SafetensorLoader {
             gate_grouped,
             up_grouped,
             down_grouped,
+            w13_fp8_grouped,
+            down_fp8_grouped,
             router_gate,
             shared_gate,
             shared_up,
@@ -2358,14 +2411,14 @@ pub(crate) struct OwnedTensor {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExpertQuantDispatchSignature {
-    rows: usize,
-    cols: usize,
-    quant_scale_rows: usize,
-    quant_scale_cols: usize,
-    quant_block_m: usize,
-    quant_block_k: usize,
-    group_size: usize,
+pub(crate) struct ExpertQuantDispatchSignature {
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) quant_scale_rows: usize,
+    pub(crate) quant_scale_cols: usize,
+    pub(crate) quant_block_m: usize,
+    pub(crate) quant_block_k: usize,
+    pub(crate) group_size: usize,
 }
 
 impl ExpertQuantDispatchSignature {
@@ -2412,7 +2465,11 @@ fn routed_expert_weight_format(
     gate: &[DeviceMatrix],
     up: &[DeviceMatrix],
     down: &[DeviceMatrix],
-) -> Result<WeightFormat> {
+) -> Result<(
+    WeightFormat,
+    Option<ExpertQuantDispatchSignature>,
+    Option<ExpertQuantDispatchSignature>,
+)> {
     let first = gate
         .first()
         .ok_or_else(|| anyhow!("MoE layer has no local gate experts"))?
@@ -2429,14 +2486,14 @@ fn routed_expert_weight_format(
     );
     let gate_sig = validate_expert_projection_dispatch_signature("gate", gate, first)?;
     let up_sig = validate_expert_projection_dispatch_signature("up", up, first)?;
-    let _down_sig = validate_expert_projection_dispatch_signature("down", down, first)?;
+    let down_sig = validate_expert_projection_dispatch_signature("down", down, first)?;
     if let (Some(gate_sig), Some(up_sig)) = (gate_sig, up_sig) {
         ensure!(
             gate_sig == up_sig,
             "Qwen3.6 MoE gate/up quant dispatch signature mismatch: gate={gate_sig:?} up={up_sig:?}"
         );
     }
-    Ok(first)
+    Ok((first, gate_sig, down_sig))
 }
 
 /// This EP rank's loaded MoE weights for one sparse layer: per-expert
@@ -2452,6 +2509,8 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) up: Vec<DeviceMatrix>,
     pub(crate) down: Vec<DeviceMatrix>,
     pub(crate) expert_weight_format: WeightFormat,
+    pub(crate) gate_up_quant_signature: Option<ExpertQuantDispatchSignature>,
+    pub(crate) down_quant_signature: Option<ExpertQuantDispatchSignature>,
     pub(crate) gate_ptrs: CudaSlice<u64>,
     pub(crate) up_ptrs: CudaSlice<u64>,
     pub(crate) down_ptrs: CudaSlice<u64>,
@@ -2467,6 +2526,11 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) gate_grouped: Option<MoeExpertGroup>,
     pub(crate) up_grouped: Option<MoeExpertGroup>,
     pub(crate) down_grouped: Option<MoeExpertGroup>,
+    /// DeepGEMM FP8 grouped-B cache for quantized routed experts. `w13`
+    /// fuses gate rows followed by up rows per expert, so the DeepGEMM
+    /// prefill lane can run one FP8 GEMM then SwiGLU+requantize.
+    pub(crate) w13_fp8_grouped: Option<MoeFp8ExpertGroup>,
+    pub(crate) down_fp8_grouped: Option<MoeFp8ExpertGroup>,
     pub(crate) router_gate: DeviceMatrix,
     pub(crate) shared_gate: DeviceMatrix,
     pub(crate) shared_up: DeviceMatrix,
@@ -2537,5 +2601,201 @@ impl MoeExpertGroup {
         ctx.stream
             .clone_htod(&host)
             .map_err(|e| anyhow!("MoE expert group ptr table H2D failed: {e}"))
+    }
+}
+
+/// One contiguous `[groups, rows, cols]` row-major FP8 expert-weight buffer
+/// with DeepGEMM-compatible FP32 `[groups, rows/128, cols/128]` block scales.
+pub(crate) struct MoeFp8ExpertGroup {
+    pub(crate) weight: CudaSlice<u8>,
+    pub(crate) scales: CudaSlice<f32>,
+    pub(crate) groups: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) scale_rows: usize,
+    pub(crate) scale_cols: usize,
+}
+
+impl MoeFp8ExpertGroup {
+    fn concat(
+        ctx: &DeviceContext,
+        experts: &[DeviceMatrix],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let groups = experts.len();
+        ensure!(groups > 0, "FP8 MoE expert group concat: no local experts");
+        let mut group = Self::empty(ctx, groups, rows, cols)?;
+        for (g, expert) in experts.iter().enumerate() {
+            group.copy_matrix_rows(ctx, g, 0, expert)?;
+        }
+        Ok(group)
+    }
+
+    fn concat_pair_rows(
+        ctx: &DeviceContext,
+        first: &[DeviceMatrix],
+        second: &[DeviceMatrix],
+        rows_each: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        ensure!(
+            first.len() == second.len() && !first.is_empty(),
+            "FP8 MoE fused group needs matching non-empty gate/up experts"
+        );
+        ensure!(
+            rows_each.is_multiple_of(128),
+            "FP8 MoE fused group first half rows must be 128-aligned, got {rows_each}"
+        );
+        let mut group = Self::empty(ctx, first.len(), rows_each * 2, cols)?;
+        for (g, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+            group.copy_matrix_rows(ctx, g, 0, a)?;
+            group.copy_matrix_rows(ctx, g, rows_each, b)?;
+        }
+        Ok(group)
+    }
+
+    fn empty(ctx: &DeviceContext, groups: usize, rows: usize, cols: usize) -> Result<Self> {
+        ensure!(groups > 0, "FP8 MoE expert group: groups must be non-zero");
+        ensure!(
+            rows.is_multiple_of(128) && cols.is_multiple_of(128),
+            "FP8 MoE DeepGEMM group needs rows/cols 128-aligned, got {rows}x{cols}"
+        );
+        let scale_rows = rows.div_ceil(128);
+        let scale_cols = cols.div_ceil(128);
+        Ok(Self {
+            weight: ctx
+                .stream
+                .alloc_zeros::<u8>(groups * rows * cols)
+                .map_err(|e| anyhow!("FP8 MoE grouped weight alloc failed: {e}"))?,
+            scales: ctx
+                .stream
+                .alloc_zeros::<f32>(groups * scale_rows * scale_cols)
+                .map_err(|e| anyhow!("FP8 MoE grouped scale alloc failed: {e}"))?,
+            groups,
+            rows,
+            cols,
+            scale_rows,
+            scale_cols,
+        })
+    }
+
+    fn copy_matrix_rows(
+        &mut self,
+        ctx: &DeviceContext,
+        group: usize,
+        row_offset: usize,
+        matrix: &DeviceMatrix,
+    ) -> Result<()> {
+        ensure!(
+            group < self.groups,
+            "FP8 MoE group index {group} outside groups {}",
+            self.groups
+        );
+        ensure!(
+            matrix.weight_format() == WeightFormat::Fp8BlockScaled,
+            "FP8 MoE grouped cache needs FP8 block-scaled experts, got {}",
+            matrix.weight_format()
+        );
+        ensure!(
+            matrix.rows + row_offset <= self.rows && matrix.cols == self.cols,
+            "FP8 MoE grouped cache shape mismatch: matrix {}x{} at row_offset {} into group {}x{}",
+            matrix.rows,
+            matrix.cols,
+            row_offset,
+            self.rows,
+            self.cols
+        );
+        ensure!(
+            row_offset.is_multiple_of(128)
+                && matrix.quant_block_m == 128
+                && matrix.quant_block_k == 128,
+            "FP8 MoE grouped cache needs 128x128 block metadata, row_offset={} block={}x{}",
+            row_offset,
+            matrix.quant_block_m,
+            matrix.quant_block_k
+        );
+        let matrix_scale_rows = matrix.rows.div_ceil(128);
+        let matrix_scale_cols = matrix.cols.div_ceil(128);
+        ensure!(
+            matrix.quant_scale_rows == matrix_scale_rows
+                && matrix.quant_scale_cols == matrix_scale_cols
+                && matrix_scale_cols == self.scale_cols,
+            "FP8 MoE grouped cache scale shape {}x{} != expected {}x{}",
+            matrix.quant_scale_rows,
+            matrix.quant_scale_cols,
+            matrix_scale_rows,
+            self.scale_cols
+        );
+        let qweight = matrix
+            .qweight_u8
+            .as_ref()
+            .ok_or_else(|| anyhow!("FP8 MoE grouped cache source missing weight bytes"))?;
+        let scales = matrix
+            .scale_f32
+            .as_ref()
+            .ok_or_else(|| anyhow!("FP8 MoE grouped cache source missing f32 scales"))?;
+        ensure!(
+            qweight.len() == matrix.rows * matrix.cols
+                && scales.len() == matrix_scale_rows * self.scale_cols,
+            "FP8 MoE grouped cache source lengths mismatch: weight={} scale={}",
+            qweight.len(),
+            scales.len()
+        );
+
+        {
+            let src = qweight.slice(0..qweight.len());
+            let group_weight_base = group * self.rows * self.cols;
+            let start = group_weight_base + row_offset * self.cols;
+            let mut dst = self.weight.slice_mut(start..start + qweight.len());
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("FP8 MoE grouped weight D2D failed: {e}"))?;
+        }
+        {
+            let src = scales.slice(0..scales.len());
+            let group_scale_base = group * self.scale_rows * self.scale_cols;
+            let start = group_scale_base + (row_offset / 128) * self.scale_cols;
+            let mut dst = self.scales.slice_mut(start..start + scales.len());
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow!("FP8 MoE grouped scale D2D failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn qweight_ptr_table(&self, ctx: &DeviceContext, row_offset: usize) -> Result<CudaSlice<u64>> {
+        ensure!(
+            row_offset < self.rows && row_offset.is_multiple_of(128),
+            "FP8 MoE qweight ptr row offset {row_offset} invalid for rows {}",
+            self.rows
+        );
+        let (base, _guard) = self.weight.device_ptr(&ctx.stream);
+        let group_stride = self.rows * self.cols;
+        let row_offset_elems = row_offset * self.cols;
+        let host: Vec<u64> = (0..self.groups)
+            .map(|g| base + (g * group_stride + row_offset_elems) as u64)
+            .collect();
+        ctx.stream
+            .clone_htod(&host)
+            .map_err(|e| anyhow!("FP8 MoE qweight ptr table H2D failed: {e}"))
+    }
+
+    fn scale_ptr_table(&self, ctx: &DeviceContext, row_offset: usize) -> Result<CudaSlice<u64>> {
+        ensure!(
+            row_offset < self.rows && row_offset.is_multiple_of(128),
+            "FP8 MoE scale ptr row offset {row_offset} invalid for rows {}",
+            self.rows
+        );
+        let (base, _guard) = self.scales.device_ptr(&ctx.stream);
+        let group_stride = self.scale_rows * self.scale_cols;
+        let row_offset_elems = (row_offset / 128) * self.scale_cols;
+        let elem_size = std::mem::size_of::<f32>() as u64;
+        let host: Vec<u64> = (0..self.groups)
+            .map(|g| base + ((g * group_stride + row_offset_elems) as u64 * elem_size))
+            .collect();
+        ctx.stream
+            .clone_htod(&host)
+            .map_err(|e| anyhow!("FP8 MoE scale ptr table H2D failed: {e}"))
     }
 }
