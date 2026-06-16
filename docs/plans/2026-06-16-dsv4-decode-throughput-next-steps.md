@@ -14,9 +14,24 @@ c ∈ {1,2,4,8(,…)}, metric = aggregate output tok/s. `scripts/sweep` (to be
 committed). guidellm not on .62; streaming `/v1/completions` → HTTP 400, so
 non-streaming for now (no TTFT/ITL).
 
-**c1–8 baseline (clean, profiling OFF, no-MTP, no compressor-batch):**
-c1=43.0, c2=45.0, c4=45.0, c8=74.8 tok/s. (The earlier "32" was a profiling
-artifact — NOT a regression. Confirmed: clean no-MTP c1=43 ≈ expected ~44.)
+**c1–8 baseline (clean, profiling OFF) — re-measured as a same-session A/B
+([[2026-06-16-dsv4-c1-8-baseline-clean-ab]]):**
+
+| c | OFF (gate off) | ON (compressor-batch) |
+|---|----------------|------------------------|
+| 1 | 43.8 | 44.9 |
+| 2 | 44.1 | 44.8 |
+| 4 | 44.2 | 69.8 (+58%) |
+| 8 | 74.0 | 77.6 (+5%) |
+
+The OFF column **replicates** the prior clean session (43.0/45.0/45.0/74.8) → the
+clean gate-OFF baseline is solid cross-session. The earlier "c1=32" was a
+profiling artifact (`serve_bench_62.sh` had `DECODE_PHASE_TIME`+`LINEAR_PROFILE`);
+the committed `2026-06-16-dsv4-c1-8-baseline-snapshot` table is now marked
+SUPERSEDED. The compressor-batch lever's biggest marginal win is c=4 (+58%);
+narrows to +5% at c=8 (other batched paths saturate). Single-sweep — the per-c
+magnitude needs ≥3 repeats before enshrining (direction/sign solid, matches the
+n=22 +38%).
 
 **Committed levers (gated `ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):**
 - `a4239598` compressor-GEMV batch (bf16 cublasLt m=N): n=22 perrow 162→92, step
