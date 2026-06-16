@@ -81,5 +81,10 @@ name = "fp8_grouped_prefill_probe"
 path = "examples/fp8_grouped_prefill_probe.rs"
 required-features = ["cuda"]
 
+[[example]]
+name = "fp8_decode_probe"
+path = "examples/fp8_decode_probe.rs"
+required-features = ["cuda"]
+
 [lints]
 workspace = true

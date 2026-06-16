@@ -897,12 +897,46 @@ mod gpu {
         // kernels keep the shape. `ARLE_QWEN35_MOE_DECODE_KERNEL=0` is the
         // same-binary A/B arm. Shape-constant pure kernel launches — decode
         // CUDA-graph capture-safe, same as the batch kernels.
-        let routed_quant = weights.expert_weight_format.is_quantized();
-        let use_decode_kernels = !routed_quant
+        let use_bf16_decode_kernels = weights.expert_weight_format == WeightFormat::DenseBf16
             && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
             && hidden_dim.is_multiple_of(8)
             && moe_inter.is_multiple_of(8)
             && qwen35_moe_decode_kernel_enabled();
+        let fp8_decode_scale_cols = if weights.expert_weight_format == WeightFormat::Fp8BlockScaled
+            && total_routes <= QWEN35_MOE_DECODE_MAX_ROUTES
+            && hidden_dim.is_multiple_of(16)
+            && moe_inter.is_multiple_of(16)
+            && qwen35_moe_decode_kernel_enabled()
+        {
+            let (gate_scale_rows, gate_scale_cols, gate_block_m, gate_block_k) =
+                fp8_signature_shape(weights.gate_up_quant_signature, "gate/up")?;
+            let (down_scale_rows, down_scale_cols, down_block_m, down_block_k) =
+                fp8_signature_shape(weights.down_quant_signature, "down")?;
+            ensure!(
+                gate_block_m == 128
+                    && gate_block_k == 128
+                    && down_block_m == 128
+                    && down_block_k == 128,
+                "Qwen FP8 decode-fused path requires 128x128 block scales, got gate {gate_block_m}x{gate_block_k}, down {down_block_m}x{down_block_k}"
+            );
+            ensure!(
+                gate_scale_cols == hidden_dim.div_ceil(128)
+                    && down_scale_cols == moe_inter.div_ceil(128),
+                "Qwen FP8 decode-fused scale cols mismatch: gate {gate_scale_cols} vs {}, down {down_scale_cols} vs {}",
+                hidden_dim.div_ceil(128),
+                moe_inter.div_ceil(128)
+            );
+            ensure!(
+                gate_scale_rows == moe_inter.div_ceil(128)
+                    && down_scale_rows == hidden_dim.div_ceil(128),
+                "Qwen FP8 decode-fused scale rows mismatch: gate {gate_scale_rows} vs {}, down {down_scale_rows} vs {}",
+                moe_inter.div_ceil(128),
+                hidden_dim.div_ceil(128)
+            );
+            Some((gate_scale_cols, down_scale_cols))
+        } else {
+            None
+        };
 
         // ── 5+6. Gate+up GEMM + SwiGLU (UNCLAMPED — Qwen3.6 has no clamp). ──
         // act rows are written within `offsets/counts` (decode path) or fully
@@ -910,7 +944,7 @@ mod gpu {
         // count is stale either way, and nothing reads it (both down GEMMs
         // consume `act` strictly within offsets/counts).
         let act = scratch.act.get(ctx, moe_inter, total_routes)?;
-        if use_decode_kernels {
+        if use_bf16_decode_kernels {
             // Fused: act = silu(gate·x) * (up·x), no gate_out/up_out slots.
             // SAFETY: weight-ptr tables + packed buffers valid on ctx.stream;
             // k = hidden_dim % 8 == 0 checked by the dispatch above.
@@ -928,6 +962,30 @@ mod gpu {
                     moe_inter,
                     hidden_dim,
                     ctx,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+        } else if let Some((gate_scale_cols, _down_scale_cols)) = fp8_decode_scale_cols {
+            // FP8/f32-scale decode-fused ABI: same compact decode-band kernel
+            // family as the DSv4 FP8 lane, but with Qwen's unclamped SwiGLU
+            // (`limit = inf`). This avoids the generic grouped batch GEMV's
+            // [num_experts, max_count] launch grid on the R<=256 decode band.
+            unsafe {
+                moe::dsv4_fp8_grouped_swiglu_decode(
+                    cache_ptr(&weights.gate_ptrs, ctx),
+                    cache_ptr(opt_ptrs(&weights.gate_scale_ptrs, "gate FP8 scale")?, ctx),
+                    cache_ptr(&weights.up_ptrs, ctx),
+                    cache_ptr(opt_ptrs(&weights.up_scale_ptrs, "up FP8 scale")?, ctx),
+                    cache_ptr(&packed_hidden.data, ctx),
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts_ptr,
+                    local_experts,
+                    max_count,
+                    moe_inter,
+                    hidden_dim,
+                    gate_scale_cols,
+                    f32::INFINITY,
                     ctx.stream.cu_stream(),
                 )?;
             }
@@ -960,7 +1018,7 @@ mod gpu {
 
         // ── 7. Grouped down GEMM → expert_out[R, H]. ────────────────────────
         let expert_out = scratch.expert_out.get(ctx, hidden_dim, total_routes)?;
-        if use_decode_kernels {
+        if use_bf16_decode_kernels {
             // SAFETY: down weight table + act/expert_out valid on ctx.stream;
             // k = moe_inter % 8 == 0 checked by the dispatch above.
             unsafe {
@@ -976,6 +1034,23 @@ mod gpu {
                     hidden_dim,
                     moe_inter,
                     ctx,
+                    ctx.stream.cu_stream(),
+                )?;
+            }
+        } else if let Some((_gate_scale_cols, down_scale_cols)) = fp8_decode_scale_cols {
+            unsafe {
+                moe::dsv4_fp8_grouped_down_decode(
+                    cache_ptr(&weights.down_ptrs, ctx),
+                    cache_ptr(opt_ptrs(&weights.down_scale_ptrs, "down FP8 scale")?, ctx),
+                    cache_ptr(&act.data, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(offsets, ctx),
+                    counts_ptr,
+                    local_experts,
+                    max_count,
+                    hidden_dim,
+                    moe_inter,
+                    down_scale_cols,
                     ctx.stream.cu_stream(),
                 )?;
             }
