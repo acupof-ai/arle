@@ -151,6 +151,7 @@ pub enum BackwardOp {
     Embedding,
     LinearAttention,
     CausalSdpaRecompute,
+    AllReduceSum,
 }
 
 impl BackwardOp {
@@ -182,6 +183,7 @@ impl BackwardOp {
             BackwardOp::Embedding => "Embedding",
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
+            BackwardOp::AllReduceSum => "AllReduceSum",
         }
     }
 }
@@ -435,6 +437,9 @@ impl Tape {
                     }
                     BackwardOp::CausalSdpaRecompute => {
                         ops::causal_sdpa_recompute_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::AllReduceSum => {
+                        ops::all_reduce_sum_backward(&entry, output_grad_id, store)?
                     }
                 };
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
