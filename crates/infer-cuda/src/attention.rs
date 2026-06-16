@@ -3987,6 +3987,7 @@ pub(crate) fn commit_layer_fold(
             None,
             true,
             original_seq_len,
+            None,
             keepalive,
         )?;
         if mode == DeepSeekV4AttentionMode::CompressedSparse {
@@ -4018,6 +4019,7 @@ pub(crate) fn commit_layer_fold(
                 None,
                 use_official_dsa,
                 indexer_rope_original_seq_len,
+                None,
                 keepalive,
             )?;
         }
@@ -5485,6 +5487,28 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
     // only in the free-continuation tail = legitimate FP8 numerics). Opt out with
     // ARLE_DSV4_DECODE_PROJ_DEEPGEMM=0.
     cuda_kernels::has_deepgemm_native()
+}
+
+/// Opt-in batched (m=N) decode compressor/indexer projection pre-pass. The
+/// per-row m=1 `compressor_forward` GEMVs (`wkv`/`wgate`) re-read the full weight
+/// per decode row (bandwidth-bound, zero amortization) — DEAD-LINEAR in batch
+/// size n (~7.4ms/row, ~54% of the decode step). When ON, the projections are
+/// batched into one DeepGEMM m=N (weight read ONCE across all N rows), mirroring
+/// `mla_attention_prepare_proj_batch`'s q/kv pre-pass. **Default OFF** (env unset
+/// → byte-identical baseline): returns `true` ONLY when
+/// `ARLE_DSV4_DECODE_COMPRESSOR_BATCH` is truthy AND native DeepGEMM is compiled
+/// in. The per-slot compressor state update (`dsv4_compressor_update_*`) stays
+/// per-row; only the SOURCE of `kv_raw`/`score_raw` changes (FP8-DeepGEMM column
+/// slice vs per-row bf16 GEMV) — needle-gated like every DSv4 projection lever.
+pub(crate) fn dsv4_decode_compressor_batch_enabled() -> Result<bool> {
+    // Default OFF (byte-identical baseline). The batched pre-pass uses `dsv4_linear`
+    // at m=N, which dispatches per `weight_format`: DenseBf16 → gemm_cuda
+    // (cublasLtMatmul, weight read ONCE across the N rows, amortized); Fp8BlockScaled
+    // → deepgemm. The DSv4 compressor weights are all bf16 (verified: 41 main + 21
+    // indexer layers), so this is the cublasLt amortized path with NO FP8-quant
+    // correctness shift and NO deepgemm-native build requirement. Mixed-precision
+    // safe by construction (per-weight format dispatch). Gate purely on the env flag.
+    env_flag("ARLE_DSV4_DECODE_COMPRESSOR_BATCH")
 }
 
 /// Prefill residual projections (wq_b now; wo/indexer next) → tensor-core DeepGEMM
@@ -7480,6 +7504,7 @@ pub(crate) fn mla_attention_prepare(
                 // YaRN on for compressed layers (matches Q/SW-K + SGLang
                 // compressor freqs_cis); original_seq_len = orig_max_pos here.
                 original_seq_len,
+                None,
                 keepalive,
             )?;
         }
@@ -7529,6 +7554,7 @@ pub(crate) fn mla_attention_prepare(
                     start_pos_device,
                     use_official_dsa,
                     indexer_rope_original_seq_len,
+                    None,
                     keepalive,
                 )?;
             }
@@ -7871,6 +7897,12 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     // `None` (the batched select fills selected_batched). `None` → byte-identical
     // single-row CSA prepare.
     batched_gather: Option<Dsv4DsaBatchedGather<'_>>,
+    // Opt-in batched decode pre-pass (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default
+    // OFF): when `Some`, this row's compressor/indexer `(kv_raw, score_raw)` were
+    // already projected batched (DeepGEMM m=N) and are passed to
+    // `compressor_forward`, skipping the per-row m=1 GEMVs. `None` → byte-identical
+    // per-row `dsv4_linear` projection.
+    compressor_precomputed: Option<Dsv4CompressorPrecomputed<'_>>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
     let head_dim = config.head_dim;
@@ -7912,6 +7944,12 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
         })?;
         let overlap = compress_ratio < 16;
+        // Split the opt-in batched pre-pass slices into main + indexer (the inner
+        // `(&HiddenStates, &HiddenStates)` pairs are `Copy` references, so reading
+        // both fields does not conflict with the per-call `state` borrows below).
+        // `None` everywhere → byte-identical per-row GEMV path.
+        let precomputed_main = compressor_precomputed.as_ref().map(|p| p.main);
+        let precomputed_indexer = compressor_precomputed.as_ref().and_then(|p| p.indexer);
         {
             let compressor_state = state.compressor.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
@@ -7929,6 +7967,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 start_pos_device,
                 true,
                 original_seq_len,
+                precomputed_main,
                 keepalive,
             )?;
         }
@@ -7976,6 +8015,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     start_pos_device,
                     use_official_dsa,
                     indexer_rope_original_seq_len,
+                    precomputed_indexer,
                     keepalive,
                 )?;
             }
@@ -8583,6 +8623,13 @@ fn compressor_forward(
     start_pos_device: Option<&CudaSlice<i32>>,
     apply_rope: bool,
     rope_original_seq_len: i32,
+    // Batched decode pre-pass (opt-in, default OFF): when `Some`, the two m=1
+    // `dsv4_linear` projection GEMVs are SKIPPED and the passed
+    // `(kv_raw, score_raw)` — this row's `[width, 1]` slices of the batched
+    // DeepGEMM outputs — are used directly. Everything downstream (the per-slot
+    // `dsv4_compressor_update_*` FFI + state advance) is UNCHANGED. `None` →
+    // byte-identical legacy per-row GEMV path.
+    precomputed: Option<(&HiddenStates, &HiddenStates)>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 compressor ratio must be non-zero");
@@ -8616,22 +8663,55 @@ fn compressor_forward(
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
 
-    // SAFETY: dsv4_linear writes the full compressor kv buffer.
-    let mut kv_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
-    let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
-    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
-        dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv_raw)
-    })?;
-    drop(nvtx_compressor_wkv);
-    keepalive.keep_hidden(&kv_raw);
-    // SAFETY: dsv4_linear writes the full compressor score buffer.
-    let mut score_raw = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
-    let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
-    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
-        dsv4_linear(ctx, &compressor.wgate, hidden, &mut score_raw)
-    })?;
-    drop(nvtx_compressor_wgate);
-    keepalive.keep_hidden(&score_raw);
+    // SOURCE of kv_raw/score_raw: either this row's `[width, 1]` slice of the
+    // batched DeepGEMM pre-pass (precomputed `Some`, opt-in) or the per-row m=1
+    // `dsv4_linear` GEMVs (precomputed `None`, byte-identical legacy default).
+    // `owned_*` hold the GEMV-produced buffers in the `None` branch (declared in
+    // the outer scope so they outlive the FFI read below); `kv_raw` / `score_raw`
+    // reference whichever source is active. The downstream
+    // `dsv4_compressor_update_*` FFI reads these by device pointer and is
+    // identical for both sources (only the numerics shift, FP8-DeepGEMM vs
+    // bf16-GEMV, which is needle-gated).
+    let mut owned_kv: Option<HiddenStates> = None;
+    let mut owned_score: Option<HiddenStates> = None;
+    let (kv_raw, score_raw): (&HiddenStates, &HiddenStates) = match precomputed {
+        Some((kv_precomputed, score_precomputed)) => {
+            ensure!(
+                kv_precomputed.hidden_dim == width
+                    && kv_precomputed.seq_len == token_count
+                    && score_precomputed.hidden_dim == width
+                    && score_precomputed.seq_len == token_count,
+                "DSv4 compressor precomputed slice shape mismatch: kv={}x{} score={}x{} expected [{width},{token_count}]",
+                kv_precomputed.hidden_dim,
+                kv_precomputed.seq_len,
+                score_precomputed.hidden_dim,
+                score_precomputed.seq_len
+            );
+            (kv_precomputed, score_precomputed)
+        }
+        None => {
+            // SAFETY: dsv4_linear writes the full compressor kv buffer.
+            let mut kv = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
+            let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
+            crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
+                dsv4_linear(ctx, &compressor.wkv, hidden, &mut kv)
+            })?;
+            drop(nvtx_compressor_wkv);
+            keepalive.keep_hidden(&kv);
+            // SAFETY: dsv4_linear writes the full compressor score buffer.
+            let mut score = unsafe { HiddenStates::uninit(ctx, width, token_count)? };
+            let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
+            crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
+                dsv4_linear(ctx, &compressor.wgate, hidden, &mut score)
+            })?;
+            drop(nvtx_compressor_wgate);
+            keepalive.keep_hidden(&score);
+            (
+                owned_kv.insert(kv) as &HiddenStates,
+                owned_score.insert(score) as &HiddenStates,
+            )
+        }
+    };
 
     let rope = &config.rope_parameters;
     // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0).
@@ -8730,6 +8810,67 @@ fn compressor_forward(
     Ok(())
 }
 
+/// Opt-in batched (m=N) decode compressor/indexer projection pre-pass
+/// (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF). Projects the N-row
+/// post-attn-LN `normed_batch` [hidden_size, N] through `compressor.wkv` /
+/// `compressor.wgate` ONCE via DeepGEMM (weight read once across all N rows),
+/// returning `kv_raw_batch [width, N]` and `score_raw_batch [width, N]`
+/// (`width = cache.rows`). Each row's `[width, 1]` column slice then feeds
+/// [`compressor_forward`] as `precomputed`, replacing the per-row m=1
+/// `dsv4_linear` GEMVs that re-read the full weight per row (bandwidth-bound,
+/// zero amortization, ~54% of the decode step, DEAD-LINEAR in N).
+///
+/// Returns `None` when the DeepGEMM caches are absent (gate off / not compiled),
+/// so the caller falls back to the byte-identical per-row GEMV path. Both outputs
+/// are fresh per-step allocations kept alive via `keepalive.keep_hidden`. Mirrors
+/// `mla_attention_prepare_proj_batch`'s q/kv pre-pass; touches NO slot state.
+pub(crate) fn compressor_batch_prepass(
+    ctx: &DeviceContext,
+    compressor: &Dsv4Compressor,
+    normed_batch: &HiddenStates,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<Option<(HiddenStates, HiddenStates)>> {
+    // Batch the per-row compressor projections into ONE m=N GEMM each. `dsv4_linear`
+    // dispatches per `weight_format`: DenseBf16 → gemm_cuda (cublasLtMatmul, weight
+    // read ONCE for all N rows = amortized); Fp8BlockScaled → deepgemm. The DSv4
+    // compressor weights are bf16, so this is the cublasLt path — the N per-row m=1
+    // GEMVs (weight re-read N times, bandwidth-bound = the measured `perrow ∝ n`
+    // bottleneck) collapse to one m=N GEMM (weight read once). No FP8 quant, so no
+    // selection-shift correctness risk; mixed-precision-safe by construction.
+    let n = normed_batch.seq_len;
+    let width = compressor.wkv.rows;
+    ensure!(
+        compressor.wgate.rows == width,
+        "DSv4 compressor batch pre-pass wkv/wgate row mismatch: wkv={width} wgate={}",
+        compressor.wgate.rows
+    );
+    ensure!(
+        compressor.wkv.cols == normed_batch.hidden_dim
+            && compressor.wgate.cols == normed_batch.hidden_dim,
+        "DSv4 compressor batch pre-pass K mismatch: wkv.cols={} wgate.cols={} normed hidden={}",
+        compressor.wkv.cols,
+        compressor.wgate.cols,
+        normed_batch.hidden_dim
+    );
+    // SAFETY: dsv4_linear writes the full output buffer.
+    let mut kv_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
+    let nvtx_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv_batched");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv_batched", || {
+        dsv4_linear(ctx, &compressor.wkv, normed_batch, &mut kv_raw_batch)
+    })?;
+    drop(nvtx_wkv);
+    keepalive.keep_hidden(&kv_raw_batch);
+    // SAFETY: dsv4_linear writes the full output buffer.
+    let mut score_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
+    let nvtx_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate_batched");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate_batched", || {
+        dsv4_linear(ctx, &compressor.wgate, normed_batch, &mut score_raw_batch)
+    })?;
+    drop(nvtx_wgate);
+    keepalive.keep_hidden(&score_raw_batch);
+    Ok(Some((kv_raw_batch, score_raw_batch)))
+}
+
 /// Batched-decode gather sink threaded into [`csa_select`] / [`mla_attention_prepare_compressed_only`]
 /// for row `r` of the N-row batched-decode lane (#60). When present, `csa_select`
 /// does the per-row CACHE WRITES only (skips the per-row read/select), gathers
@@ -8738,6 +8879,19 @@ fn compressor_forward(
 /// ONE batched `csa_select_official_batched` after the prepare loop produces
 /// byte-equivalent context_lens. `selected` is then `None` (the batched select
 /// writes directly into `selected_batched`).
+/// Per-row precomputed compressor/indexer projection slices for the opt-in
+/// batched decode pre-pass (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF).
+/// Each `(kv_raw, score_raw)` pair is this row's `[width, 1]` column slice of the
+/// batched DeepGEMM `prefill_proj_deepgemm` output. When threaded into
+/// [`mla_attention_prepare_compressed_only`], they replace the per-row m=1
+/// `dsv4_linear` GEMVs inside [`compressor_forward`]; the per-slot state update
+/// stays per-row. `main` feeds `attention.compressor`; `indexer` feeds
+/// `attention.indexer.compressor` (present only when the layer is CompressedSparse).
+pub(crate) struct Dsv4CompressorPrecomputed<'a> {
+    pub(crate) main: (&'a HiddenStates, &'a HiddenStates),
+    pub(crate) indexer: Option<(&'a HiddenStates, &'a HiddenStates)>,
+}
+
 pub(crate) struct Dsv4DsaBatchedGather<'a> {
     /// N-row staging for indexer query, shape `[local_index_heads*index_head_dim, n]`.
     pub(crate) q_i_batch: &'a mut HiddenStates,
