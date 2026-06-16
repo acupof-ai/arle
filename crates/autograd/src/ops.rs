@@ -48,7 +48,8 @@ pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
 pub(crate) use linear_attention::linear_attention_backward;
 pub(crate) use matmul::{matmul_backward, matmul_bt_backward};
 pub(crate) use moe::{
-    moe_gather_rows_backward, moe_topk_softmax_backward, moe_weighted_scatter_backward,
+    moe_gather_rows_backward, moe_grouped_linear_backward, moe_grouped_weighted_scatter_backward,
+    moe_topk_softmax_backward, moe_weighted_scatter_backward,
 };
 pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
@@ -226,7 +227,7 @@ pub fn gather_last_dim(
     gather::gather_last_dim(src, indices, store, tape)
 }
 
-pub use moe::{MoeRoute, MoeTopK};
+pub use moe::{MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute, MoeRoute, MoeTopK};
 
 pub fn moe_topk_softmax(
     logits: TensorId,
@@ -255,6 +256,28 @@ pub fn moe_weighted_scatter(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     moe::moe_weighted_scatter(values, weights, routes, out_rows, store, tape)
+}
+
+pub fn moe_grouped_linear(
+    input: TensorId,
+    experts: &[MoeGroupedLinearExpert],
+    routes: &[MoeGroupedRoute],
+    input_kind: MoeGroupedLinearInput,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    moe::moe_grouped_linear(input, experts, routes, input_kind, store, tape)
+}
+
+pub fn moe_grouped_weighted_scatter(
+    values: TensorId,
+    weights: TensorId,
+    routes: &[MoeGroupedRoute],
+    out_rows: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    moe::moe_grouped_weighted_scatter(values, weights, routes, out_rows, store, tape)
 }
 
 pub fn reshape(

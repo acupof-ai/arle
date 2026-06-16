@@ -89,6 +89,14 @@ pub struct LinearWithLora {
     lora: Option<LoraWeights>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LinearLoraParts {
+    pub weight: TensorId,
+    pub lora_a: Option<TensorId>,
+    pub lora_b: Option<TensorId>,
+    pub lora_scale: f32,
+}
+
 #[derive(Debug, Clone)]
 struct LoraWeights {
     lora_a_name: &'static str,
@@ -191,6 +199,15 @@ impl LinearWithLora {
         let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
         output_shape.push(weight_shape[0]);
         reshape(projected, &output_shape, store, tape)
+    }
+
+    pub fn parts(&self) -> LinearLoraParts {
+        LinearLoraParts {
+            weight: self.weight,
+            lora_a: self.lora.as_ref().map(|lora| lora.lora_a),
+            lora_b: self.lora.as_ref().map(|lora| lora.lora_b),
+            lora_scale: self.lora.as_ref().map(|lora| lora.scale).unwrap_or(0.0),
+        }
     }
 
     pub fn base_weight(&self) -> TensorId {
