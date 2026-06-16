@@ -116,6 +116,7 @@ unsafe extern "C" {
         num_kvheads: i32,
         gqa_ratio: i32,
         head_dim: i32,
+        rotary_dim: i32,
         max_seq_len: i32,
         batch_size: i32,
         rms_eps: f32,

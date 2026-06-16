@@ -343,14 +343,17 @@ __global__ void fused_gqa_attention_single_token_kernel(
 //   blockIdx.x = q_head_idx
 //   blockIdx.y = split_id (KV chunk index)
 //   blockIdx.z = batch_idx
-// Threads: HEAD_DIM (128)
+// Threads: HEAD_DIM (256)
 // ============================================================================
 
 #define NUM_KV_SPLITS 4
 #define BATCHED_BLOCK_N 64
+#define BATCHED_DECODE_HEAD_DIM 256
+#define BATCHED_DECODE_THREADS 256
+#define BATCHED_DECODE_NUM_WARPS (BATCHED_DECODE_THREADS / WARP_SIZE)
 
 __global__ void fused_gqa_attention_decode_batched_kernel(
-    const __nv_bfloat16* __restrict__ q_batch,    // [B, q_dim]
+    const __nv_bfloat16* __restrict__ q_batch,    // [B, num_qheads * 2 * head_dim] (Q + gate)
     const __nv_bfloat16* __restrict__ k_batch,    // [B, kv_dim]
     const __nv_bfloat16* __restrict__ v_batch,    // [B, kv_dim]
     const __nv_bfloat16* __restrict__ q_norm_weight,
@@ -368,6 +371,7 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     int num_kvheads,
     int gqa_ratio,
     int head_dim,
+    int rotary_dim,
     int max_seq_len,
     float rms_eps
 ) {
@@ -377,20 +381,21 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     int kv_head_idx = q_head_idx / gqa_ratio;
 
     int tid = threadIdx.x;  // 0..HEAD_DIM-1
-    int half_dim = head_dim / 2;
+    int half_rotary = rotary_dim / 2;
 
     int current_pos = positions[batch_idx];
     float scale = 1.0f / sqrtf((float)head_dim);
     float qk_scale = scale * 1.44269504f;  // scale * log2(e) for exp2 trick
 
     // ---- Shared memory for Q/K norm computation ----
-    __shared__ float smem_scratch[NUM_WARPS];
+    __shared__ float smem_scratch[BATCHED_DECODE_NUM_WARPS];
 
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
 
     // ---- Load Q, apply RMSNorm + RoPE ----
-    int q_base = batch_idx * num_qheads * head_dim + q_head_idx * head_dim;
+    int q_full_dim = num_qheads * head_dim * 2;
+    int q_base = batch_idx * q_full_dim + q_head_idx * 2 * head_dim;
     float q_val = __bfloat162float(q_batch[q_base + tid]);
 
     // RMSNorm for Q
@@ -400,28 +405,28 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     __syncthreads();
     if (tid == 0) {
         float total = 0.0f;
-        for (int i = 0; i < NUM_WARPS; i++) total += smem_scratch[i];
+            for (int i = 0; i < BATCHED_DECODE_NUM_WARPS; i++) total += smem_scratch[i];
         smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
     }
     __syncthreads();
     float q_rms = smem_scratch[0];
-    float q_normed = q_val * q_rms * __bfloat162float(q_norm_weight[tid]);
+    float q_normed = q_val * q_rms * (1.0f + __bfloat162float(q_norm_weight[tid]));
 
-    // RoPE for Q — half-split: lo = 0..half_dim-1, hi = half_dim..head_dim-1
-    // Store in shared memory for paired access
-    __shared__ float smem_q_rope[HEAD_DIM];
+    // RoPE for Q — partial half-split: lo = 0..rotary_dim/2-1,
+    // hi = rotary_dim/2..rotary_dim-1; dims >= rotary_dim pass through.
+    __shared__ float smem_q_rope[BATCHED_DECODE_HEAD_DIM];
     smem_q_rope[tid] = q_normed;
     __syncthreads();
 
-    float q_rot;
-    if (tid < half_dim) {
-        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + tid]);
-        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + tid]);
-        q_rot = smem_q_rope[tid] * cos_val - smem_q_rope[tid + half_dim] * sin_val;
-    } else {
-        int pair = tid - half_dim;
-        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + pair]);
-        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + pair]);
+    float q_rot = q_normed;
+    if (tid < half_rotary) {
+        float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + tid]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + tid]);
+        q_rot = smem_q_rope[tid] * cos_val - smem_q_rope[tid + half_rotary] * sin_val;
+    } else if (tid < rotary_dim) {
+        int pair = tid - half_rotary;
+        float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + pair]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + pair]);
         q_rot = smem_q_rope[pair] * sin_val + smem_q_rope[tid] * cos_val;
     }
 
@@ -435,26 +440,26 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     __syncthreads();
     if (tid == 0) {
         float total = 0.0f;
-        for (int i = 0; i < NUM_WARPS; i++) total += smem_scratch[i];
+            for (int i = 0; i < BATCHED_DECODE_NUM_WARPS; i++) total += smem_scratch[i];
         smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
     }
     __syncthreads();
     float k_rms = smem_scratch[0];
-    float k_normed = k_val * k_rms * __bfloat162float(k_norm_weight[tid]);
+    float k_normed = k_val * k_rms * (1.0f + __bfloat162float(k_norm_weight[tid]));
 
-    __shared__ float smem_k_rope[HEAD_DIM];
+    __shared__ float smem_k_rope[BATCHED_DECODE_HEAD_DIM];
     smem_k_rope[tid] = k_normed;
     __syncthreads();
 
-    float k_rot;
-    if (tid < half_dim) {
-        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + tid]);
-        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + tid]);
-        k_rot = smem_k_rope[tid] * cos_val - smem_k_rope[tid + half_dim] * sin_val;
-    } else {
-        int pair = tid - half_dim;
-        float cos_val = __bfloat162float(cos_cache[current_pos * head_dim + pair]);
-        float sin_val = __bfloat162float(sin_cache[current_pos * head_dim + pair]);
+    float k_rot = k_normed;
+    if (tid < half_rotary) {
+        float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + tid]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + tid]);
+        k_rot = smem_k_rope[tid] * cos_val - smem_k_rope[tid + half_rotary] * sin_val;
+    } else if (tid < rotary_dim) {
+        int pair = tid - half_rotary;
+        float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + pair]);
+        float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + pair]);
         k_rot = smem_k_rope[pair] * sin_val + smem_k_rope[tid] * cos_val;
     }
 
@@ -475,8 +480,9 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     }
 
     // ---- Compute this split's KV range ----
-    // seq_len here means number of *past* tokens (before the current one)
-    int past_seq_len = current_pos;
+    // seq_lens includes the current decode token; split-KV scans only the prefix
+    // because split 0 handles the current token from registers below.
+    int past_seq_len = max(0, seq_lens[batch_idx] - 1);
     int tiles_total = (past_seq_len + BATCHED_BLOCK_N - 1) / BATCHED_BLOCK_N;
     int tiles_per_split = (tiles_total + NUM_KV_SPLITS - 1) / NUM_KV_SPLITS;
     int split_start = split_id * tiles_per_split * BATCHED_BLOCK_N;
@@ -510,7 +516,7 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
             __syncthreads();
             if (tid == 0) {
                 float score = 0.0f;
-                for (int w = 0; w < NUM_WARPS; w++) score += smem_scratch[w];
+                for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) score += smem_scratch[w];
                 smem_qk[pos] = score * qk_scale;
             }
             __syncthreads();
@@ -547,7 +553,7 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         __syncthreads();
         if (tid == 0) {
             float score = 0.0f;
-            for (int w = 0; w < NUM_WARPS; w++) score += smem_scratch[w];
+            for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) score += smem_scratch[w];
             smem_scratch[0] = score * qk_scale;
         }
         __syncthreads();
@@ -674,7 +680,7 @@ __global__ void fused_gqa_attention_decode_single_kernel(
     int lane_id = tid % WARP_SIZE;
 
     // ---- Load Q, apply RMSNorm + RoPE ----
-    int q_base = q_head_idx * head_dim;
+    int q_base = q_head_idx * 2 * head_dim;
     float q_val = __bfloat162float(q_full[q_base + tid]);
 
     float q_sq = q_val * q_val;
@@ -688,7 +694,7 @@ __global__ void fused_gqa_attention_decode_single_kernel(
     }
     __syncthreads();
     float q_rms = smem_scratch[0];
-    float q_normed = q_val * q_rms * __bfloat162float(q_norm_weight[tid]);
+    float q_normed = q_val * q_rms * (1.0f + __bfloat162float(q_norm_weight[tid]));
 
     __shared__ float smem_q_rope[HEAD_DIM];
     smem_q_rope[tid] = q_normed;
@@ -721,7 +727,7 @@ __global__ void fused_gqa_attention_decode_single_kernel(
     }
     __syncthreads();
     float k_rms = smem_scratch[0];
-    float k_normed = k_val * k_rms * __bfloat162float(k_norm_weight[tid]);
+    float k_normed = k_val * k_rms * (1.0f + __bfloat162float(k_norm_weight[tid]));
 
     __shared__ float smem_k_rope[HEAD_DIM];
     smem_k_rope[tid] = k_normed;
@@ -907,13 +913,17 @@ cudaError_t fused_gqa_attention_decode_batched(
     int num_kvheads,
     int gqa_ratio,
     int head_dim,
+    int rotary_dim,
     int max_seq_len,
     int batch_size,
     float rms_eps,
     cudaStream_t stream
 ) {
+    if (head_dim != BATCHED_DECODE_HEAD_DIM) {
+        return cudaErrorInvalidValue;
+    }
     dim3 grid(num_qheads, NUM_KV_SPLITS, batch_size);
-    int threads = head_dim;
+    int threads = BATCHED_DECODE_THREADS;
 
     fused_gqa_attention_decode_batched_kernel<<<grid, threads, 0, stream>>>(
         q_batch, k_batch, v_batch,
@@ -923,7 +933,7 @@ cudaError_t fused_gqa_attention_decode_batched(
         k_cache_ptrs, v_cache_ptrs,
         partial_out, partial_m, partial_l,
         num_qheads, num_kvheads, gqa_ratio, head_dim,
-        max_seq_len, rms_eps
+        rotary_dim, max_seq_len, rms_eps
     );
     return cudaGetLastError();
 }

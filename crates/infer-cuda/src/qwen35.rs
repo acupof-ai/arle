@@ -56,12 +56,22 @@ use crate::ops::{
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
+const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
 fn qwen35_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
             || std::env::var_os("ARLE_QWEN35_MOE_PROFILE").is_some()
+    })
+}
+
+fn qwen35_batched_decode_attention_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARLE_QWEN35_BATCHED_DECODE_ATTENTION")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -432,6 +442,12 @@ pub(crate) struct FullAttnScratch {
     /// `[splits, b=1, local_q_heads, seq_len]`.
     fa3_lseaccum: SliceSlot<f32>,
     fa3_semaphore: SliceSlot<i32>,
+    /// Batched split-KV decode scratch for full attention:
+    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS, head_dim]`.
+    batch_partial_out: SliceSlot<f32>,
+    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS]`.
+    batch_partial_m: SliceSlot<f32>,
+    batch_partial_l: SliceSlot<f32>,
 }
 
 #[derive(Default)]
@@ -510,6 +526,13 @@ impl Qwen35Workspace {
         full.v_batch.release();
         full.q_prepped.release();
         full.attn_heads.release();
+        full.fa3_lse.release();
+        full.fa3_oaccum.release();
+        full.fa3_lseaccum.release();
+        full.fa3_semaphore.release();
+        full.batch_partial_out.release();
+        full.batch_partial_m.release();
+        full.batch_partial_l.release();
         linear.qkv.release();
         linear.z.release();
         linear.b_proj.release();
@@ -559,8 +582,16 @@ pub(crate) struct Qwen35BatchDecodeState {
     /// Dedicated `[*, B]`-shaped forward workspace (see struct docs).
     ws: Qwen35Workspace,
     /// Per-row absolute start positions (`[B]` i32), staged once per step;
-    /// the per-row full-attention kernel launches read `positions + r`.
+    /// batched full-attention kernels read the device array directly.
     positions: SliceSlot<i32>,
+    /// Per-row KV lengths after appending the decode token (`positions + 1`).
+    seq_lens: SliceSlot<i32>,
+    /// Per-FULL-layer `[num_slots]` u64 device tables of K/V cache pointers
+    /// (`Half** [B] -> [local_kv_heads, max_seq_len, head_dim]`). The batched
+    /// full-attn kernel writes the current row and reads the prefix through
+    /// these pointers.
+    full_k_cache_ptrs: Vec<CudaSlice<u64>>,
+    full_v_cache_ptrs: Vec<CudaSlice<u64>>,
     /// Per-LINEAR-layer `[num_slots]` u64 device tables of conv-ring pointers
     /// (`Half** [B] -> [C, K-1]` as `conv1d_decode_batch_cuda` consumes them).
     conv_state_ptrs: Vec<CudaSlice<u64>>,
@@ -571,6 +602,8 @@ pub(crate) struct Qwen35BatchDecodeState {
     /// `memcpy_htod` per layer per table, no per-row H2D).
     conv_host: Vec<u64>,
     gdr_host: Vec<u64>,
+    full_k_host: Vec<u64>,
+    full_v_host: Vec<u64>,
     /// Row→slot mapping the tables were last staged for (empty = never).
     staged_slot_indices: Vec<usize>,
     /// Batched logits `[vocab, B]` (final norm + lm_head GEMM over all rows).
@@ -582,6 +615,7 @@ pub(crate) struct Qwen35BatchDecodeState {
 impl Qwen35BatchDecodeState {
     pub(crate) fn new(
         ctx: &DeviceContext,
+        num_full_layers: usize,
         num_linear_layers: usize,
         max_batch: usize,
     ) -> Result<Self> {
@@ -589,6 +623,16 @@ impl Qwen35BatchDecodeState {
             max_batch > 0,
             "Qwen3.5 batched decode requires max_batch > 0"
         );
+        let mut full_k_cache_ptrs = Vec::with_capacity(num_full_layers);
+        let mut full_v_cache_ptrs = Vec::with_capacity(num_full_layers);
+        for layer_idx in 0..num_full_layers {
+            full_k_cache_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
+                anyhow!("alloc qwen35 batch full_k_cache_ptrs layer {layer_idx}: {e}")
+            })?);
+            full_v_cache_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
+                anyhow!("alloc qwen35 batch full_v_cache_ptrs layer {layer_idx}: {e}")
+            })?);
+        }
         let mut conv_state_ptrs = Vec::with_capacity(num_linear_layers);
         let mut gdr_state_ptrs = Vec::with_capacity(num_linear_layers);
         for layer_idx in 0..num_linear_layers {
@@ -602,10 +646,15 @@ impl Qwen35BatchDecodeState {
         Ok(Self {
             ws: Qwen35Workspace::new(),
             positions: SliceSlot::default(),
+            seq_lens: SliceSlot::default(),
+            full_k_cache_ptrs,
+            full_v_cache_ptrs,
             conv_state_ptrs,
             gdr_state_ptrs,
             conv_host: vec![0u64; max_batch],
             gdr_host: vec![0u64; max_batch],
+            full_k_host: vec![0u64; max_batch],
+            full_v_host: vec![0u64; max_batch],
             staged_slot_indices: Vec::new(),
             logits_batch: HiddenSlot::default(),
             argmax: SliceSlot::default(),
@@ -631,6 +680,34 @@ impl Qwen35BatchDecodeState {
             b,
             self.conv_host.len()
         );
+        for layer_idx in 0..self.full_k_cache_ptrs.len() {
+            for (r, &si) in slot_indices.iter().enumerate() {
+                let slot = &mut slots[si];
+                ensure!(
+                    layer_idx < slot.k_caches.len() && layer_idx < slot.v_caches.len(),
+                    "Qwen3.5 batched decode full-attn layer {layer_idx} outside slot cache \
+                     (k={}, v={})",
+                    slot.k_caches.len(),
+                    slot.v_caches.len()
+                );
+                let (k_ptr, _gk) = slot.k_caches[layer_idx].data.device_ptr_mut(&ctx.stream);
+                let (v_ptr, _gv) = slot.v_caches[layer_idx].data.device_ptr_mut(&ctx.stream);
+                self.full_k_host[r] = k_ptr;
+                self.full_v_host[r] = v_ptr;
+            }
+            ctx.stream
+                .memcpy_htod(
+                    &self.full_k_host[..b],
+                    &mut self.full_k_cache_ptrs[layer_idx],
+                )
+                .map_err(|e| anyhow!("H2D qwen35 full_k_cache_ptrs layer {layer_idx}: {e}"))?;
+            ctx.stream
+                .memcpy_htod(
+                    &self.full_v_host[..b],
+                    &mut self.full_v_cache_ptrs[layer_idx],
+                )
+                .map_err(|e| anyhow!("H2D qwen35 full_v_cache_ptrs layer {layer_idx}: {e}"))?;
+        }
         for layer_idx in 0..self.conv_state_ptrs.len() {
             for (r, &si) in slot_indices.iter().enumerate() {
                 let slot = &mut slots[si];
@@ -664,6 +741,7 @@ impl Qwen35BatchDecodeState {
     pub(crate) fn release(&mut self) {
         self.ws.release();
         self.positions.release();
+        self.seq_lens.release();
         self.logits_batch.release();
         self.argmax.release();
     }
@@ -2529,6 +2607,9 @@ impl Qwen35Model {
             fa3_oaccum,
             fa3_lseaccum,
             fa3_semaphore,
+            batch_partial_out: _,
+            batch_partial_m: _,
+            batch_partial_l: _,
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
@@ -3155,31 +3236,42 @@ impl Qwen35Model {
         bd: &mut Qwen35BatchDecodeState,
         slot_indices: &[usize],
         tokens: &[u32],
+        kv_seq_lens: &[usize],
         params: &[SamplingParams],
         sample_positions: &[u64],
     ) -> Result<Vec<u32>> {
         let b = tokens.len();
         ensure!(b >= 1, "Qwen3.5 batched decode requires at least one row");
         ensure!(
-            slot_indices.len() == b && params.len() == b && sample_positions.len() == b,
-            "Qwen3.5 batched decode surface length mismatch: slots={} tokens={} params={} positions={}",
+            slot_indices.len() == b
+                && kv_seq_lens.len() == b
+                && params.len() == b
+                && sample_positions.len() == b,
+            "Qwen3.5 batched decode surface length mismatch: slots={} tokens={} kv_lens={} params={} positions={}",
             slot_indices.len(),
             b,
+            kv_seq_lens.len(),
             params.len(),
             sample_positions.len()
         );
         // Pre-mutation validation: every row in bounds and in budget BEFORE
         // any device state is touched.
-        for &si in slot_indices {
+        for (r, &si) in slot_indices.iter().enumerate() {
             ensure!(
                 si < slots.len(),
                 "Qwen3.5 batched decode slot {si} outside executor slots {}",
                 slots.len()
             );
             ensure!(
-                slots[si].seq_len() < self.max_seq_len,
+                slots[si].seq_len() == kv_seq_lens[r],
+                "Qwen3.5 batched decode materialized seq_len {} != scheduler kv_seq_len {} for slot {si}",
+                slots[si].seq_len(),
+                kv_seq_lens[r]
+            );
+            ensure!(
+                kv_seq_lens[r] < self.max_seq_len,
                 "Qwen3.5 batched decode sequence {} exceeds KV cache budget {}",
-                slots[si].seq_len() + 1,
+                kv_seq_lens[r] + 1,
                 self.max_seq_len
             );
         }
@@ -3194,14 +3286,15 @@ impl Qwen35Model {
 
         // ── Stage per-step inputs: token ids + per-row absolute positions. ──
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let positions_host: Vec<i32> = slot_indices
-            .iter()
-            .map(|&si| slots[si].seq_len() as i32)
-            .collect();
+        let positions_host: Vec<i32> = kv_seq_lens.iter().map(|&len| len as i32).collect();
+        let seq_lens_host: Vec<i32> = positions_host.iter().map(|&p| p + 1).collect();
 
         let Qwen35BatchDecodeState {
             ws,
             positions,
+            seq_lens,
+            full_k_cache_ptrs,
+            full_v_cache_ptrs,
             conv_state_ptrs,
             gdr_state_ptrs,
             logits_batch,
@@ -3224,6 +3317,7 @@ impl Qwen35Model {
         } = ws;
         let token_ids = token_ids.upload(&self.ctx, &token_ids_host)?;
         let positions_dev = positions.upload(&self.ctx, &positions_host)?;
+        let seq_lens_dev = seq_lens.upload(&self.ctx, &seq_lens_host)?;
 
         // ── Forward body: identical layer stack to `forward_hidden_staged`
         //    at seq_len == B, with the two per-slot dispatch differences. ──
@@ -3248,6 +3342,9 @@ impl Qwen35Model {
                         slot_indices,
                         full_idx,
                         positions_dev,
+                        seq_lens_dev,
+                        &full_k_cache_ptrs[full_idx],
+                        &full_v_cache_ptrs[full_idx],
                         full,
                         attn_out,
                     )?;
@@ -3365,16 +3462,11 @@ impl Qwen35Model {
     }
 
     /// Batched-decode full attention: batched q/k/v projections over all B
-    /// rows (the GEMM amortizes), then a PER-ROW loop over the existing
-    /// single-row prep + devpos-attention + gate kernels against each row's
-    /// contiguous per-slot cache (DSv4 `dsv4.rs` Step-A pattern). Unlike
-    /// DSv4's copy-in/copy-out, the full-attn kernels index strictly
-    /// `token * dim + ...` from their base pointers with the position read
-    /// from a device scalar, so at `seq_len == 1` a column-offset pointer
-    /// (`base + r*dim`) and a per-row position pointer (`positions + r`)
-    /// address row r exactly — zero extra copies. Stream-ordered (all
-    /// launches on `ctx.stream`; rows touch disjoint caches and disjoint
-    /// scratch columns), NO host sync between rows.
+    /// rows, then one split-KV fused decode launch over grid.z = B. The kernel
+    /// reads per-row positions / seq_lens and per-row K/V cache pointers from
+    /// device arrays, so the host never loops over rows for full-attn decode.
+    /// `ARLE_QWEN35_BATCHED_DECODE_ATTENTION=0` keeps the old per-row path only
+    /// for same-binary A/B.
     #[allow(clippy::too_many_arguments)]
     fn full_attention_batch_rows(
         &self,
@@ -3384,6 +3476,9 @@ impl Qwen35Model {
         slot_indices: &[usize],
         full_idx: usize,
         positions_dev: &CudaSlice<i32>,
+        seq_lens_dev: &CudaSlice<i32>,
+        k_cache_table: &CudaSlice<u64>,
+        v_cache_table: &CudaSlice<u64>,
         fw: &mut FullAttnScratch,
         out: &mut HiddenStates,
     ) -> Result<()> {
@@ -3400,11 +3495,13 @@ impl Qwen35Model {
             v_batch,
             q_prepped,
             attn_heads,
-            // Batched decode stays on the devpos kernel; FA3 scratch unused.
             fa3_lse: _,
             fa3_oaccum: _,
             fa3_lseaccum: _,
             fa3_semaphore: _,
+            batch_partial_out,
+            batch_partial_m,
+            batch_partial_l,
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, b)?;
@@ -3413,10 +3510,90 @@ impl Qwen35Model {
         gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
         gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
 
-        let q_prepped = q_prepped.get(&self.ctx, q_dim, b)?;
         let attn_heads = attn_heads.get(&self.ctx, q_dim, b)?;
 
-        {
+        if qwen35_batched_decode_attention_enabled() && c.head_dim == 256 {
+            ensure!(
+                self.local_kv_heads > 0 && self.local_q_heads.is_multiple_of(self.local_kv_heads),
+                "Qwen3.5 batched decode full-attn requires integral GQA ratio: q_heads={} kv_heads={}",
+                self.local_q_heads,
+                self.local_kv_heads
+            );
+            let partial_scalars = b * self.local_q_heads * QWEN35_BATCHED_DECODE_KV_SPLITS;
+            let partial_out = batch_partial_out.get(&self.ctx, partial_scalars * c.head_dim)?;
+            let partial_m = batch_partial_m.get(&self.ctx, partial_scalars)?;
+            let partial_l = batch_partial_l.get(&self.ctx, partial_scalars)?;
+            let (qf_base, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (k_base, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_base, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (pos_ptr, _g7) = positions_dev.device_ptr(&self.ctx.stream);
+            let (seq_ptr, _g8) = seq_lens_dev.device_ptr(&self.ctx.stream);
+            let (ktbl_ptr, _g9) = k_cache_table.device_ptr(&self.ctx.stream);
+            let (vtbl_ptr, _g10) = v_cache_table.device_ptr(&self.ctx.stream);
+            let (po_ptr, _g11) = partial_out.device_ptr_mut(&self.ctx.stream);
+            let (pm_ptr, _g12) = partial_m.device_ptr_mut(&self.ctx.stream);
+            let (pl_ptr, _g13) = partial_l.device_ptr_mut(&self.ctx.stream);
+            let (ao_base, _g14) = attn_heads.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: q/k/v projections and output are live `[B, *]` buffers;
+            // positions/seq_lens are live `[B]` i32 device arrays; K/V pointer
+            // tables hold the first B live per-slot caches staged for this
+            // row→slot mapping. The fused kernel writes one new K/V row per
+            // batch item and all partial slots; reduce writes every attn_heads
+            // element before gate reads it.
+            unsafe {
+                ffi::fused_gqa_attention_decode_batched(
+                    qf_base as *const ffi::Half,
+                    k_base as *const ffi::Half,
+                    v_base as *const ffi::Half,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    pos_ptr as *const i32,
+                    seq_ptr as *const i32,
+                    ktbl_ptr as *const *const ffi::Half,
+                    vtbl_ptr as *const *const ffi::Half,
+                    po_ptr as *mut f32,
+                    pm_ptr as *mut f32,
+                    pl_ptr as *mut f32,
+                    self.local_q_heads as i32,
+                    self.local_kv_heads as i32,
+                    (self.local_q_heads / self.local_kv_heads) as i32,
+                    c.head_dim as i32,
+                    c.rotary_dim as i32,
+                    self.max_seq_len as i32,
+                    b as i32,
+                    c.rms_norm_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::attention_decode_reduce_batched(
+                    po_ptr as *const f32,
+                    pm_ptr as *const f32,
+                    pl_ptr as *const f32,
+                    ao_base as *mut ffi::Half,
+                    self.local_q_heads as i32,
+                    c.head_dim as i32,
+                    b as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::attention_gate_batch_hd256_cuda(
+                    qf_base as *const ffi::Half,
+                    ao_base as *mut ffi::Half,
+                    self.local_q_heads as i32,
+                    c.head_dim as i32,
+                    b as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        } else {
+            let q_prepped = q_prepped.get(&self.ctx, q_dim, b)?;
             let (qf_base, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_base, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
             let (v_base, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
@@ -3435,9 +3612,6 @@ impl Qwen35Model {
                 let max_seq_len = k_cache.len / kv_dim;
                 let (kc_ptr, _gk) = k_cache.data.device_ptr_mut(&self.ctx.stream);
                 let (vc_ptr, _gv) = v_cache.data.device_ptr_mut(&self.ctx.stream);
-                // Column-offset device addresses: token-major storage makes
-                // row r's block contiguous at element offset r*dim (bf16 = 2
-                // bytes; i32 = 4 bytes).
                 let qf_r = qf_base + (r * q_proj_dim * 2) as u64;
                 let k_r = k_base + (r * kv_dim * 2) as u64;
                 let v_r = v_base + (r * kv_dim * 2) as u64;
@@ -3445,10 +3619,9 @@ impl Qwen35Model {
                 let ao_r = ao_base + (r * q_dim * 2) as u64;
                 let pos_r = pos_base + (r * 4) as u64;
                 // SAFETY: every pointer is a live device allocation on
-                // ctx.stream; the offsets stay inside the `[*, B]` buffers for
+                // ctx.stream; offsets stay inside the `[*, B]` buffers for
                 // r < B; each kernel runs at seq_len == 1 so it touches only
-                // row r's block + slot r's caches; `pos_r` points at this
-                // row's staged i32 position.
+                // row r's block + slot r's caches.
                 unsafe {
                     ffi::prefill_attention_hd256_prep_cuda(
                         qf_r as *const ffi::Half,
@@ -3464,7 +3637,7 @@ impl Qwen35Model {
                         self.local_q_heads as i32,
                         self.local_kv_heads as i32,
                         c.head_dim as i32,
-                        1, // seq_len: one new token per row
+                        1,
                         pos_r as *const i32,
                         c.rotary_dim as i32,
                         c.rms_norm_eps,
@@ -3480,7 +3653,7 @@ impl Qwen35Model {
                         self.local_q_heads as i32,
                         self.local_kv_heads as i32,
                         c.head_dim as i32,
-                        1, // seq_len
+                        1,
                         pos_r as *const i32,
                         max_seq_len as i32,
                         sm_scale,
@@ -3492,7 +3665,7 @@ impl Qwen35Model {
                         ao_r as *mut ffi::Half,
                         self.local_q_heads as i32,
                         c.head_dim as i32,
-                        1, // seq_len
+                        1,
                         self.ctx.stream.cu_stream(),
                     )
                     .result()?;
