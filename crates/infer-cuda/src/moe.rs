@@ -298,7 +298,7 @@ mod gpu {
         DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
         deepgemm_contig_rows_cap, qwen35_deepgemm_enabled, qwen35_moe_decode_kernel_enabled,
     };
-    use crate::loader::MoeLayerWeights;
+    use crate::loader::{ExpertQuantDispatchSignature, MoeLayerWeights};
     use crate::moe_config::ExpertSplit;
     use crate::ops::{gemm_batch, silu_mul};
     use crate::workspace::{HiddenSlot, SliceSlot};
@@ -360,6 +360,11 @@ mod gpu {
     /// | `gate_out`/`up_out`  | `[I, rows_p]`| none          | masked/contiguous GEMM writes rows within its tile coverage; rows outside coverage are read only by `silu_mul`, whose outputs land in the matching `act` pad rows (down-GEMM tile coverage is identical, scatter skips pads) |
     /// | `act`                | `[I, rows_p]`| none          | `silu_mul` writes all elements |
     /// | `expert_out`         | `[H, rows_p]`| none          | GEMM writes within tile coverage; scatter reads only `packed_route_slot >= 0` rows, all within coverage |
+    /// | `dg_input_fp8`        | `[rows_p,H]` u8 | none       | FP8 DeepGEMM path only: pack-quantize overwrites every row/block consumed by the contiguous GEMM; pad rows may contain stale quantized values but remain paired with `packed_route_slot=-1` |
+    /// | `dg_input_scales`     | `[ceil(rows_p/4), H/128]` f32 | none | pack-quantize writes the scale block rows consumed by the contiguous GEMM |
+    /// | `dg_act_fp8`          | `[rows_p,I]` u8 | none       | SwiGLU+requant writes all rows consumed by the down GEMM |
+    /// | `dg_act_scales`       | `[ceil(rows_p/4), I/128]` f32 | none | SwiGLU+requant writes the scale block rows consumed by the down GEMM |
+    /// | `dg_active_*`         | `[1]` i32    | upload       | single flat active span for Qwen FP8 contiguous packing; `active_counts` is uploaded every call because `rows_p` changes |
     #[derive(Default)]
     pub(crate) struct MoeForwardScratch {
         logits: HiddenSlot,
@@ -377,6 +382,13 @@ mod gpu {
         dg_band_offsets: SliceSlot<i32>,
         dg_aligned_offsets: SliceSlot<i32>,
         dg_m_indices: SliceSlot<i32>,
+        dg_input_fp8: SliceSlot<u8>,
+        dg_input_scales: SliceSlot<f32>,
+        dg_act_fp8: SliceSlot<u8>,
+        dg_act_scales: SliceSlot<f32>,
+        dg_active_experts: SliceSlot<i32>,
+        dg_active_offsets: SliceSlot<i32>,
+        dg_active_counts: SliceSlot<i32>,
         gate_out: HiddenSlot,
         up_out: HiddenSlot,
         act: HiddenSlot,
@@ -412,6 +424,13 @@ mod gpu {
                 dg_band_offsets,
                 dg_aligned_offsets,
                 dg_m_indices,
+                dg_input_fp8,
+                dg_input_scales,
+                dg_act_fp8,
+                dg_act_scales,
+                dg_active_experts,
+                dg_active_offsets,
+                dg_active_counts,
                 gate_out,
                 up_out,
                 act,
@@ -438,6 +457,13 @@ mod gpu {
             dg_band_offsets.release();
             dg_aligned_offsets.release();
             dg_m_indices.release();
+            dg_input_fp8.release();
+            dg_input_scales.release();
+            dg_act_fp8.release();
+            dg_act_scales.release();
+            dg_active_experts.release();
+            dg_active_offsets.release();
+            dg_active_counts.release();
             gate_out.release();
             up_out.release();
             act.release();
@@ -549,15 +575,17 @@ mod gpu {
         // between the measured endpoints is uncharacterized; 1024 routed
         // rows (= 128-token chunk x top-8) keeps every measured regime on
         // its winning side and only remainder chunks land in between.
+        let has_deepgemm_grouped = weights.gate_grouped.is_some()
+            || (weights.w13_fp8_grouped.is_some() && weights.down_fp8_grouped.is_some());
         let use_deepgemm = qwen35_deepgemm_enabled()
-            && weights.gate_grouped.is_some()
+            && has_deepgemm_grouped
             && num_tokens * topk >= QWEN35_DEEPGEMM_MIN_ROUTES;
         if !use_deepgemm {
             // Grouped-mode loads cleared the per-expert Vecs (the hand
             // kernels run through the rebuilt ptr tables into the grouped
             // buffer). Accept either weight form here.
             ensure!(
-                weights.gate_grouped.is_some()
+                has_deepgemm_grouped
                     || (weights.gate.len() == local_experts
                         && weights.up.len() == local_experts
                         && weights.down.len() == local_experts),
@@ -772,14 +800,26 @@ mod gpu {
         // ── 5-7 shape resolution. Grouped-mode loads carry shapes on the
         // group (per-expert Vecs are cleared); concat already enforced
         // uniformity + the same [n, k] slab layout the ptr tables expose.
-        let moe_inter = match (&weights.gate_grouped, weights.gate.first()) {
-            (Some(g), _) => g.rows,
-            (None, Some(first)) => {
+        let moe_inter = match (
+            &weights.gate_grouped,
+            &weights.w13_fp8_grouped,
+            weights.gate.first(),
+        ) {
+            (Some(g), _, _) => g.rows,
+            (None, Some(g), _) => {
+                ensure!(
+                    g.rows.is_multiple_of(2),
+                    "FP8 MoE fused w13 grouped rows {} must be even",
+                    g.rows
+                );
+                g.rows / 2
+            }
+            (None, None, Some(first)) => {
                 let mi = first.rows;
                 expert_shape_ok(first, &weights.up[0], hidden_dim, mi)?;
                 mi
             }
-            (None, None) => {
+            (None, None, None) => {
                 anyhow::bail!("MoE weights carry neither grouped nor per-expert experts")
             }
         };
@@ -788,10 +828,17 @@ mod gpu {
         // Down dims up front (shared by both expert-GEMM paths). Grouped-mode
         // loads cleared the per-expert Vec; the group carries the (uniform,
         // concat-ensured) dims instead.
-        let (down_rows, down_cols) = match (&weights.down_grouped, weights.down.first()) {
-            (Some(g), _) => (g.rows, g.cols),
-            (None, Some(first)) => (first.rows, first.cols),
-            (None, None) => anyhow::bail!("MoE weights carry neither grouped nor per-expert down"),
+        let (down_rows, down_cols) = match (
+            &weights.down_grouped,
+            &weights.down_fp8_grouped,
+            weights.down.first(),
+        ) {
+            (Some(g), _, _) => (g.rows, g.cols),
+            (None, Some(g), _) => (g.rows, g.cols),
+            (None, None, Some(first)) => (first.rows, first.cols),
+            (None, None, None) => {
+                anyhow::bail!("MoE weights carry neither grouped nor per-expert down")
+            }
         };
         ensure!(
             down_cols == moe_inter && down_rows == hidden_dim,
@@ -1038,46 +1085,81 @@ mod gpu {
         let local_experts = split.experts_per_rank;
         let stream = ctx.stream.cu_stream();
 
-        let (gate_g, up_g, down_g) = match (
+        let fp8_grouped = match (&weights.w13_fp8_grouped, &weights.down_fp8_grouped) {
+            (Some(w13), Some(down)) => Some((w13, down)),
+            _ => None,
+        };
+        let bf16_grouped = match (
             &weights.gate_grouped,
             &weights.up_grouped,
             &weights.down_grouped,
         ) {
-            (Some(g), Some(u), Some(d)) => (g, u, d),
-            _ => anyhow::bail!(
-                "DeepGEMM MoE path requires the grouped expert caches (load with ARLE_QWEN35_DEEPGEMM=1)"
-            ),
+            (Some(g), Some(u), Some(d)) => Some((g, u, d)),
+            _ => None,
         };
-        let moe_inter = gate_g.rows;
-        ensure!(
-            gate_g.groups == local_experts
-                && up_g.groups == local_experts
-                && down_g.groups == local_experts,
-            "DeepGEMM MoE group count mismatch: gate={} up={} down={} local_experts={local_experts}",
-            gate_g.groups,
-            up_g.groups,
-            down_g.groups
-        );
-        ensure!(
-            gate_g.cols == hidden_dim
-                && up_g.rows == moe_inter
-                && up_g.cols == hidden_dim
-                && down_g.rows == hidden_dim
-                && down_g.cols == moe_inter,
-            "DeepGEMM MoE grouped cache shape mismatch: gate={}x{} up={}x{} down={}x{} H={hidden_dim} I={moe_inter}",
-            gate_g.rows,
-            gate_g.cols,
-            up_g.rows,
-            up_g.cols,
-            down_g.rows,
-            down_g.cols
-        );
-        // BF16 kernel constraints: K % 64 (BLOCK_K) and N % 8, in both GEMM
-        // directions (gate/up: n=I k=H; down: n=H k=I) → both dims % 64.
-        ensure!(
-            hidden_dim.is_multiple_of(64) && moe_inter.is_multiple_of(64),
-            "DeepGEMM BF16 MoE needs H and I aligned to 64, got H={hidden_dim} I={moe_inter}"
-        );
+        let moe_inter_for_abi = if let Some((w13, down_g)) = fp8_grouped {
+            ensure!(
+                w13.rows.is_multiple_of(2),
+                "FP8 DeepGEMM MoE fused w13 rows {} must be even",
+                w13.rows
+            );
+            let moe_inter = w13.rows / 2;
+            ensure!(
+                w13.groups == local_experts
+                    && down_g.groups == local_experts
+                    && w13.cols == hidden_dim
+                    && down_g.rows == hidden_dim
+                    && down_g.cols == moe_inter,
+                "FP8 DeepGEMM MoE grouped cache shape mismatch: w13={}x{} g={} down={}x{} g={} H={hidden_dim}",
+                w13.rows,
+                w13.cols,
+                w13.groups,
+                down_g.rows,
+                down_g.cols,
+                down_g.groups
+            );
+            ensure!(
+                hidden_dim.is_multiple_of(128) && moe_inter.is_multiple_of(128),
+                "FP8 DeepGEMM MoE needs H and I aligned to 128, got H={hidden_dim} I={moe_inter}"
+            );
+            moe_inter
+        } else if let Some((gate_g, up_g, down_g)) = bf16_grouped {
+            let moe_inter = gate_g.rows;
+            ensure!(
+                gate_g.groups == local_experts
+                    && up_g.groups == local_experts
+                    && down_g.groups == local_experts,
+                "DeepGEMM MoE group count mismatch: gate={} up={} down={} local_experts={local_experts}",
+                gate_g.groups,
+                up_g.groups,
+                down_g.groups
+            );
+            ensure!(
+                gate_g.cols == hidden_dim
+                    && up_g.rows == moe_inter
+                    && up_g.cols == hidden_dim
+                    && down_g.rows == hidden_dim
+                    && down_g.cols == moe_inter,
+                "DeepGEMM MoE grouped cache shape mismatch: gate={}x{} up={}x{} down={}x{} H={hidden_dim} I={moe_inter}",
+                gate_g.rows,
+                gate_g.cols,
+                up_g.rows,
+                up_g.cols,
+                down_g.rows,
+                down_g.cols
+            );
+            // BF16 kernel constraints: K % 64 (BLOCK_K) and N % 8, in both GEMM
+            // directions (gate/up: n=I k=H; down: n=H k=I) → both dims % 64.
+            ensure!(
+                hidden_dim.is_multiple_of(64) && moe_inter.is_multiple_of(64),
+                "DeepGEMM BF16 MoE needs H and I aligned to 64, got H={hidden_dim} I={moe_inter}"
+            );
+            moe_inter
+        } else {
+            anyhow::bail!(
+                "DeepGEMM MoE path requires grouped expert caches (load with ARLE_QWEN35_DEEPGEMM=1)"
+            )
+        };
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
@@ -1088,9 +1170,9 @@ mod gpu {
             deepgemm_contig_rows_cap(total_routes, local_experts, DEEPGEMM_CONTIG_ALIGN)
         };
         ensure!(
-            rows.checked_mul(hidden_dim.max(moe_inter))
+            rows.checked_mul(hidden_dim.max(moe_inter_for_abi))
                 .is_some_and(|v| i32::try_from(v).is_ok()),
-            "DeepGEMM MoE padded rows {rows} x max(H={hidden_dim}, I={moe_inter}) exceeds the i32 kernel ABI"
+            "DeepGEMM MoE padded rows {rows} x max(H={hidden_dim}, I={moe_inter_for_abi}) exceeds the i32 kernel ABI"
         );
 
         // ── 4 (DG). Pack routed tokens + pad-row sentinels. ─────────────────
@@ -1173,6 +1255,125 @@ mod gpu {
             }
             Some(m_indices)
         };
+
+        if let Some((w13, down_g)) = fp8_grouped {
+            ensure!(
+                !use_masked,
+                "Qwen FP8 DeepGEMM MoE is prefill-only and requires contiguous layout"
+            );
+            let moe_inter = w13.rows / 2;
+            let m_indices = m_indices.expect("contiguous path fills m_indices");
+            let scale_stride_m = rows.div_ceil(4) * 4;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = moe_inter.div_ceil(128);
+            let input_fp8 = scratch.dg_input_fp8.get(ctx, rows * hidden_dim)?;
+            let input_scales = scratch
+                .dg_input_scales
+                .get(ctx, scale_stride_m * hidden_scale_cols)?;
+            let w13_out = scratch.gate_out.get(ctx, 2 * moe_inter, rows)?;
+            let act_fp8 = scratch.dg_act_fp8.get(ctx, rows * moe_inter)?;
+            let act_scales = scratch
+                .dg_act_scales
+                .get(ctx, scale_stride_m * inter_scale_cols)?;
+            let expert_out = scratch.expert_out.get(ctx, hidden_dim, rows)?;
+            let active_experts = scratch.dg_active_experts.upload_const(ctx, &[0i32])?;
+            let active_offsets = scratch.dg_active_offsets.upload_const(ctx, &[0i32])?;
+            let rows_i32 = i32::try_from(rows)
+                .map_err(|_| anyhow::anyhow!("FP8 DeepGEMM MoE rows overflow i32"))?;
+            let active_counts = scratch.dg_active_counts.upload(ctx, &[rows_i32])?;
+            let stream = ctx.stream.cu_stream();
+            unsafe {
+                moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                    packed_hidden,
+                    cache_ptr(input_fp8, ctx),
+                    cache_ptr(input_scales, ctx),
+                    cache_ptr(active_experts, ctx),
+                    cache_ptr(active_offsets, ctx),
+                    cache_ptr(active_counts, ctx),
+                    1,
+                    rows,
+                    hidden_dim,
+                    scale_stride_m,
+                    stream,
+                )?;
+                moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                    cache_ptr(input_fp8, ctx),
+                    cache_ptr(input_scales, ctx),
+                    cache_ptr(&w13.weight, ctx),
+                    cache_ptr(&w13.scales, ctx),
+                    cache_ptr(&w13_out.data, ctx),
+                    m_indices,
+                    local_experts,
+                    rows,
+                    2 * moe_inter,
+                    hidden_dim,
+                    scale_stride_m,
+                    DEEPGEMM_CONTIG_ALIGN,
+                    stream,
+                )?;
+                moe::dsv4_deepgemm_swiglu_quantize_w13(
+                    cache_ptr(&w13_out.data, ctx),
+                    cache_ptr(act_fp8, ctx),
+                    cache_ptr(act_scales, ctx),
+                    cache_ptr(active_experts, ctx),
+                    cache_ptr(active_counts, ctx),
+                    1,
+                    rows,
+                    moe_inter,
+                    scale_stride_m,
+                    f32::INFINITY,
+                    stream,
+                )?;
+                moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                    cache_ptr(act_fp8, ctx),
+                    cache_ptr(act_scales, ctx),
+                    cache_ptr(&down_g.weight, ctx),
+                    cache_ptr(&down_g.scales, ctx),
+                    cache_ptr(&expert_out.data, ctx),
+                    m_indices,
+                    local_experts,
+                    rows,
+                    hidden_dim,
+                    moe_inter,
+                    scale_stride_m,
+                    DEEPGEMM_CONTIG_ALIGN,
+                    stream,
+                )?;
+            }
+
+            let route_out = if split.ep_size == 1 {
+                scratch.route_out.get(ctx, hidden_dim, total_routes)?
+            } else {
+                scratch
+                    .route_out
+                    .get_zeroed(ctx, hidden_dim, total_routes)?
+            };
+            unsafe {
+                moe::dsv4_scatter_all_route_slots(
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(&route_out.data, ctx),
+                    packed_route_slot,
+                    packed_weight,
+                    rows,
+                    hidden_dim,
+                    stream,
+                )?;
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&out.data, ctx),
+                    num_tokens,
+                    topk,
+                    hidden_dim,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let (gate_g, up_g, down_g) = bf16_grouped.ok_or_else(|| {
+            anyhow::anyhow!("DeepGEMM BF16 MoE path requires gate/up/down grouped caches")
+        })?;
+        let moe_inter = gate_g.rows;
 
         // ── 5+6+7 (DG). gate GEMM + up GEMM → silu_mul → down GEMM. ─────────
         // Heuristics-only hint: expected valid rows per group.
@@ -1361,6 +1562,27 @@ mod gpu {
         }
     }
 
+    fn fp8_signature_shape(
+        sig: Option<ExpertQuantDispatchSignature>,
+        label: &str,
+    ) -> Result<(usize, usize, usize, usize)> {
+        let sig =
+            sig.ok_or_else(|| anyhow::anyhow!("FP8 MoE {label} missing dispatch signature"))?;
+        ensure!(
+            sig.quant_scale_rows > 0
+                && sig.quant_scale_cols > 0
+                && sig.quant_block_m > 0
+                && sig.quant_block_k > 0,
+            "FP8 MoE {label} signature missing scale metadata: {sig:?}"
+        );
+        Ok((
+            sig.quant_scale_rows,
+            sig.quant_scale_cols,
+            sig.quant_block_m,
+            sig.quant_block_k,
+        ))
+    }
+
     fn opt_ptrs<'a>(
         ptrs: &'a Option<cudarc::driver::CudaSlice<u64>>,
         label: &str,
@@ -1404,11 +1626,12 @@ mod gpu {
                 )
             },
             WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {
-                let first = weights
-                    .gate
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("FP8 MoE pair batch has no gate experts"))?;
-                let (scale_rows, scale_cols, block_m, block_k) = fp8_grouped_shape(first)?;
+                let (scale_rows, scale_cols, block_m, block_k) =
+                    if let Some(first) = weights.gate.first() {
+                        fp8_grouped_shape(first)?
+                    } else {
+                        fp8_signature_shape(weights.gate_up_quant_signature, "gate/up")?
+                    };
                 unsafe {
                     moe::moe_fp8_block_scaled_grouped_gemv_pair_batch(
                         &weights.gate_ptrs,
@@ -1500,11 +1723,12 @@ mod gpu {
                 )
             },
             WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {
-                let first = weights
-                    .down
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("FP8 MoE down batch has no down experts"))?;
-                let (scale_rows, scale_cols, block_m, block_k) = fp8_grouped_shape(first)?;
+                let (scale_rows, scale_cols, block_m, block_k) =
+                    if let Some(first) = weights.down.first() {
+                        fp8_grouped_shape(first)?
+                    } else {
+                        fp8_signature_shape(weights.down_quant_signature, "down")?
+                    };
                 unsafe {
                     moe::moe_fp8_block_scaled_grouped_gemv_batch(
                         &weights.down_ptrs,
@@ -4947,6 +5171,36 @@ mod tests {
         assert_eq!(MAX, 8 * 32, "decode band is the batched-decode envelope");
         // grid.y chunking is ACT_TILE=8-row; the band is whole chunks.
         assert_eq!(MAX % 8, 0, "decode band must be whole 8-row chunks");
+    }
+
+    /// Qwen3.6-35B-A3B-FP8 checkpoint header contract measured from
+    /// `/data01/models/Qwen3.6-35B-A3B-FP8`: gate/up are `[512, 2048]` with
+    /// `[4, 16]` scales, down is `[2048, 512]` with `[16, 4]` scales. The
+    /// DeepGEMM FP8 port only handles this 128x128 block-scaled prefill lane.
+    #[test]
+    fn qwen36_fp8_deepgemm_prefill_shape_contract() {
+        const HIDDEN: usize = 2048;
+        const INTER: usize = 512;
+        const TOPK: usize = 8;
+        const BLOCK: usize = 128;
+
+        assert_eq!(HIDDEN % BLOCK, 0, "hidden dim must be 128-aligned");
+        assert_eq!(INTER % BLOCK, 0, "moe intermediate dim must be 128-aligned");
+
+        let gate_up_scale = (INTER.div_ceil(BLOCK), HIDDEN.div_ceil(BLOCK));
+        let down_scale = (HIDDEN.div_ceil(BLOCK), INTER.div_ceil(BLOCK));
+        assert_eq!(gate_up_scale, (4, 16));
+        assert_eq!(down_scale, (16, 4));
+
+        assert_eq!(
+            super::QWEN35_DEEPGEMM_MIN_ROUTES,
+            128 * TOPK,
+            "DeepGEMM floor is the first 128-token prefill chunk"
+        );
+        assert!(
+            super::QWEN35_MOE_DECODE_MAX_ROUTES < super::QWEN35_DEEPGEMM_MIN_ROUTES,
+            "decode must remain below the DeepGEMM prefill floor"
+        );
     }
 
     /// Host mirror of the `moe_bf16_grouped_gemm_{swiglu_,}decode` launch
