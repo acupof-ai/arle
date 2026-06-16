@@ -1885,6 +1885,14 @@ impl Dsv4Model {
         // Opt-in decode-phase timing probe (env-gated). When unset: zero behavior
         // change, zero extra syncs. Pure instrumentation — see ARLE_DSV4_DECODE_PHASE_TIME.
         let phase_time = std::env::var_os("ARLE_DSV4_DECODE_PHASE_TIME").is_some();
+        // Per-GEMV breakdown for this decode step (self-gates on
+        // ARLE_DSV4_LINEAR_PROFILE; no-op otherwise). Reset here + print after the
+        // phase log scopes the stats to ONE decode forward, exposing which linear
+        // (compressor_wkv/wgate, indexer_wq_b/weights, …) dominates compidx — the
+        // license for the batched-compressor pre-pass. NOTE: when enabled the
+        // profiler syncs per call, inflating absolute step ms; read it for the
+        // RELATIVE per-GEMV split, not the clean compidx (use phase_time alone for that).
+        crate::linear_profile::reset();
         for r in 0..n {
             let slot = &slots[slot_ids[r]];
             ensure!(
@@ -2838,6 +2846,10 @@ impl Dsv4Model {
                 moe_ms
             );
         }
+        // Per-step per-GEMV breakdown (rank-0 only; self-gates on
+        // ARLE_DSV4_LINEAR_PROFILE). Sums the compressor/indexer m=1 GEMVs that
+        // compose compidx — confirms (or kills) the batched-compressor lever.
+        crate::linear_profile::print_rank0("decode-step");
         Ok((stream, keepalive))
     }
 
