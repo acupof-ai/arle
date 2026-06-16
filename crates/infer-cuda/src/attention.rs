@@ -7448,6 +7448,448 @@ pub(crate) fn mla_attention_prepare(
     })
 }
 
+/// Batched (`m = N`) slot-INDEPENDENT projection pre-pass for the #60 batched
+/// decode lane (PHASE C — projection batching).
+///
+/// The single-token (`m=1`) per-row `mla_attention_prepare` re-reads the wq_a /
+/// wkv / wq_b projection weights ONCE PER ROW (× 43 layers — the 137ms @ n=22
+/// PREPARE hot spot). The Q/KV LoRA projections + the partial RoPE are
+/// SLOT-INDEPENDENT: each row's `c_q_normed` / `q_prepared` / `k_prepared`
+/// depends only on this row's `normed` activation + the shared `&Dsv4Attention`
+/// weights + this row's absolute position. So they batch to one `m=N` GEMV-batch
+/// per weight (each weight read ONCE across the `blockIdx.y` token grid of
+/// `dsv4_fp8_gemv_batch_cuda`), amortizing the weight read ×N — the same
+/// per-row→batched amortization as the committed lm_head GEMM batch.
+///
+/// Routes the projections through the scalar batched [`dsv4_linear`] (FP8 GEMV at
+/// `num_tokens=N`, or bf16 cuBLAS for dense weights) rather than the per-slot
+/// fused-DeepGEMM `run_fused_wqkv_decode` (whose `Dsv4FusedWqkvDecodeScratch` is
+/// PER-SLOT, sized for a single `m=1` row — it cannot stage an `m=N` batch
+/// without a new model-wide scratch). The batched-GEMV kernel's `(out_row,
+/// token)` grid is row-independent, so each row's projection result is
+/// byte-identical to the scalar `m=1` per-row path; the change vs the
+/// fused-DeepGEMM decode default is the legitimate FP8-DeepGEMM→FP8-GEMV numerics
+/// difference (needle-gated, like every DSv4 projection lever).
+///
+/// `normed` is `[N, hidden]` (the post-attn-LN batch); `positions` is `[N]` i32
+/// device, each row's absolute decode position (`start_positions[r]`). Returns
+/// `(c_q_normed[N], q_prepared[N], k_prepared[N])` plus the per-row scalars the
+/// compressed-only finish needs. The per-slot compressor / indexer / `csa_select`
+/// stay PER-ROW in [`mla_attention_prepare_compressed_only`] (they mutate the
+/// slot's compressed-key ring); this pre-pass touches NO slot state.
+pub(crate) struct Dsv4MlaProjBatch {
+    pub(crate) c_q_normed: HiddenStates,
+    pub(crate) q_prepared: HiddenStates,
+    pub(crate) k_prepared: HiddenStates,
+    pub(crate) local_heads: usize,
+    pub(crate) local_width: usize,
+    pub(crate) sink_offset: usize,
+    pub(crate) sm_scale: f32,
+    pub(crate) rope_base: f32,
+    pub(crate) original_seq_len: i32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mla_attention_prepare_proj_batch(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    compress_ratio: usize,
+    normed: &HiddenStates,
+    positions: &CudaSlice<i32>,
+    tp: &TpRuntime,
+    prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<Dsv4MlaProjBatch> {
+    ensure!(
+        normed.hidden_dim == config.hidden_size,
+        "DSv4 MLA proj-batch hidden dim {} != hidden_size {}",
+        normed.hidden_dim,
+        config.hidden_size
+    );
+    let n = normed.seq_len;
+    ensure!(n > 0, "DSv4 MLA proj-batch requires N>0 rows");
+    let head_dim = config.head_dim;
+    let local_width = attention.wq_b.rows;
+    ensure!(
+        head_dim > 0 && local_width.is_multiple_of(head_dim),
+        "DSv4 MLA proj-batch local q width {local_width} is not a multiple of head_dim {head_dim}"
+    );
+    let local_heads = local_width / head_dim;
+    ensure!(
+        local_heads > 0,
+        "DSv4 MLA proj-batch requires at least one local head"
+    );
+    let tp_rank = tp.config().rank;
+    let sink_offset = tp_rank * local_heads;
+    ensure!(
+        attention.wkv.rows == head_dim,
+        "DSv4 MLA proj-batch wkv rows {} != head_dim {head_dim}",
+        attention.wkv.rows
+    );
+    ensure!(
+        config.qk_rope_head_dim <= head_dim,
+        "DSv4 MLA proj-batch rope dim {} exceeds head_dim {head_dim}",
+        config.qk_rope_head_dim
+    );
+
+    // RoPE base/YaRN is PER-LAYER (identical policy to `mla_attention_prepare`):
+    // compressed layers (cr>0) rope at compress_rope_theta + YaRN, pure-SW
+    // (cr=0) at rope_theta with no YaRN.
+    let rope = &config.rope_parameters;
+    let (rope_base, original_seq_len) = if compress_ratio > 0 {
+        let osl = i32::try_from(rope.original_max_position_embeddings).map_err(|_| {
+            anyhow!(
+                "DSv4 original_max_position_embeddings {} overflows i32",
+                rope.original_max_position_embeddings
+            )
+        })?;
+        (config.compress_rope_theta, osl)
+    } else {
+        (config.rope_theta, 0i32)
+    };
+
+    // ── 1+2. Q/KV LoRA at m=N. The weight read MUST amortize across the N decode
+    // rows: a real batched FP8 GEMM (DeepGEMM, K-tiled, tensor-core, weight read
+    // ONCE for all N), not the per-(out_row, token) scalar GEMV which re-reads the
+    // projection weight once PER token (N independent GEMVs, zero amortization).
+    // This mirrors `mla_attention_prepare`'s prefill DeepGEMM branch verbatim at
+    // m=N: `run_fused_wqkv_prefill` (fused wqkv_a → c_q[N] q_lora + kv_raw[N]
+    // head_dim, weight read once) → q_norm RMSNorm → `prefill_proj_deepgemm`
+    // (wq_b → q_raw[N], weight read once) → kv_norm RMSNorm. The numerics shift vs
+    // the scalar FP8-GEMV (FP8-DeepGEMM activation quantize) is the intended
+    // improvement and is needle-gated. The shared `prefill_linear` scratch
+    // (max_m = DSV4_PREFILL_QUERY_CHUNK = 4096 >= N) stages the FP8 activation;
+    // the per-(out_row,token) GEMV `else` branch is the DeepGEMM-disabled fallback
+    // (byte-identical to the prior batched path).
+    let use_deepgemm = dsv4_fp8_linear_deepgemm_enabled()?
+        && attention.wqkv_a_deepgemm.is_some()
+        && attention.wq_b_deepgemm.is_some()
+        && prefill_shared.is_some();
+    let (c_q_normed, q_raw, kv_normed) = if use_deepgemm {
+        let scratch = prefill_shared.ok_or_else(|| {
+            anyhow!("DSv4 MLA proj-batch DeepGEMM path requires the prefill_linear scratch")
+        })?;
+        // Fused wqkv_a (hidden → q_lora + head_dim) at m=N via DeepGEMM: c_q[N],
+        // kv_raw[N] sliced out of the fused output. Weight read ONCE across N rows.
+        // SAFETY: run_fused_wqkv_prefill writes the full c_q / kv_raw buffers.
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, n)? };
+        let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
+        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused_batched");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_batched", || {
+            run_fused_wqkv_prefill(ctx, attention, normed, &mut *scratch, &mut c_q, &mut kv_raw)
+        })?;
+        drop(nvtx_wqkv);
+        keepalive.keep_hidden(&c_q);
+        let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&c_q_normed);
+        // Q up-projection wq_b (q_lora → per-head Q) at m=N via DeepGEMM (reuses the
+        // same FP8 prefill scratch; K=q_lora_rank <= hidden_dim). Weight read ONCE.
+        // SAFETY: prefill_proj_deepgemm writes the full q_raw buffer.
+        let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, n)? };
+        let cache = attention
+            .wq_b_deepgemm
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 MLA proj-batch DeepGEMM path requires wq_b_deepgemm"))?;
+        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b_batched");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
+            prefill_proj_deepgemm(ctx, &mut *scratch, cache, &c_q_normed, &mut q_raw)
+        })?;
+        drop(nvtx_wq_b);
+        keepalive.keep_hidden(&q_raw);
+        keepalive.keep_hidden(&kv_raw);
+        let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&kv_normed);
+        (c_q_normed, q_raw, kv_normed)
+    } else {
+        // Fallback (DeepGEMM disabled / caches not loaded / scratch absent): the
+        // scalar batched dsv4_linear path. Weights read once across the N-token
+        // grid in-kernel but NOT amortized (per-(out_row, token) grid). Byte path
+        // == the non-fused `else` branch of `mla_attention_prepare`, at seq_len=N.
+        // SAFETY: dsv4_linear writes the full c_q buffer.
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, n)? };
+        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a_batched");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a_batched", || {
+            dsv4_linear(ctx, &attention.wq_a, normed, &mut c_q)
+        })?;
+        drop(nvtx_wq_a);
+        keepalive.keep_hidden(&c_q);
+        let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&c_q_normed);
+        // SAFETY: dsv4_linear writes the full q_raw buffer.
+        let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, n)? };
+        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b_batched");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
+            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+        })?;
+        drop(nvtx_wq_b);
+        keepalive.keep_hidden(&q_raw);
+        // SAFETY: dsv4_linear writes the full kv_raw buffer.
+        let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
+        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv_batched");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wkv_batched", || {
+            dsv4_linear(ctx, &attention.wkv, normed, &mut kv_raw)
+        })?;
+        drop(nvtx_wkv);
+        keepalive.keep_hidden(&kv_raw);
+        let kv_normed = mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, config.rms_norm_eps)?;
+        keepalive.keep_hidden(&kv_normed);
+        (c_q_normed, q_raw, kv_normed)
+    };
+
+    // ── 3. Partial RoPE over all N rows with PER-ROW positions. The fused-batch
+    // kernel's Q half (RMS-scale + RoPE) and K half (RoPE-only, no norm) are
+    // byte-identical to the single-row `dsv4_prepare_q_kernel`/`_k_kernel` the
+    // decode `mla_attention_prepare` runs — only the position is sourced as
+    // `positions[token]` (this row's `start_positions[r]`) instead of a single
+    // scalar + token offset. For an N-row decode batch each row is a distinct
+    // sequence at its own absolute position, so the per-row positions array is
+    // exactly what makes the batched RoPE equal the N per-row RoPE calls.
+    // SAFETY: dsv4_prepare_qk_fused_batch writes both full output buffers.
+    let mut q_prepared = unsafe { HiddenStates::uninit(ctx, local_width, n)? };
+    let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
+    {
+        let (q_raw_ptr, _qr) = q_raw.data.device_ptr(&ctx.stream);
+        let (k_raw_ptr, _kr) = kv_normed.data.device_ptr(&ctx.stream);
+        let (q_out_ptr, _qo) = q_prepared.data.device_ptr_mut(&ctx.stream);
+        let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
+        let (pos_ptr, _pg) = positions.device_ptr(&ctx.stream);
+        // SAFETY: all buffers valid on ctx.stream; positions is [N] i32; shapes
+        // checked above.
+        unsafe {
+            ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
+                q_raw_ptr as *const ffi::Half,
+                k_raw_ptr as *const ffi::Half,
+                q_out_ptr as *mut ffi::Half,
+                k_out_ptr as *mut ffi::Half,
+                n as i32,
+                local_heads as i32,
+                head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                pos_ptr as *const i32,
+                config.rms_norm_eps,
+                rope_base,
+                original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    keepalive.keep_hidden(&q_prepared);
+    keepalive.keep_hidden(&k_prepared);
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    Ok(Dsv4MlaProjBatch {
+        c_q_normed,
+        q_prepared,
+        k_prepared,
+        local_heads,
+        local_width,
+        sink_offset,
+        sm_scale,
+        rope_base,
+        original_seq_len,
+    })
+}
+
+/// Per-row SLOT-DEPENDENT finish of the batched-decode PREPARE, paired with
+/// [`mla_attention_prepare_proj_batch`] (#60 PHASE C). The projection + RoPE for
+/// row `r` were already computed batched; this runs ONLY the per-slot half —
+/// the CSA/HCA compressor, the CSA indexer + top-k `selected` — over this row's
+/// `normed_row` (the slot's compressed-key ring is mutated here) and this row's
+/// sliced `c_q_normed_row`. It then assembles the `Dsv4MlaPrepared` the batched
+/// lane's pack/gather/fwd/finish consume, taking ownership of the per-row
+/// `q_prepared_row` / `k_prepared_row` slices the caller copied out of the batch.
+///
+/// `q_prepared_row` / `k_prepared_row` / `c_q_normed_row` are this row's `[*, 1]`
+/// slices of the batched outputs (the caller memcpy's them into row scratch,
+/// mirroring the existing `normed_row` copy-in discipline). `c_q_normed_row` MUST
+/// hold byte-identical data to what `mla_attention_prepare` would have produced
+/// for this row, so `csa_select` selects the same blocks — guaranteed by the
+/// row-independent batched GEMV.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mla_attention_prepare_compressed_only(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    layer_idx: usize,
+    normed_row: &HiddenStates,
+    c_q_normed_row: &HiddenStates,
+    q_prepared_row: HiddenStates,
+    k_prepared_row: HiddenStates,
+    proj: &Dsv4MlaProjBatch,
+    state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
+    dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<Dsv4MlaPrepared> {
+    let head_dim = config.head_dim;
+    let local_heads = proj.local_heads;
+    let local_width = proj.local_width;
+    ensure!(
+        q_prepared_row.hidden_dim == local_width && q_prepared_row.seq_len == 1,
+        "DSv4 compressed-only q_prepared row {}x{} != [{local_width},1]",
+        q_prepared_row.hidden_dim,
+        q_prepared_row.seq_len
+    );
+    ensure!(
+        k_prepared_row.hidden_dim == head_dim && k_prepared_row.seq_len == 1,
+        "DSv4 compressed-only k_prepared row {}x{} != [{head_dim},1]",
+        k_prepared_row.hidden_dim,
+        k_prepared_row.seq_len
+    );
+    ensure!(
+        state.sw_window_cache.len() == config.sliding_window * head_dim,
+        "DSv4 MLA SW window cache len {} != sliding_window*head_dim {}",
+        state.sw_window_cache.len(),
+        config.sliding_window * head_dim
+    );
+    let start_pos_i32 = i32::try_from(start_pos)
+        .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
+    let original_seq_len = proj.original_seq_len;
+
+    // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer
+    // in the batched fwd / single-row `mla_attention_fwd`.
+    let local_attn = unsafe { HiddenStates::uninit(ctx, local_width, 1)? };
+
+    // ── 4b(prep). compressor → (CSA) indexer top-k select — PER SLOT. Byte path
+    // identical to the `mla_attention_prepare` decode branch, reading this row's
+    // `normed_row` (compressor) and `c_q_normed_row` (indexer query proj).
+    let selected = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        None
+    } else {
+        let compressor = attention.compressor.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
+        })?;
+        let overlap = compress_ratio < 16;
+        {
+            let compressor_state = state.compressor.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+            })?;
+            compressor_forward(
+                ctx,
+                config,
+                compressor,
+                normed_row,
+                compressor_state,
+                head_dim,
+                compress_ratio,
+                overlap,
+                start_pos,
+                start_pos_device,
+                true,
+                original_seq_len,
+                keepalive,
+            )?;
+        }
+
+        if mode == DeepSeekV4AttentionMode::CompressedSparse {
+            let indexer = attention.indexer.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights"
+                )
+            })?;
+            let use_official_dsa = dsv4_dsa_official_enabled()?;
+            let indexer_rope_original_seq_len = if use_official_dsa {
+                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+                    |_| {
+                        anyhow!(
+                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                            config.rope_parameters.original_max_position_embeddings
+                        )
+                    },
+                )?
+            } else {
+                0
+            };
+            let indexer_rows_before = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
+            {
+                let indexer_state = state.indexer.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
+                    )
+                })?;
+                compressor_forward(
+                    ctx,
+                    config,
+                    &indexer.compressor,
+                    normed_row,
+                    indexer_state,
+                    config.index_head_dim,
+                    compress_ratio,
+                    true,
+                    start_pos,
+                    start_pos_device,
+                    use_official_dsa,
+                    indexer_rope_original_seq_len,
+                    keepalive,
+                )?;
+            }
+            let indexer_rows_after = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
+            let index_keys = &state
+                .indexer
+                .as_ref()
+                .expect("indexer state checked above")
+                .compressed;
+            let official = state.dsa_official.as_mut();
+            Some(csa_select(
+                ctx,
+                config,
+                layer_idx,
+                indexer,
+                normed_row,
+                c_q_normed_row,
+                index_keys,
+                official,
+                dsa_shared,
+                pool,
+                indexer_rows_before,
+                indexer_rows_after,
+                start_pos,
+                start_pos_device,
+                compress_ratio,
+                // Decode (token_count=1): the prefill indexer DeepGEMM lane is
+                // never taken (gated on c_q_normed.seq_len>1), so the shared
+                // prefill scratch is not needed.
+                None,
+                keepalive,
+            )?)
+        } else {
+            None
+        }
+    };
+
+    Ok(Dsv4MlaPrepared {
+        q_prepared: q_prepared_row,
+        k_prepared: k_prepared_row,
+        local_attn,
+        selected,
+        local_heads,
+        local_width,
+        token_count: 1,
+        sink_offset: proj.sink_offset,
+        sm_scale: proj.sm_scale,
+        rope_base: proj.rope_base,
+        original_seq_len,
+        start_pos_i32,
+    })
+}
+
 /// FWD half of `mla_attention` (see [`Dsv4MlaPrepared`]). Runs the FlashMLA
 /// decode kernel (or the prefill / scalar SW/hybrid fallback) over the PREPARE
 /// output, then the O-LoRA. The compressed-key pool is re-borrowed from `state`
