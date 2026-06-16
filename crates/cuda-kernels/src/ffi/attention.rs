@@ -978,8 +978,9 @@ unsafe extern "C" {
 /// separate row/head strides express both token-major q/o (`[S, h, d]`:
 /// row = h*d, head = d) and the qwen35 head-major slot caches
 /// (`[h_k, max_seq, d]`: row = d, head = max_seq*d) without relayout.
-/// Step-1 contract: b=1, slot KV viewed at exact `seqlen_k`, `num_splits=1`,
-/// causal bottom-right alignment.
+/// Step-1 prefill contract: b=1, slot KV viewed at exact `seqlen_k`,
+/// `num_splits=1`, causal bottom-right alignment. Decode may opt into
+/// `num_splits > 1`, using the upstream split-KV + PackGQA + combine path.
 #[repr(C)]
 pub struct ArleFa3FwdHd256Args {
     pub q: *const Half,
@@ -988,6 +989,12 @@ pub struct ArleFa3FwdHd256Args {
     pub o: *mut Half,
     /// fp32 scratch, `num_heads * seqlen_q` elements.
     pub softmax_lse: *mut f32,
+    /// fp32 split scratch, `num_splits * num_heads * seqlen_q * head_dim`
+    /// elements; null when `num_splits <= 1`.
+    pub out_accum: *mut f32,
+    /// fp32 split LSE scratch, `num_splits * num_heads * seqlen_q` elements;
+    /// null when `num_splits <= 1`.
+    pub softmax_lse_accum: *mut f32,
     /// device i32 scratch (>= 1 element); the shim zeroes it per launch.
     pub tile_count_semaphore: *mut i32,
     pub seqlen_q: i32,
@@ -1006,6 +1013,8 @@ pub struct ArleFa3FwdHd256Args {
     pub o_head_stride: i64,
     pub softmax_scale: f32,
     pub is_causal: i32,
+    /// 1 = direct fwd; >1 = split-KV decode fwd + combine (max 256).
+    pub num_splits: i32,
 }
 
 unsafe extern "C" {
