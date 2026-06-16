@@ -20,7 +20,7 @@ cuda = ["autograd/cuda", "dep:infer-api", "infer-api/cuda"]
 # DSv4-Flash teacher needs TP (nccl) + DeepEP MoE dispatch; forwarded to
 # infer-api -> infer-cuda. Opt-in: only the in-process DSv4-teacher OPD path
 # (Flash teacher -> dense student) pulls these; dense-only OPD ignores them.
-nccl = ["cuda", "infer-api/nccl"]
+nccl = ["cuda", "autograd/nccl", "dep:cuda-kernels", "cuda-kernels/nccl", "infer-api/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 
 [dependencies]
@@ -45,6 +45,7 @@ deepseek-spec = { path = "../deepseek-spec" }
 chat = { path = "../chat" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
+cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
