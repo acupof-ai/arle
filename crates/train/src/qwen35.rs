@@ -7,9 +7,9 @@ use std::{
 use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, causal_sdpa_recompute, causal_sdpa_with_q_start, embedding,
-        linear_attention_core, matmul_bt_with_site, mul, repeat_kv, reshape, rmsnorm, rope,
-        sigmoid, silu, slice, transpose,
+        LinearAttentionParams, add, all_reduce_sum, causal_sdpa_recompute,
+        causal_sdpa_with_q_start, embedding, linear_attention_core, matmul_bt_with_site, mul,
+        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
 };
 use half::bf16;
@@ -124,6 +124,119 @@ pub trait SequenceWindowedForward {
         position_ids: &[u32],
         window: SequenceWindow,
     ) -> Result<TensorId>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35TensorParallelConfig {
+    pub rank: usize,
+    pub world_size: usize,
+}
+
+impl Qwen35TensorParallelConfig {
+    pub const fn single() -> Self {
+        Self {
+            rank: 0,
+            world_size: 1,
+        }
+    }
+
+    pub const fn new(rank: usize, world_size: usize) -> Self {
+        Self { rank, world_size }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.world_size > 1
+    }
+
+    fn validate(self, cfg: &Qwen35Config) -> Result<()> {
+        if self.world_size == 0 {
+            return Err(Qwen35Error::InvalidConfig(
+                "tensor-parallel world size must be non-zero",
+            ));
+        }
+        if self.rank >= self.world_size {
+            return Err(Qwen35Error::InvalidConfig(
+                "tensor-parallel rank must be smaller than world size",
+            ));
+        }
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        if !cfg
+            .layer_types
+            .iter()
+            .all(|&layer| layer == LayerType::FullAttention)
+        {
+            return Err(Qwen35Error::InvalidConfig(
+                "tensor-parallel train path currently supports full-attention layers only",
+            ));
+        }
+        let _ = self.local_attention_heads(cfg)?;
+        let _ = self.local_key_value_heads(cfg)?;
+        let _ = self.local_intermediate_size(cfg)?;
+        Ok(())
+    }
+
+    fn local_attention_heads(self, cfg: &Qwen35Config) -> Result<usize> {
+        divide_tp(
+            cfg.num_attention_heads,
+            self.world_size,
+            "num_attention_heads must divide tensor-parallel world size",
+        )
+    }
+
+    fn local_key_value_heads(self, cfg: &Qwen35Config) -> Result<usize> {
+        divide_tp(
+            cfg.num_key_value_heads,
+            self.world_size,
+            "num_key_value_heads must divide tensor-parallel world size",
+        )
+    }
+
+    fn local_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize> {
+        divide_tp(
+            cfg.intermediate_size,
+            self.world_size,
+            "intermediate_size must divide tensor-parallel world size",
+        )
+    }
+
+    fn full_attn_q_proj_dim(self, cfg: &Qwen35Config) -> Result<usize> {
+        let local_heads = self.local_attention_heads(cfg)?;
+        Ok(if cfg.full_attn_gated {
+            local_heads * cfg.head_dim * 2
+        } else {
+            local_heads * cfg.head_dim
+        })
+    }
+
+    fn full_attn_q_dim(self, cfg: &Qwen35Config) -> Result<usize> {
+        Ok(self.local_attention_heads(cfg)? * cfg.head_dim)
+    }
+
+    fn full_attn_kv_dim(self, cfg: &Qwen35Config) -> Result<usize> {
+        Ok(self.local_key_value_heads(cfg)? * cfg.head_dim)
+    }
+}
+
+fn divide_tp(value: usize, world_size: usize, message: &'static str) -> Result<usize> {
+    if world_size == 0 || !value.is_multiple_of(world_size) {
+        return Err(Qwen35Error::InvalidConfig(message));
+    }
+    Ok(value / world_size)
+}
+
+fn maybe_tp_all_reduce(
+    x: TensorId,
+    tp: Qwen35TensorParallelConfig,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if tp.is_enabled() {
+        Ok(all_reduce_sum(x, store, tape)?)
+    } else {
+        Ok(x)
+    }
 }
 
 impl Qwen35KvCache {
@@ -338,6 +451,7 @@ impl Qwen35Layer {
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
         cos: TensorId,
         sin: TensorId,
         store: &mut TensorStore,
@@ -360,9 +474,8 @@ impl Qwen35Layer {
 
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let attn_out = match &self.self_attn {
-            Qwen35Attention::Full(attn) => {
-                self.forward_full_attention(h, attn, cfg, cos, sin, batch, seq_len, store, tape)?
-            }
+            Qwen35Attention::Full(attn) => self
+                .forward_full_attention(h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape)?,
             Qwen35Attention::Linear(attn) => {
                 self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
             }
@@ -381,6 +494,7 @@ impl Qwen35Layer {
         let gate = silu(gate, store, tape)?;
         let act = mul(gate, up, store, tape)?;
         let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
+        let mlp_out = maybe_tp_all_reduce(mlp_out, tp, store, tape)?;
         Ok(add(x, mlp_out, store, tape)?)
     }
 
@@ -542,6 +656,7 @@ impl Qwen35Layer {
         h: TensorId,
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
         cos: TensorId,
         sin: TensorId,
         batch: usize,
@@ -557,24 +672,26 @@ impl Qwen35Layer {
         // selects between the two paths so `qwen35_loader` can load both
         // checkpoint families without an arch fork.
         let q_full = attn.q_proj.forward(h, store, tape)?;
+        let local_attention_heads = tp.local_attention_heads(cfg)?;
+        let local_key_value_heads = tp.local_key_value_heads(cfg)?;
         let (q, gate) = if cfg.full_attn_gated {
             let q_full = reshape(
                 q_full,
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
                 store,
                 tape,
             )?;
             let q = slice(
                 q_full,
                 &[0, 0, 0, 0],
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim],
                 store,
                 tape,
             )?;
             let gate = slice(
                 q_full,
                 &[0, 0, 0, cfg.head_dim],
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
                 store,
                 tape,
             )?;
@@ -585,7 +702,7 @@ impl Qwen35Layer {
         } else {
             let q = reshape(
                 q_full,
-                &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim],
                 store,
                 tape,
             )?;
@@ -598,7 +715,7 @@ impl Qwen35Layer {
             k,
             batch,
             seq_len,
-            cfg.num_key_value_heads,
+            local_key_value_heads,
             cfg.head_dim,
             store,
             tape,
@@ -607,7 +724,7 @@ impl Qwen35Layer {
             v,
             batch,
             seq_len,
-            cfg.num_key_value_heads,
+            local_key_value_heads,
             cfg.head_dim,
             store,
             tape,
@@ -618,7 +735,7 @@ impl Qwen35Layer {
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
 
-        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let kv_repeat = local_attention_heads / local_key_value_heads;
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
@@ -633,12 +750,13 @@ impl Qwen35Layer {
             attn_hidden,
             batch,
             seq_len,
-            cfg.num_attention_heads,
+            local_attention_heads,
             cfg.head_dim,
             store,
             tape,
         )?;
-        Ok(attn.o_proj.forward(attn_hidden, store, tape)?)
+        let out = attn.o_proj.forward(attn_hidden, store, tape)?;
+        maybe_tp_all_reduce(out, tp, store, tape)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1029,6 +1147,7 @@ impl Qwen35Layer {
 #[derive(Debug, Clone)]
 pub struct Qwen35Model {
     config: Qwen35Config,
+    tp: Qwen35TensorParallelConfig,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
     layers: Vec<Qwen35Layer>,
@@ -1054,6 +1173,7 @@ impl Qwen35Model {
             cfg,
             None,
             LoraTargetSet::AllLinear,
+            Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::ScratchTrain,
             store,
         )
@@ -1063,10 +1183,25 @@ impl Qwen35Model {
         &self.config
     }
 
+    pub fn tensor_parallel(&self) -> Qwen35TensorParallelConfig {
+        self.tp
+    }
+
     pub fn supports_rollout_kv_cache(&self) -> bool {
-        self.layers
-            .iter()
-            .all(|layer| matches!(layer.self_attn, Qwen35Attention::Full(_)))
+        !self.tp.is_enabled()
+            && self
+                .layers
+                .iter()
+                .all(|layer| matches!(layer.self_attn, Qwen35Attention::Full(_)))
+    }
+
+    fn ensure_rollout_cache_supported(&self) -> Result<()> {
+        if self.tp.is_enabled() {
+            return Err(Qwen35Error::InvalidConfig(
+                "rollout KV cache requires a non-tensor-parallel train model",
+            ));
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -1080,6 +1215,11 @@ impl Qwen35Model {
         if tape.enabled {
             return Err(Qwen35Error::InvalidConfig(
                 "parity diagnostics require tape disabled",
+            ));
+        }
+        if self.tp.is_enabled() {
+            return Err(Qwen35Error::InvalidConfig(
+                "parity diagnostics require a non-tensor-parallel model",
             ));
         }
         if self.layers.is_empty() {
@@ -1129,6 +1269,7 @@ impl Qwen35Model {
                 layer0_norm,
                 attn,
                 &self.config,
+                self.tp,
                 cos,
                 sin,
                 batch,
@@ -1177,7 +1318,7 @@ impl Qwen35Model {
 
         let mut hidden = layer0_residual;
         for layer in self.layers.iter().skip(1) {
-            hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
+            hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
         }
         let final_rmsnorm = qwen35_rmsnorm(
             hidden,
@@ -1204,6 +1345,7 @@ impl Qwen35Model {
             cfg,
             None,
             LoraTargetSet::AllLinear,
+            Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen,
             store,
         )
@@ -1218,6 +1360,7 @@ impl Qwen35Model {
             cfg,
             lora,
             LoraTargetSet::AllLinear,
+            Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen,
             store,
         )
@@ -1233,6 +1376,25 @@ impl Qwen35Model {
             cfg,
             Some(lora),
             target_set,
+            Qwen35TensorParallelConfig::single(),
+            Qwen35InitMode::LoraOrFrozen,
+            store,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_lora_targets_and_tp(
+        cfg: &Qwen35Config,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        tp: Qwen35TensorParallelConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        Self::new_internal(
+            cfg,
+            Some(lora),
+            target_set,
+            tp,
             Qwen35InitMode::LoraOrFrozen,
             store,
         )
@@ -1244,7 +1406,8 @@ impl Qwen35Model {
         target_set: LoraTargetSet,
         store: &mut TensorStore,
     ) -> Result<Self> {
-        let mut model = Self::new_with_lora_targets(&base.config, lora, target_set, store)?;
+        let mut model =
+            Self::new_with_lora_targets_and_tp(&base.config, lora, target_set, base.tp, store)?;
         model.share_base_parameters_from(base)?;
 
         let keep = base
@@ -1260,6 +1423,7 @@ impl Qwen35Model {
         cfg: &Qwen35Config,
         lora: Option<LoraConfig>,
         lora_target_set: LoraTargetSet,
+        tp: Qwen35TensorParallelConfig,
         mode: Qwen35InitMode,
         store: &mut TensorStore,
     ) -> Result<Self> {
@@ -1267,6 +1431,7 @@ impl Qwen35Model {
             Qwen35InitMode::ScratchTrain => cfg.validate_train_scratch_contract()?,
             Qwen35InitMode::LoraOrFrozen => cfg.validate_train_lora_or_frozen_contract()?,
         }
+        tp.validate(cfg)?;
         let mut param_names = HashMap::new();
         let mut adapter_names = HashMap::new();
         let mut param_ids = Vec::new();
@@ -1326,7 +1491,7 @@ impl Qwen35Model {
             let gate_proj = LinearWithLora::new(
                 gate_proj_name,
                 cfg.hidden_size,
-                cfg.intermediate_size,
+                tp.local_intermediate_size(cfg)?,
                 base_requires_grad,
                 lora_for_name(lora, lora_target_set, gate_proj_name),
                 store,
@@ -1334,14 +1499,14 @@ impl Qwen35Model {
             let up_proj = LinearWithLora::new(
                 up_proj_name,
                 cfg.hidden_size,
-                cfg.intermediate_size,
+                tp.local_intermediate_size(cfg)?,
                 base_requires_grad,
                 lora_for_name(lora, lora_target_set, up_proj_name),
                 store,
             )?;
             let down_proj = LinearWithLora::new(
                 down_proj_name,
-                cfg.intermediate_size,
+                tp.local_intermediate_size(cfg)?,
                 cfg.hidden_size,
                 base_requires_grad,
                 lora_for_name(lora, lora_target_set, down_proj_name),
@@ -1391,7 +1556,7 @@ impl Qwen35Model {
                     let q_proj = LinearWithLora::new(
                         q_proj_name,
                         cfg.hidden_size,
-                        cfg.full_attn_q_proj_dim(),
+                        tp.full_attn_q_proj_dim(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, q_proj_name),
                         store,
@@ -1399,7 +1564,7 @@ impl Qwen35Model {
                     let k_proj = LinearWithLora::new(
                         k_proj_name,
                         cfg.hidden_size,
-                        cfg.full_attn_kv_dim(),
+                        tp.full_attn_kv_dim(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, k_proj_name),
                         store,
@@ -1407,14 +1572,14 @@ impl Qwen35Model {
                     let v_proj = LinearWithLora::new(
                         v_proj_name,
                         cfg.hidden_size,
-                        cfg.full_attn_kv_dim(),
+                        tp.full_attn_kv_dim(cfg)?,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, v_proj_name),
                         store,
                     )?;
                     let o_proj = LinearWithLora::new(
                         o_proj_name,
-                        cfg.full_attn_q_dim(),
+                        tp.full_attn_q_dim(cfg)?,
                         cfg.hidden_size,
                         base_requires_grad,
                         lora_for_name(lora, lora_target_set, o_proj_name),
@@ -1620,6 +1785,7 @@ impl Qwen35Model {
 
         Ok(Self {
             config: cfg.clone(),
+            tp,
             lora,
             lora_target_set,
             layers,
@@ -1688,12 +1854,14 @@ impl Qwen35Model {
     }
 
     pub fn clone_frozen(&self, store: &mut TensorStore) -> Self {
-        let cloned = match self.lora {
-            Some(lora) => {
-                Self::new_with_lora_targets(&self.config, lora, self.lora_target_set, store)
-            }
-            None => Self::new_for_eval(&self.config, store),
-        }
+        let cloned = Self::new_internal(
+            &self.config,
+            self.lora,
+            self.lora_target_set,
+            self.tp,
+            Qwen35InitMode::LoraOrFrozen,
+            store,
+        )
         .expect("clone_frozen should preserve config");
         copy_frozen_tensor_map(&self.param_names, &cloned.param_names, store);
         copy_frozen_tensor_map(&self.adapter_names, &cloned.adapter_names, store);
@@ -1785,6 +1953,7 @@ impl Qwen35Model {
         position_ids: &[u32],
         cache: &mut Qwen35KvCache,
     ) -> Result<TensorId> {
+        self.ensure_rollout_cache_supported()?;
         if input_ids.len() != position_ids.len() {
             return Err(Qwen35Error::InputLenMismatch {
                 input_len: input_ids.len(),
@@ -1807,6 +1976,7 @@ impl Qwen35Model {
         position_ids: &[u32],
         cache: &mut Qwen35KvCache,
     ) -> Result<(TensorId, Qwen35RolloutForwardProfile)> {
+        self.ensure_rollout_cache_supported()?;
         if input_ids.len() != position_ids.len() {
             return Err(Qwen35Error::InputLenMismatch {
                 input_len: input_ids.len(),
@@ -1835,6 +2005,7 @@ impl Qwen35Model {
         position_id: u32,
         cache: &mut Qwen35KvCache,
     ) -> Result<TensorId> {
+        self.ensure_rollout_cache_supported()?;
         if tape.enabled {
             return Err(Qwen35Error::InvalidConfig(
                 "device-token rollout requires tape disabled",
@@ -1901,6 +2072,7 @@ impl Qwen35Model {
         position_id: u32,
         cache: &mut Qwen35KvCache,
     ) -> Result<(TensorId, Qwen35RolloutForwardProfile)> {
+        self.ensure_rollout_cache_supported()?;
         let total_started = Instant::now();
         let mut profile = Qwen35RolloutForwardProfile::default();
 
@@ -2016,7 +2188,7 @@ impl Qwen35Model {
             tape,
         )?;
         for layer in &self.layers {
-            hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
+            hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
         }
         qwen35_rmsnorm(
             hidden,
@@ -2035,6 +2207,7 @@ impl Qwen35Model {
         positions: &[usize],
         cache: &mut Qwen35KvCache,
     ) -> Result<TensorId> {
+        self.ensure_rollout_cache_supported()?;
         let seq_len = positions.len();
         if token_indices.len() != seq_len {
             return Err(Qwen35Error::InputLenMismatch {
@@ -2120,6 +2293,7 @@ impl Qwen35Model {
         positions: &[usize],
         cache: &mut Qwen35KvCache,
     ) -> Result<(TensorId, Qwen35RolloutForwardProfile)> {
+        self.ensure_rollout_cache_supported()?;
         let total_started = Instant::now();
         let mut profile = Qwen35RolloutForwardProfile::default();
         let seq_len = positions.len();
