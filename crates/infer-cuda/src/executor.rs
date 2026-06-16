@@ -2139,6 +2139,13 @@ impl Qwen35CudaExecutor {
                 "Qwen3.5 FP8 dense DeepGEMM warmed {warmed_shapes} projection shape(s) at M={warm_m}"
             );
         }
+        let (grouped_shapes, grouped_tokens, grouped_min_rows, grouped_max_rows) =
+            self.model.warm_fp8_deepgemm_grouped_prefill()?;
+        if grouped_shapes > 0 {
+            info!(
+                "Qwen3.5 FP8 grouped DeepGEMM warmed {grouped_shapes} GEMM shape(s) at tokens<={grouped_tokens} rows={grouped_min_rows}..{grouped_max_rows}"
+            );
+        }
         if !qwen35_decode_graph_enabled() {
             info!(
                 "Qwen3.5 whole-step decode graph disabled \
