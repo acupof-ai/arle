@@ -491,14 +491,14 @@ mod backend {
             }
         }
 
-        /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6 q/v
+        /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
         /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
         /// CPU arms reject it.
         ///
         /// The CUDA forward path implements the merge (see
         /// [`infer_cuda::CudaExecutor::remerge_student_lora`] +
-        /// `infer_cuda::qwen35::Qwen35Model::remerge_student_lora`): the resident
-        /// q/v `DeviceMatrix` weights are re-merged in place from a pristine
+        /// `infer_cuda::qwen35::Qwen35Model::remerge_student_lora`): resident
+        /// `DeviceMatrix` weights are re-merged in place from a pristine
         /// base-weight cache, and the next forward picks them up. The executor
         /// lives on the [`infer_server::ServeHandle`] engine thread; this routes
         /// the merge through the out-of-band `run_on_executor` control seam (the
