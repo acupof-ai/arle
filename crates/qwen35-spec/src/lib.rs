@@ -665,19 +665,24 @@ impl Qwen35Config {
         Ok(())
     }
 
-    /// Shared train-side contract for LoRA / frozen-eval Qwen3.5. This is
-    /// intentionally broader than the scratch-pretrain path: dense full-attn
-    /// and hybrid linear-attn configs are allowed, but MoE remains rejected.
+    /// Shared train-side contract for LoRA / frozen-eval Qwen3.5/Qwen3.6. This
+    /// is intentionally broader than the scratch-pretrain path: dense full-attn,
+    /// hybrid linear-attn, and MoE configs are allowed here because the base is
+    /// frozen and only LoRA adapters train.
     pub fn validate_train_lora_or_frozen_contract(&self) -> Result<()> {
         self.validate()?;
-        if self.is_moe() {
-            return Err(Qwen35ConfigError::InvalidConfig(
-                "train-side qwen3.5 currently supports dense MLP layers only",
-            ));
-        }
         if self.rope_cache_len_hint.is_none() {
             return Err(Qwen35ConfigError::InvalidConfig(
                 "train-side qwen3.5 requires rope_cache_len_hint",
+            ));
+        }
+        if self.is_moe()
+            && (self.num_experts_per_tok == 0
+                || self.moe_intermediate_size == 0
+                || self.shared_expert_intermediate_size == 0)
+        {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.6 MoE LoRA requires non-zero expert dimensions",
             ));
         }
         Ok(())

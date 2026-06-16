@@ -32,8 +32,10 @@
 //!   smoke path).
 //! - It does not touch the tokenizer or generation config. Those live in
 //!   the same directory but are read elsewhere (e.g. `train::tokenizer`).
-//! - It does not (yet) support quantized checkpoints. Float and BF16/F16
-//!   safetensors only; quantized weights surface as a `LoaderError::UnsupportedDtype`.
+//! - Quantized checkpoint support is deliberately narrow: CUDA LoRA-student
+//!   loads accept frozen FP8 E4M3 block-scaled base linear weights when the
+//!   checkpoint provides the matching `*.weight_scale_inv` side tensor. Teacher,
+//!   trainable-base, and CPU loads still reject quantized weights.
 //!
 //! ## Independence from the `infer` crate
 //!
@@ -124,7 +126,7 @@ pub enum LoaderError {
     )]
     MissingTensor(String),
     #[error(
-        "unsupported dtype {0:?} for {1}. Hint: OPD loader currently accepts F32, BF16, and F16 safetensors only; convert quantized checkpoints before loading."
+        "unsupported dtype {0:?} for {1}. Hint: OPD loader accepts F32/BF16/F16, plus CUDA LoRA-student frozen FP8 E4M3 weights with matching *.weight_scale_inv side tensors."
     )]
     UnsupportedDtype(Dtype, String),
     #[error(
@@ -154,6 +156,7 @@ pub type Result<T> = std::result::Result<T, LoaderError>;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Qwen35HfConfig {
     pub hidden_size: usize,
+    #[serde(default)]
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -188,6 +191,40 @@ pub struct Qwen35HfConfig {
     pub linear_num_value_heads: Option<usize>,
     #[serde(default)]
     pub linear_value_head_dim: Option<usize>,
+    #[serde(default)]
+    pub num_experts: usize,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    #[serde(default = "default_decoder_sparse_step")]
+    pub decoder_sparse_step: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
+    #[serde(default = "default_norm_topk_prob")]
+    pub norm_topk_prob: bool,
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
+    #[serde(default)]
+    moe_config: Option<Qwen35HfMoeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct Qwen35HfMoeConfig {
+    #[serde(default)]
+    num_experts: usize,
+    #[serde(default)]
+    num_experts_per_tok: usize,
+    #[serde(default = "default_decoder_sparse_step")]
+    decoder_sparse_step: usize,
+    #[serde(default)]
+    moe_intermediate_size: usize,
+    #[serde(default)]
+    shared_expert_intermediate_size: usize,
+    #[serde(default = "default_norm_topk_prob")]
+    norm_topk_prob: bool,
+    #[serde(default)]
+    mlp_only_layers: Vec<usize>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -200,6 +237,14 @@ fn default_partial_rotary_factor() -> f32 {
 
 fn default_tie_word_embeddings() -> bool {
     false
+}
+
+fn default_decoder_sparse_step() -> usize {
+    1
+}
+
+fn default_norm_topk_prob() -> bool {
+    true
 }
 
 /// What kind of HF schema this directory exposes — controls name remapping
@@ -239,6 +284,7 @@ impl Qwen35HfConfig {
         };
 
         let mut config: Qwen35HfConfig = serde_json::from_value(text.clone())?;
+        config.merge_nested_moe_config();
 
         // Qwen3.5 / Qwen3.6 stash rope under a `rope_parameters` block.
         if let Some(rope) = text.get("rope_parameters") {
@@ -254,6 +300,33 @@ impl Qwen35HfConfig {
         }
 
         Ok((config, schema))
+    }
+
+    fn merge_nested_moe_config(&mut self) {
+        let Some(nested) = self.moe_config.take() else {
+            return;
+        };
+        if nested.num_experts != 0 {
+            self.num_experts = nested.num_experts;
+        }
+        if nested.num_experts_per_tok != 0 {
+            self.num_experts_per_tok = nested.num_experts_per_tok;
+        }
+        if nested.decoder_sparse_step != default_decoder_sparse_step() {
+            self.decoder_sparse_step = nested.decoder_sparse_step;
+        }
+        if nested.moe_intermediate_size != 0 {
+            self.moe_intermediate_size = nested.moe_intermediate_size;
+        }
+        if nested.shared_expert_intermediate_size != 0 {
+            self.shared_expert_intermediate_size = nested.shared_expert_intermediate_size;
+        }
+        if !nested.norm_topk_prob {
+            self.norm_topk_prob = nested.norm_topk_prob;
+        }
+        if !nested.mlp_only_layers.is_empty() {
+            self.mlp_only_layers = nested.mlp_only_layers;
+        }
     }
 
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<(Self, HfSchema)> {
@@ -319,13 +392,13 @@ impl Qwen35HfConfig {
             rotary_dim,
             rope_cache_len_hint: Some(self.max_position_embeddings.unwrap_or(32_768)),
             layer_types,
-            num_experts: 0,
-            num_experts_per_tok: 0,
-            decoder_sparse_step: 1,
-            moe_intermediate_size: 0,
-            shared_expert_intermediate_size: 0,
-            norm_topk_prob: true,
-            mlp_only_layers: Vec::new(),
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            decoder_sparse_step: self.decoder_sparse_step,
+            moe_intermediate_size: self.moe_intermediate_size,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+            mlp_only_layers: self.mlp_only_layers.clone(),
             full_attn_gated: true,
         };
         cfg.validate()?;
@@ -689,6 +762,14 @@ struct PlannedTensorLoad {
     requires_grad: bool,
     shard_idx: usize,
     bf16_cuda_frozen_base: bool,
+    fp8_cuda_frozen_base: Option<PlannedFp8BlockScaled>,
+}
+
+struct PlannedFp8BlockScaled {
+    scale_name: String,
+    scale_shard_idx: usize,
+    block_m: usize,
+    block_k: usize,
 }
 
 fn plan_tensor_loads(
@@ -776,7 +857,6 @@ fn plan_tensor_load(
         .tensor(hf_name)
         .map_err(|err| LoaderError::Safetensors(format!("{hf_name}: {err}")))?;
     let got_shape: Vec<usize> = view.shape().to_vec();
-    validate_supported_dtype(&view, hf_name)?;
 
     let slot = store.get(id).ok_or_else(|| {
         LoaderError::Custom(format!(
@@ -799,6 +879,21 @@ fn plan_tensor_load(
         });
     }
 
+    let fp8_cuda_frozen_base = plan_fp8_cuda_frozen_base(
+        mode,
+        hf_name,
+        train_name,
+        &expected_shape,
+        requires_grad,
+        view.dtype(),
+        hf_name_to_shard,
+        safetensors_views,
+        store,
+    )?;
+    if fp8_cuda_frozen_base.is_none() {
+        validate_supported_dtype(&view, hf_name)?;
+    }
+
     let bf16_cuda_frozen_base = should_load_bf16_cuda_frozen_base(
         mode,
         train_name,
@@ -816,6 +911,7 @@ fn plan_tensor_load(
         requires_grad,
         shard_idx,
         bf16_cuda_frozen_base,
+        fp8_cuda_frozen_base,
     })
 }
 
@@ -861,6 +957,128 @@ fn is_bf16_cuda_frozen_base_tensor(train_name: &str, expected_shape: &[usize]) -
         || train_name.ends_with(".mlp.gate_proj.weight")
         || train_name.ends_with(".mlp.up_proj.weight")
         || train_name.ends_with(".mlp.down_proj.weight")
+        || train_name.ends_with(".mlp.gate.weight")
+        || train_name.ends_with(".mlp.shared_expert.gate_proj.weight")
+        || train_name.ends_with(".mlp.shared_expert.up_proj.weight")
+        || train_name.ends_with(".mlp.shared_expert.down_proj.weight")
+        || train_name.ends_with(".mlp.shared_expert_gate.weight")
+        || is_qwen36_per_expert_projection(train_name)
+}
+
+fn plan_fp8_cuda_frozen_base(
+    mode: LoadMode,
+    hf_name: &str,
+    train_name: &str,
+    expected_shape: &[usize],
+    requires_grad: bool,
+    dtype: Dtype,
+    hf_name_to_shard: &HashMap<String, usize>,
+    safetensors_views: &[SafeTensors<'_>],
+    store: &TensorStore,
+) -> Result<Option<PlannedFp8BlockScaled>> {
+    const QWEN36_FP8_BLOCK_M: usize = 128;
+    const QWEN36_FP8_BLOCK_K: usize = 128;
+
+    if !(matches!(mode, LoadMode::LoraStudent { .. })
+        && !requires_grad
+        && dtype == Dtype::F8_E4M3
+        && store.backend().device() == Device::Cuda
+        && is_fp8_cuda_frozen_base_tensor(train_name, expected_shape))
+    {
+        return Ok(None);
+    }
+
+    let scale_name = fp8_scale_tensor_name(hf_name)?;
+    let scale_shard_idx = *hf_name_to_shard
+        .get(&scale_name)
+        .ok_or_else(|| LoaderError::MissingTensor(scale_name.clone()))?;
+    let scale_view = safetensors_views[scale_shard_idx]
+        .tensor(&scale_name)
+        .map_err(|err| LoaderError::Safetensors(format!("{scale_name}: {err}")))?;
+    validate_fp8_scale_view(
+        &scale_name,
+        &scale_view,
+        expected_shape,
+        QWEN36_FP8_BLOCK_M,
+        QWEN36_FP8_BLOCK_K,
+    )?;
+
+    Ok(Some(PlannedFp8BlockScaled {
+        scale_name,
+        scale_shard_idx,
+        block_m: QWEN36_FP8_BLOCK_M,
+        block_k: QWEN36_FP8_BLOCK_K,
+    }))
+}
+
+fn fp8_scale_tensor_name(hf_name: &str) -> Result<String> {
+    let base = hf_name.strip_suffix(".weight").ok_or_else(|| {
+        LoaderError::Custom(format!(
+            "FP8 tensor {hf_name} is missing the .weight suffix. Hint: \
+             Qwen3.6 FP8 block-scaled weights must have a matching \
+             *.weight_scale_inv side tensor."
+        ))
+    })?;
+    Ok(format!("{base}.weight_scale_inv"))
+}
+
+fn validate_fp8_scale_view(
+    scale_name: &str,
+    scale_view: &impl safetensors::View,
+    expected_weight_shape: &[usize],
+    block_m: usize,
+    block_k: usize,
+) -> Result<()> {
+    match scale_view.dtype() {
+        Dtype::BF16 | Dtype::F32 | Dtype::F16 => {}
+        other => return Err(LoaderError::UnsupportedDtype(other, scale_name.to_owned())),
+    }
+    let expected = fp8_scale_shape(expected_weight_shape, block_m, block_k)?;
+    let got = scale_view.shape().to_vec();
+    if got != expected {
+        return Err(LoaderError::ShapeMismatch {
+            name: scale_name.to_owned(),
+            expected,
+            got,
+            hint: ". Hint: Qwen3.6 FP8 block-scaled weights require scale shape \
+                   [ceil(rows/128), ceil(cols/128)] for each *.weight_scale_inv tensor."
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn fp8_scale_shape(shape: &[usize], block_m: usize, block_k: usize) -> Result<Vec<usize>> {
+    if shape.len() != 2 {
+        return Err(LoaderError::Custom(format!(
+            "FP8 frozen-base tensor must be rank-2, got shape {shape:?}"
+        )));
+    }
+    Ok(vec![shape[0].div_ceil(block_m), shape[1].div_ceil(block_k)])
+}
+
+fn is_fp8_cuda_frozen_base_tensor(train_name: &str, expected_shape: &[usize]) -> bool {
+    expected_shape.len() == 2
+        && (train_name.ends_with(".self_attn.q_proj.weight")
+            || train_name.ends_with(".self_attn.k_proj.weight")
+            || train_name.ends_with(".self_attn.v_proj.weight")
+            || train_name.ends_with(".self_attn.o_proj.weight")
+            || train_name.ends_with(".linear_attn.in_proj_qkv.weight")
+            || train_name.ends_with(".linear_attn.in_proj_z.weight")
+            || train_name.ends_with(".linear_attn.in_proj_b.weight")
+            || train_name.ends_with(".linear_attn.in_proj_a.weight")
+            || train_name.ends_with(".linear_attn.out_proj.weight")
+            || train_name.ends_with(".mlp.shared_expert.gate_proj.weight")
+            || train_name.ends_with(".mlp.shared_expert.up_proj.weight")
+            || train_name.ends_with(".mlp.shared_expert.down_proj.weight")
+            || is_qwen36_per_expert_projection(train_name))
+}
+
+fn is_qwen36_per_expert_projection(train_name: &str) -> bool {
+    train_name.contains(".mlp.experts.")
+        && (train_name.ends_with(".gate_proj.weight")
+            || train_name.ends_with(".up_proj.weight")
+            || train_name.ends_with(".down_proj.weight"))
 }
 
 fn validate_supported_dtype(view: &impl safetensors::View, name: &str) -> Result<()> {
@@ -878,6 +1096,30 @@ fn load_planned_tensor_into_slot(
     let view = safetensors_views[planned.shard_idx]
         .tensor(&planned.hf_name)
         .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
+    if let Some(fp8) = &planned.fp8_cuda_frozen_base {
+        let scale_view = safetensors_views[fp8.scale_shard_idx]
+            .tensor(&fp8.scale_name)
+            .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", fp8.scale_name)))?;
+        let scales = dtype_to_f32(&scale_view, &fp8.scale_name)?;
+        let weight = view.data();
+        let handle = store
+            .backend()
+            .upload_fp8_block_scaled(
+                weight.as_ref(),
+                &scales,
+                &planned.expected_shape,
+                fp8.block_m,
+                fp8.block_k,
+            )
+            .map_err(LoaderError::Autograd)?;
+        store
+            .replace_device_handle(planned.id, handle)
+            .map_err(LoaderError::Autograd)?;
+        store
+            .set_requires_grad(planned.id, false)
+            .map_err(LoaderError::Autograd)?;
+        return Ok(());
+    }
     if planned.bf16_cuda_frozen_base {
         let data = dtype_to_bf16_bits(&view, &planned.hf_name)?;
         let handle = store
@@ -1015,6 +1257,14 @@ mod tests {
             "model.language_model.layers.0.mlp.gate_proj.weight",
             "model.language_model.layers.0.mlp.up_proj.weight",
             "model.language_model.layers.0.mlp.down_proj.weight",
+            "model.language_model.layers.0.mlp.gate.weight",
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.language_model.layers.0.mlp.experts.7.up_proj.weight",
+            "model.language_model.layers.0.mlp.experts.255.down_proj.weight",
         ] {
             assert!(
                 is_bf16_cuda_frozen_base_tensor(name, &linear_shape),
@@ -1127,6 +1377,72 @@ mod tests {
         }
     }"#;
 
+    const QWEN36_MOE_CONFIG_JSON: &str = r#"{
+        "architectures": ["Qwen3_5_MoeForCausalLM"],
+        "eos_token_id": 248044,
+        "text_config": {
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "rms_norm_eps": 1e-6,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "rope_parameters": {
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25
+            },
+            "max_position_embeddings": 32768,
+            "tie_word_embeddings": false,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "decoder_sparse_step": 1,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512
+        }
+    }"#;
+
+    const QWEN36_NESTED_MOE_CONFIG_JSON: &str = r#"{
+        "architectures": ["Qwen3_5_MoeForCausalLM"],
+        "eos_token_id": 248044,
+        "text_config": {
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "rms_norm_eps": 1e-6,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "rope_parameters": {
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25
+            },
+            "max_position_embeddings": 32768,
+            "tie_word_embeddings": false,
+            "moe_config": {
+                "num_experts": 128,
+                "num_experts_per_tok": 4,
+                "decoder_sparse_step": 2,
+                "moe_intermediate_size": 1024,
+                "shared_expert_intermediate_size": 1024,
+                "norm_topk_prob": false,
+                "mlp_only_layers": [0]
+            }
+        }
+    }"#;
+
     const TINY_QWEN35_CONFIG_JSON: &str = r#"{
         "architectures": ["Qwen3_5_NextForCausalLM"],
         "eos_token_id": 7,
@@ -1230,6 +1546,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_qwen36_moe_config_without_intermediate_size() {
+        let (hf, schema) = Qwen35HfConfig::from_json_str(QWEN36_MOE_CONFIG_JSON).unwrap();
+        assert_eq!(schema, HfSchema::Qwen35);
+        assert_eq!(hf.intermediate_size, 0);
+        assert_eq!(hf.num_experts, 256);
+        assert_eq!(hf.num_experts_per_tok, 8);
+        assert_eq!(hf.moe_intermediate_size, 512);
+        assert_eq!(hf.shared_expert_intermediate_size, 512);
+
+        let cfg = hf.to_qwen35_config().expect("convert qwen36 moe");
+        assert!(cfg.is_moe());
+        assert_eq!(cfg.intermediate_size, 0);
+        assert_eq!(cfg.num_experts, 256);
+        assert_eq!(cfg.num_experts_per_tok, 8);
+        assert_eq!(cfg.decoder_sparse_step, 1);
+        assert_eq!(cfg.moe_intermediate_size, 512);
+        assert_eq!(cfg.shared_expert_intermediate_size, 512);
+        assert!(cfg.norm_topk_prob);
+        assert!(!cfg.tie_word_embeddings);
+        assert_eq!(cfg.lm_head_tensor_name(), "lm_head.weight");
+        for layer_idx in 0..cfg.num_hidden_layers {
+            assert!(cfg.is_moe_layer(layer_idx), "layer {layer_idx}");
+        }
+    }
+
+    #[test]
+    fn parses_qwen36_nested_moe_config() {
+        let (hf, _schema) = Qwen35HfConfig::from_json_str(QWEN36_NESTED_MOE_CONFIG_JSON).unwrap();
+        let cfg = hf.to_qwen35_config().expect("convert nested moe");
+        assert!(cfg.is_moe());
+        assert_eq!(cfg.num_experts, 128);
+        assert_eq!(cfg.num_experts_per_tok, 4);
+        assert_eq!(cfg.decoder_sparse_step, 2);
+        assert_eq!(cfg.moe_intermediate_size, 1024);
+        assert_eq!(cfg.shared_expert_intermediate_size, 1024);
+        assert!(!cfg.norm_topk_prob);
+        assert_eq!(cfg.mlp_only_layers, vec![0]);
+        assert!(!cfg.is_moe_layer(0));
+        assert!(cfg.is_moe_layer(1));
+        assert!(!cfg.is_moe_layer(2));
+        assert!(cfg.is_moe_layer(3));
+    }
+
+    #[test]
     fn train_name_to_hf_qwen3_strips_language_model_segment() {
         assert_eq!(
             train_name_to_hf(
@@ -1327,8 +1687,66 @@ mod tests {
 
         let message = err.to_string();
         assert!(message.contains("unsupported dtype F8_E4M3"));
-        assert!(message.contains("F32, BF16, and F16"));
-        assert!(message.contains("convert quantized checkpoints"));
+        assert!(message.contains("F32/BF16/F16"));
+        assert!(message.contains("CUDA LoRA-student frozen FP8 E4M3"));
+        assert!(message.contains("weight_scale_inv"));
+    }
+
+    #[test]
+    fn fp8_scale_name_and_shape_match_qwen36_block_contract() {
+        assert_eq!(
+            fp8_scale_tensor_name("model.language_model.layers.0.mlp.experts.7.up_proj.weight")
+                .unwrap(),
+            "model.language_model.layers.0.mlp.experts.7.up_proj.weight_scale_inv"
+        );
+        assert_eq!(
+            fp8_scale_shape(&[512, 2048], 128, 128).unwrap(),
+            vec![4, 16]
+        );
+        assert_eq!(
+            fp8_scale_shape(&[8192, 2048], 128, 128).unwrap(),
+            vec![64, 16]
+        );
+    }
+
+    #[test]
+    fn fp8_cuda_frozen_base_predicate_matches_linear_weight_only_contract() {
+        assert!(is_fp8_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight",
+            &[512, 2048]
+        ));
+        assert!(is_fp8_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            &[2048, 512]
+        ));
+        assert!(is_fp8_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            &[8192, 2048]
+        ));
+        assert!(!is_fp8_cuda_frozen_base_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[248_320, 2048]
+        ));
+        assert!(!is_fp8_cuda_frozen_base_tensor(
+            "model.language_model.layers.0.input_layernorm.weight",
+            &[2048]
+        ));
+    }
+
+    #[test]
+    fn fp8_scale_view_rejects_wrong_shape() {
+        let scale = TestTensorView::from_dtype(Dtype::BF16, vec![3, 16], vec![0_u8; 3 * 16 * 2]);
+        let err = validate_fp8_scale_view(
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight_scale_inv",
+            &scale,
+            &[512, 2048],
+            128,
+            128,
+        )
+        .expect_err("wrong scale shape should fail");
+        let message = err.to_string();
+        assert!(message.contains("shape mismatch"));
+        assert!(message.contains("ceil(rows/128)"));
     }
 
     #[test]
