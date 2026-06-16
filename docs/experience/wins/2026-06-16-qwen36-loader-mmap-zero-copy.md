@@ -12,7 +12,8 @@ The 35B-A3B BF16 load profile showed `loader.shard_read` at 37.8s and
 `loader.tensor.owned_copy` at 39.8s inside a 47.7s total load. Replacing
 `fs::read` shard loads with mmap and routing direct BF16 uploads through
 `SharedTensor` should eliminate the large `tensor.owned_copy` records and reduce
-cold-load wall once an uncontended GPU is available for the 35B rerun.
+cold-load wall. Wall-clock is the ground-truth delta because startup phase
+timers are nested/overlapping.
 
 ## Command
 
@@ -32,12 +33,20 @@ CUDA_VISIBLE_DEVICES=0 RUST_LOG=info ARLE_CUDA_STARTUP_PROFILE=1 \
   target/release/arle serve --backend cuda --model-path /data01/models/Qwen3.5-0.8B --port 18121
 ```
 
+35B cold-load after run:
+
+```bash
+sync
+echo 3 > /proc/sys/vm/drop_caches
+CUDA_VISIBLE_DEVICES=0 RUST_LOG=info ARLE_CUDA_STARTUP_PROFILE=1 \
+  target/release/arle serve --backend cuda --model-path /data01/models/Qwen3.6-35B-A3B --port 18123
+```
+
 ## Environment
 
-- Local commit under test: dirty working tree with only `crates/infer-cuda/src/loader.rs`
-  changed by this tranche; unrelated `crates/cli/src/train_cli.rs` remained dirty
-  and untouched.
-- Remote build host: H20 / CUDA 12.9, `CUDARC_CUDA_VERSION=12090`.
+- Code commit under test: `8038994f` (`perf(cuda): mmap qwen bf16 loader tensors`).
+  Unrelated `crates/cli/src/train_cli.rs` remained dirty and untouched.
+- Remote build/run host: H20 / CUDA 12.9, `CUDARC_CUDA_VERSION=12090`.
 - Remote source: `/data01/arle-clean` clean source tree with only this
   `loader.rs` patch applied.
 
@@ -76,26 +85,49 @@ Remote smoke on Qwen3.5-0.8B:
 The remaining owned copies in the smoke are tiny F32/BF16 normalization vectors
 from dtype-conversion paths, not large BF16 matrix uploads.
 
+35B-A3B BF16 after run with page cache dropped and GPUs empty:
+
+| Phase | Count | Total ms | Avg ms |
+|---|---:|---:|---:|
+| `qwen35.total` | 1 | 39,480.7 | 39,480.7 |
+| `loader.shard_mmap` | 27 | 1,574.6 | 58.3 |
+| `loader.tensor.owned_copy` | 90 | 0.0 | 0.0 |
+| `loader.shard_deserialize` | 26 | 5.7 | 0.2 |
+| `loader.moe.stacked_routed_load` | 40 | 35,471.4 | 886.8 |
+
+Owned-copy byte audit after the patch:
+
+| Metric | Result |
+|---|---:|
+| `loader.tensor.owned_copy` total bytes | 11,520 |
+| owned copies >1 MiB | 0 |
+| max owned-copy tensor | 256 bytes |
+
+Warm page-cache reference before the cold rerun: `qwen35.total=12,789.4 ms`,
+`loader.shard_mmap=980.7 ms`, and `owned_copy_big_count=0`.
+
 ## Problems
 
-The required 35B-A3B BF16 after-run could not be completed in this session:
-all 8 H20s reported 47,015 MiB already used, `nvidia-smi` listed no process in
-this container, `lsof /dev/nvidia*` did not expose an owner, and
-`nvidia-smi --gpu-reset` failed with "In use by another client". That is an
-external GPU-client confounder, so a 35B load delta taken now would not be
-SOLID.
+The first 35B after attempt was delayed because all 8 H20s initially reported
+47,015 MiB used by an external GPU client invisible from this container
+(`nvidia-smi` listed no process, `lsof /dev/nvidia*` exposed no owner, and
+`nvidia-smi --gpu-reset` failed with "In use by another client"). The final
+after run above was taken only after the GPUs returned to 0 MiB used and
+`drop_caches` succeeded.
 
 ## Δ vs baseline
 
 | Metric | Before | After |
 |---|---:|---:|
-| 35B-A3B BF16 cold load wall | 47.7s | pending uncontended GPU |
-| Large `tensor.owned_copy` uploads | present, 39.8s total phase | eliminated on direct BF16 path; small smoke has 0 copies >1 MiB |
+| 35B-A3B BF16 cold load wall (`qwen35.total`) | 47.69s | 39.48s (-17.2%) |
+| Large `tensor.owned_copy` uploads | present, 39.8s total phase | eliminated; 0 copies >1 MiB, 11.5 KiB total |
+| Shard open/read phase | `loader.shard_read` 37.81s | `loader.shard_mmap` 1.57s |
 | Shard backing | `fs::read` heap copy | mmap-backed `SharedTensor` |
 
 ## Learnings
 
 The real #101 fix is copy hygiene on the hot BF16 upload path, not per-expert
-CPU parse. After the mmap/borrow patch, the remaining decisive gate is a clean
-35B-A3B BF16 cold-load A/B on an uncontended GPU; any run with hidden 47 GiB
-contexts is an invalid baseline.
+CPU parse. mmap + direct BF16 borrow removes the large host-copy phase and cuts
+the measured cold 35B-A3B BF16 load wall by 17.2%; further load work should
+target the now-dominant H2D/page-fault path inside stacked expert upload, not
+safetensors metadata parse.
