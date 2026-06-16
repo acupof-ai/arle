@@ -2632,6 +2632,7 @@ impl Qwen35CudaExecutor {
             let num_linear = self.model.config.num_hidden_layers - num_full;
             self.batch_decode = Some(crate::qwen35::Qwen35BatchDecodeState::new(
                 &self.model.ctx,
+                num_full,
                 num_linear,
                 self.num_slots,
             )?);
@@ -2643,6 +2644,7 @@ impl Qwen35CudaExecutor {
 
         let slot_indices: Vec<usize> = rows.iter().map(|r| r.slot).collect();
         let tokens_in: Vec<u32> = rows.iter().map(|r| r.last_token).collect();
+        let kv_seq_lens: Vec<usize> = rows.iter().map(|r| r.kv_seq_len).collect();
         let params: Vec<SamplingParams> = rows.iter().map(|r| r.params.clone()).collect();
         let positions: Vec<u64> = rows
             .iter()
@@ -2653,6 +2655,7 @@ impl Qwen35CudaExecutor {
             bd,
             &slot_indices,
             &tokens_in,
+            &kv_seq_lens,
             &params,
             &positions,
         )?;
