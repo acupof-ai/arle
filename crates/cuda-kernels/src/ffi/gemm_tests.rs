@@ -1,6 +1,6 @@
 use super::*;
 use crate::tensor::DeviceContext;
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 #[test]
@@ -157,6 +157,15 @@ fn decode_e2m1(nibble: u8) -> f32 {
     LUT[(nibble & 0x0f) as usize]
 }
 
+fn single_ptr_table<T>(ctx: &DeviceContext, slice: &CudaSlice<T>) -> CudaSlice<u64> {
+    let (base, _guard) = slice.device_ptr(&ctx.stream);
+    ctx.stream.clone_htod(&[base]).expect("pointer table H2D")
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
 #[test]
 fn fp8_block_scaled_gemv_matches_reference() {
     let ctx = DeviceContext::new().expect("failed to create CUDA context");
@@ -230,6 +239,160 @@ fn fp8_block_scaled_gemv_matches_reference() {
 
     let got = ctx.stream.clone_dtoh(&output_dev).expect("output D2H");
     assert_bf16_close(&got, &expected, 0.04);
+}
+
+#[test]
+fn dsv4_fp8_grouped_decode_matches_reference() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let routes = 2usize;
+    let hidden = 16usize;
+    let intermediate = 16usize;
+    let scale_cols = 1usize;
+    let fp8_values = [0x38, 0x40, 0xb8, 0x30, 0xc0, 0x00];
+
+    let mut input_host = vec![bf16::ZERO; routes * hidden];
+    for route in 0..routes {
+        for col in 0..hidden {
+            let raw = ((route * 7 + col * 3) % 11) as f32 - 5.0;
+            input_host[route * hidden + col] = bf16::from_f32(raw * 0.125);
+        }
+    }
+
+    let mut gate = vec![0u8; intermediate * hidden];
+    let mut up = vec![0u8; intermediate * hidden];
+    let mut down = vec![0u8; hidden * intermediate];
+    for row in 0..intermediate {
+        for col in 0..hidden {
+            gate[row * hidden + col] = fp8_values[(row * 5 + col * 3) % fp8_values.len()];
+            up[row * hidden + col] = fp8_values[(row * 7 + col * 2 + 1) % fp8_values.len()];
+            down[col * intermediate + row] =
+                fp8_values[(col * 11 + row * 3 + 2) % fp8_values.len()];
+        }
+    }
+
+    let gate_scale = [0.5f32];
+    let up_scale = [0.25f32];
+    let down_scale = [1.5f32];
+    let mut expected_act = vec![0.0f32; routes * intermediate];
+    for route in 0..routes {
+        for row in 0..intermediate {
+            let mut gate_acc = 0.0f32;
+            let mut up_acc = 0.0f32;
+            for col in 0..hidden {
+                let x = input_host[route * hidden + col].to_f32();
+                gate_acc += decode_e4m3(gate[row * hidden + col]) * gate_scale[0] * x;
+                up_acc += decode_e4m3(up[row * hidden + col]) * up_scale[0] * x;
+            }
+            expected_act[route * intermediate + row] =
+                bf16::from_f32(silu(gate_acc) * up_acc).to_f32();
+        }
+    }
+    let mut expected_down = vec![0.0f32; routes * hidden];
+    for route in 0..routes {
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for col in 0..intermediate {
+                acc += decode_e4m3(down[row * intermediate + col])
+                    * down_scale[0]
+                    * expected_act[route * intermediate + col];
+            }
+            expected_down[route * hidden + row] = acc;
+        }
+    }
+
+    let input_dev = ctx.stream.clone_htod(&input_host).expect("input H2D");
+    let gate_dev = ctx.stream.clone_htod(&gate).expect("gate H2D");
+    let up_dev = ctx.stream.clone_htod(&up).expect("up H2D");
+    let down_dev = ctx.stream.clone_htod(&down).expect("down H2D");
+    let gate_scale_dev = ctx.stream.clone_htod(&gate_scale).expect("gate scale H2D");
+    let up_scale_dev = ctx.stream.clone_htod(&up_scale).expect("up scale H2D");
+    let down_scale_dev = ctx.stream.clone_htod(&down_scale).expect("down scale H2D");
+    let gate_ptrs = single_ptr_table(&ctx, &gate_dev);
+    let up_ptrs = single_ptr_table(&ctx, &up_dev);
+    let down_ptrs = single_ptr_table(&ctx, &down_dev);
+    let gate_scale_ptrs = single_ptr_table(&ctx, &gate_scale_dev);
+    let up_scale_ptrs = single_ptr_table(&ctx, &up_scale_dev);
+    let down_scale_ptrs = single_ptr_table(&ctx, &down_scale_dev);
+    let offsets = ctx.stream.clone_htod(&[0i32]).expect("offsets H2D");
+    let counts = ctx.stream.clone_htod(&[routes as i32]).expect("counts H2D");
+    let expert_indices = ctx.stream.clone_htod(&[0i32]).expect("expert indices H2D");
+    let mut act_dev = ctx
+        .stream
+        .alloc_zeros::<bf16>(routes * intermediate)
+        .expect("act alloc");
+    let mut out_dev = ctx
+        .stream
+        .alloc_zeros::<bf16>(routes * hidden)
+        .expect("out alloc");
+
+    {
+        let (gate_ptrs, _gpg) = gate_ptrs.device_ptr(&ctx.stream);
+        let (gate_scale_ptrs, _gsg) = gate_scale_ptrs.device_ptr(&ctx.stream);
+        let (up_ptrs, _upg) = up_ptrs.device_ptr(&ctx.stream);
+        let (up_scale_ptrs, _usg) = up_scale_ptrs.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input_dev.device_ptr(&ctx.stream);
+        let (act_ptr, _ag) = act_dev.device_ptr_mut(&ctx.stream);
+        let (offsets_ptr, _og) = offsets.device_ptr(&ctx.stream);
+        let (counts_ptr, _cg) = counts.device_ptr(&ctx.stream);
+        let (expert_indices_ptr, _eg) = expert_indices.device_ptr(&ctx.stream);
+        unsafe {
+            dsv4_fp8_grouped_swiglu_decode_cuda(
+                gate_ptrs as *const u64,
+                gate_scale_ptrs as *const u64,
+                up_ptrs as *const u64,
+                up_scale_ptrs as *const u64,
+                input_ptr as *const Half,
+                act_ptr as *mut Half,
+                offsets_ptr as *const i32,
+                counts_ptr as *const i32,
+                expert_indices_ptr as *const i32,
+                1,
+                routes as i32,
+                intermediate as i32,
+                hidden as i32,
+                scale_cols as i32,
+                f32::INFINITY,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("fp8 decode swiglu");
+        }
+    }
+    ctx.sync().expect("sync fp8 decode swiglu");
+    let got_act = ctx.stream.clone_dtoh(&act_dev).expect("act D2H");
+    assert_bf16_close(&got_act, &expected_act, 0.05);
+
+    {
+        let (down_ptrs, _dpg) = down_ptrs.device_ptr(&ctx.stream);
+        let (down_scale_ptrs, _dsg) = down_scale_ptrs.device_ptr(&ctx.stream);
+        let (act_ptr, _ag) = act_dev.device_ptr(&ctx.stream);
+        let (out_ptr, _outg) = out_dev.device_ptr_mut(&ctx.stream);
+        let (offsets_ptr, _og) = offsets.device_ptr(&ctx.stream);
+        let (counts_ptr, _cg) = counts.device_ptr(&ctx.stream);
+        let (expert_indices_ptr, _eg) = expert_indices.device_ptr(&ctx.stream);
+        unsafe {
+            dsv4_fp8_grouped_down_decode_cuda(
+                down_ptrs as *const u64,
+                down_scale_ptrs as *const u64,
+                act_ptr as *const Half,
+                out_ptr as *mut Half,
+                offsets_ptr as *const i32,
+                counts_ptr as *const i32,
+                expert_indices_ptr as *const i32,
+                1,
+                routes as i32,
+                hidden as i32,
+                intermediate as i32,
+                scale_cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("fp8 decode down");
+        }
+    }
+    ctx.sync().expect("sync fp8 decode down");
+    let got_down = ctx.stream.clone_dtoh(&out_dev).expect("down D2H");
+    assert_bf16_close(&got_down, &expected_down, 0.08);
 }
 
 #[test]
