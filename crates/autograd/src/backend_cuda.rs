@@ -1282,6 +1282,23 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn sum_backward_device(
+        &self,
+        upstream_grad: &DeviceHandle,
+        output_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream_grad, output_shape);
+            todo!("GPU required: cuda sum_backward_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_sum_backward_device(self, upstream_grad, output_shape)
+        }
+    }
+
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -3756,6 +3773,38 @@ fn cuda_mean_backward_device(
         elem_count,
         |mut builder| {
             builder.arg(&mut d_out).arg(d_up).arg(&inv_n).arg(&n);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_sum_backward_device(
+    backend: &CudaBackend,
+    upstream: &DeviceHandle,
+    output_shape: &[usize],
+) -> Result<DeviceHandle> {
+    let d_up = backend.cuda_slice(upstream, "sum_backward_device")?;
+    if d_up.len() != 1 {
+        return Err(AutogradError::ShapeMismatch {
+            expected: Vec::new(),
+            got: vec![d_up.len()],
+        });
+    }
+    let elem_count = shape_size(output_shape);
+    let mut d_out = backend.stream.alloc_zeros::<f32>(elem_count).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_backward_device)")
+    })?;
+    let n = i32::try_from(elem_count)
+        .map_err(|_| AutogradError::TapeInvariant("cuda sum_backward length exceeds i32"))?;
+    let scale = 1.0_f32;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("mean_backward_f32")?,
+        elem_count,
+        |mut builder| {
+            builder.arg(&mut d_out).arg(d_up).arg(&scale).arg(&n);
             builder
         },
     )?;
