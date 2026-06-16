@@ -130,6 +130,64 @@ impl CudaBf16Storage {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub struct CudaFp8BlockScaledStorage {
+    weight: Arc<cudarc::driver::CudaSlice<u8>>,
+    scales: Arc<cudarc::driver::CudaSlice<f32>>,
+    rows: usize,
+    cols: usize,
+    block_m: usize,
+    block_k: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+impl CudaFp8BlockScaledStorage {
+    pub(crate) fn new(
+        weight: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        block_m: usize,
+        block_k: usize,
+    ) -> Self {
+        Self {
+            weight: Arc::new(weight),
+            scales: Arc::new(scales),
+            rows,
+            cols,
+            block_m,
+            block_k,
+        }
+    }
+
+    pub(crate) fn weight(&self) -> &cudarc::driver::CudaSlice<u8> {
+        self.weight.as_ref()
+    }
+
+    pub(crate) fn scales(&self) -> &cudarc::driver::CudaSlice<f32> {
+        self.scales.as_ref()
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub(crate) fn block_m(&self) -> usize {
+        self.block_m
+    }
+
+    pub(crate) fn block_k(&self) -> usize {
+        self.block_k
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DeviceHandle {
     Cpu(Vec<f32>),
@@ -139,6 +197,8 @@ pub enum DeviceHandle {
     Cuda(CudaStorage),
     #[cfg(feature = "cuda")]
     CudaBf16(CudaBf16Storage),
+    #[cfg(feature = "cuda")]
+    CudaFp8BlockScaled(CudaFp8BlockScaledStorage),
 }
 
 type QwenDecodePrepareQHost = (Vec<f32>, Option<Vec<f32>>, Vec<usize>);
@@ -225,6 +285,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&f32_host, shape)
     }
 
+    fn upload_fp8_block_scaled(
+        &self,
+        weight: &[u8],
+        scales: &[f32],
+        shape: &[usize],
+        block_m: usize,
+        block_k: usize,
+    ) -> Result<DeviceHandle> {
+        let f32_host = dequantize_fp8_block_scaled_host(weight, scales, shape, block_m, block_k)?;
+        self.upload(&f32_host, shape)
+    }
+
     fn import_bf16_device_ptr_as_f32(
         &self,
         src_device_ptr: u64,
@@ -261,6 +333,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             #[cfg(feature = "cuda")]
             DeviceHandle::CudaBf16(_) => Err(crate::AutogradError::TapeInvariant(
                 "device handle readback not implemented for cuda bf16 on this backend",
+            )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp8BlockScaled(_) => Err(crate::AutogradError::TapeInvariant(
+                "device handle readback not implemented for cuda fp8 block-scaled on this backend",
             )),
         }
     }
@@ -1966,6 +2042,10 @@ impl Backend for CpuBackend {
             DeviceHandle::CudaBf16(_) => Err(crate::AutogradError::TapeInvariant(
                 "cpu backend cannot read back a cuda bf16 device handle",
             )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::CudaFp8BlockScaled(_) => Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot read back a cuda fp8 block-scaled device handle",
+            )),
         }
     }
 
@@ -2084,6 +2164,81 @@ fn shape_size(shape: &[usize]) -> usize {
 
 pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
+}
+
+pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exp = i32::from((bits >> 3) & 0x0f);
+    let mant = i32::from(bits & 0x07);
+    if exp == 0 {
+        if mant == 0 {
+            return sign * 0.0;
+        }
+        return sign * (mant as f32 / 8.0) * 2.0_f32.powi(-6);
+    }
+    if exp == 0x0f && mant == 0x07 {
+        return f32::NAN;
+    }
+    sign * (1.0 + mant as f32 / 8.0) * 2.0_f32.powi(exp - 7)
+}
+
+pub fn dequantize_fp8_block_scaled_host(
+    weight: &[u8],
+    scales: &[f32],
+    shape: &[usize],
+    block_m: usize,
+    block_k: usize,
+) -> Result<Vec<f32>> {
+    validate_fp8_block_scaled(weight, scales, shape, block_m, block_k)?;
+    let rows = shape[0];
+    let cols = shape[1];
+    let scale_cols = cols.div_ceil(block_k);
+    let mut out = Vec::with_capacity(weight.len());
+    for row in 0..rows {
+        for col in 0..cols {
+            let scale = scales[(row / block_m) * scale_cols + (col / block_k)];
+            out.push(fp8_e4m3_to_f32(weight[row * cols + col]) * scale);
+        }
+    }
+    Ok(out)
+}
+
+pub fn validate_fp8_block_scaled(
+    weight: &[u8],
+    scales: &[f32],
+    shape: &[usize],
+    block_m: usize,
+    block_k: usize,
+) -> Result<()> {
+    if shape.len() != 2 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "2",
+            got: shape.len(),
+        });
+    }
+    if block_m == 0 || block_k == 0 {
+        return Err(crate::AutogradError::TapeInvariant(
+            "fp8 block-scaled block_m/block_k must be non-zero",
+        ));
+    }
+    let expected_weight = shape_size(shape);
+    if weight.len() != expected_weight {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: weight.len(),
+            shape: shape.to_vec(),
+            size: expected_weight,
+        });
+    }
+    let scale_shape = vec![shape[0].div_ceil(block_m), shape[1].div_ceil(block_k)];
+    let expected_scales = shape_size(&scale_shape);
+    if scales.len() != expected_scales {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: scales.len(),
+            shape: scale_shape,
+            size: expected_scales,
+        });
+    }
+    Ok(())
 }
 
 /// CPU reference implementation of row-major matmul (2D + batched 3D).
