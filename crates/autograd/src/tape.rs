@@ -116,6 +116,11 @@ pub enum SavedContext {
         conv_kernel: usize,
         eps: f32,
     },
+    CausalSdpaRecomputeCtx {
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -145,6 +150,7 @@ pub enum BackwardOp {
     AddBroadcast,
     Embedding,
     LinearAttention,
+    CausalSdpaRecompute,
 }
 
 impl BackwardOp {
@@ -175,6 +181,7 @@ impl BackwardOp {
             BackwardOp::AddBroadcast => "AddBroadcast",
             BackwardOp::Embedding => "Embedding",
             BackwardOp::LinearAttention => "LinearAttention",
+            BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
         }
     }
 }
@@ -425,6 +432,9 @@ impl Tape {
                     }
                     BackwardOp::LinearAttention => {
                         ops::linear_attention_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::CausalSdpaRecompute => {
+                        ops::causal_sdpa_recompute_backward(&entry, output_grad_id, store)?
                     }
                 };
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
