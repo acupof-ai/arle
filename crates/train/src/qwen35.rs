@@ -7,7 +7,7 @@ use std::{
 use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, causal_sdpa, causal_sdpa_with_q_start, embedding,
+        LinearAttentionParams, add, causal_sdpa_recompute, causal_sdpa_with_q_start, embedding,
         linear_attention_core, matmul_bt_with_site, mul, repeat_kv, reshape, rmsnorm, rope,
         sigmoid, silu, slice, transpose,
     },
@@ -622,7 +622,7 @@ impl Qwen35Layer {
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
-        let attn_hidden = causal_sdpa(q, k, v, store, tape)?;
+        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?

@@ -34,6 +34,7 @@ use crate::{
 };
 
 pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_backward};
+pub(crate) use attention::causal_sdpa_recompute_backward;
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
@@ -107,6 +108,16 @@ pub fn causal_sdpa(
     // here lets the entire attention chain stay in the MLX graph end-
     // to-end for each layer (Qwen3.5 × 28 layers).
     attention::causal_sdpa(q, k, v, store, tape)
+}
+
+pub fn causal_sdpa_recompute(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    attention::causal_sdpa_recompute(q, k, v, store, tape)
 }
 
 pub fn causal_sdpa_with_q_start(
