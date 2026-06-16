@@ -967,7 +967,7 @@ impl Dsv4Model {
         let spec_decode_on = mtp_draft_tokens.is_some() || dsv4_spec_decode_enabled();
         let config = DeepSeekV4Config::from_json_file(model_path.join("config.json"))
             .map_err(|e| anyhow!("load DSv4 config from {}: {e}", model_path.display()))?;
-        ensure_loadable(&config)?;
+        ensure_loadable(&config, spec_decode_on)?;
 
         let moe_config = Self::moe_config_from_config(&config)?;
         let tp_cfg = *tp.config();
@@ -5713,23 +5713,27 @@ fn build_dsv4_tp_runtime() -> Result<crate::tp::TpRuntime> {
 /// loop, so we run the production config (`num_nextn_predict_layers=1`) directly
 /// rather than forcing a hand-trimmed base-only config view. Called by
 /// [`crate::loader`] before any device I/O.
-pub(crate) fn ensure_loadable(config: &DeepSeekV4Config) -> Result<()> {
+pub(crate) fn ensure_loadable(config: &DeepSeekV4Config, spec_decode_on: bool) -> Result<()> {
     ensure!(
         config.num_key_value_heads == 1,
         "DSv4 MLA expects num_key_value_heads=1, got {}",
         config.num_key_value_heads
     );
     if config.num_nextn_predict_layers > 0 {
-        if dsv4_spec_decode_enabled() {
+        // Report the effective decision (`spec_decode_on` = CLI MTP request or
+        // fallback env), not the env alone. The MTP head load gate below uses
+        // the same boolean, so the log must not claim "deferred" when
+        // `--spec-type mtp` / `--mtp-draft-tokens` already made spec decode on.
+        if spec_decode_on {
             eprintln!(
-                "[dsv4] num_nextn_predict_layers={} present; ARLE_DSV4_SPEC_DECODE=1, \
+                "[dsv4] num_nextn_predict_layers={} present; spec decode on, \
                  loading base layers plus mtp.0 draft head.",
                 config.num_nextn_predict_layers
             );
         } else {
             eprintln!(
                 "[dsv4] num_nextn_predict_layers={} present; loading the {} base layers \
-                 only (MTP draft head deferred — separate speculative-decode path).",
+                 only (MTP draft head deferred — pass --spec-type mtp / --mtp-draft-tokens).",
                 config.num_nextn_predict_layers, config.num_hidden_layers
             );
         }
