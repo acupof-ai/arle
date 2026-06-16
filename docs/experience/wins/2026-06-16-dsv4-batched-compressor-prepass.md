@@ -74,12 +74,25 @@ n=22 162.1→92.0 (−43%); slope `7.4 → ~4.4 ms/row`.
 per-row path (same cublas math, batched M), so needle is exact, not just within the
 non-determinism floor.
 
-## Partial / follow-ups
+## Full-flatten follow-on (landed, same gate)
 
-- **Partial win.** The lever amortizes the GEMV half of `perrow`; the per-slot
-  `dsv4_compressor_update` (RoPE/norm/store) is still per-row and remains ∝ n
-  (residual slope ~4.5 ms/row). Full flatten ⇒ batch the update too (EAGLE-class
-  per-slot-state batching) — next lever.
+Batched the remaining per-row decode kernels too — per-slot `compressor_update`
+(new stateful batched CUDA kernel, array-of-N state pointers), inverse-RoPE, and
+sw-window write — under the same `ARLE_DSV4_DECODE_COMPRESSOR_BATCH` gate. Same
+n=22 c=64 A/B: step **237.2 → 218.8 ms**, decode **92.7 → 100.5 tok/s** — i.e.
+**+8% over the GEMV lever, +38% vs baseline (72.7→100.5)**. Correct (needle
+"AMBER-7788-LION" exact, deterministic ×2). Component deltas vs baseline @ n=22:
+perrow 162→76 (update-batching shaved the lever's 92→76), finish 86→81, moe
+unchanged.
+
+**The flatten thesis (flat step → linear scaling) did NOT hold.** The step is
+still ∝ n (sw_attn 111→173 from n=13→22). The residual `perrow`+`finish` are
+**irreducible per-row compute** (compressor compressed-cache writes + indexer
+top-k select + sw-window writes) — no shared weight to amortize like the GEMV's
+weight-read, so batching only removed launch overhead (small). True linear
+scaling needs a different axis (DP-attention, or a compressor-cache/indexer-select
+redesign), not more per-slot batching. Kept anyway — every measured gain counts —
+but do not expect the next per-slot batching to flatten further.
 - **An earlier silent c=48 crash was the FP8-version binary — RESOLVED.** An
   initial (wrong-spec) FP8-DeepGEMM-cache build of this lever hard-crashed gate-OFF
   at c=48 (n→~22). The bf16 rewrite does not: **both gate OFF and gate ON serve
