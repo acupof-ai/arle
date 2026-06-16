@@ -746,10 +746,7 @@ fn student_rollout_only_with_keep(
     let vocab = student.config().vocab_size;
     let use_rollout_kv_cache = student.supports_rollout_kv_cache();
 
-    if use_rollout_kv_cache
-        && sampling.is_none()
-        && use_device_rollout_argmax(store, rollout_len, vocab)
-    {
+    if use_rollout_kv_cache && use_device_rollout_argmax(store, rollout_len, vocab) {
         let mut rollout_cache = Qwen35KvCache::new(student, prompt_ids.len() + rollout_len);
         let mut generated_tokens = if rollout_len == 0 {
             None
