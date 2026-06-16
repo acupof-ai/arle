@@ -81,3 +81,12 @@ Wired CSA into the batched lane (gate + want_compressed + per-row `selected`→`
 3. **Lift the decode-batch cap** (n≈22 at c=64 — scheduler/stagger; needed to reach n~97 for SGLang parity).
 4. (later) batch the per-slot compressor/indexer scatter; per-row finish.
 R2 (CSA in batched lane) is the correct foundation for #1 (CSA prepare batches with the rest). SGLang 1297@c97 needs all of 1-3.
+
+## R3 + verified bottleneck (2026-06-16): it's the DSA indexer/compressor, NOT GEMMs
+Adversarial loop corrected the hypothesis FOUR times (each measured): MTP (helps, R1) → attention kernel (+7%, R2) → projection GEMMs (R3). R3 batched the prepare projections (wqkv_a+wq_b) two ways: hand-GEMV (prep 137→111) and DeepGEMM via the shared prefill_linear (prep 111, IDENTICAL). DeepGEMM source (`sm90_fp8_gemm_1d2d.cuh`) confirms M≤BLOCK_M ⇒ weight read once (vs hand-GEMV's N× reads), so DeepGEMM is the correct primitive — but it didn't move prep because the projections aren't the cost.
+**Bit-exact split @ n=22: prep=103ms = [proj=4.0ms (DeepGEMM batched, negligible) + compidx=98.9ms], fwd=3.2, finish=43, moe=47.** The 137→111 drop was the RoPE batch, not the GEMM.
+**THE bottleneck = per-row compressor + CSA lightning-indexer top-k (`mla_attention_prepare_compressed_only`) = 99ms = 66% of step.** Per-slot DSA state (each slot's compressed cache + index_topk=512 selection), the hardest to batch.
+
+## True lever (deepest #60 core, multi-week)
+Batch the DSA across N slots: (a) batched compressor (compress N rows' KV → N per-slot caches in one grouped op), (b) batched lightning indexer (indexer scores for N rows + batched top-k over per-slot compressed caches). SGLang's DSA decode has this; we have the per-row version. This is the genuine throughput unlock + the hardest correctness (per-slot DSA state, EAGLE-rollback-class).
+Foundations landed: R2 (CSA in batched lane, attention kernel batched), R3 (batched DeepGEMM projection pre-pass + RoPE batch, +~12% from RoPE) — both correct (needle 8/8), the prepass structure is where the batched compressor/indexer plugs in. Also still: finish (43ms) batch + the MTP verify path + n≈22 cap.
