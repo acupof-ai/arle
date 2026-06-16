@@ -10,7 +10,7 @@
 //! raw-logits parity/debug surface.
 
 #[cfg(feature = "cuda")]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +19,10 @@ use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "cuda")]
 use autograd::{Backend, TensorId, TensorStore};
 #[cfg(feature = "cuda")]
-use infer_api::{LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
+use infer_api::{
+    LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
+    StudentLoraProjectionUpdate, StudentLoraUpdate,
+};
 #[cfg(feature = "cuda")]
 use infer_plan::{SamplingParams, sample_token};
 
@@ -190,16 +193,15 @@ impl InferStudent {
 
     /// Per-step student LoRA sync (OPD P2).
     ///
-    /// D2H the q/v LoRA A/B adapter tensors from the train `TensorStore` and
-    /// push them into the infer student engine, which restores its cached base
-    /// q/v weights and folds the fresh adapter in-memory (`remerge_student_lora`).
+    /// D2H the LoRA A/B adapter tensors from the train `TensorStore` and push
+    /// them into the infer student engine, which restores cached base weights
+    /// and folds each fresh adapter in-memory (`remerge_student_lora`).
     /// Idempotent across steps: the infer side always re-merges from the same
     /// pristine base, so deltas never accumulate.
     ///
-    /// `adapter_map` is the train model's `adapter_name_map()`; only q/v
-    /// adapters (full-attention layers) are recognized — the train target set
-    /// must be `AttentionQv`. Matrices are exported raw (un-scaled); the infer
-    /// merge applies `scale = alpha / r` once.
+    /// `adapter_map` is the train model's `adapter_name_map()`. Matrices are
+    /// exported raw (un-scaled); the infer merge applies `scale = alpha / r`
+    /// once. Every recognized projection must provide both A and B.
     pub fn sync_lora_from_store(
         &self,
         store: &mut TensorStore,
@@ -211,10 +213,10 @@ impl InferStudent {
         }
 
         // Collect per-layer A/B from the train store, keyed by absolute layer
-        // index. Each entry is (q_a, q_b, v_a, v_b) slots filled as found.
+        // index and projection. BTreeMap gives deterministic update ordering.
         let mut layers: HashMap<usize, PartialLayer> = HashMap::new();
         for (&name, &tensor_id) in adapter_map {
-            let Some((layer_idx, module, which)) = parse_adapter_name(name) else {
+            let Some((layer_idx, projection, which)) = parse_adapter_name(name) else {
                 continue;
             };
             let shape = store
@@ -231,10 +233,7 @@ impl InferStudent {
                 .to_host(tensor_id)
                 .map_err(|err| anyhow!("LoRA sync: D2H {name} failed: {err}"))?;
             let entry = layers.entry(layer_idx).or_default();
-            let slot = match module {
-                AdapterModule::Q => &mut entry.q,
-                AdapterModule::V => &mut entry.v,
-            };
+            let slot = entry.projections.entry(projection).or_default();
             match which {
                 Which::A => {
                     // lora_A shape = [rank, in_features]
@@ -249,8 +248,7 @@ impl InferStudent {
 
         if layers.is_empty() {
             bail!(
-                "LoRA sync: no q/v adapters found in adapter_map ({} entries); \
-                 train target set must be AttentionQv",
+                "LoRA sync: no supported adapters found in adapter_map ({} entries)",
                 adapter_map.len()
             );
         }
@@ -261,16 +259,18 @@ impl InferStudent {
         let mut out_layers: Vec<StudentLoraLayer> = Vec::with_capacity(layer_indices.len());
         for layer_idx in layer_indices {
             let partial = layers.remove(&layer_idx).expect("layer present");
-            let q_proj = partial
-                .q
-                .into_matrices(lora_config.rank, layer_idx, "q_proj")?;
-            let v_proj = partial
-                .v
-                .into_matrices(lora_config.rank, layer_idx, "v_proj")?;
+            let mut projections = Vec::with_capacity(partial.projections.len());
+            for (projection, partial_proj) in partial.projections {
+                let matrices =
+                    partial_proj.into_matrices(lora_config.rank, layer_idx, projection.label())?;
+                projections.push(StudentLoraProjectionUpdate {
+                    projection,
+                    matrices,
+                });
+            }
             out_layers.push(StudentLoraLayer {
                 layer_idx,
-                q_proj,
-                v_proj,
+                projections,
             });
         }
 
@@ -288,12 +288,11 @@ impl InferStudent {
     }
 }
 
-/// q/v adapter accumulator for one layer during the store scan.
+/// Adapter accumulator for one layer during the store scan.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 struct PartialLayer {
-    q: PartialProj,
-    v: PartialProj,
+    projections: BTreeMap<StudentLoraProjection, PartialProj>,
 }
 
 /// A single projection's optional A/B host matrices, each as
@@ -307,16 +306,15 @@ struct PartialProj {
 
 #[cfg(feature = "cuda")]
 impl PartialProj {
-    /// Convert to `StudentLoraMatrices`, or `None` if this projection had no
-    /// adapter. A dangling half (A without B or vice versa) is an error.
+    /// Convert to `StudentLoraMatrices`. A dangling half (A without B or vice
+    /// versa) is an error.
     fn into_matrices(
         self,
         rank: usize,
         layer_idx: usize,
         label: &str,
-    ) -> Result<Option<StudentLoraMatrices>> {
+    ) -> Result<StudentLoraMatrices> {
         match (self.a, self.b) {
-            (None, None) => Ok(None),
             (Some((a, a_rows, a_cols)), Some((b, b_rows, b_cols))) => {
                 if a_rows != rank {
                     bail!(
@@ -328,14 +326,15 @@ impl PartialProj {
                         "LoRA sync: layer {layer_idx} {label} lora_B cols {b_cols} != rank {rank}"
                     );
                 }
-                Ok(Some(StudentLoraMatrices {
+                Ok(StudentLoraMatrices {
                     a,
                     b,
                     rank,
                     in_features: a_cols,
                     out_features: b_rows,
-                }))
+                })
             }
+            (None, None) => bail!("LoRA sync: layer {layer_idx} {label} has no lora_A/lora_B"),
             (Some(_), None) => {
                 bail!("LoRA sync: layer {layer_idx} {label} has lora_A without lora_B")
             }
@@ -348,13 +347,6 @@ impl PartialProj {
 
 #[cfg(feature = "cuda")]
 #[derive(Copy, Clone)]
-enum AdapterModule {
-    Q,
-    V,
-}
-
-#[cfg(feature = "cuda")]
-#[derive(Copy, Clone)]
 enum Which {
     A,
     B,
@@ -362,10 +354,10 @@ enum Which {
 
 /// Parse a train adapter tensor name like
 /// `model.language_model.layers.7.self_attn.q_proj.weight.lora_a` into
-/// `(layer_idx, module, which)`. Returns `None` for non-q/v adapters (e.g.
-/// MLP adapters under an `AllLinear` target set are ignored).
+/// `(layer_idx, projection, which)`. Returns `None` for non-linear adapters
+/// such as norms or conv state tensors.
 #[cfg(feature = "cuda")]
-fn parse_adapter_name(name: &str) -> Option<(usize, AdapterModule, Which)> {
+fn parse_adapter_name(name: &str) -> Option<(usize, StudentLoraProjection, Which)> {
     let which = if name.ends_with(".lora_a") {
         Which::A
     } else if name.ends_with(".lora_b") {
@@ -376,15 +368,22 @@ fn parse_adapter_name(name: &str) -> Option<(usize, AdapterModule, Which)> {
     let parts: Vec<&str> = name.split('.').collect();
     let layers_pos = parts.iter().position(|part| *part == "layers")?;
     let layer_idx: usize = parts.get(layers_pos + 1)?.parse().ok()?;
-    if *parts.get(layers_pos + 2)? != "self_attn" {
-        return None;
-    }
-    let module = match *parts.get(layers_pos + 3)? {
-        "q_proj" => AdapterModule::Q,
-        "v_proj" => AdapterModule::V,
+    let projection = match (*parts.get(layers_pos + 2)?, *parts.get(layers_pos + 3)?) {
+        ("self_attn", "q_proj") => StudentLoraProjection::FullQ,
+        ("self_attn", "k_proj") => StudentLoraProjection::FullK,
+        ("self_attn", "v_proj") => StudentLoraProjection::FullV,
+        ("self_attn", "o_proj") => StudentLoraProjection::FullO,
+        ("self_attn", "in_proj_qkv") => StudentLoraProjection::LinearQkv,
+        ("self_attn", "in_proj_z") => StudentLoraProjection::LinearZ,
+        ("self_attn", "in_proj_b") => StudentLoraProjection::LinearB,
+        ("self_attn", "in_proj_a") => StudentLoraProjection::LinearA,
+        ("self_attn", "out_proj") => StudentLoraProjection::LinearOut,
+        ("mlp", "gate_proj") => StudentLoraProjection::MlpGate,
+        ("mlp", "up_proj") => StudentLoraProjection::MlpUp,
+        ("mlp", "down_proj") => StudentLoraProjection::MlpDown,
         _ => return None,
     };
-    Some((layer_idx, module, which))
+    Some((layer_idx, projection, which))
 }
 
 #[cfg(feature = "cuda")]
@@ -413,4 +412,84 @@ fn validate_token_ids(label: &str, tokens: &[u32], vocab_size: usize) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use infer_api::StudentLoraProjection;
+
+    use super::{Which, parse_adapter_name};
+
+    fn parsed_projection(name: &str) -> Option<StudentLoraProjection> {
+        parse_adapter_name(name).map(|(_, projection, _)| projection)
+    }
+
+    #[test]
+    fn parse_adapter_name_covers_all_linear_targets() {
+        let prefix = "model.language_model.layers.7";
+        let cases = [
+            (
+                format!("{prefix}.self_attn.q_proj.weight.lora_a"),
+                StudentLoraProjection::FullQ,
+            ),
+            (
+                format!("{prefix}.self_attn.k_proj.weight.lora_a"),
+                StudentLoraProjection::FullK,
+            ),
+            (
+                format!("{prefix}.self_attn.v_proj.weight.lora_b"),
+                StudentLoraProjection::FullV,
+            ),
+            (
+                format!("{prefix}.self_attn.o_proj.weight.lora_a"),
+                StudentLoraProjection::FullO,
+            ),
+            (
+                format!("{prefix}.self_attn.in_proj_qkv.weight.lora_a"),
+                StudentLoraProjection::LinearQkv,
+            ),
+            (
+                format!("{prefix}.self_attn.in_proj_z.weight.lora_a"),
+                StudentLoraProjection::LinearZ,
+            ),
+            (
+                format!("{prefix}.self_attn.in_proj_b.weight.lora_a"),
+                StudentLoraProjection::LinearB,
+            ),
+            (
+                format!("{prefix}.self_attn.in_proj_a.weight.lora_a"),
+                StudentLoraProjection::LinearA,
+            ),
+            (
+                format!("{prefix}.self_attn.out_proj.weight.lora_a"),
+                StudentLoraProjection::LinearOut,
+            ),
+            (
+                format!("{prefix}.mlp.gate_proj.weight.lora_a"),
+                StudentLoraProjection::MlpGate,
+            ),
+            (
+                format!("{prefix}.mlp.up_proj.weight.lora_a"),
+                StudentLoraProjection::MlpUp,
+            ),
+            (
+                format!("{prefix}.mlp.down_proj.weight.lora_a"),
+                StudentLoraProjection::MlpDown,
+            ),
+        ];
+
+        for (name, expected) in cases {
+            assert_eq!(parsed_projection(&name), Some(expected), "{name}");
+        }
+
+        let (layer_idx, projection, which) =
+            parse_adapter_name(&format!("{prefix}.self_attn.q_proj.weight.lora_a"))
+                .expect("q_proj parses");
+        assert_eq!(layer_idx, 7);
+        assert_eq!(projection, StudentLoraProjection::FullQ);
+        assert!(matches!(which, Which::A));
+
+        assert!(parse_adapter_name(&format!("{prefix}.self_attn.q_norm.weight.lora_a")).is_none());
+        assert!(parse_adapter_name(&format!("{prefix}.self_attn.conv1d.weight.lora_a")).is_none());
+    }
 }

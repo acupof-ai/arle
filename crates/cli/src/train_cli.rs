@@ -566,7 +566,6 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         args.prompt_max_tokens + args.rollout_len + 32,
         train_backend.clone(),
         cfg.vocab_size,
-        target_set,
     )?;
     #[cfg(not(feature = "cuda"))]
     let _ = &train_backend;
@@ -1439,19 +1438,9 @@ fn load_opd_infer_student(
     max_seq_len: usize,
     train_backend: std::sync::Arc<dyn autograd::Backend>,
     vocab_size: usize,
-    target_set: train::lora::LoraTargetSet,
 ) -> Result<Option<train::infer_student::InferStudent>> {
     if !train::opd::infer_rollout_flag_enabled() {
         return Ok(None);
-    }
-    if target_set != train::lora::LoraTargetSet::AttentionQv {
-        bail!(
-            "the infer rollout path currently supports --lora-target-set attention-qv only; \
-             {target} includes adapters the infer-side LoRA remerge does not sync yet. \
-             Use --lora-target-set attention-qv for infer rollout, or set \
-             ARLE_OPD_INFER_ROLLOUT=0 for the train-crate fallback.",
-            target = target_set.label()
-        );
     }
 
     use std::sync::{Arc, Mutex};

@@ -82,7 +82,10 @@ mod workspace;
 // Per-step student LoRA re-merge contract (OPD P2). The host-side data types
 // the train crate pushes into the student engine; re-exported from `infer-api`.
 #[cfg(feature = "cuda")]
-pub use qwen35::{StudentLoraLayer, StudentLoraMatrices, StudentLoraUpdate};
+pub use qwen35::{
+    StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate,
+    StudentLoraUpdate,
+};
 
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
 // `enable_cuda_graph` load flag actually gate the B=1 decode graph instead of
@@ -358,7 +361,7 @@ impl CudaExecutor {
         }
     }
 
-    /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6 q/v
+    /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
     /// projection weights (OPD per-step re-merge). Errors on the no-GPU
     /// placeholder and on non-student CUDA models (dense Qwen3 / DSv4).
     #[cfg(feature = "cuda")]
