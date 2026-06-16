@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use autograd::{
     AutogradError, Result, Tape, TensorId, TensorStore,
-    ops::{MoeRoute, add, moe_gather_rows, moe_topk_softmax, moe_weighted_scatter, mul, silu},
+    ops::{
+        MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute, MoeTopK,
+        moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax, mul, silu,
+    },
 };
 
 use crate::lora::{LinearWithLora, LoraConfig};
@@ -107,42 +110,38 @@ impl MoeWithLora {
 
         let router_logits = self.router.forward(x, store, tape)?;
         let routes = moe_topk_softmax(router_logits, self.cfg.top_k, store, tape)?;
-        let mut combined = None;
+        let grouped_routes = build_grouped_routes(&routes)?;
+        let gate_experts = grouped_linear_experts(&self.experts, |expert| &expert.gate);
+        let up_experts = grouped_linear_experts(&self.experts, |expert| &expert.up);
+        let down_experts = grouped_linear_experts(&self.experts, |expert| &expert.down);
 
-        for expert_id in 0..self.cfg.num_experts {
-            let mut token_rows = Vec::new();
-            let mut scatter_routes = Vec::new();
-            for token in 0..routes.tokens {
-                for slot in 0..routes.top_k {
-                    if routes.indices[token * routes.top_k + slot] == expert_id {
-                        token_rows.push(token);
-                        scatter_routes.push(MoeRoute { token, slot });
-                    }
-                }
-            }
-            if token_rows.is_empty() {
-                continue;
-            }
-
-            let expert_input = moe_gather_rows(x, &token_rows, store, tape)?;
-            let expert_output = self.experts[expert_id].forward(expert_input, store, tape)?;
-            let contribution = moe_weighted_scatter(
-                expert_output,
-                routes.weights,
-                &scatter_routes,
-                tokens,
-                store,
-                tape,
-            )?;
-            combined = Some(match combined {
-                Some(acc) => add(acc, contribution, store, tape)?,
-                None => contribution,
-            });
-        }
-
-        combined.ok_or(AutogradError::TapeInvariant(
-            "moe forward produced no selected expert routes",
-        ))
+        let gate = moe_grouped_linear(
+            x,
+            &gate_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::TokenRows,
+            store,
+            tape,
+        )?;
+        let up = moe_grouped_linear(
+            x,
+            &up_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::TokenRows,
+            store,
+            tape,
+        )?;
+        let activated = silu(gate, store, tape)?;
+        let hidden = mul(activated, up, store, tape)?;
+        let down = moe_grouped_linear(
+            hidden,
+            &down_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::Packed,
+            store,
+            tape,
+        )?;
+        moe_grouped_weighted_scatter(down, routes.weights, &grouped_routes, tokens, store, tape)
     }
 
     pub fn parameter_name_map(&self) -> HashMap<&'static str, TensorId> {
@@ -166,14 +165,54 @@ impl MoeWithLora {
     }
 }
 
-impl SwiGluExpert {
-    fn forward(&self, x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-        let gate = self.gate.forward(x, store, tape)?;
-        let up = self.up.forward(x, store, tape)?;
-        let activated = silu(gate, store, tape)?;
-        let hidden = mul(activated, up, store, tape)?;
-        self.down.forward(hidden, store, tape)
+fn build_grouped_routes(routes: &MoeTopK) -> Result<Vec<MoeGroupedRoute>> {
+    if routes.indices.len() != routes.tokens * routes.top_k {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: routes.tokens * routes.top_k,
+            got: routes.indices.len(),
+        });
     }
+    let mut counts = vec![0usize; routes.experts];
+    let mut grouped = Vec::with_capacity(routes.indices.len());
+    for token in 0..routes.tokens {
+        for slot in 0..routes.top_k {
+            let expert = routes.indices[token * routes.top_k + slot];
+            if expert >= routes.experts {
+                return Err(AutogradError::IndexOutOfBounds {
+                    index: expert,
+                    upper: routes.experts,
+                });
+            }
+            let row = counts[expert];
+            counts[expert] += 1;
+            grouped.push(MoeGroupedRoute {
+                expert,
+                row,
+                token,
+                slot,
+            });
+        }
+    }
+    grouped.sort_by_key(|route| (route.expert, route.row));
+    Ok(grouped)
+}
+
+fn grouped_linear_experts(
+    experts: &[SwiGluExpert],
+    select: impl Fn(&SwiGluExpert) -> &LinearWithLora,
+) -> Vec<MoeGroupedLinearExpert> {
+    experts
+        .iter()
+        .map(|expert| {
+            let parts = select(expert).parts();
+            MoeGroupedLinearExpert {
+                weight: parts.weight,
+                lora_a: parts.lora_a,
+                lora_b: parts.lora_b,
+                lora_scale: parts.lora_scale,
+            }
+        })
+        .collect()
 }
 
 fn validate_config(cfg: MoeConfig) -> Result<()> {

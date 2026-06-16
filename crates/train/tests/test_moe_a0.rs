@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use autograd::{
-    Result, Tape, Tensor, TensorId, TensorStore,
+    BackwardOp, Result, Tape, Tensor, TensorId, TensorStore,
     ops::{add, mul, mul_scalar, sum},
 };
 use train::{LoraConfig, MoeConfig, MoeWithLora};
@@ -9,6 +9,73 @@ use train::{LoraConfig, MoeConfig, MoeWithLora};
 #[test]
 fn cpu_moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
     run_moe_lora_and_router_gradients_match_finite_difference(TensorStore::default(), "cpu")
+}
+
+#[test]
+fn cpu_moe_uses_grouped_expert_linear_entries() -> Result<()> {
+    const TOKENS: usize = 5;
+    const HIDDEN: usize = 64;
+    const EXPERTS: usize = 4;
+    const TOP_K: usize = 2;
+    const INTERMEDIATE: usize = 128;
+
+    let mut store = TensorStore::default();
+    let cfg = MoeConfig {
+        hidden_size: HIDDEN,
+        intermediate_size: INTERMEDIATE,
+        num_experts: EXPERTS,
+        top_k: TOP_K,
+        lora: LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        },
+    };
+    let moe = MoeWithLora::new("a0_moe", cfg, &mut store)?;
+    let params = moe.parameter_name_map();
+    let adapters = moe.adapter_name_map();
+    set_stable_router(&mut store, &params, HIDDEN, EXPERTS);
+    set_nonzero_adapters(&mut store, &adapters);
+
+    let input = store.alloc(Tensor::new(
+        stable_input(TOKENS, HIDDEN),
+        vec![TOKENS, HIDDEN],
+        true,
+    )?);
+    let probe = store.alloc(Tensor::new(
+        deterministic_vec(TOKENS * HIDDEN, 0x2a9b_51d7, 0.50),
+        vec![TOKENS, HIDDEN],
+        false,
+    )?);
+
+    let mut tape = Tape::new();
+    let loss = loss(&moe, input, probe, &mut store, &mut tape)?;
+    let (_grads, profile) = tape.backward_profiled(loss, &mut store)?;
+
+    assert_eq!(
+        profile
+            .op_totals
+            .get(&BackwardOp::MoeGroupedLinear)
+            .map(|stats| stats.count),
+        Some(3),
+        "gate/up/down should be three grouped expert linear ops"
+    );
+    assert_eq!(
+        profile
+            .op_totals
+            .get(&BackwardOp::MoeGroupedWeightedScatter)
+            .map(|stats| stats.count),
+        Some(1),
+        "grouped MoE should scatter once"
+    );
+    assert_eq!(
+        profile
+            .op_totals
+            .get(&BackwardOp::MatmulBT)
+            .map(|stats| stats.count),
+        Some(1),
+        "only the router should remain on MatmulBT in this MoE unit"
+    );
+    Ok(())
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
