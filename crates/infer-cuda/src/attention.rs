@@ -14,9 +14,7 @@ use cuda_kernels::{KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicI8, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use crate::dsv4::{
     Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
@@ -79,29 +77,6 @@ pub(crate) fn set_dsv4_verify_frozen(frozen: bool) {
 
 pub(crate) fn dsv4_verify_frozen() -> bool {
     DSV4_VERIFY_FROZEN.load(Ordering::Relaxed)
-}
-
-fn maybe_probe_flashmla_decode_path(
-    layer_idx: usize,
-    mode: DeepSeekV4AttentionMode,
-    flashmla_used: bool,
-    token_count: usize,
-    start_pos: usize,
-) {
-    if std::env::var("ARLE_DSV4_FLASHMLA_PROBE").as_deref() != Ok("1")
-        || std::env::var("INFER_TP_RANK").as_deref() != Ok("0")
-        || token_count != 1
-        || start_pos == 0
-    {
-        return;
-    }
-
-    static SEEN: OnceLock<Mutex<HashSet<(usize, String)>>> = OnceLock::new();
-    let mode_key = format!("{mode:?}");
-    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if set.lock().unwrap().insert((layer_idx, mode_key)) {
-        eprintln!("[flashmla-probe] layer={layer_idx} mode={mode:?} flashmla_used={flashmla_used}");
-    }
 }
 
 pub(crate) struct Dsv4CompressorState {
@@ -195,73 +170,6 @@ impl Dsv4CompressorState {
             + self.prev_overlap_score.len() * bf16
             + self.compressed.device_bytes()
     }
-}
-
-#[derive(Clone, Copy)]
-struct Dsv4RollbackChecksum {
-    len: usize,
-    hash: u64,
-    sum_abs: f64,
-    first: [f32; 4],
-}
-
-impl Dsv4RollbackChecksum {
-    fn from_host(host: &[half::bf16]) -> Self {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        let mut sum_abs = 0.0_f64;
-        let mut first = [0.0_f32; 4];
-        for (idx, value) in host.iter().enumerate() {
-            hash ^= u64::from(value.to_bits());
-            hash = hash.wrapping_mul(0x100000001b3);
-            let value_f32 = value.to_f32();
-            sum_abs += f64::from(value_f32.abs());
-            if idx < first.len() {
-                first[idx] = value_f32;
-            }
-        }
-        Self {
-            len: host.len(),
-            hash,
-            sum_abs,
-            first,
-        }
-    }
-}
-
-impl std::fmt::Display for Dsv4RollbackChecksum {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "len={} hash={:016x} sum_abs={:.6} first={:?}",
-            self.len, self.hash, self.sum_abs, self.first
-        )
-    }
-}
-
-fn dsv4_mtp_rollback_dump_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_MTP_ROLLBACK_DUMP").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    ) && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
-}
-
-fn dsv4_checksum_bf16_slice(
-    ctx: &DeviceContext,
-    slice: &CudaSlice<half::bf16>,
-) -> Result<Dsv4RollbackChecksum> {
-    ctx.sync()?;
-    let host: Vec<half::bf16> = ctx
-        .stream
-        .clone_dtoh(slice)
-        .map_err(|e| anyhow!("DSv4 rollback dump D2H failed: {e}"))?;
-    Ok(Dsv4RollbackChecksum::from_host(&host))
-}
-
-fn dsv4_checksum_hidden(
-    ctx: &DeviceContext,
-    hidden: &HiddenStates,
-) -> Result<Dsv4RollbackChecksum> {
-    dsv4_checksum_bf16_slice(ctx, &hidden.data)
 }
 
 pub(crate) struct Dsv4KvAdapter {
@@ -2507,8 +2415,8 @@ impl Dsv4DsaSharedScratch {
         // per-forward topk output) is chunk-sized — see below.
         let query_tile = DSV4_DSA_PREFILL_QUERY_TILE.min(max_tokens);
         // `raw_indices` is the topk OUTPUT: written per forward over the forward's
-        // query tokens and read only by the gated `ARLE_DSV4_CSA_DUMP` block for those
-        // same <= chunk queries — never the full max_tokens context. Size it by the
+        // query tokens and read by the topk transform over those same <= chunk
+        // queries — never the full max_tokens context. Size it by the
         // chunked-prefill query bound (`DSV4_PREFILL_QUERY_CHUNK`), not `max_tokens`,
         // which at 900K x topk would be ~1.9 GB/layer. `csa_select_official` asserts
         // `q_i.seq_len <= query_chunk` before the tile loop.
@@ -3533,69 +3441,6 @@ impl Dsv4LayerAttentionState {
         }
     }
 
-    pub(crate) fn dump_mtp_rollback_state(
-        &self,
-        ctx: &DeviceContext,
-        layer_idx: usize,
-        label: &str,
-        abs_len: usize,
-    ) -> Result<()> {
-        if !dsv4_mtp_rollback_dump_enabled() {
-            return Ok(());
-        }
-        let sw = dsv4_checksum_bf16_slice(ctx, &self.sw_window_cache)?;
-        let compressor_pending = self
-            .compressor
-            .as_ref()
-            .map(|state| dsv4_checksum_bf16_slice(ctx, &state.pending_kv))
-            .transpose()?;
-        let compressor_prev = self
-            .compressor
-            .as_ref()
-            .map(|state| dsv4_checksum_bf16_slice(ctx, &state.prev_overlap_kv))
-            .transpose()?;
-        let compressor_compressed = self
-            .compressor
-            .as_ref()
-            .map(|state| dsv4_checksum_hidden(ctx, &state.compressed))
-            .transpose()?;
-        let compressor_seq = self
-            .compressor
-            .as_ref()
-            .map(|state| state.compressed.seq_len)
-            .unwrap_or(0);
-        let indexer_pending = self
-            .indexer
-            .as_ref()
-            .map(|state| dsv4_checksum_bf16_slice(ctx, &state.pending_kv))
-            .transpose()?;
-        let indexer_prev = self
-            .indexer
-            .as_ref()
-            .map(|state| dsv4_checksum_bf16_slice(ctx, &state.prev_overlap_kv))
-            .transpose()?;
-        let indexer_compressed = self
-            .indexer
-            .as_ref()
-            .map(|state| dsv4_checksum_hidden(ctx, &state.compressed))
-            .transpose()?;
-        let indexer_seq = self
-            .indexer
-            .as_ref()
-            .map(|state| state.compressed.seq_len)
-            .unwrap_or(0);
-        eprintln!(
-            "[dsv4-mtp-rollback-dump] label={label} layer={layer_idx} abs_len={abs_len} sw=({sw}) comp_seq={compressor_seq} comp_pending=({}) comp_prev=({}) comp_compressed=({}) index_seq={indexer_seq} index_pending=({}) index_prev=({}) index_compressed=({})",
-            compressor_pending.map_or_else(|| "none".to_string(), |v| v.to_string()),
-            compressor_prev.map_or_else(|| "none".to_string(), |v| v.to_string()),
-            compressor_compressed.map_or_else(|| "none".to_string(), |v| v.to_string()),
-            indexer_pending.map_or_else(|| "none".to_string(), |v| v.to_string()),
-            indexer_prev.map_or_else(|| "none".to_string(), |v| v.to_string()),
-            indexer_compressed.map_or_else(|| "none".to_string(), |v| v.to_string()),
-        );
-        Ok(())
-    }
-
     /// Allocate this layer's K+1-slot spec-ring snapshot ONCE at slot
     /// construction (no per-step alloc). Sizes mirror the deleted single-slot
     /// `rollback_snapshot` (git 7f305a1e) ×(max_depth+1): the SW slot
@@ -4154,62 +3999,6 @@ pub(crate) fn commit_layer_fold(
         )?;
     }
     Ok(())
-}
-
-/// Device-side draft-tree topology for ONE spec-verify forward: per-row
-/// absolute positions (`start_pos + depth`, repeats across siblings) and
-/// per-row branch ancestors as flattened chunk-row indices (`[n, max_anc]`,
-/// root included, self implicit, -1 padded). Feeds the positions-array
-/// prepare-QK/inverse-RoPE kernels and `arle_flashmla_tree_build_indices`,
-/// so ONE batched forward verifies the whole tree with every row attending
-/// exactly its own branch — no ring writes, no per-row replay.
-pub(crate) struct Dsv4TreeAttnMeta {
-    pub(crate) positions: CudaSlice<i32>,
-    pub(crate) ancestors: CudaSlice<i32>,
-    pub(crate) max_anc: usize,
-    pub(crate) n_rows: usize,
-}
-
-impl Dsv4TreeAttnMeta {
-    /// Upload host topology. `ancestors[r]` lists row r's branch chunk-rows
-    /// shallow→deep (root included, self excluded).
-    pub(crate) fn new(
-        ctx: &DeviceContext,
-        positions: &[usize],
-        ancestors: &[Vec<usize>],
-    ) -> Result<Self> {
-        let n = positions.len();
-        ensure!(
-            n > 0 && ancestors.len() == n,
-            "DSv4 tree meta shape mismatch: positions={} ancestors={}",
-            n,
-            ancestors.len()
-        );
-        let max_anc = ancestors.iter().map(Vec::len).max().unwrap_or(0).max(1);
-        let pos_host: Vec<i32> = positions
-            .iter()
-            .map(|&p| i32::try_from(p).map_err(|_| anyhow!("DSv4 tree position {p} overflows i32")))
-            .collect::<Result<_>>()?;
-        let mut anc_host = vec![-1i32; n * max_anc];
-        for (r, chain) in ancestors.iter().enumerate() {
-            for (j, &a) in chain.iter().enumerate() {
-                ensure!(a < n, "DSv4 tree ancestor row {a} out of {n} rows");
-                anc_host[r * max_anc + j] = a as i32;
-            }
-        }
-        Ok(Self {
-            positions: ctx
-                .stream
-                .clone_htod(&pos_host)
-                .map_err(|e| anyhow!("DSv4 tree positions H2D failed: {e}"))?,
-            ancestors: ctx
-                .stream
-                .clone_htod(&anc_host)
-                .map_err(|e| anyhow!("DSv4 tree ancestors H2D failed: {e}"))?,
-            max_anc,
-            n_rows: n,
-        })
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5571,89 +5360,6 @@ pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
     ))
 }
 
-/// Per-layer attention-output localizer (Track A FlashMLA-prefill diagnosis).
-///
-/// When `ARLE_DSV4_ATTN_DUMP=1`, every layer prints a stable FNV-1a hash of its
-/// full bf16 `local_attn` output plus the first 8 values of row 0, on rank 0
-/// only. Run the same prompt twice — once scalar (default), once with
-/// `ARLE_DSV4_FLASHMLA_PREFILL=1` — and diff the two logs: the *first* CSA/HCA
-/// layer whose hash differs is exactly where FlashMLA-prefill diverges from the
-/// scalar reference. SW layers run scalar in both passes and match by
-/// construction, so a mismatch localizes the bug to one layer in one build —
-/// replacing the end-to-end-token guess loop. Adds one `ctx.sync()` per layer,
-/// so it is strictly opt-in.
-fn dsv4_attn_dump_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_ATTN_DUMP").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    ) && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
-}
-
-/// Debug (ARLE_DSV4_KNEW_DUMP, rank 0, layer 0): dump each row's L2 + first4 of the
-/// prepared key. Compares token_a's key in a batched [token_a,wrong_b] forward (sp=5
-/// seq=2, row 0) vs the per-token [token_a]@5 forward (sp=5 seq=1, row 0) to test
-/// whether the multi-token prepare mis-computes token_a (the col1-bug hypothesis).
-fn dsv4_dump_kprep(
-    ctx: &DeviceContext,
-    layer_idx: usize,
-    label: &str,
-    h: &HiddenStates,
-    start_pos: usize,
-) {
-    if layer_idx != 0
-        || std::env::var_os("ARLE_DSV4_KNEW_DUMP").is_none()
-        || std::env::var("INFER_TP_RANK").as_deref() != Ok("0")
-    {
-        return;
-    }
-    if ctx.sync().is_err() {
-        return;
-    }
-    let host: Vec<half::bf16> = match ctx.stream.clone_dtoh(&h.data) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let n = h.hidden_dim;
-    for row in 0..h.seq_len {
-        let base = row * n;
-        let mut l2 = 0.0f32;
-        for i in 0..n {
-            let x = host[base + i].to_f32();
-            l2 += x * x;
-        }
-        let first4: Vec<f32> = (0..4.min(n)).map(|i| host[base + i].to_f32()).collect();
-        eprintln!(
-            "[knew-dump] {label} sp={start_pos} seq={} row={row} dim={n} l2={:.5} first4={first4:?}",
-            h.seq_len,
-            l2.sqrt()
-        );
-    }
-}
-
-fn dsv4_dump_attn_output(
-    ctx: &DeviceContext,
-    layer_idx: usize,
-    mode: DeepSeekV4AttentionMode,
-    out: &HiddenStates,
-) -> Result<()> {
-    ctx.sync()?;
-    let host: Vec<half::bf16> = ctx
-        .stream
-        .clone_dtoh(&out.data)
-        .map_err(|e| anyhow!("DSv4 attn-dump D2H failed: {e}"))?;
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for v in &host {
-        hash ^= u64::from(v.to_bits());
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let row0: Vec<f32> = host.iter().take(8).map(|v| v.to_f32()).collect();
-    eprintln!(
-        "[dsv4-attn-dump] layer={layer_idx} mode={mode:?} seq_len={} hidden={} hash={hash:016x} row0={row0:?}",
-        out.seq_len, out.hidden_dim
-    );
-    Ok(())
-}
-
 fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
     if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
         return Ok(true);
@@ -5968,7 +5674,6 @@ fn try_flashmla_prefill_attention(
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
     start_pos: usize,
-    tree: Option<&Dsv4TreeAttnMeta>,
     tp: &TpRuntime,
     local_heads: usize,
     local_attn: &mut HiddenStates,
@@ -5985,10 +5690,7 @@ fn try_flashmla_prefill_attention(
     if q_prepared.seq_len <= 1 {
         return Ok(false);
     }
-    // Pure-SW layers go through this path ONLY for tree-verify chunks (the
-    // unified pool degenerates to [SW cache | chunk K] and the tree indices
-    // carry the branch mask); plain prefill keeps the cheaper contiguous swa.
-    if mode == DeepSeekV4AttentionMode::SlidingWindow && tree.is_none() {
+    if mode == DeepSeekV4AttentionMode::SlidingWindow {
         return Ok(false);
     }
     ensure!(
@@ -6004,13 +5706,6 @@ fn try_flashmla_prefill_attention(
     );
 
     let token_count = q_prepared.seq_len;
-    if let Some(meta) = tree {
-        ensure!(
-            meta.n_rows == token_count,
-            "DSv4 tree meta rows {} != verify rows {token_count}",
-            meta.n_rows
-        );
-    }
     let tp_world = tp.config().world_size;
     let tp_rank = tp.config().rank;
     let global_heads = local_heads
@@ -6025,17 +5720,11 @@ fn try_flashmla_prefill_attention(
     let max_compressed_keys = match mode {
         DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
         DeepSeekV4AttentionMode::HybridCompressed => compressed_count.div_ceil(128) * 128,
-        // Tree-only: no compressed region in the unified pool.
         DeepSeekV4AttentionMode::SlidingWindow => 0,
     };
-    // Tree rows attend committed-window + branch + compressed: the branch part
-    // (<= max_anc + 1 <= 128) needs its own padded slot block on top of the
-    // chain layout's sw_window + compressed budget.
-    let tree_pad = if tree.is_some() { 128 } else { 0 };
     let topk_unified = config
         .sliding_window
-        .checked_add(tree_pad)
-        .and_then(|v| v.checked_add(max_compressed_keys))
+        .checked_add(max_compressed_keys)
         .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill topk overflow"))?;
     ensure!(
         topk_unified.is_multiple_of(128),
@@ -6093,92 +5782,44 @@ fn try_flashmla_prefill_attention(
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_build_indices");
         let (indices_ptr, _ig) = indices.device_ptr_mut(&ctx.stream);
         let (topk_ptr, _tg) = topk_length.device_ptr_mut(&ctx.stream);
-        if let Some(meta) = tree {
-            // Tree-verify chunk: per-row positions + branch ancestors replace
-            // the causal-contiguous window arithmetic. CSA passes the selector
-            // output; HCA passes its identity cap; pure-SW passes neither.
-            let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
-            let (anc_ptr, _ag) = meta.ancestors.device_ptr(&ctx.stream);
-            let (sel_ptr, _sg) = match (mode, selected) {
-                (DeepSeekV4AttentionMode::CompressedSparse, Some(sel)) => {
-                    let (p, g) = sel.device_ptr(&ctx.stream);
-                    (p as *const i32, Some(g))
+        unsafe {
+            match mode {
+                DeepSeekV4AttentionMode::CompressedSparse => {
+                    let selected = selected.ok_or_else(|| {
+                        anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
+                    })?;
+                    let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                    ffi::arle_flashmla_csa_build_indices(
+                        indices_ptr as *mut i32,
+                        topk_ptr as *mut i32,
+                        selected_ptr as *const i32,
+                        token_count as i32,
+                        start_pos as i32,
+                        config.sliding_window as i32,
+                        config.index_topk as i32,
+                        compressed_count as i32,
+                        compress_ratio as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
                 }
-                (DeepSeekV4AttentionMode::CompressedSparse, None) => {
-                    bail!("DSv4 FlashMLA CSA tree verify missing selected topk")
+                DeepSeekV4AttentionMode::HybridCompressed => {
+                    ffi::arle_flashmla_hca_build_indices(
+                        indices_ptr as *mut i32,
+                        topk_ptr as *mut i32,
+                        token_count as i32,
+                        start_pos as i32,
+                        config.sliding_window as i32,
+                        max_compressed_keys as i32,
+                        compressed_count as i32,
+                        compress_ratio as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
                 }
-                _ => (std::ptr::null(), None),
-            };
-            let max_compressed_arg = if mode == DeepSeekV4AttentionMode::HybridCompressed {
-                max_compressed_keys
-            } else {
-                0
-            };
-            unsafe {
-                ffi::arle_flashmla_tree_build_indices(
-                    indices_ptr as *mut i32,
-                    topk_ptr as *mut i32,
-                    pos_ptr as *const i32,
-                    anc_ptr as *const i32,
-                    meta.max_anc as i32,
-                    sel_ptr,
-                    token_count as i32,
-                    start_pos as i32,
-                    config.sliding_window as i32,
-                    if sel_ptr.is_null() {
-                        0
-                    } else {
-                        config.index_topk as i32
-                    },
-                    max_compressed_arg as i32,
-                    topk_unified as i32,
-                    compressed_count as i32,
-                    compress_ratio as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA tree verify indices failed: {e}"))?;
-            }
-        } else {
-            unsafe {
-                match mode {
-                    DeepSeekV4AttentionMode::CompressedSparse => {
-                        let selected = selected.ok_or_else(|| {
-                            anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
-                        })?;
-                        let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                        ffi::arle_flashmla_csa_build_indices(
-                            indices_ptr as *mut i32,
-                            topk_ptr as *mut i32,
-                            selected_ptr as *const i32,
-                            token_count as i32,
-                            start_pos as i32,
-                            config.sliding_window as i32,
-                            config.index_topk as i32,
-                            compressed_count as i32,
-                            compress_ratio as i32,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
-                    }
-                    DeepSeekV4AttentionMode::HybridCompressed => {
-                        ffi::arle_flashmla_hca_build_indices(
-                            indices_ptr as *mut i32,
-                            topk_ptr as *mut i32,
-                            token_count as i32,
-                            start_pos as i32,
-                            config.sliding_window as i32,
-                            max_compressed_keys as i32,
-                            compressed_count as i32,
-                            compress_ratio as i32,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()
-                        .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
-                    }
-                    DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
-                }
+                DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
             }
         }
     }
@@ -6343,51 +5984,26 @@ fn try_flashmla_prefill_attention(
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_inverse_rope");
         unsafe {
-            if let Some(meta) = tree {
-                let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
-                ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    config.head_dim as i32,
-                    config.qk_rope_head_dim as i32,
-                    pos_ptr as *const i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_factor,
-                    rope_beta_fast,
-                    rope_beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA tree output inverse-rope failed: {e}"))?;
-            } else {
-                ffi::arle_dsv4_output_inverse_rope_cuda(
-                    out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    config.head_dim as i32,
-                    config.qk_rope_head_dim as i32,
-                    start_pos as i32,
-                    rope_base,
-                    original_seq_len,
-                    rope_factor,
-                    rope_beta_fast,
-                    rope_beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
-            }
+            ffi::arle_dsv4_output_inverse_rope_cuda(
+                out_ptr as *mut ffi::Half,
+                token_count as i32,
+                local_heads as i32,
+                config.head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_pos as i32,
+                rope_base,
+                original_seq_len,
+                rope_factor,
+                rope_beta_fast,
+                rope_beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
         }
     }
 
-    // Tree verify is PURE: the frozen forward owns no ring state — the commit
-    // path re-establishes the rings for exactly the accepted prefix. Plain
-    // prefill keeps rolling the window with the chunk K.
-    if tree.is_none() {
-        update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
-    }
+    update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
 
     if env_flag("ARLE_DSV4_FLASHMLA_PREFILL_SYNC")? {
         ctx.sync()?;
@@ -7247,10 +6863,6 @@ pub(crate) fn mla_attention(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
-    // Spec tree-verify chunk: per-row positions + branch topology. Routes the
-    // whole multi-row chunk through ONE FlashMLA sparse forward per layer
-    // (every mode incl. pure-SW) with zero ring writes; `None` everywhere else.
-    tree: Option<&Dsv4TreeAttnMeta>,
     tp: &TpRuntime,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -7273,7 +6885,6 @@ pub(crate) fn mla_attention(
         prefill_shared.as_deref_mut(),
         start_pos,
         start_pos_device,
-        tree,
         tp,
         keepalive,
     )?;
@@ -7290,7 +6901,6 @@ pub(crate) fn mla_attention(
         prefill_shared,
         start_pos,
         start_pos_device,
-        tree,
         tp,
         prepared,
         out,
@@ -7322,10 +6932,6 @@ pub(crate) fn mla_attention_prepare(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
-    // Tree-verify chunk positions feed the RoPE prepare (siblings share absolute
-    // positions); `None` for ordinary prefill/decode. The fwd half takes `tree`
-    // separately for the SW prefill dispatch.
-    tree: Option<&Dsv4TreeAttnMeta>,
     tp: &TpRuntime,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
@@ -7513,30 +7119,7 @@ pub(crate) fn mla_attention_prepare(
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; head/dim args checked above.
         unsafe {
-            if let Some(meta) = tree {
-                // Tree-verify chunk: per-row absolute positions (siblings
-                // repeat) instead of start_pos + row.
-                let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
-                ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
-                    q_raw_ptr as *const ffi::Half,
-                    k_raw_ptr as *const ffi::Half,
-                    q_out_ptr as *mut ffi::Half,
-                    k_out_ptr as *mut ffi::Half,
-                    token_count as i32,
-                    local_heads as i32,
-                    head_dim as i32,
-                    config.qk_rope_head_dim as i32,
-                    pos_ptr as *const i32,
-                    config.rms_norm_eps,
-                    rope_base,
-                    original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            } else if let Some(start_pos_device) = start_pos_device {
+            if let Some(start_pos_device) = start_pos_device {
                 let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
                 ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
                     q_raw_ptr as *const ffi::Half,
@@ -7582,9 +7165,6 @@ pub(crate) fn mla_attention_prepare(
     }
     keepalive.keep_hidden(&q_prepared);
     keepalive.keep_hidden(&k_prepared);
-    dsv4_dump_kprep(ctx, layer_idx, "k_prepared", &k_prepared, start_pos);
-    dsv4_dump_kprep(ctx, layer_idx, "q_prepared", &q_prepared, start_pos);
-
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
     // SAFETY: the SW/hybrid attention kernel writes the full local_attn buffer
     // in `mla_attention_fwd`.
@@ -8349,7 +7929,6 @@ fn mla_attention_fwd(
     prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
-    tree: Option<&Dsv4TreeAttnMeta>,
     tp: &TpRuntime,
     prepared: Dsv4MlaPrepared,
     out: &mut HiddenStates,
@@ -8393,11 +7972,14 @@ fn mla_attention_fwd(
         // The kernel reads the pre-roped q/k, attends over the bf16 SW ring cache
         // (which it also updates), adds the sink, and un-rotates the rope tail of
         // the OUTPUT (sign = -1) before returning.
-        if let Some(meta) = tree {
-            // Tree-verify chunk: the contiguous swa kernel cannot express the
-            // branch mask (siblings share positions), so route through the
-            // sparse forward over [SW cache | chunk K] with tree indices.
-            let used = try_flashmla_prefill_attention(
+        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+            let flash = state.flashmla.as_mut().ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+            })?;
+            let scratch = flashmla_scratch.ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+            })?;
+            try_flashmla_decode_attention(
                 ctx,
                 config,
                 attention,
@@ -8408,8 +7990,11 @@ fn mla_attention_fwd(
                 None,
                 None,
                 &mut state.sw_window_cache,
+                flash,
+                scratch,
+                pool,
                 start_pos,
-                Some(meta),
+                start_pos_device,
                 tp,
                 local_heads,
                 &mut local_attn,
@@ -8419,118 +8004,68 @@ fn mla_attention_fwd(
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-            )?;
-            ensure!(
-                used,
-                "DSv4 spec tree verify requires the FlashMLA prefill path \
-                 (ARLE_DSV4_FLASHMLA_PREFILL disabled?)"
-            );
-            // Falls through to the shared O-projection tail below.
+            )?
         } else {
-            let flashmla_used = if dsv4_flashmla_decode_enabled()? {
-                let flash = state.flashmla.as_mut().ok_or_else(|| {
-                    anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
-                })?;
-                let scratch = flashmla_scratch.ok_or_else(|| {
-                    anyhow!(
-                        "ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing"
+            false
+        };
+        if !flashmla_used {
+            let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
+            // skips to this rank's head block in the whole-loaded attn_sink vector.
+            unsafe {
+                if let Some(start_pos_device) = start_pos_device {
+                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                    ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        config.sliding_window as i32,
+                        start_ptr as *const i32,
+                        sink_offset as i32,
+                        sm_scale,
+                        config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        1,
+                        ctx.stream.cu_stream(),
                     )
-                })?;
-                try_flashmla_decode_attention(
-                    ctx,
-                    config,
-                    attention,
-                    mode,
-                    compress_ratio,
-                    &q_prepared,
-                    &k_prepared,
-                    None,
-                    None,
-                    &mut state.sw_window_cache,
-                    flash,
-                    scratch,
-                    pool,
-                    start_pos,
-                    start_pos_device,
-                    tp,
-                    local_heads,
-                    &mut local_attn,
-                    sm_scale,
-                    rope_base,
-                    original_seq_len,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
-                )?
-            } else {
-                false
-            };
-            maybe_probe_flashmla_decode_path(
-                layer_idx,
-                mode,
-                flashmla_used,
-                token_count,
-                start_pos,
-            );
-            if !flashmla_used {
-                let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-                let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-                let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-                let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
-                let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-                // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
-                // skips to this rank's head block in the whole-loaded attn_sink vector.
-                unsafe {
-                    if let Some(start_pos_device) = start_pos_device {
-                        let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                        ffi::dsv4_swa_attention_start_pos_ptr_cuda(
-                            q_ptr as *const ffi::Half,
-                            k_ptr as *const ffi::Half,
-                            window_ptr as *mut ffi::Half,
-                            sink_ptr as *const ffi::Half,
-                            out_ptr as *mut ffi::Half,
-                            token_count as i32,
-                            local_heads as i32,
-                            head_dim as i32,
-                            config.sliding_window as i32,
-                            start_ptr as *const i32,
-                            sink_offset as i32,
-                            sm_scale,
-                            config.qk_rope_head_dim as i32,
-                            rope_base,
-                            original_seq_len,
-                            rope.factor,
-                            rope.beta_fast,
-                            rope.beta_slow,
-                            1,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    } else {
-                        ffi::dsv4_swa_attention_cuda(
-                            q_ptr as *const ffi::Half,
-                            k_ptr as *const ffi::Half,
-                            window_ptr as *mut ffi::Half,
-                            sink_ptr as *const ffi::Half,
-                            out_ptr as *mut ffi::Half,
-                            token_count as i32,
-                            local_heads as i32,
-                            head_dim as i32,
-                            config.sliding_window as i32,
-                            start_pos_i32,
-                            sink_offset as i32,
-                            sm_scale,
-                            config.qk_rope_head_dim as i32,
-                            rope_base,
-                            original_seq_len,
-                            rope.factor,
-                            rope.beta_fast,
-                            rope.beta_slow,
-                            1,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                    .result()?;
+                } else {
+                    ffi::dsv4_swa_attention_cuda(
+                        q_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        window_ptr as *mut ffi::Half,
+                        sink_ptr as *const ffi::Half,
+                        out_ptr as *mut ffi::Half,
+                        token_count as i32,
+                        local_heads as i32,
+                        head_dim as i32,
+                        config.sliding_window as i32,
+                        start_pos_i32,
+                        sink_offset as i32,
+                        sm_scale,
+                        config.qk_rope_head_dim as i32,
+                        rope_base,
+                        original_seq_len,
+                        rope.factor,
+                        rope.beta_fast,
+                        rope.beta_slow,
+                        1,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
                 }
             }
         }
@@ -8571,7 +8106,6 @@ fn mla_attention_fwd(
             Some(compressed),
             &mut state.sw_window_cache,
             start_pos,
-            tree,
             tp,
             local_heads,
             &mut local_attn,
@@ -8583,11 +8117,6 @@ fn mla_attention_fwd(
             rope.beta_slow,
         )? {
             true
-        } else if tree.is_some() {
-            bail!(
-                "DSv4 spec tree verify requires the FlashMLA prefill path \
-                 (ARLE_DSV4_FLASHMLA_PREFILL disabled?)"
-            );
         } else if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
                 anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
@@ -8624,7 +8153,6 @@ fn mla_attention_fwd(
         } else {
             false
         };
-        maybe_probe_flashmla_decode_path(layer_idx, mode, flashmla_used, token_count, start_pos);
         if !flashmla_used {
             let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
             let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
@@ -8717,10 +8245,6 @@ fn mla_attention_fwd(
         }
     }
     keepalive.keep_hidden(&local_attn);
-
-    if dsv4_attn_dump_enabled() {
-        dsv4_dump_attn_output(ctx, layer_idx, mode, &local_attn)?;
-    }
 
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
@@ -9629,47 +9153,6 @@ fn csa_select(
             }
         }
     }
-    maybe_probe_deepgemm_dsa_logits(
-        ctx,
-        config,
-        layer_idx,
-        &q_i,
-        &weights,
-        keys,
-        hidden.seq_len,
-        local_index_heads,
-        key_count,
-        ratio,
-        start_pos,
-        start_pos_device,
-        score_scale,
-    )?;
-    if std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
-        && std::env::var("INFER_TP_RANK").as_deref() == Ok("0")
-    {
-        let row_idx = hidden.seq_len.saturating_sub(1);
-        let available = std::cmp::min(key_count, (start_pos + row_idx) / ratio);
-        match ctx.stream.clone_dtoh(&selected) {
-            Ok(host) => {
-                let row_start = row_idx * config.index_topk;
-                let selected_head: Vec<i32> =
-                    host.iter().skip(row_start).copied().take(32).collect();
-                let invalid_selected = host
-                    .iter()
-                    .skip(row_start)
-                    .take(config.index_topk)
-                    .filter(|&&v| v < 0 || v >= available as i32)
-                    .count();
-                eprintln!(
-                    "[dsv4-csa-dump] layer={layer_idx} start_pos={start_pos} seq_len={} row={row_idx} ratio={ratio} available={available} topk={} invalid_selected={invalid_selected} selected_head={selected_head:?}",
-                    hidden.seq_len, config.index_topk,
-                );
-            }
-            Err(e) => {
-                eprintln!("[dsv4-csa-dump] layer={layer_idx} start_pos={start_pos} dtoh_err={e}")
-            }
-        }
-    }
     Ok(selected)
 }
 
@@ -9688,7 +9171,7 @@ fn csa_select_official(
     key_count: usize,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
-    layer_idx: usize,
+    _layer_idx: usize,
     ratio: usize,
     local_index_heads: usize,
     score_scale: f32,
@@ -9842,21 +9325,6 @@ fn csa_select_official(
         token_count,
         shared.query_chunk
     );
-    let dump_csa = std::env::var("ARLE_DSV4_CSA_DUMP").as_deref() == Ok("1")
-        && std::env::var("INFER_TP_RANK").as_deref() == Ok("0");
-    let context_lens_h = if dump_csa {
-        Some(
-            (0..token_count)
-                .map(|token| {
-                    let abs_pos = start_pos + token;
-                    i32::try_from(std::cmp::min(key_count, abs_pos / ratio))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-    } else {
-        None
-    };
-
     // Full-N output, allocated once. Each tile writes its disjoint [t0..t0+tlen) slice.
     let mut selected = ctx
         .stream
@@ -10071,54 +9539,6 @@ fn csa_select_official(
     }
     keepalive.keep_u8(&shared.q_fp8);
     keepalive.keep_f32(&shared.weights);
-    if dump_csa {
-        let row_idx = q_i.seq_len.saturating_sub(1);
-        let available = context_lens_h
-            .as_ref()
-            .and_then(|lens| lens.get(row_idx).copied())
-            .unwrap_or_default();
-        let selected_host = ctx.stream.clone_dtoh(&selected);
-        let raw_host = ctx
-            .stream
-            .clone_dtoh(&shared.raw_indices.slice(0..q_i.seq_len * config.index_topk));
-        match (selected_host, raw_host) {
-            (Ok(selected_host), Ok(raw_host)) => {
-                let invalid_selected = selected_host
-                    .iter()
-                    .skip(row_idx * config.index_topk)
-                    .take(config.index_topk)
-                    .filter(|&&v| v < 0 || v >= available)
-                    .count();
-                let invalid_raw = raw_host
-                    .iter()
-                    .skip(row_idx * config.index_topk)
-                    .take(config.index_topk)
-                    .filter(|&&v| v < 0 || v >= available)
-                    .count();
-                let selected_head: Vec<i32> = selected_host
-                    .iter()
-                    .skip(row_idx * config.index_topk)
-                    .copied()
-                    .take(32)
-                    .collect();
-                let raw_head: Vec<i32> = raw_host
-                    .iter()
-                    .skip(row_idx * config.index_topk)
-                    .copied()
-                    .take(32)
-                    .collect();
-                eprintln!(
-                    "[dsv4-csa-dump-official] layer={layer_idx} start_pos={start_pos} seq_len={} row={row_idx} ratio={ratio} available={available} topk={} invalid_selected={invalid_selected} invalid_raw={invalid_raw} selected_head={selected_head:?} raw_head={raw_head:?}",
-                    q_i.seq_len, config.index_topk,
-                );
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                eprintln!(
-                    "[dsv4-csa-dump-official] layer={layer_idx} start_pos={start_pos} dtoh_err={e}"
-                );
-            }
-        }
-    }
     Ok(Some(selected))
 }
 
@@ -10387,248 +9807,5 @@ pub(crate) fn csa_select_official_batched(
 
     keepalive.keep_u8(&shared.q_fp8_batch);
     keepalive.keep_f32(&shared.weights_batch);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn maybe_probe_deepgemm_dsa_logits(
-    ctx: &DeviceContext,
-    config: &DeepSeekV4Config,
-    layer_idx: usize,
-    q_i: &HiddenStates,
-    weights: &HiddenStates,
-    keys: &HiddenStates,
-    seq_len: usize,
-    local_index_heads: usize,
-    key_count: usize,
-    ratio: usize,
-    start_pos: usize,
-    start_pos_device: Option<&CudaSlice<i32>>,
-    score_scale: f32,
-) -> Result<()> {
-    if std::env::var("ARLE_DSV4_DSA_LOGITS_PROBE").as_deref() != Ok("1")
-        || std::env::var("INFER_TP_RANK").as_deref() != Ok("0")
-        || seq_len != 1
-    {
-        return Ok(());
-    }
-    static SEEN: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if !seen.lock().unwrap().insert(layer_idx) {
-        return Ok(());
-    }
-    let effective_start_pos = if let Some(start_pos_device) = start_pos_device {
-        let host = ctx
-            .stream
-            .clone_dtoh(start_pos_device)
-            .map_err(|e| anyhow!("DSv4 DSA logits probe start_pos D2H failed: {e}"))?;
-        usize::try_from(host.first().copied().unwrap_or_default())
-            .map_err(|_| anyhow!("DSv4 DSA logits probe negative start_pos"))?
-    } else {
-        start_pos
-    };
-    ensure!(
-        config.index_head_dim == 128,
-        "DeepGEMM paged-MQA logits probe expects index_head_dim=128, got {}",
-        config.index_head_dim
-    );
-    ensure!(
-        local_index_heads == 32 || local_index_heads == 64,
-        "DeepGEMM paged-MQA logits probe expects 32/64 heads, got {local_index_heads}"
-    );
-    let available = std::cmp::min(key_count, effective_start_pos / ratio);
-    if available == 0 {
-        eprintln!("[dsv4-dsa-logits-probe] layer={layer_idx} skipped reason=no_available_keys");
-        return Ok(());
-    }
-    let sample_limit = std::env::var("ARLE_DSV4_DSA_LOGITS_PROBE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16)
-        .min(available);
-    let num_sms = std::env::var("ARLE_DSV4_DSA_LOGITS_PROBE_SMS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(78);
-    let block_kv = 64usize;
-    let padded_keys = available.div_ceil(block_kv) * block_kv;
-    let logits_stride = available.div_ceil(256) * 256;
-    let q_scale_stride_m = local_index_heads.div_ceil(4) * 4;
-    let key_scale_stride_m = padded_keys;
-    let scale_cols = config.index_head_dim.div_ceil(128);
-
-    let q_fp8 = ctx
-        .stream
-        .alloc_zeros::<u8>(local_index_heads * config.index_head_dim)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe q fp8 alloc failed: {e}"))?;
-    let q_scales = ctx
-        .stream
-        .alloc_zeros::<f32>(q_scale_stride_m * scale_cols)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe q scales alloc failed: {e}"))?;
-    let key_fp8 = ctx
-        .stream
-        .alloc_zeros::<u8>(padded_keys * config.index_head_dim)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe key fp8 alloc failed: {e}"))?;
-    let key_scales = ctx
-        .stream
-        .alloc_zeros::<f32>(padded_keys * scale_cols)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe key scales alloc failed: {e}"))?;
-    let active_experts = ctx
-        .stream
-        .clone_htod(&[0_i32])
-        .map_err(|e| anyhow!("DSv4 DSA logits probe active_experts H2D failed: {e}"))?;
-    let active_offsets = ctx
-        .stream
-        .clone_htod(&[0_i32])
-        .map_err(|e| anyhow!("DSv4 DSA logits probe active_offsets H2D failed: {e}"))?;
-    let mut active_counts = ctx
-        .stream
-        .clone_htod(&[local_index_heads as i32])
-        .map_err(|e| anyhow!("DSv4 DSA logits probe active_counts H2D failed: {e}"))?;
-    let stream = ctx.stream.cu_stream();
-    unsafe {
-        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-            cache_ptr(&q_i.data, ctx),
-            cache_ptr(&q_fp8, ctx),
-            cache_ptr(&q_scales, ctx),
-            cache_ptr(&active_experts, ctx),
-            cache_ptr(&active_offsets, ctx),
-            cache_ptr(&active_counts, ctx),
-            1,
-            local_index_heads,
-            config.index_head_dim,
-            q_scale_stride_m,
-            stream,
-        )
-        .map_err(|e| anyhow!("DSv4 DSA logits probe q quantize failed: {e}"))?;
-    }
-    ctx.stream
-        .memcpy_htod(&[available as i32], &mut active_counts)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe key active_counts H2D failed: {e}"))?;
-    unsafe {
-        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-            cache_ptr(&keys.data, ctx),
-            cache_ptr(&key_fp8, ctx),
-            cache_ptr(&key_scales, ctx),
-            cache_ptr(&active_experts, ctx),
-            cache_ptr(&active_offsets, ctx),
-            cache_ptr(&active_counts, ctx),
-            1,
-            padded_keys,
-            config.index_head_dim,
-            key_scale_stride_m,
-            stream,
-        )
-        .map_err(|e| anyhow!("DSv4 DSA logits probe key quantize failed: {e}"))?;
-    }
-
-    let q_scales_host = ctx
-        .stream
-        .clone_dtoh(&q_scales)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe q scales D2H failed: {e}"))?;
-    let weights_host = ctx
-        .stream
-        .clone_dtoh(&weights.data)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe weights D2H failed: {e}"))?;
-    let fused_weights_host: Vec<f32> = (0..local_index_heads)
-        .map(|head| weights_host[head].to_f32() * q_scales_host[head] * score_scale)
-        .collect();
-    let fused_weights = ctx
-        .stream
-        .clone_htod(&fused_weights_host)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe weights H2D failed: {e}"))?;
-    let context_lens = ctx
-        .stream
-        .clone_htod(&[available as i32])
-        .map_err(|e| anyhow!("DSv4 DSA logits probe context_lens H2D failed: {e}"))?;
-    let block_table_host: Vec<i32> = (0..padded_keys / block_kv).map(|v| v as i32).collect();
-    let block_table = ctx
-        .stream
-        .clone_htod(&block_table_host)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe block_table H2D failed: {e}"))?;
-    let sched_meta = ctx
-        .stream
-        .alloc_zeros::<i32>((num_sms + 1) * 2)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe sched_meta alloc failed: {e}"))?;
-    let logits = ctx
-        .stream
-        .alloc_zeros::<f32>(logits_stride)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe logits alloc failed: {e}"))?;
-    unsafe {
-        cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
-            cache_ptr(&context_lens, ctx),
-            cache_ptr(&sched_meta, ctx),
-            1,
-            1,
-            block_kv,
-            num_sms,
-            stream,
-        )
-        .map_err(|e| anyhow!("DSv4 DSA logits probe metadata failed: {e}"))?;
-        cuda_moe::dsv4_deepgemm_fp8_paged_mqa_logits(
-            cache_ptr(&q_fp8, ctx),
-            cache_ptr(&key_fp8, ctx),
-            cache_ptr(&key_scales, ctx),
-            cache_ptr(&fused_weights, ctx),
-            cache_ptr(&context_lens, ctx),
-            cache_ptr(&block_table, ctx),
-            cache_ptr(&sched_meta, ctx),
-            cache_ptr(&logits, ctx),
-            1,
-            1,
-            local_index_heads,
-            config.index_head_dim,
-            padded_keys / block_kv,
-            block_kv,
-            available,
-            logits_stride,
-            padded_keys / block_kv,
-            block_kv * (config.index_head_dim + std::mem::size_of::<f32>()),
-            num_sms,
-            stream,
-        )
-        .map_err(|e| anyhow!("DSv4 DSA logits probe paged logits failed: {e}"))?;
-    }
-    let logits_host = ctx
-        .stream
-        .clone_dtoh(&logits)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe logits D2H failed: {e}"))?;
-    let q_host = ctx
-        .stream
-        .clone_dtoh(&q_i.data)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe q D2H failed: {e}"))?;
-    let keys_host = ctx
-        .stream
-        .clone_dtoh(&keys.data)
-        .map_err(|e| anyhow!("DSv4 DSA logits probe keys D2H failed: {e}"))?;
-
-    let mut max_abs = 0.0f32;
-    let mut sum_sq = 0.0f32;
-    let mut first = Vec::with_capacity(sample_limit);
-    for (block, &official) in logits_host.iter().enumerate().take(sample_limit) {
-        let mut reference = 0.0f32;
-        for (head, weight) in weights_host.iter().enumerate().take(local_index_heads) {
-            let q_base = head * config.index_head_dim;
-            let key_base = block * config.index_head_dim;
-            let mut dot = 0.0f32;
-            for col in 0..config.index_head_dim {
-                dot += q_host[q_base + col].to_f32() * keys_host[key_base + col].to_f32();
-            }
-            reference += weight.to_f32() * score_scale * dot.max(0.0);
-        }
-        let diff = (official - reference).abs();
-        max_abs = max_abs.max(diff);
-        sum_sq += diff * diff;
-        if block < 4 {
-            first.push(format!(
-                "{block}:dg={official:.5}:ref={reference:.5}:diff={diff:.5}"
-            ));
-        }
-    }
-    let rms = (sum_sq / sample_limit as f32).sqrt();
-    eprintln!(
-        "[dsv4-dsa-logits-probe] layer={layer_idx} available={available} sample={sample_limit} heads={local_index_heads} max_abs={max_abs:.6} rms={rms:.6} first={}",
-        first.join(",")
-    );
     Ok(())
 }

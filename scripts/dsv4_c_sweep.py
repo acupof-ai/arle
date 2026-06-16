@@ -3,9 +3,10 @@
 engine (mixed prefill/decode plans). Per-request correctness probe via distinct
 prompts with expected substrings (cross-slot contamination check).
 
-Usage: dsv4_c_sweep.py <arm-label> [c1,c2,...] [max_tokens]
+Usage: dsv4_c_sweep.py <arm-label> [c1,c2,...] [max_tokens] [repeats]
 """
 import json
+import statistics
 import sys
 import time
 import threading
@@ -70,11 +71,11 @@ def server_alive():
         return False
 
 
-def concurrent_lane(c, max_tokens, stagger_s):
+def concurrent_lane(c, max_tokens, stagger_s, repeat_idx=0):
     """c concurrent requests; stagger_s>0 staggers arrivals so later requests
     PREFILL while earlier ones DECODE — the exact mixed-plan crash shape."""
     label = f"c={c} stagger={stagger_s}s"
-    print(f"=== Concurrent lane {label} max_tokens={max_tokens} ===", flush=True)
+    print(f"=== Concurrent lane {label} repeat={repeat_idx} max_tokens={max_tokens} ===", flush=True)
     results = [None] * c
 
     def worker(i):
@@ -113,16 +114,42 @@ def concurrent_lane(c, max_tokens, stagger_s):
     print(f"  LANE RESULT {label}: ok={n_ok}/{c} expect_hit={n_hit}/{n_ok} "
           f"total_tok={total_tok} window={window:.2f}s agg={agg:.2f} tok/s "
           f"server_alive={alive}", flush=True)
-    return {"c": c, "stagger": stagger_s, "ok": n_ok, "hit": n_hit,
+    return {"c": c, "stagger": stagger_s, "repeat": repeat_idx, "ok": n_ok, "hit": n_hit,
             "total_tok": total_tok, "window": window, "agg_tok_s": agg,
             "alive_after": alive}
+
+
+def summarize_repeats(lanes):
+    grouped = {}
+    for lane in lanes:
+        key = (lane["c"], lane["stagger"])
+        grouped.setdefault(key, []).append(lane)
+    summary = []
+    for (c, stagger), rows in sorted(grouped.items()):
+        aggs = [r["agg_tok_s"] for r in rows if r["ok"] == c and r["alive_after"]]
+        if aggs:
+            item = {
+                "c": c,
+                "stagger": stagger,
+                "n": len(aggs),
+                "median_agg_tok_s": statistics.median(aggs),
+                "min_agg_tok_s": min(aggs),
+                "max_agg_tok_s": max(aggs),
+                "spread": max(aggs) - min(aggs),
+            }
+        else:
+            item = {"c": c, "stagger": stagger, "n": 0, "median_agg_tok_s": None, "spread": None}
+        summary.append(item)
+        print("  REPEAT SUMMARY " + json.dumps(item), flush=True)
+    return summary
 
 
 def main():
     arm = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     cs = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "2,4,8").split(",")]
     max_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 96
-    print(f"########## C-SWEEP ARM={arm} cs={cs} max_tokens={max_tokens} ##########",
+    repeats = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+    print(f"########## C-SWEEP ARM={arm} cs={cs} max_tokens={max_tokens} repeats={repeats} ##########",
           flush=True)
     if not server_alive():
         print("server not up", flush=True)
@@ -130,18 +157,24 @@ def main():
     # Warmup (DeepGEMM JIT etc.)
     one_request(PROBES[0][0], 8)
     lanes = []
-    for c in cs:
-        # Burst arrivals (pure decode batching after prefills drain)...
-        lanes.append(concurrent_lane(c, max_tokens, 0.0))
-        if not lanes[-1]["alive_after"]:
-            print("SERVER DIED — aborting sweep", flush=True)
-            break
-        # ...and staggered arrivals (forces mixed prefill+decode plans).
-        lanes.append(concurrent_lane(c, max_tokens, 1.0))
-        if not lanes[-1]["alive_after"]:
-            print("SERVER DIED — aborting sweep", flush=True)
-            break
-    print("JSON_SUMMARY=" + json.dumps({"arm": arm, "lanes": lanes}), flush=True)
+    for repeat_idx in range(repeats):
+        for c in cs:
+            # Burst arrivals (pure decode batching after prefills drain)...
+            lanes.append(concurrent_lane(c, max_tokens, 0.0, repeat_idx))
+            if not lanes[-1]["alive_after"]:
+                print("SERVER DIED — aborting sweep", flush=True)
+                print("JSON_SUMMARY=" + json.dumps({"arm": arm, "lanes": lanes}), flush=True)
+                return
+            # ...and staggered arrivals (forces mixed prefill+decode plans).
+            lanes.append(concurrent_lane(c, max_tokens, 1.0, repeat_idx))
+            if not lanes[-1]["alive_after"]:
+                print("SERVER DIED — aborting sweep", flush=True)
+                print("JSON_SUMMARY=" + json.dumps({"arm": arm, "lanes": lanes}), flush=True)
+                return
+    summary = summarize_repeats(lanes)
+    print("JSON_SUMMARY=" + json.dumps(
+        {"arm": arm, "repeats": repeats, "lanes": lanes, "summary": summary}
+    ), flush=True)
 
 
 if __name__ == "__main__":

@@ -164,6 +164,8 @@ pub struct ServeSpecOptions {
     pub mtp_draft_tokens: Option<usize>,
 }
 
+pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
+
 impl ServeSpecOptions {
     #[must_use]
     pub fn requested(&self) -> bool {
@@ -207,7 +209,11 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
             anyhow::bail!("--spec-type auto is not implemented; use mtp");
         }
         ServeSpecType::Mtp => {
-            engine_config.mtp_draft_tokens = Some(opts.spec.mtp_draft_tokens.unwrap_or(1));
+            engine_config.mtp_draft_tokens = Some(
+                opts.spec
+                    .mtp_draft_tokens
+                    .unwrap_or(DEFAULT_MTP_DRAFT_TOKENS),
+            );
         }
     }
 

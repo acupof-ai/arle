@@ -1516,7 +1516,8 @@ impl Dsv4CudaExecutor {
         position: u64,
         final_prefill: bool,
     ) -> Result<Vec<u32>> {
-        if self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled() {
+        let spec_on = self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled();
+        if spec_on && params.is_greedy() {
             let (token, hidden) = self.model.forward_tokens_with_hidden(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1533,6 +1534,9 @@ impl Dsv4CudaExecutor {
             }
             Ok(vec![token])
         } else {
+            if spec_on {
+                self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
+            }
             Ok(vec![self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1561,18 +1565,21 @@ impl Dsv4CudaExecutor {
                 params,
                 position,
             )?;
-            self.model.dump_mtp_rollback_state(
-                &self.slots[slot_idx],
-                "nonspec_after_forward",
-                start_pos + 1,
-            )?;
             return Ok(vec![token]);
         }
 
-        ensure!(
-            params.is_greedy(),
-            "DSv4 MTP greedy verify currently supports greedy sampling only"
-        );
+        if !params.is_greedy() {
+            self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
+            let token = self.model.forward_tokens(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &[last_token],
+                start_pos,
+                params,
+                position,
+            )?;
+            return Ok(vec![token]);
+        }
         let pending = self.spec_slots[slot_idx]
             .pending
             .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing pending token"))?;
@@ -1626,7 +1633,9 @@ impl Dsv4CudaExecutor {
         // the per-row spec loop below runs (byte-identical reference / the
         // B=1 / c<N path).
         let spec_on = self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled();
+        let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
         if spec_on
+            && all_greedy
             && crate::dsv4::dsv4_batched_mtp_enabled()
             && batch.rows.len() >= dsv4_batched_decode_min_rows()
         {
@@ -1852,7 +1861,7 @@ impl Dsv4CudaExecutor {
             &params,
             start_pos as u64,
         )?;
-        let (verify_one, _) = self.model.forward_tokens_verify(
+        let verify_one = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
             &[token_a],
@@ -1882,8 +1891,9 @@ impl Dsv4CudaExecutor {
             (start_pos + 1) as u64,
         )?;
         ensure!(
-            verify_one.first().copied() == Some(normal_one),
-            "DSv4 verify selftest one-token mismatch: verify={verify_one:?} normal={normal_one}"
+            verify_one.argmax.first().copied() == Some(normal_one),
+            "DSv4 verify selftest one-token mismatch: verify={:?} normal={normal_one}",
+            verify_one.argmax
         );
 
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
@@ -1895,14 +1905,14 @@ impl Dsv4CudaExecutor {
             &params,
             start_pos as u64,
         )?;
-        let (verify_one, _) = self.model.forward_tokens_verify(
+        let verify_one = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
             &[token_a],
             start_pos,
             (start_pos + 1) as u64,
         )?;
-        let token_b = verify_one[0];
+        let token_b = verify_one.argmax[0];
         let mut wrong_b = token_b.wrapping_add(2);
         if wrong_b == token_b {
             wrong_b = token_b.wrapping_add(3);
@@ -1917,7 +1927,7 @@ impl Dsv4CudaExecutor {
             &params,
             start_pos as u64,
         )?;
-        let (verify_two, _) = self.model.forward_tokens_verify(
+        let verify_two = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
             &[token_a, wrong_b],
@@ -1925,8 +1935,10 @@ impl Dsv4CudaExecutor {
             (start_pos + 1) as u64,
         )?;
         ensure!(
-            verify_two.first() == verify_one.first(),
-            "DSv4 verify selftest two-token row0 mismatch: one={verify_one:?} two={verify_two:?}"
+            verify_two.argmax.first() == verify_one.argmax.first(),
+            "DSv4 verify selftest two-token row0 mismatch: one={:?} two={:?}",
+            verify_one.argmax,
+            verify_two.argmax
         );
 
         // NOTE: no col1/bonus byte-identity gate here. The 2-token verify's col1
@@ -1946,7 +1958,8 @@ impl Dsv4CudaExecutor {
         self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
         if self.model.tp.config().rank == 0 {
             eprintln!(
-                "[dsv4-mtp-selftest] PASS token_a={token_a} token_b={token_b} wrong_b={wrong_b} verify_two={verify_two:?}"
+                "[dsv4-mtp-selftest] PASS token_a={token_a} token_b={token_b} wrong_b={wrong_b} verify_two={:?}",
+                verify_two.argmax
             );
         }
         Ok(())
