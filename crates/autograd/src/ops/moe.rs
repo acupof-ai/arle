@@ -578,6 +578,13 @@ pub(crate) fn moe_grouped_linear_backward(
             got: output_shape,
         });
     }
+    let (active_expert_indices, active_expert_map) = active_expert_map(experts_len, &routes)?;
+    let active_experts = active_expert_indices
+        .iter()
+        .map(|&expert_index| experts[expert_index])
+        .collect::<Vec<_>>();
+    let active_routes = remap_routes_to_active(&routes, &active_expert_map)?;
+    let active_len = active_experts.len();
 
     let need_input_grad = store.tensor(input)?.requires_grad;
     let need_weight_grad = experts
@@ -594,28 +601,35 @@ pub(crate) fn moe_grouped_linear_backward(
             .is_some_and(|id| store.tensor(id).is_ok_and(|t| t.requires_grad))
     });
 
-    let packed_input = pack_grouped_input(
+    let packed_input = pack_active_grouped_input(
         &input_t.data,
         &input_shape,
         input_kind,
-        &routes,
-        experts_len,
+        &active_routes,
+        &active_expert_indices,
         max_rows,
         in_dim,
     )?;
-    let packed_input_shape = vec![experts_len, max_rows, in_dim];
-    let grad_out_shape = vec![experts_len, max_rows, out_dim];
+    let packed_input_shape = vec![active_len, max_rows, in_dim];
+    let packed_grad_out = pack_active_expert_blocks(
+        &upstream.data,
+        experts_len,
+        max_rows,
+        out_dim,
+        &active_expert_indices,
+    )?;
+    let grad_out_shape = vec![active_len, max_rows, out_dim];
 
     let (grad_packed_input_base, grad_packed_weight_t) = if need_input_grad || need_weight_grad {
-        let packed_weight_t = pack_grouped_weight_t(&experts, out_dim, in_dim, store)?;
-        let packed_weight_t_shape = vec![experts_len, in_dim, out_dim];
+        let packed_weight_t = pack_grouped_weight_t(&active_experts, out_dim, in_dim, store)?;
+        let packed_weight_t_shape = vec![active_len, in_dim, out_dim];
         grouped_matmul_backward(
             store,
             &packed_input,
             &packed_input_shape,
             &packed_weight_t,
             &packed_weight_t_shape,
-            &upstream.data,
+            &packed_grad_out,
             &grad_out_shape,
             need_input_grad,
             need_weight_grad,
@@ -640,9 +654,9 @@ pub(crate) fn moe_grouped_linear_backward(
         })
         .collect();
     if let Some(grad_weight_t) = grad_packed_weight_t {
-        unpack_grouped_weight_t_grad(
+        unpack_grouped_weight_t_grad_active(
             &grad_weight_t,
-            experts_len,
+            &active_expert_indices,
             out_dim,
             in_dim,
             &mut grad_weights,
@@ -676,10 +690,10 @@ pub(crate) fn moe_grouped_linear_backward(
 
     let common_rank = common_lora_rank(&expert_shapes)?;
     if common_rank > 0 {
-        let packed_a_t = pack_grouped_lora_a_t(&experts, common_rank, in_dim, store)?;
-        let packed_a_t_shape = vec![experts_len, in_dim, common_rank];
-        let packed_b_t = pack_grouped_lora_b_t(&experts, out_dim, common_rank, store)?;
-        let packed_b_t_shape = vec![experts_len, common_rank, out_dim];
+        let packed_a_t = pack_grouped_lora_a_t(&active_experts, common_rank, in_dim, store)?;
+        let packed_a_t_shape = vec![active_len, in_dim, common_rank];
+        let packed_b_t = pack_grouped_lora_b_t(&active_experts, out_dim, common_rank, store)?;
+        let packed_b_t_shape = vec![active_len, common_rank, out_dim];
         let low = grouped_matmul_forward(
             store,
             &packed_input,
@@ -687,9 +701,9 @@ pub(crate) fn moe_grouped_linear_backward(
             &packed_a_t,
             &packed_a_t_shape,
         )?;
-        let low_shape = vec![experts_len, max_rows, common_rank];
-        let mut scaled_grad_out = upstream.data.clone();
-        for (expert_index, expert) in experts.iter().enumerate().take(experts_len) {
+        let low_shape = vec![active_len, max_rows, common_rank];
+        let mut scaled_grad_out = packed_grad_out.clone();
+        for (expert_index, expert) in active_experts.iter().enumerate().take(active_len) {
             let scale = expert.lora_scale;
             let expert_base = expert_index * max_rows * out_dim;
             for value in &mut scaled_grad_out[expert_base..expert_base + max_rows * out_dim] {
@@ -708,9 +722,9 @@ pub(crate) fn moe_grouped_linear_backward(
             need_lora_b_grad,
         )?;
         if let Some(grad_b_t) = grad_b_t {
-            unpack_grouped_lora_b_t_grad(
+            unpack_grouped_lora_b_t_grad_active(
                 &grad_b_t,
-                experts_len,
+                &active_expert_indices,
                 out_dim,
                 common_rank,
                 &mut grad_lora_b,
@@ -732,9 +746,9 @@ pub(crate) fn moe_grouped_linear_backward(
                 add_slice_in_place(dst, src);
             }
             if let Some(grad_a_t) = grad_a_t {
-                unpack_grouped_lora_a_t_grad(
+                unpack_grouped_lora_a_t_grad_active(
                     &grad_a_t,
-                    experts_len,
+                    &active_expert_indices,
                     common_rank,
                     in_dim,
                     &mut grad_lora_a,
@@ -744,12 +758,14 @@ pub(crate) fn moe_grouped_linear_backward(
     }
 
     let grad_input = match grad_packed_input {
-        Some(grad) => Some(unpack_grouped_input_grad(
+        Some(grad) => Some(unpack_active_grouped_input_grad(
             &grad,
             &input_shape,
             input_kind,
-            &routes,
+            &active_routes,
+            &active_expert_indices,
             experts_len,
+            active_len,
             max_rows,
             in_dim,
         )?),
@@ -1121,6 +1137,56 @@ fn grouped_linear_row_forward(
     }
 }
 
+fn active_expert_map(
+    experts: usize,
+    routes: &[MoeGroupedRoute],
+) -> Result<(Vec<usize>, Vec<Option<usize>>)> {
+    let mut seen = vec![false; experts];
+    for route in routes {
+        if route.expert >= experts {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: route.expert,
+                upper: experts,
+            });
+        }
+        seen[route.expert] = true;
+    }
+    let active = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(expert, is_active)| is_active.then_some(expert))
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Err(AutogradError::TapeInvariant(
+            "moe grouped linear backward requires at least one active expert",
+        ));
+    }
+    let mut map = vec![None; experts];
+    for (compact, &expert) in active.iter().enumerate() {
+        map[expert] = Some(compact);
+    }
+    Ok((active, map))
+}
+
+fn remap_routes_to_active(
+    routes: &[MoeGroupedRoute],
+    active_map: &[Option<usize>],
+) -> Result<Vec<MoeGroupedRoute>> {
+    routes
+        .iter()
+        .map(|route| {
+            let expert = active_map
+                .get(route.expert)
+                .and_then(|entry| *entry)
+                .ok_or(AutogradError::IndexOutOfBounds {
+                    index: route.expert,
+                    upper: active_map.len(),
+                })?;
+            Ok(MoeGroupedRoute { expert, ..*route })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pack_grouped_input(
     input: &[f32],
@@ -1146,6 +1212,46 @@ fn pack_grouped_input(
                     });
                 }
                 packed[dst..dst + in_dim].copy_from_slice(&input[src..src + in_dim]);
+            }
+            Ok(packed)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_active_grouped_input(
+    input: &[f32],
+    input_shape: &[usize],
+    input_kind: MoeGroupedLinearInput,
+    active_routes: &[MoeGroupedRoute],
+    active_expert_indices: &[usize],
+    max_rows: usize,
+    in_dim: usize,
+) -> Result<Vec<f32>> {
+    match input_kind {
+        MoeGroupedLinearInput::TokenRows => pack_grouped_input(
+            input,
+            input_shape,
+            input_kind,
+            active_routes,
+            active_expert_indices.len(),
+            max_rows,
+            in_dim,
+        ),
+        MoeGroupedLinearInput::Packed => {
+            let mut packed = vec![0.0_f32; active_expert_indices.len() * max_rows * in_dim];
+            for (compact, &expert) in active_expert_indices.iter().enumerate() {
+                let src = (expert * max_rows) * in_dim;
+                let dst = (compact * max_rows) * in_dim;
+                let len = max_rows * in_dim;
+                if src + len > input.len() {
+                    return Err(AutogradError::DataLengthMismatch {
+                        len: src + len,
+                        shape: input_shape.to_vec(),
+                        size: input.len(),
+                    });
+                }
+                packed[dst..dst + len].copy_from_slice(&input[src..src + len]);
             }
             Ok(packed)
         }
@@ -1186,6 +1292,84 @@ fn unpack_grouped_input_grad(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn unpack_active_grouped_input_grad(
+    grad: &[f32],
+    input_shape: &[usize],
+    input_kind: MoeGroupedLinearInput,
+    active_routes: &[MoeGroupedRoute],
+    active_expert_indices: &[usize],
+    experts: usize,
+    active_experts: usize,
+    max_rows: usize,
+    in_dim: usize,
+) -> Result<Vec<f32>> {
+    match input_kind {
+        MoeGroupedLinearInput::TokenRows => unpack_grouped_input_grad(
+            grad,
+            input_shape,
+            input_kind,
+            active_routes,
+            active_experts,
+            max_rows,
+            in_dim,
+        ),
+        MoeGroupedLinearInput::Packed => {
+            let mut out = vec![0.0_f32; input_shape.iter().product()];
+            for (compact, &expert) in active_expert_indices.iter().enumerate() {
+                if expert >= experts {
+                    return Err(AutogradError::IndexOutOfBounds {
+                        index: expert,
+                        upper: experts,
+                    });
+                }
+                let src = (compact * max_rows) * in_dim;
+                let dst = (expert * max_rows) * in_dim;
+                let len = max_rows * in_dim;
+                if src + len > grad.len() || dst + len > out.len() {
+                    return Err(AutogradError::DataLengthMismatch {
+                        len: src + len,
+                        shape: vec![active_experts, max_rows, in_dim],
+                        size: grad.len(),
+                    });
+                }
+                out[dst..dst + len].copy_from_slice(&grad[src..src + len]);
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn pack_active_expert_blocks(
+    input: &[f32],
+    experts: usize,
+    max_rows: usize,
+    dim: usize,
+    active_expert_indices: &[usize],
+) -> Result<Vec<f32>> {
+    let mut packed = vec![0.0_f32; active_expert_indices.len() * max_rows * dim];
+    for (compact, &expert) in active_expert_indices.iter().enumerate() {
+        if expert >= experts {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: expert,
+                upper: experts,
+            });
+        }
+        let src = (expert * max_rows) * dim;
+        let dst = (compact * max_rows) * dim;
+        let len = max_rows * dim;
+        if src + len > input.len() {
+            return Err(AutogradError::DataLengthMismatch {
+                len: src + len,
+                shape: vec![experts, max_rows, dim],
+                size: input.len(),
+            });
+        }
+        packed[dst..dst + len].copy_from_slice(&input[src..src + len]);
+    }
+    Ok(packed)
+}
+
 fn pack_grouped_weight_t(
     experts: &[MoeGroupedLinearExpert],
     out_dim: usize,
@@ -1204,20 +1388,20 @@ fn pack_grouped_weight_t(
     Ok(packed)
 }
 
-fn unpack_grouped_weight_t_grad(
+fn unpack_grouped_weight_t_grad_active(
     grad_t: &[f32],
-    experts: usize,
+    active_expert_indices: &[usize],
     out_dim: usize,
     in_dim: usize,
     grad_weights: &mut [Option<Vec<f32>>],
 ) {
-    for expert_index in 0..experts {
+    for (compact, &expert_index) in active_expert_indices.iter().enumerate() {
         let Some(grad_w) = grad_weights[expert_index].as_mut() else {
             continue;
         };
         for n in 0..out_dim {
             for k in 0..in_dim {
-                grad_w[n * in_dim + k] += grad_t[(expert_index * in_dim + k) * out_dim + n];
+                grad_w[n * in_dim + k] += grad_t[(compact * in_dim + k) * out_dim + n];
             }
         }
     }
@@ -1256,20 +1440,20 @@ fn pack_grouped_lora_a_t(
     Ok(packed)
 }
 
-fn unpack_grouped_lora_a_t_grad(
+fn unpack_grouped_lora_a_t_grad_active(
     grad_t: &[f32],
-    experts: usize,
+    active_expert_indices: &[usize],
     rank: usize,
     in_dim: usize,
     grad_lora_a: &mut [Option<Vec<f32>>],
 ) {
-    for expert_index in 0..experts {
+    for (compact, &expert_index) in active_expert_indices.iter().enumerate() {
         let Some(grad_a) = grad_lora_a[expert_index].as_mut() else {
             continue;
         };
         for r in 0..rank {
             for k in 0..in_dim {
-                grad_a[r * in_dim + k] += grad_t[(expert_index * in_dim + k) * rank + r];
+                grad_a[r * in_dim + k] += grad_t[(compact * in_dim + k) * rank + r];
             }
         }
     }
@@ -1296,20 +1480,20 @@ fn pack_grouped_lora_b_t(
     Ok(packed)
 }
 
-fn unpack_grouped_lora_b_t_grad(
+fn unpack_grouped_lora_b_t_grad_active(
     grad_t: &[f32],
-    experts: usize,
+    active_expert_indices: &[usize],
     out_dim: usize,
     rank: usize,
     grad_lora_b: &mut [Option<Vec<f32>>],
 ) {
-    for expert_index in 0..experts {
+    for (compact, &expert_index) in active_expert_indices.iter().enumerate() {
         let Some(grad_b) = grad_lora_b[expert_index].as_mut() else {
             continue;
         };
         for n in 0..out_dim {
             for r in 0..rank {
-                grad_b[n * rank + r] += grad_t[(expert_index * rank + r) * out_dim + n];
+                grad_b[n * rank + r] += grad_t[(compact * rank + r) * out_dim + n];
             }
         }
     }
