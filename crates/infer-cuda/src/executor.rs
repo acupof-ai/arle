@@ -5,6 +5,7 @@
 //! samples the next token (`sample_cuda_token`: greedy argmax / host sampling).
 
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use cuda_kernels::KVFormat;
@@ -56,6 +57,21 @@ fn decode_graph_enabled() -> bool {
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON") => true,
         Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF") => false,
         _ => DECODE_GRAPH_DEFAULT_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+fn cuda_startup_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ARLE_CUDA_STARTUP_PROFILE").is_some())
+}
+
+fn cuda_startup_log(phase: &str, start: Instant, extra: std::fmt::Arguments<'_>) {
+    if cuda_startup_profile_enabled() {
+        info!(
+            target: "infer_cuda::startup",
+            "cuda_startup phase=executor.{phase} elapsed_ms={:.1} {extra}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -2090,6 +2106,7 @@ impl Qwen35CudaExecutor {
         num_slots: usize,
         total_pages: usize,
     ) -> Result<Self> {
+        let total_t0 = Instant::now();
         ensure!(
             num_slots > 0,
             "Qwen35CudaExecutor requires at least one slot"
@@ -2101,23 +2118,43 @@ impl Qwen35CudaExecutor {
         // The host CudaKvPool pages the logical seq budget; size each slot's
         // contiguous full-attn cache to the same token budget.
         let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
+        let model_t0 = Instant::now();
         let model = crate::qwen35::Qwen35Model::from_safetensors(model_path.as_ref(), max_seq_len)?;
+        cuda_startup_log(
+            "qwen35_model_load",
+            model_t0,
+            format_args!(
+                "requested_slots={num_slots} total_pages={total_pages} max_seq_len={max_seq_len}"
+            ),
+        );
         // Dynamic KV mem budget (unified with DSv4 via the infer-seam kernel):
         // clamp num_slots to what post-weights free VRAM affords. Qwen3.5/3.6
         // previously admitted the requested count as-is → OOM at large
         // max_seq_len. Deterministic + NCCL min-reduced ⇒ TP-consistent.
+        let budget_t0 = Instant::now();
         let num_slots = model.kv_budget_num_slots(num_slots)?;
+        cuda_startup_log(
+            "qwen35_kv_budget",
+            budget_t0,
+            format_args!("effective_slots={num_slots}"),
+        );
+        let slots_t0 = Instant::now();
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
             slots.push(model.new_slot_state()?);
         }
+        cuda_startup_log(
+            "qwen35_slot_alloc",
+            slots_t0,
+            format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
+        );
         // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
         // not graph-capturable on this stack — TP≥2 stays eager, same as
         // dense) ∧ every layer's decode step is a pure device-kernel sequence.
         let decode_graph_armed = qwen35_decode_graph_enabled()
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
-        Ok(Self {
+        let executor = Self {
             model,
             slots,
             workspace: crate::qwen35::Qwen35Workspace::new(),
@@ -2125,7 +2162,13 @@ impl Qwen35CudaExecutor {
             decode_graph_armed,
             decode_graph: None,
             batch_decode: None,
-        })
+        };
+        cuda_startup_log(
+            "qwen35_executor_total",
+            total_t0,
+            format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
+        );
+        Ok(executor)
     }
 
     /// Boot-time decode-graph verdict log (mirrors the dense `warmup` info
@@ -2133,14 +2176,29 @@ impl Qwen35CudaExecutor {
     /// its first gated decode (after `CudaGraphState`'s universal eager warm
     /// run), so unused slots never pay capture/instantiation memory.
     pub(crate) fn warmup(&mut self) -> Result<()> {
+        let warmup_t0 = Instant::now();
+        let dense_t0 = Instant::now();
         let (warmed_shapes, warm_m) = self.model.warm_fp8_deepgemm_dense_prefill()?;
+        cuda_startup_log(
+            "qwen35_warm_dense_deepgemm",
+            dense_t0,
+            format_args!("shapes={warmed_shapes} warm_m={warm_m}"),
+        );
         if warmed_shapes > 0 {
             info!(
                 "Qwen3.5 FP8 dense DeepGEMM warmed {warmed_shapes} projection shape(s) at M={warm_m}"
             );
         }
+        let grouped_t0 = Instant::now();
         let (grouped_shapes, grouped_tokens, grouped_min_rows, grouped_max_rows) =
             self.model.warm_fp8_deepgemm_grouped_prefill()?;
+        cuda_startup_log(
+            "qwen35_warm_grouped_deepgemm",
+            grouped_t0,
+            format_args!(
+                "shapes={grouped_shapes} tokens={grouped_tokens} rows={grouped_min_rows}..{grouped_max_rows}"
+            ),
+        );
         if grouped_shapes > 0 {
             info!(
                 "Qwen3.5 FP8 grouped DeepGEMM warmed {grouped_shapes} GEMM shape(s) at tokens<={grouped_tokens} rows={grouped_min_rows}..{grouped_max_rows}"
@@ -2151,6 +2209,11 @@ impl Qwen35CudaExecutor {
                 "Qwen3.5 whole-step decode graph disabled \
                  (set ARLE_QWEN35_DECODE_GRAPH=1 to enable)"
             );
+            cuda_startup_log(
+                "qwen35_warmup_total",
+                warmup_t0,
+                format_args!("graph=disabled"),
+            );
             return Ok(());
         }
         if !self.model.tp.is_single() {
@@ -2159,10 +2222,20 @@ impl Qwen35CudaExecutor {
                  (world_size>1, NCCL collectives are not graph-capturable); \
                  using eager forward"
             );
+            cuda_startup_log(
+                "qwen35_warmup_total",
+                warmup_t0,
+                format_args!("graph=tp_disabled"),
+            );
             return Ok(());
         }
         if let Some(reason) = self.model.decode_graph_unsupported_reason() {
             info!("Qwen3.5 whole-step decode graph disabled: {reason}; using eager forward");
+            cuda_startup_log(
+                "qwen35_warmup_total",
+                warmup_t0,
+                format_args!("graph=unsupported"),
+            );
             return Ok(());
         }
         debug_assert!(self.decode_graph_armed);
@@ -2170,6 +2243,11 @@ impl Qwen35CudaExecutor {
             "Qwen3.5 whole-step decode graph ARMED ({} slots; lazy capture per slot, \
              one eager warm run before each first capture; eager fallback on any failure)",
             self.num_slots
+        );
+        cuda_startup_log(
+            "qwen35_warmup_total",
+            warmup_t0,
+            format_args!("graph=armed"),
         );
         Ok(())
     }
