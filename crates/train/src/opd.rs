@@ -2274,7 +2274,6 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             // as the A/B baseline.
             #[cfg(feature = "cuda")]
             if let Some(ctx) = infer_rollout.as_ref() {
-                let mut rollout: Vec<u32> = prompt_ids.to_vec();
                 // OPD engine time-share: the rollout student may have been
                 // offloaded to host RAM during the previous step's backward.
                 // Reload it before the LoRA sync (which re-merges resident base
@@ -2296,21 +2295,12 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                     .map_err(|err| {
                         OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
                     })?;
-                for _ in 0..cfg.rollout_len {
-                    let positions = (0..rollout.len() as u32).collect::<Vec<_>>();
-                    let next = ctx
-                        .student
-                        .decode_next_token(
-                            &rollout,
-                            &positions,
-                            rollout_sampling,
-                            rollout.len() as u64,
-                        )
-                        .map_err(|err| {
-                            OpdError::InvalidInput(format!("infer student decode failed: {err}"))
-                        })?;
-                    rollout.push(next);
-                }
+                let rollout = ctx
+                    .student
+                    .generate_rollout(prompt_ids, cfg.rollout_len, rollout_sampling)
+                    .map_err(|err| {
+                        OpdError::InvalidInput(format!("infer student rollout failed: {err}"))
+                    })?;
                 store.retain_ids(&rollout_keep_base);
                 // NB: the infer student engine is idle after the rollout, but we do
                 // NOT offload it here. Offloading mid-step (before the teacher

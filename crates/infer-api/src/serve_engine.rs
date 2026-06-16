@@ -50,6 +50,27 @@ where
         self.serve.reload_engine_weights()
     }
 
+    /// Generate token ids from an already-tokenized prompt through the serving
+    /// scheduler. This is the programmatic OPD rollout surface: unlike
+    /// `forward_token_logits`, it keeps one request alive in infer-core, so the
+    /// backend uses its normal KV-cache incremental decode path.
+    pub fn generate_token_ids(
+        &self,
+        prompt_token_ids: &[u32],
+        max_tokens: usize,
+        sampling: infer_plan::SamplingParams,
+    ) -> Result<Vec<u32>> {
+        if max_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let ticket = self
+            .serve
+            .submit(prompt_token_ids.to_vec(), max_tokens, sampling)
+            .map_err(|err| anyhow!("request submission failed: {err}"))?;
+        let completed: CompletedRequest = ticket.collect()?;
+        Ok(completed.generated_tokens)
+    }
+
     /// Shared `tokenize -> submit -> collect -> detokenize` body returning the
     /// projected [`CompletionOutput`]; both `complete` and `complete_stream`
     /// build on it.
