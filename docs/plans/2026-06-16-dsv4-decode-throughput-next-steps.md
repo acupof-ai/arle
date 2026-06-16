@@ -33,6 +33,15 @@ narrows to +5% at c=8 (other batched paths saturate). Single-sweep — the per-c
 magnitude needs ≥3 repeats before enshrining (direction/sign solid, matches the
 n=22 +38%).
 
+**MTP arm — measured prior sessions on a gcc≥10 host (NOT re-measurable on .62:
+clang-11 hangs the MTP-head JIT; box has only gcc-8.3+clang-11/7).** Not a
+same-config A/B vs the table above (different prompt/slots/base/session):
+- B=1: no-spec 44.5 → **MTP d2 chain-fold 52.8–53.3 (+20%)**, ×3 σ≈0.04
+  ([[2026-06-13-dsv4-mtp-d2-chain-fold-53]]).
+- concurrency: **batched MTP default-on @c≥4** → **76.7 @c8 (+77% vs per-row MTP)**,
+  78.7 @c12, prod ~2400-tok ([[2026-06-15-dsv4-batched-mtp-prod-shape-flip]]).
+A clean same-session MTP-vs-no-MTP c1–8 A/B needs a gcc≥10 build+serve host.
+
 **Committed levers (gated `ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):**
 - `a4239598` compressor-GEMV batch (bf16 cublasLt m=N): n=22 perrow 162→92, step
   302→237, +28% (profiling-on relative; re-confirm clean).
