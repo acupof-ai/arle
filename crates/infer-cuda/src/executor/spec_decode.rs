@@ -37,13 +37,9 @@ impl DraftChain {
     }
 
     /// The verify-forward schedule: row `i` at `start_pos + i`, attending the
-    /// committed KV + the chain prefix rows `[0, i)` (root included).
+    /// committed KV + the chain prefix rows `[0, i)` through plain causal attention.
     fn verify_schedule(&self, start_pos: usize) -> SpecVerifySchedule {
-        let n = self.tokens.len();
-        SpecVerifySchedule {
-            positions: (0..n).map(|i| start_pos + i).collect(),
-            ancestors: (0..n).map(|i| (0..i).collect()).collect(),
-        }
+        SpecVerifySchedule::chain(self.tokens.len(), start_pos)
     }
 }
 
@@ -103,19 +99,22 @@ impl Dsv4CudaExecutor {
             &sched,
         );
         crate::attention::set_dsv4_verify_frozen(false);
-        let (argmax, mut hiddens) = res?;
+        let mut verify = res?;
         ensure!(
-            argmax.len() == chain.tokens.len() && hiddens.len() == chain.tokens.len(),
-            "DSv4 MTP verify expected {} rows, got argmax={} hidden={}",
+            verify.argmax.len() == chain.tokens.len()
+                && verify.hiddens.len() == chain.tokens.len()
+                && verify.logits.seq_len == chain.tokens.len(),
+            "DSv4 MTP verify expected {} rows, got argmax={} hidden={} logits={}",
             chain.tokens.len(),
-            argmax.len(),
-            hiddens.len()
+            verify.argmax.len(),
+            verify.hiddens.len(),
+            verify.logits.seq_len
         );
 
-        // 3. Accept the longest matching prefix; the argmax at the divergence
-        //    is the free bonus token.
-        let accepted = longest_accepted_prefix(&chain.tokens, &argmax);
-        let bonus = argmax[accepted];
+        // 3. Greedy acceptance is the top-1 view of the verify logits matrix; the
+        //    argmax at the divergence is the free bonus token.
+        let accepted = longest_accepted_prefix(&chain.tokens, &verify.argmax);
+        let bonus = verify.argmax[accepted];
 
         self.mtp_accepts += accepted;
         self.mtp_rejects += chain.depth() - accepted;
@@ -127,14 +126,6 @@ impl Dsv4CudaExecutor {
                 self.mtp_accepts,
                 self.mtp_rejects
             );
-            if std::env::var("ARLE_DSV4_MTP_PROBE").as_deref() == Ok("1") {
-                eprintln!(
-                    "[dsv4-mtp-probe] pending={} target={} drafts_l1={:?}",
-                    chain.tokens[0],
-                    argmax[0],
-                    &chain.tokens[1..2.min(chain.tokens.len())]
-                );
-            }
         }
 
         // 4. Commit: truncate, restore the rejected ring tail (draft layer-0
@@ -151,9 +142,7 @@ impl Dsv4CudaExecutor {
         )?;
 
         let accepted_tokens: Vec<u32> = chain.tokens[1..=accepted].to_vec();
-        // Commit the accepted prefix by folding the persisted verify rows (the
-        // tree-attn + commit-fold lanes are both always-on, so there is no
-        // re-forward fallback here).
+        // Commit the accepted prefix by folding the persisted verify rows.
         let rows: Vec<usize> = (0..=accepted).collect();
         self.model.commit_accepted_fold(
             &mut self.slots[slot_idx],
@@ -164,7 +153,7 @@ impl Dsv4CudaExecutor {
         {
             let spec = &mut self.spec_slots[slot_idx];
             spec.pending = Some(bonus);
-            spec.hidden = Some(hiddens.swap_remove(accepted));
+            spec.hidden = Some(verify.hiddens.swap_remove(accepted));
         }
 
         let mut out = accepted_tokens;
@@ -311,7 +300,7 @@ impl Dsv4CudaExecutor {
         }
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
-        // attention per-slot tree-attn). The verify persists per-slot spec_normed
+        // attention per slot/row). The verify persists per-slot spec_normed
         // (fold is always on) so the commit avoids a per-slot re-forward — the
         // fold is what makes per-row MTP fast; re-forward commit scales with c and
         // erases the verify-batching win (errors/2026-06-15-...submode2-regression).
@@ -468,7 +457,7 @@ impl Dsv4CudaExecutor {
                     let mut prefix = Vec::with_capacity(accepted + 1);
                     prefix.push(tokens[0]);
                     prefix.extend_from_slice(&accepted_tokens);
-                    let (_, mut re_hiddens) = self.model.forward_tokens_verify(
+                    let mut verify = self.model.forward_tokens_verify(
                         &mut self.slots[slot_idx],
                         &mut self.kv_adapter,
                         &prefix,
@@ -477,7 +466,7 @@ impl Dsv4CudaExecutor {
                     )?;
                     let spec = &mut self.spec_slots[slot_idx];
                     spec.pending = Some(bonus);
-                    spec.hidden = Some(re_hiddens.remove(accepted));
+                    spec.hidden = Some(verify.hiddens.remove(accepted));
                     hiddens.clear();
                 }
 
@@ -491,13 +480,11 @@ impl Dsv4CudaExecutor {
 
     /// The draft depth for this step: the explicit `--mtp-draft-tokens` request,
     /// clamped to `[1, MAX_SPEC_DRAFT_DEPTH]`. The CLI flag is the single source
-    /// of truth — there is no env gate (the old `ARLE_DSV4_MTP_UNCLAMP` made the
-    /// flag beg permission from an env var, which is backwards). The clamp to
-    /// the snapshot ceiling keeps an over-large request safe-by-construction
+    /// of truth; the clamp to the snapshot ceiling keeps an over-large request safe-by-construction
     /// rather than overflowing the per-slot spec-ring buffers.
     fn spec_depth(&self) -> usize {
         self.spec_draft_tokens
-            .unwrap_or(1)
+            .unwrap_or(crate::dsv4::DEFAULT_SPEC_DRAFT_DEPTH)
             .clamp(1, crate::dsv4::MAX_SPEC_DRAFT_DEPTH)
     }
 
@@ -557,18 +544,13 @@ mod tests {
         assert_eq!(longest_accepted_prefix(&[10, 11], &[99, 0]), 0);
     }
 
-    /// The chain schedule: strictly increasing positions, prefix ancestors
-    /// (root included) — what the batched verify lane consumes.
+    /// The chain schedule is strictly increasing positions only.
     #[test]
-    fn chain_schedule_prefix_ancestors() {
+    fn chain_schedule_positions() {
         let chain = DraftChain {
             tokens: vec![10, 11, 12],
         };
         let sched = chain.verify_schedule(100);
         assert_eq!(sched.positions, vec![100, 101, 102]);
-        assert_eq!(sched.ancestors[0], Vec::<usize>::new());
-        assert_eq!(sched.ancestors[1], vec![0]);
-        assert_eq!(sched.ancestors[2], vec![0, 1]);
-        assert!(sched.is_chain());
     }
 }
