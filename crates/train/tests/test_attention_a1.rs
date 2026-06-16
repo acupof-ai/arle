@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use autograd::{
     Result, Tape, Tensor, TensorId, TensorStore,
     ops::{causal_sdpa_recompute, mul, sum},
+    tensor::Dirty,
 };
 
 #[test]
@@ -63,6 +64,16 @@ fn run_causal_sdpa_recompute_gradients_match_finite_difference(
     let mut tape = Tape::new();
     let loss = loss(q, k, v, probe, &mut store, &mut tape)?;
     let grads = tape.backward(loss, &mut store)?;
+    if backend_label == "cuda" {
+        for (name, id) in [("q", q), ("k", k), ("v", v)] {
+            let grad_id = grads.get(&id).copied().expect("cuda grad exists");
+            let grad = store.get(grad_id).expect("cuda grad tensor exists");
+            assert!(
+                grad.dirty != Dirty::Host && grad.device_handle.is_some(),
+                "A1 attention CUDA gradient for {name} fell back to host"
+            );
+        }
+    }
     let checked = [("q", q), ("k", k), ("v", v)];
     let analytic: HashMap<TensorId, Vec<f32>> = checked
         .iter()
