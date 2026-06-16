@@ -1,6 +1,11 @@
+use smallvec::smallvec;
+
+type AttentionGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
+
 use crate::{
     AutogradError, Result,
     ops::{add_broadcast, matmul, mul_scalar, reshape, softmax, transpose},
+    tape::{BackwardOp, GradPairs, SavedContext, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
 
@@ -78,6 +83,39 @@ pub fn causal_sdpa(
     let probs = softmax(masked, store, tape)?;
     let context = matmul(probs, v_3d, store, tape)?;
     reshape(context, &[batch, heads, seq_len, head_dim], store, tape)
+}
+
+pub fn causal_sdpa_recompute(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    let q_shape = store.tensor(q)?.shape.clone();
+    let k_shape = store.tensor(k)?.shape.clone();
+    let v_shape = store.tensor(v)?.shape.clone();
+    validate_attention_shapes(&q_shape, &k_shape, &v_shape)?;
+
+    let requires_grad = store.tensor(q)?.requires_grad
+        || store.tensor(k)?.requires_grad
+        || store.tensor(v)?.requires_grad;
+
+    let mut inner_tape = crate::Tape::new();
+    inner_tape.set_enabled(false);
+    let output_id = causal_sdpa(q, k, v, store, &mut inner_tape)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if tape.enabled && requires_grad {
+        tape.record(crate::TapeEntry {
+            op: BackwardOp::CausalSdpaRecompute,
+            output_id,
+            input_ids: smallvec![q, k, v],
+            saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v },
+        });
+    }
+
+    Ok(output_id)
 }
 
 pub fn causal_sdpa_with_q_start(
@@ -166,6 +204,180 @@ pub fn causal_sdpa_decode_gqa(
         &q_handle, &q_shape, &k_handle, &k_shape, &v_handle, &v_shape, q_start,
     )?;
     store.alloc_device_tensor(out_shape, out_handle)
+}
+
+pub(crate) fn causal_sdpa_recompute_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::CausalSdpaRecomputeCtx { q, k, v } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "causal_sdpa_recompute backward missing saved context",
+        ));
+    };
+
+    let q_tensor = store.tensor_host(q)?;
+    let k_tensor = store.tensor_host(k)?;
+    let v_tensor = store.tensor_host(v)?;
+    let upstream = store.tensor_host(output_grad_id)?;
+    validate_attention_shapes(&q_tensor.shape, &k_tensor.shape, &v_tensor.shape)?;
+    if upstream.shape != q_tensor.shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: q_tensor.shape.clone(),
+            got: upstream.shape,
+        });
+    }
+
+    let need_grad_q = store.tensor(q)?.requires_grad;
+    let need_grad_k = store.tensor(k)?.requires_grad;
+    let need_grad_v = store.tensor(v)?.requires_grad;
+    let mut grads = GradPairs::new();
+    if !need_grad_q && !need_grad_k && !need_grad_v {
+        return Ok(grads);
+    }
+
+    let (grad_q, grad_k, grad_v) = causal_sdpa_backward_host(
+        &q_tensor.data,
+        &k_tensor.data,
+        &v_tensor.data,
+        &upstream.data,
+        &q_tensor.shape,
+        need_grad_q,
+        need_grad_k,
+        need_grad_v,
+    )?;
+
+    if let Some(data) = grad_q {
+        grads.push((
+            q,
+            store.alloc(Tensor::new(data, q_tensor.shape.clone(), false)?),
+        ));
+    }
+    if let Some(data) = grad_k {
+        grads.push((
+            k,
+            store.alloc(Tensor::new(data, k_tensor.shape.clone(), false)?),
+        ));
+    }
+    if let Some(data) = grad_v {
+        grads.push((
+            v,
+            store.alloc(Tensor::new(data, v_tensor.shape.clone(), false)?),
+        ));
+    }
+
+    Ok(grads)
+}
+
+fn causal_sdpa_backward_host(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    upstream: &[f32],
+    shape: &[usize],
+    need_grad_q: bool,
+    need_grad_k: bool,
+    need_grad_v: bool,
+) -> Result<AttentionGradTriplet> {
+    if shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: shape.len(),
+        });
+    }
+    let batch = shape[0];
+    let heads = shape[1];
+    let seq_len = shape[2];
+    let head_dim = shape[3];
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut grad_q = need_grad_q.then(|| vec![0.0; q.len()]);
+    let mut grad_k = need_grad_k.then(|| vec![0.0; k.len()]);
+    let mut grad_v = need_grad_v.then(|| vec![0.0; v.len()]);
+    let mut scores = vec![0.0_f32; seq_len];
+    let mut probs = vec![0.0_f32; seq_len];
+    let mut d_probs = vec![0.0_f32; seq_len];
+
+    for b in 0..batch {
+        for h in 0..heads {
+            for row in 0..seq_len {
+                let mut max_score = f32::NEG_INFINITY;
+                for col in 0..=row {
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += q[offset4(b, h, row, d, heads, seq_len, head_dim)]
+                            * k[offset4(b, h, col, d, heads, seq_len, head_dim)];
+                    }
+                    let score = dot * scale;
+                    scores[col] = score;
+                    max_score = max_score.max(score);
+                }
+
+                let mut denom = 0.0_f32;
+                for col in 0..=row {
+                    let p = (scores[col] - max_score).exp();
+                    probs[col] = p;
+                    denom += p;
+                }
+                for prob in probs.iter_mut().take(row + 1) {
+                    *prob /= denom;
+                }
+
+                for col in 0..=row {
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += upstream[offset4(b, h, row, d, heads, seq_len, head_dim)]
+                            * v[offset4(b, h, col, d, heads, seq_len, head_dim)];
+                    }
+                    d_probs[col] = dot;
+                }
+
+                let mut softmax_dot = 0.0_f32;
+                for col in 0..=row {
+                    softmax_dot += d_probs[col] * probs[col];
+                }
+
+                for col in 0..=row {
+                    let d_score = probs[col] * (d_probs[col] - softmax_dot);
+                    if let Some(grad_v) = grad_v.as_mut() {
+                        for d in 0..head_dim {
+                            grad_v[offset4(b, h, col, d, heads, seq_len, head_dim)] += probs[col]
+                                * upstream[offset4(b, h, row, d, heads, seq_len, head_dim)];
+                        }
+                    }
+                    if let Some(grad_q) = grad_q.as_mut() {
+                        for d in 0..head_dim {
+                            grad_q[offset4(b, h, row, d, heads, seq_len, head_dim)] += scale
+                                * d_score
+                                * k[offset4(b, h, col, d, heads, seq_len, head_dim)];
+                        }
+                    }
+                    if let Some(grad_k) = grad_k.as_mut() {
+                        for d in 0..head_dim {
+                            grad_k[offset4(b, h, col, d, heads, seq_len, head_dim)] += scale
+                                * d_score
+                                * q[offset4(b, h, row, d, heads, seq_len, head_dim)];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((grad_q, grad_k, grad_v))
+}
+
+#[inline]
+fn offset4(
+    batch: usize,
+    head: usize,
+    token: usize,
+    dim: usize,
+    heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+) -> usize {
+    (((batch * heads + head) * seq_len + token) * head_dim) + dim
 }
 
 fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
