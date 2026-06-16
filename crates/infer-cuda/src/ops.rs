@@ -8,9 +8,18 @@ use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
+use std::sync::OnceLock;
 
 #[path = "ops/quant_linear.rs"]
 mod quant_linear;
+
+fn qwen_gemm_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
+            || std::env::var_os("ARLE_QWEN35_QUANT_PROFILE").is_some()
+    })
+}
 
 pub(crate) fn precompute_rope(
     ctx: &DeviceContext,
@@ -142,6 +151,19 @@ pub(crate) fn gemm_batch(
         x.seq_len,
         out.seq_len
     );
+    if qwen_gemm_profile_enabled()
+        && std::env::var("INFER_TP_RANK")
+            .map(|rank| rank == "0")
+            .unwrap_or(true)
+    {
+        eprintln!(
+            "[qwen-gemm-profile] format={} M={} N={} K={}",
+            weight.weight_format(),
+            weight.rows,
+            x.seq_len,
+            weight.cols
+        );
+    }
     if weight.weight_format.is_quantized() {
         return quant_linear::gemm_batch(ctx, weight, x, out);
     }
@@ -161,6 +183,14 @@ pub(crate) fn gemm_batch(
         .result()?;
     }
     Ok(())
+}
+
+pub(crate) fn warm_fp8_deepgemm_dense(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    seq_len: usize,
+) -> Result<bool> {
+    quant_linear::warm_fp8_deepgemm_dense(ctx, weight, seq_len)
 }
 
 pub(crate) fn gemv(
