@@ -16,6 +16,9 @@ The diff was coherent DSv4 #60 R4 work, not an alien change:
 - The batched decode path constructs the gather sink per row, skips per-row
   CSA read/select, and runs one `csa_select_official_batched` after the prepare
   loop.
+- The decode phase log now splits `compidx` into the per-row prepare body and
+  the single batched DSA read, so the next remote profile can attribute the
+  remaining #60 bottleneck without another instrumentation pass.
 - Single-row and prefill call sites pass `None`, preserving the byte-identical
   path outside the batched lane.
 - Batched DSA scratch is charged as a per-slot budget term because it scales
