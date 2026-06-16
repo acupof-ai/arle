@@ -4,6 +4,8 @@ pub mod activation;
 pub mod attention;
 #[path = "ops/broadcast.rs"]
 pub mod broadcast;
+#[path = "ops/checkpoint.rs"]
+pub mod checkpoint;
 #[path = "ops/collective.rs"]
 pub mod collective;
 #[path = "ops/elementwise.rs"]
@@ -52,6 +54,8 @@ pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
 pub(crate) use rope::rope_backward;
 pub(crate) use softmax::{log_softmax_backward, softmax_backward};
+
+pub use checkpoint::checkpoint;
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     // M5.3b.4: inner `activation::exp` dispatches on `dirty`; a Dirty::Device
