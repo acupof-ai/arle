@@ -4032,7 +4032,7 @@ fn load_linear_qkv_sharded(
     m: &Qwen35Config,
     tp: &TpConfig,
 ) -> Result<DeviceMatrix> {
-    let tensor = loader.borrow_raw_tensor(name)?;
+    let tensor = loader.load_raw_tensor(name)?;
     ensure!(
         tensor.dtype == Dtype::BF16,
         "{name}: expected BF16 fused qkv projection, got {:?}",
@@ -4045,7 +4045,7 @@ fn load_linear_qkv_sharded(
         tensor.shape
     );
     let sharded = crate::shard_slice::shard_head_blocks_column_parallel(
-        tensor.bytes(),
+        &tensor.bytes,
         tensor.shape[1],
         2,
         &linear_qkv_head_blocks(m),
@@ -4066,7 +4066,7 @@ fn load_conv1d_sharded(
     m: &Qwen35Config,
     tp: &TpConfig,
 ) -> Result<DeviceVec> {
-    let tensor = loader.borrow_raw_tensor(name)?;
+    let tensor = loader.load_raw_tensor(name)?;
     ensure!(
         tensor.dtype == Dtype::BF16,
         "{name}: expected BF16 conv1d weight, got {:?}",
@@ -4089,7 +4089,7 @@ fn load_conv1d_sharded(
         tensor.shape
     );
     let sharded = crate::shard_slice::shard_head_blocks_column_parallel(
-        tensor.bytes(),
+        &tensor.bytes,
         kernel,
         2,
         &linear_qkv_head_blocks(m),
@@ -4109,13 +4109,13 @@ fn load_v_head_vec_sharded(
     total_v_heads: usize,
     tp: &TpConfig,
 ) -> Result<DeviceVec> {
-    let tensor = loader.borrow_raw_tensor(name)?;
+    let tensor = loader.load_raw_tensor(name)?;
     ensure!(
         tensor.shape.len() == 1 && tensor.shape[0] == total_v_heads,
         "{name}: expected 1D [{total_v_heads}] per-v-head vector, got shape {:?}",
         tensor.shape
     );
-    let bf16_bytes = SafetensorLoader::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes())?;
+    let bf16_bytes = SafetensorLoader::dsv4_bytes_to_bf16(name, &tensor)?;
     let (start, len) = v_head_shard_range(name, total_v_heads, tp)?;
     DeviceVec::from_safetensors(ctx, &bf16_bytes[start * 2..(start + len) * 2])
         .map_err(|e| anyhow!("upload sharded per-v-head vec {name}: {e}"))
@@ -4131,7 +4131,7 @@ fn load_v_head_f32_sharded(
     total_v_heads: usize,
     tp: &TpConfig,
 ) -> Result<CudaSlice<f32>> {
-    let tensor = loader.borrow_raw_tensor(name)?;
+    let tensor = loader.load_raw_tensor(name)?;
     ensure!(
         tensor.shape.len() == 1 && tensor.shape[0] == total_v_heads,
         "{name}: expected 1D [{total_v_heads}] per-v-head tensor, got shape {:?}",
@@ -4139,12 +4139,12 @@ fn load_v_head_f32_sharded(
     );
     let host: Vec<f32> = match tensor.dtype {
         Dtype::F32 => tensor
-            .bytes()
+            .bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         Dtype::BF16 => tensor
-            .bytes()
+            .bytes
             .chunks_exact(2)
             .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
