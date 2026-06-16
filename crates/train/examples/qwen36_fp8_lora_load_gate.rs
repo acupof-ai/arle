@@ -70,10 +70,12 @@ mod app {
         let base_params = all_params.len().saturating_sub(trainable_params.len());
         let adapter_count = student.adapter_name_map().len();
         let cfg = student.config();
+        let live_host_mib = store.live_host_bytes() as f64 / (1024.0 * 1024.0);
 
         println!(
             "qwen36_fp8_lora_load_gate_result load_seconds={load_seconds:.6} \
              total_vram_mib={:.1} used_delta_mib={:.1} free_before_mib={:.1} free_after_mib={:.1} \
+             live_host_mib={live_host_mib:.1} \
              hidden={} layers={} vocab={} experts={} topk={} moe_intermediate={} shared_intermediate={} \
              all_param_tensors={} frozen_param_tensors={} trainable_param_tensors={} trainable_elements={} adapters={}",
             total as f64 / (1024.0 * 1024.0),
