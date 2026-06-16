@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Instant};
 
 use autograd::{
-    ops::{causal_sdpa_recompute, mul, sum},
     Backend, Result, Tape, Tensor, TensorStore,
+    ops::{causal_sdpa_recompute, mul, sum},
 };
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
