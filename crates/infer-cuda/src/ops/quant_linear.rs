@@ -1,8 +1,129 @@
 use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::ffi;
+use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use cuda_kernels::tensor::WeightFormat;
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cuda_kernels::tensor::{WeightFormat, cache_ptr};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
+use half::bf16;
+use std::cell::RefCell;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 1024;
+
+#[derive(Default)]
+struct QwenFp8DenseScratch {
+    input_fp8: Option<CudaSlice<u8>>,
+    input_fp8_capacity: usize,
+    input_scales: Option<CudaSlice<f32>>,
+    input_scales_capacity: usize,
+    active_experts: Option<CudaSlice<i32>>,
+    active_offsets: Option<CudaSlice<i32>>,
+    active_counts: Option<CudaSlice<i32>>,
+}
+
+thread_local! {
+    static QWEN_FP8_DENSE_SCRATCH: RefCell<QwenFp8DenseScratch> =
+        RefCell::new(QwenFp8DenseScratch::default());
+}
+
+impl QwenFp8DenseScratch {
+    fn ensure(&mut self, ctx: &DeviceContext, input_len: usize, scale_len: usize) -> Result<()> {
+        if self.input_fp8_capacity < input_len {
+            self.input_fp8 = Some(
+                ctx.stream
+                    .alloc_zeros::<u8>(input_len)
+                    .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM input alloc failed: {e}"))?,
+            );
+            self.input_fp8_capacity = input_len;
+        }
+        if self.input_scales_capacity < scale_len {
+            self.input_scales = Some(
+                ctx.stream
+                    .alloc_zeros::<f32>(scale_len)
+                    .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM scale alloc failed: {e}"))?,
+            );
+            self.input_scales_capacity = scale_len;
+        }
+        if self.active_experts.is_none() {
+            self.active_experts =
+                Some(ctx.stream.clone_htod(&[0i32]).map_err(|e| {
+                    anyhow!("Qwen FP8 dense DeepGEMM active_experts H2D failed: {e}")
+                })?);
+        }
+        if self.active_offsets.is_none() {
+            self.active_offsets =
+                Some(ctx.stream.clone_htod(&[0i32]).map_err(|e| {
+                    anyhow!("Qwen FP8 dense DeepGEMM active_offsets H2D failed: {e}")
+                })?);
+        }
+        if self.active_counts.is_none() {
+            self.active_counts =
+                Some(ctx.stream.clone_htod(&[0i32]).map_err(|e| {
+                    anyhow!("Qwen FP8 dense DeepGEMM active_counts H2D failed: {e}")
+                })?);
+        }
+        Ok(())
+    }
+}
+
+fn qwen_quant_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
+            || std::env::var_os("ARLE_QWEN35_QUANT_PROFILE").is_some()
+    })
+}
+
+fn qwen_fp8_deepgemm_dense_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if matches!(
+            std::env::var("ARLE_QWEN35_DEEPGEMM").as_deref(),
+            Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
+        ) {
+            return false;
+        }
+        match cuda_moe::dsv4_deepgemm_native_preflight() {
+            Ok(_) => true,
+            Err(err) => {
+                log::warn!("Qwen FP8 dense DeepGEMM disabled: native bridge unavailable ({err})");
+                false
+            }
+        }
+    })
+}
+
+fn qwen_quant_profile<T>(
+    ctx: &DeviceContext,
+    label: &'static str,
+    seq_len: usize,
+    rows: usize,
+    cols: usize,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !qwen_quant_profile_enabled() {
+        return f();
+    }
+    let start = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    let stop = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    start.record(&ctx.stream)?;
+    let host_t0 = Instant::now();
+    let result = f();
+    let host_ms = host_t0.elapsed().as_secs_f64() * 1000.0;
+    stop.record(&ctx.stream)?;
+    stop.synchronize()?;
+    let cuda_ms = start.elapsed_ms(&stop)? as f64;
+    if std::env::var("INFER_TP_RANK")
+        .map(|rank| rank == "0")
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "[qwen-quant-profile] {label} seq={seq_len} rows={rows} cols={cols} cuda_ms={cuda_ms:.3} host_ms={host_ms:.3}"
+        );
+    }
+    result
+}
 
 fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
     match weight.weight_format {
@@ -40,12 +161,168 @@ fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
     }
 }
 
+fn fp8_deepgemm_dense_shape(weight: &DeviceMatrix, seq_len: usize) -> bool {
+    weight.weight_format == WeightFormat::Fp8BlockScaled
+        && seq_len >= QWEN_FP8_DEEPGEMM_DENSE_MIN_M
+        && weight.quant_block_m == 128
+        && weight.quant_block_k == 128
+        && weight.rows.is_multiple_of(8)
+        && weight.cols.is_multiple_of(128)
+        && qwen_fp8_deepgemm_dense_enabled()
+}
+
+pub(super) fn warm_fp8_deepgemm_dense(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    seq_len: usize,
+) -> Result<bool> {
+    if !fp8_deepgemm_dense_shape(weight, seq_len) {
+        return Ok(false);
+    }
+    let qw = weight
+        .qweight_u8
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?;
+    let scales = weight
+        .scale_f32
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp8_block_scaled missing scale_f32"))?;
+    let m = seq_len;
+    let n = weight.rows;
+    let k = weight.cols;
+    let scale_stride_m = m.div_ceil(4) * 4;
+    let scale_cols = k.div_ceil(128);
+    let input_fp8 = ctx
+        .stream
+        .alloc_zeros::<u8>(m * k)
+        .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM warm input alloc failed: {e}"))?;
+    let input_scales = ctx
+        .stream
+        .alloc_zeros::<f32>(scale_stride_m * scale_cols)
+        .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM warm scale alloc failed: {e}"))?;
+    let out = ctx
+        .stream
+        .alloc_zeros::<bf16>(m * n)
+        .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM warm output alloc failed: {e}"))?;
+    qwen_quant_profile(ctx, "qwen/fp8/dense_deepgemm_warm", m, n, k, || unsafe {
+        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+            cache_ptr(&input_fp8, ctx),
+            cache_ptr(&input_scales, ctx),
+            cache_ptr(qw, ctx),
+            cache_ptr(scales, ctx),
+            cache_ptr(&out, ctx),
+            m,
+            n,
+            k,
+            scale_stride_m,
+            ctx.stream.cu_stream(),
+        )
+    })?;
+    Ok(true)
+}
+
+fn try_fp8_deepgemm_dense_batch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    if !fp8_deepgemm_dense_shape(weight, x.seq_len) {
+        return Ok(false);
+    }
+    let qw = weight
+        .qweight_u8
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?;
+    let scales = weight
+        .scale_f32
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp8_block_scaled missing scale_f32"))?;
+    let m = x.seq_len;
+    let n = weight.rows;
+    let k = weight.cols;
+    let scale_stride_m = m.div_ceil(4) * 4;
+    let scale_cols = k.div_ceil(128);
+    QWEN_FP8_DENSE_SCRATCH.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        scratch.ensure(ctx, m * k, scale_stride_m * scale_cols)?;
+        {
+            let active_counts = scratch
+                .active_counts
+                .as_mut()
+                .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_counts missing"))?;
+            ctx.stream
+                .memcpy_htod(&[i32::try_from(m)?], active_counts)
+                .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM active_counts H2D failed: {e}"))?;
+        }
+        let input_fp8 = scratch
+            .input_fp8
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM input scratch missing"))?;
+        let input_scales = scratch
+            .input_scales
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM scale scratch missing"))?;
+        let active_experts = scratch
+            .active_experts
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_experts missing"))?;
+        let active_offsets = scratch
+            .active_offsets
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_offsets missing"))?;
+        let active_counts = scratch
+            .active_counts
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_counts missing"))?;
+
+        qwen_quant_profile(ctx, "qwen/fp8/dense_pack_quantize", m, n, k, || unsafe {
+            cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                cache_ptr(&x.data, ctx),
+                cache_ptr(input_fp8, ctx),
+                cache_ptr(input_scales, ctx),
+                cache_ptr(active_experts, ctx),
+                cache_ptr(active_offsets, ctx),
+                cache_ptr(active_counts, ctx),
+                1,
+                m,
+                k,
+                scale_stride_m,
+                ctx.stream.cu_stream(),
+            )
+        })?;
+        qwen_quant_profile(ctx, "qwen/fp8/dense_deepgemm", m, n, k, || unsafe {
+            cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
+                cache_ptr(input_fp8, ctx),
+                cache_ptr(input_scales, ctx),
+                cache_ptr(qw, ctx),
+                cache_ptr(scales, ctx),
+                cache_ptr(&out.data, ctx),
+                m,
+                n,
+                k,
+                scale_stride_m,
+                ctx.stream.cu_stream(),
+            )
+        })
+    })?;
+    Ok(true)
+}
+
 pub(super) fn gemm_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    if matches!(
+        weight.weight_format,
+        WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
+    ) && try_fp8_deepgemm_dense_batch(ctx, weight, x, out)?
+    {
+        return Ok(());
+    }
+
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
@@ -104,21 +381,30 @@ pub(super) fn gemm_batch(
                 let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
                 let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
                 let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                ffi::gemv_fp8_block_scaled_batch_cuda(
-                    qw_ptr as *const u8,
-                    scales_ptr as *const f32,
-                    x_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    x.seq_len as i32,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    scale_rows,
-                    scale_cols,
-                    block_m,
-                    block_k,
-                    stream,
-                )
-                .result()?;
+                qwen_quant_profile(
+                    ctx,
+                    "qwen/fp8/gemv_batch",
+                    x.seq_len,
+                    weight.rows,
+                    weight.cols,
+                    || {
+                        Ok(ffi::gemv_fp8_block_scaled_batch_cuda(
+                            qw_ptr as *const u8,
+                            scales_ptr as *const f32,
+                            x_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            x.seq_len as i32,
+                            weight.rows as i32,
+                            weight.cols as i32,
+                            scale_rows,
+                            scale_cols,
+                            block_m,
+                            block_k,
+                            stream,
+                        )
+                        .result()?)
+                    },
+                )?;
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(

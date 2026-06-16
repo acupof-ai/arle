@@ -291,8 +291,11 @@ mod gpu {
     use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
     use cuda_kernels::tensor::WeightFormat;
     use cuda_kernels::tensor::cache_ptr;
+    use cudarc::driver::sys::CUevent_flags;
     use half::bf16;
     use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
+    use std::sync::OnceLock;
+    use std::time::Instant;
 
     use super::{
         DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
@@ -309,6 +312,42 @@ mod gpu {
     /// band. The masked layout is host-shape-fixed (`[G, 128, K]` regardless
     /// of routing), which also makes it the CUDA-graph-safe variant.
     const DEEPGEMM_MASKED_BAND: usize = 128;
+
+    fn qwen_moe_profile_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("ARLE_QWEN35_MOE_PROFILE").is_some())
+    }
+
+    fn qwen_moe_profile<T>(
+        ctx: &DeviceContext,
+        label: &'static str,
+        rows: usize,
+        n: usize,
+        k: usize,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !qwen_moe_profile_enabled() {
+            return f();
+        }
+        let start = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+        let stop = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+        start.record(&ctx.stream)?;
+        let host_t0 = Instant::now();
+        let result = f();
+        let host_ms = host_t0.elapsed().as_secs_f64() * 1000.0;
+        stop.record(&ctx.stream)?;
+        stop.synchronize()?;
+        let cuda_ms = start.elapsed_ms(&stop)? as f64;
+        if std::env::var("INFER_TP_RANK")
+            .map(|rank| rank == "0")
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "[qwen-moe-profile] {label} rows={rows} n={n} k={k} cuda_ms={cuda_ms:.3} host_ms={host_ms:.3}"
+            );
+        }
+        result
+    }
 
     /// Persistent device scratch for [`moe_forward_into`] — one slot per
     /// per-call buffer the old path allocated fresh (~10 device allocations per
@@ -1197,16 +1236,23 @@ mod gpu {
                 cache_ptr(scratch.dg_aligned_offsets.get(ctx, local_experts)?, ctx);
             let scan_total = cache_ptr(scratch.scan_total.get(ctx, 1)?, ctx);
             // SAFETY: counts/offsets/total valid on ctx.stream for E_l groups.
-            unsafe {
-                moe::moe_exclusive_scan_aligned_i32(
-                    counts,
-                    aligned_offsets,
-                    scan_total,
-                    local_experts,
-                    DEEPGEMM_CONTIG_ALIGN,
-                    stream,
-                )?;
-            }
+            qwen_moe_profile(
+                ctx,
+                "qwen/dg/scan_offsets",
+                rows,
+                local_experts,
+                0,
+                || unsafe {
+                    moe::moe_exclusive_scan_aligned_i32(
+                        counts,
+                        aligned_offsets,
+                        scan_total,
+                        local_experts,
+                        DEEPGEMM_CONTIG_ALIGN,
+                        stream,
+                    )
+                },
+            )?;
             aligned_offsets
         };
         let cursors = cache_ptr(scratch.cursors.get_zeroed(ctx, local_experts)?, ctx);
@@ -1217,24 +1263,31 @@ mod gpu {
         // row at offsets[local] + cursor < rows (masked: count_g <= R <= 128
         // = band capacity by the dispatch threshold; contiguous: aligned
         // offsets + counts <= the rows cap by construction).
-        unsafe {
-            moe::dsv4_pack_local_experts_with_slots(
-                cache_ptr(&normed.data, ctx),
-                route_indices,
-                route_weights,
-                offsets_ptr,
-                cursors,
-                packed_hidden,
-                packed_route_slot,
-                packed_weight,
-                num_tokens,
-                hidden_dim,
-                topk,
-                split.local_expert_start,
-                local_experts,
-                stream,
-            )?;
-        }
+        qwen_moe_profile(
+            ctx,
+            "qwen/dg/pack_slots",
+            rows,
+            hidden_dim,
+            topk,
+            || unsafe {
+                moe::dsv4_pack_local_experts_with_slots(
+                    cache_ptr(&normed.data, ctx),
+                    route_indices,
+                    route_weights,
+                    offsets_ptr,
+                    cursors,
+                    packed_hidden,
+                    packed_route_slot,
+                    packed_weight,
+                    num_tokens,
+                    hidden_dim,
+                    topk,
+                    split.local_expert_start,
+                    local_experts,
+                    stream,
+                )
+            },
+        )?;
 
         // Contiguous only: row → local-expert map (-1 pads, refilled every
         // call for the same sentinel reason as packed_route_slot).
@@ -1243,20 +1296,37 @@ mod gpu {
         } else {
             let m_indices = cache_ptr(scratch.dg_m_indices.neg1_filled(ctx, rows)?, ctx);
             // SAFETY: counts/offsets are per-group; m_indices has `rows` slots.
-            unsafe {
-                moe::dsv4_fill_m_indices_from_counts(
-                    counts,
-                    offsets_ptr,
-                    m_indices,
-                    local_experts,
-                    rows,
-                    stream,
-                )?;
-            }
+            qwen_moe_profile(
+                ctx,
+                "qwen/dg/fill_m_indices",
+                rows,
+                local_experts,
+                0,
+                || unsafe {
+                    moe::dsv4_fill_m_indices_from_counts(
+                        counts,
+                        offsets_ptr,
+                        m_indices,
+                        local_experts,
+                        rows,
+                        stream,
+                    )
+                },
+            )?;
             Some(m_indices)
         };
 
         if let Some((w13, down_g)) = fp8_grouped {
+            if qwen_moe_profile_enabled()
+                && std::env::var("INFER_TP_RANK")
+                    .map(|rank| rank == "0")
+                    .unwrap_or(true)
+            {
+                eprintln!(
+                    "[qwen-moe-profile] qwen/fp8/shape tokens={num_tokens} topk={topk} routes={total_routes} rows={rows} experts={local_experts} hidden={hidden_dim} intermediate={} masked={use_masked}",
+                    w13.rows / 2
+                );
+            }
             ensure!(
                 !use_masked,
                 "Qwen FP8 DeepGEMM MoE is prefill-only and requires contiguous layout"
@@ -1282,64 +1352,98 @@ mod gpu {
                 .map_err(|_| anyhow::anyhow!("FP8 DeepGEMM MoE rows overflow i32"))?;
             let active_counts = scratch.dg_active_counts.upload(ctx, &[rows_i32])?;
             let stream = ctx.stream.cu_stream();
-            unsafe {
-                moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-                    packed_hidden,
-                    cache_ptr(input_fp8, ctx),
-                    cache_ptr(input_scales, ctx),
-                    cache_ptr(active_experts, ctx),
-                    cache_ptr(active_offsets, ctx),
-                    cache_ptr(active_counts, ctx),
-                    1,
-                    rows,
-                    hidden_dim,
-                    scale_stride_m,
-                    stream,
-                )?;
-                moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
-                    cache_ptr(input_fp8, ctx),
-                    cache_ptr(input_scales, ctx),
-                    cache_ptr(&w13.weight, ctx),
-                    cache_ptr(&w13.scales, ctx),
-                    cache_ptr(&w13_out.data, ctx),
-                    m_indices,
-                    local_experts,
-                    rows,
-                    2 * moe_inter,
-                    hidden_dim,
-                    scale_stride_m,
-                    DEEPGEMM_CONTIG_ALIGN,
-                    stream,
-                )?;
-                moe::dsv4_deepgemm_swiglu_quantize_w13(
-                    cache_ptr(&w13_out.data, ctx),
-                    cache_ptr(act_fp8, ctx),
-                    cache_ptr(act_scales, ctx),
-                    cache_ptr(active_experts, ctx),
-                    cache_ptr(active_counts, ctx),
-                    1,
-                    rows,
-                    moe_inter,
-                    scale_stride_m,
-                    f32::INFINITY,
-                    stream,
-                )?;
-                moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
-                    cache_ptr(act_fp8, ctx),
-                    cache_ptr(act_scales, ctx),
-                    cache_ptr(&down_g.weight, ctx),
-                    cache_ptr(&down_g.scales, ctx),
-                    cache_ptr(&expert_out.data, ctx),
-                    m_indices,
-                    local_experts,
-                    rows,
-                    hidden_dim,
-                    moe_inter,
-                    scale_stride_m,
-                    DEEPGEMM_CONTIG_ALIGN,
-                    stream,
-                )?;
-            }
+            qwen_moe_profile(
+                ctx,
+                "qwen/fp8/pack_quantize_hidden",
+                rows,
+                hidden_dim,
+                0,
+                || unsafe {
+                    moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
+                        packed_hidden,
+                        cache_ptr(input_fp8, ctx),
+                        cache_ptr(input_scales, ctx),
+                        cache_ptr(active_experts, ctx),
+                        cache_ptr(active_offsets, ctx),
+                        cache_ptr(active_counts, ctx),
+                        1,
+                        rows,
+                        hidden_dim,
+                        scale_stride_m,
+                        stream,
+                    )
+                },
+            )?;
+            qwen_moe_profile(
+                ctx,
+                "qwen/fp8/gemm_w13",
+                rows,
+                2 * moe_inter,
+                hidden_dim,
+                || unsafe {
+                    moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                        cache_ptr(input_fp8, ctx),
+                        cache_ptr(input_scales, ctx),
+                        cache_ptr(&w13.weight, ctx),
+                        cache_ptr(&w13.scales, ctx),
+                        cache_ptr(&w13_out.data, ctx),
+                        m_indices,
+                        local_experts,
+                        rows,
+                        2 * moe_inter,
+                        hidden_dim,
+                        scale_stride_m,
+                        DEEPGEMM_CONTIG_ALIGN,
+                        stream,
+                    )
+                },
+            )?;
+            qwen_moe_profile(
+                ctx,
+                "qwen/fp8/swiglu_quantize",
+                rows,
+                moe_inter,
+                0,
+                || unsafe {
+                    moe::dsv4_deepgemm_swiglu_quantize_w13(
+                        cache_ptr(&w13_out.data, ctx),
+                        cache_ptr(act_fp8, ctx),
+                        cache_ptr(act_scales, ctx),
+                        cache_ptr(active_experts, ctx),
+                        cache_ptr(active_counts, ctx),
+                        1,
+                        rows,
+                        moe_inter,
+                        scale_stride_m,
+                        f32::INFINITY,
+                        stream,
+                    )
+                },
+            )?;
+            qwen_moe_profile(
+                ctx,
+                "qwen/fp8/gemm_down",
+                rows,
+                hidden_dim,
+                moe_inter,
+                || unsafe {
+                    moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                        cache_ptr(act_fp8, ctx),
+                        cache_ptr(act_scales, ctx),
+                        cache_ptr(&down_g.weight, ctx),
+                        cache_ptr(&down_g.scales, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        m_indices,
+                        local_experts,
+                        rows,
+                        hidden_dim,
+                        moe_inter,
+                        scale_stride_m,
+                        DEEPGEMM_CONTIG_ALIGN,
+                        stream,
+                    )
+                },
+            )?;
 
             let route_out = if split.ep_size == 1 {
                 scratch.route_out.get(ctx, hidden_dim, total_routes)?
@@ -1348,25 +1452,32 @@ mod gpu {
                     .route_out
                     .get_zeroed(ctx, hidden_dim, total_routes)?
             };
-            unsafe {
-                moe::dsv4_scatter_all_route_slots(
-                    cache_ptr(&expert_out.data, ctx),
-                    cache_ptr(&route_out.data, ctx),
-                    packed_route_slot,
-                    packed_weight,
-                    rows,
-                    hidden_dim,
-                    stream,
-                )?;
-                moe::dsv4_combine_route_slot_outputs(
-                    cache_ptr(&route_out.data, ctx),
-                    cache_ptr(&out.data, ctx),
-                    num_tokens,
-                    topk,
-                    hidden_dim,
-                    stream,
-                )?;
-            }
+            qwen_moe_profile(
+                ctx,
+                "qwen/fp8/scatter_combine",
+                rows,
+                hidden_dim,
+                topk,
+                || unsafe {
+                    moe::dsv4_scatter_all_route_slots(
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&route_out.data, ctx),
+                        packed_route_slot,
+                        packed_weight,
+                        rows,
+                        hidden_dim,
+                        stream,
+                    )?;
+                    moe::dsv4_combine_route_slot_outputs(
+                        cache_ptr(&route_out.data, ctx),
+                        cache_ptr(&out.data, ctx),
+                        num_tokens,
+                        topk,
+                        hidden_dim,
+                        stream,
+                    )
+                },
+            )?;
             return Ok(());
         }
 
@@ -1383,8 +1494,11 @@ mod gpu {
         // SAFETY: A `[rows, H]`, B `[G, I, H]`, D `[rows, I]` row-major BF16
         // on ctx.stream; masked_m = counts (read-only); m_indices contract
         // holds by the aligned scan (group segments start 128-aligned).
-        unsafe {
-            for (grouped_b, d) in [(gate_g, &*gate_out), (up_g, &*up_out)] {
+        for (label, grouped_b, d) in [
+            ("qwen/bf16/gemm_gate", gate_g, &*gate_out),
+            ("qwen/bf16/gemm_up", up_g, &*up_out),
+        ] {
+            qwen_moe_profile(ctx, label, rows, moe_inter, hidden_dim, || unsafe {
                 if use_masked {
                     moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
                         packed_hidden,
@@ -1397,7 +1511,7 @@ mod gpu {
                         hidden_dim,
                         expected_m,
                         stream,
-                    )?;
+                    )
                 } else {
                     moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
                         packed_hidden,
@@ -1409,46 +1523,55 @@ mod gpu {
                         moe_inter,
                         hidden_dim,
                         stream,
-                    )?;
+                    )
                 }
-            }
+            })?;
         }
         // SwiGLU over the full padded buffers (UNCLAMPED — Qwen3.6 has no
         // clamp); pad-row products land in `act` pad rows, which the down
         // GEMM tiles cover only as further pad rows the scatter skips.
         let act = scratch.act.get(ctx, moe_inter, rows)?;
-        silu_mul(ctx, gate_out, up_out, act)?;
+        qwen_moe_profile(ctx, "qwen/bf16/silu_mul", rows, moe_inter, 0, || {
+            silu_mul(ctx, gate_out, up_out, act)
+        })?;
         let expert_out = scratch.expert_out.get(ctx, hidden_dim, rows)?;
         // SAFETY: A `[rows, I]`, B `[G, H, I]`, D `[rows, H]`; same contracts
         // as the gate/up GEMMs above.
-        unsafe {
-            if use_masked {
-                moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
-                    cache_ptr(&act.data, ctx),
-                    cache_ptr(&down_g.data, ctx),
-                    cache_ptr(&expert_out.data, ctx),
-                    counts,
-                    local_experts,
-                    DEEPGEMM_MASKED_BAND,
-                    hidden_dim,
-                    moe_inter,
-                    expected_m,
-                    stream,
-                )?;
-            } else {
-                moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
-                    cache_ptr(&act.data, ctx),
-                    cache_ptr(&down_g.data, ctx),
-                    cache_ptr(&expert_out.data, ctx),
-                    m_indices.expect("contiguous path fills m_indices"),
-                    local_experts,
-                    rows,
-                    hidden_dim,
-                    moe_inter,
-                    stream,
-                )?;
-            }
-        }
+        qwen_moe_profile(
+            ctx,
+            "qwen/bf16/gemm_down",
+            rows,
+            hidden_dim,
+            moe_inter,
+            || unsafe {
+                if use_masked {
+                    moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
+                        cache_ptr(&act.data, ctx),
+                        cache_ptr(&down_g.data, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        counts,
+                        local_experts,
+                        DEEPGEMM_MASKED_BAND,
+                        hidden_dim,
+                        moe_inter,
+                        expected_m,
+                        stream,
+                    )
+                } else {
+                    moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                        cache_ptr(&act.data, ctx),
+                        cache_ptr(&down_g.data, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        m_indices.expect("contiguous path fills m_indices"),
+                        local_experts,
+                        rows,
+                        hidden_dim,
+                        moe_inter,
+                        stream,
+                    )
+                }
+            },
+        )?;
 
         // ── 8 (DG). Scatter weighted expert rows to route slots, combine. ───
         // The scatter walks ALL `rows` padded rows and skips route_slot < 0,
@@ -1464,25 +1587,32 @@ mod gpu {
                 .get_zeroed(ctx, hidden_dim, total_routes)?
         };
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
-        unsafe {
-            moe::dsv4_scatter_all_route_slots(
-                cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&route_out.data, ctx),
-                packed_route_slot,
-                packed_weight,
-                rows,
-                hidden_dim,
-                stream,
-            )?;
-            moe::dsv4_combine_route_slot_outputs(
-                cache_ptr(&route_out.data, ctx),
-                cache_ptr(&out.data, ctx),
-                num_tokens,
-                topk,
-                hidden_dim,
-                stream,
-            )?;
-        }
+        qwen_moe_profile(
+            ctx,
+            "qwen/bf16/scatter_combine",
+            rows,
+            hidden_dim,
+            topk,
+            || unsafe {
+                moe::dsv4_scatter_all_route_slots(
+                    cache_ptr(&expert_out.data, ctx),
+                    cache_ptr(&route_out.data, ctx),
+                    packed_route_slot,
+                    packed_weight,
+                    rows,
+                    hidden_dim,
+                    stream,
+                )?;
+                moe::dsv4_combine_route_slot_outputs(
+                    cache_ptr(&route_out.data, ctx),
+                    cache_ptr(&out.data, ctx),
+                    num_tokens,
+                    topk,
+                    hidden_dim,
+                    stream,
+                )
+            },
+        )?;
         Ok(())
     }
 

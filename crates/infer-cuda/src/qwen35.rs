@@ -25,14 +25,16 @@
 //! points for FP8 (`dsv4_fp8_grouped_gemm`) / 4-bit (Qwen3.6-4bit q4k) are inside
 //! [`crate::moe::moe_forward`]'s two `moe_bf16_grouped_gemm_*` calls — a follow-up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::{HostMatrixSnapshot, offload_raw_slice, reload_raw_slice};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
 use half::bf16;
 use infer_plan::SamplingParams;
 use infer_topo::TpConfig;
@@ -43,10 +45,56 @@ use crate::executor::sample_cuda_token_scratched;
 use crate::loader::SafetensorLoader;
 use crate::moe::{MoeForwardScratch, moe_forward_into};
 use crate::moe_config::ExpertSplit;
-use crate::ops::{add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul};
+use crate::ops::{
+    add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul,
+    warm_fp8_deepgemm_dense,
+};
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
+
+fn qwen35_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("ARLE_QWEN35_PROFILE").is_some()
+            || std::env::var_os("ARLE_QWEN35_MOE_PROFILE").is_some()
+    })
+}
+
+fn qwen35_profile<T>(
+    ctx: &DeviceContext,
+    label: &'static str,
+    layer_idx: Option<usize>,
+    seq_len: usize,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !qwen35_profile_enabled() {
+        return f();
+    }
+    let start = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    let stop = ctx.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    start.record(&ctx.stream)?;
+    let host_t0 = Instant::now();
+    let result = f();
+    let host_ms = host_t0.elapsed().as_secs_f64() * 1000.0;
+    stop.record(&ctx.stream)?;
+    stop.synchronize()?;
+    let cuda_ms = start.elapsed_ms(&stop)? as f64;
+    if std::env::var("INFER_TP_RANK")
+        .map(|rank| rank == "0")
+        .unwrap_or(true)
+    {
+        match layer_idx {
+            Some(layer_idx) => eprintln!(
+                "[qwen-layer-profile] {label} layer={layer_idx} seq={seq_len} cuda_ms={cuda_ms:.3} host_ms={host_ms:.3}"
+            ),
+            None => eprintln!(
+                "[qwen-layer-profile] {label} layer=na seq={seq_len} cuda_ms={cuda_ms:.3} host_ms={host_ms:.3}"
+            ),
+        }
+    }
+    result
+}
 
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
@@ -793,6 +841,65 @@ impl Qwen35Model {
             self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim,
             self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1),
         )
+    }
+
+    /// Warm the Qwen FP8 dense DeepGEMM JIT for the CUDA default prefill chunk.
+    ///
+    /// The routed-expert port already uses DSv4's grouped path. The SLO 4096/256
+    /// regression was the divergent dense-projection lane: first request paid
+    /// one DeepGEMM JIT compile per `(M,N,K)` dense FP8 projection shape. Warming
+    /// unique `(rows, cols)` at `M=2048` mirrors the scheduler's CUDA Qwen chunk
+    /// floor and keeps the compile cost out of request TTFT without mutating KV
+    /// or recurrent state.
+    pub(crate) fn warm_fp8_deepgemm_dense_prefill(&self) -> Result<(usize, usize)> {
+        let warm_m = self.max_seq_len.min(2048);
+        if warm_m < 1024 {
+            return Ok((0, warm_m));
+        }
+        let mut seen = HashSet::new();
+        let mut warmed = 0usize;
+        let mut warm = |weight: &DeviceMatrix| -> Result<()> {
+            if seen.insert((weight.rows, weight.cols))
+                && warm_fp8_deepgemm_dense(&self.ctx, weight, warm_m)?
+            {
+                warmed += 1;
+            }
+            Ok(())
+        };
+
+        for layer in &self.layers {
+            match &layer.attn {
+                Qwen35Attn::Full(full) => {
+                    warm(&full.q_proj)?;
+                    warm(&full.k_proj)?;
+                    warm(&full.v_proj)?;
+                    warm(&full.o_proj)?;
+                }
+                Qwen35Attn::Linear(linear) => {
+                    warm(&linear.in_proj_qkv)?;
+                    warm(&linear.in_proj_z)?;
+                    warm(&linear.in_proj_b)?;
+                    warm(&linear.in_proj_a)?;
+                    warm(&linear.out_proj)?;
+                }
+            }
+            if let Some(mlp) = &layer.mlp {
+                warm(&mlp.gate_proj)?;
+                warm(&mlp.up_proj)?;
+                warm(&mlp.down_proj)?;
+            }
+            if let Some(moe) = &layer.moe {
+                warm(&moe.router_gate)?;
+                warm(&moe.shared_gate)?;
+                warm(&moe.shared_up)?;
+                warm(&moe.shared_down)?;
+                warm(&moe.shared_gate_router)?;
+            }
+        }
+        if warmed > 0 {
+            self.ctx.sync()?;
+        }
+        Ok((warmed, warm_m))
     }
 
     /// Per-slot device-memory cost (bytes) at this rank's local shard widths:
@@ -1586,7 +1693,9 @@ impl Qwen35Model {
         let start_pos_dev = &*start_pos_slot.get(&self.ctx, 1)?;
 
         let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
-        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        qwen35_profile(&self.ctx, "qwen/embedding", None, seq_len, || {
+            embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
+        })?;
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
         let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, seq_len)?;
         let attn_out = attn_out.get(&self.ctx, hidden_size, seq_len)?;
@@ -1594,38 +1703,66 @@ impl Qwen35Model {
 
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
-        for layer in &self.layers {
-            rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            qwen35_profile(
+                &self.ctx,
+                "qwen/input_norm",
+                Some(layer_idx),
+                seq_len,
+                || rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed),
+            )?;
 
             match &layer.attn {
                 Qwen35Attn::Full(full_attn) => {
-                    self.full_attention(
-                        full_attn,
-                        normed,
-                        slot,
-                        full_idx,
-                        start_pos,
-                        start_pos_dev,
-                        full,
-                        attn_out,
+                    qwen35_profile(
+                        &self.ctx,
+                        "qwen/full_attention",
+                        Some(layer_idx),
+                        seq_len,
+                        || {
+                            self.full_attention(
+                                full_attn,
+                                normed,
+                                slot,
+                                full_idx,
+                                start_pos,
+                                start_pos_dev,
+                                full,
+                                attn_out,
+                            )
+                        },
                     )?;
                     full_idx += 1;
                 }
                 Qwen35Attn::Linear(lin) => {
-                    self.linear_attention(lin, normed, slot, linear_idx, linear, attn_out)?;
+                    qwen35_profile(
+                        &self.ctx,
+                        "qwen/linear_attention",
+                        Some(layer_idx),
+                        seq_len,
+                        || self.linear_attention(lin, normed, slot, linear_idx, linear, attn_out),
+                    )?;
                     linear_idx += 1;
                 }
             }
 
             // Post-attn residual add + post_attention_layernorm via the
             // `add_batch` + `rms_norm_offset` pair (`hidden_mid`/`normed`).
-            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
-            rms_norm_offset(
+            qwen35_profile(
                 &self.ctx,
-                hidden_mid,
-                &layer.post_attention_layernorm,
-                eps,
-                normed,
+                "qwen/post_attn_norm",
+                Some(layer_idx),
+                seq_len,
+                || {
+                    add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+                    rms_norm_offset(
+                        &self.ctx,
+                        hidden_mid,
+                        &layer.post_attention_layernorm,
+                        eps,
+                        normed,
+                    )
+                },
             )?;
             let mlp_in: &HiddenStates = normed;
             if let Some(moe_weights) = &layer.moe {
@@ -1633,33 +1770,53 @@ impl Qwen35Model {
                     .moe_config
                     .as_ref()
                     .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
-                moe_forward_into(
-                    &self.ctx,
-                    moe_weights,
-                    mlp_in,
-                    cfg,
-                    &self.expert_split,
-                    moe,
-                    mlp_out,
-                )?;
+                qwen35_profile(&self.ctx, "qwen/moe_ffn", Some(layer_idx), seq_len, || {
+                    moe_forward_into(
+                        &self.ctx,
+                        moe_weights,
+                        mlp_in,
+                        cfg,
+                        &self.expert_split,
+                        moe,
+                        mlp_out,
+                    )
+                })?;
             } else {
                 let mlp = layer
                     .mlp
                     .as_ref()
                     .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
-                self.dense_mlp(mlp, mlp_in, dense, mlp_out)?;
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/dense_ffn",
+                    Some(layer_idx),
+                    seq_len,
+                    || self.dense_mlp(mlp, mlp_in, dense, mlp_out),
+                )?;
             }
             // ONE all-reduce covers the whole FFN partial: the MoE buffer already
             // sums this rank's routed experts (non-local routes contribute zero)
             // + the column/row-sharded shared expert; the dense branch is a
             // row-parallel down_proj partial. No-op on a single GPU.
-            self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
+            qwen35_profile(
+                &self.ctx,
+                "qwen/ffn_allreduce",
+                Some(layer_idx),
+                seq_len,
+                || self.tp.all_reduce_sum(&self.ctx, mlp_out),
+            )?;
 
             // MLP residual add producing the next layer's residual stream.
             // The post-attn sum lives in `hidden_mid`; add_batch reads
             // hidden_mid/mlp_out and writes `hidden` (whose previous value is
             // dead).
-            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+            qwen35_profile(
+                &self.ctx,
+                "qwen/ffn_residual",
+                Some(layer_idx),
+                seq_len,
+                || add_batch(&self.ctx, hidden_mid, mlp_out, hidden),
+            )?;
         }
 
         Ok(())
@@ -1679,9 +1836,15 @@ impl Qwen35Model {
         params: &SamplingParams,
         position: u64,
     ) -> Result<u32> {
-        self.forward_hidden(slot, ws, tokens, start_pos)?;
-        self.lm_head_logits(ws, tokens.len())?;
-        self.sample_workspace_logits(ws, params, position)
+        qwen35_profile(&self.ctx, "qwen/forward_hidden", None, tokens.len(), || {
+            self.forward_hidden(slot, ws, tokens, start_pos)
+        })?;
+        qwen35_profile(&self.ctx, "qwen/lm_head", None, tokens.len(), || {
+            self.lm_head_logits(ws, tokens.len())
+        })?;
+        qwen35_profile(&self.ctx, "qwen/sample", None, tokens.len(), || {
+            self.sample_workspace_logits(ws, params, position)
+        })
     }
 
     /// Final norm (offset) + LM head on the last token only, into `ws.logits`.
@@ -2120,9 +2283,18 @@ impl Qwen35Model {
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
         let v_batch = v_batch.get(&self.ctx, kv_dim, seq_len)?;
-        gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
-        gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
-        gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/full/qkv_gemm",
+            Some(full_idx),
+            seq_len,
+            || {
+                gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
+                gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
+                gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+                Ok(())
+            },
+        )?;
 
         let q_prepped = q_prepped.get(&self.ctx, q_dim, seq_len)?;
         let attn_out = attn_heads.get(&self.ctx, q_dim, seq_len)?;
@@ -2147,30 +2319,33 @@ impl Qwen35Model {
             let (vc_ptr, _g9) = v_cache.data.device_ptr_mut(&self.ctx.stream);
             let (sp_ptr, _g10) = start_pos_dev.device_ptr(&self.ctx.stream);
             // SAFETY: all buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
-            unsafe {
-                ffi::prefill_attention_hd256_prep_cuda(
-                    qf_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    qp_ptr as *mut ffi::Half,
-                    kc_ptr as *mut ffi::Half,
-                    vc_ptr as *mut ffi::Half,
-                    self.local_q_heads as i32,
-                    self.local_kv_heads as i32,
-                    c.head_dim as i32,
-                    seq_len as i32,
-                    sp_ptr as *const i32,
-                    c.rotary_dim as i32,
-                    c.rms_norm_eps,
-                    max_seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            qwen35_profile(&self.ctx, "qwen/full/prep", Some(full_idx), seq_len, || {
+                unsafe {
+                    ffi::prefill_attention_hd256_prep_cuda(
+                        qf_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        v_ptr as *const ffi::Half,
+                        qn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        cos_ptr as *const ffi::Half,
+                        sin_ptr as *const ffi::Half,
+                        qp_ptr as *mut ffi::Half,
+                        kc_ptr as *mut ffi::Half,
+                        vc_ptr as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        self.local_kv_heads as i32,
+                        c.head_dim as i32,
+                        seq_len as i32,
+                        sp_ptr as *const i32,
+                        c.rotary_dim as i32,
+                        c.rms_norm_eps,
+                        max_seq_len as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            })?;
         }
 
         // ── 2. Attention over the contiguous cache (causal; decode = qlen 1). ──
@@ -2189,80 +2364,89 @@ impl Qwen35Model {
             // SAFETY: q_prepped/caches/out valid on ctx.stream for the shapes
             // above; `start_pos_dev` is the forward-level staged position (one
             // i32, value == start_pos).
-            unsafe {
-                if seq_len == 1 {
-                    let (sp_ptr, _g4) = start_pos_dev.device_ptr(&self.ctx.stream);
-                    ffi::nonpaged_prefill_attention_devpos_cuda(
-                        q_ptr as *const ffi::Half,
-                        kc_ptr as *const ffi::Half,
-                        vc_ptr as *const ffi::Half,
-                        o_ptr as *mut ffi::Half,
-                        self.local_q_heads as i32,
-                        self.local_kv_heads as i32,
-                        c.head_dim as i32,
-                        seq_len as i32,
-                        sp_ptr as *const i32,
-                        max_seq_len as i32,
-                        sm_scale,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                } else if c.head_dim == 256 && qwen35_fa3_enabled() {
-                    // FA3 fwd over the SAME buffers the in-tree kernel uses:
-                    // q/out token-major [S, h, 256] (HD256 prep layout),
-                    // cache head-major [h_k, max_seq, 256]. Passing the
-                    // exact `kv_len` as seqlen_k keeps the shim on the
-                    // non-varlen path; causal is bottom-right aligned =
-                    // chunked-prefill semantics. Gate + o_proj follow
-                    // unchanged.
-                    let lse = fa3_lse.get(&self.ctx, self.local_q_heads * seq_len)?;
-                    let sem = fa3_semaphore.get(&self.ctx, 1)?;
-                    let (lse_ptr, _g4) = lse.device_ptr_mut(&self.ctx.stream);
-                    let (sem_ptr, _g5) = sem.device_ptr_mut(&self.ctx.stream);
-                    let head_dim = c.head_dim as i64;
-                    let args = ffi::ArleFa3FwdHd256Args {
-                        q: q_ptr as *const ffi::Half,
-                        k: kc_ptr as *const ffi::Half,
-                        v: vc_ptr as *const ffi::Half,
-                        o: o_ptr as *mut ffi::Half,
-                        softmax_lse: lse_ptr as *mut f32,
-                        tile_count_semaphore: sem_ptr as *mut i32,
-                        seqlen_q: seq_len as i32,
-                        seqlen_k: kv_len as i32,
-                        num_heads: self.local_q_heads as i32,
-                        num_heads_k: self.local_kv_heads as i32,
-                        head_dim: c.head_dim as i32,
-                        q_row_stride: q_dim as i64,
-                        k_row_stride: head_dim,
-                        v_row_stride: head_dim,
-                        o_row_stride: q_dim as i64,
-                        q_head_stride: head_dim,
-                        k_head_stride: max_seq_len as i64 * head_dim,
-                        v_head_stride: max_seq_len as i64 * head_dim,
-                        o_head_stride: head_dim,
-                        softmax_scale: sm_scale,
-                        is_causal: 1,
-                    };
-                    ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
-                        .result()?;
-                } else {
-                    ffi::nonpaged_prefill_attention_cuda(
-                        q_ptr as *const ffi::Half,
-                        kc_ptr as *const ffi::Half,
-                        vc_ptr as *const ffi::Half,
-                        o_ptr as *mut ffi::Half,
-                        self.local_q_heads as i32,
-                        self.local_kv_heads as i32,
-                        c.head_dim as i32,
-                        seq_len as i32,
-                        kv_len as i32,
-                        max_seq_len as i32,
-                        sm_scale,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            qwen35_profile(
+                &self.ctx,
+                "qwen/full/attention",
+                Some(full_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        if seq_len == 1 {
+                            let (sp_ptr, _g4) = start_pos_dev.device_ptr(&self.ctx.stream);
+                            ffi::nonpaged_prefill_attention_devpos_cuda(
+                                q_ptr as *const ffi::Half,
+                                kc_ptr as *const ffi::Half,
+                                vc_ptr as *const ffi::Half,
+                                o_ptr as *mut ffi::Half,
+                                self.local_q_heads as i32,
+                                self.local_kv_heads as i32,
+                                c.head_dim as i32,
+                                seq_len as i32,
+                                sp_ptr as *const i32,
+                                max_seq_len as i32,
+                                sm_scale,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        } else if c.head_dim == 256 && qwen35_fa3_enabled() {
+                            // FA3 fwd over the SAME buffers the in-tree kernel uses:
+                            // q/out token-major [S, h, 256] (HD256 prep layout),
+                            // cache head-major [h_k, max_seq, 256]. Passing the
+                            // exact `kv_len` as seqlen_k keeps the shim on the
+                            // non-varlen path; causal is bottom-right aligned =
+                            // chunked-prefill semantics. Gate + o_proj follow
+                            // unchanged.
+                            let lse = fa3_lse.get(&self.ctx, self.local_q_heads * seq_len)?;
+                            let sem = fa3_semaphore.get(&self.ctx, 1)?;
+                            let (lse_ptr, _g4) = lse.device_ptr_mut(&self.ctx.stream);
+                            let (sem_ptr, _g5) = sem.device_ptr_mut(&self.ctx.stream);
+                            let head_dim = c.head_dim as i64;
+                            let args = ffi::ArleFa3FwdHd256Args {
+                                q: q_ptr as *const ffi::Half,
+                                k: kc_ptr as *const ffi::Half,
+                                v: vc_ptr as *const ffi::Half,
+                                o: o_ptr as *mut ffi::Half,
+                                softmax_lse: lse_ptr as *mut f32,
+                                tile_count_semaphore: sem_ptr as *mut i32,
+                                seqlen_q: seq_len as i32,
+                                seqlen_k: kv_len as i32,
+                                num_heads: self.local_q_heads as i32,
+                                num_heads_k: self.local_kv_heads as i32,
+                                head_dim: c.head_dim as i32,
+                                q_row_stride: q_dim as i64,
+                                k_row_stride: head_dim,
+                                v_row_stride: head_dim,
+                                o_row_stride: q_dim as i64,
+                                q_head_stride: head_dim,
+                                k_head_stride: max_seq_len as i64 * head_dim,
+                                v_head_stride: max_seq_len as i64 * head_dim,
+                                o_head_stride: head_dim,
+                                softmax_scale: sm_scale,
+                                is_causal: 1,
+                            };
+                            ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
+                                .result()?;
+                        } else {
+                            ffi::nonpaged_prefill_attention_cuda(
+                                q_ptr as *const ffi::Half,
+                                kc_ptr as *const ffi::Half,
+                                vc_ptr as *const ffi::Half,
+                                o_ptr as *mut ffi::Half,
+                                self.local_q_heads as i32,
+                                self.local_kv_heads as i32,
+                                c.head_dim as i32,
+                                seq_len as i32,
+                                kv_len as i32,
+                                max_seq_len as i32,
+                                sm_scale,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         // ── 3. Per-head sigmoid gate from q_full's gate half. ──
@@ -2270,22 +2454,37 @@ impl Qwen35Model {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
             // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per full-attn prep.
-            unsafe {
-                ffi::attention_gate_batch_hd256_cuda(
-                    qf_ptr as *const ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    self.local_q_heads as i32,
-                    c.head_dim as i32,
-                    seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            qwen35_profile(&self.ctx, "qwen/full/gate", Some(full_idx), seq_len, || {
+                unsafe {
+                    ffi::attention_gate_batch_hd256_cuda(
+                        qf_ptr as *const ffi::Half,
+                        o_ptr as *mut ffi::Half,
+                        self.local_q_heads as i32,
+                        c.head_dim as i32,
+                        seq_len as i32,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+                Ok(())
+            })?;
         }
 
-        gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/full/o_proj",
+            Some(full_idx),
+            seq_len,
+            || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
+        )?;
         // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
-        self.tp.all_reduce_sum(&self.ctx, out)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/full/allreduce",
+            Some(full_idx),
+            seq_len,
+            || self.tp.all_reduce_sum(&self.ctx, out),
+        )?;
         Ok(())
     }
 
@@ -2333,10 +2532,19 @@ impl Qwen35Model {
         let z = z.get(&self.ctx, z_dim, seq_len)?;
         let b_proj = b_proj.get(&self.ctx, b_dim, seq_len)?;
         let a_proj = a_proj.get(&self.ctx, a_dim, seq_len)?;
-        gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
-        gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
-        gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
-        gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/linear/in_proj",
+            Some(linear_idx),
+            seq_len,
+            || {
+                gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
+                gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
+                gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
+                gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
+                Ok(())
+            },
+        )?;
 
         // ── conv1d (advances the per-slot conv ring). ──
         let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, seq_len)?;
@@ -2354,19 +2562,28 @@ impl Qwen35Model {
             let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
             // SAFETY: qkv/weight/state/out valid on ctx.stream; weight len checked
             // by the kernel against num_channels*kernel.
-            unsafe {
-                ffi::conv1d_prefill_cuda(
-                    x_ptr as *const ffi::Half,
-                    w_ptr as *const ffi::Half,
-                    s_ptr as *mut ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    qkv_dim as i32,
-                    seq_len as i32,
-                    c.linear_conv_kernel_dim as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            qwen35_profile(
+                &self.ctx,
+                "qwen/linear/conv1d",
+                Some(linear_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        ffi::conv1d_prefill_cuda(
+                            x_ptr as *const ffi::Half,
+                            w_ptr as *const ffi::Half,
+                            s_ptr as *mut ffi::Half,
+                            o_ptr as *mut ffi::Half,
+                            qkv_dim as i32,
+                            seq_len as i32,
+                            c.linear_conv_kernel_dim as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         // ── gated-delta rule. Decode (seq_len==1) is always the recurrent
@@ -2412,56 +2629,65 @@ impl Qwen35Model {
             // `.get` calls above. The slot state pointer is passed as BOTH
             // h0 and ht (in-place chunk chaining): each fwd CTA reads its h0
             // slice fully before writing the same ht slice.
-            unsafe {
-                ffi::gdr_fq_prep_cuda(
-                    qkv_ptr as *const ffi::Half,
-                    b_ptr as *const ffi::Half,
-                    a_ptr as *const ffi::Half,
-                    dt_ptr as *const ffi::Half,
-                    alog_ptr as *const f32,
-                    q_ptr as *mut ffi::Half,
-                    k_ptr as *mut ffi::Half,
-                    v_ptr as *mut ffi::Half,
-                    g_ptr as *mut f32,
-                    beta_ptr as *mut f32,
-                    self.local_linear_k_heads as i32,
-                    self.local_linear_v_heads as i32,
-                    c.linear_key_head_dim as i32,
-                    c.linear_value_head_dim as i32,
-                    seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gdr_fq_cumsum_cuda(
-                    g_ptr as *const f32,
-                    gc_ptr as *mut f32,
-                    seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gdr_fq_kkt_cuda(
-                    k_ptr as *const ffi::Half,
-                    beta_ptr as *const f32,
-                    a_inv_ptr as *mut ffi::Half,
-                    seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-                ffi::gdr_fq_fwd_cuda(
-                    q_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    a_inv_ptr as *const ffi::Half,
-                    gc_ptr as *const f32,
-                    beta_ptr as *const f32,
-                    s_ptr as *const f32,
-                    o_ptr as *mut ffi::Half,
-                    s_ptr as *mut f32,
-                    seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            qwen35_profile(
+                &self.ctx,
+                "qwen/linear/gdr_fq",
+                Some(linear_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        ffi::gdr_fq_prep_cuda(
+                            qkv_ptr as *const ffi::Half,
+                            b_ptr as *const ffi::Half,
+                            a_ptr as *const ffi::Half,
+                            dt_ptr as *const ffi::Half,
+                            alog_ptr as *const f32,
+                            q_ptr as *mut ffi::Half,
+                            k_ptr as *mut ffi::Half,
+                            v_ptr as *mut ffi::Half,
+                            g_ptr as *mut f32,
+                            beta_ptr as *mut f32,
+                            self.local_linear_k_heads as i32,
+                            self.local_linear_v_heads as i32,
+                            c.linear_key_head_dim as i32,
+                            c.linear_value_head_dim as i32,
+                            seq_len as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                        ffi::gdr_fq_cumsum_cuda(
+                            g_ptr as *const f32,
+                            gc_ptr as *mut f32,
+                            seq_len as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                        ffi::gdr_fq_kkt_cuda(
+                            k_ptr as *const ffi::Half,
+                            beta_ptr as *const f32,
+                            a_inv_ptr as *mut ffi::Half,
+                            seq_len as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                        ffi::gdr_fq_fwd_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            v_ptr as *const ffi::Half,
+                            a_inv_ptr as *const ffi::Half,
+                            gc_ptr as *const f32,
+                            beta_ptr as *const f32,
+                            s_ptr as *const f32,
+                            o_ptr as *mut ffi::Half,
+                            s_ptr as *mut f32,
+                            seq_len as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
@@ -2473,42 +2699,51 @@ impl Qwen35Model {
             let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
             let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
             // SAFETY: all buffers valid on ctx.stream; head dims from config.
-            unsafe {
-                if seq_len == 1 {
-                    ffi::gated_delta_rule_decode_cuda(
-                        qkv_ptr as *const ffi::Half,
-                        b_ptr as *const ffi::Half,
-                        a_ptr as *const ffi::Half,
-                        dt_ptr as *const ffi::Half,
-                        alog_ptr as *const f32,
-                        s_ptr as *mut f32,
-                        o_ptr as *mut ffi::Half,
-                        self.local_linear_k_heads as i32,
-                        self.local_linear_v_heads as i32,
-                        c.linear_key_head_dim as i32,
-                        c.linear_value_head_dim as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                } else {
-                    ffi::gated_delta_rule_prefill_recurrent_cuda(
-                        qkv_ptr as *const ffi::Half,
-                        b_ptr as *const ffi::Half,
-                        a_ptr as *const ffi::Half,
-                        dt_ptr as *const ffi::Half,
-                        alog_ptr as *const f32,
-                        s_ptr as *mut f32,
-                        o_ptr as *mut ffi::Half,
-                        self.local_linear_k_heads as i32,
-                        self.local_linear_v_heads as i32,
-                        c.linear_key_head_dim as i32,
-                        c.linear_value_head_dim as i32,
-                        seq_len as i32,
-                        self.ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            qwen35_profile(
+                &self.ctx,
+                "qwen/linear/gdr_recurrent",
+                Some(linear_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        if seq_len == 1 {
+                            ffi::gated_delta_rule_decode_cuda(
+                                qkv_ptr as *const ffi::Half,
+                                b_ptr as *const ffi::Half,
+                                a_ptr as *const ffi::Half,
+                                dt_ptr as *const ffi::Half,
+                                alog_ptr as *const f32,
+                                s_ptr as *mut f32,
+                                o_ptr as *mut ffi::Half,
+                                self.local_linear_k_heads as i32,
+                                self.local_linear_v_heads as i32,
+                                c.linear_key_head_dim as i32,
+                                c.linear_value_head_dim as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        } else {
+                            ffi::gated_delta_rule_prefill_recurrent_cuda(
+                                qkv_ptr as *const ffi::Half,
+                                b_ptr as *const ffi::Half,
+                                a_ptr as *const ffi::Half,
+                                dt_ptr as *const ffi::Half,
+                                alog_ptr as *const f32,
+                                s_ptr as *mut f32,
+                                o_ptr as *mut ffi::Half,
+                                self.local_linear_k_heads as i32,
+                                self.local_linear_v_heads as i32,
+                                c.linear_key_head_dim as i32,
+                                c.linear_value_head_dim as i32,
+                                seq_len as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         // ── gated output RMSNorm (per value head; gate = z). ──
@@ -2526,24 +2761,45 @@ impl Qwen35Model {
             // is a per-[Vd] broadcast (no blockIdx dependence), so the
             // extension is exact (the monolith's `rms_norm_gated_batch_into`
             // passed `seq_len * num_heads` identically).
-            unsafe {
-                ffi::rms_norm_gated_cuda(
-                    x_ptr as *const ffi::Half,
-                    w_ptr as *const f32,
-                    gate_ptr as *const ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    (self.local_linear_v_heads * seq_len) as i32,
-                    c.linear_value_head_dim as i32,
-                    c.rms_norm_eps,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
+            qwen35_profile(
+                &self.ctx,
+                "qwen/linear/norm",
+                Some(linear_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        ffi::rms_norm_gated_cuda(
+                            x_ptr as *const ffi::Half,
+                            w_ptr as *const f32,
+                            gate_ptr as *const ffi::Half,
+                            o_ptr as *mut ffi::Half,
+                            (self.local_linear_v_heads * seq_len) as i32,
+                            c.linear_value_head_dim as i32,
+                            c.rms_norm_eps,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
-        gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/linear/out_proj",
+            Some(linear_idx),
+            seq_len,
+            || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
+        )?;
         // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
-        self.tp.all_reduce_sum(&self.ctx, out)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/linear/allreduce",
+            Some(linear_idx),
+            seq_len,
+            || self.tp.all_reduce_sum(&self.ctx, out),
+        )?;
         Ok(())
     }
 

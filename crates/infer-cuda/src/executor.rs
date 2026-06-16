@@ -2133,6 +2133,12 @@ impl Qwen35CudaExecutor {
     /// its first gated decode (after `CudaGraphState`'s universal eager warm
     /// run), so unused slots never pay capture/instantiation memory.
     pub(crate) fn warmup(&mut self) -> Result<()> {
+        let (warmed_shapes, warm_m) = self.model.warm_fp8_deepgemm_dense_prefill()?;
+        if warmed_shapes > 0 {
+            info!(
+                "Qwen3.5 FP8 dense DeepGEMM warmed {warmed_shapes} projection shape(s) at M={warm_m}"
+            );
+        }
         if !qwen35_decode_graph_enabled() {
             info!(
                 "Qwen3.5 whole-step decode graph disabled \
