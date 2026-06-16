@@ -33,14 +33,26 @@ narrows to +5% at c=8 (other batched paths saturate). Single-sweep — the per-c
 magnitude needs ≥3 repeats before enshrining (direction/sign solid, matches the
 n=22 +38%).
 
-**MTP arm — measured prior sessions on a gcc≥10 host (NOT re-measurable on .62:
-clang-11 hangs the MTP-head JIT; box has only gcc-8.3+clang-11/7).** Not a
-same-config A/B vs the table above (different prompt/slots/base/session):
-- B=1: no-spec 44.5 → **MTP d2 chain-fold 52.8–53.3 (+20%)**, ×3 σ≈0.04
-  ([[2026-06-13-dsv4-mtp-d2-chain-fold-53]]).
-- concurrency: **batched MTP default-on @c≥4** → **76.7 @c8 (+77% vs per-row MTP)**,
-  78.7 @c12, prod ~2400-tok ([[2026-06-15-dsv4-batched-mtp-prod-shape-flip]]).
-A clean same-session MTP-vs-no-MTP c1–8 A/B needs a gcc≥10 build+serve host.
+**MTP arm — NOW MEASURED on `.61` (gcc-13). The `.62` "hang" was the clang-11 JIT
+host compiler, confirmed by direct test** (`.61`/gcc-13 serves MTP in 136s, no
+hang; `.62`/clang-11 hangs the MTP-head shapes). `.61` same-binary A/B (commit
+`2f021c0`, profiling OFF):
+
+| c | no-MTP | MTP | Δ |
+|---|--------|-----|---|
+| 1 | 43.4 | 47.9 | +10% |
+| 2 | 43.6 | 48.1 | +10% |
+| 4 | 67.2 | 48.1 | −28% |
+| 8 | 73.5 | 79.1 | +8% |
+
+MTP +10% @B=1; −28% @c4 (MTP flat ~48 c1→c4 then 79 @c8 = per-row-plateau, batched
+only passes no-MTP at c8). On `2f021c0`, NOT my compressor-batch binary — not
+cross-comparable to the table above. Prior-session envelope (different base/slots):
+B=1 chain-fold 53.3 (+20%, [[2026-06-13-dsv4-mtp-d2-chain-fold-53]]); batched MTP
+76.7 @c8 (+77% vs per-row, [[2026-06-15-dsv4-batched-mtp-prod-shape-flip]]).
+Remaining: serve *my* `3e3e50e0`+compressor-batch binary on `.61` to get the
+compressor-batch × MTP combined number. **`.61` (gcc-13, 8×H20) is the MTP lane's
+serve host; `.62` (clang-11) cannot serve MTP.**
 
 **Committed levers (gated `ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):**
 - `a4239598` compressor-GEMV batch (bf16 cublasLt m=N): n=22 perrow 162→92, step
