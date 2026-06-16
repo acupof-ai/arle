@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cuda_kernels::KVFormat;
@@ -388,13 +391,13 @@ pub(crate) struct SafetensorLoader {
     base: PathBuf,
     shards: Vec<PathBuf>,
     weight_map: HashMap<String, usize>,
-    tensor_headers: std::cell::RefCell<Option<BTreeMap<String, TensorHeader>>>,
+    tensor_headers: std::cell::RefCell<Option<Rc<BTreeMap<String, TensorHeader>>>>,
     quant_manifest: Option<QuantManifest>,
-    /// Read-once cache of shard bytes: without it, loading N tensors re-reads the
-    /// whole shard N times (O(N × file_size) I/O). `Rc` so [`SharedTensor`] can
-    /// expose a tensor's byte range zero-copy (no `to_vec` of the multi-GiB
-    /// stacked expert tensors) without holding a `RefCell` guard across further
-    /// loads (which would panic on the next shard-cache fill).
+    /// Current-shard byte cache: without it, loading N tensors from one layer
+    /// re-reads the whole shard N times (O(N × file_size) I/O). It is bounded to
+    /// the most recent shard so cold load does not retain every layer shard in
+    /// host RSS. `Rc` lets [`SharedTensor`] expose a tensor's byte range zero-copy
+    /// while the cache entry itself can be evicted on the next shard.
     /// `Rc<Vec<u8>>` over clippy's `Rc<[u8]>`: the conversion would copy the
     /// multi-GiB shard once more — the exact copy this cache exists to avoid.
     #[allow(clippy::rc_buffer)]
@@ -408,8 +411,26 @@ enum QuantMatrixShard {
     Cols(ShardingSpec),
 }
 
+struct Fp8BlockProjectionView {
+    weight_name: String,
+    scale_name: String,
+    rows: usize,
+    cols: usize,
+    scale_rows: usize,
+    scale_cols: usize,
+    scale_apply: ScaleApply,
+}
+
+struct DirectFp8MoeRouted {
+    w13: MoeFp8ExpertGroup,
+    down: MoeFp8ExpertGroup,
+    gate_up_quant_signature: ExpertQuantDispatchSignature,
+    down_quant_signature: ExpertQuantDispatchSignature,
+}
+
 impl SafetensorLoader {
     pub(crate) fn new(base: &Path) -> Result<Self> {
+        let t0 = Instant::now();
         let quant_manifest = if base.join("config.json").exists() {
             read_quant_manifest(base)?
         } else {
@@ -436,26 +457,46 @@ impl SafetensorLoader {
                 };
                 weight_map.insert(name, idx);
             }
-            return Ok(Self {
+            let loader = Self {
                 base: base.to_path_buf(),
                 shards,
                 weight_map,
                 tensor_headers: std::cell::RefCell::new(None),
                 quant_manifest,
                 shard_cache: std::cell::RefCell::new(HashMap::new()),
-            });
+            };
+            loader.log_startup_phase(
+                "new.index",
+                t0,
+                format_args!(
+                    "shards={} weight_map={} quant_manifest={}",
+                    loader.shards.len(),
+                    loader.weight_map.len(),
+                    loader.quant_manifest.is_some()
+                ),
+            );
+            return Ok(loader);
         }
 
         let single = base.join("model.safetensors");
         if single.exists() {
-            return Ok(Self {
+            let loader = Self {
                 base: base.to_path_buf(),
                 shards: vec![single],
                 weight_map: HashMap::new(),
                 tensor_headers: std::cell::RefCell::new(None),
                 quant_manifest,
                 shard_cache: std::cell::RefCell::new(HashMap::new()),
-            });
+            };
+            loader.log_startup_phase(
+                "new.single",
+                t0,
+                format_args!(
+                    "shards=1 quant_manifest={}",
+                    loader.quant_manifest.is_some()
+                ),
+            );
+            return Ok(loader);
         }
 
         let mut shards = fs::read_dir(base)
@@ -469,14 +510,38 @@ impl SafetensorLoader {
             "no safetensors shards found under {}",
             base.display()
         );
-        Ok(Self {
+        let loader = Self {
             base: base.to_path_buf(),
             shards,
             weight_map: HashMap::new(),
             tensor_headers: std::cell::RefCell::new(None),
             quant_manifest,
             shard_cache: std::cell::RefCell::new(HashMap::new()),
-        })
+        };
+        loader.log_startup_phase(
+            "new.scan",
+            t0,
+            format_args!(
+                "shards={} quant_manifest={}",
+                loader.shards.len(),
+                loader.quant_manifest.is_some()
+            ),
+        );
+        Ok(loader)
+    }
+
+    fn startup_profile_enabled(&self) -> bool {
+        std::env::var_os("ARLE_CUDA_STARTUP_PROFILE").is_some()
+    }
+
+    fn log_startup_phase(&self, phase: &str, start: Instant, extra: std::fmt::Arguments<'_>) {
+        if self.startup_profile_enabled() {
+            log::info!(
+                target: "infer_cuda::startup",
+                "cuda_startup phase=loader.{phase} elapsed_ms={:.1} {extra}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 
     pub(crate) fn load_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
@@ -765,12 +830,25 @@ impl SafetensorLoader {
         moe_intermediate_size: usize,
         hidden_size: usize,
     ) -> Result<MoeLayerWeights> {
+        let layer_t0 = Instant::now();
         const BF16_ELEM_SIZE: usize = 2;
         let mut gate = Vec::with_capacity(split.experts_per_rank);
         let mut up = Vec::with_capacity(split.experts_per_rank);
         let mut down = Vec::with_capacity(split.experts_per_rank);
         let per_expert_probe = names.expert_gate_proj(split.local_expert_start);
         let per_expert_quant_probe = self.quant_view_for(&per_expert_probe)?.is_some();
+        let deepgemm_native_ready = crate::moe::qwen35_deepgemm_enabled()
+            && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
+                Ok(_) => true,
+                Err(err) => {
+                    log::warn!(
+                        "Qwen3.5 DeepGEMM MoE disabled: native bridge unavailable ({err}); \
+                             falling back to the hand grouped kernels"
+                    );
+                    false
+                }
+            };
+        let mut direct_fp8_routed = None;
         // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
         // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
         // export too.
@@ -779,13 +857,26 @@ impl SafetensorLoader {
                 .into_iter()
                 .find(|name| self.has_tensor(name))
         };
-        if self.has_tensor(&per_expert_probe) || per_expert_quant_probe {
+        if per_expert_quant_probe && deepgemm_native_ready {
+            direct_fp8_routed = self.load_fp8_moe_groups_direct(
+                ctx,
+                names,
+                split,
+                moe_intermediate_size,
+                hidden_size,
+            )?;
+        }
+        if direct_fp8_routed.is_some() {
+            // The direct FP8 path fills the resident DeepGEMM grouped caches
+            // without constructing the transient per-expert DeviceMatrix list.
+        } else if self.has_tensor(&per_expert_probe) || per_expert_quant_probe {
             for e in split.local_expert_start..split.local_expert_end() {
                 gate.push(self.load_matrix_quant_aware(ctx, &names.expert_gate_proj(e))?);
                 up.push(self.load_matrix_quant_aware(ctx, &names.expert_up_proj(e))?);
                 down.push(self.load_matrix_quant_aware(ctx, &names.expert_down_proj(e))?);
             }
         } else if let Some(gate_up_name) = resolve_stacked(&names.experts_stacked_gate_up_proj) {
+            let routed_t0 = Instant::now();
             let down_name = resolve_stacked(&names.experts_stacked_down_proj).ok_or_else(|| {
                 anyhow!(
                     "MoE layer `{}`: found stacked `{gate_up_name}` but no `{}` \
@@ -886,6 +977,18 @@ impl SafetensorLoader {
                     .with_context(|| format!("upload expert {e} down slice of {down_name}"))?,
                 );
             }
+            self.log_startup_phase(
+                "moe.stacked_routed_load",
+                routed_t0,
+                format_args!(
+                    "layer={} local_experts={} gate={} up={} down={}",
+                    names.mlp_prefix,
+                    split.experts_per_rank,
+                    gate.len(),
+                    up.len(),
+                    down.len()
+                ),
+            );
         } else {
             let legacy_switch_mlp =
                 resolve_stacked(&format!("{}.switch_mlp.gate_proj", names.mlp_prefix)).is_some();
@@ -906,6 +1009,20 @@ impl SafetensorLoader {
                 }
             );
         }
+        self.log_startup_phase(
+            "moe.routed_load",
+            layer_t0,
+            format_args!(
+                "layer={} local_experts={} gate={} up={} down={} direct_fp8_grouped={}",
+                names.mlp_prefix,
+                split.experts_per_rank,
+                gate.len(),
+                up.len(),
+                down.len(),
+                direct_fp8_routed.is_some()
+            ),
+        );
+        let shared_t0 = Instant::now();
         let router_gate = self.load_matrix(ctx, &names.router_gate)?;
         let (shared_gate, shared_up, shared_down) = if tp.is_single() {
             (
@@ -936,6 +1053,11 @@ impl SafetensorLoader {
             )
         };
         let shared_gate_router = self.load_matrix(ctx, &names.shared_expert_gate)?;
+        self.log_startup_phase(
+            "moe.shared_load",
+            shared_t0,
+            format_args!("layer={}", names.mlp_prefix),
+        );
 
         // DeepGEMM grouped-B caches (opt-in): concat the per-expert matrices
         // into one contiguous [G, n, k] buffer per projection, repoint the
@@ -948,19 +1070,17 @@ impl SafetensorLoader {
         // path instead of erroring at the first MoE forward — probe once here
         // and skip the grouped caches so `use_deepgemm` self-disables.
         let (expert_weight_format, gate_sig, down_sig) =
-            routed_expert_weight_format(&gate, &up, &down)?;
-        let routed_quant = expert_weight_format.is_quantized();
-        let deepgemm_native_ready = crate::moe::qwen35_deepgemm_enabled()
-            && match cuda_kernels::moe::dsv4_deepgemm_native_preflight() {
-                Ok(_) => true,
-                Err(err) => {
-                    log::warn!(
-                        "Qwen3.5 DeepGEMM MoE disabled: native bridge unavailable ({err}); \
-                             falling back to the hand grouped kernels"
-                    );
-                    false
-                }
+            if let Some(direct) = direct_fp8_routed.as_ref() {
+                (
+                    WeightFormat::Fp8BlockScaled,
+                    Some(direct.gate_up_quant_signature),
+                    Some(direct.down_quant_signature),
+                )
+            } else {
+                routed_expert_weight_format(&gate, &up, &down)?
             };
+        let routed_quant = expert_weight_format.is_quantized();
+        let grouped_t0 = Instant::now();
         let deepgemm_ready = !routed_quant && deepgemm_native_ready;
         let fp8_deepgemm_ready =
             expert_weight_format == WeightFormat::Fp8BlockScaled && deepgemm_native_ready;
@@ -979,7 +1099,9 @@ impl SafetensorLoader {
         } else {
             (None, None, None)
         };
-        let (w13_fp8_grouped, down_fp8_grouped) = if fp8_deepgemm_ready {
+        let (w13_fp8_grouped, down_fp8_grouped) = if let Some(direct) = direct_fp8_routed.take() {
+            (Some(direct.w13), Some(direct.down))
+        } else if fp8_deepgemm_ready {
             let w13_g = MoeFp8ExpertGroup::concat_pair_rows(
                 ctx,
                 &gate,
@@ -1108,6 +1230,19 @@ impl SafetensorLoader {
             up.clear();
             down.clear();
         }
+        self.log_startup_phase(
+            "moe.grouped_cache",
+            grouped_t0,
+            format_args!(
+                "layer={} format={expert_weight_format:?} fp8_deepgemm_ready={} routed_quant={} retained_gate={} retained_up={} retained_down={}",
+                names.mlp_prefix,
+                fp8_deepgemm_ready,
+                routed_quant,
+                gate.len(),
+                up.len(),
+                down.len()
+            ),
+        );
 
         Ok(MoeLayerWeights {
             gate,
@@ -1138,6 +1273,277 @@ impl SafetensorLoader {
         })
     }
 
+    fn load_fp8_moe_groups_direct(
+        &self,
+        ctx: &DeviceContext,
+        names: &qwen35_spec::Qwen35MoeTensorNames,
+        split: &crate::moe_config::ExpertSplit,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+    ) -> Result<Option<DirectFp8MoeRouted>> {
+        let t0 = Instant::now();
+        ensure!(
+            moe_intermediate_size.is_multiple_of(128) && hidden_size.is_multiple_of(128),
+            "Qwen3.6 FP8 direct grouped MoE needs 128-aligned dims, got mi={moe_intermediate_size} hidden={hidden_size}"
+        );
+        let groups = split.experts_per_rank;
+        let w13_rows = 2 * moe_intermediate_size;
+        let w13_scale_rows = w13_rows / 128;
+        let w13_scale_cols = hidden_size / 128;
+        let down_scale_rows = hidden_size / 128;
+        let down_scale_cols = moe_intermediate_size / 128;
+        let mut expert_views = Vec::with_capacity(groups);
+        let mut shard_idx = None;
+        let gate_up_sig = ExpertQuantDispatchSignature {
+            rows: moe_intermediate_size,
+            cols: hidden_size,
+            quant_scale_rows: moe_intermediate_size / 128,
+            quant_scale_cols: hidden_size / 128,
+            quant_block_m: 128,
+            quant_block_k: 128,
+            group_size: 0,
+        };
+        let down_sig = ExpertQuantDispatchSignature {
+            rows: hidden_size,
+            cols: moe_intermediate_size,
+            quant_scale_rows: hidden_size / 128,
+            quant_scale_cols: moe_intermediate_size / 128,
+            quant_block_m: 128,
+            quant_block_k: 128,
+            group_size: 0,
+        };
+
+        for e in split.local_expert_start..split.local_expert_end() {
+            let gate = match self.fp8_block_projection_view(
+                &names.expert_gate_proj(e),
+                moe_intermediate_size,
+                hidden_size,
+            )? {
+                Some(view) => view,
+                None => return Ok(None),
+            };
+            let up = match self.fp8_block_projection_view(
+                &names.expert_up_proj(e),
+                moe_intermediate_size,
+                hidden_size,
+            )? {
+                Some(view) => view,
+                None => return Ok(None),
+            };
+            let down = match self.fp8_block_projection_view(
+                &names.expert_down_proj(e),
+                hidden_size,
+                moe_intermediate_size,
+            )? {
+                Some(view) => view,
+                None => return Ok(None),
+            };
+            for view in [&gate, &up, &down] {
+                let Some(weight_idx) = self.weight_map.get(&view.weight_name).copied() else {
+                    return Ok(None);
+                };
+                let Some(scale_idx) = self.weight_map.get(&view.scale_name).copied() else {
+                    return Ok(None);
+                };
+                if weight_idx != scale_idx {
+                    return Ok(None);
+                }
+                match shard_idx {
+                    Some(idx) if idx != weight_idx => return Ok(None),
+                    Some(_) => {}
+                    None => shard_idx = Some(weight_idx),
+                }
+            }
+            expert_views.push((gate, up, down));
+        }
+        let Some(shard_idx) = shard_idx else {
+            return Ok(None);
+        };
+
+        let mut w13_weight = vec![0u8; groups * w13_rows * hidden_size];
+        let mut w13_scales = vec![0f32; groups * w13_scale_rows * w13_scale_cols];
+        let mut down_weight = vec![0u8; groups * hidden_size * moe_intermediate_size];
+        let mut down_scales = vec![0f32; groups * down_scale_rows * down_scale_cols];
+        let shard = self.shard_bytes(shard_idx)?;
+        let tensors = SafeTensors::deserialize(&shard)
+            .with_context(|| format!("deserialize {}", self.shards[shard_idx].display()))?;
+
+        for (g, (gate, up, down)) in expert_views.iter().enumerate() {
+            let w13_weight_base = g * w13_rows * hidden_size;
+            let gate_weight = &mut w13_weight
+                [w13_weight_base..w13_weight_base + moe_intermediate_size * hidden_size];
+            self.copy_fp8_projection_from_shard(&tensors, gate, gate_weight)?;
+            let up_weight_start = w13_weight_base + moe_intermediate_size * hidden_size;
+            let up_weight = &mut w13_weight
+                [up_weight_start..up_weight_start + moe_intermediate_size * hidden_size];
+            self.copy_fp8_projection_from_shard(&tensors, up, up_weight)?;
+
+            let w13_scale_base = g * w13_scale_rows * w13_scale_cols;
+            let gate_scales =
+                &mut w13_scales[w13_scale_base..w13_scale_base + gate.scale_rows * gate.scale_cols];
+            self.copy_fp8_scales_from_shard(&tensors, gate, gate_scales)?;
+            let up_scale_start = w13_scale_base + (moe_intermediate_size / 128) * w13_scale_cols;
+            let up_scales =
+                &mut w13_scales[up_scale_start..up_scale_start + up.scale_rows * up.scale_cols];
+            self.copy_fp8_scales_from_shard(&tensors, up, up_scales)?;
+
+            let down_weight_base = g * hidden_size * moe_intermediate_size;
+            let down_weight_dst = &mut down_weight
+                [down_weight_base..down_weight_base + hidden_size * moe_intermediate_size];
+            self.copy_fp8_projection_from_shard(&tensors, down, down_weight_dst)?;
+            let down_scale_base = g * down_scale_rows * down_scale_cols;
+            let down_scales_dst = &mut down_scales
+                [down_scale_base..down_scale_base + down.scale_rows * down.scale_cols];
+            self.copy_fp8_scales_from_shard(&tensors, down, down_scales_dst)?;
+        }
+
+        let w13 = MoeFp8ExpertGroup::from_host(
+            ctx,
+            &w13_weight,
+            &w13_scales,
+            groups,
+            w13_rows,
+            hidden_size,
+        )?;
+        let down = MoeFp8ExpertGroup::from_host(
+            ctx,
+            &down_weight,
+            &down_scales,
+            groups,
+            hidden_size,
+            moe_intermediate_size,
+        )?;
+        self.log_startup_phase(
+            "moe.direct_fp8_grouped_load",
+            t0,
+            format_args!(
+                "layer={} shard_idx={} local_experts={} w13_bytes={} down_bytes={}",
+                names.mlp_prefix,
+                shard_idx,
+                groups,
+                w13_weight.len(),
+                down_weight.len()
+            ),
+        );
+        Ok(Some(DirectFp8MoeRouted {
+            w13,
+            down,
+            gate_up_quant_signature: gate_up_sig,
+            down_quant_signature: down_sig,
+        }))
+    }
+
+    fn fp8_block_projection_view(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<Fp8BlockProjectionView>> {
+        let Some(view) = self.quant_view_for(name)? else {
+            return Ok(None);
+        };
+        let QuantFormat::Fp8BlockScaled {
+            block_m,
+            block_k,
+            scale_apply,
+        } = view.format
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            block_m == 128 && block_k == 128,
+            "{}: direct FP8 grouped MoE supports 128x128 block scales, got {block_m}x{block_k}",
+            view.name
+        );
+        ensure!(
+            view.storage_dtype == Dtype::F8_E4M3 && view.logical_shape == [rows, cols],
+            "{}: expected FP8 projection [{rows}, {cols}], got {:?} {:?}",
+            view.name,
+            view.storage_dtype,
+            view.logical_shape
+        );
+        let scale_name = view
+            .scale_names
+            .first()
+            .ok_or_else(|| anyhow!("{}: FP8 projection missing scale tensor", view.name))?
+            .clone();
+        Ok(Some(Fp8BlockProjectionView {
+            weight_name: view.name,
+            scale_name,
+            rows,
+            cols,
+            scale_rows: rows / 128,
+            scale_cols: cols / 128,
+            scale_apply,
+        }))
+    }
+
+    fn copy_fp8_projection_from_shard(
+        &self,
+        tensors: &SafeTensors<'_>,
+        view: &Fp8BlockProjectionView,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let tensor = tensors
+            .tensor(&view.weight_name)
+            .with_context(|| format!("find tensor {}", view.weight_name))?;
+        ensure!(
+            tensor.dtype() == Dtype::F8_E4M3 && tensor.shape() == [view.rows, view.cols],
+            "{}: expected F8_E4M3 [{}, {}], got {:?} {:?}",
+            view.weight_name,
+            view.rows,
+            view.cols,
+            tensor.dtype(),
+            tensor.shape()
+        );
+        let data = tensor.data();
+        ensure!(
+            data.len() == dst.len(),
+            "{}: FP8 weight bytes {} != destination {}",
+            view.weight_name,
+            data.len(),
+            dst.len()
+        );
+        dst.copy_from_slice(data);
+        Ok(())
+    }
+
+    fn copy_fp8_scales_from_shard(
+        &self,
+        tensors: &SafeTensors<'_>,
+        view: &Fp8BlockProjectionView,
+        dst: &mut [f32],
+    ) -> Result<()> {
+        let tensor = tensors
+            .tensor(&view.scale_name)
+            .with_context(|| format!("find tensor {}", view.scale_name))?;
+        ensure!(
+            (tensor.dtype() == Dtype::BF16 || tensor.dtype() == Dtype::F32)
+                && tensor.shape() == [view.scale_rows, view.scale_cols],
+            "{}: expected BF16/F32 scale [{}, {}], got {:?} {:?}",
+            view.scale_name,
+            view.scale_rows,
+            view.scale_cols,
+            tensor.dtype(),
+            tensor.shape()
+        );
+        let scales = tensor_bytes_to_f32(
+            &view.scale_name,
+            tensor.dtype(),
+            tensor.data(),
+            view.scale_apply,
+        )?;
+        ensure!(
+            scales.len() == dst.len(),
+            "{}: FP8 scale values {} != destination {}",
+            view.scale_name,
+            scales.len(),
+            dst.len()
+        );
+        dst.copy_from_slice(&scales);
+        Ok(())
+    }
+
     fn load_tensor(&self, name: &str) -> Result<OwnedTensor> {
         if let Some(&idx) = self.weight_map.get(name) {
             return self.load_tensor_from_shard(idx, name);
@@ -1161,7 +1567,9 @@ impl SafetensorLoader {
         if !self.weight_map.is_empty() {
             return self.weight_map.contains_key(name);
         }
-        (0..self.shards.len()).any(|idx| self.shard_has_tensor(idx, name).unwrap_or(false))
+        self.tensor_headers()
+            .map(|headers| headers.contains_key(name))
+            .unwrap_or(false)
     }
 
     fn quant_view_for(&self, name: &str) -> Result<Option<QuantTensorView>> {
@@ -1177,9 +1585,9 @@ impl SafetensorLoader {
             if !headers.contains_key(&candidate) {
                 continue;
             }
-            reject_dsv4_e8m0_scale_abi(&candidate, &headers)?;
+            reject_dsv4_e8m0_scale_abi(&candidate, headers.as_ref())?;
             if let Some(view) =
-                detect_quant_format(&candidate, &headers, self.quant_manifest.as_ref())?
+                detect_quant_format(&candidate, headers.as_ref(), self.quant_manifest.as_ref())?
             {
                 return Ok(Some(view));
             }
@@ -1187,27 +1595,100 @@ impl SafetensorLoader {
         Ok(None)
     }
 
-    fn tensor_headers(&self) -> Result<BTreeMap<String, TensorHeader>> {
+    fn tensor_headers(&self) -> Result<Rc<BTreeMap<String, TensorHeader>>> {
         if let Some(headers) = self.tensor_headers.borrow().as_ref() {
-            return Ok(headers.clone());
+            return Ok(Rc::clone(headers));
         }
+        let t0 = Instant::now();
         let mut headers = BTreeMap::new();
         for idx in 0..self.shards.len() {
-            let bytes = self.shard_bytes(idx)?;
-            let tensors = SafeTensors::deserialize(&bytes)
-                .with_context(|| format!("deserialize {}", self.shards[idx].display()))?;
-            for (name, view) in tensors.tensors() {
-                headers.insert(
-                    name,
-                    TensorHeader {
-                        dtype: view.dtype(),
-                        shape: view.shape().to_vec(),
-                    },
-                );
-            }
+            let shard_t0 = Instant::now();
+            let shard_headers = self.read_shard_headers(idx)?;
+            let tensor_count = shard_headers.len();
+            let header_bytes = self.safetensors_header_len(idx)?;
+            self.log_startup_phase(
+                "tensor_headers.shard",
+                shard_t0,
+                format_args!(
+                    "idx={idx} header_bytes={} tensors={} path={}",
+                    header_bytes,
+                    tensor_count,
+                    self.shards[idx].display()
+                ),
+            );
+            headers.extend(shard_headers);
         }
-        *self.tensor_headers.borrow_mut() = Some(headers.clone());
+        let headers = Rc::new(headers);
+        *self.tensor_headers.borrow_mut() = Some(Rc::clone(&headers));
+        self.log_startup_phase(
+            "tensor_headers.total",
+            t0,
+            format_args!(
+                "shards={} tensors={} cached_shards={}",
+                self.shards.len(),
+                headers.len(),
+                self.shard_cache.borrow().len()
+            ),
+        );
         Ok(headers)
+    }
+
+    fn read_shard_headers(&self, idx: usize) -> Result<BTreeMap<String, TensorHeader>> {
+        let path = self
+            .shards
+            .get(idx)
+            .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
+        let header = self.read_safetensors_header_bytes(idx)?;
+        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&header)
+            .with_context(|| format!("parse safetensors header {}", path.display()))?;
+        let mut headers = BTreeMap::new();
+        for (name, value) in raw {
+            if name == "__metadata__" {
+                continue;
+            }
+            let tensor: SafetensorHeaderTensor = serde_json::from_value(value)
+                .with_context(|| format!("parse safetensors tensor header {name}"))?;
+            headers.insert(
+                name,
+                TensorHeader {
+                    dtype: tensor.dtype,
+                    shape: tensor.shape,
+                },
+            );
+        }
+        Ok(headers)
+    }
+
+    fn safetensors_header_len(&self, idx: usize) -> Result<usize> {
+        Ok(self.read_safetensors_header_len(idx)?.1)
+    }
+
+    fn read_safetensors_header_bytes(&self, idx: usize) -> Result<Vec<u8>> {
+        let (mut file, header_len) = self.read_safetensors_header_len(idx)?;
+        let mut header = vec![0u8; header_len];
+        file.read_exact(&mut header)
+            .with_context(|| format!("read safetensors header {}", self.shards[idx].display()))?;
+        Ok(header)
+    }
+
+    fn read_safetensors_header_len(&self, idx: usize) -> Result<(fs::File, usize)> {
+        let path = self
+            .shards
+            .get(idx)
+            .ok_or_else(|| anyhow!("shard index {idx} out of range"))?;
+        let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut len_bytes = [0u8; 8];
+        file.read_exact(&mut len_bytes)
+            .with_context(|| format!("read safetensors header length {}", path.display()))?;
+        let header_len = usize::try_from(u64::from_le_bytes(len_bytes)).with_context(|| {
+            format!("safetensors header length too large in {}", path.display())
+        })?;
+        ensure!(
+            header_len > 0,
+            "{}: safetensors header length is zero",
+            path.display()
+        );
+        Ok((file, header_len))
     }
 
     fn load_quant_or_dense_view(
@@ -1622,9 +2103,11 @@ impl SafetensorLoader {
         }
     }
 
-    /// Read-once shard bytes: fill the cache on first touch, then hand out a
+    /// Current-shard bytes: fill the cache on first touch, then hand out a
     /// cheap `Rc` clone (no `RefCell` guard escapes, so nested loads that fill
-    /// OTHER shards never hit a `BorrowMutError`).
+    /// OTHER shards never hit a `BorrowMutError`). Loading a different shard
+    /// evicts older entries; outstanding [`SharedTensor`] borrows keep their
+    /// shard alive through their own `Rc`.
     #[allow(clippy::rc_buffer)] // Rc<[u8]> conversion would re-copy the shard
     fn shard_bytes(&self, idx: usize) -> Result<std::rc::Rc<Vec<u8>>> {
         let path = self
@@ -1634,21 +2117,19 @@ impl SafetensorLoader {
         if let Some(bytes) = self.shard_cache.borrow().get(&idx) {
             return Ok(std::rc::Rc::clone(bytes));
         }
+        let t0 = Instant::now();
         let bytes =
             std::rc::Rc::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
-        self.shard_cache
-            .borrow_mut()
-            .insert(idx, std::rc::Rc::clone(&bytes));
+        let mut cache = self.shard_cache.borrow_mut();
+        cache.clear();
+        cache.insert(idx, std::rc::Rc::clone(&bytes));
+        drop(cache);
+        self.log_startup_phase(
+            "shard_read",
+            t0,
+            format_args!("idx={idx} bytes={} path={}", bytes.len(), path.display()),
+        );
         Ok(bytes)
-    }
-
-    /// Header-only existence check against one shard — no tensor bytes are
-    /// copied (unlike `load_tensor_from_shard`).
-    fn shard_has_tensor(&self, idx: usize, name: &str) -> Result<bool> {
-        let bytes = self.shard_bytes(idx)?;
-        let tensors = SafeTensors::deserialize(&bytes)
-            .with_context(|| format!("deserialize {}", self.shards[idx].display()))?;
-        Ok(tensors.tensor(name).is_ok())
     }
 
     fn load_tensor_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
@@ -1664,12 +2145,24 @@ impl SafetensorLoader {
     /// Dtype-agnostic shard read (DSv4 FP8/FP4/E8M0). Same read-once cache as the
     /// BF16 path; the typed gate lives in the callers.
     fn load_raw_from_shard(&self, idx: usize, name: &str) -> Result<OwnedTensor> {
+        let t0 = Instant::now();
         let tensor = self.borrow_raw_from_shard(idx, name)?;
-        Ok(OwnedTensor {
+        let owned = OwnedTensor {
             shape: tensor.shape.clone(),
             bytes: tensor.bytes().to_vec(),
             dtype: tensor.dtype,
-        })
+        };
+        self.log_startup_phase(
+            "tensor.owned_copy",
+            t0,
+            format_args!(
+                "name={name} idx={idx} bytes={} dtype={:?} shape={:?}",
+                owned.bytes.len(),
+                owned.dtype,
+                owned.shape
+            ),
+        );
+        Ok(owned)
     }
 
     /// Zero-copy shard read: the returned [`SharedTensor`] aliases the tensor's
@@ -2404,6 +2897,12 @@ struct SafetensorIndex {
     weight_map: HashMap<String, String>,
 }
 
+#[derive(serde::Deserialize)]
+struct SafetensorHeaderTensor {
+    dtype: Dtype,
+    shape: Vec<usize>,
+}
+
 pub(crate) struct OwnedTensor {
     pub(crate) shape: Vec<usize>,
     pub(crate) bytes: Vec<u8>,
@@ -2617,6 +3116,50 @@ pub(crate) struct MoeFp8ExpertGroup {
 }
 
 impl MoeFp8ExpertGroup {
+    fn from_host(
+        ctx: &DeviceContext,
+        weight: &[u8],
+        scales: &[f32],
+        groups: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        ensure!(groups > 0, "FP8 MoE expert group: groups must be non-zero");
+        ensure!(
+            rows.is_multiple_of(128) && cols.is_multiple_of(128),
+            "FP8 MoE DeepGEMM group needs rows/cols 128-aligned, got {rows}x{cols}"
+        );
+        let scale_rows = rows / 128;
+        let scale_cols = cols / 128;
+        ensure!(
+            weight.len() == groups * rows * cols,
+            "FP8 MoE grouped host weight bytes {} != expected {}",
+            weight.len(),
+            groups * rows * cols
+        );
+        ensure!(
+            scales.len() == groups * scale_rows * scale_cols,
+            "FP8 MoE grouped host scale values {} != expected {}",
+            scales.len(),
+            groups * scale_rows * scale_cols
+        );
+        Ok(Self {
+            weight: ctx
+                .stream
+                .clone_htod(weight)
+                .map_err(|e| anyhow!("FP8 MoE grouped weight H2D failed: {e}"))?,
+            scales: ctx
+                .stream
+                .clone_htod(scales)
+                .map_err(|e| anyhow!("FP8 MoE grouped scales H2D failed: {e}"))?,
+            groups,
+            rows,
+            cols,
+            scale_rows,
+            scale_cols,
+        })
+    }
+
     fn concat(
         ctx: &DeviceContext,
         experts: &[DeviceMatrix],
