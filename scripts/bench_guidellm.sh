@@ -56,6 +56,11 @@
 #     up a stale system guidellm and the canonical run silently aborted.)
 #   * infer HTTP server is already running at --target
 #     (start it with: scripts/start_infer.sh)
+#   * throughput runs must not inherit DSv4 sync-profile env:
+#     ARLE_DSV4_DECODE_PHASE_TIME or ARLE_DSV4_LINEAR_PROFILE. Those knobs
+#     insert per-step synchronizations and understate tok/s. Use the profiler
+#     wrappers for profiling, or set ARLE_ALLOW_PROFILED_BENCH=1 only when the
+#     output will be labeled as profiling-contaminated rather than a baseline.
 #   * server --max-seq-len ≥ canonical prompt + canonical output + slack
 #     (canonical 4096 + 256, but synthetic tokenizer adds BOS / EOS / chat-template
 #     overhead — observed actual prompts at 4097 tokens vs server max_input 4090
@@ -312,6 +317,40 @@ if ! [[ "$TRACE_INTERVAL_MS" =~ ^[0-9]+$ ]] || [[ "$TRACE_INTERVAL_MS" -le 0 ]];
     echo "error: --trace-interval-ms must be a positive integer, got: $TRACE_INTERVAL_MS" >&2
     exit 2
 fi
+
+env_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+assert_no_dsv4_sync_profile_env() {
+    local offenders=()
+    local name value
+    for name in ARLE_DSV4_DECODE_PHASE_TIME ARLE_DSV4_LINEAR_PROFILE; do
+        value="${!name-}"
+        case "$value" in
+            ""|0|false|FALSE|no|off|OFF) ;;
+            *) offenders+=("$name=$value") ;;
+        esac
+    done
+    if [[ ${#offenders[@]} -eq 0 ]]; then
+        return 0
+    fi
+    if env_truthy "${ARLE_ALLOW_PROFILED_BENCH:-}"; then
+        echo "warning: DSv4 sync-profile env present during bench: ${offenders[*]}" >&2
+        echo "warning: ARLE_ALLOW_PROFILED_BENCH=1 set; do not publish this as a profiling-OFF baseline." >&2
+        return 0
+    fi
+    echo "error: DSv4 sync-profile env present during throughput bench: ${offenders[*]}" >&2
+    echo "       These flags add per-step synchronizations and contaminate tok/s." >&2
+    echo "       Unset them for baselines, use scripts/profile_*_guidellm.sh for profiling," >&2
+    echo "       or set ARLE_ALLOW_PROFILED_BENCH=1 only for an explicitly contaminated run." >&2
+    exit 2
+}
+
+assert_no_dsv4_sync_profile_env
 
 # ---- preflight: required tools on PATH ---------------------------------------
 if ! command -v guidellm >/dev/null 2>&1; then
