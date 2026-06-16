@@ -33,6 +33,8 @@ mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
 use self::kernels::{KernelCache, launch_1d, launch_rows};
+#[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+use cuda_kernels::collective::{CollectiveBackend, DType, NcclBackend, ReduceOp};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
@@ -52,7 +54,6 @@ const CUBLASLT_BF16_GEMMEX_MIN_N: usize = 32;
 /// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
 /// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
 /// safe to share across threads.
-#[derive(Debug)]
 pub struct CudaBackend {
     #[cfg(not(feature = "no-cuda"))]
     stream: Arc<CudaStream>,
@@ -60,6 +61,23 @@ pub struct CudaBackend {
     blas: Arc<CudaBlas>,
     #[cfg(not(feature = "no-cuda"))]
     kernels: KernelCache,
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    nccl: Option<Arc<NcclBackend>>,
+}
+
+impl std::fmt::Debug for CudaBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("CudaBackend");
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            debug.field("device", &"cuda");
+        }
+        #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+        {
+            debug.field("nccl", &self.nccl.is_some());
+        }
+        debug.finish_non_exhaustive()
+    }
 }
 
 impl CudaBackend {
@@ -88,8 +106,43 @@ impl CudaBackend {
                 stream,
                 blas: Arc::new(blas),
                 kernels,
+                #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+                nccl: None,
             })
         }
+    }
+
+    /// Create a CUDA backend with an NCCL all-reduce communicator attached.
+    ///
+    /// The communicator uses the same default stream/context as autograd CUDA
+    /// kernels, so surrounding ops and collectives are naturally ordered.
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    pub fn new_with_nccl(
+        ordinal: usize,
+        unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
+        world_size: usize,
+        rank: usize,
+    ) -> Result<Self> {
+        let mut backend = Self::new(ordinal)?;
+        let nccl = NcclBackend::init_rank(unique_id, world_size, rank).map_err(|err| {
+            AutogradError::TapeInvariant(Box::leak(
+                format!("NcclBackend::init_rank failed for autograd: {err:#}").into_boxed_str(),
+            ))
+        })?;
+        backend.nccl = Some(Arc::new(nccl));
+        Ok(backend)
+    }
+
+    /// No-GPU stub for no-cuda builds that still type-check the nccl feature.
+    #[cfg(all(feature = "nccl", feature = "no-cuda"))]
+    pub fn new_with_nccl(
+        ordinal: usize,
+        unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
+        world_size: usize,
+        rank: usize,
+    ) -> Result<Self> {
+        let _ = (ordinal, unique_id, world_size, rank);
+        todo!("GPU required: CudaBackend::new_with_nccl is unavailable under feature no-cuda")
     }
 
     /// Query device VRAM `(free_bytes, total_bytes)` for the backend's CUDA
@@ -1235,6 +1288,51 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_add_into_device(self, dest, src, shape)
+        }
+    }
+
+    fn all_reduce_sum_device(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda all_reduce_sum_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let len = shape_size(shape);
+            let src = self.cuda_slice(x, "all_reduce_sum")?;
+            if src.len() != len {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: shape.to_vec(),
+                    size: len,
+                });
+            }
+            let mut out = self
+                .stream
+                .alloc_zeros::<f32>(len)
+                .map_err(|_| AutogradError::TapeInvariant("cuda all_reduce alloc failed"))?;
+            self.stream
+                .memcpy_dtod(src, &mut out)
+                .map_err(|_| AutogradError::TapeInvariant("cuda all_reduce D2D copy failed"))?;
+
+            #[cfg(feature = "nccl")]
+            if let Some(nccl) = &self.nccl {
+                let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                unsafe {
+                    nccl.all_reduce(
+                        dst_ptr as *mut _,
+                        len,
+                        DType::F32,
+                        ReduceOp::Sum,
+                        self.stream.cu_stream().cast(),
+                    )
+                    .map_err(|_| AutogradError::TapeInvariant("NCCL all_reduce_sum failed"))?;
+                }
+            }
+
+            Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
         }
     }
 

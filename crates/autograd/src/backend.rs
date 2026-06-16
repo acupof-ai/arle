@@ -510,6 +510,24 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Device-handle all-reduce sum over the backend communicator.
+    /// Single-rank and CPU semantics are identity.
+    ///
+    /// The operation is functional: it returns a fresh handle and never
+    /// mutates `x`, so tape consumers can keep sharing the input handle.
+    fn all_reduce_sum_device(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let size = shape_size(shape);
+        if host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        self.upload(&host, shape)
+    }
+
     /// Sum of squares for a device handle, returned on host as `f64`.
     /// The default fallback reads the full tensor; CUDA overrides with a
     /// partial-reduction kernel so gradient clipping can stay device-resident.

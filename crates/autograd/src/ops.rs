@@ -4,6 +4,8 @@ pub mod activation;
 pub mod attention;
 #[path = "ops/broadcast.rs"]
 pub mod broadcast;
+#[path = "ops/collective.rs"]
+pub mod collective;
 #[path = "ops/elementwise.rs"]
 pub mod elementwise;
 #[path = "ops/embed.rs"]
@@ -36,6 +38,7 @@ use crate::{
 pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_backward};
 pub(crate) use attention::causal_sdpa_recompute_backward;
 pub(crate) use broadcast::add_broadcast_backward;
+pub(crate) use collective::all_reduce_sum_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
 pub(crate) use gather::gather_last_dim_backward;
@@ -57,6 +60,10 @@ pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
     // is the critical enabler — previously it forced a readback before the
     // inner fn could see the device state.
     activation::exp(x, store, tape)
+}
+
+pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    collective::all_reduce_sum(x, store, tape)
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
