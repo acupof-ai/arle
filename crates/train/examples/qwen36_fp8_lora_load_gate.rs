@@ -17,7 +17,7 @@ mod app {
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
         LoraConfig, LoraTargetSet, infer_student::InferStudent, qwen35::Qwen35Model,
-        qwen35_loader::load_qwen35_lora_from_hf_dir,
+        qwen35_loader::load_qwen35_lora_from_hf_dir, tokenizer::ChatTokenizer,
     };
 
     const DEFAULT_MODEL_DIR: &str = "/data01/models/Qwen3.6-35B-A3B-FP8";
@@ -31,6 +31,9 @@ mod app {
         sync_infer: bool,
         infer_model: PathBuf,
         perturb_adapter: Option<String>,
+        rollout_smoke_prompt: Option<String>,
+        rollout_smoke_tokens: usize,
+        expect_substring: Option<String>,
     }
 
     pub fn main() -> Result<()> {
@@ -121,6 +124,15 @@ mod app {
                  sync_seconds={sync_seconds:.6} perturb_adapter={}",
                 args.perturb_adapter.as_deref().unwrap_or("none")
             );
+            if let Some(prompt) = args.rollout_smoke_prompt.as_deref() {
+                run_rollout_smoke(
+                    &infer_student,
+                    &args.infer_model,
+                    prompt,
+                    args.rollout_smoke_tokens,
+                    args.expect_substring.as_deref(),
+                )?;
+            }
         }
 
         Ok(())
@@ -141,6 +153,9 @@ mod app {
         let mut infer_model = model.clone();
         let mut perturb_adapter =
             Some("model.language_model.layers.0.mlp.experts.0.up_proj.weight.lora_b".to_string());
+        let mut rollout_smoke_prompt = None;
+        let mut rollout_smoke_tokens = 32usize;
+        let mut expect_substring = None;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -176,12 +191,25 @@ mod app {
                     let raw = next_arg("--perturb-adapter", &mut args)?;
                     perturb_adapter = if raw == "none" { None } else { Some(raw) };
                 }
+                "--rollout-smoke-prompt" => {
+                    rollout_smoke_prompt = Some(next_arg("--rollout-smoke-prompt", &mut args)?);
+                }
+                "--rollout-smoke-tokens" => {
+                    rollout_smoke_tokens = next_arg("--rollout-smoke-tokens", &mut args)?
+                        .parse()
+                        .context("parse --rollout-smoke-tokens")?;
+                }
+                "--expect-substring" => {
+                    expect_substring = Some(next_arg("--expect-substring", &mut args)?);
+                }
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_load_gate --release --features cuda -- \
                          [--model DIR] [--device N] [--rank N] [--alpha F] \
                          [--target-set all-linear|attention-qv] [--sync-infer] \
-                         [--infer-model DIR] [--perturb-adapter NAME|none]"
+                         [--infer-model DIR] [--perturb-adapter NAME|none] \
+                         [--rollout-smoke-prompt TEXT] [--rollout-smoke-tokens N] \
+                         [--expect-substring TEXT]"
                     );
                     std::process::exit(0);
                 }
@@ -192,6 +220,12 @@ mod app {
         if rank == 0 || !alpha.is_finite() || alpha <= 0.0 {
             bail!("rank must be >0 and alpha must be positive finite");
         }
+        if rollout_smoke_tokens == 0 {
+            bail!("--rollout-smoke-tokens must be > 0");
+        }
+        if rollout_smoke_prompt.is_some() && !sync_infer {
+            bail!("--rollout-smoke-prompt requires --sync-infer");
+        }
         Ok(Args {
             model,
             device,
@@ -200,6 +234,9 @@ mod app {
             sync_infer,
             infer_model,
             perturb_adapter,
+            rollout_smoke_prompt,
+            rollout_smoke_tokens,
+            expect_substring,
         })
     }
 
@@ -274,6 +311,54 @@ mod app {
             train_backend,
             vocab_size,
         ))
+    }
+
+    fn run_rollout_smoke(
+        infer_student: &InferStudent,
+        model: &Path,
+        prompt: &str,
+        rollout_tokens: usize,
+        expect_substring: Option<&str>,
+    ) -> Result<()> {
+        let tokenizer_path = model.join("tokenizer.json");
+        let tokenizer = ChatTokenizer::from_file(&tokenizer_path)
+            .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", tokenizer_path.display()))?;
+        let prompt_ids = tokenizer
+            .encode(prompt, false)
+            .map_err(|err| anyhow::anyhow!("encode rollout smoke prompt: {err}"))?;
+        let started = Instant::now();
+        let rollout = infer_student
+            .generate_rollout(&prompt_ids, rollout_tokens, None)
+            .context("generate rollout smoke through InferStudent")?;
+        let generated = &rollout[prompt_ids.len()..];
+        let generated_text = tokenizer
+            .decode(generated, true)
+            .map_err(|err| anyhow::anyhow!("decode generated rollout smoke: {err}"))?;
+        let full_text = tokenizer
+            .decode(&rollout, true)
+            .map_err(|err| anyhow::anyhow!("decode full rollout smoke: {err}"))?;
+        let smoke_seconds = started.elapsed().as_secs_f64();
+        let contains_expect = expect_substring
+            .map(|needle| generated_text.contains(needle))
+            .unwrap_or(true);
+        println!(
+            "qwen36_fp8_lora_rollout_smoke_result prompt_tokens={} generated_tokens={} \
+             smoke_seconds={smoke_seconds:.6} expect={:?} contains_expect={} \
+             generated_text={:?} full_text={:?}",
+            prompt_ids.len(),
+            generated.len(),
+            expect_substring,
+            contains_expect,
+            generated_text,
+            full_text
+        );
+        if !contains_expect {
+            bail!(
+                "rollout smoke output did not contain expected substring {:?}",
+                expect_substring
+            );
+        }
+        Ok(())
     }
 }
 
