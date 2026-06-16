@@ -2020,6 +2020,20 @@ impl Dsv4Model {
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
 
+        // Opt-in full-flatten gate (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, the same
+        // gate the compressor projection pre-pass uses). When ON, the per-slot
+        // compressor STATE update, the FINISH inverse-RoPE, and the FINISH
+        // SW-window write are each batched into ONE launch over the N rows
+        // (replacing the N per-row launches). When OFF, every per-row path runs
+        // byte-identically. Computed once per forward.
+        let full_flatten = crate::attention::dsv4_decode_compressor_batch_enabled()?;
+        // Holds the host-uploaded per-row device-pointer ARRAYS for the batched
+        // compressor/finish kernels alive to function return (the N>1 keepalive is
+        // inert; pointer arrays must outlive their kernel launch under the
+        // disabled-event-tracking premature-free hazard). Only pushed when
+        // `full_flatten` is on.
+        let mut ptr_keepalive: Vec<CudaSlice<u64>> = Vec::new();
+
         // Decode-phase timing accumulators (only ever touched when phase_time).
         let (mut csa_ms, mut sw_ms, mut moe_ms) = (0f64, 0f64, 0f64);
         // Batched-lane (sw_ms) sub-block split: prep loop / batched fwd / finish loop.
@@ -2216,6 +2230,118 @@ impl Dsv4Model {
                 } else {
                     (None, None)
                 };
+                // ── 0c. Full-flatten P1a (opt-in, default OFF): per-row compressor
+                // STATE-update DEFER (gather each row's ring-state pointers + advance
+                // compressed.seq_len, NO per-row FFI) → ONE
+                // `dsv4_compressor_update_batched` over all N rows (main + indexer),
+                // reading the batched prepass outputs directly. This replaces the N
+                // per-row `dsv4_compressor_update_*` launches (the remaining ∝n
+                // `perrow`). The batched update runs BEFORE the P1b loop's per-row
+                // consumers (pack reads main `compressed`; csa cache-write reads
+                // indexer `compressed`), so they see the written keys. `indexer_rows_before`
+                // is captured per row here (P1a advances seq_len) and handed to P1b's
+                // CSA path. When the gate is OFF, this whole block is skipped and the
+                // P1b loop runs the per-row compressor (byte-identical).
+                let indexer_rows_before: Vec<usize> = if full_flatten {
+                    let mut main_sink = crate::attention::Dsv4CompressorBatchPtrs::with_capacity(n);
+                    let mut indexer_sink =
+                        crate::attention::Dsv4CompressorBatchPtrs::with_capacity(n);
+                    let mut before = Vec::with_capacity(n);
+                    let original_seq_len = proj.original_seq_len;
+                    for r in 0..n {
+                        // Defer mode reads NO `normed_row` data (the projection was
+                        // already batched in the prepass; defer only gathers state
+                        // pointers + advances seq_len), so the per-row copy-in is
+                        // skipped. `normed_row` is a `[hidden,1]` handle with
+                        // seq_len==1 — exactly the shape `compressor_forward`'s asserts
+                        // require for the token_count==1 decode path.
+                        let slot = &mut slots[slot_ids[r]];
+                        let b = crate::attention::mla_attention_compressor_defer_row(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            &normed_row,
+                            &mut slot.attention[layer_idx],
+                            start_positions[r],
+                            Some(&slot.start_pos_device),
+                            original_seq_len,
+                            &mut main_sink,
+                            &mut indexer_sink,
+                            &mut keepalive,
+                        )?;
+                        before.push(b);
+                    }
+                    // ONE batched update each for the main + indexer compressor (only
+                    // when this layer's rows actually have that compressor; the sinks
+                    // are all-or-nothing per layer since `layer.mode` is uniform).
+                    let overlap = layer.compress_ratio < 16;
+                    if let (Some((kv, score)), Some(compressor)) = (
+                        compressor_kv_score.as_ref(),
+                        layer.attention.compressor.as_ref(),
+                    ) {
+                        let positions = batched_positions.as_ref().ok_or_else(|| {
+                            anyhow!("DSv4 full-flatten P1a: batched positions missing")
+                        })?;
+                        crate::attention::dsv4_compressor_update_batched(
+                            &self.ctx,
+                            &self.config,
+                            compressor,
+                            kv,
+                            score,
+                            &main_sink,
+                            positions,
+                            n,
+                            self.config.head_dim,
+                            layer.compress_ratio,
+                            overlap,
+                            true,
+                            proj.original_seq_len,
+                            &mut ptr_keepalive,
+                        )?;
+                    }
+                    if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
+                        if let (Some((kv, score)), Some(indexer)) =
+                            (indexer_kv_score.as_ref(), layer.attention.indexer.as_ref())
+                        {
+                            let use_official_dsa = crate::attention::dsv4_dsa_official_enabled()?;
+                            let indexer_rope_original_seq_len = if use_official_dsa {
+                                i32::try_from(
+                                    self.config.rope_parameters.original_max_position_embeddings,
+                                )
+                                .map_err(|_| {
+                                    anyhow!("DSv4 full-flatten indexer rope len overflows i32")
+                                })?
+                            } else {
+                                0
+                            };
+                            let positions = batched_positions.as_ref().ok_or_else(|| {
+                                anyhow!("DSv4 full-flatten P1a: batched positions missing")
+                            })?;
+                            crate::attention::dsv4_compressor_update_batched(
+                                &self.ctx,
+                                &self.config,
+                                &indexer.compressor,
+                                kv,
+                                score,
+                                &indexer_sink,
+                                positions,
+                                n,
+                                self.config.index_head_dim,
+                                layer.compress_ratio,
+                                true, // indexer compressor always overlap
+                                use_official_dsa,
+                                indexer_rope_original_seq_len,
+                                &mut ptr_keepalive,
+                            )?;
+                        }
+                    }
+                    before
+                } else {
+                    Vec::new()
+                };
                 let _compidx_t = if phase_time {
                     ctx.stream.synchronize().ok();
                     Some(std::time::Instant::now())
@@ -2332,13 +2458,29 @@ impl Dsv4Model {
                                 })?;
                             Ok(row_buf)
                         };
-                        let comp_main_row = match compressor_kv_score.as_ref() {
-                            Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
-                            None => None,
-                        };
-                        let comp_indexer_row = match indexer_kv_score.as_ref() {
-                            Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
-                            None => None,
+                        // Full-flatten: the compressor STATE update already ran
+                        // batched in P1a, so the per-row `[width,1]` slice copies (the
+                        // ∝n per-row work this campaign removes) are SKIPPED — pass
+                        // `skip_compressor=true` + the P1a-captured `indexer_rows_before`
+                        // and NO precomputed slices. When the gate is OFF, build the
+                        // per-row slices and run the per-row compressor as before.
+                        //
+                        // The owned slice buffers are bound at iteration scope so they
+                        // outlive the prepare call that borrows them through
+                        // `compressor_precomputed` (dropping at iteration end). Empty
+                        // (`None`) under full-flatten — no per-row slice work.
+                        let (comp_main_row, comp_indexer_row) = if full_flatten {
+                            (None, None)
+                        } else {
+                            let main_row = match compressor_kv_score.as_ref() {
+                                Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
+                                None => None,
+                            };
+                            let indexer_row = match indexer_kv_score.as_ref() {
+                                Some((kv, score)) => Some((slice_row(kv)?, slice_row(score)?)),
+                                None => None,
+                            };
+                            (main_row, indexer_row)
                         };
                         let compressor_precomputed = comp_main_row.as_ref().map(|(kv, score)| {
                             crate::attention::Dsv4CompressorPrecomputed {
@@ -2348,6 +2490,12 @@ impl Dsv4Model {
                                     .map(|(ikv, iscore)| (ikv as &_, iscore as &_)),
                             }
                         });
+                        let skip_compressor = full_flatten;
+                        let idx_before_override = if full_flatten {
+                            indexer_rows_before.get(r).copied()
+                        } else {
+                            None
+                        };
                         let row_prepared = crate::attention::mla_attention_prepare_compressed_only(
                             &self.ctx,
                             &self.config,
@@ -2367,6 +2515,8 @@ impl Dsv4Model {
                             Some(&slot.start_pos_device),
                             batched_gather,
                             compressor_precomputed,
+                            skip_compressor,
+                            idx_before_override,
                             &mut keepalive,
                         )?;
                         // Pack this row's KV into the shared pool, then gather its
@@ -2575,6 +2725,31 @@ impl Dsv4Model {
                 };
                 {
                     let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_finish");
+                    // FINISH order is identical between the two gate states; only
+                    // the inverse-RoPE + SW-window WRITE switch from N per-row
+                    // launches to ONE batched launch each when `full_flatten` is on
+                    // (the heavy ∝n FINISH tail). Both must run BEFORE the per-row
+                    // O-LoRA (which consumes the inverse-roped `local_attn`).
+                    //
+                    // Pass F1: slice each row's global-head output into its
+                    // `local_attn` (per-row, cheap memcpy/TP-slice). When
+                    // full_flatten, also gather this row's local_attn / k_prepared /
+                    // sw_window device pointers for the batched FINISH kernels.
+                    let mut out_ptrs: Vec<u64> = if full_flatten {
+                        Vec::with_capacity(n)
+                    } else {
+                        Vec::new()
+                    };
+                    let mut kprep_ptrs: Vec<u64> = if full_flatten {
+                        Vec::with_capacity(n)
+                    } else {
+                        Vec::new()
+                    };
+                    let mut swcache_ptrs: Vec<u64> = if full_flatten {
+                        Vec::with_capacity(n)
+                    } else {
+                        Vec::new()
+                    };
                     for r in 0..n {
                         // One mutable borrow of row r's prepared state; field
                         // accesses below are disjoint (k_prepared/scalars `&`,
@@ -2595,27 +2770,85 @@ impl Dsv4Model {
                                 &mut p.local_attn,
                             )?;
                         }
-                        let slot = &mut slots[slot_ids[r]];
-                        let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
-                        crate::attention::flashmla_decode_finish_row(
+                        if full_flatten {
+                            // Resolve this row's device pointers (single-stream:
+                            // ptrs stay valid; buffers not reallocated this step).
+                            let (op, og) = p.local_attn.data.device_ptr(&ctx.stream);
+                            out_ptrs.push(op);
+                            drop(og);
+                            let (kp, kg) = p.k_prepared.data.device_ptr(&ctx.stream);
+                            kprep_ptrs.push(kp);
+                            drop(kg);
+                            let slot = &mut slots[slot_ids[r]];
+                            let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
+                            let (cp, cg) = sw_window.device_ptr_mut(&ctx.stream);
+                            swcache_ptrs.push(cp);
+                            drop(cg);
+                        } else {
+                            // Per-row FINISH (gate OFF): byte-identical inverse-RoPE
+                            // + SW-window write, one launch each per row.
+                            let slot = &mut slots[slot_ids[r]];
+                            let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
+                            crate::attention::flashmla_decode_finish_row(
+                                &self.ctx,
+                                &self.config,
+                                sw_window,
+                                &p.k_prepared,
+                                &mut p.local_attn,
+                                start_positions[r],
+                                &slot.start_pos_device,
+                                p.local_heads,
+                                p.rope_base,
+                                p.original_seq_len,
+                                self.config.rope_parameters.factor,
+                                self.config.rope_parameters.beta_fast,
+                                self.config.rope_parameters.beta_slow,
+                            )?;
+                        }
+                    }
+                    // Batched FINISH tail (gate ON): ONE inverse-RoPE + ONE SW-window
+                    // write over all N rows, replacing the per-row launches above.
+                    // local_heads / rope params are uniform across the layer's rows.
+                    if full_flatten {
+                        let positions = batched_positions.as_ref().ok_or_else(|| {
+                            anyhow!("DSv4 full-flatten finish: batched positions missing")
+                        })?;
+                        let local_heads = prepared[0].local_heads;
+                        let rope_base = prepared[0].rope_base;
+                        let original_seq_len = prepared[0].original_seq_len;
+                        let out_arr = crate::ops::upload_u64(&self.ctx, &out_ptrs)?;
+                        let kprep_arr = crate::ops::upload_u64(&self.ctx, &kprep_ptrs)?;
+                        let swcache_arr = crate::ops::upload_u64(&self.ctx, &swcache_ptrs)?;
+                        crate::attention::flashmla_decode_inverse_rope_batched(
                             &self.ctx,
                             &self.config,
-                            sw_window,
-                            &p.k_prepared,
-                            &mut p.local_attn,
-                            start_positions[r],
-                            &slot.start_pos_device,
-                            p.local_heads,
-                            p.rope_base,
-                            p.original_seq_len,
+                            &out_arr,
+                            positions,
+                            n,
+                            local_heads,
+                            rope_base,
+                            original_seq_len,
                             self.config.rope_parameters.factor,
                             self.config.rope_parameters.beta_fast,
                             self.config.rope_parameters.beta_slow,
                         )?;
-                        // O-LoRA: local_attn[r] → reused attn_out_row scratch →
-                        // attn_out[r] (per-row; token=1; no per-row alloc). The
-                        // shared scratch is WAR-safe under stream ordering, like
-                        // the per-row lane below.
+                        crate::attention::flashmla_decode_sw_window_batched(
+                            &self.ctx,
+                            &self.config,
+                            &kprep_arr,
+                            &swcache_arr,
+                            positions,
+                            n,
+                        )?;
+                        ptr_keepalive.push(out_arr);
+                        ptr_keepalive.push(kprep_arr);
+                        ptr_keepalive.push(swcache_arr);
+                    }
+                    // Pass F2: per-row O-LoRA → attn_out (consumes the now
+                    // inverse-roped `local_attn`). Per-row; token=1; no per-row alloc.
+                    for r in 0..n {
+                        let p = &prepared[r];
+                        let slot = &mut slots[slot_ids[r]];
                         crate::attention::mla_oproj(
                             &self.ctx,
                             &layer.attention,

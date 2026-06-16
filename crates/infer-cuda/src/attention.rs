@@ -163,6 +163,27 @@ impl Dsv4CompressorState {
         Ok(())
     }
 
+    /// Raw mutable device pointers (as `u64`) to this row's five ring-state
+    /// buffers, for gathering into the batched-compressor-update pointer arrays:
+    /// `(pending_kv, pending_score, prev_overlap_kv, prev_overlap_score,
+    /// compressed)`. Resolved on `ctx.stream`; the returned `u64`s stay valid
+    /// because the buffers are not reallocated for the rest of the forward (same
+    /// single-stream discipline the per-row path uses). The cudarc borrow guards
+    /// are dropped before returning so the caller can re-borrow `state` later.
+    pub(crate) fn batched_update_ptrs(&mut self, ctx: &DeviceContext) -> (u64, u64, u64, u64, u64) {
+        let (pkv, g0) = self.pending_kv.device_ptr_mut(&ctx.stream);
+        let (psc, g1) = self.pending_score.device_ptr_mut(&ctx.stream);
+        let (prkv, g2) = self.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+        let (prsc, g3) = self.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (comp, g4) = self.compressed.data.device_ptr_mut(&ctx.stream);
+        drop(g0);
+        drop(g1);
+        drop(g2);
+        drop(g3);
+        drop(g4);
+        (pkv, psc, prkv, prsc, comp)
+    }
+
     /// Exact requested device bytes owned by this compressor/indexer state:
     /// Σ over the four bf16 partial-row buffers + the `compressed` HiddenStates.
     #[allow(dead_code)]
@@ -3988,6 +4009,7 @@ pub(crate) fn commit_layer_fold(
             true,
             original_seq_len,
             None,
+            None,
             keepalive,
         )?;
         if mode == DeepSeekV4AttentionMode::CompressedSparse {
@@ -4019,6 +4041,7 @@ pub(crate) fn commit_layer_fold(
                 None,
                 use_official_dsa,
                 indexer_rope_original_seq_len,
+                None,
                 None,
                 keepalive,
             )?;
@@ -6830,6 +6853,99 @@ pub(crate) fn flashmla_decode_finish_row(
     Ok(())
 }
 
+/// Opt-in batched FINISH tail (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):
+/// ONE batched output inverse-RoPE over N rows' (non-contiguous) `local_attn`
+/// buffers, replacing the N per-row `arle_dsv4_output_inverse_rope_*` launches in
+/// [`flashmla_decode_finish_row`]. `out_ptrs` are this step's per-row `local_attn`
+/// device pointers (gathered host-side, all `[local_width,1]`); `start_pos` is the
+/// contiguous `[N]` decode-position array (each row's abs pos). `local_heads`,
+/// `rope_base`, `original_seq_len`, and the rope factor/beta are uniform across the
+/// layer's rows. MUST run BEFORE the per-row O-LoRA (which consumes `local_attn`).
+/// Byte-identical to N per-row inverse-RoPE calls (same kernel math, one block per
+/// (row,head)).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flashmla_decode_inverse_rope_batched(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    out_ptrs: &CudaSlice<u64>,
+    start_pos: &CudaSlice<i32>,
+    n: usize,
+    local_heads: usize,
+    rope_base: f32,
+    original_seq_len: i32,
+    rope_factor: f32,
+    rope_beta_fast: f32,
+    rope_beta_slow: f32,
+) -> Result<()> {
+    let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope_batched_ptr");
+    let (out_ptr, og) = out_ptrs.device_ptr(&ctx.stream);
+    let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
+    // SAFETY: out_ptrs holds N valid `[local_width,1]` device pointers; start_pos
+    // is `[N]`; the kernel grids N*local_heads blocks and indexes both per row.
+    unsafe {
+        ffi::arle_dsv4_output_inverse_rope_batched_ptr_cuda(
+            out_ptr as *const *mut ffi::Half,
+            n as i32,
+            local_heads as i32,
+            config.head_dim as i32,
+            config.qk_rope_head_dim as i32,
+            start_ptr as *const i32,
+            rope_base,
+            original_seq_len,
+            rope_factor,
+            rope_beta_fast,
+            rope_beta_slow,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 batched FlashMLA output inverse-rope (ptr) failed: {e}"))?;
+    }
+    drop(og);
+    drop(sg);
+    Ok(())
+}
+
+/// Opt-in batched FINISH tail (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):
+/// ONE batched SW-window write over N rows' (non-contiguous) k_prepared / SW ring
+/// cache buffers, replacing the N per-row `dsv4_update_window_cache_*` launches in
+/// [`flashmla_decode_finish_row`]. `k_ptrs` / `cache_ptrs` are this step's per-row
+/// `k_prepared[head_dim,1]` and SW ring device pointers (gathered host-side);
+/// `start_pos` is the contiguous `[N]` decode-position array. Each row writes its
+/// single new key into its own ring at slot `start_pos[r] % sliding_window`.
+/// Byte-identical to N per-row SW writes.
+pub(crate) fn flashmla_decode_sw_window_batched(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    k_ptrs: &CudaSlice<u64>,
+    cache_ptrs: &CudaSlice<u64>,
+    start_pos: &CudaSlice<i32>,
+    n: usize,
+) -> Result<()> {
+    let _nvtx = crate::nvtx::range("dsv4/flashmla_sw_window_batched_ptr");
+    let (k_ptr, kg) = k_ptrs.device_ptr(&ctx.stream);
+    let (cache_ptr, cg) = cache_ptrs.device_ptr(&ctx.stream);
+    let (start_ptr, sg) = start_pos.device_ptr(&ctx.stream);
+    // SAFETY: k_ptrs/cache_ptrs hold N valid device pointers; start_pos is `[N]`;
+    // the kernel grids N*head_dim threads and indexes per row.
+    unsafe {
+        ffi::dsv4_update_window_cache_batched_ptr_cuda(
+            k_ptr as *const *const ffi::Half,
+            cache_ptr as *const *mut ffi::Half,
+            n as i32,
+            start_ptr as *const i32,
+            config.sliding_window as i32,
+            config.head_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 batched FlashMLA SW window write (ptr) failed: {e}"))?;
+    }
+    drop(kg);
+    drop(cg);
+    drop(sg);
+    Ok(())
+}
+
 /// RMSNorm a `HiddenStates` in place into a fresh buffer (the MLA Q/KV LoRA
 /// norms `q_norm` / `kv_norm`). Thin wrapper over the shared batched RMSNorm.
 fn mla_rms_norm(
@@ -7505,6 +7621,7 @@ pub(crate) fn mla_attention_prepare(
                 // compressor freqs_cis); original_seq_len = orig_max_pos here.
                 original_seq_len,
                 None,
+                None,
                 keepalive,
             )?;
         }
@@ -7554,6 +7671,7 @@ pub(crate) fn mla_attention_prepare(
                     start_pos_device,
                     use_official_dsa,
                     indexer_rope_original_seq_len,
+                    None,
                     None,
                     keepalive,
                 )?;
@@ -7858,6 +7976,106 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     })
 }
 
+/// Full-flatten decode P1a (opt-in, default OFF): run ONE row's main + indexer
+/// compressor STATE update in DEFER mode — skip the per-row FFI, push the row's
+/// ring-state device pointers into the batch sinks, and advance
+/// `compressed.seq_len` (host bookkeeping). Returns this row's `indexer_rows_before`
+/// (the indexer compressed row count BEFORE this step's advance), captured for the
+/// later [`mla_attention_prepare_compressed_only`] (`skip_compressor=true`) CSA
+/// path. `0` for non-CSA rows (no indexer). The actual GPU state writes run later
+/// in ONE [`dsv4_compressor_update_batched`] over all N rows (BEFORE any reader:
+/// the P1b pack + csa cache-write). SW rows are a no-op (no compressor).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mla_attention_compressor_defer_row(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    layer_idx: usize,
+    normed_row: &HiddenStates,
+    state: &mut Dsv4LayerAttentionState,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    original_seq_len: i32,
+    main_sink: &mut Dsv4CompressorBatchPtrs,
+    indexer_sink: &mut Dsv4CompressorBatchPtrs,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<usize> {
+    if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        return Ok(0);
+    }
+    let head_dim = config.head_dim;
+    let compressor = attention.compressor.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
+    })?;
+    let overlap = compress_ratio < 16;
+    {
+        let compressor_state = state.compressor.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+        })?;
+        compressor_forward(
+            ctx,
+            config,
+            compressor,
+            normed_row,
+            compressor_state,
+            head_dim,
+            compress_ratio,
+            overlap,
+            start_pos,
+            start_pos_device,
+            true,
+            original_seq_len,
+            // Defer mode ignores `precomputed` (the batched update reads the batched
+            // prepass output directly); pass None.
+            None,
+            Some(main_sink),
+            keepalive,
+        )?;
+    }
+    let mut indexer_rows_before = 0usize;
+    if mode == DeepSeekV4AttentionMode::CompressedSparse {
+        let indexer = attention.indexer.as_ref().ok_or_else(|| {
+            anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights")
+        })?;
+        let use_official_dsa = dsv4_dsa_official_enabled()?;
+        let indexer_rope_original_seq_len = if use_official_dsa {
+            i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+                |_| anyhow!("DSv4 official DSA original_max_position_embeddings overflows i32"),
+            )?
+        } else {
+            0
+        };
+        indexer_rows_before = state
+            .indexer
+            .as_ref()
+            .map(|s| s.compressed.seq_len)
+            .unwrap_or(0);
+        let indexer_state = state.indexer.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 layer {layer_idx} is CompressedSparse but has no indexer state")
+        })?;
+        compressor_forward(
+            ctx,
+            config,
+            &indexer.compressor,
+            normed_row,
+            indexer_state,
+            config.index_head_dim,
+            compress_ratio,
+            true,
+            start_pos,
+            start_pos_device,
+            use_official_dsa,
+            indexer_rope_original_seq_len,
+            None,
+            Some(indexer_sink),
+            keepalive,
+        )?;
+    }
+    Ok(indexer_rows_before)
+}
+
 /// Per-row SLOT-DEPENDENT finish of the batched-decode PREPARE, paired with
 /// [`mla_attention_prepare_proj_batch`] (#60 PHASE C). The projection + RoPE for
 /// row `r` were already computed batched; this runs ONLY the per-slot half —
@@ -7903,6 +8121,17 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     // `compressor_forward`, skipping the per-row m=1 GEMVs. `None` → byte-identical
     // per-row `dsv4_linear` projection.
     compressor_precomputed: Option<Dsv4CompressorPrecomputed<'_>>,
+    // Full-flatten decode (opt-in, default OFF): when `true`, the per-row
+    // compressor / indexer STATE updates already ran in ONE batched
+    // `dsv4_compressor_update_batched` BEFORE this call (a P1a pre-pass), so the
+    // two `compressor_forward` calls here are SKIPPED — only the CSA per-row
+    // `csa_select` (which reads the now-written compressed keys) runs. The
+    // pre-pass also advanced `compressed.seq_len`, so `indexer_rows_before` (the
+    // value BEFORE this step's advance) must be supplied via
+    // `indexer_rows_before_override`. `false` → the compressor_forward calls run
+    // here (per-row update, byte-identical).
+    skip_compressor: bool,
+    indexer_rows_before_override: Option<usize>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
     let head_dim = config.head_dim;
@@ -7950,7 +8179,9 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         // `None` everywhere → byte-identical per-row GEMV path.
         let precomputed_main = compressor_precomputed.as_ref().map(|p| p.main);
         let precomputed_indexer = compressor_precomputed.as_ref().and_then(|p| p.indexer);
-        {
+        // Full-flatten: the main compressor STATE update already ran batched in the
+        // P1a pre-pass (compressed.seq_len already advanced); skip it here.
+        if !skip_compressor {
             let compressor_state = state.compressor.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
             })?;
@@ -7968,6 +8199,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 true,
                 original_seq_len,
                 precomputed_main,
+                None,
                 keepalive,
             )?;
         }
@@ -7991,12 +8223,24 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             } else {
                 0
             };
-            let indexer_rows_before = state
-                .indexer
-                .as_ref()
-                .map(|s| s.compressed.seq_len)
-                .unwrap_or(0);
-            {
+            // `indexer_rows_before` = the indexer compressed row count BEFORE this
+            // step's advance. In full-flatten the P1a pre-pass already advanced
+            // `compressed.seq_len`, so the live value would be the AFTER count;
+            // take the pre-pass-captured override instead. Otherwise read it live.
+            let indexer_rows_before = if skip_compressor {
+                indexer_rows_before_override.ok_or_else(|| {
+                    anyhow!("DSv4 full-flatten CSA prepare: indexer_rows_before_override missing")
+                })?
+            } else {
+                state
+                    .indexer
+                    .as_ref()
+                    .map(|s| s.compressed.seq_len)
+                    .unwrap_or(0)
+            };
+            // Full-flatten: the indexer compressor STATE update already ran batched
+            // in the P1a pre-pass (compressed.seq_len already advanced); skip it.
+            if !skip_compressor {
                 let indexer_state = state.indexer.as_mut().ok_or_else(|| {
                     anyhow::anyhow!(
                         "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
@@ -8016,6 +8260,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     use_official_dsa,
                     indexer_rope_original_seq_len,
                     precomputed_indexer,
+                    None,
                     keepalive,
                 )?;
             }
@@ -8630,6 +8875,16 @@ fn compressor_forward(
     // `dsv4_compressor_update_*` FFI + state advance) is UNCHANGED. `None` →
     // byte-identical legacy per-row GEMV path.
     precomputed: Option<(&HiddenStates, &HiddenStates)>,
+    // Full-flatten decode (opt-in, default OFF): when `Some`, the per-row
+    // `dsv4_compressor_update_*` FFI is SKIPPED and this row's five ring-state
+    // device pointers are pushed into the batch sink instead — the actual state
+    // update runs later in ONE `dsv4_compressor_update_batched` over all N rows.
+    // `compressed.seq_len` IS still advanced here (host bookkeeping; the batched
+    // kernel writes the data before any reader runs, in the P2 loop). Requires the
+    // start_pos_ptr path (decode); the batched kernel resolves pending/base per row
+    // from start_pos exactly like the per-row start_pos_ptr launcher. `None` → the
+    // per-row FFI runs (unchanged).
+    defer_update: Option<&mut Dsv4CompressorBatchPtrs>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 compressor ratio must be non-zero");
@@ -8662,6 +8917,32 @@ fn compressor_forward(
         compressed_rows <= compressed_capacity,
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
+
+    // Full-flatten decode (defer_update Some): skip BOTH the per-row projection
+    // GEMVs (already batched in the prepass; the batched update reads that output
+    // directly) AND the per-row state-update FFI — instead push this row's five
+    // ring-state device pointers into the batch sink and advance
+    // `compressed.seq_len` (host bookkeeping). The actual GPU state write runs
+    // later in ONE `dsv4_compressor_update_batched` over all N rows, BEFORE any
+    // reader (the P1b pack / csa cache-write). MUST early-return before the GEMV
+    // match below (else the ∝n GEMVs this campaign removes would still run).
+    // Decode-only: token_count==1; requires the start_pos_ptr path.
+    if let Some(sink) = defer_update {
+        ensure!(
+            start_pos_device.is_some(),
+            "DSv4 full-flatten compressor defer requires start_pos_device (decode path)"
+        );
+        ensure!(
+            token_count == 1,
+            "DSv4 full-flatten compressor defer is decode-only (token_count must be 1, got {token_count})"
+        );
+        // Frozen-KV verify never advances state (P1-1) — same guard as the FFI path.
+        if !dsv4_verify_frozen() {
+            sink.push(state.batched_update_ptrs(ctx));
+            state.compressed.seq_len = compressed_rows;
+        }
+        return Ok(());
+    }
 
     // SOURCE of kv_raw/score_raw: either this row's `[width, 1]` slice of the
     // batched DeepGEMM pre-pass (precomputed `Some`, opt-in) or the per-row m=1
@@ -8869,6 +9150,180 @@ pub(crate) fn compressor_batch_prepass(
     drop(nvtx_wgate);
     keepalive.keep_hidden(&score_raw_batch);
     Ok(Some((kv_raw_batch, score_raw_batch)))
+}
+
+/// Host-gathered per-row device pointer arrays for one compressor's batched
+/// state update (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF). Each `Vec`
+/// holds the N rows' `Dsv4CompressorState` ring-buffer pointers (as `u64`),
+/// uploaded to device `*_arr` arrays by [`dsv4_compressor_update_batched`]. Built
+/// over the prepare loop's row order (push exactly one entry per row).
+#[derive(Default)]
+pub(crate) struct Dsv4CompressorBatchPtrs {
+    pub(crate) pending_kv: Vec<u64>,
+    pub(crate) pending_score: Vec<u64>,
+    pub(crate) prev_overlap_kv: Vec<u64>,
+    pub(crate) prev_overlap_score: Vec<u64>,
+    pub(crate) compressed: Vec<u64>,
+}
+
+impl Dsv4CompressorBatchPtrs {
+    pub(crate) fn with_capacity(n: usize) -> Self {
+        Self {
+            pending_kv: Vec::with_capacity(n),
+            pending_score: Vec::with_capacity(n),
+            prev_overlap_kv: Vec::with_capacity(n),
+            prev_overlap_score: Vec::with_capacity(n),
+            compressed: Vec::with_capacity(n),
+        }
+    }
+
+    /// Push one row's five state pointers (resolved via
+    /// [`Dsv4CompressorState::batched_update_ptrs`]).
+    pub(crate) fn push(&mut self, ptrs: (u64, u64, u64, u64, u64)) {
+        self.pending_kv.push(ptrs.0);
+        self.pending_score.push(ptrs.1);
+        self.prev_overlap_kv.push(ptrs.2);
+        self.prev_overlap_score.push(ptrs.3);
+        self.compressed.push(ptrs.4);
+    }
+
+    fn len(&self) -> usize {
+        self.pending_kv.len()
+    }
+}
+
+/// Opt-in batched (m=N) compressor STATE update
+/// (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF): ONE `<<<n, BLOCK>>>` launch
+/// running each row's per-slot compressor ring update (RoPE/RMSNorm/store into
+/// pending/overlap/compressed), replacing the N per-row
+/// `dsv4_compressor_update_start_pos_ptr_cuda` launches. `kv_raw_batch` /
+/// `score_raw_batch` are the batched [`compressor_batch_prepass`] outputs
+/// `[width, n]`; `ape`/`norm` are the SHARED compressor weights; `ptrs` holds the
+/// N rows' state buffer pointers (one per row, gathered host-side this step);
+/// `start_pos` is the contiguous `[N]` decode-position array. Dims/rope params are
+/// uniform across the layer's rows and EXACTLY mirror the per-row
+/// [`compressor_forward`] args, so the body math is byte-identical to N per-row
+/// launches. The host-side pointer-array uploads are kept alive by the caller's
+/// `ptr_keepalive` Vec (the N>1 keepalive is inert, so the batched lane holds the
+/// arrays to function return explicitly).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsv4_compressor_update_batched(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    compressor: &Dsv4Compressor,
+    kv_raw_batch: &HiddenStates,
+    score_raw_batch: &HiddenStates,
+    ptrs: &Dsv4CompressorBatchPtrs,
+    start_pos: &CudaSlice<i32>,
+    n: usize,
+    head_dim: usize,
+    ratio: usize,
+    overlap: bool,
+    apply_rope: bool,
+    rope_original_seq_len: i32,
+    ptr_keepalive: &mut Vec<CudaSlice<u64>>,
+) -> Result<()> {
+    ensure!(ratio > 0, "DSv4 batched compressor ratio must be non-zero");
+    let width = if overlap { 2 * head_dim } else { head_dim };
+    ensure!(
+        kv_raw_batch.hidden_dim == width
+            && kv_raw_batch.seq_len == n
+            && score_raw_batch.hidden_dim == width
+            && score_raw_batch.seq_len == n,
+        "DSv4 batched compressor raw shape mismatch: kv={}x{} score={}x{} expected [{width},{n}]",
+        kv_raw_batch.hidden_dim,
+        kv_raw_batch.seq_len,
+        score_raw_batch.hidden_dim,
+        score_raw_batch.seq_len
+    );
+    ensure!(
+        ptrs.len() == n
+            && ptrs.pending_score.len() == n
+            && ptrs.prev_overlap_kv.len() == n
+            && ptrs.prev_overlap_score.len() == n
+            && ptrs.compressed.len() == n,
+        "DSv4 batched compressor pointer-array length mismatch (expected {n})"
+    );
+    // Compressed keys use compress_rope_theta with NO YaRN (original_seq_len = 0)
+    // on the indexer-no-rope path; identical to the per-row `compressor_forward`.
+    let rope = &config.rope_parameters;
+    let (rope_dim, rope_base) = if apply_rope {
+        (config.qk_rope_head_dim, config.compress_rope_theta)
+    } else {
+        (0usize, config.compress_rope_theta)
+    };
+    // Upload the five per-row pointer arrays + hold them alive to function return.
+    let pkv_arr = crate::ops::upload_u64(ctx, &ptrs.pending_kv)?;
+    let psc_arr = crate::ops::upload_u64(ctx, &ptrs.pending_score)?;
+    let prkv_arr = crate::ops::upload_u64(ctx, &ptrs.prev_overlap_kv)?;
+    let prsc_arr = crate::ops::upload_u64(ctx, &ptrs.prev_overlap_score)?;
+    let comp_arr = crate::ops::upload_u64(ctx, &ptrs.compressed)?;
+    // Resolve raw device pointers and release the cudarc borrow guards BEFORE the
+    // push below (the SyncOnDrop guards would otherwise borrow the arrays past the
+    // move into `ptr_keepalive`). The raw u64 ptrs stay valid — the buffers are not
+    // reallocated; single-stream ordering keeps the launched kernel correct.
+    {
+        let (kv_ptr, kg) = kv_raw_batch.data.device_ptr(&ctx.stream);
+        let (score_ptr, scg) = score_raw_batch.data.device_ptr(&ctx.stream);
+        let (ape_ptr, ag) = compressor.ape.data.device_ptr(&ctx.stream);
+        let (norm_ptr, ng) = compressor.norm.data.device_ptr(&ctx.stream);
+        let (pkv_a, g0) = pkv_arr.device_ptr(&ctx.stream);
+        let (psc_a, g1) = psc_arr.device_ptr(&ctx.stream);
+        let (prkv_a, g2) = prkv_arr.device_ptr(&ctx.stream);
+        let (prsc_a, g3) = prsc_arr.device_ptr(&ctx.stream);
+        let (comp_a, g4) = comp_arr.device_ptr(&ctx.stream);
+        let (start_ptr, spg) = start_pos.device_ptr(&ctx.stream);
+        // SAFETY: all buffers valid on ctx.stream; the pointer arrays hold n valid
+        // per-row device pointers; kv/score are [width,n]; dims match the per-row path.
+        unsafe {
+            ffi::dsv4_compressor_update_batched_start_pos_ptr_cuda(
+                kv_ptr as *const ffi::Half,
+                score_ptr as *const ffi::Half,
+                ape_ptr as *const ffi::Half,
+                norm_ptr as *const ffi::Half,
+                pkv_a as *const *mut ffi::Half,
+                psc_a as *const *mut ffi::Half,
+                prkv_a as *const *mut ffi::Half,
+                prsc_a as *const *mut ffi::Half,
+                comp_a as *const *mut ffi::Half,
+                n as i32,
+                1, // num_tokens per row (decode)
+                start_ptr as *const i32,
+                head_dim as i32,
+                ratio as i32,
+                width as i32,
+                i32::from(overlap),
+                config.rms_norm_eps,
+                rope_dim as i32,
+                rope_base,
+                rope_original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        drop(kg);
+        drop(scg);
+        drop(ag);
+        drop(ng);
+        drop(g0);
+        drop(g1);
+        drop(g2);
+        drop(g3);
+        drop(g4);
+        drop(spg);
+    }
+    // Hold the pointer arrays alive until the caller's keepalive Vec drops (the
+    // N>1 forward keepalive is inert, so explicit retention guards the
+    // disabled-event-tracking premature free until the next stream sync).
+    ptr_keepalive.push(pkv_arr);
+    ptr_keepalive.push(psc_arr);
+    ptr_keepalive.push(prkv_arr);
+    ptr_keepalive.push(prsc_arr);
+    ptr_keepalive.push(comp_arr);
+    Ok(())
 }
 
 /// Batched-decode gather sink threaded into [`csa_select`] / [`mla_attention_prepare_compressed_only`]

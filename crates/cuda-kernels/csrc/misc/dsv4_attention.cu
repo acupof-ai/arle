@@ -744,6 +744,51 @@ __global__ void dsv4_update_window_cache_start_pos_ptr_kernel(
   window_cache[slot * head_dim + col] = k_new[token * head_dim + col];
 }
 
+// Pointer-array batched SW-window write: ONE launch over N rows whose k_new
+// (`k_prepared[head_dim,1]`) and window_cache (per-slot SW ring) buffers are NOT
+// contiguous. `k_arr[row]`/`cache_arr[row]` are this row's buffers, this row
+// writes its single new key into its own ring at slot `start_pos[row] %
+// sliding_window`. Replaces n single-row
+// `dsv4_update_window_cache_start_pos_ptr_cuda` calls (num_tokens=1 per row;
+// byte-identical per-row write).
+__global__ void dsv4_update_window_cache_batched_ptr_kernel(
+    const uint16_t *const *__restrict__ k_arr,
+    uint16_t *const *__restrict__ cache_arr,
+    int n,
+    const int *__restrict__ start_pos,
+    int sliding_window,
+    int head_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = n * head_dim;
+  if (idx >= total) return;
+  int rowi = idx / head_dim;
+  int col = idx - rowi * head_dim;
+  int slot = start_pos[rowi] % sliding_window;
+  cache_arr[rowi][slot * head_dim + col] = k_arr[rowi][col];
+}
+
+extern "C" CUresult dsv4_update_window_cache_batched_ptr_cuda(
+    const uint16_t *const *k_arr,
+    uint16_t *const *cache_arr,
+    int n,
+    const int *start_pos,
+    int sliding_window,
+    int head_dim,
+    CUstream stream) {
+  if (n < 0 || start_pos == nullptr || sliding_window <= 0 || head_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = n * head_dim;
+  if (total == 0) return CUDA_SUCCESS;
+  if (k_arr == nullptr || cache_arr == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int grid = (total + DSV4_ATTN_BLOCK - 1) / DSV4_ATTN_BLOCK;
+  dsv4_update_window_cache_batched_ptr_kernel<<<grid, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      k_arr, cache_arr, n, start_pos, sliding_window, head_dim);
+  return (CUresult)cudaGetLastError();
+}
+
 extern "C" CUresult dsv4_update_window_cache_cuda(
     const uint16_t *k_new,
     uint16_t *window_cache,
@@ -815,7 +860,16 @@ __device__ __forceinline__ float dsv4_compressor_score_value(
          dsv4_attn_bf16_to_f32(ape[(abs_pos % ratio) * width + col]);
 }
 
-__global__ void dsv4_compressor_update_kernel(
+// Per-row compressor state update body, shared by the single-block global
+// `dsv4_compressor_update_kernel` and the batched (grid-over-rows)
+// `dsv4_compressor_update_batched_kernel`. Each invocation runs on ONE CUDA
+// block and writes ONE row's per-slot ring state (pending_kv/pending_score/
+// prev_overlap_kv/prev_overlap_score/compressed). The batched kernel calls this
+// with this row's pointers + this row's resolved start_pos so the math is
+// byte-identical to the per-row launch. `start_pos`/`pending_len`/
+// `compressed_base`/`has_prev_overlap` are ALREADY resolved by the caller (the
+// batched kernel resolves them from `start_pos_ptr[row]` before calling).
+__device__ void dsv4_compressor_update_body(
     const uint16_t *__restrict__ kv_raw,
     const uint16_t *__restrict__ score_raw,
     const uint16_t *__restrict__ ape,
@@ -827,7 +881,6 @@ __global__ void dsv4_compressor_update_kernel(
     uint16_t *__restrict__ compressed,
     int num_tokens,
     int start_pos,
-    const int *__restrict__ start_pos_ptr,
     int pending_len,
     int compressed_base,
     int head_dim,
@@ -842,12 +895,6 @@ __global__ void dsv4_compressor_update_kernel(
     float factor,
     float beta_fast,
     float beta_slow) {
-  if (start_pos_ptr != nullptr) {
-    start_pos = start_pos_ptr[0];
-    pending_len = start_pos % ratio;
-    compressed_base = start_pos / ratio;
-    has_prev_overlap = compressed_base > 0;
-  }
   __shared__ float row[DSV4_ATTN_MAX_HEAD_DIM];
   int total = pending_len + num_tokens;
   int completed = total / ratio;
@@ -990,6 +1037,104 @@ __global__ void dsv4_compressor_update_kernel(
     pending_kv[idx] = dsv4_attn_f32_to_bf16_bits(kv);
     pending_score[idx] = dsv4_attn_f32_to_bf16_bits(score);
   }
+}
+
+// Single-row launch (`<<<1, BLOCK>>>`): resolves the decode start_pos/pending/
+// base from `start_pos_ptr[0]` (or the scalar args), then runs the shared body.
+// Behavior byte-identical to the pre-refactor monolithic kernel.
+__global__ void dsv4_compressor_update_kernel(
+    const uint16_t *__restrict__ kv_raw,
+    const uint16_t *__restrict__ score_raw,
+    const uint16_t *__restrict__ ape,
+    const uint16_t *__restrict__ norm,
+    uint16_t *__restrict__ pending_kv,
+    uint16_t *__restrict__ pending_score,
+    uint16_t *__restrict__ prev_overlap_kv,
+    uint16_t *__restrict__ prev_overlap_score,
+    uint16_t *__restrict__ compressed,
+    int num_tokens,
+    int start_pos,
+    const int *__restrict__ start_pos_ptr,
+    int pending_len,
+    int compressed_base,
+    int head_dim,
+    int ratio,
+    int width,
+    int overlap,
+    int has_prev_overlap,
+    float eps,
+    int rope_dim,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  if (start_pos_ptr != nullptr) {
+    start_pos = start_pos_ptr[0];
+    pending_len = start_pos % ratio;
+    compressed_base = start_pos / ratio;
+    has_prev_overlap = compressed_base > 0;
+  }
+  dsv4_compressor_update_body(
+      kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
+      prev_overlap_score, compressed, num_tokens, start_pos, pending_len,
+      compressed_base, head_dim, ratio, width, overlap, has_prev_overlap, eps,
+      rope_dim, rope_base, original_seq_len, factor, beta_fast, beta_slow);
+}
+
+// Batched decode compressor update (`<<<n, BLOCK>>>`, blockIdx.x = row): each
+// block updates ONE row's per-slot ring state, reading this row's state buffer
+// pointers from the host-gathered pointer ARRAYS and this row's absolute decode
+// position from `start_pos_arr[row]`. `kv_raw`/`score_raw` are the batched m=N
+// prepass outputs `[width, n]` (token-major: row r occupies the contiguous
+// `[r*width, (r+1)*width)` span, == the single-row `[width,1]` slice). `ape`/
+// `norm` are the SHARED compressor weights (same for all rows). num_tokens=1 per
+// row (decode); start_pos/pending/base/has_prev_overlap are resolved per row
+// EXACTLY as the single-row start_pos_ptr launcher does, so the body math is
+// byte-identical to n single-row launches.
+__global__ void dsv4_compressor_update_batched_kernel(
+    const uint16_t *__restrict__ kv_raw,
+    const uint16_t *__restrict__ score_raw,
+    const uint16_t *__restrict__ ape,
+    const uint16_t *__restrict__ norm,
+    uint16_t *const *__restrict__ pending_kv_arr,
+    uint16_t *const *__restrict__ pending_score_arr,
+    uint16_t *const *__restrict__ prev_overlap_kv_arr,
+    uint16_t *const *__restrict__ prev_overlap_score_arr,
+    uint16_t *const *__restrict__ compressed_arr,
+    int n,
+    int num_tokens,
+    const int *__restrict__ start_pos_arr,
+    int head_dim,
+    int ratio,
+    int width,
+    int overlap,
+    float eps,
+    int rope_dim,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  int rowi = blockIdx.x;
+  if (rowi >= n) return;
+  int start_pos = start_pos_arr[rowi];
+  int pending_len = start_pos % ratio;
+  int compressed_base = start_pos / ratio;
+  int has_prev_overlap = compressed_base > 0;
+  dsv4_compressor_update_body(
+      kv_raw + rowi * num_tokens * width,
+      score_raw + rowi * num_tokens * width,
+      ape,
+      norm,
+      pending_kv_arr[rowi],
+      pending_score_arr[rowi],
+      prev_overlap_kv_arr[rowi],
+      prev_overlap_score_arr[rowi],
+      compressed_arr[rowi],
+      num_tokens, start_pos, pending_len, compressed_base, head_dim, ratio,
+      width, overlap, has_prev_overlap, eps, rope_dim, rope_base,
+      original_seq_len, factor, beta_fast, beta_slow);
 }
 
 // Parallel prefill compressor: one CUDA block per compressed-output block (grid =
@@ -1290,6 +1435,57 @@ extern "C" CUresult dsv4_compressor_update_start_pos_ptr_cuda(
       prev_overlap_score, compressed, num_tokens, 0, start_pos, 0, 0, head_dim,
       ratio, width, overlap, 0, eps, rope_dim, rope_base, original_seq_len,
       factor, beta_fast, beta_slow);
+  return (CUresult)cudaGetLastError();
+}
+
+// Batched decode compressor update: ONE `<<<n, BLOCK>>>` launch replacing n
+// single-row `dsv4_compressor_update_start_pos_ptr_cuda` calls. Each row r reads
+// its state buffer pointers from the `*_arr` device pointer arrays (host-gathered
+// from the per-slot Dsv4CompressorState) and its decode position from
+// `start_pos_arr[r]`. `kv_raw`/`score_raw` are the batched m=N prepass outputs
+// `[width, n]`. Math byte-identical to n single-row launches (each block runs the
+// shared `dsv4_compressor_update_body` with the same resolved args).
+extern "C" CUresult dsv4_compressor_update_batched_start_pos_ptr_cuda(
+    const uint16_t *kv_raw,
+    const uint16_t *score_raw,
+    const uint16_t *ape,
+    const uint16_t *norm,
+    uint16_t *const *pending_kv_arr,
+    uint16_t *const *pending_score_arr,
+    uint16_t *const *prev_overlap_kv_arr,
+    uint16_t *const *prev_overlap_score_arr,
+    uint16_t *const *compressed_arr,
+    int n,
+    int num_tokens,
+    const int *start_pos_arr,
+    int head_dim,
+    int ratio,
+    int width,
+    int overlap,
+    float eps,
+    int rope_dim,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    CUstream stream) {
+  if (n < 0 || num_tokens < 0 || start_pos_arr == nullptr || head_dim <= 0 ||
+      head_dim > DSV4_ATTN_MAX_HEAD_DIM || ratio <= 0 || ratio > 256 ||
+      width < head_dim || rope_dim < 0 || rope_dim > head_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (n == 0) return CUDA_SUCCESS;
+  if (pending_kv_arr == nullptr || pending_score_arr == nullptr ||
+      prev_overlap_kv_arr == nullptr || prev_overlap_score_arr == nullptr ||
+      compressed_arr == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dsv4_compressor_update_batched_kernel<<<n, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      kv_raw, score_raw, ape, norm, pending_kv_arr, pending_score_arr,
+      prev_overlap_kv_arr, prev_overlap_score_arr, compressed_arr, n, num_tokens,
+      start_pos_arr, head_dim, ratio, width, overlap, eps, rope_dim, rope_base,
+      original_seq_len, factor, beta_fast, beta_slow);
   return (CUresult)cudaGetLastError();
 }
 
@@ -1689,6 +1885,48 @@ __global__ void dsv4_output_inverse_rope_batch_start_pos_kernel(
   out[base + pair_col + 1] = dsv4_attn_f32_to_bf16_bits(out_b);
 }
 
+// Pointer-array batched output inverse-RoPE: ONE launch over N rows whose
+// `local_attn` buffers are NOT contiguous (each row is a separate `[local_width,
+// 1]` allocation). `out_arr[row]` is this row's buffer base, `start_pos[row]` its
+// absolute decode position. Grid = N*local_heads blocks; per (row, head) it
+// un-rotates that row's rope tail EXACTLY as the single-row kernel does (one row
+// → token=0 within its own buffer). Replaces n single-row
+// `arle_dsv4_output_inverse_rope_start_pos_ptr_cuda` calls.
+__global__ void dsv4_output_inverse_rope_batched_ptr_kernel(
+    uint16_t *const *__restrict__ out_arr,
+    int n,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    const int *__restrict__ start_pos,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow) {
+  int blk = blockIdx.x;
+  if (blk >= n * local_heads) return;
+  int rowi = blk / local_heads;
+  int head = blk - rowi * local_heads;
+  uint16_t *out = out_arr[rowi];
+  int abs_pos = start_pos[rowi];
+  int rope_start = head_dim - rope_dim;
+  int base = head * head_dim;
+
+  int pair = threadIdx.x;
+  if (pair >= rope_dim / 2) return;
+  int pair_col = rope_start + pair * 2;
+  float a = dsv4_attn_bf16_to_f32(out[base + pair_col]);
+  float b = dsv4_attn_bf16_to_f32(out[base + pair_col + 1]);
+  float out_a;
+  float out_b;
+  dsv4_apply_rope_pair(
+      a, b, pair, abs_pos, rope_dim, rope_base, original_seq_len, factor,
+      beta_fast, beta_slow, -1.0f, &out_a, &out_b);
+  out[base + pair_col] = dsv4_attn_f32_to_bf16_bits(out_a);
+  out[base + pair_col + 1] = dsv4_attn_f32_to_bf16_bits(out_b);
+}
+
 extern "C" cudaError_t arle_dsv4_output_inverse_rope_cuda(
     uint16_t *out,
     int token_count,
@@ -1763,6 +2001,32 @@ extern "C" cudaError_t arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
   if (out == nullptr) return cudaErrorInvalidValue;
   dsv4_output_inverse_rope_batch_start_pos_kernel<<<token_count * local_heads, rope_dim / 2, 0, stream>>>(
       out, token_count, local_heads, head_dim, rope_dim, start_pos, rope_base,
+      original_seq_len, factor, beta_fast, beta_slow);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t arle_dsv4_output_inverse_rope_batched_ptr_cuda(
+    uint16_t *const *out_arr,
+    int n,
+    int local_heads,
+    int head_dim,
+    int rope_dim,
+    const int *start_pos,
+    float rope_base,
+    int original_seq_len,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    cudaStream_t stream) {
+  if (n < 0 || local_heads <= 0 || head_dim <= 0 ||
+      head_dim > DSV4_ATTN_MAX_HEAD_DIM || rope_dim < 0 || rope_dim > head_dim ||
+      start_pos == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (n == 0 || rope_dim == 0) return cudaSuccess;
+  if (out_arr == nullptr) return cudaErrorInvalidValue;
+  dsv4_output_inverse_rope_batched_ptr_kernel<<<n * local_heads, rope_dim / 2, 0, stream>>>(
+      out_arr, n, local_heads, head_dim, rope_dim, start_pos, rope_base,
       original_seq_len, factor, beta_fast, beta_slow);
   return cudaGetLastError();
 }
