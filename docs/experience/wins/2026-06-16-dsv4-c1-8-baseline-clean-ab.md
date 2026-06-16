@@ -116,6 +116,35 @@ batched runs one amortized wave → scales to ~77.
 binary WITH MTP on `.61` (the `.62` build can't serve MTP at all), to get a
 compressor-batch × MTP combined number on one binary.
 
+## MTP on REAL prompts (ShareGPT) + draft-depth d2 vs d3 (.61, gcc-13)
+
+Synthetic fixed-prompt tok/s hides MTP's prompt-dependent acceptance. Re-ran on 12
+varied real **ShareGPT** first-turn prompts (89–864 chars, from the local
+`ShareGPT_V3_unfiltered_cleaned_split.json`), `max_tokens=256`, same `.61` binary
+`2f021c0`, profiling OFF. B=1 = per-prompt median tok/s (the clean signal; the c=1
+aggregate is dragged by one early-EOS prompt + one outlier).
+
+| arm | B=1 median tok/s | c=8 agg tok/s |
+|-----|------------------|---------------|
+| no-MTP | 43.7 | 82.8 |
+| **MTP d2** (`--mtp-draft-tokens 2`) | **49.7** (+14%) | 80.1 |
+| MTP d3 (`--mtp-draft-tokens 3`) | 45.3 (+4%) | 73.7 |
+
+- **MTP d2 = +14% B=1 on real prompts** (vs +10% on the synthetic prompt) — realistic
+  redundancy lifts acceptance. Per-prompt range 41–59: a java-coding prompt hit 58.7
+  (predictable → high accept), prose hit 41 (low accept). Acceptance IS prompt-dependent
+  — the synthetic single-prompt number was an underestimate of the favorable case and an
+  overestimate of the prose case.
+- **d3 is WORSE than d2** (45.3 vs 49.7, −9%): depth-3 over-drafts — the 3rd draft
+  token's marginal acceptance doesn't pay for the extra draft+verify forward. **d2 is the
+  sweet spot**, confirming [[2026-06-13-dsv4-mtp-d2-chain-fold-53]]. d3 degrades further
+  at c=8 (73.7) — deeper draft hurts more under concurrency.
+- **At c=8, MTP does not help** (no-MTP 82.8 ≥ d2 80.1 ≥ d3 73.7): batched no-MTP already
+  saturates the decode wave, so MTP's per-step draft+verify overhead is net-negative on
+  this binary. MTP winning at c≥4 needs the batched-MTP lane
+  ([[2026-06-15-dsv4-batched-mtp-prod-shape-flip]]), not fully engaged in `2f021c0`.
+  **MTP is a B=1 / low-concurrency lever here.**
+
 ## Problems / caveats
 - **Single sweep per c — the c=4 +58% vs c=8 +5% non-monotonicity is not yet
   pinned to a CI.** The direction (lever helps at c≥4) is solid and matches the
