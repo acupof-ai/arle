@@ -39,6 +39,22 @@ pub enum SavedContext {
         indices: Vec<usize>,
         src_shape: Vec<usize>,
     },
+    MoeTopKSoftmaxCtx {
+        y: TensorId,
+        indices: Vec<usize>,
+        logits_shape: Vec<usize>,
+        top_k: usize,
+    },
+    MoeGatherRowsCtx {
+        rows: Vec<usize>,
+        input_shape: Vec<usize>,
+    },
+    MoeWeightedScatterCtx {
+        routes: Vec<ops::moe::MoeRoute>,
+        values_shape: Vec<usize>,
+        weights_shape: Vec<usize>,
+        out_rows: usize,
+    },
     MeanCtx {
         input: TensorId,
         numel: usize,
@@ -114,6 +130,9 @@ pub enum BackwardOp {
     Softmax,
     LogSoftmax,
     Gather,
+    MoeTopKSoftmax,
+    MoeGatherRows,
+    MoeWeightedScatter,
     Mean,
     RMSNorm,
     Silu,
@@ -141,6 +160,9 @@ impl BackwardOp {
             BackwardOp::Softmax => "Softmax",
             BackwardOp::LogSoftmax => "LogSoftmax",
             BackwardOp::Gather => "Gather",
+            BackwardOp::MoeTopKSoftmax => "MoeTopKSoftmax",
+            BackwardOp::MoeGatherRows => "MoeGatherRows",
+            BackwardOp::MoeWeightedScatter => "MoeWeightedScatter",
             BackwardOp::Mean => "Mean",
             BackwardOp::RMSNorm => "RMSNorm",
             BackwardOp::Silu => "Silu",
@@ -374,6 +396,15 @@ impl Tape {
                     }
                     BackwardOp::Gather => {
                         ops::gather_last_dim_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::MoeTopKSoftmax => {
+                        ops::moe_topk_softmax_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::MoeGatherRows => {
+                        ops::moe_gather_rows_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::MoeWeightedScatter => {
+                        ops::moe_weighted_scatter_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::Mean => ops::mean_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RMSNorm => ops::rmsnorm_backward(&entry, output_grad_id, store)?,

@@ -16,6 +16,8 @@ pub mod layout;
 pub mod linear_attention;
 #[path = "ops/matmul.rs"]
 pub mod matmul;
+#[path = "ops/moe.rs"]
+pub mod moe;
 #[path = "ops/norm.rs"]
 pub mod norm;
 #[path = "ops/reduce.rs"]
@@ -39,6 +41,9 @@ pub(crate) use gather::gather_last_dim_backward;
 pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
 pub(crate) use linear_attention::linear_attention_backward;
 pub(crate) use matmul::{matmul_backward, matmul_bt_backward};
+pub(crate) use moe::{
+    moe_gather_rows_backward, moe_topk_softmax_backward, moe_weighted_scatter_backward,
+};
 pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
 pub(crate) use rope::rope_backward;
@@ -197,6 +202,37 @@ pub fn gather_last_dim(
     // `ensure_host` here is the enabler — previously logits coming out of
     // the final matmul were flushed to host before the gather.
     gather::gather_last_dim(src, indices, store, tape)
+}
+
+pub use moe::{MoeRoute, MoeTopK};
+
+pub fn moe_topk_softmax(
+    logits: TensorId,
+    top_k: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<MoeTopK> {
+    moe::moe_topk_softmax(logits, top_k, store, tape)
+}
+
+pub fn moe_gather_rows(
+    src: TensorId,
+    rows: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    moe::moe_gather_rows(src, rows, store, tape)
+}
+
+pub fn moe_weighted_scatter(
+    values: TensorId,
+    weights: TensorId,
+    routes: &[MoeRoute],
+    out_rows: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    moe::moe_weighted_scatter(values, weights, routes, out_rows, store, tape)
 }
 
 pub fn reshape(
