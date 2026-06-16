@@ -65,6 +65,21 @@ fn qwen35_profile_enabled() -> bool {
     })
 }
 
+fn qwen35_startup_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ARLE_CUDA_STARTUP_PROFILE").is_some())
+}
+
+fn qwen35_startup_log(phase: &str, start: Instant, extra: std::fmt::Arguments<'_>) {
+    if qwen35_startup_profile_enabled() {
+        log::info!(
+            target: "infer_cuda::startup",
+            "cuda_startup phase=qwen35.{phase} elapsed_ms={:.1} {extra}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 fn qwen35_profile<T>(
     ctx: &DeviceContext,
     label: &'static str,
@@ -1141,9 +1156,22 @@ impl Qwen35Model {
         max_seq_len: usize,
         tp: crate::tp::TpRuntime,
     ) -> Result<Self> {
+        let total_t0 = Instant::now();
+        let config_t0 = Instant::now();
         let m = Qwen35Config::from_model_dir(model_path)
             .map_err(|e| anyhow!("load Qwen3.5 config from {}: {e}", model_path.display()))?;
         validate_qwen35_cuda_config(&m)?;
+        qwen35_startup_log(
+            "config",
+            config_t0,
+            format_args!(
+                "layers={} hidden={} moe={} model_path={}",
+                m.num_hidden_layers,
+                m.hidden_size,
+                m.is_moe(),
+                model_path.display()
+            ),
+        );
         // Full attention here is the GATED q_proj variant (Qwen3.5/3.6); the
         // prep+gate kernels assume it. Vanilla un-gated Qwen3 would need
         // the dense path, not this loader.
@@ -1225,19 +1253,29 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("Qwen3.5 TP expert split: {e}"))?
         };
 
+        let loader_t0 = Instant::now();
         let ctx = DeviceContext::new()?;
         let loader = SafetensorLoader::new(model_path)?;
+        qwen35_startup_log("ctx_loader", loader_t0, format_args!(""));
 
+        let embed_t0 = Instant::now();
         let embed_tokens = loader.load_matrix(&ctx, m.embed_tokens_tensor_name())?;
         let lm_head = if m.tie_word_embeddings {
             None
         } else {
             Some(loader.load_matrix(&ctx, m.lm_head_tensor_name())?)
         };
+        qwen35_startup_log(
+            "embeddings",
+            embed_t0,
+            format_args!("tie_word_embeddings={}", m.tie_word_embeddings),
+        );
 
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for layer_idx in 0..m.num_hidden_layers {
+            let layer_t0 = Instant::now();
             let names = m.layer_tensor_names(layer_idx);
+            let attn_t0 = Instant::now();
             let attn = match &names.attention {
                 // Single GPU: full tensors, byte-identical to the pre-TP path.
                 Qwen35AttentionTensorNames::Full(full) if tp_cfg.is_single() => {
@@ -1378,7 +1416,13 @@ impl Qwen35Model {
                     }))
                 }
             };
+            qwen35_startup_log(
+                "layer.attn",
+                attn_t0,
+                format_args!("layer={layer_idx} type={:?}", m.layer_types[layer_idx]),
+            );
 
+            let ffn_t0 = Instant::now();
             let (mlp, moe) = if m.is_moe_layer(layer_idx) {
                 let moe = loader.load_moe_layer_experts(
                     &ctx,
@@ -1425,6 +1469,11 @@ impl Qwen35Model {
                     None,
                 )
             };
+            qwen35_startup_log(
+                "layer.ffn",
+                ffn_t0,
+                format_args!("layer={layer_idx} moe={}", m.is_moe_layer(layer_idx)),
+            );
 
             layers.push(Qwen35Layer {
                 input_layernorm: loader.load_vec(&ctx, &names.common.input_layernorm)?,
@@ -1434,7 +1483,13 @@ impl Qwen35Model {
                 mlp,
                 moe,
             });
+            qwen35_startup_log(
+                "layer.total",
+                layer_t0,
+                format_args!("layer={layer_idx} moe={}", m.is_moe_layer(layer_idx)),
+            );
         }
+        let tail_t0 = Instant::now();
         let norm = loader.load_vec(&ctx, m.norm_tensor_name())?;
 
         let rope_len = m
@@ -1454,6 +1509,16 @@ impl Qwen35Model {
         let (cos_cache, sin_cache) =
             crate::ops::precompute_rope(&ctx, m.rotary_dim, rope_len, m.rope_theta, None)?;
         ctx.sync()?;
+        qwen35_startup_log(
+            "tail_norm_rope_sync",
+            tail_t0,
+            format_args!("rope_len={rope_len} max_seq_len={max_seq_len}"),
+        );
+        qwen35_startup_log(
+            "total",
+            total_t0,
+            format_args!("layers={} max_seq_len={max_seq_len}", m.num_hidden_layers),
+        );
 
         Ok(Self {
             ctx,
