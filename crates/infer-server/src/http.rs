@@ -268,7 +268,17 @@ fn drive_completion_sse(
                         &tx,
                         completion_stream_chunk(&id, created, &model, delta, None, None),
                     ) {
-                        return;
+                        // Client (SSE receiver) disconnected. Stop sending, but
+                        // do NOT drop the ticket here: the engine request is
+                        // still running on the backend and continues to occupy a
+                        // live slot. Returning now would drop `ticket` and
+                        // decrement `live_requests` while GPU work is in flight,
+                        // letting the frontend over-admit past the backend cap.
+                        // Break to `ticket.collect()` below, which keeps the slot
+                        // counted until the engine actually finishes (the stream
+                        // channel is unbounded, so the engine never blocks on our
+                        // stopped draining).
+                        break;
                     }
                 }
             }
