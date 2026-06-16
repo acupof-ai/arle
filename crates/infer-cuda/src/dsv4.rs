@@ -1955,8 +1955,57 @@ impl Dsv4Model {
         keepalive.keep_hidden(&attn_out_row);
         // MoE/shared are now grouped over [N] (Phase 6a) — no per-row MoE scratch.
 
+        // PHASE C (#60): contiguous [N] absolute-position array for the batched
+        // projection pre-pass RoPE (`positions[token]` = each row's
+        // start_positions[r]). The per-slot scalar `slot.start_pos_device`
+        // buffers above stay for the per-row compressor/pack/finish; this is the
+        // packed form the batched RoPE kernel reads. Uploaded once, reused every
+        // layer (positions are fixed across the layer loop). Only allocated when
+        // the batched lane is engaged.
+        let batched_positions = if batched_attn_lane {
+            let positions_host: Vec<i32> = (0..n)
+                .map(|r| {
+                    i32::try_from(start_positions[r])
+                        .map_err(|_| anyhow!("DSv4 start_pos {} overflows i32", start_positions[r]))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let buf = crate::ops::upload_i32(&self.ctx, &positions_host)?;
+            keepalive.keep_i32(&buf);
+            Some(buf)
+        } else {
+            None
+        };
+        // Per-row [*, 1] scratch for the batched projection slice copy-in (each
+        // row's c_q_normed / q_prepared / k_prepared sliced out of the batched
+        // pre-pass output before the per-slot compressor/pack consume it).
+        // Declared once, reused across rows/layers (WAR resolved by stream
+        // order, like normed_row). Only allocated when the batched lane runs.
+        let local_width = self.layers[0].attention.wq_b.rows;
+        let q_lora_rank = self.config.q_lora_rank;
+        let mla_head_dim = self.config.head_dim;
+        // Reused per-row [q_lora_rank, 1] scratch for this row's batched
+        // c_q_normed slice (read by reference for the CSA indexer query proj).
+        // q_prepared / k_prepared rows are copied into fresh OWNED buffers inside
+        // the loop (taken by value into Dsv4MlaPrepared), so only c_q needs the
+        // reused scratch. Only allocated when the batched lane runs.
+        let mut c_q_normed_row = if batched_attn_lane {
+            // SAFETY: fully written by the per-row slice copy-in before read.
+            let cq = unsafe { HiddenStates::uninit(&self.ctx, q_lora_rank, 1)? };
+            keepalive.keep_hidden(&cq);
+            cq
+        } else {
+            // Unused (per-row lane); zero-sized stand-in keeps the binding typed.
+            unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
+        };
+
         // Decode-phase timing accumulators (only ever touched when phase_time).
         let (mut csa_ms, mut sw_ms, mut moe_ms) = (0f64, 0f64, 0f64);
+        // Batched-lane (sw_ms) sub-block split: prep loop / batched fwd / finish loop.
+        // These sum ≈ sw_ms. Only touched when phase_time.
+        let (mut prep_ms, mut fwd_ms, mut finish_ms) = (0f64, 0f64, 0f64);
+        // PREPARE sub-split: batched projection pre-pass vs per-row compressor/indexer.
+        // These sum ≈ prep_ms. Only touched when phase_time.
+        let (mut proj_ms, mut compidx_ms) = (0f64, 0f64);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
@@ -2017,6 +2066,58 @@ impl Dsv4Model {
                 // ── 1. per-row PREPARE + pack + Q-gather.
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
+                let _prep_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                // ── 0. Batched (m=N) slot-INDEPENDENT projection pre-pass
+                // (#60 PHASE C): wq_a / wkv / wq_b + RoPE over all N rows at once
+                // (weights read ONCE across the N-token grid), replacing the N
+                // per-row m=1 projection GEMVs that dominated PREPARE. The per-row
+                // loop below then reads each row's SLICE of these batched outputs
+                // for the per-slot compressor / pack / gather — no per-row
+                // projection recompute. Touches no slot state.
+                let positions = batched_positions.as_ref().ok_or_else(|| {
+                    anyhow!("DSv4 batched decode lane: batched positions buffer missing")
+                })?;
+                // Borrow the model-wide shared FP8 prefill DeepGEMM scratch for the
+                // batched (m=N) projection. `None` when DeepGEMM is disabled — the
+                // pre-pass then takes its scalar fallback. This borrow is scoped to
+                // the pre-pass and released before the per-row loop re-borrows the
+                // pool / batch scratch via the same accessor.
+                let _proj_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let proj = {
+                    let (_layer_pool, _dsa, _flash_batch, _flashmla_scratch, prefill_shared) =
+                        kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                    crate::attention::mla_attention_prepare_proj_batch(
+                        &self.ctx,
+                        &self.config,
+                        &layer.attention,
+                        layer.compress_ratio,
+                        &normed,
+                        positions,
+                        &self.tp,
+                        prefill_shared,
+                        &mut keepalive,
+                    )?
+                };
+                if let Some(t) = _proj_t {
+                    ctx.stream.synchronize().ok();
+                    proj_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
+                let _compidx_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 {
                     let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_prepare");
                     for r in 0..n {
@@ -2024,8 +2125,59 @@ impl Dsv4Model {
                         ctx.stream
                             .memcpy_dtod(&src, &mut normed_row.data)
                             .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                        let (layer_pool, dsa_shared, flash_batch, flashmla_scratch, prefill_shared) =
-                            kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                        // Copy this row's batched c_q_normed slice into the reused
+                        // per-row [*, 1] scratch (WAR-safe under stream ordering,
+                        // like normed_row); the compressed-only finish reads it by
+                        // reference for the CSA indexer query projection.
+                        {
+                            let cq_src = proj
+                                .c_q_normed
+                                .data
+                                .slice(r * q_lora_rank..(r + 1) * q_lora_rank);
+                            ctx.stream
+                                .memcpy_dtod(&cq_src, &mut c_q_normed_row.data)
+                                .map_err(|e| anyhow!("DSv4 batched c_q copy-in failed: {e}"))?;
+                        }
+                        // This row's q_prepared / k_prepared slices → fresh OWNED
+                        // [*, 1] HiddenStates the compressed-only finish takes by
+                        // value into the returned Dsv4MlaPrepared (the batched fwd
+                        // reads the gathered Q; the finish loop reads
+                        // k_prepared/local_attn — both must outlive the reused row
+                        // scratch). Cheap [*, 1] bf16 alloc per row.
+                        // SAFETY: each dtod copy fills the full buffer before read.
+                        let mut q_prepared_owned =
+                            unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
+                        {
+                            let qp_src = proj
+                                .q_prepared
+                                .data
+                                .slice(r * local_width..(r + 1) * local_width);
+                            ctx.stream
+                                .memcpy_dtod(&qp_src, &mut q_prepared_owned.data)
+                                .map_err(|e| {
+                                    anyhow!("DSv4 batched q_prepared owned copy failed: {e}")
+                                })?;
+                        }
+                        let mut k_prepared_owned =
+                            unsafe { HiddenStates::uninit(&self.ctx, mla_head_dim, 1)? };
+                        {
+                            let kp_src = proj
+                                .k_prepared
+                                .data
+                                .slice(r * mla_head_dim..(r + 1) * mla_head_dim);
+                            ctx.stream
+                                .memcpy_dtod(&kp_src, &mut k_prepared_owned.data)
+                                .map_err(|e| {
+                                    anyhow!("DSv4 batched k_prepared owned copy failed: {e}")
+                                })?;
+                        }
+                        let (
+                            layer_pool,
+                            dsa_shared,
+                            flash_batch,
+                            flashmla_scratch,
+                            _prefill_shared,
+                        ) = kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
                         let flash_batch = flash_batch.ok_or_else(|| {
                             anyhow!("DSv4 batched decode lane: batch scratch missing")
                         })?;
@@ -2034,7 +2186,7 @@ impl Dsv4Model {
                         })?;
                         let slot = &mut slots[slot_ids[r]];
                         slot_block_offsets.push(layer_pool.flashmla_slot_first_block(slot_ids[r])?);
-                        let row_prepared = crate::attention::mla_attention_prepare(
+                        let row_prepared = crate::attention::mla_attention_prepare_compressed_only(
                             &self.ctx,
                             &self.config,
                             &layer.attention,
@@ -2042,14 +2194,15 @@ impl Dsv4Model {
                             layer.compress_ratio,
                             layer_idx,
                             &normed_row,
+                            &c_q_normed_row,
+                            q_prepared_owned,
+                            k_prepared_owned,
+                            &proj,
                             &mut slot.attention[layer_idx],
                             layer_pool,
                             dsa_shared,
-                            prefill_shared,
                             start_positions[r],
                             Some(&slot.start_pos_device),
-                            None,
-                            &self.tp,
                             &mut keepalive,
                         )?;
                         // Pack this row's KV into the shared pool, then gather its
@@ -2104,7 +2257,21 @@ impl Dsv4Model {
                         prepared.push(row_prepared);
                     }
                 }
+                if let Some(t) = _compidx_t {
+                    ctx.stream.synchronize().ok();
+                    compidx_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
+                if let Some(t) = _prep_t {
+                    ctx.stream.synchronize().ok();
+                    prep_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
                 // ── 2. ONE batched indices/sched_meta build + ONE batched fwd.
+                let _fwd_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 {
                     let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_fwd");
                     let (layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
@@ -2135,7 +2302,17 @@ impl Dsv4Model {
                         sm_scale,
                     )?;
                 }
+                if let Some(t) = _fwd_t {
+                    ctx.stream.synchronize().ok();
+                    fwd_ms += t.elapsed().as_secs_f64() * 1000.0;
+                }
                 // ── 3. per-row slice-out → inverse-rope + SW-update → O-LoRA.
+                let _finish_t = if phase_time {
+                    ctx.stream.synchronize().ok();
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 {
                     let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_finish");
                     for r in 0..n {
@@ -2198,6 +2375,10 @@ impl Dsv4Model {
                             .memcpy_dtod(&attn_out_row.data, &mut dst)
                             .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
                     }
+                }
+                if let Some(t) = _finish_t {
+                    ctx.stream.synchronize().ok();
+                    finish_ms += t.elapsed().as_secs_f64() * 1000.0;
                 }
                 if let Some(t) = _sw_t {
                     ctx.stream.synchronize().ok();
@@ -2470,9 +2651,14 @@ impl Dsv4Model {
         }
         if phase_time {
             log::info!(
-                "[decode-phase] n={n} csa_attn={:.1}ms sw_attn={:.1}ms moe={:.1}ms",
+                "[decode-phase] n={n} csa_attn={:.1}ms sw_attn={:.1}ms (prep={:.1} [proj={:.1} compidx={:.1}] fwd={:.1} finish={:.1}) moe={:.1}ms",
                 csa_ms,
                 sw_ms,
+                prep_ms,
+                proj_ms,
+                compidx_ms,
+                fwd_ms,
+                finish_ms,
                 moe_ms
             );
         }
