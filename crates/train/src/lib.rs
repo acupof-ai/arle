@@ -20,6 +20,8 @@ pub mod loss;
 pub mod metrics;
 #[path = "model_family.rs"]
 pub mod model_family;
+#[path = "moe.rs"]
+pub mod moe;
 #[path = "opd.rs"]
 pub mod opd;
 #[path = "prompts.rs"]
@@ -45,6 +47,7 @@ pub use causal_lm::CausalLm;
 pub use grad_accum::GradAccumulator;
 pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig, LoraTargetSet};
 pub use metrics::*;
+pub use moe::{MoeConfig, MoeWithLora};
 pub use trainer::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig, cleanup_after_backward,
 };
