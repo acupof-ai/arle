@@ -7,14 +7,38 @@ use autograd::{
 use train::{LoraConfig, MoeConfig, MoeWithLora};
 
 #[test]
-fn moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
+fn cpu_moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
+    run_moe_lora_and_router_gradients_match_finite_difference(TensorStore::default(), "cpu")
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
+    use std::sync::Arc;
+
+    use autograd::{backend::Backend, backend_cuda::CudaBackend};
+
+    let ordinal = std::env::var("ARLE_CUDA_TEST_DEVICE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let backend: Arc<dyn Backend> = Arc::new(CudaBackend::new(ordinal)?);
+    run_moe_lora_and_router_gradients_match_finite_difference(
+        TensorStore::with_backend(backend),
+        "cuda",
+    )
+}
+
+fn run_moe_lora_and_router_gradients_match_finite_difference(
+    mut store: TensorStore,
+    backend_label: &'static str,
+) -> Result<()> {
     const TOKENS: usize = 5;
     const HIDDEN: usize = 64;
     const EXPERTS: usize = 4;
     const TOP_K: usize = 2;
     const INTERMEDIATE: usize = 128;
 
-    let mut store = TensorStore::default();
     let cfg = MoeConfig {
         hidden_size: HIDDEN,
         intermediate_size: INTERMEDIATE,
@@ -37,14 +61,14 @@ fn moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
         vec![TOKENS, HIDDEN],
         true,
     )?);
-    let target = store.alloc(Tensor::new(
-        deterministic_vec(TOKENS * HIDDEN, 0x51d3_7a91, 0.10),
+    let probe = store.alloc(Tensor::new(
+        deterministic_vec(TOKENS * HIDDEN, 0x51d3_7a91, 0.50),
         vec![TOKENS, HIDDEN],
         false,
     )?);
 
     let mut tape = Tape::new();
-    let loss = loss(&moe, input, target, &mut store, &mut tape)?;
+    let loss = loss(&moe, input, probe, &mut store, &mut tape)?;
     let grads = tape.backward(loss, &mut store)?;
 
     let mut checked: Vec<(&'static str, TensorId)> = Vec::new();
@@ -69,63 +93,98 @@ fn moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
             (*id, grad)
         })
         .collect();
+    let probe_data = store.to_host(probe)?;
 
     let keep: HashSet<TensorId> = params
         .values()
         .chain(adapters.values())
         .copied()
-        .chain([input, target])
+        .chain([input, probe])
         .collect();
 
-    let eps = 1.0e-2_f32;
-    let mut max_abs = 0.0_f32;
-    let mut max_rel = 0.0_f32;
+    let eps = std::env::var("ARLE_A0_FD_EPS")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(1.0e-3_f32);
+    let rel_tol = 1.0e-2_f64;
+    let relative_floor = 2.0e-4_f64;
+    let tiny_abs_tol = 3.0e-6_f64;
+    let mut max_abs_at_worst_rel = 0.0_f64;
+    let mut max_rel = 0.0_f64;
+    let mut max_tiny_abs = 0.0_f64;
     let mut checked_values = 0usize;
+    let mut relative_values = 0usize;
+    let mut tiny_values = 0usize;
+    let mut tiny_abs_failures = 0usize;
     let mut worst_name = "";
     let mut worst_index = 0usize;
-    let mut worst_analytic = 0.0_f32;
-    let mut worst_numeric = 0.0_f32;
+    let mut worst_analytic = 0.0_f64;
+    let mut worst_numeric = 0.0_f64;
 
     for (name, param_id) in checked {
         let len = store.get(param_id).expect("param exists").size;
         for index in 0..len {
             let original = store.get(param_id).expect("param exists").data[index];
             set_param_value(&mut store, param_id, index, original + eps);
-            let plus = scalar_loss(&moe, input, target, &mut store)?;
+            let plus = forward_output(&moe, input, &mut store)?;
             store.retain_ids(&keep);
 
             set_param_value(&mut store, param_id, index, original - eps);
-            let minus = scalar_loss(&moe, input, target, &mut store)?;
+            let minus = forward_output(&moe, input, &mut store)?;
             store.retain_ids(&keep);
 
             set_param_value(&mut store, param_id, index, original);
 
-            let numeric = (plus - minus) / (2.0 * eps);
-            let analytic_value = analytic[&param_id][index];
+            let numeric = plus
+                .iter()
+                .zip(minus.iter())
+                .zip(probe_data.iter())
+                .map(|((&plus_value, &minus_value), &probe_value)| {
+                    f64::from(plus_value - minus_value) * f64::from(probe_value)
+                })
+                .sum::<f64>()
+                / (2.0 * f64::from(eps));
+            let analytic_value = f64::from(analytic[&param_id][index]);
             let abs = (analytic_value - numeric).abs();
-            let rel = abs / analytic_value.abs().max(numeric.abs()).max(1.0e-6);
-            if abs > max_abs {
-                max_abs = abs;
-                max_rel = rel;
-                worst_name = name;
-                worst_index = index;
-                worst_analytic = analytic_value;
-                worst_numeric = numeric;
+            let denom = analytic_value.abs().max(numeric.abs());
+            if denom < relative_floor {
+                tiny_values += 1;
+                max_tiny_abs = max_tiny_abs.max(abs);
+                if abs > tiny_abs_tol {
+                    tiny_abs_failures += 1;
+                }
+            } else {
+                relative_values += 1;
+                let rel = abs / denom;
+                if rel > max_rel {
+                    max_abs_at_worst_rel = abs;
+                    max_rel = rel;
+                    worst_name = name;
+                    worst_index = index;
+                    worst_analytic = analytic_value;
+                    worst_numeric = numeric;
+                }
             }
             checked_values += 1;
         }
     }
 
     eprintln!(
-        "a0_moe_finite_diff checked_values={checked_values} max_abs={max_abs:.6e} \
+        "a0_moe_finite_diff backend={backend_label} eps={eps:.1e} checked_values={checked_values} \
+         relative_values={relative_values} tiny_values={tiny_values} \
+         max_abs_at_worst_rel={max_abs_at_worst_rel:.6e} \
          max_rel={max_rel:.6e} worst={worst_name}[{worst_index}] \
-         analytic={worst_analytic:.6e} numeric={worst_numeric:.6e}"
+         analytic={worst_analytic:.6e} numeric={worst_numeric:.6e} \
+         max_tiny_abs={max_tiny_abs:.6e} tiny_abs_failures={tiny_abs_failures}"
     );
     assert!(
-        max_abs < 1.0e-3,
-        "A0 MoE finite diff failed: checked={checked_values} max_abs={max_abs:.6e} \
+        max_rel < rel_tol && tiny_abs_failures == 0,
+        "A0 MoE finite diff failed: checked={checked_values} relative={relative_values} \
+         tiny={tiny_values} backend={backend_label} eps={eps:.1e} \
+         max_abs_at_worst_rel={max_abs_at_worst_rel:.6e} \
          max_rel={max_rel:.6e} worst={worst_name}[{worst_index}] \
-         analytic={worst_analytic:.6e} numeric={worst_numeric:.6e}"
+         analytic={worst_analytic:.6e} numeric={worst_numeric:.6e} \
+         max_tiny_abs={max_tiny_abs:.6e} tiny_abs_failures={tiny_abs_failures}"
     );
     Ok(())
 }
@@ -133,26 +192,21 @@ fn moe_lora_and_router_gradients_match_finite_difference() -> Result<()> {
 fn loss(
     moe: &MoeWithLora,
     input: TensorId,
-    target: TensorId,
+    probe: TensorId,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let out = moe.forward(input, store, tape)?;
-    let neg_target = mul_scalar(target, -1.0, store, tape)?;
-    let diff = add(out, neg_target, store, tape)?;
-    let sq = mul(diff, diff, store, tape)?;
-    sum(sq, store, tape)
+    let weighted = mul(out, probe, store, tape)?;
+    let anchor = mul_scalar(input, 0.0, store, tape)?;
+    let weighted = add(weighted, anchor, store, tape)?;
+    sum(weighted, store, tape)
 }
 
-fn scalar_loss(
-    moe: &MoeWithLora,
-    input: TensorId,
-    target: TensorId,
-    store: &mut TensorStore,
-) -> Result<f32> {
+fn forward_output(moe: &MoeWithLora, input: TensorId, store: &mut TensorStore) -> Result<Vec<f32>> {
     let mut tape = Tape::new();
-    let loss = loss(moe, input, target, store, &mut tape)?;
-    Ok(store.to_host(loss)?[0])
+    let out = moe.forward(input, store, &mut tape)?;
+    store.to_host(out)
 }
 
 fn set_param_value(store: &mut TensorStore, param_id: TensorId, index: usize, value: f32) {
@@ -198,7 +252,7 @@ fn stable_input(tokens: usize, hidden: usize) -> Vec<f32> {
         [3.0, -1.0, 1.0, 5.0],
         [5.0, -1.0, 3.0, 1.0],
     ];
-    let mut data = deterministic_vec(tokens * hidden, 0x7a31_9b25, 0.005);
+    let mut data = deterministic_vec(tokens * hidden, 0x7a31_9b25, 0.20);
     for token in 0..tokens {
         for expert in 0..4 {
             data[token * hidden + expert] = route_scores[token][expert];
