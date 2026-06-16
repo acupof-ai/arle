@@ -1,4 +1,4 @@
-# Qwen3.6 FP8 DeepGEMM SLO throughput gate: correctness and memory pass, throughput fail
+# Qwen3.6 FP8 DeepGEMM SLO throughput gate: memory pass, throughput pathologically slow
 
 ## SLO-shape probed? Y
 
@@ -16,10 +16,11 @@ large-R prefill.
 
 ## Hypothesis
 
-If the FP8 DeepGEMM port is a throughput win, it should show up on the 4096/256
-shape where prefill dominates and where the FP8 model's memory footprint permits
-more slots. If it still loses there, H20 should be treated as compute-bound for
-this QAT track: FP8 remains a memory/slot lever, not a raw throughput lever.
+If the FP8 DeepGEMM port is correctly wired, it should be competitive with or
+faster than BF16 on the 4096/256 prefill-heavy shape. A large regression here is
+not evidence against FP8 or DeepGEMM as a method, and not evidence that H20 is
+"compute-bound"; it is evidence that this ARLE Qwen FP8 prefill implementation
+is still wrong or dominated by an unrooted overhead.
 
 ## Environment
 
@@ -60,15 +61,21 @@ that were still incomplete at the fixed 60s point.
 
 ## Verdict
 
-Outcome (b): FP8 still does not win on the SLO shape. The throughput gate is a
-KILL for H20 raw throughput/default claims. This is now framed as H20 reality for
-this track, not a new correctness bug: the FP8 lane is coherent and retrieves
-the needle, native DeepGEMM is actually built, large-R prefill no longer hits the
-old non-returning cliff, and the SLO run still loses to BF16.
+FP8 still does not win on the SLO shape, but the magnitude is the important
+signal: FP8 TTFT is 20.7s vs BF16 1.76s at c=1, output throughput is 6.54 tok/s
+vs 31.50 tok/s, and FP8 completes 0 requests at c=2 while BF16 completes 8.
+That is pathologically slow. The throughput gate is a KILL for this ARLE FP8
+DeepGEMM prefill implementation as currently wired.
 
-Stop chasing raw FP8 throughput on H20 for QAT. Keep FP8 as an opt-in
-memory/slot lever: it fits about 2.1x the long-shape slots in the same VRAM
-budget, but BF16 remains the throughput baseline on this SKU.
+Do not interpret this as an H20 compute-bound verdict or as a throughput-method
+verdict against FP8/DeepGEMM. Industry FP8 prefill should not be 12x slower than
+BF16. The required next step is root-cause profiling of the ARLE Qwen FP8 prefill
+path: JIT warmup, BF16-to-FP8 pack-quantize, generated grouped GEMM shape/config,
+max-m padding, fallback gates, activation quantization, and scatter/combine.
+
+Keep the memory/slot result: FP8 fits about 2.1x the long-shape slots in the
+same VRAM budget. The raw-throughput result remains an unrooted implementation
+bug until a stage breakdown proves otherwise.
 
 ## Artifacts
 
@@ -86,4 +93,5 @@ budget, but BF16 remains the throughput baseline on this SKU.
 When the synthetic bench generator and server tokenizer disagree by one token,
 the apparent 4096-token run can be an ingress abort with zero engine steps. The
 valid SLO gate is the server-usage shape, not the generator's nominal token
-count.
+count. A double-digit FP8 slowdown on that valid SLO shape is our implementation
+bug until profiled to a specific external limit.
