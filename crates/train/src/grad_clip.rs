@@ -51,6 +51,19 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
         return;
     }
 
+    // Diagnostic (opt-in, env-gated to avoid per-step stderr spam): surface the
+    // pre-clip global L2 norm so we can falsify whether the batchmean KL fix
+    // (grads now ~vocab x larger) trips `--grad-clip` every step — which would
+    // re-introduce an LR cut via clipping instead of AdamW eps. The prod clip
+    // path otherwise discards this norm, leaving the question unobservable.
+    if std::env::var("ARLE_OPD_LOG_GRAD_NORM").is_ok() {
+        let pre_clip_norm = compute_global_norm_f64(params, store);
+        eprintln!(
+            "[grad-clip] pre_clip_norm={pre_clip_norm:.6e} max_norm={max_norm:.3e} clipped={}",
+            pre_clip_norm > f64::from(max_norm)
+        );
+    }
+
     if try_clip_grad_norm_device(params, max_norm, store) {
         return;
     }
