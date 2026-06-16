@@ -7,15 +7,16 @@ use std::{
 use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        LinearAttentionParams, add, all_reduce_sum, causal_sdpa_recompute,
+        LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
+        MoeTopK, add, add_broadcast, all_reduce_sum, causal_sdpa_recompute,
         causal_sdpa_with_q_start, checkpoint, embedding, linear_attention_core,
-        matmul_bt_with_site, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice,
-        transpose,
+        matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
+        mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
 };
 use half::bf16;
-use qwen35_spec::Qwen35AttentionTensorNames;
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
+use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35MoeTensorNames};
 use thiserror::Error;
 
 use crate::{
@@ -72,10 +73,34 @@ enum Qwen35Attention {
 }
 
 #[derive(Debug, Clone)]
-struct Qwen35Mlp {
+struct Qwen35DenseMlp {
     gate_proj: LinearWithLora,
     up_proj: LinearWithLora,
     down_proj: LinearWithLora,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen35SparseExpert {
+    gate_proj: LinearWithLora,
+    up_proj: LinearWithLora,
+    down_proj: LinearWithLora,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen35SparseMlp {
+    router_gate: LinearWithLora,
+    shared_gate_proj: LinearWithLora,
+    shared_up_proj: LinearWithLora,
+    shared_down_proj: LinearWithLora,
+    shared_expert_gate: LinearWithLora,
+    experts: Vec<Qwen35SparseExpert>,
+    top_k: usize,
+}
+
+#[derive(Debug, Clone)]
+enum Qwen35Mlp {
+    Dense(Box<Qwen35DenseMlp>),
+    Sparse(Box<Qwen35SparseMlp>),
 }
 
 #[derive(Debug, Clone)]
@@ -453,9 +478,7 @@ impl Qwen35Layer {
         ids.push(hidden);
         ids.push(self.input_layernorm);
         ids.push(self.post_attention_layernorm);
-        collect_linear_ids(&self.mlp.gate_proj, &mut ids);
-        collect_linear_ids(&self.mlp.up_proj, &mut ids);
-        collect_linear_ids(&self.mlp.down_proj, &mut ids);
+        collect_mlp_ids(&self.mlp, &mut ids);
         match &self.self_attn {
             Qwen35Attention::Full(attn) => {
                 collect_linear_ids(&attn.q_proj, &mut ids);
@@ -526,12 +549,7 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
-        let up = self.mlp.up_proj.forward(h, store, tape)?;
-        let gate = silu(gate, store, tape)?;
-        let act = mul(gate, up, store, tape)?;
-        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
-        let mlp_out = maybe_tp_all_reduce(mlp_out, tp, store, tape)?;
+        let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
         Ok(add(x, mlp_out, store, tape)?)
     }
 
@@ -591,11 +609,15 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
-        let up = self.mlp.up_proj.forward(h, store, tape)?;
-        let gate = silu(gate, store, tape)?;
-        let act = mul(gate, up, store, tape)?;
-        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
+        let mlp_out = self.forward_mlp(
+            h,
+            cfg,
+            Qwen35TensorParallelConfig::single(),
+            batch,
+            seq_len,
+            store,
+            tape,
+        )?;
         Ok(add(x, mlp_out, store, tape)?)
     }
 
@@ -674,11 +696,15 @@ impl Qwen35Layer {
         profile.post_attention_rmsnorm += started.elapsed();
 
         let started = Instant::now();
-        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
-        let up = self.mlp.up_proj.forward(h, store, tape)?;
-        let gate = silu(gate, store, tape)?;
-        let act = mul(gate, up, store, tape)?;
-        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
+        let mlp_out = self.forward_mlp(
+            h,
+            cfg,
+            Qwen35TensorParallelConfig::single(),
+            batch,
+            seq_len,
+            store,
+            tape,
+        )?;
         profile.mlp += started.elapsed();
 
         let started = Instant::now();
@@ -686,6 +712,111 @@ impl Qwen35Layer {
         profile.mlp_residual += started.elapsed();
 
         Ok((out, profile))
+    }
+
+    fn forward_mlp(
+        &self,
+        h: TensorId,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        match &self.mlp {
+            Qwen35Mlp::Dense(mlp) => {
+                let gate = mlp.gate_proj.forward(h, store, tape)?;
+                let up = mlp.up_proj.forward(h, store, tape)?;
+                let gate = silu(gate, store, tape)?;
+                let act = mul(gate, up, store, tape)?;
+                let mlp_out = mlp.down_proj.forward(act, store, tape)?;
+                maybe_tp_all_reduce(mlp_out, tp, store, tape)
+            }
+            Qwen35Mlp::Sparse(mlp) => {
+                if tp.is_enabled() {
+                    return Err(Qwen35Error::InvalidConfig(
+                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
+                    ));
+                }
+                self.forward_sparse_mlp(mlp, h, cfg, batch, seq_len, store, tape)
+            }
+        }
+    }
+
+    fn forward_sparse_mlp(
+        &self,
+        mlp: &Qwen35SparseMlp,
+        h: TensorId,
+        cfg: &Qwen35Config,
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let tokens = batch * seq_len;
+        let flat_h = reshape(h, &[tokens, cfg.hidden_size], store, tape)?;
+        let router_logits = mlp.router_gate.forward(flat_h, store, tape)?;
+        let routes = moe_topk_softmax(router_logits, mlp.top_k, store, tape)?;
+        let grouped_routes = build_qwen35_grouped_routes(&routes)?;
+
+        let gate_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.gate_proj);
+        let up_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.up_proj);
+        let down_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.down_proj);
+
+        let routed_gate = moe_grouped_linear(
+            flat_h,
+            &gate_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::TokenRows,
+            store,
+            tape,
+        )?;
+        let routed_up = moe_grouped_linear(
+            flat_h,
+            &up_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::TokenRows,
+            store,
+            tape,
+        )?;
+        let routed_gate = silu(routed_gate, store, tape)?;
+        let routed_hidden = mul(routed_gate, routed_up, store, tape)?;
+        let routed_down = moe_grouped_linear(
+            routed_hidden,
+            &down_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::Packed,
+            store,
+            tape,
+        )?;
+        let routed = moe_grouped_weighted_scatter(
+            routed_down,
+            routes.weights,
+            &grouped_routes,
+            tokens,
+            store,
+            tape,
+        )?;
+
+        let shared_gate = mlp.shared_gate_proj.forward(flat_h, store, tape)?;
+        let shared_up = mlp.shared_up_proj.forward(flat_h, store, tape)?;
+        let shared_gate = silu(shared_gate, store, tape)?;
+        let shared_hidden = mul(shared_gate, shared_up, store, tape)?;
+        let shared = mlp.shared_down_proj.forward(shared_hidden, store, tape)?;
+        let shared_expert_gate = mlp.shared_expert_gate.forward(flat_h, store, tape)?;
+        let shared_expert_gate = sigmoid(shared_expert_gate, store, tape)?;
+        let shared_expert_gate =
+            broadcast_to_shape(shared_expert_gate, &[tokens, cfg.hidden_size], store, tape)?;
+        let shared = mul(shared, shared_expert_gate, store, tape)?;
+
+        let out = add(routed, shared, store, tape)?;
+        Ok(reshape(
+            out,
+            &[batch, seq_len, cfg.hidden_size],
+            store,
+            tape,
+        )?)
     }
 
     fn forward_full_attention(
@@ -1344,20 +1475,15 @@ impl Qwen35Model {
             tape,
         )?;
         let post_attention_norm = qwen35_parity_bf16_round(post_attention_norm, store)?;
-        let gate = layer0
-            .mlp
-            .gate_proj
-            .forward(post_attention_norm, store, tape)?;
-        let gate = qwen35_parity_bf16_round(gate, store)?;
-        let up = layer0
-            .mlp
-            .up_proj
-            .forward(post_attention_norm, store, tape)?;
-        let up = qwen35_parity_bf16_round(up, store)?;
-        let gate = silu(gate, store, tape)?;
-        let act = mul(gate, up, store, tape)?;
-        let act = qwen35_parity_bf16_round(act, store)?;
-        let layer0_ffn = layer0.mlp.down_proj.forward(act, store, tape)?;
+        let layer0_ffn = layer0.forward_mlp(
+            post_attention_norm,
+            &self.config,
+            self.tp,
+            batch,
+            seq_len,
+            store,
+            tape,
+        )?;
         let layer0_ffn = qwen35_parity_bf16_round(layer0_ffn, store)?;
         let layer0_residual = add(hidden_plus_attn, layer0_ffn, store, tape)?;
         let layer0_residual = qwen35_parity_bf16_round(layer0_residual, store)?;
@@ -1502,11 +1628,7 @@ impl Qwen35Model {
         )?;
         register_named(&mut param_names, embed_tokens_name, embed_tokens);
 
-        let lm_head_name = if cfg.tie_word_embeddings {
-            cfg.lm_head_tensor_name()
-        } else {
-            leak_name(format!("{}.lm_head.weight", cfg.model_prefix()))
-        };
+        let lm_head_name = cfg.lm_head_tensor_name();
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
         } else {
@@ -1523,11 +1645,9 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
             let names = cfg.layer_tensor_names(layer_idx);
-            let input_layernorm_name = leak_name(names.common.input_layernorm);
-            let post_attention_layernorm_name = leak_name(names.common.post_attention_layernorm);
-            let gate_proj_name = leak_name(names.common.mlp_gate_proj);
-            let up_proj_name = leak_name(names.common.mlp_up_proj);
-            let down_proj_name = leak_name(names.common.mlp_down_proj);
+            let input_layernorm_name = leak_name(names.common.input_layernorm.clone());
+            let post_attention_layernorm_name =
+                leak_name(names.common.post_attention_layernorm.clone());
 
             let input_layernorm = ones_parameter(
                 input_layernorm_name,
@@ -1535,30 +1655,57 @@ impl Qwen35Model {
                 base_requires_grad,
                 store,
             )?;
-            let gate_proj = LinearWithLora::new(
-                gate_proj_name,
-                cfg.hidden_size,
-                tp.local_intermediate_size(cfg)?,
-                base_requires_grad,
-                lora_for_name(lora, lora_target_set, gate_proj_name),
-                store,
-            )?;
-            let up_proj = LinearWithLora::new(
-                up_proj_name,
-                cfg.hidden_size,
-                tp.local_intermediate_size(cfg)?,
-                base_requires_grad,
-                lora_for_name(lora, lora_target_set, up_proj_name),
-                store,
-            )?;
-            let down_proj = LinearWithLora::new(
-                down_proj_name,
-                tp.local_intermediate_size(cfg)?,
-                cfg.hidden_size,
-                base_requires_grad,
-                lora_for_name(lora, lora_target_set, down_proj_name),
-                store,
-            )?;
+            let mlp = if cfg.is_moe_layer(layer_idx) {
+                if tp.is_enabled() {
+                    return Err(Qwen35Error::InvalidConfig(
+                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
+                    ));
+                }
+                if !cfg.norm_topk_prob {
+                    return Err(Qwen35Error::InvalidConfig(
+                        "train-side Qwen3.6 MoE currently requires norm_topk_prob=true",
+                    ));
+                }
+                let moe_names = names.common.moe_tensor_names();
+                Qwen35Mlp::Sparse(Box::new(new_sparse_mlp(
+                    &moe_names,
+                    cfg,
+                    base_requires_grad,
+                    lora,
+                    lora_target_set,
+                    store,
+                )?))
+            } else {
+                let gate_proj_name = leak_name(names.common.mlp_gate_proj);
+                let up_proj_name = leak_name(names.common.mlp_up_proj);
+                let down_proj_name = leak_name(names.common.mlp_down_proj);
+                Qwen35Mlp::Dense(Box::new(Qwen35DenseMlp {
+                    gate_proj: LinearWithLora::new(
+                        gate_proj_name,
+                        cfg.hidden_size,
+                        tp.local_intermediate_size(cfg)?,
+                        base_requires_grad,
+                        lora_for_name(lora, lora_target_set, gate_proj_name),
+                        store,
+                    )?,
+                    up_proj: LinearWithLora::new(
+                        up_proj_name,
+                        cfg.hidden_size,
+                        tp.local_intermediate_size(cfg)?,
+                        base_requires_grad,
+                        lora_for_name(lora, lora_target_set, up_proj_name),
+                        store,
+                    )?,
+                    down_proj: LinearWithLora::new(
+                        down_proj_name,
+                        tp.local_intermediate_size(cfg)?,
+                        cfg.hidden_size,
+                        base_requires_grad,
+                        lora_for_name(lora, lora_target_set, down_proj_name),
+                        store,
+                    )?,
+                }))
+            };
             let post_attention_layernorm = ones_parameter(
                 post_attention_layernorm_name,
                 &[cfg.hidden_size],
@@ -1567,24 +1714,12 @@ impl Qwen35Model {
             )?;
 
             register_named(&mut param_names, input_layernorm_name, input_layernorm);
-            for (name, id) in gate_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in gate_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
-            for (name, id) in up_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in up_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
-            for (name, id) in down_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in down_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
+            register_mlp(
+                &mut param_names,
+                &mut adapter_names,
+                &mut register_named,
+                &mlp,
+            );
             register_named(
                 &mut param_names,
                 post_attention_layernorm_name,
@@ -1805,11 +1940,7 @@ impl Qwen35Model {
                 input_layernorm,
                 self_attn,
                 post_attention_layernorm,
-                mlp: Qwen35Mlp {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                },
+                mlp,
             });
         }
 
@@ -1869,18 +2000,7 @@ impl Qwen35Model {
             layer.input_layernorm = base_layer.input_layernorm;
             layer.post_attention_layernorm = base_layer.post_attention_layernorm;
             share_base_attention(&mut layer.self_attn, &base_layer.self_attn)?;
-            layer
-                .mlp
-                .gate_proj
-                .set_base_weight(base_layer.mlp.gate_proj.base_weight());
-            layer
-                .mlp
-                .up_proj
-                .set_base_weight(base_layer.mlp.up_proj.base_weight());
-            layer
-                .mlp
-                .down_proj
-                .set_base_weight(base_layer.mlp.down_proj.base_weight());
+            share_base_mlp(&mut layer.mlp, &base_layer.mlp)?;
         }
 
         self.param_names = base.param_names.clone();
@@ -2499,19 +2619,6 @@ impl Qwen35Model {
         }
         let mut map = self.param_names.clone();
         for layer in &self.layers {
-            let merged_gate = {
-                let tensor = layer.mlp.gate_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
-            let merged_up = {
-                let tensor = layer.mlp.up_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
-            let merged_down = {
-                let tensor = layer.mlp.down_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
-
             match &layer.self_attn {
                 Qwen35Attention::Full(attn) => {
                     let merged_q = {
@@ -2581,15 +2688,7 @@ impl Qwen35Model {
                     }
                 }
             }
-            for (name, _) in layer.mlp.gate_proj.parameter_name_map() {
-                map.insert(name, merged_gate);
-            }
-            for (name, _) in layer.mlp.up_proj.parameter_name_map() {
-                map.insert(name, merged_up);
-            }
-            for (name, _) in layer.mlp.down_proj.parameter_name_map() {
-                map.insert(name, merged_down);
-            }
+            insert_materialized_mlp_params(&mut map, &layer.mlp, store)?;
         }
         Ok(map)
     }
@@ -2746,6 +2845,99 @@ fn register_linear(
     }
 }
 
+fn new_sparse_mlp(
+    names: &Qwen35MoeTensorNames,
+    cfg: &Qwen35Config,
+    base_requires_grad: bool,
+    lora: Option<LoraConfig>,
+    lora_target_set: LoraTargetSet,
+    store: &mut TensorStore,
+) -> Result<Qwen35SparseMlp> {
+    let router_gate_name = leak_name(names.router_gate.clone());
+    let shared_gate_proj_name = leak_name(names.shared_expert_gate_proj.clone());
+    let shared_up_proj_name = leak_name(names.shared_expert_up_proj.clone());
+    let shared_down_proj_name = leak_name(names.shared_expert_down_proj.clone());
+    let shared_expert_gate_name = leak_name(names.shared_expert_gate.clone());
+
+    let mut experts = Vec::with_capacity(cfg.num_experts);
+    for expert_idx in 0..cfg.num_experts {
+        let gate_proj_name = leak_name(names.expert_gate_proj(expert_idx));
+        let up_proj_name = leak_name(names.expert_up_proj(expert_idx));
+        let down_proj_name = leak_name(names.expert_down_proj(expert_idx));
+        experts.push(Qwen35SparseExpert {
+            gate_proj: LinearWithLora::new(
+                gate_proj_name,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                base_requires_grad,
+                lora_for_name(lora, lora_target_set, gate_proj_name),
+                store,
+            )?,
+            up_proj: LinearWithLora::new(
+                up_proj_name,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                base_requires_grad,
+                lora_for_name(lora, lora_target_set, up_proj_name),
+                store,
+            )?,
+            down_proj: LinearWithLora::new(
+                down_proj_name,
+                cfg.moe_intermediate_size,
+                cfg.hidden_size,
+                base_requires_grad,
+                lora_for_name(lora, lora_target_set, down_proj_name),
+                store,
+            )?,
+        });
+    }
+
+    Ok(Qwen35SparseMlp {
+        router_gate: LinearWithLora::new(
+            router_gate_name,
+            cfg.hidden_size,
+            cfg.num_experts,
+            base_requires_grad,
+            lora_for_name(lora, lora_target_set, router_gate_name),
+            store,
+        )?,
+        shared_gate_proj: LinearWithLora::new(
+            shared_gate_proj_name,
+            cfg.hidden_size,
+            cfg.shared_expert_intermediate_size,
+            base_requires_grad,
+            lora_for_name(lora, lora_target_set, shared_gate_proj_name),
+            store,
+        )?,
+        shared_up_proj: LinearWithLora::new(
+            shared_up_proj_name,
+            cfg.hidden_size,
+            cfg.shared_expert_intermediate_size,
+            base_requires_grad,
+            lora_for_name(lora, lora_target_set, shared_up_proj_name),
+            store,
+        )?,
+        shared_down_proj: LinearWithLora::new(
+            shared_down_proj_name,
+            cfg.shared_expert_intermediate_size,
+            cfg.hidden_size,
+            base_requires_grad,
+            lora_for_name(lora, lora_target_set, shared_down_proj_name),
+            store,
+        )?,
+        shared_expert_gate: LinearWithLora::new(
+            shared_expert_gate_name,
+            cfg.hidden_size,
+            1,
+            base_requires_grad,
+            lora_for_name(lora, lora_target_set, shared_expert_gate_name),
+            store,
+        )?,
+        experts,
+        top_k: cfg.num_experts_per_tok,
+    })
+}
+
 fn share_base_attention(
     attention: &mut Qwen35Attention,
     base_attention: &Qwen35Attention,
@@ -2783,6 +2975,51 @@ fn share_base_attention(
     }
 }
 
+fn share_base_mlp(mlp: &mut Qwen35Mlp, base_mlp: &Qwen35Mlp) -> Result<()> {
+    match (mlp, base_mlp) {
+        (Qwen35Mlp::Dense(mlp), Qwen35Mlp::Dense(base_mlp)) => {
+            mlp.gate_proj
+                .set_base_weight(base_mlp.gate_proj.base_weight());
+            mlp.up_proj.set_base_weight(base_mlp.up_proj.base_weight());
+            mlp.down_proj
+                .set_base_weight(base_mlp.down_proj.base_weight());
+            Ok(())
+        }
+        (Qwen35Mlp::Sparse(mlp), Qwen35Mlp::Sparse(base_mlp)) => {
+            mlp.router_gate
+                .set_base_weight(base_mlp.router_gate.base_weight());
+            mlp.shared_gate_proj
+                .set_base_weight(base_mlp.shared_gate_proj.base_weight());
+            mlp.shared_up_proj
+                .set_base_weight(base_mlp.shared_up_proj.base_weight());
+            mlp.shared_down_proj
+                .set_base_weight(base_mlp.shared_down_proj.base_weight());
+            mlp.shared_expert_gate
+                .set_base_weight(base_mlp.shared_expert_gate.base_weight());
+            if mlp.experts.len() != base_mlp.experts.len() {
+                return Err(Qwen35Error::InvalidConfig(
+                    "cannot share Qwen3.6 MoE base weights across mismatched expert counts",
+                ));
+            }
+            for (expert, base_expert) in mlp.experts.iter_mut().zip(&base_mlp.experts) {
+                expert
+                    .gate_proj
+                    .set_base_weight(base_expert.gate_proj.base_weight());
+                expert
+                    .up_proj
+                    .set_base_weight(base_expert.up_proj.base_weight());
+                expert
+                    .down_proj
+                    .set_base_weight(base_expert.down_proj.base_weight());
+            }
+            Ok(())
+        }
+        _ => Err(Qwen35Error::InvalidConfig(
+            "cannot share Qwen3.5 base weights across mismatched MLP layer types",
+        )),
+    }
+}
+
 fn lora_for_name(
     lora: Option<LoraConfig>,
     target_set: LoraTargetSet,
@@ -2794,6 +3031,196 @@ fn lora_for_name(
 fn collect_linear_ids(linear: &LinearWithLora, ids: &mut Vec<TensorId>) {
     ids.extend(linear.parameter_name_map().values().copied());
     ids.extend(linear.adapter_name_map().values().copied());
+}
+
+fn collect_mlp_ids(mlp: &Qwen35Mlp, ids: &mut Vec<TensorId>) {
+    match mlp {
+        Qwen35Mlp::Dense(dense) => {
+            collect_linear_ids(&dense.gate_proj, ids);
+            collect_linear_ids(&dense.up_proj, ids);
+            collect_linear_ids(&dense.down_proj, ids);
+        }
+        Qwen35Mlp::Sparse(sparse) => {
+            collect_linear_ids(&sparse.router_gate, ids);
+            collect_linear_ids(&sparse.shared_gate_proj, ids);
+            collect_linear_ids(&sparse.shared_up_proj, ids);
+            collect_linear_ids(&sparse.shared_down_proj, ids);
+            collect_linear_ids(&sparse.shared_expert_gate, ids);
+            for expert in &sparse.experts {
+                collect_linear_ids(&expert.gate_proj, ids);
+                collect_linear_ids(&expert.up_proj, ids);
+                collect_linear_ids(&expert.down_proj, ids);
+            }
+        }
+    }
+}
+
+fn register_mlp(
+    param_names: &mut HashMap<&'static str, TensorId>,
+    adapter_names: &mut HashMap<&'static str, TensorId>,
+    register_named: &mut impl FnMut(&mut HashMap<&'static str, TensorId>, &'static str, TensorId),
+    mlp: &Qwen35Mlp,
+) {
+    match mlp {
+        Qwen35Mlp::Dense(dense) => {
+            register_linear(param_names, adapter_names, register_named, &dense.gate_proj);
+            register_linear(param_names, adapter_names, register_named, &dense.up_proj);
+            register_linear(param_names, adapter_names, register_named, &dense.down_proj);
+        }
+        Qwen35Mlp::Sparse(sparse) => {
+            register_linear(
+                param_names,
+                adapter_names,
+                register_named,
+                &sparse.router_gate,
+            );
+            register_linear(
+                param_names,
+                adapter_names,
+                register_named,
+                &sparse.shared_gate_proj,
+            );
+            register_linear(
+                param_names,
+                adapter_names,
+                register_named,
+                &sparse.shared_up_proj,
+            );
+            register_linear(
+                param_names,
+                adapter_names,
+                register_named,
+                &sparse.shared_down_proj,
+            );
+            register_linear(
+                param_names,
+                adapter_names,
+                register_named,
+                &sparse.shared_expert_gate,
+            );
+            for expert in &sparse.experts {
+                register_linear(
+                    param_names,
+                    adapter_names,
+                    register_named,
+                    &expert.gate_proj,
+                );
+                register_linear(param_names, adapter_names, register_named, &expert.up_proj);
+                register_linear(
+                    param_names,
+                    adapter_names,
+                    register_named,
+                    &expert.down_proj,
+                );
+            }
+        }
+    }
+}
+
+fn insert_materialized_linear(
+    map: &mut HashMap<&'static str, TensorId>,
+    linear: &LinearWithLora,
+    store: &mut TensorStore,
+) -> Result<()> {
+    let tensor = linear.merged_tensor(store)?;
+    let merged = store.alloc(tensor);
+    for (name, _) in linear.parameter_name_map() {
+        map.insert(name, merged);
+    }
+    Ok(())
+}
+
+fn insert_materialized_mlp_params(
+    map: &mut HashMap<&'static str, TensorId>,
+    mlp: &Qwen35Mlp,
+    store: &mut TensorStore,
+) -> Result<()> {
+    match mlp {
+        Qwen35Mlp::Dense(dense) => {
+            insert_materialized_linear(map, &dense.gate_proj, store)?;
+            insert_materialized_linear(map, &dense.up_proj, store)?;
+            insert_materialized_linear(map, &dense.down_proj, store)?;
+        }
+        Qwen35Mlp::Sparse(sparse) => {
+            insert_materialized_linear(map, &sparse.router_gate, store)?;
+            insert_materialized_linear(map, &sparse.shared_gate_proj, store)?;
+            insert_materialized_linear(map, &sparse.shared_up_proj, store)?;
+            insert_materialized_linear(map, &sparse.shared_down_proj, store)?;
+            insert_materialized_linear(map, &sparse.shared_expert_gate, store)?;
+            for expert in &sparse.experts {
+                insert_materialized_linear(map, &expert.gate_proj, store)?;
+                insert_materialized_linear(map, &expert.up_proj, store)?;
+                insert_materialized_linear(map, &expert.down_proj, store)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_qwen35_grouped_routes(routes: &MoeTopK) -> Result<Vec<MoeGroupedRoute>> {
+    if routes.indices.len() != routes.tokens * routes.top_k {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: routes.tokens * routes.top_k,
+            got: routes.indices.len(),
+        }
+        .into());
+    }
+    let mut counts = vec![0usize; routes.experts];
+    let mut grouped = Vec::with_capacity(routes.indices.len());
+    for token in 0..routes.tokens {
+        for slot in 0..routes.top_k {
+            let expert = routes.indices[token * routes.top_k + slot];
+            if expert >= routes.experts {
+                return Err(AutogradError::IndexOutOfBounds {
+                    index: expert,
+                    upper: routes.experts,
+                }
+                .into());
+            }
+            let row = counts[expert];
+            counts[expert] += 1;
+            grouped.push(MoeGroupedRoute {
+                expert,
+                row,
+                token,
+                slot,
+            });
+        }
+    }
+    grouped.sort_by_key(|route| (route.expert, route.row));
+    Ok(grouped)
+}
+
+fn qwen35_grouped_linear_experts(
+    experts: &[Qwen35SparseExpert],
+    select: impl Fn(&Qwen35SparseExpert) -> &LinearWithLora,
+) -> Vec<MoeGroupedLinearExpert> {
+    experts
+        .iter()
+        .map(|expert| {
+            let parts = select(expert).parts();
+            MoeGroupedLinearExpert {
+                weight: parts.weight,
+                lora_a: parts.lora_a,
+                lora_b: parts.lora_b,
+                lora_scale: parts.lora_scale,
+            }
+        })
+        .collect()
+}
+
+fn broadcast_to_shape(
+    x: TensorId,
+    shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let zeros = store.alloc(Tensor::new(
+        vec![0.0; shape.iter().product()],
+        shape.to_vec(),
+        false,
+    )?);
+    Ok(add_broadcast(zeros, x, store, tape)?)
 }
 
 fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
@@ -3378,6 +3805,42 @@ mod tests {
         }
     }
 
+    fn tiny_qwen36_moe_config(max_seq_len: usize) -> Qwen35Config {
+        Qwen35Config {
+            hidden_size: 8,
+            intermediate_size: 0,
+            num_hidden_layers: 1,
+            vocab_size: 12,
+            rms_norm_eps: 1.0e-6,
+            stop_token_ids: vec![11],
+            bos_token_id: Some(1),
+            eos_token_id: 11,
+            tie_word_embeddings: false,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 4,
+            linear_num_value_heads: 2,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 4,
+            rope_cache_len_hint: Some(max_seq_len),
+            layer_types: vec![LayerType::FullAttention],
+            num_experts: 3,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 6,
+            shared_expert_intermediate_size: 6,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+            full_attn_gated: true,
+        }
+    }
+
     fn logits_host(store: &mut TensorStore, logits: TensorId) -> TestResult<Vec<f32>> {
         Ok(store.to_host(logits)?)
     }
@@ -3422,6 +3885,40 @@ mod tests {
             .ok_or_else(|| format!("tensor {tensor_id} missing index {index}"))?;
         *slot = value;
         Ok(())
+    }
+
+    fn fill_tensor(store: &mut TensorStore, tensor_id: TensorId, value: f32) -> TestResult {
+        let tensor = store
+            .get_mut(tensor_id)
+            .ok_or_else(|| format!("missing tensor {tensor_id}"))?;
+        for slot in &mut tensor.data {
+            *slot = value;
+        }
+        tensor.device_handle = None;
+        Ok(())
+    }
+
+    fn set_moe_router_tie(
+        store: &mut TensorStore,
+        model: &Qwen35Model,
+        layer_idx: usize,
+    ) -> TestResult {
+        let name = format!("model.language_model.layers.{layer_idx}.mlp.gate.weight");
+        let params = model.param_name_map();
+        let router = *params
+            .get(name.as_str())
+            .ok_or_else(|| format!("missing router tensor {name}"))?;
+        fill_tensor(store, router, 0.0)
+    }
+
+    fn first_nonzero_grad_index(store: &mut TensorStore, grad_id: TensorId) -> TestResult<usize> {
+        let grad = store.to_host(grad_id)?;
+        grad.iter()
+            .enumerate()
+            .filter(|(_, value)| value.abs() > 1.0e-7)
+            .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+            .map(|(idx, _)| idx)
+            .ok_or_else(|| "gradient has no stable non-zero element".into())
     }
 
     fn greedy_next(host: &[f32], seq_len: usize, vocab: usize) -> u32 {
@@ -3525,6 +4022,100 @@ mod tests {
                 "window row {local_pos} must match full logits slice; max_abs={max_abs}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen36_moe_lora_param_names_match_checkpoint_contract() -> TestResult {
+        let mut store = TensorStore::default();
+        let cfg = tiny_qwen36_moe_config(8);
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let model =
+            Qwen35Model::new_with_lora_targets(&cfg, lora, LoraTargetSet::AllLinear, &mut store)?;
+        let params = model.param_name_map();
+        let adapters = model.adapter_name_map();
+        for name in [
+            "model.language_model.layers.0.mlp.gate.weight",
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight",
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+            "lm_head.weight",
+        ] {
+            assert!(params.contains_key(name), "missing param {name}");
+        }
+        assert!(
+            !params.contains_key("model.language_model.layers.0.mlp.gate_proj.weight"),
+            "MoE layers must not expose dense MLP gate_proj names"
+        );
+        assert!(
+            adapters
+                .contains_key("model.language_model.layers.0.mlp.experts.0.up_proj.weight.lora_b"),
+            "routed expert LoRA-B must be trainable"
+        );
+        assert!(
+            adapters.contains_key(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight.lora_b"
+            ),
+            "shared expert LoRA-B must be trainable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qwen36_moe_lora_gradient_matches_finite_difference() -> TestResult {
+        let mut store = TensorStore::default();
+        let cfg = tiny_qwen36_moe_config(8);
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let model =
+            Qwen35Model::new_with_lora_targets(&cfg, lora, LoraTargetSet::AllLinear, &mut store)?;
+        set_moe_router_tie(&mut store, &model, 0)?;
+        let target_name = "model.language_model.layers.0.mlp.experts.0.up_proj.weight.lora_b";
+        let target = *model
+            .adapter_name_map()
+            .get(target_name)
+            .ok_or_else(|| format!("missing adapter {target_name}"))?;
+        let tokens = [1_u32, 3];
+        let positions = [0_u32, 1];
+
+        let mut tape = Tape::new();
+        let loss = squared_logits_loss(&model, &mut store, &mut tape, &tokens, &positions)?;
+        let grads = tape.backward(loss, &mut store)?;
+        let grad_id = *grads
+            .get(&target)
+            .ok_or_else(|| format!("missing grad for {target_name}"))?;
+        let probe_index = first_nonzero_grad_index(&mut store, grad_id)?;
+        let analytic = store.to_host(grad_id)?[probe_index];
+
+        let base = store
+            .get(target)
+            .and_then(|tensor| tensor.data.get(probe_index).copied())
+            .ok_or_else(|| format!("missing target element {probe_index}"))?;
+        let eps = 1.0e-3_f32;
+        set_tensor_element(&mut store, target, probe_index, base + eps)?;
+        let plus = squared_logits_loss_value(&model, &mut store, &tokens, &positions)?;
+        set_tensor_element(&mut store, target, probe_index, base - eps)?;
+        let minus = squared_logits_loss_value(&model, &mut store, &tokens, &positions)?;
+        set_tensor_element(&mut store, target, probe_index, base)?;
+        let numeric = (plus - minus) / (2.0 * eps);
+        let denom = analytic.abs().max(numeric.abs()).max(1.0e-6);
+        let rel_err = (analytic - numeric).abs() / denom;
+        eprintln!(
+            "qwen36_moe_lora_fd target={target_name}[{probe_index}] analytic={analytic:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e}"
+        );
+        assert!(
+            rel_err <= 1.0e-2,
+            "Qwen35 integrated MoE LoRA finite diff failed: analytic={analytic:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e}"
+        );
         Ok(())
     }
 
