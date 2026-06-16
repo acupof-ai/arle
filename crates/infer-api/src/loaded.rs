@@ -393,6 +393,47 @@ mod backend {
             }
         }
 
+        /// Programmatic token-id generation over the serving scheduler/KV path.
+        /// OPD uses this for student rollout: one submitted request owns one KV
+        /// slot and decodes incrementally until `max_tokens` is reached.
+        #[cfg(feature = "cuda")]
+        pub fn generate_token_ids(
+            &self,
+            prompt_token_ids: &[u32],
+            max_tokens: usize,
+            sampling: infer_plan::SamplingParams,
+        ) -> Result<Vec<u32>> {
+            match self {
+                Self::Cuda(engine) => {
+                    engine.generate_token_ids(prompt_token_ids, max_tokens, sampling)
+                }
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
+            }
+        }
+
         /// Offload the engine's device weights to host RAM (OPD teacher weight
         /// time-share), returning the device bytes freed. CUDA-only: the
         /// Qwen3.5/3.6 hybrid OPD teacher path moves its weights off-device so a

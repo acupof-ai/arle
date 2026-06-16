@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use autograd::{TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,7 +13,7 @@ use infer_plan::SamplingParams;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
-    model_family::{resolve_model_family, ModelFamily},
+    model_family::{ModelFamily, resolve_model_family},
     tokenizer::ChatTokenizer,
 };
 
@@ -299,8 +299,8 @@ fn maybe_save_full_student_checkpoint(
     }
 
     use train::qwen35_checkpoint::{
-        save_qwen35_student_checkpoint, ConfigJsonSource, GenerationConfigSource,
-        Qwen35StepCheckpoint, Qwen35StudentWeights,
+        ConfigJsonSource, GenerationConfigSource, Qwen35StepCheckpoint, Qwen35StudentWeights,
+        save_qwen35_student_checkpoint,
     };
 
     fs::create_dir_all(out_dir)
@@ -516,12 +516,12 @@ fn load_opd_prompt_source(
 }
 
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         lora::LoraConfig,
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
     };
@@ -538,7 +538,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         alpha: args.lora_alpha,
     };
 
-    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
 
     eprintln!(
@@ -560,6 +560,16 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
         .collect();
     let cfg = student.config().clone();
+    #[cfg(feature = "cuda")]
+    let infer_student = load_opd_infer_student(
+        student_dir,
+        args.prompt_max_tokens + args.rollout_len + 32,
+        train_backend.clone(),
+        cfg.vocab_size,
+        target_set,
+    )?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = &train_backend;
 
     let prompt_source = load_opd_prompt_source(&args, student_dir, cfg.vocab_size)?;
 
@@ -609,6 +619,13 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         let prompt_index = prompt_sampler.next_index(prompt_source.train_prompts.len());
         let prompt_ids = prompt_source.train_prompts[prompt_index].as_slice();
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
+        #[cfg(feature = "cuda")]
+        let infer_rollout = infer_student
+            .as_ref()
+            .map(|student| train::opd::InferRolloutCtx {
+                student,
+                lora_config: lora,
+            });
         let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
             &student,
             &teacher_forward,
@@ -630,7 +647,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             },
             None,
             #[cfg(feature = "cuda")]
-            None,
+            infer_rollout,
             step_profile.as_mut(),
         )
         .with_context(|| format!("opd step {step} failed"))?;
@@ -737,11 +754,11 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 }
 
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35::Qwen35Model,
     };
@@ -759,7 +776,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
         );
     }
 
-    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
     let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).context("build smoke teacher")?;
     let teacher_forward = train::teacher_infer::InProcessTeacher::new(&teacher);
@@ -990,13 +1007,13 @@ fn heldout_nll(
 }
 
 fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdKlMask, OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
@@ -1011,7 +1028,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         alpha: args.lora_alpha,
     };
 
-    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
 
     eprintln!(
@@ -1235,13 +1252,13 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
 }
 
 fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdKlMask, OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35::Qwen35Model,
     };
@@ -1260,7 +1277,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
         );
     }
 
-    let (mut store, backend_label) = build_opd_store(args.backend)?;
+    let (mut store, _train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
     let student = Qwen35Model::new_with_lora_targets(&cfg, lora, target_set, &mut store)
         .context("build smoke LoRA student")?;
@@ -1416,8 +1433,69 @@ fn opd_summary(step_metrics: &[OpdStepMetric]) -> OpdSummary {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn load_opd_infer_student(
+    student_dir: &Path,
+    max_seq_len: usize,
+    train_backend: std::sync::Arc<dyn autograd::Backend>,
+    vocab_size: usize,
+    target_set: train::lora::LoraTargetSet,
+) -> Result<Option<train::infer_student::InferStudent>> {
+    if !train::opd::infer_rollout_flag_enabled() {
+        return Ok(None);
+    }
+    if target_set != train::lora::LoraTargetSet::AttentionQv {
+        bail!(
+            "the infer rollout path currently supports --lora-target-set attention-qv only; \
+             {target} includes adapters the infer-side LoRA remerge does not sync yet. \
+             Use --lora-target-set attention-qv for infer rollout, or set \
+             ARLE_OPD_INFER_ROLLOUT=0 for the train-crate fallback.",
+            target = target_set.label()
+        );
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+
+    let max_seq_len = max_seq_len.max(128);
+    let page_size = 16usize;
+    eprintln!(
+        "[arle train opd] loading infer rollout student from {} (max_seq_len={max_seq_len})",
+        student_dir.display()
+    );
+    let engine = LoadedInferenceEngine::load_with_config(
+        student_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("student model path is not valid UTF-8"))?,
+        true,
+        EngineLoadConfig {
+            num_slots: 1,
+            page_size,
+            total_pages: max_seq_len.div_ceil(page_size),
+            max_prompt_tokens: max_seq_len,
+            max_total_tokens: max_seq_len,
+            chunked_prefill_size: max_seq_len,
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load infer rollout student from {}", student_dir.display()))?;
+
+    Ok(Some(train::infer_student::InferStudent::new(
+        Arc::new(Mutex::new(engine)),
+        train_backend,
+        vocab_size,
+    )))
+}
+
 #[allow(unused_variables)]
-fn build_opd_store(arg: OpdBackendArg) -> Result<(autograd::TensorStore, &'static str)> {
+fn build_opd_store(
+    arg: OpdBackendArg,
+) -> Result<(
+    autograd::TensorStore,
+    std::sync::Arc<dyn autograd::Backend>,
+    &'static str,
+)> {
     #[cfg(feature = "cuda")]
     {
         use std::sync::Arc;
@@ -1425,8 +1503,10 @@ fn build_opd_store(arg: OpdBackendArg) -> Result<(autograd::TensorStore, &'stati
         if want_cuda {
             let backend =
                 autograd::backend_cuda::CudaBackend::new(0).context("init CUDA backend (GPU 0)")?;
+            let backend: Arc<dyn autograd::Backend> = Arc::new(backend);
             return Ok((
-                autograd::TensorStore::with_backend(Arc::new(backend)),
+                autograd::TensorStore::with_backend(backend.clone()),
+                backend,
                 "cuda:0",
             ));
         }
@@ -1440,7 +1520,12 @@ fn build_opd_store(arg: OpdBackendArg) -> Result<(autograd::TensorStore, &'stati
             );
         }
     }
-    Ok((autograd::TensorStore::default(), "cpu"))
+    let backend: std::sync::Arc<dyn autograd::Backend> = std::sync::Arc::new(autograd::CpuBackend);
+    Ok((
+        autograd::TensorStore::with_backend(backend.clone()),
+        backend,
+        "cpu",
+    ))
 }
 
 fn parse_prompt_ids(raw: Option<&str>) -> Result<Vec<u32>> {
@@ -2182,9 +2267,9 @@ mod tests {
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
+        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
         current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config, kl_mask_arg,
-        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection, OpdLrSchedule,
-        OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
+        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
     };
     use crate::args::{LrScheduleArg, OpdKlMaskArg};
 
