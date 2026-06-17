@@ -446,13 +446,15 @@ pub fn moe_grouped_linear(
         validate_grouped_linear_input(&input_t.shape, experts, routes, input_kind, store)?;
     let (out_dim, expert_shapes) = validate_grouped_linear_experts(experts, in_dim, store)?;
 
+    let (active_expert_indices, _) = active_expert_map(experts_len, routes)?;
     let mut route_lookup = vec![None; experts_len * max_rows];
     for route in routes {
         route_lookup[route.expert * max_rows + route.row] = Some(*route);
     }
 
     let mut out = vec![0.0_f32; experts_len * max_rows * out_dim];
-    for (expert_index, expert) in experts.iter().enumerate() {
+    for &expert_index in &active_expert_indices {
+        let expert = experts[expert_index];
         let weight = store.tensor_host(expert.weight)?;
         let lora_a = match expert.lora_a {
             Some(id) => Some(store.tensor_host(id)?),
