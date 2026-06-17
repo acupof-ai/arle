@@ -1,4 +1,11 @@
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+    time::Instant,
+};
 
 use smallvec::smallvec;
 
@@ -9,6 +16,106 @@ use crate::{
 };
 
 type OptionalMatmulGrads = (Option<Vec<f32>>, Option<Vec<f32>>);
+
+static MOE_GROUPED_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+static MOE_GROUPED_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct MoeGroupedLinearProfile {
+    enabled: bool,
+    call: u64,
+}
+
+impl MoeGroupedLinearProfile {
+    fn new() -> Self {
+        let enabled = *MOE_GROUPED_PROFILE_ENABLED.get_or_init(|| {
+            std::env::var("ARLE_MOE_GROUPED_PROFILE")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false)
+        });
+        let call = if enabled {
+            MOE_GROUPED_PROFILE_CALLS.fetch_add(1, AtomicOrdering::Relaxed) + 1
+        } else {
+            0
+        };
+        Self { enabled, call }
+    }
+
+    fn emit_summary(
+        &self,
+        experts: usize,
+        active: usize,
+        max_rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        rank: usize,
+        input_kind: MoeGroupedLinearInput,
+        need_input_grad: bool,
+        need_weight_grad: bool,
+        need_lora_a_grad: bool,
+        need_lora_b_grad: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "moe_grouped_linear_profile call={} stage=summary experts={} active={} \
+             max_rows={} in_dim={} out_dim={} rank={} input_kind={:?} \
+             need_input_grad={} need_weight_grad={} need_lora_a_grad={} \
+             need_lora_b_grad={}",
+            self.call,
+            experts,
+            active,
+            max_rows,
+            in_dim,
+            out_dim,
+            rank,
+            input_kind,
+            need_input_grad,
+            need_weight_grad,
+            need_lora_a_grad,
+            need_lora_b_grad
+        );
+    }
+
+    fn time_result<T>(
+        &self,
+        label: &'static str,
+        stage: &'static str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !self.enabled {
+            return f();
+        }
+        let started = Instant::now();
+        let result = f();
+        eprintln!(
+            "moe_grouped_linear_profile call={} label={} stage={} seconds={:.6} ok={}",
+            self.call,
+            label,
+            stage,
+            started.elapsed().as_secs_f64(),
+            result.is_ok()
+        );
+        result
+    }
+
+    fn time_value<T>(&self, label: &'static str, stage: &'static str, f: impl FnOnce() -> T) -> T {
+        if !self.enabled {
+            return f();
+        }
+        let started = Instant::now();
+        let result = f();
+        eprintln!(
+            "moe_grouped_linear_profile call={} label={} stage={} seconds={:.6}",
+            self.call,
+            label,
+            stage,
+            started.elapsed().as_secs_f64()
+        );
+        result
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeRoute {
@@ -583,6 +690,8 @@ pub(crate) fn moe_grouped_linear_backward(
     output_grad_id: TensorId,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
+    let profile = MoeGroupedLinearProfile::new();
+    let total_started = profile.enabled.then(Instant::now);
     let SavedContext::MoeGroupedLinearCtx {
         input,
         experts,
@@ -642,31 +751,53 @@ pub(crate) fn moe_grouped_linear_backward(
             .lora_b
             .is_some_and(|id| store.tensor(id).is_ok_and(|t| t.requires_grad))
     });
-
-    let packed_input = pack_active_grouped_input(
-        &input_t.data,
-        &input_shape,
-        input_kind,
-        &active_routes,
-        &active_expert_indices,
+    let common_rank = common_lora_rank(&expert_shapes)?;
+    profile.emit_summary(
+        experts_len,
+        active_len,
         max_rows,
         in_dim,
-    )?;
-    let packed_input_shape = vec![active_len, max_rows, in_dim];
-    let packed_grad_out = pack_active_expert_blocks(
-        &upstream.data,
-        experts_len,
-        max_rows,
         out_dim,
-        &active_expert_indices,
-    )?;
+        common_rank,
+        input_kind,
+        need_input_grad,
+        need_weight_grad,
+        need_lora_a_grad,
+        need_lora_b_grad,
+    );
+
+    let packed_input = profile.time_result("pack", "active_input", || {
+        pack_active_grouped_input(
+            &input_t.data,
+            &input_shape,
+            input_kind,
+            &active_routes,
+            &active_expert_indices,
+            max_rows,
+            in_dim,
+        )
+    })?;
+    let packed_input_shape = vec![active_len, max_rows, in_dim];
+    let packed_grad_out = profile.time_result("pack", "grad_out", || {
+        pack_active_expert_blocks(
+            &upstream.data,
+            experts_len,
+            max_rows,
+            out_dim,
+            &active_expert_indices,
+        )
+    })?;
     let grad_out_shape = vec![active_len, max_rows, out_dim];
 
     let (grad_packed_input_base, grad_packed_weight_t) = if need_input_grad || need_weight_grad {
-        let packed_weight_t = pack_grouped_weight_t(&active_experts, out_dim, in_dim, store)?;
+        let packed_weight_t = profile.time_result("pack", "base_weight_t", || {
+            pack_grouped_weight_t(&active_experts, out_dim, in_dim, store)
+        })?;
         let packed_weight_t_shape = vec![active_len, in_dim, out_dim];
         grouped_matmul_backward(
             store,
+            &profile,
+            "base_backward",
             &packed_input,
             &packed_input_shape,
             &packed_weight_t,
@@ -682,78 +813,97 @@ pub(crate) fn moe_grouped_linear_backward(
 
     let mut grad_packed_input = need_input_grad.then(|| vec![0.0_f32; packed_input.len()]);
     if let (Some(dst), Some(src)) = (grad_packed_input.as_mut(), grad_packed_input_base.as_ref()) {
-        add_slice_in_place(dst, src);
+        profile.time_value("merge", "base_input_grad", || add_slice_in_place(dst, src));
     }
 
-    let mut grad_weights: Vec<Option<Vec<f32>>> = experts
-        .iter()
-        .map(|expert| {
-            store
-                .tensor(expert.weight)
-                .ok()
-                .filter(|t| t.requires_grad)
-                .map(|t| vec![0.0_f32; t.size])
-        })
-        .collect();
+    let mut grad_weights: Vec<Option<Vec<f32>>> =
+        profile.time_value("alloc", "grad_weights", || {
+            experts
+                .iter()
+                .map(|expert| {
+                    store
+                        .tensor(expert.weight)
+                        .ok()
+                        .filter(|t| t.requires_grad)
+                        .map(|t| vec![0.0_f32; t.size])
+                })
+                .collect()
+        });
     if let Some(grad_weight_t) = grad_packed_weight_t {
-        unpack_grouped_weight_t_grad_active(
-            &grad_weight_t,
-            &active_expert_indices,
-            out_dim,
-            in_dim,
-            &mut grad_weights,
-        );
+        profile.time_value("unpack", "base_weight_t_grad", || {
+            unpack_grouped_weight_t_grad_active(
+                &grad_weight_t,
+                &active_expert_indices,
+                out_dim,
+                in_dim,
+                &mut grad_weights,
+            );
+        });
     }
 
-    let mut grad_lora_a: Vec<Option<Vec<f32>>> = experts
-        .iter()
-        .map(|expert| {
-            expert.lora_a.and_then(|id| {
-                store
-                    .tensor(id)
-                    .ok()
-                    .filter(|t| t.requires_grad)
-                    .map(|t| vec![0.0_f32; t.size])
+    let mut grad_lora_a: Vec<Option<Vec<f32>>> = profile.time_value("alloc", "grad_lora_a", || {
+        experts
+            .iter()
+            .map(|expert| {
+                expert.lora_a.and_then(|id| {
+                    store
+                        .tensor(id)
+                        .ok()
+                        .filter(|t| t.requires_grad)
+                        .map(|t| vec![0.0_f32; t.size])
+                })
             })
-        })
-        .collect();
-    let mut grad_lora_b: Vec<Option<Vec<f32>>> = experts
-        .iter()
-        .map(|expert| {
-            expert.lora_b.and_then(|id| {
-                store
-                    .tensor(id)
-                    .ok()
-                    .filter(|t| t.requires_grad)
-                    .map(|t| vec![0.0_f32; t.size])
+            .collect()
+    });
+    let mut grad_lora_b: Vec<Option<Vec<f32>>> = profile.time_value("alloc", "grad_lora_b", || {
+        experts
+            .iter()
+            .map(|expert| {
+                expert.lora_b.and_then(|id| {
+                    store
+                        .tensor(id)
+                        .ok()
+                        .filter(|t| t.requires_grad)
+                        .map(|t| vec![0.0_f32; t.size])
+                })
             })
-        })
-        .collect();
+            .collect()
+    });
 
-    let common_rank = common_lora_rank(&expert_shapes)?;
     if common_rank > 0 {
-        let packed_a_t = pack_grouped_lora_a_t(&active_experts, common_rank, in_dim, store)?;
+        let packed_a_t = profile.time_result("pack", "lora_a_t", || {
+            pack_grouped_lora_a_t(&active_experts, common_rank, in_dim, store)
+        })?;
         let packed_a_t_shape = vec![active_len, in_dim, common_rank];
-        let packed_b_t = pack_grouped_lora_b_t(&active_experts, out_dim, common_rank, store)?;
+        let packed_b_t = profile.time_result("pack", "lora_b_t", || {
+            pack_grouped_lora_b_t(&active_experts, out_dim, common_rank, store)
+        })?;
         let packed_b_t_shape = vec![active_len, common_rank, out_dim];
         let low = grouped_matmul_forward(
             store,
+            &profile,
+            "lora_low_forward",
             &packed_input,
             &packed_input_shape,
             &packed_a_t,
             &packed_a_t_shape,
         )?;
         let low_shape = vec![active_len, max_rows, common_rank];
-        let mut scaled_grad_out = packed_grad_out.clone();
-        for (expert_index, expert) in active_experts.iter().enumerate().take(active_len) {
-            let scale = expert.lora_scale;
-            let expert_base = expert_index * max_rows * out_dim;
-            for value in &mut scaled_grad_out[expert_base..expert_base + max_rows * out_dim] {
-                *value *= scale;
+        let mut scaled_grad_out =
+            profile.time_value("clone", "scaled_grad_out", || packed_grad_out.clone());
+        profile.time_value("scale", "grad_out", || {
+            for (expert_index, expert) in active_experts.iter().enumerate().take(active_len) {
+                let scale = expert.lora_scale;
+                let expert_base = expert_index * max_rows * out_dim;
+                for value in &mut scaled_grad_out[expert_base..expert_base + max_rows * out_dim] {
+                    *value *= scale;
+                }
             }
-        }
+        });
         let (grad_low, grad_b_t) = grouped_matmul_backward(
             store,
+            &profile,
+            "lora_b_backward",
             &low,
             &low_shape,
             &packed_b_t,
@@ -764,17 +914,21 @@ pub(crate) fn moe_grouped_linear_backward(
             need_lora_b_grad,
         )?;
         if let Some(grad_b_t) = grad_b_t {
-            unpack_grouped_lora_b_t_grad_active(
-                &grad_b_t,
-                &active_expert_indices,
-                out_dim,
-                common_rank,
-                &mut grad_lora_b,
-            );
+            profile.time_value("unpack", "lora_b_t_grad", || {
+                unpack_grouped_lora_b_t_grad_active(
+                    &grad_b_t,
+                    &active_expert_indices,
+                    out_dim,
+                    common_rank,
+                    &mut grad_lora_b,
+                );
+            });
         }
         if let Some(grad_low) = grad_low {
             let (grad_x_lora, grad_a_t) = grouped_matmul_backward(
                 store,
+                &profile,
+                "lora_a_backward",
                 &packed_input,
                 &packed_input_shape,
                 &packed_a_t,
@@ -785,32 +939,36 @@ pub(crate) fn moe_grouped_linear_backward(
                 need_lora_a_grad,
             )?;
             if let (Some(dst), Some(src)) = (grad_packed_input.as_mut(), grad_x_lora.as_ref()) {
-                add_slice_in_place(dst, src);
+                profile.time_value("merge", "lora_input_grad", || add_slice_in_place(dst, src));
             }
             if let Some(grad_a_t) = grad_a_t {
-                unpack_grouped_lora_a_t_grad_active(
-                    &grad_a_t,
-                    &active_expert_indices,
-                    common_rank,
-                    in_dim,
-                    &mut grad_lora_a,
-                );
+                profile.time_value("unpack", "lora_a_t_grad", || {
+                    unpack_grouped_lora_a_t_grad_active(
+                        &grad_a_t,
+                        &active_expert_indices,
+                        common_rank,
+                        in_dim,
+                        &mut grad_lora_a,
+                    );
+                });
             }
         }
     }
 
     let grad_input = match grad_packed_input {
-        Some(grad) => Some(unpack_active_grouped_input_grad(
-            &grad,
-            &input_shape,
-            input_kind,
-            &active_routes,
-            &active_expert_indices,
-            experts_len,
-            active_len,
-            max_rows,
-            in_dim,
-        )?),
+        Some(grad) => Some(profile.time_result("unpack", "input_grad", || {
+            unpack_active_grouped_input_grad(
+                &grad,
+                &input_shape,
+                input_kind,
+                &active_routes,
+                &active_expert_indices,
+                experts_len,
+                active_len,
+                max_rows,
+                in_dim,
+            )
+        })?),
         None => None,
     };
 
@@ -837,6 +995,13 @@ pub(crate) fn moe_grouped_linear_backward(
         }
     }
 
+    if let Some(started) = total_started {
+        eprintln!(
+            "moe_grouped_linear_profile call={} stage=total seconds={:.6}",
+            profile.call,
+            started.elapsed().as_secs_f64()
+        );
+    }
     Ok(grads)
 }
 
@@ -1543,23 +1708,29 @@ fn unpack_grouped_lora_b_t_grad_active(
 
 fn grouped_matmul_forward(
     store: &TensorStore,
+    profile: &MoeGroupedLinearProfile,
+    label: &'static str,
     a: &[f32],
     a_shape: &[usize],
     b: &[f32],
     b_shape: &[usize],
 ) -> Result<Vec<f32>> {
-    let a_handle = store.backend().upload(a, a_shape)?;
-    let b_handle = store.backend().upload(b, b_shape)?;
-    let (out_handle, _out_shape) = store
-        .backend()
-        .matmul(&a_handle, a_shape, &b_handle, b_shape)?;
-    store.backend().eval(&[&out_handle])?;
-    store.backend().readback(&out_handle)
+    let a_handle = profile.time_result(label, "upload_a", || store.backend().upload(a, a_shape))?;
+    let b_handle = profile.time_result(label, "upload_b", || store.backend().upload(b, b_shape))?;
+    let (out_handle, _out_shape) = profile.time_result(label, "matmul", || {
+        store
+            .backend()
+            .matmul(&a_handle, a_shape, &b_handle, b_shape)
+    })?;
+    profile.time_result(label, "eval", || store.backend().eval(&[&out_handle]))?;
+    profile.time_result(label, "readback", || store.backend().readback(&out_handle))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn grouped_matmul_backward(
     store: &TensorStore,
+    profile: &MoeGroupedLinearProfile,
+    label: &'static str,
     a: &[f32],
     a_shape: &[usize],
     b: &[f32],
@@ -1572,30 +1743,38 @@ fn grouped_matmul_backward(
     if !need_grad_a && !need_grad_b {
         return Ok((None, None));
     }
-    let a_handle = store.backend().upload(a, a_shape)?;
-    let b_handle = store.backend().upload(b, b_shape)?;
-    let grad_handle = store.backend().upload(grad_out, grad_out_shape)?;
-    let (grad_a, grad_b) = store.backend().matmul_backward_device(
-        &a_handle,
-        a_shape,
-        &b_handle,
-        b_shape,
-        &grad_handle,
-        grad_out_shape,
-        need_grad_a,
-        need_grad_b,
-    )?;
+    let a_handle = profile.time_result(label, "upload_a", || store.backend().upload(a, a_shape))?;
+    let b_handle = profile.time_result(label, "upload_b", || store.backend().upload(b, b_shape))?;
+    let grad_handle = profile.time_result(label, "upload_grad", || {
+        store.backend().upload(grad_out, grad_out_shape)
+    })?;
+    let (grad_a, grad_b) = profile.time_result(label, "matmul_backward_device", || {
+        store.backend().matmul_backward_device(
+            &a_handle,
+            a_shape,
+            &b_handle,
+            b_shape,
+            &grad_handle,
+            grad_out_shape,
+            need_grad_a,
+            need_grad_b,
+        )
+    })?;
     let grad_a = match grad_a {
         Some(handle) => {
-            store.backend().eval(&[&handle])?;
-            Some(store.backend().readback(&handle)?)
+            profile.time_result(label, "eval_grad_a", || store.backend().eval(&[&handle]))?;
+            Some(profile.time_result(label, "readback_grad_a", || {
+                store.backend().readback(&handle)
+            })?)
         }
         None => None,
     };
     let grad_b = match grad_b {
         Some(handle) => {
-            store.backend().eval(&[&handle])?;
-            Some(store.backend().readback(&handle)?)
+            profile.time_result(label, "eval_grad_b", || store.backend().eval(&[&handle]))?;
+            Some(profile.time_result(label, "readback_grad_b", || {
+                store.backend().readback(&handle)
+            })?)
         }
         None => None,
     };
