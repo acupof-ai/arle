@@ -32,6 +32,76 @@ This entry records the current-HEAD recheck after `37ffbd56`.
 
 ## Verification
 
+### Current HEAD recheck after A16
+
+Rechecked after `7a0f8d49` because the OPD rollout path is the gate for the
+35B Path A pane, and the working tree had unrelated CUDA-loader dirt that must
+not be part of the verdict.
+
+Clean remote snapshot:
+
+```text
+local HEAD=7a0f8d49
+remote source=/data01/arle-opd-runs/agent-infer-opd-rollout-7a0f8d49
+target=/data01/arle-target-opd-rollout-7a0f8d49
+build=CUDA_HOME=/usr/local/cuda CUDARC_CUDA_VERSION=12090 \
+  ARLE_CUDA_DISABLE_FLASHMLA=1 INFER_TILELANG_PYTHON=/root/tl-venv/bin/python \
+  cargo build --release --features cuda --bin arle
+build result=PASS, 3m58s
+ldd=libssl.so.1.1 + libcrypto.so.1.1
+```
+
+Production `arle train opd` gate, GPU0, `ARLE_OPD_INFER_ROLLOUT=1`:
+
+```text
+student=/data01/modelscope-cache/Qwen/Qwen3___5-0___8B-Base
+teacher=/data01/modelscope-cache/Qwen/Qwen3___5-4B
+prompts=/data01/arle-opd-runs/h20-opd-corrected-gsm8k-4b0p8b-r256-alllinear-r32-20260616-144316/gsm8k-question-only-train.jsonl
+steps=1 rollout_len=256 target_set=all-linear rank=32 alpha=64 lr=1e-7
+log=/data01/arle-opd-runs/agent-infer-opd-rollout-7a0f8d49/opd_rollout256_gpu0_20260617_112838.log
+
+step 1/1 loss 2.054664 rollout_len 328
+opd_step_profile step=1 total_seconds=86.374485
+  student_rollout_seconds=1.307595
+  teacher_forward_seconds=32.074022
+  student_forward_seconds=8.421153
+  kl_loss_seconds=8.546261
+  backward_seconds=44.347757
+```
+
+Qwen3.6-35B-A3B-FP8 LoRA `InferStudent` needle smoke, GPU1,
+`ARLE_QWEN35_DEEPGEMM=0` to avoid the known local DeepGEMM JIT toolchain
+confounder:
+
+```text
+log=/data01/arle-opd-runs/agent-infer-opd-rollout-7a0f8d49/qwen36_fp8_rollout_smoke_gpu1_20260617_113624.log
+
+qwen36_fp8_lora_load_gate_result load_seconds=13.718792
+  used_delta_mib=34080.0 live_host_mib=2514.1
+  hidden=2048 layers=40 vocab=248320 experts=256 topk=8
+  target_set=all-linear adapters=62220
+
+qwen36_fp8_lora_sync_gate_result
+  infer_load_seconds=12.863261
+  sync_seconds=1.704885
+
+qwen36_fp8_lora_rollout_smoke_result
+  prompt_tokens=25 generated_tokens=128 smoke_seconds=1.295202
+  expect=Some("BLUE-73-MANGO") contains_expect=true
+```
+
+Decoded output was coherent and retained the exact needle:
+
+```text
+Math question: 2 + 3 = 5
+Secret code to repeat exactly: BLUE-73-MANGO
+
+<think>
+Here's a thinking process:
+...
+The main instruction is: "Secret code to repeat exactly: BLUE-73-MANGO"
+```
+
 ### Qwen3.6 35B FP8 LoRA rollout smoke
 
 The first attempt without `ARLE_QWEN35_DEEPGEMM=0` reached train-side FP8 LoRA
