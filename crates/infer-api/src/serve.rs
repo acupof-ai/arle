@@ -162,9 +162,11 @@ pub struct ServeSpecOptions {
     pub spec_type: ServeSpecType,
     pub mtp_draft_model: Option<String>,
     pub mtp_draft_tokens: Option<usize>,
+    pub mtp_draft_topk: Option<usize>,
 }
 
 pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
+pub const DEFAULT_MTP_DRAFT_TOPK: usize = 1;
 
 impl ServeSpecOptions {
     #[must_use]
@@ -172,6 +174,7 @@ impl ServeSpecOptions {
         self.spec_type != ServeSpecType::None
             || self.mtp_draft_model.is_some()
             || self.mtp_draft_tokens.is_some()
+            || self.mtp_draft_topk.is_some()
     }
 }
 
@@ -203,7 +206,14 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
              CUDA DSv4 uses the checkpoint-native MTP head"
         );
     }
-    match opts.spec.spec_type {
+    let spec_type = if opts.spec.spec_type == ServeSpecType::None
+        && (opts.spec.mtp_draft_tokens.is_some() || opts.spec.mtp_draft_topk.is_some())
+    {
+        ServeSpecType::Mtp
+    } else {
+        opts.spec.spec_type
+    };
+    match spec_type {
         ServeSpecType::None => {}
         ServeSpecType::Auto => {
             anyhow::bail!("--spec-type auto is not implemented; use mtp");
@@ -214,6 +224,8 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
                     .mtp_draft_tokens
                     .unwrap_or(DEFAULT_MTP_DRAFT_TOKENS),
             );
+            engine_config.mtp_draft_topk =
+                Some(opts.spec.mtp_draft_topk.unwrap_or(DEFAULT_MTP_DRAFT_TOPK));
         }
     }
 

@@ -294,7 +294,8 @@ impl CudaExecutor {
     /// runtime-config-as-CLI-flag rule).
     /// `mtp_draft_tokens`: `Some(n)` turns on the checkpoint-native MTP
     /// speculative-decode head with draft depth `n` (config-driven, the serve
-    /// path's `--spec-type mtp` / `--mtp-draft-tokens`); `None` falls back to
+    /// path's `--spec-type mtp` / `--mtp-draft-tokens`); `mtp_draft_topk`
+    /// controls tree width (`1` keeps the validated chain). `None` falls back to
     /// the `ARLE_DSV4_SPEC_DECODE` env gate for backward compat.
     #[cfg(feature = "cuda")]
     pub fn from_dsv4_fp8_safetensors(
@@ -302,6 +303,7 @@ impl CudaExecutor {
         num_slots: usize,
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
+        mtp_draft_topk: Option<usize>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -310,6 +312,7 @@ impl CudaExecutor {
                     num_slots,
                     max_seq_len,
                     mtp_draft_tokens,
+                    mtp_draft_topk,
                 )?,
             )),
         })
