@@ -191,7 +191,8 @@ impl RealCudaExecutor {
 
     /// Build the DSv4-Flash executor (MLA + HC + FP8 MoE, multi-GPU TP/EP).
     /// `mtp_draft_tokens`: `Some(n)` = config-driven MTP spec decode on (draft
-    /// depth `n`); `mtp_draft_topk`: `Some(k)` = MTP tree width (`1` = chain).
+    /// depth `n`); `mtp_draft_topk`: `Some(k)` = per-level MTP draft candidate
+    /// width (`1` = chain-only candidates).
     /// `None` falls back to the `ARLE_DSV4_SPEC_DECODE` env gate.
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
@@ -966,8 +967,8 @@ pub(crate) struct Dsv4CudaExecutor {
     /// serve path's `--spec-type mtp`); `None` falls back to the
     /// `ARLE_DSV4_SPEC_DECODE` env gate at each spec branch.
     spec_draft_tokens: Option<usize>,
-    /// MTP draft tree width. `None`/`Some(1)` keeps the validated chain path;
-    /// `Some(k>1)` enables the per-slot top-k tree verifier.
+    /// MTP draft candidate width. `None`/`Some(1)` keeps chain-only candidates;
+    /// `Some(k>1)` widens the draft matrix while verifier rows stay chain-shaped.
     spec_draft_topk: Option<usize>,
     num_slots: usize,
     mtp_accepts: usize,
@@ -1646,7 +1647,6 @@ impl Dsv4CudaExecutor {
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
         if spec_on
             && all_greedy
-            && self.spec_topk() == 1
             && crate::dsv4::dsv4_batched_mtp_enabled()
             && batch.rows.len() >= dsv4_batched_decode_min_rows()
         {
