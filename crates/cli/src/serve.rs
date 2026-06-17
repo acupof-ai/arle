@@ -10,8 +10,8 @@
 use std::{env, process::ExitCode};
 
 use infer_api::{
-    DEFAULT_MTP_DRAFT_TOKENS, EngineLoadConfig, KvCacheDtype, ServeHttpOptions, ServeKvSsdOptions,
-    ServeSpecOptions, ServeSpecType, serve_http,
+    DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, EngineLoadConfig, KvCacheDtype,
+    ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions, ServeSpecType, serve_http,
 };
 
 use crate::{
@@ -179,6 +179,9 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
             "--mtp-draft-tokens is currently only supported by the CUDA backend".to_string(),
         );
     }
+    if serve_args.mtp_draft_topk.is_some() && backend != ServeBackend::Cuda {
+        return Err("--mtp-draft-topk is currently only supported by the CUDA backend".to_string());
+    }
 
     // Surfaces the rewrite serve router does not expose yet. Reject rather than
     // silently ignore so the user is not misled into thinking they took effect.
@@ -211,6 +214,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     if spec.spec_type == ServeSpecType::Mtp {
         engine_config.mtp_draft_tokens =
             Some(spec.mtp_draft_tokens.unwrap_or(DEFAULT_MTP_DRAFT_TOKENS));
+        engine_config.mtp_draft_topk = Some(spec.mtp_draft_topk.unwrap_or(DEFAULT_MTP_DRAFT_TOPK));
     }
 
     let options = ServeHttpOptions {
@@ -242,7 +246,9 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         ServeSpecTypeArg::Mtp => ServeSpecType::Mtp,
     };
     if spec_type == ServeSpecType::None
-        && (serve_args.mtp_draft_model.is_some() || serve_args.mtp_draft_tokens.is_some())
+        && (serve_args.mtp_draft_model.is_some()
+            || serve_args.mtp_draft_tokens.is_some()
+            || serve_args.mtp_draft_topk.is_some())
     {
         spec_type = ServeSpecType::Mtp;
     }
@@ -250,6 +256,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         spec_type,
         mtp_draft_model: serve_args.mtp_draft_model.clone(),
         mtp_draft_tokens: serve_args.mtp_draft_tokens,
+        mtp_draft_topk: serve_args.mtp_draft_topk,
     }
 }
 
@@ -1055,6 +1062,10 @@ mod tests {
         assert_eq!(
             config.options.engine_config.mtp_draft_tokens,
             Some(DEFAULT_MTP_DRAFT_TOKENS)
+        );
+        assert_eq!(
+            config.options.engine_config.mtp_draft_topk,
+            Some(DEFAULT_MTP_DRAFT_TOPK)
         );
     }
 

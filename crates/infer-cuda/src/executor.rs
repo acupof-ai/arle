@@ -191,12 +191,14 @@ impl RealCudaExecutor {
 
     /// Build the DSv4-Flash executor (MLA + HC + FP8 MoE, multi-GPU TP/EP).
     /// `mtp_draft_tokens`: `Some(n)` = config-driven MTP spec decode on (draft
-    /// depth `n`); `None` falls back to the `ARLE_DSV4_SPEC_DECODE` env gate.
+    /// depth `n`); `mtp_draft_topk`: `Some(k)` = MTP tree width (`1` = chain).
+    /// `None` falls back to the `ARLE_DSV4_SPEC_DECODE` env gate.
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
+        mtp_draft_topk: Option<usize>,
     ) -> Result<Self> {
         Ok(Self::Dsv4(Box::new(
             Dsv4CudaExecutor::from_dsv4_fp8_safetensors(
@@ -204,6 +206,7 @@ impl RealCudaExecutor {
                 num_slots,
                 max_seq_len,
                 mtp_draft_tokens,
+                mtp_draft_topk,
             )?,
         )))
     }
@@ -963,6 +966,9 @@ pub(crate) struct Dsv4CudaExecutor {
     /// serve path's `--spec-type mtp`); `None` falls back to the
     /// `ARLE_DSV4_SPEC_DECODE` env gate at each spec branch.
     spec_draft_tokens: Option<usize>,
+    /// MTP draft tree width. `None`/`Some(1)` keeps the validated chain path;
+    /// `Some(k>1)` enables the per-slot top-k tree verifier.
+    spec_draft_topk: Option<usize>,
     num_slots: usize,
     mtp_accepts: usize,
     mtp_rejects: usize,
@@ -1297,12 +1303,15 @@ impl Dsv4CudaExecutor {
         num_slots: usize,
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
+        mtp_draft_topk: Option<usize>,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
+        let mtp_draft_tokens_for_load = mtp_draft_tokens
+            .or_else(|| mtp_draft_topk.map(|_| crate::dsv4::DEFAULT_SPEC_DRAFT_DEPTH));
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
             model_path.as_ref(),
-            mtp_draft_tokens,
+            mtp_draft_tokens_for_load,
         )?;
         // [vram-probe] TEMP bit-exact VRAM attribution (remove after budget unification).
         // Returns measured-used bytes (or None when mem_get_info fails) so the
@@ -1404,7 +1413,8 @@ impl Dsv4CudaExecutor {
             slots,
             kv_adapter,
             spec_slots,
-            spec_draft_tokens: mtp_draft_tokens,
+            spec_draft_tokens: mtp_draft_tokens_for_load,
+            spec_draft_topk: mtp_draft_topk,
             num_slots,
             mtp_accepts: 0,
             mtp_rejects: 0,
@@ -1516,7 +1526,7 @@ impl Dsv4CudaExecutor {
         position: u64,
         final_prefill: bool,
     ) -> Result<Vec<u32>> {
-        let spec_on = self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled();
+        let spec_on = self.spec_requested();
         if spec_on && params.is_greedy() {
             let (token, hidden) = self.model.forward_tokens_with_hidden(
                 &mut self.slots[slot_idx],
@@ -1556,7 +1566,7 @@ impl Dsv4CudaExecutor {
         params: &SamplingParams,
         position: u64,
     ) -> Result<Vec<u32>> {
-        if !(self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled()) {
+        if !self.spec_requested() {
             let token = self.model.forward_tokens(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
@@ -1632,10 +1642,11 @@ impl Dsv4CudaExecutor {
         // per-slot) instead of the per-row `spec_step` loop. With the env unset
         // the per-row spec loop below runs (byte-identical reference / the
         // B=1 / c<N path).
-        let spec_on = self.spec_draft_tokens.is_some() || crate::dsv4::dsv4_spec_decode_enabled();
+        let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
         if spec_on
             && all_greedy
+            && self.spec_topk() == 1
             && crate::dsv4::dsv4_batched_mtp_enabled()
             && batch.rows.len() >= dsv4_batched_decode_min_rows()
         {
