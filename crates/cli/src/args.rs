@@ -154,6 +154,16 @@ pub(crate) enum OpdTeacherRuntimeArg {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum OpdSftAnchorArg {
+    /// Use the sampled student rollout as the optional GKD hard-token CE anchor.
+    #[value(name = "student-rollout", alias = "student_rollout")]
+    StudentRollout,
+    /// Use completion/target tokens from --prompts-file as the hard-token CE anchor.
+    #[value(name = "corpus-truth", alias = "corpus_truth")]
+    CorpusTruth,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum LrScheduleArg {
     /// Keep AdamW at the fixed --lr value for every step.
     Fixed,
@@ -697,6 +707,10 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_enum, default_value_t = OpdKlMaskArg::Completion)]
     pub(crate) kl_mask: OpdKlMaskArg,
 
+    /// Logits/backward window size for OPD scoring (0 disables windowing).
+    #[arg(long, default_value_t = train::opd::DEFAULT_LOGITS_WINDOW_SIZE)]
+    pub(crate) logits_window_size: usize,
+
     /// Total OPD training steps.
     #[arg(long, default_value_t = 5)]
     pub(crate) steps: usize,
@@ -713,9 +727,14 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long)]
     pub(crate) lr_warmup_steps: Option<usize>,
 
-    /// Pure OPD has no SFT anchor; the only accepted value is 0.0.
+    /// GKD blend lambda. Default 0.0 is pure KL OPD; lambda=1 with
+    /// --sft-anchor corpus-truth runs off-policy SFT on prompt completions.
     #[arg(long, default_value_t = 0.0)]
     pub(crate) gkd_lambda: f32,
+
+    /// Hard-token SFT anchor used when --gkd-lambda > 0.
+    #[arg(long, value_enum, default_value_t = OpdSftAnchorArg::StudentRollout)]
+    pub(crate) sft_anchor: OpdSftAnchorArg,
 
     /// Observe held-out NLL every N steps (0 disables it).
     #[arg(long, default_value_t = 0)]
@@ -896,7 +915,8 @@ pub(crate) struct TrainSelfOpdArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, CliCommand, LrScheduleArg, OpdKlMaskArg, OpdTeacherRuntimeArg, RunArgs, TrainCommand,
+        Args, CliCommand, LrScheduleArg, OpdKlMaskArg, OpdSftAnchorArg, OpdTeacherRuntimeArg,
+        RunArgs, TrainCommand,
     };
     use clap::{CommandFactory, Parser};
 
@@ -1180,6 +1200,8 @@ mod tests {
             "5",
             "--gkd-lambda",
             "0.0",
+            "--sft-anchor",
+            "student-rollout",
             "--save-checkpoint",
             "/tmp/opd-save",
             "--save-every",
@@ -1214,6 +1236,7 @@ mod tests {
         assert_eq!(opd.eval_ids.as_deref(), Some("1,2,3"));
         assert_eq!(opd.gate_every_n, 5);
         assert_eq!(opd.gkd_lambda, 0.0);
+        assert_eq!(opd.sft_anchor, OpdSftAnchorArg::StudentRollout);
         assert_eq!(opd.kl_temperature, 2.0);
         assert_eq!(opd.kl_mask, OpdKlMaskArg::Full);
         assert_eq!(
@@ -1251,6 +1274,33 @@ mod tests {
         assert_eq!(opd.prompt_seed, 0);
         assert_eq!(opd.lr_schedule, LrScheduleArg::Fixed);
         assert_eq!(opd.lr_warmup_steps, None);
+        assert_eq!(opd.sft_anchor, OpdSftAnchorArg::StudentRollout);
+    }
+
+    #[test]
+    fn accepts_train_opd_corpus_truth_sft_anchor() {
+        let args = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--prompts-file",
+            "examples/opd/teacher-rollouts.jsonl",
+            "--gkd-lambda",
+            "1.0",
+            "--sft-anchor",
+            "corpus-truth",
+        ])
+        .expect("off-policy corpus-truth SFT flags should parse");
+        let Some(CliCommand::Train(train)) = args.command else {
+            panic!("expected train command");
+        };
+        let TrainCommand::Opd(opd) = train.command else {
+            panic!("expected train opd command");
+        };
+        assert_eq!(opd.gkd_lambda, 1.0);
+        assert_eq!(opd.sft_anchor, OpdSftAnchorArg::CorpusTruth);
     }
 
     #[test]
