@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     backend::{
-        cpu_matmul_bt_backward, matmul_bt_output_shape as backend_matmul_bt_output_shape,
+        Device, cpu_matmul_bt_backward, matmul_bt_output_shape as backend_matmul_bt_output_shape,
         matmul_output_shape as backend_matmul_output_shape,
     },
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
@@ -263,6 +263,12 @@ pub(crate) fn matmul_bt_backward(
             expected: "both operands must be rank-2",
             got: a_shape.len().max(b_shape.len()),
         });
+    }
+
+    if store.backend().device() != Device::Cpu {
+        store.ensure_device(a)?;
+        store.ensure_device(b)?;
+        store.ensure_device(output_grad_id)?;
     }
 
     let device_path_ok = {
