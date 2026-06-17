@@ -88,3 +88,28 @@ DECISIVE NEXT (measurement, not more grep): a **layer-0 activation probe,
 CUDA vs Metal**, same prompt + weights — layer 0 is `linear_attention`, so it
 tests the gated-delta path immediately and localizes the first divergent op in
 one run. This is the dedicated probe session the original Fix line called for.
+
+## Update 2026-06-17 — closed by decoded serve gates
+
+The layer-0 `linear_attention` suspicion above was killed by an activation dump:
+CUDA layer-0 `in_proj_qkv`, `conv1d_silu_qkv`, `gdr_out`, `gated_norm_out`, and
+`out_proj` were finite with sane magnitudes. The real blocker surfaced during
+decoded serve checks: CUDA 12.9 cuBLAS/Lt raises host SIGFPE on small BF16 GEMM
+continuation/chat shapes (`M=8192,N=14,K=2048` and then
+`M=8192,N=16,K=2048`). `gemm_cublaslt_impl` now routes `N <= 16` dense BF16
+GEMM through the existing handwritten GEMV loop before touching cuBLAS.
+
+Post-fix gates on `.62`:
+
+```text
+BF16 /data01/models/Qwen3.6-35B-A3B:
+  decoded QA coherent (Paris / 42 present in decoded output)
+  RAW=1 TEMPLATE=qwen3_nonthink needle 115,300 x2 -> exact=2/2 DET at both lengths
+
+FP8 /data01/models/Qwen3.6-35B-A3B-FP8:
+  decoded QA coherent (Paris / arithmetic reasoning present in decoded output)
+  RAW=1 TEMPLATE=qwen3_nonthink needle 115,300 x2 -> exact=2/2 DET at both lengths
+```
+
+See
+[`docs/experience/wins/2026-06-17-qwen36-f2-bf16-fp8-coherence-gate.md`](../wins/2026-06-17-qwen36-f2-bf16-fp8-coherence-gate.md).
