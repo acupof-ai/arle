@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use autograd::{Tape, TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,7 +13,7 @@ use infer_plan::SamplingParams;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
-    model_family::{ModelFamily, resolve_model_family},
+    model_family::{resolve_model_family, ModelFamily},
     tokenizer::ChatTokenizer,
 };
 
@@ -22,8 +22,8 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
-        OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
-        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
+        OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainArgs,
+        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -32,6 +32,10 @@ const TRAIN_ENV_COMMANDS: &[&str] = &["train env", "train estimate-memory", "tra
 
 fn opd_step_profile_enabled() -> bool {
     std::env::var_os("ARLE_OPD_STEP_PROFILE").is_some()
+}
+
+fn opd_logits_window_size_arg(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
 }
 
 fn print_opd_step_profile(step: usize, profile: &train::opd::OpdStepProfile) {
@@ -239,13 +243,40 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn validate_pure_opd_gkd_lambda(gkd_lambda: f32) -> Result<()> {
-    if gkd_lambda == 0.0 && gkd_lambda.is_finite() {
-        return Ok(());
+fn validate_train_opd_gkd_args(gkd_lambda: f32, sft_anchor: OpdSftAnchorArg) -> Result<()> {
+    if !(0.0..=1.0).contains(&gkd_lambda) || !gkd_lambda.is_finite() {
+        bail!("--gkd-lambda must be finite and in [0.0, 1.0], got {gkd_lambda}");
     }
-    bail!(
-        "`arle train opd` is the pure-KL OPD path; --gkd-lambda must be exactly 0.0, got {gkd_lambda}"
-    )
+    match sft_anchor {
+        OpdSftAnchorArg::StudentRollout => {
+            if gkd_lambda == 0.0 {
+                Ok(())
+            } else {
+                bail!(
+                    "`arle train opd` keeps the student-rollout anchor pure-KL; \
+                     --gkd-lambda must be 0.0 unless --sft-anchor corpus-truth is used, \
+                     got {gkd_lambda}"
+                )
+            }
+        }
+        OpdSftAnchorArg::CorpusTruth => {
+            if gkd_lambda > 0.0 {
+                Ok(())
+            } else {
+                bail!(
+                    "--sft-anchor corpus-truth requires --gkd-lambda > 0.0; \
+                     use --gkd-lambda 1.0 for off-policy SFT on teacher completions"
+                )
+            }
+        }
+    }
+}
+
+fn opd_sft_anchor_arg(arg: OpdSftAnchorArg) -> train::opd::GkdSftAnchor {
+    match arg {
+        OpdSftAnchorArg::StudentRollout => train::opd::GkdSftAnchor::StudentRollout,
+        OpdSftAnchorArg::CorpusTruth => train::opd::GkdSftAnchor::CorpusTruth,
+    }
 }
 
 struct OpdCheckpointSources {
@@ -299,8 +330,8 @@ fn maybe_save_full_student_checkpoint(
     }
 
     use train::qwen35_checkpoint::{
-        ConfigJsonSource, GenerationConfigSource, Qwen35StepCheckpoint, Qwen35StudentWeights,
-        save_qwen35_student_checkpoint,
+        save_qwen35_student_checkpoint, ConfigJsonSource, GenerationConfigSource,
+        Qwen35StepCheckpoint, Qwen35StudentWeights,
     };
 
     fs::create_dir_all(out_dir)
@@ -334,8 +365,10 @@ fn maybe_save_full_student_checkpoint(
 
 struct OpdPromptSource {
     train_prompts: Vec<Vec<u32>>,
+    train_completions: Vec<Option<Vec<u32>>>,
     eval_ids: Vec<u32>,
     report_prompt_ids: Vec<u32>,
+    completion_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +488,26 @@ fn validate_prompt_collection(label: &str, prompts: &[Vec<u32>], vocab_size: usi
     Ok(())
 }
 
+fn validate_completion_collection(
+    label: &str,
+    completions: &[Option<Vec<u32>>],
+    prompts_len: usize,
+    vocab_size: usize,
+) -> Result<()> {
+    if completions.len() != prompts_len {
+        bail!(
+            "{label} length {} must match prompt count {prompts_len}",
+            completions.len()
+        );
+    }
+    for (idx, completion) in completions.iter().enumerate() {
+        if let Some(tokens) = completion {
+            validate_token_ids(&format!("{label}[{idx}]"), tokens, vocab_size)?;
+        }
+    }
+    Ok(())
+}
+
 fn load_opd_prompt_source(
     args: &TrainOpdArgs,
     student_dir: &Path,
@@ -470,6 +523,18 @@ fn load_opd_prompt_source(
         .with_context(|| format!("load OPD prompt corpus from {}", prompt_file.display()))?;
         validate_prompt_collection("--prompts-file train prompt", &loaded.train, vocab_size)?;
         validate_prompt_collection("--prompts-file heldout prompt", &loaded.heldout, vocab_size)?;
+        validate_completion_collection(
+            "--prompts-file train completion",
+            &loaded.train_completions,
+            loaded.train.len(),
+            vocab_size,
+        )?;
+        validate_completion_collection(
+            "--prompts-file heldout completion",
+            &loaded.heldout_completions,
+            loaded.heldout.len(),
+            vocab_size,
+        )?;
         let eval_ids = match args.eval_ids.as_deref() {
             Some(raw) => {
                 let ids = parse_prompt_ids(Some(raw))?;
@@ -483,18 +548,22 @@ fn load_opd_prompt_source(
                 .unwrap_or_else(|| loaded.train[0].clone()),
         };
         eprintln!(
-            "[arle train opd] loaded prompt corpus {}: train={} heldout={} rows={} truncated={}",
+            "[arle train opd] loaded prompt corpus {}: train={} heldout={} rows={} truncated={} completion_rows={} truncated_completion_rows={}",
             prompt_file.display(),
             loaded.train.len(),
             loaded.heldout.len(),
             loaded.jsonl_rows,
             loaded.truncated_rows,
+            loaded.completion_rows,
+            loaded.truncated_completion_rows,
         );
         let report_prompt_ids = loaded.train[0].clone();
         return Ok(OpdPromptSource {
             train_prompts: loaded.train,
+            train_completions: loaded.train_completions,
             eval_ids,
             report_prompt_ids,
+            completion_rows: loaded.completion_rows,
         });
     }
 
@@ -510,8 +579,10 @@ fn load_opd_prompt_source(
     };
     Ok(OpdPromptSource {
         train_prompts: vec![prompt_ids.clone()],
+        train_completions: vec![None],
         eval_ids,
         report_prompt_ids: prompt_ids,
+        completion_rows: 0,
     })
 }
 
@@ -519,6 +590,9 @@ enum OpdCliTeacher<'a> {
     InProcess(train::teacher_infer::InProcessTeacher<'a>),
     #[cfg(feature = "cuda")]
     Infer(train::teacher_infer::InferTeacher),
+    CorpusSftOnly {
+        vocab_size: usize,
+    },
 }
 
 impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
@@ -542,6 +616,13 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             Self::Infer(teacher) => train::teacher_infer::TeacherForward::forward_logits_device(
                 teacher, input_ids, positions, store, tape,
             ),
+            Self::CorpusSftOnly { .. } => {
+                Err(train::teacher_infer::TeacherForwardError::InvalidInput(
+                    "corpus-truth SFT-only teacher was asked to score KL logits; \
+                     this path is only valid with --sft-anchor corpus-truth --gkd-lambda 1.0"
+                        .to_owned(),
+                ))
+            }
         }
     }
 
@@ -568,6 +649,13 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
                     teacher, input_ids, positions, window, store, tape,
                 )
             }
+            Self::CorpusSftOnly { .. } => {
+                Err(train::teacher_infer::TeacherForwardError::InvalidInput(
+                    "corpus-truth SFT-only teacher was asked to score windowed KL logits; \
+                     this path is only valid with --sft-anchor corpus-truth --gkd-lambda 1.0"
+                        .to_owned(),
+                ))
+            }
         }
     }
 
@@ -576,6 +664,7 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             Self::InProcess(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
             #[cfg(feature = "cuda")]
             Self::Infer(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
+            Self::CorpusSftOnly { vocab_size } => *vocab_size,
         }
     }
 
@@ -586,6 +675,7 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             }
             #[cfg(feature = "cuda")]
             Self::Infer(teacher) => train::teacher_infer::TeacherForward::parameter_ids(teacher),
+            Self::CorpusSftOnly { .. } => &[],
         }
     }
 
@@ -600,6 +690,7 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             Self::Infer(teacher) => {
                 train::teacher_infer::TeacherForward::offload_engine_weights(teacher)
             }
+            Self::CorpusSftOnly { .. } => Ok(0),
         }
     }
 
@@ -614,18 +705,16 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             Self::Infer(teacher) => {
                 train::teacher_infer::TeacherForward::reload_engine_weights(teacher)
             }
+            Self::CorpusSftOnly { .. } => Ok(()),
         }
     }
 }
 
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         lora::LoraConfig,
-        opd::{
-            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
-        },
+        opd::{opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, OpdStepConfig},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
     };
 
@@ -633,7 +722,15 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .student_model
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
-    validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
+    validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
+    let sft_anchor = opd_sft_anchor_arg(args.sft_anchor);
+    let corpus_sft_only = args.sft_anchor == OpdSftAnchorArg::CorpusTruth && args.gkd_lambda == 1.0;
+    if corpus_sft_only && args.logits_window_size == 0 {
+        bail!(
+            "--sft-anchor corpus-truth --gkd-lambda 1.0 requires the windowed logits path; \
+             omit --logits-window-size or pass a positive value"
+        );
+    }
     let teacher_dir = args.teacher_model.as_deref().unwrap_or(student_dir);
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
@@ -644,7 +741,9 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
 
-    let teacher_model = if matches!(args.teacher_runtime, OpdTeacherRuntimeArg::InProcess) {
+    let teacher_model = if corpus_sft_only {
+        None
+    } else if matches!(args.teacher_runtime, OpdTeacherRuntimeArg::InProcess) {
         eprintln!(
             "[arle train opd] loading in-process teacher from {}",
             teacher_dir.display()
@@ -669,16 +768,26 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .collect();
     let cfg = student.config().clone();
     #[cfg(feature = "cuda")]
-    let infer_student = load_opd_infer_student(
-        student_dir,
-        args.prompt_max_tokens + args.rollout_len + 32,
-        train_backend.clone(),
-        cfg.vocab_size,
-    )?;
+    let infer_student = if corpus_sft_only {
+        None
+    } else {
+        load_opd_infer_student(
+            student_dir,
+            args.prompt_max_tokens + args.rollout_len + 32,
+            train_backend.clone(),
+            cfg.vocab_size,
+        )?
+    };
     #[cfg(not(feature = "cuda"))]
     let _ = &train_backend;
 
     let teacher_forward = match args.teacher_runtime {
+        OpdTeacherRuntimeArg::InProcess if corpus_sft_only => OpdCliTeacher::CorpusSftOnly {
+            vocab_size: cfg.vocab_size,
+        },
+        OpdTeacherRuntimeArg::Infer if corpus_sft_only => OpdCliTeacher::CorpusSftOnly {
+            vocab_size: cfg.vocab_size,
+        },
         OpdTeacherRuntimeArg::InProcess => {
             let teacher = teacher_model
                 .as_ref()
@@ -706,6 +815,21 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     };
 
     let prompt_source = load_opd_prompt_source(&args, student_dir, cfg.vocab_size)?;
+    if args.sft_anchor == OpdSftAnchorArg::CorpusTruth {
+        if args.prompts_file.is_none() {
+            bail!("--sft-anchor corpus-truth requires --prompts-file with completion/target rows");
+        }
+        if prompt_source
+            .train_completions
+            .iter()
+            .any(|completion| completion.as_deref().is_none_or(<[u32]>::is_empty))
+        {
+            bail!(
+                "--sft-anchor corpus-truth requires every train row in --prompts-file \
+                 to have non-empty completion, target, or completion_ids"
+            );
+        }
+    }
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let lr_schedule =
@@ -752,6 +876,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         let _step_lr = lr_schedule.apply_to_optimizer(&mut optimizer, (step - 1) as u64);
         let prompt_index = prompt_sampler.next_index(prompt_source.train_prompts.len());
         let prompt_ids = prompt_source.train_prompts[prompt_index].as_slice();
+        let corpus_tokens = prompt_source.train_completions[prompt_index].as_deref();
         let mut step_profile = opd_step_profile_enabled().then(train::opd::OpdStepProfile::default);
         #[cfg(feature = "cuda")]
         let infer_rollout = infer_student
@@ -770,13 +895,13 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             &mut store,
             &mut tape,
             GkdLossConfig {
-                lambda: 0.0,
-                sft_anchor: GkdSftAnchor::StudentRollout,
-                corpus_tokens: None,
+                lambda: args.gkd_lambda,
+                sft_anchor,
+                corpus_tokens,
                 kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
                 kl_direction,
                 kl_temperature: args.kl_temperature,
-                logits_window_size: None,
+                logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
                 kl_mask,
             },
             None,
@@ -856,6 +981,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "rollout_len": args.rollout_len,
             "lr": args.lr,
             "gkd_lambda": args.gkd_lambda,
+            "sft_anchor": format!("{:?}", args.sft_anchor),
             "kl_temperature": args.kl_temperature,
             "gate_every_n": args.gate_every_n,
             "lora_rank": args.lora_rank,
@@ -867,6 +993,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "losses": losses,
             "gate_nlls": gate_nlls,
             "prompt_ids": prompt_source.report_prompt_ids,
+            "completion_rows": prompt_source.completion_rows,
             "eval_ids": prompt_source.eval_ids,
             "vocab_size": cfg.vocab_size,
             "hidden_size": cfg.hidden_size,
@@ -889,16 +1016,19 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 }
 
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdStepConfig,
         },
         qwen35::Qwen35Model,
     };
 
-    validate_pure_opd_gkd_lambda(args.gkd_lambda)?;
+    validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
+    if args.sft_anchor != OpdSftAnchorArg::StudentRollout {
+        bail!("train opd --smoke does not support --sft-anchor corpus-truth");
+    }
     if args.prompts_file.is_some() {
         bail!("--prompts-file requires --student-model; smoke mode uses --prompt-ids");
     }
@@ -964,7 +1094,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
                 kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
                 kl_direction,
                 kl_temperature: args.kl_temperature,
-                logits_window_size: None,
+                logits_window_size: opd_logits_window_size_arg(args.logits_window_size),
                 kl_mask,
             },
             None,
@@ -1142,13 +1272,13 @@ fn heldout_nll(
 }
 
 fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdKlMask, OpdStepConfig,
         },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
@@ -1403,13 +1533,13 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
 }
 
 fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{Tape, optim::AdamW};
+    use autograd::{optim::AdamW, Tape};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
-            opd_step_with_teacher_forward_profiled_gkd_anchor,
+            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
+            OpdKlMask, OpdStepConfig,
         },
         qwen35::Qwen35Model,
     };
@@ -2449,9 +2579,9 @@ mod tests {
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
-        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
         current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config, kl_mask_arg,
-        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
+        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection, OpdLrSchedule,
+        OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
     };
     use crate::args::{LrScheduleArg, OpdKlMaskArg};
 
