@@ -19,8 +19,9 @@ pub mod app {
         LoraConfig, LoraTargetSet,
         infer_student::InferStudent,
         opd::{
-            GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask, OpdStepConfig, OpdStepProfile,
-            infer_rollout_flag_enabled, opd_step_with_teacher_forward_profiled_gkd_anchor,
+            DEFAULT_LOGITS_WINDOW_SIZE, GkdLossConfig, GkdSftAnchor, InferRolloutCtx, OpdKlMask,
+            OpdStepConfig, OpdStepProfile, infer_rollout_flag_enabled,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         prompts::load_jsonl_prompt_sets,
         qwen35::{Qwen35KvCache, Qwen35Model, forward_rollout_cached},
@@ -204,6 +205,7 @@ pub mod app {
         learning_rate: f32,
         train_steps: usize,
         rollout_len: usize,
+        logits_window_size: usize,
         eval_steps: Vec<usize>,
         prompt_source: PromptSourceArg,
         prompt_max_tokens: usize,
@@ -422,17 +424,19 @@ pub mod app {
         );
 
         let mut eval_summaries = Vec::new();
-        eval_summaries.push(evaluate_snapshot(
-            0,
-            &prompts.train,
-            &prompts.heldout,
-            &teacher,
-            &student,
-            &teacher_params,
-            &student_model_params,
-            &mut store,
-            &mut tape,
-        )?);
+        if eval_steps.contains(&0) {
+            eval_summaries.push(evaluate_snapshot(
+                0,
+                &prompts.train,
+                &prompts.heldout,
+                &teacher,
+                &student,
+                &teacher_params,
+                &student_model_params,
+                &mut store,
+                &mut tape,
+            )?);
+        }
 
         let mut step_losses = Vec::with_capacity(args.train_steps);
         let mut step_seconds = Vec::with_capacity(args.train_steps);
@@ -464,7 +468,7 @@ pub mod app {
                     kl_chunk_size: GkdLossConfig::default().kl_chunk_size,
                     kl_direction: train::loss::KlDirection::Forward,
                     kl_temperature: 1.0,
-                    logits_window_size: None,
+                    logits_window_size: Some(args.logits_window_size),
                     kl_mask: OpdKlMask::CompletionOnly,
                 },
                 None,
@@ -624,6 +628,7 @@ pub mod app {
         let mut learning_rate = student_mode.default_learning_rate();
         let mut train_steps = DEFAULT_TRAIN_STEPS;
         let mut rollout_len = DEFAULT_ROLLOUT_LEN;
+        let mut logits_window_size = DEFAULT_LOGITS_WINDOW_SIZE;
         let mut eval_steps = EVAL_STEPS.to_vec();
         let mut prompt_source = PromptSourceArg::BuiltIn(PromptSetArg::Eight);
         let mut prompt_source_explicit = false;
@@ -664,9 +669,17 @@ pub mod app {
                     };
                     rollout_len = parse_positive_usize("--rollout-len", &raw)?;
                 }
+                "--logits-window-size" => {
+                    let Some(raw) = args.next() else {
+                        return Err("--logits-window-size requires a positive usize value".into());
+                    };
+                    logits_window_size = parse_positive_usize("--logits-window-size", &raw)?;
+                }
                 "--eval-steps" => {
                     let Some(raw) = args.next() else {
-                        return Err("--eval-steps requires a comma-separated step list".into());
+                        return Err(
+                            "--eval-steps requires a comma-separated step list or `none`".into(),
+                        );
                     };
                     eval_steps = parse_eval_steps(&raw)?;
                 }
@@ -724,14 +737,14 @@ pub mod app {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p train --example {} --release --features cuda -- [--teacher-model DIR] [--student-model DIR] [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--eval-steps CSV] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE] [--safety-first-step-max-seconds VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
+                        "usage: cargo run -p train --example {} --release --features cuda -- [--teacher-model DIR] [--student-model DIR] [--lr VALUE] [--steps VALUE] [--rollout-len VALUE] [--logits-window-size VALUE] [--eval-steps CSV|none] [--prompt-set 8|32] [--prompts-file PATH | --example-prompts-file PATH] [--prompt-max-tokens VALUE] [--safety-first-step-max-seconds VALUE]\n\nJSONL prompt rows use: {{\"text\":\"...\",\"max_tokens\":16}}. The final 4 rows are held out; earlier rows train.",
                         student_mode.usage_example()
                     );
                     return Ok(None);
                 }
                 unknown => {
                     return Err(format!(
-                        "unknown argument `{unknown}`. Supported arguments: --teacher-model DIR, --student-model DIR, --lr VALUE, --steps VALUE, --rollout-len VALUE, --eval-steps CSV, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE, --safety-first-step-max-seconds VALUE"
+                        "unknown argument `{unknown}`. Supported arguments: --teacher-model DIR, --student-model DIR, --lr VALUE, --steps VALUE, --rollout-len VALUE, --logits-window-size VALUE, --eval-steps CSV|none, --prompt-set 8|32, --prompts-file PATH, --example-prompts-file PATH, --prompt-max-tokens VALUE, --safety-first-step-max-seconds VALUE"
                     )
                     .into());
                 }
@@ -741,6 +754,7 @@ pub mod app {
             learning_rate,
             train_steps,
             rollout_len,
+            logits_window_size,
             eval_steps,
             prompt_source,
             prompt_max_tokens,
@@ -784,6 +798,9 @@ pub mod app {
     }
 
     fn parse_eval_steps(raw: &str) -> AnyResult<Vec<usize>> {
+        if raw.eq_ignore_ascii_case("none") {
+            return Ok(Vec::new());
+        }
         let mut steps = Vec::new();
         for part in raw.split(',') {
             let trimmed = part.trim();
@@ -796,15 +813,15 @@ pub mod app {
                     .map_err(|err| format!("invalid --eval-steps item `{trimmed}`: {err}"))?,
             );
         }
-        if steps.is_empty() {
-            return Err("--eval-steps requires at least one step".into());
-        }
         steps.sort_unstable();
         steps.dedup();
         Ok(steps)
     }
 
     fn eval_steps_for(train_steps: usize, configured_steps: &[usize]) -> Vec<usize> {
+        if configured_steps.is_empty() {
+            return Vec::new();
+        }
         let mut steps = configured_steps
             .iter()
             .copied()
@@ -864,7 +881,7 @@ pub mod app {
         eval_steps: &[usize],
     ) {
         println!(
-            "config backend=cuda teacher_model_dir={} student_model_dir={} same_model_dir={} student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} decode_len={DECODE_LEN} lr={:.9e} default_lr={:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={:.6} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
+            "config backend=cuda teacher_model_dir={} student_model_dir={} same_model_dir={} student_mode={} lora_rank={} lora_alpha={:.6} lora_target_set={} train_steps={} rollout_len={} default_rollout_len={DEFAULT_ROLLOUT_LEN} logits_window_size={} default_logits_window_size={DEFAULT_LOGITS_WINDOW_SIZE} decode_len={DECODE_LEN} lr={:.9e} default_lr={:.9e} grad_clip={GRAD_CLIP} perturb_scale={PERTURB_SCALE} perturb_seed=0x{PERTURB_SEED:016x} safety_first_step_max_seconds={:.6} prompt_source={} train_prompt_count={} heldout_prompt_count={} eval_steps={eval_steps:?}",
             model_dirs.teacher.display(),
             model_dirs.student.display(),
             same_dir(&model_dirs.teacher, &model_dirs.student),
@@ -880,6 +897,7 @@ pub mod app {
                 .unwrap_or("none"),
             args.train_steps,
             args.rollout_len,
+            args.logits_window_size,
             args.learning_rate,
             student_mode.default_learning_rate(),
             args.safety_first_step_max_seconds,
