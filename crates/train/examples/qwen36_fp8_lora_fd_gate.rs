@@ -55,6 +55,7 @@ mod app {
     enum GateMode {
         MlpLayer,
         FullModel,
+        Tail,
     }
 
     struct GateInput {
@@ -178,7 +179,7 @@ mod app {
             print_backward_profile(profile);
         }
 
-        let selected = select_target_probe(&student, &grads, &mut store, &args)?;
+        let selected = select_target_probe(&student, &grads, &mut store, &args, gate_input.hidden)?;
         store.retain_ids(&keep);
 
         let original = tensor_value(&mut store, selected.target, selected.index)?;
@@ -340,7 +341,7 @@ mod app {
                          --release --features cuda -- [--model DIR] [--device N] \
                          [--rank N] [--alpha F] [--target-set all-linear] \
                          [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
-                         [--mode mlp-layer|full-model] [--layer N] [--profile-backward] \
+                         [--mode mlp-layer|full-model|tail] [--layer N] [--profile-backward] \
                          [--profile-forward-only] [--check-route-stability] \
                          [--freeze-base-routes] [--sparse-logit-probe]"
                     );
@@ -364,8 +365,8 @@ mod app {
         if freeze_base_routes && mode != GateMode::FullModel {
             bail!("--freeze-base-routes requires --mode full-model");
         }
-        if sparse_logit_probe && mode != GateMode::FullModel {
-            bail!("--sparse-logit-probe requires --mode full-model");
+        if sparse_logit_probe && !matches!(mode, GateMode::FullModel | GateMode::Tail) {
+            bail!("--sparse-logit-probe requires --mode full-model or --mode tail");
         }
         Ok(Args {
             model,
@@ -416,6 +417,7 @@ mod app {
         match raw {
             "mlp-layer" | "mlp" => Ok(GateMode::MlpLayer),
             "full-model" | "full" => Ok(GateMode::FullModel),
+            "tail" | "lm-head-tail" => Ok(GateMode::Tail),
             other => bail!("unknown mode {other:?}"),
         }
     }
@@ -425,6 +427,7 @@ mod app {
             match self {
                 Self::MlpLayer => "mlp-layer",
                 Self::FullModel => "full-model",
+                Self::Tail => "tail",
             }
         }
     }
@@ -441,7 +444,23 @@ mod app {
         grads: &std::collections::HashMap<TensorId, TensorId>,
         store: &mut TensorStore,
         args: &Args,
+        hidden: Option<TensorId>,
     ) -> Result<SelectedProbe> {
+        if args.mode == GateMode::Tail {
+            let target = hidden.context("tail mode missing hidden target")?;
+            let grad_id = *grads
+                .get(&target)
+                .context("missing gradient for diagnostic tail hidden")?;
+            let grad = store.to_host(grad_id)?;
+            let index = largest_nonzero_index(&grad)
+                .context("gradient for diagnostic tail hidden has no non-zero element")?;
+            return Ok(SelectedProbe {
+                name: "diagnostic.tail_hidden".to_string(),
+                target,
+                index,
+                analytic: grad[index],
+            });
+        }
         if args.target_adapter == "auto:routed-up" {
             return select_auto_routed_up_probe(model, grads, store, args.layer);
         }
@@ -517,14 +536,14 @@ mod app {
         positions: &[u32],
     ) -> Result<GateInput> {
         let hidden = match args.mode {
-            GateMode::MlpLayer => Some(store.alloc(Tensor::new(
+            GateMode::MlpLayer | GateMode::Tail => Some(store.alloc(Tensor::new(
                 deterministic_vec(
                     args.tokens.len() * model.config().hidden_size,
                     0x4781_9f20_aa11_0017,
                     0.02,
                 ),
                 vec![1, args.tokens.len(), model.config().hidden_size],
-                false,
+                args.mode == GateMode::Tail,
             )?)),
             GateMode::FullModel => None,
         };
@@ -605,6 +624,10 @@ mod app {
                     store,
                     tape,
                 )?)
+            }
+            GateMode::Tail => {
+                let hidden = hidden.context("tail mode missing hidden input")?;
+                Ok(model.forward_lm_head_tail_for_diagnostics(hidden, store, tape)?)
             }
             GateMode::FullModel => {
                 if let Some(frozen_routes) = frozen_routes {
