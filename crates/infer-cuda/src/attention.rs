@@ -3590,52 +3590,6 @@ impl Dsv4LayerAttentionState {
         }
         Ok(())
     }
-
-    /// Park one spec-tree node's just-written SW/FP8 ring slot into node scratch.
-    /// Same copy granularity as the frozen-KV rollback snapshot, but indexed by
-    /// flattened tree node rather than depth.
-    pub(crate) fn save_spec_node_slot(
-        &self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        snap: &mut Dsv4SpecRingSnapshot,
-        node_idx: usize,
-        abs_pos: usize,
-    ) -> Result<()> {
-        ensure!(
-            node_idx <= snap.max_depth,
-            "DSv4 spec-node save index {node_idx} exceeds node-scratch capacity {}",
-            snap.max_depth + 1
-        );
-        snap.capture_sw_slot(ctx, &self.sw_window_cache, node_idx, abs_pos)?;
-        if let Some(flash) = &self.flashmla {
-            snap.capture_fp8_slot(ctx, pool, flash, node_idx, abs_pos)?;
-        }
-        Ok(())
-    }
-
-    /// Replay a parked spec-tree node's SW/FP8 ring slot before a row whose
-    /// ancestor path needs that node. The whole-window rollback owns scalar
-    /// counters/flags; this only swaps the position-keyed ring bytes.
-    pub(crate) fn restore_spec_node_slot(
-        &mut self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-        snap: &Dsv4SpecRingSnapshot,
-        node_idx: usize,
-        abs_pos: usize,
-    ) -> Result<()> {
-        ensure!(
-            node_idx <= snap.max_depth,
-            "DSv4 spec-node restore index {node_idx} exceeds node-scratch capacity {}",
-            snap.max_depth + 1
-        );
-        snap.restore_sw_slot(ctx, &mut self.sw_window_cache, node_idx, abs_pos)?;
-        if let Some(slot_idx) = self.flashmla.as_ref().map(|f| f.slot_idx) {
-            snap.restore_fp8_slot(ctx, pool, slot_idx, node_idx, abs_pos)?;
-        }
-        Ok(())
-    }
 }
 
 impl Dsv4SpecRingSnapshot {
