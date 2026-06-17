@@ -11,8 +11,9 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::Device,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 type OptionalMatmulGrads = (Option<Vec<f32>>, Option<Vec<f32>>);
@@ -789,27 +790,49 @@ pub(crate) fn moe_grouped_linear_backward(
     })?;
     let grad_out_shape = vec![active_len, max_rows, out_dim];
 
-    let (grad_packed_input_base, grad_packed_weight_t) = if need_input_grad || need_weight_grad {
-        let packed_weight_t = profile.time_result("pack", "base_weight_t", || {
-            pack_grouped_weight_t(&active_experts, out_dim, in_dim, store)
-        })?;
-        let packed_weight_t_shape = vec![active_len, in_dim, out_dim];
-        grouped_matmul_backward(
-            store,
-            &profile,
-            "base_backward",
-            &packed_input,
-            &packed_input_shape,
-            &packed_weight_t,
-            &packed_weight_t_shape,
-            &packed_grad_out,
-            &grad_out_shape,
-            need_input_grad,
-            need_weight_grad,
-        )?
-    } else {
-        (None, None)
-    };
+    let resident_base_input_grad =
+        if need_input_grad && !need_weight_grad && store.backend().device() == Device::Cuda {
+            profile.time_result("base_resident_input_grad", "total", || {
+                grouped_base_input_grad_resident(
+                    store,
+                    &active_experts,
+                    &packed_input,
+                    &packed_input_shape,
+                    &packed_grad_out,
+                    &grad_out_shape,
+                    max_rows,
+                    in_dim,
+                    out_dim,
+                )
+            })?
+        } else {
+            None
+        };
+
+    let (grad_packed_input_base, grad_packed_weight_t) =
+        if let Some(grad) = resident_base_input_grad {
+            (Some(grad), None)
+        } else if need_input_grad || need_weight_grad {
+            let packed_weight_t = profile.time_result("pack", "base_weight_t", || {
+                pack_grouped_weight_t(&active_experts, out_dim, in_dim, store)
+            })?;
+            let packed_weight_t_shape = vec![active_len, in_dim, out_dim];
+            grouped_matmul_backward(
+                store,
+                &profile,
+                "base_backward",
+                &packed_input,
+                &packed_input_shape,
+                &packed_weight_t,
+                &packed_weight_t_shape,
+                &packed_grad_out,
+                &grad_out_shape,
+                need_input_grad,
+                need_weight_grad,
+            )?
+        } else {
+            (None, None)
+        };
 
     let mut grad_packed_input = need_input_grad.then(|| vec![0.0_f32; packed_input.len()]);
     if let (Some(dst), Some(src)) = (grad_packed_input.as_mut(), grad_packed_input_base.as_ref()) {
@@ -1593,6 +1616,101 @@ fn pack_grouped_weight_t(
         }
     }
     Ok(packed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_base_input_grad_resident(
+    store: &TensorStore,
+    experts: &[MoeGroupedLinearExpert],
+    packed_input: &[f32],
+    packed_input_shape: &[usize],
+    packed_grad_out: &[f32],
+    grad_out_shape: &[usize],
+    max_rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Option<Vec<f32>>> {
+    if store.backend().device() != Device::Cuda {
+        return Ok(None);
+    }
+    if packed_input_shape != [experts.len(), max_rows, in_dim] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![experts.len(), max_rows, in_dim],
+            got: packed_input_shape.to_vec(),
+        });
+    }
+    if grad_out_shape != [experts.len(), max_rows, out_dim] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![experts.len(), max_rows, out_dim],
+            got: grad_out_shape.to_vec(),
+        });
+    }
+
+    let mut weight_handles = Vec::with_capacity(experts.len());
+    for expert in experts {
+        let tensor = store.tensor(expert.weight)?;
+        if tensor.shape != [out_dim, in_dim] {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![out_dim, in_dim],
+                got: tensor.shape.clone(),
+            });
+        }
+        if tensor.dirty == Dirty::Host {
+            return Ok(None);
+        }
+        let Some(handle) = tensor.device_handle.as_ref().cloned() else {
+            return Ok(None);
+        };
+        weight_handles.push(handle);
+    }
+
+    let mut out = vec![0.0_f32; packed_input.len()];
+    let a_shape = [max_rows, in_dim];
+    let b_shape = [out_dim, in_dim];
+    let g_shape = [max_rows, out_dim];
+    let input_stride = max_rows * in_dim;
+    let grad_stride = max_rows * out_dim;
+    for (compact, weight_handle) in weight_handles.iter().enumerate() {
+        let input_start = compact * input_stride;
+        let grad_start = compact * grad_stride;
+        let a_handle = store.backend().upload(
+            &packed_input[input_start..input_start + input_stride],
+            &a_shape,
+        )?;
+        let g_handle = store.backend().upload(
+            &packed_grad_out[grad_start..grad_start + grad_stride],
+            &g_shape,
+        )?;
+        let (grad_a, grad_b) = store.backend().matmul_bt_backward_device(
+            &a_handle,
+            &a_shape,
+            weight_handle,
+            &b_shape,
+            &g_handle,
+            &g_shape,
+            true,
+            false,
+        )?;
+        if grad_b.is_some() {
+            return Err(AutogradError::TapeInvariant(
+                "resident base input-grad unexpectedly produced a weight gradient",
+            ));
+        }
+        let grad_a = grad_a.ok_or(AutogradError::TapeInvariant(
+            "resident base input-grad missing input gradient",
+        ))?;
+        store.backend().eval(&[&grad_a])?;
+        let host = store.backend().readback(&grad_a)?;
+        if host.len() != input_stride {
+            return Err(AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: a_shape.to_vec(),
+                size: input_stride,
+            });
+        }
+        out[input_start..input_start + input_stride].copy_from_slice(&host);
+    }
+    Ok(Some(out))
 }
 
 fn unpack_grouped_weight_t_grad_active(
