@@ -1,3 +1,4 @@
+use std::cell::Cell;
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use train::{
         GkdLossConfig, GkdSftAnchor, OpdError, OpdKlMask, OpdStepConfig, OpdStepProfile, opd_step,
         opd_step_with_teacher_forward_profiled_gkd_anchor, student_rollout_only,
     },
-    qwen35::{LayerType, Qwen35Config, Qwen35Model},
-    teacher_infer::InProcessTeacher,
+    qwen35::{LayerType, Qwen35Config, Qwen35Model, SequenceWindow},
+    teacher_infer::{DeviceLogits, InProcessTeacher, TeacherForward},
     trajectory_scorer::{ExactMatchScorer, TrajectoryScorer, select_best},
 };
 
@@ -50,6 +51,22 @@ fn student_param_snapshot(store: &TensorStore, params: &[TensorId]) -> Vec<(Tens
                     .data
                     .clone(),
             )
+        })
+        .collect()
+}
+
+fn student_grad_snapshot(store: &TensorStore, params: &[TensorId]) -> Vec<(TensorId, Vec<f32>)> {
+    params
+        .iter()
+        .copied()
+        .filter_map(|id| {
+            let tensor = store.get(id).expect("student parameter survives cleanup");
+            if !tensor.requires_grad {
+                return None;
+            }
+            let grad_id = tensor.grad?;
+            let grad = store.get(grad_id).expect("student grad survives cleanup");
+            Some((id, grad.data.clone()))
         })
         .collect()
 }
@@ -98,6 +115,57 @@ fn tiny_hybrid_qwen35_config() -> Qwen35Config {
     cfg.linear_value_head_dim = cfg.rotary_dim;
     cfg.layer_types = vec![LayerType::FullAttention, LayerType::LinearAttention];
     cfg
+}
+
+struct CountingTeacher<'a> {
+    inner: InProcessTeacher<'a>,
+    full_calls: Cell<usize>,
+    window_calls: Cell<usize>,
+}
+
+impl<'a> CountingTeacher<'a> {
+    fn new(model: &'a Qwen35Model) -> Self {
+        Self {
+            inner: InProcessTeacher::new(model),
+            full_calls: Cell::new(0),
+            window_calls: Cell::new(0),
+        }
+    }
+}
+
+impl TeacherForward for CountingTeacher<'_> {
+    fn forward_logits_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> train::teacher_infer::Result<DeviceLogits> {
+        self.full_calls.set(self.full_calls.get() + 1);
+        self.inner
+            .forward_logits_device(input_ids, positions, store, tape)
+    }
+
+    fn forward_logits_window_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        window: SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> train::teacher_infer::Result<DeviceLogits> {
+        self.window_calls.set(self.window_calls.get() + 1);
+        self.inner
+            .forward_logits_window_device(input_ids, positions, window, store, tape)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn parameter_ids(&self) -> &[TensorId] {
+        self.inner.parameter_ids()
+    }
 }
 
 static OPD_BACKWARD_PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -289,6 +357,138 @@ fn opd_step_pure_chunked_kl_honors_reverse_direction() {
         reverse.abs() <= 1.0e-6,
         "identical teacher/student reverse KL should be zero, got {reverse:.10e}; \
          this catches the pure chunked rollout path hardcoding Forward"
+    );
+}
+
+#[test]
+fn opd_step_windowed_pure_kl_preempts_chunked_route() {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let teacher = CountingTeacher::new(&teacher);
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    perturb_student_params(&mut store, &student_params);
+    let mut optimizer = AdamW::new(0.0, (0.9, 0.999), 1.0e-8, 0.0);
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let forced_rollout: Vec<u32> = vec![1, 3, 8, 4, 5, 6, 7];
+
+    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
+        &student,
+        &teacher,
+        &prompt_ids,
+        OpdStepConfig {
+            rollout_len: 4,
+            rollout_sampling: None,
+            grad_clip: 0.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+        GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: Some(2),
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
+            logits_window_size: Some(2),
+            kl_mask: OpdKlMask::CompletionOnly,
+        },
+        Some(&forced_rollout),
+        #[cfg(feature = "cuda")]
+        None,
+        None,
+    )
+    .expect("windowed pure KL OPD step runs");
+
+    assert!(outcome.loss.is_finite());
+    assert_eq!(
+        teacher.full_calls.get(),
+        0,
+        "logits_window_size must preempt the full/chunked KL route"
+    );
+    assert_eq!(
+        teacher.window_calls.get(),
+        2,
+        "completion KL range of four positions with window=2 should run two windows"
+    );
+}
+
+fn pure_kl_loss_and_grads(logits_window_size: Option<usize>) -> (f32, Vec<(TensorId, Vec<f32>)>) {
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let cfg = tiny_qwen35_config();
+
+    let teacher = Qwen35Model::new_for_eval(&cfg, &mut store).expect("build teacher");
+    let teacher = InProcessTeacher::new(&teacher);
+    let student = Qwen35Model::new(&cfg, &mut store).expect("build student");
+    let student_params = student.all_parameter_ids();
+    perturb_student_params(&mut store, &student_params);
+    let mut optimizer = AdamW::new(0.0, (0.9, 0.999), 1.0e-8, 0.0);
+    let prompt_ids: Vec<u32> = vec![1, 3, 8];
+    let forced_rollout: Vec<u32> = vec![1, 3, 8, 4, 5, 6, 7];
+
+    let outcome = opd_step_with_teacher_forward_profiled_gkd_anchor(
+        &student,
+        &teacher,
+        &prompt_ids,
+        OpdStepConfig {
+            rollout_len: 4,
+            rollout_sampling: None,
+            grad_clip: 0.0,
+        },
+        &student_params,
+        &mut optimizer,
+        &mut store,
+        &mut tape,
+        GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: Some(2),
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
+            logits_window_size,
+            kl_mask: OpdKlMask::CompletionOnly,
+        },
+        Some(&forced_rollout),
+        #[cfg(feature = "cuda")]
+        None,
+        None,
+    )
+    .expect("pure KL OPD step runs");
+
+    (outcome.loss, student_grad_snapshot(&store, &student_params))
+}
+
+#[test]
+fn opd_step_windowed_pure_kl_matches_chunked_loss_and_grads() {
+    let (chunked_loss, chunked_grads) = pure_kl_loss_and_grads(None);
+    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(Some(2));
+
+    assert!(
+        (chunked_loss - windowed_loss).abs() <= 1.0e-6,
+        "windowed loss {windowed_loss:.9e} must match chunked loss {chunked_loss:.9e}"
+    );
+    assert_eq!(chunked_grads.len(), windowed_grads.len());
+
+    let mut max_abs = 0.0f32;
+    for ((chunked_id, chunked), (windowed_id, windowed)) in
+        chunked_grads.iter().zip(windowed_grads.iter())
+    {
+        assert_eq!(chunked_id, windowed_id);
+        assert_eq!(chunked.len(), windowed.len());
+        for (&left, &right) in chunked.iter().zip(windowed.iter()) {
+            max_abs = max_abs.max((left - right).abs());
+        }
+    }
+    assert!(
+        max_abs <= 2.0e-5,
+        "windowed pure KL gradients must match chunked gradients, max_abs={max_abs:.9e}"
     );
 }
 

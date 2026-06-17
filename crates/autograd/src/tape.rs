@@ -346,7 +346,38 @@ impl Tape {
         Ok((grads, profile))
     }
 
-    fn backward_collect_only(
+    pub fn backward_accumulate_targets(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+        target_ids: &[TensorId],
+    ) -> Result<HashMap<TensorId, TensorId>> {
+        let grads = self.backward_impl(loss_id, store, None, false)?;
+        for &target_id in target_ids {
+            if let Some(&grad_id) = grads.get(&target_id) {
+                store.accumulate_grad(target_id, grad_id)?;
+            }
+        }
+        Ok(grads)
+    }
+
+    pub fn backward_from_seed_accumulate_targets(
+        &mut self,
+        output_id: TensorId,
+        seed_grad_id: TensorId,
+        store: &mut TensorStore,
+        target_ids: &[TensorId],
+    ) -> Result<HashMap<TensorId, TensorId>> {
+        let grads = self.backward_impl_seed(output_id, Some(seed_grad_id), store, None, false)?;
+        for &target_id in target_ids {
+            if let Some(&grad_id) = grads.get(&target_id) {
+                store.accumulate_grad(target_id, grad_id)?;
+            }
+        }
+        Ok(grads)
+    }
+
+    pub fn backward_collect(
         &mut self,
         loss_id: TensorId,
         store: &mut TensorStore,
@@ -354,9 +385,28 @@ impl Tape {
         self.backward_impl(loss_id, store, None, false)
     }
 
+    fn backward_collect_only(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+    ) -> Result<HashMap<TensorId, TensorId>> {
+        self.backward_collect(loss_id, store)
+    }
+
     fn backward_impl(
         &mut self,
         loss_id: TensorId,
+        store: &mut TensorStore,
+        profile: Option<&mut BackwardProfile>,
+        accumulate_into_store: bool,
+    ) -> Result<HashMap<TensorId, TensorId>> {
+        self.backward_impl_seed(loss_id, None, store, profile, accumulate_into_store)
+    }
+
+    fn backward_impl_seed(
+        &mut self,
+        loss_id: TensorId,
+        seed_grad_id: Option<TensorId>,
         store: &mut TensorStore,
         mut profile: Option<&mut BackwardProfile>,
         accumulate_into_store: bool,
@@ -414,13 +464,26 @@ impl Tape {
             );
 
             let mut grads = HashMap::new();
-            let loss_grad_id = store.fill_like(loss_id, 1.0)?;
+            let loss_grad_id = if let Some(seed_grad_id) = seed_grad_id {
+                let expected = store.tensor(loss_id)?.shape.clone();
+                let got = store.tensor(seed_grad_id)?.shape.clone();
+                if expected != got {
+                    return Err(AutogradError::GradientShapeMismatch {
+                        tensor_id: loss_id,
+                        expected,
+                        got,
+                    });
+                }
+                seed_grad_id
+            } else {
+                store.fill_like(loss_id, 1.0)?
+            };
             // P3.1: seed the backward chain with a device-resident `1.0`
             // when the backend has device residency. Without this the
             // every-op `device_path_ok` gate in M5.3b / Wave 1 / P1 / P2 /
             // P3 falls through to host fallback, because `g.dirty=Host`
-            // from the first step. The seed is scalar (4 B), so the
-            // upload cost is negligible.
+            // from the first step. Explicit seed gradients follow the same
+            // device-residency rule so downstream ops stay on-device.
             store.ensure_device(loss_grad_id)?;
             grads.insert(loss_id, loss_grad_id);
             if store
@@ -685,8 +748,12 @@ fn merge_grad(
             }
         }
     } else {
-        let cloned_grad_id = store.clone_tensor(new_grad_id)?;
-        grads.insert(tensor_id, cloned_grad_id);
+        let grad_id = if accumulate_into_store {
+            store.clone_tensor(new_grad_id)?
+        } else {
+            new_grad_id
+        };
+        grads.insert(tensor_id, grad_id);
     }
 
     if store
@@ -783,6 +850,62 @@ mod tests {
         assert_eq!(
             profile.site_totals[&(BackwardOp::MatmulBT, "unit.matmul_bt")].count,
             1
+        );
+    }
+
+    #[test]
+    fn backward_accumulate_targets_only_persists_requested_grads() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+        let y = store.alloc(Tensor::new(vec![4.0, 5.0], vec![2], true).expect("create y"));
+        let mut tape = Tape::new();
+        let prod = ops::mul(x, y, &mut store, &mut tape).expect("x*y");
+        let loss = ops::sum(prod, &mut store, &mut tape).expect("sum");
+
+        let grads = tape
+            .backward_accumulate_targets(loss, &mut store, &[x])
+            .expect("target-only backward");
+
+        assert!(grads.contains_key(&x));
+        assert!(grads.contains_key(&y));
+        let x_stored = store
+            .get(x)
+            .and_then(|tensor| tensor.grad)
+            .expect("x stored grad");
+        assert_eq!(
+            store.to_host(x_stored).expect("x grad host"),
+            vec![4.0, 5.0]
+        );
+        assert!(
+            store.get(y).and_then(|tensor| tensor.grad).is_none(),
+            "non-target tensor must not keep a persistent grad"
+        );
+    }
+
+    #[test]
+    fn backward_from_seed_accumulate_targets_uses_explicit_output_grad() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+        let mut tape = Tape::new();
+        let squared = ops::mul(x, x, &mut store, &mut tape).expect("x*x");
+        let seed = store.alloc(Tensor::new(vec![3.0, 4.0], vec![2], false).expect("seed"));
+
+        let grads = tape
+            .backward_from_seed_accumulate_targets(squared, seed, &mut store, &[x])
+            .expect("seed backward");
+
+        let grad_id = *grads.get(&x).expect("x grad exists");
+        assert_eq!(
+            store.to_host(grad_id).expect("x grad host"),
+            vec![12.0, -24.0]
+        );
+        let stored = store
+            .get(x)
+            .and_then(|tensor| tensor.grad)
+            .expect("x stored grad");
+        assert_eq!(
+            store.to_host(stored).expect("stored x grad host"),
+            vec![12.0, -24.0]
         );
     }
 

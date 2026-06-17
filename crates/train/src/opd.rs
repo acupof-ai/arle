@@ -22,7 +22,7 @@
 
 use autograd::{
     AutogradError, BackwardOp, BackwardProfile, Device, Tape, TensorId, TensorStore,
-    optim::Optimizer,
+    optim::Optimizer, tensor::Dirty,
 };
 use infer_plan::{SamplingParams, sample_token};
 use std::{
@@ -46,7 +46,9 @@ use crate::{
         forward_rollout_cached_device_token,
     },
     teacher_infer::{InProcessTeacher, TeacherForward, TeacherForwardError},
-    trainer::{cleanup_after_backward, retained_param_and_grad_ids},
+    trainer::{
+        cleanup_after_backward, extend_keep_with_params_and_grads, retained_param_and_grad_ids,
+    },
 };
 #[cfg(feature = "cuda")]
 use crate::{infer_student::InferStudent, lora::LoraConfig};
@@ -207,6 +209,10 @@ pub enum OpdKlMask {
     CompletionOnly,
 }
 
+/// Default Route-B logits window. Keep it aligned with the KL chunk size so
+/// each backward materializes at most one `[window, vocab]` logits tile.
+pub const DEFAULT_LOGITS_WINDOW_SIZE: usize = DEFAULT_KL_CHUNK_SIZE;
+
 #[derive(Debug, Clone, Copy)]
 pub struct GkdLossConfig<'a> {
     pub lambda: f32,
@@ -240,6 +246,40 @@ fn record_profile(
 ) {
     if let Some(profile) = profile.as_deref_mut() {
         update(profile);
+    }
+}
+
+fn opd_step_trace_enabled() -> bool {
+    match std::env::var("ARLE_OPD_STEP_TRACE") {
+        Ok(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
+        Err(_) => false,
+    }
+}
+
+fn log_opd_step_trace(step_started: Instant, event: &str, detail: impl AsRef<str>) {
+    if opd_step_trace_enabled() {
+        eprintln!(
+            "opd_step_trace event={event} elapsed_seconds={:.6} {}",
+            step_started.elapsed().as_secs_f64(),
+            detail.as_ref()
+        );
+    }
+}
+
+fn log_opd_window_trace(
+    kind: &str,
+    event: &str,
+    index: usize,
+    window_started: Instant,
+    detail: impl AsRef<str>,
+) {
+    if opd_step_trace_enabled() {
+        eprintln!(
+            "opd_window_trace kind={kind} event={event} index={index} \
+             elapsed_seconds={:.6} {}",
+            window_started.elapsed().as_secs_f64(),
+            detail.as_ref()
+        );
     }
 }
 
@@ -1754,6 +1794,91 @@ fn backward_weighted_window_loss(
     Ok(loss_value)
 }
 
+fn cleanup_window_backward_retaining_base(
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    base_tape_len: usize,
+    base_keep: &HashSet<TensorId>,
+    student_model_params: &[TensorId],
+    keep_extra: &HashSet<TensorId>,
+    keep_grads: &[TensorId],
+) {
+    tape.entries.truncate(base_tape_len);
+    tape.set_enabled(true);
+    let mut keep = base_keep.clone();
+    keep.extend(keep_extra.iter().copied());
+    for &grad_id in keep_grads {
+        keep.insert(grad_id);
+    }
+    extend_keep_with_params_and_grads(&mut keep, student_model_params.iter().copied(), store);
+    store.retain_ids(&keep);
+}
+
+fn accumulate_tensor_grad(
+    store: &mut TensorStore,
+    existing_grad_id: TensorId,
+    incoming_grad_id: TensorId,
+) -> Result<()> {
+    let expected = store
+        .get(existing_grad_id)
+        .ok_or(AutogradError::InvalidTensorId(existing_grad_id))?
+        .shape
+        .clone();
+    let incoming = store
+        .get(incoming_grad_id)
+        .ok_or(AutogradError::InvalidTensorId(incoming_grad_id))?
+        .shape
+        .clone();
+    if expected != incoming {
+        return Err(AutogradError::GradientShapeMismatch {
+            tensor_id: existing_grad_id,
+            expected,
+            got: incoming,
+        }
+        .into());
+    }
+
+    let both_on_device = {
+        let existing = store
+            .get(existing_grad_id)
+            .ok_or(AutogradError::InvalidTensorId(existing_grad_id))?;
+        let incoming = store
+            .get(incoming_grad_id)
+            .ok_or(AutogradError::InvalidTensorId(incoming_grad_id))?;
+        existing.dirty != Dirty::Host
+            && existing.device_handle.is_some()
+            && incoming.dirty != Dirty::Host
+            && incoming.device_handle.is_some()
+    };
+    if both_on_device {
+        let existing_handle = store
+            .get(existing_grad_id)
+            .and_then(|tensor| tensor.device_handle.as_ref())
+            .ok_or(AutogradError::InvalidTensorId(existing_grad_id))?
+            .clone();
+        let incoming_handle = store
+            .get(incoming_grad_id)
+            .and_then(|tensor| tensor.device_handle.as_ref())
+            .ok_or(AutogradError::InvalidTensorId(incoming_grad_id))?
+            .clone();
+        let sum_handle =
+            store
+                .backend()
+                .add_into_device(&existing_handle, &incoming_handle, &incoming)?;
+        store.replace_device_handle(existing_grad_id, sum_handle)?;
+        return Ok(());
+    }
+
+    let incoming_data = store.to_host(incoming_grad_id)?;
+    let existing = store
+        .get_mut(existing_grad_id)
+        .ok_or(AutogradError::InvalidTensorId(existing_grad_id))?;
+    for (dst, src) in existing.data.iter_mut().zip(incoming_data) {
+        *dst += src;
+    }
+    Ok(())
+}
+
 fn map_qwen35_forward_error(stage: &str, err: Qwen35Error) -> OpdError {
     match err {
         Qwen35Error::InputLenMismatch {
@@ -1824,6 +1949,262 @@ fn map_teacher_forward_error(stage: &str, err: TeacherForwardError) -> OpdError 
 }
 
 #[allow(clippy::too_many_arguments)]
+fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
+    prompt_ids: &[u32],
+    rollout: &[u32],
+    positions: &[u32],
+    vocab: usize,
+    gkd_config: GkdLossConfig<'_>,
+    window_size: usize,
+    student_target_params: &[TensorId],
+    student_model_params: &[TensorId],
+    keep_extra: &HashSet<TensorId>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    profile: &mut Option<&mut OpdStepProfile>,
+) -> Result<f32> {
+    let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
+    let windows = sequence_windows_for_range(kl_range, window_size)?;
+    if windows.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "OPD windowed Route B built zero KL windows. Hint: verify \
+             prompt length, rollout length, and --logits-window-size."
+                .to_owned(),
+        ));
+    }
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let student_started = Instant::now();
+    log_opd_window_trace(
+        "kl",
+        "student_hidden_forward_start",
+        0,
+        student_started,
+        format!("seq_len={}", rollout.len()),
+    );
+    let student_hidden = student
+        .forward_hidden_states(store, tape, rollout, positions)
+        .map_err(|err| map_qwen35_forward_error("student windowed KL hidden", err))?;
+    log_opd_window_trace(
+        "kl",
+        "student_hidden_forward_done",
+        0,
+        student_started,
+        format!("tensor_id={student_hidden}"),
+    );
+    record_profile(profile, |profile| {
+        profile.student_forward_seconds += student_started.elapsed().as_secs_f64();
+    });
+    let base_tape_len = tape.entries.len();
+    let base_keep = store.live_ids().into_iter().collect::<HashSet<_>>();
+
+    let mut total_loss = 0.0f32;
+    let mut hidden_grad: Option<TensorId> = None;
+    for (window_offset, window) in windows.into_iter().enumerate() {
+        let window_index = window_offset + 1;
+        let window_started = Instant::now();
+        log_opd_window_trace(
+            "kl",
+            "start",
+            window_index,
+            window_started,
+            format!(
+                "start={} end={} len={} cached_hidden=true",
+                window.start,
+                window.end,
+                window.len()
+            ),
+        );
+        tape.entries.truncate(base_tape_len);
+        tape.set_enabled(true);
+        let mut window_tape = Tape::new();
+        window_tape.set_enabled(false);
+
+        let phase_started = Instant::now();
+        log_opd_window_trace(
+            "kl",
+            "teacher_forward_start",
+            window_index,
+            window_started,
+            "",
+        );
+        let teacher_logits = teacher
+            .forward_logits_window_device(rollout, positions, window, store, &mut window_tape)
+            .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
+        log_opd_window_trace(
+            "kl",
+            "teacher_forward_done",
+            window_index,
+            window_started,
+            format!("shape={:?}", teacher_logits.shape),
+        );
+        record_profile(profile, |profile| {
+            profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        validate_logits_shape(
+            "teacher windowed KL",
+            &teacher_logits.shape,
+            window.len(),
+            vocab,
+        )?;
+
+        window_tape.set_enabled(true);
+        let phase_started = Instant::now();
+        log_opd_window_trace(
+            "kl",
+            "student_logits_window_start",
+            window_index,
+            window_started,
+            "",
+        );
+        let student_logits = student
+            .logits_from_hidden_window(store, &mut window_tape, student_hidden, window)
+            .map_err(|err| map_qwen35_forward_error("student cached-hidden KL", err))?;
+        log_opd_window_trace(
+            "kl",
+            "student_logits_window_done",
+            window_index,
+            window_started,
+            format!("tensor_id={student_logits}"),
+        );
+        let student_shape = store
+            .get(student_logits)
+            .ok_or(AutogradError::InvalidTensorId(student_logits))?
+            .shape
+            .clone();
+        validate_logits_shape("student windowed KL", &student_shape, window.len(), vocab)?;
+        record_profile(profile, |profile| {
+            profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+
+        let phase_started = Instant::now();
+        log_opd_window_trace("kl", "kl_loss_start", window_index, window_started, "");
+        let kl_loss = kl_distill_loss_for_config(
+            student_logits,
+            teacher_logits.tensor_id,
+            window.len(),
+            gkd_config.kl_chunk_size,
+            gkd_config.kl_direction,
+            gkd_config.kl_temperature,
+            store,
+            &mut window_tape,
+        )?;
+        log_opd_window_trace(
+            "kl",
+            "kl_loss_done",
+            window_index,
+            window_started,
+            format!("tensor_id={kl_loss}"),
+        );
+        record_profile(profile, |profile| {
+            profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        let weight = window.len() as f32 / kl_range.len() as f32;
+        log_opd_window_trace("kl", "backward_start", window_index, window_started, "");
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(OpdError::InvalidInput(format!(
+                "OPD window loss weight must be finite and non-negative, got {weight}. \
+                 Hint: verify lambda and window/target counts before Route B backward."
+            )));
+        }
+        let loss_started = Instant::now();
+        let weighted_loss = if (weight - 1.0).abs() < f32::EPSILON {
+            kl_loss
+        } else {
+            mul_scalar(kl_loss, weight, store, &mut window_tape)?
+        };
+        let loss_value = store.to_host(weighted_loss)?[0];
+        validate_loss_value(loss_value)?;
+        total_loss += loss_value;
+        record_profile(profile, |profile| {
+            profile.kl_loss_seconds += loss_started.elapsed().as_secs_f64();
+        });
+
+        let phase_started = Instant::now();
+        let window_grads = window_tape.backward_collect(weighted_loss, store)?;
+        let window_hidden_grad = *window_grads
+            .get(&student_hidden)
+            .ok_or(AutogradError::MissingGradient(student_hidden))?;
+        for &target_id in student_target_params {
+            if target_id == student_hidden {
+                continue;
+            }
+            if let Some(&grad_id) = window_grads.get(&target_id) {
+                store.accumulate_grad(target_id, grad_id)?;
+            }
+        }
+        let mut keep_grads = Vec::with_capacity(2);
+        if let Some(existing_hidden_grad) = hidden_grad {
+            keep_grads.push(existing_hidden_grad);
+        }
+        keep_grads.push(window_hidden_grad);
+        cleanup_window_backward_retaining_base(
+            store,
+            tape,
+            base_tape_len,
+            &base_keep,
+            student_model_params,
+            keep_extra,
+            &keep_grads,
+        );
+        if let Some(existing_hidden_grad) = hidden_grad {
+            accumulate_tensor_grad(store, existing_hidden_grad, window_hidden_grad)?;
+        } else {
+            hidden_grad = Some(window_hidden_grad);
+        }
+        record_profile(profile, |profile| {
+            profile.backward_seconds += phase_started.elapsed().as_secs_f64();
+        });
+        log_opd_window_trace(
+            "kl",
+            "backward_done",
+            window_index,
+            window_started,
+            format!("loss_accum={total_loss:.12e}"),
+        );
+        log_opd_window_trace("kl", "cleanup_start", window_index, window_started, "");
+        cleanup_window_backward_retaining_base(
+            store,
+            tape,
+            base_tape_len,
+            &base_keep,
+            student_model_params,
+            keep_extra,
+            hidden_grad.as_slice(),
+        );
+        log_opd_window_trace("kl", "done", window_index, window_started, "");
+    }
+
+    let hidden_grad = hidden_grad.ok_or(AutogradError::MissingGradient(student_hidden))?;
+    let base_backward_started = Instant::now();
+    log_opd_window_trace(
+        "kl",
+        "base_backward_start",
+        0,
+        base_backward_started,
+        format!("seed_grad_id={hidden_grad}"),
+    );
+    tape.entries.truncate(base_tape_len);
+    tape.set_enabled(false);
+    tape.backward_from_seed_accumulate_targets(
+        student_hidden,
+        hidden_grad,
+        store,
+        student_target_params,
+    )?;
+    log_opd_window_trace("kl", "base_backward_done", 0, base_backward_started, "");
+    record_profile(profile, |profile| {
+        profile.backward_seconds += base_backward_started.elapsed().as_secs_f64();
+    });
+    cleanup_after_backward(store, tape, student_model_params, keep_extra);
+
+    Ok(total_loss)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
@@ -1833,6 +2214,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     vocab: usize,
     gkd_config: GkdLossConfig<'_>,
     window_size: usize,
+    student_target_params: &[TensorId],
     student_model_params: &[TensorId],
     keep_extra: &HashSet<TensorId>,
     store: &mut TensorStore,
@@ -1842,16 +2224,63 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     let mut total_loss = 0.0f32;
     let mut backward_windows = 0usize;
 
+    if gkd_config.lambda == 0.0 {
+        return backward_windowed_pure_kl_cached_student_hidden(
+            student,
+            teacher,
+            prompt_ids,
+            rollout,
+            positions,
+            vocab,
+            gkd_config,
+            window_size,
+            student_target_params,
+            student_model_params,
+            keep_extra,
+            store,
+            tape,
+            profile,
+        );
+    }
+
     if gkd_config.lambda < 1.0 {
         let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
         for window in sequence_windows_for_range(kl_range, window_size)? {
+            let window_index = backward_windows + 1;
+            let window_started = Instant::now();
+            log_opd_window_trace(
+                "kl",
+                "start",
+                window_index,
+                window_started,
+                format!(
+                    "start={} end={} len={}",
+                    window.start,
+                    window.end,
+                    window.len()
+                ),
+            );
             tape.entries.clear();
             tape.set_enabled(false);
 
             let phase_started = Instant::now();
+            log_opd_window_trace(
+                "kl",
+                "teacher_forward_start",
+                window_index,
+                window_started,
+                "",
+            );
             let teacher_logits = teacher
                 .forward_logits_window_device(rollout, positions, window, store, tape)
                 .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
+            log_opd_window_trace(
+                "kl",
+                "teacher_forward_done",
+                window_index,
+                window_started,
+                format!("shape={:?}", teacher_logits.shape),
+            );
             record_profile(profile, |profile| {
                 profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
             });
@@ -1864,9 +2293,23 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
 
             tape.set_enabled(true);
             let phase_started = Instant::now();
+            log_opd_window_trace(
+                "kl",
+                "student_forward_start",
+                window_index,
+                window_started,
+                "",
+            );
             let student_logits = student
                 .forward_logits_window(store, tape, rollout, positions, window)
                 .map_err(|err| map_qwen35_forward_error("student windowed KL", err))?;
+            log_opd_window_trace(
+                "kl",
+                "student_forward_done",
+                window_index,
+                window_started,
+                format!("tensor_id={student_logits}"),
+            );
             let student_shape = store
                 .get(student_logits)
                 .ok_or(AutogradError::InvalidTensorId(student_logits))?
@@ -1878,6 +2321,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
             });
 
             let phase_started = Instant::now();
+            log_opd_window_trace("kl", "kl_loss_start", window_index, window_started, "");
             let kl_loss = kl_distill_loss_for_config(
                 student_logits,
                 teacher_logits.tensor_id,
@@ -1888,13 +2332,30 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
                 store,
                 tape,
             )?;
+            log_opd_window_trace(
+                "kl",
+                "kl_loss_done",
+                window_index,
+                window_started,
+                format!("tensor_id={kl_loss}"),
+            );
             record_profile(profile, |profile| {
                 profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
             });
             let weight = (1.0 - gkd_config.lambda) * (window.len() as f32 / kl_range.len() as f32);
+            log_opd_window_trace("kl", "backward_start", window_index, window_started, "");
             total_loss += backward_weighted_window_loss(kl_loss, weight, store, tape, profile)?;
+            log_opd_window_trace(
+                "kl",
+                "backward_done",
+                window_index,
+                window_started,
+                format!("loss_accum={total_loss:.12e}"),
+            );
             backward_windows += 1;
+            log_opd_window_trace("kl", "cleanup_start", window_index, window_started, "");
             cleanup_after_backward(store, tape, student_model_params, keep_extra);
+            log_opd_window_trace("kl", "done", window_index, window_started, "");
         }
     }
 
@@ -2210,6 +2671,15 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         *profile = OpdStepProfile::default();
     }
     let total_started = Instant::now();
+    log_opd_step_trace(
+        total_started,
+        "start",
+        format!(
+            "prompt_len={} rollout_len={}",
+            prompt_ids.len(),
+            cfg.rollout_len
+        ),
+    );
     validate_step_config(&cfg)?;
     validate_gkd_loss_config(gkd_config)?;
     let vocab = student.config().vocab_size;
@@ -2263,6 +2733,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         let rollout = if let Some(forced_rollout) = forced_rollout {
             tape.entries.clear();
             tape.set_enabled(false);
+            log_opd_step_trace(total_started, "forced_rollout_start", "");
             validate_forced_rollout(forced_rollout, prompt_ids, cfg.rollout_len, vocab)?;
             store.retain_ids(&rollout_keep_base);
             forced_rollout.to_vec()
@@ -2276,6 +2747,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             // as the A/B baseline.
             #[cfg(feature = "cuda")]
             if let Some(ctx) = infer_rollout.as_ref() {
+                log_opd_step_trace(total_started, "infer_rollout_reload_start", "");
                 // OPD engine time-share: the rollout student may have been
                 // offloaded to host RAM during the previous step's backward.
                 // Reload it before the LoRA sync (which re-merges resident base
@@ -2292,17 +2764,24 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                         OpdError::InvalidInput(format!("infer student reload failed: {err}"))
                     })?;
                 }
+                log_opd_step_trace(total_started, "infer_rollout_sync_lora_start", "");
                 ctx.student
                     .sync_lora_from_store(store, &student.adapter_name_map(), ctx.lora_config)
                     .map_err(|err| {
                         OpdError::InvalidInput(format!("infer student LoRA sync failed: {err}"))
                     })?;
+                log_opd_step_trace(total_started, "infer_rollout_generate_start", "");
                 let rollout = ctx
                     .student
                     .generate_rollout(prompt_ids, cfg.rollout_len, rollout_sampling)
                     .map_err(|err| {
                         OpdError::InvalidInput(format!("infer student rollout failed: {err}"))
                     })?;
+                log_opd_step_trace(
+                    total_started,
+                    "infer_rollout_generate_done",
+                    format!("actual_rollout_len={}", rollout.len()),
+                );
                 store.retain_ids(&rollout_keep_base);
                 // NB: the infer student engine is idle after the rollout, but we do
                 // NOT offload it here. Offloading mid-step (before the teacher
@@ -2313,6 +2792,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 // `backward_chunked_kl_rollout`), on a quiesced device.
                 rollout
             } else {
+                log_opd_step_trace(total_started, "train_rollout_start", "");
                 student_rollout_only(
                     student,
                     prompt_ids,
@@ -2324,6 +2804,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             }
             #[cfg(not(feature = "cuda"))]
             {
+                log_opd_step_trace(total_started, "train_rollout_start", "");
                 student_rollout_only(
                     student,
                     prompt_ids,
@@ -2337,6 +2818,110 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
         record_profile(&mut profile, |profile| {
             profile.student_rollout_seconds += phase_started.elapsed().as_secs_f64();
         });
+        log_opd_step_trace(
+            total_started,
+            "student_rollout_done",
+            format!("actual_rollout_len={}", rollout.len()),
+        );
+
+        // 2. Windowed scoring/backward first: Route B is the memory path for
+        // long rollouts and large vocabs. `kl_chunk_size` still chunks softmax
+        // work inside each window, but it must not preempt windowed forward.
+        let positions: Vec<u32> = (0..rollout.len() as u32).collect();
+        if let Some(window_size) = gkd_config.logits_window_size {
+            log_opd_step_trace(
+                total_started,
+                "windowed_route_start",
+                format!("window_size={window_size}"),
+            );
+            let phase_started = Instant::now();
+            optimizer.zero_grad(store, student_params);
+            record_profile(&mut profile, |profile| {
+                profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
+            });
+
+            #[cfg(feature = "cuda")]
+            let student_engine_offloaded = if engine_offload.offloads_student() {
+                if let Some(ctx) = infer_rollout.as_ref() {
+                    log_opd_step_trace(total_started, "infer_rollout_offload_start", "");
+                    store
+                        .backend()
+                        .device_synchronize()
+                        .map_err(OpdError::from)?;
+                    let freed = ctx.student.offload_engine_weights().map_err(|err| {
+                        OpdError::InvalidInput(format!("infer student offload failed: {err}"))
+                    })?;
+                    eprintln!(
+                        "opd_engine_offload student_offloaded freed_bytes={freed} freed_mib={:.1}",
+                        freed as f64 / (1024.0 * 1024.0)
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            log_opd_step_trace(total_started, "windowed_backward_start", "");
+            let loss_result = backward_windowed_gkd_loss(
+                student,
+                teacher,
+                prompt_ids,
+                &rollout,
+                &positions,
+                vocab,
+                gkd_config,
+                window_size,
+                student_params,
+                &student_model_params,
+                &keep_extra,
+                store,
+                tape,
+                &mut profile,
+            );
+            log_opd_step_trace(total_started, "windowed_backward_done", "");
+
+            #[cfg(feature = "cuda")]
+            if student_engine_offloaded {
+                log_opd_step_trace(
+                    total_started,
+                    "infer_rollout_reload_post_backward_start",
+                    "",
+                );
+                store
+                    .backend()
+                    .device_synchronize()
+                    .map_err(OpdError::from)?;
+                if let Some(ctx) = infer_rollout.as_ref() {
+                    ctx.student.reload_engine_weights().map_err(|err| {
+                        OpdError::InvalidInput(format!(
+                            "infer student reload (post-windowed-backward) failed: {err}"
+                        ))
+                    })?;
+                }
+            }
+
+            let loss_value = loss_result?;
+            validate_loss_value(loss_value)?;
+
+            let phase_started = Instant::now();
+            clip_grad_norm(student_params, cfg.grad_clip, store);
+            record_profile(&mut profile, |profile| {
+                profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            let phase_started = Instant::now();
+            optimizer.step(store, student_params)?;
+            record_profile(&mut profile, |profile| {
+                profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            log_opd_step_trace(total_started, "optimizer_step_done", "");
+
+            return Ok(OpdStepOutcome {
+                loss: loss_value,
+                rollout_len: rollout.len(),
+            });
+        }
 
         if let Some(chunk_size) = gkd_config.kl_chunk_size
             && gkd_config.lambda == 0.0
@@ -2429,50 +3014,9 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             });
         }
 
-        // 2. Teacher forward — still tape-disabled. Teacher params carry
+        // 3. Teacher forward — still tape-disabled. Teacher params carry
         //    `requires_grad = false` so no entries record even if tape was on,
         //    but disabling cheap-defends against any rogue grad-bearing weight.
-        let positions: Vec<u32> = (0..rollout.len() as u32).collect();
-        if let Some(window_size) = gkd_config.logits_window_size {
-            let phase_started = Instant::now();
-            optimizer.zero_grad(store, student_params);
-            record_profile(&mut profile, |profile| {
-                profile.optimizer_zero_grad_seconds += phase_started.elapsed().as_secs_f64();
-            });
-
-            let loss_value = backward_windowed_gkd_loss(
-                student,
-                teacher,
-                prompt_ids,
-                &rollout,
-                &positions,
-                vocab,
-                gkd_config,
-                window_size,
-                &student_model_params,
-                &keep_extra,
-                store,
-                tape,
-                &mut profile,
-            )?;
-
-            let phase_started = Instant::now();
-            clip_grad_norm(student_params, cfg.grad_clip, store);
-            record_profile(&mut profile, |profile| {
-                profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
-            });
-            let phase_started = Instant::now();
-            optimizer.step(store, student_params)?;
-            record_profile(&mut profile, |profile| {
-                profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
-            });
-
-            return Ok(OpdStepOutcome {
-                loss: loss_value,
-                rollout_len: rollout.len(),
-            });
-        }
-
         let phase_started = Instant::now();
         let teacher_logits = teacher
             .forward_logits_device(&rollout, &positions, store, tape)

@@ -3546,6 +3546,83 @@ impl Qwen35Model {
         self.forward_batch_indices_profiled(store, tape, &token_indices, &positions, 1, trace)
     }
 
+    pub fn forward_hidden_states(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+    ) -> Result<TensorId> {
+        if input_ids.len() != position_ids.len() {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: input_ids.len(),
+                expected_len: position_ids.len(),
+            });
+        }
+        if input_ids.is_empty() {
+            return Err(Qwen35Error::InvalidConfig(
+                "hidden-state forward requires at least one token",
+            ));
+        }
+        let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let positions = position_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)
+    }
+
+    pub fn logits_from_hidden_window(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        hidden: TensorId,
+        window: SequenceWindow,
+    ) -> Result<TensorId> {
+        if window.start >= window.end {
+            return Err(Qwen35Error::InvalidConfig(
+                "hidden logits window must be non-empty",
+            ));
+        }
+        let hidden_shape = store
+            .get(hidden)
+            .ok_or(AutogradError::InvalidTensorId(hidden))?
+            .shape
+            .clone();
+        if hidden_shape.len() != 3 {
+            return Err(AutogradError::InvalidRank {
+                expected: "3",
+                got: hidden_shape.len(),
+            }
+            .into());
+        }
+        if hidden_shape[0] != 1 || hidden_shape[2] != self.config.hidden_size {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![1, hidden_shape[1], self.config.hidden_size],
+                got: hidden_shape.clone(),
+            }
+            .into());
+        }
+        if window.end > hidden_shape[1] {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: window.end,
+                expected_len: hidden_shape[1],
+            });
+        }
+        let hidden_window = if window.start == 0 && window.end == hidden_shape[1] {
+            hidden
+        } else {
+            slice(
+                hidden,
+                &[0, window.start, 0],
+                &[1, window.end, self.config.hidden_size],
+                store,
+                tape,
+            )?
+        };
+        linear_forward(hidden_window, self.lm_head, store, tape)
+    }
+
     #[doc(hidden)]
     pub fn forward_with_moe_routes_for_diagnostics(
         &self,
@@ -3843,18 +3920,7 @@ impl SequenceWindowedForward for Qwen35Model {
             .collect::<Vec<_>>();
         let hidden =
             self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)?;
-        let hidden_window = if window.start == 0 && window.end == prefix_len {
-            hidden
-        } else {
-            slice(
-                hidden,
-                &[0, window.start, 0],
-                &[1, window.end, self.config.hidden_size],
-                store,
-                tape,
-            )?
-        };
-        linear_forward(hidden_window, self.lm_head, store, tape)
+        self.logits_from_hidden_window(store, tape, hidden, window)
     }
 }
 

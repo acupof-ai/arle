@@ -394,8 +394,8 @@ mod tests {
             Tensor::new(teacher_logits.to_vec(), shape.to_vec(), false).expect("teacher logits"),
         );
         // Mirror `kl_distill_loss`'s `batchmean` scale: `mean` over (positions ×
-        // vocab) then `* vocab` to recover `sum_v / positions`. -1.0 * vocab and
-        // +1.0 * vocab match the real path's `-temperature_sq * vocab_scale` /
+        // vocab) then `* vocab` to recover `sum_v / positions`. `-vocab` and
+        // `vocab` match the real path's `-temperature_sq * vocab_scale` /
         // `temperature_sq * vocab_scale` at temperature == 1.0 byte-for-byte.
         let vocab = shape.last().copied().expect("vocab dim") as f32;
         let loss = match direction {
@@ -406,7 +406,7 @@ mod tests {
                 let weighted =
                     mul(teacher_probs, student_log_probs, &mut store, &mut tape).expect("weighted");
                 let avg = mean(weighted, &mut store, &mut tape).expect("mean");
-                mul_scalar(avg, -1.0 * vocab, &mut store, &mut tape).expect("forward loss")
+                mul_scalar(avg, -vocab, &mut store, &mut tape).expect("forward loss")
             }
             KlDirection::Reverse => {
                 let student_probs = softmax(student, &mut store, &mut tape).expect("student probs");
