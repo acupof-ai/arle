@@ -43,7 +43,7 @@ existing handwritten BF16 GEMV kernel, one column at a time, before touching any
 cuBLAS handle:
 
 ```text
-N > 0 && N < 16 && K*sizeof(bf16) <= 48 KiB -> handwritten GEMV loop
+N > 0 && N <= 16 && K*sizeof(bf16) <= 48 KiB -> handwritten GEMV loop
 otherwise -> existing cuBLAS/Lt path
 ```
 
@@ -106,6 +106,19 @@ grep 'Floating point exception|SIGFPE|received signal' -> no matches
 ...
 [qwen-layer-profile] qwen/forward_hidden layer=na seq=1 cuda_ms=25.635 host_ms=25.635
 [qwen-layer-profile] qwen/sample layer=na seq=1 cuda_ms=0.041 host_ms=0.040
+```
+
+Follow-up HTTP chat gate showed the boundary matters: the first chat request
+crashed at exactly `N=16` with the same libcublasLt divide-error class. The
+fallback threshold was therefore tightened to include `N=16`, still leaving the
+normal `N=64` chunked-prefill path on cuBLAS/Lt:
+
+```text
+log=/data01/arle-f2-probes/f2_bf16_profile_serve.log
+
+[qwen-layer-profile] qwen/embedding layer=na seq=16 cuda_ms=0.195 host_ms=0.192
+[qwen-layer-profile] qwen/input_norm layer=0 seq=16 cuda_ms=0.168 host_ms=0.163
+[qwen-gemm-profile] format=dense_bf16 M=8192 N=16 K=2048
 ```
 
 ## Rule
