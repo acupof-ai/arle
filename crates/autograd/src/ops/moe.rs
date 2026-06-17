@@ -594,16 +594,47 @@ pub fn moe_grouped_linear(
         validate_grouped_linear_input(&input_t.shape, experts, routes, input_kind, store)?;
     let (out_dim, expert_shapes) = validate_grouped_linear_experts(experts, in_dim, store)?;
 
-    let (active_expert_indices, _) = active_expert_map(experts_len, routes)?;
+    let (active_expert_indices, active_expert_map) = active_expert_map(experts_len, routes)?;
+    let active_routes = remap_routes_to_active(routes, &active_expert_map)?;
+    let packed_input_shape = vec![active_expert_indices.len(), max_rows, in_dim];
+    let resident_base_output = if store.backend().device() == Device::Cuda {
+        let packed_input = pack_active_grouped_input(
+            &input_t.data,
+            &input_t.shape,
+            input_kind,
+            &active_routes,
+            &active_expert_indices,
+            max_rows,
+            in_dim,
+        )?;
+        grouped_base_forward_resident(
+            store,
+            experts,
+            &active_expert_indices,
+            &packed_input,
+            &packed_input_shape,
+            max_rows,
+            in_dim,
+            out_dim,
+        )?
+    } else {
+        None
+    };
+    let resident_base_forward = resident_base_output.is_some();
     let mut route_lookup = vec![None; experts_len * max_rows];
     for route in routes {
         route_lookup[route.expert * max_rows + route.row] = Some(*route);
     }
 
-    let mut out = vec![0.0_f32; experts_len * max_rows * out_dim];
+    let mut out =
+        resident_base_output.unwrap_or_else(|| vec![0.0_f32; experts_len * max_rows * out_dim]);
     for &expert_index in &active_expert_indices {
         let expert = experts[expert_index];
-        let weight = store.tensor_host(expert.weight)?;
+        let weight = if resident_base_forward {
+            None
+        } else {
+            Some(store.tensor_host(expert.weight)?)
+        };
         let lora_a = match expert.lora_a {
             Some(id) => Some(store.tensor_host(id)?),
             None => None,
@@ -627,17 +658,30 @@ pub fn moe_grouped_linear(
             };
             let x = &input_t.data[input_offset..input_offset + in_dim];
             let out_offset = (expert_index * max_rows + row) * out_dim;
-            grouped_linear_row_forward(
-                x,
-                &weight.data,
-                out_dim,
-                in_dim,
-                lora_a.as_ref().map(|t| t.data.as_slice()),
-                lora_b.as_ref().map(|t| t.data.as_slice()),
-                expert_shapes[expert_index].rank,
-                expert.lora_scale,
-                &mut out[out_offset..out_offset + out_dim],
-            );
+            if let Some(weight) = weight.as_ref() {
+                grouped_linear_row_forward(
+                    x,
+                    &weight.data,
+                    out_dim,
+                    in_dim,
+                    lora_a.as_ref().map(|t| t.data.as_slice()),
+                    lora_b.as_ref().map(|t| t.data.as_slice()),
+                    expert_shapes[expert_index].rank,
+                    expert.lora_scale,
+                    &mut out[out_offset..out_offset + out_dim],
+                );
+            } else {
+                grouped_lora_delta_row_forward(
+                    x,
+                    out_dim,
+                    in_dim,
+                    lora_a.as_ref().map(|t| t.data.as_slice()),
+                    lora_b.as_ref().map(|t| t.data.as_slice()),
+                    expert_shapes[expert_index].rank,
+                    expert.lora_scale,
+                    &mut out[out_offset..out_offset + out_dim],
+                );
+            }
         }
     }
 
@@ -1367,6 +1411,35 @@ fn grouped_linear_row_forward(
     }
 }
 
+fn grouped_lora_delta_row_forward(
+    x: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    lora_a: Option<&[f32]>,
+    lora_b: Option<&[f32]>,
+    rank: usize,
+    lora_scale: f32,
+    out: &mut [f32],
+) {
+    let (Some(a), Some(b)) = (lora_a, lora_b) else {
+        return;
+    };
+    if rank == 0 {
+        return;
+    }
+    let mut low = vec![0.0_f32; rank];
+    for r in 0..rank {
+        low[r] = dot(x, &a[r * in_dim..(r + 1) * in_dim]);
+    }
+    for n in 0..out_dim {
+        let mut delta = 0.0_f64;
+        for r in 0..rank {
+            delta += f64::from(low[r]) * f64::from(b[n * rank + r]);
+        }
+        out[n] += (delta * f64::from(lora_scale)) as f32;
+    }
+}
+
 fn active_expert_map(
     experts: usize,
     routes: &[MoeGroupedRoute],
@@ -1616,6 +1689,86 @@ fn pack_grouped_weight_t(
         }
     }
     Ok(packed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_base_forward_resident(
+    store: &TensorStore,
+    experts: &[MoeGroupedLinearExpert],
+    active_expert_indices: &[usize],
+    packed_input: &[f32],
+    packed_input_shape: &[usize],
+    max_rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Option<Vec<f32>>> {
+    if store.backend().device() != Device::Cuda {
+        return Ok(None);
+    }
+    if packed_input_shape != [active_expert_indices.len(), max_rows, in_dim] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![active_expert_indices.len(), max_rows, in_dim],
+            got: packed_input_shape.to_vec(),
+        });
+    }
+
+    let mut weight_handles = Vec::with_capacity(active_expert_indices.len());
+    for &expert_index in active_expert_indices {
+        let expert = experts[expert_index];
+        let tensor = store.tensor(expert.weight)?;
+        if tensor.shape != [out_dim, in_dim] {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![out_dim, in_dim],
+                got: tensor.shape.clone(),
+            });
+        }
+        if tensor.requires_grad || tensor.dirty == Dirty::Host {
+            return Ok(None);
+        }
+        let Some(handle) = tensor.device_handle.as_ref().cloned() else {
+            return Ok(None);
+        };
+        weight_handles.push(handle);
+    }
+
+    let mut out = vec![0.0_f32; experts.len() * max_rows * out_dim];
+    let a_shape = [max_rows, in_dim];
+    let b_shape = [out_dim, in_dim];
+    let input_stride = max_rows * in_dim;
+    let output_stride = max_rows * out_dim;
+    for (compact, (&expert_index, weight_handle)) in active_expert_indices
+        .iter()
+        .zip(weight_handles.iter())
+        .enumerate()
+    {
+        let input_start = compact * input_stride;
+        let a_handle = store.backend().upload(
+            &packed_input[input_start..input_start + input_stride],
+            &a_shape,
+        )?;
+        let (out_handle, out_shape) =
+            store
+                .backend()
+                .matmul_bt(&a_handle, &a_shape, weight_handle, &b_shape)?;
+        if out_shape != [max_rows, out_dim] {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![max_rows, out_dim],
+                got: out_shape,
+            });
+        }
+        store.backend().eval(&[&out_handle])?;
+        let host = store.backend().readback(&out_handle)?;
+        if host.len() != output_stride {
+            return Err(AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: vec![max_rows, out_dim],
+                size: output_stride,
+            });
+        }
+        let out_start = (expert_index * max_rows) * out_dim;
+        out[out_start..out_start + output_stride].copy_from_slice(&host);
+    }
+    Ok(Some(out))
 }
 
 #[allow(clippy::too_many_arguments)]
