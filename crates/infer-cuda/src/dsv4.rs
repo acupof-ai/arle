@@ -268,41 +268,25 @@ pub(crate) struct Dsv4SlotImage {
 pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
 pub(crate) const DEFAULT_SPEC_DRAFT_DEPTH: usize = 2;
 
-/// Max draft-tree node count (root + drafts) the per-slot node scratch and
-/// commit-fold cache are sized for. Runtime `depth/topk` must fit this complete
-/// tree; otherwise fail loud instead of silently pruning branches. 64 covers
-/// topk=2 depth=5 (63 rows) and topk=4 depth=2 (21 rows).
-pub(crate) const MAX_SPEC_TREE_NODES: usize = 64;
 pub(crate) const DEFAULT_SPEC_DRAFT_TOPK: usize = 1;
 
-/// Row schedule for one speculative verify forward: per-row absolute positions
-/// plus the ring-slot replay needed by tree rows whose same-depth siblings have
-/// overwritten an ancestor's sliding-window ring slot. A topk=1 chain has no
-/// restores/saves and keeps the previous linear verify behavior.
+/// Row schedule for one speculative verify forward. Top-k draft candidates do
+/// not change this shape: the target model verifies the top-1 chain only, so
+/// rows are always strictly increasing positions.
 pub(crate) struct SpecVerifySchedule {
     /// Per row: absolute position (`start_pos + node depth`).
     pub(crate) positions: Vec<usize>,
-    /// Per row: source rows whose parked ring slots must be replayed before this
-    /// row's attention. Values are row/node indices in the same flattened tree.
-    pub(crate) restores: Vec<Vec<usize>>,
-    /// Per row: park this row's just-written ring slot after attention because a
-    /// later row may need it as an ancestor.
-    pub(crate) saves: Vec<bool>,
 }
 
 impl SpecVerifySchedule {
     pub(crate) fn chain(n: usize, start_pos: usize) -> Self {
         Self {
             positions: (0..n).map(|r| start_pos + r).collect(),
-            restores: vec![Vec::new(); n],
-            saves: vec![false; n],
         }
     }
 
     pub(crate) fn is_chain(&self) -> bool {
-        self.restores.iter().all(Vec::is_empty)
-            && self.saves.iter().all(|&save| !save)
-            && self.positions.windows(2).all(|w| w[1] == w[0] + 1)
+        self.positions.windows(2).all(|w| w[1] == w[0] + 1)
     }
 }
 
@@ -318,11 +302,6 @@ pub(crate) struct SpecVerifyResult {
 /// ([`Dsv4Model::mtp_forward_level`]).
 pub(crate) struct MtpDraftRow {
     pub token: u32,
-    pub node: usize,
-    /// `(node, abs_pos)` parked slots to replay before this row's MTP attention.
-    pub restores: Vec<(usize, usize)>,
-    /// Park this row's just-written MTP ring slot after attention.
-    pub save: bool,
 }
 
 pub(crate) struct Dsv4SlotState {
@@ -332,12 +311,8 @@ pub(crate) struct Dsv4SlotState {
     /// pre-allocated ONCE here (no per-step alloc). One entry per attention layer,
     /// index-aligned with `attention`.
     spec_rings: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
-    /// Per-attention-layer node scratch for MTP tree draft/verify. Saves a row's
-    /// just-written SW/FP8 ring slot so a later same-depth sibling can replay the
-    /// correct ancestor branch. `topk=1` never touches it.
-    spec_nodes: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
     /// P2 commit-fold scratch: per-layer attn-normed verify rows
-    /// (`[hidden, MAX_SPEC_TREE_NODES]`), persisted by the verify lane so
+    /// (`[hidden, MAX_SPEC_DRAFT_DEPTH + 1]`), persisted by the verify lane so
     /// the commit can re-ingest the accepted prefix (compressor/indexer + ring
     /// K) without a second full forward. `Some` only when
     /// `model.spec_decode_on`.
@@ -645,27 +620,17 @@ impl Dsv4SlotState {
         } else {
             None
         };
-        let spec_nodes = if model.spec_decode_on {
-            let mut nodes = Vec::with_capacity(attention.len());
-            for state in &attention {
-                nodes.push(state.alloc_spec_ring_snapshot(
-                    &model.ctx,
-                    &model.config,
-                    &model.kv_arena,
-                    MAX_SPEC_TREE_NODES - 1,
-                )?);
-            }
-            Some(nodes)
-        } else {
-            None
-        };
         // P2 commit-fold scratch: per-layer persisted verify rows.
         let spec_normed = if model.spec_decode_on {
             let mut cache = Vec::with_capacity(attention.len());
             for _ in 0..attention.len() {
                 // SAFETY: rows are written by the verify lane before any read.
                 cache.push(unsafe {
-                    HiddenStates::uninit(&model.ctx, model.config.hidden_size, MAX_SPEC_TREE_NODES)?
+                    HiddenStates::uninit(
+                        &model.ctx,
+                        model.config.hidden_size,
+                        MAX_SPEC_DRAFT_DEPTH + 1,
+                    )?
                 });
             }
             Some(cache)
@@ -695,7 +660,6 @@ impl Dsv4SlotState {
         Ok(Self {
             attention,
             spec_rings,
-            spec_nodes,
             spec_normed,
             start_pos_device,
             decode_graph: None,
@@ -707,9 +671,8 @@ impl Dsv4SlotState {
     }
 
     /// Exact requested device bytes owned by this ONE slot: the per-layer
-    /// attention states + the per-layer spec-ring snapshots + tree node scratch
-    /// + the per-layer spec-normed commit-fold scratch + the `start_pos_device`
-    /// scalar.
+    /// attention states + the per-layer spec-ring snapshots + the per-layer
+    /// spec-normed commit-fold scratch + the `start_pos_device` scalar.
     ///
     /// EXCLUDED (and why):
     /// - `decode_graph`: `None` at slot construction (lazy, captured on the
@@ -732,10 +695,6 @@ impl Dsv4SlotState {
             .spec_rings
             .as_ref()
             .map_or(0, |rings| rings.iter().map(|r| r.device_bytes()).sum());
-        let spec_nodes_bytes: usize = self
-            .spec_nodes
-            .as_ref()
-            .map_or(0, |nodes| nodes.iter().map(|r| r.device_bytes()).sum());
         let spec_normed_bytes: usize = self
             .spec_normed
             .as_ref()
@@ -743,7 +702,6 @@ impl Dsv4SlotState {
         vec![
             ("attention(per-layer)", attention_bytes),
             ("spec_rings", spec_rings_bytes),
-            ("spec_nodes", spec_nodes_bytes),
             ("spec_normed", spec_normed_bytes),
             (
                 "start_pos_device",
@@ -1733,13 +1691,6 @@ impl Dsv4Model {
             sched.positions.len() == tokens.len(),
             "DSv4 verify schedule rows {} != tokens {}",
             sched.positions.len(),
-            tokens.len()
-        );
-        ensure!(
-            sched.restores.len() == tokens.len() && sched.saves.len() == tokens.len(),
-            "DSv4 verify schedule fixup rows restores={} saves={} != tokens {}",
-            sched.restores.len(),
-            sched.saves.len(),
             tokens.len()
         );
         let _nvtx = crate::nvtx::range("dsv4/lm_head_verify");
@@ -3183,12 +3134,13 @@ impl Dsv4Model {
     /// - `slots[s].start_pos_device`: SCRATCH — H2D'd per row before that row's
     ///   attention; every decode-path attention reads it fresh.
     /// - `slots[s].seq_len`: NOT mutated here (no commit). The caller advances it
-    ///   on the per-slot commit re-forward. (Contrast `forward_decode_batch_stream_impl`,
-    ///   which advances seq_len because it IS the commit.)
-    /// - `slot.spec_normed`: NOT touched — commit-fold is DISABLED for the
-    ///   batched path (the combined `[M,hidden]` normed would scatter the wrong
-    ///   slot's rows into a slot's fold cache; codex P2). The caller commits via
-    ///   per-slot re-forward only.
+    ///   in the fold commit or per-slot re-forward. (Contrast
+    ///   `forward_decode_batch_stream_impl`, which advances seq_len because it IS
+    ///   the commit.)
+    /// - `slot.spec_normed`: written only when `fold=true`. The combined
+    ///   `[M,hidden]` normed is sliced by slot and copied into the owning slot's
+    ///   cache; `fold=false` skips this and the caller commits via per-slot
+    ///   re-forward.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_decode_batch_verify(
         &self,
@@ -3232,7 +3184,7 @@ impl Dsv4Model {
             );
             ensure!(
                 scheds[s].is_chain(),
-                "DSv4 cross-slot batched MTP verify currently supports topk=1 chains only"
+                "DSv4 cross-slot batched MTP verify requires chain-shaped schedules"
             );
             let slot = &slots[slot_ids[s]];
             ensure!(
@@ -3771,9 +3723,9 @@ impl Dsv4Model {
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(sched) = verify.filter(|_| seq_len > 1) {
                 // MTP verify: attention PER ROW on the seq_len==1 decode path
-                // (device start_pos), in schedule order. Tree schedules replay
-                // parked ancestor ring slots before a row attends, then park rows
-                // that a later sibling may need. A chain has no fixups.
+                // (device start_pos), in strict top-1 chain order. Top-k draft
+                // candidates are interpreted after this logits matrix is produced;
+                // they never add verifier rows or branch replay here.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_per_token");
                 if let Some(cache) = slot.spec_normed.as_mut() {
                     let rows = seq_len * hidden_size;
@@ -3791,23 +3743,6 @@ impl Dsv4Model {
                     kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 for r in 0..seq_len {
                     let pos_r = sched.positions[r];
-                    for &source_row in &sched.restores[r] {
-                        ensure!(
-                            source_row < seq_len,
-                            "DSv4 verify restore source row {source_row} out of {seq_len}"
-                        );
-                        let snaps = slot
-                            .spec_nodes
-                            .as_ref()
-                            .ok_or_else(|| anyhow!("DSv4 MTP tree verify needs node scratch"))?;
-                        slot.attention[layer_idx].restore_spec_node_slot(
-                            &self.ctx,
-                            layer_pool,
-                            &snaps[layer_idx],
-                            source_row,
-                            sched.positions[source_row],
-                        )?;
-                    }
                     let pos_r_i32 = i32::try_from(pos_r)
                         .map_err(|_| anyhow!("DSv4 verify pos {pos_r} overflows i32"))?;
                     self.ctx
@@ -3838,19 +3773,6 @@ impl Dsv4Model {
                         attn_out_row,
                         &mut keepalive,
                     )?;
-                    if sched.saves[r] {
-                        let snaps = slot
-                            .spec_nodes
-                            .as_mut()
-                            .ok_or_else(|| anyhow!("DSv4 MTP tree verify needs node scratch"))?;
-                        slot.attention[layer_idx].save_spec_node_slot(
-                            &self.ctx,
-                            layer_pool,
-                            &mut snaps[layer_idx],
-                            r,
-                            pos_r,
-                        )?;
-                    }
                     let mut dst = attn_out
                         .data
                         .slice_mut(r * hidden_size..(r + 1) * hidden_size);
@@ -4211,14 +4133,11 @@ impl Dsv4Model {
         Ok((stream, keepalive))
     }
 
-    /// Draft a whole tree LEVEL in one MTP forward (fast-path plan P3). All
-    /// `rows` are siblings/cousins at the same draft depth — one shared
-    /// absolute `position` — so the point-wise pipeline (embed, e/h
-    /// projections, HC wraps, MoE, lm_head) batches over `m = rows.len()`
-    /// and only the target-layer attention runs per row (with the ring
-    /// park/replay fix-ups inline, since sibling expansions share the ring
-    /// slot at their depth). Candidates come from k rounds of device argmax
-    /// + mask — no full-vocab D2H. `m == 1, k == 1` is the chain draft.
+    /// Draft one MTP matrix level. `rows` is the chain batch for this level
+    /// (single-slot path uses `m == 1`; cross-slot batched draft uses one row per
+    /// slot). The point-wise pipeline batches over `m`, target-layer attention
+    /// runs per row at `position`, and candidates come from k rounds of device
+    /// argmax + mask — no full-vocab D2H.
     ///
     /// Returns per row: top-k candidate tokens (highest first) + the wide
     /// MTP stream the row's children chain from.
@@ -4313,8 +4232,9 @@ impl Dsv4Model {
         keepalive.keep_hidden(&h_proj);
         keepalive.keep_hidden(&stream);
 
-        // ── ONE MTP transformer layer over the batch; attention per row with
-        // ring park/replay (siblings share the target layer's depth slot).
+        // ── ONE MTP transformer layer over the batch; attention per row at the
+        // chain position. Top-k widens the logits readout only; it does not add
+        // branch rows here.
         let layer = &mtp.layer;
         let target_layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
         ensure!(
@@ -4354,20 +4274,7 @@ impl Dsv4Model {
             keepalive.keep_hidden(&attn_row);
             let (layer_pool, mut dsa_shared, mut flashmla_scratch, mut prefill_shared) =
                 kv_adapter.layer_and_dsa_shared_mut(target_layer_idx)?;
-            for (r, row) in rows.iter().enumerate() {
-                for &(node, abs_pos) in &row.restores {
-                    let snaps = slot
-                        .spec_nodes
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("DSv4 MTP draft replay needs node scratch"))?;
-                    slot.attention[target_layer_idx].restore_spec_node_slot(
-                        ctx,
-                        layer_pool,
-                        &snaps[target_layer_idx],
-                        node,
-                        abs_pos,
-                    )?;
-                }
+            for r in 0..rows.len() {
                 let src = attn_normed
                     .data
                     .slice(r * hidden_size..(r + 1) * hidden_size);
@@ -4393,19 +4300,6 @@ impl Dsv4Model {
                     &mut attn_row,
                     &mut keepalive,
                 )?;
-                if row.save {
-                    let snaps = slot
-                        .spec_nodes
-                        .as_mut()
-                        .ok_or_else(|| anyhow!("DSv4 MTP draft park needs node scratch"))?;
-                    slot.attention[target_layer_idx].save_spec_node_slot(
-                        ctx,
-                        layer_pool,
-                        &mut snaps[target_layer_idx],
-                        row.node,
-                        position as usize,
-                    )?;
-                }
                 let mut dst = attn_out
                     .data
                     .slice_mut(r * hidden_size..(r + 1) * hidden_size);
@@ -4538,7 +4432,7 @@ impl Dsv4Model {
     /// ring/position): this is the orthogonal batching axis — N slots, ONE row
     /// each, each slot its OWN ring + position. The head math (embed / enorm /
     /// e_proj / hnorm / h_proj / stream-combine), MoE / shared / all-reduce, and
-    /// head_hc + lm_head + argmax all batch over the N rows exactly as
+    /// head_hc + lm_head + top-k all batch over the N rows exactly as
     /// `mtp_forward_level` already batches over `m`; ONLY the attention differs —
     /// a PER-SLOT loop (each slot's `attention[target_layer]` ring at its own
     /// `positions[s]`), mirroring `forward_decode_batch_verify`'s per-slot
@@ -4554,7 +4448,8 @@ impl Dsv4Model {
     ///   are snapshotted PRE-DRAFT by the caller's `capture_spec_rings` and the
     ///   rejected tail restored by `restore_spec_ring_tail` (caller owns that).
     /// - Per-slot h_prev STREAMS: returned as the `DeviceVec` half of each
-    ///   `(token, stream)` — the caller chains level i+1 from this per slot.
+    ///   `(candidates, stream)` — the caller chains level i+1 from
+    ///   `candidates[0]` per slot and keeps the whole candidate row.
     /// - `slots[s].seq_len` / `spec_normed` / committed KV: NOT touched (the
     ///   draft attention writes the speculative ring tail only; commit is the
     ///   caller's separate fold / re-forward).
@@ -4566,7 +4461,8 @@ impl Dsv4Model {
         rows: &[MtpDraftRow],
         h_prevs: &[&DeviceVec],
         positions: &[u64],
-    ) -> Result<Vec<(u32, DeviceVec)>> {
+        top_k: usize,
+    ) -> Result<Vec<(Vec<u32>, DeviceVec)>> {
         ensure!(
             self.spec_decode_on,
             "DSv4 MTP forward called while spec decode is off (need --spec-type mtp / \
@@ -4822,7 +4718,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&moe_with_shared);
         keepalive.keep_hidden(&ffn_stream);
 
-        // ── Head: per-row HC fold + norm, batched lm_head, device argmax.
+        // ── Head: per-row HC fold + norm, batched lm_head, device top-k.
         let mut head_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         {
             let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
@@ -4849,7 +4745,7 @@ impl Dsv4Model {
         let mut logits = unsafe { HiddenStates::uninit(ctx, self.lm_head.rows, m)? };
         self.lm_head_project_batch(&head_normed, &mut logits)?;
         keepalive.keep_hidden(&logits);
-        let candidates = self.mtp_argmax_batch(&logits)?;
+        let candidates = self.mtp_topk_device(&mut logits, top_k.max(1))?;
         std::hint::black_box(keepalive.len());
         drop(keepalive);
 
@@ -4857,7 +4753,7 @@ impl Dsv4Model {
         // next level from its OWN row only — no cross-slot aliasing).
         ensure!(
             candidates.len() == n,
-            "DSv4 batched MTP level produced {} tokens for {n} slots",
+            "DSv4 batched MTP level produced {} candidate rows for {n} slots",
             candidates.len()
         );
         let mut out = Vec::with_capacity(n);
@@ -4896,8 +4792,8 @@ impl Dsv4Model {
         crate::attention::dsv4_linear(&self.ctx, &self.lm_head, x, out)
     }
 
-    /// Batched device argmax over `[m, vocab]` logits — one launch, one
-    /// D2H of m ids (the chain draft is greedy; width was deleted).
+    /// Batched device argmax over `[m, vocab]` verifier logits — one launch,
+    /// one D2H of m target top-1 ids.
     fn mtp_argmax_batch(&self, logits: &HiddenStates) -> Result<Vec<u32>> {
         let ctx = &self.ctx;
         let m = logits.seq_len;
