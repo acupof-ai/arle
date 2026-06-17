@@ -265,6 +265,48 @@ fn maybe_tp_all_reduce(
     }
 }
 
+fn trace_model_component(trace: bool, component: &'static str, duration: Duration) {
+    if trace {
+        println!(
+            "qwen35_full_forward_trace scope=model component={} seconds={:.6}",
+            component,
+            duration.as_secs_f64()
+        );
+    }
+}
+
+fn trace_forward_component(
+    trace: bool,
+    layer_index: usize,
+    component: &'static str,
+    duration: Duration,
+) {
+    if trace {
+        println!(
+            "qwen35_full_forward_trace scope=layer layer={} component={} seconds={:.6}",
+            layer_index,
+            component,
+            duration.as_secs_f64()
+        );
+    }
+}
+
+fn trace_attention_component(
+    trace: bool,
+    layer_index: usize,
+    component: &'static str,
+    duration: Duration,
+) {
+    if trace {
+        println!(
+            "qwen35_full_forward_trace scope=attention layer={} component={} seconds={:.6}",
+            layer_index,
+            component,
+            duration.as_secs_f64()
+        );
+    }
+}
+
 impl Qwen35KvCache {
     pub fn new(model: &Qwen35Model, max_seq_len: usize) -> Self {
         Self {
@@ -311,6 +353,12 @@ pub struct Qwen35AttentionForwardProfile {
     pub gate: Duration,
     pub merge: Duration,
     pub o_proj: Duration,
+    pub linear_qkv_proj: Duration,
+    pub linear_z_proj: Duration,
+    pub linear_b_proj: Duration,
+    pub linear_a_proj: Duration,
+    pub linear_core: Duration,
+    pub linear_out_proj: Duration,
 }
 
 #[doc(hidden)]
@@ -551,6 +599,122 @@ impl Qwen35Layer {
         )?;
         let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
         Ok(add(x, mlp_out, store, tape)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_profiled(
+        &self,
+        layer_index: usize,
+        x: TensorId,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos: TensorId,
+        sin: TensorId,
+        trace: bool,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<(TensorId, Qwen35LayerForwardProfile)> {
+        let x_shape = store
+            .get(x)
+            .ok_or(AutogradError::InvalidTensorId(x))?
+            .shape
+            .clone();
+        if x_shape.len() != 3 {
+            return Err(AutogradError::InvalidRank {
+                expected: "rank-3 hidden states [batch, seq, hidden]",
+                got: x_shape.len(),
+            }
+            .into());
+        }
+        let batch = x_shape[0];
+        let seq_len = x_shape[1];
+        let mut profile = Qwen35LayerForwardProfile::default();
+
+        let started = Instant::now();
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        profile.input_rmsnorm += started.elapsed();
+        trace_forward_component(trace, layer_index, "input_rmsnorm", profile.input_rmsnorm);
+
+        let started = Instant::now();
+        let attn_out = match &self.self_attn {
+            Qwen35Attention::Full(attn) => {
+                let mut attention_profile = Qwen35AttentionForwardProfile::default();
+                let out = self.forward_full_attention_profiled(
+                    layer_index,
+                    h,
+                    attn,
+                    cfg,
+                    tp,
+                    cos,
+                    sin,
+                    batch,
+                    seq_len,
+                    trace,
+                    store,
+                    tape,
+                    &mut attention_profile,
+                )?;
+                profile.attention_detail = attention_profile;
+                out
+            }
+            Qwen35Attention::Linear(attn) => {
+                let mut attention_profile = Qwen35AttentionForwardProfile::default();
+                let out = self.forward_linear_attention_profiled(
+                    layer_index,
+                    h,
+                    attn,
+                    cfg,
+                    batch,
+                    seq_len,
+                    trace,
+                    store,
+                    tape,
+                    &mut attention_profile,
+                )?;
+                profile.attention_detail = attention_profile;
+                out
+            }
+        };
+        profile.attention += started.elapsed();
+        trace_forward_component(trace, layer_index, "attention_total", profile.attention);
+
+        let started = Instant::now();
+        let x = add(x, attn_out, store, tape)?;
+        profile.attention_residual += started.elapsed();
+        trace_forward_component(
+            trace,
+            layer_index,
+            "attention_residual",
+            profile.attention_residual,
+        );
+
+        let started = Instant::now();
+        let h = qwen35_rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        profile.post_attention_rmsnorm += started.elapsed();
+        trace_forward_component(
+            trace,
+            layer_index,
+            "post_attention_rmsnorm",
+            profile.post_attention_rmsnorm,
+        );
+
+        let started = Instant::now();
+        let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
+        profile.mlp += started.elapsed();
+        trace_forward_component(trace, layer_index, "mlp", profile.mlp);
+
+        let started = Instant::now();
+        let out = add(x, mlp_out, store, tape)?;
+        profile.mlp_residual += started.elapsed();
+        trace_forward_component(trace, layer_index, "mlp_residual", profile.mlp_residual);
+
+        Ok((out, profile))
     }
 
     fn forward_with_kv_cache(
@@ -925,6 +1089,155 @@ impl Qwen35Layer {
         )?;
         let out = attn.o_proj.forward(attn_hidden, store, tape)?;
         maybe_tp_all_reduce(out, tp, store, tape)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full_attention_profiled(
+        &self,
+        layer_index: usize,
+        h: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos: TensorId,
+        sin: TensorId,
+        batch: usize,
+        seq_len: usize,
+        trace: bool,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        profile: &mut Qwen35AttentionForwardProfile,
+    ) -> Result<TensorId> {
+        let started = Instant::now();
+        let q_full = attn.q_proj.forward(h, store, tape)?;
+        profile.q_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "q_proj", profile.q_proj);
+
+        let local_attention_heads = tp.local_attention_heads(cfg)?;
+        let local_key_value_heads = tp.local_key_value_heads(cfg)?;
+        let started = Instant::now();
+        let (q, gate) = if cfg.full_attn_gated {
+            let q_full = reshape(
+                q_full,
+                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            let q = slice(
+                q_full,
+                &[0, 0, 0, 0],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            let gate = slice(
+                q_full,
+                &[0, 0, 0, cfg.head_dim],
+                &[batch, seq_len, local_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            (
+                transpose(q, 1, 2, store, tape)?,
+                Some(transpose(gate, 1, 2, store, tape)?),
+            )
+        } else {
+            let q = reshape(
+                q_full,
+                &[batch, seq_len, local_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            (transpose(q, 1, 2, store, tape)?, None)
+        };
+        profile.q_layout += started.elapsed();
+        trace_attention_component(trace, layer_index, "q_layout", profile.q_layout);
+
+        let started = Instant::now();
+        let k = attn.k_proj.forward(h, store, tape)?;
+        profile.k_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "k_proj", profile.k_proj);
+
+        let started = Instant::now();
+        let v = attn.v_proj.forward(h, store, tape)?;
+        profile.v_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "v_proj", profile.v_proj);
+
+        let started = Instant::now();
+        let k = split_heads(
+            k,
+            batch,
+            seq_len,
+            local_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let v = split_heads(
+            v,
+            batch,
+            seq_len,
+            local_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        profile.kv_split += started.elapsed();
+        trace_attention_component(trace, layer_index, "kv_split", profile.kv_split);
+
+        let started = Instant::now();
+        let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+        let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+        profile.qk_norm += started.elapsed();
+        trace_attention_component(trace, layer_index, "qk_norm", profile.qk_norm);
+
+        let started = Instant::now();
+        let q = rope(q, cos, sin, store, tape)?;
+        let k = rope(k, cos, sin, store, tape)?;
+        profile.rope += started.elapsed();
+        trace_attention_component(trace, layer_index, "rope", profile.rope);
+
+        let kv_repeat = local_attention_heads / local_key_value_heads;
+        let started = Instant::now();
+        let k = repeat_kv(k, kv_repeat, store, tape)?;
+        let v = repeat_kv(v, kv_repeat, store, tape)?;
+        profile.repeat_kv += started.elapsed();
+        trace_attention_component(trace, layer_index, "repeat_kv", profile.repeat_kv);
+
+        let started = Instant::now();
+        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
+        profile.sdpa += started.elapsed();
+        trace_attention_component(trace, layer_index, "sdpa", profile.sdpa);
+
+        let started = Instant::now();
+        let attn_hidden = if let Some(gate) = gate {
+            let gate = sigmoid(gate, store, tape)?;
+            mul(attn_hidden, gate, store, tape)?
+        } else {
+            attn_hidden
+        };
+        profile.gate += started.elapsed();
+        trace_attention_component(trace, layer_index, "gate", profile.gate);
+
+        let started = Instant::now();
+        let attn_hidden = merge_heads(
+            attn_hidden,
+            batch,
+            seq_len,
+            local_attention_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        profile.merge += started.elapsed();
+        trace_attention_component(trace, layer_index, "merge", profile.merge);
+
+        let started = Instant::now();
+        let out = attn.o_proj.forward(attn_hidden, store, tape)?;
+        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
+        profile.o_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "o_proj", profile.o_proj);
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1309,6 +1622,83 @@ impl Qwen35Layer {
             tape,
         )?;
         Ok(attn.out_proj.forward(linear, store, tape)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_linear_attention_profiled(
+        &self,
+        layer_index: usize,
+        h: TensorId,
+        attn: &Qwen35LinearAttention,
+        cfg: &Qwen35Config,
+        batch: usize,
+        seq_len: usize,
+        trace: bool,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        profile: &mut Qwen35AttentionForwardProfile,
+    ) -> Result<TensorId> {
+        let started = Instant::now();
+        let qkv = attn.in_proj_qkv.forward(h, store, tape)?;
+        profile.linear_qkv_proj += started.elapsed();
+        trace_attention_component(
+            trace,
+            layer_index,
+            "linear_qkv_proj",
+            profile.linear_qkv_proj,
+        );
+
+        let started = Instant::now();
+        let z = attn.in_proj_z.forward(h, store, tape)?;
+        profile.linear_z_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "linear_z_proj", profile.linear_z_proj);
+
+        let started = Instant::now();
+        let b_proj = attn.in_proj_b.forward(h, store, tape)?;
+        profile.linear_b_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "linear_b_proj", profile.linear_b_proj);
+
+        let started = Instant::now();
+        let a_proj = attn.in_proj_a.forward(h, store, tape)?;
+        profile.linear_a_proj += started.elapsed();
+        trace_attention_component(trace, layer_index, "linear_a_proj", profile.linear_a_proj);
+
+        let started = Instant::now();
+        let linear = linear_attention_core(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            attn.conv1d_weight,
+            attn.dt_bias,
+            attn.a_log,
+            attn.norm,
+            LinearAttentionParams {
+                batch,
+                seq_len,
+                num_key_heads: cfg.linear_num_key_heads,
+                num_value_heads: cfg.linear_num_value_heads,
+                key_dim: cfg.linear_key_head_dim,
+                value_dim: cfg.linear_value_head_dim,
+                conv_kernel: cfg.linear_conv_kernel_dim,
+                eps: cfg.rms_norm_eps,
+            },
+            store,
+            tape,
+        )?;
+        profile.linear_core += started.elapsed();
+        trace_attention_component(trace, layer_index, "linear_core", profile.linear_core);
+
+        let started = Instant::now();
+        let out = attn.out_proj.forward(linear, store, tape)?;
+        profile.linear_out_proj += started.elapsed();
+        trace_attention_component(
+            trace,
+            layer_index,
+            "linear_out_proj",
+            profile.linear_out_proj,
+        );
+        Ok(out)
     }
 }
 
@@ -2412,6 +2802,98 @@ impl Qwen35Model {
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
+    fn forward_batch_indices_profiled(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+        trace: bool,
+    ) -> Result<(TensorId, Qwen35RolloutForwardProfile)> {
+        let total_started = Instant::now();
+        let mut profile = Qwen35RolloutForwardProfile::default();
+        let seq_len = positions.len();
+        if token_indices.len() != batch * seq_len {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: token_indices.len(),
+                expected_len: batch * seq_len,
+            });
+        }
+
+        let started = Instant::now();
+        let cos = select_cache_rows(self.cos_cache, positions, store)?;
+        let sin = select_cache_rows(self.sin_cache, positions, store)?;
+        profile.cache_select += started.elapsed();
+        trace_model_component(trace, "cache_select", profile.cache_select);
+
+        let started = Instant::now();
+        let mut hidden = embedding(self.embed_tokens, token_indices, store, tape)?;
+        hidden = reshape(
+            hidden,
+            &[batch, seq_len, self.config.hidden_size],
+            store,
+            tape,
+        )?;
+        profile.embedding += started.elapsed();
+        trace_model_component(trace, "embedding", profile.embedding);
+
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let started = Instant::now();
+            let (next_hidden, layer_profile) = if self.gradient_checkpointing && tape.enabled {
+                let layer = layer.clone();
+                let cfg = self.config.clone();
+                let tp = self.tp;
+                let cos_id = cos;
+                let sin_id = sin;
+                let input_ids = layer.checkpoint_input_ids(hidden);
+                let hidden = checkpoint(input_ids, store, tape, move |store, tape, inputs| {
+                    let hidden = *inputs.first().ok_or(AutogradError::TapeInvariant(
+                        "qwen35 checkpoint missing hidden input",
+                    ))?;
+                    layer
+                        .forward(hidden, &cfg, tp, cos_id, sin_id, store, tape)
+                        .map_err(qwen35_to_autograd)
+                })?;
+                (hidden, Qwen35LayerForwardProfile::default())
+            } else {
+                layer.forward_profiled(
+                    layer_index,
+                    hidden,
+                    &self.config,
+                    self.tp,
+                    cos,
+                    sin,
+                    trace,
+                    store,
+                    tape,
+                )?
+            };
+            hidden = next_hidden;
+            trace_model_component(trace, "layer_total", started.elapsed());
+            profile.layers.push(layer_profile);
+        }
+
+        let started = Instant::now();
+        let hidden = qwen35_rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        profile.final_norm += started.elapsed();
+        trace_model_component(trace, "final_norm", profile.final_norm);
+
+        let started = Instant::now();
+        let logits = linear_forward(hidden, self.lm_head, store, tape)?;
+        profile.lm_head += started.elapsed();
+        trace_model_component(trace, "lm_head", profile.lm_head);
+        profile.total = total_started.elapsed();
+        trace_model_component(trace, "total", profile.total);
+        Ok((logits, profile))
+    }
+
     fn forward_batch_hidden_indices(
         &self,
         store: &mut TensorStore,
@@ -2664,6 +3146,23 @@ impl Qwen35Model {
         position_ids: &[u32],
     ) -> Result<TensorId> {
         self.forward_batch(store, tape, input_ids, position_ids, 1, position_ids.len())
+    }
+
+    #[doc(hidden)]
+    pub fn forward_profiled_for_diagnostics(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+        trace: bool,
+    ) -> Result<(TensorId, Qwen35RolloutForwardProfile)> {
+        let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let positions = position_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        self.forward_batch_indices_profiled(store, tape, &token_indices, &positions, 1, trace)
     }
 
     pub fn forward_logits_window(
