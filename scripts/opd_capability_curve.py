@@ -233,6 +233,11 @@ def launch_serve(cp: Checkpoint, args: argparse.Namespace, output_dir: Path) -> 
         "--port", str(port),
         "--bind", args.serve_host,
     ]
+    # Size the serve token ceiling so it never silently caps the eval generation
+    # below --gsm8k-max-tokens (the reasoning gen budget). Auto = prompt
+    # headroom (1024) + gen budget.
+    serve_total = args.serve_max_total_tokens or (1024 + args.gsm8k_max_tokens)
+    cmd += ["--max-total-tokens", str(serve_total), "--max-prompt-tokens", str(serve_total)]
     if cp.adapter_path:
         if not args.serve_supports_adapter:
             raise RuntimeError(
@@ -298,6 +303,7 @@ def run_capability_eval(
         cmd += ["--seed", str(args.seed)]
     if args.gsm8k_shots is not None:
         cmd += ["--gsm8k-shots", str(args.gsm8k_shots)]
+    cmd += ["--gsm8k-max-tokens", str(args.gsm8k_max_tokens)]
     rc = _run(cmd, dry_run=args.dry_run)
     if rc != 0 and not args.dry_run:
         raise RuntimeError(f"capability eval failed for {cp.label!r} (exit {rc})")
@@ -460,6 +466,9 @@ def main(argv: list[str]) -> int:
     ev.add_argument("--seed", type=int, default=None, help="single seed (mutually exclusive with --seeds)")
     ev.add_argument("--seeds", default=None, help="comma seed list → multi-seed seed_<N>/ + CI")
     ev.add_argument("--gsm8k-shots", type=int, default=None, help="few-shot count for GSM8K")
+    ev.add_argument("--gsm8k-max-tokens", type=int, default=2048,
+                    help="GSM8K generation budget (reasoning). 2048 covers base-model CoT; "
+                         ">=10K for thinking-mode models. Old 256 truncated chains before ####.")
     ev.add_argument("--swe-limit", type=int, default=3, help="SWE-bench Pro instance count when swe_pro is selected")
 
     sv = parser.add_argument_group("serve lifecycle (model_path checkpoints only)")
@@ -468,6 +477,10 @@ def main(argv: list[str]) -> int:
     sv.add_argument("--serve-port", type=int, default=8123)
     sv.add_argument("--serve-ready-timeout", type=float, default=600.0,
                     help="seconds to wait for /v1/models to come up")
+    sv.add_argument("--serve-max-total-tokens", type=int, default=0,
+                    help="arle serve --max-total-tokens ceiling. 0 = auto-size to "
+                         "(prompt headroom 1024 + --gsm8k-max-tokens) so the serve never "
+                         "silently caps the eval generation below --gsm8k-max-tokens.")
     sv.add_argument("--serve-extra-arg", action="append", default=[],
                     help="extra arg passed verbatim to arle serve (repeatable)")
     sv.add_argument("--serve-supports-adapter", action="store_true",

@@ -287,6 +287,7 @@ def run_mmlu(
     debug_samples: int = 5,
     seed: int | None = None,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
+    max_tokens: int = 32,
 ) -> dict:
     """Run MMLU 5-shot eval. Saves the first `debug_samples` raw responses
     to <output_dir>/mmlu_debug.json so future extractor fixes can target
@@ -361,9 +362,10 @@ def run_mmlu(
         )
         # Base models often need a few tokens to commit to a letter when
         # leading whitespace / paren / "The answer is" pattern lands.
-        # 32 tokens covers all those shapes and is still fast.
+        # 32 tokens covers all those shapes and is still fast (MMLU is a
+        # single-letter task; per-task budget, see --mmlu-max-tokens).
         try:
-            resp = client.completion(prompt, max_tokens=32, temperature=0.0)
+            resp = client.completion(prompt, max_tokens=max_tokens, temperature=0.0)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[mmlu] sample {i} request error: {exc}", flush=True)
             invalid += 1
@@ -488,6 +490,7 @@ def run_gsm8k(
     n_shots: int = 8,
     seed: int | None = None,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
+    max_tokens: int = 2048,
 ) -> dict:
     try:
         from datasets import load_dataset
@@ -527,7 +530,12 @@ def run_gsm8k(
     for i, ex in enumerate(pool):
         prompt = few_shot + f"Q: {ex['question']}\nA:"
         try:
-            resp = client.completion(prompt, max_tokens=256, temperature=0.0)
+            # GSM8K is a multi-step reasoning task: a CoT solution routinely runs
+            # 150-400+ tokens before `####`. The old 256 cap truncated longer
+            # chains mid-reasoning (and thinking-mode models need far more) ->
+            # wrong/miss. Per-task budget; see --gsm8k-max-tokens (>=10K for
+            # thinking models).
+            resp = client.completion(prompt, max_tokens=max_tokens, temperature=0.0)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[gsm8k] sample {i} request error: {exc}", flush=True)
             invalid += 1
@@ -636,6 +644,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 n_shots=args.gsm8k_shots,
                 seed=seed,
                 dataset_revision=args.gsm8k_revision,
+                max_tokens=args.gsm8k_max_tokens,
             )
         elif task == "mmlu":
             report = run_mmlu(
@@ -644,6 +653,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 output_dir,
                 seed=seed,
                 dataset_revision=args.mmlu_revision,
+                max_tokens=args.mmlu_max_tokens,
             )
         else:
             report = TASK_RUNNERS[task](client, args.n_samples, output_dir, seed=seed)
@@ -679,6 +689,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
     parser.add_argument("--gsm8k-shots", type=int, default=8, help="few-shot examples for GSM8K")
+    parser.add_argument("--gsm8k-max-tokens", type=int, default=2048,
+                        help="generation budget for GSM8K (reasoning). 2048 covers base-model CoT; "
+                             "raise to >=10K for thinking-mode models with long reasoning traces. "
+                             "The old hardcoded 256 truncated longer chains before the #### answer.")
+    parser.add_argument("--mmlu-max-tokens", type=int, default=32,
+                        help="generation budget for MMLU (single-letter answer); 32 is ample.")
     parser.add_argument("--seed", type=int, default=None,
                         help="if set, shuffle per-subject MMLU pool and GSM8K test pool before "
                              "sampling. Distinct seeds give independent draws for variance estimation. "
