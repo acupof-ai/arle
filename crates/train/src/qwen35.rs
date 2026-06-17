@@ -3713,6 +3713,23 @@ impl Qwen35Model {
         layer.forward_mlp(hidden, &self.config, self.tp, batch, seq_len, store, tape)
     }
 
+    #[doc(hidden)]
+    pub fn forward_lm_head_tail_for_diagnostics(
+        &self,
+        hidden: TensorId,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let hidden = qwen35_rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        linear_forward(hidden, self.lm_head, store, tape)
+    }
+
     pub fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
         self.param_names.clone()
     }
