@@ -89,6 +89,56 @@ D2/T2 had 137 `tree_hits > accepted` lines: top-k matrix hits occurred off the
 verified top-1 chain, but the verifier rows still stayed 3 and those off-chain
 hits were not committed as accepted KV rows.
 
+### Follow-up speed rerun after the "why slower" review
+
+The first speed read above was a short helper run and was not comparable to the
+historic 53 tok/s B=1 entry. I restored `sglang-eic-test` on node 62 and reran
+same-binary/same-env checks on current `origin/main` (`ee0ddb8d`, which includes
+the fix commit as an ancestor).
+
+Startup confounder found and removed first:
+- Initial no-MTP startup sat for 600s, and an MTP `num-slots=64` retry sat for
+  >210s, both with workers alive and CPU busy.
+- `/data01/deepgemm-warm/locks` contained 16 stale lock files from 2026-06-16
+  while the cache contained 16 cubins. Removing only the stale lock files (not
+  the cubin cache) made no-MTP and MTP `num-slots=16` both ready in 25s.
+- This means the failed startups were pod/cache hygiene contamination, not a
+  top-k verifier-shape issue.
+
+Fixed synthetic prompt, `max_tokens=128`, `num-slots=16`, no errored or
+zero-token requests:
+
+| arm | c1 agg tok/s | c2 agg tok/s | c4 agg tok/s | c8 agg tok/s | bad verify rows | avg accepted | avg tree_hits |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| no-MTP | 34.74 | 34.75 | 34.82 | 54.34 | n/a | n/a | n/a |
+| D2/T1 | 21.96 | 21.97 | 21.97 | 33.71 | 0/1224 | 0.764 | 0.764 |
+| D2/T2 | 21.96 | 21.95 | 21.94 | 33.65 | 0/1224 | 0.764 | 0.913 |
+
+ShareGPT small sample, 8 first-turn prompts from
+`/data01/mashisong/ShareGPT_V3_unfiltered_cleaned_split.json`, c=1,
+`max_tokens=128`, no errored or zero-token requests:
+
+| arm | success | median tok/s | mean tok/s | bad verify rows | off-chain hits | avg accepted | avg tree_hits |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| no-MTP | 8/8 | 34.46 | 31.13 | n/a | n/a | n/a | n/a |
+| D2/T1 | 8/8 | 24.66 | 24.85 | 0/516 | 0 | 0.981 | 0.981 |
+| D2/T2 | 8/8 | 24.64 | 24.63 | 0/516 | 99 | 0.981 | 1.219 |
+
+Artifacts:
+- `/data01/arle-speed-ee0ddb8d/topk-ab-slots16-lockclean-20260617_142651/`
+- `/data01/arle-speed-ee0ddb8d/no-mtp-lockclean-20260617_143115/`
+- `/data01/arle-speed-ee0ddb8d/sharegpt-topk-20260617_143342/`
+
+Verdict: `topk=2` now has the intended constant verifier row cost
+(`verify_rows=3` for D2), and its speed is effectively identical to `topk=1`.
+The speed regression versus no-MTP in these reruns is not caused by extra
+top-k compute; it is caused by acceptance being below break-even. `topk=2`
+does increase off-chain `tree_hits`, but the current chain-shaped verifier
+cannot commit those off-chain paths as accepted KV rows because their prefixes
+were not target-verified. So `--mtp-draft-topk 2` is correctness-safe and
+generic, but it is not a speed lever until the branch-hit path is paired with a
+commit-safe verification/rollback design.
+
 ## Rule
 
 For MTP top-k, state the tensor shape before coding. "One verify forward" is
