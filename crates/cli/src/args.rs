@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
+pub(crate) const DEFAULT_OPD_LOGITS_WINDOW_SIZE: usize = 32;
+
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -708,7 +710,7 @@ pub(crate) struct TrainOpdArgs {
     pub(crate) kl_mask: OpdKlMaskArg,
 
     /// Logits/backward window size for OPD scoring (0 disables windowing).
-    #[arg(long, default_value_t = train::opd::DEFAULT_LOGITS_WINDOW_SIZE)]
+    #[arg(long, default_value_t = DEFAULT_OPD_LOGITS_WINDOW_SIZE)]
     pub(crate) logits_window_size: usize,
 
     /// Total OPD training steps.
