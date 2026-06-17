@@ -50,8 +50,8 @@ pub use loaded::LoadedInferenceEngine;
 pub use loaded::cuda_model_takes_multiproc_serve;
 pub use loaded::{EngineLoadConfig, KvCacheDtype};
 pub use serve::{
-    DEFAULT_MTP_DRAFT_TOKENS, ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions, ServeSpecType,
-    serve_http,
+    DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeKvSsdOptions,
+    ServeSpecOptions, ServeSpecType, serve_http,
 };
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
