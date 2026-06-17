@@ -238,6 +238,16 @@ pub fn moe_topk_softmax(
     moe::moe_topk_softmax(logits, top_k, store, tape)
 }
 
+pub fn moe_topk_softmax_with_indices(
+    logits: TensorId,
+    top_k: usize,
+    indices: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<MoeTopK> {
+    moe::moe_topk_softmax_with_indices(logits, top_k, indices, store, tape)
+}
+
 pub fn moe_gather_rows(
     src: TensorId,
     rows: &[usize],

@@ -11,7 +11,8 @@ use autograd::{
         MoeTopK, add, add_broadcast, all_reduce_sum, causal_sdpa_recompute,
         causal_sdpa_with_q_start, checkpoint, embedding, linear_attention_core,
         matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
-        mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
 };
 use half::bf16;
@@ -786,6 +787,67 @@ impl Qwen35Layer {
         Ok(add(x, mlp_out, store, tape)?)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_frozen_moe_routes(
+        &self,
+        layer_index: usize,
+        x: TensorId,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos: TensorId,
+        sin: TensorId,
+        frozen_routes: &[Qwen35MoeRouteSignature],
+        next_route: &mut usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let x_shape = store
+            .get(x)
+            .ok_or(AutogradError::InvalidTensorId(x))?
+            .shape
+            .clone();
+        if x_shape.len() != 3 {
+            return Err(AutogradError::InvalidRank {
+                expected: "rank-3 hidden states [batch, seq, hidden]",
+                got: x_shape.len(),
+            }
+            .into());
+        }
+        let batch = x_shape[0];
+        let seq_len = x_shape[1];
+
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let attn_out = match &self.self_attn {
+            Qwen35Attention::Full(attn) => self
+                .forward_full_attention(h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape)?,
+            Qwen35Attention::Linear(attn) => {
+                self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
+            }
+        };
+        let x = add(x, attn_out, store, tape)?;
+
+        let h = qwen35_rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        let mlp_out = self.forward_mlp_with_frozen_routes(
+            layer_index,
+            h,
+            cfg,
+            tp,
+            batch,
+            seq_len,
+            frozen_routes,
+            next_route,
+            store,
+            tape,
+        )?;
+        Ok(add(x, mlp_out, store, tape)?)
+    }
+
     fn forward_with_kv_cache(
         &self,
         x: TensorId,
@@ -1013,6 +1075,49 @@ impl Qwen35Layer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mlp_with_frozen_routes(
+        &self,
+        layer_index: usize,
+        h: TensorId,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        batch: usize,
+        seq_len: usize,
+        frozen_routes: &[Qwen35MoeRouteSignature],
+        next_route: &mut usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        match &self.mlp {
+            Qwen35Mlp::Dense(_) => self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape),
+            Qwen35Mlp::Sparse(mlp) => {
+                if tp.is_enabled() {
+                    return Err(Qwen35Error::InvalidConfig(
+                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
+                    ));
+                }
+                let route = frozen_routes
+                    .get(*next_route)
+                    .ok_or(Qwen35Error::InvalidConfig(
+                        "frozen MoE routes missing sparse layer signature",
+                    ))?;
+                *next_route += 1;
+                self.forward_sparse_mlp_with_frozen_routes(
+                    layer_index,
+                    mlp,
+                    h,
+                    cfg,
+                    batch,
+                    seq_len,
+                    route,
+                    store,
+                    tape,
+                )
+            }
+        }
+    }
+
     fn forward_sparse_mlp(
         &self,
         mlp: &Qwen35SparseMlp,
@@ -1112,6 +1217,92 @@ impl Qwen35Layer {
             top_k: routes.top_k,
             indices: routes.indices.clone(),
         });
+        let grouped_routes = build_qwen35_grouped_routes(&routes)?;
+
+        let gate_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.gate_proj);
+        let up_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.up_proj);
+        let down_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.down_proj);
+
+        let routed_gate = moe_grouped_linear(
+            flat_h,
+            &gate_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::TokenRows,
+            store,
+            tape,
+        )?;
+        let routed_up = moe_grouped_linear(
+            flat_h,
+            &up_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::TokenRows,
+            store,
+            tape,
+        )?;
+        let routed_gate = silu(routed_gate, store, tape)?;
+        let routed_hidden = mul(routed_gate, routed_up, store, tape)?;
+        let routed_down = moe_grouped_linear(
+            routed_hidden,
+            &down_experts,
+            &grouped_routes,
+            MoeGroupedLinearInput::Packed,
+            store,
+            tape,
+        )?;
+        let routed = moe_grouped_weighted_scatter(
+            routed_down,
+            routes.weights,
+            &grouped_routes,
+            tokens,
+            store,
+            tape,
+        )?;
+
+        let shared_gate = mlp.shared_gate_proj.forward(flat_h, store, tape)?;
+        let shared_up = mlp.shared_up_proj.forward(flat_h, store, tape)?;
+        let shared_gate = silu(shared_gate, store, tape)?;
+        let shared_hidden = mul(shared_gate, shared_up, store, tape)?;
+        let shared = mlp.shared_down_proj.forward(shared_hidden, store, tape)?;
+        let shared_expert_gate = mlp.shared_expert_gate.forward(flat_h, store, tape)?;
+        let shared_expert_gate = sigmoid(shared_expert_gate, store, tape)?;
+        let shared_expert_gate =
+            broadcast_to_shape(shared_expert_gate, &[tokens, cfg.hidden_size], store, tape)?;
+        let shared = mul(shared, shared_expert_gate, store, tape)?;
+
+        let out = add(routed, shared, store, tape)?;
+        Ok(reshape(
+            out,
+            &[batch, seq_len, cfg.hidden_size],
+            store,
+            tape,
+        )?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_sparse_mlp_with_frozen_routes(
+        &self,
+        layer_index: usize,
+        mlp: &Qwen35SparseMlp,
+        h: TensorId,
+        cfg: &Qwen35Config,
+        batch: usize,
+        seq_len: usize,
+        route: &Qwen35MoeRouteSignature,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let tokens = batch * seq_len;
+        validate_qwen35_moe_route_signature(
+            route,
+            layer_index,
+            tokens,
+            mlp.experts.len(),
+            mlp.top_k,
+        )?;
+        let flat_h = reshape(h, &[tokens, cfg.hidden_size], store, tape)?;
+        let router_logits = mlp.router_gate.forward(flat_h, store, tape)?;
+        let routes =
+            moe_topk_softmax_with_indices(router_logits, mlp.top_k, &route.indices, store, tape)?;
         let grouped_routes = build_qwen35_grouped_routes(&routes)?;
 
         let gate_experts = qwen35_grouped_linear_experts(&mlp.experts, |expert| &expert.gate_proj);
@@ -3417,6 +3608,74 @@ impl Qwen35Model {
         Ok((logits, route_signatures))
     }
 
+    #[doc(hidden)]
+    pub fn forward_with_frozen_moe_routes_for_diagnostics(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+        frozen_routes: &[Qwen35MoeRouteSignature],
+    ) -> Result<TensorId> {
+        let seq_len = position_ids.len();
+        if input_ids.len() != seq_len {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: input_ids.len(),
+                expected_len: seq_len,
+            });
+        }
+        let max_seq_len = self
+            .config
+            .rope_cache_len_hint
+            .ok_or(Qwen35Error::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ))?;
+        if seq_len > max_seq_len {
+            return Err(Qwen35Error::InvalidConfig(
+                "sequence length exceeds configured rope cache length",
+            ));
+        }
+
+        let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let positions = position_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        let cos = select_cache_rows(self.cos_cache, &positions, store)?;
+        let sin = select_cache_rows(self.sin_cache, &positions, store)?;
+
+        let mut hidden = embedding(self.embed_tokens, &token_indices, store, tape)?;
+        hidden = reshape(hidden, &[1, seq_len, self.config.hidden_size], store, tape)?;
+        let mut next_route = 0usize;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_with_frozen_moe_routes(
+                layer_index,
+                hidden,
+                &self.config,
+                self.tp,
+                cos,
+                sin,
+                frozen_routes,
+                &mut next_route,
+                store,
+                tape,
+            )?;
+        }
+        if next_route != frozen_routes.len() {
+            return Err(Qwen35Error::InvalidConfig(
+                "frozen MoE routes contain unused signatures",
+            ));
+        }
+        let hidden = qwen35_rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        linear_forward(hidden, self.lm_head, store, tape)
+    }
+
     pub fn forward_logits_window(
         &self,
         store: &mut TensorStore,
@@ -4080,6 +4339,42 @@ fn build_qwen35_grouped_routes(routes: &MoeTopK) -> Result<Vec<MoeGroupedRoute>>
     }
     grouped.sort_by_key(|route| (route.expert, route.row));
     Ok(grouped)
+}
+
+fn validate_qwen35_moe_route_signature(
+    route: &Qwen35MoeRouteSignature,
+    layer: usize,
+    tokens: usize,
+    experts: usize,
+    top_k: usize,
+) -> Result<()> {
+    if route.layer != layer {
+        return Err(Qwen35Error::InvalidConfig(
+            "frozen MoE route layer index mismatch",
+        ));
+    }
+    if route.tokens != tokens || route.experts != experts || route.top_k != top_k {
+        return Err(Qwen35Error::InvalidConfig(
+            "frozen MoE route shape mismatch",
+        ));
+    }
+    if route.indices.len() != tokens * top_k {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: tokens * top_k,
+            got: route.indices.len(),
+        }
+        .into());
+    }
+    for &expert in &route.indices {
+        if expert >= experts {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: expert,
+                upper: experts,
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn qwen35_grouped_linear_experts(
