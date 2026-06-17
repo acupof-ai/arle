@@ -267,7 +267,7 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
 
 static bool gemm_small_n_uses_gemv(int N, int K) {
   static constexpr size_t kMaxGemvSharedBytes = 48 * 1024;
-  return N > 0 && N < 16 &&
+  return N > 0 && N <= 16 &&
          static_cast<size_t>(K) * sizeof(__nv_bfloat16) <= kMaxGemvSharedBytes;
 }
 
