@@ -31,6 +31,7 @@ mod app {
     const DEFAULT_MODEL_DIR: &str = "/data01/models/Qwen3.6-35B-A3B-FP8";
     const DEFAULT_TARGET_ADAPTER: &str =
         "model.language_model.layers.0.mlp.shared_expert.up_proj.weight.lora_b";
+    const SPARSE_LOGIT_PROBE_PER_ROW: usize = 64;
 
     #[derive(Debug)]
     struct Args {
@@ -46,6 +47,8 @@ mod app {
         profile_backward: bool,
         profile_forward_only: bool,
         check_route_stability: bool,
+        freeze_base_routes: bool,
+        sparse_logit_probe: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +72,8 @@ mod app {
         println!(
             "qwen36_fp8_lora_fd_gate_start model={} device={} rank={} alpha={:.6} \
              target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={} \
-             profile_backward={} profile_forward_only={} check_route_stability={}",
+             profile_backward={} profile_forward_only={} check_route_stability={} \
+             freeze_base_routes={} sparse_logit_probe={}",
             args.model.display(),
             args.device,
             args.lora.rank,
@@ -82,7 +86,9 @@ mod app {
             args.layer,
             args.profile_backward,
             args.profile_forward_only,
-            args.check_route_stability
+            args.check_route_stability,
+            args.freeze_base_routes,
+            args.sparse_logit_probe
         );
 
         let backend = Arc::new(
@@ -118,6 +124,28 @@ mod app {
         keep.insert(gate_input.probe);
         store.retain_ids(&keep);
 
+        let frozen_routes = if args.freeze_base_routes {
+            let routes = collect_base_moe_routes(&student, &mut store, &args.tokens, &positions)?;
+            let total_slots = routes
+                .iter()
+                .map(|route| route.indices.len())
+                .sum::<usize>();
+            println!(
+                "qwen36_fp8_lora_route_frozen base_layers={} total_slots={} \
+                 tokens={} top_k={} experts={}",
+                routes.len(),
+                total_slots,
+                args.tokens.len(),
+                routes.first().map(|route| route.top_k).unwrap_or(0),
+                routes.first().map(|route| route.experts).unwrap_or(0)
+            );
+            store.retain_ids(&keep);
+            Some(routes)
+        } else {
+            None
+        };
+        let frozen_routes_ref = frozen_routes.as_deref();
+
         let analytic_started = Instant::now();
         let mut tape = Tape::new();
         let mut base_routes = Vec::new();
@@ -133,6 +161,7 @@ mod app {
             gate_input.hidden,
             gate_input.probe,
             route_sink,
+            frozen_routes_ref,
         )?;
         let loss_base = scalar_host(&mut store, loss)?;
         let (grads, backward_profile) = if args.profile_backward {
@@ -169,6 +198,7 @@ mod app {
             &positions,
             &gate_input,
             plus_route_sink,
+            frozen_routes_ref,
         )?;
         backend
             .device_synchronize()
@@ -192,6 +222,7 @@ mod app {
             &positions,
             &gate_input,
             minus_route_sink,
+            frozen_routes_ref,
         )?;
         backend
             .device_synchronize()
@@ -209,14 +240,17 @@ mod app {
         println!(
             "qwen36_fp8_lora_fd_gate_result load_seconds={:.6} analytic_seconds={:.6} \
              plus_seconds={:.6} minus_seconds={:.6} live_host_mib={live_host_mib:.1} \
-             mode={} layer={} target={} index={} eps={:.1e} loss_base={:.9e} loss_minus={:.9e} \
-             loss_plus={:.9e} analytic={:.9e} numeric={:.9e} rel_err={:.3e}",
+             mode={} layer={} route_frozen={} sparse_logit_probe={} target={} index={} eps={:.1e} \
+             loss_base={:.9e} loss_minus={:.9e} loss_plus={:.9e} \
+             analytic={:.9e} numeric={:.9e} rel_err={:.3e}",
             secs(load_elapsed),
             secs(analytic_elapsed),
             secs(plus_elapsed),
             secs(minus_elapsed),
             args.mode.label(),
             args.layer,
+            args.freeze_base_routes,
+            args.sparse_logit_probe,
             selected.name,
             selected.index,
             args.eps,
@@ -257,6 +291,8 @@ mod app {
         let mut profile_backward = false;
         let mut profile_forward_only = false;
         let mut check_route_stability = false;
+        let mut freeze_base_routes = false;
+        let mut sparse_logit_probe = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -296,6 +332,8 @@ mod app {
                 "--profile-backward" => profile_backward = true,
                 "--profile-forward-only" => profile_forward_only = true,
                 "--check-route-stability" => check_route_stability = true,
+                "--freeze-base-routes" => freeze_base_routes = true,
+                "--sparse-logit-probe" => sparse_logit_probe = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_fd_gate \
@@ -303,7 +341,8 @@ mod app {
                          [--rank N] [--alpha F] [--target-set all-linear] \
                          [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
                          [--mode mlp-layer|full-model] [--layer N] [--profile-backward] \
-                         [--profile-forward-only] [--check-route-stability]"
+                         [--profile-forward-only] [--check-route-stability] \
+                         [--freeze-base-routes] [--sparse-logit-probe]"
                     );
                     std::process::exit(0);
                 }
@@ -322,6 +361,12 @@ mod app {
         if check_route_stability && mode != GateMode::FullModel {
             bail!("--check-route-stability requires --mode full-model");
         }
+        if freeze_base_routes && mode != GateMode::FullModel {
+            bail!("--freeze-base-routes requires --mode full-model");
+        }
+        if sparse_logit_probe && mode != GateMode::FullModel {
+            bail!("--sparse-logit-probe requires --mode full-model");
+        }
         Ok(Args {
             model,
             device,
@@ -335,6 +380,8 @@ mod app {
             profile_backward,
             profile_forward_only,
             check_route_stability,
+            freeze_base_routes,
+            sparse_logit_probe,
         })
     }
 
@@ -493,6 +540,7 @@ mod app {
             positions,
             hidden,
             None,
+            None,
         )?;
         let shape = store
             .get(output)
@@ -503,8 +551,33 @@ mod app {
             .get(output)
             .context("gate output tensor missing")?
             .size;
-        let probe = deterministic_vec(size, 0x8d12_ba11_cafe_f00d, 0.01);
-        let probe = store.alloc(Tensor::new(probe, shape, false)?);
+        let (probe_data, probe_shape) =
+            if args.sparse_logit_probe && args.mode == GateMode::FullModel {
+                let vocab = *shape
+                    .last()
+                    .context("full-model output missing vocab dimension")?;
+                let prefix_elems = size / vocab;
+                let (probe, indices) = deterministic_sparse_logit_probe(
+                    prefix_elems,
+                    vocab,
+                    SPARSE_LOGIT_PROBE_PER_ROW,
+                    size,
+                );
+                let preview = indices.iter().copied().take(16).collect::<Vec<_>>();
+                println!(
+                    "qwen36_fp8_lora_sparse_logit_probe prefix_elems={} vocab={} \
+                 per_row={} nonzero={} scale=1.0 indices_preview={:?}",
+                    prefix_elems,
+                    vocab,
+                    SPARSE_LOGIT_PROBE_PER_ROW,
+                    indices.len(),
+                    preview
+                );
+                (probe, shape)
+            } else {
+                (deterministic_vec(size, 0x8d12_ba11_cafe_f00d, 0.01), shape)
+            };
+        let probe = store.alloc(Tensor::new(probe_data, probe_shape, false)?);
         store.free(output).ok();
         Ok(GateInput { hidden, probe })
     }
@@ -519,6 +592,7 @@ mod app {
         positions: &[u32],
         hidden: Option<TensorId>,
         route_sink: Option<&mut Vec<Qwen35MoeRouteSignature>>,
+        frozen_routes: Option<&[Qwen35MoeRouteSignature]>,
     ) -> Result<TensorId> {
         match mode {
             GateMode::MlpLayer => {
@@ -533,7 +607,19 @@ mod app {
                 )?)
             }
             GateMode::FullModel => {
-                if let Some(route_sink) = route_sink {
+                if let Some(frozen_routes) = frozen_routes {
+                    let output = model.forward_with_frozen_moe_routes_for_diagnostics(
+                        store,
+                        tape,
+                        tokens,
+                        positions,
+                        frozen_routes,
+                    )?;
+                    if let Some(route_sink) = route_sink {
+                        route_sink.extend(frozen_routes.iter().cloned());
+                    }
+                    Ok(output)
+                } else if let Some(route_sink) = route_sink {
                     let (output, routes) = model
                         .forward_with_moe_routes_for_diagnostics(store, tape, tokens, positions)?;
                     route_sink.extend(routes);
@@ -556,9 +642,19 @@ mod app {
         hidden: Option<TensorId>,
         probe: TensorId,
         route_sink: Option<&mut Vec<Qwen35MoeRouteSignature>>,
+        frozen_routes: Option<&[Qwen35MoeRouteSignature]>,
     ) -> Result<TensorId> {
         let output = forward_gate_output(
-            model, store, tape, mode, layer, tokens, positions, hidden, route_sink,
+            model,
+            store,
+            tape,
+            mode,
+            layer,
+            tokens,
+            positions,
+            hidden,
+            route_sink,
+            frozen_routes,
         )?;
         let weighted = mul(output, probe, store, tape)?;
         Ok(sum(weighted, store, tape)?)
@@ -571,6 +667,7 @@ mod app {
         positions: &[u32],
         input: &GateInput,
         route_sink: Option<&mut Vec<Qwen35MoeRouteSignature>>,
+        frozen_routes: Option<&[Qwen35MoeRouteSignature]>,
     ) -> Result<f32> {
         let mut tape = Tape::new();
         tape.set_enabled(false);
@@ -585,8 +682,23 @@ mod app {
             input.hidden,
             input.probe,
             route_sink,
+            frozen_routes,
         )?;
         scalar_host(store, loss)
+    }
+
+    fn collect_base_moe_routes(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> Result<Vec<Qwen35MoeRouteSignature>> {
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let (output, routes) =
+            model.forward_with_moe_routes_for_diagnostics(store, &mut tape, tokens, positions)?;
+        store.free(output).ok();
+        Ok(routes)
     }
 
     fn profile_forward_only(
@@ -946,6 +1058,36 @@ mod app {
                 (bits * 2.0 - 1.0) * scale
             })
             .collect()
+    }
+
+    fn deterministic_indices(len: usize, vocab: usize, mut state: u64) -> Vec<usize> {
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                ((state >> 32) as usize) % vocab
+            })
+            .collect()
+    }
+
+    fn deterministic_sparse_logit_probe(
+        rows: usize,
+        vocab: usize,
+        per_row: usize,
+        full_size: usize,
+    ) -> (Vec<f32>, Vec<usize>) {
+        let mut probe = vec![0.0_f32; full_size];
+        let indices = deterministic_indices(rows * per_row, vocab, 0x5e17_1d5a_baad_f00d);
+        let values = deterministic_vec(rows * per_row, 0x8d12_ba11_cafe_f00d, 1.0);
+        for row in 0..rows {
+            for slot in 0..per_row {
+                let flat = row * per_row + slot;
+                let index = indices[flat];
+                probe[row * vocab + index] += values[flat];
+            }
+        }
+        (probe, indices)
     }
 }
 

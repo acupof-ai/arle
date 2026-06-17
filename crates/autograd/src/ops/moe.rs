@@ -65,7 +65,6 @@ pub fn moe_topk_softmax(
     validate_top_k(top_k, experts)?;
 
     let mut indices = Vec::with_capacity(tokens * top_k);
-    let mut weights = vec![0.0_f32; tokens * top_k];
     for token in 0..tokens {
         let row = &input.data[token * experts..(token + 1) * experts];
         let mut order: Vec<usize> = (0..experts).collect();
@@ -75,7 +74,48 @@ pub fn moe_topk_softmax(
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| lhs.cmp(&rhs))
         });
-        let selected = &order[..top_k];
+        indices.extend_from_slice(&order[..top_k]);
+    }
+
+    moe_topk_softmax_with_indices(logits, top_k, &indices, store, tape)
+}
+
+pub fn moe_topk_softmax_with_indices(
+    logits: TensorId,
+    top_k: usize,
+    indices: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<MoeTopK> {
+    let input = store.tensor_host(logits)?;
+    if input.shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: input.shape.len(),
+        });
+    }
+    let tokens = input.shape[0];
+    let experts = input.shape[1];
+    validate_top_k(top_k, experts)?;
+    if indices.len() != tokens * top_k {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: tokens * top_k,
+            got: indices.len(),
+        });
+    }
+
+    let mut weights = vec![0.0_f32; tokens * top_k];
+    for token in 0..tokens {
+        let row = &input.data[token * experts..(token + 1) * experts];
+        let selected = &indices[token * top_k..(token + 1) * top_k];
+        for &expert in selected {
+            if expert >= experts {
+                return Err(AutogradError::IndexOutOfBounds {
+                    index: expert,
+                    upper: experts,
+                });
+            }
+        }
         let max_logit = selected
             .iter()
             .map(|&expert| row[expert])
@@ -85,10 +125,10 @@ pub fn moe_topk_softmax(
             denom += (row[expert] - max_logit).exp();
         }
         for (slot, &expert) in selected.iter().enumerate() {
-            indices.push(expert);
             weights[token * top_k + slot] = (row[expert] - max_logit).exp() / denom;
         }
     }
+    let indices = indices.to_vec();
 
     let weights_id = store.alloc(Tensor::new(
         weights,
@@ -1659,4 +1699,50 @@ fn validate_routes(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::{mul, sum};
+
+    #[test]
+    fn moe_topk_softmax_with_indices_freezes_forward_and_backward() -> Result<()> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let logits = store.alloc(Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 0.0, -1.0, 2.0, 1.0],
+            vec![2, 4],
+            true,
+        )?);
+
+        let routes =
+            moe_topk_softmax_with_indices(logits, 2, &[3, 1, 0, 2], &mut store, &mut tape)?;
+        assert_eq!(routes.indices, vec![3, 1, 0, 2]);
+        let weights = store.to_host(routes.weights)?;
+        assert!((weights[0] - 0.880_797_1).abs() < 1.0e-6);
+        assert!((weights[1] - 0.119_202_92).abs() < 1.0e-6);
+        assert!((weights[2] - 0.119_202_92).abs() < 1.0e-6);
+        assert!((weights[3] - 0.880_797_1).abs() < 1.0e-6);
+
+        let probe = store.alloc(Tensor::new(vec![1.0, 3.0, -2.0, 0.5], vec![2, 2], false)?);
+        let weighted = mul(routes.weights, probe, &mut store, &mut tape)?;
+        let loss = sum(weighted, &mut store, &mut tape)?;
+        let grads = tape.backward(loss, &mut store)?;
+        let grad_id = *grads
+            .get(&logits)
+            .ok_or(AutogradError::MissingGradient(logits))?;
+        let grad = store.to_host(grad_id)?;
+
+        assert_eq!(grad.len(), 8);
+        assert!(grad[0].abs() < 1.0e-6);
+        assert!(grad[1].abs() > 1.0e-2);
+        assert!(grad[2].abs() < 1.0e-6);
+        assert!(grad[3].abs() > 1.0e-2);
+        assert!(grad[4].abs() > 1.0e-2);
+        assert!(grad[5].abs() < 1.0e-6);
+        assert!(grad[6].abs() > 1.0e-2);
+        assert!(grad[7].abs() < 1.0e-6);
+        Ok(())
+    }
 }
