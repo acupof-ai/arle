@@ -418,7 +418,10 @@ fn opd_step_windowed_pure_kl_preempts_chunked_route() {
     );
 }
 
-fn pure_kl_loss_and_grads(logits_window_size: Option<usize>) -> (f32, Vec<(TensorId, Vec<f32>)>) {
+fn pure_kl_loss_and_grads(
+    kl_chunk_size: Option<usize>,
+    logits_window_size: Option<usize>,
+) -> (f32, Vec<(TensorId, Vec<f32>)>) {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let cfg = tiny_qwen35_config();
@@ -449,7 +452,7 @@ fn pure_kl_loss_and_grads(logits_window_size: Option<usize>) -> (f32, Vec<(Tenso
             lambda: 0.0,
             sft_anchor: GkdSftAnchor::StudentRollout,
             corpus_tokens: None,
-            kl_chunk_size: Some(2),
+            kl_chunk_size,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
             logits_window_size,
@@ -467,8 +470,8 @@ fn pure_kl_loss_and_grads(logits_window_size: Option<usize>) -> (f32, Vec<(Tenso
 
 #[test]
 fn opd_step_windowed_pure_kl_matches_chunked_loss_and_grads() {
-    let (chunked_loss, chunked_grads) = pure_kl_loss_and_grads(None);
-    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(Some(2));
+    let (chunked_loss, chunked_grads) = pure_kl_loss_and_grads(Some(2), None);
+    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(Some(2), Some(2));
 
     assert!(
         (chunked_loss - windowed_loss).abs() <= 1.0e-6,
@@ -489,6 +492,31 @@ fn opd_step_windowed_pure_kl_matches_chunked_loss_and_grads() {
     assert!(
         max_abs <= 2.0e-5,
         "windowed pure KL gradients must match chunked gradients, max_abs={max_abs:.9e}"
+    );
+}
+
+#[test]
+fn opd_step_windowed_pure_kl_matches_full_loss_and_grads() {
+    let (full_loss, full_grads) = pure_kl_loss_and_grads(None, None);
+    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(None, Some(2));
+
+    assert!(
+        (full_loss - windowed_loss).abs() <= 1.0e-6,
+        "windowed loss {windowed_loss:.9e} must match full loss {full_loss:.9e}"
+    );
+    assert_eq!(full_grads.len(), windowed_grads.len());
+
+    let mut max_abs = 0.0f32;
+    for ((full_id, full), (windowed_id, windowed)) in full_grads.iter().zip(windowed_grads.iter()) {
+        assert_eq!(full_id, windowed_id);
+        assert_eq!(full.len(), windowed.len());
+        for (&left, &right) in full.iter().zip(windowed.iter()) {
+            max_abs = max_abs.max((left - right).abs());
+        }
+    }
+    assert!(
+        max_abs <= 2.0e-5,
+        "windowed pure KL gradients must match full gradients, max_abs={max_abs:.9e}"
     );
 }
 
