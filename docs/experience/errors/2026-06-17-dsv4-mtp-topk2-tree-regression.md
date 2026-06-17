@@ -50,10 +50,7 @@ Local:
 - `CUDARC_CUDA_VERSION=12090 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib` passed.
 - `CUDARC_CUDA_VERSION=12090 cargo test -p infer-cuda --release --no-default-features --features cuda,no-cuda spec_decode --lib` passed, 6 tests.
 
-Remote DSv4 D2/T2 rebuild, correctness, and bench: pending in the follow-up
-verification run.
-
-Update after remote attempt:
+Remote:
 - Node 61 (`sglang-bench-61`) cannot run pods: kubelet reports
   `DiskPressure=True`; even a privileged no-GPU cleanup pod is rejected with
   `Pod was rejected: The node had condition: [DiskPressure]`.
@@ -66,11 +63,31 @@ Update after remote attempt:
   (`6 passed`).
 - Binary string gate: new `dsv4-mtp` log contains `verify_rows` and
   `tree_hits`; old `dsv4-mtp-tree` string is absent.
-- Full DSv4 serve/bench gate is blocked on node 62 because an unrelated OPD
-  workload occupies GPU5:
-  PID `1597726` (`opd_step_cuda_realckpt_lora_bench`, GPU memory 88.6 GiB). It
-  is not this DSv4 run's leftover, so it was not killed without explicit
-  approval.
+- Full DSv4 D2/T1 smoke passed on node 62:
+  `--spec-type mtp --mtp-draft-tokens 2 --mtp-draft-topk 1`; one completion
+  request returned 24/24 completion tokens, and serve log lines showed
+  `depth=2 topk=1 draft_rows=2 verify_rows=3`.
+- Full DSv4 D2/T2 smoke passed on node 62:
+  `--spec-type mtp --mtp-draft-tokens 2 --mtp-draft-topk 2`; one completion
+  request returned 24/24 completion tokens, and serve log lines showed
+  `depth=2 topk=2 draft_rows=2 verify_rows=3`.
+- Short real-prompt bench, 8 prompts, `max_tokens=96`, no zero-token or errored
+  requests:
+
+| arm | c1 seq success | c1 agg tok/s | c4 success | c4 agg tok/s | bad verify rows |
+|---|---:|---:|---:|---:|---:|
+| D2/T1 | 8/8 | 24.25 | 8/8 | 27.01 | 0/783 |
+| D2/T2 | 8/8 | 24.25 | 8/8 | 26.64 | 0/788 |
+
+Artifacts on node 62:
+- `/data01/arle-test-30290e07/d2_t1_bench_bench.json`
+- `/data01/arle-test-30290e07/d2_t1_bench_serve_20260617_122545.log`
+- `/data01/arle-test-30290e07/d2_t2_bench_bench.json`
+- `/data01/arle-test-30290e07/d2_t2_bench_serve_20260617_122732.log`
+
+D2/T2 had 137 `tree_hits > accepted` lines: top-k matrix hits occurred off the
+verified top-1 chain, but the verifier rows still stayed 3 and those off-chain
+hits were not committed as accepted KV rows.
 
 ## Rule
 
