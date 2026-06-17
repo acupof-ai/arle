@@ -32,6 +32,9 @@ pub struct EngineLoadConfig {
     pub chunked_prefill_size: usize,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
+    /// `Some(k)` = MTP draft tree top-k width; `1` keeps the validated chain.
+    #[serde(default)]
+    pub mtp_draft_topk: Option<usize>,
     /// Requested KV-cache dtype. Backends resolve `Auto` inside their own
     /// builder so the service/scheduler layers stay device-neutral.
     #[serde(default)]
@@ -73,6 +76,7 @@ impl Default for EngineLoadConfig {
             max_total_tokens: 65_536,
             chunked_prefill_size: 64,
             mtp_draft_tokens: None,
+            mtp_draft_topk: None,
             kv_cache_dtype: KvCacheDtype::Auto,
             kv_t1_budget_bytes: None,
             memory_budget_bytes: None,
@@ -644,7 +648,7 @@ mod backend {
         fn load_cpu(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             use infer_server::OpenAiTokenizer;
 
-            if config.mtp_draft_tokens.is_some() {
+            if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
                 anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
             }
             // CPU smoke: placeholder executor over a real host KV pool; still
@@ -743,7 +747,7 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        if config.mtp_draft_tokens.is_some() {
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         let metal_kv_dtype = infer_metal::MetalKvCacheDtype::resolve(config.kv_cache_dtype)?;
@@ -873,7 +877,7 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        if config.mtp_draft_tokens.is_some() {
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         anyhow::ensure!(
@@ -949,7 +953,7 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        if config.mtp_draft_tokens.is_some() {
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         anyhow::ensure!(
@@ -1262,6 +1266,7 @@ mod backend {
                 num_slots,
                 infer_cuda::dsv4_max_seq_len(),
                 config.mtp_draft_tokens,
+                config.mtp_draft_topk,
             )?,
             CudaModelKind::DiffusionGemma => unreachable!("checked before CUDA executor build"),
         };
@@ -1420,7 +1425,7 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        if config.mtp_draft_tokens.is_some() {
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         let gguf_path = resolve_gguf_path(model_path, "HIP")?;
@@ -1470,7 +1475,7 @@ mod backend {
     )> {
         use infer_server::OpenAiTokenizer;
 
-        if config.mtp_draft_tokens.is_some() {
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         let gguf_path = resolve_gguf_path(model_path, "Vulkan")?;
@@ -1543,7 +1548,7 @@ mod backend {
     ) -> Result<axum::Router> {
         use infer_server::{OpenAiTokenizer, openai_router};
 
-        if config.mtp_draft_tokens.is_some() {
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;

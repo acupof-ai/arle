@@ -1,29 +1,22 @@
-//! DSv4 MTP speculative-decode orchestration — CHAIN-ONLY (ckl's minimal
-//! scheme, 2026-06-12).
+//! DSv4 MTP speculative-decode orchestration.
 //!
-//! One step: draft a top-1 chain off the MTP head (depth sequential — the
-//! nextn-1 head predicts one step, so level i+1 must chain from level i's
-//! stream; ~2 ms/level), verify it in ONE frozen forward (the transformer's
-//! teacher-forcing property: every row's logits come out of the same pass),
-//! accept the longest matching prefix + the free bonus (the argmax at the
-//! divergence IS the target's true token), and commit from the persisted
-//! verify rows (fold) or via the re-forward (fallback).
-//!
-//! WIDTH WAS DELETED (`94d91948` was its last commit): a wide candidate
-//! checked WITHOUT its own forward row is exactly the bonus (membership at
-//! the divergence = committing the argmax — already free), and a candidate
-//! row only pays when the walk CONTINUES through it — measured on this MoE,
-//! a verify row costs ~13% of a forward in distinct-expert reads, so the
-//! +0.4 A a complete d2k2 tree buys costs more than it returns (33.6 tok/s
-//! vs the chain-fold's projected ~37). Width returns only with a
-//! depth-robust draft head (OPD axis) AND a cheaper row cost — git history
-//! has the tree machinery if that day comes.
+//! `topk == 1` is the validated linear chain: draft depth sequentially, verify
+//! `[pending, d0..]`, accept the longest prefix plus the free bonus. `topk > 1`
+//! drafts a complete top-k tree, verifies every flattened tree row once, then
+//! commits the longest matching root-to-leaf path. The tree path is opt-in via
+//! `--mtp-draft-topk`; the default chain path stays structurally unchanged.
 
 use anyhow::{Result, anyhow, ensure};
 
 use crate::dsv4::SpecVerifySchedule;
 
 use super::{DeviceVec, Dsv4CudaExecutor};
+
+struct SpecShape {
+    depth: usize,
+    topk: usize,
+    nodes: usize,
+}
 
 /// The draft chain for one step: `tokens[0]` is the already-committed
 /// `pending`, `tokens[1..]` the drafts, depth = drafts.
@@ -43,6 +36,90 @@ impl DraftChain {
     }
 }
 
+/// Flattened speculative draft tree. Node 0 is the root/pending token. Nodes are
+/// stored breadth-first, so node index == verify row index.
+struct DraftTree {
+    tokens: Vec<u32>,
+    parent: Vec<usize>,
+    children: Vec<Vec<usize>>,
+    depth: Vec<usize>,
+}
+
+impl DraftTree {
+    fn new(pending: u32) -> Self {
+        Self {
+            tokens: vec![pending],
+            parent: vec![0],
+            children: vec![Vec::new()],
+            depth: vec![0],
+        }
+    }
+
+    fn push(&mut self, parent: usize, token: u32) -> usize {
+        let idx = self.tokens.len();
+        self.tokens.push(token);
+        self.parent.push(parent);
+        self.children.push(Vec::new());
+        self.depth.push(self.depth[parent] + 1);
+        self.children[parent].push(idx);
+        idx
+    }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn token(&self, node: usize) -> u32 {
+        self.tokens[node]
+    }
+
+    fn parent(&self, node: usize) -> Option<usize> {
+        (node != 0).then_some(self.parent[node])
+    }
+
+    fn depth(&self, node: usize) -> usize {
+        self.depth[node]
+    }
+
+    fn branch_ancestors(&self, node: usize) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut cur = node;
+        while let Some(parent) = self.parent(cur) {
+            if parent != 0 {
+                chain.push(parent);
+            }
+            cur = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
+    fn verify_schedule(&self, start_pos: usize) -> SpecVerifySchedule {
+        let rows = self.len();
+        let positions: Vec<usize> = self.depth.iter().map(|d| start_pos + d).collect();
+        let max_depth = self.depth.iter().copied().max().unwrap_or(0);
+        let mut owner = vec![usize::MAX; max_depth + 1];
+        let mut restores = vec![Vec::new(); rows];
+        let mut saves = vec![false; rows];
+        for row in 0..rows {
+            for ancestor in self.branch_ancestors(row) {
+                let depth = self.depth(ancestor);
+                if owner[depth] != ancestor {
+                    restores[row].push(ancestor);
+                    saves[ancestor] = true;
+                    owner[depth] = ancestor;
+                }
+            }
+            owner[self.depth(row)] = row;
+        }
+        SpecVerifySchedule {
+            positions,
+            restores,
+            saves,
+        }
+    }
+}
+
 /// Longest accepted prefix: draft `i+1` is accepted iff it equals the
 /// target's argmax after row `i`. Returns the accepted draft count.
 fn longest_accepted_prefix(tokens: &[u32], argmax: &[u32]) -> usize {
@@ -51,6 +128,30 @@ fn longest_accepted_prefix(tokens: &[u32], argmax: &[u32]) -> usize {
         accepted += 1;
     }
     accepted
+}
+
+fn longest_accepted_path(tree: &DraftTree, argmax: &[u32]) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut cur = 0;
+    while let Some(child) = tree.children[cur]
+        .iter()
+        .copied()
+        .find(|&child| tree.tokens[child] == argmax[cur])
+    {
+        path.push(child);
+        cur = child;
+    }
+    path
+}
+
+fn complete_tree_nodes(depth: usize, topk: usize) -> Option<usize> {
+    let mut total = 1usize;
+    let mut level = 1usize;
+    for _ in 0..depth {
+        level = level.checked_mul(topk)?;
+        total = total.checked_add(level)?;
+    }
+    Some(total)
 }
 
 impl Dsv4CudaExecutor {
@@ -64,6 +165,9 @@ impl Dsv4CudaExecutor {
         start_pos: usize,
         position: u64,
     ) -> Result<Vec<u32>> {
+        if self.spec_topk() > 1 {
+            return self.spec_step_tree(slot_idx, start_pos, position);
+        }
         let depth = self.spec_depth();
         let pending = self.spec_slots[slot_idx]
             .pending
@@ -252,6 +356,9 @@ impl Dsv4CudaExecutor {
                 let rows: Vec<crate::dsv4::MtpDraftRow> = (0..n)
                     .map(|s| crate::dsv4::MtpDraftRow {
                         token: tokens_per_slot[s][level],
+                        node: level,
+                        restores: Vec::new(),
+                        save: false,
                     })
                     .collect();
                 let h_refs: Vec<&DeviceVec> = cur_hidden.iter().collect();
@@ -488,6 +595,218 @@ impl Dsv4CudaExecutor {
             .clamp(1, crate::dsv4::MAX_SPEC_DRAFT_DEPTH)
     }
 
+    pub(super) fn spec_topk(&self) -> usize {
+        self.spec_draft_topk
+            .unwrap_or(crate::dsv4::DEFAULT_SPEC_DRAFT_TOPK)
+            .max(1)
+    }
+
+    pub(super) fn spec_requested(&self) -> bool {
+        self.spec_draft_tokens.is_some()
+            || self.spec_draft_topk.is_some()
+            || crate::dsv4::dsv4_spec_decode_enabled()
+    }
+
+    fn spec_shape(&self) -> Result<SpecShape> {
+        let depth = self.spec_depth();
+        let topk = self.spec_topk();
+        let nodes = complete_tree_nodes(depth, topk).ok_or_else(|| {
+            anyhow!("DSv4 MTP tree node count overflow for depth={depth} topk={topk}")
+        })?;
+        ensure!(
+            nodes <= crate::dsv4::MAX_SPEC_TREE_NODES,
+            "DSv4 MTP tree depth={depth} topk={topk} needs {nodes} verify rows, max {}",
+            crate::dsv4::MAX_SPEC_TREE_NODES
+        );
+        Ok(SpecShape { depth, topk, nodes })
+    }
+
+    fn spec_step_tree(
+        &mut self,
+        slot_idx: usize,
+        start_pos: usize,
+        position: u64,
+    ) -> Result<Vec<u32>> {
+        let shape = self.spec_shape()?;
+        let pending = self.spec_slots[slot_idx]
+            .pending
+            .ok_or_else(|| anyhow!("DSv4 MTP tree decode missing pending token"))?;
+        let hidden = self.spec_slots[slot_idx]
+            .hidden
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 MTP tree decode missing previous hidden"))?
+            .clone();
+
+        self.model.capture_spec_rings(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            start_pos,
+            shape.depth,
+        )?;
+        let tree = self.draft_tree(slot_idx, pending, &hidden, &shape, start_pos)?;
+        ensure!(
+            tree.len() == shape.nodes,
+            "DSv4 MTP tree built {} rows, expected {} for depth={} topk={}",
+            tree.len(),
+            shape.nodes,
+            shape.depth,
+            shape.topk
+        );
+
+        let sched = tree.verify_schedule(start_pos);
+        crate::attention::set_dsv4_verify_frozen(true);
+        let res = self.model.forward_tokens_verify_scheduled(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &tree.tokens,
+            start_pos,
+            position,
+            &sched,
+        );
+        crate::attention::set_dsv4_verify_frozen(false);
+        let mut verify = res?;
+        ensure!(
+            verify.argmax.len() == tree.len()
+                && verify.hiddens.len() == tree.len()
+                && verify.logits.seq_len == tree.len(),
+            "DSv4 MTP tree verify expected {} rows, got argmax={} hidden={} logits={}",
+            tree.len(),
+            verify.argmax.len(),
+            verify.hiddens.len(),
+            verify.logits.seq_len
+        );
+
+        let path = longest_accepted_path(&tree, &verify.argmax);
+        let accepted = path.len();
+        let last_row = path.last().copied().unwrap_or(0);
+        let bonus = verify.argmax[last_row];
+        let drafts = tree.len() - 1;
+        self.mtp_accepts += accepted;
+        self.mtp_rejects += drafts - accepted;
+        if self.model.tp.config().rank == 0 {
+            let path_tokens: Vec<u32> = path.iter().map(|&row| tree.tokens[row]).collect();
+            eprintln!(
+                "[dsv4-mtp-tree] depth={} topk={} verify_rows={} draft_nodes={} accepted={} path={:?} accept_total={} reject_total={} bonus={bonus}",
+                shape.depth,
+                shape.topk,
+                tree.len(),
+                drafts,
+                accepted,
+                path_tokens,
+                self.mtp_accepts,
+                self.mtp_rejects
+            );
+        }
+
+        self.model
+            .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+        self.model.restore_spec_ring_tail(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            start_pos,
+            accepted,
+            shape.depth,
+        )?;
+
+        let mut rows = Vec::with_capacity(accepted + 1);
+        rows.push(0usize);
+        rows.extend_from_slice(&path);
+        self.model.commit_accepted_fold(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &rows,
+            start_pos,
+        )?;
+        {
+            let spec = &mut self.spec_slots[slot_idx];
+            spec.pending = Some(bonus);
+            spec.hidden = Some(verify.hiddens.swap_remove(last_row));
+        }
+
+        let mut out: Vec<u32> = path.iter().map(|&row| tree.tokens[row]).collect();
+        out.push(bonus);
+        Ok(out)
+    }
+
+    fn draft_tree(
+        &mut self,
+        slot_idx: usize,
+        pending: u32,
+        trunk_hidden: &DeviceVec,
+        shape: &SpecShape,
+        start_pos: usize,
+    ) -> Result<DraftTree> {
+        let mut tree = DraftTree::new(pending);
+        let mut node_stream: Vec<Option<DeviceVec>> = vec![None];
+        let mut frontier = vec![0usize];
+        let mut owner = vec![usize::MAX; shape.depth + 1];
+        for depth in 0..shape.depth {
+            ensure!(
+                !frontier.is_empty(),
+                "DSv4 MTP tree frontier unexpectedly empty at depth {depth}"
+            );
+            let contested = frontier.len() > 1;
+            let mut rows = Vec::with_capacity(frontier.len());
+            for &node in &frontier {
+                let mut restores = Vec::new();
+                for ancestor in tree.branch_ancestors(node) {
+                    let ancestor_depth = tree.depth(ancestor);
+                    if owner[ancestor_depth] != ancestor {
+                        restores.push((ancestor, start_pos + ancestor_depth));
+                        owner[ancestor_depth] = ancestor;
+                    }
+                }
+                owner[depth] = node;
+                rows.push(crate::dsv4::MtpDraftRow {
+                    token: tree.token(node),
+                    node,
+                    restores,
+                    save: contested,
+                });
+            }
+            let h_prevs: Vec<&DeviceVec> = frontier
+                .iter()
+                .map(|&node| match tree.parent(node) {
+                    Some(parent) => node_stream[parent].as_ref().expect("parent MTP stream"),
+                    None => trunk_hidden,
+                })
+                .collect();
+            let expanded = self.model.mtp_forward_level(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &rows,
+                &h_prevs,
+                (start_pos + depth) as u64,
+                shape.topk,
+            )?;
+            drop(h_prevs);
+            ensure!(
+                expanded.len() == frontier.len(),
+                "DSv4 MTP tree depth {depth} expanded {} rows for frontier {}",
+                expanded.len(),
+                frontier.len()
+            );
+            let mut next = Vec::with_capacity(frontier.len() * shape.topk);
+            for (&node, (candidates, stream)) in frontier.iter().zip(expanded) {
+                ensure!(
+                    candidates.len() == shape.topk,
+                    "DSv4 MTP tree node {node} returned {} candidates, expected {}",
+                    candidates.len(),
+                    shape.topk
+                );
+                node_stream[node] = Some(stream);
+                for candidate in candidates {
+                    let child = tree.push(node, candidate);
+                    debug_assert_eq!(child, node_stream.len());
+                    node_stream.push(None);
+                    next.push(child);
+                }
+            }
+            frontier = next;
+        }
+        Ok(tree)
+    }
+
     /// Draft a top-1 chain: `depth` sequential MTP head passes, each chaining
     /// from the previous level's stream. Single node per level ⇒ no ring
     /// contention, no fix-ups.
@@ -505,6 +824,9 @@ impl Dsv4CudaExecutor {
         for level in 0..depth {
             let rows = [crate::dsv4::MtpDraftRow {
                 token: tokens[level],
+                node: level,
+                restores: Vec::new(),
+                save: false,
             }];
             let mut expanded = self.model.mtp_forward_level(
                 &mut self.slots[slot_idx],
@@ -512,10 +834,15 @@ impl Dsv4CudaExecutor {
                 &rows,
                 &[&h_prev],
                 (start_pos + level) as u64,
+                1,
             )?;
-            let (candidate, stream) = expanded
+            let (candidates, stream) = expanded
                 .pop()
                 .ok_or_else(|| anyhow!("DSv4 MTP draft level returned no rows"))?;
+            let candidate = candidates
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow!("DSv4 MTP draft level returned no candidate"))?;
             tokens.push(candidate);
             h_prev = stream;
         }
@@ -525,7 +852,9 @@ impl Dsv4CudaExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftChain, longest_accepted_prefix};
+    use super::{
+        DraftChain, DraftTree, complete_tree_nodes, longest_accepted_path, longest_accepted_prefix,
+    };
 
     /// Accept the longest matching prefix; the divergence argmax is the bonus.
     #[test]
@@ -552,5 +881,52 @@ mod tests {
         };
         let sched = chain.verify_schedule(100);
         assert_eq!(sched.positions, vec![100, 101, 102]);
+        assert!(sched.is_chain());
+    }
+
+    #[test]
+    fn complete_tree_node_count() {
+        assert_eq!(complete_tree_nodes(2, 2), Some(7));
+        assert_eq!(complete_tree_nodes(2, 4), Some(21));
+        assert_eq!(complete_tree_nodes(5, 2), Some(63));
+    }
+
+    #[test]
+    fn tree_longest_branch() {
+        let mut tree = DraftTree::new(10);
+        let a = tree.push(0, 11);
+        let b = tree.push(0, 21);
+        tree.push(a, 12);
+        tree.push(b, 22);
+        let b_alt = tree.push(b, 23);
+        let mut argmax = vec![0u32; tree.len()];
+        argmax[0] = 21;
+        argmax[b] = 23;
+        assert_eq!(longest_accepted_path(&tree, &argmax), vec![b, b_alt]);
+    }
+
+    #[test]
+    fn tree_schedule_replays_same_depth_siblings() {
+        let mut tree = DraftTree::new(10);
+        let a = tree.push(0, 11);
+        let b = tree.push(0, 21);
+        let a0 = tree.push(a, 12);
+        let a1 = tree.push(a, 13);
+        let b0 = tree.push(b, 22);
+        let b1 = tree.push(b, 23);
+
+        let sched = tree.verify_schedule(100);
+        assert_eq!(sched.positions, vec![100, 101, 101, 102, 102, 102, 102]);
+        assert!(!sched.is_chain());
+        assert!(sched.restores[0].is_empty());
+        assert!(sched.restores[a].is_empty());
+        assert!(sched.restores[b].is_empty());
+        assert_eq!(sched.restores[a0], vec![a]);
+        assert!(sched.restores[a1].is_empty());
+        assert_eq!(sched.restores[b0], vec![b]);
+        assert!(sched.restores[b1].is_empty());
+
+        let saved: Vec<usize> = (0..tree.len()).filter(|&row| sched.saves[row]).collect();
+        assert_eq!(saved, vec![a, b]);
     }
 }
