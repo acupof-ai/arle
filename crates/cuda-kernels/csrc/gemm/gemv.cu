@@ -265,6 +265,30 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
   return cudaGetLastError();
 }
 
+static bool gemm_small_n_uses_gemv(int N, int K) {
+  static constexpr size_t kMaxGemvSharedBytes = 48 * 1024;
+  return N > 0 && N < 16 &&
+         static_cast<size_t>(K) * sizeof(__nv_bfloat16) <= kMaxGemvSharedBytes;
+}
+
+static cudaError_t gemm_small_n_gemv_loop(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+                                          __nv_bfloat16 *Y, int M, int N, int K,
+                                          cudaStream_t stream) {
+  int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+  size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16);
+  for (int col = 0; col < N; ++col) {
+    const __nv_bfloat16 *x_col = X + static_cast<size_t>(col) * K;
+    __nv_bfloat16 *y_col = Y + static_cast<size_t>(col) * M;
+    gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, smem_bytes, stream>>>(
+        W, x_col, y_col, M, K);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      return err;
+    }
+  }
+  return cudaSuccess;
+}
+
 // M_pf-gemm Phase 0: at first miss for a given (M,N,K), benchmark
 // all heuristic-returned algos (5 iters each) and cache the fastest.
 // cuBLAS heuristic top-1 is optimized for "average cost across many
@@ -305,6 +329,10 @@ static bool deterministic_gemm_enabled() {
 static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                       __nv_bfloat16 *Y, int M, int N, int K,
                                       cudaStream_t stream, bool graphsafe) {
+  if (gemm_small_n_uses_gemv(N, K)) {
+    return gemm_small_n_gemv_loop(W, X, Y, M, N, K, stream);
+  }
+
   CublasDeviceState *state = current_device_state();
   if (state == nullptr) {
     return cudaErrorNotReady;
