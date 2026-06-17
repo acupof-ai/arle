@@ -21,7 +21,10 @@ mod app {
     };
     use train::{
         LoraConfig, LoraTargetSet,
-        qwen35::{Qwen35AttentionForwardProfile, Qwen35Model, Qwen35RolloutForwardProfile},
+        qwen35::{
+            Qwen35AttentionForwardProfile, Qwen35Model, Qwen35MoeRouteSignature,
+            Qwen35RolloutForwardProfile,
+        },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
 
@@ -42,6 +45,7 @@ mod app {
         layer: usize,
         profile_backward: bool,
         profile_forward_only: bool,
+        check_route_stability: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +69,7 @@ mod app {
         println!(
             "qwen36_fp8_lora_fd_gate_start model={} device={} rank={} alpha={:.6} \
              target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={} \
-             profile_backward={} profile_forward_only={}",
+             profile_backward={} profile_forward_only={} check_route_stability={}",
             args.model.display(),
             args.device,
             args.lora.rank,
@@ -77,7 +81,8 @@ mod app {
             args.mode.label(),
             args.layer,
             args.profile_backward,
-            args.profile_forward_only
+            args.profile_forward_only,
+            args.check_route_stability
         );
 
         let backend = Arc::new(
@@ -115,6 +120,8 @@ mod app {
 
         let analytic_started = Instant::now();
         let mut tape = Tape::new();
+        let mut base_routes = Vec::new();
+        let route_sink = args.check_route_stability.then_some(&mut base_routes);
         let loss = weighted_logits_loss(
             &student,
             &mut store,
@@ -125,6 +132,7 @@ mod app {
             &positions,
             gate_input.hidden,
             gate_input.probe,
+            route_sink,
         )?;
         let loss_base = scalar_host(&mut store, loss)?;
         let (grads, backward_profile) = if args.profile_backward {
@@ -145,6 +153,7 @@ mod app {
         store.retain_ids(&keep);
 
         let original = tensor_value(&mut store, selected.target, selected.index)?;
+        let mut plus_routes = Vec::new();
         let plus_started = Instant::now();
         set_tensor_value(
             &mut store,
@@ -152,13 +161,22 @@ mod app {
             selected.index,
             original + args.eps,
         )?;
-        let loss_plus = loss_value(&student, &mut store, &args, &positions, &gate_input)?;
+        let plus_route_sink = args.check_route_stability.then_some(&mut plus_routes);
+        let loss_plus = loss_value(
+            &student,
+            &mut store,
+            &args,
+            &positions,
+            &gate_input,
+            plus_route_sink,
+        )?;
         backend
             .device_synchronize()
             .context("synchronize after plus finite diff")?;
         let plus_elapsed = plus_started.elapsed();
         store.retain_ids(&keep);
 
+        let mut minus_routes = Vec::new();
         let minus_started = Instant::now();
         set_tensor_value(
             &mut store,
@@ -166,7 +184,15 @@ mod app {
             selected.index,
             original - args.eps,
         )?;
-        let loss_minus = loss_value(&student, &mut store, &args, &positions, &gate_input)?;
+        let minus_route_sink = args.check_route_stability.then_some(&mut minus_routes);
+        let loss_minus = loss_value(
+            &student,
+            &mut store,
+            &args,
+            &positions,
+            &gate_input,
+            minus_route_sink,
+        )?;
         backend
             .device_synchronize()
             .context("synchronize after minus finite diff")?;
@@ -176,6 +202,9 @@ mod app {
 
         let numeric = (loss_plus - loss_minus) / (2.0 * args.eps);
         let rel_err = rel_err(selected.analytic, numeric);
+        if args.check_route_stability {
+            print_route_stability(&base_routes, &plus_routes, &minus_routes);
+        }
         let live_host_mib = store.live_host_bytes() as f64 / (1024.0 * 1024.0);
         println!(
             "qwen36_fp8_lora_fd_gate_result load_seconds={:.6} analytic_seconds={:.6} \
@@ -227,6 +256,7 @@ mod app {
         let mut layer = 0usize;
         let mut profile_backward = false;
         let mut profile_forward_only = false;
+        let mut check_route_stability = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -265,6 +295,7 @@ mod app {
                 }
                 "--profile-backward" => profile_backward = true,
                 "--profile-forward-only" => profile_forward_only = true,
+                "--check-route-stability" => check_route_stability = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_fd_gate \
@@ -272,7 +303,7 @@ mod app {
                          [--rank N] [--alpha F] [--target-set all-linear] \
                          [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
                          [--mode mlp-layer|full-model] [--layer N] [--profile-backward] \
-                         [--profile-forward-only]"
+                         [--profile-forward-only] [--check-route-stability]"
                     );
                     std::process::exit(0);
                 }
@@ -288,6 +319,9 @@ mod app {
         if tokens.is_empty() {
             bail!("--tokens must contain at least one token id");
         }
+        if check_route_stability && mode != GateMode::FullModel {
+            bail!("--check-route-stability requires --mode full-model");
+        }
         Ok(Args {
             model,
             device,
@@ -300,6 +334,7 @@ mod app {
             layer,
             profile_backward,
             profile_forward_only,
+            check_route_stability,
         })
     }
 
@@ -457,6 +492,7 @@ mod app {
             &args.tokens,
             positions,
             hidden,
+            None,
         )?;
         let shape = store
             .get(output)
@@ -482,6 +518,7 @@ mod app {
         tokens: &[u32],
         positions: &[u32],
         hidden: Option<TensorId>,
+        route_sink: Option<&mut Vec<Qwen35MoeRouteSignature>>,
     ) -> Result<TensorId> {
         match mode {
             GateMode::MlpLayer => {
@@ -495,7 +532,16 @@ mod app {
                     tape,
                 )?)
             }
-            GateMode::FullModel => Ok(model.forward(store, tape, tokens, positions)?),
+            GateMode::FullModel => {
+                if let Some(route_sink) = route_sink {
+                    let (output, routes) = model
+                        .forward_with_moe_routes_for_diagnostics(store, tape, tokens, positions)?;
+                    route_sink.extend(routes);
+                    Ok(output)
+                } else {
+                    Ok(model.forward(store, tape, tokens, positions)?)
+                }
+            }
         }
     }
 
@@ -509,9 +555,11 @@ mod app {
         positions: &[u32],
         hidden: Option<TensorId>,
         probe: TensorId,
+        route_sink: Option<&mut Vec<Qwen35MoeRouteSignature>>,
     ) -> Result<TensorId> {
-        let output =
-            forward_gate_output(model, store, tape, mode, layer, tokens, positions, hidden)?;
+        let output = forward_gate_output(
+            model, store, tape, mode, layer, tokens, positions, hidden, route_sink,
+        )?;
         let weighted = mul(output, probe, store, tape)?;
         Ok(sum(weighted, store, tape)?)
     }
@@ -522,6 +570,7 @@ mod app {
         args: &Args,
         positions: &[u32],
         input: &GateInput,
+        route_sink: Option<&mut Vec<Qwen35MoeRouteSignature>>,
     ) -> Result<f32> {
         let mut tape = Tape::new();
         tape.set_enabled(false);
@@ -535,6 +584,7 @@ mod app {
             positions,
             input.hidden,
             input.probe,
+            route_sink,
         )?;
         scalar_host(store, loss)
     }
@@ -614,6 +664,120 @@ mod app {
         let analytic = f64::from(analytic);
         let numeric = f64::from(numeric);
         (analytic - numeric).abs() / analytic.abs().max(numeric.abs()).max(1.0e-12)
+    }
+
+    fn print_route_stability(
+        base: &[Qwen35MoeRouteSignature],
+        plus: &[Qwen35MoeRouteSignature],
+        minus: &[Qwen35MoeRouteSignature],
+    ) {
+        let plus_summary = route_diff_summary(base, plus);
+        let minus_summary = route_diff_summary(base, minus);
+        println!(
+            "qwen36_fp8_lora_route_stability base_layers={} plus_layers={} \
+             minus_layers={} plus_changed_layers={} plus_changed_slots={} \
+             plus_total_slots={} plus_shape_mismatches={} minus_changed_layers={} \
+             minus_changed_slots={} minus_total_slots={} minus_shape_mismatches={}",
+            base.len(),
+            plus.len(),
+            minus.len(),
+            plus_summary.changed_layers,
+            plus_summary.changed_slots,
+            plus_summary.total_slots,
+            plus_summary.shape_mismatches,
+            minus_summary.changed_layers,
+            minus_summary.changed_slots,
+            minus_summary.total_slots,
+            minus_summary.shape_mismatches
+        );
+        print_route_diff_layers("plus", base, plus);
+        print_route_diff_layers("minus", base, minus);
+    }
+
+    #[derive(Debug, Default)]
+    struct RouteDiffSummary {
+        changed_layers: usize,
+        changed_slots: usize,
+        total_slots: usize,
+        shape_mismatches: usize,
+    }
+
+    fn route_diff_summary(
+        base: &[Qwen35MoeRouteSignature],
+        other: &[Qwen35MoeRouteSignature],
+    ) -> RouteDiffSummary {
+        let mut summary = RouteDiffSummary::default();
+        for (base_layer, other_layer) in base.iter().zip(other.iter()) {
+            if base_layer.layer != other_layer.layer
+                || base_layer.tokens != other_layer.tokens
+                || base_layer.top_k != other_layer.top_k
+                || base_layer.experts != other_layer.experts
+                || base_layer.indices.len() != other_layer.indices.len()
+            {
+                summary.shape_mismatches += 1;
+                continue;
+            }
+            let changed = base_layer
+                .indices
+                .iter()
+                .zip(&other_layer.indices)
+                .filter(|(left, right)| left != right)
+                .count();
+            summary.total_slots += base_layer.indices.len();
+            summary.changed_slots += changed;
+            if changed > 0 {
+                summary.changed_layers += 1;
+            }
+        }
+        summary.shape_mismatches += base.len().abs_diff(other.len());
+        summary
+    }
+
+    fn print_route_diff_layers(
+        arm: &str,
+        base: &[Qwen35MoeRouteSignature],
+        other: &[Qwen35MoeRouteSignature],
+    ) {
+        let mut printed = 0usize;
+        for (base_layer, other_layer) in base.iter().zip(other.iter()) {
+            if base_layer.layer != other_layer.layer
+                || base_layer.indices.len() != other_layer.indices.len()
+            {
+                println!(
+                    "qwen36_fp8_lora_route_stability_layer arm={arm} \
+                     layer={} status=shape_mismatch base_slots={} other_slots={}",
+                    base_layer.layer,
+                    base_layer.indices.len(),
+                    other_layer.indices.len()
+                );
+                printed += 1;
+            } else {
+                let changed = base_layer
+                    .indices
+                    .iter()
+                    .zip(&other_layer.indices)
+                    .filter(|(left, right)| left != right)
+                    .count();
+                if changed == 0 {
+                    continue;
+                }
+                println!(
+                    "qwen36_fp8_lora_route_stability_layer arm={arm} \
+                     layer={} changed_slots={} total_slots={} tokens={} top_k={} \
+                     experts={}",
+                    base_layer.layer,
+                    changed,
+                    base_layer.indices.len(),
+                    base_layer.tokens,
+                    base_layer.top_k,
+                    base_layer.experts
+                );
+                printed += 1;
+            }
+            if printed >= 16 {
+                break;
+            }
+        }
     }
 
     fn print_backward_profile(profile: &BackwardProfile) {
