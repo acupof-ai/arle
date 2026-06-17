@@ -32,7 +32,7 @@ pub struct EngineLoadConfig {
     pub chunked_prefill_size: usize,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
-    /// `Some(k)` = MTP draft tree top-k width; `1` keeps the validated chain.
+    /// `Some(k)` = per-level MTP draft top-k width; verifier rows stay chain-shaped.
     #[serde(default)]
     pub mtp_draft_topk: Option<usize>,
     /// Requested KV-cache dtype. Backends resolve `Auto` inside their own
