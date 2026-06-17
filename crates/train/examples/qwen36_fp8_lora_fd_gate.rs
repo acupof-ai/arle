@@ -20,7 +20,9 @@ mod app {
         ops::{mul, sum},
     };
     use train::{
-        LoraConfig, LoraTargetSet, qwen35::Qwen35Model, qwen35_loader::load_qwen35_lora_from_hf_dir,
+        LoraConfig, LoraTargetSet,
+        qwen35::{Qwen35AttentionForwardProfile, Qwen35Model, Qwen35RolloutForwardProfile},
+        qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
 
     const DEFAULT_MODEL_DIR: &str = "/data01/models/Qwen3.6-35B-A3B-FP8";
@@ -39,6 +41,7 @@ mod app {
         mode: GateMode,
         layer: usize,
         profile_backward: bool,
+        profile_forward_only: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +65,7 @@ mod app {
         println!(
             "qwen36_fp8_lora_fd_gate_start model={} device={} rank={} alpha={:.6} \
              target_set={} target_adapter={} eps={:.1e} tokens={:?} mode={} layer={} \
-             profile_backward={}",
+             profile_backward={} profile_forward_only={}",
             args.model.display(),
             args.device,
             args.lora.rank,
@@ -73,7 +76,8 @@ mod app {
             args.tokens,
             args.mode.label(),
             args.layer,
-            args.profile_backward
+            args.profile_backward,
+            args.profile_forward_only
         );
 
         let backend = Arc::new(
@@ -91,6 +95,11 @@ mod app {
         let load_elapsed = load_started.elapsed();
 
         let positions = (0..args.tokens.len() as u32).collect::<Vec<_>>();
+        if args.profile_forward_only {
+            profile_forward_only(&student, &mut store, &args, &positions)?;
+            return Ok(());
+        }
+
         let keep_before_probe = student
             .all_parameter_ids()
             .into_iter()
@@ -217,6 +226,7 @@ mod app {
         let mut mode = GateMode::MlpLayer;
         let mut layer = 0usize;
         let mut profile_backward = false;
+        let mut profile_forward_only = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -254,13 +264,15 @@ mod app {
                         .context("parse --layer")?;
                 }
                 "--profile-backward" => profile_backward = true,
+                "--profile-forward-only" => profile_forward_only = true,
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_fd_gate \
                          --release --features cuda -- [--model DIR] [--device N] \
                          [--rank N] [--alpha F] [--target-set all-linear] \
                          [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
-                         [--mode mlp-layer|full-model] [--layer N] [--profile-backward]"
+                         [--mode mlp-layer|full-model] [--layer N] [--profile-backward] \
+                         [--profile-forward-only]"
                     );
                     std::process::exit(0);
                 }
@@ -287,6 +299,7 @@ mod app {
             mode,
             layer,
             profile_backward,
+            profile_forward_only,
         })
     }
 
@@ -526,6 +539,35 @@ mod app {
         scalar_host(store, loss)
     }
 
+    fn profile_forward_only(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        args: &Args,
+        positions: &[u32],
+    ) -> Result<()> {
+        if args.mode != GateMode::FullModel {
+            bail!("--profile-forward-only requires --mode full-model");
+        }
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let started = Instant::now();
+        let (output, profile) = model.forward_profiled_for_diagnostics(
+            store,
+            &mut tape,
+            &args.tokens,
+            positions,
+            true,
+        )?;
+        let elapsed = started.elapsed();
+        let output_shape = store
+            .get(output)
+            .context("profile forward output tensor missing")?
+            .shape
+            .clone();
+        print_forward_profile(&profile, elapsed, &output_shape);
+        Ok(())
+    }
+
     fn scalar_host(store: &mut TensorStore, id: TensorId) -> Result<f32> {
         let values = store.to_host(id)?;
         values
@@ -614,6 +656,109 @@ mod app {
                 site,
                 stats.count
             );
+        }
+    }
+
+    fn print_forward_profile(
+        profile: &Qwen35RolloutForwardProfile,
+        wall: Duration,
+        output_shape: &[usize],
+    ) {
+        let profile_seconds = secs(profile.total);
+        let wall_seconds = secs(wall);
+        println!(
+            "qwen36_fp8_lora_fd_forward_profile total_seconds={profile_seconds:.6} \
+             wall_seconds={wall_seconds:.6} layers={} output_shape={:?} \
+             cache_select_seconds={:.6} embedding_seconds={:.6} input_rmsnorm_seconds={:.6} \
+             attention_seconds={:.6} attention_residual_seconds={:.6} \
+             post_attention_rmsnorm_seconds={:.6} mlp_seconds={:.6} \
+             mlp_residual_seconds={:.6} final_norm_seconds={:.6} lm_head_seconds={:.6}",
+            profile.layers.len(),
+            output_shape,
+            secs(profile.cache_select),
+            secs(profile.embedding),
+            secs(profile.input_rmsnorm_total()),
+            secs(profile.attention_total()),
+            secs(profile.attention_residual_total()),
+            secs(profile.post_attention_rmsnorm_total()),
+            secs(profile.mlp_total()),
+            secs(profile.mlp_residual_total()),
+            secs(profile.final_norm),
+            secs(profile.lm_head)
+        );
+
+        for (idx, layer) in profile.layers.iter().enumerate() {
+            println!(
+                "qwen36_fp8_lora_fd_forward_profile_layer layer={} \
+                 input_rmsnorm_seconds={:.6} attention_seconds={:.6} \
+                 attention_residual_seconds={:.6} post_attention_rmsnorm_seconds={:.6} \
+                 mlp_seconds={:.6} mlp_residual_seconds={:.6}",
+                idx,
+                secs(layer.input_rmsnorm),
+                secs(layer.attention),
+                secs(layer.attention_residual),
+                secs(layer.post_attention_rmsnorm),
+                secs(layer.mlp),
+                secs(layer.mlp_residual)
+            );
+        }
+
+        let attention: Qwen35AttentionForwardProfile =
+            profile
+                .layers
+                .iter()
+                .fold(Default::default(), |mut acc, layer| {
+                    acc.q_proj += layer.attention_detail.q_proj;
+                    acc.q_layout += layer.attention_detail.q_layout;
+                    acc.k_proj += layer.attention_detail.k_proj;
+                    acc.v_proj += layer.attention_detail.v_proj;
+                    acc.kv_split += layer.attention_detail.kv_split;
+                    acc.qk_norm += layer.attention_detail.qk_norm;
+                    acc.rope += layer.attention_detail.rope;
+                    acc.repeat_kv += layer.attention_detail.repeat_kv;
+                    acc.append_kv += layer.attention_detail.append_kv;
+                    acc.sdpa += layer.attention_detail.sdpa;
+                    acc.gate += layer.attention_detail.gate;
+                    acc.merge += layer.attention_detail.merge;
+                    acc.o_proj += layer.attention_detail.o_proj;
+                    acc.linear_qkv_proj += layer.attention_detail.linear_qkv_proj;
+                    acc.linear_z_proj += layer.attention_detail.linear_z_proj;
+                    acc.linear_b_proj += layer.attention_detail.linear_b_proj;
+                    acc.linear_a_proj += layer.attention_detail.linear_a_proj;
+                    acc.linear_core += layer.attention_detail.linear_core;
+                    acc.linear_out_proj += layer.attention_detail.linear_out_proj;
+                    acc
+                });
+        for (component, duration) in [
+            ("q_proj", attention.q_proj),
+            ("q_layout", attention.q_layout),
+            ("k_proj", attention.k_proj),
+            ("v_proj", attention.v_proj),
+            ("kv_split", attention.kv_split),
+            ("qk_norm", attention.qk_norm),
+            ("rope", attention.rope),
+            ("repeat_kv", attention.repeat_kv),
+            ("append_kv", attention.append_kv),
+            ("sdpa", attention.sdpa),
+            ("gate", attention.gate),
+            ("merge", attention.merge),
+            ("o_proj", attention.o_proj),
+            ("linear_qkv_proj", attention.linear_qkv_proj),
+            ("linear_z_proj", attention.linear_z_proj),
+            ("linear_b_proj", attention.linear_b_proj),
+            ("linear_a_proj", attention.linear_a_proj),
+            ("linear_core", attention.linear_core),
+            ("linear_out_proj", attention.linear_out_proj),
+        ] {
+            let seconds = secs(duration);
+            if seconds > 0.0 {
+                println!(
+                    "qwen36_fp8_lora_fd_forward_profile_attention component={} \
+                     seconds={seconds:.6} pct_total={:.3}",
+                    component,
+                    pct(seconds, profile_seconds)
+                );
+            }
         }
     }
 
