@@ -137,6 +137,55 @@ len=300 depth=0.00 run=1 pt=314 cls=exact wall=15.8s out='738291'
 SUMMARY len=300 depth=0.00 exact=2 partial=0 miss=0 DET
 ```
 
+## FP8 training finite-diff tail gate
+
+The training-side tail was rerun from a clean tracked-only archive of
+`c1f5b519` on `.62` GPU2, not from the dirty `/data01/arle-build` tree:
+
+```text
+source=/data01/arle-codex-c1f5b519
+target=/data01/arle-target-codex-c1f5b519
+model=/data01/models/Qwen3.6-35B-A3B-FP8
+CUDA_VISIBLE_DEVICES=2
+CUDA_HOME=/usr/local/cuda
+CUDARC_CUDA_VERSION=12090
+ARLE_CUDA_DISABLE_FLASHMLA=1
+INFER_TILELANG_PYTHON=/root/tl-venv/bin/python
+```
+
+A0 MoE FD gate, CUDA backend, `eps=1e-3` and relative tolerance:
+
+```text
+a0_moe_finite_diff backend=cuda eps=1.0e-3 checked_values=4864
+relative_values=1036 tiny_values=3828 max_abs_at_worst_rel=5.588241e-7
+max_rel=2.673310e-3 worst=a0_moe.router.weight[13]
+analytic=-2.090383e-4 numeric=-2.084794e-4
+max_tiny_abs=9.490354e-7 tiny_abs_failures=0
+test result: ok. 3 passed
+```
+
+Real-checkpoint Qwen3.6 FP8 LoRA MLP-layer FD gate:
+
+```text
+qwen36_fp8_lora_fd_gate ... --target-set all-linear \
+  --target-adapter auto:routed-up --mode mlp-layer --layer 0 \
+  --eps 1e-3 --profile-backward
+
+qwen36_fp8_lora_fd_backward_profile total_seconds=0.095036
+op_seconds=0.041475 merge_grad_seconds=0.053254
+qwen36_fp8_lora_fd_gate_result load_seconds=13.909568
+analytic_seconds=0.103256 plus_seconds=0.006681 minus_seconds=0.006814
+target=model.language_model.layers.0.mlp.experts.210.up_proj.weight.lora_b
+index=186 eps=1.0e-3 analytic=-2.581576268e-7
+numeric=-2.587512427e-7 rel_err=2.294e-3
+qwen36_fp8_lora_fd_gate PASS
+```
+
+The unfrozen and route-frozen full-model scalar FD diagnostics remain killed as
+oracles by the existing route/noise entries; the licensed gradient gate is the
+real-checkpoint MLP-layer FD above plus the A0 relative FD test. Do not relabel
+the full-model scalar diagnostic as a pass.
+
 ## Verdict
 
 F2 is closed for the exercised CUDA 35B-A3B teacher paths: BF16 and FP8 both
