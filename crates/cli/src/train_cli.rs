@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use autograd::{TensorId, TensorStore};
+use autograd::{Tape, TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use indicatif::{ProgressBar, ProgressStyle};
 use infer_plan::SamplingParams;
@@ -22,8 +22,8 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
-        PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand, TrainEnvArgs,
-        TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
+        OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainArgs, TrainCommand,
+        TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -515,6 +515,109 @@ fn load_opd_prompt_source(
     })
 }
 
+enum OpdCliTeacher<'a> {
+    InProcess(train::teacher_infer::InProcessTeacher<'a>),
+    #[cfg(feature = "cuda")]
+    Infer(train::teacher_infer::InferTeacher),
+}
+
+impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
+    fn forward_logits_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> std::result::Result<
+        train::teacher_infer::DeviceLogits,
+        train::teacher_infer::TeacherForwardError,
+    > {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::forward_logits_device(
+                    teacher, input_ids, positions, store, tape,
+                )
+            }
+            #[cfg(feature = "cuda")]
+            Self::Infer(teacher) => train::teacher_infer::TeacherForward::forward_logits_device(
+                teacher, input_ids, positions, store, tape,
+            ),
+        }
+    }
+
+    fn forward_logits_window_device(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+        window: train::qwen35::SequenceWindow,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> std::result::Result<
+        train::teacher_infer::DeviceLogits,
+        train::teacher_infer::TeacherForwardError,
+    > {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::forward_logits_window_device(
+                    teacher, input_ids, positions, window, store, tape,
+                )
+            }
+            #[cfg(feature = "cuda")]
+            Self::Infer(teacher) => {
+                train::teacher_infer::TeacherForward::forward_logits_window_device(
+                    teacher, input_ids, positions, window, store, tape,
+                )
+            }
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::InProcess(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
+            #[cfg(feature = "cuda")]
+            Self::Infer(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
+        }
+    }
+
+    fn parameter_ids(&self) -> &[TensorId] {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::parameter_ids(teacher)
+            }
+            #[cfg(feature = "cuda")]
+            Self::Infer(teacher) => train::teacher_infer::TeacherForward::parameter_ids(teacher),
+        }
+    }
+
+    fn offload_engine_weights(
+        &self,
+    ) -> std::result::Result<usize, train::teacher_infer::TeacherForwardError> {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::offload_engine_weights(teacher)
+            }
+            #[cfg(feature = "cuda")]
+            Self::Infer(teacher) => {
+                train::teacher_infer::TeacherForward::offload_engine_weights(teacher)
+            }
+        }
+    }
+
+    fn reload_engine_weights(
+        &self,
+    ) -> std::result::Result<(), train::teacher_infer::TeacherForwardError> {
+        match self {
+            Self::InProcess(teacher) => {
+                train::teacher_infer::TeacherForward::reload_engine_weights(teacher)
+            }
+            #[cfg(feature = "cuda")]
+            Self::Infer(teacher) => {
+                train::teacher_infer::TeacherForward::reload_engine_weights(teacher)
+            }
+        }
+    }
+}
+
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use autograd::{Tape, optim::AdamW};
     use train::{
@@ -541,13 +644,18 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
     let mut tape = Tape::new();
 
-    eprintln!(
-        "[arle train opd] loading teacher from {}",
-        teacher_dir.display()
-    );
-    let teacher = load_qwen35_from_hf_dir(teacher_dir, &mut store)
-        .with_context(|| format!("load teacher from {}", teacher_dir.display()))?;
-    let teacher_forward = train::teacher_infer::InProcessTeacher::new(&teacher);
+    let teacher_model = if matches!(args.teacher_runtime, OpdTeacherRuntimeArg::InProcess) {
+        eprintln!(
+            "[arle train opd] loading in-process teacher from {}",
+            teacher_dir.display()
+        );
+        Some(
+            load_qwen35_from_hf_dir(teacher_dir, &mut store)
+                .with_context(|| format!("load teacher from {}", teacher_dir.display()))?,
+        )
+    } else {
+        None
+    };
     eprintln!(
         "[arle train opd] loading student from {}",
         student_dir.display()
@@ -569,6 +677,33 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     )?;
     #[cfg(not(feature = "cuda"))]
     let _ = &train_backend;
+
+    let teacher_forward = match args.teacher_runtime {
+        OpdTeacherRuntimeArg::InProcess => {
+            let teacher = teacher_model
+                .as_ref()
+                .expect("in-process teacher was loaded before student");
+            OpdCliTeacher::InProcess(train::teacher_infer::InProcessTeacher::new(teacher))
+        }
+        OpdTeacherRuntimeArg::Infer => {
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!(
+                    "--teacher-runtime infer requires a CUDA build because infer raw-logits \
+                     teacher scoring is CUDA-only"
+                );
+            }
+            #[cfg(feature = "cuda")]
+            {
+                OpdCliTeacher::Infer(load_opd_infer_teacher(
+                    teacher_dir,
+                    args.prompt_max_tokens + args.rollout_len + 32,
+                    train_backend.clone(),
+                    cfg.vocab_size,
+                )?)
+            }
+        }
+    };
 
     let prompt_source = load_opd_prompt_source(&args, student_dir, cfg.vocab_size)?;
 
@@ -716,6 +851,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "backend": backend_label,
             "student_model": student_dir.display().to_string(),
             "teacher_model": teacher_dir.display().to_string(),
+            "teacher_runtime": format!("{:?}", args.teacher_runtime),
             "steps": args.steps,
             "rollout_len": args.rollout_len,
             "lr": args.lr,
@@ -1446,6 +1582,47 @@ fn opd_summary(step_metrics: &[OpdStepMetric]) -> OpdSummary {
         min_loss,
         max_loss,
     }
+}
+
+#[cfg(feature = "cuda")]
+fn load_opd_infer_teacher(
+    teacher_dir: &Path,
+    max_seq_len: usize,
+    train_backend: std::sync::Arc<dyn autograd::Backend>,
+    vocab_size: usize,
+) -> Result<train::teacher_infer::InferTeacher> {
+    use std::sync::{Arc, Mutex};
+
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+
+    let max_seq_len = max_seq_len.max(128);
+    let page_size = 16usize;
+    eprintln!(
+        "[arle train opd] loading infer teacher from {} (max_seq_len={max_seq_len})",
+        teacher_dir.display()
+    );
+    let engine = LoadedInferenceEngine::load_with_config(
+        teacher_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("teacher model path is not valid UTF-8"))?,
+        true,
+        EngineLoadConfig {
+            num_slots: 1,
+            page_size,
+            total_pages: max_seq_len.div_ceil(page_size),
+            max_prompt_tokens: max_seq_len,
+            max_total_tokens: max_seq_len,
+            chunked_prefill_size: max_seq_len,
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load infer teacher from {}", teacher_dir.display()))?;
+
+    Ok(train::teacher_infer::InferTeacher::new(
+        Arc::new(Mutex::new(engine)),
+        train_backend,
+        vocab_size,
+    ))
 }
 
 #[cfg(feature = "cuda")]
