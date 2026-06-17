@@ -145,6 +145,15 @@ pub(crate) enum OpdKlMaskArg {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum OpdTeacherRuntimeArg {
+    /// Load the teacher through the train-side Qwen3.5 autograd loader.
+    #[value(name = "in-process", alias = "in_process")]
+    InProcess,
+    /// Load the teacher through infer-api and score raw logits through the runtime.
+    Infer,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum LrScheduleArg {
     /// Keep AdamW at the fixed --lr value for every step.
     Fixed,
@@ -622,6 +631,10 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, alias = "teacher")]
     pub(crate) teacher_model: Option<PathBuf>,
 
+    /// Teacher scoring runtime. `infer` supports runtime-only teacher checkpoints.
+    #[arg(long, value_enum, default_value_t = OpdTeacherRuntimeArg::InProcess)]
+    pub(crate) teacher_runtime: OpdTeacherRuntimeArg,
+
     /// Initial prompt token ids, comma-separated. Defaults to `1,3,8`.
     #[arg(long, value_name = "IDS")]
     pub(crate) prompt_ids: Option<String>,
@@ -878,7 +891,9 @@ pub(crate) struct TrainSelfOpdArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, CliCommand, LrScheduleArg, OpdKlMaskArg, RunArgs, TrainCommand};
+    use super::{
+        Args, CliCommand, LrScheduleArg, OpdKlMaskArg, OpdTeacherRuntimeArg, RunArgs, TrainCommand,
+    };
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -1151,6 +1166,10 @@ mod tests {
             "opd",
             "--student-model",
             "models/qwen",
+            "--teacher-model",
+            "models/qwen-teacher",
+            "--teacher-runtime",
+            "infer",
             "--eval-ids",
             "1,2,3",
             "--gate-every-n",
@@ -1183,6 +1202,11 @@ mod tests {
         let TrainCommand::Opd(opd) = train.command else {
             panic!("expected train opd command");
         };
+        assert_eq!(
+            opd.teacher_model.as_deref(),
+            Some(std::path::Path::new("models/qwen-teacher"))
+        );
+        assert_eq!(opd.teacher_runtime, OpdTeacherRuntimeArg::Infer);
         assert_eq!(opd.eval_ids.as_deref(), Some("1,2,3"));
         assert_eq!(opd.gate_every_n, 5);
         assert_eq!(opd.gkd_lambda, 0.0);
@@ -1217,6 +1241,7 @@ mod tests {
             panic!("expected train opd command");
         };
         assert_eq!(opd.kl_mask, OpdKlMaskArg::Completion);
+        assert_eq!(opd.teacher_runtime, OpdTeacherRuntimeArg::InProcess);
         assert!(opd.prompts_file.is_none());
         assert_eq!(opd.prompt_max_tokens, 512);
         assert_eq!(opd.prompt_seed, 0);
