@@ -16,7 +16,7 @@ under `/v1/train/*` is documented separately in the train/runtime docs.
 | Category | Route | Notes |
 | --- | --- | --- |
 | Generation | `POST /v1/completions` | Raw prompt surface. SSE supported. |
-| Generation | `POST /v1/chat/completions` | Chat message surface. SSE supported. |
+| Generation | `POST /v1/chat/completions` | Chat message surface. Non-streaming only. |
 | Generation | `POST /v1/responses` | Newer text/tool-call subset. Non-streaming and SSE supported. |
 | Discovery | `GET /v1/models` | Returns the boot-time serving identity snapshot. |
 | Probes | `GET /healthz` | Lightweight unauthenticated liveness probe. |
@@ -30,12 +30,10 @@ under `/v1/train/*` is documented separately in the train/runtime docs.
 
 ## Streaming Behavior
 
-- `POST /v1/completions` supports SSE streaming. `stream_options.include_usage`
-  is supported, and `stream_options.continuous_usage_stats` is accepted as a
-  compatibility hint when `include_usage=true`.
-- `POST /v1/chat/completions` supports SSE streaming for plain assistant text.
-  Requests that combine `stream=true` with `tools` are rejected until the
-  server can emit structured `delta.tool_calls` chunks.
+- `POST /v1/completions` supports SSE streaming. Completion chunks always carry
+  `usage: null`; the terminal chunk carries usage. `stream_options` is not
+  parsed yet.
+- `POST /v1/chat/completions` currently rejects `stream=true`.
 - `POST /v1/responses` supports both non-streaming and SSE forms for the
   current text/tool-call subset. SSE emits `response.created`,
   `response.output_text.delta`, terminal `response.completed`, then `[DONE]`.
@@ -57,16 +55,16 @@ under `/v1/train/*` is documented separately in the train/runtime docs.
 - `model` is optional on request bodies, but when present it must match the
   currently served model reported by `GET /v1/models` (case-insensitive; final
   path segment match allowed). Mismatches return `404 model_not_found`.
-- Streaming completions accept `stream_options.include_usage`;
-  `/v1/completions` also accepts `stream_options.continuous_usage_stats` as a
-  compatibility hint, and it requires `stream_options.include_usage=true`.
+- Streaming completions currently ignore OpenAI `stream_options`; usage is
+  emitted on the terminal completion chunk.
 - Chat and responses validation is explicit: supported roles are `system`,
   `user`, `assistant`, and `tool`; `content` part arrays must be text-only.
 - Tool definitions must use `type=function`; malformed assistant `tool_calls`
   and tool messages without `tool_call_id` are rejected with structured
   `invalid_parameter` errors.
-- `/v1/chat/completions` and `/v1/responses` reject `stream=true` when `tools`
-  are present instead of pretending to support streamed tool-call deltas.
+- `/v1/chat/completions` rejects `stream=true`; `/v1/responses` rejects
+  `stream=true` when `tools` are present instead of pretending to support
+  streamed tool-call deltas.
 - JSON request bodies are capped at `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include
   `WWW-Authenticate`.

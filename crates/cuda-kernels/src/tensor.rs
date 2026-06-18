@@ -7,6 +7,7 @@ use cudarc::driver::{
 };
 use half::bf16;
 use std::any::type_name;
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -656,6 +657,26 @@ mod pipeline_fence_tests {
     }
 }
 
+fn bf16_safetensor_host_slice(data: &[u8]) -> Result<Cow<'_, [bf16]>> {
+    ensure!(
+        data.len().is_multiple_of(2),
+        "Data length must be even for bf16: got {} bytes",
+        data.len()
+    );
+    // Safetensors are little-endian. If a mmap-backed tensor starts at an
+    // unaligned byte offset, casting `u8*` to `bf16*` would be undefined
+    // behavior; fall back to a small decode buffer only for that case.
+    let (prefix, aligned, suffix) = unsafe { data.align_to::<bf16>() };
+    if prefix.is_empty() && suffix.is_empty() {
+        return Ok(Cow::Borrowed(aligned));
+    }
+    Ok(Cow::Owned(
+        data.chunks_exact(2)
+            .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+            .collect(),
+    ))
+}
+
 /// 1D device tensor (vector) — stored as bf16.
 pub struct DeviceVec {
     pub data: CudaSlice<bf16>,
@@ -678,20 +699,9 @@ impl DeviceVec {
         })
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
-        if !data.len().is_multiple_of(2) {
-            return Err(anyhow!(
-                "Data length must be even for bf16: got {} bytes",
-                data.len()
-            ));
-        }
-        let len = data.len() / 2;
-        // NOTE: This assumes a little-endian host. Safetensors are little-endian.
-        // On a big-endian machine, this will be incorrect. A full solution would
-        // involve byte-swapping.
-        let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), len) };
-        Self::from_host(ctx, slice)
+        let slice = bf16_safetensor_host_slice(data)?;
+        Self::from_host(ctx, slice.as_ref())
     }
 
     /// Create zeroed tensor
@@ -3255,7 +3265,6 @@ impl DeviceMatrix {
         Ok(())
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn from_safetensors(
         ctx: &DeviceContext,
         data: &[u8],
@@ -3269,14 +3278,10 @@ impl DeviceMatrix {
                 data.len()
             ));
         }
-        // NOTE: This assumes a little-endian host. Safetensors are little-endian.
-        // On a big-endian machine, this will be incorrect. A full solution would
-        // involve byte-swapping.
-        let slice =
-            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<bf16>(), rows * cols) };
+        let slice = bf16_safetensor_host_slice(data)?;
         let gpu_data = ctx
             .stream
-            .clone_htod(slice)
+            .clone_htod(slice.as_ref())
             .map_err(|e| anyhow!("H2D copy failed: {}", e))?;
         Ok(Self {
             data: gpu_data,

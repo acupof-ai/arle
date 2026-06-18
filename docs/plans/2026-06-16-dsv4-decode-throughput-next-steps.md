@@ -6,10 +6,10 @@ DSv4 code-mess audit are recorded in one place. Verification lane = `.62`
 
 ## Where we are (measured, clean = profiling OFF)
 
-**Standard bench "姿势" (now fixed — use this every time):** serve with profiling
+**Standard clean bench "姿势" (now fixed — use this every time):** serve with profiling
 **OFF** (NO `ARLE_DSV4_DECODE_PHASE_TIME` / `ARLE_DSV4_LINEAR_PROFILE` — each adds a
 per-step `cudaStreamSynchronize` that kills async overlap and **understates tok/s
-by ~25–35%**), all opt gates ON, MTP on; fixed prompt + `max_tokens=128`,
+by ~25–35%**), all non-MTP opt gates ON; fixed prompt + `max_tokens=128`,
 c ∈ {1,2,4,8(,…)}, metric = aggregate output tok/s. `scripts/dsv4_c_sweep.py`
 now has repeat/median/spread support; `scripts/bench_dsv4_trace_http.py` uses
 text `/v1/completions` SSE for TTFT/ITL capture. guidellm still needs pod-side
@@ -64,8 +64,8 @@ serve host; `.62` (clang-11) cannot serve MTP.**
 
 ## Open items / next steps (ranked by value)
 
-1. **MTP enablement — the biggest single lever (~1.7×, B=1 53 per
-   `2026-06-13-dsv4-mtp-d2-chain-fold-53`).** Two-part finding on this build:
+1. **MTP enablement — B=1 is ~1.2×, batched-MTP-vs-per-row reaches ~1.7× at
+   c≥8.** Two-part finding on this build:
    - **Head load fixed in the cleanup pass:** `--spec-type mtp` is now
      self-sufficient, the MTP draft head log reports the effective loader state,
      and the default draft depth is d2. `ARLE_DSV4_SPEC_DECODE` remains only a
