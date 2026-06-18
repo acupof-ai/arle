@@ -2862,9 +2862,20 @@ impl SafetensorLoader {
         names: &deepseek_spec::DeepSeekV4MoeTensorNames,
         split: &crate::moe_config::ExpertSplit,
         routing_kind: deepseek_spec::DeepSeekV4MoeRoutingKind,
+        // GLM (`weight_scale_inv` FP8) ⇒ re-encode experts into the DSv4 FP8+E8M0
+        // layout the grouped DeepGEMM cache consumes; DSv4 loads E8M0 directly.
+        glm: bool,
     ) -> Result<crate::dsv4::Dsv4MoeLayer> {
         use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
+
+        let load_fp8 = |name: &str| -> Result<DeviceMatrix> {
+            if glm {
+                self.load_dsv4_glm_fp8_as_dsv4(ctx, name)
+            } else {
+                self.load_dsv4_block_scaled(ctx, name)
+            }
+        };
 
         let mut w13 = Vec::with_capacity(split.experts_per_rank);
         let mut w2 = Vec::with_capacity(split.experts_per_rank);
@@ -2872,12 +2883,12 @@ impl SafetensorLoader {
             let expert = names.expert(e);
             // w1 (gate) over w3 (up), row-stacked into one fused FP8 cache so the
             // masked grouped GEMM produces [gate | up] in a single launch.
-            let w1 = self.load_dsv4_block_scaled(ctx, &expert.w1)?;
-            let w3 = self.load_dsv4_block_scaled(ctx, &expert.w3)?;
+            let w1 = load_fp8(&expert.w1)?;
+            let w3 = load_fp8(&expert.w3)?;
             w13.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(
                 ctx, &w1, &w3,
             )?);
-            let down = self.load_dsv4_block_scaled(ctx, &expert.w2)?;
+            let down = load_fp8(&expert.w2)?;
             w2.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &down)?);
         }
         let first_w13 = w13
@@ -2939,11 +2950,11 @@ impl SafetensorLoader {
             .shared_experts
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 expects an always-on shared expert"))?;
-        let shared_w1 = self.load_dsv4_block_scaled(ctx, &shared.w1)?;
-        let shared_w3 = self.load_dsv4_block_scaled(ctx, &shared.w3)?;
+        let shared_w1 = load_fp8(&shared.w1)?;
+        let shared_w3 = load_fp8(&shared.w3)?;
         let shared_w13 =
             Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(ctx, &shared_w1, &shared_w3)?;
-        let shared_down = self.load_dsv4_block_scaled(ctx, &shared.w2)?;
+        let shared_down = load_fp8(&shared.w2)?;
         let shared_w2 = Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &shared_down)?;
 
         Ok(crate::dsv4::Dsv4MoeLayer {
@@ -2959,6 +2970,44 @@ impl SafetensorLoader {
             shared_w13,
             shared_w2,
             gemv_tables: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Load a GLM dense-MLP layer (`first_k_dense_replace` layers): a plain SwiGLU
+    /// FFN (`gate_proj`/`up_proj`/`down_proj` at `intermediate_size`). GLM ships
+    /// FP8 + F32 `weight_scale_inv`; dequantize each to dense bf16 (the FP8 grouped
+    /// caches need E8M0 scales GLM doesn't carry — Tranche-D may revisit).
+    pub(crate) fn load_dsv4_dense_mlp(
+        &self,
+        ctx: &DeviceContext,
+        names: &deepseek_spec::DeepSeekV4ExpertTensorNames,
+    ) -> Result<crate::dsv4::Dsv4DenseMlp> {
+        // w1 = gate_proj, w3 = up_proj, w2 = down_proj.
+        let gate = self.load_dsv4_block_scaled_dialect(ctx, &names.w1)?;
+        let up = self.load_dsv4_block_scaled_dialect(ctx, &names.w3)?;
+        let down = self.load_dsv4_block_scaled_dialect(ctx, &names.w2)?;
+        let hidden_dim = gate.cols;
+        let intermediate = gate.rows;
+        ensure!(
+            up.rows == intermediate && up.cols == hidden_dim,
+            "GLM dense up_proj shape {}x{} != gate {}x{}",
+            up.rows,
+            up.cols,
+            intermediate,
+            hidden_dim
+        );
+        ensure!(
+            down.rows == hidden_dim && down.cols == intermediate,
+            "GLM dense down_proj shape {}x{} != [{hidden_dim}, {intermediate}]",
+            down.rows,
+            down.cols
+        );
+        Ok(crate::dsv4::Dsv4DenseMlp {
+            gate,
+            up,
+            down,
+            hidden_dim,
+            intermediate,
         })
     }
 
@@ -3025,8 +3074,12 @@ impl SafetensorLoader {
         names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
         tp: &TpConfig,
     ) -> Result<crate::dsv4::Dsv4Attention> {
-        let attn_sink = self.load_dsv4_vec(ctx, &names.attn_sink)?;
-        let attn_sink_f32 = {
+        // GLM (`plain_o_proj`) ships no `attn_sink` tensor — its MLA has no per-head
+        // sink logit. DSv4 loads `attn_sink` + an f32 mirror.
+        let (attn_sink, attn_sink_f32) = if config.plain_o_proj {
+            (None, None)
+        } else {
+            let attn_sink = self.load_dsv4_vec(ctx, &names.attn_sink)?;
             let mut dst = ctx
                 .stream
                 .alloc_zeros::<f32>(attn_sink.len)
@@ -3044,11 +3097,27 @@ impl SafetensorLoader {
                 .map_err(|e| anyhow!("DSv4 attn_sink bf16->f32 mirror failed: {e}"))?;
             }
             drop(_dg);
-            dst
+            drop(_sg);
+            (Some(attn_sink), Some(dst))
         };
-        let wq_a = self.load_dsv4_block_scaled(ctx, &names.wq_a)?;
-        let wkv = self.load_dsv4_block_scaled(ctx, &names.wkv)?;
-        let wqkv_a_deepgemm = if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+        // GLM (`plain_o_proj`) ships FP8 + F32 `weight_scale_inv` scales: dequant the
+        // Q/KV down/up projections to dense bf16 (the FP8 DeepGEMM caches below are
+        // DSv4-only — they need the E8M0 `dsv4_scales` layout). TP head-sharding of
+        // the GLM projections is a Tranche-D concern; load replicated for the
+        // single-GPU typecheck/bring-up.
+        let glm = config.plain_o_proj;
+        let (wq_a, wkv) = if glm {
+            (
+                self.load_dsv4_block_scaled_dialect(ctx, &names.wq_a)?,
+                self.load_dsv4_block_scaled_dialect(ctx, &names.wkv)?,
+            )
+        } else {
+            (
+                self.load_dsv4_block_scaled(ctx, &names.wq_a)?,
+                self.load_dsv4_block_scaled(ctx, &names.wkv)?,
+            )
+        };
+        let wqkv_a_deepgemm = if !glm && crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
             Some(
                 cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(
                     ctx, &wq_a, &wkv,
@@ -3057,60 +3126,100 @@ impl SafetensorLoader {
         } else {
             None
         };
-        let wq_b = self.load_dsv4_block_scaled_sharded(
-            ctx,
-            &names.wq_b,
-            names
-                .shard_for(config, &names.wq_b, tp.world_size)
-                .unwrap_or(Shard::Replicated),
-            tp,
-        )?;
+        let wq_b = if glm {
+            self.load_dsv4_block_scaled_dialect(ctx, &names.wq_b)?
+        } else {
+            self.load_dsv4_block_scaled_sharded(
+                ctx,
+                &names.wq_b,
+                names
+                    .shard_for(config, &names.wq_b, tp.world_size)
+                    .unwrap_or(Shard::Replicated),
+                tp,
+            )?
+        };
         // DeepGEMM-layout cache for the decode wq_b projection (lever #1: residual
         // scalar GEMV → tensor-core). Built under the same gate as the fused
         // wq_a|wkv cache so the runtime ARLE_DSV4_DECODE_PROJ_DEEPGEMM flag can A/B
-        // it without a rebuild.
-        let wq_b_deepgemm = if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+        // it without a rebuild. DSv4-only (FP8 path).
+        let wq_b_deepgemm = if !glm && crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
             Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wq_b)?)
         } else {
             None
         };
-        let wo_a = self.load_dsv4_block_scaled_sharded(
-            ctx,
-            &names.wo_a,
-            names
-                .shard_for(config, &names.wo_a, tp.world_size)
-                .unwrap_or(Shard::Replicated),
-            tp,
-        )?;
-        let wo_a_groups = Self::build_dsv4_wo_a_group_tables(ctx, &wo_a, config.o_lora_rank)?;
-        let wo_b = self.load_dsv4_block_scaled_sharded(
-            ctx,
-            &names.wo_b,
-            names
-                .shard_for(config, &names.wo_b, tp.world_size)
-                .unwrap_or(Shard::Replicated),
-            tp,
-        )?;
-        // DeepGEMM caches for the decode output projection (lever #1b), same gate.
-        let (wo_a_deepgemm, wo_b_deepgemm) =
-            if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
-                (
-                    (wo_a_groups.groups == 1)
-                        .then(|| {
+        // Output projection. DSv4: low-rank wo_a→wo_b (+ per-group tables). GLM
+        // (`plain_o_proj`): a single plain `o_proj` [hidden, num_heads*v_head_dim],
+        // and the kv_b absorption split (w_kc/w_vc).
+        let (wo_a, wo_a_groups, wo_b, wo_a_deepgemm, wo_b_deepgemm, o_proj, w_kc, w_vc) = if config
+            .plain_o_proj
+        {
+            let o_proj = self.load_dsv4_block_scaled_dialect(
+                ctx,
+                names
+                    .o_proj
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("GLM plain_o_proj layer missing o_proj name"))?,
+            )?;
+            let (w_kc, w_vc) = self.load_dsv4_kv_b_absorb(ctx, config, names, tp)?;
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(o_proj),
+                Some(w_kc),
+                Some(w_vc),
+            )
+        } else {
+            let wo_a = self.load_dsv4_block_scaled_sharded(
+                ctx,
+                &names.wo_a,
+                names
+                    .shard_for(config, &names.wo_a, tp.world_size)
+                    .unwrap_or(Shard::Replicated),
+                tp,
+            )?;
+            let wo_a_groups = Self::build_dsv4_wo_a_group_tables(ctx, &wo_a, config.o_lora_rank)?;
+            let wo_b = self.load_dsv4_block_scaled_sharded(
+                ctx,
+                &names.wo_b,
+                names
+                    .shard_for(config, &names.wo_b, tp.world_size)
+                    .unwrap_or(Shard::Replicated),
+                tp,
+            )?;
+            // DeepGEMM caches for the decode output projection (lever #1b), same gate.
+            let (wo_a_deepgemm, wo_b_deepgemm) =
+                if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+                    (
+                        (wo_a_groups.groups == 1)
+                            .then(|| {
+                                cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
+                                    ctx, &wo_a,
+                                )
+                            })
+                            .transpose()?,
+                        Some(
                             cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
-                                ctx, &wo_a,
-                            )
-                        })
-                        .transpose()?,
-                    Some(
-                        cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
-                            ctx, &wo_b,
-                        )?,
-                    ),
-                )
-            } else {
-                (None, None)
-            };
+                                ctx, &wo_b,
+                            )?,
+                        ),
+                    )
+                } else {
+                    (None, None)
+                };
+            (
+                Some(wo_a),
+                Some(wo_a_groups),
+                Some(wo_b),
+                wo_a_deepgemm,
+                wo_b_deepgemm,
+                None,
+                None,
+                None,
+            )
+        };
         Ok(crate::dsv4::Dsv4Attention {
             wq_a,
             wqkv_a_deepgemm,
@@ -3134,9 +3243,243 @@ impl SafetensorLoader {
             indexer: names
                 .indexer
                 .as_ref()
-                .map(|i| self.load_dsv4_indexer(ctx, i))
+                .map(|i| self.load_dsv4_indexer(ctx, config, i))
                 .transpose()?,
+            o_proj,
+            w_kc,
+            w_vc,
         })
+    }
+
+    /// GLM `kv_b` absorption split (SGLang `deepseek_weight_loader.py:567-590`,
+    /// the non-`use_deep_gemm_bmm` path that yields bf16 `w_kc`/`w_vc`).
+    ///
+    /// `kv_b_proj.weight` is `[num_heads*(qk_nope_head_dim + v_head_dim), kv_lora_rank]`
+    /// (FP8 block-scaled). We:
+    ///   1. dequantize to bf16,
+    ///   2. `unflatten(0, (num_heads, qk_nope+v_head_dim))`,
+    ///   3. split dim-1 into `w_kc[h, qk_nope, kv_lora]` and `w_vc[h, v_head, kv_lora]`,
+    ///   4. transpose `w_vc → [h, kv_lora, v_head]` (SGLang `.contiguous().transpose(1,2)`).
+    ///      `w_kc` keeps `[h, qk_nope, kv_lora]` (SGLang's double-transpose is a no-op
+    ///      on logical shape, only re-laying-out memory).
+    ///
+    /// GPU-UNVERIFIABLE (pod): the exact dequant scale application (F32
+    /// `weight_scale_inv`, block [128,128]) and the per-head BMM contraction the
+    /// Tranche-D forward feeds these into need a pod load+forward to confirm.
+    pub(crate) fn load_dsv4_kv_b_absorb(
+        &self,
+        ctx: &DeviceContext,
+        config: &deepseek_spec::DeepSeekV4Config,
+        names: &deepseek_spec::DeepSeekV4AttentionTensorNames,
+        tp: &TpConfig,
+    ) -> Result<(DeviceMatrix, DeviceMatrix)> {
+        let kv_b_name = names
+            .kv_b_proj
+            .as_ref()
+            .ok_or_else(|| anyhow!("GLM attention missing kv_b_proj name"))?;
+        let qk_nope = config.qk_nope_head_dim;
+        let v_head = config.v_head_dim;
+        let kv_lora = config.kv_lora_rank;
+        let num_heads = config.num_attention_heads;
+        ensure!(
+            qk_nope > 0 && v_head > 0 && kv_lora > 0,
+            "GLM kv_b split needs qk_nope_head_dim/v_head_dim/kv_lora_rank > 0, \
+             got {qk_nope}/{v_head}/{kv_lora}"
+        );
+        // Dequantize kv_b to host f32 [num_heads*(qk_nope+v_head), kv_lora].
+        let rows = num_heads * (qk_nope + v_head);
+        let kv_b = self.dequantize_dsv4_block_scaled_to_f32_host(kv_b_name, rows, kv_lora)?;
+        // Split per head into w_kc / w_vc host buffers (row-major), emit bf16 LE bytes.
+        let per_head = qk_nope + v_head;
+        let mut w_kc_bytes = Vec::with_capacity(num_heads * qk_nope * kv_lora * 2);
+        let mut w_vc = vec![0.0f32; num_heads * kv_lora * v_head];
+        for h in 0..num_heads {
+            let head_base = h * per_head * kv_lora;
+            // w_kc[h] = rows [0, qk_nope) of head h, shape [qk_nope, kv_lora]
+            // (kept row-major, matching SGLang's logical [h, qk_nope, kv_lora]).
+            for v in &kv_b[head_base..head_base + qk_nope * kv_lora] {
+                w_kc_bytes.extend_from_slice(&half::bf16::from_f32(*v).to_le_bytes());
+            }
+            // w_vc[h] = rows [qk_nope, qk_nope+v_head) of head h, shape [v_head, kv_lora];
+            // transpose to [kv_lora, v_head] (SGLang `.transpose(1,2)`).
+            let vc_src_base = head_base + qk_nope * kv_lora;
+            for r in 0..v_head {
+                for c in 0..kv_lora {
+                    // dst[h, c, r] in [num_heads, kv_lora, v_head] row-major.
+                    w_vc[h * kv_lora * v_head + c * v_head + r] =
+                        kv_b[vc_src_base + r * kv_lora + c];
+                }
+            }
+        }
+        let w_vc_bytes: Vec<u8> = w_vc
+            .iter()
+            .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+            .collect();
+        let _ = tp; // kv_b absorption is per-head and replicated at the head grain;
+        // TP head-sharding of w_kc/w_vc is a Tranche-D concern (matches o_proj/wq_b).
+        let w_kc = DeviceMatrix::from_safetensors(ctx, &w_kc_bytes, num_heads * qk_nope, kv_lora)
+            .with_context(|| format!("upload GLM w_kc from {kv_b_name}"))?;
+        let w_vc = DeviceMatrix::from_safetensors(ctx, &w_vc_bytes, num_heads * kv_lora, v_head)
+            .with_context(|| format!("upload GLM w_vc from {kv_b_name}"))?;
+        Ok((w_kc, w_vc))
+    }
+
+    /// Dequantize a DSv4/GLM block-scaled FP8 E4M3 matrix to host f32, applying the
+    /// block scale. DSv4 ships `<prefix>.scale` (F8_E8M0, 1 byte/block); GLM ships
+    /// `<name>.weight_scale_inv` (F32, block [128,128]). The block scale multiplies
+    /// (SGLang `w.to(bf16) * weight_scale_inv`, `deepseek_weight_loader.py:557-563`).
+    ///
+    /// GPU-UNVERIFIABLE (pod): the F32 `weight_scale_inv` block layout (row-major
+    /// `[ceil(rows/128), ceil(cols/128)]`, multiply) is taken from the SGLang loader
+    /// + the index.json scale shape `[224, 4]` for kv_b `[28672, 512]`; the exact
+    /// dequant must be confirmed against a pod forward.
+    /// Load a GLM (`weight_scale_inv`) FP8 matrix and re-encode it into the DSv4
+    /// FP8 E4M3 + E8M0 block-scale layout the `Dsv4Fp8DeepGemmWeightCache` consumes
+    /// (per-128×128 block, UE8M0 scale = the block's max-abs power-of-two). This is
+    /// the canonical DeepGEMM block quantization, applied to the dequantized
+    /// weights so GLM MoE/dense layers can ride the existing FP8 grouped GEMM.
+    ///
+    /// GPU-UNVERIFIABLE (pod): the E8M0 re-encode is exact only if GLM's F32
+    /// `weight_scale_inv` blocks are themselves power-of-two (DeepGEMM UE8M0); if
+    /// they carry mantissa, the round-to-pow2 here loses precision and the MoE
+    /// path must instead run a bf16 grouped GEMM (Tranche D). Confirm on the pod.
+    fn load_dsv4_glm_fp8_as_dsv4(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceMatrix> {
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D FP8 tensor, got {:?}",
+            tensor.shape
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        let f32 = self.dequantize_dsv4_block_scaled_to_f32_host(name, rows, cols)?;
+        const BLOCK: usize = 128;
+        let scale_rows = rows.div_ceil(BLOCK);
+        let scale_cols = cols.div_ceil(BLOCK);
+        let mut weight_bytes = vec![0u8; rows * cols];
+        let mut scale_bytes = vec![0u8; scale_rows * scale_cols];
+        for sr in 0..scale_rows {
+            for sc in 0..scale_cols {
+                // Block max-abs → E8M0 exponent (DeepGEMM UE8M0): scale = 2^e ≥ max-abs/448.
+                let mut max_abs = 0.0f32;
+                for r in sr * BLOCK..((sr + 1) * BLOCK).min(rows) {
+                    for c in sc * BLOCK..((sc + 1) * BLOCK).min(cols) {
+                        max_abs = max_abs.max(f32[r * cols + c].abs());
+                    }
+                }
+                // E4M3 max normal magnitude is 448.0.
+                let e = if max_abs > 0.0 {
+                    (max_abs / 448.0).log2().ceil() as i32
+                } else {
+                    0
+                };
+                let scale = 2.0f32.powi(e);
+                // E8M0 byte = biased exponent (bias 127).
+                scale_bytes[sr * scale_cols + sc] = (e + 127).clamp(0, 255) as u8;
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                for r in sr * BLOCK..((sr + 1) * BLOCK).min(rows) {
+                    for c in sc * BLOCK..((sc + 1) * BLOCK).min(cols) {
+                        weight_bytes[r * cols + c] =
+                            crate::quant_format::encode_f8_e4m3fn(f32[r * cols + c] * inv);
+                    }
+                }
+            }
+        }
+        DeviceMatrix::from_dsv4_fp8_block_scaled(
+            ctx,
+            &weight_bytes,
+            &scale_bytes,
+            rows,
+            cols,
+            scale_rows,
+            scale_cols,
+        )
+        .with_context(|| format!("re-encode GLM FP8→DSv4 {name}"))
+    }
+
+    fn dequantize_dsv4_block_scaled_to_f32_host(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        use crate::quant_format::decode_f8_e4m3fn;
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.shape == [rows, cols],
+            "{name}: expected FP8 shape [{rows}, {cols}], got {:?}",
+            tensor.shape
+        );
+        ensure!(
+            tensor.dtype == Dtype::F8_E4M3,
+            "{name}: GLM kv_b dequant expects F8_E4M3, got {:?}",
+            tensor.dtype
+        );
+        let weight = tensor.bytes();
+        ensure!(
+            weight.len() == rows * cols,
+            "{name}: FP8 byte len {} != rows*cols {}",
+            weight.len(),
+            rows * cols
+        );
+        // Resolve the block scale: prefer GLM `weight_scale_inv` (F32), else the
+        // DSv4 `<prefix>.scale` (F8_E8M0).
+        let base = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| anyhow!("{name}: quantized tensor name must end with .weight"))?;
+        let glm_scale = format!("{base}.weight_scale_inv");
+        let (scale_f32, scale_rows, scale_cols, block_m, block_k) =
+            if let Ok(s) = self.borrow_raw_tensor(&glm_scale) {
+                ensure!(
+                    s.dtype == Dtype::F32,
+                    "{glm_scale}: GLM block scale expected F32, got {:?}",
+                    s.dtype
+                );
+                ensure!(s.shape.len() == 2, "{glm_scale}: expected 2D scale");
+                let (sr, sc) = (s.shape[0], s.shape[1]);
+                let vals: Vec<f32> = s
+                    .bytes()
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                // Block dims inferred from the weight/scale shapes (GLM uses [128,128]).
+                let block_m = rows.div_ceil(sr);
+                let block_k = cols.div_ceil(sc);
+                (vals, sr, sc, block_m, block_k)
+            } else {
+                let dsv4_scale = format!("{base}.scale");
+                let s = self.borrow_raw_tensor(&dsv4_scale)?;
+                ensure!(
+                    s.dtype == Dtype::F8_E8M0,
+                    "{dsv4_scale}: DSv4 block scale expected F8_E8M0, got {:?}",
+                    s.dtype
+                );
+                ensure!(s.shape.len() == 2, "{dsv4_scale}: expected 2D scale");
+                let (sr, sc) = (s.shape[0], s.shape[1]);
+                // E8M0 byte = biased exponent (bias 127) → scale = 2^(byte-127).
+                let vals: Vec<f32> = s
+                    .bytes()
+                    .iter()
+                    .map(|&b| 2.0f32.powi(b as i32 - 127))
+                    .collect();
+                let block_m = rows.div_ceil(sr);
+                let block_k = cols.div_ceil(sc);
+                (vals, sr, sc, block_m, block_k)
+            };
+        ensure!(
+            scale_f32.len() == scale_rows * scale_cols,
+            "{name}: block-scale element count {} != {scale_rows}*{scale_cols}",
+            scale_f32.len()
+        );
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let sr = r / block_m;
+            for c in 0..cols {
+                let sc = c / block_k;
+                let scale = scale_f32[sr.min(scale_rows - 1) * scale_cols + sc.min(scale_cols - 1)];
+                out[r * cols + c] = decode_f8_e4m3fn(weight[r * cols + c]) * scale;
+            }
+        }
+        Ok(out)
     }
 
     /// Load one compressor sub-block (`wkv`/`wgate`/`ape` matrices + `norm` vec).
@@ -3153,30 +3496,106 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load one CSA indexer sub-block (`wq_b`/`weights_proj` + a key compressor).
+    /// Load one indexer sub-block. DSv4 CSA: `wq_b`/`weights_proj` + a key
+    /// compressor. GLM DSA (`SparseIndexed`): `wq_b`/`weights_proj` + `wk` key
+    /// projection + `k_norm` (weight+bias), no compressor.
     pub(crate) fn load_dsv4_indexer(
         &self,
         ctx: &DeviceContext,
+        config: &deepseek_spec::DeepSeekV4Config,
         names: &deepseek_spec::DeepSeekV4IndexerTensorNames,
     ) -> Result<crate::dsv4::Dsv4Indexer> {
-        let wq_b = self.load_dsv4_global_matrix(ctx, &names.wq_b)?;
-        let wq_b_deepgemm = if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+        let glm = config.plain_o_proj;
+        // GLM indexer wq_b is FP8 + `weight_scale_inv`; dequant to dense bf16.
+        let wq_b = if glm {
+            self.load_dsv4_block_scaled_dialect(ctx, &names.wq_b)?
+        } else {
+            self.load_dsv4_global_matrix(ctx, &names.wq_b)?
+        };
+        // The decode DeepGEMM cache is built only for the FP8 DSv4 wq_b; GLM's
+        // dequantized bf16 wq_b uses the scalar/dense path.
+        let wq_b_deepgemm = if !glm && crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
             Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wq_b)?)
         } else {
             None
         };
-        Ok(crate::dsv4::Dsv4Indexer {
-            wq_b,
-            weights_proj: self.load_dsv4_global_matrix(ctx, &names.weights_proj)?,
-            compressor: self.load_dsv4_compressor(
+        let weights_proj = self.load_dsv4_global_matrix(ctx, &names.weights_proj)?;
+        let (compressor, wk, k_norm, k_norm_bias) = if glm {
+            let wk = match names.wk.as_ref() {
+                Some(n) => Some(self.load_dsv4_block_scaled_dialect(ctx, n)?),
+                None => None,
+            };
+            let k_norm = match names.k_norm.as_ref() {
+                Some(n) => Some(self.load_dsv4_vec(ctx, n)?),
+                None => None,
+            };
+            let k_norm_bias = match names.k_norm_bias.as_ref() {
+                Some(n) => Some(self.load_dsv4_vec(ctx, n)?),
+                None => None,
+            };
+            (None, wk, k_norm, k_norm_bias)
+        } else {
+            let compressor = self.load_dsv4_compressor(
                 ctx,
                 names
                     .compressor
                     .as_ref()
                     .expect("DSv4 indexer always has a compressor"),
-            )?,
+            )?;
+            (Some(compressor), None, None, None)
+        };
+        Ok(crate::dsv4::Dsv4Indexer {
+            wq_b,
+            weights_proj,
+            compressor,
+            wk,
+            k_norm,
+            k_norm_bias,
             wq_b_deepgemm,
         })
+    }
+
+    /// Load a block-scaled FP8 matrix choosing the scale dialect by sibling:
+    /// GLM `<base>.weight_scale_inv` (F32) ⇒ dequantize to a dense bf16
+    /// [`DeviceMatrix`] (full F32 scale precision, no E8M0 lossy round-trip);
+    /// DSv4 `<base>.scale` (E8M0) ⇒ the existing FP8 block-scaled path. BF16/F32
+    /// on disk falls through to the dense loader.
+    ///
+    /// GPU-UNVERIFIABLE (pod): the dequant-to-bf16 choice for GLM (vs keeping FP8)
+    /// trades VRAM for correctness and must be re-checked against a pod forward —
+    /// the F32 block scale cannot ride the E8M0 `dsv4_scales` path losslessly.
+    pub(crate) fn load_dsv4_block_scaled_dialect(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
+        let tensor = self.borrow_raw_tensor(name)?;
+        if tensor.dtype == Dtype::BF16 || tensor.dtype == Dtype::F32 {
+            return self.load_dsv4_bf16_matrix(ctx, name);
+        }
+        let base = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| anyhow!("{name}: quantized tensor name must end with .weight"))?;
+        let has_inv = self
+            .borrow_raw_tensor(&format!("{base}.weight_scale_inv"))
+            .is_ok();
+        if has_inv {
+            ensure!(
+                tensor.shape.len() == 2,
+                "{name}: expected 2D quantized tensor, got {:?}",
+                tensor.shape
+            );
+            let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+            let f32 = self.dequantize_dsv4_block_scaled_to_f32_host(name, rows, cols)?;
+            let bytes: Vec<u8> = f32
+                .iter()
+                .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+                .collect();
+            DeviceMatrix::from_safetensors(ctx, &bytes, rows, cols)
+                .with_context(|| format!("upload GLM dequant bf16 {name}"))
+        } else {
+            self.load_dsv4_block_scaled(ctx, name)
+        }
     }
 }
 

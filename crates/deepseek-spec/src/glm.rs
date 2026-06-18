@@ -214,7 +214,9 @@ impl GlmMoeDsaConfig {
     /// Does NOT call `DeepSeekV4Config::validate` (that gate is DSv4-strict and
     /// rejects the GLM dialect's `o_lora_rank == 0` / `model_type`).
     pub fn into_deepseek_v4(&self) -> Result<crate::v4::DeepSeekV4Config> {
-        use crate::v4::{DeepSeekV4AttentionMode, DeepSeekV4Config, DeepSeekV4RopeParameters};
+        use crate::v4::{
+            DeepSeekV4AttentionMode, DeepSeekV4Config, DeepSeekV4RopeParameters, TensorDialect,
+        };
 
         let n = self.num_hidden_layers;
         let rope_theta = self.rope_theta() as f32;
@@ -286,6 +288,8 @@ impl GlmMoeDsaConfig {
             per_layer_attention_mode: Some(vec![DeepSeekV4AttentionMode::SparseIndexed; n]),
             per_layer_dense_mlp: Some((0..n).map(|l| !self.is_sparse_layer(l)).collect()),
             per_layer_full_indexer: Some((0..n).map(|l| self.is_full_indexer_layer(l)).collect()),
+            // GLM-5.2 HF tensor names.
+            tensor_dialect: TensorDialect::Glm,
         })
     }
 }
@@ -410,6 +414,179 @@ mod tests {
 
         assert_eq!(v4.num_key_value_heads, 1);
         assert_eq!(v4.hc_mult, 1);
+        assert_eq!(v4.tensor_dialect, crate::v4::TensorDialect::Glm);
+    }
+
+    /// GLM HF tensor names emitted by the `Glm` dialect, cross-checked against the
+    /// real `/data02/models/GLM-5.2-FP8/model.safetensors.index.json`.
+    #[test]
+    fn glm_dialect_emits_hf_tensor_names() {
+        let v4 = GlmMoeDsaConfig::from_json_str(GLM52)
+            .unwrap()
+            .into_deepseek_v4()
+            .unwrap();
+
+        let top = v4.tensor_names();
+        assert_eq!(top.embed_tokens(), "model.embed_tokens.weight");
+        assert_eq!(top.lm_head(), "lm_head.weight");
+        assert_eq!(top.norm(), "model.norm.weight");
+
+        // Layer 0 is dense (first_k_dense_replace=3) and a "full" indexer layer.
+        let l0 = v4.layer_tensor_names(0);
+        assert_eq!(l0.attn_norm, "model.layers.0.input_layernorm.weight");
+        assert_eq!(
+            l0.ffn_norm,
+            "model.layers.0.post_attention_layernorm.weight"
+        );
+        assert_eq!(l0.attn.wq_a, "model.layers.0.self_attn.q_a_proj.weight");
+        assert_eq!(
+            l0.attn.q_norm,
+            "model.layers.0.self_attn.q_a_layernorm.weight"
+        );
+        assert_eq!(l0.attn.wq_b, "model.layers.0.self_attn.q_b_proj.weight");
+        assert_eq!(
+            l0.attn.wkv,
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+        );
+        assert_eq!(
+            l0.attn.kv_norm,
+            "model.layers.0.self_attn.kv_a_layernorm.weight"
+        );
+        assert_eq!(
+            l0.attn.kv_b_proj.as_deref(),
+            Some("model.layers.0.self_attn.kv_b_proj.weight")
+        );
+        assert_eq!(
+            l0.attn.o_proj.as_deref(),
+            Some("model.layers.0.self_attn.o_proj.weight")
+        );
+        assert!(l0.attn.compressor.is_none());
+        // Full-indexer layer carries the DSA Lightning Indexer weights.
+        let idx = l0.attn.indexer.as_ref().unwrap();
+        assert_eq!(idx.wq_b, "model.layers.0.self_attn.indexer.wq_b.weight");
+        assert_eq!(
+            idx.weights_proj,
+            "model.layers.0.self_attn.indexer.weights_proj.weight"
+        );
+        assert_eq!(
+            idx.wk.as_deref(),
+            Some("model.layers.0.self_attn.indexer.wk.weight")
+        );
+        assert_eq!(
+            idx.k_norm.as_deref(),
+            Some("model.layers.0.self_attn.indexer.k_norm.weight")
+        );
+        assert_eq!(
+            idx.k_norm_bias.as_deref(),
+            Some("model.layers.0.self_attn.indexer.k_norm.bias")
+        );
+        assert!(idx.compressor.is_none());
+        // Dense layer: a plain MLP, no router gate / experts.
+        let dense = l0.ffn.dense_mlp.as_ref().unwrap();
+        assert_eq!(dense.w1, "model.layers.0.mlp.gate_proj.weight");
+        assert_eq!(dense.w3, "model.layers.0.mlp.up_proj.weight");
+        assert_eq!(dense.w2, "model.layers.0.mlp.down_proj.weight");
+
+        // Layer 3 is sparse (MoE) and a "shared" indexer layer (no indexer tensors).
+        let l3 = v4.layer_tensor_names(3);
+        assert!(l3.attn.indexer.is_none());
+        assert!(l3.ffn.dense_mlp.is_none());
+        assert_eq!(l3.ffn.gate_weight, "model.layers.3.mlp.gate.weight");
+        assert_eq!(
+            l3.ffn.gate_bias.as_deref(),
+            Some("model.layers.3.mlp.gate.e_score_correction_bias")
+        );
+        assert_eq!(
+            l3.ffn.expert(0).w1,
+            "model.layers.3.mlp.experts.0.gate_proj.weight"
+        );
+        assert_eq!(
+            l3.ffn.expert(0).w3,
+            "model.layers.3.mlp.experts.0.up_proj.weight"
+        );
+        assert_eq!(
+            l3.ffn.expert(0).w2,
+            "model.layers.3.mlp.experts.0.down_proj.weight"
+        );
+        let shared = l3.ffn.shared_experts.as_ref().unwrap();
+        assert_eq!(
+            shared.w1,
+            "model.layers.3.mlp.shared_experts.gate_proj.weight"
+        );
+        assert_eq!(
+            shared.w3,
+            "model.layers.3.mlp.shared_experts.up_proj.weight"
+        );
+        assert_eq!(
+            shared.w2,
+            "model.layers.3.mlp.shared_experts.down_proj.weight"
+        );
+    }
+
+    /// The `Dsv4` dialect (default) must keep the abbreviated DSv4 names
+    /// byte-unchanged — the GLM dialect work must not perturb the DSv4 path.
+    #[test]
+    fn dsv4_dialect_names_unchanged() {
+        use crate::v4::DeepSeekV4Config;
+        let cfg = DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "torch_dtype": "bfloat16",
+            "vocab_size": 129280, "hidden_size": 4096, "num_hidden_layers": 3,
+            "num_attention_heads": 64, "num_key_value_heads": 1, "head_dim": 512,
+            "hidden_act": "silu", "swiglu_limit": 10.0,
+            "q_lora_rank": 1024, "o_lora_rank": 1024, "o_groups": 8,
+            "qk_rope_head_dim": 64, "n_routed_experts": 256, "n_shared_experts": 1,
+            "num_experts_per_tok": 6, "moe_intermediate_size": 2048,
+            "routed_scaling_factor": 1.5, "norm_topk_prob": true,
+            "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
+            "index_n_heads": 64, "index_head_dim": 128, "index_topk": 512,
+            "num_hash_layers": 1, "sliding_window": 128,
+            "compress_ratios": [0, 4, 32], "compress_rope_theta": 160000.0,
+            "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 0, "max_position_embeddings": 1048576,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"type": "yarn", "factor": 16.0,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32.0, "beta_slow": 1.0},
+            "rms_norm_eps": 1.0e-6, "initializer_range": 0.02,
+            "tie_word_embeddings": false, "attention_bias": false,
+            "attention_dropout": 0.0, "bos_token_id": 0, "eos_token_id": 1
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tensor_dialect, crate::v4::TensorDialect::Dsv4);
+
+        let top = cfg.tensor_names();
+        assert_eq!(top.embed_tokens(), "embed.weight");
+        assert_eq!(top.lm_head(), "head.weight");
+        assert_eq!(top.norm(), "norm.weight");
+
+        // CSA layer (compress_ratio=4): abbreviated names + compressor + indexer.
+        let l1 = cfg.layer_tensor_names(1);
+        assert_eq!(l1.attn_norm, "layers.1.attn_norm.weight");
+        assert_eq!(l1.ffn_norm, "layers.1.ffn_norm.weight");
+        assert_eq!(l1.attn.wq_a, "layers.1.attn.wq_a.weight");
+        assert_eq!(l1.attn.q_norm, "layers.1.attn.q_norm.weight");
+        assert_eq!(l1.attn.wkv, "layers.1.attn.wkv.weight");
+        assert_eq!(l1.attn.wo_a, "layers.1.attn.wo_a.weight");
+        assert_eq!(l1.attn.wo_b, "layers.1.attn.wo_b.weight");
+        assert_eq!(l1.attn.attn_sink, "layers.1.attn.attn_sink");
+        assert!(l1.attn.kv_b_proj.is_none());
+        assert!(l1.attn.o_proj.is_none());
+        assert!(l1.attn.compressor.is_some());
+        let idx = l1.attn.indexer.as_ref().unwrap();
+        assert_eq!(idx.wq_b, "layers.1.attn.indexer.wq_b.weight");
+        assert!(idx.wk.is_none() && idx.k_norm.is_none());
+        assert!(idx.compressor.is_some());
+        assert_eq!(l1.ffn.gate_bias.as_deref(), Some("layers.1.ffn.gate.bias"));
+        assert_eq!(l1.ffn.expert(7).w2, "layers.1.ffn.experts.7.w2.weight");
+        assert!(l1.ffn.dense_mlp.is_none());
+        assert_eq!(
+            l1.ffn.shared_experts.as_ref().unwrap().w3,
+            "layers.1.ffn.shared_experts.w3.weight"
+        );
     }
 
     #[test]
