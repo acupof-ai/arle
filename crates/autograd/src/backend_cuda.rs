@@ -167,6 +167,7 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    #[track_caller]
     fn upload_slice(&self, host: &[f32], shape: &[usize]) -> Result<CudaSlice<f32>> {
         let size = shape_size(shape);
         if host.len() != size {
@@ -175,6 +176,21 @@ impl CudaBackend {
                 shape: shape.to_vec(),
                 size,
             });
+        }
+
+        if let Ok(raw_threshold) = std::env::var("ARLE_CUDA_UPLOAD_TRACE_MIN_ELEMS")
+            && let Ok(threshold) = raw_threshold.parse::<usize>()
+            && host.len() >= threshold
+        {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "arle_cuda_upload_trace caller={}:{} shape={shape:?} len={} bytes={} backtrace={:?}",
+                caller.file(),
+                caller.line(),
+                host.len(),
+                host.len().saturating_mul(std::mem::size_of::<f32>()),
+                std::backtrace::Backtrace::force_capture()
+            );
         }
 
         self.stream.clone_htod(host).map_err(|err| {
