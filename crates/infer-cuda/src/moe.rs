@@ -1939,7 +1939,7 @@ mod dsv4_gpu {
     };
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::moe_config::ExpertSplit;
-    use crate::ops::gemm_batch;
+    use crate::ops::{gemm_batch, silu_mul};
 
     const CONTIG_ROUTE_ALIGN: usize = 128;
 
@@ -3082,7 +3082,9 @@ mod dsv4_gpu {
         // correct. Locked default-on in band (native kernel, always compiled —
         // the bandwidth-fixed successor to the scalar-GEMV lane that lost at 25%
         // HBM, errors/2026-06-13-dsv4-decode-gemv-lane-bandwidth-kill).
-        if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES {
+        // GLM bf16 layers MUST NOT take the FP8 decode/GEMV lane — both are
+        // FP8-only. They fall through to the contiguous bf16 grouped path.
+        if total_routes <= DSV4_DECODE_GEMV_MAX_ROUTES && !layer.w13_grouped.is_bf16 {
             let tables = layer.gemv_tables.get_or_init(|| {
                 build_gemv_tables(ctx, layer).map(Some).unwrap_or_else(|e| {
                     log::warn!("DSv4 GEMV decode lane table build failed: {e}");
@@ -3273,6 +3275,12 @@ mod dsv4_gpu {
         swiglu_limit: f32,
         scratch: &mut Dsv4MoeDecodeScratch,
     ) -> Result<()> {
+        // GLM bf16 MoE uses the non-pooled contiguous lane (sigmoid/noaux router,
+        // GPU router stays off the pooled path). bf16 should never reach here.
+        ensure!(
+            !layer.w13_grouped.is_bf16,
+            "GLM bf16 MoE uses the contiguous lane, not the pooled decode lane"
+        );
         let num_tokens = hidden.seq_len;
         let hidden_dim = hidden.hidden_dim;
         let total_routes = num_tokens * topk;
@@ -3708,6 +3716,19 @@ mod dsv4_gpu {
         swiglu_limit: f32,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<HiddenStates> {
+        // GLM bf16 routed experts: route through the bf16 contiguous grouped
+        // GEMM lane (no FP8 quant). DSv4 keeps the FP8 path byte-unchanged.
+        if layer.w13_grouped.is_bf16 {
+            return bf16_grouped_experts(
+                ctx,
+                layer,
+                packed_hidden,
+                counts,
+                offsets,
+                swiglu_limit,
+                keepalive,
+            );
+        }
         let num_groups = layer.num_groups;
         let hidden_dim = packed_hidden.hidden_dim;
         let intermediate = layer.intermediate;
@@ -3853,6 +3874,158 @@ mod dsv4_gpu {
                 intermediate,
                 scale_stride_m,
                 contig_align,
+                stream,
+            )?;
+        }
+
+        out_compact.seq_len = packed_hidden.seq_len;
+        Ok(out_compact)
+    }
+
+    /// GLM bf16 routed experts (contiguous grouped lane). Mirrors
+    /// `deepgemm_grouped_experts` but skips every FP8 quantize step: the bf16
+    /// weights flow straight through `deepgemm_m_grouped_bf16_gemm_nt_contiguous`.
+    ///
+    /// Gate and up are SEPARATE grouped caches (`w13_grouped`=gate,
+    /// `w13_up_grouped`=up), each `[groups, intermediate, hidden]` — NOT a fused
+    /// `[groups, 2*intermediate, hidden]`. This is required because
+    /// `dsv4_deepgemm_swiglu_quantize_w13` proves the DeepGEMM contiguous output
+    /// is per-ROW interleaved (`w13_row[col]`=gate, `w13_row[inter+col]`=up), so
+    /// a fused single GEMM cannot be element-split for the bf16
+    /// `dsv4_swiglu_clamped_batch` (which needs separate contiguous gate/up). Two
+    /// GEMMs → separate `[rows, inter]` gate/up → element-wise SwiGLU — the same
+    /// structure the proven Qwen3.6 bf16 MoE path uses.
+    /// ponytail: pod-verify bf16 grouped expert GEMM produces correct routed
+    /// output (no FP8 path verified on Mac)
+    fn bf16_grouped_experts(
+        ctx: &DeviceContext,
+        layer: &Dsv4MoeLayer,
+        packed_hidden: &HiddenStates,
+        counts: &cudarc::driver::CudaSlice<i32>,
+        offsets: &cudarc::driver::CudaSlice<i32>,
+        swiglu_limit: f32,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<HiddenStates> {
+        let num_groups = layer.num_groups;
+        let hidden_dim = packed_hidden.hidden_dim;
+        let intermediate = layer.intermediate;
+        let gate_g = &layer.w13_grouped;
+        let up_g = layer
+            .w13_up_grouped
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GLM bf16 routed experts require w13_up_grouped"))?;
+        let w2 = &layer.w2_grouped;
+        ensure!(
+            layer.hidden_dim == hidden_dim,
+            "GLM bf16 grouped expert hidden dim {} != packed hidden dim {hidden_dim}",
+            layer.hidden_dim
+        );
+        ensure!(
+            gate_g.is_bf16 && up_g.is_bf16 && w2.is_bf16,
+            "GLM bf16 grouped experts require bf16 caches"
+        );
+        ensure!(
+            gate_g.groups == num_groups
+                && up_g.groups == num_groups
+                && w2.groups == num_groups
+                && gate_g.rows == intermediate
+                && gate_g.cols == hidden_dim
+                && up_g.rows == intermediate
+                && up_g.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "GLM bf16 grouped expert cache metadata mismatch: groups={} gate={}x{} up={}x{} w2={}x{} hidden={hidden_dim} inter={intermediate}",
+            num_groups,
+            gate_g.rows,
+            gate_g.cols,
+            up_g.rows,
+            up_g.cols,
+            w2.rows,
+            w2.cols,
+        );
+
+        // GLM uses plain SiLU(gate)*up with NO clamp (into_deepseek_v4 sets
+        // swiglu_limit=0.0). The clamped kernel rejects limit<=0, so use the
+        // unclamped silu_mul (same as the Qwen3.6 bf16 MoE path).
+        let _ = swiglu_limit;
+        let rows = packed_hidden.seq_len.max(1);
+        // Separate gate / up GEMM outputs, each [rows, intermediate].
+        let gate_out = HiddenStates::zeros(ctx, intermediate, rows)?;
+        let up_out = HiddenStates::zeros(ctx, intermediate, rows)?;
+        // SwiGLU activation [rows, intermediate].
+        let mut act = HiddenStates::zeros(ctx, intermediate, rows)?;
+        let mut out_compact = HiddenStates::zeros(ctx, hidden_dim, packed_hidden.seq_len.max(1))?;
+        let m_indices = alloc_neg1_i32(ctx, rows)?;
+        keepalive.keep_hidden(&gate_out);
+        keepalive.keep_hidden(&up_out);
+        keepalive.keep_hidden(&act);
+        keepalive.keep_hidden(&out_compact);
+        keepalive.keep_i32(&m_indices);
+
+        let p_hidden = cache_ptr(&packed_hidden.data, ctx);
+        let p_gate_out = cache_ptr(&gate_out.data, ctx);
+        let p_up_out = cache_ptr(&up_out.data, ctx);
+        let p_act = cache_ptr(&act.data, ctx);
+        let p_out_compact = cache_ptr(&out_compact.data, ctx);
+        let p_m_indices = cache_ptr(&m_indices, ctx);
+        // The grouped bf16 weight buffers are CudaSlice<u8> holding bf16 bytes;
+        // reinterpret the device address as bf16 for the kernel.
+        let p_gate_w = cache_ptr(&gate_g.weight, ctx).cast::<bf16>();
+        let p_up_w = cache_ptr(&up_g.weight, ctx).cast::<bf16>();
+        let p_w2 = cache_ptr(&w2.weight, ctx).cast::<bf16>();
+        let stream = ctx.stream.cu_stream();
+
+        // SAFETY: all buffers valid on ctx.stream for the checked shapes; the
+        // bf16 grouped GEMM bounds rows by m_indices (pad rows stay -1).
+        unsafe {
+            moe::dsv4_fill_m_indices_from_counts(
+                cache_ptr(counts, ctx),
+                cache_ptr(offsets, ctx),
+                p_m_indices,
+                num_groups,
+                rows,
+                stream,
+            )?;
+            // gate: [rows, hidden] @ gate[groups, inter, hidden]^T -> [rows, inter]
+            moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                p_hidden,
+                p_gate_w,
+                p_gate_out,
+                p_m_indices,
+                num_groups,
+                rows,
+                intermediate,
+                hidden_dim,
+                stream,
+            )?;
+            // up: [rows, hidden] @ up[groups, inter, hidden]^T -> [rows, inter]
+            moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                p_hidden,
+                p_up_w,
+                p_up_out,
+                p_m_indices,
+                num_groups,
+                rows,
+                intermediate,
+                hidden_dim,
+                stream,
+            )?;
+        }
+        // SwiGLU: act = SiLU(gate) ⊙ up over the two separate contiguous
+        // [rows, inter] buffers (unclamped — GLM has no swiglu clamp).
+        silu_mul(ctx, &gate_out, &up_out, &mut act)?;
+        // SAFETY: same buffer-validity contract as the gate/up GEMMs above.
+        unsafe {
+            // w2: [rows, inter] @ w2[groups, hidden, inter]^T -> [rows, hidden]
+            moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                p_act,
+                p_w2,
+                p_out_compact,
+                p_m_indices,
+                num_groups,
+                rows,
+                hidden_dim,
+                intermediate,
                 stream,
             )?;
         }
@@ -4423,6 +4596,10 @@ mod dsv4_gpu {
         pub(crate) groups: usize,
         pub(crate) rows: usize,
         pub(crate) cols: usize,
+        /// GLM bf16 grouped cache: `weight` holds bf16 LE bytes (2 bytes/elt,
+        /// group-major `[groups, rows, cols]`) and `scales` is empty (len 0).
+        /// FP8 (DSv4) caches keep `false` (block-scaled u8 weight + f32 scales).
+        pub(crate) is_bf16: bool,
     }
 
     /// Concatenate the per-expert FP8 caches into one contiguous group-major
@@ -4488,6 +4665,54 @@ mod dsv4_gpu {
             groups: num_groups,
             rows,
             cols,
+            is_bf16: false,
+        })
+    }
+
+    /// GLM bf16 routed-expert grouped cache. Uploads the loader's pre-built
+    /// group-major bf16 LE byte buffer (`[groups, rows, cols]`, 2 bytes/elt)
+    /// in one H2D. `scales` is empty (bf16 has no block scales).
+    ///
+    /// GLM `weight_scale_inv` blocks are general F32 (non-pow2), so the DSv4
+    /// E8M0 re-encode would be lossy — GLM MoE runs bf16 for correctness. The
+    /// loader concatenates expert weights group-major (the same order
+    /// `build_grouped_cache` lays out FP8 experts) before calling this.
+    /// ponytail: pod-verify bf16 group-major byte layout matches
+    /// deepgemm_m_grouped_bf16_gemm_nt_contiguous's [num_groups, n, k] expectation
+    pub(crate) fn build_grouped_cache_bf16(
+        ctx: &DeviceContext,
+        weight_bytes_group_major: &[u8],
+        num_groups: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<GroupedCache> {
+        ensure!(
+            num_groups > 0,
+            "GLM bf16 grouped cache has no local experts"
+        );
+        let weight_stride = rows * cols * std::mem::size_of::<bf16>();
+        ensure!(
+            weight_bytes_group_major.len() == num_groups * weight_stride,
+            "GLM bf16 grouped cache byte len {} != groups({num_groups})*rows({rows})*cols({cols})*2 = {}",
+            weight_bytes_group_major.len(),
+            num_groups * weight_stride
+        );
+        let weight = ctx
+            .stream
+            .clone_htod(weight_bytes_group_major)
+            .map_err(|e| anyhow::anyhow!("GLM bf16 grouped weight H2D failed: {e}"))?;
+        // Empty scales (bf16 has no block scales).
+        let scales = ctx
+            .stream
+            .alloc_zeros::<f32>(0)
+            .map_err(|e| anyhow::anyhow!("GLM bf16 grouped scale alloc failed: {e}"))?;
+        Ok(GroupedCache {
+            weight,
+            scales,
+            groups: num_groups,
+            rows,
+            cols,
+            is_bf16: true,
         })
     }
 
@@ -4738,9 +4963,9 @@ mod dsv4_gpu {
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
-    Dsv4GemvTables, Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache, dsv4_moe_forward,
-    dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
-    dsv4_shared_expert_forward_decode_graph,
+    Dsv4GemvTables, Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache,
+    build_grouped_cache_bf16, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
+    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
 };
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};

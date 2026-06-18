@@ -25,11 +25,18 @@ use crate::paged_kv_table::{contiguous_page_table_byte_range, physical_page};
 use crate::tp::TpRuntime;
 
 const DSV4_FLASHMLA_MODEL1: i32 = 1;
+/// GLM-5.2 V32 model-type int passed to the FlashMLA sparse decode shim
+/// (`arle_flashmla_sm90_sparse_decode_*`, model_type=0). V32 = 576-wide latent q
+/// (512 NoPE + 64 RoPE), 512-wide latent output, 656 B/tok packed KV.
+const DSV4_FLASHMLA_V32: i32 = 0;
 const DSV4_FLASHMLA_S_Q: usize = 1;
 /// Packed bytes per token the FlashMLA sparse-FP8 decode reads for the canonical
 /// MODEL1 NoPE=448 / RoPE=64 shape (validated against `kv_arena.bytes_per_token`
 /// in `Dsv4FlashMlaDecodeState::new`).
 const DSV4_FLASH_KV_BYTES_PER_TOKEN_I32: i32 = 584;
+/// Packed bytes per token for GLM-5.2 V32 (NoPE=512 / RoPE=64): 512 + 128 (bf16
+/// rope) + 16 (scale region) = 656. Matches the shim `V32_BYTES_PER_TOKEN`.
+const DSV4_V32_KV_BYTES_PER_TOKEN_I32: i32 = 656;
 const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
 const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
 const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
@@ -906,9 +913,17 @@ impl Dsv4FlashMlaDecodeShape {
         local_heads: usize,
         tp_world: usize,
     ) -> Result<Self> {
+        // Two FlashMLA decode shapes are wired: MODEL1 (head_dim=512 / 584 B/tok,
+        // DSv4 pre-absorbed) and V32 (head_dim=576 / 656 B/tok, GLM-5.2 latent =
+        // kv_lora_rank(512)+rope(64)). Both ride the same sparse-FP8 decode kernel
+        // with a model_type/byte-stride switch (see `try_flashmla_decode_attention`).
         ensure!(
-            config.head_dim == 512 && kv_arena.bytes_per_token == 584,
-            "DSv4 FlashMLA decode only wires MODEL1 head_dim=512 bytes/token=584"
+            (config.head_dim == 512 && kv_arena.bytes_per_token == 584)
+                || (config.head_dim == 576 && kv_arena.bytes_per_token == 656),
+            "DSv4 FlashMLA decode only wires MODEL1 (head_dim=512 / 584 B/tok) or \
+             V32 (head_dim=576 / 656 B/tok), got head_dim={} bytes/token={}",
+            config.head_dim,
+            kv_arena.bytes_per_token
         );
         ensure!(
             local_heads > 0 && tp_world > 0,
@@ -940,9 +955,9 @@ impl Dsv4FlashMlaDecodeShape {
             DeepSeekV4AttentionMode::SlidingWindow => 0,
             DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
             DeepSeekV4AttentionMode::HybridCompressed => compressed_rows.div_ceil(128) * 128,
-            DeepSeekV4AttentionMode::SparseIndexed => {
-                unimplemented!("Tranche D: GLM SparseIndexed max_compressed_keys (decode)")
-            }
+            // GLM SparseIndexed: top-k cap over the full latent pool == CSA.
+            // GLM topk_unified = sliding_window(0) + index_topk(2048) = 2048 (128-multiple).
+            DeepSeekV4AttentionMode::SparseIndexed => config.index_topk,
         };
         let topk_unified = config
             .sliding_window
@@ -1777,6 +1792,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         ensure!(
             n > 0 && n <= self.max_batch,
             "DSv4 batched fwd n={n} invalid"
+        );
+        // The batched-decode lane (lever #60, default-OFF) is MODEL1-only: it bakes
+        // 584 B/tok + d_qk==d_v==512 strides below. V32/GLM (head_dim=576, d_v=512
+        // latent, 656 B/tok) would be silently mis-strided here, so it MUST route
+        // through the single-row `try_flashmla_decode_attention` V32 path instead.
+        ensure!(
+            config.head_dim == 512,
+            "DSv4 batched FlashMLA decode is MODEL1-only (head_dim=512); V32 \
+             (head_dim={}) must use the single-row decode lane",
+            config.head_dim
         );
         let global_heads = shape.h_q;
         let head_dim = config.head_dim;
@@ -4012,7 +4037,13 @@ pub(crate) fn commit_layer_fold(
 
     // ── FP8 SW ring pack for the accepted positions (table-routed strided
     // pack, mirrors flashmla_pack_sw_ring's math for m explicit slots).
-    if let Some(flash) = &mut state.flashmla {
+    // GLM pure-SparseIndexed (sliding_window==0) has no SW ring (and the
+    // `% config.sliding_window` below would divide by zero) — skip the SW
+    // fold entirely; the per-token sparse pack carries the latent.
+    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring entirely; attention is indexer-selected full-latent only
+    if config.sliding_window > 0
+        && let Some(flash) = &mut state.flashmla
+    {
         let scratch = flashmla_scratch.ok_or_else(|| {
             anyhow!("DSv4 commit fold: FlashMLA arena present but shared decode scratch missing")
         })?;
@@ -5589,9 +5620,12 @@ fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
     match mode {
         DeepSeekV4AttentionMode::CompressedSparse => 1,
         DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
-        DeepSeekV4AttentionMode::SparseIndexed => {
-            unimplemented!("Tranche D: GLM SparseIndexed flashmla_mode_int")
-        }
+        // GLM SparseIndexed selects via the indexer top-k over the FULL per-token
+        // latent pool — structurally the CSA sparse index build (uses `selected`),
+        // so it shares the CSA kernel mode_int=1. The V32 MODEL_TYPE (0) is a
+        // separate constant passed to the fwd kernel (DSV4_FLASHMLA_V32), not this.
+        // ponytail: pod-verify SparseIndexed uses the CSA-style (mode_int=1) sparse index build
+        DeepSeekV4AttentionMode::SparseIndexed => 1,
     }
 }
 
@@ -5688,19 +5722,39 @@ fn flashmla_pack_one_sw_token(
     let mut pool_view = pool_buf.slice_mut(range);
     let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let nope_ptr = k_ptr;
+    // rope offset = head_dim - rope_dim: MODEL1 512-64=448, V32 576-64=512.
+    // stride = head_dim: MODEL1 512, V32 576. The config formula already yields
+    // the right offset/stride for both shapes; only the pack FN differs (V32
+    // packs 8 NoPE tiles + 16-byte scale region → 656 B/tok).
+    // ponytail: pod-verify V32 pack offsets (nope@0 stride576, rope@512 stride576) + 656 B/tok pool addressing
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
-    flash_kv::dsv4_fp8_kv_pack_strided_raw(
-        ctx,
-        nope_ptr,
-        rope_ptr,
-        pool_ptr,
-        &scratch.one_block_id,
-        &scratch.one_row,
-        1,
-        64,
-        config.head_dim,
-        config.head_dim,
-    )
+    if config.head_dim == 576 {
+        flash_kv::dsv4_v32_fp8_kv_pack_strided_raw(
+            ctx,
+            nope_ptr,
+            rope_ptr,
+            pool_ptr,
+            &scratch.one_block_id,
+            &scratch.one_row,
+            1,
+            64,
+            config.head_dim,
+            config.head_dim,
+        )
+    } else {
+        flash_kv::dsv4_fp8_kv_pack_strided_raw(
+            ctx,
+            nope_ptr,
+            rope_ptr,
+            pool_ptr,
+            &scratch.one_block_id,
+            &scratch.one_row,
+            1,
+            64,
+            config.head_dim,
+            config.head_dim,
+        )
+    }
 }
 
 fn flashmla_pack_compressed_delta(
@@ -5815,6 +5869,13 @@ fn update_bf16_sw_window(
     start_pos_device: Option<&CudaSlice<i32>>,
     config: &DeepSeekV4Config,
 ) -> Result<()> {
+    // GLM pure-SparseIndexed has no SW ring (sliding_window==0); the window-cache
+    // update kernel does `% sliding_window` → would divide by zero. Nothing to
+    // ring when there is no window.
+    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring entirely; attention is indexer-selected full-latent only
+    if config.sliding_window == 0 {
+        return Ok(());
+    }
     let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
     let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
     unsafe {
@@ -5933,10 +5994,20 @@ fn try_flashmla_prefill_attention(
     if mode == DeepSeekV4AttentionMode::SlidingWindow && chain_verify.is_none() {
         return Ok(false);
     }
-    ensure!(
-        config.head_dim == 512 && config.qk_rope_head_dim == 64,
-        "DSv4 FlashMLA prefill only supports MODEL1 head_dim=512 rope_dim=64"
-    );
+    // MODEL1 (head_dim=512) + V32 (GLM, head_dim=576 = 512 latent + 64 rope).
+    let (model_type_int, bytes_per_token) = match (
+        config.head_dim,
+        config.qk_rope_head_dim,
+        config.kv_lora_rank,
+    ) {
+        (512, 64, _) => (DSV4_FLASHMLA_MODEL1, DSV4_FLASH_KV_BYTES_PER_TOKEN_I32),
+        (576, 64, 512) => (DSV4_FLASHMLA_V32, DSV4_V32_KV_BYTES_PER_TOKEN_I32),
+        (hd, rd, kv) => anyhow::bail!(
+            "DSv4 FlashMLA prefill: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv}); want MODEL1 (512,64) or V32 (576,64,kv512)"
+        ),
+    };
+    let is_v32 = model_type_int == DSV4_FLASHMLA_V32;
+    let _ = (model_type_int, bytes_per_token, is_v32);
     ensure!(
         q_prepared.seq_len == k_prepared.seq_len && local_attn.seq_len == q_prepared.seq_len,
         "DSv4 FlashMLA prefill shape mismatch: q={} k={} out={}",
@@ -5968,9 +6039,8 @@ fn try_flashmla_prefill_attention(
         DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
         DeepSeekV4AttentionMode::HybridCompressed => compressed_count.div_ceil(128) * 128,
         DeepSeekV4AttentionMode::SlidingWindow => 0,
-        DeepSeekV4AttentionMode::SparseIndexed => {
-            unimplemented!("Tranche D: GLM SparseIndexed max_compressed_keys (prefill)")
-        }
+        // GLM SparseIndexed: top-k cap over the full latent pool == CSA.
+        DeepSeekV4AttentionMode::SparseIndexed => config.index_topk,
     };
     let chain_pad = if chain_verify.is_some() { 128 } else { 0 };
     let topk_unified = config
@@ -6117,7 +6187,30 @@ fn try_flashmla_prefill_attention(
                     }
                     DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
                     DeepSeekV4AttentionMode::SparseIndexed => {
-                        unimplemented!("Tranche D: GLM SparseIndexed prefill build-indices")
+                        // GLM SparseIndexed mirrors the CSA index build (top-k over
+                        // `selected`), but over the FULL per-token latent (no
+                        // compressor): pass compress_ratio=1.
+                        let selected = selected.ok_or_else(|| {
+                            anyhow!("DSv4 FlashMLA SparseIndexed prefill missing selected topk")
+                        })?;
+                        let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                        // ponytail: pod-verify SparseIndexed prefill index build uses ratio=1 (full latent)
+                        ffi::arle_flashmla_csa_build_indices(
+                            indices_ptr as *mut i32,
+                            topk_ptr as *mut i32,
+                            selected_ptr as *const i32,
+                            token_count as i32,
+                            start_pos as i32,
+                            config.sliding_window as i32,
+                            config.index_topk as i32,
+                            compressed_count as i32,
+                            1,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| {
+                            anyhow!("DSv4 FlashMLA SparseIndexed prefill indices failed: {e}")
+                        })?;
                     }
                 }
             }
@@ -6405,10 +6498,21 @@ fn try_flashmla_decode_attention(
     let start_pos_device = start_pos_device.ok_or_else(|| {
         anyhow!("DSv4 FlashMLA decode requires device start_pos for token_count=1")
     })?;
-    ensure!(
-        config.head_dim == 512 && config.qk_rope_head_dim == 64,
-        "DSv4 FlashMLA decode only supports MODEL1 head_dim=512 rope_dim=64"
-    );
+    // MODEL1 (DSv4, head_dim=512) and V32 (GLM, head_dim=576 = 512 latent NoPE
+    // + 64 RoPE). The FlashMLA shim reads q[heads, d_qk] and writes out[heads,
+    // d_v=512 latent]; for MODEL1 d_qk==d_v==512, for V32 d_qk=576 but d_v=512.
+    let (model_type_int, bytes_per_token) = match (
+        config.head_dim,
+        config.qk_rope_head_dim,
+        config.kv_lora_rank,
+    ) {
+        (512, 64, _) => (DSV4_FLASHMLA_MODEL1, DSV4_FLASH_KV_BYTES_PER_TOKEN_I32),
+        (576, 64, 512) => (DSV4_FLASHMLA_V32, DSV4_V32_KV_BYTES_PER_TOKEN_I32),
+        (hd, rd, kv) => anyhow::bail!(
+            "DSv4 FlashMLA decode: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv}); want MODEL1 (512,64) or V32 (576,64,kv512)"
+        ),
+    };
+    let is_v32 = model_type_int == DSV4_FLASHMLA_V32;
     ensure!(
         local_attn.seq_len == 1,
         "DSv4 FlashMLA decode writes exactly one token"
@@ -6424,7 +6528,13 @@ fn try_flashmla_decode_attention(
         "DSv4 FlashMLA decode requires global heads 64/128, got {global_heads}"
     );
 
-    {
+    // GLM pure-SparseIndexed (sliding_window==0): there is no SW ring to
+    // bootstrap; attention is indexer-selected full-latent only. The
+    // per-token KV pack (`flashmla_pack_one_sw_token`) still runs — it
+    // populates THIS token's latent into the sparse pool the indexer selects
+    // from. The SW-ring bootstrap is the only SW-specific step here.
+    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring entirely; attention is indexer-selected full-latent only
+    if config.sliding_window > 0 {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_sw_ring");
         flashmla_pack_sw_ring(ctx, flash, scratch, pool, sw_window_cache, config)?;
     }
@@ -6594,10 +6704,16 @@ fn try_flashmla_decode_attention(
         out_ptr as *mut ffi::Half
     };
 
-    let bytes_per_token = DSV4_FLASH_KV_BYTES_PER_TOKEN_I32;
     let stride_kv_block_bytes = 64_i32 * bytes_per_token;
+    // q is [b, s_q, h_q, d_qk]: d_qk = head_dim (512 MODEL1 / 576 V32).
+    // out / o_accum are [..., h_q, d_v]: d_v = kv_lora latent = 512 ALWAYS
+    // (the shim hard-asserts d_v==512). For MODEL1 head_dim==d_v==512 so the
+    // two coincide; for V32 they diverge (q=576, output latent=512).
+    // ponytail: pod-verify V32 FlashMLA decode stride/dim arg mapping (d_qk=576 latent=512)
+    let d_qk = config.head_dim as i32;
+    let d_v = if is_v32 { 512 } else { config.head_dim as i32 };
     let stride_q = (global_heads * config.head_dim) as i32;
-    let stride_o = stride_q;
+    let stride_o = (global_heads as i32) * d_v;
     let stride_indices = flash.topk_unified as i32;
     let stride_lse = global_heads as i32;
     {
@@ -6619,17 +6735,17 @@ fn try_flashmla_decode_attention(
                 1,
                 global_heads as i32,
                 1,
-                config.head_dim as i32,
-                config.head_dim as i32,
+                d_qk,
+                d_v,
                 (flash.sw_blocks + flash.comp_blocks) as i32,
                 64,
                 stride_indices,
                 flash.num_sm_parts,
-                DSV4_FLASHMLA_MODEL1,
+                model_type_int,
                 sm_scale,
                 stride_q,
                 stride_q,
-                config.head_dim as i32,
+                d_qk,
                 stride_kv_block_bytes,
                 bytes_per_token,
                 stride_indices,
@@ -6638,12 +6754,12 @@ fn try_flashmla_decode_attention(
                 1,
                 stride_o,
                 stride_o,
-                config.head_dim as i32,
+                d_v,
                 global_heads as i32,
                 global_heads as i32,
                 stride_o,
                 stride_o,
-                config.head_dim as i32,
+                d_v,
                 ctx.stream.cu_stream(),
             )
             .result()
@@ -6651,6 +6767,9 @@ fn try_flashmla_decode_attention(
         }
     }
 
+    // The FlashMLA output is [heads, d_v]: d_v == head_dim for MODEL1, but the
+    // 512-wide latent for V32. Slice / un-rotate on the OUTPUT width (d_v).
+    let out_head_dim = d_v as usize;
     if tp_world > 1 {
         let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr(&ctx.stream);
         {
@@ -6660,9 +6779,9 @@ fn try_flashmla_decode_attention(
                     full_out_ptr as *const ffi::Half,
                     out_ptr as *mut ffi::Half,
                     1,
-                    (global_heads * config.head_dim) as i32,
-                    (local_heads * config.head_dim) as i32,
-                    (tp_rank * local_heads * config.head_dim) as i32,
+                    (global_heads * out_head_dim) as i32,
+                    (local_heads * out_head_dim) as i32,
+                    (tp_rank * local_heads * out_head_dim) as i32,
                     ctx.stream.cu_stream(),
                 )
                 .result()
@@ -6672,7 +6791,13 @@ fn try_flashmla_decode_attention(
         drop(full_out_guard);
     }
 
-    {
+    // Output inverse-RoPE un-rotates the rope tail of the MODEL1 absorbed
+    // output [heads, 512]. V32's FlashMLA output is the pure kv_lora latent
+    // [heads, 512] (NoPE only — the 64 rope dims live in q/k for scoring, not
+    // in the value-side latent), so there is NO output rope tail to un-rotate.
+    // V32's value side is reconstructed by the w_vc absorption (D3d) downstream.
+    // ponytail: pod-verify V32 skips output inverse-RoPE (512 latent is pure NoPE)
+    if !is_v32 {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope");
         unsafe {
             ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
@@ -7270,6 +7395,199 @@ pub(crate) fn mla_attention(
     )
 }
 
+/// GLM runtime Q absorption: q_raw [heads, qk_nope(192)+qk_rope(64)] → absorbed
+/// q [heads, kv_lora(512)+qk_rope(64) = head_dim(576)] per head, via the per-head
+/// contraction q_latent[h] = w_kc[h] · q_nope[h] (w_kc loaded in `gemm_batch`
+/// orientation `[kv_lora(out), qk_nope(in)]` per head, see `load_dsv4_kv_b_absorb`
+/// step 4). The q_rope(64) tail is carried through unchanged.
+///
+/// Input  `q_raw`: `[local_heads * qk_head_dim(256), token_count]` token-major
+///         (per head: q_nope(qk_nope=192) | q_rope(qk_rope=64)).
+/// Output `q_absorbed`: `[local_heads * head_dim(576), token_count]` token-major
+///         (per head: q_latent(kv_lora=512) | q_rope(qk_rope=64)).
+///
+/// w_kc `DeviceMatrix` is `[local_heads*kv_lora, qk_nope]`; head `h`'s block is
+/// rows `[h*kv_lora, (h+1)*kv_lora)` = `[kv_lora, qk_nope]`. Per head we run the
+/// dense bf16 `gemm_cuda` (`weight[R=kv_lora, C=qk_nope] · x[qk_nope, tok]`).
+///
+/// DECODE (token_count==1): each head's q_nope rows are contiguous (one token),
+/// so the per-head GEMM + the q_rope copy are exact. This is the V32/GLM decode
+/// hot path and is fully wired.
+///
+/// PREFILL (token_count>1): token-major layout makes a single head's rows
+/// strided across tokens (`stride = qk_head_dim`), so a per-head GEMM needs a
+/// gather/scatter or a batched-head kernel that ARLE doesn't yet expose. Rather
+/// than serve a wrong projection, this bails loudly for token_count>1.
+/// ponytail: pod-verify GLM prefill Q absorption — wire a batched-head bf16 GEMM
+/// (or per-token-per-head gather) for token_count>1; decode (==1) is exact.
+/// ponytail: pod-verify w_kc per-head contraction q_latent = w_kc · q_nope (decode)
+fn glm_absorb_q(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    w_kc: &DeviceMatrix,
+    q_raw: &HiddenStates,
+    local_heads: usize,
+    token_count: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<HiddenStates> {
+    let qk_nope = config.qk_nope_head_dim;
+    let qk_rope = config.qk_rope_head_dim;
+    let kv_lora = config.kv_lora_rank;
+    let qk_head = qk_nope + qk_rope; // 256
+    let head_dim = kv_lora + qk_rope; // 576
+    ensure!(
+        w_kc.rows == local_heads * kv_lora && w_kc.cols == qk_nope,
+        "GLM w_kc shape {}x{} != [heads*kv_lora={}, qk_nope={}]",
+        w_kc.rows,
+        w_kc.cols,
+        local_heads * kv_lora,
+        qk_nope
+    );
+    ensure!(
+        q_raw.hidden_dim == local_heads * qk_head && q_raw.seq_len == token_count,
+        "GLM q absorb input {}x{} != [heads*qk_head={}, tok={}]",
+        q_raw.hidden_dim,
+        q_raw.seq_len,
+        local_heads * qk_head,
+        token_count
+    );
+    ensure!(
+        config.head_dim == head_dim,
+        "GLM q absorb head_dim {} != kv_lora+qk_rope {}",
+        config.head_dim,
+        head_dim
+    );
+    if token_count != 1 {
+        // See doc: token-major strided per-head rows need a batched-head kernel.
+        bail!(
+            "GLM runtime Q absorption (w_kc) prefill (token_count={token_count}>1) not \
+             wired: needs a batched-head bf16 GEMM. Decode (token_count==1) is exact."
+        );
+    }
+    let mut q_absorbed = HiddenStates::zeros(ctx, local_heads * head_dim, token_count)?;
+    let stream = ctx.stream.cu_stream();
+    // Phase 1: per-head q_nope · w_kc → q_latent (raw pointers; guards scoped here).
+    {
+        let (w_ptr, _gw) = w_kc.data.device_ptr(&ctx.stream);
+        let (q_ptr, _gq) = q_raw.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = q_absorbed.data.device_ptr_mut(&ctx.stream);
+        for h in 0..local_heads {
+            // q_nope[h] = q_raw[h*qk_head .. h*qk_head+qk_nope] (token 0).
+            let q_nope_h = unsafe { (q_ptr as *const ffi::Half).add(h * qk_head) };
+            // w_kc[h] block: rows [h*kv_lora, (h+1)*kv_lora), [kv_lora, qk_nope].
+            let w_h = unsafe { (w_ptr as *const ffi::Half).add(h * kv_lora * qk_nope) };
+            // q_latent[h] → q_absorbed[h*head_dim .. h*head_dim+kv_lora].
+            let out_h = unsafe { (out_ptr as *mut ffi::Half).add(h * head_dim) };
+            // SAFETY: per-head bf16 GEMM weight[kv_lora, qk_nope] · q_nope[qk_nope, 1].
+            unsafe {
+                ffi::gemm_cuda(
+                    w_h,
+                    q_nope_h,
+                    out_h,
+                    kv_lora as i32,
+                    token_count as i32,
+                    qk_nope as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("GLM glm_absorb_q head {h} gemm failed: {e}"))?;
+            }
+        }
+    }
+    // Phase 2: copy each head's q_rope(64) tail through unchanged.
+    for h in 0..local_heads {
+        let rope_src = q_raw
+            .data
+            .slice((h * qk_head + qk_nope)..(h * qk_head + qk_head));
+        let mut rope_dst = q_absorbed
+            .data
+            .slice_mut((h * head_dim + kv_lora)..(h * head_dim + head_dim));
+        ctx.stream
+            .memcpy_dtod(&rope_src, &mut rope_dst)
+            .map_err(|e| anyhow!("GLM glm_absorb_q head {h} rope copy failed: {e}"))?;
+    }
+    keepalive.keep_hidden(&q_absorbed);
+    Ok(q_absorbed)
+}
+
+/// GLM runtime V absorption: latent attn_out `[local_heads*kv_lora(512), tok]` →
+/// v `[local_heads*v_head_dim(256), tok]`, per head `v[h] = w_vc[h] · attn_out[h]`.
+/// w_vc loaded in `gemm_batch` orientation `[v_head(out), kv_lora(in)]` per head
+/// (`load_dsv4_kv_b_absorb` step 4); head `h`'s block is rows `[h*v_head,
+/// (h+1)*v_head)`. Per head we run dense bf16 `gemm_cuda` (`weight[v_head,
+/// kv_lora] · x[kv_lora, tok]`). The resulting v `[heads*v_head]` feeds the plain
+/// `o_proj` (D4).
+///
+/// DECODE (token_count==1): each head's latent rows are contiguous (one token) →
+/// per-head GEMM is exact (V32/GLM decode hot path, fully wired). PREFILL
+/// (token_count>1): strided per-head rows need a batched-head kernel → bails.
+/// ponytail: pod-verify GLM prefill V absorption (token_count>1 batched-head GEMM)
+/// ponytail: pod-verify w_vc per-head contraction v = w_vc · attn_out feeds plain o_proj
+fn glm_absorb_v(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    w_vc: &DeviceMatrix,
+    local_attn: &HiddenStates,
+    local_heads: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<HiddenStates> {
+    let kv_lora = config.kv_lora_rank;
+    let v_head = config.v_head_dim;
+    let token_count = local_attn.seq_len;
+    ensure!(
+        w_vc.rows == local_heads * v_head && w_vc.cols == kv_lora,
+        "GLM w_vc shape {}x{} != [heads*v_head={}, kv_lora={}]",
+        w_vc.rows,
+        w_vc.cols,
+        local_heads * v_head,
+        kv_lora
+    );
+    ensure!(
+        local_attn.hidden_dim == local_heads * kv_lora,
+        "GLM v absorb input {} != heads*kv_lora {}",
+        local_attn.hidden_dim,
+        local_heads * kv_lora
+    );
+    if token_count != 1 {
+        bail!(
+            "GLM runtime V absorption (w_vc) prefill (token_count={token_count}>1) not \
+             wired: needs a batched-head bf16 GEMM. Decode (token_count==1) is exact."
+        );
+    }
+    let mut v_out = HiddenStates::zeros(ctx, local_heads * v_head, token_count)?;
+    let stream = ctx.stream.cu_stream();
+    // Per-head attn_out · w_vc → v (raw pointers; guards scoped to drop before return).
+    {
+        let (w_ptr, _gw) = w_vc.data.device_ptr(&ctx.stream);
+        let (a_ptr, _ga) = local_attn.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = v_out.data.device_ptr_mut(&ctx.stream);
+        for h in 0..local_heads {
+            // attn_out[h] = local_attn[h*kv_lora .. (h+1)*kv_lora] (token 0).
+            let a_h = unsafe { (a_ptr as *const ffi::Half).add(h * kv_lora) };
+            // w_vc[h] block rows [h*v_head, (h+1)*v_head), [v_head, kv_lora].
+            let w_h = unsafe { (w_ptr as *const ffi::Half).add(h * v_head * kv_lora) };
+            // v[h] → v_out[h*v_head .. (h+1)*v_head].
+            let out_h = unsafe { (out_ptr as *mut ffi::Half).add(h * v_head) };
+            // SAFETY: per-head bf16 GEMM weight[v_head, kv_lora] · attn_out[kv_lora, 1].
+            unsafe {
+                ffi::gemm_cuda(
+                    w_h,
+                    a_h,
+                    out_h,
+                    v_head as i32,
+                    token_count as i32,
+                    kv_lora as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("GLM glm_absorb_v head {h} gemm failed: {e}"))?;
+            }
+        }
+    }
+    keepalive.keep_hidden(&v_out);
+    Ok(v_out)
+}
+
 /// PREPARE half of `mla_attention` (see [`Dsv4MlaPrepared`]). Q/KV LoRA + partial
 /// RoPE, and for CSA/HCA the compressor + (CSA) indexer top-k `selected`. Leaves
 /// `state.compressor` / `state.indexer` populated for the fwd's compressed-key
@@ -7308,11 +7626,20 @@ pub(crate) fn mla_attention_prepare(
     let head_dim = config.head_dim;
     let token_count = hidden.seq_len;
     let local_width = attention.wq_b.rows;
+    // DSv4 wq_b emits the PRE-ABSORBED q at `head_dim` (512) per head. GLM's wq_b
+    // emits the standard q at `qk_nope+qk_rope` (= 256) per head, absorbed to the
+    // 576 latent at runtime (`glm_absorb_q`). So derive local_heads from the wq_b
+    // per-head width, which is qk_head for GLM (w_kc.is_some()) and head_dim else.
+    let q_head_width = if attention.w_kc.is_some() {
+        config.qk_nope_head_dim + config.qk_rope_head_dim
+    } else {
+        head_dim
+    };
     ensure!(
-        head_dim > 0 && local_width.is_multiple_of(head_dim),
-        "DSv4 MLA local q width {local_width} is not a multiple of head_dim {head_dim}"
+        q_head_width > 0 && local_width.is_multiple_of(q_head_width),
+        "DSv4 MLA local q width {local_width} is not a multiple of q_head_width {q_head_width}"
     );
-    let local_heads = local_width / head_dim;
+    let local_heads = local_width / q_head_width;
     ensure!(local_heads > 0, "DSv4 MLA requires at least one local head");
     let tp_rank = tp.config().rank;
     // This rank owns global heads [tp_rank*local_heads, +local_heads); the
@@ -7325,8 +7652,11 @@ pub(crate) fn mla_attention_prepare(
     );
     // wo_a/wo_b ↔ out shape checks live in `mla_attention_fwd` (PREPARE has no
     // `out`); the O-LoRA there owns the projection.
+    // GLM pure-SparseIndexed has sliding_window==0 (no SW window — attention is
+    // indexer-selected full-latent only). DSv4 modes require a non-zero window.
+    // ponytail: pod-verify GLM pure-SparseIndexed (sliding_window=0) skips SW-ring entirely; attention is indexer-selected full-latent only
     ensure!(
-        config.sliding_window > 0,
+        config.sliding_window > 0 || mode == DeepSeekV4AttentionMode::SparseIndexed,
         "DSv4 MLA requires a non-zero sliding_window"
     );
     ensure!(
@@ -7470,6 +7800,30 @@ pub(crate) fn mla_attention_prepare(
     keepalive.keep_hidden(&c_q_normed);
     keepalive.keep_hidden(&q_raw);
     keepalive.keep_hidden(&kv_normed);
+
+    // ── 2b. GLM runtime Q absorption (w_kc.is_some()). GLM's wq_b produces
+    // q_nope(qk_nope=192) + q_rope(qk_rope=64) = qk_head_dim(256) per head; the
+    // FlashMLA latent path needs the absorbed q[heads, kv_lora(512) + rope(64) =
+    // head_dim(576)]. Per SGLang forward_mla.py: q_latent[h] = q_nope[h] · w_kc[h]
+    // (w_kc logical [h, qk_nope=192, kv_lora=512]); reassemble [q_latent(512) |
+    // q_rope(64)] per head, so the partial-RoPE + pack + FlashMLA below see the
+    // 576-wide latent q. DSv4 (w_kc None) skips — q_raw is already pre-absorbed.
+    let (q_raw, local_width) = if let Some(w_kc) = attention.w_kc.as_ref() {
+        let q_absorbed = glm_absorb_q(
+            ctx,
+            config,
+            w_kc,
+            &q_raw,
+            local_heads,
+            token_count,
+            keepalive,
+        )?;
+        let lw = q_absorbed.hidden_dim;
+        (q_absorbed, lw)
+    } else {
+        (q_raw, local_width)
+    };
+    keepalive.keep_hidden(&q_raw);
 
     // ── 3. Partial RoPE on the trailing rope_dim cols of Q (per head) and K.
     // SAFETY: dsv4_prepare_qk_cuda writes both full output buffers.
@@ -7776,11 +8130,19 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     ensure!(n > 0, "DSv4 MLA proj-batch requires N>0 rows");
     let head_dim = config.head_dim;
     let local_width = attention.wq_b.rows;
+    // See mla_attention_prepare: GLM wq_b emits qk_head-wide q (runtime-absorbed),
+    // DSv4 emits pre-absorbed head_dim-wide q. (Batched lane is MODEL1-only today;
+    // this keeps the derivation correct if a V32 batched lane is ever wired.)
+    let q_head_width = if attention.w_kc.is_some() {
+        config.qk_nope_head_dim + config.qk_rope_head_dim
+    } else {
+        head_dim
+    };
     ensure!(
-        head_dim > 0 && local_width.is_multiple_of(head_dim),
-        "DSv4 MLA proj-batch local q width {local_width} is not a multiple of head_dim {head_dim}"
+        q_head_width > 0 && local_width.is_multiple_of(q_head_width),
+        "DSv4 MLA proj-batch local q width {local_width} is not a multiple of q_head_width {q_head_width}"
     );
-    let local_heads = local_width / head_dim;
+    let local_heads = local_width / q_head_width;
     ensure!(
         local_heads > 0,
         "DSv4 MLA proj-batch requires at least one local head"
@@ -8514,15 +8876,26 @@ fn mla_attention_fwd(
     } else {
         // ── 4b(fwd). CSA / HCA: hybrid windowed+compressed attention over the
         // compressor pool (re-borrowed from `state`) + PREPARE's `selected`.
-        let compressed = &state
-            .compressor
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
-            })?
-            .compressed;
-        let compressed_count = compressed.seq_len;
-        let compressed_capacity = compressed.data.len() / head_dim;
+        // GLM SparseIndexed has NO compressor (pure indexer top-k over the full
+        // latent); it must be served by the FlashMLA sparse prefill path below,
+        // so leave `compressed` absent and feed nulls to the kernel args.
+        let compressed: Option<&HiddenStates> = if mode == DeepSeekV4AttentionMode::SparseIndexed {
+            None
+        } else {
+            Some(
+                &state
+                    .compressor
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                        )
+                    })?
+                    .compressed,
+            )
+        };
+        let compressed_count = compressed.map_or(0, |c| c.seq_len);
+        let compressed_capacity = compressed.map_or(0, |c| c.data.len() / head_dim);
         let compressed_count_arg = if start_pos_device.is_some() {
             // CUDA graph replay bakes scalar launch args. In decode, the causal
             // bound is `abs_pos / compress_ratio`, so the kernel may safely see
@@ -8535,9 +8908,8 @@ fn mla_attention_fwd(
             DeepSeekV4AttentionMode::CompressedSparse => 1,
             DeepSeekV4AttentionMode::HybridCompressed => 2,
             DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
-            DeepSeekV4AttentionMode::SparseIndexed => {
-                unimplemented!("Tranche D: GLM SparseIndexed prefill mode_int")
-            }
+            // GLM SparseIndexed uses the CSA-style hybrid kernel arg.
+            DeepSeekV4AttentionMode::SparseIndexed => 1,
         };
         let flashmla_used = if try_flashmla_prefill_attention(
             ctx,
@@ -8548,7 +8920,7 @@ fn mla_attention_fwd(
             &q_prepared,
             &k_prepared,
             selected.as_ref(),
-            Some(compressed),
+            compressed,
             &mut state.sw_window_cache,
             start_pos,
             chain_verify,
@@ -8581,7 +8953,7 @@ fn mla_attention_fwd(
                 &q_prepared,
                 &k_prepared,
                 selected.as_ref(),
-                Some(compressed),
+                compressed,
                 &mut state.sw_window_cache,
                 flash,
                 scratch,
@@ -8613,7 +8985,12 @@ fn mla_attention_fwd(
                 .device_ptr(&ctx.stream);
             let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
             let (comp_ptr, _cguard) = if compressed_count_arg > 0 {
-                let (p, g) = compressed.data.device_ptr(&ctx.stream);
+                // compressed_count_arg > 0 implies `compressed` is Some (SparseIndexed
+                // has no compressor → compressed_count_arg == 0 → this branch is skipped).
+                let (p, g) = compressed
+                    .expect("compressed present when compressed_count_arg > 0")
+                    .data
+                    .device_ptr(&ctx.stream);
                 (p as *const ffi::Half, Some(g))
             } else {
                 (std::ptr::null(), None)
@@ -8699,8 +9076,22 @@ fn mla_attention_fwd(
     }
     keepalive.keep_hidden(&local_attn);
 
+    // ── 4b. GLM runtime V absorption (w_vc.is_some()). The FlashMLA output is
+    // the [heads, kv_lora(512)] latent; GLM projects it back to v[heads,
+    // v_head(256)] via v[h] = attn_out[h] · w_vc[h] before the plain o_proj.
+    // This changes local_attn's hidden_dim from heads*512 to heads*256. DSv4
+    // (w_vc None) skips — local_attn is already the wo_a/wo_b latent.
+    let local_attn = if let Some(w_vc) = attention.w_vc.as_ref() {
+        let v = glm_absorb_v(ctx, config, w_vc, &local_attn, local_heads, keepalive)?;
+        keepalive.keep_hidden(&v);
+        v
+    } else {
+        local_attn
+    };
+
     // ── 5. O-LoRA: wo_a (per o-group, down to the output latent) → wo_b (up
     // back to hidden). Row-parallel: the all-reduce-sum is the model's concern.
+    // GLM (o_proj.is_some()) takes the plain-o early return in mla_oproj.
     // SAFETY: dsv4_linear writes the full latent buffer.
     mla_oproj(
         ctx,
@@ -9085,6 +9476,21 @@ pub(crate) fn mla_oproj(
     keepalive: &mut Dsv4ForwardKeepalive,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    // GLM plain output projection: a single GEMM v[heads*v_head_dim] -> hidden.
+    // No wo_a/wo_b low-rank, no group tables. `local_attn` for GLM is the
+    // post-w_vc v ([heads*v_head_dim]); o_proj is [hidden, heads*v_head_dim].
+    // DSv4 (o_proj None) falls through to the wo_a/wo_b path UNCHANGED.
+    // ponytail: pod-verify plain o_proj input is post-w_vc v (heads*v_head_dim)
+    if let Some(o_proj) = attention.o_proj.as_ref() {
+        let _ = &mut prefill_shared;
+        let _ = keepalive;
+        let nvtx = crate::nvtx::range("dsv4/linear/o_proj");
+        crate::linear_profile::profile(ctx, "dsv4/linear/o_proj", || {
+            dsv4_linear(ctx, o_proj, local_attn, out)
+        })?;
+        drop(nvtx);
+        return Ok(());
+    }
     let shape = dsv4_oproj_group_shape(
         attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
         attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
