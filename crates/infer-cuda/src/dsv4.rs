@@ -192,11 +192,14 @@ pub(crate) struct Dsv4Attention {
     /// DSv4 low-rank output up-projection. `None` ⇔ GLM plain-o.
     pub wo_b: Option<DeviceMatrix>,
     /// DeepGEMM-layout FP8 caches of the output projection (`wo_a`/`wo_b`) for the
-    /// decode path (lever #1b), companion to [`Self::wq_b_deepgemm`]. The `wo_a`
-    /// cache is present only when this rank owns exactly one output group; the
-    /// grouped route kernel covers multi-group ranks. `None` unless the fused-wqkv
-    /// decode alloc gate is on (and always `None` on GLM plain-o).
+    /// decode path (lever #1b), companion to [`Self::wq_b_deepgemm`]. The flat
+    /// `wo_a` cache is present only when this rank owns exactly one output group.
+    /// Multi-group ranks use `wo_a_group_deepgemm` below so TP4 does not fall back
+    /// to the scalar route GEMV path.
     pub wo_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
+    /// Per-output-group DeepGEMM caches for `wo_a` on ranks that own multiple
+    /// whole output groups (TP1/2/4). Each cache is `[o_lora_rank, group_width]`.
+    pub wo_a_group_deepgemm: Option<Vec<Dsv4Fp8DeepGemmWeightCache>>,
     pub wo_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     /// Per-head attention sink logit. `None` ⇔ GLM (no `attn_sink` tensor).
     pub attn_sink: Option<DeviceVec>,
