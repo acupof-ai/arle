@@ -54,10 +54,9 @@ use crate::{
 use crate::{infer_student::InferStudent, lora::LoraConfig};
 use autograd::ops::{add, mul_scalar, slice};
 
-/// Opt-in context to route the OPD student rollout through the in-process
-/// infer engine (`InferStudent`) instead of the train-crate hand-written
-/// decode kernel. P3 wiring behind the `ARLE_OPD_INFER_ROLLOUT` flag — see
-/// `docs/plans/2026-05-29-opd-student-rollout-via-infer.md`.
+/// Context to route the OPD student rollout through the in-process infer engine
+/// (`InferStudent`) instead of the train-crate hand-written decode kernel. This
+/// is the CUDA default; `ARLE_OPD_INFER_ROLLOUT=0` selects the fallback A/B arm.
 ///
 /// The caller constructs this only when both (a) the env flag is set and
 /// (b) an `InferStudent` was loaded; when `None`, the train-crate rollout
@@ -2797,12 +2796,12 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             forced_rollout.to_vec()
         } else {
             let rollout_sampling = cfg.rollout_sampling.as_ref();
-            // P3 infer-engine rollout (opt-in): mirror the train LoRA into the
+            // Infer-engine rollout: mirror the train LoRA into the
             // infer student once per step, then decode `rollout_len` tokens via
             // the infer engine. Produces the same `rollout: Vec<u32>` the
             // train-crate helper would, so downstream KL/backward is unchanged.
-            // When the flag/ctx is absent, the public train-crate helper runs
-            // as the A/B baseline.
+            // When the ctx is absent, the public train-crate helper runs as
+            // the A/B baseline.
             #[cfg(feature = "cuda")]
             if let Some(ctx) = infer_rollout.as_ref() {
                 log_opd_step_trace(total_started, "infer_rollout_reload_start", "");
