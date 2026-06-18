@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use autograd::{Tape, TensorId, TensorStore};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,7 +13,7 @@ use infer_plan::SamplingParams;
 use qwen35_spec::{LayerType, Qwen35Config};
 use serde::Serialize;
 use train::{
-    model_family::{resolve_model_family, ModelFamily},
+    model_family::{ModelFamily, resolve_model_family},
     tokenizer::ChatTokenizer,
 };
 
@@ -330,8 +330,8 @@ fn maybe_save_full_student_checkpoint(
     }
 
     use train::qwen35_checkpoint::{
-        save_qwen35_student_checkpoint, ConfigJsonSource, GenerationConfigSource,
-        Qwen35StepCheckpoint, Qwen35StudentWeights,
+        ConfigJsonSource, GenerationConfigSource, Qwen35StepCheckpoint, Qwen35StudentWeights,
+        save_qwen35_student_checkpoint,
     };
 
     fs::create_dir_all(out_dir)
@@ -711,10 +711,10 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
 }
 
 fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         lora::LoraConfig,
-        opd::{opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, OpdStepConfig},
+        opd::{GkdLossConfig, OpdStepConfig, opd_step_with_teacher_forward_profiled_gkd_anchor},
         qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
     };
 
@@ -766,6 +766,54 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .into_iter()
         .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
         .collect();
+    if std::env::var_os("ARLE_OPD_LOG_TRAINABLE_PARAMS").is_some() {
+        let mut names = std::collections::HashMap::new();
+        for (name, id) in student.param_name_map() {
+            names.insert(id, name.to_owned());
+        }
+        for (name, id) in student.adapter_name_map() {
+            names.insert(id, name.to_owned());
+        }
+        let mut rows = student_params
+            .iter()
+            .filter_map(|&id| {
+                store.get(id).map(|tensor| {
+                    let elems = tensor.shape.iter().product::<usize>();
+                    let alloc_elems = tensor.data.len().max(tensor.size);
+                    (
+                        alloc_elems,
+                        elems,
+                        id,
+                        tensor.data.len(),
+                        tensor.size,
+                        tensor.shape.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(alloc_elems, _, _, _, _, _)| std::cmp::Reverse(*alloc_elems));
+        let total = rows
+            .iter()
+            .map(|(_, elems, _, _, _, _)| *elems)
+            .sum::<usize>();
+        let total_alloc = rows
+            .iter()
+            .map(|(alloc_elems, _, _, _, _, _)| *alloc_elems)
+            .sum::<usize>();
+        eprintln!(
+            "[arle train opd] trainable_params count={} total_elems={} total_alloc_elems={} top_shapes:",
+            rows.len(),
+            total,
+            total_alloc
+        );
+        for (alloc_elems, elems, id, data_len, size, shape) in rows.iter().take(12) {
+            let name = names.get(id).map(String::as_str).unwrap_or("<unnamed>");
+            eprintln!(
+                "[arle train opd] trainable_param id={} elems={} alloc_elems={} data_len={} size={} shape={:?} name={}",
+                id, elems, alloc_elems, data_len, size, shape, name
+            );
+        }
+    }
     let cfg = student.config().clone();
     #[cfg(feature = "cuda")]
     let infer_student = if corpus_sft_only {
@@ -1016,11 +1064,11 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
 }
 
 fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35::Qwen35Model,
     };
@@ -1272,13 +1320,13 @@ fn heldout_nll(
 }
 
 fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdKlMask, OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35_loader::load_qwen35_lora_from_hf_dir,
     };
@@ -1533,13 +1581,13 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
 }
 
 fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
-    use autograd::{optim::AdamW, Tape};
+    use autograd::{Tape, optim::AdamW};
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         lora::LoraConfig,
         opd::{
-            opd_step_with_teacher_forward_profiled_gkd_anchor, GkdLossConfig, GkdSftAnchor,
-            OpdKlMask, OpdStepConfig,
+            GkdLossConfig, GkdSftAnchor, OpdKlMask, OpdStepConfig,
+            opd_step_with_teacher_forward_profiled_gkd_anchor,
         },
         qwen35::Qwen35Model,
     };
@@ -2579,9 +2627,9 @@ mod tests {
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
+        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
         current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config, kl_mask_arg,
-        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection, OpdLrSchedule,
-        OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
+        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
     };
     use crate::args::{LrScheduleArg, OpdKlMaskArg};
 

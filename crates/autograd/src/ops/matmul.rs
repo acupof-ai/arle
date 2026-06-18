@@ -235,7 +235,7 @@ pub(crate) fn matmul_bt_backward(
     output_grad_id: TensorId,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
-    let SavedContext::MatmulBTCtx { a, b, .. } = entry.saved.clone() else {
+    let SavedContext::MatmulBTCtx { a, b, site } = entry.saved.clone() else {
         return Err(AutogradError::TapeInvariant(
             "matmul_bt backward missing saved context",
         ));
@@ -252,6 +252,25 @@ pub(crate) fn matmul_bt_backward(
             expected: expected_shape,
             got: upstream_shape,
         });
+    }
+    if let Ok(raw_threshold) = std::env::var("ARLE_MATMUL_BT_BWD_TRACE_MIN_ELEMS")
+        && let Ok(threshold) = raw_threshold.parse::<usize>()
+        && upstream_shape.iter().product::<usize>() >= threshold
+    {
+        let a_tensor = store.tensor(a)?;
+        let b_tensor = store.tensor(b)?;
+        let g_tensor = store.tensor(output_grad_id)?;
+        eprintln!(
+            "arle_matmul_bt_bwd_trace site={site} a={a_shape:?} b={b_shape:?} \
+             grad={upstream_shape:?} need_a={need_grad_a} need_b={need_grad_b} \
+             dirty_a={:?} dirty_b={:?} dirty_g={:?} has_dev_a={} has_dev_b={} has_dev_g={}",
+            a_tensor.dirty,
+            b_tensor.dirty,
+            g_tensor.dirty,
+            a_tensor.device_handle.is_some(),
+            b_tensor.device_handle.is_some(),
+            g_tensor.device_handle.is_some()
+        );
     }
 
     let mut grads = GradPairs::new();
