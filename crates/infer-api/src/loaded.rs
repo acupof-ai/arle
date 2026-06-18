@@ -118,6 +118,12 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     if model_type == "deepseek_v4" || arch_contains("DeepseekV4") {
         return CudaModelKind::Dsv4;
     }
+    // GLM-5.2 (glm_moe_dsa) is the DeepSeek-V3.2-DSA family — it rides the DSv4
+    // V32 path (adapter in `dsv4.rs` resolves the config dialect). Must precede
+    // the expert-count→Qwen35 branch below, else GLM's 256 experts misroute.
+    if model_type == "glm_moe_dsa" || arch_contains("GlmMoeDsa") {
+        return CudaModelKind::Dsv4;
+    }
     if model_type == "diffusion_gemma"
         || model_type == "gemma4"
         || arch_contains("DiffusionGemma")
@@ -173,6 +179,14 @@ mod classify_tests {
         assert_eq!(
             classify_cuda_model(
                 &json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"})
+            ),
+            CudaModelKind::Dsv4
+        );
+        // GLM-5.2 (glm_moe_dsa) rides the DSv4 path; its 256 experts must not
+        // misroute to Qwen35.
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["GlmMoeDsaForCausalLM"], "model_type": "glm_moe_dsa", "n_routed_experts": 256})
             ),
             CudaModelKind::Dsv4
         );
