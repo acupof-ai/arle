@@ -48,8 +48,13 @@ pub(crate) struct Dsv4MlaKvArena {
 }
 
 /// Packed bytes per token the FlashMLA sparse-FP8 decode reads for the canonical
-/// NoPE=448 / RoPE=64 shape (`dsv4_fp8_kv_pack` doc).
+/// MODEL1 NoPE=448 / RoPE=64 shape (`dsv4_fp8_kv_pack` doc):
+/// 448 fp8 NoPE + 128 bf16 RoPE + 8 e8m0 scales = 584.
 const DSV4_FLASH_KV_BYTES_PER_TOKEN: usize = 584;
+/// V32 / GLM shape NoPE=512 (= `kv_lora_rank`) / RoPE=64:
+/// 512 fp8 NoPE + 128 bf16 RoPE + 16 scales = 656 (matches
+/// `arle_flashmla_decode_shim.cu:62-63` `V32_BYTES_PER_TOKEN`).
+const DSV4_V32_KV_BYTES_PER_TOKEN: usize = 656;
 const DSV4_FLASH_PAGE_BLOCK_SIZE: usize = 64;
 
 impl Dsv4MlaKvArena {
@@ -65,18 +70,30 @@ impl Dsv4MlaKvArena {
                     config.head_dim
                 )
             })?;
-        // The shared pack kernel is fixed to the MODEL1 NoPE=448/RoPE=64 layout;
-        // a different shape needs a new pack kernel, not a param tweak.
-        ensure!(
-            nope_dim == 448 && rope_dim == 64,
-            "DSv4 MLA KV arena only wires the FlashMLA MODEL1 NoPE=448/RoPE=64 \
-             pack (584 B/token), got NoPE={nope_dim} RoPE={rope_dim}"
-        );
+        // Two FP8 pack/decode layouts are wired (`arle_flashmla_decode_shim.cu`):
+        //   • MODEL1: NoPE=448 / RoPE=64 → 584 B/token (DSv4-Flash, pre-absorbed).
+        //   • V32:    NoPE=512 / RoPE=64 → 656 B/token (GLM-5.2, NoPE == kv_lora_rank).
+        // GPU-UNVERIFIABLE (pod): the V32 *pack* kernel emitting the 656 B/token /
+        // 512-NoPE layout is wired in Tranche D — this arena only sizes the buffer.
+        let bytes_per_token = match (nope_dim, rope_dim) {
+            (448, 64) => DSV4_FLASH_KV_BYTES_PER_TOKEN,
+            // V32: NoPE latent is the full kv_lora_rank (512 for GLM-5.2).
+            (n, 64) if n == config.kv_lora_rank && config.kv_lora_rank > 0 => {
+                DSV4_V32_KV_BYTES_PER_TOKEN
+            }
+            _ => bail!(
+                "DSv4 MLA KV arena wires only the FlashMLA MODEL1 NoPE=448/RoPE=64 \
+                 (584 B/token) or V32 NoPE={}=kv_lora_rank/RoPE=64 (656 B/token) packs, \
+                 got NoPE={nope_dim} RoPE={rope_dim} kv_lora_rank={}",
+                config.kv_lora_rank,
+                config.kv_lora_rank
+            ),
+        };
         Ok(Self {
             rope_dim,
             nope_dim,
             page_block_size: DSV4_FLASH_PAGE_BLOCK_SIZE,
-            bytes_per_token: DSV4_FLASH_KV_BYTES_PER_TOKEN,
+            bytes_per_token,
             num_layers: config.num_hidden_layers,
         })
     }
@@ -93,13 +110,27 @@ pub(crate) struct Dsv4Compressor {
     pub norm: DeviceVec,
 }
 
-/// Sparse indexer sub-block (CompressedSparse mode only): a second compressor
-/// over `index_head_dim` keys + `wq_b`/`weights_proj` projections that feed the
-/// `dsv4_csa_select_cuda` top-k block selector.
+/// Sparse indexer sub-block. DSv4 CompressedSparse: a key compressor over
+/// `index_head_dim` keys + `wq_b`/`weights_proj`. GLM DSA (`SparseIndexed`): the
+/// indexer runs over the full (uncompressed) latent KV — no compressor; instead a
+/// plain key projection `wk` + key RMSNorm `k_norm`. Both feed the top-k block
+/// selector.
 pub(crate) struct Dsv4Indexer {
     pub wq_b: DeviceMatrix,
     pub weights_proj: DeviceMatrix,
-    pub compressor: Dsv4Compressor,
+    /// DSv4 CSA key compressor. `None` ⇒ GLM SparseIndexed (uses `wk`/`k_norm`).
+    pub compressor: Option<Dsv4Compressor>,
+    /// GLM SparseIndexed only: indexer key projection `[index_n_heads*index_head_dim,
+    /// hidden]`. `None` ⇒ DSv4 (keys come through the compressor). Consumed by the
+    /// Tranche-D GLM forward (not yet wired).
+    #[allow(dead_code)]
+    pub wk: Option<DeviceMatrix>,
+    /// GLM SparseIndexed only: indexer key RMSNorm weight + bias. `None` ⇒ DSv4.
+    /// Consumed by the Tranche-D GLM forward.
+    #[allow(dead_code)]
+    pub k_norm: Option<DeviceVec>,
+    #[allow(dead_code)]
+    pub k_norm_bias: Option<DeviceVec>,
     /// DeepGEMM repack of `wq_b` for the prefill index-query projection (the #1
     /// remaining projection after wq_b/wo: 135ms / 67% of linear at M=1024). Built
     /// when the prefill DeepGEMM scratch is enabled; `None` falls back to scalar.
@@ -114,6 +145,20 @@ pub(crate) struct Dsv4HyperConnection {
     pub base: DeviceVec,
     pub mix_fn: DeviceMatrix,
     pub scale: DeviceVec,
+}
+
+impl Dsv4HyperConnection {
+    /// Zero placeholder for GLM (`hc_mult == 1`, no hyper-connections): the mixers
+    /// are the identity (`stream_dim == hidden_size`), so the forward never reads
+    /// these weights. GLM checkpoints ship no `hc_*` tensors, so the loader builds
+    /// this instead of loading.
+    fn identity_placeholder(ctx: &DeviceContext) -> Result<Self> {
+        Ok(Self {
+            base: DeviceVec::zeros(ctx, 1)?,
+            mix_fn: DeviceMatrix::from_safetensors(ctx, &[0u8; 2], 1, 1)?,
+            scale: DeviceVec::zeros(ctx, 1)?,
+        })
+    }
 }
 
 /// One DSv4 MLA attention block's weights.
@@ -135,25 +180,45 @@ pub(crate) struct Dsv4Attention {
     pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wkv: DeviceMatrix,
     pub kv_norm: DeviceVec,
-    pub wo_a: DeviceMatrix,
+    /// DSv4 low-rank output down-projection. `None` ⇔ GLM (`config.plain_o_proj`,
+    /// which uses `o_proj` instead).
+    pub wo_a: Option<DeviceMatrix>,
     /// Per-output-group pointer table for `wo_a`. DSv4 output projection groups
     /// attention heads before the low-rank down projection; one TP rank may own
     /// more than one full output group (TP1/2/4 on DSv4-Flash), so `wo_a` is
     /// launched as group-routed `[token, group]` rows instead of pretending the
-    /// rank-local attention row is one flat K.
-    pub wo_a_groups: Dsv4WoAGroupTables,
-    pub wo_b: DeviceMatrix,
+    /// rank-local attention row is one flat K. `None` ⇔ GLM plain-o.
+    pub wo_a_groups: Option<Dsv4WoAGroupTables>,
+    /// DSv4 low-rank output up-projection. `None` ⇔ GLM plain-o.
+    pub wo_b: Option<DeviceMatrix>,
     /// DeepGEMM-layout FP8 caches of the output projection (`wo_a`/`wo_b`) for the
     /// decode path (lever #1b), companion to [`Self::wq_b_deepgemm`]. The `wo_a`
     /// cache is present only when this rank owns exactly one output group; the
     /// grouped route kernel covers multi-group ranks. `None` unless the fused-wqkv
-    /// decode alloc gate is on.
+    /// decode alloc gate is on (and always `None` on GLM plain-o).
     pub wo_a_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wo_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
-    pub attn_sink: DeviceVec,
-    pub attn_sink_f32: CudaSlice<f32>,
+    /// Per-head attention sink logit. `None` ⇔ GLM (no `attn_sink` tensor).
+    pub attn_sink: Option<DeviceVec>,
+    pub attn_sink_f32: Option<CudaSlice<f32>>,
     pub compressor: Option<Dsv4Compressor>,
     pub indexer: Option<Dsv4Indexer>,
+    /// GLM plain output projection `[hidden, num_heads*v_head_dim]` (replaces the
+    /// DSv4 `wo_a`/`wo_b` low-rank). `Some` ⇔ `config.plain_o_proj`; DSv4 leaves
+    /// `None` and uses `wo_a`/`wo_b`/`wo_a_groups`. Consumed by the Tranche-D GLM
+    /// forward (not yet wired).
+    #[allow(dead_code)]
+    pub o_proj: Option<DeviceMatrix>,
+    /// GLM `kv_b` absorption split — the up-projection of the compressed KV latent,
+    /// folded at runtime around the V32 FlashMLA call (SGLang `forward_absorb_core`
+    /// `deepseek_v2.py`). `w_kc[heads, qk_nope_head_dim, kv_lora_rank]` lifts q_nope
+    /// into the 512-latent; `w_vc[heads, kv_lora_rank, v_head_dim]` projects the
+    /// latent output back to v. `Some` ⇔ GLM (`config.kv_lora_rank > 0`); DSv4's
+    /// pre-absorbed checkpoint leaves both `None`. Consumed by the Tranche-D forward.
+    #[allow(dead_code)]
+    pub w_kc: Option<DeviceMatrix>,
+    #[allow(dead_code)]
+    pub w_vc: Option<DeviceMatrix>,
 }
 
 pub(crate) struct Dsv4WoAGroupTables {
@@ -202,6 +267,28 @@ pub(crate) struct Dsv4MoeLayer {
     pub gemv_tables: std::sync::OnceLock<Option<crate::moe::Dsv4GemvTables>>,
 }
 
+/// GLM dense-MLP layer (the first `first_k_dense_replace` layers): a plain SwiGLU
+/// FFN at `intermediate_size` (12288) replacing the routed-expert stack. GLM ships
+/// FP8 + F32 `weight_scale_inv`; the loader dequantizes to dense bf16 (the FP8
+/// DeepGEMM caches need the E8M0 `dsv4_scales` layout GLM doesn't carry). Present
+/// only on GLM dense layers; DSv4 (all-MoE) never builds this.
+///
+/// GPU-UNVERIFIABLE (pod): keeping the dense FFN in bf16 (vs FP8) trades VRAM for
+/// a simpler bring-up; the Tranche-D forward consumes `gate`/`up`/`down` directly.
+///
+/// All fields are consumed by the Tranche-D GLM forward (not yet wired).
+#[allow(dead_code)]
+pub(crate) struct Dsv4DenseMlp {
+    /// Gate projection `[intermediate, hidden]` (bf16).
+    pub gate: DeviceMatrix,
+    /// Up projection `[intermediate, hidden]` (bf16).
+    pub up: DeviceMatrix,
+    /// Down projection `[hidden, intermediate]` (bf16).
+    pub down: DeviceMatrix,
+    pub hidden_dim: usize,
+    pub intermediate: usize,
+}
+
 /// One DSv4 transformer layer: hyper-connection mixers (`hc_attn`/`hc_ffn`),
 /// pre-attn / pre-ffn norms, attention, and MoE. `mode` records the attention
 /// variant (SW / CSA / HCA) the forward dispatches on.
@@ -211,9 +298,17 @@ pub(crate) struct Dsv4Layer {
     pub attn_norm: DeviceVec,
     pub ffn_norm: DeviceVec,
     pub attention: Dsv4Attention,
-    pub moe: Dsv4MoeLayer,
+    /// Routed MoE block. `None` ⇔ a GLM dense layer (uses `dense_mlp`). DSv4 always
+    /// `Some` (every layer is MoE).
+    pub moe: Option<Dsv4MoeLayer>,
     pub mode: DeepSeekV4AttentionMode,
     pub compress_ratio: usize,
+    /// GLM dense layers only (`config.per_layer_dense_mlp[i]`): a plain FFN that
+    /// replaces the routed-expert forward. `Some` ⇒ the forward runs `dense_mlp`
+    /// instead of `moe`. DSv4 layers leave this `None`. Consumed by the Tranche-D
+    /// GLM forward (not yet wired).
+    #[allow(dead_code)]
+    pub dense_mlp: Option<Dsv4DenseMlp>,
 }
 
 /// One shipped DSv4 MTP draft head (`mtp.0.*`): a full transformer layer plus
@@ -714,7 +809,7 @@ impl Dsv4SlotState {
                 let intermediate = model
                     .layers
                     .first()
-                    .map(|layer| layer.moe.intermediate)
+                    .map(|layer| layer.moe.as_ref().expect("DSv4 layer.moe").intermediate)
                     .ok_or_else(|| anyhow!("DSv4 deepep_ll: model has no layers"))?;
                 Some(transport.alloc_ll_scratch(&model.ctx, intermediate)?)
             }
@@ -1019,8 +1114,29 @@ impl Dsv4Model {
         // (backward-compat fallback). Resolved once and stored on the model so
         // per-slot construction reads the same decision.
         let spec_decode_on = mtp_draft_tokens.is_some() || dsv4_spec_decode_enabled();
-        let config = DeepSeekV4Config::from_json_file(model_path.join("config.json"))
-            .map_err(|e| anyhow!("load DSv4 config from {}: {e}", model_path.display()))?;
+        // Peek model_type: GLM-5.2 (`glm_moe_dsa`) parses through the GLM dialect
+        // adapter (V32 shape, plain-o, hc_mult=1, num_nextn=0, Glm tensor names);
+        // every other DSv4 checkpoint loads through the strict DSv4 parser
+        // byte-unchanged.
+        let config_path = model_path.join("config.json");
+        let config_json = std::fs::read_to_string(&config_path)
+            .map_err(|e| anyhow!("read DSv4 config {}: {e}", config_path.display()))?;
+        let model_type = serde_json::from_str::<serde_json::Value>(&config_json)
+            .ok()
+            .and_then(|v| {
+                v.get("model_type")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let config = if model_type == "glm_moe_dsa" {
+            deepseek_spec::GlmMoeDsaConfig::from_json_str(&config_json)
+                .and_then(|glm| glm.into_deepseek_v4())
+                .map_err(|e| anyhow!("load GLM config from {}: {e}", config_path.display()))?
+        } else {
+            DeepSeekV4Config::from_json_str(&config_json)
+                .map_err(|e| anyhow!("load DSv4 config from {}: {e}", config_path.display()))?
+        };
         ensure_loadable(&config, spec_decode_on)?;
 
         let moe_config = Self::moe_config_from_config(&config)?;
@@ -1052,6 +1168,10 @@ impl Dsv4Model {
         let embed_tokens = loader.load_dsv4_global_matrix(&ctx, names.embed_tokens())?;
         let lm_head = loader.load_dsv4_global_matrix(&ctx, names.lm_head())?;
 
+        // GLM (`glm_moe_dsa`) markers: re-encode FP8 MoE experts from `weight_scale_inv`,
+        // and bypass the absent hyper-connections (`hc_mult == 1`, identity mixers).
+        let glm = config.plain_o_proj;
+        let hc_absent = config.hc_mult == 1;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             let plan = config
@@ -1059,25 +1179,61 @@ impl Dsv4Model {
                 .ok_or_else(|| anyhow!("DSv4 layer {layer_idx} has no attention plan"))?;
             let lnames = config.layer_tensor_names(layer_idx);
             let attention = loader.load_dsv4_attention(&ctx, &config, &lnames.attn, &tp_cfg)?;
-            let moe = loader.load_dsv4_moe_layer(
-                &ctx,
-                &lnames.ffn,
-                &split,
-                config.moe_routing_kind(layer_idx),
-            )?;
+            // GLM dense layers (`per_layer_dense_mlp[i]`): a plain FFN, no experts.
+            let is_dense = config
+                .per_layer_dense_mlp
+                .as_ref()
+                .and_then(|f| f.get(layer_idx).copied())
+                .unwrap_or(false);
+            let (moe, dense_mlp) = if is_dense {
+                let dense = loader.load_dsv4_dense_mlp(
+                    &ctx,
+                    lnames.ffn.dense_mlp.as_ref().ok_or_else(|| {
+                        anyhow!("GLM dense layer {layer_idx} missing dense_mlp names")
+                    })?,
+                )?;
+                (None, Some(dense))
+            } else {
+                let moe = loader.load_dsv4_moe_layer(
+                    &ctx,
+                    &lnames.ffn,
+                    &split,
+                    config.moe_routing_kind(layer_idx),
+                    glm,
+                )?;
+                (Some(moe), None)
+            };
+            // hc-absent (GLM): identity mixers; skip the (non-existent) hc tensor loads.
+            let (hc_attn, hc_ffn) = if hc_absent {
+                (
+                    Dsv4HyperConnection::identity_placeholder(&ctx)?,
+                    Dsv4HyperConnection::identity_placeholder(&ctx)?,
+                )
+            } else {
+                (
+                    loader.load_dsv4_hyper_connection(&ctx, &lnames.hc_attn)?,
+                    loader.load_dsv4_hyper_connection(&ctx, &lnames.hc_ffn)?,
+                )
+            };
             layers.push(Dsv4Layer {
-                hc_attn: loader.load_dsv4_hyper_connection(&ctx, &lnames.hc_attn)?,
-                hc_ffn: loader.load_dsv4_hyper_connection(&ctx, &lnames.hc_ffn)?,
+                hc_attn,
+                hc_ffn,
                 attn_norm: loader.load_dsv4_vec(&ctx, &lnames.attn_norm)?,
                 ffn_norm: loader.load_dsv4_vec(&ctx, &lnames.ffn_norm)?,
                 attention,
                 moe,
                 mode: plan.mode,
                 compress_ratio: plan.compress_ratio,
+                dense_mlp,
             });
         }
         let norm = loader.load_dsv4_vec(&ctx, names.norm())?;
-        let head_hc = loader.load_dsv4_hyper_connection(&ctx, &names.head_hc())?;
+        // GLM has no head hyper-connection; identity placeholder.
+        let head_hc = if hc_absent {
+            Dsv4HyperConnection::identity_placeholder(&ctx)?
+        } else {
+            loader.load_dsv4_hyper_connection(&ctx, &names.head_hc())?
+        };
         let mtp = if spec_decode_on && config.num_nextn_predict_layers > 0 {
             ensure!(
                 config.num_nextn_predict_layers == 1,
@@ -1086,11 +1242,13 @@ impl Dsv4Model {
             );
             let mtp_names = config.mtp_tensor_names(0);
             let attention = loader.load_dsv4_attention(&ctx, &config, &mtp_names.attn, &tp_cfg)?;
+            // MTP is DSv4-only (GLM ships num_nextn=0): always MoE, glm=false.
             let moe = loader.load_dsv4_moe_layer(
                 &ctx,
                 &mtp_names.ffn,
                 &split,
                 DeepSeekV4MoeRoutingKind::LearnedBias,
+                false,
             )?;
             let compress_ratio = 0;
             Some(Dsv4MtpLayer {
@@ -1100,9 +1258,10 @@ impl Dsv4Model {
                     attn_norm: loader.load_dsv4_vec(&ctx, &mtp_names.attn_norm)?,
                     ffn_norm: loader.load_dsv4_vec(&ctx, &mtp_names.ffn_norm)?,
                     attention,
-                    moe,
+                    moe: Some(moe),
                     mode: config.attention_mode_for_compress_ratio(compress_ratio),
                     compress_ratio,
+                    dense_mlp: None,
                 },
                 head_hc: loader.load_dsv4_hyper_connection(&ctx, &mtp_names.hc_head)?,
                 enorm: loader.load_dsv4_vec(&ctx, &mtp_names.enorm)?,
@@ -1167,9 +1326,13 @@ impl Dsv4Model {
             self.tp.config().world_size,
             num_slots,
             if needs_moe_decode_shared {
-                self.layers
-                    .first()
-                    .map(|layer| (&self.moe_config, &self.split, &layer.moe))
+                self.layers.first().map(|layer| {
+                    (
+                        &self.moe_config,
+                        &self.split,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                    )
+                })
             } else {
                 None
             },
@@ -1240,7 +1403,7 @@ impl Dsv4Model {
                     crate::moe::Dsv4MoeDecodeScratch::device_bytes(
                         &self.moe_config,
                         &self.split,
-                        &layer.moe,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
                     )
                 })
                 .unwrap_or(0)
@@ -2129,7 +2292,10 @@ impl Dsv4Model {
                         match layer.attention.indexer.as_ref() {
                             Some(indexer) => crate::attention::compressor_batch_prepass(
                                 &self.ctx,
-                                &indexer.compressor,
+                                indexer
+                                    .compressor
+                                    .as_ref()
+                                    .expect("DSv4 CSA indexer has a key compressor"),
                                 &normed,
                                 &mut keepalive,
                             )?,
@@ -2235,7 +2401,10 @@ impl Dsv4Model {
                             crate::attention::dsv4_compressor_update_batched(
                                 &self.ctx,
                                 &self.config,
-                                &indexer.compressor,
+                                indexer
+                                    .compressor
+                                    .as_ref()
+                                    .expect("DSv4 CSA indexer has a key compressor"),
                                 kv,
                                 score,
                                 &indexer_sink,
@@ -2956,7 +3125,7 @@ impl Dsv4Model {
                             self,
                             transport,
                             scratch,
-                            &layer.moe,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
                             &tokens[start..end],
                             tokens.len(),
                             &owned_in,
@@ -2984,7 +3153,7 @@ impl Dsv4Model {
                         crate::moe::dsv4_moe_forward_deepep(
                             self,
                             transport,
-                            &layer.moe,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
                             tokens,
                             &normed,
                             &mut moe_out,
@@ -2997,7 +3166,7 @@ impl Dsv4Model {
             } else {
                 crate::moe::dsv4_moe_forward(
                     self,
-                    &layer.moe,
+                    layer.moe.as_ref().expect("DSv4 layer.moe"),
                     tokens,
                     &normed,
                     &mut moe_out,
@@ -3017,7 +3186,7 @@ impl Dsv4Model {
             crate::moe::dsv4_shared_expert_forward(
                 &self.ctx,
                 &self.ctx.stream,
-                &layer.moe,
+                layer.moe.as_ref().expect("DSv4 layer.moe"),
                 &normed,
                 &mut shared,
                 self.config.swiglu_limit,
@@ -3373,7 +3542,7 @@ impl Dsv4Model {
                 let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 crate::moe::dsv4_moe_forward(
                     self,
-                    &layer.moe,
+                    layer.moe.as_ref().expect("DSv4 layer.moe"),
                     &tokens,
                     &normed,
                     &mut moe_out,
@@ -3389,7 +3558,7 @@ impl Dsv4Model {
                 crate::moe::dsv4_shared_expert_forward(
                     &self.ctx,
                     &self.ctx.stream,
-                    &layer.moe,
+                    layer.moe.as_ref().expect("DSv4 layer.moe"),
                     &normed,
                     &mut shared,
                     self.config.swiglu_limit,
@@ -3846,7 +4015,7 @@ impl Dsv4Model {
                             self,
                             transport,
                             scratch,
-                            &layer.moe,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
                             &tokens[start..end],
                             tokens.len(),
                             &owned_in,
@@ -3875,7 +4044,7 @@ impl Dsv4Model {
                         crate::moe::dsv4_moe_forward_deepep(
                             self,
                             transport,
-                            &layer.moe,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
                             tokens,
                             &normed,
                             &mut moe_out,
@@ -3890,7 +4059,7 @@ impl Dsv4Model {
             } else {
                 crate::moe::dsv4_moe_forward(
                     self,
-                    &layer.moe,
+                    layer.moe.as_ref().expect("DSv4 layer.moe"),
                     tokens,
                     &normed,
                     &mut moe_out,
@@ -3919,7 +4088,7 @@ impl Dsv4Model {
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
                         &self.ctx.comm_stream,
-                        &layer.moe,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
                         &normed,
                         shared,
                         self.config.swiglu_limit,
@@ -3958,7 +4127,7 @@ impl Dsv4Model {
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
                         &self.ctx.stream,
-                        &layer.moe,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
                         &normed,
                         shared,
                         self.config.swiglu_limit,
@@ -3976,7 +4145,7 @@ impl Dsv4Model {
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
                         &self.ctx.stream,
-                        &layer.moe,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
                         &normed,
                         &mut shared,
                         self.config.swiglu_limit,
@@ -4236,7 +4405,7 @@ impl Dsv4Model {
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::moe::dsv4_moe_forward(
             self,
-            &layer.moe,
+            layer.moe.as_ref().expect("DSv4 layer.moe"),
             &level_tokens,
             &ffn_normed,
             &mut moe_out,
@@ -4247,7 +4416,7 @@ impl Dsv4Model {
         crate::moe::dsv4_shared_expert_forward(
             ctx,
             &ctx.stream,
-            &layer.moe,
+            layer.moe.as_ref().expect("DSv4 layer.moe"),
             &ffn_normed,
             &mut shared,
             self.config.swiglu_limit,
@@ -4587,7 +4756,7 @@ impl Dsv4Model {
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::moe::dsv4_moe_forward(
             self,
-            &layer.moe,
+            layer.moe.as_ref().expect("DSv4 layer.moe"),
             &level_tokens,
             &ffn_normed,
             &mut moe_out,
@@ -4598,7 +4767,7 @@ impl Dsv4Model {
         crate::moe::dsv4_shared_expert_forward(
             ctx,
             &ctx.stream,
-            &layer.moe,
+            layer.moe.as_ref().expect("DSv4 layer.moe"),
             &ffn_normed,
             &mut shared,
             self.config.swiglu_limit,
@@ -5105,7 +5274,7 @@ impl Dsv4Model {
                     )?;
                     crate::moe::dsv4_moe_forward_decode_graph(
                         self,
-                        &layer.moe,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
                         &graph.token_ids_u32,
                         ffn_normed,
                         moe_out,
@@ -5114,7 +5283,7 @@ impl Dsv4Model {
                     crate::moe::dsv4_shared_expert_forward_decode_graph(
                         &self.ctx,
                         &self.ctx.stream,
-                        &layer.moe,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
                         ffn_normed,
                         shared,
                         self.config.swiglu_limit,

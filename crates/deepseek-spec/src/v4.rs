@@ -5,6 +5,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DeepSeekConfigError, Result, Shard};
 
+/// Tensor-name dialect for the safetensors checkpoint this config drives.
+///
+/// `Dsv4` (default) emits the DSv4-Flash abbreviated names (`layers.N.attn.wq_a`
+/// …) byte-unchanged. `Glm` emits the GLM-5.2 (`glm_moe_dsa`) HF names
+/// (`model.layers.N.self_attn.q_a_proj` …); the GLM adapter
+/// [`crate::glm::GlmMoeDsaConfig::into_deepseek_v4`] sets it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TensorDialect {
+    #[default]
+    Dsv4,
+    Glm,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeepSeekV4RopeParameters {
     #[serde(default, alias = "type")]
@@ -87,6 +100,10 @@ pub struct DeepSeekV4Config {
     /// Per-layer "full indexer" (recompute topk) flag. `None` ⇒ DSv4.
     #[serde(skip)]
     pub per_layer_full_indexer: Option<Vec<bool>>,
+    /// Safetensors tensor-name dialect. `Dsv4` (default) ⇒ abbreviated DSv4
+    /// names byte-unchanged; `Glm` ⇒ GLM-5.2 HF names.
+    #[serde(skip)]
+    pub tensor_dialect: TensorDialect,
 }
 
 impl DeepSeekV4Config {
@@ -186,16 +203,37 @@ impl DeepSeekV4Config {
     }
 
     pub fn tensor_names(&self) -> DeepSeekV4TensorNames {
-        DeepSeekV4TensorNames
+        DeepSeekV4TensorNames {
+            dialect: self.tensor_dialect,
+        }
     }
 
     pub fn layer_tensor_names(&self, layer_idx: usize) -> DeepSeekV4LayerTensorNames {
         let compress_ratio = self.compress_ratios[layer_idx];
+        // GLM: per-layer dense-MLP / full-indexer come from the explicit schedule,
+        // not `compress_ratios`. `indexer present` ⇒ this layer carries indexer
+        // tensors (a "full" layer); "shared" layers reuse the prior topk and ship
+        // no indexer weights. `dense MLP` ⇒ no expert stack, a plain FFN.
+        let is_dense_mlp = self
+            .per_layer_dense_mlp
+            .as_ref()
+            .and_then(|flags| flags.get(layer_idx).copied())
+            .unwrap_or(false);
+        let has_indexer = match &self.per_layer_full_indexer {
+            // GLM: indexer tensors only on "full" layers.
+            Some(flags) => flags.get(layer_idx).copied().unwrap_or(false),
+            // DSv4: derive from compress_ratio (CSA layers carry the indexer).
+            None => self
+                .attention_mode_for_compress_ratio(compress_ratio)
+                .has_indexer(),
+        };
         self.tensor_names().layer(
             layer_idx,
             compress_ratio,
             layer_idx < self.num_hash_layers,
             self.n_shared_experts > 0,
+            is_dense_mlp,
+            has_indexer,
         )
     }
 
@@ -593,19 +631,30 @@ fn topk_indices_by_score(scores: &[f32], bias: &[f32], k: usize) -> Vec<usize> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DeepSeekV4TensorNames;
+pub struct DeepSeekV4TensorNames {
+    pub dialect: TensorDialect,
+}
 
 impl DeepSeekV4TensorNames {
     pub fn embed_tokens(&self) -> &'static str {
-        "embed.weight"
+        match self.dialect {
+            TensorDialect::Dsv4 => "embed.weight",
+            TensorDialect::Glm => "model.embed_tokens.weight",
+        }
     }
 
     pub fn norm(&self) -> &'static str {
-        "norm.weight"
+        match self.dialect {
+            TensorDialect::Dsv4 => "norm.weight",
+            TensorDialect::Glm => "model.norm.weight",
+        }
     }
 
     pub fn lm_head(&self) -> &'static str {
-        "head.weight"
+        match self.dialect {
+            TensorDialect::Dsv4 => "head.weight",
+            TensorDialect::Glm => "lm_head.weight",
+        }
     }
 
     pub fn head_hc(&self) -> DeepSeekV4HyperConnectionTensorNames {
@@ -618,12 +667,21 @@ impl DeepSeekV4TensorNames {
         compress_ratio: usize,
         hash_routing: bool,
         include_shared_experts: bool,
+        dense_mlp: bool,
+        has_indexer: bool,
     ) -> DeepSeekV4LayerTensorNames {
+        let prefix = match self.dialect {
+            TensorDialect::Dsv4 => format!("layers.{layer_idx}"),
+            TensorDialect::Glm => format!("model.layers.{layer_idx}"),
+        };
         DeepSeekV4LayerTensorNames::new(
-            format!("layers.{layer_idx}"),
+            prefix,
             compress_ratio,
             hash_routing,
             include_shared_experts,
+            self.dialect,
+            dense_mlp,
+            has_indexer,
         )
     }
 
@@ -690,15 +748,32 @@ pub struct DeepSeekV4IndexerTensorNames {
     pub weights_proj: String,
     /// `None` ⇒ GLM SparseIndexed (indexer over full latent, no key compressor).
     pub compressor: Option<DeepSeekV4CompressorTensorNames>,
+    /// GLM only: indexer key projection `wk` `[index_n_heads*index_head_dim, hidden]`
+    /// (DSv4 derives indexer keys through the compressor instead). `None` ⇒ DSv4.
+    pub wk: Option<String>,
+    /// GLM only: indexer key RMSNorm (`weight` + `bias`). `None` ⇒ DSv4.
+    pub k_norm: Option<String>,
+    pub k_norm_bias: Option<String>,
 }
 
 impl DeepSeekV4IndexerTensorNames {
-    fn new(prefix: String, has_compressor: bool) -> Self {
+    fn new(prefix: String, has_compressor: bool, dialect: TensorDialect) -> Self {
+        let (wk, k_norm, k_norm_bias) = match dialect {
+            TensorDialect::Dsv4 => (None, None, None),
+            TensorDialect::Glm => (
+                Some(format!("{prefix}.wk.weight")),
+                Some(format!("{prefix}.k_norm.weight")),
+                Some(format!("{prefix}.k_norm.bias")),
+            ),
+        };
         Self {
             wq_b: format!("{prefix}.wq_b.weight"),
             weights_proj: format!("{prefix}.weights_proj.weight"),
             compressor: has_compressor
                 .then(|| DeepSeekV4CompressorTensorNames::new(format!("{prefix}.compressor"))),
+            wk,
+            k_norm,
+            k_norm_bias,
             prefix,
         }
     }
@@ -718,6 +793,18 @@ impl DeepSeekV4IndexerTensorNames {
                 },
             );
         }
+        if self.wk.as_deref() == Some(name) {
+            return Some(
+                if config.index_n_heads.is_multiple_of(tensor_parallel_size) {
+                    Shard::Column { dim: 0 }
+                } else {
+                    Shard::Replicated
+                },
+            );
+        }
+        if self.k_norm.as_deref() == Some(name) || self.k_norm_bias.as_deref() == Some(name) {
+            return Some(Shard::Replicated);
+        }
         self.compressor
             .as_ref()
             .and_then(|compressor| compressor.shard_for(name))
@@ -730,34 +817,90 @@ pub struct DeepSeekV4AttentionTensorNames {
     pub wq_a: String,
     pub q_norm: String,
     pub wq_b: String,
+    /// KV down-projection latent. DSv4 `wkv`; GLM `kv_a_proj_with_mqa`.
     pub wkv: String,
     pub kv_norm: String,
     pub wo_a: String,
     pub wo_b: String,
     pub attn_sink: String,
+    /// GLM only: non-absorbed `kv_b_proj`
+    /// `[num_heads*(qk_nope+v_head_dim), kv_lora_rank]`, split at load into
+    /// `w_kc`/`w_vc`. `None` ⇒ DSv4 (pre-absorbed checkpoint, no `kv_b`).
+    pub kv_b_proj: Option<String>,
+    /// GLM only: plain output projection `[hidden, num_heads*v_head_dim]`
+    /// (replaces the DSv4 `wo_a`/`wo_b` low-rank). `None` ⇒ DSv4.
+    pub o_proj: Option<String>,
     pub compressor: Option<DeepSeekV4CompressorTensorNames>,
     pub indexer: Option<DeepSeekV4IndexerTensorNames>,
 }
 
 impl DeepSeekV4AttentionTensorNames {
-    fn new(prefix: String, compress_ratio: usize) -> Self {
-        let compressor = (compress_ratio > 0)
-            .then(|| DeepSeekV4CompressorTensorNames::new(format!("{prefix}.compressor")));
-        let indexer = (compress_ratio > 0 && compress_ratio < 16)
-            // DSv4 CSA indexer always rides a key compressor.
-            .then(|| DeepSeekV4IndexerTensorNames::new(format!("{prefix}.indexer"), true));
-        Self {
-            wq_a: format!("{prefix}.wq_a.weight"),
-            q_norm: format!("{prefix}.q_norm.weight"),
-            wq_b: format!("{prefix}.wq_b.weight"),
-            wkv: format!("{prefix}.wkv.weight"),
-            kv_norm: format!("{prefix}.kv_norm.weight"),
-            wo_a: format!("{prefix}.wo_a.weight"),
-            wo_b: format!("{prefix}.wo_b.weight"),
-            attn_sink: format!("{prefix}.attn_sink"),
-            compressor,
-            indexer,
-            prefix,
+    fn new(
+        prefix: String,
+        compress_ratio: usize,
+        dialect: TensorDialect,
+        has_indexer: bool,
+    ) -> Self {
+        match dialect {
+            TensorDialect::Dsv4 => {
+                let compressor = (compress_ratio > 0)
+                    .then(|| DeepSeekV4CompressorTensorNames::new(format!("{prefix}.compressor")));
+                let indexer = (compress_ratio > 0 && compress_ratio < 16)
+                    // DSv4 CSA indexer always rides a key compressor.
+                    .then(|| {
+                        DeepSeekV4IndexerTensorNames::new(
+                            format!("{prefix}.indexer"),
+                            true,
+                            TensorDialect::Dsv4,
+                        )
+                    });
+                Self {
+                    wq_a: format!("{prefix}.wq_a.weight"),
+                    q_norm: format!("{prefix}.q_norm.weight"),
+                    wq_b: format!("{prefix}.wq_b.weight"),
+                    wkv: format!("{prefix}.wkv.weight"),
+                    kv_norm: format!("{prefix}.kv_norm.weight"),
+                    wo_a: format!("{prefix}.wo_a.weight"),
+                    wo_b: format!("{prefix}.wo_b.weight"),
+                    attn_sink: format!("{prefix}.attn_sink"),
+                    kv_b_proj: None,
+                    o_proj: None,
+                    compressor,
+                    indexer,
+                    prefix,
+                }
+            }
+            TensorDialect::Glm => {
+                // GLM ships a standard non-absorbed MLA: kv_a_proj_with_mqa (down)
+                // + kv_b_proj (up, split into w_kc/w_vc at load) and a plain o_proj
+                // — no wo_a/wo_b low-rank, no attn_sink. The indexer (DSA Lightning
+                // Indexer) is present only on "full" layers; it has its own wk key
+                // projection (no key compressor).
+                let indexer = has_indexer.then(|| {
+                    DeepSeekV4IndexerTensorNames::new(
+                        format!("{prefix}.indexer"),
+                        false,
+                        TensorDialect::Glm,
+                    )
+                });
+                Self {
+                    wq_a: format!("{prefix}.q_a_proj.weight"),
+                    q_norm: format!("{prefix}.q_a_layernorm.weight"),
+                    wq_b: format!("{prefix}.q_b_proj.weight"),
+                    wkv: format!("{prefix}.kv_a_proj_with_mqa.weight"),
+                    kv_norm: format!("{prefix}.kv_a_layernorm.weight"),
+                    // Plain-o GLM has no wo_a/wo_b; keep DSv4-shaped placeholders
+                    // unused (loader gates on `o_proj`/`config.plain_o_proj`).
+                    wo_a: format!("{prefix}.wo_a.weight"),
+                    wo_b: format!("{prefix}.wo_b.weight"),
+                    attn_sink: format!("{prefix}.attn_sink"),
+                    kv_b_proj: Some(format!("{prefix}.kv_b_proj.weight")),
+                    o_proj: Some(format!("{prefix}.o_proj.weight")),
+                    compressor: None,
+                    indexer,
+                    prefix,
+                }
+            }
         }
     }
 
@@ -786,6 +929,14 @@ impl DeepSeekV4AttentionTensorNames {
         if name == self.attn_sink {
             return Some(Shard::Replicated);
         }
+        // GLM non-absorbed MLA: kv_b_proj (up, per-head) is column-parallel over
+        // heads; plain o_proj (over num_heads*v_head_dim) is row-parallel.
+        if self.kv_b_proj.as_deref() == Some(name) {
+            return Some(Shard::Column { dim: 0 });
+        }
+        if self.o_proj.as_deref() == Some(name) {
+            return Some(Shard::Row { dim: 1 });
+        }
         self.compressor
             .as_ref()
             .and_then(|compressor| compressor.shard_for(name))
@@ -806,13 +957,21 @@ pub struct DeepSeekV4ExpertTensorNames {
 }
 
 impl DeepSeekV4ExpertTensorNames {
-    fn new(prefix: String) -> Self {
-        Self {
-            w1: format!("{prefix}.w1.weight"),
-            w2: format!("{prefix}.w2.weight"),
-            w3: format!("{prefix}.w3.weight"),
-            prefix,
-        }
+    fn new(prefix: String, dialect: TensorDialect) -> Self {
+        // w1 = gate, w3 = up, w2 = down. DSv4 abbreviates; GLM ships HF names.
+        let (w1, w2, w3) = match dialect {
+            TensorDialect::Dsv4 => (
+                format!("{prefix}.w1.weight"),
+                format!("{prefix}.w2.weight"),
+                format!("{prefix}.w3.weight"),
+            ),
+            TensorDialect::Glm => (
+                format!("{prefix}.gate_proj.weight"),
+                format!("{prefix}.down_proj.weight"),
+                format!("{prefix}.up_proj.weight"),
+            ),
+        };
+        Self { w1, w2, w3, prefix }
     }
 }
 
@@ -824,23 +983,50 @@ pub struct DeepSeekV4MoeTensorNames {
     pub gate_tid2eid: Option<String>,
     pub experts_prefix: String,
     pub shared_experts: Option<DeepSeekV4ExpertTensorNames>,
+    /// GLM `first_k_dense_replace` layers: a plain FFN (`gate_proj`/`up_proj`/
+    /// `down_proj`) replaces the expert stack. `None` ⇒ MoE layer. DSv4 always
+    /// `None` (all layers MoE).
+    pub dense_mlp: Option<DeepSeekV4ExpertTensorNames>,
+    dialect: TensorDialect,
 }
 
 impl DeepSeekV4MoeTensorNames {
-    fn new(prefix: String, hash_routing: bool, include_shared_experts: bool) -> Self {
+    fn new(
+        prefix: String,
+        hash_routing: bool,
+        include_shared_experts: bool,
+        dialect: TensorDialect,
+        dense_mlp: bool,
+    ) -> Self {
+        // GLM uses `gate.e_score_correction_bias` for the noaux_tc correction;
+        // DSv4 uses `gate.bias`.
+        let gate_bias = (!hash_routing).then(|| match dialect {
+            TensorDialect::Dsv4 => format!("{prefix}.gate.bias"),
+            TensorDialect::Glm => format!("{prefix}.gate.e_score_correction_bias"),
+        });
+        // A GLM dense-MLP layer has no router gate / experts; its FFN matrices
+        // sit directly under `mlp.{gate,up,down}_proj`.
+        let dense_mlp = (dense_mlp && dialect == TensorDialect::Glm)
+            .then(|| DeepSeekV4ExpertTensorNames::new(prefix.clone(), TensorDialect::Glm));
         Self {
             gate_weight: format!("{prefix}.gate.weight"),
-            gate_bias: (!hash_routing).then(|| format!("{prefix}.gate.bias")),
+            gate_bias,
             gate_tid2eid: hash_routing.then(|| format!("{prefix}.gate.tid2eid")),
             experts_prefix: format!("{prefix}.experts"),
-            shared_experts: include_shared_experts
-                .then(|| DeepSeekV4ExpertTensorNames::new(format!("{prefix}.shared_experts"))),
+            shared_experts: include_shared_experts.then(|| {
+                DeepSeekV4ExpertTensorNames::new(format!("{prefix}.shared_experts"), dialect)
+            }),
+            dense_mlp,
+            dialect,
             prefix,
         }
     }
 
     pub fn expert(&self, expert_idx: usize) -> DeepSeekV4ExpertTensorNames {
-        DeepSeekV4ExpertTensorNames::new(format!("{}.{}", self.experts_prefix, expert_idx))
+        DeepSeekV4ExpertTensorNames::new(
+            format!("{}.{}", self.experts_prefix, expert_idx),
+            self.dialect,
+        )
     }
 
     pub fn shard_for(&self, name: &str) -> Option<Shard> {
@@ -880,22 +1066,47 @@ pub struct DeepSeekV4LayerTensorNames {
 }
 
 impl DeepSeekV4LayerTensorNames {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         prefix: String,
         compress_ratio: usize,
         hash_routing: bool,
         include_shared_experts: bool,
+        dialect: TensorDialect,
+        dense_mlp: bool,
+        has_indexer: bool,
     ) -> Self {
+        let (attn_norm, ffn_norm, attn_prefix, ffn_prefix) = match dialect {
+            TensorDialect::Dsv4 => (
+                format!("{prefix}.attn_norm.weight"),
+                format!("{prefix}.ffn_norm.weight"),
+                format!("{prefix}.attn"),
+                format!("{prefix}.ffn"),
+            ),
+            TensorDialect::Glm => (
+                format!("{prefix}.input_layernorm.weight"),
+                format!("{prefix}.post_attention_layernorm.weight"),
+                format!("{prefix}.self_attn"),
+                format!("{prefix}.mlp"),
+            ),
+        };
         Self {
-            attn_norm: format!("{prefix}.attn_norm.weight"),
-            ffn_norm: format!("{prefix}.ffn_norm.weight"),
+            attn_norm,
+            ffn_norm,
             hc_attn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_attn")),
             hc_ffn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_ffn")),
-            attn: DeepSeekV4AttentionTensorNames::new(format!("{prefix}.attn"), compress_ratio),
+            attn: DeepSeekV4AttentionTensorNames::new(
+                attn_prefix,
+                compress_ratio,
+                dialect,
+                has_indexer,
+            ),
             ffn: DeepSeekV4MoeTensorNames::new(
-                format!("{prefix}.ffn"),
+                ffn_prefix,
                 hash_routing,
                 include_shared_experts,
+                dialect,
+                dense_mlp,
             ),
             prefix,
         }
@@ -948,11 +1159,20 @@ impl DeepSeekV4MtpTensorNames {
             hc_attn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_attn")),
             hc_ffn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_ffn")),
             hc_head: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_head")),
-            attn: DeepSeekV4AttentionTensorNames::new(format!("{prefix}.attn"), 0),
+            // MTP is DSv4-only (GLM ships num_nextn_predict_layers=0): DSv4 dialect,
+            // no indexer (compress_ratio=0), no dense MLP.
+            attn: DeepSeekV4AttentionTensorNames::new(
+                format!("{prefix}.attn"),
+                0,
+                TensorDialect::Dsv4,
+                false,
+            ),
             ffn: DeepSeekV4MoeTensorNames::new(
                 format!("{prefix}.ffn"),
                 false,
                 include_shared_experts,
+                TensorDialect::Dsv4,
+                false,
             ),
             prefix,
         }

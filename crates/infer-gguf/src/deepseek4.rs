@@ -181,6 +181,7 @@ pub fn dsv4_config_from_gguf(g: &GgufFile) -> Result<DeepSeekV4Config> {
         per_layer_attention_mode: None,
         per_layer_dense_mlp: None,
         per_layer_full_indexer: None,
+        tensor_dialect: deepseek_spec::TensorDialect::Dsv4,
     };
     config
         .validate()
