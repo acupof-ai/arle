@@ -2595,7 +2595,6 @@ mod dsv4_gpu {
         layer: &Dsv4MoeLayer,
         tokens: &[u32],
         logits: &HiddenStates,
-        decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<DeviceRouting> {
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
@@ -2616,49 +2615,23 @@ mod dsv4_gpu {
             cfg.num_experts
         );
 
-        let mut decode_scratch = decode_scratch;
-        let (route_indices, route_weights, token_ids) = if let Some(scratch) =
-            decode_scratch.as_mut()
-        {
-            let scratch = &mut **scratch;
-            ensure!(
-                num_tokens == 1 && total_routes == scratch.topk,
-                "DSv4 decode route scratch only supports one token: tokens={num_tokens} routes={total_routes} scratch_topk={}",
-                scratch.topk
-            );
-            let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
-                ctx.stream
-                    .memcpy_htod(tokens, &mut scratch.token_ids)
-                    .map_err(|e| anyhow::anyhow!("DSv4 decode route token-id H2D failed: {e}"))?;
-                Some(scratch.token_ids.clone())
-            } else {
-                None
-            };
-            (
-                scratch.route_indices.clone(),
-                scratch.route_weights.clone(),
-                token_ids,
-            )
+        let route_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(total_routes)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route-index alloc failed: {e}"))?;
+        let route_weights = ctx
+            .stream
+            .alloc_zeros::<f32>(total_routes)
+            .map_err(|e| anyhow::anyhow!("DSv4 device route-weight alloc failed: {e}"))?;
+        let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
+            let token_ids = ctx
+                .stream
+                .clone_htod(tokens)
+                .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?;
+            keepalive.keep_route_u32(&token_ids);
+            Some(token_ids)
         } else {
-            let route_indices = ctx
-                .stream
-                .alloc_zeros::<i32>(total_routes)
-                .map_err(|e| anyhow::anyhow!("DSv4 device route-index alloc failed: {e}"))?;
-            let route_weights = ctx
-                .stream
-                .alloc_zeros::<f32>(total_routes)
-                .map_err(|e| anyhow::anyhow!("DSv4 device route-weight alloc failed: {e}"))?;
-            let token_ids = if matches!(layer.routing_kind, DeepSeekV4MoeRoutingKind::Hash) {
-                let token_ids = ctx
-                    .stream
-                    .clone_htod(tokens)
-                    .map_err(|e| anyhow::anyhow!("DSv4 device route token-id H2D failed: {e}"))?;
-                keepalive.keep_route_u32(&token_ids);
-                Some(token_ids)
-            } else {
-                None
-            };
-            (route_indices, route_weights, token_ids)
+            None
         };
 
         let routing_kind = match layer.routing_kind {
@@ -2813,19 +2786,14 @@ mod dsv4_gpu {
         tokens: &[u32],
         hidden: &HiddenStates,
         out: &mut HiddenStates,
-        decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
-        let split = &model.split;
-        let swiglu_limit = model.config.swiglu_limit;
-
         let num_tokens = hidden.seq_len;
         let hidden_dim = hidden.hidden_dim;
         let topk = cfg.top_k;
-        let experts_per_rank = split.experts_per_rank;
-        let local_start = split.local_expert_start;
+        let experts_per_rank = model.split.experts_per_rank;
 
         ensure!(
             tokens.len() == num_tokens,
@@ -2858,19 +2826,10 @@ mod dsv4_gpu {
             "DSv4 expert hidden dim {} != runtime hidden dim {hidden_dim}",
             layer.hidden_dim
         );
-        if let Some(scratch) = decode_scratch.as_ref() {
-            scratch.validate_routed(hidden_dim, topk, layer)?;
-            ensure!(
-                num_tokens == 1,
-                "DSv4 decode MoE scratch is only valid for one-token decode, got {num_tokens}"
-            );
-        }
-
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
         // ── 1+2. Router gemm → logits[T, E] → route (host oracle or device). ───
-        let mut decode_scratch = decode_scratch;
         let (route_indices, route_weights) =
             crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
                 let _nvtx = crate::nvtx::range("dsv4/moe_route");
@@ -2878,14 +2837,7 @@ mod dsv4_gpu {
                 let mut logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, num_tokens)? };
                 gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
                 if use_gpu_router() {
-                    let routing = dsv4_route_device(
-                        model,
-                        layer,
-                        tokens,
-                        &logits,
-                        decode_scratch.as_deref_mut(),
-                        keepalive,
-                    )?;
+                    let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
                     Ok((routing.indices, routing.weights))
                 } else {
                     keepalive.keep_hidden(&logits);
@@ -2912,25 +2864,6 @@ mod dsv4_gpu {
                     Ok((route_indices, route_weights))
                 }
             })?;
-
-        if let Some(scratch) = decode_scratch.as_mut() {
-            let scratch = &mut **scratch;
-            let route_indices = cache_ptr(&route_indices, ctx);
-            let route_weights = cache_ptr(&route_weights, ctx);
-            return dsv4_moe_forward_decode_pooled(
-                ctx,
-                layer,
-                split,
-                route_indices,
-                route_weights,
-                hidden,
-                out,
-                topk,
-                local_start,
-                swiglu_limit,
-                scratch,
-            );
-        }
 
         dsv4_moe_forward_masked_tail(
             model,
@@ -3633,7 +3566,7 @@ mod dsv4_gpu {
         gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
         let total_routes = num_tokens * topk;
         let (topk_idx_i64, route_weights) = if use_gpu_router() {
-            let routing = dsv4_route_device(model, layer, tokens, &logits, None, keepalive)?;
+            let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
             let topk_idx_i64 = ctx
                 .stream
                 .alloc_zeros::<i64>(total_routes)
@@ -3840,31 +3773,8 @@ mod dsv4_gpu {
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         swiglu_limit: f32,
-        decode_scratch: Option<&mut Dsv4MoeDecodeScratch>,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
-        if let Some(scratch) = decode_scratch {
-            ensure!(
-                hidden.seq_len == 1
-                    && scratch.hidden_dim == hidden.hidden_dim
-                    && scratch.shared_intermediate == layer.shared_w2.cols,
-                "DSv4 shared decode scratch mismatch: tokens={} scratch_H={} hidden_H={} scratch_I={} layer_I={}",
-                hidden.seq_len,
-                scratch.hidden_dim,
-                hidden.hidden_dim,
-                scratch.shared_intermediate,
-                layer.shared_w2.cols
-            );
-            return dsv4_shared_expert_pooled(
-                ctx,
-                stream,
-                layer,
-                hidden,
-                out,
-                swiglu_limit,
-                &mut scratch.shared,
-            );
-        }
         let shared = dsv4_shared_expert(ctx, stream, layer, hidden, swiglu_limit, keepalive)?;
         ensure!(
             shared.hidden_dim == out.hidden_dim && shared.seq_len >= out.seq_len,
@@ -3881,6 +3791,37 @@ mod dsv4_gpu {
             .map_err(|e| anyhow::anyhow!("DSv4 shared expert output D2D failed: {e}"))?;
         keepalive.keep_hidden(&shared);
         Ok(())
+    }
+
+    pub(crate) fn dsv4_shared_expert_forward_decode_graph(
+        ctx: &DeviceContext,
+        stream: &Arc<CudaStream>,
+        layer: &Dsv4MoeLayer,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4MoeDecodeScratch,
+    ) -> Result<()> {
+        ensure!(
+            hidden.seq_len == 1
+                && scratch.hidden_dim == hidden.hidden_dim
+                && scratch.shared_intermediate == layer.shared_w2.cols,
+            "DSv4 shared decode-graph scratch mismatch: tokens={} scratch_H={} hidden_H={} scratch_I={} layer_I={}",
+            hidden.seq_len,
+            scratch.hidden_dim,
+            hidden.hidden_dim,
+            scratch.shared_intermediate,
+            layer.shared_w2.cols
+        );
+        dsv4_shared_expert_pooled(
+            ctx,
+            stream,
+            layer,
+            hidden,
+            out,
+            swiglu_limit,
+            &mut scratch.shared,
+        )
     }
 
     /// Dispatch DSv4 host routing for one layer: bias-routed → learned router +
@@ -4833,7 +4774,7 @@ mod dsv4_gpu {
             let mut logits = HiddenStates::zeros(ctx, cfg.num_experts, owned_n)?;
             gemm_batch(ctx, &layer.gate, hidden, &mut logits)?;
             keepalive.keep_hidden(&logits);
-            let routing = dsv4_route_device(model, layer, tokens, &logits, None, keepalive)?;
+            let routing = dsv4_route_device(model, layer, tokens, &logits, keepalive)?;
             keepalive.keep_route_f32(&routing.weights);
             // SAFETY: both buffers hold `total_routes` elements on `ctx.stream`.
             unsafe {
@@ -4967,6 +4908,7 @@ mod dsv4_gpu {
 pub(crate) use dsv4_gpu::{
     Dsv4GemvTables, Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache, dsv4_moe_forward,
     dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
+    dsv4_shared_expert_forward_decode_graph,
 };
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};

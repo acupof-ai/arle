@@ -833,7 +833,7 @@ impl Dsv4SlotState {
     /// - `attention`: SNAPSHOT per layer — see
     ///   [`crate::attention::Dsv4LayerAttentionState::swap_out_image`] for the
     ///   per-buffer enumeration.
-    /// - `Dsv4KvAdapter::{moe_decode_shared,shared_expert_out}`: SCRATCH
+    /// - `Dsv4KvAdapter::{moe_decode_graph_scratch,shared_expert_out}`: SCRATCH
     ///   (adapter-level shared, not slot state) — every buffer is zeroed /
     ///   sentinel-memset or fully overwritten before read; layers/slots execute
     ///   sequentially on the compute stream, and the comm-overlap path fences
@@ -1092,13 +1092,10 @@ impl Dsv4Model {
         max_seq_len: usize,
         num_slots: usize,
     ) -> Result<crate::attention::Dsv4KvAdapter> {
-        let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
-        // The decode-graph path (ARLE_DSV4_DECODE_GRAPH) runs the masked MoE tail
-        // through this same shared scratch INDEPENDENT of the GPU router (#60: it
-        // reads the model-wide shared scratch where it used to read the per-slot
-        // Vec, which was allocated unconditionally). Allocate whenever EITHER
-        // consumer is live, else decode-graph-without-router errors at dsv4.rs:3032.
-        let needs_moe_decode_shared = use_gpu_router || dsv4_decode_graph_enabled();
+        // The eager B=1 path uses the FP8 decode-band MoE lane. The shared
+        // routed-MoE scratch is decode-graph-only; do not let GPU-router env
+        // selection switch eager decode back to the old pooled MoE path.
+        let needs_moe_decode_shared = dsv4_decode_graph_enabled();
         let mut specs = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let local_width = layer.attention.wq_b.rows;
@@ -1185,11 +1182,9 @@ impl Dsv4Model {
             }
             _ => 0,
         };
-        // Mirror new_kv_adapter's allocation gate: the routed-MoE decode scratch is
-        // live for the GPU-router decode path AND the decode-graph masked-MoE tail
-        // (#60). Budget for it whenever either consumer allocates it.
-        let needs_moe_decode_shared =
-            std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some() || dsv4_decode_graph_enabled();
+        // Mirror new_kv_adapter's allocation gate: routed-MoE scratch is
+        // decode-graph-only. Eager B=1 uses the FP8 decode-band MoE lane.
+        let needs_moe_decode_shared = dsv4_decode_graph_enabled();
         let moe_decode_shared_bytes = if needs_moe_decode_shared {
             self.layers
                 .first()
@@ -2958,7 +2953,6 @@ impl Dsv4Model {
                     tokens,
                     &normed,
                     &mut moe_out,
-                    None,
                     &mut keepalive,
                 )?;
                 keepalive.keep_hidden(&moe_out);
@@ -2968,9 +2962,9 @@ impl Dsv4Model {
                 self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
             }
             keepalive.keep_hidden(&moe_out);
-            // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path,
-            // decode_scratch=None) — one batched SwiGLU GEMM pair, replacing the
-            // per-row loop + N host syncs.
+            // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path)
+            // — one batched SwiGLU GEMM pair, replacing the per-row loop + N
+            // host syncs.
             let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             crate::moe::dsv4_shared_expert_forward(
                 &self.ctx,
@@ -2979,7 +2973,6 @@ impl Dsv4Model {
                 &normed,
                 &mut shared,
                 self.config.swiglu_limit,
-                None,
                 &mut keepalive,
             )?;
             keepalive.keep_hidden(&shared);
@@ -3339,7 +3332,6 @@ impl Dsv4Model {
                     &tokens,
                     &normed,
                     &mut moe_out,
-                    None,
                     &mut keepalive,
                 )?;
                 keepalive.keep_hidden(&moe_out);
@@ -3356,7 +3348,6 @@ impl Dsv4Model {
                     &normed,
                     &mut shared,
                     self.config.swiglu_limit,
-                    None,
                     &mut keepalive,
                 )?;
                 keepalive.keep_hidden(&shared);
@@ -3539,9 +3530,7 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
-        let use_gpu_router = std::env::var_os("ARLE_DSV4_GPU_ROUTER").is_some();
         let use_deepep_transport = dsv4_use_deepep_transport()?;
-        let use_moe_decode_scratch = use_gpu_router && seq_len == 1 && !use_deepep_transport;
         let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
         let ctx = &self.ctx;
         let start_pos_device = if seq_len == 1 {
@@ -3751,7 +3740,7 @@ impl Dsv4Model {
             // DeepEP combine already reduces the EP-sharded routed output; the
             // non-deepep path needs the explicit TP all-reduce below.
             let needs_moe_allreduce = !use_deepep_transport;
-            let (mut moe_scratch, mut shared_out) = kv_adapter.moe_decode_shared_mut();
+            let mut shared_out = kv_adapter.shared_expert_out_mut();
             if use_deepep_transport {
                 #[cfg(feature = "deepep")]
                 {
@@ -3854,18 +3843,12 @@ impl Dsv4Model {
                     bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
                 }
             } else {
-                let decode_scratch = if use_moe_decode_scratch {
-                    moe_scratch.as_deref_mut()
-                } else {
-                    None
-                };
                 crate::moe::dsv4_moe_forward(
                     self,
                     &layer.moe,
                     tokens,
                     &normed,
                     &mut moe_out,
-                    decode_scratch,
                     &mut keepalive,
                 )?;
             }
@@ -3895,11 +3878,6 @@ impl Dsv4Model {
                         &normed,
                         shared,
                         self.config.swiglu_limit,
-                        if use_moe_decode_scratch {
-                            moe_scratch.as_deref_mut()
-                        } else {
-                            None
-                        },
                         &mut keepalive,
                     )
                 })?;
@@ -3939,11 +3917,6 @@ impl Dsv4Model {
                         &normed,
                         shared,
                         self.config.swiglu_limit,
-                        if use_moe_decode_scratch {
-                            moe_scratch.as_deref_mut()
-                        } else {
-                            None
-                        },
                         &mut keepalive,
                     )
                 })?;
@@ -3962,11 +3935,6 @@ impl Dsv4Model {
                         &normed,
                         &mut shared,
                         self.config.swiglu_limit,
-                        if use_moe_decode_scratch {
-                            moe_scratch
-                        } else {
-                            None
-                        },
                         &mut keepalive,
                     )
                 })?;
@@ -4227,7 +4195,6 @@ impl Dsv4Model {
             &level_tokens,
             &ffn_normed,
             &mut moe_out,
-            None,
             &mut keepalive,
         )?;
         self.tp.all_reduce_sum(ctx, &mut moe_out)?;
@@ -4239,7 +4206,6 @@ impl Dsv4Model {
             &ffn_normed,
             &mut shared,
             self.config.swiglu_limit,
-            None,
             &mut keepalive,
         )?;
         let mut moe_with_shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
@@ -4580,7 +4546,6 @@ impl Dsv4Model {
             &level_tokens,
             &ffn_normed,
             &mut moe_out,
-            None,
             &mut keepalive,
         )?;
         self.tp.all_reduce_sum(ctx, &mut moe_out)?;
@@ -4592,7 +4557,6 @@ impl Dsv4Model {
             &ffn_normed,
             &mut shared,
             self.config.swiglu_limit,
-            None,
             &mut keepalive,
         )?;
         let mut moe_with_shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
@@ -5063,8 +5027,7 @@ impl Dsv4Model {
                     shared,
                     ..
                 } = layer_scratch;
-                let (moe_scratch, _) = kv_adapter.moe_decode_shared_mut();
-                let moe_scratch = moe_scratch.ok_or_else(|| {
+                let moe_scratch = kv_adapter.moe_decode_graph_scratch_mut().ok_or_else(|| {
                     anyhow!("DSv4 decode graph requires shared MoE decode scratch")
                 })?;
                 moe_graph.run_or_capture(|| {
@@ -5103,15 +5066,14 @@ impl Dsv4Model {
                         moe_out,
                         moe_scratch,
                     )?;
-                    crate::moe::dsv4_shared_expert_forward(
+                    crate::moe::dsv4_shared_expert_forward_decode_graph(
                         &self.ctx,
                         &self.ctx.stream,
                         &layer.moe,
                         ffn_normed,
                         shared,
                         self.config.swiglu_limit,
-                        Some(moe_scratch),
-                        &mut keepalive,
+                        moe_scratch,
                     )
                 })?;
                 self.tp
