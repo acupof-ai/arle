@@ -3168,7 +3168,13 @@ impl SafetensorLoader {
         Ok(crate::dsv4::Dsv4Indexer {
             wq_b,
             weights_proj: self.load_dsv4_global_matrix(ctx, &names.weights_proj)?,
-            compressor: self.load_dsv4_compressor(ctx, &names.compressor)?,
+            compressor: self.load_dsv4_compressor(
+                ctx,
+                names
+                    .compressor
+                    .as_ref()
+                    .expect("DSv4 indexer always has a compressor"),
+            )?,
             wq_b_deepgemm,
         })
     }
