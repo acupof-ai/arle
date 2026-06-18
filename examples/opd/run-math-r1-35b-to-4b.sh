@@ -18,10 +18,10 @@
 #   ./examples/opd/run-math-r1-35b-to-4b.sh
 #
 # Fit note:
-#   rollout_len=1536 is the R1 long-reasoning target. If current autograd
-#   backward cannot fit it, lower ROLLOUT_LEN only as an explicit fit probe and
-#   record the OOM tensor in the run log. 4096+ belongs to the chunked-forward
-#   lane, not this launcher.
+#   rollout_len>=2048 is the R1 long-reasoning gate. Short 256-token rollouts
+#   are invalid for reasoning verdicts because they truncate the teacher-scored
+#   chain and teach early-final-answer behavior. 4096+ belongs to the chunked
+#   forward/backward lane, not this launcher.
 
 set -euo pipefail
 
@@ -44,12 +44,12 @@ PROMPTS_FILE="${PROMPTS_FILE:-/data01/arle-opd-runs/math-train-question-only.jso
 
 STEPS="${STEPS:-250}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
-ROLLOUT_LEN="${ROLLOUT_LEN:-1536}"
+ROLLOUT_LEN="${ROLLOUT_LEN:-2048}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 ROLLOUT_TOP_K="${ROLLOUT_TOP_K:-0}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
-PROMPT_MAX_TOKENS="${PROMPT_MAX_TOKENS:-1024}"
+PROMPT_MAX_TOKENS="${PROMPT_MAX_TOKENS:-2048}"
 PROMPT_SEED="${PROMPT_SEED:-0}"
 
 KL_DIRECTION="${KL_DIRECTION:-forward}"
@@ -90,6 +90,8 @@ log() {
 [[ "$SAVE_EVERY" =~ ^[0-9]+$ ]] || die "SAVE_EVERY must be an integer"
 [[ "$ROLLOUT_LEN" =~ ^[0-9]+$ && "$ROLLOUT_LEN" -gt 0 ]] || die "ROLLOUT_LEN must be a positive integer"
 [[ "$PROMPT_MAX_TOKENS" =~ ^[0-9]+$ && "$PROMPT_MAX_TOKENS" -gt 0 ]] || die "PROMPT_MAX_TOKENS must be a positive integer"
+[[ "$ROLLOUT_LEN" -ge 2048 ]] || die "ROLLOUT_LEN must be >=2048 for the reasoning verdict lane"
+[[ "$PROMPT_MAX_TOKENS" -ge 2048 ]] || die "PROMPT_MAX_TOKENS must be >=2048 for the reasoning verdict lane"
 [[ "$ENGINE_OFFLOAD" =~ ^(off|0|false|student|teacher|all|1|true)$ ]] || die "bad ENGINE_OFFLOAD=$ENGINE_OFFLOAD"
 
 mkdir -p "$RUN_ROOT" "$CHECKPOINT_DIR" "$LOG_DIR"
