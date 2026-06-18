@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # H20-gated OPD capability curve run:
-# Qwen3.5-4B teacher -> Qwen3.5-0.8B LoRA student, full-materialized
+# Qwen3.6-35B-A3B teacher -> Qwen3.5-4B LoRA student, full-materialized
 # step_NNNNNN checkpoints, then scripts/opd_capability_curve.py over the
 # base student + each checkpoint (+ optional teacher upper-bound point).
 #
@@ -18,12 +18,13 @@ CURVE_DIR="${CURVE_DIR:-$RUN_ROOT/curve}"
 LOG_DIR="${LOG_DIR:-$RUN_ROOT/logs}"
 MANIFEST="${MANIFEST:-$RUN_ROOT/curve_manifest.json}"
 
-STUDENT_MODEL="${STUDENT_MODEL:-/data01/models/Qwen3.5-0.8B-Base}"
-TEACHER_MODEL="${TEACHER_MODEL:-/data01/models/Qwen3.5-4B}"
+STUDENT_MODEL="${STUDENT_MODEL:-/data01/modelscope-cache/Qwen/Qwen3___5-4B}"
+TEACHER_MODEL="${TEACHER_MODEL:-/data01/models/Qwen3.6-35B-A3B}"
+TEACHER_RUNTIME="${TEACHER_RUNTIME:-infer}"
 
 STEPS="${STEPS:-10000}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
-ROLLOUT_LEN="${ROLLOUT_LEN:-8}"
+ROLLOUT_LEN="${ROLLOUT_LEN:-2048}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 ROLLOUT_TOP_K="${ROLLOUT_TOP_K:-0}"
@@ -38,8 +39,8 @@ GRAD_CLIP="${GRAD_CLIP:-1.0}"
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_TARGET_SET="${LORA_TARGET_SET:-attention-qv}"
-PROMPTS_FILE="${PROMPTS_FILE:-$ROOT/examples/opd/opd-diverse-1k.jsonl}"
-PROMPT_MAX_TOKENS="${PROMPT_MAX_TOKENS:-512}"
+PROMPTS_FILE="${PROMPTS_FILE:-$ROOT/examples/opd/gsm8k-train.jsonl}"
+PROMPT_MAX_TOKENS="${PROMPT_MAX_TOKENS:-2048}"
 PROMPT_SEED="${PROMPT_SEED:-0}"
 EVAL_IDS="${EVAL_IDS:-}"
 GATE_EVERY_N="${GATE_EVERY_N:-0}"
@@ -48,6 +49,7 @@ CURVE_TASKS="${CURVE_TASKS:-mmlu,gsm8k}"
 N_SAMPLES="${N_SAMPLES:-500}"
 SEEDS="${SEEDS:-0,1,2,3,4}"
 GSM8K_SHOTS="${GSM8K_SHOTS:-}"
+GSM8K_MAX_TOKENS="${GSM8K_MAX_TOKENS:-2048}"
 SWE_LIMIT="${SWE_LIMIT:-3}"
 INCLUDE_TEACHER="${INCLUDE_TEACHER:-1}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
@@ -86,7 +88,14 @@ fi
 [[ "$STUDENT_MODEL" != "$TEACHER_MODEL" ]] || die "teacher==student is confounded; pass a larger TEACHER_MODEL"
 [[ "$STEPS" =~ ^[0-9]+$ ]] || die "STEPS must be an integer"
 [[ "$SAVE_EVERY" =~ ^[0-9]+$ ]] || die "SAVE_EVERY must be an integer"
+[[ "$ROLLOUT_LEN" =~ ^[0-9]+$ ]] || die "ROLLOUT_LEN must be an integer"
+[[ "$PROMPT_MAX_TOKENS" =~ ^[0-9]+$ ]] || die "PROMPT_MAX_TOKENS must be an integer"
+[[ "$GSM8K_MAX_TOKENS" =~ ^[0-9]+$ ]] || die "GSM8K_MAX_TOKENS must be an integer"
 [[ "$STEPS" -gt 0 ]] || die "STEPS must be > 0 for the capability run"
+[[ "$ROLLOUT_LEN" -ge 2048 ]] || die "ROLLOUT_LEN must be >=2048; shorter rollouts truncate reasoning chains"
+[[ "$PROMPT_MAX_TOKENS" -ge 2048 ]] || die "PROMPT_MAX_TOKENS must be >=2048 for the reasoning OPD run"
+[[ "$GSM8K_MAX_TOKENS" -ge 2048 ]] || die "GSM8K_MAX_TOKENS must be >=2048 for untruncated GSM8K eval"
+[[ "$TEACHER_RUNTIME" =~ ^(infer|in-process)$ ]] || die "TEACHER_RUNTIME must be infer or in-process"
 if [[ -z "$LR_WARMUP_STEPS" ]]; then
   LR_WARMUP_STEPS=$(((STEPS * 3 + 99) / 100))
 fi
@@ -101,7 +110,9 @@ fi
 log "run_root=$RUN_ROOT"
 log "student=$STUDENT_MODEL"
 log "teacher=$TEACHER_MODEL"
+log "teacher_runtime=$TEACHER_RUNTIME"
 log "prompts=$PROMPTS_FILE"
+log "rollout_len=$ROLLOUT_LEN prompt_max_tokens=$PROMPT_MAX_TOKENS gsm8k_max_tokens=$GSM8K_MAX_TOKENS"
 log "lr_schedule=$LR_SCHEDULE warmup_steps=$LR_WARMUP_STEPS"
 log "checkpoints=$CHECKPOINT_DIR"
 
@@ -135,7 +146,7 @@ save_steps = sorted(set(save_steps))
 
 points = [
     {
-        "label": "base-0p8b",
+        "label": "base-student",
         "model_path": str(student),
         "model_id": student.name,
     }
@@ -152,7 +163,7 @@ for step in save_steps:
 if include_teacher:
     points.append(
         {
-            "label": "teacher-4b-upper",
+            "label": "teacher-upper",
             "model_path": str(teacher),
             "model_id": teacher.name,
         }
@@ -198,6 +209,7 @@ if [[ "$RUN_TRAIN" == "1" ]]; then
     train opd
     --backend "$TRAIN_BACKEND"
     --teacher-model "$TEACHER_MODEL"
+    --teacher-runtime "$TEACHER_RUNTIME"
     --student-model "$STUDENT_MODEL"
     --steps "$STEPS"
     --rollout-len "$ROLLOUT_LEN"
@@ -249,6 +261,7 @@ if [[ "$RUN_CURVE" == "1" ]]; then
     --serve-port "$SERVE_PORT"
     --serve-ready-timeout "$SERVE_READY_TIMEOUT"
     --arle-bin "$ARLE_BIN"
+    --gsm8k-max-tokens "$GSM8K_MAX_TOKENS"
     --output "$CURVE_DIR"
   )
   if [[ -n "$GSM8K_SHOTS" ]]; then
