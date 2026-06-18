@@ -155,6 +155,48 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
     Ok(())
 }
 
+/// V32 (GLM-5.2, 512 NoPE / 656 B/tok) strided FP8 KV pack. Identical contract
+/// to [`dsv4_fp8_kv_pack_strided_raw`] but launches the `<512>` instantiation:
+/// caller passes `nope = k_prepared, rope = k_prepared + 512,
+/// stride_nope_elems = stride_rope_elems = head_dim = 576`.
+pub fn dsv4_v32_fp8_kv_pack_strided_raw(
+    ctx: &DeviceContext,
+    nope_ptr: u64,
+    rope_ptr: u64,
+    packed_kv_ptr: u64,
+    token_block_id: &CudaSlice<i32>,
+    token_in_block_row: &CudaSlice<i32>,
+    n_tokens: usize,
+    page_block_size: usize,
+    stride_nope_elems: usize,
+    stride_rope_elems: usize,
+) -> Result<()> {
+    if n_tokens == 0 {
+        return Ok(());
+    }
+
+    let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
+    let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
+
+    unsafe {
+        ffi::arle_dsv4_v32_fp8_kv_pack_strided_cuda(
+            nope_ptr as *const ffi::Half,
+            rope_ptr as *const ffi::Half,
+            packed_kv_ptr as *mut u8,
+            tbid_ptr as *const i32,
+            tibr_ptr as *const i32,
+            n_tokens as i32,
+            page_block_size as i32,
+            stride_nope_elems as i32,
+            stride_rope_elems as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
+}
+
 /// Fill the single `[block_id,row]` scratch pair for FlashMLA decode SW pack
 /// from a device-resident `start_pos` scalar.
 pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
