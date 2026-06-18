@@ -2760,6 +2760,99 @@ impl SafetensorLoader {
         }
     }
 
+    fn build_dsv4_wo_a_group_tables(
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+        rows_per_group: usize,
+    ) -> Result<crate::dsv4::Dsv4WoAGroupTables> {
+        ensure!(
+            rows_per_group > 0 && weight.rows.is_multiple_of(rows_per_group),
+            "DSv4 wo_a grouped table needs rows {} divisible by rows_per_group {}",
+            weight.rows,
+            rows_per_group
+        );
+        let groups = weight.rows / rows_per_group;
+        ensure!(groups > 0, "DSv4 wo_a grouped table has zero groups");
+        ensure!(
+            weight.dsv4_scale_rows > 0
+                && weight.dsv4_scale_cols > 0
+                && weight.dsv4_scale_rows.is_multiple_of(groups),
+            "DSv4 wo_a scale rows {} must be non-zero and divisible by groups {groups}",
+            weight.dsv4_scale_rows
+        );
+        let scale_rows_per_group = weight.dsv4_scale_rows / groups;
+        let qweight = weight
+            .qweight
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 wo_a grouped table missing quantized weight bytes"))?;
+        let scales = weight
+            .dsv4_scales
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 wo_a grouped table missing E8M0 scales"))?;
+        let weight_stride_bytes = match weight.weight_format {
+            WeightFormat::Dsv4Fp8BlockScaled => rows_per_group.checked_mul(weight.cols),
+            WeightFormat::Dsv4Fp4BlockScaled => {
+                ensure!(
+                    weight.cols.is_multiple_of(2),
+                    "DSv4 wo_a FP4 grouped table needs even cols, got {}",
+                    weight.cols
+                );
+                rows_per_group.checked_mul(weight.cols / 2)
+            }
+            other => bail!("DSv4 wo_a grouped table expected FP8/FP4 block-scaled, got {other:?}"),
+        }
+        .ok_or_else(|| {
+            anyhow!(
+                "DSv4 wo_a grouped table weight stride overflow rows_per_group={} cols={}",
+                rows_per_group,
+                weight.cols
+            )
+        })?;
+        let scale_stride_bytes = scale_rows_per_group
+            .checked_mul(weight.dsv4_scale_cols)
+            .ok_or_else(|| {
+                anyhow!(
+                    "DSv4 wo_a grouped table scale stride overflow scale_rows={} scale_cols={}",
+                    scale_rows_per_group,
+                    weight.dsv4_scale_cols
+                )
+            })?;
+        ensure!(
+            qweight.len() == weight_stride_bytes * groups,
+            "DSv4 wo_a grouped qweight len {} != groups({groups})*stride({weight_stride_bytes})",
+            qweight.len()
+        );
+        ensure!(
+            scales.len() == scale_stride_bytes * groups,
+            "DSv4 wo_a grouped scale len {} != groups({groups})*stride({scale_stride_bytes})",
+            scales.len()
+        );
+
+        let (weight_base, _wg) = qweight.device_ptr(&ctx.stream);
+        let (scale_base, _sg) = scales.device_ptr(&ctx.stream);
+        let weight_ptrs: Vec<u64> = (0..groups)
+            .map(|g| weight_base + (g * weight_stride_bytes) as u64)
+            .collect();
+        let scale_ptrs: Vec<u64> = (0..groups)
+            .map(|g| scale_base + (g * scale_stride_bytes) as u64)
+            .collect();
+        Ok(crate::dsv4::Dsv4WoAGroupTables {
+            weight_ptrs: ctx
+                .stream
+                .clone_htod(&weight_ptrs)
+                .map_err(|e| anyhow!("DSv4 wo_a weight ptr table H2D failed: {e}"))?,
+            scale_ptrs: ctx
+                .stream
+                .clone_htod(&scale_ptrs)
+                .map_err(|e| anyhow!("DSv4 wo_a scale ptr table H2D failed: {e}"))?,
+            groups,
+            rows_per_group,
+            cols_per_group: weight.cols,
+            scale_rows_per_group,
+            scale_cols: weight.dsv4_scale_cols,
+        })
+    }
+
     /// Build the per-rank DSv4 MoE layer (FP8 DeepGEMM expert caches + router).
     /// Bias-routed layers load `gate.bias`; hash-routed layers load the host
     /// `gate.tid2eid` table instead (and skip the bias).
@@ -2989,6 +3082,7 @@ impl SafetensorLoader {
                 .unwrap_or(Shard::Replicated),
             tp,
         )?;
+        let wo_a_groups = Self::build_dsv4_wo_a_group_tables(ctx, &wo_a, config.o_lora_rank)?;
         let wo_b = self.load_dsv4_block_scaled_sharded(
             ctx,
             &names.wo_b,
@@ -3001,11 +3095,13 @@ impl SafetensorLoader {
         let (wo_a_deepgemm, wo_b_deepgemm) =
             if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
                 (
-                    Some(
-                        cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
-                            ctx, &wo_a,
-                        )?,
-                    ),
+                    (wo_a_groups.groups == 1)
+                        .then(|| {
+                            cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
+                                ctx, &wo_a,
+                            )
+                        })
+                        .transpose()?,
                     Some(
                         cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
                             ctx, &wo_b,
@@ -3024,6 +3120,7 @@ impl SafetensorLoader {
             wkv,
             kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
             wo_a,
+            wo_a_groups,
             wo_b,
             wo_a_deepgemm,
             wo_b_deepgemm,

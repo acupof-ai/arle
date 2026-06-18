@@ -6941,7 +6941,6 @@ pub(crate) struct Dsv4MlaPrepared {
     pub(crate) local_attn: HiddenStates,
     pub(crate) selected: Option<CudaSlice<i32>>,
     pub(crate) local_heads: usize,
-    local_width: usize,
     token_count: usize,
     sink_offset: usize,
     pub(crate) sm_scale: f32,
@@ -7449,7 +7448,6 @@ pub(crate) fn mla_attention_prepare(
         local_attn,
         selected,
         local_heads,
-        local_width,
         token_count,
         sink_offset,
         sm_scale,
@@ -8045,7 +8043,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         local_attn,
         selected,
         local_heads,
-        local_width,
         token_count: 1,
         sink_offset: proj.sink_offset,
         sm_scale: proj.sm_scale,
@@ -8091,7 +8088,6 @@ fn mla_attention_fwd(
         mut local_attn,
         selected,
         local_heads,
-        local_width,
         token_count,
         sink_offset,
         sm_scale,
@@ -8101,11 +8097,6 @@ fn mla_attention_fwd(
     } = prepared;
     let head_dim = config.head_dim;
     let rope = &config.rope_parameters;
-    ensure!(
-        attention.wo_a.cols == local_width,
-        "DSv4 MLA wo_a cols {} != local attention width {local_width}",
-        attention.wo_a.cols
-    );
     ensure!(
         attention.wo_b.rows == out.hidden_dim && out.seq_len == token_count,
         "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
@@ -8447,6 +8438,156 @@ fn mla_attention_fwd(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Dsv4OProjGroupShape {
+    groups: usize,
+    rows_per_group: usize,
+    cols_per_group: usize,
+    routes: usize,
+}
+
+fn dsv4_oproj_group_shape(
+    wo_a_rows: usize,
+    wo_a_cols: usize,
+    table_groups: usize,
+    table_rows_per_group: usize,
+    table_cols_per_group: usize,
+    local_width: usize,
+    token_count: usize,
+) -> Result<Dsv4OProjGroupShape> {
+    ensure!(token_count > 0, "DSv4 O-LoRA projection requires tokens");
+    ensure!(
+        wo_a_cols > 0 && local_width.is_multiple_of(wo_a_cols),
+        "DSv4 O-LoRA local attention width {local_width} is not a whole number of wo_a groups (group width {wo_a_cols})"
+    );
+    let groups = local_width / wo_a_cols;
+    ensure!(groups > 0, "DSv4 O-LoRA has zero local output groups");
+    ensure!(
+        groups == table_groups
+            && table_rows_per_group > 0
+            && table_cols_per_group == wo_a_cols
+            && wo_a_rows == groups * table_rows_per_group,
+        "DSv4 O-LoRA group table mismatch: local groups={groups}, table groups={table_groups}, \
+         table rows/group={table_rows_per_group}, table cols/group={table_cols_per_group}, \
+         wo_a={}x{}",
+        wo_a_rows,
+        wo_a_cols
+    );
+    let routes = token_count.checked_mul(groups).ok_or_else(|| {
+        anyhow!("DSv4 O-LoRA route count overflow: token_count={token_count} groups={groups}")
+    })?;
+    Ok(Dsv4OProjGroupShape {
+        groups,
+        rows_per_group: table_rows_per_group,
+        cols_per_group: wo_a_cols,
+        routes,
+    })
+}
+
+fn dsv4_wo_a_grouped_linear(
+    ctx: &DeviceContext,
+    attention: &Dsv4Attention,
+    local_attn: &HiddenStates,
+    shape: Dsv4OProjGroupShape,
+    latent: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        local_attn.hidden_dim == shape.groups * shape.cols_per_group
+            && latent.hidden_dim == shape.groups * shape.rows_per_group
+            && local_attn.seq_len == latent.seq_len,
+        "DSv4 O-LoRA grouped shape mismatch: local_attn {}x{}, latent {}x{}, groups={} rows/group={} cols/group={}",
+        local_attn.hidden_dim,
+        local_attn.seq_len,
+        latent.hidden_dim,
+        latent.seq_len,
+        shape.groups,
+        shape.rows_per_group,
+        shape.cols_per_group
+    );
+    ensure!(
+        attention.wo_a_groups.scale_rows_per_group > 0 && attention.wo_a_groups.scale_cols > 0,
+        "DSv4 O-LoRA grouped scale shape must be non-empty"
+    );
+    let (weight_ptrs, _wg) = attention.wo_a_groups.weight_ptrs.device_ptr(&ctx.stream);
+    let (scale_ptrs, _sg) = attention.wo_a_groups.scale_ptrs.device_ptr(&ctx.stream);
+    let (input_ptr, _ig) = local_attn.data.device_ptr(&ctx.stream);
+    let (output_ptr, _og) = latent.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+    // SAFETY: pointer tables were built from this rank's contiguous `wo_a`
+    // groups at load time. `route_meta=null` selects group `route % groups`;
+    // route order is `[token0/group0, token0/group1, ..., token1/group0, ...]`,
+    // which is exactly the `HiddenStates` token-major layout when each group is
+    // `cols_per_group` wide.
+    unsafe {
+        match attention.wo_a.weight_format {
+            WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_route_gemv_batch_cuda(
+                weight_ptrs as *const u64,
+                scale_ptrs as *const u64,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                std::ptr::null(),
+                0,
+                i32::try_from(shape.groups)?,
+                i32::try_from(shape.routes)?,
+                i32::try_from(shape.rows_per_group)?,
+                i32::try_from(shape.cols_per_group)?,
+                i32::try_from(attention.wo_a_groups.scale_rows_per_group)?,
+                i32::try_from(attention.wo_a_groups.scale_cols)?,
+                0,
+                stream,
+            ),
+            WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_route_gemv_batch_cuda(
+                weight_ptrs as *const u64,
+                scale_ptrs as *const u64,
+                input_ptr as *const ffi::Half,
+                output_ptr as *mut ffi::Half,
+                std::ptr::null(),
+                0,
+                i32::try_from(shape.groups)?,
+                i32::try_from(shape.routes)?,
+                i32::try_from(shape.rows_per_group)?,
+                i32::try_from(shape.cols_per_group)?,
+                i32::try_from(attention.wo_a_groups.scale_rows_per_group)?,
+                i32::try_from(attention.wo_a_groups.scale_cols)?,
+                0,
+                stream,
+            ),
+            other => bail!("DSv4 O-LoRA grouped wo_a expected FP8/FP4 block-scaled, got {other:?}"),
+        }
+        .result()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod oproj_tests {
+    use super::*;
+
+    #[test]
+    fn oproj_group_shape_accepts_multiple_full_groups_per_rank() {
+        let shape = dsv4_oproj_group_shape(2048, 4096, 2, 1024, 4096, 8192, 3).unwrap();
+        assert_eq!(
+            shape,
+            Dsv4OProjGroupShape {
+                groups: 2,
+                rows_per_group: 1024,
+                cols_per_group: 4096,
+                routes: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn oproj_group_shape_rejects_split_output_group() {
+        let err = dsv4_oproj_group_shape(8192, 4096, 8, 1024, 4096, 2048, 1)
+            .expect_err("half output group must fail closed");
+        assert!(
+            err.to_string().contains("whole number of wo_a groups"),
+            "{err}"
+        );
+    }
+}
+
 /// O-LoRA output projection, extracted from `mla_attention` so the batched-decode
 /// path can call it ONCE over [N] rows (Phase 4): `wo_a` (down to the output latent)
 /// → `wo_b` (up to hidden) into `out`. Row-parallel — the all-reduce-sum is the
@@ -8468,23 +8609,32 @@ pub(crate) fn mla_oproj(
     keepalive: &mut Dsv4ForwardKeepalive,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    // SAFETY: dsv4_linear writes the full latent buffer.
+    let shape = dsv4_oproj_group_shape(
+        attention.wo_a.rows,
+        attention.wo_a.cols,
+        attention.wo_a_groups.groups,
+        attention.wo_a_groups.rows_per_group,
+        attention.wo_a_groups.cols_per_group,
+        local_attn.hidden_dim,
+        token_count,
+    )?;
     let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
-    let wo_dg = token_count == 1
+    let wo_a_decode_dg = shape.groups == 1
+        && token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
+        && attention.wo_a_deepgemm.is_some();
+    let wo_a_prefill_dg = shape.groups == 1
+        && token_count > 1
+        && dsv4_prefill_proj_deepgemm_enabled()
         && attention.wo_a_deepgemm.is_some()
-        && attention.wo_b_deepgemm.is_some();
-    if wo_dg {
+        && prefill_shared.is_some();
+    if wo_a_decode_dg {
         // Lever #1b: wo_a/wo_b (M=1) through tensor-core DeepGEMM, reusing the
-        // fused-wqkv FP8 scratch (local_width == hidden_size on DSv4-Flash).
+        // fused-wqkv FP8 scratch for the single-output-group case.
         let scratch = state.fused_wqkv.as_ref().expect("wo_dg gate checked");
         let wo_a_cache = attention
             .wo_a_deepgemm
-            .as_ref()
-            .expect("wo_dg gate checked");
-        let wo_b_cache = attention
-            .wo_b_deepgemm
             .as_ref()
             .expect("wo_dg gate checked");
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
@@ -8499,26 +8649,10 @@ pub(crate) fn mla_oproj(
             )
         })?;
         drop(nvtx_wo_a);
-        keepalive.keep_hidden(&latent);
-        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, attention.wo_b.cols)
-        })?;
-        drop(nvtx_wo_b);
-    } else if token_count > 1
-        && dsv4_prefill_proj_deepgemm_enabled()
-        && attention.wo_a_deepgemm.is_some()
-        && attention.wo_b_deepgemm.is_some()
-        && prefill_shared.is_some()
-    {
-        // Prefill wo_a/wo_b (M=token_count) → DeepGEMM, off the scalar fp8_gemv
-        // (same lever as prefill wq_b; reuses the prefill FP8 scratch).
+    } else if wo_a_prefill_dg {
+        // Prefill wo_a (M=token_count) → DeepGEMM for the single-output-group case.
         let wo_a_cache = attention
             .wo_a_deepgemm
-            .as_ref()
-            .expect("wo prefill gate checked");
-        let wo_b_cache = attention
-            .wo_b_deepgemm
             .as_ref()
             .expect("wo prefill gate checked");
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
@@ -8531,22 +8665,54 @@ pub(crate) fn mla_oproj(
             })?;
         }
         drop(nvtx_wo_a);
-        keepalive.keep_hidden(&latent);
+    } else if shape.groups == 1 {
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_linear(ctx, &attention.wo_a, local_attn, &mut latent)
+        })?;
+        drop(nvtx_wo_a);
+    } else {
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, &mut latent)
+        })?;
+        drop(nvtx_wo_a);
+    }
+    keepalive.keep_hidden(&latent);
+
+    let wo_b_decode_dg = token_count == 1
+        && dsv4_decode_proj_deepgemm_enabled()
+        && state.fused_wqkv.is_some()
+        && attention.wo_b_deepgemm.is_some();
+    let wo_b_prefill_dg = token_count > 1
+        && dsv4_prefill_proj_deepgemm_enabled()
+        && attention.wo_b_deepgemm.is_some()
+        && prefill_shared.is_some();
+    if wo_b_decode_dg {
+        let scratch = state.fused_wqkv.as_ref().expect("wo_b dg gate checked");
+        let wo_b_cache = attention
+            .wo_b_deepgemm
+            .as_ref()
+            .expect("wo_b dg gate checked");
+        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+            decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, attention.wo_b.cols)
+        })?;
+        drop(nvtx_wo_b);
+    } else if wo_b_prefill_dg {
+        let wo_b_cache = attention
+            .wo_b_deepgemm
+            .as_ref()
+            .expect("wo_b prefill gate checked");
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         {
-            let scratch = prefill_shared.expect("wo prefill gate checked");
+            let scratch = prefill_shared.expect("wo_b prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
                 prefill_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out)
             })?;
         }
         drop(nvtx_wo_b);
     } else {
-        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
-        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_linear(ctx, &attention.wo_a, local_attn, &mut latent)
-        })?;
-        drop(nvtx_wo_a);
-        keepalive.keep_hidden(&latent);
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
             dsv4_linear(ctx, &attention.wo_b, &latent, out)
