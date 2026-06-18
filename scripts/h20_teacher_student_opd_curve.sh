@@ -58,6 +58,7 @@ RUN_CURVE="${RUN_CURVE:-1}"
 ARLE_BIN="${ARLE_BIN:-$ROOT/target/release/arle}"
 BUILD_ARLE="${BUILD_ARLE:-1}"
 TRAIN_BACKEND="${TRAIN_BACKEND:-auto}"
+ENGINE_OFFLOAD="${ENGINE_OFFLOAD:-student}"
 SERVE_BACKEND="${SERVE_BACKEND:-cuda}"
 SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
 SERVE_PORT="${SERVE_PORT:-8123}"
@@ -96,6 +97,7 @@ fi
 [[ "$PROMPT_MAX_TOKENS" -ge 2048 ]] || die "PROMPT_MAX_TOKENS must be >=2048 for the reasoning OPD run"
 [[ "$GSM8K_MAX_TOKENS" -ge 2048 ]] || die "GSM8K_MAX_TOKENS must be >=2048 for untruncated GSM8K eval"
 [[ "$TEACHER_RUNTIME" =~ ^(infer|in-process)$ ]] || die "TEACHER_RUNTIME must be infer or in-process"
+[[ "$ENGINE_OFFLOAD" =~ ^(off|0|false|student|teacher|all|1|true)$ ]] || die "ENGINE_OFFLOAD must be off/0/false/student/teacher/all/1/true"
 if [[ -z "$LR_WARMUP_STEPS" ]]; then
   LR_WARMUP_STEPS=$(((STEPS * 3 + 99) / 100))
 fi
@@ -113,6 +115,7 @@ log "teacher=$TEACHER_MODEL"
 log "teacher_runtime=$TEACHER_RUNTIME"
 log "prompts=$PROMPTS_FILE"
 log "rollout_len=$ROLLOUT_LEN prompt_max_tokens=$PROMPT_MAX_TOKENS gsm8k_max_tokens=$GSM8K_MAX_TOKENS"
+log "engine_offload=$ENGINE_OFFLOAD"
 log "lr_schedule=$LR_SCHEDULE warmup_steps=$LR_WARMUP_STEPS"
 log "checkpoints=$CHECKPOINT_DIR"
 
@@ -241,9 +244,10 @@ if [[ "$RUN_TRAIN" == "1" ]]; then
   fi
 
   log "train command:"
+  printf '  ARLE_OPD_ENGINE_OFFLOAD=%q' "$ENGINE_OFFLOAD"
   printf '  %q' "$ARLE_BIN" "${train_args[@]}"
   printf '\n'
-  "$ARLE_BIN" "${train_args[@]}" 2>&1 | tee "$LOG_DIR/train.log"
+  ARLE_OPD_ENGINE_OFFLOAD="$ENGINE_OFFLOAD" "$ARLE_BIN" "${train_args[@]}" 2>&1 | tee "$LOG_DIR/train.log"
   check_checkpoint_dirs
 else
   log "RUN_TRAIN=0; manifest was written but checkpoints were not produced"
