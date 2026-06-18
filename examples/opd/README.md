@@ -42,6 +42,22 @@ What this does:
 Downloads land in `~/.cache/modelscope/hub` or `~/.cache/huggingface/hub`
 depending on source and resume on retry. First Qwen3.5-4B run pulls ~7 GB.
 
+## Retained long-reasoning recipe
+
+For the MATH R1 bring-up lane, use the retained launcher instead of a copied
+one-liner:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+./examples/opd/launch-math-r1-35b-to-4b-pod.sh
+```
+
+This starts `run-math-r1-35b-to-4b.sh` in a persistent tmux session by default
+and records the exact train parameters to `<RUN_ROOT>/run_config.json`. The
+launcher defaults to Qwen3.6-35B-A3B-FP8 teacher, Qwen3.5-4B student, MATH
+question-only prompts, rollout length 2048, completion-only KL, all-linear LoRA
+rank 32 / alpha 64, cosine LR, and teacher offload.
+
 ## Environment overrides
 
 | Var | Default | Notes |
