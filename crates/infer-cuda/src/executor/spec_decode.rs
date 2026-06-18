@@ -28,7 +28,7 @@ impl DraftChain {
     /// The verify-forward schedule: row `i` at `start_pos + i`, attending the
     /// committed KV + the chain prefix rows `[0, i)` through plain causal attention.
     fn verify_schedule(&self, start_pos: usize) -> SpecVerifySchedule {
-        SpecVerifySchedule::chain(self.tokens.len(), start_pos)
+        SpecVerifySchedule::prefix_chain(self.tokens.len(), start_pos)
     }
 
     fn validate(&self) -> Result<()> {
@@ -55,7 +55,7 @@ impl DraftChain {
 }
 
 /// Longest prefix whose target top-1 is present in the draft top-k matrix.
-/// This is diagnostic for the matrix/tree hit rate; only hits that stay on the
+/// This is diagnostic for the top-k candidate hit rate; only hits that stay on the
 /// verified top-1 chain can be committed by the current fold path.
 fn longest_candidate_hit_prefix(candidates: &[Vec<u32>], argmax: &[u32]) -> usize {
     let mut hits = 0;
@@ -143,7 +143,7 @@ impl Dsv4CudaExecutor {
 
         // 3. The verify logits are still the chain matrix. Top-k only changes the
         //    candidate membership test; off-chain hits stop at the free bonus.
-        let tree_hits = longest_candidate_hit_prefix(&chain.candidates, &verify.argmax);
+        let candidate_hits = longest_candidate_hit_prefix(&chain.candidates, &verify.argmax);
         let accepted = longest_accepted_prefix(&chain, &verify.argmax);
         let bonus = verify.argmax[accepted];
 
@@ -151,12 +151,12 @@ impl Dsv4CudaExecutor {
         self.mtp_rejects += chain.depth() - accepted;
         if self.model.tp.config().rank == 0 {
             eprintln!(
-                "[dsv4-mtp] depth={} topk={} draft_rows={} verify_rows={} tree_hits={} accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
+                "[dsv4-mtp] depth={} topk={} draft_rows={} verify_rows={} candidate_hits={} accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
                 depth,
                 topk,
                 chain.depth(),
                 chain.tokens.len(),
-                tree_hits,
+                candidate_hits,
                 self.mtp_accepts,
                 self.mtp_rejects
             );
@@ -402,7 +402,7 @@ impl Dsv4CudaExecutor {
                     argmax.len(),
                     hiddens.len()
                 );
-                let tree_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
+                let candidate_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
                 let accepted = longest_accepted_prefix(chain, &argmax);
                 let bonus = argmax[accepted];
                 self.mtp_accepts += accepted;
@@ -410,7 +410,7 @@ impl Dsv4CudaExecutor {
                 if self.model.tp.config().rank == 0 {
                     eprintln!(
                         "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \
-                         draft_rows={chain_depth} verify_rows={} tree_hits={tree_hits} \
+                         draft_rows={chain_depth} verify_rows={} candidate_hits={candidate_hits} \
                          accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
                         tokens.len(),
                         self.mtp_accepts,
@@ -467,7 +467,7 @@ impl Dsv4CudaExecutor {
                     hiddens.len()
                 );
 
-                let tree_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
+                let candidate_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
                 let accepted = longest_accepted_prefix(chain, &argmax);
                 let bonus = argmax[accepted];
                 self.mtp_accepts += accepted;
@@ -475,7 +475,7 @@ impl Dsv4CudaExecutor {
                 if self.model.tp.config().rank == 0 {
                     eprintln!(
                         "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \
-                         draft_rows={chain_depth} verify_rows={} tree_hits={tree_hits} \
+                         draft_rows={chain_depth} verify_rows={} candidate_hits={candidate_hits} \
                          accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
                         tokens.len(),
                         self.mtp_accepts,
@@ -652,13 +652,14 @@ mod tests {
         assert_eq!(argmax[0], 21);
     }
 
-    /// The chain schedule is strictly increasing positions only.
     #[test]
-    fn chain_schedule_positions() {
+    fn chain_schedule_prefix_ancestors() {
         let chain = chain(vec![10, 11, 12], vec![vec![11, 21], vec![12, 22]]);
         let sched = chain.verify_schedule(100);
         assert_eq!(sched.positions, vec![100, 101, 102]);
+        assert_eq!(sched.ancestors, vec![vec![], vec![0], vec![0, 1]]);
         assert!(sched.is_chain());
+        assert!(sched.has_prefix_ancestors());
     }
 
     #[test]
@@ -669,5 +670,6 @@ mod tests {
         assert_eq!(chain.candidates.len(), 2);
         assert_eq!(sched.positions.len(), 3);
         assert_eq!(sched.positions, vec![4096, 4097, 4098]);
+        assert_eq!(sched.ancestors.len(), 3);
     }
 }
