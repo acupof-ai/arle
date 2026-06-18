@@ -86,12 +86,13 @@ serve host; `.62` (clang-11) cannot serve MTP.**
      TO GET THE REAL ~53: build+serve MTP on a proper build host (gcc≥10, no
      clang-11 JIT workaround), where the MTP-head deepgemm JIT compiles normally.
      Transfer note: `scp` via jumpbox (18.5MB one-shot) >> base64 chunks.
-2. **Compute/comm overlap for the BATCHED (n>1) lane.** Existing
-   `ARLE_DSV4_COMM_OVERLAP` is `seq_len==1` ONLY (overlaps shared-expert compute
-   w/ routed-MoE all-reduce; has the consumer `wait_event` via
-   record/wait_pipeline_fence). Extend to n>1: hide the MoE all-reduce under
-   cross-layer / cross-expert compute (overlap sources at any batch: token-chunk,
-   intra-GEMM tile, cross-layer op, cross-expert). Three-stage handshake:
+2. **Compute/comm overlap for the BATCHED (n>1) lane.** As of `087df440`
+   (2026-06-18), B=1 allreduce decode always overlaps shared-expert compute
+   with the routed-MoE all-reduce; the old `ARLE_DSV4_COMM_OVERLAP` env is gone.
+   This still does not cover `seq_len>1` verify/batched rows. Extend to n>1:
+   hide the MoE all-reduce under cross-layer / cross-expert compute (overlap
+   sources at any batch: token-chunk, intra-GEMM tile, cross-layer op,
+   cross-expert). Three-stage handshake:
    ev_c (compute record) → comm wait_event(ev_c)+AllReduce+ev_m record →
    compute wait_event(ev_m) before the consumer. Raises the saturation level.
 3. **True linear scaling** (throughput ∝ n) — needs the per-row COMPUTE to stop

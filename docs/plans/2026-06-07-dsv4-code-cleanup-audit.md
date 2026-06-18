@@ -22,6 +22,12 @@ re-grep the symbol before touching.** Each cleanup is tagged **safe-now** or
 **wait-for-batched-decode** (the unified plan
 [`2026-06-07-unified-batched-kvpool-abstraction.md`](2026-06-07-unified-batched-kvpool-abstraction.md)).
 
+**2026-06-18 update:** `087df440` resolved the `ARLE_DSV4_GPU_ROUTER` naming wart by
+deleting the DSv4 env gate, host D2H route fallback, host `tid2eid` table, and host
+route oracle. The same commit deleted `ARLE_DSV4_COMM_OVERLAP`; B=1 allreduce decode
+now always overlaps the shared expert on the comm stream. Do not reintroduce either
+as a CLI/env knob.
+
 ---
 
 ## A. The `ARLE_DSV4_*` env-flag family → CLI `--flags` (task #35)
@@ -42,10 +48,8 @@ threaded to a config struct, with env retained only as a test-harness override s
 | `ARLE_DSV4_FLASHMLA_PREFILL` | `attention.rs:2384` | **ON** (opt-out `=0`) | FlashMLA `sparse_fwd` prefill vs scalar |
 | `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` | `attention.rs:2395` | **ON** (opt-out `=0`) | fused `wq_a\|wkv` FP8 DeepGEMM vs scalar GEMV |
 | `ARLE_DSV4_FUSED_WQKV_DECODE` | `attention.rs:2481` | **ON** (opt-out `=0`) | fused MLA-LoRA decode projection |
-| `ARLE_DSV4_GPU_ROUTER` | `moe.rs:834` | **ON** (opt-out `=0`) | on-device MoE router (no per-layer logits D2H) |
 | `ARLE_DSV4_MOE_CONTIG_DECODE` | `moe.rs:839` | **OFF** (opt-in `=1`) | contiguous/pooled decode MoE (slower at B=1) |
 | `ARLE_DSV4_MOE_TRANSPORT` / `ARLE_DSV4_MOE_BACKEND` | `dsv4.rs:2027`, `deepep.rs:42/45` | **allreduce** | MoE transport: `allreduce` vs `deepep` |
-| `ARLE_DSV4_COMM_OVERLAP` | `dsv4.rs:2049` | **OFF** (opt-in `=1`) | shared-expert on comm_stream behind moe AR |
 | `ARLE_DSV4_DECODE_GRAPH` | `dsv4.rs:2042`, `attention.rs:4606` | **OFF** (opt-in `=1`) | decode CUDA graph capture |
 | `ARLE_DSV4_SPEC_DECODE` | `dsv4.rs:2056` | **OFF** (opt-in `=1`) | MTP/EAGLE spec decode (parked, see §D) |
 | `ARLE_DSV4_MTP_FROZEN_LAYER` | `dsv4.rs:1467` | (usize, mapping) | frozen-KV MTP target-layer index |
@@ -53,26 +57,16 @@ threaded to a config struct, with env retained only as a test-harness override s
 
 **Cleanup:** introduce a `Dsv4RuntimeConfig` (or extend the existing serve/launch config)
 with `--dsv4-dsa-indexer`, `--dsv4-flashmla-decode`, `--dsv4-flashmla-prefill`,
-`--dsv4-fp8-linear-deepgemm`, `--dsv4-fused-wqkv-decode`, `--dsv4-gpu-router`,
-`--dsv4-moe-transport=<allreduce|deepep>`, `--dsv4-comm-overlap`, `--dsv4-decode-graph`,
+`--dsv4-fp8-linear-deepgemm`, `--dsv4-fused-wqkv-decode`,
+`--dsv4-moe-transport=<allreduce|deepep>`, `--dsv4-decode-graph`,
 `--dsv4-spec-decode`, `--dsv4-mtp-frozen-layer`. Keep the env reads as a fallback shim
 inside the config builder (so the resident A/B harnesses keep working) but the
 production source of truth becomes the CLI flag. `ARLE_CUDA_MEMPOOL_RETAIN` is a
 cuda-kernels-level knob → a `--cuda-mempool-retain` or a context-init config field.
 
-**Naming wart to fix while here (the #35-noted one):** `ARLE_DSV4_GPU_ROUTER` has TWO
-meanings under one name:
-- `moe.rs:834` `use_gpu_router()` → gates the **on-device router** (default-on, opt-out `=0`).
-- `dsv4.rs:853` / `dsv4.rs:1044` `use_gpu_router = env::var_os(...).is_some()` → gates the
-  **pooled/contiguous decode-scratch path** (default-OFF via `.is_some()`), feeding
-  `use_moe_decode_scratch` (`dsv4.rs:1046`) and the decode-graph entry guard
-  (`dsv4.rs:855-865`). This is a different feature ([[reference_dsv4_pooled_decode_slower_than_masked_b1]]).
-  Same env var name → confusing and arguably a latent bug (setting `ARLE_DSV4_GPU_ROUTER=0`
-  in moe.rs keeps the router ON but turns the `.is_some()` check… still true). **Give the
-  two paths distinct CLI flags** (`--dsv4-gpu-router` for the router; the pooled-scratch
-  gate should be folded into `--dsv4-moe-contig-decode` or removed — it overlaps
-  `MOE_CONTIG_DECODE` semantically). **safe-now**, but verify the `.is_some()` vs `!="0"`
-  semantics divergence is intentional before collapsing.
+**Resolved wart:** the old `ARLE_DSV4_GPU_ROUTER` double meaning is gone. DSv4
+eager/allreduce/DeepEP route on device unconditionally; decode-graph scratch is
+keyed by the graph path, not the router name.
 
 ### A.2 Diagnostics / dump probes — keep as env (test-harness shim), **safe-now to document only**
 
@@ -122,16 +116,13 @@ on ≥2 shapes, then delete + no half-state).
 
 - The decode MoE has a **masked** (default, fast at B=1: 37.6 tok/s) and a **pooled/contiguous**
   path (`dsv4_moe_forward_decode_pooled`, `moe.rs:1326`; entry `moe.rs:1024/1163`), gated by
-  `use_moe_decode_scratch` (`dsv4.rs:1046`) ← the misnamed `ARLE_DSV4_GPU_ROUTER`.is_some() +
-  `ARLE_DSV4_MOE_CONTIG_DECODE`. Pooled is **slower at B=1** (28.4 vs 37.6,
+  `ARLE_DSV4_MOE_CONTIG_DECODE` / decode-graph scratch. Pooled is **slower at B=1** (28.4 vs 37.6,
   [[reference_dsv4_pooled_decode_slower_than_masked_b1]]) so it is correctly default-off.
 - **Verdict:** the pooled path is the *batched-decode* primitive (it operates on a contiguous
   N-token scratch); the masked path is the B=1-optimal one. **Both stay** — but the batched-decode
   work (unified plan Phase 6, `moe.rs:874/1104` one-token scratch guard widened to N) will
   re-home which one is canonical. **wait-for-batched-decode**: don't delete either until the
-  batched MoE lands and the c-sweep decides the canonical decode-MoE path. Note the misnamed
-  gate (§A.1) should be untangled *before* this, so the batched path isn't coupled to the
-  confusing `GPU_ROUTER`.is_some() check.
+  batched MoE lands and the c-sweep decides the canonical decode-MoE path.
 
 ### B.3 Scalar hybrid-attention + scalar FP8 GEMV decode/prefill paths — **KEEP, wait**
 
