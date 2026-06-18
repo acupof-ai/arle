@@ -20,7 +20,8 @@ fn reshape_backward_restores_input_shape() -> Result<()> {
     let grad_id = grads.get(&x).copied().expect("reshape grad exists");
     let grad = store.get(grad_id).expect("grad tensor exists");
     assert_eq!(grad.shape, vec![2, 3]);
-    assert_eq!(grad.data, vec![1.0; 6]);
+    let grad_data = store.to_host(grad_id)?;
+    assert_eq!(grad_data, vec![1.0; 6]);
 
     Ok(())
 }
@@ -39,7 +40,8 @@ fn slice_backward_scatter_restores_input_shape() -> Result<()> {
     let grad_id = grads.get(&x).copied().expect("slice grad exists");
     let grad = store.get(grad_id).expect("grad tensor exists");
     assert_eq!(grad.shape, vec![2, 3]);
-    assert_eq!(grad.data, vec![0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    let grad_data = store.to_host(grad_id)?;
+    assert_eq!(grad_data, vec![0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
 
     Ok(())
 }

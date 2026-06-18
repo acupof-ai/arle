@@ -653,6 +653,42 @@ fn cuda_matmul_bt_backward_device_matches_cpu() {
 }
 
 #[test]
+fn cuda_matmul_bt_input_grad_device_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_matmul_bt_input_grad_device_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let a_shape: Vec<usize> = vec![64, 96];
+    let b_shape: Vec<usize> = vec![128, 96];
+    let g_shape: Vec<usize> = vec![64, 128];
+    let a = rng_vec(0xABCD_0101, a_shape.iter().product(), 1.0);
+    let b = rng_vec(0xABCD_0102, b_shape.iter().product(), 1.0);
+    let g = rng_vec(0xABCD_0103, g_shape.iter().product(), 1.0);
+
+    let (host_grad_a, _) =
+        cpu_matmul_bt_backward(&a, &a_shape, &b, &b_shape, &g, &g_shape, true, false)
+            .expect("cpu matmul_bt_backward");
+
+    let b_h = backend.upload(&b, &b_shape).expect("upload b");
+    let g_h = backend.upload(&g, &g_shape).expect("upload g");
+    let grad_a_h = backend
+        .matmul_bt_input_grad_device(&b_h, &b_shape, &g_h, &g_shape, &a_shape)
+        .expect("cuda matmul_bt_input_grad_device");
+    backend.eval(&[&grad_a_h]).expect("cuda eval");
+    let dev_grad_a = backend.readback(&grad_a_h).expect("grad_a readback");
+
+    let (excess_a, abs_a, idx_a) = max_err_with_tol(&dev_grad_a, &host_grad_a, 1e-4, 1e-4);
+    assert!(
+        excess_a <= 1.0,
+        "matmul_bt_input_grad_device grad_a exceeds atol=1e-4 + rtol=1e-4 at idx {idx_a} \
+         (|diff|={abs_a}, dev={}, host={}, excess_ratio={excess_a})",
+        dev_grad_a[idx_a],
+        host_grad_a[idx_a]
+    );
+}
+
+#[test]
 fn cuda_rms_norm_device_lazy_matches_cpu() {
     let Ok(backend) = CudaBackend::new(0) else {
         eprintln!("skipping cuda_rms_norm_device_lazy_matches_cpu: no CUDA device");
