@@ -262,15 +262,17 @@ pub(crate) struct Dsv4SlotImage {
 /// FUTURE (ideal): plumb the requested depth to the model so the snapshot sizes
 /// to `depth+1` instead of this fixed `MAX+1`, reclaiming per-slot memory.
 pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
+pub(crate) const MAX_SPEC_VERIFY_ROWS: usize = MAX_SPEC_DRAFT_DEPTH + 1;
 pub(crate) const DEFAULT_SPEC_DRAFT_DEPTH: usize = 2;
 
 pub(crate) const DEFAULT_SPEC_DRAFT_TOPK: usize = 1;
 
 /// Row schedule for one speculative verify forward. Top-k draft candidates do
-/// not change this shape: the target model verifies the top-1 chain only, so
-/// rows are always strictly increasing positions. `ancestors` is the optional
-/// prefix metadata used by the batched FlashMLA sparse verify lane: row `r`
-/// attends committed KV plus chunk rows `[0, r)` and self.
+/// not imply a full flattened tree: sparse FlashMLA verifies only the rows whose
+/// hidden/KV may be committed or used as the next pending-token parent.
+/// `ancestors` is the prefix metadata used by the batched FlashMLA sparse verify
+/// lane: row `r` attends committed KV plus the listed earlier chunk rows and
+/// self.
 pub(crate) struct SpecVerifySchedule {
     /// Per row: absolute position (`start_pos + node depth`).
     pub(crate) positions: Vec<usize>,
@@ -289,6 +291,22 @@ impl SpecVerifySchedule {
         }
     }
 
+    pub(crate) fn branch_root(candidates: usize, start_pos: usize) -> Self {
+        let mut positions = Vec::with_capacity(candidates + 1);
+        let mut ancestors = Vec::with_capacity(candidates + 1);
+        positions.push(start_pos);
+        ancestors.push(Vec::new());
+        for _ in 0..candidates {
+            positions.push(start_pos + 1);
+            ancestors.push(vec![0]);
+        }
+        Self {
+            positions,
+            ancestors,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_prefix_chain_at(&self, start_pos: usize) -> bool {
         self.positions
             .iter()
@@ -298,6 +316,38 @@ impl SpecVerifySchedule {
             && self.ancestors.iter().enumerate().all(|(row, ancestors)| {
                 ancestors.len() == row && ancestors.iter().copied().eq(0..row)
             })
+    }
+
+    pub(crate) fn validate_sparse_at(&self, start_pos: usize) -> Result<()> {
+        ensure!(
+            !self.positions.is_empty() && self.positions.len() == self.ancestors.len(),
+            "DSv4 sparse verify schedule shape mismatch: positions={} ancestors={}",
+            self.positions.len(),
+            self.ancestors.len()
+        );
+        ensure!(
+            self.positions.len() <= MAX_SPEC_VERIFY_ROWS,
+            "DSv4 sparse verify rows {} exceed fold cache rows {MAX_SPEC_VERIFY_ROWS}",
+            self.positions.len()
+        );
+        for (row, &pos) in self.positions.iter().enumerate() {
+            ensure!(
+                pos >= start_pos,
+                "DSv4 sparse verify row {row} position {pos} precedes start_pos {start_pos}"
+            );
+            for &ancestor in &self.ancestors[row] {
+                ensure!(
+                    ancestor < row,
+                    "DSv4 sparse verify row {row} has non-causal ancestor row {ancestor}"
+                );
+                ensure!(
+                    self.positions[ancestor] < pos,
+                    "DSv4 sparse verify row {row} position {pos} ancestor {ancestor} position {} is not earlier",
+                    self.positions[ancestor]
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -323,7 +373,7 @@ pub(crate) struct Dsv4SlotState {
     /// index-aligned with `attention`.
     spec_rings: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
     /// P2 commit-fold scratch: per-layer attn-normed verify rows
-    /// (`[hidden, MAX_SPEC_DRAFT_DEPTH + 1]`), persisted by the verify lane so
+    /// (`[hidden, MAX_SPEC_VERIFY_ROWS]`), persisted by the verify lane so
     /// the commit can re-ingest the accepted prefix (compressor/indexer + ring
     /// K) without a second full forward. `Some` only when
     /// `model.spec_decode_on`.
@@ -640,7 +690,7 @@ impl Dsv4SlotState {
                     HiddenStates::uninit(
                         &model.ctx,
                         model.config.hidden_size,
-                        MAX_SPEC_DRAFT_DEPTH + 1,
+                        MAX_SPEC_VERIFY_ROWS,
                     )?
                 });
             }
@@ -3095,10 +3145,7 @@ impl Dsv4Model {
                 scheds[s].positions.len(),
                 scheds[s].ancestors.len()
             );
-            ensure!(
-                scheds[s].is_prefix_chain_at(start_positions[s]),
-                "DSv4 batched MTP verify requires start-aligned prefix-chain metadata"
-            );
+            scheds[s].validate_sparse_at(start_positions[s])?;
             let slot = &slots[slot_ids[s]];
             ensure!(
                 slot.seq_len == start_positions[s],
@@ -3569,11 +3616,12 @@ impl Dsv4Model {
         let chain_verify_meta = match verify {
             Some(sched) if seq_len > 1 => {
                 ensure!(
-                    sched.positions.len() == seq_len
-                        && sched.ancestors.len() == seq_len
-                        && sched.is_prefix_chain_at(start_pos),
-                    "DSv4 chain verify requires start-aligned prefix-chain metadata"
+                    sched.positions.len() == seq_len && sched.ancestors.len() == seq_len,
+                    "DSv4 sparse verify schedule rows ({}, {}) != token rows {seq_len}",
+                    sched.positions.len(),
+                    sched.ancestors.len()
                 );
+                sched.validate_sparse_at(start_pos)?;
                 Some(crate::attention::Dsv4ChainVerifyAttnMeta::new(
                     &self.ctx,
                     &sched.positions,
