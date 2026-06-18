@@ -205,9 +205,9 @@ __global__ void arle_hca_build_indices_kernel(
     }
 }
 
-// Chain-verify sparse indices. Rows are the top-1 verify chain only:
+// Sparse verify indices. Rows may be a top-1 chain or a bounded branch shape:
 //   positions[token] = absolute position for this row
-//   ancestors[token, :] = prefix chunk rows [0, token), -1 padded
+//   ancestors[token, :] = causal chunk ancestor rows, -1 padded
 //
 // Pool layout is still [SW cache | chunk K | compressed]. Row layout:
 //   committed SW offsets | prefix ancestors + self | compressed part | -1 tail.

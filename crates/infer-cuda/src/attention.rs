@@ -5653,10 +5653,10 @@ fn update_bf16_sw_window(
     Ok(())
 }
 
-/// Batched DSv4 chain-verify attention metadata. Rows are the verified top-1
-/// chain only: row `r` is at `positions[r]` and attends chunk ancestors `[0, r)`
-/// plus self. This is not a complete top-k tree verifier; top-k only widens the
-/// candidate matrix interpreted after the target logits are produced.
+/// Batched DSv4 sparse-verify attention metadata. Row `r` is at
+/// `positions[r]` and attends committed KV plus the listed earlier chunk
+/// ancestors and self. The caller decides whether those rows are a linear chain
+/// or the bounded D2 top-k branch shape.
 pub(crate) struct Dsv4ChainVerifyAttnMeta {
     pub(crate) positions: CudaSlice<i32>,
     pub(crate) ancestors: CudaSlice<i32>,
