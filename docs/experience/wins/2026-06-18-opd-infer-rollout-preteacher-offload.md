@@ -25,8 +25,16 @@ MoE offload now snapshots and reloads the full `MoeLayerWeights` structure:
 per-expert BF16/FP8 matrices, BF16 grouped caches, FP8 grouped caches, router
 gate, shared expert weights, and rebuilt routed pointer/scale tables.
 
+The second rerun then proved the capacity ordering problem: the rollout student
+offloaded 34.1 GiB and the teacher initial load succeeded, but the first step
+failed while reloading the rollout student with the teacher still resident. The
+CLI now also honors `ARLE_OPD_ENGINE_OFFLOAD=all/teacher` immediately after the
+initial infer-teacher load, so `all` starts each step with both idle infer
+engines offloaded. The existing windowed KL path reloads teacher only after
+rollout and after offloading the rollout student.
+
 Default behavior is unchanged when `ARLE_OPD_ENGINE_OFFLOAD` is unset or set to
-`teacher`.
+`student`.
 
 ## Verification
 
@@ -38,6 +46,7 @@ Local gates:
 - `CUDARC_CUDA_VERSION=12090 cargo check -p train --release --no-default-features --features cuda,no-cuda --lib`
 - `CUDARC_CUDA_VERSION=12090 cargo check -p cli --release --no-default-features --features cuda,no-cuda --lib`
 - `CUDARC_CUDA_VERSION=12090 cargo check -p infer-cuda --release --no-default-features --features cuda,no-cuda --lib`
+- `CUDARC_CUDA_VERSION=12090 cargo check -p cli --release --no-default-features --features cuda,no-cuda --lib`
 - `CUDARC_CUDA_VERSION=12090 cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda --lib -- -D warnings`
 - `CUDARC_CUDA_VERSION=12090 cargo clippy -p cli --release --no-default-features --features cpu,no-cuda --lib -- -D warnings`
 
@@ -46,14 +55,18 @@ Remote evidence:
 - Pre-MoE-offload build `ab22f727` on `.62` reached
   `offload infer rollout student before infer teacher load`, then failed with
   `Qwen3.6 MoE weight offload is not supported (OPD teacher time-share is dense-only)`.
+- MoE-offload build `bd1f2d27` on `.62` reached
+  `student_pre_teacher_offloaded freed_mib=34057.8`, loaded the infer teacher,
+  then failed at first-step rollout-student reload while the teacher was still
+  resident (`infer student reload failed: reload moe.gate[35]`).
 
-Pending remote 35B smoke rerun after the MoE offload support lands:
+Pending remote 35B smoke rerun after the teacher pre-step offload lands:
 
 - Gate: Qwen3.6-35B-A3B-FP8 OPD, `ARLE_OPD_INFER_ROLLOUT=1`,
-  `ARLE_OPD_ENGINE_OFFLOAD=student`, `--steps 1`, `--rollout-len 8`.
+  `ARLE_OPD_ENGINE_OFFLOAD=all`, `--steps 1`, `--rollout-len 8`.
 - Expected reachability signal: `infer_rollout_generate_start` followed by a
   completed OPD step, or a later measured blocker unrelated to initial teacher
-  load residency / MoE offload coverage.
+  load residency / MoE offload coverage / first-step teacher residency.
 
 ## Rule
 

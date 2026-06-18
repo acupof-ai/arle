@@ -853,12 +853,14 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             #[cfg(feature = "cuda")]
             {
                 maybe_preoffload_infer_student_before_teacher(&infer_student, &train_backend)?;
-                OpdCliTeacher::Infer(load_opd_infer_teacher(
+                let teacher = OpdCliTeacher::Infer(load_opd_infer_teacher(
                     teacher_dir,
                     args.prompt_max_tokens + args.rollout_len + 32,
                     train_backend.clone(),
                     cfg.vocab_size,
-                )?)
+                )?);
+                maybe_preoffload_infer_teacher_before_steps(&teacher, &train_backend)?;
+                teacher
             }
         }
     };
@@ -1869,6 +1871,27 @@ fn maybe_preoffload_infer_student_before_teacher(
         .context("offload infer rollout student before infer teacher load")?;
     eprintln!(
         "opd_engine_offload student_pre_teacher_offloaded freed_bytes={freed} freed_mib={:.1}",
+        freed as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn maybe_preoffload_infer_teacher_before_steps(
+    teacher: &OpdCliTeacher<'_>,
+    train_backend: &std::sync::Arc<dyn autograd::Backend>,
+) -> Result<()> {
+    if !train::opd::engine_offload_mode().offloads_teacher() {
+        return Ok(());
+    }
+
+    train_backend
+        .device_synchronize()
+        .context("synchronize train backend before infer teacher pre-step offload")?;
+    let freed = train::teacher_infer::TeacherForward::offload_engine_weights(teacher)
+        .map_err(|err| anyhow!("offload infer teacher before first OPD step failed: {err}"))?;
+    eprintln!(
+        "opd_engine_offload teacher_pre_step_offloaded freed_bytes={freed} freed_mib={:.1}",
         freed as f64 / (1024.0 * 1024.0)
     );
     Ok(())
