@@ -1566,6 +1566,35 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn matmul_bt_input_grad_device(
+        &self,
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        input_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (b, b_shape, grad_out, grad_out_shape, input_shape);
+            todo!(
+                "GPU required: cuda matmul_bt_input_grad_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_matmul_bt_input_grad_device(
+                self,
+                b,
+                b_shape,
+                grad_out,
+                grad_out_shape,
+                input_shape,
+            )
+        }
+    }
+
     /// Device-resident gradient accumulation. Allocates a fresh
     /// `CudaSlice<f32>` for the sum (so the previous `dest` handle remains
     /// valid for any tape consumers still holding it) and launches the
@@ -3964,6 +3993,85 @@ fn cuda_matmul_backward_device(
             got: a_shape.len().max(b_shape.len()),
         }),
     }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_matmul_bt_input_grad_device(
+    backend: &CudaBackend,
+    b: &DeviceHandle,
+    b_shape: &[usize],
+    grad_out: &DeviceHandle,
+    grad_out_shape: &[usize],
+    input_shape: &[usize],
+) -> Result<DeviceHandle> {
+    let expected_out = matmul_bt_output_shape(input_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+
+    let d_g = backend.cuda_slice(grad_out, "matmul_bt_input_grad_device")?;
+    if d_g.len() != shape_size(grad_out_shape) {
+        return Err(AutogradError::TapeInvariant(
+            "cuda matmul_bt_input_grad_device grad handle size does not match shape",
+        ));
+    }
+
+    let (grad_a, grad_a_shape) = match b {
+        DeviceHandle::Cuda(storage) => {
+            let d_b = backend.cuda_storage_slice(storage)?;
+            if d_b.len() != shape_size(b_shape) {
+                return Err(AutogradError::TapeInvariant(
+                    "cuda matmul_bt_input_grad_device handle size does not match shape",
+                ));
+            }
+            backend.matmul_device(d_g, grad_out_shape, d_b, b_shape)?
+        }
+        DeviceHandle::CudaBf16(storage) => {
+            let d_b = backend.cuda_bf16_storage_slice(storage)?;
+            if d_b.len() != shape_size(b_shape) {
+                return Err(AutogradError::TapeInvariant(
+                    "cuda bf16 matmul_bt_input_grad_device handle size does not match shape",
+                ));
+            }
+            backend.matmul_device_f32_bf16(d_g, grad_out_shape, d_b, b_shape)?
+        }
+        DeviceHandle::CudaFp8BlockScaled(storage) => {
+            let (weight, _, rows, cols, _, _) = backend.cuda_fp8_block_scaled_storage(storage)?;
+            if b_shape != [rows, cols] {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: vec![rows, cols],
+                    got: b_shape.to_vec(),
+                });
+            }
+            if weight.len() != shape_size(b_shape) {
+                return Err(AutogradError::TapeInvariant(
+                    "cuda fp8 matmul_bt_input_grad_device handle size does not match shape",
+                ));
+            }
+            backend.matmul_device_f32_fp8_block_scaled(d_g, grad_out_shape, storage)?
+        }
+        DeviceHandle::Cpu(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda matmul_bt_input_grad_device requires cuda handles",
+            ));
+        }
+        #[cfg(feature = "metal")]
+        DeviceHandle::Metal(_) => {
+            return Err(AutogradError::TapeInvariant(
+                "cuda matmul_bt_input_grad_device cannot use a metal handle",
+            ));
+        }
+    };
+    if grad_a_shape != input_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: input_shape.to_vec(),
+            got: grad_a_shape,
+        });
+    }
+    Ok(DeviceHandle::Cuda(CudaStorage::new(grad_a)))
 }
 
 // Device-resident sibling of `cpu_matmul_bt_backward`.

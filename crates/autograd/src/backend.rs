@@ -544,6 +544,39 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((grad_a_handle, grad_b_handle))
     }
 
+    /// Device-handle input-gradient for `C = A @ B^T`.
+    ///
+    /// This is the narrow `grad_a = grad_out @ B` case used by frozen base
+    /// weights. It avoids requiring the original `A` handle when no
+    /// `grad_b` is needed.
+    fn matmul_bt_input_grad_device(
+        &self,
+        b: &DeviceHandle,
+        b_shape: &[usize],
+        grad_out: &DeviceHandle,
+        grad_out_shape: &[usize],
+        input_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let expected_out = matmul_bt_output_shape(input_shape, b_shape)?;
+        if grad_out_shape != expected_out.as_slice() {
+            return Err(AutogradError::ShapeMismatch {
+                expected: expected_out,
+                got: grad_out_shape.to_vec(),
+            });
+        }
+        let b_host = self.readback(b)?;
+        let grad_host = self.readback(grad_out)?;
+        let (grad_a, grad_a_shape) =
+            cpu_matmul_forward(&grad_host, grad_out_shape, &b_host, b_shape)?;
+        if grad_a_shape != input_shape {
+            return Err(AutogradError::ShapeMismatch {
+                expected: input_shape.to_vec(),
+                got: grad_a_shape,
+            });
+        }
+        self.upload(&grad_a, input_shape)
+    }
+
     /// Elementwise `C = A + B` over identically-shaped contiguous tensors.
     /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
