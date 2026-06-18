@@ -188,10 +188,15 @@ the full-model scalar diagnostic as a pass.
 
 ## Verdict
 
-F2 is closed for the exercised CUDA 35B-A3B teacher paths: BF16 and FP8 both
+F2 is closed for the exercised CUDA 35B-A3B hand-kernel teacher paths
+(`ARLE_QWEN35_DEEPGEMM=0`): BF16 and FP8 both
 serve, generate coherent decoded text, and retrieve the needle exactly under
 the Qwen3 non-thinking template. The prior deterministic garbage signature is
 not present.
+
+This is not yet a default-configuration verdict for Qwen DeepGEMM-enabled serve;
+that needs a same-template BF16+FP8 coherence rerun with the default DeepGEMM
+setting before broadening the claim.
 
 The chat endpoint still emits visible thinking text for this checkpoint even
 when the user asks for final-only. That is a prompt/template behavior issue, not

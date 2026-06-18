@@ -68,6 +68,10 @@ same session — both ran c=48 cleanly, no crash):
 perrow Δ across n (gate OFF→ON): n=4 31.1→19.0 (−39%), n=8 61.5→34.5 (−44%),
 n=22 162.1→92.0 (−43%); slope `7.4 → ~4.4 ms/row`.
 
+Roofline note: this entry licenses the component A/B and end-to-end direction,
+not a roofline-efficiency verdict. Achieved-vs-peak is deferred to a follow-up
+nsys/ncu pass per `docs/bench-and-trace-spec.md` §7.7.
+
 **Both gate states serve c=48 (n→22) cleanly — no crash.** Correctness (gate ON):
 "capital of France" → "Paris" (deterministic across two greedy runs), needle
 "GREEN-5521-CAT" retrieved exact, "17+25" → "42". bf16 ⇒ no numerical shift vs the
