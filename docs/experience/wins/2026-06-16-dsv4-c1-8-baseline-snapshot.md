@@ -18,8 +18,7 @@ Serve `/data01/serve_bench_62.sh` env + `ARLE_DSV4_DECODE_COMPRESSOR_BATCH=1`:
 - TP=8 (`INFER_CUDA_DEVICES=0..7`), `num-slots 64`, `max-total-tokens 4096`,
   `chunked_prefill_size 64`.
 - `ARLE_DSV4_MOE_BACKEND=allreduce`, `ARLE_DSV4_EXPERT_BACKEND=deepgemm`
-  (native, CUDA 12.9), `ARLE_DSV4_INCREMENTAL_KV=1`,
-  `ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=1`.
+  (native, CUDA 12.9), `ARLE_DSV4_INCREMENTAL_KV=1`.
 - batched FlashMLA decode (default-on at c≥4), MTP, fused-wqkv decode,
   decode-proj DeepGEMM (all code-default on).
 - `ARLE_DSV4_DECODE_COMPRESSOR_BATCH=1` = the compressor-GEMV lever (a4239598) +

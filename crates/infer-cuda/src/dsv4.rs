@@ -1815,7 +1815,10 @@ impl Dsv4Model {
         let n = slot_ids.len();
         // Opt-in decode-phase timing probe (env-gated). When unset: zero behavior
         // change, zero extra syncs. Pure instrumentation — see ARLE_DSV4_DECODE_PHASE_TIME.
-        let phase_time = std::env::var_os("ARLE_DSV4_DECODE_PHASE_TIME").is_some();
+        let phase_time = matches!(
+            std::env::var("ARLE_DSV4_DECODE_PHASE_TIME").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        );
         // Per-GEMV breakdown for this decode step (self-gates on
         // ARLE_DSV4_LINEAR_PROFILE; no-op otherwise). Reset here + print after the
         // phase log scopes the stats to ONE decode forward, exposing which linear
