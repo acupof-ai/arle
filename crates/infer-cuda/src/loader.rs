@@ -1294,112 +1294,18 @@ impl SafetensorLoader {
             (None, None)
         };
 
-        // Per-expert weight-pointer tables (one device pointer per owned
-        // expert) — built from the per-expert matrices on the default path,
-        // or from the grouped buffer offsets on the DeepGEMM path.
-        let (gate_ptrs, up_ptrs, down_ptrs) = match (
-            &gate_grouped,
-            &up_grouped,
-            &down_grouped,
-            &w13_fp8_grouped,
-            &down_fp8_grouped,
-        ) {
-            (Some(g), Some(u), Some(d), _, _) => {
-                (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
-            }
-            (None, None, None, Some(w13), Some(down_g)) => (
-                w13.qweight_ptr_table(ctx, 0)?,
-                w13.qweight_ptr_table(ctx, moe_intermediate_size)?,
-                down_g.qweight_ptr_table(ctx, 0)?,
-            ),
-            _ => {
-                let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
-                let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
-                let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
-                if routed_quant {
-                    (
-                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &gate_refs)?,
-                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &up_refs)?,
-                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &down_refs)?,
-                    )
-                } else {
-                    (
-                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?,
-                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?,
-                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?,
-                    )
-                }
-            }
-        };
-        let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if fp8_deepgemm_ready {
-            let w13 = w13_fp8_grouped
-                .as_ref()
-                .ok_or_else(|| anyhow!("FP8 DeepGEMM w13 cache missing after build"))?;
-            let down_g = down_fp8_grouped
-                .as_ref()
-                .ok_or_else(|| anyhow!("FP8 DeepGEMM down cache missing after build"))?;
-            (
-                Some(w13.scale_ptr_table(ctx, 0)?),
-                Some(w13.scale_ptr_table(ctx, moe_intermediate_size)?),
-                Some(down_g.scale_ptr_table(ctx, 0)?),
-            )
-        } else if routed_quant
-            && matches!(
-                expert_weight_format,
-                WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
-            )
-        {
-            let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
-            let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
-            let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
-            (
-                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                    ctx, &gate_refs,
-                )?),
-                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                    ctx, &up_refs,
-                )?),
-                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                    ctx, &down_refs,
-                )?),
-            )
-        } else if routed_quant && expert_weight_format == WeightFormat::Fp4E2M1Group {
-            let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
-            let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
-            let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
-            (
-                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
-                    ctx, &gate_refs,
-                )?),
-                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
-                    ctx, &up_refs,
-                )?),
-                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
-                    ctx, &down_refs,
-                )?),
-            )
-        } else {
-            (None, None, None)
-        };
-        let (gate_global_ptrs, up_global_ptrs, down_global_ptrs) =
-            if routed_quant && expert_weight_format == WeightFormat::Fp4E2M1Group {
-                let gate_refs: Vec<&DeviceMatrix> = gate.iter().collect();
-                let up_refs: Vec<&DeviceMatrix> = up.iter().collect();
-                let down_refs: Vec<&DeviceMatrix> = down.iter().collect();
-                (
-                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                        ctx, &gate_refs,
-                    )?),
-                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                        ctx, &up_refs,
-                    )?),
-                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                        ctx, &down_refs,
-                    )?),
-                )
-            } else {
-                (None, None, None)
-            };
+        let ptr_tables = build_moe_layer_pointer_tables(
+            ctx,
+            expert_weight_format,
+            &gate,
+            &up,
+            &down,
+            gate_grouped.as_ref(),
+            up_grouped.as_ref(),
+            down_grouped.as_ref(),
+            w13_fp8_grouped.as_ref(),
+            down_fp8_grouped.as_ref(),
+        )?;
         if fp8_deepgemm_ready {
             gate.clear();
             up.clear();
@@ -1426,15 +1332,15 @@ impl SafetensorLoader {
             expert_weight_format,
             gate_up_quant_signature: gate_sig,
             down_quant_signature: down_sig,
-            gate_ptrs,
-            up_ptrs,
-            down_ptrs,
-            gate_scale_ptrs,
-            up_scale_ptrs,
-            down_scale_ptrs,
-            gate_global_ptrs,
-            up_global_ptrs,
-            down_global_ptrs,
+            gate_ptrs: ptr_tables.gate_ptrs,
+            up_ptrs: ptr_tables.up_ptrs,
+            down_ptrs: ptr_tables.down_ptrs,
+            gate_scale_ptrs: ptr_tables.gate_scale_ptrs,
+            up_scale_ptrs: ptr_tables.up_scale_ptrs,
+            down_scale_ptrs: ptr_tables.down_scale_ptrs,
+            gate_global_ptrs: ptr_tables.gate_global_ptrs,
+            up_global_ptrs: ptr_tables.up_global_ptrs,
+            down_global_ptrs: ptr_tables.down_global_ptrs,
             gate_grouped,
             up_grouped,
             down_grouped,
@@ -3438,136 +3344,195 @@ impl MoeLayerWeights {
     }
 
     fn rebuild_pointer_tables(&mut self, ctx: &DeviceContext) -> Result<()> {
-        let routed_quant = self.expert_weight_format.is_quantized();
-        let fp8_grouped_ready = self.w13_fp8_grouped.is_some() && self.down_fp8_grouped.is_some();
+        let ptr_tables = build_moe_layer_pointer_tables(
+            ctx,
+            self.expert_weight_format,
+            &self.gate,
+            &self.up,
+            &self.down,
+            self.gate_grouped.as_ref(),
+            self.up_grouped.as_ref(),
+            self.down_grouped.as_ref(),
+            self.w13_fp8_grouped.as_ref(),
+            self.down_fp8_grouped.as_ref(),
+        )?;
+        self.gate_ptrs = ptr_tables.gate_ptrs;
+        self.up_ptrs = ptr_tables.up_ptrs;
+        self.down_ptrs = ptr_tables.down_ptrs;
+        self.gate_scale_ptrs = ptr_tables.gate_scale_ptrs;
+        self.up_scale_ptrs = ptr_tables.up_scale_ptrs;
+        self.down_scale_ptrs = ptr_tables.down_scale_ptrs;
+        self.gate_global_ptrs = ptr_tables.gate_global_ptrs;
+        self.up_global_ptrs = ptr_tables.up_global_ptrs;
+        self.down_global_ptrs = ptr_tables.down_global_ptrs;
+        Ok(())
+    }
+}
 
-        let (gate_ptrs, up_ptrs, down_ptrs) = match (
-            &self.gate_grouped,
-            &self.up_grouped,
-            &self.down_grouped,
-            &self.w13_fp8_grouped,
-            &self.down_fp8_grouped,
-        ) {
-            (Some(g), Some(u), Some(d), _, _) => {
-                (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
-            }
-            (None, None, None, Some(w13), Some(down_g)) => {
-                let up_offset = w13.rows / 2;
-                (
-                    w13.qweight_ptr_table(ctx, 0)?,
-                    w13.qweight_ptr_table(ctx, up_offset)?,
-                    down_g.qweight_ptr_table(ctx, 0)?,
-                )
-            }
-            _ => {
-                let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
-                let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
-                let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
-                ensure!(
-                    !gate_refs.is_empty() && !up_refs.is_empty() && !down_refs.is_empty(),
-                    "MoE reload cannot rebuild per-expert pointer tables from empty experts"
-                );
-                if routed_quant {
-                    (
-                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &gate_refs)?,
-                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &up_refs)?,
-                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &down_refs)?,
-                    )
-                } else {
-                    (
-                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?,
-                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?,
-                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?,
-                    )
-                }
-            }
-        };
+struct MoeLayerPointerTables {
+    gate_ptrs: CudaSlice<u64>,
+    up_ptrs: CudaSlice<u64>,
+    down_ptrs: CudaSlice<u64>,
+    gate_scale_ptrs: Option<CudaSlice<u64>>,
+    up_scale_ptrs: Option<CudaSlice<u64>>,
+    down_scale_ptrs: Option<CudaSlice<u64>>,
+    gate_global_ptrs: Option<CudaSlice<u64>>,
+    up_global_ptrs: Option<CudaSlice<u64>>,
+    down_global_ptrs: Option<CudaSlice<u64>>,
+}
 
-        let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if fp8_grouped_ready {
-            let w13 = self
-                .w13_fp8_grouped
-                .as_ref()
-                .ok_or_else(|| anyhow!("FP8 MoE reload missing w13 grouped cache"))?;
-            let down_g = self
-                .down_fp8_grouped
-                .as_ref()
-                .ok_or_else(|| anyhow!("FP8 MoE reload missing down grouped cache"))?;
-            let up_offset = w13.rows / 2;
+struct MoeExpertRefs<'a> {
+    gate: Vec<&'a DeviceMatrix>,
+    up: Vec<&'a DeviceMatrix>,
+    down: Vec<&'a DeviceMatrix>,
+}
+
+fn moe_expert_refs<'a>(
+    gate: &'a [DeviceMatrix],
+    up: &'a [DeviceMatrix],
+    down: &'a [DeviceMatrix],
+) -> Result<MoeExpertRefs<'a>> {
+    ensure!(
+        !gate.is_empty() && gate.len() == up.len() && gate.len() == down.len(),
+        "MoE pointer-table rebuild requires matching non-empty per-expert matrices: gate={} up={} down={}",
+        gate.len(),
+        up.len(),
+        down.len()
+    );
+    Ok(MoeExpertRefs {
+        gate: gate.iter().collect(),
+        up: up.iter().collect(),
+        down: down.iter().collect(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_moe_layer_pointer_tables(
+    ctx: &DeviceContext,
+    expert_weight_format: WeightFormat,
+    gate: &[DeviceMatrix],
+    up: &[DeviceMatrix],
+    down: &[DeviceMatrix],
+    gate_grouped: Option<&MoeExpertGroup>,
+    up_grouped: Option<&MoeExpertGroup>,
+    down_grouped: Option<&MoeExpertGroup>,
+    w13_fp8_grouped: Option<&MoeFp8ExpertGroup>,
+    down_fp8_grouped: Option<&MoeFp8ExpertGroup>,
+) -> Result<MoeLayerPointerTables> {
+    let routed_quant = expert_weight_format.is_quantized();
+    let bf16_grouped = match (gate_grouped, up_grouped, down_grouped) {
+        (Some(g), Some(u), Some(d)) => Some((g, u, d)),
+        (None, None, None) => None,
+        _ => bail!("MoE pointer-table rebuild found partial BF16 grouped cache"),
+    };
+    let fp8_grouped = match (w13_fp8_grouped, down_fp8_grouped) {
+        (Some(w13), Some(down_g)) => Some((w13, down_g)),
+        (None, None) => None,
+        _ => bail!("MoE pointer-table rebuild found partial FP8 grouped cache"),
+    };
+    ensure!(
+        bf16_grouped.is_none() || fp8_grouped.is_none(),
+        "MoE pointer-table rebuild cannot use both BF16 and FP8 grouped caches"
+    );
+
+    let (gate_ptrs, up_ptrs, down_ptrs) = if let Some((g, u, d)) = bf16_grouped {
+        (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
+    } else if let Some((w13, down_g)) = fp8_grouped {
+        let up_offset = w13.rows / 2;
+        (
+            w13.qweight_ptr_table(ctx, 0)?,
+            w13.qweight_ptr_table(ctx, up_offset)?,
+            down_g.qweight_ptr_table(ctx, 0)?,
+        )
+    } else {
+        let refs = moe_expert_refs(gate, up, down)?;
+        if routed_quant {
             (
-                Some(w13.scale_ptr_table(ctx, 0)?),
-                Some(w13.scale_ptr_table(ctx, up_offset)?),
-                Some(down_g.scale_ptr_table(ctx, 0)?),
+                cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.gate)?,
+                cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.up)?,
+                cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.down)?,
             )
-        } else if routed_quant
-            && matches!(
-                self.expert_weight_format,
-                WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
+        } else {
+            (
+                cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &refs.gate)?,
+                cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &refs.up)?,
+                cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &refs.down)?,
             )
-        {
-            let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
-            let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
-            let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
+        }
+    };
+
+    let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if let Some((w13, down_g)) = fp8_grouped
+    {
+        let up_offset = w13.rows / 2;
+        (
+            Some(w13.scale_ptr_table(ctx, 0)?),
+            Some(w13.scale_ptr_table(ctx, up_offset)?),
+            Some(down_g.scale_ptr_table(ctx, 0)?),
+        )
+    } else if routed_quant
+        && matches!(
+            expert_weight_format,
+            WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
+        )
+    {
+        let refs = moe_expert_refs(gate, up, down)?;
+        (
+            Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                ctx, &refs.gate,
+            )?),
+            Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                ctx, &refs.up,
+            )?),
+            Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                ctx, &refs.down,
+            )?),
+        )
+    } else if routed_quant && expert_weight_format == WeightFormat::Fp4E2M1Group {
+        let refs = moe_expert_refs(gate, up, down)?;
+        (
+            Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                ctx, &refs.gate,
+            )?),
+            Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                ctx, &refs.up,
+            )?),
+            Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                ctx, &refs.down,
+            )?),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let (gate_global_ptrs, up_global_ptrs, down_global_ptrs) =
+        if routed_quant && expert_weight_format == WeightFormat::Fp4E2M1Group {
+            let refs = moe_expert_refs(gate, up, down)?;
             (
                 Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                    ctx, &gate_refs,
+                    ctx, &refs.gate,
                 )?),
                 Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                    ctx, &up_refs,
+                    ctx, &refs.up,
                 )?),
                 Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                    ctx, &down_refs,
-                )?),
-            )
-        } else if routed_quant && self.expert_weight_format == WeightFormat::Fp4E2M1Group {
-            let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
-            let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
-            let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
-            (
-                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
-                    ctx, &gate_refs,
-                )?),
-                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
-                    ctx, &up_refs,
-                )?),
-                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
-                    ctx, &down_refs,
+                    ctx, &refs.down,
                 )?),
             )
         } else {
             (None, None, None)
         };
 
-        let (gate_global_ptrs, up_global_ptrs, down_global_ptrs) =
-            if routed_quant && self.expert_weight_format == WeightFormat::Fp4E2M1Group {
-                let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
-                let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
-                let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
-                (
-                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                        ctx, &gate_refs,
-                    )?),
-                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                        ctx, &up_refs,
-                    )?),
-                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
-                        ctx, &down_refs,
-                    )?),
-                )
-            } else {
-                (None, None, None)
-            };
-
-        self.gate_ptrs = gate_ptrs;
-        self.up_ptrs = up_ptrs;
-        self.down_ptrs = down_ptrs;
-        self.gate_scale_ptrs = gate_scale_ptrs;
-        self.up_scale_ptrs = up_scale_ptrs;
-        self.down_scale_ptrs = down_scale_ptrs;
-        self.gate_global_ptrs = gate_global_ptrs;
-        self.up_global_ptrs = up_global_ptrs;
-        self.down_global_ptrs = down_global_ptrs;
-        Ok(())
-    }
+    Ok(MoeLayerPointerTables {
+        gate_ptrs,
+        up_ptrs,
+        down_ptrs,
+        gate_scale_ptrs,
+        up_scale_ptrs,
+        down_scale_ptrs,
+        gate_global_ptrs,
+        up_global_ptrs,
+        down_global_ptrs,
+    })
 }
 
 fn offload_matrix_vec(

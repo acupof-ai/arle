@@ -293,12 +293,12 @@ impl SpecVerifySchedule {
         }
     }
 
-    pub(crate) fn is_chain(&self) -> bool {
-        self.positions.windows(2).all(|w| w[1] == w[0] + 1)
-    }
-
-    pub(crate) fn has_prefix_ancestors(&self) -> bool {
-        self.ancestors.len() == self.positions.len()
+    pub(crate) fn is_prefix_chain_at(&self, start_pos: usize) -> bool {
+        self.positions
+            .iter()
+            .copied()
+            .eq((0..self.positions.len()).map(|row| start_pos + row))
+            && self.ancestors.len() == self.positions.len()
             && self.ancestors.iter().enumerate().all(|(row, ancestors)| {
                 ancestors.len() == row && ancestors.iter().copied().eq(0..row)
             })
@@ -3235,12 +3235,8 @@ impl Dsv4Model {
                 scheds[s].ancestors.len()
             );
             ensure!(
-                scheds[s].is_chain(),
-                "DSv4 cross-slot batched MTP verify requires chain-shaped schedules"
-            );
-            ensure!(
-                scheds[s].has_prefix_ancestors(),
-                "DSv4 batched MTP verify requires prefix-ancestor chain metadata"
+                scheds[s].is_prefix_chain_at(start_positions[s]),
+                "DSv4 batched MTP verify requires start-aligned prefix-chain metadata"
             );
             let slot = &slots[slot_ids[s]];
             ensure!(
@@ -3722,9 +3718,8 @@ impl Dsv4Model {
                 ensure!(
                     sched.positions.len() == seq_len
                         && sched.ancestors.len() == seq_len
-                        && sched.is_chain()
-                        && sched.has_prefix_ancestors(),
-                    "DSv4 chain verify requires prefix-ancestor chain metadata"
+                        && sched.is_prefix_chain_at(start_pos),
+                    "DSv4 chain verify requires start-aligned prefix-chain metadata"
                 );
                 Some(crate::attention::Dsv4ChainVerifyAttnMeta::new(
                     &self.ctx,
