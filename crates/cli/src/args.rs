@@ -474,7 +474,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
 
-    /// MTP per-level draft top-k width on CUDA. Verifier rows stay chain-shaped.
+    /// MTP root-branch top-k width on CUDA D2; D2/T2 verifies root + candidates.
     #[arg(long, value_name = "K")]
     pub(crate) mtp_draft_topk: Option<usize>,
 
