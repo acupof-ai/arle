@@ -1,9 +1,9 @@
 //! DSv4 MTP speculative-decode orchestration.
 //!
-//! The drafter always advances one top-1 chain and returns the draft logits'
-//! per-level top-k candidate matrix. The target verifier still receives only
-//! `[pending, d0, d1, ...]`, so verify rows stay `depth + 1`; `topk > 1` only
-//! widens the candidate set used when interpreting the existing verify logits.
+//! `topk == 1` keeps the linear chain: verify `[pending, d0, d1, ...]` and
+//! return accepted drafts plus the free target bonus. `topk > 1` uses the D2
+//! branch verifier: verify `[pending, root_topk...]` so D2/T2 stays at 3 target
+//! rows while off-chain first-token hits become commit-safe.
 
 use anyhow::{Result, anyhow, ensure};
 
@@ -54,6 +54,70 @@ impl DraftChain {
     }
 }
 
+/// D2 top-k branch verifier. `tokens[0]` is pending; `tokens[1..]` are root
+/// top-k candidates, each verified at `start_pos + 1` with row 0 as ancestor.
+/// The accepted branch token is committed; the target argmax after that branch
+/// becomes the pending/bonus token for the next step.
+struct DraftBranch {
+    tokens: Vec<u32>,
+}
+
+struct BranchAccept {
+    accepted: usize,
+    bonus: u32,
+    pending_row: usize,
+    rows: Vec<usize>,
+    out: Vec<u32>,
+}
+
+impl DraftBranch {
+    fn verify_schedule(&self, start_pos: usize) -> SpecVerifySchedule {
+        SpecVerifySchedule::branch_root(self.tokens.len() - 1, start_pos)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.tokens.len() >= 2,
+            "DSv4 MTP branch verify needs pending + at least one candidate, got {} rows",
+            self.tokens.len()
+        );
+        Ok(())
+    }
+
+    fn accept(&self, argmax: &[u32]) -> Result<BranchAccept> {
+        ensure!(
+            argmax.len() == self.tokens.len(),
+            "DSv4 MTP branch argmax rows {} != tokens {}",
+            argmax.len(),
+            self.tokens.len()
+        );
+        if let Some(child_row) = self.tokens[1..]
+            .iter()
+            .position(|&token| token == argmax[0])
+            .map(|idx| idx + 1)
+        {
+            let branch = self.tokens[child_row];
+            let bonus = argmax[child_row];
+            Ok(BranchAccept {
+                accepted: 1,
+                bonus,
+                pending_row: child_row,
+                rows: vec![0, child_row],
+                out: vec![branch, bonus],
+            })
+        } else {
+            let bonus = argmax[0];
+            Ok(BranchAccept {
+                accepted: 0,
+                bonus,
+                pending_row: 0,
+                rows: vec![0],
+                out: vec![bonus],
+            })
+        }
+    }
+}
+
 /// Longest prefix whose target top-1 is present in the draft top-k matrix.
 /// This is diagnostic for the top-k candidate hit rate; only hits that stay on the
 /// verified top-1 chain can be committed by the current fold path.
@@ -94,6 +158,9 @@ impl Dsv4CudaExecutor {
     ) -> Result<Vec<u32>> {
         let depth = self.spec_depth();
         let topk = self.spec_topk();
+        if topk > 1 {
+            return self.spec_step_branch(slot_idx, start_pos, position, depth, topk);
+        }
         let pending = self.spec_slots[slot_idx]
             .pending
             .ok_or_else(|| anyhow!("DSv4 MTP decode missing pending token"))?;
@@ -194,15 +261,108 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// Cross-slot batched MTP decode step. Drive the per-row `spec_step`'s draft + verify
-    /// across all N slots at once — batching the MoE/HC/norm over all verify
-    /// chains (`forward_decode_batch_verify`) while attention stays per-slot —
-    /// then per-slot accept / commit / ring-restore. Returns one committed-token
+    fn spec_step_branch(
+        &mut self,
+        slot_idx: usize,
+        start_pos: usize,
+        position: u64,
+        depth: usize,
+        topk: usize,
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            depth == 2,
+            "DSv4 top-k branch verify currently supports D2 only; got depth={depth}"
+        );
+        ensure!(
+            topk < crate::dsv4::MAX_SPEC_VERIFY_ROWS,
+            "DSv4 top-k branch verify topk={topk} needs {} verify rows, max {}",
+            topk + 1,
+            crate::dsv4::MAX_SPEC_VERIFY_ROWS
+        );
+        let pending = self.spec_slots[slot_idx]
+            .pending
+            .ok_or_else(|| anyhow!("DSv4 MTP branch decode missing pending token"))?;
+        let hidden = self.spec_slots[slot_idx]
+            .hidden
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 MTP branch decode missing previous hidden"))?
+            .clone();
+
+        self.model.capture_spec_rings(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            start_pos,
+            depth,
+        )?;
+
+        let branch = self.draft_branch(slot_idx, pending, &hidden, topk, start_pos)?;
+        branch.validate()?;
+        let sched = branch.verify_schedule(start_pos);
+        crate::attention::set_dsv4_verify_frozen(true);
+        let res = self.model.forward_tokens_verify_scheduled(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &branch.tokens,
+            start_pos,
+            position,
+            &sched,
+        );
+        crate::attention::set_dsv4_verify_frozen(false);
+        let mut verify = res?;
+        ensure!(
+            verify.argmax.len() == branch.tokens.len()
+                && verify.hiddens.len() == branch.tokens.len()
+                && verify.logits.seq_len == branch.tokens.len(),
+            "DSv4 MTP branch verify expected {} rows, got argmax={} hidden={} logits={}",
+            branch.tokens.len(),
+            verify.argmax.len(),
+            verify.hiddens.len(),
+            verify.logits.seq_len
+        );
+
+        let accept = branch.accept(&verify.argmax)?;
+        self.mtp_accepts += accept.accepted;
+        self.mtp_rejects += depth - accept.accepted;
+        if self.model.tp.config().rank == 0 {
+            eprintln!(
+                "[dsv4-mtp-branch] depth={depth} topk={topk} draft_rows=1 verify_rows={} accepted={} accept_total={} reject_total={} bonus={}",
+                branch.tokens.len(),
+                accept.accepted,
+                self.mtp_accepts,
+                self.mtp_rejects,
+                accept.bonus
+            );
+        }
+
+        self.model
+            .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+        self.model.restore_spec_ring_tail(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            start_pos,
+            accept.accepted,
+            depth,
+        )?;
+        self.model.commit_accepted_fold(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &accept.rows,
+            start_pos,
+        )?;
+        let spec = &mut self.spec_slots[slot_idx];
+        spec.pending = Some(accept.bonus);
+        spec.hidden = Some(verify.hiddens.swap_remove(accept.pending_row));
+        Ok(accept.out)
+    }
+
+    /// Cross-slot batched MTP decode step. `topk == 1` batches the linear chains;
+    /// `topk > 1` takes the D2 branch verifier so off-chain first-token hits do
+    /// not fall back to chain-only bonus semantics. Returns one committed-token
     /// list per input slot, index-aligned with `slot_ids`.
     ///
     /// B=1 never calls this path; the executor keeps single-slot spec on
-    /// `spec_step`. B>1 always calls this path so draft and verify do not
-    /// degrade into per-slot tiny GEMMs/GEMVs.
+    /// `spec_step`. B>1 always calls this path so verify does not degrade into
+    /// per-slot tiny GEMMs/GEMVs.
     ///
     /// §0.1 mutated state (per slot s, looped — no cross-slot aliasing; each
     /// `Dsv4SlotState` owns its rings):
@@ -262,6 +422,16 @@ impl Dsv4CudaExecutor {
             )?;
             pendings.push(pending);
             h_prevs.push(hidden);
+        }
+        if topk > 1 {
+            return self.spec_step_batched_branch(
+                slot_ids,
+                start_positions,
+                pendings,
+                h_prevs,
+                depth,
+                topk,
+            );
         }
 
         let mut tokens_per_slot: Vec<Vec<u32>> = pendings.iter().map(|&p| vec![p]).collect();
@@ -390,6 +560,132 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
+    fn spec_step_batched_branch(
+        &mut self,
+        slot_ids: &[usize],
+        start_positions: &[usize],
+        pendings: Vec<u32>,
+        h_prevs: Vec<DeviceVec>,
+        depth: usize,
+        topk: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        let n = slot_ids.len();
+        ensure!(
+            depth == 2,
+            "DSv4 top-k branch verify currently supports D2 only; got depth={depth}"
+        );
+        ensure!(
+            topk < crate::dsv4::MAX_SPEC_VERIFY_ROWS,
+            "DSv4 top-k branch verify topk={topk} needs {} verify rows, max {}",
+            topk + 1,
+            crate::dsv4::MAX_SPEC_VERIFY_ROWS
+        );
+        let rows: Vec<crate::dsv4::MtpDraftRow> = pendings
+            .iter()
+            .map(|&token| crate::dsv4::MtpDraftRow { token })
+            .collect();
+        let h_refs: Vec<&DeviceVec> = h_prevs.iter().collect();
+        let expanded = self.model.mtp_forward_level_batched(
+            &mut self.slots,
+            &mut self.kv_adapter,
+            slot_ids,
+            &rows,
+            &h_refs,
+            start_positions,
+            0,
+            topk,
+        )?;
+        ensure!(
+            expanded.len() == n,
+            "DSv4 batched MTP branch draft returned {} rows for {n} slots",
+            expanded.len()
+        );
+
+        let mut branches = Vec::with_capacity(n);
+        let mut scheds = Vec::with_capacity(n);
+        for (s, (candidates, _stream)) in expanded.into_iter().enumerate() {
+            ensure!(
+                candidates.len() == topk,
+                "DSv4 batched MTP branch slot {s} returned {} candidates, expected {topk}",
+                candidates.len()
+            );
+            let mut tokens = Vec::with_capacity(topk + 1);
+            tokens.push(pendings[s]);
+            tokens.extend(candidates);
+            let branch = DraftBranch { tokens };
+            branch.validate()?;
+            scheds.push(branch.verify_schedule(start_positions[s]));
+            branches.push(branch);
+        }
+
+        let branch_tokens: Vec<Vec<u32>> = branches
+            .iter()
+            .map(|branch| branch.tokens.clone())
+            .collect();
+        let verified = self.model.forward_decode_batch_verify(
+            &mut self.slots,
+            &mut self.kv_adapter,
+            slot_ids,
+            &branch_tokens,
+            start_positions,
+            &scheds,
+        )?;
+        ensure!(
+            verified.len() == n,
+            "DSv4 batched branch verify returned {} chains for {n} slots",
+            verified.len()
+        );
+
+        let mut out = Vec::with_capacity(n);
+        for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
+            let slot_idx = slot_ids[s];
+            let start_pos = start_positions[s];
+            let branch = &branches[s];
+            ensure!(
+                argmax.len() == branch.tokens.len() && hiddens.len() == branch.tokens.len(),
+                "DSv4 batched branch verify slot {slot_idx} expected {} rows, got argmax={} hidden={}",
+                branch.tokens.len(),
+                argmax.len(),
+                hiddens.len()
+            );
+            let accept = branch.accept(&argmax)?;
+            self.mtp_accepts += accept.accepted;
+            self.mtp_rejects += depth - accept.accepted;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp-branch-batched] slot={slot_idx} depth={depth} topk={topk} \
+                     draft_rows=1 verify_rows={} accepted={} accept_total={} reject_total={} bonus={}",
+                    branch.tokens.len(),
+                    accept.accepted,
+                    self.mtp_accepts,
+                    self.mtp_rejects,
+                    accept.bonus
+                );
+            }
+
+            self.model
+                .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+            self.model.restore_spec_ring_tail(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                start_pos,
+                accept.accepted,
+                depth,
+            )?;
+            self.model.commit_accepted_fold(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &accept.rows,
+                start_pos,
+            )?;
+            let spec = &mut self.spec_slots[slot_idx];
+            spec.pending = Some(accept.bonus);
+            spec.hidden = Some(hiddens.swap_remove(accept.pending_row));
+            out.push(accept.out);
+        }
+        Ok(out)
+    }
+
     /// The draft depth for this step: the explicit `--mtp-draft-tokens` request,
     /// clamped to `[1, MAX_SPEC_DRAFT_DEPTH]`. The CLI flag is the single source
     /// of truth; the clamp to the snapshot ceiling keeps an over-large request safe-by-construction
@@ -456,11 +752,42 @@ impl Dsv4CudaExecutor {
             candidates: matrix,
         })
     }
+
+    fn draft_branch(
+        &mut self,
+        slot_idx: usize,
+        pending: u32,
+        trunk_hidden: &DeviceVec,
+        topk: usize,
+        start_pos: usize,
+    ) -> Result<DraftBranch> {
+        let rows = [crate::dsv4::MtpDraftRow { token: pending }];
+        let mut expanded = self.model.mtp_forward_level(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &rows,
+            &[trunk_hidden],
+            start_pos as u64,
+            topk,
+        )?;
+        let (candidates, _stream) = expanded
+            .pop()
+            .ok_or_else(|| anyhow!("DSv4 MTP branch draft returned no rows"))?;
+        ensure!(
+            candidates.len() == topk,
+            "DSv4 MTP branch draft returned {} candidates, expected {topk}",
+            candidates.len()
+        );
+        let mut tokens = Vec::with_capacity(topk + 1);
+        tokens.push(pending);
+        tokens.extend(candidates);
+        Ok(DraftBranch { tokens })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftChain, longest_accepted_prefix, longest_candidate_hit_prefix};
+    use super::{DraftBranch, DraftChain, longest_accepted_prefix, longest_candidate_hit_prefix};
 
     fn chain(tokens: Vec<u32>, candidates: Vec<Vec<u32>>) -> DraftChain {
         let chain = DraftChain { tokens, candidates };
@@ -525,5 +852,43 @@ mod tests {
         assert_eq!(sched.positions.len(), 3);
         assert_eq!(sched.positions, vec![4096, 4097, 4098]);
         assert_eq!(sched.ancestors.len(), 3);
+    }
+
+    #[test]
+    fn d2_t2_branch_verify_rows_are_root_plus_candidates() {
+        let branch = DraftBranch {
+            tokens: vec![10, 11, 21],
+        };
+        let sched = branch.verify_schedule(100);
+        assert_eq!(sched.positions, vec![100, 101, 101]);
+        assert_eq!(sched.ancestors, vec![vec![], vec![0], vec![0]]);
+        sched.validate_sparse_at(100).unwrap();
+        assert!(!sched.is_prefix_chain_at(100));
+    }
+
+    #[test]
+    fn branch_accepts_off_chain_first_token() {
+        let branch = DraftBranch {
+            tokens: vec![10, 11, 21],
+        };
+        let accept = branch.accept(&[21, 12, 22]).unwrap();
+        assert_eq!(accept.accepted, 1);
+        assert_eq!(accept.rows, vec![0, 2]);
+        assert_eq!(accept.pending_row, 2);
+        assert_eq!(accept.out, vec![21, 22]);
+        assert_eq!(accept.bonus, 22);
+    }
+
+    #[test]
+    fn branch_rejects_when_root_misses_topk() {
+        let branch = DraftBranch {
+            tokens: vec![10, 11, 21],
+        };
+        let accept = branch.accept(&[99, 12, 22]).unwrap();
+        assert_eq!(accept.accepted, 0);
+        assert_eq!(accept.rows, vec![0]);
+        assert_eq!(accept.pending_row, 0);
+        assert_eq!(accept.out, vec![99]);
+        assert_eq!(accept.bonus, 99);
     }
 }
