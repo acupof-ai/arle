@@ -71,6 +71,7 @@ LORA_ALPHA="${LORA_ALPHA:-64}"
 
 TRAIN_BACKEND="${TRAIN_BACKEND:-cuda}"
 ENGINE_OFFLOAD="${ENGINE_OFFLOAD:-teacher}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 STEP_PROFILE="${STEP_PROFILE:-1}"
 STEP_TRACE="${STEP_TRACE:-0}"
 JSON_OUTPUT="${JSON_OUTPUT:-1}"
@@ -138,6 +139,7 @@ cfg = {
     "lora_alpha": int("$LORA_ALPHA"),
     "train_backend": "$TRAIN_BACKEND",
     "engine_offload": "$ENGINE_OFFLOAD",
+    "gradient_checkpointing": "$GRADIENT_CHECKPOINTING",
     "cuda_visible_devices": "$CUDA_VISIBLE_DEVICES",
     "arle_bin": "$ARLE_BIN",
     "run_root": "$RUN_ROOT",
@@ -194,14 +196,15 @@ log "teacher=$TEACHER_MODEL"
 log "student=$STUDENT_MODEL"
 log "prompts=$PROMPTS_FILE"
 log "rollout_len=$ROLLOUT_LEN lora=$LORA_TARGET_SET/r$LORA_RANK/a$LORA_ALPHA"
-log "cuda_visible_devices=$CUDA_VISIBLE_DEVICES engine_offload=$ENGINE_OFFLOAD"
-printf '[opd-math-r1] command: CUDA_VISIBLE_DEVICES=%q ARLE_OPD_ENGINE_OFFLOAD=%q %q' \
-  "$CUDA_VISIBLE_DEVICES" "$ENGINE_OFFLOAD" "$ARLE_BIN"
+log "cuda_visible_devices=$CUDA_VISIBLE_DEVICES engine_offload=$ENGINE_OFFLOAD gradient_checkpointing=$GRADIENT_CHECKPOINTING"
+printf '[opd-math-r1] command: CUDA_VISIBLE_DEVICES=%q ARLE_OPD_ENGINE_OFFLOAD=%q ARLE_OPD_GRADIENT_CHECKPOINTING=%q %q' \
+  "$CUDA_VISIBLE_DEVICES" "$ENGINE_OFFLOAD" "$GRADIENT_CHECKPOINTING" "$ARLE_BIN"
 printf ' %q' "${train_args[@]}"
 printf '\n'
 
 CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
 ARLE_OPD_ENGINE_OFFLOAD="$ENGINE_OFFLOAD" \
+ARLE_OPD_GRADIENT_CHECKPOINTING="$GRADIENT_CHECKPOINTING" \
 ARLE_OPD_STEP_PROFILE="$STEP_PROFILE" \
 ARLE_OPD_STEP_TRACE="$STEP_TRACE" \
 "$ARLE_BIN" "${train_args[@]}" 2>&1 | tee "$LOG_DIR/train.log"
