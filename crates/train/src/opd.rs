@@ -2204,6 +2204,9 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
         log_opd_window_trace("kl", "done", window_index, window_started, "");
     }
 
+    store
+        .free(teacher_full_logits.tensor_id)
+        .map_err(OpdError::from)?;
     let hidden_grad = hidden_grad.ok_or(AutogradError::MissingGradient(student_hidden))?;
     let base_backward_started = Instant::now();
     log_opd_window_trace(
