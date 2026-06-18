@@ -16,6 +16,8 @@ use std::{
 
 #[cfg(feature = "cuda")]
 use autograd::Backend;
+#[cfg(feature = "cuda")]
+use autograd::ops::slice;
 use autograd::{AutogradError, Tape, Tensor, TensorId, TensorStore};
 use base64::{Engine as _, engine::general_purpose};
 use half::bf16;
@@ -794,8 +796,8 @@ impl TeacherForward for InferTeacher {
         input_ids: &[u32],
         positions: &[u32],
         window: SequenceWindow,
-        _store: &mut TensorStore,
-        _tape: &mut Tape,
+        store: &mut TensorStore,
+        tape: &mut Tape,
     ) -> Result<DeviceLogits> {
         if input_ids.is_empty() {
             return Err(TeacherForwardError::InvalidInput(
@@ -818,13 +820,16 @@ impl TeacherForward for InferTeacher {
             )));
         }
 
-        Err(TeacherForwardError::InvalidInput(
-            "InferTeacher does not support true windowed logits yet: infer-api \
-             currently returns full [seq_len, vocab] raw logits. Use \
-             --teacher-runtime in-process with --logits-window-size, or add a \
-             real infer-api windowed raw-logits primitive before enabling this path."
-                .to_owned(),
-        ))
+        let full_logits = self.forward_logits_device(input_ids, positions, store, tape)?;
+        let tensor_id = slice(
+            full_logits.tensor_id,
+            &[0, window.start, 0],
+            &[1, window.end, self.vocab_size],
+            store,
+            tape,
+        )?;
+        let shape = vec![1, window.end - window.start, self.vocab_size];
+        Ok(DeviceLogits { tensor_id, shape })
     }
 
     fn vocab_size(&self) -> usize {
