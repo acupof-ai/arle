@@ -247,6 +247,11 @@ pub(crate) struct Dsv4MoeLayer {
     /// row-stacked) and down cache (w2). Built once by the loader; the masked
     /// grouped GEMM reads these directly every step.
     pub w13_grouped: crate::moe::GroupedCache,
+    /// GLM bf16 routed experts only: the separate `up` grouped cache
+    /// (`[groups, intermediate, hidden]`). `w13_grouped` holds gate-only for GLM
+    /// (the bf16 SwiGLU needs separate gate/up — the DeepGEMM output is per-row
+    /// interleaved). DSv4 keeps the fused `w13_grouped` and leaves this `None`.
+    pub w13_up_grouped: Option<crate::moe::GroupedCache>,
     pub w2_grouped: crate::moe::GroupedCache,
     pub num_groups: usize,
     pub hidden_dim: usize,
@@ -1776,14 +1781,20 @@ impl Dsv4Model {
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
         for row in 0..rows {
-            crate::hc::head_hidden_from_stream(
-                &self.ctx,
-                &self.config,
-                &self.head_hc,
-                stream,
-                row,
-                &mut last_hidden,
-            )?;
+            if self.config.hc_mult == 1 {
+                // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
+                // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
+                crate::ops::copy_row_to_vec(&self.ctx, stream, row, &mut last_hidden)?;
+            } else {
+                crate::hc::head_hidden_from_stream(
+                    &self.ctx,
+                    &self.config,
+                    &self.head_hc,
+                    stream,
+                    row,
+                    &mut last_hidden,
+                )?;
+            }
             crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
             let mut dst = head_normed
                 .data
@@ -2132,22 +2143,34 @@ impl Dsv4Model {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
-            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
-            keepalive.keep_f32(&mhc.pre);
-            keepalive.keep_f32(&mhc.post);
-            keepalive.keep_f32(&mhc.comb);
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+            // GLM (hc_mult==1): no hyper-connection; the stream IS the hidden, so
+            // the pre-mixer is identity. Replace the mhc pre+norm with a plain
+            // RMSNorm of the stream (the C identity placeholders are 1x1 ZERO
+            // mixers — running them through gen_mhc/mhc_pre would zero the stream).
+            // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::hc::mhc_pre_rms_norm(
-                &self.ctx,
-                &stream,
-                &mhc.pre,
-                &layer.attn_norm,
-                eps,
-                hidden_size,
-                hc_mult,
-                &mut normed,
-            )?;
+            let attn_mhc = if self.config.hc_mult == 1 {
+                crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.attn_norm, eps, &mut normed)?;
+                None
+            } else {
+                let mhc =
+                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
+                keepalive.keep_f32(&mhc.pre);
+                keepalive.keep_f32(&mhc.post);
+                keepalive.keep_f32(&mhc.comb);
+                // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+                crate::hc::mhc_pre_rms_norm(
+                    &self.ctx,
+                    &stream,
+                    &mhc.pre,
+                    &layer.attn_norm,
+                    eps,
+                    hidden_size,
+                    hc_mult,
+                    &mut normed,
+                )?;
+                Some(mhc)
+            };
             keepalive.keep_hidden(&normed);
 
             // ── Attention: per-row independent single-token MLA into row r.
@@ -3023,18 +3046,23 @@ impl Dsv4Model {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
             }
-            // SAFETY: hc_post writes the full stream buffer.
+            // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-            crate::hc::hc_post(
-                &self.ctx,
-                &attn_out,
-                &stream,
-                &mhc.post,
-                &mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut attn_stream,
-            )?;
+            if let Some(mhc) = attn_mhc.as_ref() {
+                crate::hc::hc_post(
+                    &self.ctx,
+                    &attn_out,
+                    &stream,
+                    &mhc.post,
+                    &mhc.comb,
+                    hidden_size,
+                    hc_mult,
+                    &mut attn_stream,
+                )?;
+            } else {
+                // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
+                crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)?;
+            }
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
@@ -3045,22 +3073,30 @@ impl Dsv4Model {
             } else {
                 None
             };
-            let mhc = crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
-            keepalive.keep_f32(&mhc.pre);
-            keepalive.keep_f32(&mhc.post);
-            keepalive.keep_f32(&mhc.comb);
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+            // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::hc::mhc_pre_rms_norm(
-                &self.ctx,
-                &stream,
-                &mhc.pre,
-                &layer.ffn_norm,
-                eps,
-                hidden_size,
-                hc_mult,
-                &mut normed,
-            )?;
+            let ffn_mhc = if self.config.hc_mult == 1 {
+                crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.ffn_norm, eps, &mut normed)?;
+                None
+            } else {
+                let mhc =
+                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+                keepalive.keep_f32(&mhc.pre);
+                keepalive.keep_f32(&mhc.post);
+                keepalive.keep_f32(&mhc.comb);
+                // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+                crate::hc::mhc_pre_rms_norm(
+                    &self.ctx,
+                    &stream,
+                    &mhc.pre,
+                    &layer.ffn_norm,
+                    eps,
+                    hidden_size,
+                    hc_mult,
+                    &mut normed,
+                )?;
+                Some(mhc)
+            };
             keepalive.keep_hidden(&normed);
             // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
             // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
@@ -3070,149 +3106,172 @@ impl Dsv4Model {
             // single-row forward (see its collective-participation invariants).
             // Bit-identity vs per-row is NOT expected (grouped GEMM / LL combine
             // tile over N differently); gated on needle retrieval, not byte-parity.
-            let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            if use_deepep_transport {
-                #[cfg(feature = "deepep")]
-                {
-                    let transport = self.deepep.as_ref().ok_or_else(|| {
-                        anyhow!("ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted")
-                    })?;
-                    if transport.is_low_latency() {
-                        // Token-owned LL path: this rank owns the contiguous
-                        // token cols [start..end) of the replicated `normed`.
-                        // Every rank participates in the dispatch/combine
-                        // COLLECTIVES even with owned_n == 0 (seq_len < world).
-                        let world = self.tp.config().world_size;
-                        let rank = self.tp.config().rank;
-                        let per = seq_len.div_ceil(world);
-                        let start = (rank * per).min(seq_len);
-                        let end = ((rank + 1) * per).min(seq_len);
-                        let owned_n = end - start;
-                        // Zero the full output; each rank scatters its owned
-                        // cols, then an all-reduce gathers them (replacing the
-                        // moe all-reduce — DeepEP combine already EP-reduced).
-                        self.ctx
-                            .stream
-                            .memset_zeros(&mut moe_out.data)
-                            .map_err(|e| anyhow!("deepep_ll batched moe_out zero failed: {e}"))?;
-                        let mut owned_in =
-                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                        owned_in.seq_len = owned_n;
-                        keepalive.keep_hidden(&owned_in);
-                        if owned_n > 0 {
+            //
+            // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
+            // replaces the routed-expert + shared-expert MoE entirely.
+            let mut moe_with_shared =
+                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+            if let Some(dense) = layer.dense_mlp.as_ref() {
+                dsv4_dense_mlp_forward(
+                    &self.ctx,
+                    dense,
+                    &normed,
+                    &mut moe_with_shared,
+                    self.config.swiglu_limit,
+                    &mut keepalive,
+                )?;
+                keepalive.keep_hidden(&moe_with_shared);
+            } else {
+                let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                if use_deepep_transport {
+                    #[cfg(feature = "deepep")]
+                    {
+                        let transport = self.deepep.as_ref().ok_or_else(|| {
+                            anyhow!(
+                                "ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted"
+                            )
+                        })?;
+                        if transport.is_low_latency() {
+                            // Token-owned LL path: this rank owns the contiguous
+                            // token cols [start..end) of the replicated `normed`.
+                            // Every rank participates in the dispatch/combine
+                            // COLLECTIVES even with owned_n == 0 (seq_len < world).
+                            let world = self.tp.config().world_size;
+                            let rank = self.tp.config().rank;
+                            let per = seq_len.div_ceil(world);
+                            let start = (rank * per).min(seq_len);
+                            let end = ((rank + 1) * per).min(seq_len);
+                            let owned_n = end - start;
+                            // Zero the full output; each rank scatters its owned
+                            // cols, then an all-reduce gathers them (replacing the
+                            // moe all-reduce — DeepEP combine already EP-reduced).
                             self.ctx
                                 .stream
-                                .memcpy_dtod(
-                                    &normed.data.slice(start * hidden_size..end * hidden_size),
-                                    &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
-                                )
+                                .memset_zeros(&mut moe_out.data)
                                 .map_err(|e| {
-                                    anyhow!("deepep_ll batched owned-slice copy failed: {e}")
+                                    anyhow!("deepep_ll batched moe_out zero failed: {e}")
                                 })?;
-                        }
-                        let mut owned_out =
-                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                        owned_out.seq_len = owned_n;
-                        keepalive.keep_hidden(&owned_out);
-                        // The LL scratch is whole-forward scratch (fully
-                        // overwritten per call); it is parked per-slot for the
-                        // single-row path, so the batch borrows row 0's.
-                        let scratch =
-                            slots[slot_ids[0]]
+                            let mut owned_in =
+                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                            owned_in.seq_len = owned_n;
+                            keepalive.keep_hidden(&owned_in);
+                            if owned_n > 0 {
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &normed.data.slice(start * hidden_size..end * hidden_size),
+                                        &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("deepep_ll batched owned-slice copy failed: {e}")
+                                    })?;
+                            }
+                            let mut owned_out =
+                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                            owned_out.seq_len = owned_n;
+                            keepalive.keep_hidden(&owned_out);
+                            // The LL scratch is whole-forward scratch (fully
+                            // overwritten per call); it is parked per-slot for the
+                            // single-row path, so the batch borrows row 0's.
+                            let scratch = slots[slot_ids[0]]
                                 .deepep_ll_scratch
                                 .as_mut()
                                 .ok_or_else(|| {
                                     anyhow!("deepep_ll selected but slot LL scratch not allocated")
                                 })?;
-                        crate::moe::dsv4_moe_forward_deepep_ll(
-                            self,
-                            transport,
-                            scratch,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &tokens[start..end],
-                            tokens.len(),
-                            &owned_in,
-                            &mut owned_out,
-                            &mut keepalive,
-                        )?;
-                        if owned_n > 0 {
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(
-                                    &owned_out.data.slice(0..owned_n * hidden_size),
-                                    &mut moe_out
-                                        .data
-                                        .slice_mut(start * hidden_size..end * hidden_size),
-                                )
-                                .map_err(|e| {
-                                    anyhow!("deepep_ll batched owned scatter failed: {e}")
-                                })?;
+                            crate::moe::dsv4_moe_forward_deepep_ll(
+                                self,
+                                transport,
+                                scratch,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &tokens[start..end],
+                                tokens.len(),
+                                &owned_in,
+                                &mut owned_out,
+                                &mut keepalive,
+                            )?;
+                            if owned_n > 0 {
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &owned_out.data.slice(0..owned_n * hidden_size),
+                                        &mut moe_out
+                                            .data
+                                            .slice_mut(start * hidden_size..end * hidden_size),
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("deepep_ll batched owned scatter failed: {e}")
+                                    })?;
+                            }
+                            // All-gather via all-reduce: only owned cols are nonzero.
+                            self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                        } else {
+                            // Intranode normal-mode DeepEP: already [N]-shaped; its
+                            // combine reduces across EP, no moe all-reduce needed.
+                            crate::moe::dsv4_moe_forward_deepep(
+                                self,
+                                transport,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                tokens,
+                                &normed,
+                                &mut moe_out,
+                                &mut keepalive,
+                            )?;
                         }
-                        // All-gather via all-reduce: only owned cols are nonzero.
-                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
-                    } else {
-                        // Intranode normal-mode DeepEP: already [N]-shaped; its
-                        // combine reduces across EP, no moe all-reduce needed.
-                        crate::moe::dsv4_moe_forward_deepep(
-                            self,
-                            transport,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            tokens,
-                            &normed,
-                            &mut moe_out,
-                            &mut keepalive,
-                        )?;
                     }
+                    #[cfg(not(feature = "deepep"))]
+                    bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+                } else {
+                    crate::moe::dsv4_moe_forward(
+                        self,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        tokens,
+                        &normed,
+                        &mut moe_out,
+                        &mut keepalive,
+                    )?;
+                    keepalive.keep_hidden(&moe_out);
+                    // Routed experts are EP-sharded → sum, then add the replicated
+                    // shared expert once per rank. One all-reduce over [N, hidden].
+                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                    self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
                 }
-                #[cfg(not(feature = "deepep"))]
-                bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
-            } else {
-                crate::moe::dsv4_moe_forward(
-                    self,
+                keepalive.keep_hidden(&moe_out);
+                // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path)
+                // — one batched SwiGLU GEMM pair, replacing the per-row loop + N
+                // host syncs.
+                let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                crate::moe::dsv4_shared_expert_forward(
+                    &self.ctx,
+                    &self.ctx.stream,
                     layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    tokens,
                     &normed,
-                    &mut moe_out,
+                    &mut shared,
+                    self.config.swiglu_limit,
                     &mut keepalive,
                 )?;
-                keepalive.keep_hidden(&moe_out);
-                // Routed experts are EP-sharded → sum, then add the replicated
-                // shared expert once per rank. One all-reduce over [N, hidden].
-                let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                keepalive.keep_hidden(&shared);
+                // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+                crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
+                keepalive.keep_hidden(&moe_with_shared);
             }
-            keepalive.keep_hidden(&moe_out);
-            // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path)
-            // — one batched SwiGLU GEMM pair, replacing the per-row loop + N
-            // host syncs.
-            let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::moe::dsv4_shared_expert_forward(
-                &self.ctx,
-                &self.ctx.stream,
-                layer.moe.as_ref().expect("DSv4 layer.moe"),
-                &normed,
-                &mut shared,
-                self.config.swiglu_limit,
-                &mut keepalive,
-            )?;
-            keepalive.keep_hidden(&shared);
-            // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
-            let mut moe_with_shared =
-                unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
-            keepalive.keep_hidden(&moe_with_shared);
-            // SAFETY: hc_post writes the full stream buffer.
+            // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-            crate::hc::hc_post(
-                &self.ctx,
-                &moe_with_shared,
-                &stream,
-                &mhc.post,
-                &mhc.comb,
-                hidden_size,
-                hc_mult,
-                &mut ffn_stream,
-            )?;
+            if let Some(mhc) = ffn_mhc.as_ref() {
+                crate::hc::hc_post(
+                    &self.ctx,
+                    &moe_with_shared,
+                    &stream,
+                    &mhc.post,
+                    &mhc.comb,
+                    hidden_size,
+                    hc_mult,
+                    &mut ffn_stream,
+                )?;
+            } else {
+                // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
+                crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)?;
+            }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
             if let Some(t) = _moe_t {
@@ -3398,23 +3457,41 @@ impl Dsv4Model {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
                 // ── Attention half: HC params + pre-norm over the whole [M] batch.
-                let mhc =
-                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)?;
-                keepalive.keep_f32(&mhc.pre);
-                keepalive.keep_f32(&mhc.post);
-                keepalive.keep_f32(&mhc.comb);
-                // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
+                // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.attn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
-                )?;
+                let attn_mhc = if self.config.hc_mult == 1 {
+                    // GLM: plain RMSNorm of the stream (stream IS the hidden).
+                    crate::ops::rms_norm_batch(
+                        &self.ctx,
+                        &stream,
+                        &layer.attn_norm,
+                        eps,
+                        &mut normed,
+                    )?;
+                    None
+                } else {
+                    let mhc = crate::hc::gen_mhc_params(
+                        &self.ctx,
+                        &self.config,
+                        &layer.hc_attn,
+                        &stream,
+                    )?;
+                    keepalive.keep_f32(&mhc.pre);
+                    keepalive.keep_f32(&mhc.post);
+                    keepalive.keep_f32(&mhc.comb);
+                    // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
+                    crate::hc::mhc_pre_rms_norm(
+                        &self.ctx,
+                        &stream,
+                        &mhc.pre,
+                        &layer.attn_norm,
+                        eps,
+                        hidden_size,
+                        hc_mult,
+                        &mut normed,
+                    )?;
+                    Some(mhc)
+                };
                 keepalive.keep_hidden(&normed);
 
                 // ── Attention PER SLOT / PER CHUNK: write the slot block into
@@ -3503,19 +3580,24 @@ impl Dsv4Model {
                     let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                     self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
                 }
-                // SAFETY: hc_post writes the full stream buffer.
+                // SAFETY: hc_post / add_batch writes the full stream buffer.
                 let mut attn_stream =
                     unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-                crate::hc::hc_post(
-                    &self.ctx,
-                    &attn_out,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut attn_stream,
-                )?;
+                if let Some(mhc) = attn_mhc.as_ref() {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &attn_out,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut attn_stream,
+                    )?;
+                } else {
+                    // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
+                    crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)?;
+                }
                 keepalive.keep_hidden(&attn_stream);
                 stream = attn_stream;
 
@@ -3523,69 +3605,103 @@ impl Dsv4Model {
                 // (the dominant amortization — math-identical to per-row, byte
                 // parity NOT expected: grouped GEMM tiles over M differently;
                 // gated on needle, not byte-parity). Allreduce transport only.
-                let mhc =
-                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
-                keepalive.keep_f32(&mhc.pre);
-                keepalive.keep_f32(&mhc.post);
-                keepalive.keep_f32(&mhc.comb);
-                // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
+                // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.ffn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
-                )?;
+                let ffn_mhc = if self.config.hc_mult == 1 {
+                    crate::ops::rms_norm_batch(
+                        &self.ctx,
+                        &stream,
+                        &layer.ffn_norm,
+                        eps,
+                        &mut normed,
+                    )?;
+                    None
+                } else {
+                    let mhc =
+                        crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)?;
+                    keepalive.keep_f32(&mhc.pre);
+                    keepalive.keep_f32(&mhc.post);
+                    keepalive.keep_f32(&mhc.comb);
+                    // SAFETY: fused hc_pre+rms_norm writes the full [m, hidden_size] buffer.
+                    crate::hc::mhc_pre_rms_norm(
+                        &self.ctx,
+                        &stream,
+                        &mhc.pre,
+                        &layer.ffn_norm,
+                        eps,
+                        hidden_size,
+                        hc_mult,
+                        &mut normed,
+                    )?;
+                    Some(mhc)
+                };
                 keepalive.keep_hidden(&normed);
-                // SAFETY: the MoE forward writes the full routed output buffer.
-                let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::moe::dsv4_moe_forward(
-                    self,
-                    layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    &tokens,
-                    &normed,
-                    &mut moe_out,
-                    &mut keepalive,
-                )?;
-                keepalive.keep_hidden(&moe_out);
-                {
-                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                    self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
-                }
-                // Grouped shared expert over [M] (dense FFN, prefill path).
-                let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::moe::dsv4_shared_expert_forward(
-                    &self.ctx,
-                    &self.ctx.stream,
-                    layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    &normed,
-                    &mut shared,
-                    self.config.swiglu_limit,
-                    &mut keepalive,
-                )?;
-                keepalive.keep_hidden(&shared);
-                // SAFETY: add_batch writes the full [m, hidden_size] buffer.
+                // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
+                // replaces the routed-expert + shared-expert MoE entirely.
                 let mut moe_with_shared =
                     unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
-                keepalive.keep_hidden(&moe_with_shared);
-                // SAFETY: hc_post writes the full stream buffer.
+                if let Some(dense) = layer.dense_mlp.as_ref() {
+                    dsv4_dense_mlp_forward(
+                        &self.ctx,
+                        dense,
+                        &normed,
+                        &mut moe_with_shared,
+                        self.config.swiglu_limit,
+                        &mut keepalive,
+                    )?;
+                    keepalive.keep_hidden(&moe_with_shared);
+                } else {
+                    // SAFETY: the MoE forward writes the full routed output buffer.
+                    let mut moe_out =
+                        unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                    crate::moe::dsv4_moe_forward(
+                        self,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        &tokens,
+                        &normed,
+                        &mut moe_out,
+                        &mut keepalive,
+                    )?;
+                    keepalive.keep_hidden(&moe_out);
+                    {
+                        let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                    }
+                    // Grouped shared expert over [M] (dense FFN, prefill path).
+                    let mut shared =
+                        unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                    crate::moe::dsv4_shared_expert_forward(
+                        &self.ctx,
+                        &self.ctx.stream,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        &normed,
+                        &mut shared,
+                        self.config.swiglu_limit,
+                        &mut keepalive,
+                    )?;
+                    keepalive.keep_hidden(&shared);
+                    // SAFETY: add_batch writes the full [m, hidden_size] buffer.
+                    crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
+                    keepalive.keep_hidden(&moe_with_shared);
+                }
+                // SAFETY: hc_post / add_batch writes the full stream buffer.
                 let mut ffn_stream =
                     unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-                crate::hc::hc_post(
-                    &self.ctx,
-                    &moe_with_shared,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut ffn_stream,
-                )?;
+                if let Some(mhc) = ffn_mhc.as_ref() {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &moe_with_shared,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut ffn_stream,
+                    )?;
+                } else {
+                    // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
+                    crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)?;
+                }
                 keepalive.keep_hidden(&ffn_stream);
                 stream = ffn_stream;
             }
@@ -3672,16 +3788,24 @@ impl Dsv4Model {
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
         // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
-        crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
-            crate::hc::head_hidden_from_stream(
-                ctx,
-                &self.config,
-                &self.head_hc,
-                stream,
-                seq_len - 1,
-                &mut last_hidden,
-            )
-        })?;
+        if self.config.hc_mult == 1 {
+            // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
+            // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
+            crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
+                crate::ops::copy_row_to_vec(ctx, stream, seq_len - 1, &mut last_hidden)
+            })?;
+        } else {
+            crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
+                crate::hc::head_hidden_from_stream(
+                    ctx,
+                    &self.config,
+                    &self.head_hc,
+                    stream,
+                    seq_len - 1,
+                    &mut last_hidden,
+                )
+            })?;
+        }
         keepalive.keep_hidden(stream);
         keepalive.keep_vec(&last_hidden);
         if let Some(out) = last_hidden_out {
@@ -3807,28 +3931,43 @@ impl Dsv4Model {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
-            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
-                crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
-            })?;
-            keepalive.keep_f32(&mhc.pre);
-            keepalive.keep_f32(&mhc.post);
-            keepalive.keep_f32(&mhc.comb);
-            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size]
-            // buffer. (The old attn_in_L0 tail dump went with the intermediate.)
+            // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
+            // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
+            // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.attn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
-                )
-            })?;
+            let attn_mhc = if self.config.hc_mult == 1 {
+                // GLM: plain RMSNorm of the stream (stream IS the hidden).
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
+                    crate::ops::rms_norm_batch(
+                        &self.ctx,
+                        &stream,
+                        &layer.attn_norm,
+                        eps,
+                        &mut normed,
+                    )
+                })?;
+                None
+            } else {
+                let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
+                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
+                })?;
+                keepalive.keep_f32(&mhc.pre);
+                keepalive.keep_f32(&mhc.post);
+                keepalive.keep_f32(&mhc.comb);
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
+                    crate::hc::mhc_pre_rms_norm(
+                        &self.ctx,
+                        &stream,
+                        &mhc.pre,
+                        &layer.attn_norm,
+                        eps,
+                        hidden_size,
+                        hc_mult,
+                        &mut normed,
+                    )
+                })?;
+                Some(mhc)
+            };
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -3904,294 +4043,341 @@ impl Dsv4Model {
                     self.tp.all_reduce_sum(&self.ctx, &mut attn_out)
                 })?;
             }
-            // SAFETY: hc_post writes the full stream buffer.
+            // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
-                crate::hc::hc_post(
-                    &self.ctx,
-                    &attn_out,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut attn_stream,
-                )
-            })?;
+            if let Some(mhc) = attn_mhc.as_ref() {
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &attn_out,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut attn_stream,
+                    )
+                })?;
+            } else {
+                // GLM plain residual: stream = attn_out + stream (stream_dim==hidden).
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                    crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)
+                })?;
+            }
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
             // ── MoE half: HC-wrap the FP8 DeepGEMM MoE block.
-            let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
-                crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)
-            })?;
-            keepalive.keep_f32(&mhc.pre);
-            keepalive.keep_f32(&mhc.post);
-            keepalive.keep_f32(&mhc.comb);
-            // SAFETY: hc_pre writes the full [seq_len, hidden_size] buffer.
-            // SAFETY: fused hc_pre+rms_norm writes the full [seq_len, hidden_size] buffer.
+            // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
+            // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
+            // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
-                crate::hc::mhc_pre_rms_norm(
-                    &self.ctx,
-                    &stream,
-                    &mhc.pre,
-                    &layer.ffn_norm,
-                    eps,
-                    hidden_size,
-                    hc_mult,
-                    &mut normed,
-                )
-            })?;
+            let ffn_mhc = if self.config.hc_mult == 1 {
+                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
+                    crate::ops::rms_norm_batch(
+                        &self.ctx,
+                        &stream,
+                        &layer.ffn_norm,
+                        eps,
+                        &mut normed,
+                    )
+                })?;
+                None
+            } else {
+                let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
+                    crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)
+                })?;
+                keepalive.keep_f32(&mhc.pre);
+                keepalive.keep_f32(&mhc.post);
+                keepalive.keep_f32(&mhc.comb);
+                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
+                    crate::hc::mhc_pre_rms_norm(
+                        &self.ctx,
+                        &stream,
+                        &mhc.pre,
+                        &layer.ffn_norm,
+                        eps,
+                        hidden_size,
+                        hc_mult,
+                        &mut normed,
+                    )
+                })?;
+                Some(mhc)
+            };
             keepalive.keep_hidden(&normed);
-            let use_comm_overlap = seq_len == 1 && !use_deepep_transport;
-            let normed_ready = if use_comm_overlap {
-                let fence = ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
-                ctx.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Comm)?;
-                Some(fence)
-            } else {
-                None
-            };
-            // SAFETY: the MoE forward writes the full routed output buffer.
-            let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            // DeepEP combine already reduces the EP-sharded routed output; the
-            // non-deepep path needs the explicit TP all-reduce below.
-            let needs_moe_allreduce = !use_deepep_transport;
-            let mut shared_out = kv_adapter.shared_expert_out_mut();
-            if use_deepep_transport {
-                #[cfg(feature = "deepep")]
-                {
-                    let transport = self.deepep.as_ref().ok_or_else(|| {
-                        anyhow!("ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted")
-                    })?;
-                    if transport.is_low_latency() {
-                        // ── deepep_ll token-owned path ──────────────────────
-                        // TP8 replicates `normed` [hidden, n]; HiddenStates is
-                        // token-major (token i at i*hidden), so this rank's owned
-                        // shard cols [start..end] is a CONTIGUOUS byte range.
-                        let world = self.tp.config().world_size;
-                        let rank = self.tp.config().rank;
-                        let per = seq_len.div_ceil(world);
-                        let start = (rank * per).min(seq_len);
-                        let end = ((rank + 1) * per).min(seq_len);
-                        let owned_n = end - start;
-                        // Zero the full output; every rank scatters its owned cols
-                        // then an all-reduce gathers them (replaces the moe AR).
-                        self.ctx
-                            .stream
-                            .memset_zeros(&mut moe_out.data)
-                            .map_err(|e| anyhow!("deepep_ll moe_out zero failed: {e}"))?;
-                        // The LL dispatch + combine are COLLECTIVES: EVERY rank must
-                        // participate every step or the symmetric protocol deadlocks
-                        // (DeepEP "timeout for dispatch receive"). A rank that owns 0
-                        // tokens (when seq_len < world) still dispatches 0 tokens and
-                        // runs the masked GEMMs over the tokens routed to ITS local
-                        // experts. So always call the LL forward — it internally
-                        // handles owned_n == 0 — and only scatter when owned_n > 0.
-                        let scratch = slot.deepep_ll_scratch.as_mut().ok_or_else(|| {
-                            anyhow!("deepep_ll selected but slot LL scratch not allocated")
-                        })?;
-                        // Copy this rank's owned contiguous columns of `normed`
-                        // into a compact `[hidden, owned_n]` buffer (the LL dispatch
-                        // needs a standalone `[owned_n, hidden]` input; `.slice()`
-                        // yields a borrowed CudaView, not an owned CudaSlice, so we
-                        // materialize it — same one-copy pattern as the per-row
-                        // attention slab path above). owned_n may be 0.
-                        let mut owned_in =
-                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                        owned_in.seq_len = owned_n;
-                        keepalive.keep_hidden(&owned_in);
-                        if owned_n > 0 {
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(
-                                    &normed.data.slice(start * hidden_size..end * hidden_size),
-                                    &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
-                                )
-                                .map_err(|e| anyhow!("deepep_ll owned-slice copy failed: {e}"))?;
-                        }
-                        let mut owned_out =
-                            HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                        owned_out.seq_len = owned_n;
-                        keepalive.keep_hidden(&owned_out);
-                        crate::moe::dsv4_moe_forward_deepep_ll(
-                            self,
-                            transport,
-                            scratch,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &tokens[start..end],
-                            tokens.len(),
-                            &owned_in,
-                            &mut owned_out,
-                            &mut keepalive,
-                        )?;
-                        if owned_n > 0 {
-                            // Scatter owned_out into moe_out's owned cols (contiguous).
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(
-                                    &owned_out.data.slice(0..owned_n * hidden_size),
-                                    &mut moe_out
-                                        .data
-                                        .slice_mut(start * hidden_size..end * hidden_size),
-                                )
-                                .map_err(|e| {
-                                    anyhow!("deepep_ll owned scatter into moe_out failed: {e}")
-                                })?;
-                        }
-                        // All-gather via all-reduce: each rank contributed only its
-                        // owned cols (rest zero), so the sum is the full gather.
-                        // This REPLACES the moe all-reduce (needs_moe_allreduce=false).
-                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
-                    } else {
-                        crate::moe::dsv4_moe_forward_deepep(
-                            self,
-                            transport,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            tokens,
-                            &normed,
-                            &mut moe_out,
-                            &mut keepalive,
-                        )?;
-                    }
-                }
-                #[cfg(not(feature = "deepep"))]
-                {
-                    bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
-                }
-            } else {
-                crate::moe::dsv4_moe_forward(
-                    self,
-                    layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    tokens,
-                    &normed,
-                    &mut moe_out,
-                    &mut keepalive,
-                )?;
-            }
-            keepalive.keep_hidden(&moe_out);
-            let nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-            let mut shared_owned = None;
-            let shared_ready = if use_comm_overlap {
-                let shared = shared_out
-                    .as_deref_mut()
-                    .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert output buffer"))?;
-                ensure!(
-                    shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
-                    "DSv4 shared decode scratch shape {}x{} != {}x{}",
-                    shared.hidden_dim,
-                    shared.seq_len,
-                    hidden_size,
-                    seq_len
-                );
-                let _normed_ready = normed_ready
-                    .as_ref()
-                    .expect("comm-overlap path records normed fence");
-                crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                    crate::moe::dsv4_shared_expert_forward(
-                        &self.ctx,
-                        &self.ctx.comm_stream,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &normed,
-                        shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
-                    )
-                })?;
-                Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
-            } else {
-                None
-            };
-            // Routed experts are EP-sharded; sum them first, then add the replicated
-            // shared expert exactly once per rank. In the comm-overlap path, shared
-            // expert depends on `normed`, while this compute-stream collective depends
-            // on the routed `moe_out`; the two can run concurrently.
-            if needs_moe_allreduce {
-                let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
-                    self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
-                })?;
-            }
-            if use_comm_overlap {
-                // Already launched on the comm stream above.
-            } else if seq_len == 1 {
-                let shared = shared_out
-                    .as_deref_mut()
-                    .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert output buffer"))?;
-                ensure!(
-                    shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
-                    "DSv4 shared decode scratch shape {}x{} != {}x{}",
-                    shared.hidden_dim,
-                    shared.seq_len,
-                    hidden_size,
-                    seq_len
-                );
-                crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                    crate::moe::dsv4_shared_expert_forward(
-                        &self.ctx,
-                        &self.ctx.stream,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &normed,
-                        shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
-                    )
-                })?;
-            } else {
-                // Keep the default masked path order byte-for-byte with main:
-                // routed MoE → all-reduce → allocate/run shared expert. Moving
-                // shared scratch allocation before all-reduce can reuse in-flight
-                // helper buffers under disabled cudarc event tracking.
-                // SAFETY: dsv4_shared_expert_forward writes the full shared output.
-                let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                    crate::moe::dsv4_shared_expert_forward(
-                        &self.ctx,
-                        &self.ctx.stream,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &normed,
-                        &mut shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
-                    )
-                })?;
-                shared_owned = Some(shared);
-            };
-            let shared = if seq_len == 1 {
-                shared_out
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert output buffer"))?
-            } else {
-                shared_owned
-                    .as_ref()
-                    .expect("multi-token shared expert allocates owned output")
-            };
-            keepalive.keep_hidden(shared);
-            if let Some(fence) = shared_ready.as_ref() {
-                ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
-            }
-            // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+            // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
+            // replaces the routed-expert + shared-expert MoE entirely.
             let mut moe_with_shared =
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
-                crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)
-            })?;
-            keepalive.keep_hidden(&moe_with_shared);
-            // SAFETY: hc_post writes the full stream buffer.
-            let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
-            crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
-                crate::hc::hc_post(
+            if let Some(dense) = layer.dense_mlp.as_ref() {
+                dsv4_dense_mlp_forward(
                     &self.ctx,
-                    &moe_with_shared,
-                    &stream,
-                    &mhc.post,
-                    &mhc.comb,
-                    hidden_size,
-                    hc_mult,
-                    &mut ffn_stream,
-                )
-            })?;
-            drop(nvtx_shared_hc);
+                    dense,
+                    &normed,
+                    &mut moe_with_shared,
+                    self.config.swiglu_limit,
+                    &mut keepalive,
+                )?;
+                keepalive.keep_hidden(&moe_with_shared);
+            } else {
+                let use_comm_overlap = seq_len == 1 && !use_deepep_transport;
+                let normed_ready = if use_comm_overlap {
+                    let fence = ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+                    ctx.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Comm)?;
+                    Some(fence)
+                } else {
+                    None
+                };
+                // SAFETY: the MoE forward writes the full routed output buffer.
+                let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                // DeepEP combine already reduces the EP-sharded routed output; the
+                // non-deepep path needs the explicit TP all-reduce below.
+                let needs_moe_allreduce = !use_deepep_transport;
+                let mut shared_out = kv_adapter.shared_expert_out_mut();
+                if use_deepep_transport {
+                    #[cfg(feature = "deepep")]
+                    {
+                        let transport = self.deepep.as_ref().ok_or_else(|| {
+                            anyhow!(
+                                "ARLE_DSV4_MOE_TRANSPORT=deepep but DeepEP transport is not booted"
+                            )
+                        })?;
+                        if transport.is_low_latency() {
+                            // ── deepep_ll token-owned path ──────────────────────
+                            // TP8 replicates `normed` [hidden, n]; HiddenStates is
+                            // token-major (token i at i*hidden), so this rank's owned
+                            // shard cols [start..end] is a CONTIGUOUS byte range.
+                            let world = self.tp.config().world_size;
+                            let rank = self.tp.config().rank;
+                            let per = seq_len.div_ceil(world);
+                            let start = (rank * per).min(seq_len);
+                            let end = ((rank + 1) * per).min(seq_len);
+                            let owned_n = end - start;
+                            // Zero the full output; every rank scatters its owned cols
+                            // then an all-reduce gathers them (replaces the moe AR).
+                            self.ctx
+                                .stream
+                                .memset_zeros(&mut moe_out.data)
+                                .map_err(|e| anyhow!("deepep_ll moe_out zero failed: {e}"))?;
+                            // The LL dispatch + combine are COLLECTIVES: EVERY rank must
+                            // participate every step or the symmetric protocol deadlocks
+                            // (DeepEP "timeout for dispatch receive"). A rank that owns 0
+                            // tokens (when seq_len < world) still dispatches 0 tokens and
+                            // runs the masked GEMMs over the tokens routed to ITS local
+                            // experts. So always call the LL forward — it internally
+                            // handles owned_n == 0 — and only scatter when owned_n > 0.
+                            let scratch = slot.deepep_ll_scratch.as_mut().ok_or_else(|| {
+                                anyhow!("deepep_ll selected but slot LL scratch not allocated")
+                            })?;
+                            // Copy this rank's owned contiguous columns of `normed`
+                            // into a compact `[hidden, owned_n]` buffer (the LL dispatch
+                            // needs a standalone `[owned_n, hidden]` input; `.slice()`
+                            // yields a borrowed CudaView, not an owned CudaSlice, so we
+                            // materialize it — same one-copy pattern as the per-row
+                            // attention slab path above). owned_n may be 0.
+                            let mut owned_in =
+                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                            owned_in.seq_len = owned_n;
+                            keepalive.keep_hidden(&owned_in);
+                            if owned_n > 0 {
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &normed.data.slice(start * hidden_size..end * hidden_size),
+                                        &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("deepep_ll owned-slice copy failed: {e}")
+                                    })?;
+                            }
+                            let mut owned_out =
+                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
+                            owned_out.seq_len = owned_n;
+                            keepalive.keep_hidden(&owned_out);
+                            crate::moe::dsv4_moe_forward_deepep_ll(
+                                self,
+                                transport,
+                                scratch,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                &tokens[start..end],
+                                tokens.len(),
+                                &owned_in,
+                                &mut owned_out,
+                                &mut keepalive,
+                            )?;
+                            if owned_n > 0 {
+                                // Scatter owned_out into moe_out's owned cols (contiguous).
+                                self.ctx
+                                    .stream
+                                    .memcpy_dtod(
+                                        &owned_out.data.slice(0..owned_n * hidden_size),
+                                        &mut moe_out
+                                            .data
+                                            .slice_mut(start * hidden_size..end * hidden_size),
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("deepep_ll owned scatter into moe_out failed: {e}")
+                                    })?;
+                            }
+                            // All-gather via all-reduce: each rank contributed only its
+                            // owned cols (rest zero), so the sum is the full gather.
+                            // This REPLACES the moe all-reduce (needs_moe_allreduce=false).
+                            self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                        } else {
+                            crate::moe::dsv4_moe_forward_deepep(
+                                self,
+                                transport,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                tokens,
+                                &normed,
+                                &mut moe_out,
+                                &mut keepalive,
+                            )?;
+                        }
+                    }
+                    #[cfg(not(feature = "deepep"))]
+                    {
+                        bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
+                    }
+                } else {
+                    crate::moe::dsv4_moe_forward(
+                        self,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        tokens,
+                        &normed,
+                        &mut moe_out,
+                        &mut keepalive,
+                    )?;
+                }
+                keepalive.keep_hidden(&moe_out);
+                let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
+                let mut shared_owned = None;
+                let shared_ready = if use_comm_overlap {
+                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                        anyhow!("DSv4 decode requires shared-expert output buffer")
+                    })?;
+                    ensure!(
+                        shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                        "DSv4 shared decode scratch shape {}x{} != {}x{}",
+                        shared.hidden_dim,
+                        shared.seq_len,
+                        hidden_size,
+                        seq_len
+                    );
+                    let _normed_ready = normed_ready
+                        .as_ref()
+                        .expect("comm-overlap path records normed fence");
+                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                        crate::moe::dsv4_shared_expert_forward(
+                            &self.ctx,
+                            &self.ctx.comm_stream,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            &normed,
+                            shared,
+                            self.config.swiglu_limit,
+                            &mut keepalive,
+                        )
+                    })?;
+                    Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
+                } else {
+                    None
+                };
+                // Routed experts are EP-sharded; sum them first, then add the replicated
+                // shared expert exactly once per rank. In the comm-overlap path, shared
+                // expert depends on `normed`, while this compute-stream collective depends
+                // on the routed `moe_out`; the two can run concurrently.
+                if needs_moe_allreduce {
+                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                    crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
+                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)
+                    })?;
+                }
+                if use_comm_overlap {
+                    // Already launched on the comm stream above.
+                } else if seq_len == 1 {
+                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                        anyhow!("DSv4 decode requires shared-expert output buffer")
+                    })?;
+                    ensure!(
+                        shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
+                        "DSv4 shared decode scratch shape {}x{} != {}x{}",
+                        shared.hidden_dim,
+                        shared.seq_len,
+                        hidden_size,
+                        seq_len
+                    );
+                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                        crate::moe::dsv4_shared_expert_forward(
+                            &self.ctx,
+                            &self.ctx.stream,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            &normed,
+                            shared,
+                            self.config.swiglu_limit,
+                            &mut keepalive,
+                        )
+                    })?;
+                } else {
+                    // Keep the default masked path order byte-for-byte with main:
+                    // routed MoE → all-reduce → allocate/run shared expert. Moving
+                    // shared scratch allocation before all-reduce can reuse in-flight
+                    // helper buffers under disabled cudarc event tracking.
+                    // SAFETY: dsv4_shared_expert_forward writes the full shared output.
+                    let mut shared =
+                        unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
+                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                        crate::moe::dsv4_shared_expert_forward(
+                            &self.ctx,
+                            &self.ctx.stream,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            &normed,
+                            &mut shared,
+                            self.config.swiglu_limit,
+                            &mut keepalive,
+                        )
+                    })?;
+                    shared_owned = Some(shared);
+                };
+                let shared = if seq_len == 1 {
+                    shared_out.as_deref().ok_or_else(|| {
+                        anyhow!("DSv4 decode requires shared-expert output buffer")
+                    })?
+                } else {
+                    shared_owned
+                        .as_ref()
+                        .expect("multi-token shared expert allocates owned output")
+                };
+                keepalive.keep_hidden(shared);
+                if let Some(fence) = shared_ready.as_ref() {
+                    ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
+                }
+                // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
+                crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
+                    crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)
+                })?;
+                keepalive.keep_hidden(&moe_with_shared);
+            }
+            // SAFETY: hc_post / add_batch writes the full stream buffer.
+            let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
+            if let Some(mhc) = ffn_mhc.as_ref() {
+                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                    crate::hc::hc_post(
+                        &self.ctx,
+                        &moe_with_shared,
+                        &stream,
+                        &mhc.post,
+                        &mhc.comb,
+                        hidden_size,
+                        hc_mult,
+                        &mut ffn_stream,
+                    )
+                })?;
+            } else {
+                // GLM plain residual: stream = ffn_out + stream (stream_dim==hidden).
+                crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                    crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)
+                })?;
+            }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
         }
@@ -5006,6 +5192,12 @@ impl Dsv4Model {
         params: &SamplingParams,
         position: u64,
     ) -> Result<u32> {
+        // ponytail: pod-verify GLM decode-graph path (not wired; eager path is the GLM lane)
+        if self.config.hc_mult == 1 {
+            anyhow::bail!(
+                "DSv4 decode-graph path does not support GLM (hc_mult==1); use the eager decode path"
+            );
+        }
         ensure!(
             slot.seq_len == start_pos,
             "DSv4 graph decode slot seq_len {} != start_pos {start_pos}",
@@ -5455,6 +5647,57 @@ impl Dsv4Model {
             .map_err(|e| anyhow::anyhow!("DSv4 MoE config invalid: {e}"))?;
         Ok(moe)
     }
+}
+
+/// GLM dense layer (`config.per_layer_dense_mlp[i]`) forward: a plain SwiGLU
+/// FFN that replaces the routed-expert + shared-expert MoE. bf16 throughout
+/// (gate/up/down are `DeviceMatrix` DenseBf16). DSv4 never has `dense_mlp`, so
+/// this is GLM-only.
+///
+///   gate = down·SiLU(gate_w·x) ⊙ (up_w·x)
+///
+/// `out` must be `[hidden, tok]` (== `x` hidden). Writes the FFN output for the
+/// MoE half; the caller folds it into the residual.
+fn dsv4_dense_mlp_forward(
+    ctx: &DeviceContext,
+    dense: &Dsv4DenseMlp,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+    swiglu_limit: f32,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    ensure!(
+        x.hidden_dim == dense.hidden_dim
+            && out.hidden_dim == dense.hidden_dim
+            && x.seq_len == out.seq_len,
+        "GLM dense MLP shape mismatch: x={}x{} out={}x{} hidden={}",
+        x.hidden_dim,
+        x.seq_len,
+        out.hidden_dim,
+        out.seq_len,
+        dense.hidden_dim
+    );
+    let tok = x.seq_len;
+    let inter = dense.intermediate;
+    // gate = gate_w · x  → [intermediate, tok]
+    let mut gate = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
+    crate::attention::dsv4_linear(ctx, &dense.gate, x, &mut gate)?;
+    keepalive.keep_hidden(&gate);
+    // up = up_w · x  → [intermediate, tok]
+    let mut up = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
+    crate::attention::dsv4_linear(ctx, &dense.up, x, &mut up)?;
+    keepalive.keep_hidden(&up);
+    // act = SiLU(gate) ⊙ up. GLM dense uses plain SiLU(gate)*up with NO clamp
+    // (into_deepseek_v4 sets swiglu_limit=0.0, which the clamped kernel rejects),
+    // so use the unclamped silu_mul.
+    // ponytail: pod-verify GLM dense FFN activation = silu(gate)*up (unclamped)
+    let _ = swiglu_limit;
+    let mut act = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
+    crate::ops::silu_mul(ctx, &gate, &up, &mut act)?;
+    keepalive.keep_hidden(&act);
+    // out = down_w · act  → [hidden, tok]
+    crate::attention::dsv4_linear(ctx, &dense.down, &act, out)?;
+    Ok(())
 }
 
 fn dsv4_use_deepep_transport() -> Result<bool> {

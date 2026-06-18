@@ -845,6 +845,24 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// V32 (512 NoPE / 656 B/tok) variant of `arle_dsv4_fp8_kv_pack_strided_cuda`
+    /// for GLM-5.2. Identical signature; packs 8 NoPE tiles + a 16-byte scale
+    /// region. Caller passes `nope = k_prepared, rope = k_prepared + 512,
+    /// stride_nope_elems = stride_rope_elems = head_dim = 576`. Strides must be
+    /// ≥ 512 (NoPE) / 64 (RoPE).
+    pub fn arle_dsv4_v32_fp8_kv_pack_strided_cuda(
+        nope: *const Half,
+        rope: *const Half,
+        packed_kv: *mut u8,
+        token_block_id: *const i32,
+        token_in_block_row: *const i32,
+        n_tokens: i32,
+        page_block_size: i32,
+        stride_nope_elems: i32,
+        stride_rope_elems: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Fill one `[block_id,row]` pair for FlashMLA decode's SW FP8 pack from
     /// a device-resident `start_pos` scalar. The following
     /// `arle_dsv4_fp8_kv_pack_strided_cuda(..., n_tokens=1, ...)` consumes

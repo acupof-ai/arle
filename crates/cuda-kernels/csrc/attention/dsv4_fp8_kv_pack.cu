@@ -50,16 +50,15 @@
 
 namespace {
 
-// MODEL1 constants — DO NOT EDIT without also updating the upstream contract
-// anchors above.
-static constexpr int HEAD_DIM_NOPE   = 448;
+// Shape-INDEPENDENT constants shared by both MODEL1 (NoPE=448) and V32
+// (NoPE=512). The NoPE-dim-dependent constants (NUM_TILES, NUM_SCALES,
+// TOKEN_DATA_BYTES, TOKEN_BYTES) are derived as `constexpr` LOCALS inside the
+// `dsv4_fp8_kv_pack_kernel<HEAD_DIM_NOPE>` template so one body serves both
+// shapes. The E4M3-max=448 used in the SCALE MATH is the representable max,
+// NOT the dim — it stays 448 verbatim for every instantiation.
 static constexpr int HEAD_DIM_ROPE   = 64;
 static constexpr int QUANT_TILE_SIZE = 64;
-static constexpr int NUM_TILES       = HEAD_DIM_NOPE / QUANT_TILE_SIZE;   // 7
-static constexpr int NUM_SCALES      = 8;                                 // 7 used + 1 pad
 static constexpr int ROPE_BYTES      = HEAD_DIM_ROPE * sizeof(__nv_bfloat16); // 128
-static constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;       // 576
-static constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;    // 584 (per-token stride)
 
 static constexpr int THREADS_PER_BLOCK = 128;
 static constexpr int NOPE_THREADS      = 64;   // 0..63 handle NoPE quant
@@ -109,6 +108,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // interleaved-in-`k_prepared` caller passes (head_dim=512, head_dim=512)
 // with separate base pointers `k_prepared + 0` (NoPE) and
 // `k_prepared + 448` (RoPE).
+template <int HEAD_DIM_NOPE>
 __global__ void dsv4_fp8_kv_pack_kernel(
     const __nv_bfloat16* __restrict__ nope,   // [n_tokens, stride_nope_elems]
     const __nv_bfloat16* __restrict__ rope,   // [n_tokens, stride_rope_elems]
@@ -120,6 +120,16 @@ __global__ void dsv4_fp8_kv_pack_kernel(
     int stride_nope_elems,
     int stride_rope_elems)
 {
+    // Per-instantiation NoPE-dim-dependent constants.
+    //   MODEL1: NoPE=448 → NUM_TILES=7, NUM_SCALES=8, TOKEN_BYTES=584.
+    //   V32   : NoPE=512 → NUM_TILES=8, NUM_SCALES=16, TOKEN_BYTES=656.
+    // ponytail: pod-verify V32 scale region is 16 bytes with tiles in [0,8) and
+    // [8,16) zero-padded — matches shim V32_BYTES_PER_TOKEN=656
+    constexpr int NUM_TILES       = HEAD_DIM_NOPE / QUANT_TILE_SIZE;        // 7 / 8
+    constexpr int NUM_SCALES      = (NUM_TILES <= 7) ? 8 : 16;              // 8 / 16
+    constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;            // 576 / 640
+    constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;         // 584 / 656
+
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
 
@@ -216,11 +226,14 @@ __global__ void dsv4_fp8_kv_pack_kernel(
             // Broadcast scale as float (exact, since scale is a power of 2).
             s_scale_f = __bfloat162float(scale_bf16);
 
-            // Per-tile scale byte (one of 7 used slots).
+            // Per-tile scale byte (slots [0, NUM_TILES) hold the tile scales).
             token_scales_base[tile] = byte;
-            // Padding byte (slot 7) — written once at the last tile.
+            // Padding bytes (slots [NUM_TILES, NUM_SCALES)) — zeroed once at the
+            // last tile by lane 0. MODEL1: slot 7 only. V32: slots 8..15.
             if (tile == NUM_TILES - 1) {
-                token_scales_base[NUM_SCALES - 1] = 0;
+                for (int i = NUM_TILES; i < NUM_SCALES; ++i) {
+                    token_scales_base[i] = 0;
+                }
             }
         }
         __syncthreads();
@@ -238,7 +251,7 @@ __global__ void dsv4_fp8_kv_pack_kernel(
             float quantized = (scale_f != 0.0f) ? (v / scale_f) : 0.0f;
             __nv_fp8_e4m3 fp8_v = __nv_fp8_e4m3(quantized);
             const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
-            // NoPE bytes are contiguous in token_data_base[0..448).
+            // NoPE bytes are contiguous in token_data_base[0..HEAD_DIM_NOPE).
             token_data_base[dim_idx] = (uint8_t)fp8_v.__x;
         }
     }
@@ -293,6 +306,14 @@ __global__ void dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel(
     int page_block_size,
     int stride_elems)
 {
+    // MODEL1-only (DSv4 CSA) — GLM has no compressor so this kernel is never
+    // launched on the GLM path. Self-contained MODEL1 constants (NoPE=448).
+    constexpr int HEAD_DIM_NOPE    = 448;
+    constexpr int NUM_TILES        = HEAD_DIM_NOPE / QUANT_TILE_SIZE;  // 7
+    constexpr int NUM_SCALES       = 8;                                // 7 used + 1 pad
+    constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;       // 576
+    constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;    // 584
+
     if (blockIdx.x != 0) return;
     const int pos = *start_pos;
     if (pos < 0 || ratio <= 0 || ((pos + 1) % ratio) != 0) return;
@@ -409,11 +430,12 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_cuda(
 
     dim3 grid((unsigned)n_tokens, 1, 1);
     dim3 block(THREADS_PER_BLOCK, 1, 1);
-    dsv4_fp8_kv_pack_kernel<<<grid, block, 0, stream>>>(
+    // MODEL1 contiguous pack: NoPE=448. Strides equal the dims (tight packing).
+    dsv4_fp8_kv_pack_kernel<448><<<grid, block, 0, stream>>>(
         nope, rope, packed_kv,
         token_block_id, token_in_block_row,
         n_tokens, page_block_size,
-        HEAD_DIM_NOPE, HEAD_DIM_ROPE);
+        448, HEAD_DIM_ROPE);
     return cudaGetLastError();
 }
 
@@ -438,7 +460,7 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
 {
     if (n_tokens == 0) return cudaSuccess;
     if (page_block_size <= 0) return cudaErrorInvalidValue;
-    if (stride_nope_elems < HEAD_DIM_NOPE || stride_rope_elems < HEAD_DIM_ROPE) {
+    if (stride_nope_elems < 448 || stride_rope_elems < HEAD_DIM_ROPE) {
         return cudaErrorInvalidValue;
     }
     if (nope == nullptr || rope == nullptr || packed_kv == nullptr
@@ -448,7 +470,44 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
 
     dim3 grid((unsigned)n_tokens, 1, 1);
     dim3 block(THREADS_PER_BLOCK, 1, 1);
-    dsv4_fp8_kv_pack_kernel<<<grid, block, 0, stream>>>(
+    // MODEL1 strided pack: NoPE=448 (explicit instantiation).
+    dsv4_fp8_kv_pack_kernel<448><<<grid, block, 0, stream>>>(
+        nope, rope, packed_kv,
+        token_block_id, token_in_block_row,
+        n_tokens, page_block_size,
+        stride_nope_elems, stride_rope_elems);
+    return cudaGetLastError();
+}
+
+// V32 (GLM-5.2) strided pack: NoPE=512 / 656 B/tok. Mirror of the MODEL1
+// strided entry above, launching the <512> instantiation (NUM_TILES=8,
+// NUM_SCALES=16). The k_prepared-style caller passes (nope=k_prepared,
+// rope=k_prepared+512, stride_nope_elems=stride_rope_elems=head_dim=576).
+extern "C" cudaError_t arle_dsv4_v32_fp8_kv_pack_strided_cuda(
+    const __nv_bfloat16* nope,
+    const __nv_bfloat16* rope,
+    uint8_t* packed_kv,
+    const int* token_block_id,
+    const int* token_in_block_row,
+    int n_tokens,
+    int page_block_size,
+    int stride_nope_elems,
+    int stride_rope_elems,
+    cudaStream_t stream)
+{
+    if (n_tokens == 0) return cudaSuccess;
+    if (page_block_size <= 0) return cudaErrorInvalidValue;
+    if (stride_nope_elems < 512 || stride_rope_elems < HEAD_DIM_ROPE) {
+        return cudaErrorInvalidValue;
+    }
+    if (nope == nullptr || rope == nullptr || packed_kv == nullptr
+        || token_block_id == nullptr || token_in_block_row == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+
+    dim3 grid((unsigned)n_tokens, 1, 1);
+    dim3 block(THREADS_PER_BLOCK, 1, 1);
+    dsv4_fp8_kv_pack_kernel<512><<<grid, block, 0, stream>>>(
         nope, rope, packed_kv,
         token_block_id, token_in_block_row,
         n_tokens, page_block_size,
@@ -514,7 +573,7 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_
     if (compressed == nullptr || packed_kv == nullptr || start_pos == nullptr) {
         return cudaErrorInvalidValue;
     }
-    if (ratio <= 0 || sw_blocks < 0 || page_block_size <= 0 || stride_elems < HEAD_DIM_NOPE + HEAD_DIM_ROPE) {
+    if (ratio <= 0 || sw_blocks < 0 || page_block_size <= 0 || stride_elems < 448 + HEAD_DIM_ROPE) {
         return cudaErrorInvalidValue;
     }
     dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(
