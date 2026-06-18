@@ -266,8 +266,15 @@ pub(crate) struct Dsv4MoeLayer {
     pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
+    /// DSv4 uses these directly. GLM also builds them to keep DSv4 structs
+    /// non-optional, but routes the shared expert through the bf16 caches below.
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
     pub shared_w2: Dsv4Fp8DeepGemmWeightCache,
+    /// GLM shared expert bf16 caches (gate / up / down), each a single grouped
+    /// expert. DSv4 leaves these `None`; the DSv4 FP8 shared path is unchanged.
+    pub shared_gate_bf16: Option<crate::moe::GroupedCache>,
+    pub shared_up_bf16: Option<crate::moe::GroupedCache>,
+    pub shared_w2_bf16: Option<crate::moe::GroupedCache>,
     /// Decode-band grouped-GEMV lane tables (per-expert weight/scale pointer
     /// tables + UE8M0-re-encoded scales), built lazily on first decode-band
     /// MoE forward. `Some(None)` = build attempted and failed the lossless
@@ -1702,6 +1709,11 @@ impl Dsv4Model {
             && last_hidden_out.is_none()
             && seq_len == 1
             && !use_deepep_transport
+            // GLM's shared expert runs the bf16 path, whose GEMMs allocate
+            // per-call scratch — illegal inside the captured decode-graph closure
+            // (would alias on replay). GLM decodes eagerly until the bf16 shared
+            // scratch is pre-allocated into Dsv4MoeDecodeScratch (follow-up).
+            && !self.config.plain_o_proj
         {
             return self.forward_tokens_decode_graph(
                 slot, kv_adapter, tokens[0], start_pos, params, position,

@@ -846,8 +846,12 @@ unsafe extern "C" {
     ) -> CUresult;
 
     /// V32 (512 NoPE / 656 B/tok) variant of `arle_dsv4_fp8_kv_pack_strided_cuda`
-    /// for GLM-5.2. Identical signature; packs 8 NoPE tiles + a 16-byte scale
-    /// region. Caller passes `nope = k_prepared, rope = k_prepared + 512,
+    /// for GLM-5.2. Identical signature, DIFFERENT inline layout (NOT the MODEL1
+    /// trailing-e8m0 format): per token `[512 NoPE fp8][4 F32 scales @512][128
+    /// rope bf16]`, stride 656. Each F32 scale covers one 128-elem NoPE block
+    /// (= amax/448, NO power-of-two rounding) — matches the vendored V32 decode
+    /// (`config.h` NUM_SCALES=4, QUANT_TILE_SIZE=128). Caller passes
+    /// `nope = k_prepared, rope = k_prepared + 512,
     /// stride_nope_elems = stride_rope_elems = head_dim = 576`. Strides must be
     /// ≥ 512 (NoPE) / 64 (RoPE).
     pub fn arle_dsv4_v32_fp8_kv_pack_strided_cuda(
