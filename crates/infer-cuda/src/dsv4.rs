@@ -308,21 +308,6 @@ impl SpecVerifySchedule {
         }
     }
 
-    pub(crate) fn branch_root(candidates: usize, start_pos: usize) -> Self {
-        let mut positions = Vec::with_capacity(candidates + 1);
-        let mut ancestors = Vec::with_capacity(candidates + 1);
-        positions.push(start_pos);
-        ancestors.push(Vec::new());
-        for _ in 0..candidates {
-            positions.push(start_pos + 1);
-            ancestors.push(vec![0]);
-        }
-        Self {
-            positions,
-            ancestors,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn is_prefix_chain_at(&self, start_pos: usize) -> bool {
         self.positions
