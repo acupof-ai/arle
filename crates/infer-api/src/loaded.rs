@@ -1233,6 +1233,13 @@ mod backend {
         }
         let num_slots = config.num_slots;
         let page_size = config.page_size;
+        let mtp_requested = config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some();
+        if mtp_requested && !matches!(kind, CudaModelKind::Dsv4) {
+            anyhow::bail!(
+                "--spec-type mtp / --mtp-draft-* is only wired for CUDA DSv4 checkpoints; \
+                 model kind {kind:?} would otherwise ignore the request"
+            );
+        }
         // Executors receive the CONFIGURED `total_pages` (Dense: shared device
         // pool size; Qwen3.5/3.6: per-slot token budget / page_size). The host
         // admission pool capacity is derived separately below — after the

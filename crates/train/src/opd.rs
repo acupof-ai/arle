@@ -2104,12 +2104,6 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
         });
         let weight = window.len() as f32 / kl_range.len() as f32;
         log_opd_window_trace("kl", "backward_start", window_index, window_started, "");
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(OpdError::InvalidInput(format!(
-                "OPD window loss weight must be finite and non-negative, got {weight}. \
-                 Hint: verify lambda and window/target counts before Route B backward."
-            )));
-        }
         let loss_started = Instant::now();
         let weighted_loss = if (weight - 1.0).abs() < f32::EPSILON {
             kl_loss
@@ -2129,9 +2123,6 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
             .get(&student_hidden)
             .ok_or(AutogradError::MissingGradient(student_hidden))?;
         for &target_id in student_target_params {
-            if target_id == student_hidden {
-                continue;
-            }
             if let Some(&grad_id) = window_grads.get(&target_id) {
                 store.accumulate_grad(target_id, grad_id)?;
             }

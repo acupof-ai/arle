@@ -3340,12 +3340,8 @@ impl Dsv4Model {
                                 .map_err(|e| {
                                     anyhow!("DSv4 batched verify row copy-in failed: {e}")
                                 })?;
-                            let (
-                                layer_pool,
-                                mut dsa_shared,
-                                mut flashmla_scratch,
-                                mut prefill_shared,
-                            ) = kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                            let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                                kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                             let slot = &mut slots[slot_ids[s]];
                             crate::attention::mla_attention(
                                 &self.ctx,
@@ -3357,9 +3353,9 @@ impl Dsv4Model {
                                 &normed_chunk,
                                 &mut slot.attention[layer_idx],
                                 layer_pool,
-                                dsa_shared.as_deref_mut(),
-                                flashmla_scratch.as_deref_mut(),
-                                prefill_shared.as_deref_mut(),
+                                dsa_shared,
+                                flashmla_scratch,
+                                prefill_shared,
                                 pos_r,
                                 Some(&verify_pos_dev),
                                 &self.tp,
@@ -5449,12 +5445,12 @@ pub(crate) fn dsv4_mtp_commit_fold_enabled() -> bool {
     true
 }
 
-/// Cross-slot batched MTP decode (batched-MTP Stage 1). Default OFF: with the
-/// env unset the executor keeps the per-row spec loop (byte-identical to today).
-/// When ON (`ARLE_DSV4_BATCHED_MTP=1`) and the decode batch has at least
+/// Cross-slot batched MTP decode (batched-MTP Stage 1). Default ON: with the
+/// env unset the executor takes the licensed batched path for eligible batches.
+/// Set `ARLE_DSV4_BATCHED_MTP=0` to force the per-row reference. When ON and the
+/// decode batch has at least
 /// `dsv4_batched_decode_min_rows()` rows under MTP spec, the executor batches the
 /// MoE/HC/norm over all N verify chains (attention stays per-slot — Stage 1).
-/// bench/correctness pending pod-verify (license-or-kill per the bench spec).
 pub(crate) fn dsv4_batched_mtp_enabled() -> bool {
     // Default ON (2026-06-15, multi-shape licensed): batched MTP decode wins +77-81%
     // vs per-row MTP at c>=8 (per-row plateaus ~42-46 tok/s, can't sustain >7-8

@@ -1,5 +1,11 @@
 # Lever 2 — batch the per-slot DRAFT + COMMIT (batched MTP residual ~30%)
 
+> Superseded by measurement on 2026-06-15. The "draft amortizes a real MoE →
+> verify-class win" code-read hypothesis below was killed by
+> [2026-06-15-dsv4-batched-mtp-lever2a-draft-marginal.md](../experience/wins/2026-06-15-dsv4-batched-mtp-lever2a-draft-marginal.md):
+> batched draft was only +2.4% at/below noise. Treat this file as historical
+> design context, not current execution guidance.
+
 Batched MTP fold WIN (+81% @c=12,
 [wins](../experience/wins/2026-06-15-dsv4-batched-mtp-fold-win.md)) batched the VERIFY
 but left DRAFT + COMMIT per-slot serial. Phase profile (`ARLE_DSV4_MTP_STEP_PROFILE`,

@@ -1020,7 +1020,8 @@ mod tests {
             return;
         }
         // Only meaningful when the compiled backend is not CUDA; on a CUDA
-        // build `--spec-type mtp` is accepted for checkpoint-native DSv4 MTP.
+        // build the CLI accepts the flag, then infer-api fail-closes it for
+        // non-DSv4 model kinds once the checkpoint type is known.
         if CompiledBackend::detect() == CompiledBackend::Cuda {
             return;
         }

@@ -199,16 +199,22 @@ class ServeSession:
     def teardown(self) -> None:
         if self.proc is None:
             return
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=10)
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+        else:
+            self.proc.wait(timeout=0)
 
 
 def _models_url(base_url: str) -> str:
-    return f"{base_url.rstrip('/')}/v1/models"
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
 
 
 def serve_is_ready(base_url: str, timeout: float = 5.0) -> bool:
@@ -255,18 +261,21 @@ def launch_serve(cp: Checkpoint, args: argparse.Namespace, output_dir: Path) -> 
     log_fh = log_path.open("w", encoding="utf-8")
     print(f"[curve] launch: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
+    log_fh.close()
+    session = ServeSession(base_url=base_url, proc=proc, log_path=log_path)
 
     deadline = time.time() + args.serve_ready_timeout
     while time.time() < deadline:
         if proc.poll() is not None:
+            session.teardown()
             raise RuntimeError(
                 f"arle serve for {cp.label!r} exited early (code {proc.returncode}); see {log_path}"
             )
         if serve_is_ready(base_url):
             print(f"[curve] serve ready for {cp.label!r} at {base_url}", flush=True)
-            return ServeSession(base_url=base_url, proc=proc, log_path=log_path)
+            return session
         time.sleep(2.0)
-    proc.terminate()
+    session.teardown()
     raise RuntimeError(
         f"arle serve for {cp.label!r} not ready within {args.serve_ready_timeout}s; see {log_path}"
     )
@@ -363,15 +372,19 @@ def _read_cap_metrics(cap_dir: Path, cap_tasks: list[str]) -> dict[str, Any]:
         out["mode"] = "multi_seed"
         out["seeds"] = summary.get("seeds")
         for task in cap_tasks:
-            per_seed = {
-                seed: blob.get(task, {}).get("accuracy")
-                for seed, blob in summary.get("per_seed", {}).items()
+            per_seed_reports = summary.get("per_seed", {})
+            per_seed = {seed: blob.get(task, {}).get("accuracy") for seed, blob in per_seed_reports.items()}
+            per_seed_n_scored = {
+                seed: blob.get(task, {}).get("n_scored") for seed, blob in per_seed_reports.items()
             }
             accs = [v for v in per_seed.values() if v is not None]
+            scored = [v for v in per_seed_n_scored.values() if v is not None]
             out["tasks"][task] = {
                 "per_seed": per_seed,
+                "per_seed_n_scored": per_seed_n_scored,
                 "mean_accuracy": (sum(accs) / len(accs)) if accs else None,
                 "n_seeds": len(accs),
+                "n_scored": min(scored) if scored else None,
             }
     else:
         out["mode"] = "single"
@@ -523,6 +536,7 @@ def main(argv: list[str]) -> int:
         "schema_version": "opd-capability-curve-v1",
         "baseline_label": baseline_label,
         "tasks": requested,
+        "requested_n_samples": args.n_samples,
         "n_samples": args.n_samples,
         "seed": args.seed,
         "seeds": args.seeds,
@@ -584,6 +598,10 @@ def main(argv: list[str]) -> int:
             "base_url": cp.base_url,
             "adapter_path": cp.adapter_path,
             "capability": cap_metrics,
+            "actual_n_scored": {
+                task: cap_metrics.get("tasks", {}).get(task, {}).get("n_scored")
+                for task in cap_tasks
+            },
             "swe_pro": {"ran_generate": want_swe, "dir": str(cp_out / "swe_pro")} if want_swe else None,
         })
 

@@ -1636,13 +1636,12 @@ impl Dsv4CudaExecutor {
                 && batch.positions.len() == batch.rows.len(),
             "DSv4 decode batch surface length mismatch"
         );
-        // Cross-slot batched MTP decode (batched-MTP Stage 1). Default OFF
-        // (`ARLE_DSV4_BATCHED_MTP`): when ON, spec is on, and the batch has
-        // `>= dsv4_batched_decode_min_rows()` rows, drive all N chains through
-        // ONE batched verify (MoE grouped over the verify rows, attention
-        // per-slot) instead of the per-row `spec_step` loop. With the env unset
-        // the per-row spec loop below runs (byte-identical reference / the
-        // B=1 / c<N path).
+        // Cross-slot batched MTP decode (batched-MTP Stage 1). Default ON:
+        // when spec is on and the batch has `>= dsv4_batched_decode_min_rows()`
+        // rows, drive all N chains through one batched verify (MoE grouped over
+        // the verify rows, attention per-slot) instead of the per-row
+        // `spec_step` loop. Force the per-row reference with
+        // `ARLE_DSV4_BATCHED_MTP=0`; c<N still falls through below.
         let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
         if spec_on

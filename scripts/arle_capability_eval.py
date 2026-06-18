@@ -90,6 +90,12 @@ class ArleClient:
         self.model_id = model_id
         self.timeout = timeout
 
+    def _v1_url(self, suffix: str) -> str:
+        suffix = suffix.lstrip("/")
+        if self.base_url.endswith("/v1"):
+            return f"{self.base_url}/{suffix}"
+        return f"{self.base_url}/v1/{suffix}"
+
     def chat(self, messages: list[dict], max_tokens: int = 64, temperature: float = 0.0) -> str:
         body = {
             "model": self.model_id,
@@ -98,7 +104,7 @@ class ArleClient:
             "temperature": temperature,
         }
         req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
+            self._v1_url("chat/completions"),
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -115,7 +121,7 @@ class ArleClient:
             "temperature": temperature,
         }
         req = urllib.request.Request(
-            f"{self.base_url}/v1/completions",
+            self._v1_url("completions"),
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -316,16 +322,41 @@ def run_mmlu(
     for ex in ds_dev:
         dev_by_subject.setdefault(ex["subject"], []).append(ex)
 
-    # Sample n_samples evenly across subjects for speed.
+    # Sample n_samples evenly across subjects for speed. Keep the actual pool
+    # at the requested size when possible: floor-only allocation under-ran the
+    # default 200 as 57 subjects * 3 = 171.
     subjects = sorted({ex["subject"] for ex in ds_test})
-    n_per_subject = max(1, n_samples // len(subjects))
+    test_by_subject: dict[str, list[dict]] = {subj: [] for subj in subjects}
+    for ex in ds_test:
+        test_by_subject[ex["subject"]].append(ex)
+    subject_order = subjects.copy()
+    if seed is not None:
+        random.Random(f"mmlu-{seed}-subjects").shuffle(subject_order)
+    base_quota, extra = divmod(max(n_samples, 0), len(subject_order) or 1)
     pool: list[dict] = []
-    for subj in subjects:
-        subj_pool = [ex for ex in ds_test if ex["subject"] == subj]
+    used_by_subject: dict[str, int] = {}
+    for index, subj in enumerate(subject_order):
+        quota = base_quota + (1 if index < extra else 0)
+        if quota == 0:
+            used_by_subject[subj] = 0
+            continue
+        subj_pool = list(test_by_subject[subj])
         if seed is not None:
             random.Random(f"mmlu-{seed}-{subj}").shuffle(subj_pool)
-        pool.extend(subj_pool[:n_per_subject])
-    pool = pool[:n_samples]
+        take = min(quota, len(subj_pool))
+        used_by_subject[subj] = take
+        pool.extend(subj_pool[:take])
+    if len(pool) < n_samples:
+        for subj in subject_order:
+            subj_pool = list(test_by_subject[subj])
+            if seed is not None:
+                random.Random(f"mmlu-{seed}-{subj}").shuffle(subj_pool)
+            start = used_by_subject.get(subj, 0)
+            need = n_samples - len(pool)
+            if need <= 0:
+                break
+            pool.extend(subj_pool[start : start + need])
+    pool = pool[: max(n_samples, 0)]
     sample_fingerprint = _fingerprint_records([
         {
             "subject": ex["subject"],

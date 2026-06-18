@@ -56,6 +56,11 @@ c=8 both configs already get broad batching (batched-FlashMLA + natural GEMM/MoE
 batch), so the lever's marginal gain narrows to +5% (77.6 vs 74.0). Consistent with
 "gain ∝ n until other batched paths saturate."
 
+Roofline note: this entry is a same-session tok/s A/B anchor only. It does not
+compute achieved-vs-peak; per `docs/bench-and-trace-spec.md` §7.7, roofline is
+deferred to the next nsys/ncu component pass before using these rows as a
+kernel-efficiency claim.
+
 ## MTP arm — MEASURED on .61 (gcc-13), root cause of the .62 "hang" confirmed
 
 The `.62` MTP-head deepgemm JIT does NOT hang because of MTP — it hangs because

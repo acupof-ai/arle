@@ -8,6 +8,7 @@ use std::{
 use autograd::{Backend, Tape, TensorStore, backend_cuda::CudaBackend};
 use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
 use train::{
+    qwen35::SequenceWindow,
     qwen35_loader::load_qwen35_from_hf_dir,
     teacher_infer::{InProcessTeacher, InferTeacher, TeacherForward},
 };
@@ -76,6 +77,22 @@ fn infer_teacher_matches_in_process_on_dominant_logits() -> TestResult {
         relerr <= DOMINANT_RELERR_GATE,
         "InferTeacher vs InProcessTeacher top-{DOMINANT_TOP_K} relerr {relerr:e} exceeds \
          BF16-realistic gate {DOMINANT_RELERR_GATE:e}"
+    );
+
+    let window_err = infer_teacher
+        .forward_logits_window_device(
+            &[9419u32, 9450],
+            &[0u32, 1],
+            SequenceWindow { start: 1, end: 2 },
+            &mut store,
+            &mut tape,
+        )
+        .expect_err("InferTeacher must not fake windowed logits via full raw logits");
+    assert!(
+        window_err
+            .to_string()
+            .contains("does not support true windowed logits"),
+        "unexpected InferTeacher window error: {window_err}"
     );
 
     Ok(())

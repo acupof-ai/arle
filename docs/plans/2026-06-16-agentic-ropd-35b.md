@@ -61,7 +61,7 @@ dominant fact. See Open Decision #1.
 
 ```
 F2 (fix 35B inference coherence) → F1 (SIGFPE) → T0 (train-path decision)
-  → T1/T2 (infer-engine-as-student + LoRA-on-MoE) → T3 (LoRA sync) 
+  → T1/T2 (infer-engine-as-student + LoRA-on-MoE) → T3 (LoRA sync)
   → R1→R2 (agent rollout into opd_step) → S2/S3/S4 (rubric machinery)
   → L1→L2 (best-of-N ROPD step) → E1→E2→E3 (capability curve, ≥5 seed + Wilson CI)
 ```
