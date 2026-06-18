@@ -1502,6 +1502,9 @@ __device__ __forceinline__ int dsv4_route_local_expert(
     int local_expert_start,
     int experts_per_rank)
 {
+    if (route_meta == nullptr) {
+        return route % experts_per_rank;
+    }
     const int expert = route_meta[route * 3 + 1];
     const int local = expert - local_expert_start;
     return (local >= 0 && local < experts_per_rank) ? local : -1;
@@ -1511,6 +1514,9 @@ __device__ __forceinline__ float dsv4_route_weight(
     const int32_t* __restrict__ route_meta,
     int route)
 {
+    if (route_meta == nullptr) {
+        return 1.0f;
+    }
     return __int_as_float(route_meta[route * 3 + 2]);
 }
 
