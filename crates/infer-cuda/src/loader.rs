@@ -3,6 +3,7 @@
 //! Holds the BF16 safetensors loader, `CudaModel::from_safetensors` weight
 //! upload, the per-step paging metadata (`PageMeta`), and the BF16 config gate.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
@@ -579,6 +580,12 @@ struct ShardTensorMeta {
     len: usize,
 }
 
+struct ShardedBytesCow<'a> {
+    bytes: Cow<'a, [u8]>,
+    rows: usize,
+    cols: usize,
+}
+
 fn shard_cache_bytes_limit() -> usize {
     env::var("ARLE_CUDA_SHARD_CACHE_BYTES")
         .ok()
@@ -724,21 +731,24 @@ impl SafetensorLoader {
     /// BF16; this normalizes F32→BF16 so the recurrent kernel's bf16 input ABI
     /// holds), uploaded as a [`DeviceVec`].
     pub(crate) fn load_vec_any(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape.len() == 1,
             "{name}: expected 1D tensor, got shape {:?}",
             tensor.shape
         );
-        DeviceVec::from_safetensors(ctx, Self::dsv4_bytes_to_bf16(name, &tensor)?.as_ref())
-            .with_context(|| format!("upload vec {name}"))
+        DeviceVec::from_safetensors(
+            ctx,
+            Self::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes())?.as_ref(),
+        )
+        .with_context(|| format!("upload vec {name}"))
     }
 
     /// Load a 1D F32 tensor (Qwen3.5 `A_log` / gated-norm scale) directly into a
     /// device `f32` slice — the recurrent + gated-RMSNorm kernels read these as
     /// `*const f32`. Accepts F32 (passthrough) or BF16 (widened to F32).
     pub(crate) fn load_f32_vec(&self, ctx: &DeviceContext, name: &str) -> Result<CudaSlice<f32>> {
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape.len() == 1,
             "{name}: expected 1D tensor, got shape {:?}",
@@ -746,12 +756,12 @@ impl SafetensorLoader {
         );
         let host: Vec<f32> = match tensor.dtype {
             Dtype::F32 => tensor
-                .bytes
+                .bytes()
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
             Dtype::BF16 => tensor
-                .bytes
+                .bytes()
                 .chunks_exact(2)
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect(),
@@ -1864,25 +1874,26 @@ impl SafetensorLoader {
                 ),
             },
             QuantFormat::DenseF32 => {
-                let tensor = self.load_raw_tensor(&view.name)?;
+                let tensor = self.borrow_raw_tensor(&view.name)?;
                 ensure!(
                     tensor.shape.len() == 2,
                     "{}: expected 2D F32 tensor, got {:?}",
                     view.name,
                     tensor.shape
                 );
-                let sharded =
-                    self.shard_raw_2d(&tensor.bytes, tensor.shape[0], tensor.shape[1], 4, &shard)?;
-                let owned = OwnedTensor {
-                    shape: vec![sharded.rows, sharded.cols],
-                    bytes: sharded.bytes,
-                    dtype: Dtype::F32,
-                };
+                let sharded = self.shard_raw_2d_cow(
+                    tensor.bytes(),
+                    tensor.shape[0],
+                    tensor.shape[1],
+                    4,
+                    &shard,
+                )?;
                 DeviceMatrix::from_safetensors(
                     ctx,
-                    Self::dsv4_bytes_to_bf16(&view.name, &owned)?.as_ref(),
-                    owned.shape[0],
-                    owned.shape[1],
+                    Self::tensor_bytes_to_bf16(&view.name, Dtype::F32, sharded.bytes.as_ref())?
+                        .as_ref(),
+                    sharded.rows,
+                    sharded.cols,
                 )
                 .with_context(|| format!("upload dense F32 tensor {}", view.name))
             }
@@ -1935,25 +1946,37 @@ impl SafetensorLoader {
             .with_context(|| format!("upload sharded tensor {name}"))
     }
 
-    fn shard_raw_2d(
+    fn shard_raw_2d_cow<'a>(
         &self,
-        bytes: &[u8],
+        bytes: &'a [u8],
         rows: usize,
         cols: usize,
         elem_size: usize,
         shard: &QuantMatrixShard,
-    ) -> Result<crate::shard_slice::ShardedBytes> {
+    ) -> Result<ShardedBytesCow<'a>> {
         match shard {
-            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
-                bytes: bytes.to_vec(),
+            QuantMatrixShard::Full => Ok(ShardedBytesCow {
+                bytes: Cow::Borrowed(bytes),
                 rows,
                 cols,
             }),
             QuantMatrixShard::Rows(spec) => {
-                crate::shard_slice::shard_column_parallel(bytes, rows, cols, elem_size, spec)
+                let sharded =
+                    crate::shard_slice::shard_column_parallel(bytes, rows, cols, elem_size, spec)?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
             QuantMatrixShard::Cols(spec) => {
-                crate::shard_slice::shard_row_parallel(bytes, rows, cols, elem_size, spec)
+                let sharded =
+                    crate::shard_slice::shard_row_parallel(bytes, rows, cols, elem_size, spec)?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
         }
     }
@@ -1967,7 +1990,7 @@ impl SafetensorLoader {
         block_k: usize,
         scale_apply: ScaleApply,
     ) -> Result<DeviceMatrix> {
-        let weight = self.load_raw_tensor(&view.name)?;
+        let weight = self.borrow_raw_tensor(&view.name)?;
         ensure!(
             weight.dtype == Dtype::F8_E4M3 && weight.shape == view.logical_shape,
             "{}: expected F8_E4M3 {:?}, got {:?} {:?}",
@@ -1978,8 +2001,8 @@ impl SafetensorLoader {
         );
         let rows = view.logical_shape[0];
         let cols = view.logical_shape[1];
-        let weight_shard = self.shard_raw_2d(&weight.bytes, rows, cols, 1, shard)?;
-        let scale = self.load_raw_tensor(&view.scale_names[0])?;
+        let weight_shard = self.shard_raw_2d_cow(weight.bytes(), rows, cols, 1, shard)?;
+        let scale = self.borrow_raw_tensor(&view.scale_names[0])?;
         let scale_elem = float_elem_size(&view.scale_names[0], scale.dtype)?;
         let scale_rows = rows.div_ceil(block_m);
         let scale_cols = cols.div_ceil(block_k);
@@ -1989,8 +2012,8 @@ impl SafetensorLoader {
             view.scale_names[0],
             scale.shape
         );
-        let scale_shard = self.shard_fp8_block_scales(
-            &scale.bytes,
+        let scale_shard = self.shard_fp8_block_scales_cow(
+            scale.bytes(),
             scale_elem,
             rows,
             cols,
@@ -2001,12 +2024,12 @@ impl SafetensorLoader {
         let scales = tensor_bytes_to_f32(
             &view.scale_names[0],
             scale.dtype,
-            &scale_shard.bytes,
+            scale_shard.bytes.as_ref(),
             scale_apply,
         )?;
         DeviceMatrix::from_fp8_block_scaled(
             ctx,
-            &weight_shard.bytes,
+            weight_shard.bytes.as_ref(),
             &scales,
             weight_shard.rows,
             weight_shard.cols,
@@ -2016,21 +2039,21 @@ impl SafetensorLoader {
         .with_context(|| format!("upload FP8 block-scaled tensor {}", view.name))
     }
 
-    fn shard_fp8_block_scales(
+    fn shard_fp8_block_scales_cow<'a>(
         &self,
-        bytes: &[u8],
+        bytes: &'a [u8],
         elem_size: usize,
         rows: usize,
         cols: usize,
         block_m: usize,
         block_k: usize,
         shard: &QuantMatrixShard,
-    ) -> Result<crate::shard_slice::ShardedBytes> {
+    ) -> Result<ShardedBytesCow<'a>> {
         let scale_rows = rows.div_ceil(block_m);
         let scale_cols = cols.div_ceil(block_k);
         match shard {
-            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
-                bytes: bytes.to_vec(),
+            QuantMatrixShard::Full => Ok(ShardedBytesCow {
+                bytes: Cow::Borrowed(bytes),
                 rows: scale_rows,
                 cols: scale_cols,
             }),
@@ -2046,13 +2069,18 @@ impl SafetensorLoader {
                     size: spec.size.div_ceil(block_m),
                     total: scale_rows,
                 };
-                crate::shard_slice::shard_column_parallel(
+                let sharded = crate::shard_slice::shard_column_parallel(
                     bytes,
                     scale_rows,
                     scale_cols,
                     elem_size,
                     &scale_spec,
-                )
+                )?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
             QuantMatrixShard::Cols(spec) => {
                 ensure!(
@@ -2066,13 +2094,18 @@ impl SafetensorLoader {
                     size: spec.size.div_ceil(block_k),
                     total: scale_cols,
                 };
-                crate::shard_slice::shard_row_parallel(
+                let sharded = crate::shard_slice::shard_row_parallel(
                     bytes,
                     scale_rows,
                     scale_cols,
                     elem_size,
                     &scale_spec,
-                )
+                )?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
         }
     }
@@ -2084,7 +2117,7 @@ impl SafetensorLoader {
         shard: &QuantMatrixShard,
         scale_apply: ScaleApply,
     ) -> Result<DeviceMatrix> {
-        let weight = self.load_raw_tensor(&view.name)?;
+        let weight = self.borrow_raw_tensor(&view.name)?;
         ensure!(
             weight.dtype == Dtype::F8_E4M3 && weight.shape == view.logical_shape,
             "{}: expected F8_E4M3 {:?}, got {:?} {:?}",
@@ -2095,12 +2128,21 @@ impl SafetensorLoader {
         );
         let rows = view.logical_shape[0];
         let cols = view.logical_shape[1];
-        let weight_shard = self.shard_raw_2d(&weight.bytes, rows, cols, 1, shard)?;
-        let scale = self.load_raw_tensor(&view.scale_names[0])?;
-        let input_scale = self.load_raw_tensor(&view.scale_names[1])?;
-        let scales = tensor_to_f32_vec(&view.scale_names[0], &scale, scale_apply)?;
-        let input_scales =
-            tensor_to_f32_vec(&view.scale_names[1], &input_scale, ScaleApply::Multiply)?;
+        let weight_shard = self.shard_raw_2d_cow(weight.bytes(), rows, cols, 1, shard)?;
+        let scale = self.borrow_raw_tensor(&view.scale_names[0])?;
+        let input_scale = self.borrow_raw_tensor(&view.scale_names[1])?;
+        let scales = tensor_bytes_to_f32(
+            &view.scale_names[0],
+            scale.dtype,
+            scale.bytes(),
+            scale_apply,
+        )?;
+        let input_scales = tensor_bytes_to_f32(
+            &view.scale_names[1],
+            input_scale.dtype,
+            input_scale.bytes(),
+            ScaleApply::Multiply,
+        )?;
         ensure!(
             scales.len() == 1 && input_scales.len() == 1,
             "{}: FP8 per-shard dispatch currently requires scalar weight/input scales, got {}/{}",
@@ -2110,7 +2152,7 @@ impl SafetensorLoader {
         );
         DeviceMatrix::from_fp8_per_shard(
             ctx,
-            &weight_shard.bytes,
+            weight_shard.bytes.as_ref(),
             &scales,
             &input_scales,
             weight_shard.rows,
@@ -2127,7 +2169,7 @@ impl SafetensorLoader {
         group_size: usize,
         global_scale_apply: ScaleApply,
     ) -> Result<DeviceMatrix> {
-        let weight = self.load_raw_tensor(&view.name)?;
+        let weight = self.borrow_raw_tensor(&view.name)?;
         let rows = view.logical_shape[0];
         let cols = view.logical_shape[1];
         ensure!(
@@ -2139,8 +2181,8 @@ impl SafetensorLoader {
             weight.shape
         );
         let weight_shard =
-            self.shard_fp4_packed_weight(&weight.bytes, rows, cols, group_size, shard)?;
-        let scale = self.load_raw_tensor(&view.scale_names[0])?;
+            self.shard_fp4_packed_weight_cow(weight.bytes(), rows, cols, group_size, shard)?;
+        let scale = self.borrow_raw_tensor(&view.scale_names[0])?;
         ensure!(
             scale.dtype == Dtype::F8_E4M3 && scale.shape == [rows, cols / group_size],
             "{}: expected FP8 group scale [{rows}, {}], got {:?} {:?}",
@@ -2150,9 +2192,14 @@ impl SafetensorLoader {
             scale.shape
         );
         let scale_shard =
-            self.shard_fp4_group_scales(&scale.bytes, rows, cols, group_size, shard)?;
-        let global = self.load_raw_tensor(&view.scale_names[1])?;
-        let global_scales = tensor_to_f32_vec(&view.scale_names[1], &global, global_scale_apply)?;
+            self.shard_fp4_group_scales_cow(scale.bytes(), rows, cols, group_size, shard)?;
+        let global = self.borrow_raw_tensor(&view.scale_names[1])?;
+        let global_scales = tensor_bytes_to_f32(
+            &view.scale_names[1],
+            global.dtype,
+            global.bytes(),
+            global_scale_apply,
+        )?;
         ensure!(
             global_scales.len() == 1,
             "{}: FP4 global scale must be scalar, got {} values",
@@ -2160,10 +2207,11 @@ impl SafetensorLoader {
             global_scales.len()
         );
         let input_scales = if view.scale_names.len() > 2 {
-            let input = self.load_raw_tensor(&view.scale_names[2])?;
-            Some(tensor_to_f32_vec(
+            let input = self.borrow_raw_tensor(&view.scale_names[2])?;
+            Some(tensor_bytes_to_f32(
                 &view.scale_names[2],
-                &input,
+                input.dtype,
+                input.bytes(),
                 ScaleApply::Multiply,
             )?)
         } else {
@@ -2171,8 +2219,8 @@ impl SafetensorLoader {
         };
         DeviceMatrix::from_fp4_e2m1_group(
             ctx,
-            &weight_shard.bytes,
-            &scale_shard.bytes,
+            weight_shard.bytes.as_ref(),
+            scale_shard.bytes.as_ref(),
             &global_scales,
             input_scales.as_deref(),
             weight_shard.rows,
@@ -2182,23 +2230,29 @@ impl SafetensorLoader {
         .with_context(|| format!("upload FP4 E2M1 tensor {}", view.name))
     }
 
-    fn shard_fp4_packed_weight(
+    fn shard_fp4_packed_weight_cow<'a>(
         &self,
-        bytes: &[u8],
+        bytes: &'a [u8],
         rows: usize,
         logical_cols: usize,
         group_size: usize,
         shard: &QuantMatrixShard,
-    ) -> Result<crate::shard_slice::ShardedBytes> {
+    ) -> Result<ShardedBytesCow<'a>> {
         let packed_cols = logical_cols / 2;
         match shard {
-            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
-                bytes: bytes.to_vec(),
+            QuantMatrixShard::Full => Ok(ShardedBytesCow {
+                bytes: Cow::Borrowed(bytes),
                 rows,
                 cols: packed_cols,
             }),
             QuantMatrixShard::Rows(spec) => {
-                crate::shard_slice::shard_column_parallel(bytes, rows, packed_cols, 1, spec)
+                let sharded =
+                    crate::shard_slice::shard_column_parallel(bytes, rows, packed_cols, 1, spec)?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
             QuantMatrixShard::Cols(spec) => {
                 ensure!(
@@ -2214,28 +2268,45 @@ impl SafetensorLoader {
                     size: spec.size / 2,
                     total: logical_cols / 2,
                 };
-                crate::shard_slice::shard_row_parallel(bytes, rows, packed_cols, 1, &packed_spec)
+                let sharded = crate::shard_slice::shard_row_parallel(
+                    bytes,
+                    rows,
+                    packed_cols,
+                    1,
+                    &packed_spec,
+                )?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
         }
     }
 
-    fn shard_fp4_group_scales(
+    fn shard_fp4_group_scales_cow<'a>(
         &self,
-        bytes: &[u8],
+        bytes: &'a [u8],
         rows: usize,
         logical_cols: usize,
         group_size: usize,
         shard: &QuantMatrixShard,
-    ) -> Result<crate::shard_slice::ShardedBytes> {
+    ) -> Result<ShardedBytesCow<'a>> {
         let scale_cols = logical_cols / group_size;
         match shard {
-            QuantMatrixShard::Full => Ok(crate::shard_slice::ShardedBytes {
-                bytes: bytes.to_vec(),
+            QuantMatrixShard::Full => Ok(ShardedBytesCow {
+                bytes: Cow::Borrowed(bytes),
                 rows,
                 cols: scale_cols,
             }),
             QuantMatrixShard::Rows(spec) => {
-                crate::shard_slice::shard_column_parallel(bytes, rows, scale_cols, 1, spec)
+                let sharded =
+                    crate::shard_slice::shard_column_parallel(bytes, rows, scale_cols, 1, spec)?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
             QuantMatrixShard::Cols(spec) => {
                 ensure!(
@@ -2248,7 +2319,18 @@ impl SafetensorLoader {
                     size: spec.size / group_size,
                     total: scale_cols,
                 };
-                crate::shard_slice::shard_row_parallel(bytes, rows, scale_cols, 1, &scale_spec)
+                let sharded = crate::shard_slice::shard_row_parallel(
+                    bytes,
+                    rows,
+                    scale_cols,
+                    1,
+                    &scale_spec,
+                )?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
             }
         }
     }
@@ -2390,7 +2472,7 @@ impl SafetensorLoader {
 
     /// Zero-copy tensor lookup across shards (the borrow-path twin of
     /// [`Self::load_raw_tensor`]).
-    fn borrow_raw_tensor(&self, name: &str) -> Result<SharedTensor> {
+    pub(crate) fn borrow_raw_tensor(&self, name: &str) -> Result<SharedTensor> {
         if let Some(&idx) = self.weight_map.get(name) {
             return self.borrow_raw_from_shard(idx, name);
         }
@@ -2440,10 +2522,6 @@ fn float_elem_size(name: &str, dtype: Dtype) -> Result<usize> {
         Dtype::BF16 => Ok(2),
         other => bail!("{name}: expected BF16/F32 scale tensor, got {other:?}"),
     }
-}
-
-fn tensor_to_f32_vec(name: &str, tensor: &OwnedTensor, apply: ScaleApply) -> Result<Vec<f32>> {
-    tensor_bytes_to_f32(name, tensor.dtype, &tensor.bytes, apply)
 }
 
 fn tensor_bytes_to_f32(
@@ -2517,19 +2595,33 @@ impl SafetensorLoader {
     pub(crate) fn dsv4_bytes_to_bf16<'a>(
         name: &str,
         tensor: &'a OwnedTensor,
-    ) -> Result<std::borrow::Cow<'a, [u8]>> {
-        match tensor.dtype {
-            Dtype::BF16 => Ok(std::borrow::Cow::Borrowed(tensor.bytes.as_slice())),
-            Dtype::F32 => Ok(std::borrow::Cow::Owned(
-                tensor
-                    .bytes
-                    .chunks_exact(4)
-                    .flat_map(|c| {
-                        half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .to_le_bytes()
-                    })
-                    .collect(),
-            )),
+    ) -> Result<Cow<'a, [u8]>> {
+        Self::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes.as_slice())
+    }
+
+    pub(crate) fn tensor_bytes_to_bf16<'a>(
+        name: &str,
+        dtype: Dtype,
+        bytes: &'a [u8],
+    ) -> Result<Cow<'a, [u8]>> {
+        match dtype {
+            Dtype::BF16 => Ok(Cow::Borrowed(bytes)),
+            Dtype::F32 => {
+                ensure!(
+                    bytes.len().is_multiple_of(4),
+                    "{name}: F32 tensor byte length {} is not divisible by 4",
+                    bytes.len()
+                );
+                Ok(Cow::Owned(
+                    bytes
+                        .chunks_exact(4)
+                        .flat_map(|c| {
+                            half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .to_le_bytes()
+                        })
+                        .collect(),
+                ))
+            }
             other => anyhow::bail!("{name}: DSv4 tensor expected BF16/F32, got {other:?}"),
         }
     }
@@ -2537,14 +2629,17 @@ impl SafetensorLoader {
     /// Load a DSv4 1D norm/bias vector (q_norm, kv_norm, attn_sink, layer norms,
     /// gate bias) — BF16 or F32 in the checkpoint, normalized to BF16.
     pub(crate) fn load_dsv4_vec(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceVec> {
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape.len() == 1,
             "{name}: expected 1D tensor, got shape {:?}",
             tensor.shape
         );
-        DeviceVec::from_safetensors(ctx, Self::dsv4_bytes_to_bf16(name, &tensor)?.as_ref())
-            .with_context(|| format!("upload DSv4 vec {name}"))
+        DeviceVec::from_safetensors(
+            ctx,
+            Self::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes())?.as_ref(),
+        )
+        .with_context(|| format!("upload DSv4 vec {name}"))
     }
 
     /// Load a DSv4 2D router gate (the only non-FP8 2D weight) — BF16 or F32 in
@@ -2554,7 +2649,7 @@ impl SafetensorLoader {
         ctx: &DeviceContext,
         name: &str,
     ) -> Result<DeviceMatrix> {
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D tensor, got shape {:?}",
@@ -2562,7 +2657,7 @@ impl SafetensorLoader {
         );
         DeviceMatrix::from_safetensors(
             ctx,
-            Self::dsv4_bytes_to_bf16(name, &tensor)?.as_ref(),
+            Self::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes())?.as_ref(),
             tensor.shape[0],
             tensor.shape[1],
         )
@@ -2579,7 +2674,7 @@ impl SafetensorLoader {
         ctx: &DeviceContext,
         name: &str,
     ) -> Result<DeviceMatrix> {
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D quantized tensor, got shape {:?}",
@@ -2589,7 +2684,7 @@ impl SafetensorLoader {
             .strip_suffix(".weight")
             .map(|prefix| format!("{prefix}.scale"))
             .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
-        let scale = self.load_raw_tensor(&scale_name)?;
+        let scale = self.borrow_raw_tensor(&scale_name)?;
         ensure!(
             scale.dtype == Dtype::F8_E8M0,
             "{scale_name}: expected F8_E8M0 block scale, got {:?}",
@@ -2607,8 +2702,8 @@ impl SafetensorLoader {
                 let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
                 DeviceMatrix::from_dsv4_fp8_block_scaled(
                     ctx,
-                    &tensor.bytes,
-                    &scale.bytes,
+                    tensor.bytes(),
+                    scale.bytes(),
                     rows,
                     cols,
                     scale_rows,
@@ -2622,8 +2717,8 @@ impl SafetensorLoader {
                 let logical_cols = packed_cols * 2;
                 DeviceMatrix::from_dsv4_fp4_block_scaled(
                     ctx,
-                    &tensor.bytes,
-                    &scale.bytes,
+                    tensor.bytes(),
+                    scale.bytes(),
                     rows,
                     logical_cols,
                     scale_rows,
@@ -2673,7 +2768,7 @@ impl SafetensorLoader {
             return self.load_dsv4_block_scaled(ctx, name);
         }
 
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.shape.len() == 2,
             "{name}: expected 2D quantized tensor, got shape {:?}",
@@ -2683,7 +2778,7 @@ impl SafetensorLoader {
             .strip_suffix(".weight")
             .map(|prefix| format!("{prefix}.scale"))
             .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
-        let scale = self.load_raw_tensor(&scale_name)?;
+        let scale = self.borrow_raw_tensor(&scale_name)?;
         ensure!(
             scale.dtype == Dtype::F8_E8M0,
             "{scale_name}: expected F8_E8M0 block scale, got {:?}",
@@ -2703,7 +2798,7 @@ impl SafetensorLoader {
                     Shard::Column { dim: 0 } => {
                         let spec = infer_topo::column_shard(rows, tp);
                         let weight = crate::shard_slice::shard_column_parallel(
-                            &tensor.bytes,
+                            tensor.bytes(),
                             rows,
                             cols,
                             1,
@@ -2712,7 +2807,7 @@ impl SafetensorLoader {
                         let scale_spec =
                             Self::dsv4_scale_shard_for_value_shard(name, &spec, scale_rows, 128)?;
                         let scales = crate::shard_slice::shard_column_parallel(
-                            &scale.bytes,
+                            scale.bytes(),
                             scale_rows,
                             scale_cols,
                             1,
@@ -2723,7 +2818,7 @@ impl SafetensorLoader {
                     Shard::Row { dim: 1 } => {
                         let spec = infer_topo::row_shard(cols, tp);
                         let weight = crate::shard_slice::shard_row_parallel(
-                            &tensor.bytes,
+                            tensor.bytes(),
                             rows,
                             cols,
                             1,
@@ -2732,7 +2827,7 @@ impl SafetensorLoader {
                         let scale_spec =
                             Self::dsv4_scale_shard_for_value_shard(name, &spec, scale_cols, 128)?;
                         let scales = crate::shard_slice::shard_row_parallel(
-                            &scale.bytes,
+                            scale.bytes(),
                             scale_rows,
                             scale_cols,
                             1,
@@ -2874,19 +2969,19 @@ impl SafetensorLoader {
     /// router; the host copy remains the A/B oracle.
     pub(crate) fn load_dsv4_i64_host(&self, name: &str) -> Result<Vec<i64>> {
         use safetensors::tensor::Dtype;
-        let tensor = self.load_raw_tensor(name)?;
+        let tensor = self.borrow_raw_tensor(name)?;
         ensure!(
             tensor.dtype == Dtype::I64,
             "{name}: DSv4 tid2eid expected I64, got {:?}",
             tensor.dtype
         );
         ensure!(
-            tensor.bytes.len() % 8 == 0,
+            tensor.bytes().len() % 8 == 0,
             "{name}: I64 byte length {} is not a multiple of 8",
-            tensor.bytes.len()
+            tensor.bytes().len()
         );
         Ok(tensor
-            .bytes
+            .bytes()
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().expect("8-byte chunk")))
             .collect())
@@ -2914,7 +3009,7 @@ impl SafetensorLoader {
         ctx: &DeviceContext,
         name: &str,
     ) -> Result<DeviceMatrix> {
-        let dtype = self.load_raw_tensor(name)?.dtype;
+        let dtype = self.borrow_raw_tensor(name)?.dtype;
         match dtype {
             Dtype::BF16 | Dtype::F32 => self.load_dsv4_bf16_matrix(ctx, name),
             Dtype::F8_E4M3 | Dtype::I8 => self.load_dsv4_block_scaled(ctx, name),
@@ -3526,5 +3621,79 @@ impl MoeFp8ExpertGroup {
         ctx.stream
             .clone_htod(&host)
             .map_err(|e| anyhow!("FP8 MoE scale ptr table H2D failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_loader() -> SafetensorLoader {
+        SafetensorLoader {
+            base: PathBuf::new(),
+            shards: Vec::new(),
+            weight_map: HashMap::new(),
+            tensor_headers: std::cell::RefCell::new(None),
+            quant_manifest: None,
+            shard_cache: std::cell::RefCell::new(ShardByteCache::new(DEFAULT_SHARD_CACHE_BYTES)),
+            shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn full_shards_borrow_source_bytes() {
+        let loader = empty_loader();
+        let bytes = (0u8..16).collect::<Vec<_>>();
+
+        let raw = loader
+            .shard_raw_2d_cow(&bytes, 4, 4, 1, &QuantMatrixShard::Full)
+            .unwrap();
+        assert!(matches!(raw.bytes, Cow::Borrowed(_)));
+        assert_eq!(raw.bytes.as_ref(), bytes.as_slice());
+        assert_eq!((raw.rows, raw.cols), (4, 4));
+
+        let scales = loader
+            .shard_fp8_block_scales_cow(&bytes[..4], 1, 256, 256, 128, 128, &QuantMatrixShard::Full)
+            .unwrap();
+        assert!(matches!(scales.bytes, Cow::Borrowed(_)));
+        assert_eq!(scales.bytes.as_ref(), &bytes[..4]);
+        assert_eq!((scales.rows, scales.cols), (2, 2));
+
+        let fp4 = loader
+            .shard_fp4_packed_weight_cow(&bytes, 4, 8, 4, &QuantMatrixShard::Full)
+            .unwrap();
+        assert!(matches!(fp4.bytes, Cow::Borrowed(_)));
+        assert_eq!(fp4.bytes.as_ref(), bytes.as_slice());
+        assert_eq!((fp4.rows, fp4.cols), (4, 4));
+    }
+
+    #[test]
+    fn partial_shards_allocate_sliced_bytes() {
+        let loader = empty_loader();
+        let bytes = (0u8..16).collect::<Vec<_>>();
+
+        let row_spec = ShardingSpec {
+            offset: 1,
+            size: 2,
+            total: 4,
+        };
+        let rows = loader
+            .shard_raw_2d_cow(&bytes, 4, 4, 1, &QuantMatrixShard::Rows(row_spec))
+            .unwrap();
+        assert!(matches!(rows.bytes, Cow::Owned(_)));
+        assert_eq!(rows.bytes.as_ref(), &[4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!((rows.rows, rows.cols), (2, 4));
+
+        let col_spec = ShardingSpec {
+            offset: 1,
+            size: 2,
+            total: 4,
+        };
+        let cols = loader
+            .shard_raw_2d_cow(&bytes, 4, 4, 1, &QuantMatrixShard::Cols(col_spec))
+            .unwrap();
+        assert!(matches!(cols.bytes, Cow::Owned(_)));
+        assert_eq!(cols.bytes.as_ref(), &[1, 2, 5, 6, 9, 10, 13, 14]);
+        assert_eq!((cols.rows, cols.cols), (4, 2));
     }
 }
