@@ -2155,15 +2155,32 @@ pub(crate) struct Dsv4PrefillDeepGemmLinearScratch {
     input_fp8: CudaSlice<u8>,
     input_scales: CudaSlice<f32>,
     qkv_raw: HiddenStates,
+    oproj_group_in: CudaSlice<half::bf16>,
+    oproj_group_out: CudaSlice<half::bf16>,
     active_experts: CudaSlice<i32>,
     active_offsets: CudaSlice<i32>,
     active_counts: CudaSlice<i32>,
     max_m: usize,
     max_k: usize,
     max_scale_stride_m: usize,
+    oproj_group_cols: usize,
+    oproj_group_rows: usize,
     hidden_dim: usize,
     q_lora_rank: usize,
     head_dim: usize,
+}
+
+fn dsv4_oproj_group_dims(config: &DeepSeekV4Config) -> Result<(usize, usize)> {
+    ensure!(
+        config.o_groups > 0 && config.num_attention_heads.is_multiple_of(config.o_groups),
+        "DSv4 grouped wo_a scratch needs num_attention_heads {} divisible by o_groups {}",
+        config.num_attention_heads,
+        config.o_groups
+    );
+    let cols = (config.num_attention_heads / config.o_groups)
+        .checked_mul(config.head_dim)
+        .ok_or_else(|| anyhow!("DSv4 grouped wo_a cols overflow"))?;
+    Ok((cols, config.o_lora_rank))
 }
 
 impl Dsv4PrefillDeepGemmLinearScratch {
@@ -2180,6 +2197,7 @@ impl Dsv4PrefillDeepGemmLinearScratch {
         let max_k = config.hidden_size;
         let q_lora_rank = config.q_lora_rank;
         let head_dim = config.head_dim;
+        let (oproj_group_cols, oproj_group_rows) = dsv4_oproj_group_dims(config)?;
         let max_scale_stride_m = max_m.div_ceil(4) * 4;
         let scale_cols = max_k.div_ceil(128);
         Ok(Self {
@@ -2206,6 +2224,30 @@ impl Dsv4PrefillDeepGemmLinearScratch {
                 )?)
                 .map_err(|e| anyhow!("DSv4 prefill DeepGEMM linear scales alloc failed: {e}"))?,
             qkv_raw: unsafe { HiddenStates::uninit(ctx, q_lora_rank + head_dim, max_m)? },
+            oproj_group_in: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(max_m.checked_mul(oproj_group_cols.max(1)).ok_or_else(
+                    || {
+                        anyhow!(
+                            "DSv4 grouped wo_a input scratch overflow: M={} K={}",
+                            max_m,
+                            oproj_group_cols
+                        )
+                    },
+                )?)
+                .map_err(|e| anyhow!("DSv4 grouped wo_a input scratch alloc failed: {e}"))?,
+            oproj_group_out: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(max_m.checked_mul(oproj_group_rows.max(1)).ok_or_else(
+                    || {
+                        anyhow!(
+                            "DSv4 grouped wo_a output scratch overflow: M={} N={}",
+                            max_m,
+                            oproj_group_rows
+                        )
+                    },
+                )?)
+                .map_err(|e| anyhow!("DSv4 grouped wo_a output scratch alloc failed: {e}"))?,
             active_experts: ctx
                 .stream
                 .clone_htod(&[0_i32])
@@ -2221,6 +2263,8 @@ impl Dsv4PrefillDeepGemmLinearScratch {
             max_m,
             max_k,
             max_scale_stride_m,
+            oproj_group_cols,
+            oproj_group_rows,
             hidden_dim: config.hidden_size,
             q_lora_rank,
             head_dim,
@@ -2236,6 +2280,8 @@ impl Dsv4PrefillDeepGemmLinearScratch {
         self.input_fp8.len() // u8
             + self.input_scales.len() * f32_sz
             + self.qkv_raw.device_bytes()
+            + self.oproj_group_in.len() * std::mem::size_of::<half::bf16>()
+            + self.oproj_group_out.len() * std::mem::size_of::<half::bf16>()
             + self.active_experts.len() * i32_sz
             + self.active_offsets.len() * i32_sz
             + self.active_counts.len() * i32_sz
@@ -4870,6 +4916,74 @@ pub(crate) fn mla_linear(
 /// with the pre-repacked weight `cache`. Used for the residual decode projections
 /// (wo_a/wo_b; lever #1b) when K ≤ the scratch hidden_dim. The scratch may have
 /// been consumed by an earlier projection this step — safe, all on `ctx.stream`.
+fn decode_proj_deepgemm_raw<I, O>(
+    ctx: &DeviceContext,
+    scratch: &Dsv4FusedWqkvDecodeScratch,
+    cache: &cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache,
+    input: &I,
+    input_len: usize,
+    out: &mut O,
+    out_len: usize,
+    k: usize,
+) -> Result<()>
+where
+    I: DevicePtr<half::bf16>,
+    O: DevicePtrMut<half::bf16>,
+{
+    ensure!(
+        cache.cols == k && input_len >= k && out_len >= cache.rows,
+        "DSv4 decode_proj_deepgemm_raw shape mismatch: cache {}x{} k={k} input_len={} out_len={}",
+        cache.rows,
+        cache.cols,
+        input_len,
+        out_len
+    );
+    let stream = ctx.stream.cu_stream();
+    let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+    let (fp8_ptr, _fp8_guard) = scratch.input_fp8.device_ptr(&ctx.stream);
+    let (scale_ptr, _scale_guard) = scratch.input_scales.device_ptr(&ctx.stream);
+    let (active_experts_ptr, _active_experts_guard) =
+        scratch.active_experts.device_ptr(&ctx.stream);
+    let (active_offsets_ptr, _active_offsets_guard) =
+        scratch.active_offsets.device_ptr(&ctx.stream);
+    let (active_counts_ptr, _active_counts_guard) = scratch.active_counts.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = cache.weight.device_ptr(&ctx.stream);
+    let (weight_scale_ptr, _weight_scale_guard) = cache.scales.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
+            input_ptr as *const ffi::Half,
+            fp8_ptr as *mut u8,
+            scale_ptr as *mut f32,
+            active_experts_ptr as *const i32,
+            active_offsets_ptr as *const i32,
+            active_counts_ptr as *const i32,
+            1,
+            i32::try_from(scratch.max_m)?,
+            i32::try_from(k)?,
+            i32::try_from(scratch.scale_stride_m)?,
+            stream,
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 decode proj activation quantize failed: {e}"))?;
+        ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
+            fp8_ptr as *const u8,
+            scale_ptr as *const f32,
+            weight_ptr as *const u8,
+            weight_scale_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            1,
+            i32::try_from(cache.rows)?,
+            i32::try_from(cache.cols)?,
+            i32::try_from(scratch.scale_stride_m)?,
+            stream,
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 decode proj DeepGEMM dense failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn decode_proj_deepgemm(
     ctx: &DeviceContext,
     scratch: &Dsv4FusedWqkvDecodeScratch,
@@ -4892,39 +5006,18 @@ fn decode_proj_deepgemm(
         out.hidden_dim,
         out.seq_len
     );
-    let stream = ctx.stream.cu_stream();
-    // SAFETY: all buffers live on ctx.stream; K ≤ scratch hidden_dim so the fused
-    // FP8 + scale scratch covers the extents.
-    unsafe {
-        cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
-            cache_ptr(&input.data, ctx),
-            cache_ptr(&scratch.input_fp8, ctx),
-            cache_ptr(&scratch.input_scales, ctx),
-            cache_ptr(&scratch.active_experts, ctx),
-            cache_ptr(&scratch.active_offsets, ctx),
-            cache_ptr(&scratch.active_counts, ctx),
-            1,
-            scratch.max_m,
-            k,
-            scratch.scale_stride_m,
-            stream,
-        )
-        .map_err(|e| anyhow!("DSv4 decode proj activation quantize failed: {e}"))?;
-        cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
-            cache_ptr(&scratch.input_fp8, ctx),
-            cache_ptr(&scratch.input_scales, ctx),
-            cache_ptr(&cache.weight, ctx),
-            cache_ptr(&cache.scales, ctx),
-            cache_ptr(&out.data, ctx),
-            1,
-            cache.rows,
-            cache.cols,
-            scratch.scale_stride_m,
-            stream,
-        )
-        .map_err(|e| anyhow!("DSv4 decode proj DeepGEMM dense failed: {e}"))?;
-    }
-    Ok(())
+    let in_len = input.data.len();
+    let out_len = out.data.len();
+    decode_proj_deepgemm_raw(
+        ctx,
+        scratch,
+        cache,
+        &input.data,
+        in_len,
+        &mut out.data,
+        out_len,
+        k,
+    )
 }
 
 /// Prefill (M=token_count) residual projection via DeepGEMM: quantize `input`
@@ -5006,6 +5099,84 @@ fn prefill_proj_deepgemm(
             stream,
         )
         .map_err(|e| anyhow!("DSv4 prefill_proj_deepgemm DeepGEMM dense failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn prefill_proj_deepgemm_group_scratch(
+    ctx: &DeviceContext,
+    scratch: &mut Dsv4PrefillDeepGemmLinearScratch,
+    cache: &cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache,
+    m: usize,
+) -> Result<()> {
+    let k = cache.cols;
+    let n = cache.rows;
+    ensure!(
+        m > 0
+            && m <= scratch.max_m
+            && k <= scratch.oproj_group_cols
+            && n <= scratch.oproj_group_rows,
+        "DSv4 grouped wo_a DeepGEMM scratch mismatch: M={m} cache={n}x{k} scratch M={} in_cols={} out_rows={}",
+        scratch.max_m,
+        scratch.oproj_group_cols,
+        scratch.oproj_group_rows
+    );
+    let scale_stride_m = m.div_ceil(4) * 4;
+    let scale_cols = k.div_ceil(128);
+    ensure!(
+        scale_stride_m <= scratch.max_scale_stride_m
+            && scale_stride_m * scale_cols <= scratch.input_scales.len()
+            && m * k <= scratch.oproj_group_in.len()
+            && m * n <= scratch.oproj_group_out.len(),
+        "DSv4 grouped wo_a DeepGEMM scratch extent mismatch: M={m} K={k} N={n} stride={scale_stride_m}"
+    );
+    let active_count =
+        i32::try_from(m).map_err(|_| anyhow!("DSv4 grouped wo_a token count {m} overflows i32"))?;
+    ctx.stream
+        .memcpy_htod(&[active_count], &mut scratch.active_counts)
+        .map_err(|e| anyhow!("DSv4 grouped wo_a active_counts H2D failed: {e}"))?;
+    let stream = ctx.stream.cu_stream();
+    let (input_ptr, _input_guard) = scratch.oproj_group_in.device_ptr(&ctx.stream);
+    let (fp8_ptr, _fp8_guard) = scratch.input_fp8.device_ptr(&ctx.stream);
+    let (scale_ptr, _scale_guard) = scratch.input_scales.device_ptr(&ctx.stream);
+    let (active_experts_ptr, _active_experts_guard) =
+        scratch.active_experts.device_ptr(&ctx.stream);
+    let (active_offsets_ptr, _active_offsets_guard) =
+        scratch.active_offsets.device_ptr(&ctx.stream);
+    let (active_counts_ptr, _active_counts_guard) = scratch.active_counts.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = cache.weight.device_ptr(&ctx.stream);
+    let (weight_scale_ptr, _weight_scale_guard) = cache.scales.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = scratch.oproj_group_out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
+            input_ptr as *const ffi::Half,
+            fp8_ptr as *mut u8,
+            scale_ptr as *mut f32,
+            active_experts_ptr as *const i32,
+            active_offsets_ptr as *const i32,
+            active_counts_ptr as *const i32,
+            1,
+            i32::try_from(m)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_stride_m)?,
+            stream,
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 grouped wo_a activation quantize failed: {e}"))?;
+        ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
+            fp8_ptr as *const u8,
+            scale_ptr as *const f32,
+            weight_ptr as *const u8,
+            weight_scale_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            i32::try_from(m)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_stride_m)?,
+            stream,
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 grouped wo_a DeepGEMM dense failed: {e}"))?;
     }
     Ok(())
 }
@@ -8691,6 +8862,161 @@ fn dsv4_wo_a_grouped_linear(
     Ok(())
 }
 
+fn dsv4_oproj_group_gather(
+    ctx: &DeviceContext,
+    src: &HiddenStates,
+    group: usize,
+    shape: Dsv4OProjGroupShape,
+    scratch: &mut Dsv4PrefillDeepGemmLinearScratch,
+) -> Result<()> {
+    ensure!(
+        group < shape.groups
+            && src.hidden_dim == shape.groups * shape.cols_per_group
+            && src.seq_len <= scratch.max_m
+            && shape.cols_per_group <= scratch.oproj_group_cols
+            && src.seq_len * shape.cols_per_group <= scratch.oproj_group_in.len(),
+        "DSv4 grouped O-LoRA gather mismatch: group={} groups={} src={}x{} scratch M={} cols={}",
+        group,
+        shape.groups,
+        src.hidden_dim,
+        src.seq_len,
+        scratch.max_m,
+        scratch.oproj_group_cols
+    );
+    let (src_ptr, _src_guard) = src.data.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = scratch.oproj_group_in.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dsv4_oproj_group_gather_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            i32::try_from(src.seq_len)?,
+            i32::try_from(shape.groups)?,
+            i32::try_from(shape.cols_per_group)?,
+            i32::try_from(group)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 grouped O-LoRA gather failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn dsv4_oproj_group_scatter(
+    ctx: &DeviceContext,
+    scratch: &Dsv4PrefillDeepGemmLinearScratch,
+    group: usize,
+    shape: Dsv4OProjGroupShape,
+    dst: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        group < shape.groups
+            && dst.hidden_dim == shape.groups * shape.rows_per_group
+            && dst.seq_len <= scratch.max_m
+            && shape.rows_per_group <= scratch.oproj_group_rows
+            && dst.seq_len * shape.rows_per_group <= scratch.oproj_group_out.len(),
+        "DSv4 grouped O-LoRA scatter mismatch: group={} groups={} dst={}x{} scratch M={} rows={}",
+        group,
+        shape.groups,
+        dst.hidden_dim,
+        dst.seq_len,
+        scratch.max_m,
+        scratch.oproj_group_rows
+    );
+    let (src_ptr, _src_guard) = scratch.oproj_group_out.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = dst.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dsv4_oproj_group_scatter_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            i32::try_from(dst.seq_len)?,
+            i32::try_from(shape.groups)?,
+            i32::try_from(shape.rows_per_group)?,
+            i32::try_from(group)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow!("DSv4 grouped O-LoRA scatter failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn dsv4_wo_a_grouped_deepgemm_decode(
+    ctx: &DeviceContext,
+    scratch: &Dsv4FusedWqkvDecodeScratch,
+    caches: &[cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache],
+    local_attn: &HiddenStates,
+    shape: Dsv4OProjGroupShape,
+    latent: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        caches.len() == shape.groups,
+        "DSv4 grouped O-LoRA DeepGEMM cache count {} != groups {}",
+        caches.len(),
+        shape.groups
+    );
+    ensure!(
+        local_attn.seq_len == 1 && latent.seq_len == 1,
+        "DSv4 grouped O-LoRA decode DeepGEMM expects one row, got local={} latent={}",
+        local_attn.seq_len,
+        latent.seq_len
+    );
+    for (group, cache) in caches.iter().enumerate() {
+        let input_start = group * shape.cols_per_group;
+        let input_end = input_start + shape.cols_per_group;
+        let output_start = group * shape.rows_per_group;
+        let output_end = output_start + shape.rows_per_group;
+        let input = local_attn.data.slice(input_start..input_end);
+        let mut output = latent.data.slice_mut(output_start..output_end);
+        let input_len = input.len();
+        let output_len = output.len();
+        decode_proj_deepgemm_raw(
+            ctx,
+            scratch,
+            cache,
+            &input,
+            input_len,
+            &mut output,
+            output_len,
+            shape.cols_per_group,
+        )?;
+    }
+    Ok(())
+}
+
+fn dsv4_wo_a_grouped_deepgemm_prefill(
+    ctx: &DeviceContext,
+    scratch: &mut Dsv4PrefillDeepGemmLinearScratch,
+    caches: &[cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache],
+    local_attn: &HiddenStates,
+    shape: Dsv4OProjGroupShape,
+    latent: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        caches.len() == shape.groups,
+        "DSv4 grouped O-LoRA DeepGEMM cache count {} != groups {}",
+        caches.len(),
+        shape.groups
+    );
+    ensure!(
+        local_attn.seq_len <= scratch.max_m
+            && shape.cols_per_group <= scratch.oproj_group_cols
+            && shape.rows_per_group <= scratch.oproj_group_rows,
+        "DSv4 grouped O-LoRA prefill scratch mismatch: M={} shape cols={} rows={} scratch M={} cols={} rows={}",
+        local_attn.seq_len,
+        shape.cols_per_group,
+        shape.rows_per_group,
+        scratch.max_m,
+        scratch.oproj_group_cols,
+        scratch.oproj_group_rows
+    );
+    for (group, cache) in caches.iter().enumerate() {
+        dsv4_oproj_group_gather(ctx, local_attn, group, shape, scratch)?;
+        prefill_proj_deepgemm_group_scratch(ctx, scratch, cache, local_attn.seq_len)?;
+        dsv4_oproj_group_scatter(ctx, scratch, group, shape, latent)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod oproj_tests {
     use super::*;
@@ -8779,6 +9105,16 @@ pub(crate) fn mla_oproj(
         && dsv4_prefill_proj_deepgemm_enabled()
         && attention.wo_a_deepgemm.is_some()
         && prefill_shared.is_some();
+    let wo_a_group_decode_dg = shape.groups > 1
+        && token_count == 1
+        && dsv4_decode_proj_deepgemm_enabled()
+        && state.fused_wqkv.is_some()
+        && attention.wo_a_group_deepgemm.is_some();
+    let wo_a_group_prefill_dg = shape.groups > 1
+        && token_count > 1
+        && dsv4_prefill_proj_deepgemm_enabled()
+        && attention.wo_a_group_deepgemm.is_some()
+        && prefill_shared.is_some();
     if wo_a_decode_dg {
         // Lever #1b: wo_a/wo_b (M=1) through tensor-core DeepGEMM, reusing the
         // fused-wqkv FP8 scratch for the single-output-group case.
@@ -8799,6 +9135,27 @@ pub(crate) fn mla_oproj(
             )
         })?;
         drop(nvtx_wo_a);
+    } else if wo_a_group_decode_dg {
+        let scratch = state
+            .fused_wqkv
+            .as_ref()
+            .expect("wo grouped dg gate checked");
+        let wo_a_caches = attention
+            .wo_a_group_deepgemm
+            .as_ref()
+            .expect("wo grouped dg gate checked");
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_wo_a_grouped_deepgemm_decode(
+                ctx,
+                scratch,
+                wo_a_caches,
+                local_attn,
+                shape,
+                &mut latent,
+            )
+        })?;
+        drop(nvtx_wo_a);
     } else if wo_a_prefill_dg {
         // Prefill wo_a (M=token_count) → DeepGEMM for the single-output-group case.
         let wo_a_cache = attention
@@ -8812,6 +9169,28 @@ pub(crate) fn mla_oproj(
                 .expect("wo prefill gate checked");
             crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
                 prefill_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent)
+            })?;
+        }
+        drop(nvtx_wo_a);
+    } else if wo_a_group_prefill_dg {
+        let wo_a_caches = attention
+            .wo_a_group_deepgemm
+            .as_ref()
+            .expect("wo grouped prefill gate checked");
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        {
+            let scratch = prefill_shared
+                .as_deref_mut()
+                .expect("wo grouped prefill gate checked");
+            crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+                dsv4_wo_a_grouped_deepgemm_prefill(
+                    ctx,
+                    scratch,
+                    wo_a_caches,
+                    local_attn,
+                    shape,
+                    &mut latent,
+                )
             })?;
         }
         drop(nvtx_wo_a);

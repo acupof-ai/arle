@@ -25,6 +25,78 @@ __device__ __forceinline__ uint16_t dsv4_attn_f32_to_bf16_bits(const float value
   return *reinterpret_cast<uint16_t *>(&out);
 }
 
+__global__ void dsv4_oproj_group_gather_kernel(
+    const uint16_t *__restrict__ src,
+    uint16_t *__restrict__ dst,
+    int num_tokens,
+    int groups,
+    int cols_per_group,
+    int group) {
+  int64_t total = (int64_t)num_tokens * cols_per_group;
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int col = (int)(idx % cols_per_group);
+  int row = (int)(idx / cols_per_group);
+  int64_t src_idx = ((int64_t)row * groups + group) * cols_per_group + col;
+  dst[idx] = src[src_idx];
+}
+
+__global__ void dsv4_oproj_group_scatter_kernel(
+    const uint16_t *__restrict__ src,
+    uint16_t *__restrict__ dst,
+    int num_tokens,
+    int groups,
+    int rows_per_group,
+    int group) {
+  int64_t total = (int64_t)num_tokens * rows_per_group;
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int col = (int)(idx % rows_per_group);
+  int row = (int)(idx / rows_per_group);
+  int64_t dst_idx = ((int64_t)row * groups + group) * rows_per_group + col;
+  dst[dst_idx] = src[idx];
+}
+
+extern "C" CUresult dsv4_oproj_group_gather_cuda(
+    const uint16_t *src,
+    uint16_t *dst,
+    int num_tokens,
+    int groups,
+    int cols_per_group,
+    int group,
+    cudaStream_t stream) {
+  if (num_tokens < 0 || groups <= 0 || cols_per_group <= 0 || group < 0 ||
+      group >= groups || src == nullptr || dst == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int64_t total = (int64_t)num_tokens * cols_per_group;
+  if (total == 0) return CUDA_SUCCESS;
+  int blocks = (int)((total + DSV4_ATTN_BLOCK - 1) / DSV4_ATTN_BLOCK);
+  dsv4_oproj_group_gather_kernel<<<blocks, DSV4_ATTN_BLOCK, 0, stream>>>(
+      src, dst, num_tokens, groups, cols_per_group, group);
+  return (CUresult)cudaGetLastError();
+}
+
+extern "C" CUresult dsv4_oproj_group_scatter_cuda(
+    const uint16_t *src,
+    uint16_t *dst,
+    int num_tokens,
+    int groups,
+    int rows_per_group,
+    int group,
+    cudaStream_t stream) {
+  if (num_tokens < 0 || groups <= 0 || rows_per_group <= 0 || group < 0 ||
+      group >= groups || src == nullptr || dst == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int64_t total = (int64_t)num_tokens * rows_per_group;
+  if (total == 0) return CUDA_SUCCESS;
+  int blocks = (int)((total + DSV4_ATTN_BLOCK - 1) / DSV4_ATTN_BLOCK);
+  dsv4_oproj_group_scatter_kernel<<<blocks, DSV4_ATTN_BLOCK, 0, stream>>>(
+      src, dst, num_tokens, groups, rows_per_group, group);
+  return (CUresult)cudaGetLastError();
+}
+
 __device__ float dsv4_attn_block_sum(float value) {
   __shared__ float warp_sums[DSV4_ATTN_BLOCK / WARP_SIZE];
   value = warp_reduce_sum(value);

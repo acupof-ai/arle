@@ -1244,6 +1244,17 @@ impl Dsv4Fp8DeepGemmWeightCache {
         Ok(cache)
     }
 
+    pub fn from_dsv4_weight_row_range(
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+        row_start: usize,
+        rows: usize,
+    ) -> Result<Self> {
+        let mut cache = Self::uninit(ctx, rows, weight.cols)?;
+        cache.fill_from_dsv4_weight_row_range(ctx, weight, row_start, rows, 0)?;
+        Ok(cache)
+    }
+
     pub fn from_dsv4_weight_pair_rows(
         ctx: &DeviceContext,
         first: &DeviceMatrix,
@@ -1309,6 +1320,25 @@ impl Dsv4Fp8DeepGemmWeightCache {
             ctx,
             weight,
             self,
+            dst_row_offset,
+            dst_row_offset / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+        )
+    }
+
+    pub fn fill_from_dsv4_weight_row_range(
+        &mut self,
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+        row_start: usize,
+        rows: usize,
+        dst_row_offset: usize,
+    ) -> Result<()> {
+        dsv4_fill_fp8_deepgemm_weight_cache_row_range(
+            ctx,
+            weight,
+            self,
+            row_start,
+            rows,
             dst_row_offset,
             dst_row_offset / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
         )
@@ -1500,6 +1530,142 @@ fn dsv4_fill_fp8_deepgemm_weight_cache(
         )
         .result()
         .map_err(|err| anyhow!("DeepSeek V4 DeepGEMM FP8 cache build failed: {err}"))?;
+    }
+    Ok(())
+}
+
+fn dsv4_fill_fp8_deepgemm_weight_cache_row_range(
+    ctx: &DeviceContext,
+    src: &DeviceMatrix,
+    dst: &mut Dsv4Fp8DeepGemmWeightCache,
+    src_row_start: usize,
+    src_rows: usize,
+    dst_row_offset: usize,
+    dst_scale_row_offset: usize,
+) -> Result<()> {
+    let source_format = Dsv4DeepGemmSourceFormat::from_weight_format(src.weight_format)?;
+    ensure!(
+        src_rows > 0,
+        "DeepSeek V4 DeepGEMM row-range cache needs rows > 0"
+    );
+    ensure!(
+        src_row_start + src_rows <= src.rows,
+        "DeepSeek V4 DeepGEMM source row range [{}..{}) exceeds rows {}",
+        src_row_start,
+        src_row_start + src_rows,
+        src.rows
+    );
+    ensure!(
+        src.cols == dst.cols,
+        "DeepSeek V4 DeepGEMM row-range cache K mismatch: source={} cache={}",
+        src.cols,
+        dst.cols
+    );
+    ensure!(
+        dst_row_offset + src_rows <= dst.rows,
+        "DeepSeek V4 DeepGEMM row-range cache dst row overflow: offset={} rows={} cache={}",
+        dst_row_offset,
+        src_rows,
+        dst.rows
+    );
+    ensure!(
+        src_row_start.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M)
+            && src_rows.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M)
+            && dst_row_offset.is_multiple_of(DSV4_DEEPGEMM_FP8_SCALE_GRAN_M),
+        "DeepSeek V4 DeepGEMM row-range cache rows must be {}-aligned (src_start={} rows={} dst_offset={})",
+        DSV4_DEEPGEMM_FP8_SCALE_GRAN_M,
+        src_row_start,
+        src_rows,
+        dst_row_offset
+    );
+    ensure!(
+        src.dsv4_scale_rows > 0 && src.dsv4_scale_cols > 0,
+        "DeepSeek V4 DeepGEMM row-range cache source needs DSv4 block scales"
+    );
+    let src_scale_row_start = src_row_start / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M;
+    let src_scale_rows = src_rows / DSV4_DEEPGEMM_FP8_SCALE_GRAN_M;
+    ensure!(
+        src_scale_row_start + src_scale_rows <= src.dsv4_scale_rows,
+        "DeepSeek V4 DeepGEMM row-range scale source overflow: start={} rows={} source={}",
+        src_scale_row_start,
+        src_scale_rows,
+        src.dsv4_scale_rows
+    );
+    ensure!(
+        dst_scale_row_offset + src_scale_rows <= dst.scale_rows,
+        "DeepSeek V4 DeepGEMM row-range cache scale row overflow: offset={} rows={} cache={}",
+        dst_scale_row_offset,
+        src_scale_rows,
+        dst.scale_rows
+    );
+
+    let qweight = src
+        .qweight
+        .as_ref()
+        .ok_or_else(|| anyhow!("DeepSeek V4 DeepGEMM row-range source missing raw weight bytes"))?;
+    let src_scales = src
+        .dsv4_scales
+        .as_ref()
+        .ok_or_else(|| anyhow!("DeepSeek V4 DeepGEMM row-range source missing block scales"))?;
+    let bytes_per_src_row = match source_format {
+        Dsv4DeepGemmSourceFormat::Fp8 => src.cols,
+        Dsv4DeepGemmSourceFormat::Fp4 => {
+            ensure!(
+                src.cols.is_multiple_of(2),
+                "DeepSeek V4 FP4 DeepGEMM row-range source cols must be even, got {}",
+                src.cols
+            );
+            src.cols / 2
+        }
+    };
+    ensure!(
+        qweight.len() == src.rows * bytes_per_src_row,
+        "DeepSeek V4 DeepGEMM row-range source weight len {} != expected {}",
+        qweight.len(),
+        src.rows * bytes_per_src_row
+    );
+    ensure!(
+        src_scales.len() == src.dsv4_scale_rows * src.dsv4_scale_cols,
+        "DeepSeek V4 DeepGEMM row-range source scale len {} != expected {}",
+        src_scales.len(),
+        src.dsv4_scale_rows * src.dsv4_scale_cols
+    );
+    let rows_i32 = i32::try_from(src_rows)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM row-range rows overflow i32"))?;
+    let cols_i32 = i32::try_from(src.cols)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM row-range cols overflow i32"))?;
+    let scale_rows_i32 = i32::try_from(src_scale_rows)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM row-range scale rows overflow i32"))?;
+    let scale_cols_i32 = i32::try_from(src.dsv4_scale_cols)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM row-range scale cols overflow i32"))?;
+    let dst_scale_cols_i32 = i32::try_from(dst.scale_cols)
+        .map_err(|_| anyhow!("DeepSeek V4 DeepGEMM row-range cache scale cols overflow i32"))?;
+    let (src_ptr, _src_guard) = qweight.device_ptr(&ctx.stream);
+    let (src_scale_ptr, _src_scale_guard) = src_scales.device_ptr(&ctx.stream);
+    let (dst_weight_ptr, _dst_weight_guard) = dst.weight.device_ptr_mut(&ctx.stream);
+    let (dst_scale_ptr, _dst_scale_guard) = dst.scales.device_ptr_mut(&ctx.stream);
+    let src_ptr = unsafe { (src_ptr as *const u8).add(src_row_start * bytes_per_src_row) };
+    let src_scale_ptr =
+        unsafe { (src_scale_ptr as *const u8).add(src_scale_row_start * src.dsv4_scale_cols) };
+    let dst_weight_ptr = unsafe { (dst_weight_ptr as *mut u8).add(dst_row_offset * dst.cols) };
+    let dst_scale_ptr =
+        unsafe { (dst_scale_ptr as *mut f32).add(dst_scale_row_offset * dst.scale_cols) };
+    unsafe {
+        ffi::dsv4_block_scaled_to_fp8_deepgemm_cuda(
+            src_ptr,
+            src_scale_ptr,
+            dst_weight_ptr,
+            dst_scale_ptr,
+            rows_i32,
+            cols_i32,
+            scale_rows_i32,
+            scale_cols_i32,
+            dst_scale_cols_i32,
+            source_format as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|err| anyhow!("DeepSeek V4 DeepGEMM FP8 row-range cache build failed: {err}"))?;
     }
     Ok(())
 }
