@@ -988,6 +988,7 @@ struct OffloadedBlock {
     /// Dense MLP snapshot — `Some` iff this layer is dense (mutually exclusive
     /// with `moe`, mirroring [`Qwen35Layer`]).
     mlp: Option<OffloadedDenseMlp>,
+    moe: Option<crate::loader::MoeLayerHostSnapshot>,
 }
 
 struct OffloadedDenseMlp {
@@ -1809,22 +1810,9 @@ impl Qwen35Model {
     /// the VRAM headroom the time-share buys. Per-slot KV / recurrent state
     /// ([`Qwen35SlotState`]) is owned by the executor and untouched here.
     ///
-    /// MoE expert weight offload is NOT supported (OPD is dense-only): a MoE
-    /// layer bails so the caller does not silently keep ~19 GB of expert VRAM
-    /// resident while believing the engine is offloaded.
     pub(crate) fn offload_engine_weights(&mut self) -> Result<usize> {
         if self.offloaded.is_some() {
             return Ok(0);
-        }
-        // PREFLIGHT (before ANY mutation): MoE weight offload is unsupported.
-        // Bailing mid-loop after embed/lm_head/norm are already swapped to
-        // placeholders — with `self.offloaded` still unset — would make reload a
-        // no-op and the next forward run on corrupted placeholder weights.
-        for layer in &self.layers {
-            ensure!(
-                layer.moe.is_none(),
-                "Qwen3.6 MoE weight offload is not supported (OPD teacher time-share is dense-only)"
-            );
         }
         let ctx = self.ctx.clone();
         // Drain ALL in-flight GPU work before snapshotting. The OPD step has
@@ -1868,6 +1856,14 @@ impl Qwen35Model {
                         up_proj,
                         down_proj,
                     })
+                }
+                None => None,
+            };
+            let moe = match layer.moe.as_mut() {
+                Some(moe) => {
+                    let snap = moe.offload_to_host(&ctx)?;
+                    freed += snap.freed_bytes();
+                    Some(snap)
                 }
                 None => None,
             };
@@ -1933,6 +1929,7 @@ impl Qwen35Model {
                 post_attention_layernorm,
                 attn,
                 mlp,
+                moe,
             });
         }
 
@@ -1984,26 +1981,33 @@ impl Qwen35Model {
             self.layers.len()
         );
         for (layer, block) in self.layers.iter_mut().zip(blocks) {
+            let OffloadedBlock {
+                input_layernorm,
+                post_attention_layernorm,
+                attn,
+                mlp,
+                moe,
+            } = block;
             layer
                 .input_layernorm
-                .reload_from_host(&ctx, &block.input_layernorm)?;
+                .reload_from_host(&ctx, &input_layernorm)?;
             layer
                 .post_attention_layernorm
-                .reload_from_host(&ctx, &block.post_attention_layernorm)?;
+                .reload_from_host(&ctx, &post_attention_layernorm)?;
 
-            match (layer.mlp.as_mut(), block.mlp) {
-                (Some(dense), Some(snap)) => {
+            match (layer.mlp.as_mut(), layer.moe.as_mut(), mlp, moe) {
+                (Some(dense), None, Some(snap), None) => {
                     dense.gate_proj.reload_from_host(&ctx, &snap.gate_proj)?;
                     dense.up_proj.reload_from_host(&ctx, &snap.up_proj)?;
                     dense.down_proj.reload_from_host(&ctx, &snap.down_proj)?;
                 }
-                (None, None) => {
-                    anyhow::bail!("Qwen3.6 MoE weight reload is not supported (OPD is dense-only)")
+                (None, Some(moe), None, Some(snap)) => {
+                    moe.reload_from_host(&ctx, &snap)?;
                 }
-                _ => anyhow::bail!("offload/reload dense-MLP presence mismatch"),
+                _ => anyhow::bail!("offload/reload MLP/MoE presence mismatch"),
             }
 
-            match (&mut layer.attn, block.attn) {
+            match (&mut layer.attn, attn) {
                 (Qwen35Attn::Full(full), OffloadedAttn::Full(snap)) => {
                     let OffloadedFullAttn {
                         q_proj,

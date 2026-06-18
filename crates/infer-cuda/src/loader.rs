@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
-use cuda_kernels::tensor::WeightFormat;
+use cuda_kernels::tensor::{HostMatrixSnapshot, WeightFormat};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
@@ -3318,6 +3318,367 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) shared_gate_router: DeviceMatrix,
 }
 
+pub(crate) struct MoeLayerHostSnapshot {
+    gate: Vec<HostMatrixSnapshot>,
+    up: Vec<HostMatrixSnapshot>,
+    down: Vec<HostMatrixSnapshot>,
+    gate_grouped: Option<MoeExpertGroupHostSnapshot>,
+    up_grouped: Option<MoeExpertGroupHostSnapshot>,
+    down_grouped: Option<MoeExpertGroupHostSnapshot>,
+    w13_fp8_grouped: Option<MoeFp8ExpertGroupHostSnapshot>,
+    down_fp8_grouped: Option<MoeFp8ExpertGroupHostSnapshot>,
+    router_gate: HostMatrixSnapshot,
+    shared_gate: HostMatrixSnapshot,
+    shared_up: HostMatrixSnapshot,
+    shared_down: HostMatrixSnapshot,
+    shared_gate_router: HostMatrixSnapshot,
+    freed_bytes: usize,
+}
+
+impl MoeLayerHostSnapshot {
+    #[must_use]
+    pub(crate) fn freed_bytes(&self) -> usize {
+        self.freed_bytes
+    }
+}
+
+struct MoeExpertGroupHostSnapshot {
+    data: Vec<half::bf16>,
+    groups: usize,
+    rows: usize,
+    cols: usize,
+}
+
+struct MoeFp8ExpertGroupHostSnapshot {
+    weight: Vec<u8>,
+    scales: Vec<f32>,
+    groups: usize,
+    rows: usize,
+    cols: usize,
+}
+
+impl MoeLayerWeights {
+    pub(crate) fn offload_to_host(&mut self, ctx: &DeviceContext) -> Result<MoeLayerHostSnapshot> {
+        let mut freed = 0usize;
+        let gate = offload_matrix_vec(ctx, &mut self.gate, "moe.gate", &mut freed)?;
+        let up = offload_matrix_vec(ctx, &mut self.up, "moe.up", &mut freed)?;
+        let down = offload_matrix_vec(ctx, &mut self.down, "moe.down", &mut freed)?;
+        let gate_grouped =
+            offload_group_opt(ctx, &mut self.gate_grouped, "moe.gate_grouped", &mut freed)?;
+        let up_grouped =
+            offload_group_opt(ctx, &mut self.up_grouped, "moe.up_grouped", &mut freed)?;
+        let down_grouped =
+            offload_group_opt(ctx, &mut self.down_grouped, "moe.down_grouped", &mut freed)?;
+        let w13_fp8_grouped = offload_fp8_group_opt(
+            ctx,
+            &mut self.w13_fp8_grouped,
+            "moe.w13_fp8_grouped",
+            &mut freed,
+        )?;
+        let down_fp8_grouped = offload_fp8_group_opt(
+            ctx,
+            &mut self.down_fp8_grouped,
+            "moe.down_fp8_grouped",
+            &mut freed,
+        )?;
+        let router_gate = self.router_gate.offload_to_host(ctx)?;
+        freed += router_gate.freed_bytes();
+        let shared_gate = self.shared_gate.offload_to_host(ctx)?;
+        freed += shared_gate.freed_bytes();
+        let shared_up = self.shared_up.offload_to_host(ctx)?;
+        freed += shared_up.freed_bytes();
+        let shared_down = self.shared_down.offload_to_host(ctx)?;
+        freed += shared_down.freed_bytes();
+        let shared_gate_router = self.shared_gate_router.offload_to_host(ctx)?;
+        freed += shared_gate_router.freed_bytes();
+
+        Ok(MoeLayerHostSnapshot {
+            gate,
+            up,
+            down,
+            gate_grouped,
+            up_grouped,
+            down_grouped,
+            w13_fp8_grouped,
+            down_fp8_grouped,
+            router_gate,
+            shared_gate,
+            shared_up,
+            shared_down,
+            shared_gate_router,
+            freed_bytes: freed,
+        })
+    }
+
+    pub(crate) fn reload_from_host(
+        &mut self,
+        ctx: &DeviceContext,
+        snapshot: &MoeLayerHostSnapshot,
+    ) -> Result<()> {
+        reload_matrix_vec(ctx, &mut self.gate, &snapshot.gate, "moe.gate")?;
+        reload_matrix_vec(ctx, &mut self.up, &snapshot.up, "moe.up")?;
+        reload_matrix_vec(ctx, &mut self.down, &snapshot.down, "moe.down")?;
+        self.gate_grouped = reload_group_opt(ctx, &snapshot.gate_grouped, "moe.gate_grouped")?;
+        self.up_grouped = reload_group_opt(ctx, &snapshot.up_grouped, "moe.up_grouped")?;
+        self.down_grouped = reload_group_opt(ctx, &snapshot.down_grouped, "moe.down_grouped")?;
+        self.w13_fp8_grouped =
+            reload_fp8_group_opt(ctx, &snapshot.w13_fp8_grouped, "moe.w13_fp8_grouped")?;
+        self.down_fp8_grouped =
+            reload_fp8_group_opt(ctx, &snapshot.down_fp8_grouped, "moe.down_fp8_grouped")?;
+        self.router_gate
+            .reload_from_host(ctx, &snapshot.router_gate)?;
+        self.shared_gate
+            .reload_from_host(ctx, &snapshot.shared_gate)?;
+        self.shared_up.reload_from_host(ctx, &snapshot.shared_up)?;
+        self.shared_down
+            .reload_from_host(ctx, &snapshot.shared_down)?;
+        self.shared_gate_router
+            .reload_from_host(ctx, &snapshot.shared_gate_router)?;
+        self.rebuild_pointer_tables(ctx)
+    }
+
+    fn rebuild_pointer_tables(&mut self, ctx: &DeviceContext) -> Result<()> {
+        let routed_quant = self.expert_weight_format.is_quantized();
+        let fp8_grouped_ready = self.w13_fp8_grouped.is_some() && self.down_fp8_grouped.is_some();
+
+        let (gate_ptrs, up_ptrs, down_ptrs) = match (
+            &self.gate_grouped,
+            &self.up_grouped,
+            &self.down_grouped,
+            &self.w13_fp8_grouped,
+            &self.down_fp8_grouped,
+        ) {
+            (Some(g), Some(u), Some(d), _, _) => {
+                (g.ptr_table(ctx)?, u.ptr_table(ctx)?, d.ptr_table(ctx)?)
+            }
+            (None, None, None, Some(w13), Some(down_g)) => {
+                let up_offset = w13.rows / 2;
+                (
+                    w13.qweight_ptr_table(ctx, 0)?,
+                    w13.qweight_ptr_table(ctx, up_offset)?,
+                    down_g.qweight_ptr_table(ctx, 0)?,
+                )
+            }
+            _ => {
+                let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
+                let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
+                let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
+                ensure!(
+                    !gate_refs.is_empty() && !up_refs.is_empty() && !down_refs.is_empty(),
+                    "MoE reload cannot rebuild per-expert pointer tables from empty experts"
+                );
+                if routed_quant {
+                    (
+                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &gate_refs)?,
+                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &up_refs)?,
+                        cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &down_refs)?,
+                    )
+                } else {
+                    (
+                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &gate_refs)?,
+                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &up_refs)?,
+                        cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &down_refs)?,
+                    )
+                }
+            }
+        };
+
+        let (gate_scale_ptrs, up_scale_ptrs, down_scale_ptrs) = if fp8_grouped_ready {
+            let w13 = self
+                .w13_fp8_grouped
+                .as_ref()
+                .ok_or_else(|| anyhow!("FP8 MoE reload missing w13 grouped cache"))?;
+            let down_g = self
+                .down_fp8_grouped
+                .as_ref()
+                .ok_or_else(|| anyhow!("FP8 MoE reload missing down grouped cache"))?;
+            let up_offset = w13.rows / 2;
+            (
+                Some(w13.scale_ptr_table(ctx, 0)?),
+                Some(w13.scale_ptr_table(ctx, up_offset)?),
+                Some(down_g.scale_ptr_table(ctx, 0)?),
+            )
+        } else if routed_quant
+            && matches!(
+                self.expert_weight_format,
+                WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
+            )
+        {
+            let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
+            let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
+            let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
+            (
+                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                    ctx, &gate_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                    ctx, &up_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                    ctx, &down_refs,
+                )?),
+            )
+        } else if routed_quant && self.expert_weight_format == WeightFormat::Fp4E2M1Group {
+            let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
+            let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
+            let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
+            (
+                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                    ctx, &gate_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                    ctx, &up_refs,
+                )?),
+                Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                    ctx, &down_refs,
+                )?),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        let (gate_global_ptrs, up_global_ptrs, down_global_ptrs) =
+            if routed_quant && self.expert_weight_format == WeightFormat::Fp4E2M1Group {
+                let gate_refs: Vec<&DeviceMatrix> = self.gate.iter().collect();
+                let up_refs: Vec<&DeviceMatrix> = self.up.iter().collect();
+                let down_refs: Vec<&DeviceMatrix> = self.down.iter().collect();
+                (
+                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                        ctx, &gate_refs,
+                    )?),
+                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                        ctx, &up_refs,
+                    )?),
+                    Some(cuda_kernels::moe::build_expert_scale_f32_ptr_table(
+                        ctx, &down_refs,
+                    )?),
+                )
+            } else {
+                (None, None, None)
+            };
+
+        self.gate_ptrs = gate_ptrs;
+        self.up_ptrs = up_ptrs;
+        self.down_ptrs = down_ptrs;
+        self.gate_scale_ptrs = gate_scale_ptrs;
+        self.up_scale_ptrs = up_scale_ptrs;
+        self.down_scale_ptrs = down_scale_ptrs;
+        self.gate_global_ptrs = gate_global_ptrs;
+        self.up_global_ptrs = up_global_ptrs;
+        self.down_global_ptrs = down_global_ptrs;
+        Ok(())
+    }
+}
+
+fn offload_matrix_vec(
+    ctx: &DeviceContext,
+    matrices: &mut [DeviceMatrix],
+    label: &str,
+    freed: &mut usize,
+) -> Result<Vec<HostMatrixSnapshot>> {
+    matrices
+        .iter_mut()
+        .enumerate()
+        .map(|(idx, matrix)| {
+            let snapshot = matrix
+                .offload_to_host(ctx)
+                .with_context(|| format!("offload {label}[{idx}]"))?;
+            *freed += snapshot.freed_bytes();
+            Ok(snapshot)
+        })
+        .collect()
+}
+
+fn reload_matrix_vec(
+    ctx: &DeviceContext,
+    matrices: &mut [DeviceMatrix],
+    snapshots: &[HostMatrixSnapshot],
+    label: &str,
+) -> Result<()> {
+    ensure!(
+        matrices.len() == snapshots.len(),
+        "reload {label}: matrix count {} != snapshot count {}",
+        matrices.len(),
+        snapshots.len()
+    );
+    for (idx, (matrix, snapshot)) in matrices.iter_mut().zip(snapshots).enumerate() {
+        matrix
+            .reload_from_host(ctx, snapshot)
+            .with_context(|| format!("reload {label}[{idx}]"))?;
+    }
+    Ok(())
+}
+
+fn offload_group_opt(
+    ctx: &DeviceContext,
+    group: &mut Option<MoeExpertGroup>,
+    label: &str,
+    freed: &mut usize,
+) -> Result<Option<MoeExpertGroupHostSnapshot>> {
+    match group {
+        Some(group) => {
+            let (snapshot, bytes) = group
+                .offload_to_host(ctx)
+                .with_context(|| format!("offload {label}"))?;
+            *freed += bytes;
+            Ok(Some(snapshot))
+        }
+        None => Ok(None),
+    }
+}
+
+fn reload_group_opt(
+    ctx: &DeviceContext,
+    snapshot: &Option<MoeExpertGroupHostSnapshot>,
+    label: &str,
+) -> Result<Option<MoeExpertGroup>> {
+    snapshot
+        .as_ref()
+        .map(|snapshot| {
+            MoeExpertGroup::from_host(ctx, snapshot).with_context(|| format!("reload {label}"))
+        })
+        .transpose()
+}
+
+fn offload_fp8_group_opt(
+    ctx: &DeviceContext,
+    group: &mut Option<MoeFp8ExpertGroup>,
+    label: &str,
+    freed: &mut usize,
+) -> Result<Option<MoeFp8ExpertGroupHostSnapshot>> {
+    match group {
+        Some(group) => {
+            let (snapshot, bytes) = group
+                .offload_to_host(ctx)
+                .with_context(|| format!("offload {label}"))?;
+            *freed += bytes;
+            Ok(Some(snapshot))
+        }
+        None => Ok(None),
+    }
+}
+
+fn reload_fp8_group_opt(
+    ctx: &DeviceContext,
+    snapshot: &Option<MoeFp8ExpertGroupHostSnapshot>,
+    label: &str,
+) -> Result<Option<MoeFp8ExpertGroup>> {
+    snapshot
+        .as_ref()
+        .map(|snapshot| {
+            MoeFp8ExpertGroup::from_host(
+                ctx,
+                &snapshot.weight,
+                &snapshot.scales,
+                snapshot.groups,
+                snapshot.rows,
+                snapshot.cols,
+            )
+            .with_context(|| format!("reload {label}"))
+        })
+        .transpose()
+}
+
 /// One contiguous `[groups, rows, cols]` row-major BF16 expert-weight buffer —
 /// DeepGEMM's grouped-B layout (group `g` starts at `g * rows * cols`).
 pub(crate) struct MoeExpertGroup {
@@ -3328,6 +3689,53 @@ pub(crate) struct MoeExpertGroup {
 }
 
 impl MoeExpertGroup {
+    fn from_host(ctx: &DeviceContext, snapshot: &MoeExpertGroupHostSnapshot) -> Result<Self> {
+        ensure!(
+            snapshot.groups > 0,
+            "MoE expert group: groups must be non-zero"
+        );
+        ensure!(
+            snapshot.data.len() == snapshot.groups * snapshot.rows * snapshot.cols,
+            "MoE grouped host data len {} != expected {}",
+            snapshot.data.len(),
+            snapshot.groups * snapshot.rows * snapshot.cols
+        );
+        Ok(Self {
+            data: ctx
+                .stream
+                .clone_htod(snapshot.data.as_slice())
+                .map_err(|e| anyhow!("MoE expert group H2D failed: {e}"))?,
+            groups: snapshot.groups,
+            rows: snapshot.rows,
+            cols: snapshot.cols,
+        })
+    }
+
+    fn offload_to_host(
+        &mut self,
+        ctx: &DeviceContext,
+    ) -> Result<(MoeExpertGroupHostSnapshot, usize)> {
+        let data = ctx
+            .stream
+            .clone_dtoh(&self.data)
+            .map_err(|e| anyhow!("MoE expert group D2H failed: {e}"))?;
+        let freed = data.len() * std::mem::size_of::<half::bf16>();
+        ctx.sync()?;
+        self.data = ctx
+            .stream
+            .alloc_zeros::<half::bf16>(1)
+            .map_err(|e| anyhow!("MoE expert group placeholder alloc failed: {e}"))?;
+        Ok((
+            MoeExpertGroupHostSnapshot {
+                data,
+                groups: self.groups,
+                rows: self.rows,
+                cols: self.cols,
+            },
+            freed,
+        ))
+    }
+
     /// Concatenate per-expert `[rows, cols]` matrices into one contiguous
     /// group-major buffer (D2D). Weights are static after load; the source
     /// matrices may be dropped afterwards **only after a stream sync** (event
@@ -3439,6 +3847,41 @@ impl MoeFp8ExpertGroup {
             scale_rows,
             scale_cols,
         })
+    }
+
+    fn offload_to_host(
+        &mut self,
+        ctx: &DeviceContext,
+    ) -> Result<(MoeFp8ExpertGroupHostSnapshot, usize)> {
+        let weight = ctx
+            .stream
+            .clone_dtoh(&self.weight)
+            .map_err(|e| anyhow!("FP8 MoE grouped weight D2H failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_dtoh(&self.scales)
+            .map_err(|e| anyhow!("FP8 MoE grouped scales D2H failed: {e}"))?;
+        let freed =
+            weight.len() * std::mem::size_of::<u8>() + scales.len() * std::mem::size_of::<f32>();
+        ctx.sync()?;
+        self.weight = ctx
+            .stream
+            .alloc_zeros::<u8>(1)
+            .map_err(|e| anyhow!("FP8 MoE grouped weight placeholder alloc failed: {e}"))?;
+        self.scales = ctx
+            .stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| anyhow!("FP8 MoE grouped scales placeholder alloc failed: {e}"))?;
+        Ok((
+            MoeFp8ExpertGroupHostSnapshot {
+                weight,
+                scales,
+                groups: self.groups,
+                rows: self.rows,
+                cols: self.cols,
+            },
+            freed,
+        ))
     }
 
     fn concat(
