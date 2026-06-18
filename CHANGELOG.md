@@ -430,15 +430,13 @@ Related governance docs:
   decode wave moves from 125.497 ms to 112.724 ms; NCCL exchange, launch
   overhead, async allocation/free, and local expert FP8/FP4 GEMV remain the top
   targets.
-- Added the default DSv4 B=1 fused dispatch payload path. Padded DeepEP decode
-  now appends the route metadata as raw BF16 words behind each hidden row and
-  exchanges hidden+metadata through one BF16 grouped send/recv instead of
-  separate BF16 hidden and I32 metadata exchanges. Set
-  `ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=0` to force the old split exchange. Real
-  8xH20 nsys keeps the output correct, reduces SendRecv launches from 1,032 to
-  688, and records the isolated decode wave at 118.985 ms in the latest capture;
-  NCCL SendRecv/AllReduce, launch/runtime overhead, allocator churn, D2H, and
-  local expert FP8/FP4 GEMV remain the next targets.
+- Added the DSv4 B=1 fused dispatch payload experiment. Padded DeepEP decode
+  appended route metadata as raw BF16 words behind each hidden row and exchanged
+  hidden+metadata through one BF16 grouped send/recv instead of separate BF16
+  hidden and I32 metadata exchanges. Real 8xH20 nsys kept the output correct,
+  reduced SendRecv launches from 1,032 to 688, and recorded the isolated decode
+  wave at 118.985 ms; NCCL SendRecv/AllReduce, launch/runtime overhead,
+  allocator churn, D2H, and local expert FP8/FP4 GEMV remained the next targets.
 - Optimized the gated route-wise grouped expert experiment by pairing its
   route-local `w1` and `w3` GEMV launches for matching DSv4 block-scaled FP8 or
   FP4 weights, falling back to split route GEMV when format or shape differs.

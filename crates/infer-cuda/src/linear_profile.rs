@@ -15,7 +15,12 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static STATS: OnceLock<Mutex<BTreeMap<&'static str, Stat>>> = OnceLock::new();
 
 fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var_os("ARLE_DSV4_LINEAR_PROFILE").is_some())
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_DSV4_LINEAR_PROFILE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
 }
 
 fn stats() -> &'static Mutex<BTreeMap<&'static str, Stat>> {

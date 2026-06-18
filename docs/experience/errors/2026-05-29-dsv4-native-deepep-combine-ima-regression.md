@@ -21,9 +21,9 @@ hits an illegal memory access** on every request — even a 16-token smoke
   (Single-process `INFER_CUDA_DEVICES` mode fails earlier at boot:
   `cudaIpcOpenMemHandle: invalid device context` — DeepEP needs separate
   processes; multiproc is mandatory.)
-- **Dispatch OK** with `ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=1` (toolchain default).
-  Without it, dispatch IMAs ("sync after dispatch"); with it, dispatch passes
-  and the failure moves to combine.
+- **Dispatch OK** with the then-default fused dispatch payload path. The older
+  split exchange produced dispatch IMAs ("sync after dispatch"); the fused path
+  passed dispatch and moved the failure to combine.
 
 ## Ruled out (the combine IMA is NOT any of these)
 
@@ -88,9 +88,9 @@ kernel) or a proper git-bisect is the decisive next tool**, not more grepping.
   hundreds of commits ago), smoke-test it at HEAD FIRST — it may have silently
   regressed. The +46% was main `04938e85`; HEAD combine is broken.
 - native-deepep run-reqs (so the boot/dispatch stages aren't re-discovered):
-  `ARLE_MULTIPROC_SERVE=1` + `ARLE_DSV4_FUSED_DISPATCH_PAYLOAD=1` +
-  `ARLE_DEEPEP_DIR=/data01/build/DeepEP` (the d4f41e4 legacy layout) +
-  `ARLE_DSV4_EXPERT_BACKEND=native`. See [[project_h20_pod_access]].
+  `ARLE_MULTIPROC_SERVE=1` + `ARLE_DEEPEP_DIR=/data01/build/DeepEP`
+  (the d4f41e4 legacy layout) + `ARLE_DSV4_EXPERT_BACKEND=native`.
+  See [[project_h20_pod_access]].
 
 ## Update 2026-05-30 — confirmed GENUINE at CLEAN true-HEAD (not a stale-tree artifact)
 
