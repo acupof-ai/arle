@@ -68,9 +68,8 @@ pub trait TeacherForward {
         _tape: &mut Tape,
     ) -> Result<DeviceLogits> {
         Err(TeacherForwardError::InvalidInput(
-            "--logits-window-size requires a windowed teacher; the in-process \
-             Qwen35 teacher supports it, API and infer-runtime teachers still \
-             materialize full logits and are intentionally rejected for Route B"
+            "--logits-window-size requires a teacher implementation that can \
+             return the requested logits window on device"
                 .to_owned(),
         ))
     }
@@ -795,7 +794,7 @@ impl TeacherForward for InferTeacher {
         input_ids: &[u32],
         positions: &[u32],
         window: SequenceWindow,
-        store: &mut TensorStore,
+        _store: &mut TensorStore,
         _tape: &mut Tape,
     ) -> Result<DeviceLogits> {
         if input_ids.is_empty() {
@@ -819,93 +818,13 @@ impl TeacherForward for InferTeacher {
             )));
         }
 
-        let total_started = Instant::now();
-        let raw_started = Instant::now();
-        let raw_logits = {
-            let engine = self.engine.lock().map_err(|err| {
-                TeacherForwardError::InferRuntime(format!(
-                    "LoadedInferenceEngine lock poisoned before raw logits forward: {err}"
-                ))
-            })?;
-            engine
-                .forward_token_logits(input_ids, positions)
-                .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?
-        };
-        let raw_forward_seconds = raw_started.elapsed().as_secs_f64();
-        if raw_logits.vocab_size() != self.vocab_size {
-            return Err(TeacherForwardError::InvalidInput(format!(
-                "InferTeacher vocab mismatch: raw logits vocab={}, configured vocab={}. \
-                 Hint: construct InferTeacher with the vocab size from the same infer model.",
-                raw_logits.vocab_size(),
-                self.vocab_size
-            )));
-        }
-        if raw_logits.seq_len() != input_ids.len() {
-            return Err(TeacherForwardError::InvalidInput(format!(
-                "InferTeacher seq_len mismatch: raw logits seq_len={}, input token len={}",
-                raw_logits.seq_len(),
-                input_ids.len()
-            )));
-        }
-
-        let sync_started = Instant::now();
-        raw_logits
-            .device
-            .sync()
-            .map_err(|err| TeacherForwardError::InferRuntime(err.to_string()))?;
-        let sync_seconds = sync_started.elapsed().as_secs_f64();
-        let vocab = raw_logits.vocab_size();
-        let window_len = window.len();
-        let shape = vec![1, window_len, vocab];
-        let elem_offset = window.start.checked_mul(vocab).ok_or_else(|| {
-            TeacherForwardError::InvalidInput(
-                "InferTeacher logits window element offset overflowed".to_owned(),
-            )
-        })?;
-        let len = window_len.checked_mul(vocab).ok_or_else(|| {
-            TeacherForwardError::InvalidInput(
-                "InferTeacher logits window length overflowed".to_owned(),
-            )
-        })?;
-        if elem_offset + len > raw_logits.logits.len {
-            return Err(TeacherForwardError::InvalidInput(format!(
-                "InferTeacher logits window [{}..{}) exceeds raw logits len {}",
-                elem_offset,
-                elem_offset + len,
-                raw_logits.logits.len
-            )));
-        }
-        let byte_offset = elem_offset
-            .checked_mul(std::mem::size_of::<bf16>())
-            .ok_or_else(|| {
-                TeacherForwardError::InvalidInput(
-                    "InferTeacher logits window byte offset overflowed".to_owned(),
-                )
-            })?;
-        let bridge_started = Instant::now();
-        let handle = raw_logits.with_logits_device_ptr(|src_ptr| {
-            let window_ptr =
-                src_ptr
-                    .checked_add(byte_offset as u64)
-                    .ok_or(AutogradError::TapeInvariant(
-                        "InferTeacher logits window pointer offset overflowed",
-                    ))?;
-            self.train_backend
-                .import_bf16_device_ptr_as_f32(window_ptr, len, &shape)
-        })?;
-        let d2d_bridge_import_seconds = bridge_started.elapsed().as_secs_f64();
-        if let Ok(mut profile) = self.last_profile.lock() {
-            *profile = InferTeacherProfile {
-                total_seconds: total_started.elapsed().as_secs_f64(),
-                raw_forward_seconds,
-                sync_seconds,
-                d2d_bridge_import_seconds,
-                seq_len: window_len,
-                vocab_size: vocab,
-            };
-        }
-        let tensor_id = store.alloc_device_tensor(shape.clone(), handle)?;
-        Ok(DeviceLogits { tensor_id, shape })
+        Err(TeacherForwardError::InvalidInput(
+            "InferTeacher does not support true windowed logits yet: infer-api \
+             currently returns full [seq_len, vocab] raw logits. Use \
+             --teacher-runtime in-process with --logits-window-size, or add a \
+             real infer-api windowed raw-logits primitive before enabling this path."
+                .to_owned(),
+        ))
     }
 
     fn vocab_size(&self) -> usize {
