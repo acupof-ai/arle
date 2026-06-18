@@ -1998,6 +1998,41 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
     record_profile(profile, |profile| {
         profile.student_forward_seconds += student_started.elapsed().as_secs_f64();
     });
+
+    let mut teacher_tape = Tape::new();
+    teacher_tape.set_enabled(false);
+    let teacher_started = Instant::now();
+    log_opd_window_trace(
+        "kl",
+        "teacher_full_forward_start",
+        0,
+        teacher_started,
+        format!("seq_len={}", rollout.len()),
+    );
+    let teacher_full_logits = teacher
+        .forward_logits_device(rollout, positions, store, &mut teacher_tape)
+        .map_err(|err| map_teacher_forward_error("teacher full KL cache", err))?;
+    log_opd_window_trace(
+        "kl",
+        "teacher_full_forward_done",
+        0,
+        teacher_started,
+        format!("shape={:?}", teacher_full_logits.shape),
+    );
+    let expected_teacher_shape = vec![1, rollout.len(), vocab];
+    if teacher_full_logits.shape != expected_teacher_shape {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD cached teacher logits shape mismatch: got {:?}, expected {:?}. \
+             Hint: the TeacherForward implementation must return full \
+             [batch=1, seq_len, vocab] logits when the windowed pure-KL path \
+             caches teacher logits for reuse.",
+            teacher_full_logits.shape, expected_teacher_shape
+        )));
+    }
+    record_profile(profile, |profile| {
+        profile.teacher_forward_seconds += teacher_started.elapsed().as_secs_f64();
+    });
+
     let base_tape_len = tape.entries.len();
     let base_keep = store.live_ids().into_iter().collect::<HashSet<_>>();
 
@@ -2031,25 +2066,25 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
             window_started,
             "",
         );
-        let teacher_logits = teacher
-            .forward_logits_window_device(rollout, positions, window, store, &mut window_tape)
-            .map_err(|err| map_teacher_forward_error("teacher windowed KL", err))?;
+        let teacher_tensor_id = slice(
+            teacher_full_logits.tensor_id,
+            &[0, window.start, 0],
+            &[1, window.end, vocab],
+            store,
+            &mut window_tape,
+        )?;
+        let teacher_shape = vec![1, window.len(), vocab];
         log_opd_window_trace(
             "kl",
             "teacher_forward_done",
             window_index,
             window_started,
-            format!("shape={:?}", teacher_logits.shape),
+            format!("shape={teacher_shape:?} cached_full=true"),
         );
         record_profile(profile, |profile| {
             profile.teacher_forward_seconds += phase_started.elapsed().as_secs_f64();
         });
-        validate_logits_shape(
-            "teacher windowed KL",
-            &teacher_logits.shape,
-            window.len(),
-            vocab,
-        )?;
+        validate_logits_shape("teacher windowed KL", &teacher_shape, window.len(), vocab)?;
 
         window_tape.set_enabled(true);
         let phase_started = Instant::now();
@@ -2084,7 +2119,7 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
         log_opd_window_trace("kl", "kl_loss_start", window_index, window_started, "");
         let kl_loss = kl_distill_loss_for_config(
             student_logits,
-            teacher_logits.tensor_id,
+            teacher_tensor_id,
             window.len(),
             gkd_config.kl_chunk_size,
             gkd_config.kl_direction,
