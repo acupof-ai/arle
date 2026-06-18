@@ -16,22 +16,22 @@ use std::rc::Rc;
 use std::slice;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use cuda_kernels::KVFormat;
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cuda_kernels::tensor::{HostMatrixSnapshot, WeightFormat};
-use cuda_kernels::KVFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{SafeTensors, tensor::Dtype};
 
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
 use crate::ops::{precompute_rope, upload_i32};
 use crate::quant_format::{
-    detect_quant_format, read_quant_manifest, reject_dsv4_e8m0_scale_abi, QuantFormat,
-    QuantManifest, QuantTensorView, ScaleApply, TensorHeader,
+    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
+    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
 };
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
@@ -2869,130 +2869,72 @@ impl SafetensorLoader {
         use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
 
+        // Both DSv4 and GLM run FP8 MoE. DSv4 ships FP8 E4M3 + E8M0 (`<prefix>.scale`),
+        // consumed by `from_dsv4_weight*`. GLM ships FP8 E4M3 + F32 `weight_scale_inv`
+        // (general 128×128 block scales), consumed losslessly by
+        // `from_fp8_block_scaled_weight*` (the 1D2D `sfb` F32-scale path — no E8M0
+        // re-encode, no dequant). Both produce a `Dsv4Fp8DeepGemmWeightCache` and
+        // ride the SAME `build_grouped_cache`.
+        let build_w13 =
+            |first: &DeviceMatrix, second: &DeviceMatrix| -> Result<Dsv4Fp8DeepGemmWeightCache> {
+                if glm {
+                    Dsv4Fp8DeepGemmWeightCache::from_fp8_block_scaled_weight_pair_rows(
+                        ctx, first, second,
+                    )
+                } else {
+                    Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(ctx, first, second)
+                }
+            };
+        let build_w2 = |down: &DeviceMatrix| -> Result<Dsv4Fp8DeepGemmWeightCache> {
+            if glm {
+                Dsv4Fp8DeepGemmWeightCache::from_fp8_block_scaled_weight(ctx, down)
+            } else {
+                Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, down)
+            }
+        };
         let load_fp8 = |name: &str| -> Result<DeviceMatrix> {
             if glm {
-                self.load_dsv4_glm_fp8_as_dsv4(ctx, name)
+                self.load_dsv4_glm_fp8_as_block_scaled(ctx, name)
             } else {
                 self.load_dsv4_block_scaled(ctx, name)
             }
         };
 
-        // ponytail: FP8 grouped GEMM with F32 (non-pow2) block scales is a perf
-        // follow-up; GLM MoE runs bf16 for correctness (the E8M0 re-encode is
-        // lossy for GLM's general F32 block scales).
-        let (w13_grouped, w13_up_grouped, w2_grouped, hidden_dim, intermediate) = if glm {
-            // GLM ROUTED experts → bf16 grouped caches. Gate and up are stored
-            // as SEPARATE grouped caches (each [groups, intermediate, hidden]),
-            // NOT a fused [groups, 2*intermediate, hidden]: the DeepGEMM
-            // contiguous output is per-ROW interleaved (gate|up), which the bf16
-            // element-wise SwiGLU cannot split — so the forward runs two GEMMs
-            // (the same structure the proven Qwen3.6 bf16 MoE path uses). down
-            // (w2) is [hidden, intermediate]. Each byte buffer is group-major.
-            let mut gate_bytes: Vec<u8> = Vec::new();
-            let mut up_bytes: Vec<u8> = Vec::new();
-            let mut w2_bytes: Vec<u8> = Vec::new();
-            let mut shape_gu: Option<(usize, usize)> = None; // (inter, hidden)
-            let mut shape_w2: Option<(usize, usize)> = None; // (hidden, inter)
-            for e in split.local_expert_start..split.local_expert_end() {
-                let expert = names.expert(e);
-                let (gate_b, g_rows, g_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&expert.w1)?;
-                let (up_b, u_rows, u_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&expert.w3)?;
-                ensure!(
-                    g_rows == u_rows && g_cols == u_cols,
-                    "GLM expert {e} gate/up shape mismatch: {g_rows}x{g_cols} vs {u_rows}x{u_cols}"
-                );
-                gate_bytes.extend_from_slice(&gate_b);
-                up_bytes.extend_from_slice(&up_b);
-                let (d_b, d_rows, d_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&expert.w2)?;
-                w2_bytes.extend_from_slice(&d_b);
-                let gu_shape = (g_rows, g_cols);
-                let w2_shape = (d_rows, d_cols);
-                match shape_gu {
-                    Some(s) => ensure!(s == gu_shape, "GLM expert {e} gate/up shape drift"),
-                    None => shape_gu = Some(gu_shape),
-                }
-                match shape_w2 {
-                    Some(s) => ensure!(s == w2_shape, "GLM expert {e} w2 shape drift"),
-                    None => shape_w2 = Some(w2_shape),
-                }
-            }
-            let (intermediate, hidden_dim) =
-                shape_gu.ok_or_else(|| anyhow!("GLM MoE layer has no local experts"))?;
-            let (w2_rows, w2_cols) =
-                shape_w2.ok_or_else(|| anyhow!("GLM MoE layer has no local down experts"))?;
-            ensure!(
-                w2_rows == hidden_dim && w2_cols == intermediate,
-                "GLM grouped w2 shape mismatch: {w2_rows}x{w2_cols} != hidden({hidden_dim})xinter({intermediate})"
-            );
-            let gate_grouped = crate::moe::build_grouped_cache_bf16(
-                ctx,
-                &gate_bytes,
-                split.experts_per_rank,
-                intermediate,
-                hidden_dim,
-            )?;
-            let up_grouped = crate::moe::build_grouped_cache_bf16(
-                ctx,
-                &up_bytes,
-                split.experts_per_rank,
-                intermediate,
-                hidden_dim,
-            )?;
-            let w2_grouped = crate::moe::build_grouped_cache_bf16(
-                ctx,
-                &w2_bytes,
-                split.experts_per_rank,
-                hidden_dim,
-                intermediate,
-            )?;
-            (
-                gate_grouped,
-                Some(up_grouped),
-                w2_grouped,
-                hidden_dim,
-                intermediate,
-            )
-        } else {
-            let mut w13 = Vec::with_capacity(split.experts_per_rank);
-            let mut w2 = Vec::with_capacity(split.experts_per_rank);
-            for e in split.local_expert_start..split.local_expert_end() {
-                let expert = names.expert(e);
-                // w1 (gate) over w3 (up), row-stacked into one fused FP8 cache so the
-                // masked grouped GEMM produces [gate | up] in a single launch.
-                let w1 = load_fp8(&expert.w1)?;
-                let w3 = load_fp8(&expert.w3)?;
-                w13.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(
-                    ctx, &w1, &w3,
-                )?);
-                let down = load_fp8(&expert.w2)?;
-                w2.push(Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &down)?);
-            }
-            let first_w13 = w13
-                .first()
-                .ok_or_else(|| anyhow!("DSv4 MoE layer has no local experts"))?;
-            let first_w2 = w2
-                .first()
-                .ok_or_else(|| anyhow!("DSv4 MoE layer has no local down experts"))?;
-            let hidden_dim = first_w13.cols;
-            let intermediate = first_w2.cols;
-            ensure!(
-                first_w13.rows == 2 * intermediate,
-                "DSv4 grouped w13 rows {} != 2*intermediate {}",
-                first_w13.rows,
-                2 * intermediate
-            );
-            ensure!(
-                first_w2.rows == hidden_dim,
-                "DSv4 grouped w2 rows {} != hidden_dim {hidden_dim}",
-                first_w2.rows
-            );
-            let w13_grouped =
-                crate::moe::build_grouped_cache(ctx, w13.as_slice(), 2 * intermediate, hidden_dim)?;
-            let w2_grouped =
-                crate::moe::build_grouped_cache(ctx, w2.as_slice(), hidden_dim, intermediate)?;
-            // DSv4 keeps the fused w13 (no separate up cache).
-            (w13_grouped, None, w2_grouped, hidden_dim, intermediate)
-        };
+        let mut w13 = Vec::with_capacity(split.experts_per_rank);
+        let mut w2 = Vec::with_capacity(split.experts_per_rank);
+        for e in split.local_expert_start..split.local_expert_end() {
+            let expert = names.expert(e);
+            // w1 (gate) over w3 (up), row-stacked into one fused FP8 cache so the
+            // masked grouped GEMM produces [gate | up] in a single launch.
+            let w1 = load_fp8(&expert.w1)?;
+            let w3 = load_fp8(&expert.w3)?;
+            w13.push(build_w13(&w1, &w3)?);
+            let down = load_fp8(&expert.w2)?;
+            w2.push(build_w2(&down)?);
+        }
+        let first_w13 = w13
+            .first()
+            .ok_or_else(|| anyhow!("DSv4 MoE layer has no local experts"))?;
+        let first_w2 = w2
+            .first()
+            .ok_or_else(|| anyhow!("DSv4 MoE layer has no local down experts"))?;
+        let hidden_dim = first_w13.cols;
+        let intermediate = first_w2.cols;
+        ensure!(
+            first_w13.rows == 2 * intermediate,
+            "DSv4 grouped w13 rows {} != 2*intermediate {}",
+            first_w13.rows,
+            2 * intermediate
+        );
+        ensure!(
+            first_w2.rows == hidden_dim,
+            "DSv4 grouped w2 rows {} != hidden_dim {hidden_dim}",
+            first_w2.rows
+        );
+        let w13_grouped =
+            crate::moe::build_grouped_cache(ctx, w13.as_slice(), 2 * intermediate, hidden_dim)?;
+        let w2_grouped =
+            crate::moe::build_grouped_cache(ctx, w2.as_slice(), hidden_dim, intermediate)?;
         let num_groups = w13_grouped.groups;
         ensure!(
             num_groups == split.experts_per_rank && w2_grouped.groups == num_groups,
@@ -3025,53 +2967,21 @@ impl SafetensorLoader {
             }
         };
 
-        // SHARED expert. DSv4 keeps the E8M0 FP8 caches (`shared_w13`/`shared_w2`)
-        // and runs the FP8 DeepGEMM shared path. GLM ALSO builds these (to keep
-        // the struct fields non-Option, avoiding the ~18-site ripple across the
-        // DSv4 shared decode/pooled/masked paths) but NEVER reads them — GLM's
-        // shared expert runs the bf16 caches below. GLM `weight_scale_inv` blocks
-        // are general F32, NON-power-of-two (e.g. 1.3e-4); the E8M0 re-encode
-        // rounds each block scale to the nearest power of 2 → up to ±40% per-block
-        // weight error on this ALWAYS-ON expert (every token). Routed experts
-        // already run bf16; the shared expert must too.
+        // SHARED expert (always-on, n_shared_experts == 1). Both DSv4 and GLM run
+        // the FP8 DeepGEMM shared path; `build_w13`/`build_w2` pick the E8M0 (DSv4)
+        // or F32-block-scale (GLM 1D2D) builder, matching the routed experts.
         let shared = names
             .shared_experts
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 expects an always-on shared expert"))?;
         let shared_w1 = load_fp8(&shared.w1)?;
         let shared_w3 = load_fp8(&shared.w3)?;
-        let shared_w13 =
-            Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(ctx, &shared_w1, &shared_w3)?;
+        let shared_w13 = build_w13(&shared_w1, &shared_w3)?;
         let shared_down = load_fp8(&shared.w2)?;
-        let shared_w2 = Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &shared_down)?;
-
-        // GLM shared expert → bf16 single-group caches (gate / up / down).
-        // Dequantize the F32-block-scaled FP8 → bf16 (the same lossless dequant
-        // the routed bf16 experts use), then upload as a 1-group GroupedCache.
-        let (shared_gate_bf16, shared_up_bf16, shared_w2_bf16) = if glm {
-            let (gate_b, g_rows, g_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&shared.w1)?;
-            let (up_b, u_rows, u_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&shared.w3)?;
-            ensure!(
-                g_rows == u_rows && g_cols == u_cols,
-                "GLM shared expert gate/up shape mismatch: {g_rows}x{g_cols} vs {u_rows}x{u_cols}"
-            );
-            let (d_b, d_rows, d_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&shared.w2)?;
-            ensure!(
-                d_rows == g_cols && d_cols == g_rows,
-                "GLM shared expert down shape {d_rows}x{d_cols} != [hidden({g_cols}), inter({g_rows})]"
-            );
-            // gate/up: [inter, hidden]; down: [hidden, inter]. One group each.
-            let gate_g = crate::moe::build_grouped_cache_bf16(ctx, &gate_b, 1, g_rows, g_cols)?;
-            let up_g = crate::moe::build_grouped_cache_bf16(ctx, &up_b, 1, u_rows, u_cols)?;
-            let down_g = crate::moe::build_grouped_cache_bf16(ctx, &d_b, 1, d_rows, d_cols)?;
-            (Some(gate_g), Some(up_g), Some(down_g))
-        } else {
-            (None, None, None)
-        };
+        let shared_w2 = build_w2(&shared_down)?;
 
         Ok(crate::dsv4::Dsv4MoeLayer {
             w13_grouped,
-            w13_up_grouped,
             w2_grouped,
             num_groups,
             hidden_dim,
@@ -3082,9 +2992,6 @@ impl SafetensorLoader {
             routing_kind,
             shared_w13,
             shared_w2,
-            shared_gate_bf16,
-            shared_up_bf16,
-            shared_w2_bf16,
             gemv_tables: std::sync::OnceLock::new(),
         })
     }
@@ -3488,87 +3395,73 @@ impl SafetensorLoader {
         Ok((w_kc, w_vc))
     }
 
-    /// Dequantize a GLM FP8 block-scaled weight to host bf16 (lossless dequant
-    /// then a single f32→bf16 round). Returns `(bytes_le, rows, cols)` where
-    /// `bytes_le` is row-major bf16 little-endian (2 bytes/elt). Used by the GLM
-    /// bf16 MoE routed-expert path (the E8M0 re-encode is lossy for GLM's
-    /// general F32 block scales).
-    fn load_dsv4_glm_fp8_as_bf16_host(&self, name: &str) -> Result<(Vec<u8>, usize, usize)> {
-        let tensor = self.borrow_raw_tensor(name)?;
-        ensure!(
-            tensor.shape.len() == 2,
-            "{name}: expected 2D FP8 tensor, got {:?}",
-            tensor.shape
-        );
-        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
-        let f32 = self.dequantize_dsv4_block_scaled_to_f32_host(name, rows, cols)?;
-        let mut bytes = Vec::with_capacity(rows * cols * 2);
-        for &v in &f32 {
-            bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
-        }
-        Ok((bytes, rows, cols))
-    }
-
-    /// Load a GLM (`weight_scale_inv`) FP8 matrix and re-encode it into the DSv4
-    /// FP8 E4M3 + E8M0 block-scale layout the `Dsv4Fp8DeepGemmWeightCache` consumes
-    /// (per-128×128 block, UE8M0 scale = the block's max-abs power-of-two), the
-    /// canonical DeepGEMM block quantization. Used by the GLM SHARED expert only
-    /// (routed experts run bf16 — see `load_dsv4_glm_fp8_as_bf16_host`).
-    ///
-    /// GPU-UNVERIFIABLE (pod): the E8M0 re-encode is exact only if GLM's F32
-    /// `weight_scale_inv` blocks are themselves power-of-two; general F32 block
-    /// scales lose precision in the round-to-pow2 (lossy — confirm on the pod).
-    fn load_dsv4_glm_fp8_as_dsv4(&self, ctx: &DeviceContext, name: &str) -> Result<DeviceMatrix> {
-        let tensor = self.borrow_raw_tensor(name)?;
-        ensure!(
-            tensor.shape.len() == 2,
-            "{name}: expected 2D FP8 tensor, got {:?}",
-            tensor.shape
-        );
-        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
-        let f32 = self.dequantize_dsv4_block_scaled_to_f32_host(name, rows, cols)?;
+    /// Load a GLM (`weight_scale_inv`) FP8 E4M3 matrix into a `Fp8BlockScaled`
+    /// `DeviceMatrix` (raw FP8 bytes + F32 per-128×128-block scales), WITHOUT
+    /// dequantizing. This is the lossless 1D2D DeepGEMM weight format: the
+    /// `Dsv4Fp8DeepGemmWeightCache::from_fp8_block_scaled_weight*` builders copy
+    /// the FP8 bytes + F32 scales straight into the grouped cache's `weight`/`scales`,
+    /// which the `sm90_fp8_gemm_1d2d` kernel reads via `const float* sfb` (F32 weight
+    /// scales). GLM's `weight_scale_inv` is already `[N/128, K/128]` row-major F32 —
+    /// the exact `[scale_rows, scale_cols]` layout the cache expects, no transpose,
+    /// no E8M0 re-encode (which is lossy for GLM's general non-pow2 F32 scales).
+    fn load_dsv4_glm_fp8_as_block_scaled(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+    ) -> Result<DeviceMatrix> {
         const BLOCK: usize = 128;
-        let scale_rows = rows.div_ceil(BLOCK);
-        let scale_cols = cols.div_ceil(BLOCK);
-        let mut weight_bytes = vec![0u8; rows * cols];
-        let mut scale_bytes = vec![0u8; scale_rows * scale_cols];
-        for sr in 0..scale_rows {
-            for sc in 0..scale_cols {
-                // Block max-abs → E8M0 exponent (DeepGEMM UE8M0): scale = 2^e ≥ max-abs/448.
-                let mut max_abs = 0.0f32;
-                for r in sr * BLOCK..((sr + 1) * BLOCK).min(rows) {
-                    for c in sc * BLOCK..((sc + 1) * BLOCK).min(cols) {
-                        max_abs = max_abs.max(f32[r * cols + c].abs());
-                    }
-                }
-                // E4M3 max normal magnitude is 448.0.
-                let e = if max_abs > 0.0 {
-                    (max_abs / 448.0).log2().ceil() as i32
-                } else {
-                    0
-                };
-                let scale = 2.0f32.powi(e);
-                // E8M0 byte = biased exponent (bias 127).
-                scale_bytes[sr * scale_cols + sc] = (e + 127).clamp(0, 255) as u8;
-                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-                for r in sr * BLOCK..((sr + 1) * BLOCK).min(rows) {
-                    for c in sc * BLOCK..((sc + 1) * BLOCK).min(cols) {
-                        weight_bytes[r * cols + c] =
-                            crate::quant_format::encode_f8_e4m3fn(f32[r * cols + c] * inv);
-                    }
-                }
-            }
-        }
-        DeviceMatrix::from_dsv4_fp8_block_scaled(
-            ctx,
-            &weight_bytes,
-            &scale_bytes,
-            rows,
-            cols,
-            scale_rows,
-            scale_cols,
-        )
-        .with_context(|| format!("re-encode GLM FP8→DSv4 {name}"))
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D FP8 tensor, got {:?}",
+            tensor.shape
+        );
+        ensure!(
+            tensor.dtype == Dtype::F8_E4M3,
+            "{name}: GLM MoE FP8 weight expects F8_E4M3, got {:?}",
+            tensor.dtype
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        let weight = tensor.bytes();
+        ensure!(
+            weight.len() == rows * cols,
+            "{name}: FP8 byte len {} != rows*cols {}",
+            weight.len(),
+            rows * cols
+        );
+        // GLM block scale: `<prefix>.weight_scale_inv`, F32, `[N/128, K/128]`.
+        let base = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| anyhow!("{name}: quantized tensor name must end with .weight"))?;
+        let scale_name = format!("{base}.weight_scale_inv");
+        let scale = self.borrow_raw_tensor(&scale_name)?;
+        ensure!(
+            scale.dtype == Dtype::F32,
+            "{scale_name}: GLM block scale expected F32, got {:?}",
+            scale.dtype
+        );
+        ensure!(
+            scale.shape.len() == 2,
+            "{scale_name}: expected 2D scale, got {:?}",
+            scale.shape
+        );
+        let (scale_rows, scale_cols) = (scale.shape[0], scale.shape[1]);
+        // Assert GLM's weight_scale_inv resolves to the expected [N/128, K/128]
+        // F32 grid the 1D2D grouped GEMM's `sfb` consumes (fail loudly pre-pod).
+        let want_rows = rows.div_ceil(BLOCK);
+        let want_cols = cols.div_ceil(BLOCK);
+        ensure!(
+            scale_rows == want_rows && scale_cols == want_cols,
+            "{scale_name}: GLM block scale {scale_rows}x{scale_cols} != [N/128, K/128] = \
+             {want_rows}x{want_cols} for weight {rows}x{cols} (block 128x128)"
+        );
+        let scales: Vec<f32> = scale
+            .bytes()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        DeviceMatrix::from_fp8_block_scaled(ctx, weight, &scales, rows, cols, BLOCK, BLOCK)
+            .with_context(|| format!("upload GLM FP8 block-scaled MoE weight {name}"))
     }
 
     /// Dequantize a DSv4/GLM block-scaled FP8 E4M3 matrix to host f32, applying the
