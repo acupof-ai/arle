@@ -1963,6 +1963,7 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
     keep_extra: &HashSet<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
+    engine_offload: EngineOffloadMode,
     profile: &mut Option<&mut OpdStepProfile>,
 ) -> Result<f32> {
     let kl_range = kl_logit_range(gkd_config.kl_mask, prompt_ids.len(), rollout.len())?;
@@ -1975,32 +1976,20 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
         ));
     }
 
-    tape.entries.clear();
-    tape.set_enabled(true);
-    let student_started = Instant::now();
-    log_opd_window_trace(
-        "kl",
-        "student_hidden_forward_start",
-        0,
-        student_started,
-        format!("seq_len={}", rollout.len()),
-    );
-    let student_hidden = student
-        .forward_hidden_states(store, tape, rollout, positions)
-        .map_err(|err| map_qwen35_forward_error("student windowed KL hidden", err))?;
-    log_opd_window_trace(
-        "kl",
-        "student_hidden_forward_done",
-        0,
-        student_started,
-        format!("tensor_id={student_hidden}"),
-    );
-    record_profile(profile, |profile| {
-        profile.student_forward_seconds += student_started.elapsed().as_secs_f64();
-    });
-
     let mut teacher_tape = Tape::new();
     teacher_tape.set_enabled(false);
+    if engine_offload.offloads_teacher() {
+        let reload_started = Instant::now();
+        log_opd_window_trace("kl", "teacher_reload_start", 0, reload_started, "");
+        store
+            .backend()
+            .device_synchronize()
+            .map_err(OpdError::from)?;
+        teacher
+            .reload_engine_weights()
+            .map_err(|err| map_teacher_forward_error("teacher reload (windowed KL)", err))?;
+        log_opd_window_trace("kl", "teacher_reload_done", 0, reload_started, "");
+    }
     let teacher_started = Instant::now();
     log_opd_window_trace(
         "kl",
@@ -2031,6 +2020,44 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
     }
     record_profile(profile, |profile| {
         profile.teacher_forward_seconds += teacher_started.elapsed().as_secs_f64();
+    });
+
+    if engine_offload.offloads_teacher() {
+        store
+            .backend()
+            .device_synchronize()
+            .map_err(OpdError::from)?;
+        let freed = teacher
+            .offload_engine_weights()
+            .map_err(|err| map_teacher_forward_error("teacher offload (windowed KL)", err))?;
+        eprintln!(
+            "opd_engine_offload teacher_offloaded freed_bytes={freed} freed_mib={:.1}",
+            freed as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let student_started = Instant::now();
+    log_opd_window_trace(
+        "kl",
+        "student_hidden_forward_start",
+        0,
+        student_started,
+        format!("seq_len={}", rollout.len()),
+    );
+    let student_hidden = student
+        .forward_hidden_states(store, tape, rollout, positions)
+        .map_err(|err| map_qwen35_forward_error("student windowed KL hidden", err))?;
+    log_opd_window_trace(
+        "kl",
+        "student_hidden_forward_done",
+        0,
+        student_started,
+        format!("tensor_id={student_hidden}"),
+    );
+    record_profile(profile, |profile| {
+        profile.student_forward_seconds += student_started.elapsed().as_secs_f64();
     });
 
     let base_tape_len = tape.entries.len();
@@ -2248,6 +2275,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
     keep_extra: &HashSet<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
+    engine_offload: EngineOffloadMode,
     profile: &mut Option<&mut OpdStepProfile>,
 ) -> Result<f32> {
     let mut total_loss = 0.0f32;
@@ -2268,6 +2296,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
             keep_extra,
             store,
             tape,
+            engine_offload,
             profile,
         );
     }
@@ -2907,6 +2936,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 &keep_extra,
                 store,
                 tape,
+                engine_offload,
                 &mut profile,
             );
             log_opd_step_trace(total_started, "windowed_backward_done", "");
