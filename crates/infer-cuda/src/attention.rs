@@ -5661,6 +5661,60 @@ fn update_bf16_sw_window(
     Ok(())
 }
 
+/// Batched DSv4 chain-verify attention metadata. Rows are the verified top-1
+/// chain only: row `r` is at `positions[r]` and attends chunk ancestors `[0, r)`
+/// plus self. This is not a complete top-k tree verifier; top-k only widens the
+/// candidate matrix interpreted after the target logits are produced.
+pub(crate) struct Dsv4ChainVerifyAttnMeta {
+    pub(crate) positions: CudaSlice<i32>,
+    pub(crate) ancestors: CudaSlice<i32>,
+    pub(crate) max_anc: usize,
+    pub(crate) n_rows: usize,
+}
+
+impl Dsv4ChainVerifyAttnMeta {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        positions: &[usize],
+        ancestors: &[Vec<usize>],
+    ) -> Result<Self> {
+        let n = positions.len();
+        ensure!(
+            n > 0 && ancestors.len() == n,
+            "DSv4 chain verify meta shape mismatch: positions={} ancestors={}",
+            n,
+            ancestors.len()
+        );
+        let max_anc = ancestors.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let pos_host: Vec<i32> = positions
+            .iter()
+            .map(|&p| {
+                i32::try_from(p)
+                    .map_err(|_| anyhow!("DSv4 chain verify position {p} overflows i32"))
+            })
+            .collect::<Result<_>>()?;
+        let mut anc_host = vec![-1i32; n * max_anc];
+        for (r, chain) in ancestors.iter().enumerate() {
+            for (j, &a) in chain.iter().enumerate() {
+                ensure!(a < n, "DSv4 chain verify ancestor row {a} out of {n} rows");
+                anc_host[r * max_anc + j] = a as i32;
+            }
+        }
+        Ok(Self {
+            positions: ctx
+                .stream
+                .clone_htod(&pos_host)
+                .map_err(|e| anyhow!("DSv4 chain verify positions H2D failed: {e}"))?,
+            ancestors: ctx
+                .stream
+                .clone_htod(&anc_host)
+                .map_err(|e| anyhow!("DSv4 chain verify ancestors H2D failed: {e}"))?,
+            max_anc,
+            n_rows: n,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_flashmla_prefill_attention(
     ctx: &DeviceContext,
@@ -5674,6 +5728,7 @@ fn try_flashmla_prefill_attention(
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
     start_pos: usize,
+    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     local_heads: usize,
     local_attn: &mut HiddenStates,
@@ -5690,7 +5745,7 @@ fn try_flashmla_prefill_attention(
     if q_prepared.seq_len <= 1 {
         return Ok(false);
     }
-    if mode == DeepSeekV4AttentionMode::SlidingWindow {
+    if mode == DeepSeekV4AttentionMode::SlidingWindow && chain_verify.is_none() {
         return Ok(false);
     }
     ensure!(
@@ -5706,6 +5761,13 @@ fn try_flashmla_prefill_attention(
     );
 
     let token_count = q_prepared.seq_len;
+    if let Some(meta) = chain_verify {
+        ensure!(
+            meta.n_rows == token_count,
+            "DSv4 chain verify meta rows {} != verify rows {token_count}",
+            meta.n_rows
+        );
+    }
     let tp_world = tp.config().world_size;
     let tp_rank = tp.config().rank;
     let global_heads = local_heads
@@ -5722,9 +5784,11 @@ fn try_flashmla_prefill_attention(
         DeepSeekV4AttentionMode::HybridCompressed => compressed_count.div_ceil(128) * 128,
         DeepSeekV4AttentionMode::SlidingWindow => 0,
     };
+    let chain_pad = if chain_verify.is_some() { 128 } else { 0 };
     let topk_unified = config
         .sliding_window
-        .checked_add(max_compressed_keys)
+        .checked_add(chain_pad)
+        .and_then(|v| v.checked_add(max_compressed_keys))
         .ok_or_else(|| anyhow!("DSv4 FlashMLA prefill topk overflow"))?;
     ensure!(
         topk_unified.is_multiple_of(128),
@@ -5782,44 +5846,89 @@ fn try_flashmla_prefill_attention(
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_build_indices");
         let (indices_ptr, _ig) = indices.device_ptr_mut(&ctx.stream);
         let (topk_ptr, _tg) = topk_length.device_ptr_mut(&ctx.stream);
-        unsafe {
-            match mode {
-                DeepSeekV4AttentionMode::CompressedSparse => {
-                    let selected = selected.ok_or_else(|| {
-                        anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
-                    })?;
-                    let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
-                    ffi::arle_flashmla_csa_build_indices(
-                        indices_ptr as *mut i32,
-                        topk_ptr as *mut i32,
-                        selected_ptr as *const i32,
-                        token_count as i32,
-                        start_pos as i32,
-                        config.sliding_window as i32,
-                        config.index_topk as i32,
-                        compressed_count as i32,
-                        compress_ratio as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
+        if let Some(meta) = chain_verify {
+            let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+            let (anc_ptr, _ag) = meta.ancestors.device_ptr(&ctx.stream);
+            let (sel_ptr, _sg) = match (mode, selected) {
+                (DeepSeekV4AttentionMode::CompressedSparse, Some(sel)) => {
+                    let (p, g) = sel.device_ptr(&ctx.stream);
+                    (p as *const i32, Some(g))
                 }
-                DeepSeekV4AttentionMode::HybridCompressed => {
-                    ffi::arle_flashmla_hca_build_indices(
-                        indices_ptr as *mut i32,
-                        topk_ptr as *mut i32,
-                        token_count as i32,
-                        start_pos as i32,
-                        config.sliding_window as i32,
-                        max_compressed_keys as i32,
-                        compressed_count as i32,
-                        compress_ratio as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()
-                    .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
+                (DeepSeekV4AttentionMode::CompressedSparse, None) => {
+                    bail!("DSv4 FlashMLA CSA chain verify missing selected topk")
                 }
-                DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                _ => (std::ptr::null(), None),
+            };
+            let max_compressed_arg = if mode == DeepSeekV4AttentionMode::HybridCompressed {
+                max_compressed_keys
+            } else {
+                0
+            };
+            unsafe {
+                ffi::arle_flashmla_chain_verify_build_indices(
+                    indices_ptr as *mut i32,
+                    topk_ptr as *mut i32,
+                    pos_ptr as *const i32,
+                    anc_ptr as *const i32,
+                    meta.max_anc as i32,
+                    sel_ptr,
+                    token_count as i32,
+                    start_pos as i32,
+                    config.sliding_window as i32,
+                    if sel_ptr.is_null() {
+                        0
+                    } else {
+                        config.index_topk as i32
+                    },
+                    max_compressed_arg as i32,
+                    topk_unified as i32,
+                    compressed_count as i32,
+                    compress_ratio as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA chain verify indices failed: {e}"))?;
+            }
+        } else {
+            unsafe {
+                match mode {
+                    DeepSeekV4AttentionMode::CompressedSparse => {
+                        let selected = selected.ok_or_else(|| {
+                            anyhow!("DSv4 FlashMLA CSA prefill missing selected topk")
+                        })?;
+                        let (selected_ptr, _sg) = selected.device_ptr(&ctx.stream);
+                        ffi::arle_flashmla_csa_build_indices(
+                            indices_ptr as *mut i32,
+                            topk_ptr as *mut i32,
+                            selected_ptr as *const i32,
+                            token_count as i32,
+                            start_pos as i32,
+                            config.sliding_window as i32,
+                            config.index_topk as i32,
+                            compressed_count as i32,
+                            compress_ratio as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 FlashMLA CSA prefill indices failed: {e}"))?;
+                    }
+                    DeepSeekV4AttentionMode::HybridCompressed => {
+                        ffi::arle_flashmla_hca_build_indices(
+                            indices_ptr as *mut i32,
+                            topk_ptr as *mut i32,
+                            token_count as i32,
+                            start_pos as i32,
+                            config.sliding_window as i32,
+                            max_compressed_keys as i32,
+                            compressed_count as i32,
+                            compress_ratio as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()
+                        .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
+                    }
+                    DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                }
             }
         }
     }
@@ -5984,26 +6093,50 @@ fn try_flashmla_prefill_attention(
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_inverse_rope");
         unsafe {
-            ffi::arle_dsv4_output_inverse_rope_cuda(
-                out_ptr as *mut ffi::Half,
-                token_count as i32,
-                local_heads as i32,
-                config.head_dim as i32,
-                config.qk_rope_head_dim as i32,
-                start_pos as i32,
-                rope_base,
-                original_seq_len,
-                rope_factor,
-                rope_beta_fast,
-                rope_beta_slow,
-                ctx.stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
+            if let Some(meta) = chain_verify {
+                let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
+                ffi::arle_dsv4_output_inverse_rope_batch_start_pos_cuda(
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    pos_ptr as *const i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_factor,
+                    rope_beta_fast,
+                    rope_beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| {
+                    anyhow!("DSv4 FlashMLA chain verify output inverse-rope failed: {e}")
+                })?;
+            } else {
+                ffi::arle_dsv4_output_inverse_rope_cuda(
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    config.head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_pos as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope_factor,
+                    rope_beta_fast,
+                    rope_beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 FlashMLA prefill output inverse-rope failed: {e}"))?;
+            }
         }
     }
 
-    update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+    if chain_verify.is_none() {
+        update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+    }
 
     if env_flag("ARLE_DSV4_FLASHMLA_PREFILL_SYNC")? {
         ctx.sync()?;
@@ -6863,6 +6996,7 @@ pub(crate) fn mla_attention(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     out: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
@@ -6885,6 +7019,7 @@ pub(crate) fn mla_attention(
         prefill_shared.as_deref_mut(),
         start_pos,
         start_pos_device,
+        chain_verify,
         tp,
         keepalive,
     )?;
@@ -6901,6 +7036,7 @@ pub(crate) fn mla_attention(
         prefill_shared,
         start_pos,
         start_pos_device,
+        chain_verify,
         tp,
         prepared,
         out,
@@ -6932,6 +7068,7 @@ pub(crate) fn mla_attention_prepare(
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Dsv4MlaPrepared> {
@@ -7119,7 +7256,28 @@ pub(crate) fn mla_attention_prepare(
         let (k_out_ptr, _ko) = k_prepared.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers valid on ctx.stream; head/dim args checked above.
         unsafe {
-            if let Some(start_pos_device) = start_pos_device {
+            if let Some(meta) = chain_verify {
+                let (start_ptr, _sg) = meta.positions.device_ptr(&ctx.stream);
+                ffi::dsv4_prepare_qk_fused_batch_start_pos_cuda(
+                    q_raw_ptr as *const ffi::Half,
+                    k_raw_ptr as *const ffi::Half,
+                    q_out_ptr as *mut ffi::Half,
+                    k_out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.qk_rope_head_dim as i32,
+                    start_ptr as *const i32,
+                    config.rms_norm_eps,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else if let Some(start_pos_device) = start_pos_device {
                 let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
                 ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
                     q_raw_ptr as *const ffi::Half,
@@ -7929,6 +8087,7 @@ fn mla_attention_fwd(
     prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
     prepared: Dsv4MlaPrepared,
     out: &mut HiddenStates,
@@ -7972,14 +8131,8 @@ fn mla_attention_fwd(
         // The kernel reads the pre-roped q/k, attends over the bf16 SW ring cache
         // (which it also updates), adds the sink, and un-rotates the rope tail of
         // the OUTPUT (sign = -1) before returning.
-        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
-            let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
-            })?;
-            let scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
-            })?;
-            try_flashmla_decode_attention(
+        if let Some(meta) = chain_verify {
+            let used = try_flashmla_prefill_attention(
                 ctx,
                 config,
                 attention,
@@ -7990,11 +8143,8 @@ fn mla_attention_fwd(
                 None,
                 None,
                 &mut state.sw_window_cache,
-                flash,
-                scratch,
-                pool,
                 start_pos,
-                start_pos_device,
+                Some(meta),
                 tp,
                 local_heads,
                 &mut local_attn,
@@ -8004,68 +8154,109 @@ fn mla_attention_fwd(
                 rope.factor,
                 rope.beta_fast,
                 rope.beta_slow,
-            )?
+            )?;
+            ensure!(
+                used,
+                "DSv4 chain verify requires the FlashMLA sparse prefill path"
+            );
         } else {
-            false
-        };
-        if !flashmla_used {
-            let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-            let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
-            let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
-            // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
-            // skips to this rank's head block in the whole-loaded attn_sink vector.
-            unsafe {
-                if let Some(start_pos_device) = start_pos_device {
-                    let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
-                    ffi::dsv4_swa_attention_start_pos_ptr_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        config.sliding_window as i32,
-                        start_ptr as *const i32,
-                        sink_offset as i32,
-                        sm_scale,
-                        config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len,
-                        rope.factor,
-                        rope.beta_fast,
-                        rope.beta_slow,
-                        1,
-                        ctx.stream.cu_stream(),
+            let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+                let flash = state.flashmla.as_mut().ok_or_else(|| {
+                    anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+                })?;
+                let scratch = flashmla_scratch.ok_or_else(|| {
+                    anyhow!(
+                        "ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing"
                     )
-                    .result()?;
-                } else {
-                    ffi::dsv4_swa_attention_cuda(
-                        q_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        window_ptr as *mut ffi::Half,
-                        sink_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        token_count as i32,
-                        local_heads as i32,
-                        head_dim as i32,
-                        config.sliding_window as i32,
-                        start_pos_i32,
-                        sink_offset as i32,
-                        sm_scale,
-                        config.qk_rope_head_dim as i32,
-                        rope_base,
-                        original_seq_len,
-                        rope.factor,
-                        rope.beta_fast,
-                        rope.beta_slow,
-                        1,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                })?;
+                try_flashmla_decode_attention(
+                    ctx,
+                    config,
+                    attention,
+                    mode,
+                    compress_ratio,
+                    &q_prepared,
+                    &k_prepared,
+                    None,
+                    None,
+                    &mut state.sw_window_cache,
+                    flash,
+                    scratch,
+                    pool,
+                    start_pos,
+                    start_pos_device,
+                    tp,
+                    local_heads,
+                    &mut local_attn,
+                    sm_scale,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                )?
+            } else {
+                false
+            };
+            if !flashmla_used {
+                let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+                let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
+                let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+                let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+                let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
+                // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
+                // skips to this rank's head block in the whole-loaded attn_sink vector.
+                unsafe {
+                    if let Some(start_pos_device) = start_pos_device {
+                        let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+                        ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            window_ptr as *mut ffi::Half,
+                            sink_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            config.sliding_window as i32,
+                            start_ptr as *const i32,
+                            sink_offset as i32,
+                            sm_scale,
+                            config.qk_rope_head_dim as i32,
+                            rope_base,
+                            original_seq_len,
+                            rope.factor,
+                            rope.beta_fast,
+                            rope.beta_slow,
+                            1,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    } else {
+                        ffi::dsv4_swa_attention_cuda(
+                            q_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            window_ptr as *mut ffi::Half,
+                            sink_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            token_count as i32,
+                            local_heads as i32,
+                            head_dim as i32,
+                            config.sliding_window as i32,
+                            start_pos_i32,
+                            sink_offset as i32,
+                            sm_scale,
+                            config.qk_rope_head_dim as i32,
+                            rope_base,
+                            original_seq_len,
+                            rope.factor,
+                            rope.beta_fast,
+                            rope.beta_slow,
+                            1,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
                 }
             }
         }
@@ -8106,6 +8297,7 @@ fn mla_attention_fwd(
             Some(compressed),
             &mut state.sw_window_cache,
             start_pos,
+            chain_verify,
             tp,
             local_heads,
             &mut local_attn,
@@ -8117,6 +8309,8 @@ fn mla_attention_fwd(
             rope.beta_slow,
         )? {
             true
+        } else if chain_verify.is_some() {
+            bail!("DSv4 chain verify requires the FlashMLA sparse prefill path");
         } else if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
                 anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
