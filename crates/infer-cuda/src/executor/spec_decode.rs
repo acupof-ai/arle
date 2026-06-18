@@ -163,8 +163,7 @@ impl Dsv4CudaExecutor {
         }
 
         // 4. Commit: truncate, restore the rejected ring tail (draft layer-0
-        //    writes), then either fold from the persisted verify rows or
-        //    re-forward the accepted prefix.
+        //    writes), then fold from the persisted verify rows.
         self.model
             .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
         self.model.restore_spec_ring_tail(
@@ -195,18 +194,15 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
-    /// Cross-slot batched MTP decode step (batched-MTP Stage 1, gated OFF by
-    /// `ARLE_DSV4_BATCHED_MTP`). Drive the per-row `spec_step`'s draft + verify
+    /// Cross-slot batched MTP decode step. Drive the per-row `spec_step`'s draft + verify
     /// across all N slots at once — batching the MoE/HC/norm over all verify
     /// chains (`forward_decode_batch_verify`) while attention stays per-slot —
     /// then per-slot accept / commit / ring-restore. Returns one committed-token
     /// list per input slot, index-aligned with `slot_ids`.
     ///
-    /// N=1 IDENTITY: with a single slot this does structurally the same work as
-    /// per-row `spec_step` — same `capture_spec_rings`, same per-slot draft
-    /// (`draft_chain`), same verify forward (M=depth+1 = the single chain), same
-    /// `longest_accepted_prefix` + bonus, same `truncate_slot` /
-    /// `restore_spec_ring_tail` / per-slot re-forward commit.
+    /// B=1 never calls this path; the executor keeps single-slot spec on
+    /// `spec_step`. B>1 always calls this path so draft and verify do not
+    /// degrade into per-slot tiny GEMMs/GEMVs.
     ///
     /// §0.1 mutated state (per slot s, looped — no cross-slot aliasing; each
     /// `Dsv4SlotState` owns its rings):
@@ -214,38 +210,31 @@ impl Dsv4CudaExecutor {
     ///   rejected tail restored post-accept (`restore_spec_ring_tail`) — looped
     ///   per slot, the PROVEN per-row calls (NOT a batched snapshot).
     /// - `slots[s].seq_len` + accepted KV `[start_pos .. start_pos+accepted]`:
-    ///   overwritten by the per-slot commit re-forward (`forward_tokens_verify`,
-    ///   which WRITES the accepted-prefix rings + advances seq_len).
+    ///   written by the per-slot commit fold from persisted verify rows.
     /// - `spec_slots[s].pending` / `.hidden`: set to the bonus token + the
     ///   accepted chain head's MTP stream hidden.
-    /// - `slot.spec_normed`: written only when commit-fold is enabled; the
-    ///   batched verify scatters each slot's chain rows into that slot's own
-    ///   fold cache. With fold disabled, the caller commits by per-slot
-    ///   re-forward.
+    /// - `slot.spec_normed`: the batched verify scatters each slot's chain rows
+    ///   into that slot's own fold cache.
     pub(crate) fn spec_step_batched(
         &mut self,
         slot_ids: &[usize],
         start_positions: &[usize],
-        positions: &[u64],
     ) -> Result<Vec<Vec<u32>>> {
         let n = slot_ids.len();
         ensure!(n > 0, "DSv4 batched spec step requires at least one slot");
         ensure!(
-            start_positions.len() == n && positions.len() == n,
-            "DSv4 batched spec step surface length mismatch (slots {n}, starts {}, positions {})",
-            start_positions.len(),
-            positions.len()
+            start_positions.len() == n,
+            "DSv4 batched spec step surface length mismatch (slots {n}, starts {})",
+            start_positions.len()
         );
         let depth = self.spec_depth();
         let topk = self.spec_topk();
 
         // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
         // The ring capture is ALWAYS per-slot (cheap host-side snapshot, the
-        // PROVEN per-row call — never batched). The DRAFT is either:
-        //   - per-slot serial `draft_chain` (default — byte-identical to today), OR
-        //   - lever 2a: depth-sequential, slot-batched `mtp_forward_level_batched`
-        //     (gated `ARLE_DSV4_BATCHED_MTP_DRAFT`), amortizing the MTP-head MoE
-        //     over the N slots while the level loop stays sequential (chaining).
+        // proven per-row call — never batched). Draft itself is depth-sequential
+        // and slot-batched: each level depends on the previous token/hidden, but
+        // the N slots share one `mtp_forward_level_batched` wave per level.
         let mut chains: Vec<DraftChain> = Vec::with_capacity(n);
         let mut scheds: Vec<SpecVerifySchedule> = Vec::with_capacity(n);
 
@@ -275,84 +264,57 @@ impl Dsv4CudaExecutor {
             h_prevs.push(hidden);
         }
 
-        if crate::dsv4::dsv4_batched_mtp_draft_enabled() {
-            // Lever 2a: per depth LEVEL, ONE batched MTP-head forward over the N
-            // slots' current draft tokens. The level loop is sequential (level
-            // i+1 chains from level i's per-slot stream + token); the N slots
-            // batch WITHIN each level. With N=1 / depth identical to the per-slot
-            // draft_chain (same head math, same per-slot attention, same chaining).
-            let mut tokens_per_slot: Vec<Vec<u32>> = pendings.iter().map(|&p| vec![p]).collect();
-            let mut candidates_per_slot: Vec<Vec<Vec<u32>>> =
-                (0..n).map(|_| Vec::with_capacity(depth)).collect();
-            // h_prev[s] starts as the trunk hidden; updated to level i's stream.
-            let mut cur_hidden: Vec<DeviceVec> = h_prevs;
-            for level in 0..depth {
-                let rows: Vec<crate::dsv4::MtpDraftRow> = (0..n)
-                    .map(|s| crate::dsv4::MtpDraftRow {
-                        token: tokens_per_slot[s][level],
-                    })
-                    .collect();
-                let h_refs: Vec<&DeviceVec> = cur_hidden.iter().collect();
-                let positions: Vec<u64> = (0..n)
-                    .map(|s| (start_positions[s] + level) as u64)
-                    .collect();
-                let expanded = self.model.mtp_forward_level_batched(
-                    &mut self.slots,
-                    &mut self.kv_adapter,
-                    slot_ids,
-                    &rows,
-                    &h_refs,
-                    &positions,
-                    topk,
-                )?;
-                ensure!(
-                    expanded.len() == n,
-                    "DSv4 batched MTP draft level {level} returned {} rows for {n} slots",
-                    expanded.len()
-                );
-                let mut next_hidden: Vec<DeviceVec> = Vec::with_capacity(n);
-                for (s, (candidates, stream)) in expanded.into_iter().enumerate() {
-                    let candidate = candidates.first().copied().ok_or_else(|| {
-                        anyhow!("DSv4 batched MTP draft level {level} returned no candidate")
-                    })?;
-                    tokens_per_slot[s].push(candidate);
-                    candidates_per_slot[s].push(candidates);
-                    next_hidden.push(stream);
-                }
-                cur_hidden = next_hidden;
+        let mut tokens_per_slot: Vec<Vec<u32>> = pendings.iter().map(|&p| vec![p]).collect();
+        let mut candidates_per_slot: Vec<Vec<Vec<u32>>> =
+            (0..n).map(|_| Vec::with_capacity(depth)).collect();
+        // h_prev[s] starts as the trunk hidden; updated to level i's stream.
+        let mut cur_hidden: Vec<DeviceVec> = h_prevs;
+        for level in 0..depth {
+            let rows: Vec<crate::dsv4::MtpDraftRow> = (0..n)
+                .map(|s| crate::dsv4::MtpDraftRow {
+                    token: tokens_per_slot[s][level],
+                })
+                .collect();
+            let h_refs: Vec<&DeviceVec> = cur_hidden.iter().collect();
+            let expanded = self.model.mtp_forward_level_batched(
+                &mut self.slots,
+                &mut self.kv_adapter,
+                slot_ids,
+                &rows,
+                &h_refs,
+                start_positions,
+                level,
+                topk,
+            )?;
+            ensure!(
+                expanded.len() == n,
+                "DSv4 batched MTP draft level {level} returned {} rows for {n} slots",
+                expanded.len()
+            );
+            let mut next_hidden: Vec<DeviceVec> = Vec::with_capacity(n);
+            for (s, (candidates, stream)) in expanded.into_iter().enumerate() {
+                let candidate = candidates.first().copied().ok_or_else(|| {
+                    anyhow!("DSv4 batched MTP draft level {level} returned no candidate")
+                })?;
+                tokens_per_slot[s].push(candidate);
+                candidates_per_slot[s].push(candidates);
+                next_hidden.push(stream);
             }
-            for s in 0..n {
-                let tokens = std::mem::take(&mut tokens_per_slot[s]);
-                let candidates = std::mem::take(&mut candidates_per_slot[s]);
-                let chain = DraftChain { tokens, candidates };
-                chain.validate()?;
-                scheds.push(chain.verify_schedule(start_positions[s]));
-                chains.push(chain);
-            }
-        } else {
-            // Default: per-slot serial draft (byte-identical to today).
-            for s in 0..n {
-                let chain = self.draft_chain(
-                    slot_ids[s],
-                    pendings[s],
-                    &h_prevs[s],
-                    depth,
-                    topk,
-                    start_positions[s],
-                )?;
-                chain.validate()?;
-                scheds.push(chain.verify_schedule(start_positions[s]));
-                chains.push(chain);
-            }
+            cur_hidden = next_hidden;
+        }
+        for s in 0..n {
+            let tokens = std::mem::take(&mut tokens_per_slot[s]);
+            let candidates = std::mem::take(&mut candidates_per_slot[s]);
+            let chain = DraftChain { tokens, candidates };
+            chain.validate()?;
+            scheds.push(chain.verify_schedule(start_positions[s]));
+            chains.push(chain);
         }
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
-        // attention per slot/row). The verify persists per-slot spec_normed
-        // (fold is always on) so the commit avoids a per-slot re-forward — the
-        // fold is what makes per-row MTP fast; re-forward commit scales with c and
-        // erases the verify-batching win (errors/2026-06-15-...submode2-regression).
+        // attention per slot/row). The verify persists per-slot spec_normed for
+        // the commit fold.
         let chain_tokens: Vec<Vec<u32>> = chains.iter().map(|chain| chain.tokens.clone()).collect();
-        let fold = crate::dsv4::dsv4_mtp_commit_fold_enabled();
         let verified = self.model.forward_decode_batch_verify(
             &mut self.slots,
             &mut self.kv_adapter,
@@ -360,7 +322,6 @@ impl Dsv4CudaExecutor {
             &chain_tokens,
             start_positions,
             &scheds,
-            fold,
         )?;
         ensure!(
             verified.len() == n,
@@ -368,170 +329,63 @@ impl Dsv4CudaExecutor {
             verified.len()
         );
 
-        // ── 3. Per-slot accept / commit / ring-restore. The batched verify above
-        // is the amortized phase; the per-slot draft (phase 0) and per-slot commit
-        // (phase 2) stay sequential — the profile shows which dominates the wave.
-        //
-        // Commit is FOLD (default — re-ingest the per-slot spec_normed the batched
-        // verify persisted; no re-forward, the cheap path per-row MTP uses) or
-        // RE-FORWARD (fallback when fold is disabled). When fold is on AND lever 2b
-        // (`ARLE_DSV4_BATCHED_MTP_COMMIT`) is enabled, the per-slot fold's 60-layer
-        // host loop is shared across all slots via `commit_accepted_fold_batched`:
-        // the cheap per-slot truncate+restore stay per-slot (host/ring ops), then
-        // ONE batched fold over all slots, then the per-slot pending/hidden set.
-        let batched_commit = fold && crate::dsv4::dsv4_batched_mtp_commit_enabled();
+        // ── 3. Per-slot accept / ring-restore / fold commit. The batched verify
+        // above is the amortized phase; commit stays the proven per-slot fold.
         let mut out = Vec::with_capacity(n);
-        if batched_commit {
-            // Phase 3a (per slot — cheap host/ring ops): accept, stats, truncate,
-            // rejected-tail restore. Collect each slot's accepted count + the
-            // accepted-row hidden + bonus + output tokens for after the batched fold.
-            let mut accepted_per_slot: Vec<usize> = Vec::with_capacity(n);
-            let mut accepted_hiddens: Vec<DeviceVec> = Vec::with_capacity(n);
-            let mut bonuses: Vec<u32> = Vec::with_capacity(n);
-            let mut slot_outs: Vec<Vec<u32>> = Vec::with_capacity(n);
-            for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
-                let slot_idx = slot_ids[s];
-                let start_pos = start_positions[s];
-                let chain = &chains[s];
-                let tokens = &chain.tokens;
-                let chain_depth = chain.depth();
-                ensure!(
-                    argmax.len() == tokens.len() && hiddens.len() == tokens.len(),
-                    "DSv4 batched verify slot {slot_idx} expected {} rows, got argmax={} hidden={}",
+        for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
+            let slot_idx = slot_ids[s];
+            let start_pos = start_positions[s];
+            let chain = &chains[s];
+            let tokens = &chain.tokens;
+            let chain_depth = chain.depth();
+            ensure!(
+                argmax.len() == tokens.len() && hiddens.len() == tokens.len(),
+                "DSv4 batched verify slot {slot_idx} expected {} rows, got argmax={} hidden={}",
+                tokens.len(),
+                argmax.len(),
+                hiddens.len()
+            );
+
+            let candidate_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
+            let accepted = longest_accepted_prefix(chain, &argmax);
+            let bonus = argmax[accepted];
+            self.mtp_accepts += accepted;
+            self.mtp_rejects += chain_depth - accepted;
+            if self.model.tp.config().rank == 0 {
+                eprintln!(
+                    "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \
+                     draft_rows={chain_depth} verify_rows={} candidate_hits={candidate_hits} \
+                     accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
                     tokens.len(),
-                    argmax.len(),
-                    hiddens.len()
+                    self.mtp_accepts,
+                    self.mtp_rejects
                 );
-                let candidate_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
-                let accepted = longest_accepted_prefix(chain, &argmax);
-                let bonus = argmax[accepted];
-                self.mtp_accepts += accepted;
-                self.mtp_rejects += chain_depth - accepted;
-                if self.model.tp.config().rank == 0 {
-                    eprintln!(
-                        "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \
-                         draft_rows={chain_depth} verify_rows={} candidate_hits={candidate_hits} \
-                         accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
-                        tokens.len(),
-                        self.mtp_accepts,
-                        self.mtp_rejects
-                    );
-                }
-                self.model
-                    .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
-                self.model.restore_spec_ring_tail(
-                    &mut self.slots[slot_idx],
-                    &mut self.kv_adapter,
-                    start_pos,
-                    accepted,
-                    depth,
-                )?;
-                let mut slot_out: Vec<u32> = tokens[1..=accepted].to_vec();
-                slot_out.push(bonus);
-                accepted_per_slot.push(accepted);
-                // The batched verify's per-slot hidden at the accepted row is the
-                // next step's trunk (same as per-row fold's verify hidden).
-                accepted_hiddens.push(hiddens.swap_remove(accepted));
-                bonuses.push(bonus);
-                slot_outs.push(slot_out);
             }
-            // Phase 3b: ONE 60-layer pass folding the accepted prefix for every
-            // slot (the amortization — per-slot rings written, no MoE).
-            self.model.commit_accepted_fold_batched(
-                &mut self.slots,
+
+            self.model
+                .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+            self.model.restore_spec_ring_tail(
+                &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
-                slot_ids,
-                &accepted_per_slot,
-                start_positions,
+                start_pos,
+                accepted,
+                depth,
             )?;
-            // Phase 3c (per slot): publish pending + trunk hidden, emit tokens.
-            for s in 0..n {
-                let spec = &mut self.spec_slots[slot_ids[s]];
-                spec.pending = Some(bonuses[s]);
-                spec.hidden = Some(accepted_hiddens.remove(0));
-                out.push(std::mem::take(&mut slot_outs[s]));
-            }
-        } else {
-            for (s, (argmax, mut hiddens)) in verified.into_iter().enumerate() {
-                let slot_idx = slot_ids[s];
-                let start_pos = start_positions[s];
-                let position = positions[s];
-                let chain = &chains[s];
-                let tokens = &chain.tokens;
-                let chain_depth = chain.depth();
-                ensure!(
-                    argmax.len() == tokens.len() && hiddens.len() == tokens.len(),
-                    "DSv4 batched verify slot {slot_idx} expected {} rows, got argmax={} hidden={}",
-                    tokens.len(),
-                    argmax.len(),
-                    hiddens.len()
-                );
+            let accepted_tokens: Vec<u32> = tokens[1..=accepted].to_vec();
+            let rows: Vec<usize> = (0..=accepted).collect();
+            self.model.commit_accepted_fold(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &rows,
+                start_pos,
+            )?;
+            let spec = &mut self.spec_slots[slot_idx];
+            spec.pending = Some(bonus);
+            spec.hidden = Some(hiddens.swap_remove(accepted));
 
-                let candidate_hits = longest_candidate_hit_prefix(&chain.candidates, &argmax);
-                let accepted = longest_accepted_prefix(chain, &argmax);
-                let bonus = argmax[accepted];
-                self.mtp_accepts += accepted;
-                self.mtp_rejects += chain_depth - accepted;
-                if self.model.tp.config().rank == 0 {
-                    eprintln!(
-                        "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \
-                         draft_rows={chain_depth} verify_rows={} candidate_hits={candidate_hits} \
-                         accepted={accepted} accept_total={} reject_total={} bonus={bonus}",
-                        tokens.len(),
-                        self.mtp_accepts,
-                        self.mtp_rejects
-                    );
-                }
-
-                // Truncate to the committed length, restore the rejected ring tail
-                // (the draft's speculative layer-0 writes), then commit the accepted
-                // prefix: FOLD (default — re-ingest the per-slot spec_normed the
-                // batched verify persisted; no re-forward, the cheap path per-row MTP
-                // uses) or RE-FORWARD (fallback when fold is disabled).
-                self.model
-                    .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
-                self.model.restore_spec_ring_tail(
-                    &mut self.slots[slot_idx],
-                    &mut self.kv_adapter,
-                    start_pos,
-                    accepted,
-                    depth,
-                )?;
-                let accepted_tokens: Vec<u32> = tokens[1..=accepted].to_vec();
-                if fold {
-                    let rows: Vec<usize> = (0..=accepted).collect();
-                    self.model.commit_accepted_fold(
-                        &mut self.slots[slot_idx],
-                        &mut self.kv_adapter,
-                        &rows,
-                        start_pos,
-                    )?;
-                    let spec = &mut self.spec_slots[slot_idx];
-                    spec.pending = Some(bonus);
-                    // The batched verify's per-slot hidden at the accepted row is the
-                    // next step's trunk (same as per-row fold's verify hidden).
-                    spec.hidden = Some(hiddens.swap_remove(accepted));
-                } else {
-                    let mut prefix = Vec::with_capacity(accepted + 1);
-                    prefix.push(tokens[0]);
-                    prefix.extend_from_slice(&accepted_tokens);
-                    let mut verify = self.model.forward_tokens_verify(
-                        &mut self.slots[slot_idx],
-                        &mut self.kv_adapter,
-                        &prefix,
-                        start_pos,
-                        position,
-                    )?;
-                    let spec = &mut self.spec_slots[slot_idx];
-                    spec.pending = Some(bonus);
-                    spec.hidden = Some(verify.hiddens.remove(accepted));
-                    hiddens.clear();
-                }
-
-                let mut slot_out = accepted_tokens;
-                slot_out.push(bonus);
-                out.push(slot_out);
-            }
+            let mut slot_out = accepted_tokens;
+            slot_out.push(bonus);
+            out.push(slot_out);
         }
         Ok(out)
     }
