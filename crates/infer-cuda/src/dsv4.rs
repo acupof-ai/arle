@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::{CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache};
@@ -247,11 +247,6 @@ pub(crate) struct Dsv4MoeLayer {
     /// row-stacked) and down cache (w2). Built once by the loader; the masked
     /// grouped GEMM reads these directly every step.
     pub w13_grouped: crate::moe::GroupedCache,
-    /// GLM bf16 routed experts only: the separate `up` grouped cache
-    /// (`[groups, intermediate, hidden]`). `w13_grouped` holds gate-only for GLM
-    /// (the bf16 SwiGLU needs separate gate/up — the DeepGEMM output is per-row
-    /// interleaved). DSv4 keeps the fused `w13_grouped` and leaves this `None`.
-    pub w13_up_grouped: Option<crate::moe::GroupedCache>,
     pub w2_grouped: crate::moe::GroupedCache,
     pub num_groups: usize,
     pub hidden_dim: usize,
@@ -266,15 +261,10 @@ pub(crate) struct Dsv4MoeLayer {
     pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
-    /// DSv4 uses these directly. GLM also builds them to keep DSv4 structs
-    /// non-optional, but routes the shared expert through the bf16 caches below.
+    /// Both DSv4 and GLM run the FP8 DeepGEMM shared path; GLM ships F32
+    /// `weight_scale_inv` block scales which the 1D2D FP8 GEMM consumes directly.
     pub shared_w13: Dsv4Fp8DeepGemmWeightCache,
     pub shared_w2: Dsv4Fp8DeepGemmWeightCache,
-    /// GLM shared expert bf16 caches (gate / up / down), each a single grouped
-    /// expert. DSv4 leaves these `None`; the DSv4 FP8 shared path is unchanged.
-    pub shared_gate_bf16: Option<crate::moe::GroupedCache>,
-    pub shared_up_bf16: Option<crate::moe::GroupedCache>,
-    pub shared_w2_bf16: Option<crate::moe::GroupedCache>,
     /// Decode-band grouped-GEMV lane tables (per-expert weight/scale pointer
     /// tables + UE8M0-re-encoded scales), built lazily on first decode-band
     /// MoE forward. `Some(None)` = build attempted and failed the lossless
@@ -1683,16 +1673,16 @@ impl Dsv4Model {
         let use_deepep_transport = dsv4_use_deepep_transport()?;
         // FlashMLA-decode captures cleanly (capture-safety fixes e95e11b6).
         // The graph routes on-device into fixed scratch and runs the masked
-        // MoE tail — no gpu_router/pooled dependency.
+        // MoE tail — no gpu_router/pooled dependency. GLM rides the same FP8 MoE
+        // path (routed + shared) with no per-call scratch alloc, so it captures
+        // like DSv4 (the bf16-shared per-call-alloc hazard that gated GLM off is
+        // gone). ponytail: pod-verify GLM V32 SparseIndexed decode captures+replays
+        // cleanly under the decode-graph (no host launches / per-call alloc in the
+        // indexer/sparse-attention forward) before relying on it for GLM serving.
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
             && seq_len == 1
             && !use_deepep_transport
-            // GLM's shared expert runs the bf16 path, whose GEMMs allocate
-            // per-call scratch — illegal inside the captured decode-graph closure
-            // (would alias on replay). GLM decodes eagerly until the bf16 shared
-            // scratch is pre-allocated into Dsv4MoeDecodeScratch (follow-up).
-            && !self.config.plain_o_proj
         {
             return self.forward_tokens_decode_graph(
                 slot, kv_adapter, tokens[0], start_pos, params, position,

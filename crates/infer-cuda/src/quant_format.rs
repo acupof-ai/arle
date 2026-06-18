@@ -295,41 +295,6 @@ pub(crate) fn decode_f8_e4m3fn(byte: u8) -> f32 {
     sign * (1.0 + mant as f32 / 8.0) * 2.0f32.powi(exp as i32 - BIAS)
 }
 
-/// Encode an f32 into an FP8 E4M3FN byte (the inverse of [`decode_f8_e4m3fn`]).
-/// Saturates to ±448 (E4M3FN max normal); flushes sub-minimal to ±0.
-pub(crate) fn encode_f8_e4m3fn(value: f32) -> u8 {
-    const FP8_E4M3FN_MAX: f32 = 448.0;
-    if !value.is_finite() || value == 0.0 {
-        return 0;
-    }
-    let sign = if value.is_sign_negative() { 0x80 } else { 0x00 };
-    let x = value.abs().min(FP8_E4M3FN_MAX);
-    // Subnormals: exp field 0, mantissa in units of 2^-9.
-    if x < 2_f32.powi(-9) * 0.5 {
-        return sign;
-    }
-    if x < 2_f32.powi(-6) {
-        let mant = (x / 2_f32.powi(-9)).round().clamp(1.0, 7.0) as u8;
-        return sign | mant;
-    }
-    if x >= 256.0 {
-        let mant = ((x / 256.0 - 1.0) * 8.0).round().clamp(0.0, 6.0) as u8;
-        return sign | 0x78 | mant;
-    }
-    let exp_unbiased = x.log2().floor() as i32;
-    let mut exp = (exp_unbiased + 7).clamp(1, 14);
-    let base = 2_f32.powi(exp_unbiased);
-    let mut mant = ((x / base - 1.0) * 8.0).round() as i32;
-    if mant >= 8 {
-        mant = 0;
-        exp += 1;
-        if exp >= 15 {
-            return sign | 0x78;
-        }
-    }
-    sign | ((exp as u8) << 3) | (mant.clamp(0, 7) as u8)
-}
-
 pub(crate) fn decode_fp4_e2m1(nibble: u8) -> f32 {
     let nibble = nibble & 0x0f;
     let sign = if nibble & 0x08 != 0 { -1.0 } else { 1.0 };

@@ -233,7 +233,13 @@ impl GlmMoeDsaConfig {
             num_key_value_heads: 1,
             head_dim: self.kv_lora_rank + self.qk_rope_head_dim,
             hidden_act: "silu".to_string(),
-            swiglu_limit: 0.0,
+            // GLM has an UNCLAMPED SwiGLU (no gpt-oss-style ±limit clamp that DSv4
+            // uses, e.g. 10.0). The DSv4 FP8 MoE swiglu kernel clamps
+            // `gate=min(gate,limit)` / `up=clamp(up,±limit)` and rejects `limit<=0`,
+            // so express "no clamp" as a large finite sentinel: `fminf`/`fmaxf`
+            // against f32::MAX is a no-op for any real activation, and it satisfies
+            // the kernel's `limit > 0` precondition.
+            swiglu_limit: f32::MAX,
             q_lora_rank: self.q_lora_rank,
             // GLM has plain o_proj; the wo_a→wo_b low-rank path is unused.
             o_lora_rank: 0,
