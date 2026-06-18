@@ -116,6 +116,26 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_oproj_group_gather_cuda(
+        src: *const super::Half,
+        dst: *mut super::Half,
+        num_tokens: i32,
+        groups: i32,
+        cols_per_group: i32,
+        group: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    pub fn dsv4_oproj_group_scatter_cuda(
+        src: *const super::Half,
+        dst: *mut super::Half,
+        num_tokens: i32,
+        groups: i32,
+        rows_per_group: i32,
+        group: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_prepare_qk_cuda(
         q_raw: *const super::Half,
         k_raw: *const super::Half,
