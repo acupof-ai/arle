@@ -219,7 +219,6 @@ export_runtime_env() {
     export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     export ARLE_DSV4_MOE_BACKEND="$MOE_BACKEND"
     export ARLE_DSV4_INCREMENTAL_KV="${ARLE_DSV4_INCREMENTAL_KV:-1}"
-    export ARLE_DSV4_FUSED_DISPATCH_PAYLOAD="${ARLE_DSV4_FUSED_DISPATCH_PAYLOAD:-1}"
     export ARLE_DSV4_EXPERT_BACKEND="$EXPERT_BACKEND"
     # 2026-05-27 SLO unblock: grouped local expert path uses M-blind
     # dsv4_fp8_grouped_gemv_batch_kernel (grid Y = max_count, no weight reuse) —

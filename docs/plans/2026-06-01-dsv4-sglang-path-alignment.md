@@ -225,8 +225,7 @@ Primary entry points:
 - Native DeepEP: `forward_native_deepep_routed_gpu` plus
   `deepep_sys::Buffer::{dispatch,combine}`.
 - Materialization risk: `ensure_deepgemm_scratch`, `ensure_native_deepep_scratch`,
-  per-call `input_fp8/input_scales/act_fp8/act_scales` zeroing, and
-  `dsv4_pack_dispatch_payload_cuda` / `dsv4_unpack_dispatch_payload_cuda`.
+  and per-call `input_fp8/input_scales/act_fp8/act_scales` zeroing.
 
 - Enable native DeepEP only after PC2.
 - Remove post-FFN all-reduce from the SGLang candidate path.
