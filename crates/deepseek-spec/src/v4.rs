@@ -66,6 +66,27 @@ pub struct DeepSeekV4Config {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     pub pad_token_id: Option<u32>,
+    // GLM-5.2 (glm_moe_dsa) dialect extensions. Default/None ⇒ DSv4-Flash
+    // absorbed-MODEL1 semantics, byte-unchanged. Populated by
+    // `crate::glm::GlmMoeDsaConfig::into_deepseek_v4`.
+    #[serde(default)]
+    pub kv_lora_rank: usize,
+    #[serde(default)]
+    pub qk_nope_head_dim: usize,
+    #[serde(default)]
+    pub v_head_dim: usize,
+    /// `true` ⇒ standard plain `o_proj` (GLM); `false` ⇒ DSv4 wo_a→wo_b low-rank.
+    #[serde(default)]
+    pub plain_o_proj: bool,
+    /// Explicit per-layer attention mode (GLM). `None` ⇒ derive from `compress_ratios`.
+    #[serde(skip)]
+    pub per_layer_attention_mode: Option<Vec<DeepSeekV4AttentionMode>>,
+    /// Per-layer dense-MLP (vs MoE) flag (GLM `mlp_layer_types`). `None` ⇒ all-MoE.
+    #[serde(skip)]
+    pub per_layer_dense_mlp: Option<Vec<bool>>,
+    /// Per-layer "full indexer" (recompute topk) flag. `None` ⇒ DSv4.
+    #[serde(skip)]
+    pub per_layer_full_indexer: Option<Vec<bool>>,
 }
 
 impl DeepSeekV4Config {
@@ -201,7 +222,10 @@ impl DeepSeekV4Config {
 
     pub fn attention_layer_plan(&self, layer_idx: usize) -> Option<DeepSeekV4AttentionLayerPlan> {
         let compress_ratio = *self.compress_ratios.get(layer_idx)?;
-        let mode = self.attention_mode_for_compress_ratio(compress_ratio);
+        let mode = match &self.per_layer_attention_mode {
+            Some(modes) => *modes.get(layer_idx)?,
+            None => self.attention_mode_for_compress_ratio(compress_ratio),
+        };
         Some(DeepSeekV4AttentionLayerPlan {
             layer_idx,
             compress_ratio,
@@ -224,6 +248,7 @@ impl DeepSeekV4Config {
                 DeepSeekV4AttentionMode::SlidingWindow => summary.sliding_window_layers += 1,
                 DeepSeekV4AttentionMode::CompressedSparse => summary.csa_layers += 1,
                 DeepSeekV4AttentionMode::HybridCompressed => summary.hca_layers += 1,
+                DeepSeekV4AttentionMode::SparseIndexed => summary.sparse_indexed_layers += 1,
             }
             if plan.hash_routing {
                 summary.hash_routed_moe_layers += 1;
@@ -253,21 +278,21 @@ impl DeepSeekV4Config {
     }
 
     pub fn indexer_shape(&self, compress_ratio: usize) -> Option<DeepSeekV4IndexerShape> {
-        (self.attention_mode_for_compress_ratio(compress_ratio)
-            == DeepSeekV4AttentionMode::CompressedSparse)
-            .then(|| DeepSeekV4IndexerShape {
-                compress_ratio,
-                wq_b_rows: self.index_n_heads * self.index_head_dim,
-                wq_b_cols: self.q_lora_rank,
-                weights_proj_rows: self.index_n_heads,
-                weights_proj_cols: self.hidden_size,
-                key_head_dim: self.index_head_dim,
-                key_heads: self.index_n_heads,
-                topk: self.index_topk,
-                compressor: self
-                    .compressor_shape(compress_ratio)
-                    .expect("CSA compress_ratio must have compressor shape"),
-            })
+        let mode = self.attention_mode_for_compress_ratio(compress_ratio);
+        mode.has_indexer().then(|| DeepSeekV4IndexerShape {
+            compress_ratio,
+            wq_b_rows: self.index_n_heads * self.index_head_dim,
+            wq_b_cols: self.q_lora_rank,
+            weights_proj_rows: self.index_n_heads,
+            weights_proj_cols: self.hidden_size,
+            key_head_dim: self.index_head_dim,
+            key_heads: self.index_n_heads,
+            topk: self.index_topk,
+            compressor: (mode == DeepSeekV4AttentionMode::CompressedSparse).then(|| {
+                self.compressor_shape(compress_ratio)
+                    .expect("CSA compress_ratio must have compressor shape")
+            }),
+        })
     }
 
     pub fn output_projection_shape(&self) -> DeepSeekV4OutputProjectionShape {
@@ -419,6 +444,8 @@ pub enum DeepSeekV4AttentionMode {
     SlidingWindow,
     CompressedSparse,
     HybridCompressed,
+    /// GLM DSA: Lightning Indexer over the full latent KV, no compressor.
+    SparseIndexed,
 }
 
 impl DeepSeekV4AttentionMode {
@@ -435,7 +462,7 @@ impl DeepSeekV4AttentionMode {
     }
 
     pub fn has_indexer(self) -> bool {
-        self == Self::CompressedSparse
+        matches!(self, Self::CompressedSparse | Self::SparseIndexed)
     }
 }
 
@@ -456,6 +483,7 @@ pub struct DeepSeekV4AttentionOperatorSummary {
     pub sliding_window_layers: usize,
     pub csa_layers: usize,
     pub hca_layers: usize,
+    pub sparse_indexed_layers: usize,
     pub hash_routed_moe_layers: usize,
     pub bias_routed_moe_layers: usize,
 }
@@ -483,7 +511,7 @@ pub struct DeepSeekV4IndexerShape {
     pub key_heads: usize,
     pub key_head_dim: usize,
     pub topk: usize,
-    pub compressor: DeepSeekV4CompressorShape,
+    pub compressor: Option<DeepSeekV4CompressorShape>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,15 +688,17 @@ pub struct DeepSeekV4IndexerTensorNames {
     pub prefix: String,
     pub wq_b: String,
     pub weights_proj: String,
-    pub compressor: DeepSeekV4CompressorTensorNames,
+    /// `None` ⇒ GLM SparseIndexed (indexer over full latent, no key compressor).
+    pub compressor: Option<DeepSeekV4CompressorTensorNames>,
 }
 
 impl DeepSeekV4IndexerTensorNames {
-    fn new(prefix: String) -> Self {
+    fn new(prefix: String, has_compressor: bool) -> Self {
         Self {
             wq_b: format!("{prefix}.wq_b.weight"),
             weights_proj: format!("{prefix}.weights_proj.weight"),
-            compressor: DeepSeekV4CompressorTensorNames::new(format!("{prefix}.compressor")),
+            compressor: has_compressor
+                .then(|| DeepSeekV4CompressorTensorNames::new(format!("{prefix}.compressor"))),
             prefix,
         }
     }
@@ -688,7 +718,9 @@ impl DeepSeekV4IndexerTensorNames {
                 },
             );
         }
-        self.compressor.shard_for(name)
+        self.compressor
+            .as_ref()
+            .and_then(|compressor| compressor.shard_for(name))
     }
 }
 
@@ -712,7 +744,8 @@ impl DeepSeekV4AttentionTensorNames {
         let compressor = (compress_ratio > 0)
             .then(|| DeepSeekV4CompressorTensorNames::new(format!("{prefix}.compressor")));
         let indexer = (compress_ratio > 0 && compress_ratio < 16)
-            .then(|| DeepSeekV4IndexerTensorNames::new(format!("{prefix}.indexer")));
+            // DSv4 CSA indexer always rides a key compressor.
+            .then(|| DeepSeekV4IndexerTensorNames::new(format!("{prefix}.indexer"), true));
         Self {
             wq_a: format!("{prefix}.wq_a.weight"),
             q_norm: format!("{prefix}.q_norm.weight"),
@@ -1160,7 +1193,14 @@ mod tests {
             "layers.2.attn.compressor.wgate.weight"
         );
         assert_eq!(
-            csa.attn.indexer.as_ref().unwrap().compressor.ape,
+            csa.attn
+                .indexer
+                .as_ref()
+                .unwrap()
+                .compressor
+                .as_ref()
+                .unwrap()
+                .ape,
             "layers.2.attn.indexer.compressor.ape"
         );
         assert_eq!(csa.ffn.gate_bias.as_deref(), Some("layers.2.ffn.gate.bias"));

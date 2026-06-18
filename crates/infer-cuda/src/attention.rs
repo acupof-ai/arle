@@ -940,6 +940,9 @@ impl Dsv4FlashMlaDecodeShape {
             DeepSeekV4AttentionMode::SlidingWindow => 0,
             DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
             DeepSeekV4AttentionMode::HybridCompressed => compressed_rows.div_ceil(128) * 128,
+            DeepSeekV4AttentionMode::SparseIndexed => {
+                unimplemented!("Tranche D: GLM SparseIndexed max_compressed_keys (decode)")
+            }
         };
         let topk_unified = config
             .sliding_window
@@ -5399,6 +5402,9 @@ fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
     match mode {
         DeepSeekV4AttentionMode::CompressedSparse => 1,
         DeepSeekV4AttentionMode::SlidingWindow | DeepSeekV4AttentionMode::HybridCompressed => 2,
+        DeepSeekV4AttentionMode::SparseIndexed => {
+            unimplemented!("Tranche D: GLM SparseIndexed flashmla_mode_int")
+        }
     }
 }
 
@@ -5775,6 +5781,9 @@ fn try_flashmla_prefill_attention(
         DeepSeekV4AttentionMode::CompressedSparse => config.index_topk,
         DeepSeekV4AttentionMode::HybridCompressed => compressed_count.div_ceil(128) * 128,
         DeepSeekV4AttentionMode::SlidingWindow => 0,
+        DeepSeekV4AttentionMode::SparseIndexed => {
+            unimplemented!("Tranche D: GLM SparseIndexed max_compressed_keys (prefill)")
+        }
     };
     let chain_pad = if chain_verify.is_some() { 128 } else { 0 };
     let topk_unified = config
@@ -5920,6 +5929,9 @@ fn try_flashmla_prefill_attention(
                         .map_err(|e| anyhow!("DSv4 FlashMLA HCA prefill indices failed: {e}"))?;
                     }
                     DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+                    DeepSeekV4AttentionMode::SparseIndexed => {
+                        unimplemented!("Tranche D: GLM SparseIndexed prefill build-indices")
+                    }
                 }
             }
         }
@@ -8267,6 +8279,9 @@ fn mla_attention_fwd(
             DeepSeekV4AttentionMode::CompressedSparse => 1,
             DeepSeekV4AttentionMode::HybridCompressed => 2,
             DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+            DeepSeekV4AttentionMode::SparseIndexed => {
+                unimplemented!("Tranche D: GLM SparseIndexed prefill mode_int")
+            }
         };
         let flashmla_used = if try_flashmla_prefill_attention(
             ctx,
