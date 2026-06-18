@@ -2282,12 +2282,16 @@ fn deepseek_v4_param_count(cfg: &DeepSeekV4Config) -> u64 {
                 let shape = cfg
                     .indexer_shape(compress_ratio)
                     .expect("CSA layer has indexer shape");
+                let compressor = shape
+                    .compressor
+                    .as_ref()
+                    .expect("CSA indexer always has a compressor");
                 mul_u64(shape.wq_b_rows, shape.wq_b_cols)
                     + mul_u64(shape.weights_proj_rows, shape.weights_proj_cols)
-                    + mul_u64(shape.compressor.wkv_rows, shape.compressor.wkv_cols)
-                    + mul_u64(shape.compressor.wgate_rows, shape.compressor.wgate_cols)
-                    + mul_u64(shape.compressor.ape_rows, shape.compressor.ape_cols)
-                    + shape.compressor.norm_len as u64
+                    + mul_u64(compressor.wkv_rows, compressor.wkv_cols)
+                    + mul_u64(compressor.wgate_rows, compressor.wgate_cols)
+                    + mul_u64(compressor.ape_rows, compressor.ape_cols)
+                    + compressor.norm_len as u64
             } else {
                 0
             };
