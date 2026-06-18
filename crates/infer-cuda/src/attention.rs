@@ -34,8 +34,9 @@ const DSV4_FLASHMLA_S_Q: usize = 1;
 /// MODEL1 NoPE=448 / RoPE=64 shape (validated against `kv_arena.bytes_per_token`
 /// in `Dsv4FlashMlaDecodeState::new`).
 const DSV4_FLASH_KV_BYTES_PER_TOKEN_I32: i32 = 584;
-/// Packed bytes per token for GLM-5.2 V32 (NoPE=512 / RoPE=64): 512 + 128 (bf16
-/// rope) + 16 (scale region) = 656. Matches the shim `V32_BYTES_PER_TOKEN`.
+/// Packed bytes per token for GLM-5.2 V32 (NoPE=512 / RoPE=64), inline layout:
+/// 512 (NoPE fp8) + 16 (4× F32 block scales) + 128 (bf16 rope) = 656. Matches
+/// the shim `V32_BYTES_PER_TOKEN` and the vendored decode's inline reads.
 const DSV4_V32_KV_BYTES_PER_TOKEN_I32: i32 = 656;
 const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
 const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
@@ -5723,9 +5724,10 @@ fn flashmla_pack_one_sw_token(
     let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let nope_ptr = k_ptr;
     // rope offset = head_dim - rope_dim: MODEL1 512-64=448, V32 576-64=512.
-    // stride = head_dim: MODEL1 512, V32 576. The config formula already yields
-    // the right offset/stride for both shapes; only the pack FN differs (V32
-    // packs 8 NoPE tiles + 16-byte scale region → 656 B/tok).
+    // stride = head_dim: MODEL1 512, V32 576. The config formula yields the
+    // right offset/stride for both shapes; only the pack FN differs. V32 writes
+    // the inline 656 B/tok layout [512 NoPE fp8][4 F32 scales @512][128 rope bf16]
+    // (4× 128-elem NoPE blocks, F32 scale=amax/448) per the vendored decode.
     // ponytail: pod-verify V32 pack offsets (nope@0 stride576, rope@512 stride576) + 656 B/tok pool addressing
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     if config.head_dim == 576 {
