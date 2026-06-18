@@ -1,6 +1,9 @@
 use thiserror::Error;
 
+pub mod glm;
 pub mod v4;
+
+pub use glm::{GlmMoeDsaConfig, GlmRopeParameters};
 
 pub use v4::{
     DeepSeekV4AttentionLayerPlan, DeepSeekV4AttentionMode, DeepSeekV4AttentionOperatorSummary,
