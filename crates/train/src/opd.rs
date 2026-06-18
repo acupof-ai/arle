@@ -2244,12 +2244,22 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
     );
     tape.entries.truncate(base_tape_len);
     tape.set_enabled(false);
-    tape.backward_from_seed_accumulate_targets(
-        student_hidden,
-        hidden_grad,
-        store,
-        student_target_params,
-    )?;
+    if opd_backward_profile_enabled() {
+        let (_, backward_profile) = tape.backward_from_seed_accumulate_targets_profiled(
+            student_hidden,
+            hidden_grad,
+            store,
+            student_target_params,
+        )?;
+        print_backward_profile("base", 0, total_loss, &backward_profile);
+    } else {
+        tape.backward_from_seed_accumulate_targets(
+            student_hidden,
+            hidden_grad,
+            store,
+            student_target_params,
+        )?;
+    }
     log_opd_window_trace("kl", "base_backward_done", 0, base_backward_started, "");
     record_profile(profile, |profile| {
         profile.backward_seconds += base_backward_started.elapsed().as_secs_f64();
