@@ -24,8 +24,9 @@ fn slice_backward_scatters_grad_into_input_shape() -> Result<()> {
     let grad_id = grads.get(&x).copied().expect("slice grad exists");
     let grad = store.get(grad_id).expect("grad tensor exists");
     assert_eq!(grad.shape, vec![2, 2, 3]);
+    let grad_data = store.to_host(grad_id)?;
     assert_eq!(
-        grad.data,
+        grad_data,
         vec![
             0.0, 0.0, 0.0, //
             0.0, 1.0, 1.0, //
