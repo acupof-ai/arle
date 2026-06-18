@@ -1,6 +1,13 @@
 # DSv4 MTP tree fast path — end-to-end design (no more half-steps)
 
-Status: DESIGN. One coherent build per this doc, then ONE license-or-kill.
+Status: SUPERSEDED 2026-06-19. This design assumed ARLE should expand
+`topk` into full verifier tree rows (for example D2/K2 = 7 rows). The current
+implemented lane is chain-shaped: D2 verifies 3 rows and `topk` only widens
+candidate matching. A full SGLang-style tree is a separate feature because it
+needs an explicit `draft_token_num` budget/selector plus tree-mask metadata.
+See `docs/experience/wins/2026-06-19-dsv4-mtp-chain-topk-pending-remote.md`.
+
+Historical status: DESIGN. One coherent build per this doc, then ONE license-or-kill.
 Supersedes the piecemeal sequence (chain → per-token → ring-replay tree), each
 of which fixed one cost center and got killed by the next. This doc closes the
 whole budget first.
