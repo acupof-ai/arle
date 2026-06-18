@@ -25,6 +25,10 @@ DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
 EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
+NUM_SLOTS="${NUM_SLOTS:-}"
+SPEC_TYPE="${SPEC_TYPE:-none}"
+MTP_DRAFT_TOKENS="${MTP_DRAFT_TOKENS:-}"
+MTP_DRAFT_TOPK="${MTP_DRAFT_TOPK:-}"
 DEEPGEMM_ROOT="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
 DEEPGEMM_LIBRARY_ROOT="${ARLE_DEEPGEMM_LIBRARY_ROOT:-$DEEPGEMM_ROOT/deep_gemm}"
 DEEPGEMM_CUTLASS_INCLUDE="${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
@@ -45,6 +49,12 @@ Options:
   --port PORT        HTTP port (default: $PORT)
   --max-tokens N     smoke max_tokens; default 32, must be >=32
   --devices LIST     CUDA device list (default: $DEVICES)
+  --num-slots N      logical scheduler slots passed to arle serve
+  --spec-type NAME   speculative decode route passed to arle serve
+                    (default: $SPEC_TYPE)
+  --mtp-draft-tokens N
+                    MTP draft depth passed to arle serve
+  --mtp-draft-topk K MTP top-k width passed to arle serve
   --moe-backend NAME DSv4 MoE backend (default: $MOE_BACKEND).
                     Accepts: deepep | native-deepep | allreduce.
                     native-deepep requires --deepep-dir + nvcc at build time.
@@ -68,6 +78,7 @@ Environment:
   ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_BACKEND, ARLE_DSV4_EXPERT_BACKEND,
   ARLE_DEEPEP_DIR, ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
   NSYS_DELAY_SECONDS, NSYS_DURATION_SECONDS.
+  NUM_SLOTS, SPEC_TYPE, MTP_DRAFT_TOKENS, MTP_DRAFT_TOPK.
 EOF
 }
 
@@ -102,6 +113,10 @@ parse_args() {
             --port) need_value "$@"; PORT="$2"; TARGET="http://${HOST}:${PORT}"; shift 2 ;;
             --max-tokens) need_value "$@"; MAX_TOKENS="$2"; shift 2 ;;
             --devices) need_value "$@"; DEVICES="$2"; shift 2 ;;
+            --num-slots) need_value "$@"; NUM_SLOTS="$2"; shift 2 ;;
+            --spec-type) need_value "$@"; SPEC_TYPE="$2"; shift 2 ;;
+            --mtp-draft-tokens) need_value "$@"; MTP_DRAFT_TOKENS="$2"; shift 2 ;;
+            --mtp-draft-topk) need_value "$@"; MTP_DRAFT_TOPK="$2"; shift 2 ;;
             --moe-backend) need_value "$@"; MOE_BACKEND="$2"; shift 2 ;;
             --expert-backend) need_value "$@"; EXPERT_BACKEND="$2"; shift 2 ;;
             --deepep-dir) need_value "$@"; DEEPEP_DIR="$(abs_path "$2")"; shift 2 ;;
@@ -271,6 +286,10 @@ env_check() {
     echo "CUDA_VISIBLE_DEVICES=$DEVICES"
     echo "ARLE_DSV4_MOE_BACKEND=$MOE_BACKEND"
     echo "ARLE_DSV4_EXPERT_BACKEND=$EXPERT_BACKEND"
+    echo "NUM_SLOTS=${NUM_SLOTS:-auto}"
+    echo "SPEC_TYPE=$SPEC_TYPE"
+    echo "MTP_DRAFT_TOKENS=${MTP_DRAFT_TOKENS:-unset}"
+    echo "MTP_DRAFT_TOPK=${MTP_DRAFT_TOPK:-unset}"
     if [[ "$MOE_BACKEND" == "native-deepep" ]]; then
         echo "ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR"
         echo "ARLE_DEEPEP_LAYOUT=$(deepep_layout_label "$ARLE_DEEPEP_DIR")"
@@ -309,6 +328,20 @@ wait_ready() {
     done
 }
 
+serve_args() {
+    local -n out="$1"
+    out=(
+        serve
+        --backend cuda
+        --model-path "$MODEL_PATH"
+        --port "$PORT"
+        --spec-type "$SPEC_TYPE"
+    )
+    [[ -z "$NUM_SLOTS" ]] || out+=(--num-slots "$NUM_SLOTS")
+    [[ -z "$MTP_DRAFT_TOKENS" ]] || out+=(--mtp-draft-tokens "$MTP_DRAFT_TOKENS")
+    [[ -z "$MTP_DRAFT_TOPK" ]] || out+=(--mtp-draft-topk "$MTP_DRAFT_TOPK")
+}
+
 smoke() {
     require_max_tokens_decode
     preflight
@@ -330,16 +363,15 @@ smoke() {
     # reports land in this server.log). Unset by default → zero change to
     # production runs. Intentionally unquoted so the multi-word command
     # word-splits into argv.
-    # Rewrite-stack serve: runtime knobs ride env vars (INFER_DSV4_MAX_SEQ_LEN,
-    # ARLE_DSV4_*); FP8 KV + dynamic KV memory budget are the DSv4 defaults, so
-    # the old --num-slots/--mem-fraction-static/--kv-cache-dtype flags are gone.
+    # Rewrite-stack serve: DSv4 runtime knobs ride env vars (INFER_DSV4_MAX_SEQ_LEN,
+    # ARLE_DSV4_*); request-shape knobs stay explicit CLI args for reproducible
+    # smoke/nsys runs.
+    local -a args
+    serve_args args
     (
         cd "$ROOT"
         export INFER_DSV4_MAX_SEQ_LEN="$MAX_SEQ_LEN"
-        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" serve \
-            --backend cuda \
-            --model-path "$MODEL_PATH" \
-            --port "$PORT"
+        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" "${args[@]}"
     ) >"$server_log" 2>&1 &
     server_pid=$!
 
@@ -406,13 +438,12 @@ nsys_profile() {
     fi
 
     local server_log="$ARTIFACT_ROOT/nsys-server.log"
+    local -a args
+    serve_args args
     (
         cd "$ROOT"
         export INFER_DSV4_MAX_SEQ_LEN="$MAX_SEQ_LEN"
-        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" serve \
-            --backend cuda \
-            --model-path "$MODEL_PATH" \
-            --port "$PORT"
+        exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" "${args[@]}"
     ) >"$server_log" 2>&1 &
     server_pid=$!
 
