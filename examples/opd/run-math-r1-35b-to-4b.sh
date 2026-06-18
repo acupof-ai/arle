@@ -8,8 +8,10 @@
 #   4B-vs-35B checks; MATH-500 showed headroom and uses this train prompt
 #   corpus shape.
 #
-# Default paths match the .62 pod layout used during bring-up. Override any
-# variable from the environment instead of editing this file.
+# Default paths match the .62 pod layout used during bring-up. This file is the
+# canonical foreground runner: keep the parameter block explicit, override from
+# the environment, and commit any new bring-up recipe as a shell wrapper instead
+# of pasting ad-hoc commands into notes.
 #
 # Example:
 #   CUDA_VISIBLE_DEVICES=2 \
@@ -68,7 +70,7 @@ LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-64}"
 
 TRAIN_BACKEND="${TRAIN_BACKEND:-cuda}"
-ENGINE_OFFLOAD="${ENGINE_OFFLOAD:-student}"
+ENGINE_OFFLOAD="${ENGINE_OFFLOAD:-teacher}"
 STEP_PROFILE="${STEP_PROFILE:-1}"
 STEP_TRACE="${STEP_TRACE:-0}"
 JSON_OUTPUT="${JSON_OUTPUT:-1}"
@@ -137,7 +139,12 @@ cfg = {
     "train_backend": "$TRAIN_BACKEND",
     "engine_offload": "$ENGINE_OFFLOAD",
     "cuda_visible_devices": "$CUDA_VISIBLE_DEVICES",
+    "arle_bin": "$ARLE_BIN",
+    "run_root": "$RUN_ROOT",
     "checkpoint_dir": "$CHECKPOINT_DIR",
+    "log_dir": "$LOG_DIR",
+    "step_profile": "$STEP_PROFILE",
+    "step_trace": "$STEP_TRACE",
 }
 path = Path("$CONFIG_JSON")
 path.parent.mkdir(parents=True, exist_ok=True)
