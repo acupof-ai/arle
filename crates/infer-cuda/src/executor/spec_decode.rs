@@ -6,11 +6,39 @@
 //! top-k hits are diagnostics/free bonus candidates, not commit-safe accepted
 //! rows, because their prefixes were not target-verified.
 
+use std::time::Instant;
+
 use anyhow::{Result, anyhow, ensure};
+use cuda_kernels::prelude::DeviceContext;
 
 use crate::dsv4::SpecVerifySchedule;
 
 use super::{DeviceVec, Dsv4CudaExecutor};
+
+fn mtp_phase_time_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_MTP_PHASE_TIME").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn mtp_phase_start(ctx: &DeviceContext, enabled: bool) -> Instant {
+    if enabled {
+        ctx.stream.synchronize().ok();
+    }
+    Instant::now()
+}
+
+fn mtp_phase_mark(ctx: &DeviceContext, last: &mut Instant, enabled: bool) -> f64 {
+    if !enabled {
+        return 0.0;
+    }
+    ctx.stream.synchronize().ok();
+    let now = Instant::now();
+    let ms = now.duration_since(*last).as_secs_f64() * 1000.0;
+    *last = now;
+    ms
+}
 
 /// The draft chain for one step: `tokens[0]` is the already-committed
 /// `pending`, `tokens[1..]` the top-1 draft path, depth = drafts. `candidates`
@@ -95,6 +123,8 @@ impl Dsv4CudaExecutor {
     ) -> Result<Vec<u32>> {
         let depth = self.spec_depth();
         let topk = self.spec_topk();
+        let phase_time = mtp_phase_time_enabled();
+        let mut phase_last = mtp_phase_start(&self.model.ctx, phase_time);
         let pending = self.spec_slots[slot_idx]
             .pending
             .ok_or_else(|| anyhow!("DSv4 MTP decode missing pending token"))?;
@@ -113,10 +143,12 @@ impl Dsv4CudaExecutor {
             start_pos,
             depth,
         )?;
+        let capture_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // 1. Draft the top-1 chain and retain each level's top-k candidate row.
         let chain = self.draft_chain(slot_idx, pending, &hidden, depth, topk, start_pos)?;
         chain.validate()?;
+        let draft_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // 2. Verify the whole chain in ONE frozen forward.
         let sched = chain.verify_schedule(start_pos);
@@ -131,6 +163,7 @@ impl Dsv4CudaExecutor {
         );
         crate::attention::set_dsv4_verify_frozen(false);
         let mut verify = res?;
+        let verify_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
         ensure!(
             verify.argmax.len() == chain.tokens.len()
                 && verify.hiddens.len() == chain.tokens.len()
@@ -192,6 +225,14 @@ impl Dsv4CudaExecutor {
 
         let mut out = accepted_tokens;
         out.push(bonus);
+        let commit_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
+        if phase_time && self.model.tp.config().rank == 0 {
+            eprintln!(
+                "[dsv4-mtp-phase] n=1 depth={depth} topk={topk} capture={capture_ms:.3}ms draft={draft_ms:.3}ms verify={verify_ms:.3}ms commit={commit_ms:.3}ms total={:.3}ms accepted={accepted} out_tokens={}",
+                capture_ms + draft_ms + verify_ms + commit_ms,
+                out.len()
+            );
+        }
         Ok(out)
     }
 
@@ -229,6 +270,8 @@ impl Dsv4CudaExecutor {
         );
         let depth = self.spec_depth();
         let topk = self.spec_topk();
+        let phase_time = mtp_phase_time_enabled();
+        let mut phase_last = mtp_phase_start(&self.model.ctx, phase_time);
 
         // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
         // The ring capture is ALWAYS per-slot (cheap host-side snapshot, the
@@ -263,6 +306,7 @@ impl Dsv4CudaExecutor {
             pendings.push(pending);
             h_prevs.push(hidden);
         }
+        let capture_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
         let mut tokens_per_slot: Vec<Vec<u32>> = pendings.iter().map(|&p| vec![p]).collect();
         let mut candidates_per_slot: Vec<Vec<Vec<u32>>> =
             (0..n).map(|_| Vec::with_capacity(depth)).collect();
@@ -309,6 +353,7 @@ impl Dsv4CudaExecutor {
             scheds.push(chain.verify_schedule(start_positions[s]));
             chains.push(chain);
         }
+        let draft_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
         // attention per slot/row). The verify persists per-slot spec_normed for
@@ -322,6 +367,7 @@ impl Dsv4CudaExecutor {
             start_positions,
             &scheds,
         )?;
+        let verify_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
         ensure!(
             verified.len() == n,
             "DSv4 batched verify returned {} chains for {n} slots",
@@ -385,6 +431,14 @@ impl Dsv4CudaExecutor {
             let mut slot_out = accepted_tokens;
             slot_out.push(bonus);
             out.push(slot_out);
+        }
+        let commit_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
+        if phase_time && self.model.tp.config().rank == 0 {
+            let out_tokens: usize = out.iter().map(Vec::len).sum();
+            eprintln!(
+                "[dsv4-mtp-phase] n={n} depth={depth} topk={topk} capture={capture_ms:.3}ms draft={draft_ms:.3}ms verify={verify_ms:.3}ms commit={commit_ms:.3}ms total={:.3}ms out_tokens={out_tokens}",
+                capture_ms + draft_ms + verify_ms + commit_ms
+            );
         }
         Ok(out)
     }
