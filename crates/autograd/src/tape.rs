@@ -377,6 +377,29 @@ impl Tape {
         Ok(grads)
     }
 
+    pub fn backward_from_seed_accumulate_targets_profiled(
+        &mut self,
+        output_id: TensorId,
+        seed_grad_id: TensorId,
+        store: &mut TensorStore,
+        target_ids: &[TensorId],
+    ) -> Result<(HashMap<TensorId, TensorId>, BackwardProfile)> {
+        let mut profile = BackwardProfile::default();
+        let grads = self.backward_impl_seed(
+            output_id,
+            Some(seed_grad_id),
+            store,
+            Some(&mut profile),
+            false,
+        )?;
+        for &target_id in target_ids {
+            if let Some(&grad_id) = grads.get(&target_id) {
+                store.accumulate_grad(target_id, grad_id)?;
+            }
+        }
+        Ok((grads, profile))
+    }
+
     pub fn backward_collect(
         &mut self,
         loss_id: TensorId,
@@ -907,6 +930,41 @@ mod tests {
             store.to_host(stored).expect("stored x grad host"),
             vec![12.0, -24.0]
         );
+    }
+
+    #[test]
+    fn backward_from_seed_profiled_matches_plain_and_counts_ops() {
+        fn run(profiled: bool) -> (Vec<f32>, Option<BackwardProfile>) {
+            let mut store = TensorStore::default();
+            let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+            let mut tape = Tape::new();
+            let squared = ops::mul(x, x, &mut store, &mut tape).expect("x*x");
+            let seed = store.alloc(Tensor::new(vec![3.0, 4.0], vec![2], false).expect("seed"));
+
+            let (grads, profile) = if profiled {
+                let (grads, profile) = tape
+                    .backward_from_seed_accumulate_targets_profiled(squared, seed, &mut store, &[x])
+                    .expect("profiled seed backward");
+                (grads, Some(profile))
+            } else {
+                (
+                    tape.backward_from_seed_accumulate_targets(squared, seed, &mut store, &[x])
+                        .expect("plain seed backward"),
+                    None,
+                )
+            };
+            let grad_id = *grads.get(&x).expect("x grad exists");
+            (store.to_host(grad_id).expect("x grad host"), profile)
+        }
+
+        let (plain_grad, _) = run(false);
+        let (profiled_grad, profile) = run(true);
+        assert_eq!(plain_grad, profiled_grad);
+        assert_eq!(profiled_grad, vec![12.0, -24.0]);
+
+        let profile = profile.expect("profile returned");
+        assert_eq!(profile.op_totals[&BackwardOp::Mul].count, 1);
+        assert!(profile.total_duration >= profile.total_op_duration());
     }
 
     #[test]
