@@ -658,8 +658,8 @@ mod tests {
         let sched = chain.verify_schedule(100);
         assert_eq!(sched.positions, vec![100, 101, 102]);
         assert_eq!(sched.ancestors, vec![vec![], vec![0], vec![0, 1]]);
-        assert!(sched.is_chain());
-        assert!(sched.has_prefix_ancestors());
+        assert!(sched.is_prefix_chain_at(100));
+        assert!(!sched.is_prefix_chain_at(101));
     }
 
     #[test]
