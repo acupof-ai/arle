@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{anyhow, bail, ensure, Result};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::{CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache};
@@ -122,12 +122,10 @@ pub(crate) struct Dsv4Indexer {
     pub compressor: Option<Dsv4Compressor>,
     /// GLM SparseIndexed only: indexer key projection `[index_n_heads*index_head_dim,
     /// hidden]`. `None` ⇒ DSv4 (keys come through the compressor). Consumed by the
-    /// Tranche-D GLM forward (not yet wired).
-    #[allow(dead_code)]
+    /// SparseIndexed index-key build (`sparse_indexed_index_key_forward`).
     pub wk: Option<DeviceMatrix>,
     /// GLM SparseIndexed only: indexer key RMSNorm weight + bias. `None` ⇒ DSv4.
-    /// Consumed by the Tranche-D GLM forward.
-    #[allow(dead_code)]
+    /// Consumed by the SparseIndexed index-key build.
     pub k_norm: Option<DeviceVec>,
     #[allow(dead_code)]
     pub k_norm_bias: Option<DeviceVec>,
@@ -367,31 +365,31 @@ pub(crate) struct Dsv4SlotImage {
     layers: Vec<crate::attention::Dsv4LayerImage>,
 }
 
-/// Max MTP draft depth (K) the per-slot frozen-KV spec-ring snapshot is sized
-/// for. The ring tail is depth-shaped; the verifier rows are tree-shaped and
-/// separately capped by `MAX_SPEC_VERIFY_ROWS`. The model retains only the
-/// `spec_decode_on` bool, not the requested `--mtp-draft-tokens` count, so the
-/// snapshot is sized to this fixed ceiling rather than the per-request depth.
+/// Max MTP draft depth the per-slot frozen-KV spec-ring snapshot is sized
+/// for. The ring tail and verifier rows are chain-shaped: `topk` widens
+/// candidate matching, not the number of verifier rows on this path. The model
+/// retains only the `spec_decode_on` bool, not the requested
+/// `--mtp-draft-tokens` count, so the snapshot is sized to this fixed ceiling
+/// rather than the per-request depth.
 /// `spec_depth` clamps the requested depth into `[1, MAX_SPEC_DRAFT_DEPTH]`, so
 /// the ring path can never exceed the snapshot; the `capture_spec_rings`
 /// assert is then a redundant safety net. 8 covers every shipped MTP head
 /// config (the 1-layer nextn checkpoint runs depth-1 by default; deeper
-/// EAGLE-tree drafts are the future axis this ceiling anticipates).
+/// SGLang-style tree drafts need a separate draft-token budget/selector).
 /// FUTURE (ideal): plumb the requested depth to the model so the snapshot sizes
 /// to `depth+1` instead of this fixed `MAX+1`, reclaiming per-slot memory.
 pub(crate) const MAX_SPEC_DRAFT_DEPTH: usize = 8;
-/// Bounded tree verifier rows per slot. Covers D2K7 (57 rows), D3K3 (40 rows),
-/// and D4K2 (31 rows) without turning every slot into an unbounded hidden cache.
+/// Bounded chain verifier rows per slot. Current MTP uses `depth + 1` rows;
+/// `topk` does not increase this count.
 pub(crate) const MAX_SPEC_VERIFY_ROWS: usize = 64;
 pub(crate) const DEFAULT_SPEC_DRAFT_DEPTH: usize = 2;
 
 pub(crate) const DEFAULT_SPEC_DRAFT_TOPK: usize = 1;
 
-/// Row schedule for one speculative verify forward. Top-k draft candidates are
-/// flattened into tree nodes; sparse FlashMLA verifies them in one target pass.
-/// `ancestors` is the prefix metadata used by the batched FlashMLA sparse verify
-/// lane: row `r` attends committed KV plus the listed earlier chunk rows and
-/// self.
+/// Row schedule for one speculative verify forward. Sparse FlashMLA verifies
+/// the scheduled rows in one target pass. `ancestors` is the prefix metadata
+/// used by the batched FlashMLA sparse verify lane: row `r` attends committed
+/// KV plus the listed earlier chunk rows and self.
 pub(crate) struct SpecVerifySchedule {
     /// Per row: absolute position (`start_pos + node depth`).
     pub(crate) positions: Vec<usize>,
@@ -433,7 +431,7 @@ impl SpecVerifySchedule {
     }
 }
 
-/// Target verify output for an MTP tree: the full `[rows, vocab]` logits
+/// Target verify output for an MTP verify chunk: the full `[rows, vocab]` logits
 /// matrix plus the greedy top-1 view and per-row MTP stream hiddens.
 pub(crate) struct SpecVerifyResult {
     pub(crate) logits: HiddenStates,
@@ -1366,12 +1364,21 @@ impl Dsv4Model {
         // scratch (a fixed subtraction from the budget) and the per-(slot,
         // CSA-layer) stateful rotated_keys mirrors (a per-slot term). #67.
         let official_on = crate::attention::dsv4_dsa_official_enabled().unwrap_or(true);
-        let csa_cr = self
+        // First indexer layer's indexer ratio (CSA = compress_ratio; GLM
+        // SparseIndexed → 1, full-sequence every-token-a-key). Widened from CSA-only
+        // so the shared DSA scratch + batched per-slot scratch are budgeted for GLM.
+        let idx_cr = self
             .layers
             .iter()
-            .find(|layer| matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse))
-            .map(|layer| layer.compress_ratio);
-        let dsa_shared_bytes: usize = match (official_on, csa_cr) {
+            .find(|layer| layer.mode.has_indexer())
+            .map(|layer| {
+                if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    1
+                } else {
+                    layer.compress_ratio
+                }
+            });
+        let dsa_shared_bytes: usize = match (official_on, idx_cr) {
             (true, Some(cr)) => {
                 crate::attention::dsv4_dsa_shared_scratch_bytes(&self.config, cr, max_seq_len)
             }
@@ -1410,29 +1417,48 @@ impl Dsv4Model {
         let mut dsa_rotated_per_slot: usize = 0;
         let mut state_caches_per_slot: usize = 0;
         for layer in &self.layers {
-            if layer.compress_ratio == 0 {
+            // SlidingWindow: no compressor, no indexer — skip. (GLM SparseIndexed
+            // has compress_ratio==0 but DOES run the indexer, so it must NOT skip;
+            // gate on the mode, not on compress_ratio==0.)
+            if !layer.mode.has_compressor() && !layer.mode.has_indexer() {
                 continue;
             }
-            let cc = max_seq_len.div_ceil(layer.compress_ratio).max(1);
-            state_caches_per_slot = state_caches_per_slot
-                .saturating_add(cc.saturating_mul(self.config.head_dim).saturating_mul(2));
-            if matches!(layer.mode, DeepSeekV4AttentionMode::CompressedSparse) {
+            // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1,
+            // no compressor). CompressedSparse/HCA keep their real compress_ratio.
+            let index_ratio = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                1
+            } else {
+                layer.compress_ratio
+            };
+            // MAIN compressor compressed-key cache (CSA/HCA only, head_dim wide).
+            // GLM SparseIndexed has no main compressor — skip this term entirely.
+            if layer.mode.has_compressor() {
+                let cc = max_seq_len.div_ceil(layer.compress_ratio).max(1);
+                state_caches_per_slot = state_caches_per_slot
+                    .saturating_add(cc.saturating_mul(self.config.head_dim).saturating_mul(2));
+            }
+            // Indexer terms (CSA + GLM SparseIndexed): index_head_dim compressed
+            // cache + (official) rotated_keys + DSA key-cache band, all at
+            // index_ratio (=1 for GLM, full-length).
+            if layer.mode.has_indexer() {
+                let index_cc = max_seq_len.div_ceil(index_ratio).max(1);
                 state_caches_per_slot = state_caches_per_slot.saturating_add(
-                    cc.saturating_mul(self.config.index_head_dim)
+                    index_cc
+                        .saturating_mul(self.config.index_head_dim)
                         .saturating_mul(2),
                 );
                 if official_on {
                     dsa_rotated_per_slot = dsa_rotated_per_slot.saturating_add(
                         crate::attention::dsv4_dsa_rotated_keys_bytes(
                             &self.config,
-                            layer.compress_ratio,
+                            index_ratio,
                             max_seq_len,
                         ),
                     );
                     state_caches_per_slot = state_caches_per_slot.saturating_add(
                         crate::attention::dsv4_dsa_key_cache_bytes(
                             &self.config,
-                            layer.compress_ratio,
+                            index_ratio,
                             max_seq_len,
                         )
                         .unwrap_or(0),
@@ -1445,7 +1471,7 @@ impl Dsv4Model {
         // per-SLOT cost (NOT a fixed subtraction — that would be circular, since
         // num_slots is derived from this budget). One term per slot (the scratch
         // is one shared instance, not per CSA layer), gated on a CSA layer existing.
-        let dsa_batched_per_slot = match (official_on, csa_cr) {
+        let dsa_batched_per_slot = match (official_on, idx_cr) {
             (true, Some(cr)) => crate::attention::dsv4_dsa_batched_scratch_bytes_per_slot(
                 &self.config,
                 cr,
@@ -1556,7 +1582,7 @@ impl Dsv4Model {
         slot.restore_spec_ring_tail(&self.ctx, kv_adapter, start_pos, accepted_n, depth)
     }
 
-    /// Commit the accepted prefix (`accepted_rows` = verify row indices in tree
+    /// Commit the accepted prefix (`accepted_rows` = verify row indices in
     /// schedule order, root first) from the persisted verify rows — per layer:
     /// compressor/indexer re-ingestion + ring K re-derivation — then advance the
     /// slot length. Caller order: truncate → rejected-tail restore → THIS.
@@ -2183,11 +2209,20 @@ impl Dsv4Model {
                 } else {
                     None
                 };
-                // CSA (cr 1..=15) and HCA (cr≥16) both pack + attend the compressed
-                // pool; only pure SW (cr=0) has no compressor. Byte-identical to the
-                // old `== HybridCompressed` for the SW/HCA modes that already ran here.
-                let want_compressed = layer.mode != DeepSeekV4AttentionMode::SlidingWindow;
-                let is_csa = layer.mode == DeepSeekV4AttentionMode::CompressedSparse;
+                // CSA (cr 1..=15) and HCA (cr≥16) both pack + attend a separate
+                // compressed pool. GLM SparseIndexed has NO main compressor — it
+                // attends the full latent via the FlashMLA KV pool (no separate
+                // compressed pool), so it must NOT request the compressed pack
+                // (flashmla_pack_borrow(true) fetches state.compressor == None and
+                // would error). Gate on has_compressor() so SparseIndexed packs only
+                // SW + current. Byte-identical for SW/HCA/CSA.
+                let want_compressed = layer.mode.has_compressor();
+                // CSA + GLM SparseIndexed both run the indexer top-k select. The
+                // batched-decode DSA select lane widens to has_indexer() so GLM
+                // shares it; CSA-only compressor-batch / full-flatten paths below
+                // stay gated on CompressedSparse (SparseIndexed has no compressor).
+                // ponytail: pod-verify SparseIndexed batched-decode DSA select lane end-to-end
+                let runs_indexer = layer.mode.has_indexer();
                 // BATCHED CSA-SELECT (#60): when this CSA layer runs on the
                 // official DSA path AND the shared scratch is present, defer the
                 // per-row READ (paged-MQA logits + topk) into ONE batch_size=N
@@ -2195,7 +2230,7 @@ impl Dsv4Model {
                 // inside the prepare loop. When off (non-official DSA, or scratch
                 // absent), the existing per-row `csa_select_official` +
                 // `gather_selected_row` path runs byte-identically.
-                let use_batched_dsa_select = is_csa
+                let use_batched_dsa_select = runs_indexer
                     && crate::attention::dsv4_dsa_official_enabled()?
                     && kv_adapter
                         .layer_dsa_and_flashmla_batch_mut(layer_idx)?
@@ -2644,9 +2679,13 @@ impl Dsv4Model {
                         // None (the per-row read was deferred); `selected_batched`
                         // is filled by the ONE `csa_select_official_batched` after
                         // this loop, so skip the per-row gather here.
-                        if is_csa && !use_batched_dsa_select {
+                        // CSA + GLM SparseIndexed (has_indexer) both produce a per-row
+                        // `selected`; gather it when the batched select lane is off.
+                        if runs_indexer && !use_batched_dsa_select {
                             let sel = row_prepared.selected.as_ref().ok_or_else(|| {
-                                anyhow!("DSv4 batched CSA decode: row {r} missing indexer selected")
+                                anyhow!(
+                                    "DSv4 batched indexer decode: row {r} missing indexer selected"
+                                )
                             })?;
                             flash_batch.gather_selected_row(&self.ctx, sel, r)?;
                         }
@@ -2706,10 +2745,17 @@ impl Dsv4Model {
                         key_counts.len(),
                         n
                     );
-                    let ratio = layer.compress_ratio;
+                    // GLM SparseIndexed: full-sequence indexer, every token a key
+                    // (ratio=1); context_lens = abs_pos / 1 = abs_pos. CSA keeps its
+                    // compress_ratio. ensure still holds (1 > 0).
+                    let ratio = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                        1
+                    } else {
+                        layer.compress_ratio
+                    };
                     ensure!(
                         ratio > 0,
-                        "DSv4 batched CSA select: CSA layer must have compress_ratio>0"
+                        "DSv4 batched indexer select: indexer layer must have ratio>0"
                     );
                     // Byte-equivalent to the single-row GPU fill:
                     //   context_lens[r] = min(key_count_r, abs_pos_r / ratio)
@@ -3287,24 +3333,24 @@ impl Dsv4Model {
     }
 
     /// Cross-slot batched MTP verify (batched-MTP Stage 1). Verify N draft
-    /// trees in ONE layer-major forward over `M = Σ_s row_count_s` rows, grouped
+    /// chains in ONE layer-major forward over `M = Σ_s row_count_s` rows, grouped
     /// contiguously by slot. The MoE / HC-wrap / norm / head math runs over all
     /// M rows at once; attention stays PER-SLOT but not PER-ROW: each slot's
-    /// tree chunk runs through one FlashMLA sparse verify call per layer. Per
-    /// slot s, rows `[off_s .. off_s + len_s)` are its tree in schedule order;
+    /// chain chunk runs through one FlashMLA sparse verify call per layer. Per
+    /// slot s, rows `[off_s .. off_s + len_s)` are its chain in schedule order;
     /// ancestor metadata makes row r attend slot s's committed KV + exactly the
-    /// tree rows listed in `scheds[s].ancestors[r]`.
+    /// chain rows listed in `scheds[s].ancestors[r]`.
     ///
     /// Returns per slot `(argmax, hiddens)`: `argmax[j]` is the target's argmax
-    /// AFTER tree row j (so the accepted child of node j must equal it), and
+    /// AFTER chain row j (so the accepted next chain token must equal it), and
     /// `hiddens[j]` is that row's MTP stream hidden (for the commit path head).
     /// The lm_head extraction batches the greedy fold + projection + argmax over
     /// all M rows (one GEMM, one argmax, one D2H), then slices per slot — the
-    /// per-tree-row GEMV loop in the per-row `spec_step` cost N×depth syncs.
+    /// per-row GEMV loop in the old verify cost N×depth syncs.
     ///
     /// PRECONDITIONS: each slot's `seq_len == start_pos_s` (contiguous append);
     /// allreduce transport only (the deepep_ll owned-shard partition is keyed on
-    /// the whole-batch `seq_len`, not per-slot tree chunks — Stage 1/2 stay on
+    /// the whole-batch `seq_len`, not per-slot verify chunks — Stage 1/2 stay on
     /// allreduce, matching `mtp_forward_level`); the draft already wrote each
     /// slot's frozen-layer rings (the verify is pure: it READS the frozen KV).
     ///
@@ -3334,10 +3380,10 @@ impl Dsv4Model {
         scheds: &[SpecVerifySchedule],
     ) -> Result<Vec<(Vec<u32>, Vec<DeviceVec>)>> {
         let n = slot_ids.len();
-        ensure!(n > 0, "DSv4 batched verify requires at least one tree");
+        ensure!(n > 0, "DSv4 batched verify requires at least one chain");
         ensure!(
             row_tokens.len() == n && start_positions.len() == n && scheds.len() == n,
-            "DSv4 batched verify surface length mismatch (slots {n}, trees {}, starts {}, scheds {})",
+            "DSv4 batched verify surface length mismatch (slots {n}, chains {}, starts {}, scheds {})",
             row_tokens.len(),
             start_positions.len(),
             scheds.len()
@@ -3346,7 +3392,7 @@ impl Dsv4Model {
             !dsv4_use_deepep_transport()?,
             "DSv4 batched MTP verify supports the allreduce transport only \
              (the deepep_ll owned-shard partition is keyed on the whole-batch \
-              seq_len, not per-slot tree chunks)"
+              seq_len, not per-slot verify chunks)"
         );
 
         // Per-slot row-block offsets into the combined [M, *] buffers.
@@ -3354,7 +3400,7 @@ impl Dsv4Model {
         for (s, &len) in lens.iter().enumerate() {
             ensure!(
                 len >= 1 && scheds[s].positions.len() == len && scheds[s].ancestors.len() == len,
-                "DSv4 batched verify slot {s} tree rows {len} != schedule rows ({}, {})",
+                "DSv4 batched verify slot {s} chain rows {len} != schedule rows ({}, {})",
                 scheds[s].positions.len(),
                 scheds[s].ancestors.len()
             );
@@ -3381,16 +3427,16 @@ impl Dsv4Model {
             offsets.push(acc);
             acc += len;
         }
-        let m = acc; // total rows over all per-slot trees
+        let m = acc; // total rows over all per-slot chains
 
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
         let stream_dim = hidden_size * hc_mult;
-        let seq_len = m; // batch dimension: M tree rows
+        let seq_len = m; // batch dimension: M verify rows
         let eps = self.config.rms_norm_eps;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
-        // Combined token list, grouped by slot (slot s's tree at [off_s..]).
+        // Combined token list, grouped by slot (slot s's chain at [off_s..]).
         let tokens: Vec<u32> = row_tokens.iter().flat_map(|c| c.iter().copied()).collect();
         let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
 
@@ -3413,10 +3459,9 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
 
-        // Per-slot tree verify: one FlashMLA sparse forward over each slot's
+        // Per-slot chain verify: one FlashMLA sparse forward over each slot's
         // chunk per layer. The prefix metadata expresses row r -> ancestors
-        // explicitly, so D2/K2 is 7 rows in one target verify, not 7 target
-        // verifies.
+        // explicitly. Current topk does not add rows: D2 verifies 3 rows.
         let max_chunk = *lens.iter().max().unwrap_or(&1);
         let mut normed_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
         let mut attn_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
@@ -3476,14 +3521,14 @@ impl Dsv4Model {
                 keepalive.keep_hidden(&normed);
 
                 // ── Attention PER SLOT / PER CHUNK: write the slot block into
-                // chunk scratch, run the sparse tree-verify lane once, then
+                // chunk scratch, run the sparse chain-verify lane once, then
                 // scatter it back into the combined block.
                 // SAFETY: each [off..off+len) block of attn_out is written by the
                 // copy-out below before attn_out is read by hc_post.
                 let mut attn_out =
                     unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 {
-                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_tree_verify");
+                    let _nvtx = crate::nvtx::range("dsv4/mla_attn_chain_verify");
                     for s in 0..n {
                         let off = offsets[s];
                         let len = lens[s];
@@ -3502,7 +3547,7 @@ impl Dsv4Model {
                                 anyhow!("DSv4 batched verify chunk copy-in failed: {e}")
                             })?;
                         // Commit-fold scatter: persist THIS slot's per-layer
-                        // attn-normed tree rows into the OWNING slot's
+                        // attn-normed chain rows into the OWNING slot's
                         // `spec_normed[layer_idx]`. The combined `normed` is
                         // sliced per slot, so there is no cross-slot aliasing.
                         let slot = &mut slots[slot_ids[s]];
@@ -3953,7 +3998,7 @@ impl Dsv4Model {
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(meta) = sparse_verify_meta.as_ref() {
                 // Scheduled verify: one sparse FlashMLA attention over the
-                // whole row chunk. Ancestors carry row `r`'s tree dependency,
+                // whole row chunk. Ancestors carry row `r`'s chain dependency,
                 // so no row replay or slot-ring mutation is needed; commit
                 // writes accepted rows later.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
@@ -4373,7 +4418,7 @@ impl Dsv4Model {
     /// argmax + mask — no full-vocab D2H.
     ///
     /// Returns per row: top-k candidate tokens (highest first) + the wide
-    /// MTP stream the row's children branch from.
+    /// MTP stream the next draft row branches from.
     pub(crate) fn mtp_forward_level(
         &self,
         slot: &mut Dsv4SlotState,
@@ -4466,8 +4511,8 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
 
         // ── ONE MTP transformer layer over the batch; attention per row at the
-        // draft position. Top-k widens this draft readout; tree expansion is
-        // orchestrated by the caller, then target verifies the resulting rows.
+        // draft position. Top-k widens this draft readout; the caller decides
+        // which candidate rows are scheduled for target verify.
         let layer = &mtp.layer;
         let target_layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
         ensure!(
@@ -4640,8 +4685,8 @@ impl Dsv4Model {
         std::hint::black_box(keepalive.len());
         drop(keepalive);
 
-        // Split the level stream into per-row owned vecs (children branch from
-        // their own row only).
+        // Split the level stream into per-row owned vecs (next draft rows
+        // branch from their own parent row only).
         let mut out = Vec::with_capacity(m);
         for (r, cand) in candidates.into_iter().enumerate() {
             let mut row_stream = DeviceVec::zeros(ctx, stream_dim)?;

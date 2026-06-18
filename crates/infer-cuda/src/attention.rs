@@ -298,13 +298,23 @@ impl Dsv4KvAdapter {
                 num_slots,
             )?);
         }
-        // Build the ONE shared official-DSA scratch when any CSA layer exists.
-        // All CSA layers must agree on compress_ratio: the scratch's
-        // compressed-capacity sizing is shared (uniform cr=4 on DSv4-Flash).
+        // Build the ONE shared official-DSA scratch when any indexer layer
+        // exists. Widened to has_indexer() so GLM SparseIndexed (every layer)
+        // also builds the scratch. All indexer layers must agree on the indexer
+        // ratio: CSA = compress_ratio (uniform cr=4 on DSv4-Flash); GLM
+        // SparseIndexed maps to ratio=1 (full-sequence, every token a key). A
+        // mixed CSA+SparseIndexed model trips the uniform-ratio assertion below
+        // (out of scope: GLM is pure SparseIndexed, DSv4 pure CSA).
         let mut csa_ratios = layer_specs
             .iter()
-            .filter(|(mode, _, _)| *mode == DeepSeekV4AttentionMode::CompressedSparse)
-            .map(|&(_, compress_ratio, _)| compress_ratio);
+            .filter(|(mode, _, _)| mode.has_indexer())
+            .map(|&(mode, compress_ratio, _)| {
+                if mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    1
+                } else {
+                    compress_ratio
+                }
+            });
         let dsa_shared = match csa_ratios.next() {
             Some(first_cr) if dsv4_dsa_official_enabled()? => {
                 ensure!(
@@ -708,12 +718,21 @@ impl Dsv4LayerKvLayout {
             None
         };
 
-        let dsa_slot_bytes =
-            if mode == DeepSeekV4AttentionMode::CompressedSparse && dsv4_dsa_official_enabled()? {
-                dsv4_dsa_key_cache_bytes(config, compress_ratio, max_seq_len)?
-            } else {
-                0
-            };
+        // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1,
+        // no compressor). CompressedSparse keeps its real compress_ratio.
+        let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
+            1
+        } else {
+            compress_ratio
+        };
+        // Widen the per-slot DSA key-cache to has_indexer() (CSA + GLM
+        // SparseIndexed); sized at index_ratio (=1 for GLM) so the div_ceil in
+        // dsv4_dsa_key_cache_bytes never sees compress_ratio==0.
+        let dsa_slot_bytes = if mode.has_indexer() && dsv4_dsa_official_enabled()? {
+            dsv4_dsa_key_cache_bytes(config, index_ratio, max_seq_len)?
+        } else {
+            0
+        };
         let dsa_key_cache = if dsa_slot_bytes > 0 {
             Some(
                 ctx.stream
@@ -1624,14 +1643,15 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             )
         })?;
         self.upload_row_meta(ctx, start_positions, slot_block_offsets)?;
-        // CSA: feed the gathered per-row top-k buffer; SW/HCA: selected_ptr=0
-        // (byte-identical to the prior SW/HCA-only batched index build). The kernel
-        // asserts `mode==CSA ⟹ selected != null` (build_indices.cu:318), so the CSA
-        // ptr must be live here — `gather_selected_row` ran for every row in prepare.
-        let selected_ptr = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+        // Indexer modes (CSA + GLM SparseIndexed): feed the gathered per-row top-k
+        // buffer; SW/HCA: selected_ptr=0 (byte-identical to the prior SW/HCA-only
+        // batched index build). The kernel asserts `mode==CSA ⟹ selected != null`
+        // (build_indices.cu:318); SparseIndexed shares mode_int=1, so its ptr must
+        // be live too — `gather_selected_row` ran for every row in prepare.
+        let selected_ptr = if mode.has_indexer() {
             ensure!(
                 self.csa_topk == shape.max_compressed_keys,
-                "DSv4 batched CSA: csa_topk {} != layer {layer_idx} max_compressed_keys {} \
+                "DSv4 batched indexer: csa_topk {} != layer {layer_idx} max_compressed_keys {} \
                  (gather row stride would mismatch the kernel read stride)",
                 self.csa_topk,
                 shape.max_compressed_keys
@@ -1694,7 +1714,12 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             shape.sw_blocks,
             config.sliding_window,
             shape.max_compressed_keys,
-            if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            // GLM SparseIndexed: full-sequence indexer, every token a key
+            // (ratio=1); the kernel causality gate block_end = c*ratio + (ratio-1)
+            // needs ratio=1. SW also passes 1; CSA/HCA keep compress_ratio.
+            if mode == DeepSeekV4AttentionMode::SlidingWindow
+                || mode == DeepSeekV4AttentionMode::SparseIndexed
+            {
                 1
             } else {
                 compress_ratio
@@ -3216,9 +3241,11 @@ impl Dsv4LayerAttentionState {
             .alloc_zeros::<half::bf16>(sw_len)
             .map_err(|e| anyhow::anyhow!("DSv4 SW window cache alloc failed: {e}"))?;
         let overlap = compress_ratio < 16;
-        let compressor = if mode == DeepSeekV4AttentionMode::SlidingWindow {
-            None
-        } else {
+        // GLM SparseIndexed shares the indexer at ratio=1; the MAIN compressor
+        // stays compressor-modes-only (CSA/HCA). SparseIndexed has no main key
+        // compressor, so gating on has_compressor() yields None for GLM and
+        // avoids Dsv4CompressorState::new(.., ratio=0, ..) (compress_ratio==0).
+        let compressor = if mode.has_compressor() {
             Some(Dsv4CompressorState::new(
                 ctx,
                 config.head_dim,
@@ -3226,12 +3253,21 @@ impl Dsv4LayerAttentionState {
                 overlap,
                 max_seq_len,
             )?)
+        } else {
+            None
         };
-        let indexer = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+        // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1,
+        // no compressor). CompressedSparse keeps its real compress_ratio.
+        let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
+            1
+        } else {
+            compress_ratio
+        };
+        let indexer = if mode.has_indexer() {
             Some(Dsv4CompressorState::new(
                 ctx,
                 config.index_head_dim,
-                compress_ratio,
+                index_ratio,
                 true,
                 max_seq_len,
             )?)
@@ -3259,19 +3295,20 @@ impl Dsv4LayerAttentionState {
         } else {
             None
         };
-        let dsa_official =
-            if mode == DeepSeekV4AttentionMode::CompressedSparse && dsv4_dsa_official_enabled()? {
-                Some(Dsv4DsaOfficialState::new(
-                    ctx,
-                    config,
-                    compress_ratio,
-                    max_seq_len,
-                    slot_idx,
-                    pool,
-                )?)
-            } else {
-                None
-            };
+        // GLM SparseIndexed shares the official DSA scratch at ratio=1; the
+        // indexer gate widens to has_indexer(), compressor stays CSA/HCA-only.
+        let dsa_official = if mode.has_indexer() && dsv4_dsa_official_enabled()? {
+            Some(Dsv4DsaOfficialState::new(
+                ctx,
+                config,
+                index_ratio,
+                max_seq_len,
+                slot_idx,
+                pool,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             sw_window_cache,
             compressor,
@@ -3909,9 +3946,16 @@ pub(crate) fn commit_layer_fold(
         (config.rope_theta, 0i32)
     };
 
-    // ── Compressor + indexer ingestion (compressed layers only), exactly the
-    // calls the re-forward's mla_attention would have made, non-frozen.
-    if mode != DeepSeekV4AttentionMode::SlidingWindow {
+    // ── Compressor + indexer ingestion (compressor layers only), exactly the
+    // calls the re-forward's mla_attention would have made, non-frozen. This is
+    // the MTP/spec commit re-forward; GLM ships no MTP (num_nextn_predict_layers
+    // == 0) so SparseIndexed never reaches here — fail loud.
+    ensure!(
+        mode != DeepSeekV4AttentionMode::SparseIndexed,
+        "DSv4 commit_layer_fold (MTP commit) does not support SparseIndexed; GLM ships no MTP \
+         (num_nextn_predict_layers==0) so this path is unreachable"
+    );
+    if mode.has_compressor() {
         let compressor = attention.compressor.as_ref().ok_or_else(|| {
             anyhow!("DSv4 commit fold: {mode:?} layer without compressor weights")
         })?;
@@ -6568,9 +6612,11 @@ fn try_flashmla_decode_attention(
     }
 
     let mode_int = flashmla_mode_int(mode);
-    let selected_ptr_u64 = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+    // Indexer modes (CSA + GLM SparseIndexed) feed the per-row top-k `selected`
+    // (shared mode_int=1); SW/HCA pass selected_ptr=0.
+    let selected_ptr_u64 = if mode.has_indexer() {
         let selected =
-            selected.ok_or_else(|| anyhow!("DSv4 FlashMLA CSA missing selected topk"))?;
+            selected.ok_or_else(|| anyhow!("DSv4 FlashMLA indexer missing selected topk"))?;
         let (ptr, guard) = selected.device_ptr(&ctx.stream);
         let ptr_u64 = ptr;
         drop(guard);
@@ -6590,7 +6636,11 @@ fn try_flashmla_decode_attention(
             config.sliding_window,
             start_ptr,
             flash.max_compressed_keys,
-            if mode == DeepSeekV4AttentionMode::SlidingWindow {
+            // GLM SparseIndexed: every token a key (ratio=1); SW also 1; CSA/HCA
+            // keep compress_ratio.
+            if mode == DeepSeekV4AttentionMode::SlidingWindow
+                || mode == DeepSeekV4AttentionMode::SparseIndexed
+            {
                 1
             } else {
                 compress_ratio
@@ -7921,49 +7971,61 @@ pub(crate) fn mla_attention_prepare(
     // discarded by the frozen update guard. Keep CSA query/top-k below, but read
     // the committed compressed/indexer pools as-is.
     let skip_frozen_compressor = dsv4_verify_frozen() && chain_verify.is_some();
-    let selected = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+    // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1, no
+    // compressor). CompressedSparse keeps its real compress_ratio.
+    let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
+        1
+    } else {
+        compress_ratio
+    };
+    let selected = if !mode.has_indexer() && !mode.has_compressor() {
+        // SlidingWindow: neither compressor nor indexer.
         None
     } else {
-        // ── 4b(prep). compressor → (CSA) indexer top-k select.
-        let compressor = attention.compressor.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-        })?;
+        // ── 4b(prep). MAIN compressor (CSA/HCA only) → (indexer modes) top-k
+        // select. GLM SparseIndexed has no MAIN compressor — gate it on
+        // has_compressor() so GLM skips straight to the indexer block.
         let overlap = compress_ratio < 16;
-        if skip_frozen_compressor {
-            ensure!(
-                state.compressor.is_some(),
-                "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-            );
-        } else {
-            let compressor_state = state.compressor.as_mut().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+        if mode.has_compressor() {
+            let compressor = attention.compressor.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
             })?;
-            compressor_forward(
-                ctx,
-                config,
-                compressor,
-                hidden,
-                compressor_state,
-                head_dim,
-                compress_ratio,
-                overlap,
-                start_pos,
-                start_pos_device,
-                true,
-                // YaRN on for compressed layers (matches Q/SW-K + SGLang
-                // compressor freqs_cis); original_seq_len = orig_max_pos here.
-                original_seq_len,
-                None,
-                None,
-                keepalive,
-            )?;
+            if skip_frozen_compressor {
+                ensure!(
+                    state.compressor.is_some(),
+                    "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                );
+            } else {
+                let compressor_state = state.compressor.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                    )
+                })?;
+                compressor_forward(
+                    ctx,
+                    config,
+                    compressor,
+                    hidden,
+                    compressor_state,
+                    head_dim,
+                    compress_ratio,
+                    overlap,
+                    start_pos,
+                    start_pos_device,
+                    true,
+                    // YaRN on for compressed layers (matches Q/SW-K + SGLang
+                    // compressor freqs_cis); original_seq_len = orig_max_pos here.
+                    original_seq_len,
+                    None,
+                    None,
+                    keepalive,
+                )?;
+            }
         }
 
-        if mode == DeepSeekV4AttentionMode::CompressedSparse {
+        if mode.has_indexer() {
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights"
-                )
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
             let use_official_dsa = dsv4_dsa_official_enabled()?;
             let indexer_rope_original_seq_len = if use_official_dsa {
@@ -7983,39 +8045,52 @@ pub(crate) fn mla_attention_prepare(
                 .as_ref()
                 .map(|s| s.compressed.seq_len)
                 .unwrap_or(0);
-            // Indexer keys: a second compressor over index_head_dim keys (no APE
-            // gate on the keys — `apply_rope = true`, head_dim = index_head_dim).
+            // Indexer keys: CSA runs a second compressor over index_head_dim keys
+            // (apply_rope=true, head_dim=index_head_dim). GLM SparseIndexed has no
+            // key compressor — build one full-length index key per token (ratio=1).
             if skip_frozen_compressor {
                 ensure!(
                     state.indexer.is_some(),
-                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
+                    "DSv4 layer {layer_idx} is {mode:?} but has no indexer state"
                 );
             } else {
                 let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
-                    )
+                    anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
                 })?;
-                compressor_forward(
-                    ctx,
-                    config,
-                    indexer
-                        .compressor
-                        .as_ref()
-                        .expect("DSv4 CSA indexer has a key compressor"),
-                    hidden,
-                    indexer_state,
-                    config.index_head_dim,
-                    compress_ratio,
-                    true,
-                    start_pos,
-                    start_pos_device,
-                    use_official_dsa,
-                    indexer_rope_original_seq_len,
-                    None,
-                    None,
-                    keepalive,
-                )?;
+                if mode == DeepSeekV4AttentionMode::CompressedSparse {
+                    compressor_forward(
+                        ctx,
+                        config,
+                        indexer
+                            .compressor
+                            .as_ref()
+                            .expect("DSv4 CSA indexer has a key compressor"),
+                        hidden,
+                        indexer_state,
+                        config.index_head_dim,
+                        compress_ratio,
+                        true,
+                        start_pos,
+                        start_pos_device,
+                        use_official_dsa,
+                        indexer_rope_original_seq_len,
+                        None,
+                        None,
+                        keepalive,
+                    )?;
+                } else {
+                    // GLM SparseIndexed: full-sequence index-key build (no
+                    // compressor); every token → one key row at its abs position.
+                    sparse_indexed_index_key_forward(
+                        ctx,
+                        config,
+                        indexer,
+                        hidden,
+                        indexer_state,
+                        start_pos,
+                        keepalive,
+                    )?;
+                }
             }
             let indexer_rows_after = state
                 .indexer
@@ -8043,7 +8118,7 @@ pub(crate) fn mla_attention_prepare(
                 indexer_rows_after,
                 start_pos,
                 start_pos_device,
-                compress_ratio,
+                index_ratio,
                 prefill_shared,
                 // Prefill / single-row path: no batched gather (byte-identical).
                 None,
@@ -8350,6 +8425,14 @@ pub(crate) fn mla_attention_compressor_defer_row(
     indexer_sink: &mut Dsv4CompressorBatchPtrs,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<usize> {
+    // GLM SparseIndexed has no compressor, and the batched-defer kernel is
+    // compressor-specific. Full-flatten is opt-in/default-OFF and never set for
+    // SparseIndexed; fail loud rather than silently mis-handle it.
+    ensure!(
+        mode != DeepSeekV4AttentionMode::SparseIndexed,
+        "DSv4 full-flatten compressor-defer path does not support SparseIndexed (no compressor); \
+         ARLE_DSV4_DECODE_COMPRESSOR_BATCH/full-flatten must be off for GLM"
+    );
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         return Ok(0);
     }
@@ -8517,49 +8600,61 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     // ── 4b(prep). compressor → (CSA) indexer top-k select — PER SLOT. Byte path
     // identical to the `mla_attention_prepare` decode branch, reading this row's
     // `normed_row` (compressor) and `c_q_normed_row` (indexer query proj).
-    let selected = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+    // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1, no
+    // compressor). CompressedSparse keeps its real compress_ratio.
+    let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
+        1
+    } else {
+        compress_ratio
+    };
+    let selected = if !mode.has_indexer() && !mode.has_compressor() {
         None
     } else {
-        let compressor = attention.compressor.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
-        })?;
         let overlap = compress_ratio < 16;
         // Split the opt-in batched pre-pass slices into main + indexer (the inner
         // `(&HiddenStates, &HiddenStates)` pairs are `Copy` references, so reading
         // both fields does not conflict with the per-call `state` borrows below).
-        // `None` everywhere → byte-identical per-row GEMV path.
+        // `None` everywhere → byte-identical per-row GEMV path. The
+        // compressor-batch / full-flatten gates only fire for compressor layers,
+        // so for GLM SparseIndexed they are always None/false.
         let precomputed_main = compressor_precomputed.as_ref().map(|p| p.main);
         let precomputed_indexer = compressor_precomputed.as_ref().and_then(|p| p.indexer);
-        // Full-flatten: the main compressor STATE update already ran batched in the
-        // P1a pre-pass (compressed.seq_len already advanced); skip it here.
-        if !skip_compressor {
-            let compressor_state = state.compressor.as_mut().ok_or_else(|| {
-                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+        // MAIN compressor (CSA/HCA only): GLM SparseIndexed has none — gate on
+        // has_compressor(). Full-flatten: the main compressor STATE update already
+        // ran batched in the P1a pre-pass; skip it here.
+        if mode.has_compressor() {
+            let compressor = attention.compressor.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
             })?;
-            compressor_forward(
-                ctx,
-                config,
-                compressor,
-                normed_row,
-                compressor_state,
-                head_dim,
-                compress_ratio,
-                overlap,
-                start_pos,
-                start_pos_device,
-                true,
-                original_seq_len,
-                precomputed_main,
-                None,
-                keepalive,
-            )?;
+            if !skip_compressor {
+                let compressor_state = state.compressor.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                    )
+                })?;
+                compressor_forward(
+                    ctx,
+                    config,
+                    compressor,
+                    normed_row,
+                    compressor_state,
+                    head_dim,
+                    compress_ratio,
+                    overlap,
+                    start_pos,
+                    start_pos_device,
+                    true,
+                    original_seq_len,
+                    precomputed_main,
+                    None,
+                    keepalive,
+                )?;
+            }
         }
 
-        if mode == DeepSeekV4AttentionMode::CompressedSparse {
+        if mode.has_indexer() {
             let indexer = attention.indexer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer weights"
-                )
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
             })?;
             let use_official_dsa = dsv4_dsa_official_enabled()?;
             let indexer_rope_original_seq_len = if use_official_dsa {
@@ -8578,6 +8673,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
             // step's advance. In full-flatten the P1a pre-pass already advanced
             // `compressed.seq_len`, so the live value would be the AFTER count;
             // take the pre-pass-captured override instead. Otherwise read it live.
+            // (full-flatten is compressor-only, so SparseIndexed always reads live.)
             let indexer_rows_before = if skip_compressor {
                 indexer_rows_before_override.ok_or_else(|| {
                     anyhow!("DSv4 full-flatten CSA prepare: indexer_rows_before_override missing")
@@ -8589,34 +8685,47 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     .map(|s| s.compressed.seq_len)
                     .unwrap_or(0)
             };
-            // Full-flatten: the indexer compressor STATE update already ran batched
-            // in the P1a pre-pass (compressed.seq_len already advanced); skip it.
+            // CSA runs the indexer key compressor; GLM SparseIndexed builds one
+            // full-length index key per token (ratio=1, no compressor). Full-flatten
+            // (skip_compressor) only applies to compressor layers.
             if !skip_compressor {
                 let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
-                    )
+                    anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
                 })?;
-                compressor_forward(
-                    ctx,
-                    config,
-                    indexer
-                        .compressor
-                        .as_ref()
-                        .expect("DSv4 CSA indexer has a key compressor"),
-                    normed_row,
-                    indexer_state,
-                    config.index_head_dim,
-                    compress_ratio,
-                    true,
-                    start_pos,
-                    start_pos_device,
-                    use_official_dsa,
-                    indexer_rope_original_seq_len,
-                    precomputed_indexer,
-                    None,
-                    keepalive,
-                )?;
+                if mode == DeepSeekV4AttentionMode::CompressedSparse {
+                    compressor_forward(
+                        ctx,
+                        config,
+                        indexer
+                            .compressor
+                            .as_ref()
+                            .expect("DSv4 CSA indexer has a key compressor"),
+                        normed_row,
+                        indexer_state,
+                        config.index_head_dim,
+                        compress_ratio,
+                        true,
+                        start_pos,
+                        start_pos_device,
+                        use_official_dsa,
+                        indexer_rope_original_seq_len,
+                        precomputed_indexer,
+                        None,
+                        keepalive,
+                    )?;
+                } else {
+                    // GLM SparseIndexed: per-row index-key build (no compressor,
+                    // no precomputed batch path — those are compressor-only).
+                    sparse_indexed_index_key_forward(
+                        ctx,
+                        config,
+                        indexer,
+                        normed_row,
+                        indexer_state,
+                        start_pos,
+                        keepalive,
+                    )?;
+                }
             }
             let indexer_rows_after = state
                 .indexer
@@ -8649,7 +8758,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 indexer_rows_after,
                 start_pos,
                 start_pos_device,
-                compress_ratio,
+                index_ratio,
                 // Decode (token_count=1): the prefill indexer DeepGEMM lane is
                 // never taken (gated on c_q_normed.seq_len>1), so the shared
                 // prefill scratch is not needed.
@@ -9690,6 +9799,106 @@ pub(crate) fn mla_oproj(
             )
         })?;
         drop(nvtx_wo_b);
+    }
+    Ok(())
+}
+
+/// GLM SparseIndexed only: build the full-sequence index KEY ring (ratio=1, no
+/// compressor). For each of `hidden`'s tokens, project a single MQA index key via
+/// `indexer.wk`, RMSNorm it with `indexer.k_norm` (width `index_head_dim`), and
+/// append the `[index_head_dim, seq_len]` normed keys into `state.compressed` at
+/// absolute rows `[start_pos .. start_pos + seq_len)`. This mirrors what
+/// `compressor_forward` does for CSA but with NO compression — every token is one
+/// key, exactly what `csa_select_official` reads (`keys = [index_head_dim, rows]`,
+/// Hadamard-rotated then FP8-stored downstream).
+fn sparse_indexed_index_key_forward(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    indexer: &Dsv4Indexer,
+    hidden: &HiddenStates,
+    state: &mut Dsv4CompressorState,
+    start_pos: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    let wk = indexer.wk.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 SparseIndexed layer indexer missing wk projection (GLM tranche-C weight)")
+    })?;
+    let k_norm = indexer.k_norm.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 SparseIndexed layer indexer missing k_norm (GLM tranche-C weight)")
+    })?;
+    let seq_len = hidden.seq_len;
+    // Project the index key(s): [wk.rows, seq_len].
+    // SAFETY: dsv4_linear writes the full wk_out buffer.
+    let mut wk_out = unsafe { HiddenStates::uninit(ctx, wk.rows, seq_len)? };
+    dsv4_linear(ctx, wk, hidden, &mut wk_out)?;
+    keepalive.keep_hidden(&wk_out);
+
+    // The index KEY ring stores ONE key of width `index_head_dim` per token. The
+    // DeepSeek-V3.2 lightning indexer key is a SINGLE MQA key per token. GLM's
+    // `wk` doc says `[index_n_heads*index_head_dim, hidden]`. The width reduction
+    // (index_n_heads*index_head_dim → index_head_dim) is the load-bearing
+    // unverifiable detail and is handled by branching on `wk.rows`.
+    let normed = if wk.rows == config.index_head_dim {
+        // Single-head MQA key (DSv3.2/GLM-DSA `wk = Linear(hidden, index_head_dim)`,
+        // ONE key shared across all index_n_heads query heads — confirmed against the
+        // vLLM DeepSeek-V3.2 indexer reference: wk out = head_dim, not n_head*head_dim).
+        // This is the branch GLM takes (index_head_dim=128). Normalize the key here.
+        //
+        // NUMERIC GAP (pod-verify): the DSv3.2 reference normalizes the index key with
+        // `LayerNorm(index_head_dim, eps=1e-6)` (mean-subtract + variance + the loaded
+        // `k_norm` weight AND `k_norm_bias`). GLM ships a `k_norm.bias`, which implies
+        // LayerNorm, not RMSNorm. This path applies the bias-free `mla_rms_norm` with
+        // `config.rms_norm_eps` instead — a correctness approximation that must be
+        // replaced with a LayerNorm(+bias, eps=1e-6) kernel once a GPU forward confirms
+        // GLM's exact index-key norm. `k_norm_bias` is intentionally still consumed
+        // below (kept live) so the wiring is in place for that fix.
+        // ponytail: pod-verify GLM index k_norm = LayerNorm(eps=1e-6) with k_norm weight+bias — current path is bias-free RMSNorm
+        let _ = indexer.k_norm_bias.as_ref();
+        mla_rms_norm(ctx, &wk_out, k_norm, config.rms_norm_eps)?
+    } else {
+        // GLM's real `wk` is `[index_head_dim, hidden]` (single MQA key), so this
+        // branch is not expected. Fail loud rather than fabricate a per-head→single-key
+        // reduction the official scorer never expects.
+        // ponytail: pod-verify GLM wk index-key width if this ever fires (expected wk.rows == index_head_dim)
+        bail!(
+            "DSv4 SparseIndexed index-key build: wk.rows {} != index_head_dim {} — GLM's \
+             lightning-indexer key is a single MQA head of width index_head_dim; a wider wk \
+             means an unexpected checkpoint layout. Pod-verify GLM wk before enabling decode",
+            wk.rows,
+            config.index_head_dim
+        );
+    };
+    keepalive.keep_hidden(&normed);
+    ensure!(
+        normed.hidden_dim == config.index_head_dim,
+        "DSv4 SparseIndexed normed index key width {} != index_head_dim {}",
+        normed.hidden_dim,
+        config.index_head_dim
+    );
+    ensure!(
+        state.compressed.hidden_dim == config.index_head_dim,
+        "DSv4 SparseIndexed indexer state hidden_dim {} != index_head_dim {}",
+        state.compressed.hidden_dim,
+        config.index_head_dim
+    );
+
+    // Append into the ring at absolute rows [start_pos, start_pos + seq_len): for
+    // ratio=1 this is a plain bf16 dtod copy at element offset
+    // `start_pos * index_head_dim`. Frozen-KV verify never advances state.
+    let capacity = state.compressed.data.len() / config.index_head_dim;
+    ensure!(
+        start_pos + seq_len <= capacity,
+        "DSv4 SparseIndexed index-key ring overflow: start_pos {start_pos} + seq_len {seq_len} \
+         exceeds capacity {capacity}"
+    );
+    if !dsv4_verify_frozen() {
+        let lo = start_pos * config.index_head_dim;
+        let hi = (start_pos + seq_len) * config.index_head_dim;
+        let mut dst = state.compressed.data.slice_mut(lo..hi);
+        ctx.stream
+            .memcpy_dtod(&normed.data, &mut dst)
+            .map_err(|e| anyhow!("DSv4 SparseIndexed index-key ring D2D failed: {e}"))?;
+        state.compressed.seq_len = start_pos + seq_len;
     }
     Ok(())
 }

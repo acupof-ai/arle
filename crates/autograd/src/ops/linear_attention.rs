@@ -11,7 +11,11 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
-    backend::{LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardParams},
+    backend::{
+        Device, LinearAttentionDeviceBackwardArgs, LinearAttentionDeviceForwardArgs,
+        LinearAttentionDeviceParams, LinearAttentionScanBackwardArgs,
+        LinearAttentionScanBackwardParams,
+    },
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -175,6 +179,40 @@ pub fn linear_attention_core(
         store,
     )?;
 
+    let requires_grad = [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ]
+    .into_iter()
+    .try_fold(false, |acc, tensor_id| {
+        store
+            .tensor(tensor_id)
+            .map(|tensor| acc || tensor.requires_grad)
+    })?;
+
+    if let Some(output_id) = try_linear_attention_forward_device(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        requires_grad,
+        store,
+        tape,
+    )? {
+        return Ok(output_id);
+    }
+
     for tensor_id in [
         qkv,
         z,
@@ -210,14 +248,6 @@ pub fn linear_attention_core(
         params,
     );
 
-    let requires_grad = qkv_tensor.requires_grad
-        || z_tensor.requires_grad
-        || b_tensor.requires_grad
-        || a_tensor.requires_grad
-        || conv_tensor.requires_grad
-        || dt_tensor.requires_grad
-        || a_log_tensor.requires_grad
-        || norm_tensor.requires_grad;
     let output_shape = vec![
         params.batch,
         params.seq_len,
@@ -248,6 +278,17 @@ pub fn linear_attention_core(
                 dt_bias,
                 a_log,
                 norm_weight,
+                preact: None,
+                qkv_conv: None,
+                q: None,
+                k: None,
+                v: None,
+                g: None,
+                g_cumsum: None,
+                beta: None,
+                a_inv: None,
+                chunk_state: None,
+                raw_output: None,
                 batch: params.batch,
                 seq_len: params.seq_len,
                 num_key_heads: params.num_key_heads,
@@ -261,6 +302,458 @@ pub fn linear_attention_core(
     }
 
     Ok(output_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_linear_attention_forward_device(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    requires_grad: bool,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<Option<TensorId>> {
+    if store.backend().device() != Device::Cuda {
+        return Ok(None);
+    }
+
+    for tensor_id in [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ] {
+        store.ensure_device(tensor_id)?;
+    }
+
+    let qkv_handle = store
+        .tensor(qkv)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let z_handle = store
+        .tensor(z)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let b_handle = store
+        .tensor(b_proj)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let a_handle = store
+        .tensor(a_proj)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let conv_handle = store
+        .tensor(conv1d_weight)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let dt_handle = store
+        .tensor(dt_bias)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let a_log_handle = store
+        .tensor(a_log)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+    let norm_handle = store
+        .tensor(norm_weight)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone();
+
+    let Some(result) =
+        store
+            .backend()
+            .linear_attention_forward_device(LinearAttentionDeviceForwardArgs {
+                params: LinearAttentionDeviceParams {
+                    batch: params.batch,
+                    seq_len: params.seq_len,
+                    num_key_heads: params.num_key_heads,
+                    num_value_heads: params.num_value_heads,
+                    key_dim: params.key_dim,
+                    value_dim: params.value_dim,
+                    conv_kernel: params.conv_kernel,
+                    eps: params.eps,
+                },
+                qkv: &qkv_handle,
+                z: &z_handle,
+                b_proj: &b_handle,
+                a_proj: &a_handle,
+                conv1d_weight: &conv_handle,
+                dt_bias: &dt_handle,
+                a_log: &a_log_handle,
+                norm_weight: &norm_handle,
+            })?
+    else {
+        return Ok(None);
+    };
+
+    let q_dim = params.num_key_heads * params.key_dim;
+    let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+    let num_chunks = params.seq_len.div_ceil(64);
+    let output_shape = vec![
+        params.batch,
+        params.seq_len,
+        params.num_value_heads * params.value_dim,
+    ];
+    let head_shape = vec![params.batch, params.seq_len, params.num_value_heads];
+    let preact_id =
+        store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.preact)?;
+    let qkv_conv_id =
+        store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
+    let q_id = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            params.seq_len,
+            params.num_value_heads,
+            params.key_dim,
+        ],
+        result.q,
+    )?;
+    let k_id = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            params.seq_len,
+            params.num_value_heads,
+            params.key_dim,
+        ],
+        result.k,
+    )?;
+    let v_id = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            params.seq_len,
+            params.num_value_heads,
+            params.value_dim,
+        ],
+        result.v,
+    )?;
+    let g_id = store.alloc_device_tensor(head_shape.clone(), result.g)?;
+    let g_cumsum_id = store.alloc_device_tensor(head_shape.clone(), result.g_cumsum)?;
+    let beta_id = store.alloc_device_tensor(head_shape, result.beta)?;
+    let a_inv_id = store.alloc_device_tensor(
+        vec![params.batch, params.seq_len, params.num_value_heads, 64],
+        result.a_inv,
+    )?;
+    let chunk_state_id = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            num_chunks,
+            params.num_value_heads,
+            params.key_dim,
+            params.value_dim,
+        ],
+        result.chunk_state,
+    )?;
+    let raw_output_id = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            params.seq_len,
+            params.num_value_heads,
+            params.value_dim,
+        ],
+        result.raw_output,
+    )?;
+    let output_id = store.alloc_device_tensor(output_shape, result.output)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::LinearAttention,
+            output_id,
+            input_ids: smallvec![
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight
+            ],
+            saved: SavedContext::LinearAttentionCtx {
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight,
+                preact: Some(preact_id),
+                qkv_conv: Some(qkv_conv_id),
+                q: Some(q_id),
+                k: Some(k_id),
+                v: Some(v_id),
+                g: Some(g_id),
+                g_cumsum: Some(g_cumsum_id),
+                beta: Some(beta_id),
+                a_inv: Some(a_inv_id),
+                chunk_state: Some(chunk_state_id),
+                raw_output: Some(raw_output_id),
+                batch: params.batch,
+                seq_len: params.seq_len,
+                num_key_heads: params.num_key_heads,
+                num_value_heads: params.num_value_heads,
+                key_dim: params.key_dim,
+                value_dim: params.value_dim,
+                conv_kernel: params.conv_kernel,
+                eps: params.eps,
+            },
+        });
+    }
+    Ok(Some(output_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_linear_attention_backward_device(
+    output_grad_id: TensorId,
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    preact: Option<TensorId>,
+    qkv_conv: Option<TensorId>,
+    q: Option<TensorId>,
+    k: Option<TensorId>,
+    v: Option<TensorId>,
+    g: Option<TensorId>,
+    g_cumsum: Option<TensorId>,
+    beta: Option<TensorId>,
+    a_inv: Option<TensorId>,
+    chunk_state: Option<TensorId>,
+    raw_output: Option<TensorId>,
+    params: LinearAttentionParams,
+    store: &mut TensorStore,
+) -> Result<Option<GradPairs>> {
+    if store.backend().device() != Device::Cuda {
+        return Ok(None);
+    }
+    let Some(preact) = preact else {
+        return Ok(None);
+    };
+    let Some(qkv_conv) = qkv_conv else {
+        return Ok(None);
+    };
+    let Some(q) = q else {
+        return Ok(None);
+    };
+    let Some(k) = k else {
+        return Ok(None);
+    };
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    let Some(g) = g else {
+        return Ok(None);
+    };
+    let Some(g_cumsum) = g_cumsum else {
+        return Ok(None);
+    };
+    let Some(beta) = beta else {
+        return Ok(None);
+    };
+    let Some(a_inv) = a_inv else {
+        return Ok(None);
+    };
+    let Some(chunk_state) = chunk_state else {
+        return Ok(None);
+    };
+    let Some(raw_output) = raw_output else {
+        return Ok(None);
+    };
+
+    for tensor_id in [
+        output_grad_id,
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        preact,
+        qkv_conv,
+        q,
+        k,
+        v,
+        g,
+        g_cumsum,
+        beta,
+        a_inv,
+        chunk_state,
+        raw_output,
+    ] {
+        store.ensure_device(tensor_id)?;
+    }
+
+    let handle = |store: &TensorStore, id: TensorId| -> Result<_> {
+        Ok(store
+            .tensor(id)?
+            .device_handle
+            .as_ref()
+            .ok_or(AutogradError::TapeInvariant(
+                "linear attention device tensor missing handle",
+            ))?
+            .clone())
+    };
+    let upstream_handle = handle(store, output_grad_id)?;
+    let qkv_handle = handle(store, qkv)?;
+    let z_handle = handle(store, z)?;
+    let b_handle = handle(store, b_proj)?;
+    let a_handle = handle(store, a_proj)?;
+    let conv_handle = handle(store, conv1d_weight)?;
+    let dt_handle = handle(store, dt_bias)?;
+    let a_log_handle = handle(store, a_log)?;
+    let norm_handle = handle(store, norm_weight)?;
+    let preact_handle = handle(store, preact)?;
+    let qkv_conv_handle = handle(store, qkv_conv)?;
+    let q_handle = handle(store, q)?;
+    let k_handle = handle(store, k)?;
+    let v_handle = handle(store, v)?;
+    let g_handle = handle(store, g)?;
+    let g_cumsum_handle = handle(store, g_cumsum)?;
+    let beta_handle = handle(store, beta)?;
+    let a_inv_handle = handle(store, a_inv)?;
+    let chunk_state_handle = handle(store, chunk_state)?;
+    let raw_output_handle = handle(store, raw_output)?;
+
+    let Some(device_grads) =
+        store
+            .backend()
+            .linear_attention_backward_device(LinearAttentionDeviceBackwardArgs {
+                params: LinearAttentionDeviceParams {
+                    batch: params.batch,
+                    seq_len: params.seq_len,
+                    num_key_heads: params.num_key_heads,
+                    num_value_heads: params.num_value_heads,
+                    key_dim: params.key_dim,
+                    value_dim: params.value_dim,
+                    conv_kernel: params.conv_kernel,
+                    eps: params.eps,
+                },
+                upstream: &upstream_handle,
+                qkv: &qkv_handle,
+                z: &z_handle,
+                b_proj: &b_handle,
+                a_proj: &a_handle,
+                conv1d_weight: &conv_handle,
+                dt_bias: &dt_handle,
+                a_log: &a_log_handle,
+                norm_weight: &norm_handle,
+                preact: &preact_handle,
+                qkv_conv: &qkv_conv_handle,
+                q: &q_handle,
+                k: &k_handle,
+                v: &v_handle,
+                g: &g_handle,
+                g_cumsum: &g_cumsum_handle,
+                beta: &beta_handle,
+                a_inv: &a_inv_handle,
+                chunk_state: &chunk_state_handle,
+                raw_output: &raw_output_handle,
+            })?
+    else {
+        return Ok(None);
+    };
+
+    let q_dim = params.num_key_heads * params.key_dim;
+    let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+    let mut grads = GradPairs::new();
+    if store.tensor(qkv)?.requires_grad {
+        grads.push((
+            qkv,
+            store.alloc_device_tensor(
+                vec![params.batch, params.seq_len, qkv_dim],
+                device_grads.dqkv,
+            )?,
+        ));
+    }
+    if store.tensor(z)?.requires_grad {
+        grads.push((
+            z,
+            store.alloc_device_tensor(
+                vec![
+                    params.batch,
+                    params.seq_len,
+                    params.num_value_heads * params.value_dim,
+                ],
+                device_grads.dz,
+            )?,
+        ));
+    }
+    if store.tensor(b_proj)?.requires_grad {
+        grads.push((
+            b_proj,
+            store.alloc_device_tensor(
+                vec![params.batch, params.seq_len, params.num_value_heads],
+                device_grads.db,
+            )?,
+        ));
+    }
+    if store.tensor(a_proj)?.requires_grad {
+        grads.push((
+            a_proj,
+            store.alloc_device_tensor(
+                vec![params.batch, params.seq_len, params.num_value_heads],
+                device_grads.da,
+            )?,
+        ));
+    }
+    if store.tensor(conv1d_weight)?.requires_grad {
+        grads.push((
+            conv1d_weight,
+            store.alloc_device_tensor(vec![qkv_dim, params.conv_kernel], device_grads.dconv)?,
+        ));
+    }
+    if store.tensor(dt_bias)?.requires_grad {
+        grads.push((
+            dt_bias,
+            store.alloc_device_tensor(vec![params.num_value_heads], device_grads.ddt)?,
+        ));
+    }
+    if store.tensor(a_log)?.requires_grad {
+        grads.push((
+            a_log,
+            store.alloc_device_tensor(vec![params.num_value_heads], device_grads.da_log)?,
+        ));
+    }
+    if store.tensor(norm_weight)?.requires_grad {
+        grads.push((
+            norm_weight,
+            store.alloc_device_tensor(vec![params.value_dim], device_grads.dnorm)?,
+        ));
+    }
+    Ok(Some(grads))
 }
 
 pub(crate) fn linear_attention_backward(
@@ -277,6 +770,17 @@ pub(crate) fn linear_attention_backward(
         dt_bias,
         a_log,
         norm_weight,
+        preact,
+        qkv_conv,
+        q,
+        k,
+        v,
+        g,
+        g_cumsum,
+        beta,
+        a_inv,
+        chunk_state,
+        raw_output,
         batch,
         seq_len,
         num_key_heads,
@@ -314,6 +818,33 @@ pub(crate) fn linear_attention_backward(
         params,
         store,
     )?;
+
+    if let Some(grads) = try_linear_attention_backward_device(
+        output_grad_id,
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        preact,
+        qkv_conv,
+        q,
+        k,
+        v,
+        g,
+        g_cumsum,
+        beta,
+        a_inv,
+        chunk_state,
+        raw_output,
+        params,
+        store,
+    )? {
+        return Ok(grads);
+    }
 
     let mut profile =
         linear_attention_backward_profile_enabled().then(LinearAttentionBackwardProfile::default);

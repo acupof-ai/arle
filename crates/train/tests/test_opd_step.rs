@@ -239,6 +239,9 @@ fn run_tiny_windowed_gkd_step() -> (f32, usize) {
             kl_chunk_size: Some(2),
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::Full,
         },
@@ -332,6 +335,9 @@ fn pure_chunked_kl_opd_loss(direction: KlDirection) -> f32 {
             kl_chunk_size: Some(1),
             kl_direction: direction,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
@@ -395,6 +401,9 @@ fn opd_step_windowed_pure_kl_preempts_chunked_route() {
             kl_chunk_size: Some(2),
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: Some(2),
             kl_mask: OpdKlMask::CompletionOnly,
         },
@@ -408,19 +417,20 @@ fn opd_step_windowed_pure_kl_preempts_chunked_route() {
     assert!(outcome.loss.is_finite());
     assert_eq!(
         teacher.full_calls.get(),
-        0,
-        "logits_window_size must preempt the full/chunked KL route"
+        1,
+        "pure-KL cached-hidden route should score teacher logits once and slice cached windows"
     );
     assert_eq!(
         teacher.window_calls.get(),
-        2,
-        "completion KL range of four positions with window=2 should run two windows"
+        0,
+        "pure-KL cached-hidden route should not call teacher window forwards"
     );
 }
 
 fn pure_kl_loss_and_grads(
     kl_chunk_size: Option<usize>,
     logits_window_size: Option<usize>,
+    fused_distill: bool,
 ) -> (f32, Vec<(TensorId, Vec<f32>)>) {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
@@ -455,6 +465,9 @@ fn pure_kl_loss_and_grads(
             kl_chunk_size,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill,
             logits_window_size,
             kl_mask: OpdKlMask::CompletionOnly,
         },
@@ -470,8 +483,8 @@ fn pure_kl_loss_and_grads(
 
 #[test]
 fn opd_step_windowed_pure_kl_matches_chunked_loss_and_grads() {
-    let (chunked_loss, chunked_grads) = pure_kl_loss_and_grads(Some(2), None);
-    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(Some(2), Some(2));
+    let (chunked_loss, chunked_grads) = pure_kl_loss_and_grads(Some(2), None, true);
+    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(Some(2), Some(2), true);
 
     assert!(
         (chunked_loss - windowed_loss).abs() <= 1.0e-6,
@@ -497,8 +510,8 @@ fn opd_step_windowed_pure_kl_matches_chunked_loss_and_grads() {
 
 #[test]
 fn opd_step_windowed_pure_kl_matches_full_loss_and_grads() {
-    let (full_loss, full_grads) = pure_kl_loss_and_grads(None, None);
-    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(None, Some(2));
+    let (full_loss, full_grads) = pure_kl_loss_and_grads(None, None, true);
+    let (windowed_loss, windowed_grads) = pure_kl_loss_and_grads(None, Some(2), true);
 
     assert!(
         (full_loss - windowed_loss).abs() <= 1.0e-6,
@@ -517,6 +530,31 @@ fn opd_step_windowed_pure_kl_matches_full_loss_and_grads() {
     assert!(
         max_abs <= 2.0e-5,
         "windowed pure KL gradients must match full gradients, max_abs={max_abs:.9e}"
+    );
+}
+
+#[test]
+fn opd_step_windowed_no_fused_distill_matches_full_loss_and_grads() {
+    let (full_loss, full_grads) = pure_kl_loss_and_grads(None, None, true);
+    let (optout_loss, optout_grads) = pure_kl_loss_and_grads(None, Some(2), false);
+
+    assert!(
+        (full_loss - optout_loss).abs() <= 1.0e-6,
+        "no-fused windowed loss {optout_loss:.9e} must match full loss {full_loss:.9e}"
+    );
+    assert_eq!(full_grads.len(), optout_grads.len());
+
+    let mut max_abs = 0.0f32;
+    for ((full_id, full), (optout_id, optout)) in full_grads.iter().zip(optout_grads.iter()) {
+        assert_eq!(full_id, optout_id);
+        assert_eq!(full.len(), optout.len());
+        for (&left, &right) in full.iter().zip(optout.iter()) {
+            max_abs = max_abs.max((left - right).abs());
+        }
+    }
+    assert!(
+        max_abs <= 2.0e-5,
+        "no-fused windowed pure KL gradients must match full gradients, max_abs={max_abs:.9e}"
     );
 }
 
@@ -831,6 +869,9 @@ fn opd_step_error_after_rollout_cleans_tape_and_temporaries() {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },
@@ -1220,6 +1261,9 @@ fn opd_step_rejects_short_rope_cache_with_actionable_error() {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         },

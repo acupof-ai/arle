@@ -24,7 +24,9 @@ use crate::{
 use crate::{
     Result,
     backend::{
-        Backend, Device, DeviceGradClipResult, DeviceHandle, LinearAttentionScanBackwardArgs,
+        Backend, Device, DeviceGradClipResult, DeviceHandle, LinearAttentionDeviceBackwardArgs,
+        LinearAttentionDeviceBackwardResult, LinearAttentionDeviceForwardArgs,
+        LinearAttentionDeviceForwardResult, LinearAttentionScanBackwardArgs,
         LinearAttentionScanBackwardGrads,
     },
 };
@@ -36,6 +38,8 @@ mod kernels;
 use self::kernels::{KernelCache, launch_1d, launch_2d, launch_rows};
 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
 use cuda_kernels::collective::{CollectiveBackend, DType, NcclBackend, ReduceOp};
+#[cfg(not(feature = "no-cuda"))]
+use cuda_kernels::ffi;
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
@@ -51,6 +55,17 @@ use std::sync::Arc;
 
 #[cfg(not(feature = "no-cuda"))]
 const CUBLASLT_BF16_GEMMEX_MIN_N: usize = 32;
+
+#[cfg(not(feature = "no-cuda"))]
+fn check_cuda_ffi(status: CUresult, label: &'static str) -> Result<()> {
+    if status == CUresult::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(AutogradError::TapeInvariant(Box::leak(
+            format!("{label} failed with CUDA status {status:?}").into_boxed_str(),
+        )))
+    }
+}
 
 /// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
 /// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
@@ -1185,6 +1200,42 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_linear_attention_scan_backward(self, args)
+        }
+    }
+
+    fn linear_attention_forward_device(
+        &self,
+        args: LinearAttentionDeviceForwardArgs<'_>,
+    ) -> Result<Option<LinearAttentionDeviceForwardResult>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = args;
+            todo!(
+                "GPU required: cuda linear_attention_forward_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_linear_attention_forward_device(self, args)
+        }
+    }
+
+    fn linear_attention_backward_device(
+        &self,
+        args: LinearAttentionDeviceBackwardArgs<'_>,
+    ) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = args;
+            todo!(
+                "GPU required: cuda linear_attention_backward_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_linear_attention_backward_device(self, args)
         }
     }
 
@@ -3353,6 +3404,648 @@ fn cuda_gather_last_dim_backward(
     )?;
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_linear_attention_forward_device(
+    backend: &CudaBackend,
+    args: LinearAttentionDeviceForwardArgs<'_>,
+) -> Result<Option<LinearAttentionDeviceForwardResult>> {
+    let p = args.params;
+    if p.batch != 1
+        || p.num_value_heads != 32
+        || p.key_dim != 128
+        || p.value_dim != 128
+        || p.conv_kernel > 5
+    {
+        return Ok(None);
+    }
+
+    let q_dim = p.num_key_heads * p.key_dim;
+    let qkv_dim = q_dim * 2 + p.num_value_heads * p.value_dim;
+    let qkv_len = p.batch * p.seq_len * qkv_dim;
+    let z_len = p.batch * p.seq_len * p.num_value_heads * p.value_dim;
+    let head_len = p.batch * p.seq_len * p.num_value_heads;
+    let conv_len = qkv_dim * p.conv_kernel;
+    let num_chunks = p.seq_len.div_ceil(64);
+    let qkv_bf16_len = p.seq_len * qkv_dim;
+    let q_len = p.seq_len * p.num_value_heads * p.key_dim;
+    let v_len = p.seq_len * p.num_value_heads * p.value_dim;
+    let a_len = p.seq_len * p.num_value_heads * 64;
+    let state_len = p.num_value_heads * p.key_dim * p.value_dim;
+    let chunk_state_len = num_chunks * state_len;
+
+    let qkv = backend.cuda_slice(args.qkv, "linear_attention_forward qkv")?;
+    let z = backend.cuda_slice(args.z, "linear_attention_forward z")?;
+    let b_proj = backend.cuda_slice(args.b_proj, "linear_attention_forward b_proj")?;
+    let a_proj = backend.cuda_slice(args.a_proj, "linear_attention_forward a_proj")?;
+    let conv1d_weight =
+        backend.cuda_slice(args.conv1d_weight, "linear_attention_forward conv1d_weight")?;
+    let dt_bias = backend.cuda_slice(args.dt_bias, "linear_attention_forward dt_bias")?;
+    let a_log = backend.cuda_slice(args.a_log, "linear_attention_forward a_log")?;
+    let norm_weight =
+        backend.cuda_slice(args.norm_weight, "linear_attention_forward norm_weight")?;
+
+    for (label, got, expected) in [
+        ("qkv", qkv.len(), qkv_len),
+        ("z", z.len(), z_len),
+        ("b_proj", b_proj.len(), head_len),
+        ("a_proj", a_proj.len(), head_len),
+        ("conv1d_weight", conv1d_weight.len(), conv_len),
+        ("dt_bias", dt_bias.len(), p.num_value_heads),
+        ("a_log", a_log.len(), p.num_value_heads),
+        ("norm_weight", norm_weight.len(), p.value_dim),
+    ] {
+        if got != expected {
+            return Err(AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "cuda linear_attention_forward_device {label} len mismatch: got={got} expected={expected}"
+                )
+                .into_boxed_str(),
+            )));
+        }
+    }
+
+    let b_bf16 = backend.local_f32_as_bf16(b_proj, head_len)?;
+    let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
+    let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
+
+    let mut preact = backend
+        .stream
+        .alloc_zeros::<f32>(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la preact)"))?;
+    let mut qkv_conv = backend
+        .stream
+        .alloc_zeros::<u16>(qkv_bf16_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la qkv_conv)"))?;
+    let mut q = backend
+        .stream
+        .alloc_zeros::<u16>(q_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la q)"))?;
+    let mut k = backend
+        .stream
+        .alloc_zeros::<u16>(q_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la k)"))?;
+    let mut v = backend
+        .stream
+        .alloc_zeros::<u16>(v_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la v)"))?;
+    let mut g = backend
+        .stream
+        .alloc_zeros::<f32>(head_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la g)"))?;
+    let mut g_cumsum = backend
+        .stream
+        .alloc_zeros::<f32>(head_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la g_cumsum)"))?;
+    let mut beta = backend
+        .stream
+        .alloc_zeros::<f32>(head_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la beta)"))?;
+    let mut a_tril = backend
+        .stream
+        .alloc_zeros::<f32>(a_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la a_tril)"))?;
+    let mut a_inv = backend
+        .stream
+        .alloc_zeros::<u16>(a_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la a_inv)"))?;
+    let mut w = backend
+        .stream
+        .alloc_zeros::<u16>(q_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la w)"))?;
+    let mut u = backend
+        .stream
+        .alloc_zeros::<u16>(v_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la u)"))?;
+    let initial_state = backend
+        .stream
+        .alloc_zeros::<f32>(state_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la initial_state)"))?;
+    let mut chunk_state = backend
+        .stream
+        .alloc_zeros::<f32>(chunk_state_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_state)"))?;
+    let mut v_new = backend
+        .stream
+        .alloc_zeros::<u16>(v_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la v_new)"))?;
+    let mut final_state = backend
+        .stream
+        .alloc_zeros::<f32>(state_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la final_state)"))?;
+    let mut raw_output = backend
+        .stream
+        .alloc_zeros::<u16>(v_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la raw_output)"))?;
+    let mut output = backend
+        .stream
+        .alloc_zeros::<f32>(z_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la output)"))?;
+
+    let seq_len_i32 = i32::try_from(p.seq_len)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention seq_len exceeds i32"))?;
+    let qkv_dim_i32 = i32::try_from(qkv_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32"))?;
+    let conv_kernel_i32 = i32::try_from(p.conv_kernel)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
+    let num_key_heads_i32 = i32::try_from(p.num_key_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention key heads exceeds i32"))?;
+    let num_value_heads_i32 = i32::try_from(p.num_value_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention value heads exceeds i32"))?;
+    let rows_i32 = i32::try_from(p.seq_len * p.num_value_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
+    let value_dim_i32 = i32::try_from(p.value_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
+
+    {
+        let (preact_ptr, _preact_guard) = preact.device_ptr_mut(&backend.stream);
+        let (qkv_conv_ptr, _qkv_conv_guard) = qkv_conv.device_ptr_mut(&backend.stream);
+        let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
+        let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
+        let total_i32 = i32::try_from(qkv_len)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds i32"))?;
+        launch_1d(
+            &backend.stream,
+            backend
+                .kernels
+                .function("linear_attention_conv1d_silu_forward_f32_to_bf16")?,
+            qkv_len,
+            |mut builder| {
+                builder
+                    .arg(&preact_ptr)
+                    .arg(&qkv_conv_ptr)
+                    .arg(&qkv_ptr)
+                    .arg(&conv_ptr)
+                    .arg(&total_i32)
+                    .arg(&qkv_dim_i32)
+                    .arg(&seq_len_i32)
+                    .arg(&conv_kernel_i32);
+                builder
+            },
+        )?;
+    }
+    {
+        let (qkv_ptr, _qkv_guard) = qkv_conv.device_ptr(&backend.stream);
+        let (b_ptr, _b_guard) = b_bf16.device_ptr(&backend.stream);
+        let (a_ptr, _a_guard) = a_bf16.device_ptr(&backend.stream);
+        let (dt_ptr, _dt_guard) = dt_bf16.device_ptr(&backend.stream);
+        let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&backend.stream);
+        let (q_ptr, _q_guard) = q.device_ptr_mut(&backend.stream);
+        let (k_ptr, _k_guard) = k.device_ptr_mut(&backend.stream);
+        let (v_ptr, _v_guard) = v.device_ptr_mut(&backend.stream);
+        let (g_ptr, _g_guard) = g.device_ptr_mut(&backend.stream);
+        let (beta_ptr, _beta_guard) = beta.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_prepare_cuda(
+                    qkv_ptr as *const ffi::Half,
+                    b_ptr as *const ffi::Half,
+                    a_ptr as *const ffi::Half,
+                    dt_ptr as *const ffi::Half,
+                    a_log_ptr as *const f32,
+                    q_ptr as *mut ffi::Half,
+                    k_ptr as *mut ffi::Half,
+                    v_ptr as *mut ffi::Half,
+                    g_ptr as *mut f32,
+                    beta_ptr as *mut f32,
+                    num_key_heads_i32,
+                    num_value_heads_i32,
+                    qkv_dim_i32,
+                    seq_len_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_prepare_cuda",
+        )?;
+    }
+    {
+        let (g_ptr, _g_guard) = g.device_ptr(&backend.stream);
+        let (gc_ptr, _gc_guard) = g_cumsum.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_cumsum_cuda(
+                    g_ptr as *const f32,
+                    gc_ptr as *mut f32,
+                    seq_len_i32,
+                    num_value_heads_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_cumsum_cuda",
+        )?;
+    }
+    {
+        let (k_ptr, _k_guard) = k.device_ptr(&backend.stream);
+        let (gc_ptr, _gc_guard) = g_cumsum.device_ptr(&backend.stream);
+        let (beta_ptr, _beta_guard) = beta.device_ptr(&backend.stream);
+        let (a_tril_ptr, _a_tril_guard) = a_tril.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_a_cuda(
+                    k_ptr as *const ffi::Half,
+                    gc_ptr as *const f32,
+                    beta_ptr as *const f32,
+                    a_tril_ptr as *mut f32,
+                    seq_len_i32,
+                    num_value_heads_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_a_cuda",
+        )?;
+    }
+    {
+        let (a_tril_ptr, _a_tril_guard) = a_tril.device_ptr(&backend.stream);
+        let (a_inv_ptr, _a_inv_guard) = a_inv.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_solve_cuda(
+                    a_tril_ptr as *const f32,
+                    a_inv_ptr as *mut ffi::Half,
+                    seq_len_i32,
+                    num_value_heads_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_solve_cuda",
+        )?;
+    }
+    {
+        let (k_ptr, _k_guard) = k.device_ptr(&backend.stream);
+        let (v_ptr, _v_guard) = v.device_ptr(&backend.stream);
+        let (beta_ptr, _beta_guard) = beta.device_ptr(&backend.stream);
+        let (w_ptr, _w_guard) = w.device_ptr_mut(&backend.stream);
+        let (u_ptr, _u_guard) = u.device_ptr_mut(&backend.stream);
+        let (a_inv_ptr, _a_inv_guard) = a_inv.device_ptr(&backend.stream);
+        let (gc_ptr, _gc_guard) = g_cumsum.device_ptr(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_recompute_cuda(
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    beta_ptr as *const f32,
+                    w_ptr as *mut ffi::Half,
+                    u_ptr as *mut ffi::Half,
+                    a_inv_ptr as *const ffi::Half,
+                    gc_ptr as *const f32,
+                    seq_len_i32,
+                    num_value_heads_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_recompute_cuda",
+        )?;
+    }
+    {
+        let (k_ptr, _k_guard) = k.device_ptr(&backend.stream);
+        let (w_ptr, _w_guard) = w.device_ptr(&backend.stream);
+        let (u_ptr, _u_guard) = u.device_ptr(&backend.stream);
+        let (gc_ptr, _gc_guard) = g_cumsum.device_ptr(&backend.stream);
+        let (initial_ptr, _initial_guard) = initial_state.device_ptr(&backend.stream);
+        let (chunk_ptr, _chunk_guard) = chunk_state.device_ptr_mut(&backend.stream);
+        let (vnew_ptr, _vnew_guard) = v_new.device_ptr_mut(&backend.stream);
+        let (final_ptr, _final_guard) = final_state.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_state_cuda(
+                    k_ptr as *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    u_ptr as *const ffi::Half,
+                    gc_ptr as *const f32,
+                    initial_ptr as *const f32,
+                    chunk_ptr as *mut f32,
+                    vnew_ptr as *mut ffi::Half,
+                    final_ptr as *mut f32,
+                    seq_len_i32,
+                    num_value_heads_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_state_cuda",
+        )?;
+    }
+    {
+        let (q_ptr, _q_guard) = q.device_ptr(&backend.stream);
+        let (k_ptr, _k_guard) = k.device_ptr(&backend.stream);
+        let (vnew_ptr, _vnew_guard) = v_new.device_ptr(&backend.stream);
+        let (chunk_ptr, _chunk_guard) = chunk_state.device_ptr(&backend.stream);
+        let (gc_ptr, _gc_guard) = g_cumsum.device_ptr(&backend.stream);
+        let (raw_ptr, _raw_guard) = raw_output.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::gated_delta_rule_prefill_chunk_o_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    vnew_ptr as *const ffi::Half,
+                    chunk_ptr as *const f32,
+                    gc_ptr as *const f32,
+                    raw_ptr as *mut ffi::Half,
+                    seq_len_i32,
+                    num_value_heads_i32,
+                    (p.key_dim as f32).sqrt().recip(),
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_chunk_o_cuda",
+        )?;
+    }
+    {
+        let (out_ptr, _out_guard) = output.device_ptr_mut(&backend.stream);
+        let (raw_ptr, _raw_guard) = raw_output.device_ptr(&backend.stream);
+        let (z_ptr, _z_guard) = z.device_ptr(&backend.stream);
+        let (norm_ptr, _norm_guard) = norm_weight.device_ptr(&backend.stream);
+        launch_rows(
+            &backend.stream,
+            backend
+                .kernels
+                .function("linear_attention_rms_gated_forward_f32_from_bf16")?,
+            p.seq_len * p.num_value_heads,
+            256,
+            (256 * std::mem::size_of::<f32>()) as u32,
+            |mut builder| {
+                builder
+                    .arg(&out_ptr)
+                    .arg(&raw_ptr)
+                    .arg(&z_ptr)
+                    .arg(&norm_ptr)
+                    .arg(&rows_i32)
+                    .arg(&value_dim_i32)
+                    .arg(&p.eps);
+                builder
+            },
+        )?;
+    }
+
+    Ok(Some(LinearAttentionDeviceForwardResult {
+        output: DeviceHandle::Cuda(CudaStorage::new(output)),
+        preact: DeviceHandle::Cuda(CudaStorage::new(preact)),
+        qkv_conv: DeviceHandle::CudaBf16(CudaBf16Storage::new(qkv_conv)),
+        q: DeviceHandle::CudaBf16(CudaBf16Storage::new(q)),
+        k: DeviceHandle::CudaBf16(CudaBf16Storage::new(k)),
+        v: DeviceHandle::CudaBf16(CudaBf16Storage::new(v)),
+        g: DeviceHandle::Cuda(CudaStorage::new(g)),
+        g_cumsum: DeviceHandle::Cuda(CudaStorage::new(g_cumsum)),
+        beta: DeviceHandle::Cuda(CudaStorage::new(beta)),
+        a_inv: DeviceHandle::CudaBf16(CudaBf16Storage::new(a_inv)),
+        chunk_state: DeviceHandle::Cuda(CudaStorage::new(chunk_state)),
+        raw_output: DeviceHandle::CudaBf16(CudaBf16Storage::new(raw_output)),
+    }))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_linear_attention_backward_device(
+    backend: &CudaBackend,
+    args: LinearAttentionDeviceBackwardArgs<'_>,
+) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
+    let p = args.params;
+    if p.batch != 1
+        || p.num_value_heads != 32
+        || p.key_dim != 128
+        || p.value_dim != 128
+        || p.conv_kernel > 5
+    {
+        return Ok(None);
+    }
+
+    let q_dim = p.num_key_heads * p.key_dim;
+    let qkv_dim = q_dim * 2 + p.num_value_heads * p.value_dim;
+    let qkv_len = p.batch * p.seq_len * qkv_dim;
+    let z_len = p.batch * p.seq_len * p.num_value_heads * p.value_dim;
+    let head_len = p.batch * p.seq_len * p.num_value_heads;
+    let conv_len = qkv_dim * p.conv_kernel;
+    let rows = p.batch * p.num_value_heads;
+    let state_elems = p.key_dim * p.value_dim;
+    let state_len = rows * state_elems;
+    let chunk_history_len = rows * 64 * state_elems;
+    let chunk_kv_len = rows * 64 * p.value_dim;
+    let num_chunks = p.seq_len.div_ceil(64);
+    let chunk_state_len = num_chunks * p.num_value_heads * state_elems;
+
+    let upstream = backend.cuda_slice(args.upstream, "linear_attention_backward upstream")?;
+    let qkv = backend.cuda_slice(args.qkv, "linear_attention_backward qkv")?;
+    let z = backend.cuda_slice(args.z, "linear_attention_backward z")?;
+    let a_proj = backend.cuda_slice(args.a_proj, "linear_attention_backward a_proj")?;
+    let conv1d_weight = backend.cuda_slice(
+        args.conv1d_weight,
+        "linear_attention_backward conv1d_weight",
+    )?;
+    let dt_bias = backend.cuda_slice(args.dt_bias, "linear_attention_backward dt_bias")?;
+    let a_log = backend.cuda_slice(args.a_log, "linear_attention_backward a_log")?;
+    let norm_weight =
+        backend.cuda_slice(args.norm_weight, "linear_attention_backward norm_weight")?;
+    let preact = backend.cuda_slice(args.preact, "linear_attention_backward preact")?;
+    let beta = backend.cuda_slice(args.beta, "linear_attention_backward beta")?;
+    let g = backend.cuda_slice(args.g, "linear_attention_backward g")?;
+    let chunk_state =
+        backend.cuda_slice(args.chunk_state, "linear_attention_backward chunk_state")?;
+
+    for (label, got, expected) in [
+        ("upstream", upstream.len(), z_len),
+        ("qkv", qkv.len(), qkv_len),
+        ("z", z.len(), z_len),
+        ("a_proj", a_proj.len(), head_len),
+        ("conv1d_weight", conv1d_weight.len(), conv_len),
+        ("dt_bias", dt_bias.len(), p.num_value_heads),
+        ("a_log", a_log.len(), p.num_value_heads),
+        ("norm_weight", norm_weight.len(), p.value_dim),
+        ("preact", preact.len(), qkv_len),
+        ("beta", beta.len(), head_len),
+        ("g", g.len(), head_len),
+        ("chunk_state", chunk_state.len(), chunk_state_len),
+    ] {
+        if got != expected {
+            return Err(AutogradError::TapeInvariant(Box::leak(
+                format!(
+                    "cuda linear_attention_backward_device {label} len mismatch: got={got} expected={expected}"
+                )
+                .into_boxed_str(),
+            )));
+        }
+    }
+
+    let mut dqkv_conv = backend
+        .stream
+        .alloc_zeros::<f32>(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dqkv_conv)"))?;
+    let mut dz = backend
+        .stream
+        .alloc_zeros::<f32>(z_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dz)"))?;
+    let mut db = backend
+        .stream
+        .alloc_zeros::<f32>(head_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la db)"))?;
+    let mut da = backend
+        .stream
+        .alloc_zeros::<f32>(head_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la da)"))?;
+    let mut ddt = backend
+        .stream
+        .alloc_zeros::<f32>(p.num_value_heads)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la ddt)"))?;
+    let mut da_log = backend
+        .stream
+        .alloc_zeros::<f32>(p.num_value_heads)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la da_log)"))?;
+    let mut dnorm = backend
+        .stream
+        .alloc_zeros::<f32>(p.value_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dnorm)"))?;
+    let mut grad_state_scratch = backend
+        .stream
+        .alloc_zeros::<f32>(state_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la grad_state)"))?;
+    let mut state_recompute_scratch =
+        backend.stream.alloc_zeros::<f32>(state_len).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (la state_recompute)")
+        })?;
+    let mut chunk_history_scratch = backend
+        .stream
+        .alloc_zeros::<f32>(chunk_history_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_history)"))?;
+    let mut chunk_kv_scratch = backend
+        .stream
+        .alloc_zeros::<f32>(chunk_kv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_kv)"))?;
+
+    let batch_i32 = i32::try_from(p.batch)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention batch exceeds i32"))?;
+    let seq_len_i32 = i32::try_from(p.seq_len)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention seq_len exceeds i32"))?;
+    let num_key_heads_i32 = i32::try_from(p.num_key_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention key heads exceeds i32"))?;
+    let num_value_heads_i32 = i32::try_from(p.num_value_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention value heads exceeds i32"))?;
+    let key_dim_i32 = i32::try_from(p.key_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention key_dim exceeds i32"))?;
+    let value_dim_i32 = i32::try_from(p.value_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
+    let qkv_dim_i32 = i32::try_from(qkv_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32"))?;
+    let total_i32 = i32::try_from(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds i32"))?;
+    let conv_kernel_i32 = i32::try_from(p.conv_kernel)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
+
+    {
+        let (dqkv_conv_ptr, _dqkv_conv_guard) = dqkv_conv.device_ptr_mut(&backend.stream);
+        let (dz_ptr, _dz_guard) = dz.device_ptr_mut(&backend.stream);
+        let (db_ptr, _db_guard) = db.device_ptr_mut(&backend.stream);
+        let (da_ptr, _da_guard) = da.device_ptr_mut(&backend.stream);
+        let (ddt_ptr, _ddt_guard) = ddt.device_ptr_mut(&backend.stream);
+        let (da_log_ptr, _da_log_guard) = da_log.device_ptr_mut(&backend.stream);
+        let (dnorm_ptr, _dnorm_guard) = dnorm.device_ptr_mut(&backend.stream);
+        let (grad_state_ptr, _grad_state_guard) =
+            grad_state_scratch.device_ptr_mut(&backend.stream);
+        let (state_recompute_ptr, _state_recompute_guard) =
+            state_recompute_scratch.device_ptr_mut(&backend.stream);
+        let (chunk_history_ptr, _chunk_history_guard) =
+            chunk_history_scratch.device_ptr_mut(&backend.stream);
+        let (chunk_kv_ptr, _chunk_kv_guard) = chunk_kv_scratch.device_ptr_mut(&backend.stream);
+        let (upstream_ptr, _upstream_guard) = upstream.device_ptr(&backend.stream);
+        let (z_ptr, _z_guard) = z.device_ptr(&backend.stream);
+        let (a_proj_ptr, _a_proj_guard) = a_proj.device_ptr(&backend.stream);
+        let (dt_ptr, _dt_guard) = dt_bias.device_ptr(&backend.stream);
+        let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&backend.stream);
+        let (norm_ptr, _norm_guard) = norm_weight.device_ptr(&backend.stream);
+        let (preact_ptr, _preact_guard) = preact.device_ptr(&backend.stream);
+        let (beta_ptr, _beta_guard) = beta.device_ptr(&backend.stream);
+        let (g_ptr, _g_guard) = g.device_ptr(&backend.stream);
+        let (chunk_state_ptr, _chunk_state_guard) = chunk_state.device_ptr(&backend.stream);
+
+        launch_rows(
+            &backend.stream,
+            backend
+                .kernels
+                .function("linear_attention_chunked_scan_backward_f32")?,
+            rows,
+            256,
+            0,
+            |mut builder| {
+                builder
+                    .arg(&dqkv_conv_ptr)
+                    .arg(&dz_ptr)
+                    .arg(&db_ptr)
+                    .arg(&da_ptr)
+                    .arg(&ddt_ptr)
+                    .arg(&da_log_ptr)
+                    .arg(&dnorm_ptr)
+                    .arg(&grad_state_ptr)
+                    .arg(&state_recompute_ptr)
+                    .arg(&chunk_history_ptr)
+                    .arg(&chunk_kv_ptr)
+                    .arg(&upstream_ptr)
+                    .arg(&z_ptr)
+                    .arg(&a_proj_ptr)
+                    .arg(&dt_ptr)
+                    .arg(&a_log_ptr)
+                    .arg(&norm_ptr)
+                    .arg(&preact_ptr)
+                    .arg(&beta_ptr)
+                    .arg(&g_ptr)
+                    .arg(&chunk_state_ptr)
+                    .arg(&batch_i32)
+                    .arg(&seq_len_i32)
+                    .arg(&num_key_heads_i32)
+                    .arg(&num_value_heads_i32)
+                    .arg(&key_dim_i32)
+                    .arg(&value_dim_i32)
+                    .arg(&qkv_dim_i32)
+                    .arg(&p.eps);
+                builder
+            },
+        )?;
+    }
+
+    let mut dqkv = backend
+        .stream
+        .alloc_zeros::<f32>(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dqkv)"))?;
+    let mut dconv = backend
+        .stream
+        .alloc_zeros::<f32>(conv_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dconv)"))?;
+    {
+        let (dqkv_ptr, _dqkv_guard) = dqkv.device_ptr_mut(&backend.stream);
+        let (dconv_ptr, _dconv_guard) = dconv.device_ptr_mut(&backend.stream);
+        let (dqkv_conv_ptr, _dqkv_conv_guard) = dqkv_conv.device_ptr(&backend.stream);
+        let (preact_ptr, _preact_guard) = preact.device_ptr(&backend.stream);
+        let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
+        let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
+        launch_1d(
+            &backend.stream,
+            backend
+                .kernels
+                .function("linear_attention_conv1d_silu_backward_f32")?,
+            qkv_len,
+            |mut builder| {
+                builder
+                    .arg(&dqkv_ptr)
+                    .arg(&dconv_ptr)
+                    .arg(&dqkv_conv_ptr)
+                    .arg(&preact_ptr)
+                    .arg(&qkv_ptr)
+                    .arg(&conv_ptr)
+                    .arg(&total_i32)
+                    .arg(&qkv_dim_i32)
+                    .arg(&seq_len_i32)
+                    .arg(&conv_kernel_i32);
+                builder
+            },
+        )?;
+    }
+
+    Ok(Some(LinearAttentionDeviceBackwardResult {
+        dqkv: DeviceHandle::Cuda(CudaStorage::new(dqkv)),
+        dz: DeviceHandle::Cuda(CudaStorage::new(dz)),
+        db: DeviceHandle::Cuda(CudaStorage::new(db)),
+        da: DeviceHandle::Cuda(CudaStorage::new(da)),
+        dconv: DeviceHandle::Cuda(CudaStorage::new(dconv)),
+        ddt: DeviceHandle::Cuda(CudaStorage::new(ddt)),
+        da_log: DeviceHandle::Cuda(CudaStorage::new(da_log)),
+        dnorm: DeviceHandle::Cuda(CudaStorage::new(dnorm)),
+    }))
 }
 
 #[cfg(not(feature = "no-cuda"))]

@@ -13,7 +13,7 @@ no-cuda = ["cuda-kernels?/no-cuda"]
 metal = ["dep:mlx-sys"]
 # CUDA backend via cudarc cuBLAS SGEMM. Same per-call upload/download model.
 # PENDING REMOTE CUDA VERIFICATION — user validates on GPU box.
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:cuda-kernels", "cuda-kernels/cuda"]
 nccl = ["cuda", "dep:cuda-kernels", "cuda-kernels/nccl"]
 safetensors = ["dep:safetensors", "dep:memmap2", "dep:half"]
 

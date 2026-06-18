@@ -1,8 +1,8 @@
 mod helpers;
 
 use autograd::{
+    ops::{linear_attention_core, mul, sum, LinearAttentionParams},
     Result, Tape, TensorStore,
-    ops::{LinearAttentionParams, linear_attention_core, mul, sum},
 };
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use helpers::max_abs_err;
@@ -12,14 +12,19 @@ use helpers::num_grad;
 use autograd::backend_cuda::CudaBackend;
 #[cfg(feature = "metal")]
 use autograd::backend_metal::MetalBackend;
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use autograd::tensor::Dirty;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use std::sync::Arc;
 #[cfg(feature = "metal")]
 use std::sync::Mutex;
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use std::time::Instant;
 
 #[cfg(feature = "metal")]
 static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(any(feature = "metal", feature = "cuda"))]
 fn tiny_params() -> LinearAttentionParams {
     LinearAttentionParams {
         batch: 1,
@@ -29,6 +34,33 @@ fn tiny_params() -> LinearAttentionParams {
         key_dim: 2,
         value_dim: 2,
         conv_kernel: 2,
+        eps: 1.0e-5,
+    }
+}
+
+fn host_gradcheck_params() -> LinearAttentionParams {
+    LinearAttentionParams {
+        batch: 1,
+        seq_len: 80,
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_dim: 16,
+        value_dim: 16,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    }
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn qwen35_chunked_params(seq_len: usize) -> LinearAttentionParams {
+    LinearAttentionParams {
+        batch: 1,
+        seq_len,
+        num_key_heads: 8,
+        num_value_heads: 32,
+        key_dim: 128,
+        value_dim: 128,
+        conv_kernel: 4,
         eps: 1.0e-5,
     }
 }
@@ -88,13 +120,32 @@ impl LinearAttentionFixture {
             conv1d_weight: (0..conv_len)
                 .map(|i| ((i as f32 * 0.13).sin()) * 0.09)
                 .collect(),
-            dt_bias: vec![0.05],
-            a_log: vec![-0.3],
-            norm_weight: vec![1.0, 0.9],
+            dt_bias: (0..params.num_value_heads)
+                .map(|i| 0.03 + ((i as f32 * 0.17).sin()) * 0.02)
+                .collect(),
+            a_log: (0..params.num_value_heads)
+                .map(|i| -0.3 + ((i as f32 * 0.13).cos()) * 0.04)
+                .collect(),
+            norm_weight: (0..params.value_dim)
+                .map(|i| 0.9 + ((i as f32 * 0.07).sin()) * 0.1)
+                .collect(),
             coeff: (0..z_len)
                 .map(|i| 0.3 + ((i as f32 * 0.07).sin()) * 0.05)
                 .collect(),
         }
+    }
+
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    fn hard_forget(params: LinearAttentionParams) -> Self {
+        let mut fixture = Self::new(params);
+        fixture.qkv.iter_mut().for_each(|v| *v *= 0.5);
+        fixture.z.iter_mut().for_each(|v| *v *= 0.5);
+        fixture.b_proj.fill(0.0);
+        fixture.a_proj.fill(0.5);
+        fixture.dt_bias.fill(0.0);
+        fixture.a_log.fill(3.0);
+        fixture.conv1d_weight.iter_mut().for_each(|v| *v *= 0.5);
+        fixture
     }
 }
 
@@ -229,9 +280,275 @@ fn max_err_with_index(lhs: &[f32], rhs: &[f32]) -> (usize, f32) {
         .expect("non-empty slices")
 }
 
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn max_rel_err(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter()
+        .zip(rhs.iter())
+        .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1.0e-6))
+        .fold(0.0, f32::max)
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn max_rel_err_qkv_range(
+    lhs: &[f32],
+    rhs: &[f32],
+    params: LinearAttentionParams,
+    start: usize,
+    len: usize,
+) -> f32 {
+    let qkv_dim = qkv_dim(params);
+    let mut err = 0.0_f32;
+    for token in 0..(params.batch * params.seq_len) {
+        let base = token * qkv_dim + start;
+        err = err.max(max_rel_err(&lhs[base..base + len], &rhs[base..base + len]));
+    }
+    err
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn compare_cpu_cuda_device_linear_attention(
+    params: LinearAttentionParams,
+    fixture: &LinearAttentionFixture,
+    label: &str,
+    rel_tol: f32,
+) -> Result<()> {
+    let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
+    let z_shape = [params.batch, params.seq_len, z_dim(params)];
+    let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+
+    let nvrtc_started = Instant::now();
+    let Ok(cuda_backend) = CudaBackend::new(0) else {
+        eprintln!("skipping {label}: no CUDA device");
+        return Ok(());
+    };
+    eprintln!(
+        "{label} stage=nvrtc_build seconds={:.3}",
+        nvrtc_started.elapsed().as_secs_f64()
+    );
+
+    let cpu_started = Instant::now();
+    let mut cpu_store = TensorStore::default();
+    let mut cpu_tape = Tape::new();
+    let cpu_qkv = cpu_store.from_slice(&fixture.qkv, &qkv_shape)?;
+    let cpu_z = cpu_store.from_slice(&fixture.z, &z_shape)?;
+    let cpu_b = cpu_store.from_slice(&fixture.b_proj, &head_shape)?;
+    let cpu_a = cpu_store.from_slice(&fixture.a_proj, &head_shape)?;
+    let cpu_conv = cpu_store.from_slice(
+        &fixture.conv1d_weight,
+        &[qkv_dim(params), params.conv_kernel],
+    )?;
+    let cpu_dt = cpu_store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+    let cpu_a_log = cpu_store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+    let cpu_norm = cpu_store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+    let cpu_coeff = cpu_store.from_slice(&fixture.coeff, &z_shape)?;
+    for tensor_id in [
+        cpu_qkv, cpu_z, cpu_b, cpu_a, cpu_conv, cpu_dt, cpu_a_log, cpu_norm,
+    ] {
+        cpu_store
+            .get_mut(tensor_id)
+            .expect("cpu tensor exists")
+            .requires_grad = true;
+    }
+    let cpu_out = linear_attention_core(
+        cpu_qkv,
+        cpu_z,
+        cpu_b,
+        cpu_a,
+        cpu_conv,
+        cpu_dt,
+        cpu_a_log,
+        cpu_norm,
+        params,
+        &mut cpu_store,
+        &mut cpu_tape,
+    )?;
+    let cpu_weighted = mul(cpu_out, cpu_coeff, &mut cpu_store, &mut cpu_tape)?;
+    let cpu_loss = sum(cpu_weighted, &mut cpu_store, &mut cpu_tape)?;
+    let cpu_grads = cpu_tape.backward(cpu_loss, &mut cpu_store)?;
+    let cpu_out_host = cpu_store.to_host(cpu_out)?;
+    let cpu_qkv_grad = cpu_store.to_host(*cpu_grads.get(&cpu_qkv).expect("cpu qkv grad"))?;
+    let _cpu_z_grad = cpu_store.to_host(*cpu_grads.get(&cpu_z).expect("cpu z grad"))?;
+    let cpu_b_grad = cpu_store.to_host(*cpu_grads.get(&cpu_b).expect("cpu b grad"))?;
+    let cpu_a_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a).expect("cpu a grad"))?;
+    let cpu_conv_grad = cpu_store.to_host(*cpu_grads.get(&cpu_conv).expect("cpu conv grad"))?;
+    let cpu_dt_grad = cpu_store.to_host(*cpu_grads.get(&cpu_dt).expect("cpu dt grad"))?;
+    let cpu_a_log_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a_log).expect("cpu a_log grad"))?;
+    let cpu_norm_grad = cpu_store.to_host(*cpu_grads.get(&cpu_norm).expect("cpu norm grad"))?;
+    eprintln!(
+        "{label} stage=cpu_fwd_bwd seconds={:.3}",
+        cpu_started.elapsed().as_secs_f64()
+    );
+
+    let cuda_started = Instant::now();
+    let mut cuda_store = TensorStore::with_backend(Arc::new(cuda_backend));
+    let mut cuda_tape = Tape::new();
+    let cuda_qkv = cuda_store.from_slice(&fixture.qkv, &qkv_shape)?;
+    let cuda_z = cuda_store.from_slice(&fixture.z, &z_shape)?;
+    let cuda_b = cuda_store.from_slice(&fixture.b_proj, &head_shape)?;
+    let cuda_a = cuda_store.from_slice(&fixture.a_proj, &head_shape)?;
+    let cuda_conv = cuda_store.from_slice(
+        &fixture.conv1d_weight,
+        &[qkv_dim(params), params.conv_kernel],
+    )?;
+    let cuda_dt = cuda_store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+    let cuda_a_log = cuda_store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+    let cuda_norm = cuda_store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+    let cuda_coeff = cuda_store.from_slice(&fixture.coeff, &z_shape)?;
+    for tensor_id in [
+        cuda_qkv, cuda_z, cuda_b, cuda_a, cuda_conv, cuda_dt, cuda_a_log, cuda_norm, cuda_coeff,
+    ] {
+        cuda_store.ensure_device(tensor_id)?;
+    }
+    cuda_store.backend().device_synchronize()?;
+    eprintln!(
+        "{label} stage=cuda_upload seconds={:.3}",
+        cuda_started.elapsed().as_secs_f64()
+    );
+    for tensor_id in [
+        cuda_qkv, cuda_z, cuda_b, cuda_a, cuda_conv, cuda_dt, cuda_a_log, cuda_norm,
+    ] {
+        cuda_store
+            .get_mut(tensor_id)
+            .expect("cuda tensor exists")
+            .requires_grad = true;
+    }
+    let cuda_forward_started = Instant::now();
+    let cuda_out = linear_attention_core(
+        cuda_qkv,
+        cuda_z,
+        cuda_b,
+        cuda_a,
+        cuda_conv,
+        cuda_dt,
+        cuda_a_log,
+        cuda_norm,
+        params,
+        &mut cuda_store,
+        &mut cuda_tape,
+    )?;
+    cuda_store.backend().device_synchronize()?;
+    eprintln!(
+        "{label} stage=cuda_forward seconds={:.3}",
+        cuda_forward_started.elapsed().as_secs_f64()
+    );
+    let cuda_loss_started = Instant::now();
+    let cuda_weighted = mul(cuda_out, cuda_coeff, &mut cuda_store, &mut cuda_tape)?;
+    let cuda_loss = sum(cuda_weighted, &mut cuda_store, &mut cuda_tape)?;
+    cuda_store.backend().device_synchronize()?;
+    eprintln!(
+        "{label} stage=cuda_loss_graph seconds={:.3}",
+        cuda_loss_started.elapsed().as_secs_f64()
+    );
+    let cuda_backward_started = Instant::now();
+    let cuda_grads = cuda_tape.backward(cuda_loss, &mut cuda_store)?;
+    cuda_store.backend().device_synchronize()?;
+    eprintln!(
+        "{label} stage=cuda_backward seconds={:.3}",
+        cuda_backward_started.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "{label} stage=cuda_fwd_bwd seconds={:.3}",
+        cuda_started.elapsed().as_secs_f64()
+    );
+    for (name, id) in [
+        ("qkv", cuda_qkv),
+        ("z", cuda_z),
+        ("b_proj", cuda_b),
+        ("a_proj", cuda_a),
+        ("conv1d_weight", cuda_conv),
+        ("dt_bias", cuda_dt),
+        ("a_log", cuda_a_log),
+        ("norm_weight", cuda_norm),
+    ] {
+        let grad_id = *cuda_grads.get(&id).expect("cuda grad exists");
+        let grad = cuda_store.get(grad_id).expect("cuda grad tensor exists");
+        assert!(
+            grad.dirty != Dirty::Host && grad.device_handle.is_some(),
+            "{label} {name} grad fell back to host"
+        );
+    }
+
+    let compare_started = Instant::now();
+    let cuda_out_host = cuda_store.to_host(cuda_out)?;
+    let cuda_qkv_grad = cuda_store.to_host(*cuda_grads.get(&cuda_qkv).expect("cuda qkv grad"))?;
+    let cuda_z_grad = cuda_store.to_host(*cuda_grads.get(&cuda_z).expect("cuda z grad"))?;
+    let cuda_b_grad = cuda_store.to_host(*cuda_grads.get(&cuda_b).expect("cuda b grad"))?;
+    let cuda_a_grad = cuda_store.to_host(*cuda_grads.get(&cuda_a).expect("cuda a grad"))?;
+    let cuda_conv_grad =
+        cuda_store.to_host(*cuda_grads.get(&cuda_conv).expect("cuda conv grad"))?;
+    let cuda_dt_grad = cuda_store.to_host(*cuda_grads.get(&cuda_dt).expect("cuda dt grad"))?;
+    let cuda_a_log_grad =
+        cuda_store.to_host(*cuda_grads.get(&cuda_a_log).expect("cuda a_log grad"))?;
+    let cuda_norm_grad =
+        cuda_store.to_host(*cuda_grads.get(&cuda_norm).expect("cuda norm grad"))?;
+
+    let q_dim = params.num_key_heads * params.key_dim;
+    let v_dim = params.num_value_heads * params.value_dim;
+    let output_abs_err = max_abs_err(&cuda_out_host, &cpu_out_host);
+    eprintln!("{label} out max_abs_err={output_abs_err:.6e}");
+    assert!(
+        output_abs_err.is_finite(),
+        "{label} output error is non-finite"
+    );
+
+    let checks = [
+        (
+            "dq",
+            max_rel_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, 0, q_dim),
+        ),
+        (
+            "dk",
+            max_rel_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, q_dim, q_dim),
+        ),
+        (
+            "dv",
+            max_rel_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, q_dim * 2, v_dim),
+        ),
+        ("dbeta", max_rel_err(&cuda_b_grad, &cpu_b_grad)),
+        ("dg", max_rel_err(&cuda_a_grad, &cpu_a_grad)),
+        ("da_log", max_rel_err(&cuda_a_log_grad, &cpu_a_log_grad)),
+        ("dnorm", max_rel_err(&cuda_norm_grad, &cpu_norm_grad)),
+        ("dconv", max_rel_err(&cuda_conv_grad, &cpu_conv_grad)),
+    ];
+    for (name, err) in checks {
+        eprintln!("{label} {name} max_rel_err={err:.6e}");
+        assert!(err.is_finite(), "{label} {name} error is non-finite");
+        assert!(
+            err <= rel_tol,
+            "{label} {name} max rel err {err} > {rel_tol}"
+        );
+    }
+    let ddt_rel = max_rel_err(&cuda_dt_grad, &cpu_dt_grad);
+    assert!(
+        ddt_rel.is_finite() && ddt_rel <= rel_tol,
+        "{label} ddt_bias max rel err {ddt_rel} > {rel_tol}"
+    );
+    for (name, values) in [
+        ("cuda_out", &cuda_out_host),
+        ("cuda_dqkv", &cuda_qkv_grad),
+        ("cuda_dz", &cuda_z_grad),
+        ("cuda_dbeta", &cuda_b_grad),
+        ("cuda_da", &cuda_a_grad),
+        ("cuda_dconv", &cuda_conv_grad),
+        ("cuda_ddt_bias", &cuda_dt_grad),
+        ("cuda_dA_log", &cuda_a_log_grad),
+        ("cuda_dnorm", &cuda_norm_grad),
+    ] {
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "{label} {name} contains non-finite values"
+        );
+    }
+    eprintln!(
+        "{label} stage=analytic_compare seconds={:.3}",
+        compare_started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 #[test]
 fn linear_attention_grad_matches_numeric() -> Result<()> {
-    let params = tiny_params();
+    let params = host_gradcheck_params();
     let fixture = LinearAttentionFixture::new(params);
     let (
         _,
@@ -807,4 +1124,30 @@ fn cuda_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     assert!(max_abs_err(&cuda_norm_grad, &cpu_norm_grad) <= 1.0e-3);
 
     Ok(())
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_qwen35_chunked_grad_matches_cpu() -> Result<()> {
+    let params = qwen35_chunked_params(80);
+    let fixture = LinearAttentionFixture::new(params);
+    compare_cpu_cuda_device_linear_attention(
+        params,
+        &fixture,
+        "cuda qwen35 chunked linear_attention",
+        2.0e-2,
+    )
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_hard_forget_grad_matches_cpu_and_stays_finite() -> Result<()> {
+    let params = qwen35_chunked_params(64);
+    let fixture = LinearAttentionFixture::hard_forget(params);
+    compare_cpu_cuda_device_linear_attention(
+        params,
+        &fixture,
+        "cuda qwen35 hard-forget linear_attention",
+        2.0e-2,
+    )
 }

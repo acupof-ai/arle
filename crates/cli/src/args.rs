@@ -47,6 +47,16 @@ fn parse_positive_temperature(value: &str) -> Result<f32, String> {
     Ok(parsed)
 }
 
+fn parse_unit_interval(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("expected a finite number, got '{value}'"))?;
+    if parsed.is_finite() && (0.0..=1.0).contains(&parsed) {
+        return Ok(parsed);
+    }
+    Err("value must be finite and in [0.0, 1.0]".to_string())
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum TracePromptsMode {
     On,
@@ -698,6 +708,18 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = 1.0, value_parser = parse_positive_temperature)]
     pub(crate) kl_temperature: f32,
 
+    /// Generalized JSD beta in [0,1]. Unset keeps --kl-direction.
+    #[arg(long, value_parser = parse_unit_interval)]
+    pub(crate) kl_beta: Option<f32>,
+
+    /// Sparse teacher target top-k. Requires H20 Piece A engine-side top-k.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) teacher_topk: Option<usize>,
+
+    /// Revert windowed Route-B KL to dense logits+KL instead of fused lm_head+loss.
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_fused_distill: bool,
+
     /// KL token mask. Completion-only matches the validated GKD/OPD recipe.
     #[arg(long, value_enum, default_value_t = OpdKlMaskArg::Completion)]
     pub(crate) kl_mask: OpdKlMaskArg,
@@ -833,6 +855,14 @@ pub(crate) struct TrainSelfOpdArgs {
     /// KL softening temperature (>0). Values other than 1.0 are pure-OPD only.
     #[arg(long, default_value_t = 1.0, value_parser = parse_positive_temperature)]
     pub(crate) kl_temperature: f32,
+
+    /// Generalized JSD beta in [0,1]. Unset keeps --kl-direction.
+    #[arg(long, value_parser = parse_unit_interval)]
+    pub(crate) kl_beta: Option<f32>,
+
+    /// Sparse teacher target top-k. Requires H20 Piece A engine-side top-k.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) teacher_topk: Option<usize>,
 
     /// Total SOPD training steps.
     #[arg(long, default_value_t = 5)]
@@ -1203,6 +1233,8 @@ mod tests {
             "5",
             "--kl-temperature",
             "2.0",
+            "--kl-beta",
+            "0.5",
             "--kl-mask",
             "full",
             "--prompts-file",
@@ -1233,6 +1265,9 @@ mod tests {
         assert_eq!(opd.gkd_lambda, 0.0);
         assert_eq!(opd.sft_anchor, OpdSftAnchorArg::StudentRollout);
         assert_eq!(opd.kl_temperature, 2.0);
+        assert_eq!(opd.kl_beta, Some(0.5));
+        assert_eq!(opd.teacher_topk, None);
+        assert!(!opd.no_fused_distill);
         assert_eq!(opd.kl_mask, OpdKlMaskArg::Full);
         assert_eq!(
             opd.prompts_file.as_deref(),
@@ -1270,6 +1305,50 @@ mod tests {
         assert_eq!(opd.lr_schedule, LrScheduleArg::Fixed);
         assert_eq!(opd.lr_warmup_steps, None);
         assert_eq!(opd.sft_anchor, OpdSftAnchorArg::StudentRollout);
+        assert_eq!(opd.kl_beta, None);
+        assert_eq!(opd.teacher_topk, None);
+        assert!(!opd.no_fused_distill);
+    }
+
+    #[test]
+    fn accepts_train_opd_teacher_topk_flag() {
+        let args = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--teacher-topk",
+            "64",
+        ])
+        .expect("train opd teacher top-k flag should parse");
+        let Some(CliCommand::Train(train)) = args.command else {
+            panic!("expected train command");
+        };
+        let TrainCommand::Opd(opd) = train.command else {
+            panic!("expected train opd command");
+        };
+        assert_eq!(opd.teacher_topk, Some(64));
+    }
+
+    #[test]
+    fn accepts_train_opd_no_fused_distill_flag() {
+        let args = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--no-fused-distill",
+        ])
+        .expect("train opd no-fused-distill flag should parse");
+        let Some(CliCommand::Train(train)) = args.command else {
+            panic!("expected train command");
+        };
+        let TrainCommand::Opd(opd) = train.command else {
+            panic!("expected train opd command");
+        };
+        assert!(opd.no_fused_distill);
     }
 
     #[test]
@@ -1328,6 +1407,8 @@ mod tests {
         );
         assert_eq!(opd.save_every, 3);
         assert_eq!(opd.kl_temperature, 1.0);
+        assert_eq!(opd.kl_beta, None);
+        assert_eq!(opd.teacher_topk, None);
         assert_eq!(opd.lr_schedule, LrScheduleArg::Cosine);
         assert_eq!(opd.lr_warmup_steps, Some(9));
     }
@@ -1346,6 +1427,38 @@ mod tests {
         .err()
         .expect("zero KL temperature should be rejected");
         assert!(err.to_string().contains("temperature must be > 0.0"));
+    }
+
+    #[test]
+    fn rejects_train_opd_kl_beta_outside_unit_interval() {
+        let err = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--kl-beta",
+            "1.1",
+        ])
+        .err()
+        .expect("out-of-range KL beta should be rejected");
+        assert!(err.to_string().contains("[0.0, 1.0]"));
+    }
+
+    #[test]
+    fn rejects_train_opd_zero_teacher_topk() {
+        let err = Args::try_parse_from([
+            "arle",
+            "train",
+            "opd",
+            "--student-model",
+            "models/qwen",
+            "--teacher-topk",
+            "0",
+        ])
+        .err()
+        .expect("zero teacher top-k should be rejected");
+        assert!(err.to_string().contains("at least 1"));
     }
 
     #[test]

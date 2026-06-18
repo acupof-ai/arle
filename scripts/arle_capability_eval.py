@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ARLE capability eval — minimal MMLU + GSM8K harness against an ARLE serve.
+"""ARLE capability eval — minimal capability harness against an ARLE serve.
 
 Talks to ARLE's OpenAI v1 surface (`/v1/chat/completions` or `/v1/completions`)
 exposed by `arle serve` / `infer`. Designed for the capability-eval plan
@@ -8,7 +8,7 @@ defined in `docs/plans/2026-05-22-arle-opd-capability-eval-plan.md` P0 phase:
     arle serve --backend cuda --model-path <path> --port 8123 &
     ARLE_BASE_URL=http://localhost:8123 \
       python scripts/arle_capability_eval.py \
-        --tasks mmlu,gsm8k \
+        --tasks mmlu,gsm8k,math500 \
         --n-samples 200 \
         --output bench-output/<dated-dir>/
 
@@ -19,9 +19,10 @@ harness's 50k LOC + heavy deps are overkill for the first capability data
 point on a freshly-distilled student. Once we have the baseline triplet,
 we can graduate to lm-eval if we need broader task coverage.
 
-Tasks supported (P0 cut):
+Tasks supported:
   - mmlu     — MMLU 5-shot exact-match on the answer letter (A/B/C/D)
   - gsm8k   — GSM8K 8-shot exact-match on the final numeric answer after `####`
+  - math500  — MATH-500 greedy exact-match on the final boxed answer
 
 Tasks deferred:
   - ifeval  — requires rule-based verifier set; ship in a later patch
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -77,6 +79,16 @@ def _parse_seed_list(raw: str | None) -> list[int] | None:
     if len(set(seeds)) != len(seeds):
         raise ValueError("--seeds must not contain duplicates")
     return seeds
+
+
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n == 0:
+        return (0.0, 1.0)
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
 
 
 # ───────────────────────── HTTP client ──────────────────────────
@@ -198,12 +210,20 @@ class HfTransformersClient:
         return self.completion(prompt, max_tokens=max_tokens, temperature=temperature)
 
 
-def build_client(backend: str, *, base_url: str | None, model_id: str | None, model_path: str | None, dtype: str = "bfloat16"):
+def build_client(
+    backend: str,
+    *,
+    base_url: str | None,
+    model_id: str | None,
+    model_path: str | None,
+    dtype: str = "bfloat16",
+    request_timeout: float = 120.0,
+):
     """Factory shared by CLI and tests so the eval-driver code stays backend-agnostic."""
     if backend == "arle":
         if not (base_url and model_id):
             raise ValueError("--backend arle requires --base-url and --model-id")
-        return ArleClient(base_url=base_url, model_id=model_id)
+        return ArleClient(base_url=base_url, model_id=model_id, timeout=request_timeout)
     if backend == "hf":
         if not model_path:
             raise ValueError("--backend hf requires --model-path")
@@ -448,6 +468,7 @@ def run_mmlu(
     elapsed = time.time() - t0
     scored = len(pool) - invalid
     accuracy = correct / scored if scored else 0.0
+    ci95 = _wilson_ci(correct, scored)
     report = {
         "task": "mmlu",
         "status": "ok",
@@ -469,6 +490,7 @@ def run_mmlu(
         "n_invalid": invalid,
         "n_correct": correct,
         "accuracy": accuracy,
+        "ci95": list(ci95),
         "elapsed_seconds": elapsed,
         "seed": seed,
         "per_subject": per_subject,
@@ -605,6 +627,7 @@ def run_gsm8k(
     elapsed = time.time() - t0
     scored = len(pool) - invalid
     accuracy = correct / scored if scored else 0.0
+    ci95 = _wilson_ci(correct, scored)
     report = {
         "task": "gsm8k",
         "status": "ok",
@@ -627,6 +650,7 @@ def run_gsm8k(
         "n_correct": correct,
         "n_shots": len(shot_examples),
         "accuracy": accuracy,
+        "ci95": list(ci95),
         "elapsed_seconds": elapsed,
         "seed": seed,
     }
@@ -638,12 +662,211 @@ def run_gsm8k(
     return report
 
 
+# ───────────────────────── MATH-500 ──────────────────────────────
+
+
+MATH500_PROMPT_TEMPLATE = (
+    "Problem:\n{problem}\n\n"
+    "Solve the problem. Put the final answer in \\boxed{{}}.\n"
+    "Solution:\n"
+)
+
+
+def _extract_last_braced(text: str, marker: str) -> str | None:
+    start = text.rfind(marker)
+    if start < 0:
+        return None
+    i = start + len(marker)
+    depth = 1
+    out: list[str] = []
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(out).strip()
+        out.append(ch)
+        i += 1
+    return None
+
+
+def _math_normalize_answer(answer: str) -> str:
+    s = answer.strip()
+    boxed = _extract_last_braced(s, "\\boxed{")
+    if boxed is not None:
+        s = boxed
+    s = s.strip("$")
+    for old, new in (
+        ("\\left", ""),
+        ("\\right", ""),
+        ("\\!", ""),
+        ("\\,", ""),
+        ("\\;", ""),
+        ("\\:", ""),
+        ("\\dfrac", "\\frac"),
+        ("\\tfrac", "\\frac"),
+    ):
+        s = s.replace(old, new)
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = s.replace(",", "")
+    s = re.sub(r"\s+", "", s)
+    s = s.rstrip(".")
+    return s.lower()
+
+
+def _math_gold_answer(example: dict) -> str:
+    raw = str(example.get("answer") or "")
+    if raw:
+        return _math_normalize_answer(raw)
+    boxed = _extract_last_braced(str(example.get("solution") or ""), "\\boxed{")
+    return _math_normalize_answer(boxed or "")
+
+
+def _math_extract_answer(text: str) -> str | None:
+    boxed = _extract_last_braced(text, "\\boxed{")
+    if boxed:
+        return _math_normalize_answer(boxed)
+    m = re.search(r"####\s*(.+)", text)
+    if m:
+        return _math_normalize_answer(m.group(1).splitlines()[0])
+    for pattern in (
+        r"final answer is\s*:?\s*(.+)",
+        r"answer is\s*:?\s*(.+)",
+        r"therefore\s*,?\s*(.+)",
+    ):
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        if matches:
+            return _math_normalize_answer(matches[-1].splitlines()[0])
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return _math_normalize_answer(lines[-1])
+
+
+def run_math500(
+    client: ArleClient,
+    n_samples: int,
+    output_dir: Path,
+    debug_samples: int = 5,
+    seed: int | None = None,
+    dataset_revision: str = DEFAULT_DATASET_REVISION,
+    max_tokens: int = 4096,
+) -> dict:
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        return {
+            "task": "math500",
+            "status": "skipped",
+            "reason": "datasets package not installed; pip install datasets",
+        }
+
+    print("[math500] loading dataset...", flush=True)
+    ds_test = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=dataset_revision)
+    indices = list(range(len(ds_test)))
+    if seed is not None:
+        random.Random(f"math500-{seed}").shuffle(indices)
+    pool = [ds_test[i] for i in indices[: min(n_samples, len(ds_test))]]
+    sample_fingerprint = _fingerprint_records([
+        {
+            "problem": ex.get("problem"),
+            "answer": ex.get("answer"),
+            "solution": ex.get("solution"),
+        }
+        for ex in pool
+    ])
+    seed_tag = f" seed={seed}" if seed is not None else ""
+    print(f"[math500] running {len(pool)} problems{seed_tag}", flush=True)
+
+    correct = 0
+    invalid = 0
+    debug_records: list[dict] = []
+    per_question: list[dict] = []
+    t0 = time.time()
+    for i, ex in enumerate(pool):
+        prompt = MATH500_PROMPT_TEMPLATE.format(problem=ex["problem"])
+        try:
+            resp = client.completion(prompt, max_tokens=max_tokens, temperature=0.0)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+            print(f"[math500] sample {i} request error: {exc}", flush=True)
+            invalid += 1
+            per_question.append({"i": i, "gold": None, "predicted": None, "status": "request_error"})
+            continue
+        gold = _math_gold_answer(ex)
+        pred = _math_extract_answer(resp)
+        status = "scored"
+        if pred is None or not gold:
+            invalid += 1
+            status = "extract_fail"
+        elif pred == gold:
+            correct += 1
+        per_question.append({
+            "i": i,
+            "gold": gold,
+            "predicted": pred,
+            "correct": pred == gold if pred is not None else False,
+            "status": status,
+        })
+        if i < debug_samples:
+            debug_records.append(
+                {
+                    "i": i,
+                    "gold": gold,
+                    "extracted": pred,
+                    "response_first_500": resp[:500],
+                }
+            )
+        if (i + 1) % 25 == 0:
+            print(
+                f"[math500] {i + 1}/{len(pool)} acc={correct / max(1, i + 1 - invalid):.3f}",
+                flush=True,
+            )
+
+    elapsed = time.time() - t0
+    scored = len(pool) - invalid
+    accuracy = correct / scored if scored else 0.0
+    ci95 = _wilson_ci(correct, scored)
+    report = {
+        "task": "math500",
+        "status": "ok",
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "final_result_contract": FINAL_RESULT_CONTRACT,
+        "dataset": {
+            "name": "HuggingFaceH4/MATH-500",
+            "split": "test",
+            "revision": dataset_revision,
+            "sample_fingerprint": sample_fingerprint,
+        },
+        "prompting": {
+            "shots": 0,
+            "answer_format": "final answer normalized from \\boxed{} or fallback final-answer text",
+        },
+        "n_samples": len(pool),
+        "n_scored": scored,
+        "n_invalid": invalid,
+        "n_correct": correct,
+        "accuracy": accuracy,
+        "ci95": list(ci95),
+        "elapsed_seconds": elapsed,
+        "seed": seed,
+    }
+    (output_dir / "math500.json").write_text(json.dumps(report, indent=2))
+    if debug_records:
+        (output_dir / "math500_debug.json").write_text(json.dumps(debug_records, indent=2))
+    (output_dir / "math500_perquestion.json").write_text(json.dumps(per_question, indent=2))
+    print(f"[math500] accuracy={accuracy:.3f} ({correct}/{scored}, invalid={invalid}, {elapsed:.1f}s)", flush=True)
+    return report
+
+
 # ───────────────────────── CLI ──────────────────────────────────
 
 
 TASK_RUNNERS = {
     "mmlu": run_mmlu,
     "gsm8k": run_gsm8k,
+    "math500": run_math500,
 }
 
 
@@ -661,6 +884,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
         "dataset_revisions": {
             "mmlu": args.mmlu_revision,
             "gsm8k": args.gsm8k_revision,
+            "math500": args.math500_revision,
         },
         "tasks": {},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -686,6 +910,15 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 dataset_revision=args.mmlu_revision,
                 max_tokens=args.mmlu_max_tokens,
             )
+        elif task == "math500":
+            report = run_math500(
+                client,
+                args.n_samples,
+                output_dir,
+                seed=seed,
+                dataset_revision=args.math500_revision,
+                max_tokens=args.math_max_tokens,
+            )
         else:
             report = TASK_RUNNERS[task](client, args.n_samples, output_dir, seed=seed)
         summary["tasks"][task] = report
@@ -699,7 +932,9 @@ def _print_summary(summary: dict) -> None:
     print("\n========== summary ==========", flush=True)
     for task, report in summary["tasks"].items():
         if report["status"] == "ok":
-            print(f"  {task}: {report['accuracy']:.3f} ({report['n_correct']}/{report['n_scored']})")
+            ci = report.get("ci95")
+            suffix = f" CI95=[{ci[0]:.3f}, {ci[1]:.3f}]" if ci else ""
+            print(f"  {task}: {report['accuracy']:.3f} ({report['n_correct']}/{report['n_scored']}){suffix}")
         else:
             print(f"  {task}: {report['status']} - {report.get('reason', '')}")
 
@@ -717,6 +952,8 @@ def main(argv: list[str]) -> int:
                         help="--backend hf only: HF model directory (or HF repo id)")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
                         help="--backend hf only")
+    parser.add_argument("--request-timeout", type=float, default=1800.0,
+                        help="HTTP request timeout in seconds for --backend arle")
     parser.add_argument("--tasks", default="mmlu,gsm8k", help="comma-separated subset of: " + ", ".join(TASK_RUNNERS))
     parser.add_argument("--n-samples", type=int, default=200, help="samples per task")
     parser.add_argument("--gsm8k-shots", type=int, default=8, help="few-shot examples for GSM8K")
@@ -724,6 +961,8 @@ def main(argv: list[str]) -> int:
                         help="generation budget for GSM8K (reasoning). 2048 covers base-model CoT; "
                              "raise to >=10K for thinking-mode models with long reasoning traces. "
                              "The old hardcoded 256 truncated longer chains before the #### answer.")
+    parser.add_argument("--math-max-tokens", type=int, default=4096,
+                        help="generation budget for MATH-500 greedy reasoning; OPD A/B uses >=4096.")
     parser.add_argument("--mmlu-max-tokens", type=int, default=32,
                         help="generation budget for MMLU (single-letter answer); 32 is ample.")
     parser.add_argument("--seed", type=int, default=None,
@@ -732,17 +971,26 @@ def main(argv: list[str]) -> int:
                              "Default unset = original deterministic ordering, reproduces older runs.")
     parser.add_argument("--seeds", default=None,
                         help="comma-separated seed list. When set, writes seed_<N>/ subdirectories "
-                             "compatible with scripts/analyze_multi_seed.py.")
+                             "compatible with scripts/analyze_multi_seed.py. Do not use for full "
+                             "deterministic MATH-500; use training-seed checkpoints instead.")
     parser.add_argument("--mmlu-revision", default=os.environ.get("ARLE_MMLU_REVISION", DEFAULT_DATASET_REVISION),
                         help="Hugging Face revision for cais/mmlu")
     parser.add_argument("--gsm8k-revision", default=os.environ.get("ARLE_GSM8K_REVISION", DEFAULT_DATASET_REVISION),
                         help="Hugging Face revision for openai/gsm8k")
+    parser.add_argument("--math500-revision", default=os.environ.get("ARLE_MATH500_REVISION", DEFAULT_DATASET_REVISION),
+                        help="Hugging Face revision for HuggingFaceH4/MATH-500")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    client = build_client(args.backend, base_url=args.base_url, model_id=args.model_id,
-                          model_path=args.model_path, dtype=args.dtype)
+    client = build_client(
+        args.backend,
+        base_url=args.base_url,
+        model_id=args.model_id,
+        model_path=args.model_path,
+        dtype=args.dtype,
+        request_timeout=args.request_timeout,
+    )
 
     requested = [t.strip() for t in args.tasks.split(",") if t.strip()]
     unknown = [t for t in requested if t not in TASK_RUNNERS]
@@ -757,6 +1005,13 @@ def main(argv: list[str]) -> int:
         return 2
     if seeds is not None and args.seed is not None:
         print("--seed and --seeds are mutually exclusive", file=sys.stderr)
+        return 2
+    if seeds is not None and requested == ["math500"] and args.n_samples >= 500:
+        print(
+            "full deterministic MATH-500 uses one greedy eval and Wilson CI; "
+            "use separate training-seed checkpoints for variance",
+            file=sys.stderr,
+        )
         return 2
 
     if seeds is None:
@@ -776,6 +1031,7 @@ def main(argv: list[str]) -> int:
         "dataset_revisions": {
             "mmlu": args.mmlu_revision,
             "gsm8k": args.gsm8k_revision,
+            "math500": args.math500_revision,
         },
         "tasks": requested,
         "per_seed": {},
@@ -792,6 +1048,7 @@ def main(argv: list[str]) -> int:
                 "n_correct": report.get("n_correct"),
                 "n_scored": report.get("n_scored"),
                 "n_invalid": report.get("n_invalid"),
+                "ci95": report.get("ci95"),
             }
             for task, report in summary["tasks"].items()
         }
