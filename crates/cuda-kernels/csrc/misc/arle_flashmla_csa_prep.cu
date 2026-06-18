@@ -205,7 +205,105 @@ __global__ void arle_hca_build_indices_kernel(
     }
 }
 
-}  // namespace (HCA helpers)
+// Chain-verify sparse indices. Rows are the top-1 verify chain only:
+//   positions[token] = absolute position for this row
+//   ancestors[token, :] = prefix chunk rows [0, token), -1 padded
+//
+// Pool layout is still [SW cache | chunk K | compressed]. Row layout:
+//   committed SW offsets | prefix ancestors + self | compressed part | -1 tail.
+// This keeps D2/T2 at depth+1 rows and lets one FlashMLA sparse call verify the
+// whole chain chunk without writing the slot's rolling SW cache.
+__global__ void arle_chain_verify_build_indices_kernel(
+        int32_t* __restrict__ indices,
+        int32_t* __restrict__ topk_length,
+        const int32_t* __restrict__ positions,
+        const int32_t* __restrict__ ancestors,
+        int max_anc,
+        const int32_t* __restrict__ selected,
+        int s_q,
+        int start_pos,
+        int sw_window,
+        int index_topk,
+        int max_compressed,
+        int topk_unified,
+        int n_tokens,
+        int compressed_count,
+        int compress_ratio) {
+    int token = blockIdx.x;
+    if (token >= s_q) return;
+
+    const int abs_pos = positions[token];
+    const int sw_start = max(0, abs_pos + 1 - sw_window);
+    const int committed = max(0, start_pos - sw_start);
+    const int sw_base = max(0, start_pos - sw_window);
+
+    int32_t* row = indices + (size_t)token * topk_unified;
+
+    for (int j = threadIdx.x; j < committed; j += blockDim.x) {
+        int p = sw_start + j;
+        row[j] = p - sw_base;
+    }
+
+    int anc = 0;
+    if (threadIdx.x == 0) {
+        const int32_t* anc_row = ancestors + (size_t)token * max_anc;
+        for (int j = 0; j < max_anc; ++j) {
+            int32_t a = anc_row[j];
+            if (a < 0) break;
+            row[committed + anc] = sw_window + a;
+            ++anc;
+        }
+        row[committed + anc] = sw_window + token;
+    }
+    __syncthreads();
+
+    {
+        int count = 0;
+        const int32_t* anc_row = ancestors + (size_t)token * max_anc;
+        for (int j = 0; j < max_anc; ++j) {
+            if (anc_row[j] < 0) break;
+            ++count;
+        }
+        anc = count;
+    }
+    const int chunk_part = anc + 1;
+    const int comp_base_in_pool = sw_window + n_tokens;
+    const int window_part = committed + chunk_part;
+
+    int comp_part = 0;
+    if (selected != nullptr) {
+        comp_part = index_topk;
+        const int32_t* sel = selected + (size_t)token * index_topk;
+        for (int k = threadIdx.x; k < index_topk; k += blockDim.x) {
+            int32_t c = sel[k];
+            bool valid = (c >= 0) && (c < compressed_count);
+            if (valid && compress_ratio > 0) {
+                int block_end = c * compress_ratio + (compress_ratio - 1);
+                if (block_end > abs_pos) valid = false;
+            }
+            row[window_part + k] = valid ? (comp_base_in_pool + c) : -1;
+        }
+    } else if (max_compressed > 0) {
+        int comp_keys = (compress_ratio > 0) ? (abs_pos / compress_ratio) : 0;
+        if (comp_keys > compressed_count) comp_keys = compressed_count;
+        if (comp_keys < 0) comp_keys = 0;
+        comp_part = comp_keys;
+        for (int k = threadIdx.x; k < comp_keys; k += blockDim.x) {
+            row[window_part + k] = comp_base_in_pool + k;
+        }
+    }
+
+    int pad_start = window_part + comp_part;
+    for (int k = pad_start + threadIdx.x; k < topk_unified; k += blockDim.x) {
+        row[k] = -1;
+    }
+
+    if (threadIdx.x == 0) {
+        topk_length[token] = pad_start;
+    }
+}
+
+}  // namespace (FlashMLA index helpers)
 
 extern "C" {
 
@@ -319,6 +417,41 @@ cudaError_t arle_flashmla_hca_build_indices(
         indices, topk_length,
         s_q, start_pos, sw_window, topk_unified,
         /*n_tokens=*/s_q, compressed_count, compress_ratio, sw_base);
+    return cudaGetLastError();
+}
+
+cudaError_t arle_flashmla_chain_verify_build_indices(
+        int32_t* indices,
+        int32_t* topk_length,
+        const int32_t* positions,
+        const int32_t* ancestors,
+        int max_anc,
+        const int32_t* selected,
+        int s_q,
+        int start_pos,
+        int sw_window,
+        int index_topk,
+        int max_compressed,
+        int topk_unified,
+        int compressed_count,
+        int compress_ratio,
+        cudaStream_t stream) {
+    if (s_q <= 0) return cudaSuccess;
+    if (sw_window <= 0 || index_topk < 0 || max_compressed < 0 ||
+        compressed_count < 0 || start_pos < 0 || max_anc < 0 ||
+        positions == nullptr || (ancestors == nullptr && max_anc > 0)) {
+        return cudaErrorInvalidValue;
+    }
+    if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;
+    const int comp_cap = (selected != nullptr) ? index_topk : max_compressed;
+    if (sw_window + max_anc + 1 + comp_cap > topk_unified) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kBlock = 128;
+    arle_chain_verify_build_indices_kernel<<<s_q, kBlock, 0, stream>>>(
+        indices, topk_length, positions, ancestors, max_anc, selected,
+        s_q, start_pos, sw_window, index_topk, max_compressed, topk_unified,
+        /*n_tokens=*/s_q, compressed_count, compress_ratio);
     return cudaGetLastError();
 }
 
