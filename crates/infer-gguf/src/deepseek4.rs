@@ -173,6 +173,14 @@ pub fn dsv4_config_from_gguf(g: &GgufFile) -> Result<DeepSeekV4Config> {
         pad_token_id: g
             .get_u64("tokenizer.ggml.padding_token_id")
             .and_then(|v| u32::try_from(v).ok()),
+        // GLM-5.2 dialect extensions: unused on the DSv4 GGUF path.
+        kv_lora_rank: 0,
+        qk_nope_head_dim: 0,
+        v_head_dim: 0,
+        plain_o_proj: false,
+        per_layer_attention_mode: None,
+        per_layer_dense_mlp: None,
+        per_layer_full_indexer: None,
     };
     config
         .validate()
