@@ -1255,40 +1255,6 @@ fn validate_dsv4_prefill_kv_view(
     Ok(())
 }
 
-/// Gate for the layer-major batched DSv4 decode path. Default ON since the
-/// 2026-06-15 N=4 flip (see the in-body note), so the `arle serve
-/// --dsv4-batched-decode` CLI flag is now a no-op — the lane is on by default.
-/// Force the per-row byte-identical reference with `INFER_DSV4_BATCHED_DECODE=0`.
-fn dsv4_batched_decode_enabled() -> bool {
-    // Default ON (2026-06-15 N=4 flip): the no-MTP decode path auto-batches at
-    // `rows >= dsv4_batched_decode_min_rows()`. `--spec-type` defaults to None, so
-    // the DEFAULT serve takes the batched lane at c>=4 (the +58% @c=8 win) with no
-    // env var and no MTP-state risk (the gate also requires `!spec`; batched+MTP
-    // reconciliation stays deferred). Force the per-row byte-identical reference
-    // with `INFER_DSV4_BATCHED_DECODE=0`.
-    match std::env::var("INFER_DSV4_BATCHED_DECODE") {
-        Ok(v) => !matches!(
-            v.as_str(),
-            "0" | "false" | "FALSE" | "no" | "off" | "OFF" | ""
-        ),
-        Err(_) => true,
-    }
-}
-
-/// Minimum concurrent decode rows for the batched lane (default 4 = the N=4
-/// crossover ckl licensed: batched amortization overtakes MTP's c-independent
-/// ~2×/row at c>=3 prod / c>=4 short, [c-sweep]
-/// (docs/experience/wins/2026-06-14-dsv4-batched-decode-csweep-threshold-n4.md)).
-/// Below this the per-row path runs. Clamped to >=2 (single-row never batches).
-/// `INFER_DSV4_BATCHED_DECODE_MIN_ROWS`.
-fn dsv4_batched_decode_min_rows() -> usize {
-    std::env::var("INFER_DSV4_BATCHED_DECODE_MIN_ROWS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|&v| v >= 2)
-        .unwrap_or(4)
-}
-
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -1636,19 +1602,17 @@ impl Dsv4CudaExecutor {
                 && batch.positions.len() == batch.rows.len(),
             "DSv4 decode batch surface length mismatch"
         );
-        // Cross-slot batched MTP decode (batched-MTP Stage 1). Default ON:
-        // when spec is on and the batch has `>= dsv4_batched_decode_min_rows()`
-        // rows, drive all N chains through one batched verify (MoE grouped over
-        // the verify rows, attention per-slot) instead of the per-row
-        // `spec_step` loop. Force the per-row reference with
-        // `ARLE_DSV4_BATCHED_MTP=0`; c<N still falls through below.
+        if batch.rows.len() == 1 {
+            return self.forward_decode_row(&batch.rows[0]);
+        }
+
+        // Cross-slot batched MTP decode (batched-MTP Stage 1). B=1 already took
+        // the single-row path above; B>1 drives all N chains through one batched
+        // verify (MoE grouped over the verify rows, attention per-slot) instead
+        // of the per-row `spec_step` loop.
         let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
-        if spec_on
-            && all_greedy
-            && crate::dsv4::dsv4_batched_mtp_enabled()
-            && batch.rows.len() >= dsv4_batched_decode_min_rows()
-        {
+        if spec_on && all_greedy {
             for row in &batch.rows {
                 ensure!(
                     row.params.is_greedy(),
@@ -1664,8 +1628,7 @@ impl Dsv4CudaExecutor {
                     row.slot
                 );
             }
-            let committed =
-                self.spec_step_batched(&batch.slot_ids, &batch.start_positions, &batch.positions)?;
+            let committed = self.spec_step_batched(&batch.slot_ids, &batch.start_positions)?;
             ensure!(
                 committed.len() == batch.rows.len(),
                 "DSv4 batched MTP returned {} chains for {} rows",
@@ -1687,52 +1650,41 @@ impl Dsv4CudaExecutor {
         }
 
         // True batched decode (layer-major driver, batched attention + grouped
-        // MoE). Default ON at `rows >= dsv4_batched_decode_min_rows()` (N=4); below
-        // the threshold and under `--spec-type mtp` the per-row loop below runs
-        // (the byte-identical reference / the MTP spec path). Only the multi-row,
-        // non-spec path batches.
-        if dsv4_batched_decode_enabled()
-            && batch.rows.len() >= dsv4_batched_decode_min_rows()
-            && !spec_on
-        {
-            let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
-            let out = self.model.forward_decode_batch(
-                &mut self.slots,
-                &mut self.kv_adapter,
-                &batch.slot_ids,
-                &batch.tokens,
-                &batch.start_positions,
-                &batch.positions,
-                &params,
-            )?;
-            ensure!(
-                out.len() == batch.rows.len(),
-                "DSv4 batched decode returned {} tokens for {} rows",
-                out.len(),
-                batch.rows.len()
-            );
-            return Ok(batch
-                .slot_ids
-                .iter()
-                .zip(out)
-                .map(|(&slot, token)| SlotToken {
-                    slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                })
-                .collect());
+        // MoE). B=1 is the single-row reference above; B>1 always batches. If
+        // spec was requested but sampling is not greedy, disable spec state for
+        // these rows and use the same normal batched decode lane.
+        if spec_on {
+            for row in &batch.rows {
+                self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
+            }
         }
-
-        let mut tokens = Vec::with_capacity(batch.rows.len());
-        for (idx, row) in batch.rows.iter().enumerate() {
-            debug_assert_eq!(batch.slot_ids[idx], row.slot);
-            debug_assert_eq!(batch.tokens[idx], row.last_token);
-            debug_assert_eq!(batch.start_positions[idx], row.start_pos);
-            debug_assert_eq!(batch.positions[idx], row.position);
-            tokens.extend(self.forward_decode_row(row)?);
-        }
-        Ok(tokens)
+        let params: Vec<SamplingParams> = batch.rows.iter().map(|r| r.params.clone()).collect();
+        let out = self.model.forward_decode_batch(
+            &mut self.slots,
+            &mut self.kv_adapter,
+            &batch.slot_ids,
+            &batch.tokens,
+            &batch.start_positions,
+            &batch.positions,
+            &params,
+        )?;
+        ensure!(
+            out.len() == batch.rows.len(),
+            "DSv4 batched decode returned {} tokens for {} rows",
+            out.len(),
+            batch.rows.len()
+        );
+        Ok(batch
+            .slot_ids
+            .iter()
+            .zip(out)
+            .map(|(&slot, token)| SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
     }
 
     fn submit(&mut self, plan: &ForwardPlan, kv_batch: &KvBatchDescriptor) -> Result<StepOutput> {

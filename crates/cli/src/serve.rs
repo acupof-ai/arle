@@ -63,12 +63,6 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
                 crate::args::ServeCommBackendArg::Nccl => "nccl",
             },
         );
-        // Same pre-spawn env channel for the batched DSv4 decode opt-in
-        // (`dsv4_batched_decode_enabled` in infer-cuda reads it; workers
-        // inherit). Setting the env var directly remains a harness shim.
-        if serve_args.dsv4_batched_decode {
-            std::env::set_var("INFER_DSV4_BATCHED_DECODE", "1");
-        }
     }
     match resolve_config(args, &serve_args) {
         Ok(config) => run_config(config),
