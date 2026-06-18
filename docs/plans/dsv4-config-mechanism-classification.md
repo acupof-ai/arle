@@ -54,6 +54,11 @@ use `cuda_kernels::HAS_DEEPGEMM_NATIVE`.
 ### B. LOCKED DEFAULT → hard-wire `true` (delete the env read)
 Licensed, always-compiled, not an A/B knob:
 
+- `ARLE_DSV4_GPU_ROUTER` → removed by `087df440` (2026-06-18). DSv4 routing is
+  device-only; the host D2H route oracle and host `tid2eid` table were deleted.
+- `ARLE_DSV4_COMM_OVERLAP` → removed by `087df440` (2026-06-18). B=1 allreduce
+  decode always overlaps the shared expert on the comm stream; DeepEP keeps the
+  non-overlap ordering.
 - `ARLE_DSV4_MOE_DECODE_FP8` (moe.rs:2922) → `true`. **Verified native**: the FP8
   decode lane calls `dsv4_fp8_grouped_swiglu_decode_cuda` (native CUDA in the
   unconditional csrc glob — NOT Triton/DeepGEMM). It is the bandwidth-fixed
@@ -68,9 +73,9 @@ These ARE environment/experiment knobs (ckl's "实验时可以用环境") — le
 
 - **Experiment / A-B**: `ARLE_DSV4_DSA_INDEXER` (used by
   `scripts/dsv4_variable_shape_dsa_gate.py` for legacy-vs-official A/B — codex P2),
-  `ARLE_DSV4_GPU_ROUTER`, `ARLE_DSV4_MOE_TRANSPORT`/`MOE_BACKEND`,
+  `ARLE_DSV4_MOE_TRANSPORT`/`MOE_BACKEND`,
   `ARLE_DSV4_MOE_CONTIG_DECODE`, `ARLE_DSV4_WHOLE_STEP_GRAPH`,
-  `ARLE_DSV4_COMM_OVERLAP`, `ARLE_DSV4_DECODE_GRAPH`, `ARLE_DSV4_MTP_FROZEN_LAYER`,
+  `ARLE_DSV4_DECODE_GRAPH`, `ARLE_DSV4_MTP_FROZEN_LAYER`,
   `*_ALLOC` force-alloc probes.
 - **Debug / log**: `ARLE_DSV4_ATTN_DUMP`, `KNEW_DUMP`, `CSA_DUMP`, `STEP_PROFILE`,
   `STAGE_PROFILE`, `TAIL_DUMP`, `MTP_ROLLBACK_DUMP`, `DSA_LOGITS_PROBE`, `RUST_LOG`.
