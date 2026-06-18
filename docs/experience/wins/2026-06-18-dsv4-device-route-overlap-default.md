@@ -56,6 +56,14 @@ All c-sweep runs used `/data01/models/DeepSeek-V4-Flash`, TP=8, H20x8,
 | `087df440` MTP D2 topk=2 | 1 | 0s | 1/1 | 35.34 | `draft_rows=2 verify_rows=3` |
 | `087df440` MTP D2 topk=2 | 1 | 1s | 1/1 | 35.36 | `draft_rows=2 verify_rows=3` |
 
+ShareGPT small probe, c=1, 8 prompts, 128 output tokens, warmed after a cold
+first no-spec pass. This is a cheap coherent-prompt check, not a full SLO sweep.
+
+| arm | success | wall | output tok/s | TTFT p50 | ITL p50 | E2E p50 | note |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `087df440` no-spec hot | 8/8 | 26.93s | 38.0 | 207.4ms | 24.7ms | 3372.5ms | warmed control |
+| `087df440` MTP D2 topk=2 | 8/8 | 33.93s | 30.2 | 196.6ms | 59.5ms | 4224.5ms | `draft_rows=2 verify_rows=3` |
+
 Immediate A/B anchors from the same .62 investigation:
 
 | arm | output tok/s |
@@ -71,9 +79,9 @@ Immediate A/B anchors from the same .62 investigation:
   about 32.7 tok/s, so the old number is not a valid direct baseline for this
   diff.
 - MTP D2 is still slower than no-spec here. Shape is now correct (`verify_rows=3`
-  for D2/T2, topk=1 and topk=2), but `seq_len>1` verify does not use the B=1
-  comm-overlap path. Keep MTP explicit until ShareGPT/SLO-shape evidence licenses
-  a default.
+  for D2/T2, topk=1 and topk=2), including on ShareGPT, but `seq_len>1` verify
+  does not use the B=1 comm-overlap path. Keep MTP explicit until a new verify
+  optimization clears ShareGPT/SLO-shape A/B.
 
 ## Rule
 
@@ -88,3 +96,6 @@ target verify row count.
 - `/data01/arle-gpu-verify-087df440/bench-output/head_csweep_c1_mtp_d2_default_087df440.mtp_tail.txt`
 - `/data01/arle-gpu-verify-087df440/bench-output/head_csweep_c1_mtp_d2_topk2_default_087df440.c_sweep.log`
 - `/data01/arle-gpu-verify-087df440/bench-output/head_csweep_c1_mtp_d2_topk2_default_087df440.mtp_tail.txt`
+- `/data01/arle-gpu-verify-087df440/bench-output/sharegpt8_default_hot_087df440.sharegpt.log`
+- `/data01/arle-gpu-verify-087df440/bench-output/sharegpt8_mtp_d2_topk2_087df440.sharegpt.log`
+- `/data01/arle-gpu-verify-087df440/bench-output/sharegpt8_mtp_d2_topk2_087df440.mtp_tail.txt`
