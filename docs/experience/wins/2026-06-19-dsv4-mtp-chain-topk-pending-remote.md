@@ -1,4 +1,4 @@
-# DSv4 MTP Tree Verify Pending Remote — guidellm, CUDA, 2026-06-19
+# DSv4 MTP Chain Topk Pending Remote — guidellm, CUDA, 2026-06-19
 
 ## SLO-shape probed? N — pending remote
 
@@ -11,14 +11,15 @@ Deferred — no GPU profile in this local tranche.
 
 ## Goal
 
-- Replace chain-only MTP acceptance with a bounded top-k tree schedule verified
-  by one target pass using explicit ancestor metadata.
+- Keep DSv4 MTP verify on the bounded top-1 chain (`depth + 1` rows) while
+  allowing each draft row to record `topk` candidates for target-top1 matching.
 
 ## Hypothesis
 
-- D2/K2 should expose 7 verifier rows in a single sparse verify forward, so an
-  off-chain top-k child can be accepted only when its full ancestor path is
-  present in the verified tree.
+- D2/K2 should still verify 3 rows, not 7. `topk` can turn a non-chain
+  candidate into the bonus token, but it cannot extend the committed prefix
+  beyond that candidate unless the later rows were actually drafted/verified on
+  that branch.
 
 ## Command
 
@@ -41,7 +42,7 @@ pending remote: scripts/bench_guidellm.sh <dsv4-label> ...
 
 Pending remote. Local gates passed:
 
-- `rustfmt --check crates/infer-cuda/src/executor/spec_decode.rs crates/infer-cuda/src/dsv4.rs crates/infer-cuda/src/loader.rs crates/infer-cuda/src/moe.rs`
+- `rustfmt --check crates/infer-cuda/src/executor/spec_decode.rs crates/infer-cuda/src/dsv4.rs`
 - `CUDARC_CUDA_VERSION=12090 cargo test -p infer-cuda --release --no-default-features --features cuda,no-cuda spec_decode --lib`
 - `CUDARC_CUDA_VERSION=12090 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`
 - `CUDARC_CUDA_VERSION=12090 cargo clippy -p infer-cuda --release --no-default-features --features cuda,no-cuda --lib -- -D warnings`
@@ -52,9 +53,12 @@ Pending remote. Local gates passed:
 
 ## Learnings
 
-- Top-k MTP must be represented as tree nodes plus an ancestor mask. Treating
-  top-k as diagnostics on a top-1 chain loses valid branch hits; verifying rows
-  by replaying paths would be the wrong cost model.
+- Current ARLE CLI has `depth` and `topk`, but no SGLang-style
+  `draft_token_num` selector. Therefore topk must not silently expand into a
+  full `K^D` verify tree; that overstates verifier cost and regresses latency.
+- A full SGLang-style topk tree is a separate feature: it needs a draft-token
+  budget/selector plus tree-mask metadata. Until that exists, this lane remains
+  chain-shaped and performance-comparable to D2K1 on verifier row count.
 
 ## Delta vs baseline
 
