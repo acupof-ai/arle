@@ -114,6 +114,13 @@ pub enum SavedContext {
         indices: Vec<usize>,
         table_shape: Vec<usize>,
     },
+    FusedLinearDistillCtx {
+        grad_hidden: Option<TensorId>,
+        grad_weight: Option<TensorId>,
+    },
+    GeneralizedJsdCtx {
+        grad_student: TensorId,
+    },
     LinearAttentionCtx {
         qkv: TensorId,
         z: TensorId,
@@ -123,6 +130,17 @@ pub enum SavedContext {
         dt_bias: TensorId,
         a_log: TensorId,
         norm_weight: TensorId,
+        preact: Option<TensorId>,
+        qkv_conv: Option<TensorId>,
+        q: Option<TensorId>,
+        k: Option<TensorId>,
+        v: Option<TensorId>,
+        g: Option<TensorId>,
+        g_cumsum: Option<TensorId>,
+        beta: Option<TensorId>,
+        a_inv: Option<TensorId>,
+        chunk_state: Option<TensorId>,
+        raw_output: Option<TensorId>,
         batch: usize,
         seq_len: usize,
         num_key_heads: usize,
@@ -170,6 +188,8 @@ pub enum BackwardOp {
     Transpose,
     AddBroadcast,
     Embedding,
+    FusedLinearDistill,
+    GeneralizedJsd,
     LinearAttention,
     CausalSdpaRecompute,
     AllReduceSum,
@@ -205,6 +225,8 @@ impl BackwardOp {
             BackwardOp::Transpose => "Transpose",
             BackwardOp::AddBroadcast => "AddBroadcast",
             BackwardOp::Embedding => "Embedding",
+            BackwardOp::FusedLinearDistill => "FusedLinearDistill",
+            BackwardOp::GeneralizedJsd => "GeneralizedJsd",
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
@@ -579,6 +601,12 @@ impl Tape {
                     }
                     BackwardOp::Embedding => {
                         ops::embedding_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::FusedLinearDistill => {
+                        ops::fused_linear_distill_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::GeneralizedJsd => {
+                        ops::generalized_jsd_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::LinearAttention => {
                         ops::linear_attention_backward(&entry, output_grad_id, store)?

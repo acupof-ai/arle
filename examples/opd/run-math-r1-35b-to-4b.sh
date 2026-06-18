@@ -56,8 +56,10 @@ PROMPT_SEED="${PROMPT_SEED:-0}"
 
 KL_DIRECTION="${KL_DIRECTION:-forward}"
 KL_TEMPERATURE="${KL_TEMPERATURE:-1.0}"
+KL_BETA="${KL_BETA:-}"
 KL_MASK="${KL_MASK:-completion}"
 LOGITS_WINDOW_SIZE="${LOGITS_WINDOW_SIZE:-32}"
+NO_FUSED_DISTILL="${NO_FUSED_DISTILL:-0}"
 GKD_LAMBDA="${GKD_LAMBDA:-0.0}"
 
 LR="${LR:-2e-5}"
@@ -127,8 +129,10 @@ cfg = {
     "prompt_seed": int("$PROMPT_SEED"),
     "kl_direction": "$KL_DIRECTION",
     "kl_temperature": float("$KL_TEMPERATURE"),
+    "kl_beta": None if "$KL_BETA" == "" else float("$KL_BETA"),
     "kl_mask": "$KL_MASK",
     "logits_window_size": int("$LOGITS_WINDOW_SIZE"),
+    "no_fused_distill": "$NO_FUSED_DISTILL" == "1",
     "gkd_lambda": float("$GKD_LAMBDA"),
     "lr": float("$LR"),
     "lr_schedule": "$LR_SCHEDULE",
@@ -185,6 +189,12 @@ train_args=(
   --save-checkpoint "$CHECKPOINT_DIR"
   --save-every "$SAVE_EVERY"
 )
+if [[ -n "$KL_BETA" ]]; then
+  train_args+=(--kl-beta "$KL_BETA")
+fi
+if [[ "$NO_FUSED_DISTILL" == "1" ]]; then
+  train_args+=(--no-fused-distill)
+fi
 if [[ "$JSON_OUTPUT" == "1" ]]; then
   train_args+=(--json)
 fi
@@ -195,6 +205,7 @@ log "train log=$LOG_DIR/train.log"
 log "teacher=$TEACHER_MODEL"
 log "student=$STUDENT_MODEL"
 log "prompts=$PROMPTS_FILE"
+log "kl_direction=$KL_DIRECTION kl_beta=${KL_BETA:-unset} rollout_temperature=$ROLLOUT_TEMPERATURE logits_window_size=$LOGITS_WINDOW_SIZE no_fused_distill=$NO_FUSED_DISTILL"
 log "rollout_len=$ROLLOUT_LEN lora=$LORA_TARGET_SET/r$LORA_RANK/a$LORA_ALPHA"
 log "cuda_visible_devices=$CUDA_VISIBLE_DEVICES engine_offload=$ENGINE_OFFLOAD gradient_checkpointing=$GRADIENT_CHECKPOINTING"
 printf '[opd-math-r1] command: CUDA_VISIBLE_DEVICES=%q ARLE_OPD_ENGINE_OFFLOAD=%q ARLE_OPD_GRADIENT_CHECKPOINTING=%q %q' \

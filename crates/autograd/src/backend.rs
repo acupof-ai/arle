@@ -249,6 +249,84 @@ pub struct LinearAttentionScanBackwardGrads {
     pub dnorm: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttentionDeviceParams {
+    pub batch: usize,
+    pub seq_len: usize,
+    pub num_key_heads: usize,
+    pub num_value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_kernel: usize,
+    pub eps: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttentionDeviceForwardArgs<'a> {
+    pub params: LinearAttentionDeviceParams,
+    pub qkv: &'a DeviceHandle,
+    pub z: &'a DeviceHandle,
+    pub b_proj: &'a DeviceHandle,
+    pub a_proj: &'a DeviceHandle,
+    pub conv1d_weight: &'a DeviceHandle,
+    pub dt_bias: &'a DeviceHandle,
+    pub a_log: &'a DeviceHandle,
+    pub norm_weight: &'a DeviceHandle,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearAttentionDeviceForwardResult {
+    pub output: DeviceHandle,
+    pub preact: DeviceHandle,
+    pub qkv_conv: DeviceHandle,
+    pub q: DeviceHandle,
+    pub k: DeviceHandle,
+    pub v: DeviceHandle,
+    pub g: DeviceHandle,
+    pub g_cumsum: DeviceHandle,
+    pub beta: DeviceHandle,
+    pub a_inv: DeviceHandle,
+    pub chunk_state: DeviceHandle,
+    pub raw_output: DeviceHandle,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttentionDeviceBackwardArgs<'a> {
+    pub params: LinearAttentionDeviceParams,
+    pub upstream: &'a DeviceHandle,
+    pub qkv: &'a DeviceHandle,
+    pub z: &'a DeviceHandle,
+    pub b_proj: &'a DeviceHandle,
+    pub a_proj: &'a DeviceHandle,
+    pub conv1d_weight: &'a DeviceHandle,
+    pub dt_bias: &'a DeviceHandle,
+    pub a_log: &'a DeviceHandle,
+    pub norm_weight: &'a DeviceHandle,
+    pub preact: &'a DeviceHandle,
+    pub qkv_conv: &'a DeviceHandle,
+    pub q: &'a DeviceHandle,
+    pub k: &'a DeviceHandle,
+    pub v: &'a DeviceHandle,
+    pub g: &'a DeviceHandle,
+    pub g_cumsum: &'a DeviceHandle,
+    pub beta: &'a DeviceHandle,
+    pub a_inv: &'a DeviceHandle,
+    pub chunk_state: &'a DeviceHandle,
+    pub raw_output: &'a DeviceHandle,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearAttentionDeviceBackwardResult {
+    pub dqkv: DeviceHandle,
+    pub dz: DeviceHandle,
+    pub db: DeviceHandle,
+    pub da: DeviceHandle,
+    pub dconv: DeviceHandle,
+    pub ddt: DeviceHandle,
+    pub da_log: DeviceHandle,
+    pub dnorm: DeviceHandle,
+}
+
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
 
@@ -352,6 +430,22 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         &self,
         _args: LinearAttentionScanBackwardArgs<'_>,
     ) -> Result<Option<LinearAttentionScanBackwardGrads>> {
+        Ok(None)
+    }
+
+    /// Optional device-resident Qwen3.5 gated-delta linear-attention forward.
+    /// CPU remains the reference; CUDA overrides exact production shapes.
+    fn linear_attention_forward_device(
+        &self,
+        _args: LinearAttentionDeviceForwardArgs<'_>,
+    ) -> Result<Option<LinearAttentionDeviceForwardResult>> {
+        Ok(None)
+    }
+
+    fn linear_attention_backward_device(
+        &self,
+        _args: LinearAttentionDeviceBackwardArgs<'_>,
+    ) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
         Ok(None)
     }
 
