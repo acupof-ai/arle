@@ -2913,22 +2913,17 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
 
             #[cfg(feature = "cuda")]
             if student_engine_offloaded {
+                // Keep the rollout engine offloaded until the next rollout.
+                // Reloading here happens before `cleanup_after_backward` prunes
+                // the long-sequence autograd tape and can OOM on 2K-token OPD
+                // steps. The next-step reload path above runs after cleanup and
+                // before LoRA sync/generation, which is the first point where the
+                // infer student must be resident again.
                 log_opd_step_trace(
                     total_started,
-                    "infer_rollout_reload_post_backward_start",
+                    "infer_rollout_reload_deferred_until_next_step",
                     "",
                 );
-                store
-                    .backend()
-                    .device_synchronize()
-                    .map_err(OpdError::from)?;
-                if let Some(ctx) = infer_rollout.as_ref() {
-                    ctx.student.reload_engine_weights().map_err(|err| {
-                        OpdError::InvalidInput(format!(
-                            "infer student reload (post-windowed-backward) failed: {err}"
-                        ))
-                    })?;
-                }
             }
 
             let loss_value = loss_result?;
