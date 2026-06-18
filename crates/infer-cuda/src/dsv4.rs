@@ -155,8 +155,8 @@ pub(crate) struct Dsv4Attention {
 ///
 /// Routing kind is per-layer: bias-routed layers carry `gate_bias` (the
 /// `noaux_tc` correction); hash-routed layers (`layer_idx < num_hash_layers`)
-/// carry `hash_tid2eid` (a host `[vocab_size * topk]` table mapping token id →
-/// experts directly) and ignore the learned router gate. Exactly one is `Some`.
+/// carry a device `hash_tid2eid` table mapping token id to experts directly and
+/// ignore the learned router gate.
 pub(crate) struct Dsv4MoeLayer {
     /// Contiguous per-rank group-major fused gate+up FP8 cache (w1 over w3,
     /// row-stacked) and down cache (w2). Built once by the loader; the masked
@@ -171,12 +171,8 @@ pub(crate) struct Dsv4MoeLayer {
     pub gate: DeviceMatrix,
     /// Bias-routed layers only: per-expert `noaux_tc` correction `[n_routed]`.
     pub gate_bias: Option<DeviceVec>,
-    /// Hash-routed layers only: host `tid2eid` table (`vocab_size * topk` i64),
-    /// sliced per token to pick experts without the learned router.
-    pub hash_tid2eid: Option<Vec<i64>>,
     /// Hash-routed layers only: device `tid2eid` table used by the on-device
-    /// router. Kept alongside the host table so the existing host route remains
-    /// available as an A/B oracle.
+    /// router.
     pub hash_tid2eid_device: Option<CudaSlice<i64>>,
     pub routing_kind: DeepSeekV4MoeRoutingKind,
     /// Dense shared expert FP8 caches (always-on, n_shared_experts == 1).
@@ -3726,8 +3722,7 @@ impl Dsv4Model {
                 )
             })?;
             keepalive.keep_hidden(&normed);
-            let use_comm_overlap =
-                dsv4_comm_overlap_enabled() && seq_len == 1 && !use_deepep_transport;
+            let use_comm_overlap = seq_len == 1 && !use_deepep_transport;
             let normed_ready = if use_comm_overlap {
                 let fence = ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
                 ctx.wait_on_pipeline_fence(&fence, CudaPipelineStreamKind::Comm)?;
@@ -5278,13 +5273,6 @@ fn dsv4_decode_graph_enabled() -> bool {
 fn dsv4_whole_step_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_WHOLE_STEP_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
-fn dsv4_comm_overlap_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_COMM_OVERLAP").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }
