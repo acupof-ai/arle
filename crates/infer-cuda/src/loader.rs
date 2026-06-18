@@ -3150,9 +3150,17 @@ impl SafetensorLoader {
         // Output projection. DSv4: low-rank wo_a→wo_b (+ per-group tables). GLM
         // (`plain_o_proj`): a single plain `o_proj` [hidden, num_heads*v_head_dim],
         // and the kv_b absorption split (w_kc/w_vc).
-        let (wo_a, wo_a_groups, wo_b, wo_a_deepgemm, wo_b_deepgemm, o_proj, w_kc, w_vc) = if config
-            .plain_o_proj
-        {
+        let (
+            wo_a,
+            wo_a_groups,
+            wo_b,
+            wo_a_deepgemm,
+            wo_a_group_deepgemm,
+            wo_b_deepgemm,
+            o_proj,
+            w_kc,
+            w_vc,
+        ) = if config.plain_o_proj {
             let o_proj = self.load_dsv4_block_scaled_dialect(
                 ctx,
                 names
@@ -3162,6 +3170,7 @@ impl SafetensorLoader {
             )?;
             let (w_kc, w_vc) = self.load_dsv4_kv_b_absorb(ctx, config, names, tp)?;
             (
+                None,
                 None,
                 None,
                 None,
@@ -3190,8 +3199,24 @@ impl SafetensorLoader {
                 tp,
             )?;
             // DeepGEMM caches for the decode output projection (lever #1b), same gate.
-            let (wo_a_deepgemm, wo_b_deepgemm) =
+            let (wo_a_deepgemm, wo_a_group_deepgemm, wo_b_deepgemm) =
                 if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
+                    let group_caches = if wo_a_groups.groups > 1 {
+                        let mut caches = Vec::with_capacity(wo_a_groups.groups);
+                        for group in 0..wo_a_groups.groups {
+                            caches.push(
+                                cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_row_range(
+                                    ctx,
+                                    &wo_a,
+                                    group * wo_a_groups.rows_per_group,
+                                    wo_a_groups.rows_per_group,
+                                )?,
+                            );
+                        }
+                        Some(caches)
+                    } else {
+                        None
+                    };
                     (
                         (wo_a_groups.groups == 1)
                             .then(|| {
@@ -3200,6 +3225,7 @@ impl SafetensorLoader {
                                 )
                             })
                             .transpose()?,
+                        group_caches,
                         Some(
                             cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
                                 ctx, &wo_b,
@@ -3207,13 +3233,14 @@ impl SafetensorLoader {
                         ),
                     )
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
             (
                 Some(wo_a),
                 Some(wo_a_groups),
                 Some(wo_b),
                 wo_a_deepgemm,
+                wo_a_group_deepgemm,
                 wo_b_deepgemm,
                 None,
                 None,
@@ -3232,6 +3259,7 @@ impl SafetensorLoader {
             wo_a_groups,
             wo_b,
             wo_a_deepgemm,
+            wo_a_group_deepgemm,
             wo_b_deepgemm,
             attn_sink,
             attn_sink_f32,
