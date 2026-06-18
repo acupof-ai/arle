@@ -155,10 +155,12 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
     Ok(())
 }
 
-/// V32 (GLM-5.2, 512 NoPE / 656 B/tok) strided FP8 KV pack. Identical contract
-/// to [`dsv4_fp8_kv_pack_strided_raw`] but launches the `<512>` instantiation:
-/// caller passes `nope = k_prepared, rope = k_prepared + 512,
-/// stride_nope_elems = stride_rope_elems = head_dim = 576`.
+/// V32 (GLM-5.2, 512 NoPE / 656 B/tok) strided FP8 KV pack. Same call shape as
+/// [`dsv4_fp8_kv_pack_strided_raw`] but launches the SEPARATE V32 kernel that
+/// writes the inline layout `[512 NoPE fp8][4 F32 scales @512][128 rope bf16]`
+/// (stride 656; F32 per-128-block scales = amax/448, no pow-2 rounding — NOT
+/// the MODEL1 trailing-e8m0 format). Caller passes `nope = k_prepared,
+/// rope = k_prepared + 512, stride_nope_elems = stride_rope_elems = head_dim = 576`.
 pub fn dsv4_v32_fp8_kv_pack_strided_raw(
     ctx: &DeviceContext,
     nope_ptr: u64,

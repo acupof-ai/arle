@@ -3025,13 +3025,15 @@ impl SafetensorLoader {
             }
         };
 
-        // SHARED expert: GLM keeps the C E8M0 re-encode (via `load_fp8`). This is
-        // the spec's acceptable fallback — the shared expert is a single
-        // always-on expert (small), and keeping it FP8 avoids making
-        // `shared_w13`/`shared_w2` Option (an ~18-site ripple across the DSv4
-        // shared decode/pooled/masked paths that would risk DSv4 byte-identity).
-        // ponytail: pod-verify shared-expert E8M0 re-encode precision (GLM general
-        // F32 block scales → E8M0 is lossy on 1 expert; routed experts are bf16)
+        // SHARED expert. DSv4 keeps the E8M0 FP8 caches (`shared_w13`/`shared_w2`)
+        // and runs the FP8 DeepGEMM shared path. GLM ALSO builds these (to keep
+        // the struct fields non-Option, avoiding the ~18-site ripple across the
+        // DSv4 shared decode/pooled/masked paths) but NEVER reads them — GLM's
+        // shared expert runs the bf16 caches below. GLM `weight_scale_inv` blocks
+        // are general F32, NON-power-of-two (e.g. 1.3e-4); the E8M0 re-encode
+        // rounds each block scale to the nearest power of 2 → up to ±40% per-block
+        // weight error on this ALWAYS-ON expert (every token). Routed experts
+        // already run bf16; the shared expert must too.
         let shared = names
             .shared_experts
             .as_ref()
@@ -3042,6 +3044,30 @@ impl SafetensorLoader {
             Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_pair_rows(ctx, &shared_w1, &shared_w3)?;
         let shared_down = load_fp8(&shared.w2)?;
         let shared_w2 = Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &shared_down)?;
+
+        // GLM shared expert → bf16 single-group caches (gate / up / down).
+        // Dequantize the F32-block-scaled FP8 → bf16 (the same lossless dequant
+        // the routed bf16 experts use), then upload as a 1-group GroupedCache.
+        let (shared_gate_bf16, shared_up_bf16, shared_w2_bf16) = if glm {
+            let (gate_b, g_rows, g_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&shared.w1)?;
+            let (up_b, u_rows, u_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&shared.w3)?;
+            ensure!(
+                g_rows == u_rows && g_cols == u_cols,
+                "GLM shared expert gate/up shape mismatch: {g_rows}x{g_cols} vs {u_rows}x{u_cols}"
+            );
+            let (d_b, d_rows, d_cols) = self.load_dsv4_glm_fp8_as_bf16_host(&shared.w2)?;
+            ensure!(
+                d_rows == g_cols && d_cols == g_rows,
+                "GLM shared expert down shape {d_rows}x{d_cols} != [hidden({g_cols}), inter({g_rows})]"
+            );
+            // gate/up: [inter, hidden]; down: [hidden, inter]. One group each.
+            let gate_g = crate::moe::build_grouped_cache_bf16(ctx, &gate_b, 1, g_rows, g_cols)?;
+            let up_g = crate::moe::build_grouped_cache_bf16(ctx, &up_b, 1, u_rows, u_cols)?;
+            let down_g = crate::moe::build_grouped_cache_bf16(ctx, &d_b, 1, d_rows, d_cols)?;
+            (Some(gate_g), Some(up_g), Some(down_g))
+        } else {
+            (None, None, None)
+        };
 
         Ok(crate::dsv4::Dsv4MoeLayer {
             w13_grouped,
@@ -3056,6 +3082,9 @@ impl SafetensorLoader {
             routing_kind,
             shared_w13,
             shared_w2,
+            shared_gate_bf16,
+            shared_up_bf16,
+            shared_w2_bf16,
             gemv_tables: std::sync::OnceLock::new(),
         })
     }

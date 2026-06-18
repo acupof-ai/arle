@@ -48,17 +48,55 @@
 #include <cstdint>
 #include <cmath>
 
+// === V32 (GLM-5.2) contract — DIFFERENT format from MODEL1 ======================
+//
+// The vendored V32 sparse-FP8 decode reads a per-token INLINE layout (NOT the
+// MODEL1 trailing-e8m0 scale region). Ground truth:
+//   - `vendor/flashmla/csrc/sm90/decode/sparse_fp8/config.h`: V32 →
+//     HEAD_DIM_NOPE=512, HEAD_DIM_ROPE=64, QUANT_TILE_SIZE=128, NUM_SCALES=4.
+//   - `splitkv_mla.cuh` V32 branch (~543-562, 600-605):
+//       gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride
+//                 (per-token stride = k_row_stride = 656, FULLY INLINE)
+//       scales  = *(float4*)load_128b((float*)(gK_base + HEAD_DIM_NOPE))
+//                 (4× F32, INLINE, at offset 512)
+//       RoPE    @ gK_base + HEAD_DIM_NOPE + NUM_SCALES*sizeof(float) = offset 528
+//       dequant uses scale = scales[dim_idx/2] over dim_idx∈[0,8) 64-blocks, so
+//       each F32 scale covers a 128-elem NoPE block.
+//
+// Definitive V32 per-token layout (656 bytes, INLINE, stride 656):
+//   [0, 512)   NoPE fp8 (512 bytes)
+//   [512, 528) 4× F32 scales (16 bytes) — block b covers NoPE elems
+//              [b*128, (b+1)*128); scale[b] = amax(block_b) / 448.0 stored as
+//              F32 (NO power-of-two rounding); 448 = E4M3 max
+//   [528, 656) RoPE bf16 (64 dims × 2 = 128 bytes)
+//   block stride = page_block_size * 656.
+//
+// This is implemented by the SEPARATE `dsv4_v32_fp8_kv_pack_kernel` below — it
+// does NOT share the MODEL1 template (which writes a trailing e8m0 scale region
+// at 64-elem QUANT_TILE granularity, the wrong format for V32).
+// =================================================================================
+
 namespace {
 
-// Shape-INDEPENDENT constants shared by both MODEL1 (NoPE=448) and V32
-// (NoPE=512). The NoPE-dim-dependent constants (NUM_TILES, NUM_SCALES,
-// TOKEN_DATA_BYTES, TOKEN_BYTES) are derived as `constexpr` LOCALS inside the
-// `dsv4_fp8_kv_pack_kernel<HEAD_DIM_NOPE>` template so one body serves both
-// shapes. The E4M3-max=448 used in the SCALE MATH is the representable max,
-// NOT the dim — it stays 448 verbatim for every instantiation.
+// Shape-INDEPENDENT constants shared by the MODEL1 pack body. The
+// NoPE-dim-dependent constants (NUM_TILES, NUM_SCALES, TOKEN_DATA_BYTES,
+// TOKEN_BYTES) are derived as `constexpr` LOCALS inside the
+// `dsv4_fp8_kv_pack_kernel<HEAD_DIM_NOPE>` template. The E4M3-max=448 used in
+// the SCALE MATH is the representable max, NOT the dim — it stays 448 verbatim.
+// V32 (NoPE=512, inline F32 scales) is a SEPARATE kernel, not a template
+// instantiation here.
 static constexpr int HEAD_DIM_ROPE   = 64;
 static constexpr int QUANT_TILE_SIZE = 64;
 static constexpr int ROPE_BYTES      = HEAD_DIM_ROPE * sizeof(__nv_bfloat16); // 128
+
+// V32 inline-layout constants (config.h: HEAD_DIM_NOPE=512, QUANT_TILE_SIZE=128,
+// NUM_SCALES=4). Fully inline 656 B/token: [512 NoPE fp8][4 F32 @512][128 rope bf16].
+static constexpr int V32_HEAD_DIM_NOPE  = 512;
+static constexpr int V32_QUANT_TILE     = 128;             // 128-elem NoPE block / F32 scale
+static constexpr int V32_NUM_SCALES     = 4;               // 512 / 128
+static constexpr int V32_SCALE_BYTES    = V32_NUM_SCALES * (int)sizeof(float); // 16
+static constexpr int V32_TOKEN_BYTES    =
+    V32_HEAD_DIM_NOPE + V32_SCALE_BYTES + ROPE_BYTES;      // 512 + 16 + 128 = 656
 
 static constexpr int THREADS_PER_BLOCK = 128;
 static constexpr int NOPE_THREADS      = 64;   // 0..63 handle NoPE quant
@@ -108,6 +146,8 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // interleaved-in-`k_prepared` caller passes (head_dim=512, head_dim=512)
 // with separate base pointers `k_prepared + 0` (NoPE) and
 // `k_prepared + 448` (RoPE).
+//
+// MODEL1 only (NoPE=448). V32 is handled by `dsv4_v32_fp8_kv_pack_kernel`.
 template <int HEAD_DIM_NOPE>
 __global__ void dsv4_fp8_kv_pack_kernel(
     const __nv_bfloat16* __restrict__ nope,   // [n_tokens, stride_nope_elems]
@@ -120,15 +160,15 @@ __global__ void dsv4_fp8_kv_pack_kernel(
     int stride_nope_elems,
     int stride_rope_elems)
 {
-    // Per-instantiation NoPE-dim-dependent constants.
-    //   MODEL1: NoPE=448 → NUM_TILES=7, NUM_SCALES=8, TOKEN_BYTES=584.
-    //   V32   : NoPE=512 → NUM_TILES=8, NUM_SCALES=16, TOKEN_BYTES=656.
-    // ponytail: pod-verify V32 scale region is 16 bytes with tiles in [0,8) and
-    // [8,16) zero-padded — matches shim V32_BYTES_PER_TOKEN=656
-    constexpr int NUM_TILES       = HEAD_DIM_NOPE / QUANT_TILE_SIZE;        // 7 / 8
-    constexpr int NUM_SCALES      = (NUM_TILES <= 7) ? 8 : 16;              // 8 / 16
-    constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;            // 576 / 640
-    constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;         // 584 / 656
+    // MODEL1-only NoPE-dim-dependent constants (NoPE=448 → NUM_TILES=7,
+    // NUM_SCALES=8, TOKEN_BYTES=584). The trailing e8m0 scale region at 64-elem
+    // QUANT_TILE granularity is the MODEL1 format; V32 uses a different inline
+    // F32-scale layout handled by the SEPARATE `dsv4_v32_fp8_kv_pack_kernel`.
+    static_assert(HEAD_DIM_NOPE == 448, "MODEL1 pack template is NoPE=448 only");
+    constexpr int NUM_TILES       = HEAD_DIM_NOPE / QUANT_TILE_SIZE;        // 7
+    constexpr int NUM_SCALES      = 8;                                      // 7 used + 1 pad
+    constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;            // 576
+    constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;         // 584
 
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
@@ -263,6 +303,111 @@ __global__ void dsv4_fp8_kv_pack_kernel(
         __nv_bfloat16* rope_base = reinterpret_cast<__nv_bfloat16*>(
             token_data_base + HEAD_DIM_NOPE);
         rope_base[rope_lane] = v;
+    }
+}
+
+// === V32 (GLM-5.2) inline-F32-scale pack kernel =================================
+//
+// Per-token INLINE 656-byte layout (stride 656), matching the vendored V32
+// decode (`splitkv_mla.cuh` V32 branch):
+//   [0, 512)   NoPE fp8 e4m3 (512 bytes)
+//   [512, 528) 4× F32 scales — scale[b] = amax(NoPE[b*128:(b+1)*128]) / 448.0
+//              stored as plain F32 (NO power-of-two rounding)
+//   [528, 656) RoPE bf16 (64 dims)
+//
+// Block-paged write: block_base = packed_kv + block_id*page_block_size*656;
+// token at block_base + row*656.
+//
+// Thread roles (128 threads / 4 warps): threads [0,64) quantize NoPE (4 blocks
+// of 128, processed lane-strided over 128 lanes... — here 64 NoPE threads each
+// handle 2 elements per 128-block, 4 blocks in series); threads [64,128) copy
+// the 64 RoPE dims. The dequant kernel reads F32 scales directly, so we store
+// the F32 amax/448 ratio with no exponent rounding (this is the whole point of
+// the fix — MODEL1's e8m0 rounding cost up to ±40% per block).
+__global__ void dsv4_v32_fp8_kv_pack_kernel(
+    const __nv_bfloat16* __restrict__ nope,   // [n_tokens, stride_nope_elems]
+    const __nv_bfloat16* __restrict__ rope,   // [n_tokens, stride_rope_elems]
+    uint8_t* __restrict__ packed_kv,
+    const int* __restrict__ token_block_id,
+    const int* __restrict__ token_in_block_row,
+    int n_tokens,
+    int page_block_size,
+    int stride_nope_elems,
+    int stride_rope_elems)
+{
+    const int t = blockIdx.x;
+    if (t >= n_tokens) return;
+
+    const int tid = threadIdx.x;
+    const int block_id = token_block_id[t];
+    const int row = token_in_block_row[t];
+
+    // Block-paged base (inline 656 B/token, stride 656).
+    const int64_t block_stride = (int64_t)page_block_size * V32_TOKEN_BYTES;
+    uint8_t* token_base =
+        packed_kv + (int64_t)block_id * block_stride + (int64_t)row * V32_TOKEN_BYTES;
+
+    // Inline sub-regions.
+    uint8_t* nope_fp8_base   = token_base;                         // [0, 512)
+    float*   scales_base     = (float*)(token_base + V32_HEAD_DIM_NOPE); // [512, 528)
+    __nv_bfloat16* rope_base =
+        (__nv_bfloat16*)(token_base + V32_HEAD_DIM_NOPE + V32_SCALE_BYTES); // [528, 656)
+
+    // Shared scratch: per-128-block reduction across the 64 NoPE threads + the
+    // broadcast scale. 64 NoPE threads = 2 warps; combine via 2 shared slots.
+    __shared__ float s_warp_max[2];
+    __shared__ float s_scale_f;
+
+    const int NOPE_THREADS = 64;
+    const bool is_nope = (tid < NOPE_THREADS);
+    const int  nope_lane = is_nope ? tid : -1;     // 0..63 for NoPE threads
+    const int  rope_lane = (tid >= NOPE_THREADS) ? (tid - NOPE_THREADS) : -1;
+
+    // 4 NoPE blocks of 128 elems each → one F32 scale per block. Each NoPE thread
+    // handles 2 elems per block (lane, lane+64).
+    #pragma unroll
+    for (int blk = 0; blk < V32_NUM_SCALES; ++blk) {
+        const int base_dim = blk * V32_QUANT_TILE;     // 0, 128, 256, 384
+        float v0 = 0.0f, v1 = 0.0f;
+        if (is_nope) {
+            v0 = __bfloat162float(nope[(int64_t)t * stride_nope_elems + base_dim + nope_lane]);
+            v1 = __bfloat162float(nope[(int64_t)t * stride_nope_elems + base_dim + nope_lane + 64]);
+        }
+
+        // amax over the 128 elements of this block.
+        if (is_nope) {
+            float a = fmaxf(fabsf(v0), fabsf(v1));
+            float warp_max = warp_reduce_max(a);
+            if ((nope_lane & 31) == 0) {
+                s_warp_max[nope_lane >> 5] = warp_max;
+            }
+        }
+        __syncthreads();
+
+        if (is_nope && nope_lane == 0) {
+            float amax = fmaxf(s_warp_max[0], s_warp_max[1]);
+            // scale = amax / 448 (E4M3 max), stored as plain F32 (NO pow-2
+            // rounding). Guards: zero/non-finite block → scale 0 (dequant reads
+            // it back as 0; locally use 1.0 below so val/scale doesn't NaN).
+            float scale = (amax > 0.0f && isfinite(amax)) ? (amax / 448.0f) : 0.0f;
+            scales_base[blk] = scale;
+            s_scale_f = scale;
+        }
+        __syncthreads();
+
+        if (is_nope) {
+            float scale_f = s_scale_f;
+            float inv = (scale_f != 0.0f) ? (1.0f / scale_f) : 0.0f;
+            __nv_fp8_e4m3 q0 = __nv_fp8_e4m3(v0 * inv);
+            __nv_fp8_e4m3 q1 = __nv_fp8_e4m3(v1 * inv);
+            nope_fp8_base[base_dim + nope_lane]      = (uint8_t)q0.__x;
+            nope_fp8_base[base_dim + nope_lane + 64] = (uint8_t)q1.__x;
+        }
+    }
+
+    // RoPE copy: 64 bf16 dims, one per RoPE thread.
+    if (!is_nope && rope_lane < HEAD_DIM_ROPE) {
+        rope_base[rope_lane] = rope[(int64_t)t * stride_rope_elems + rope_lane];
     }
 }
 
@@ -479,10 +624,11 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
     return cudaGetLastError();
 }
 
-// V32 (GLM-5.2) strided pack: NoPE=512 / 656 B/tok. Mirror of the MODEL1
-// strided entry above, launching the <512> instantiation (NUM_TILES=8,
-// NUM_SCALES=16). The k_prepared-style caller passes (nope=k_prepared,
-// rope=k_prepared+512, stride_nope_elems=stride_rope_elems=head_dim=576).
+// V32 (GLM-5.2) strided pack: NoPE=512 / 656 B/tok INLINE layout. Launches the
+// SEPARATE `dsv4_v32_fp8_kv_pack_kernel` (NOT the MODEL1 template): per token
+// [512 NoPE fp8][4 F32 scales @512][128 rope bf16], stride 656, with F32
+// (non-pow2) block scales = amax(128-block)/448. The k_prepared-style caller
+// passes (nope=k_prepared, rope=k_prepared+512, stride_nope=stride_rope=head_dim=576).
 extern "C" cudaError_t arle_dsv4_v32_fp8_kv_pack_strided_cuda(
     const __nv_bfloat16* nope,
     const __nv_bfloat16* rope,
@@ -497,7 +643,7 @@ extern "C" cudaError_t arle_dsv4_v32_fp8_kv_pack_strided_cuda(
 {
     if (n_tokens == 0) return cudaSuccess;
     if (page_block_size <= 0) return cudaErrorInvalidValue;
-    if (stride_nope_elems < 512 || stride_rope_elems < HEAD_DIM_ROPE) {
+    if (stride_nope_elems < V32_HEAD_DIM_NOPE || stride_rope_elems < HEAD_DIM_ROPE) {
         return cudaErrorInvalidValue;
     }
     if (nope == nullptr || rope == nullptr || packed_kv == nullptr
@@ -507,7 +653,7 @@ extern "C" cudaError_t arle_dsv4_v32_fp8_kv_pack_strided_cuda(
 
     dim3 grid((unsigned)n_tokens, 1, 1);
     dim3 block(THREADS_PER_BLOCK, 1, 1);
-    dsv4_fp8_kv_pack_kernel<512><<<grid, block, 0, stream>>>(
+    dsv4_v32_fp8_kv_pack_kernel<<<grid, block, 0, stream>>>(
         nope, rope, packed_kv,
         token_block_id, token_in_block_row,
         n_tokens, page_block_size,
