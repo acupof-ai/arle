@@ -403,6 +403,7 @@ struct TileLangKernelSpec {
 enum KernelSet {
     Full,
     Dsv4Flash,
+    OpdGdr,
 }
 
 impl KernelSet {
@@ -412,8 +413,9 @@ impl KernelSet {
             Ok(value) => match value.trim() {
                 "" | "full" | "all" => Self::Full,
                 "dsv4_flash" | "dsv4-flash" => Self::Dsv4Flash,
+                "opd_gdr" | "opd-gdr" => Self::OpdGdr,
                 other => panic!(
-                    "Unsupported ARLE_CUDA_KERNEL_SET={other:?}. Supported values: full, dsv4_flash."
+                    "Unsupported ARLE_CUDA_KERNEL_SET={other:?}. Supported values: full, dsv4_flash, opd_gdr."
                 ),
             },
             Err(_) => Self::Full,
@@ -422,12 +424,16 @@ impl KernelSet {
 
     fn tilelang_aot_enabled(self) -> bool {
         match self {
-            Self::Full => true,
+            Self::Full | Self::OpdGdr => true,
             // DSv4-Flash uses native CUDA C + FlashMLA, not ARLE's TileLang
             // Qwen/GDR attention families. Stub those FFI symbols so a DSv4
             // build can link without paying the TileLang AOT tax.
             Self::Dsv4Flash => false,
         }
+    }
+
+    fn tilelang_gdr_only(self) -> bool {
+        matches!(self, Self::OpdGdr)
     }
 }
 
@@ -851,6 +857,105 @@ fn write_tilelang_unsupported_stub(
     generated_sources.push(stub_path);
 }
 
+fn write_tilelang_attention_stub_sources(out_dir: &Path, generated_sources: &mut Vec<PathBuf>) {
+    for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_prefill_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_prefill_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd256_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_prefill_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd64_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
+            TILELANG_DISPATCH_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_split_partial_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"),
+            TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
+            generated_sources,
+        );
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_split_merge_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
+            TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+    for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
+        let suffix = format!("q{q}_kv{kv}");
+        write_tilelang_unsupported_stub(
+            out_dir,
+            &format!("batch_decode_paged_hd128_fp8_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
+            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
+            TILELANG_DISPATCH_FP8_PUBLIC_DECL,
+            generated_sources,
+        );
+    }
+}
+
 fn compile_tilelang_stub_kernels(cuda_path: &str, out_dir: &Path) {
     let mut generated_sources = Vec::new();
 
@@ -1033,262 +1138,276 @@ fn compile_tilelang_stub_kernels(cuda_path: &str, out_dir: &Path) {
     );
 }
 
-fn compile_tilelang_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[SmSpec]) {
+fn compile_tilelang_aot_kernels(
+    cuda_path: &str,
+    out_dir: &Path,
+    sm_targets: &[SmSpec],
+    gdr_only: bool,
+) {
     let python = find_tilelang_python().unwrap_or_else(|message| panic!("{message}"));
     let (tilelang_src, cutlass_include) = tilelang_include_dirs(&python);
     let mut generated_sources = Vec::new();
 
-    for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_prefill_paged_hd128_{suffix}"),
-            kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
-            kernel_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
-            out_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
-            kernel_family: "attention",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_CALL_ARGS,
-            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
+    if gdr_only {
+        write_tilelang_attention_stub_sources(out_dir, &mut generated_sources);
+        println!(
+            "cargo:warning=ARLE_CUDA_KERNEL_SET=opd_gdr: stubbing non-GDR TileLang attention kernels."
         );
-    }
+    } else {
+        for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_prefill_paged_hd128_{suffix}"),
+                kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
+                kernel_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
+                out_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
+                kernel_family: "attention",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_CALL_ARGS,
+                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
 
-    for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_prefill_paged_hd256_{suffix}"),
-            kernel_path: "tools/tilelang/batch_prefill_paged_hd256.py",
-            kernel_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
-            out_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
-            kernel_family: "attention",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_CALL_ARGS,
-            allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
-    }
+        for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_prefill_paged_hd256_{suffix}"),
+                kernel_path: "tools/tilelang/batch_prefill_paged_hd256.py",
+                kernel_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
+                out_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
+                kernel_family: "attention",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_CALL_ARGS,
+                allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
 
-    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
-            kernel_family: "attention",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_CALL_ARGS,
-            allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
-    }
+        for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
+                kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
+                out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
+                kernel_family: "attention",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_CALL_ARGS,
+                allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
 
-    for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd128_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd128_{suffix}"),
-            kernel_family: "attention",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_CALL_ARGS,
-            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
-    }
+        for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd128_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
+                kernel_name: format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
+                out_name: format!("tilelang_batch_decode_paged_hd128_{suffix}"),
+                kernel_family: "attention",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_CALL_ARGS,
+                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
 
-    // DSV4-mini HD64 substrate (master §8.2 P1.0). Same FFI shape as the
-    // HD128/HD256 BF16 prefill+decode families; only the cubin's baked
-    // `head_dim` differs.
-    for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_prefill_paged_hd64_{suffix}"),
-            kernel_path: "tools/tilelang/batch_prefill_paged_hd64.py",
-            kernel_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
-            out_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
-            kernel_family: "attention",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_CALL_ARGS,
-            allow_sm70: false,
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
-    }
+        // DSV4-mini HD64 substrate (master §8.2 P1.0). Same FFI shape as the
+        // HD128/HD256 BF16 prefill+decode families; only the cubin's baked
+        // `head_dim` differs.
+        for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_prefill_paged_hd64_{suffix}"),
+                kernel_path: "tools/tilelang/batch_prefill_paged_hd64.py",
+                kernel_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
+                out_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
+                kernel_family: "attention",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_CALL_ARGS,
+                allow_sm70: false,
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
 
-    for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd64_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd64.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd64_{suffix}"),
-            kernel_family: "attention",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_CALL_ARGS,
-            allow_sm70: false,
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
-    }
+        for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd64_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd64.py",
+                kernel_name: format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
+                out_name: format!("tilelang_batch_decode_paged_hd64_{suffix}"),
+                kernel_family: "attention",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_CALL_ARGS,
+                allow_sm70: false,
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
 
-    for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let partial_spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd128_split_partial_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
-            kernel_family: "attention_bf16_split_partial",
-            kernel_key: Some("split_partial"),
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS,
-            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &partial_spec,
-            &mut generated_sources,
-        );
+        for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let partial_spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd128_split_partial_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
+                kernel_name: format!(
+                    "tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"
+                ),
+                out_name: format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
+                kernel_family: "attention_bf16_split_partial",
+                kernel_key: Some("split_partial"),
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS,
+                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &partial_spec,
+                &mut generated_sources,
+            );
 
-        let merge_spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd128_split_merge_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
-            kernel_family: "attention_bf16_split_merge",
-            kernel_key: Some("split_merge"),
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS,
-            allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &merge_spec,
-            &mut generated_sources,
-        );
-    }
+            let merge_spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd128_split_merge_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
+                kernel_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
+                out_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
+                kernel_family: "attention_bf16_split_merge",
+                kernel_key: Some("split_merge"),
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS,
+                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &merge_spec,
+                &mut generated_sources,
+            );
+        }
 
-    // M_b.2 Phase A0 — FP8 KV decode (single config (32,8) = Qwen3.5-4B).
-    for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        let spec = TileLangKernelSpec {
-            artifact_dir: format!("batch_decode_paged_hd128_fp8_{suffix}"),
-            kernel_path: "tools/tilelang/batch_decode_paged_hd128_fp8.py",
-            kernel_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
-            out_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
-            kernel_family: "attention_fp8",
-            kernel_key: None,
-            num_q_heads: Some(q),
-            num_kv_heads: Some(kv),
-            public_decl: TILELANG_DISPATCH_FP8_PUBLIC_DECL,
-            extern_decl: TILELANG_DISPATCH_FP8_EXTERN_DECL,
-            call_args: TILELANG_DISPATCH_FP8_CALL_ARGS,
-            allow_sm70: false,
-        };
-        build_tilelang_kernel(
-            &python,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            &tilelang_src,
-            &cutlass_include,
-            &spec,
-            &mut generated_sources,
-        );
+        // M_b.2 Phase A0 — FP8 KV decode (single config (32,8) = Qwen3.5-4B).
+        for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
+            let suffix = format!("q{q}_kv{kv}");
+            let spec = TileLangKernelSpec {
+                artifact_dir: format!("batch_decode_paged_hd128_fp8_{suffix}"),
+                kernel_path: "tools/tilelang/batch_decode_paged_hd128_fp8.py",
+                kernel_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
+                out_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
+                kernel_family: "attention_fp8",
+                kernel_key: None,
+                num_q_heads: Some(q),
+                num_kv_heads: Some(kv),
+                public_decl: TILELANG_DISPATCH_FP8_PUBLIC_DECL,
+                extern_decl: TILELANG_DISPATCH_FP8_EXTERN_DECL,
+                call_args: TILELANG_DISPATCH_FP8_CALL_ARGS,
+                allow_sm70: false,
+            };
+            build_tilelang_kernel(
+                &python,
+                out_dir,
+                sm_targets,
+                cuda_path,
+                &tilelang_src,
+                &cutlass_include,
+                &spec,
+                &mut generated_sources,
+            );
+        }
     }
 
     let gdr_specs = [
@@ -2289,7 +2408,12 @@ fn main() {
     }
 
     if kernel_set.tilelang_aot_enabled() {
-        compile_tilelang_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+        compile_tilelang_aot_kernels(
+            &cuda_path,
+            &out_dir,
+            &sm_targets,
+            kernel_set.tilelang_gdr_only(),
+        );
     } else {
         compile_tilelang_stub_kernels(&cuda_path, &out_dir);
     }

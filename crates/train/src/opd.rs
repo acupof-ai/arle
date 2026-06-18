@@ -38,7 +38,8 @@ use crate::{
     causal_lm::live_tensor_ids,
     grad_clip::clip_grad_norm,
     loss::{
-        DEFAULT_KL_CHUNK_SIZE, KlDirection, cross_entropy_loss, kl_distill_loss,
+        DEFAULT_KL_CHUNK_SIZE, KlDirection, cross_entropy_loss, fused_linear_distill_loss,
+        generalized_beta_jsd_loss, generalized_beta_jsd_loss_chunked, kl_distill_loss,
         kl_distill_loss_chunked,
     },
     qwen35::{
@@ -220,6 +221,9 @@ pub struct GkdLossConfig<'a> {
     pub kl_chunk_size: Option<usize>,
     pub kl_direction: KlDirection,
     pub kl_temperature: f32,
+    pub kl_beta: Option<f32>,
+    pub teacher_topk: Option<usize>,
+    pub fused_distill: bool,
     pub logits_window_size: Option<usize>,
     pub kl_mask: OpdKlMask,
 }
@@ -233,6 +237,9 @@ impl Default for GkdLossConfig<'_> {
             kl_chunk_size: Some(DEFAULT_KL_CHUNK_SIZE),
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
         }
@@ -1139,6 +1146,15 @@ fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
             config.kl_temperature, config.lambda
         )));
     }
+    if let Some(beta) = config.kl_beta
+        && !(beta.is_finite() && (0.0..=1.0).contains(&beta))
+    {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD KL beta must be finite and in [0.0, 1.0], got {beta}. \
+             Hint: omit --kl-beta to keep --kl-direction, or pass 0.5 for \
+             TRL-style generalized JSD."
+        )));
+    }
     if config.kl_chunk_size == Some(0) {
         return Err(OpdError::InvalidInput(
             "OPD KL chunk size must be > 0 when set. Hint: pass \
@@ -1146,6 +1162,30 @@ fn validate_gkd_loss_config(config: GkdLossConfig<'_>) -> Result<()> {
              explicit larger value after a memory check."
                 .to_owned(),
         ));
+    }
+    if let Some(teacher_topk) = config.teacher_topk {
+        if teacher_topk == 0 {
+            return Err(OpdError::InvalidInput(
+                "OPD teacher top-k must be > 0 when set. Hint: omit \
+                 --teacher-topk to keep the dense full-vocab teacher path, or \
+                 pass a positive k after Piece A engine-side top-k is available."
+                    .to_owned(),
+            ));
+        }
+        if config.kl_direction != KlDirection::Forward {
+            return Err(OpdError::InvalidInput(
+                "OPD teacher top-k is forward-KL only. Hint: omit \
+                 --teacher-topk for reverse KL, or use --kl-direction forward."
+                    .to_owned(),
+            ));
+        }
+        if config.kl_beta.is_some() {
+            return Err(OpdError::InvalidInput(
+                "OPD teacher top-k does not support generalized JSD beta. Hint: \
+                 omit --kl-beta for sparse forward-KL teacher targets."
+                    .to_owned(),
+            ));
+        }
     }
     if config.logits_window_size == Some(0) {
         return Err(OpdError::InvalidInput(
@@ -1180,9 +1220,34 @@ fn kl_distill_loss_for_config(
     kl_chunk_size: Option<usize>,
     kl_direction: KlDirection,
     kl_temperature: f32,
+    kl_beta: Option<f32>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    if let Some(beta) = kl_beta {
+        return match kl_chunk_size {
+            Some(chunk_size) => generalized_beta_jsd_loss_chunked(
+                student_logits,
+                teacher_logits,
+                num_positions,
+                chunk_size,
+                kl_temperature,
+                beta,
+                store,
+                tape,
+            ),
+            None => generalized_beta_jsd_loss(
+                student_logits,
+                teacher_logits,
+                num_positions,
+                kl_temperature,
+                beta,
+                store,
+                tape,
+            ),
+        }
+        .map_err(OpdError::from);
+    }
     match kl_chunk_size {
         Some(chunk_size) => kl_distill_loss_chunked(
             student_logits,
@@ -1318,6 +1383,7 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
     kl_mask: OpdKlMask,
     kl_direction: KlDirection,
     kl_temperature: f32,
+    kl_beta: Option<f32>,
     student_model_params: &[TensorId],
     keep_extra: &HashSet<TensorId>,
     store: &mut TensorStore,
@@ -1464,16 +1530,29 @@ fn backward_chunked_kl_rollout<T: TeacherForward + ?Sized>(
         profile.student_forward_seconds += student_phase_started.elapsed().as_secs_f64();
     });
 
-    let loss = kl_distill_loss_chunked(
-        student_kl,
-        teacher_kl,
-        kl_range.len(),
-        chunk_size,
-        kl_temperature,
-        kl_direction,
-        store,
-        tape,
-    )
+    let loss = if let Some(beta) = kl_beta {
+        generalized_beta_jsd_loss_chunked(
+            student_kl,
+            teacher_kl,
+            kl_range.len(),
+            chunk_size,
+            kl_temperature,
+            beta,
+            store,
+            tape,
+        )
+    } else {
+        kl_distill_loss_chunked(
+            student_kl,
+            teacher_kl,
+            kl_range.len(),
+            chunk_size,
+            kl_temperature,
+            kl_direction,
+            store,
+            tape,
+        )
+    }
     .map_err(OpdError::from)?;
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
     record_profile(profile, |profile| {
@@ -2114,45 +2193,70 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
 
         window_tape.set_enabled(true);
         let phase_started = Instant::now();
-        log_opd_window_trace(
-            "kl",
-            "student_logits_window_start",
-            window_index,
-            window_started,
-            "",
-        );
-        let student_logits = student
-            .logits_from_hidden_window(store, &mut window_tape, student_hidden, window)
-            .map_err(|err| map_qwen35_forward_error("student cached-hidden KL", err))?;
-        log_opd_window_trace(
-            "kl",
-            "student_logits_window_done",
-            window_index,
-            window_started,
-            format!("tensor_id={student_logits}"),
-        );
-        let student_shape = store
-            .get(student_logits)
-            .ok_or(AutogradError::InvalidTensorId(student_logits))?
-            .shape
-            .clone();
-        validate_logits_shape("student windowed KL", &student_shape, window.len(), vocab)?;
-        record_profile(profile, |profile| {
-            profile.student_forward_seconds += phase_started.elapsed().as_secs_f64();
-        });
-
-        let phase_started = Instant::now();
-        log_opd_window_trace("kl", "kl_loss_start", window_index, window_started, "");
-        let kl_loss = kl_distill_loss_for_config(
-            student_logits,
-            teacher_tensor_id,
-            window.len(),
-            gkd_config.kl_chunk_size,
-            gkd_config.kl_direction,
-            gkd_config.kl_temperature,
-            store,
-            &mut window_tape,
-        )?;
+        let kl_loss = if gkd_config.kl_beta.is_some() || !gkd_config.fused_distill {
+            let logits_started = Instant::now();
+            log_opd_window_trace(
+                "kl",
+                "student_logits_window_start",
+                window_index,
+                window_started,
+                format!(
+                    "kl_beta={} fused_distill={}",
+                    gkd_config.kl_beta.is_some(),
+                    gkd_config.fused_distill
+                ),
+            );
+            let student_logits = student
+                .logits_from_hidden_window(store, &mut window_tape, student_hidden, window)
+                .map_err(|err| map_qwen35_forward_error("student cached-hidden KL beta", err))?;
+            record_profile(profile, |profile| {
+                profile.student_forward_seconds += logits_started.elapsed().as_secs_f64();
+            });
+            let loss_started = Instant::now();
+            let loss = kl_distill_loss_for_config(
+                student_logits,
+                teacher_tensor_id,
+                window.len(),
+                gkd_config.kl_chunk_size,
+                gkd_config.kl_direction,
+                gkd_config.kl_temperature,
+                gkd_config.kl_beta,
+                store,
+                &mut window_tape,
+            )?;
+            record_profile(profile, |profile| {
+                profile.kl_loss_seconds += loss_started.elapsed().as_secs_f64();
+            });
+            loss
+        } else {
+            log_opd_window_trace(
+                "kl",
+                "fused_linear_distill_start",
+                window_index,
+                window_started,
+                format!(
+                    "hidden_tensor_id={student_hidden} lm_head_tensor_id={}",
+                    student.lm_head_weight_id()
+                ),
+            );
+            // Default fused path is not bit-identical to dense logits+KL; local tests gate ~2e-5 equivalence. --no-fused-distill is the revert lever; H20 needle + same-binary A/B + wins are pending.
+            let loss = fused_linear_distill_loss(
+                student_hidden,
+                student.lm_head_weight_id(),
+                teacher_tensor_id,
+                window.start,
+                window.len(),
+                gkd_config.kl_chunk_size.unwrap_or(window.len()),
+                gkd_config.kl_temperature,
+                gkd_config.kl_direction,
+                store,
+                &mut window_tape,
+            )?;
+            record_profile(profile, |profile| {
+                profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
+            });
+            loss
+        };
         log_opd_window_trace(
             "kl",
             "kl_loss_done",
@@ -2160,9 +2264,6 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
             window_started,
             format!("tensor_id={kl_loss}"),
         );
-        record_profile(profile, |profile| {
-            profile.kl_loss_seconds += phase_started.elapsed().as_secs_f64();
-        });
         let weight = window.len() as f32 / kl_range.len() as f32;
         log_opd_window_trace("kl", "backward_start", window_index, window_started, "");
         let loss_started = Instant::now();
@@ -2396,6 +2497,7 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
                 gkd_config.kl_chunk_size,
                 gkd_config.kl_direction,
                 gkd_config.kl_temperature,
+                gkd_config.kl_beta,
                 store,
                 tape,
             )?;
@@ -2749,6 +2851,13 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
     );
     validate_step_config(&cfg)?;
     validate_gkd_loss_config(gkd_config)?;
+    if let Some(teacher_topk) = gkd_config.teacher_topk {
+        return Err(OpdError::InvalidInput(format!(
+            "OPD teacher_topk={teacher_topk} requires Piece A engine-side \
+             top-k teacher targets on H20/CUDA. Local Piece C only wires the \
+             config gate; omit --teacher-topk to keep the dense full-vocab path."
+        )));
+    }
     let vocab = student.config().vocab_size;
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
@@ -3047,6 +3156,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
                 gkd_config.kl_mask,
                 gkd_config.kl_direction,
                 gkd_config.kl_temperature,
+                gkd_config.kl_beta,
                 &student_model_params,
                 &keep_extra,
                 store,
@@ -3132,6 +3242,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             gkd_config.kl_chunk_size,
             gkd_config.kl_direction,
             gkd_config.kl_temperature,
+            gkd_config.kl_beta,
             store,
             tape,
         )?;
@@ -3438,6 +3549,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -3455,6 +3569,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -3471,6 +3588,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -3482,6 +3602,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -3497,6 +3620,9 @@ mod tests {
             kl_chunk_size: Some(0),
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::Full,
         })
@@ -3511,6 +3637,72 @@ mod tests {
     }
 
     #[test]
+    fn validate_gkd_loss_config_gates_teacher_topk_shape_and_objective() {
+        validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: Some(64),
+            fused_distill: true,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
+        })
+        .expect("positive teacher top-k should be valid for sparse forward KL");
+
+        let zero = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: Some(0),
+            fused_distill: true,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
+        })
+        .expect_err("zero teacher top-k must be rejected");
+        assert!(format!("{zero}").contains("teacher top-k"));
+
+        let reverse = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            kl_direction: KlDirection::Reverse,
+            kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: Some(64),
+            fused_distill: true,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
+        })
+        .expect_err("sparse teacher top-k must reject reverse KL");
+        assert!(format!("{reverse}").contains("forward-KL only"));
+
+        let beta = validate_gkd_loss_config(GkdLossConfig {
+            lambda: 0.0,
+            sft_anchor: GkdSftAnchor::StudentRollout,
+            corpus_tokens: None,
+            kl_chunk_size: None,
+            kl_direction: KlDirection::Forward,
+            kl_temperature: 1.0,
+            kl_beta: Some(0.5),
+            teacher_topk: Some(64),
+            fused_distill: true,
+            logits_window_size: None,
+            kl_mask: OpdKlMask::CompletionOnly,
+        })
+        .expect_err("sparse teacher top-k must reject generalized JSD");
+        assert!(format!("{beta}").contains("JSD beta"));
+    }
+
+    #[test]
     fn validate_gkd_loss_config_rejects_temperature_with_sft_blend() {
         let err = validate_gkd_loss_config(GkdLossConfig {
             lambda: 0.5,
@@ -3519,6 +3711,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 2.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
         })
@@ -3539,6 +3734,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 2.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
         })
@@ -3554,6 +3752,9 @@ mod tests {
             kl_chunk_size: None,
             kl_direction: KlDirection::Forward,
             kl_temperature: 1.0,
+            kl_beta: None,
+            teacher_topk: None,
+            fused_distill: true,
             logits_window_size: Some(0),
             kl_mask: OpdKlMask::Full,
         })
@@ -3615,6 +3816,7 @@ mod tests {
             Some(1),
             KlDirection::Forward,
             1.0,
+            None,
             &mut store,
             &mut tape,
         )

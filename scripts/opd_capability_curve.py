@@ -6,7 +6,7 @@ Given a manifest of checkpoints, this script, **for each checkpoint**:
   1. ensures an OpenAI-v1 serve is reachable — either an existing `base_url`
      you pass through, or a `model_path` it launches `arle serve` for and
      tears down afterwards;
-  2. runs `scripts/arle_capability_eval.py` (mmlu, gsm8k) by subprocess
+  2. runs `scripts/arle_capability_eval.py` (mmlu, gsm8k, math500) by subprocess
      (optionally multi-seed → seed_<N>/ subdirs);
   3. optionally runs `scripts/arle_swe_pro_eval.py` prepare + generate by
      subprocess (the official Docker `evaluate` stays out of band; see
@@ -15,7 +15,7 @@ Given a manifest of checkpoints, this script, **for each checkpoint**:
   5. prints a Δ-vs-baseline table, reusing `scripts/analyze_multi_seed.py`
      for binomial / Wilson CI where seeds are present.
 
-It reimplements no eval logic. MMLU/GSM8K scoring lives in
+It reimplements no eval logic. MMLU/GSM8K/MATH-500 scoring lives in
 arle_capability_eval.py; SWE-bench Pro lives in arle_swe_pro_eval.py; CI math
 lives in analyze_multi_seed.py. This file is glue: serve lifecycle + manifest
 fan-out + a Δ table.
@@ -61,7 +61,7 @@ Examples
   # baseline as a single inline checkpoint, driver launches+tears down the serve
   python scripts/opd_capability_curve.py \
     --checkpoint label=base,model_path=/models/Qwen3-4B \
-    --tasks mmlu,gsm8k --n-samples 100 --seed 0 \
+    --tasks mmlu,gsm8k,math500 --n-samples 100 --seed 0 \
     --serve-backend cuda \
     --output bench-output/curve-base
 
@@ -74,7 +74,7 @@ Examples
   ]
   JSON
   python scripts/opd_capability_curve.py --manifest /tmp/curve.json \
-    --tasks mmlu,gsm8k --n-samples 500 --seeds 0,1,2,3,4 \
+    --tasks math500 --n-samples 500 --math-max-tokens 4096 \
     --serve-backend cuda --output bench-output/curve-opd
 
   # dry-run: print exactly what would happen, launch nothing, eval nothing
@@ -86,6 +86,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import shutil
@@ -104,7 +105,7 @@ CAP_EVAL = SCRIPTS_DIR / "arle_capability_eval.py"
 SWE_EVAL = SCRIPTS_DIR / "arle_swe_pro_eval.py"
 ANALYZE = SCRIPTS_DIR / "analyze_multi_seed.py"
 
-CAP_TASKS = {"mmlu", "gsm8k"}
+CAP_TASKS = {"mmlu", "gsm8k", "math500"}
 SWE_TASK = "swe_pro"
 
 
@@ -118,6 +119,9 @@ class Checkpoint:
     model_path: str | None = None
     adapter_path: str | None = None
     model_id: str | None = None
+    arm: str | None = None
+    training_seed: int | None = None
+    delta_vs_arm: str | None = None
 
     def resolved_model_id(self) -> str:
         if self.model_id:
@@ -152,7 +156,16 @@ def _parse_inline_checkpoint(raw: str) -> Checkpoint:
             raise ValueError(f"inline checkpoint field {part!r} must be key=value")
         key, value = part.split("=", 1)
         fields[key.strip()] = value.strip()
-    allowed = {"label", "base_url", "model_path", "adapter_path", "model_id"}
+    allowed = {
+        "label",
+        "base_url",
+        "model_path",
+        "adapter_path",
+        "model_id",
+        "arm",
+        "training_seed",
+        "delta_vs_arm",
+    }
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"inline checkpoint unknown keys {sorted(unknown)}; allowed {sorted(allowed)}")
@@ -174,6 +187,9 @@ def load_checkpoints(args: argparse.Namespace) -> list[Checkpoint]:
                 model_path=entry.get("model_path"),
                 adapter_path=entry.get("adapter_path"),
                 model_id=entry.get("model_id"),
+                arm=entry.get("arm"),
+                training_seed=entry.get("training_seed"),
+                delta_vs_arm=entry.get("delta_vs_arm"),
             )
             cp.validate()
             checkpoints.append(cp)
@@ -240,9 +256,9 @@ def launch_serve(cp: Checkpoint, args: argparse.Namespace, output_dir: Path) -> 
         "--bind", args.serve_host,
     ]
     # Size the serve token ceiling so it never silently caps the eval generation
-    # below --gsm8k-max-tokens (the reasoning gen budget). Auto = prompt
+    # below the selected reasoning gen budget. Auto = prompt
     # headroom (1024) + gen budget.
-    serve_total = args.serve_max_total_tokens or (1024 + args.gsm8k_max_tokens)
+    serve_total = args.serve_max_total_tokens or (1024 + max(args.gsm8k_max_tokens, args.math_max_tokens))
     cmd += ["--max-total-tokens", str(serve_total), "--max-prompt-tokens", str(serve_total)]
     if cp.adapter_path:
         if not args.serve_supports_adapter:
@@ -313,6 +329,8 @@ def run_capability_eval(
     if args.gsm8k_shots is not None:
         cmd += ["--gsm8k-shots", str(args.gsm8k_shots)]
     cmd += ["--gsm8k-max-tokens", str(args.gsm8k_max_tokens)]
+    cmd += ["--math-max-tokens", str(args.math_max_tokens)]
+    cmd += ["--request-timeout", str(args.request_timeout)]
     rc = _run(cmd, dry_run=args.dry_run)
     if rc != 0 and not args.dry_run:
         raise RuntimeError(f"capability eval failed for {cp.label!r} (exit {rc})")
@@ -392,6 +410,7 @@ def _read_cap_metrics(cap_dir: Path, cap_tasks: list[str]) -> dict[str, Any]:
             report = summary.get("tasks", {}).get(task, {})
             out["tasks"][task] = {
                 "accuracy": report.get("accuracy"),
+                "ci95": report.get("ci95"),
                 "n_correct": report.get("n_correct"),
                 "n_scored": report.get("n_scored"),
                 "n_invalid": report.get("n_invalid"),
@@ -407,6 +426,75 @@ def _metric_value(cap_metrics: dict[str, Any], task: str) -> float | None:
     if cap_metrics.get("mode") == "multi_seed":
         return blob.get("mean_accuracy")
     return blob.get("accuracy")
+
+
+def write_curve_svg(curve: dict[str, Any], task: str, out_path: Path) -> bool:
+    points = [
+        p for p in curve["points"]
+        if _metric_value(p["capability"], task) is not None
+    ]
+    if not points:
+        return False
+
+    width, height = 760, 420
+    left, right, top, bottom = 70, 170, 34, 58
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    all_have_seed = all(p.get("training_seed") is not None for p in points)
+    xs_raw = [p["training_seed"] if all_have_seed else i for i, p in enumerate(points)]
+    ys_raw = [100.0 * _metric_value(p["capability"], task) for p in points]
+    x_min, x_max = min(xs_raw), max(xs_raw)
+    y_min, y_max = min(ys_raw), max(ys_raw)
+    if x_min == x_max:
+        x_min -= 1
+        x_max += 1
+    if y_min == y_max:
+        y_min -= 1
+        y_max += 1
+    y_pad = max(1.0, (y_max - y_min) * 0.2)
+    y_min = max(0.0, y_min - y_pad)
+    y_max = min(100.0, y_max + y_pad)
+
+    def sx(x: float) -> float:
+        return left + (x - x_min) / (x_max - x_min) * plot_w
+
+    def sy(y: float) -> float:
+        return top + (y_max - y) / (y_max - y_min) * plot_h
+
+    grouped: dict[str, list[tuple[float, float, str]]] = {}
+    for idx, (p, x, y) in enumerate(zip(points, xs_raw, ys_raw)):
+        name = p.get("arm") or p["label"]
+        grouped.setdefault(name, []).append((float(x), y, p["label"]))
+
+    colors = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
+    elems = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{left}" y="24" font-family="sans-serif" font-size="16" font-weight="700">OPD capability curve: {html.escape(task)}</text>',
+        f'<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#333"/>',
+        f'<text x="{left + plot_w / 2}" y="{height - 18}" text-anchor="middle" font-family="sans-serif" font-size="12">{"training seed" if all_have_seed else "checkpoint"}</text>',
+        f'<text x="18" y="{top + plot_h / 2}" transform="rotate(-90 18 {top + plot_h / 2})" text-anchor="middle" font-family="sans-serif" font-size="12">accuracy (%)</text>',
+    ]
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        yv = y_min + frac * (y_max - y_min)
+        y = sy(yv)
+        elems.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" stroke="#ddd"/>')
+        elems.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" font-family="sans-serif" font-size="11">{yv:.1f}</text>')
+    for i, (name, vals) in enumerate(sorted(grouped.items())):
+        vals.sort()
+        color = colors[i % len(colors)]
+        path = " ".join(("M" if j == 0 else "L") + f"{sx(x):.1f},{sy(y):.1f}" for j, (x, y, _) in enumerate(vals))
+        elems.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"/>')
+        for x, y, label in vals:
+            elems.append(f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="4" fill="{color}"><title>{html.escape(label)} {y:.2f}%</title></circle>')
+        lx = left + plot_w + 18
+        ly = top + 20 + i * 22
+        elems.append(f'<line x1="{lx}" y1="{ly - 4}" x2="{lx + 18}" y2="{ly - 4}" stroke="{color}" stroke-width="2"/>')
+        elems.append(f'<text x="{lx + 24}" y="{ly}" font-family="sans-serif" font-size="12">{html.escape(name)}</text>')
+    elems.append("</svg>")
+    out_path.write_text("\n".join(elems) + "\n")
+    return True
 
 
 # ───────────────────────── delta table ──────────────────────────
@@ -432,6 +520,58 @@ def print_delta_table(curve: dict[str, Any], baseline_label: str, cap_tasks: lis
             else:
                 row.append(f"{100 * (v - bv):+.2f}")
         print("  " + "  ".join(f"{c:>14}" for c in row))
+
+
+def _mean_sigma(values: list[float]) -> tuple[float, float]:
+    mu = sum(values) / len(values)
+    if len(values) < 2:
+        return mu, 0.0
+    var = sum((v - mu) ** 2 for v in values) / (len(values) - 1)
+    return mu, var ** 0.5
+
+
+def print_training_seed_table(curve: dict[str, Any], cap_tasks: list[str]) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for point in curve["points"]:
+        arm = point.get("arm")
+        if arm is None or point.get("training_seed") is None:
+            continue
+        grouped.setdefault(arm, []).append(point)
+    if not grouped:
+        return
+
+    print("\n========== across training seeds ==========", flush=True)
+    for task in cap_tasks:
+        print(f"\n{task}", flush=True)
+        print(f"  {'arm':>28}  {'n':>3}  {'mean':>8}  {'sigma':>8}  {'delta_vs':>24}  {'Δmean(pp)':>10}  {'Δsigma':>8}")
+        for arm, points in sorted(grouped.items()):
+            by_seed = {
+                p["training_seed"]: _metric_value(p["capability"], task)
+                for p in points
+                if _metric_value(p["capability"], task) is not None
+            }
+            vals = list(by_seed.values())
+            if not vals:
+                continue
+            mu, sig = _mean_sigma(vals)
+            delta_vs = next((p.get("delta_vs_arm") for p in points if p.get("delta_vs_arm")), None)
+            delta_mean = delta_sigma = None
+            if delta_vs and delta_vs in grouped:
+                control = {
+                    p["training_seed"]: _metric_value(p["capability"], task)
+                    for p in grouped[delta_vs]
+                    if _metric_value(p["capability"], task) is not None
+                }
+                deltas = [by_seed[s] - control[s] for s in sorted(by_seed.keys() & control.keys())]
+                if deltas:
+                    delta_mean, delta_sigma = _mean_sigma(deltas)
+            print(
+                f"  {arm:>28}  {len(vals):>3}  {mu:>8.4f}  {sig:>8.4f}  "
+                f"{(delta_vs or '—'):>24}  "
+                f"{(f'{100 * delta_mean:+.2f}' if delta_mean is not None else '—'):>10}  "
+                f"{(f'{100 * delta_sigma:.2f}' if delta_sigma is not None else '—'):>8}",
+                flush=True,
+            )
 
 
 def maybe_run_analyze(curve_out: Path, points: list[dict[str, Any]], baseline_label: str, cap_tasks: list[str], dry_run: bool) -> None:
@@ -474,14 +614,18 @@ def main(argv: list[str]) -> int:
 
     ev = parser.add_argument_group("eval selection")
     ev.add_argument("--tasks", default="mmlu,gsm8k",
-                    help="comma list of: mmlu, gsm8k, swe_pro")
-    ev.add_argument("--n-samples", type=int, default=200, help="samples per MMLU/GSM8K task")
+                    help="comma list of: mmlu, gsm8k, math500, swe_pro")
+    ev.add_argument("--n-samples", type=int, default=200, help="samples per selected capability task")
     ev.add_argument("--seed", type=int, default=None, help="single seed (mutually exclusive with --seeds)")
     ev.add_argument("--seeds", default=None, help="comma seed list → multi-seed seed_<N>/ + CI")
     ev.add_argument("--gsm8k-shots", type=int, default=None, help="few-shot count for GSM8K")
     ev.add_argument("--gsm8k-max-tokens", type=int, default=2048,
                     help="GSM8K generation budget (reasoning). 2048 covers base-model CoT; "
                          ">=10K for thinking-mode models. Old 256 truncated chains before ####.")
+    ev.add_argument("--math-max-tokens", type=int, default=4096,
+                    help="MATH-500 generation budget (reasoning). OPD A/B uses >=4096.")
+    ev.add_argument("--request-timeout", type=float, default=1800.0,
+                    help="per-sample ARLE HTTP timeout for capability eval subprocesses")
     ev.add_argument("--swe-limit", type=int, default=3, help="SWE-bench Pro instance count when swe_pro is selected")
 
     sv = parser.add_argument_group("serve lifecycle (model_path checkpoints only)")
@@ -492,8 +636,8 @@ def main(argv: list[str]) -> int:
                     help="seconds to wait for /v1/models to come up")
     sv.add_argument("--serve-max-total-tokens", type=int, default=0,
                     help="arle serve --max-total-tokens ceiling. 0 = auto-size to "
-                         "(prompt headroom 1024 + --gsm8k-max-tokens) so the serve never "
-                         "silently caps the eval generation below --gsm8k-max-tokens.")
+                         "(prompt headroom 1024 + max reasoning max-tokens) so the serve never "
+                         "silently caps the eval generation below the selected task budget.")
     sv.add_argument("--serve-extra-arg", action="append", default=[],
                     help="extra arg passed verbatim to arle serve (repeatable)")
     sv.add_argument("--serve-supports-adapter", action="store_true",
@@ -501,6 +645,8 @@ def main(argv: list[str]) -> int:
     sv.add_argument("--arle-bin", default=None, help="path to the arle binary (default: PATH / target/release)")
 
     parser.add_argument("--output", type=Path, required=True, help="curve output directory")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="reuse <checkpoint>/capability/summary.json when present")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every action, launch no serve, run no eval")
     args = parser.parse_args(argv)
@@ -550,39 +696,43 @@ def main(argv: list[str]) -> int:
         cp_out = args.output / cp.label
         cp_out.mkdir(parents=True, exist_ok=True)
         session: ServeSession | None = None
-        try:
-            if cp.base_url:
-                base_url = cp.base_url
-                if not args.dry_run and not serve_is_ready(base_url):
-                    raise RuntimeError(
-                        f"checkpoint {cp.label!r} base_url {base_url} not reachable "
-                        "(GET /v1/models failed); start the serve first"
-                    )
-                print(f"[curve] using existing serve {base_url}", flush=True)
-            else:
-                if args.dry_run:
-                    base_url = f"http://{args.serve_host}:{args.serve_port}"
-                    arle = args.arle_bin or shutil.which("arle") or str(REPO_ROOT / "target/release/arle")
-                    print(
-                        f"[curve] would launch: {arle} serve --backend {args.serve_backend} "
-                        f"--model-path {cp.model_path} --port {args.serve_port}",
-                        flush=True,
-                    )
+        cap_summary = cp_out / "capability" / "summary.json"
+        if cap_tasks and args.skip_existing and cap_summary.exists():
+            print(f"[curve] skip existing capability summary for {cp.label!r}: {cap_summary}", flush=True)
+        else:
+            try:
+                if cp.base_url:
+                    base_url = cp.base_url
+                    if not args.dry_run and not serve_is_ready(base_url):
+                        raise RuntimeError(
+                            f"checkpoint {cp.label!r} base_url {base_url} not reachable "
+                            "(GET /v1/models failed); start the serve first"
+                        )
+                    print(f"[curve] using existing serve {base_url}", flush=True)
                 else:
-                    session = launch_serve(cp, args, cp_out)
-                    base_url = session.base_url
+                    if args.dry_run:
+                        base_url = f"http://{args.serve_host}:{args.serve_port}"
+                        arle = args.arle_bin or shutil.which("arle") or str(REPO_ROOT / "target/release/arle")
+                        print(
+                            f"[curve] would launch: {arle} serve --backend {args.serve_backend} "
+                            f"--model-path {cp.model_path} --port {args.serve_port}",
+                            flush=True,
+                        )
+                    else:
+                        session = launch_serve(cp, args, cp_out)
+                        base_url = session.base_url
 
-            if cap_tasks:
-                run_capability_eval(cp, base_url, args, cap_tasks, cp_out)
-            if want_swe:
-                run_swe_pro(cp, base_url, args, cp_out)
-        except (RuntimeError, OSError) as exc:
-            print(f"[curve] error on checkpoint {cp.label!r}: {exc}", file=sys.stderr)
-            return 1
-        finally:
-            if session is not None:
-                print(f"[curve] teardown serve for {cp.label!r}", flush=True)
-                session.teardown()
+                if cap_tasks:
+                    run_capability_eval(cp, base_url, args, cap_tasks, cp_out)
+                if want_swe:
+                    run_swe_pro(cp, base_url, args, cp_out)
+            except (RuntimeError, OSError) as exc:
+                print(f"[curve] error on checkpoint {cp.label!r}: {exc}", file=sys.stderr)
+                return 1
+            finally:
+                if session is not None:
+                    print(f"[curve] teardown serve for {cp.label!r}", flush=True)
+                    session.teardown()
 
         cap_metrics = (
             _read_cap_metrics(cp_out / "capability", cap_tasks)
@@ -597,6 +747,9 @@ def main(argv: list[str]) -> int:
             "model_path": cp.model_path,
             "base_url": cp.base_url,
             "adapter_path": cp.adapter_path,
+            "arm": cp.arm,
+            "training_seed": cp.training_seed,
+            "delta_vs_arm": cp.delta_vs_arm,
             "capability": cap_metrics,
             "actual_n_scored": {
                 task: cap_metrics.get("tasks", {}).get(task, {}).get("n_scored")
@@ -606,12 +759,18 @@ def main(argv: list[str]) -> int:
         })
 
     curve["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if cap_tasks:
+        svg_path = args.output / "curve.svg"
+        if write_curve_svg(curve, cap_tasks[0], svg_path):
+            curve["curve_svg"] = str(svg_path)
+            print(f"[curve] wrote {svg_path}", flush=True)
     curve_path = args.output / "curve.json"
     curve_path.write_text(json.dumps(curve, indent=2))
     print(f"\n[curve] wrote {curve_path}", flush=True)
 
     if cap_tasks:
         print_delta_table(curve, baseline_label, cap_tasks)
+        print_training_seed_table(curve, cap_tasks)
         if args.seeds:
             maybe_run_analyze(args.output, curve["points"], baseline_label, cap_tasks, args.dry_run)
 

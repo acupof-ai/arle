@@ -12,6 +12,8 @@ pub mod collective;
 pub mod elementwise;
 #[path = "ops/embed.rs"]
 pub mod embed;
+#[path = "ops/fused_linear_distill.rs"]
+pub mod fused_linear_distill;
 #[path = "ops/gather.rs"]
 pub mod gather;
 #[path = "ops/layout.rs"]
@@ -43,6 +45,7 @@ pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::all_reduce_sum_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
+pub(crate) use fused_linear_distill::{fused_linear_distill_backward, generalized_jsd_backward};
 pub(crate) use gather::gather_last_dim_backward;
 pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
 pub(crate) use linear_attention::linear_attention_backward;
