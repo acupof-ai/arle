@@ -216,11 +216,11 @@ fn alloc_neg1_i32(
 
 #[cfg(feature = "cuda")]
 mod gpu {
-    use anyhow::{Result, ensure};
+    use anyhow::{ensure, Result};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, HiddenStates, RawDevicePtr};
-    use cuda_kernels::tensor::WeightFormat;
     use cuda_kernels::tensor::cache_ptr;
+    use cuda_kernels::tensor::WeightFormat;
     use cudarc::driver::sys::CUevent_flags;
     use half::bf16;
     use infer_moe::{MoeConfig, ScoringFunc, TopkMethod};
@@ -228,8 +228,8 @@ mod gpu {
     use std::time::Instant;
 
     use super::{
-        DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
         deepgemm_contig_rows_cap, qwen35_deepgemm_enabled, qwen35_moe_decode_kernel_enabled,
+        DEEPGEMM_CONTIG_ALIGN, QWEN35_DEEPGEMM_MIN_ROUTES, QWEN35_MOE_DECODE_MAX_ROUTES,
     };
     use crate::loader::{ExpertQuantDispatchSignature, MoeLayerWeights};
     use crate::moe_config::ExpertSplit;
@@ -1925,17 +1925,17 @@ mod gpu {
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 mod dsv4_gpu {
-    use anyhow::{Result, ensure};
+    use anyhow::{ensure, Result};
     use cuda_kernels::moe;
     use cuda_kernels::prelude::{DeviceContext, HiddenStates};
-    use cuda_kernels::tensor::{Dsv4Fp8DeepGemmWeightCache, RawDevicePtr, cache_ptr};
+    use cuda_kernels::tensor::{cache_ptr, Dsv4Fp8DeepGemmWeightCache, RawDevicePtr};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use half::bf16;
     use std::sync::Arc;
 
     use super::{
-        DEEPGEMM_CONTIG_ALIGN, DSV4_DECODE_CONTIG_ALIGN, DSV4_DECODE_CONTIG_MAX_ROUTES,
-        alloc_neg1_i32, deepgemm_contig_rows_cap,
+        alloc_neg1_i32, deepgemm_contig_rows_cap, DEEPGEMM_CONTIG_ALIGN, DSV4_DECODE_CONTIG_ALIGN,
+        DSV4_DECODE_CONTIG_MAX_ROUTES,
     };
     use crate::dsv4::{Dsv4ForwardKeepalive, Dsv4Model, Dsv4MoeLayer};
     use crate::moe_config::ExpertSplit;
@@ -3651,6 +3651,11 @@ mod dsv4_gpu {
         swiglu_limit: f32,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
+        // GLM: bf16 shared expert (the E8M0 FP8 re-encode is lossy on its general
+        // F32 block scales). DSv4 leaves the bf16 caches `None` → FP8 path below.
+        if layer.shared_gate_bf16.is_some() {
+            return dsv4_shared_expert_bf16(ctx, stream, layer, hidden, out, keepalive);
+        }
         let shared = dsv4_shared_expert(ctx, stream, layer, hidden, swiglu_limit, keepalive)?;
         ensure!(
             shared.hidden_dim == out.hidden_dim && shared.seq_len >= out.seq_len,
@@ -3678,6 +3683,15 @@ mod dsv4_gpu {
         swiglu_limit: f32,
         scratch: &mut Dsv4MoeDecodeScratch,
     ) -> Result<()> {
+        // GLM never reaches the captured decode-graph closure: `forward_tokens`
+        // gates the decode graph on `!config.plain_o_proj` because the bf16 shared
+        // expert's GEMMs allocate per-call scratch (illegal under capture/replay).
+        // Hard-fail instead of silently allocating inside the capture.
+        ensure!(
+            layer.shared_gate_bf16.is_none(),
+            "GLM bf16 shared expert must not run under the captured decode graph \
+             (forward_tokens gates it off for GLM); reached the FP8 decode-graph path"
+        );
         ensure!(
             hidden.seq_len == 1
                 && scratch.hidden_dim == hidden.hidden_dim
@@ -4301,6 +4315,10 @@ mod dsv4_gpu {
     ) -> Result<()> {
         let hidden_dim = hidden.hidden_dim;
         let num_tokens = hidden.seq_len;
+        ensure!(
+            num_tokens > 0,
+            "GLM bf16 shared expert requires at least one token"
+        );
         let shared_inter = layer.shared_w2.cols;
         ensure!(
             num_tokens == 1
@@ -4396,6 +4414,136 @@ mod dsv4_gpu {
 
     /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
     /// gate+up → clamped SwiGLU → w2 down, over every token. No routing/scatter.
+    /// GLM bf16 shared expert (single dense group, all tokens). Mirrors
+    /// `bf16_grouped_experts` with num_groups=1 / m_indices≡0: gate & up GEMMs
+    /// → unclamped SiLU(gate)⊙up → down GEMM, all bf16. Writes the result into
+    /// `out` (`[hidden, num_tokens]`). Eager-only (the GEMMs allocate scratch, so
+    /// this is illegal under decode-graph capture — `forward_tokens` routes GLM
+    /// eagerly). Resolves the lossy E8M0 re-encode on this always-on expert.
+    fn dsv4_shared_expert_bf16(
+        ctx: &DeviceContext,
+        _stream: &Arc<CudaStream>,
+        layer: &Dsv4MoeLayer,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let hidden_dim = hidden.hidden_dim;
+        let num_tokens = hidden.seq_len;
+        let gate_g = layer
+            .shared_gate_bf16
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GLM bf16 shared expert requires shared_gate_bf16"))?;
+        let up_g = layer
+            .shared_up_bf16
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GLM bf16 shared expert requires shared_up_bf16"))?;
+        let w2 = layer
+            .shared_w2_bf16
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GLM bf16 shared expert requires shared_w2_bf16"))?;
+        let intermediate = gate_g.rows;
+        ensure!(
+            gate_g.is_bf16 && up_g.is_bf16 && w2.is_bf16,
+            "GLM bf16 shared expert requires bf16 caches"
+        );
+        ensure!(
+            gate_g.groups == 1
+                && up_g.groups == 1
+                && w2.groups == 1
+                && gate_g.cols == hidden_dim
+                && up_g.rows == intermediate
+                && up_g.cols == hidden_dim
+                && w2.rows == hidden_dim
+                && w2.cols == intermediate,
+            "GLM bf16 shared cache metadata mismatch: gate={}x{} up={}x{} w2={}x{} H={hidden_dim} I={intermediate}",
+            gate_g.rows,
+            gate_g.cols,
+            up_g.rows,
+            up_g.cols,
+            w2.rows,
+            w2.cols,
+        );
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
+            "GLM bf16 shared out shape {}x{} != hidden {hidden_dim}x{num_tokens}",
+            out.hidden_dim,
+            out.seq_len
+        );
+
+        let rows = num_tokens;
+        let gate_out = HiddenStates::zeros(ctx, intermediate, rows)?;
+        let up_out = HiddenStates::zeros(ctx, intermediate, rows)?;
+        let mut act = HiddenStates::zeros(ctx, intermediate, rows)?;
+        // Single group spanning every row → m_indices all 0.
+        let m_indices = ctx
+            .stream
+            .alloc_zeros::<i32>(rows)
+            .map_err(|e| anyhow::anyhow!("GLM bf16 shared m_indices alloc failed: {e}"))?;
+        keepalive.keep_hidden(&gate_out);
+        keepalive.keep_hidden(&up_out);
+        keepalive.keep_hidden(&act);
+        keepalive.keep_i32(&m_indices);
+
+        let p_hidden = cache_ptr(&hidden.data, ctx);
+        let p_gate_out = cache_ptr(&gate_out.data, ctx);
+        let p_up_out = cache_ptr(&up_out.data, ctx);
+        let p_act = cache_ptr(&act.data, ctx);
+        let p_out = cache_ptr(&out.data, ctx);
+        let p_m_indices = cache_ptr(&m_indices, ctx);
+        let p_gate_w = cache_ptr(&gate_g.weight, ctx).cast::<bf16>();
+        let p_up_w = cache_ptr(&up_g.weight, ctx).cast::<bf16>();
+        let p_w2 = cache_ptr(&w2.weight, ctx).cast::<bf16>();
+        let stream = ctx.stream.cu_stream();
+
+        // SAFETY: all buffers valid on ctx.stream for the checked shapes; the
+        // single-group bf16 GEMMs bound rows by m_indices≡0 (all valid).
+        unsafe {
+            // gate: [rows, hidden] @ gate[1, inter, hidden]^T -> [rows, inter]
+            moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                p_hidden,
+                p_gate_w,
+                p_gate_out,
+                p_m_indices,
+                1,
+                rows,
+                intermediate,
+                hidden_dim,
+                stream,
+            )?;
+            // up: [rows, hidden] @ up[1, inter, hidden]^T -> [rows, inter]
+            moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                p_hidden,
+                p_up_w,
+                p_up_out,
+                p_m_indices,
+                1,
+                rows,
+                intermediate,
+                hidden_dim,
+                stream,
+            )?;
+        }
+        // GLM shared expert: plain SiLU(gate)⊙up (no clamp), same as routed.
+        silu_mul(ctx, &gate_out, &up_out, &mut act)?;
+        // SAFETY: same buffer-validity contract as the gate/up GEMMs above.
+        unsafe {
+            // w2: [rows, inter] @ w2[1, hidden, inter]^T -> [rows, hidden]
+            moe::deepgemm_m_grouped_bf16_gemm_nt_contiguous(
+                p_act,
+                p_w2,
+                p_out,
+                p_m_indices,
+                1,
+                rows,
+                hidden_dim,
+                intermediate,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     fn dsv4_shared_expert(
         ctx: &DeviceContext,
         stream: &Arc<CudaStream>,
@@ -4963,21 +5111,21 @@ mod dsv4_gpu {
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
-    Dsv4GemvTables, Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache,
-    build_grouped_cache_bf16, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
-    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
+    build_grouped_cache, build_grouped_cache_bf16, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
+    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph, Dsv4GemvTables,
+    Dsv4MoeDecodeScratch, GroupedCache,
 };
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
 #[cfg(feature = "cuda")]
 pub(crate) use gpu::{
-    MoeForwardScratch, moe_forward, moe_forward_into, qwen35_decode_moe_graph_capturable,
+    moe_forward, moe_forward_into, qwen35_decode_moe_graph_capturable, MoeForwardScratch,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infer_moe::{MoeConfig, route};
+    use infer_moe::{route, MoeConfig};
 
     fn cfg(num_experts: usize, top_k: usize, norm: bool) -> MoeConfig {
         MoeConfig::qwen36(num_experts, top_k, norm, 8)
