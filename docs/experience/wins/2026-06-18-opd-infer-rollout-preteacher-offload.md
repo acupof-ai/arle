@@ -70,6 +70,24 @@ Remote evidence:
   - `optimizer_step_done` at 26.547 s
   - JSON result: `losses=[4.843664646148682]`, `steps=1`, `teacher_runtime=Infer`
   - Exit: `EXIT:0`
+- Rollout-256 target smoke on `.62` also passed with the same binary shape and
+  `ARLE_OPD_ENGINE_OFFLOAD=all`:
+  - Log start: `START 2026-06-18T06:21:29+00:00
+    host=iv-ye8is8fbi8s6iplibbg7 ... model=/data01/models/Qwen3.6-35B-A3B-FP8 gpu=1`
+  - `student_pre_teacher_offloaded freed_mib=34057.8`
+  - `teacher_pre_step_offloaded freed_mib=34057.8`
+  - `infer_rollout_generate_start` at 5.009 s ->
+    `infer_rollout_generate_done` at 7.896 s (`actual_rollout_len=259`), so the
+    256-token rollout generation itself took 2.886 s with infer KV-cache decode.
+  - `teacher_reload_done` 4.959 s, `teacher_full_forward_done` 12.337 s for
+    shape `[1, 259, 248320]`.
+  - `student_hidden_forward_done` 66.712 s and `base_backward_done` 96.948 s:
+    the remaining wall time is now the train/autograd forward-backward path, not
+    rollout generation.
+  - `optimizer_step_done` at 201.159 s.
+  - JSON result: `losses=[0.42180460691452026]`, `steps=1`,
+    `rollout_len=256`, `teacher_runtime=Infer`.
+  - Exit: `EXIT:0`.
 
 Remote command:
 
@@ -96,6 +114,9 @@ ARLE_OPD_STEP_TRACE=1 ARLE_OPD_STEP_PROFILE=1 \
 
 Remote log: `/tmp/arle_opd35_student_offload_smoke.log` on
 `iv-ye8is8fbi8s6iplibbg7`.
+
+Rollout-256 rerun used the same command with `--rollout-len 256`; remote log:
+`/tmp/arle_opd35_r256_smoke.log` on `iv-ye8is8fbi8s6iplibbg7`.
 
 ## Rule
 
