@@ -7557,6 +7557,14 @@ pub(crate) fn mla_attention_prepare(
     // CSA / HCA: run the compressor (+ for CSA the indexer + top-k `selected`)
     // here in PREPARE — these are projection/select kernels that produce
     // `state.compressor` / `selected`, which the fwd consumes. SW has neither.
+    //
+    // Frozen chain verify is different: the verify rows are speculative and
+    // must not append compressed/indexer KV. FlashMLA chain verify already packs
+    // the verify rows' K directly as the current chunk, so recomputing
+    // compressor/indexer key projections here only creates rows that are then
+    // discarded by the frozen update guard. Keep CSA query/top-k below, but read
+    // the committed compressed/indexer pools as-is.
+    let skip_frozen_compressor = dsv4_verify_frozen() && chain_verify.is_some();
     let selected = if mode == DeepSeekV4AttentionMode::SlidingWindow {
         None
     } else {
@@ -7565,7 +7573,12 @@ pub(crate) fn mla_attention_prepare(
             anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
         })?;
         let overlap = compress_ratio < 16;
-        {
+        if skip_frozen_compressor {
+            ensure!(
+                state.compressor.is_some(),
+                "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+            );
+        } else {
             let compressor_state = state.compressor.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
             })?;
@@ -7616,7 +7629,12 @@ pub(crate) fn mla_attention_prepare(
                 .unwrap_or(0);
             // Indexer keys: a second compressor over index_head_dim keys (no APE
             // gate on the keys — `apply_rope = true`, head_dim = index_head_dim).
-            {
+            if skip_frozen_compressor {
+                ensure!(
+                    state.indexer.is_some(),
+                    "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
+                );
+            } else {
                 let indexer_state = state.indexer.as_mut().ok_or_else(|| {
                     anyhow::anyhow!(
                         "DSv4 layer {layer_idx} is CompressedSparse but has no indexer state"
