@@ -1652,6 +1652,7 @@ const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "dsv4_update_window_cache_start_pos_ptr_cuda",
     "dsv4_compressor_update_start_pos_ptr_cuda",
     "arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda",
+    "arle_dsv4_v32_fp8_kv_pack_strided_cuda",
     "dsv4_mtp_add_eproj_hproj_cuda",
 ];
 

@@ -3734,6 +3734,25 @@ impl<T> RawDevicePtr<T> {
     pub fn as_mut_ptr(self) -> *mut T {
         self.ptr as *mut T
     }
+
+    /// Reinterpret the device address as a pointer to `U`. The caller asserts
+    /// the underlying bytes are a valid `[U]` (e.g. a `CudaSlice<u8>` byte
+    /// buffer that actually holds bf16 weights). No allocation; just a u64 view.
+    pub fn cast<U>(self) -> RawDevicePtr<U> {
+        RawDevicePtr {
+            ptr: self.ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Advance the pointer by `count` elements of `T` (`count * size_of::<T>()`
+    /// bytes). The caller asserts the result stays within the backing slice.
+    pub fn offset_elems(self, count: usize) -> RawDevicePtr<T> {
+        RawDevicePtr {
+            ptr: self.ptr + (count * std::mem::size_of::<T>()) as u64,
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// Extract and cache a raw device pointer from a CudaSlice.
