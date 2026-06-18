@@ -2040,9 +2040,18 @@ impl Dsv4FlashMlaDecodeBatchScratch {
     ) -> Result<()> {
         let shape = self.layer_shape(layer_idx)?;
         ensure!(
-            attention.attn_sink_f32.len() >= shape.h_q,
+            attention
+                .attn_sink_f32
+                .as_ref()
+                .expect("DSv4 attn_sink_f32")
+                .len()
+                >= shape.h_q,
             "DSv4 batched FlashMLA attn_sink_f32 len {} < global heads {}",
-            attention.attn_sink_f32.len(),
+            attention
+                .attn_sink_f32
+                .as_ref()
+                .expect("DSv4 attn_sink_f32")
+                .len(),
             shape.h_q
         );
         // Resolve raw device pointers and release the cudarc borrow guards BEFORE
@@ -2050,7 +2059,11 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         // `self.q_batched`/`self.out_batched`). The raw u64 ptrs stay valid —
         // the buffers are not reallocated; same single-stream discipline the
         // per-row path uses.
-        let (sink_ptr, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
+        let (sink_ptr, sink_guard) = attention
+            .attn_sink_f32
+            .as_ref()
+            .expect("DSv4 attn_sink_f32")
+            .device_ptr(&ctx.stream);
         let sink_ptr = sink_ptr as *const f32;
         drop(sink_guard);
         let (q_ptr, q_guard) = self.q_batched.device_ptr(&ctx.stream);
@@ -3871,7 +3884,10 @@ pub(crate) fn commit_layer_fold(
             compressor_forward(
                 ctx,
                 config,
-                &indexer.compressor,
+                indexer
+                    .compressor
+                    .as_ref()
+                    .expect("DSv4 CSA indexer has a key compressor"),
                 gathered,
                 indexer_state,
                 config.index_head_dim,
@@ -6020,15 +6036,33 @@ fn try_flashmla_prefill_attention(
             )
         };
 
-    let (sink_base, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
+    let (sink_base, sink_guard) = attention
+        .attn_sink_f32
+        .as_ref()
+        .expect("DSv4 attn_sink_f32")
+        .device_ptr(&ctx.stream);
     ensure!(
         if tp_world > 1 {
-            attention.attn_sink_f32.len() >= global_heads
+            attention
+                .attn_sink_f32
+                .as_ref()
+                .expect("DSv4 attn_sink_f32")
+                .len()
+                >= global_heads
         } else {
-            attention.attn_sink_f32.len() >= tp_rank * local_heads + local_heads
+            attention
+                .attn_sink_f32
+                .as_ref()
+                .expect("DSv4 attn_sink_f32")
+                .len()
+                >= tp_rank * local_heads + local_heads
         },
         "DSv4 FlashMLA prefill attn_sink_f32 len {} cannot cover heads",
-        attention.attn_sink_f32.len()
+        attention
+            .attn_sink_f32
+            .as_ref()
+            .expect("DSv4 attn_sink_f32")
+            .len()
     );
     let sink_ptr = if tp_world > 1 {
         sink_base as *const f32
@@ -6347,15 +6381,33 @@ fn try_flashmla_decode_attention(
         q_ptr as *const ffi::Half
     };
 
-    let (sink_base, sink_guard) = attention.attn_sink_f32.device_ptr(&ctx.stream);
+    let (sink_base, sink_guard) = attention
+        .attn_sink_f32
+        .as_ref()
+        .expect("DSv4 attn_sink_f32")
+        .device_ptr(&ctx.stream);
     ensure!(
         if tp_world > 1 {
-            attention.attn_sink_f32.len() >= global_heads
+            attention
+                .attn_sink_f32
+                .as_ref()
+                .expect("DSv4 attn_sink_f32")
+                .len()
+                >= global_heads
         } else {
-            attention.attn_sink_f32.len() >= tp_rank * local_heads + local_heads
+            attention
+                .attn_sink_f32
+                .as_ref()
+                .expect("DSv4 attn_sink_f32")
+                .len()
+                >= tp_rank * local_heads + local_heads
         },
         "DSv4 FlashMLA attn_sink_f32 len {} cannot cover heads",
-        attention.attn_sink_f32.len()
+        attention
+            .attn_sink_f32
+            .as_ref()
+            .expect("DSv4 attn_sink_f32")
+            .len()
     );
     let sink_ptr = if tp_world > 1 {
         sink_base as *const f32
@@ -7118,9 +7170,9 @@ pub(crate) fn mla_attention_prepare(
         config.sliding_window * head_dim
     );
     ensure!(
-        attention.attn_sink.len >= sink_offset + local_heads,
+        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len >= sink_offset + local_heads,
         "DSv4 MLA attn_sink len {} cannot cover rank {tp_rank} heads [{sink_offset}, {})",
-        attention.attn_sink.len,
+        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len,
         sink_offset + local_heads
     );
 
@@ -7402,7 +7454,10 @@ pub(crate) fn mla_attention_prepare(
                 compressor_forward(
                     ctx,
                     config,
-                    &indexer.compressor,
+                    indexer
+                        .compressor
+                        .as_ref()
+                        .expect("DSv4 CSA indexer has a key compressor"),
                     hidden,
                     indexer_state,
                     config.index_head_dim,
@@ -7798,7 +7853,10 @@ pub(crate) fn mla_attention_compressor_defer_row(
         compressor_forward(
             ctx,
             config,
-            &indexer.compressor,
+            indexer
+                .compressor
+                .as_ref()
+                .expect("DSv4 CSA indexer has a key compressor"),
             normed_row,
             indexer_state,
             config.index_head_dim,
@@ -7989,7 +8047,10 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 compressor_forward(
                     ctx,
                     config,
-                    &indexer.compressor,
+                    indexer
+                        .compressor
+                        .as_ref()
+                        .expect("DSv4 CSA indexer has a key compressor"),
                     normed_row,
                     indexer_state,
                     config.index_head_dim,
@@ -8110,12 +8171,13 @@ fn mla_attention_fwd(
     let head_dim = config.head_dim;
     let rope = &config.rope_parameters;
     ensure!(
-        attention.wo_b.rows == out.hidden_dim && out.seq_len == token_count,
+        attention.wo_b.as_ref().expect("DSv4 wo_b").rows == out.hidden_dim
+            && out.seq_len == token_count,
         "DSv4 MLA output shape mismatch: wo_b rows {} out {}x{} expected {}x{}",
-        attention.wo_b.rows,
+        attention.wo_b.as_ref().expect("DSv4 wo_b").rows,
         out.hidden_dim,
         out.seq_len,
-        attention.wo_b.rows,
+        attention.wo_b.as_ref().expect("DSv4 wo_b").rows,
         token_count
     );
     keepalive.keep_hidden(&q_prepared);
@@ -8197,7 +8259,12 @@ fn mla_attention_fwd(
                 let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
                 let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
                 let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-                let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+                let (sink_ptr, _sg) = attention
+                    .attn_sink
+                    .as_ref()
+                    .expect("DSv4 attn_sink")
+                    .data
+                    .device_ptr(&ctx.stream);
                 let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
                 // SAFETY: all buffers valid on ctx.stream; window sized above; sink_offset
                 // skips to this rank's head block in the whole-loaded attn_sink vector.
@@ -8349,7 +8416,12 @@ fn mla_attention_fwd(
             let (q_ptr, _qg) = q_prepared.data.device_ptr(&ctx.stream);
             let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
             let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
-            let (sink_ptr, _sg) = attention.attn_sink.data.device_ptr(&ctx.stream);
+            let (sink_ptr, _sg) = attention
+                .attn_sink
+                .as_ref()
+                .expect("DSv4 attn_sink")
+                .data
+                .device_ptr(&ctx.stream);
             let (out_ptr, _og) = local_attn.data.device_ptr_mut(&ctx.stream);
             let (comp_ptr, _cguard) = if compressed_count_arg > 0 {
                 let (p, g) = compressed.data.device_ptr(&ctx.stream);
@@ -8520,11 +8592,32 @@ fn dsv4_wo_a_grouped_linear(
         shape.cols_per_group
     );
     ensure!(
-        attention.wo_a_groups.scale_rows_per_group > 0 && attention.wo_a_groups.scale_cols > 0,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .scale_rows_per_group
+            > 0
+            && attention
+                .wo_a_groups
+                .as_ref()
+                .expect("DSv4 wo_a_groups")
+                .scale_cols
+                > 0,
         "DSv4 O-LoRA grouped scale shape must be non-empty"
     );
-    let (weight_ptrs, _wg) = attention.wo_a_groups.weight_ptrs.device_ptr(&ctx.stream);
-    let (scale_ptrs, _sg) = attention.wo_a_groups.scale_ptrs.device_ptr(&ctx.stream);
+    let (weight_ptrs, _wg) = attention
+        .wo_a_groups
+        .as_ref()
+        .expect("DSv4 wo_a_groups")
+        .weight_ptrs
+        .device_ptr(&ctx.stream);
+    let (scale_ptrs, _sg) = attention
+        .wo_a_groups
+        .as_ref()
+        .expect("DSv4 wo_a_groups")
+        .scale_ptrs
+        .device_ptr(&ctx.stream);
     let (input_ptr, _ig) = local_attn.data.device_ptr(&ctx.stream);
     let (output_ptr, _og) = latent.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
@@ -8534,7 +8627,7 @@ fn dsv4_wo_a_grouped_linear(
     // which is exactly the `HiddenStates` token-major layout when each group is
     // `cols_per_group` wide.
     unsafe {
-        match attention.wo_a.weight_format {
+        match attention.wo_a.as_ref().expect("DSv4 wo_a").weight_format {
             WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_route_gemv_batch_cuda(
                 weight_ptrs as *const u64,
                 scale_ptrs as *const u64,
@@ -8546,8 +8639,20 @@ fn dsv4_wo_a_grouped_linear(
                 i32::try_from(shape.routes)?,
                 i32::try_from(shape.rows_per_group)?,
                 i32::try_from(shape.cols_per_group)?,
-                i32::try_from(attention.wo_a_groups.scale_rows_per_group)?,
-                i32::try_from(attention.wo_a_groups.scale_cols)?,
+                i32::try_from(
+                    attention
+                        .wo_a_groups
+                        .as_ref()
+                        .expect("DSv4 wo_a_groups")
+                        .scale_rows_per_group,
+                )?,
+                i32::try_from(
+                    attention
+                        .wo_a_groups
+                        .as_ref()
+                        .expect("DSv4 wo_a_groups")
+                        .scale_cols,
+                )?,
                 0,
                 stream,
             ),
@@ -8562,8 +8667,20 @@ fn dsv4_wo_a_grouped_linear(
                 i32::try_from(shape.routes)?,
                 i32::try_from(shape.rows_per_group)?,
                 i32::try_from(shape.cols_per_group)?,
-                i32::try_from(attention.wo_a_groups.scale_rows_per_group)?,
-                i32::try_from(attention.wo_a_groups.scale_cols)?,
+                i32::try_from(
+                    attention
+                        .wo_a_groups
+                        .as_ref()
+                        .expect("DSv4 wo_a_groups")
+                        .scale_rows_per_group,
+                )?,
+                i32::try_from(
+                    attention
+                        .wo_a_groups
+                        .as_ref()
+                        .expect("DSv4 wo_a_groups")
+                        .scale_cols,
+                )?,
                 0,
                 stream,
             ),
@@ -8625,15 +8742,33 @@ pub(crate) fn mla_oproj(
     out: &mut HiddenStates,
 ) -> Result<()> {
     let shape = dsv4_oproj_group_shape(
-        attention.wo_a.rows,
-        attention.wo_a.cols,
-        attention.wo_a_groups.groups,
-        attention.wo_a_groups.rows_per_group,
-        attention.wo_a_groups.cols_per_group,
+        attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
+        attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .groups,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .rows_per_group,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .cols_per_group,
         local_attn.hidden_dim,
         token_count,
     )?;
-    let mut latent = unsafe { HiddenStates::uninit(ctx, attention.wo_a.rows, token_count)? };
+    let mut latent = unsafe {
+        HiddenStates::uninit(
+            ctx,
+            attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
+            token_count,
+        )?
+    };
     let wo_a_decode_dg = shape.groups == 1
         && token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
@@ -8660,7 +8795,7 @@ pub(crate) fn mla_oproj(
                 wo_a_cache,
                 local_attn,
                 &mut latent,
-                attention.wo_a.cols,
+                attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
             )
         })?;
         drop(nvtx_wo_a);
@@ -8683,7 +8818,12 @@ pub(crate) fn mla_oproj(
     } else if shape.groups == 1 {
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            dsv4_linear(ctx, &attention.wo_a, local_attn, &mut latent)
+            dsv4_linear(
+                ctx,
+                attention.wo_a.as_ref().expect("DSv4 wo_a"),
+                local_attn,
+                &mut latent,
+            )
         })?;
         drop(nvtx_wo_a);
     } else {
@@ -8711,7 +8851,14 @@ pub(crate) fn mla_oproj(
             .expect("wo_b dg gate checked");
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, attention.wo_b.cols)
+            decode_proj_deepgemm(
+                ctx,
+                scratch,
+                wo_b_cache,
+                &latent,
+                out,
+                attention.wo_b.as_ref().expect("DSv4 wo_b").cols,
+            )
         })?;
         drop(nvtx_wo_b);
     } else if wo_b_prefill_dg {
@@ -8730,7 +8877,12 @@ pub(crate) fn mla_oproj(
     } else {
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            dsv4_linear(ctx, &attention.wo_b, &latent, out)
+            dsv4_linear(
+                ctx,
+                attention.wo_b.as_ref().expect("DSv4 wo_b"),
+                &latent,
+                out,
+            )
         })?;
         drop(nvtx_wo_b);
     }
