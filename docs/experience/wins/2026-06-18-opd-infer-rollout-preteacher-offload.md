@@ -59,14 +59,43 @@ Remote evidence:
   `student_pre_teacher_offloaded freed_mib=34057.8`, loaded the infer teacher,
   then failed at first-step rollout-student reload while the teacher was still
   resident (`infer student reload failed: reload moe.gate[35]`).
+- Teacher-pre-step-offload build `1f104267` on `.62` passed the 35B FP8 OPD
+  smoke with `ARLE_OPD_ENGINE_OFFLOAD=all`:
+  - `student_pre_teacher_offloaded freed_mib=34057.8`
+  - `teacher_pre_step_offloaded freed_mib=34057.8`
+  - `infer_rollout_generate_start` -> `infer_rollout_generate_done`
+    (`actual_rollout_len=11`, prompt 3 + rollout 8)
+  - `teacher_reload_done` 5.190 s, `teacher_full_forward_done` 0.085 s
+  - `student_hidden_forward_done` 2.295 s
+  - `optimizer_step_done` at 26.547 s
+  - JSON result: `losses=[4.843664646148682]`, `steps=1`, `teacher_runtime=Infer`
+  - Exit: `EXIT:0`
 
-Pending remote 35B smoke rerun after the teacher pre-step offload lands:
+Remote command:
 
-- Gate: Qwen3.6-35B-A3B-FP8 OPD, `ARLE_OPD_INFER_ROLLOUT=1`,
-  `ARLE_OPD_ENGINE_OFFLOAD=all`, `--steps 1`, `--rollout-len 8`.
-- Expected reachability signal: `infer_rollout_generate_start` followed by a
-  completed OPD step, or a later measured blocker unrelated to initial teacher
-  load residency / MoE offload coverage / first-step teacher residency.
+```bash
+CUDA_VISIBLE_DEVICES=1 INFER_CUDA_DEVICES=0 INFER_TP_SIZE=1 \
+ARLE_OPD_INFER_ROLLOUT=1 ARLE_OPD_ENGINE_OFFLOAD=all \
+ARLE_OPD_STEP_TRACE=1 ARLE_OPD_STEP_PROFILE=1 \
+/data01/arle-verify-ab22f727-target/release-fast/arle train opd \
+  --backend cuda \
+  --student-model /data01/models/Qwen3.6-35B-A3B-FP8 \
+  --teacher-model /data01/models/Qwen3.6-35B-A3B-FP8 \
+  --teacher-runtime infer \
+  --steps 1 \
+  --rollout-len 8 \
+  --prompt-max-tokens 64 \
+  --prompt-ids 1,3,8 \
+  --logits-window-size 8 \
+  --lora-rank 1 \
+  --lora-alpha 2 \
+  --lora-target-set attention-qv \
+  --grad-clip 1.0 \
+  --json
+```
+
+Remote log: `/tmp/arle_opd35_student_offload_smoke.log` on
+`iv-ye8is8fbi8s6iplibbg7`.
 
 ## Rule
 
