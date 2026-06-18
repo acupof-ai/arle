@@ -16,22 +16,22 @@ use std::rc::Rc;
 use std::slice;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use cuda_kernels::KVFormat;
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, PagedKVPool};
 use cuda_kernels::tensor::{HostMatrixSnapshot, WeightFormat};
+use cuda_kernels::KVFormat;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::Shard;
 use infer_topo::{ShardingSpec, TpConfig};
 use qwen3_spec::Qwen3Config;
-use safetensors::{SafeTensors, tensor::Dtype};
+use safetensors::{tensor::Dtype, SafeTensors};
 
 use crate::model::{Attention, CudaModel, Mlp, TransformerBlock};
 use crate::ops::{precompute_rope, upload_i32};
 use crate::quant_format::{
-    QuantFormat, QuantManifest, QuantTensorView, ScaleApply, TensorHeader, detect_quant_format,
-    read_quant_manifest, reject_dsv4_e8m0_scale_abi,
+    detect_quant_format, read_quant_manifest, reject_dsv4_e8m0_scale_abi, QuantFormat,
+    QuantManifest, QuantTensorView, ScaleApply, TensorHeader,
 };
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
@@ -3382,7 +3382,7 @@ impl SafetensorLoader {
             compressor: names
                 .compressor
                 .as_ref()
-                .map(|c| self.load_dsv4_compressor(ctx, c))
+                .map(|c| self.load_dsv4_compressor(ctx, c, glm))
                 .transpose()?,
             indexer: names
                 .indexer
@@ -3477,9 +3477,10 @@ impl SafetensorLoader {
             .iter()
             .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
             .collect();
-        let _ = tp; // kv_b absorption is per-head and replicated at the head grain;
+        // kv_b absorption is per-head and replicated at the head grain;
         // TP head-sharding of w_kc/w_vc is a Tranche-D concern (matches o_proj/wq_b).
         // w_kc: [num_heads*kv_lora, qk_nope]; w_vc: [num_heads*v_head, kv_lora].
+        let _ = tp;
         let w_kc = DeviceMatrix::from_safetensors(ctx, &w_kc_bytes, num_heads * kv_lora, qk_nope)
             .with_context(|| format!("upload GLM w_kc from {kv_b_name}"))?;
         let w_vc = DeviceMatrix::from_safetensors(ctx, &w_vc_bytes, num_heads * v_head, kv_lora)
@@ -3666,15 +3667,25 @@ impl SafetensorLoader {
     }
 
     /// Load one compressor sub-block (`wkv`/`wgate`/`ape` matrices + `norm` vec).
+    /// GLM uses F32 `weight_scale_inv` scales, so its compressor projections are
+    /// dequantized to bf16. DSv4 keeps the original dtype-dispatching path.
     pub(crate) fn load_dsv4_compressor(
         &self,
         ctx: &DeviceContext,
         names: &deepseek_spec::DeepSeekV4CompressorTensorNames,
+        glm: bool,
     ) -> Result<crate::dsv4::Dsv4Compressor> {
+        let load_matrix = |name: &str| {
+            if glm {
+                self.load_dsv4_block_scaled_dialect(ctx, name)
+            } else {
+                self.load_dsv4_global_matrix(ctx, name)
+            }
+        };
         Ok(crate::dsv4::Dsv4Compressor {
-            wkv: self.load_dsv4_global_matrix(ctx, &names.wkv)?,
-            wgate: self.load_dsv4_global_matrix(ctx, &names.wgate)?,
-            ape: self.load_dsv4_global_matrix(ctx, &names.ape)?,
+            wkv: load_matrix(&names.wkv)?,
+            wgate: load_matrix(&names.wgate)?,
+            ape: load_matrix(&names.ape)?,
             norm: self.load_dsv4_vec(ctx, &names.norm)?,
         })
     }
@@ -3724,6 +3735,7 @@ impl SafetensorLoader {
                     .compressor
                     .as_ref()
                     .expect("DSv4 indexer always has a compressor"),
+                false,
             )?;
             (Some(compressor), None, None, None)
         };
