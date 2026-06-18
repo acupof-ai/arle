@@ -1,0 +1,756 @@
+use smallvec::smallvec;
+
+use crate::{
+    AutogradError, Result,
+    tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
+    tensor::{Tensor, TensorId, TensorStore},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedLinearDistillDirection {
+    Forward,
+    Reverse,
+}
+
+pub fn generalized_jsd_loss(
+    student_logits: TensorId,
+    teacher_logits: TensorId,
+    num_positions: usize,
+    temperature: f32,
+    beta: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let shape = validate_logits_inputs(student_logits, teacher_logits, num_positions, store)?;
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(AutogradError::TapeInvariant(
+            "generalized_jsd_loss: temperature must be finite and > 0.0",
+        ));
+    }
+    if !(beta > 0.0 && beta < 1.0 && beta.is_finite()) {
+        return Err(AutogradError::TapeInvariant(
+            "generalized_jsd_loss: beta must be finite and strictly between 0.0 and 1.0",
+        ));
+    }
+
+    // ponytail: beta-JSD is opt-in host-eager; add device kernels only if
+    // recipe A/B makes --kl-beta worth default-path performance work.
+    let student_data = store.to_host(student_logits)?;
+    let teacher_data = store.to_host(teacher_logits)?;
+    let inv_temperature = 1.0 / temperature;
+    let loss_scale = temperature * temperature / num_positions as f32;
+    let grad_scale = temperature / num_positions as f32;
+    let student_mix = 1.0 - beta;
+    let log_student_mix = student_mix.ln();
+    let log_teacher_mix = beta.ln();
+    let mut loss_sum = 0.0_f32;
+    let mut grad_student = vec![0.0_f32; student_data.len()];
+
+    for row in 0..num_positions {
+        let base = row * shape.vocab;
+        let mut student_scaled = vec![0.0_f32; shape.vocab];
+        let mut teacher_scaled = vec![0.0_f32; shape.vocab];
+        for vocab_index in 0..shape.vocab {
+            student_scaled[vocab_index] = student_data[base + vocab_index] * inv_temperature;
+            teacher_scaled[vocab_index] = teacher_data[base + vocab_index] * inv_temperature;
+        }
+
+        let student_log_probs = log_softmax_row(&student_scaled);
+        let teacher_log_probs = log_softmax_row(&teacher_scaled);
+        let mut mixture_log_probs = vec![0.0_f32; shape.vocab];
+        let mut student_kl = 0.0_f32;
+        let mut teacher_kl = 0.0_f32;
+        for vocab_index in 0..shape.vocab {
+            mixture_log_probs[vocab_index] = logaddexp(
+                student_log_probs[vocab_index] + log_student_mix,
+                teacher_log_probs[vocab_index] + log_teacher_mix,
+            );
+            let student_prob = student_log_probs[vocab_index].exp();
+            let teacher_prob = teacher_log_probs[vocab_index].exp();
+            student_kl +=
+                student_prob * (student_log_probs[vocab_index] - mixture_log_probs[vocab_index]);
+            teacher_kl +=
+                teacher_prob * (teacher_log_probs[vocab_index] - mixture_log_probs[vocab_index]);
+        }
+        loss_sum += beta * teacher_kl + student_mix * student_kl;
+        for vocab_index in 0..shape.vocab {
+            let student_prob = student_log_probs[vocab_index].exp();
+            grad_student[base + vocab_index] = grad_scale
+                * student_mix
+                * student_prob
+                * (student_log_probs[vocab_index] - mixture_log_probs[vocab_index] - student_kl);
+        }
+    }
+
+    let loss_id = store.alloc(Tensor::new(vec![loss_sum * loss_scale], Vec::new(), true)?);
+    let grad_id = store.alloc(Tensor::new(grad_student, shape.student_shape, false)?);
+    tape.record(TapeEntry {
+        op: BackwardOp::GeneralizedJsd,
+        output_id: loss_id,
+        input_ids: smallvec![student_logits],
+        saved: SavedContext::GeneralizedJsdCtx {
+            grad_student: grad_id,
+        },
+    });
+    Ok(loss_id)
+}
+
+pub(crate) fn generalized_jsd_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::GeneralizedJsdCtx { grad_student } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "generalized_jsd backward missing saved context",
+        ));
+    };
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if !upstream_shape.is_empty() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: Vec::new(),
+            got: upstream_shape,
+        });
+    }
+    let upstream = store.to_host(output_grad_id)?[0];
+    Ok(smallvec![(
+        entry.input_ids[0],
+        scale_saved_grad(grad_student, upstream, store)?
+    )])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fused_linear_distill_loss(
+    hidden: TensorId,
+    weight: TensorId,
+    teacher_logits: TensorId,
+    row_start: usize,
+    num_rows: usize,
+    chunk_rows: usize,
+    temperature: f32,
+    direction: FusedLinearDistillDirection,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // Not bit-identical to matmul+KL; tests gate ~2e-5 equivalence. Default OPD flip still needs H20 needle + same-binary A/B + wins.
+    let shape = validate_inputs(hidden, weight, teacher_logits, row_start, num_rows, store)?;
+    if chunk_rows == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: chunk_rows must be > 0",
+        ));
+    }
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: temperature must be finite and > 0.0",
+        ));
+    }
+
+    let need_hidden_grad = store.tensor(hidden)?.requires_grad;
+    let need_weight_grad = store.tensor(weight)?.requires_grad;
+    let requires_grad = need_hidden_grad || need_weight_grad;
+    let hidden_data = store.to_host(hidden)?;
+    let weight_data = store.to_host(weight)?;
+    let teacher_data = store.to_host(teacher_logits)?;
+
+    let mut grad_hidden = need_hidden_grad.then(|| vec![0.0_f32; hidden_data.len()]);
+    let mut grad_weight = need_weight_grad.then(|| vec![0.0_f32; weight_data.len()]);
+    let inv_temperature = 1.0 / temperature;
+    let grad_scale = temperature / num_rows as f32;
+    let loss_scale = temperature * temperature / num_rows as f32;
+    let mut loss_sum = 0.0_f32;
+
+    for chunk_start in (0..num_rows).step_by(chunk_rows) {
+        let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_rows);
+        for local_row in chunk_start..chunk_end {
+            let hidden_row = row_start + local_row;
+            let hidden_base = hidden_row * shape.hidden_dim;
+            let teacher_base = local_row * shape.vocab;
+            let hidden_slice = &hidden_data[hidden_base..hidden_base + shape.hidden_dim];
+
+            let mut student_scaled = vec![0.0_f32; shape.vocab];
+            let mut teacher_scaled = vec![0.0_f32; shape.vocab];
+            for vocab_index in 0..shape.vocab {
+                let weight_base = vocab_index * shape.hidden_dim;
+                let mut dot = 0.0_f32;
+                for hidden_index in 0..shape.hidden_dim {
+                    dot += hidden_slice[hidden_index] * weight_data[weight_base + hidden_index];
+                }
+                student_scaled[vocab_index] = dot * inv_temperature;
+                teacher_scaled[vocab_index] =
+                    teacher_data[teacher_base + vocab_index] * inv_temperature;
+            }
+
+            let student_log_probs = log_softmax_row(&student_scaled);
+            let teacher_log_probs = log_softmax_row(&teacher_scaled);
+            let mut dlogits = vec![0.0_f32; shape.vocab];
+
+            match direction {
+                FusedLinearDistillDirection::Forward => {
+                    let mut row_ce = 0.0_f32;
+                    for vocab_index in 0..shape.vocab {
+                        let teacher_prob = teacher_log_probs[vocab_index].exp();
+                        row_ce -= teacher_prob * student_log_probs[vocab_index];
+                        dlogits[vocab_index] =
+                            grad_scale * (student_log_probs[vocab_index].exp() - teacher_prob);
+                    }
+                    loss_sum += row_ce;
+                }
+                FusedLinearDistillDirection::Reverse => {
+                    let mut row_kl = 0.0_f32;
+                    for vocab_index in 0..shape.vocab {
+                        let student_prob = student_log_probs[vocab_index].exp();
+                        row_kl += student_prob
+                            * (student_log_probs[vocab_index] - teacher_log_probs[vocab_index]);
+                    }
+                    for vocab_index in 0..shape.vocab {
+                        let student_prob = student_log_probs[vocab_index].exp();
+                        dlogits[vocab_index] = grad_scale
+                            * student_prob
+                            * (student_log_probs[vocab_index]
+                                - teacher_log_probs[vocab_index]
+                                - row_kl);
+                    }
+                    loss_sum += row_kl;
+                }
+            }
+
+            if let Some(grad_hidden) = grad_hidden.as_mut() {
+                for hidden_index in 0..shape.hidden_dim {
+                    let mut grad = 0.0_f32;
+                    for (vocab_index, &dlogit) in dlogits.iter().enumerate() {
+                        grad += dlogit * weight_data[vocab_index * shape.hidden_dim + hidden_index];
+                    }
+                    grad_hidden[hidden_base + hidden_index] += grad;
+                }
+            }
+            if let Some(grad_weight) = grad_weight.as_mut() {
+                for (vocab_index, &grad) in dlogits.iter().enumerate() {
+                    let weight_base = vocab_index * shape.hidden_dim;
+                    for hidden_index in 0..shape.hidden_dim {
+                        grad_weight[weight_base + hidden_index] +=
+                            grad * hidden_slice[hidden_index];
+                    }
+                }
+            }
+        }
+    }
+
+    let loss_id = store.alloc(Tensor::new(
+        vec![loss_sum * loss_scale],
+        Vec::new(),
+        requires_grad,
+    )?);
+    if requires_grad {
+        let grad_hidden_id = grad_hidden
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.hidden_shape.clone(), false)?)))
+            .transpose()?;
+        let grad_weight_id = grad_weight
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
+            .transpose()?;
+        tape.record(TapeEntry {
+            op: BackwardOp::FusedLinearDistill,
+            output_id: loss_id,
+            input_ids: smallvec![hidden, weight],
+            saved: SavedContext::FusedLinearDistillCtx {
+                grad_hidden: grad_hidden_id,
+                grad_weight: grad_weight_id,
+            },
+        });
+    }
+
+    Ok(loss_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fused_linear_distill_loss_sparse(
+    hidden: TensorId,
+    weight: TensorId,
+    teacher_topk_log_probs: TensorId,
+    teacher_topk_indices: &[i32],
+    row_start: usize,
+    num_rows: usize,
+    chunk_rows: usize,
+    temperature: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let (shape, teacher_topk_log_prob_data) = validate_sparse_inputs(
+        hidden,
+        weight,
+        teacher_topk_log_probs,
+        teacher_topk_indices,
+        row_start,
+        num_rows,
+        store,
+    )?;
+    if chunk_rows == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: chunk_rows must be > 0",
+        ));
+    }
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: temperature must be finite and > 0.0",
+        ));
+    }
+
+    let need_hidden_grad = store.tensor(hidden)?.requires_grad;
+    let need_weight_grad = store.tensor(weight)?.requires_grad;
+    let requires_grad = need_hidden_grad || need_weight_grad;
+    let hidden_data = store.to_host(hidden)?;
+    let weight_data = store.to_host(weight)?;
+
+    let mut grad_hidden = need_hidden_grad.then(|| vec![0.0_f32; hidden_data.len()]);
+    let mut grad_weight = need_weight_grad.then(|| vec![0.0_f32; weight_data.len()]);
+    let inv_temperature = 1.0 / temperature;
+    let grad_scale = temperature / num_rows as f32;
+    let loss_scale = temperature * temperature / num_rows as f32;
+    let mut loss_sum = 0.0_f32;
+
+    for chunk_start in (0..num_rows).step_by(chunk_rows) {
+        let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_rows);
+        for local_row in chunk_start..chunk_end {
+            let hidden_row = row_start + local_row;
+            let hidden_base = hidden_row * shape.hidden_dim;
+            let topk_base = local_row * shape.topk;
+            let hidden_slice = &hidden_data[hidden_base..hidden_base + shape.hidden_dim];
+
+            let mut student_scaled = vec![0.0_f32; shape.vocab];
+            for (vocab_index, student_value) in student_scaled.iter_mut().enumerate() {
+                let weight_base = vocab_index * shape.hidden_dim;
+                let mut dot = 0.0_f32;
+                for hidden_index in 0..shape.hidden_dim {
+                    dot += hidden_slice[hidden_index] * weight_data[weight_base + hidden_index];
+                }
+                *student_value = dot * inv_temperature;
+            }
+
+            let student_log_probs = log_softmax_row(&student_scaled);
+            let mut row_ce = 0.0_f32;
+            let mut row_teacher_mass = 0.0_f32;
+            for topk_offset in 0..shape.topk {
+                let slot = topk_base + topk_offset;
+                let teacher_log_prob = teacher_topk_log_prob_data[slot];
+                let vocab_index = teacher_topk_indices[slot] as usize;
+                let teacher_prob = teacher_log_prob.exp();
+                row_ce -= teacher_prob * student_log_probs[vocab_index];
+                row_teacher_mass += teacher_prob;
+            }
+            let mut dlogits = vec![0.0_f32; shape.vocab];
+            for vocab_index in 0..shape.vocab {
+                dlogits[vocab_index] =
+                    grad_scale * row_teacher_mass * student_log_probs[vocab_index].exp();
+            }
+            for topk_offset in 0..shape.topk {
+                let slot = topk_base + topk_offset;
+                let vocab_index = teacher_topk_indices[slot] as usize;
+                let teacher_prob = teacher_topk_log_prob_data[slot].exp();
+                dlogits[vocab_index] -= grad_scale * teacher_prob;
+            }
+            loss_sum += row_ce;
+
+            if let Some(grad_hidden) = grad_hidden.as_mut() {
+                for hidden_index in 0..shape.hidden_dim {
+                    let mut grad = 0.0_f32;
+                    for (vocab_index, &dlogit) in dlogits.iter().enumerate() {
+                        grad += dlogit * weight_data[vocab_index * shape.hidden_dim + hidden_index];
+                    }
+                    grad_hidden[hidden_base + hidden_index] += grad;
+                }
+            }
+            if let Some(grad_weight) = grad_weight.as_mut() {
+                for (vocab_index, &grad) in dlogits.iter().enumerate() {
+                    let weight_base = vocab_index * shape.hidden_dim;
+                    for hidden_index in 0..shape.hidden_dim {
+                        grad_weight[weight_base + hidden_index] +=
+                            grad * hidden_slice[hidden_index];
+                    }
+                }
+            }
+        }
+    }
+
+    let loss_id = store.alloc(Tensor::new(
+        vec![loss_sum * loss_scale],
+        Vec::new(),
+        requires_grad,
+    )?);
+    if requires_grad {
+        let grad_hidden_id = grad_hidden
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.hidden_shape.clone(), false)?)))
+            .transpose()?;
+        let grad_weight_id = grad_weight
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
+            .transpose()?;
+        tape.record(TapeEntry {
+            op: BackwardOp::FusedLinearDistill,
+            output_id: loss_id,
+            input_ids: smallvec![hidden, weight],
+            saved: SavedContext::FusedLinearDistillCtx {
+                grad_hidden: grad_hidden_id,
+                grad_weight: grad_weight_id,
+            },
+        });
+    }
+
+    Ok(loss_id)
+}
+
+pub(crate) fn fused_linear_distill_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::FusedLinearDistillCtx {
+        grad_hidden,
+        grad_weight,
+    } = entry.saved.clone()
+    else {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill backward missing saved context",
+        ));
+    };
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if !upstream_shape.is_empty() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: Vec::new(),
+            got: upstream_shape,
+        });
+    }
+    let upstream = store.to_host(output_grad_id)?[0];
+    let mut grads = GradPairs::new();
+    if let Some(grad_id) = grad_hidden {
+        let scaled = scale_saved_grad(grad_id, upstream, store)?;
+        grads.push((entry.input_ids[0], scaled));
+    }
+    if let Some(grad_id) = grad_weight {
+        let scaled = scale_saved_grad(grad_id, upstream, store)?;
+        grads.push((entry.input_ids[1], scaled));
+    }
+    Ok(grads)
+}
+
+fn scale_saved_grad(grad_id: TensorId, scale: f32, store: &mut TensorStore) -> Result<TensorId> {
+    if (scale - 1.0).abs() < f32::EPSILON {
+        return store.clone_tensor(grad_id);
+    }
+    let grad = store.tensor_host(grad_id)?;
+    let data = grad.data.into_iter().map(|value| value * scale).collect();
+    Ok(store.alloc(Tensor::new(data, grad.shape, false)?))
+}
+
+#[derive(Debug, Clone)]
+struct FusedLinearDistillShape {
+    hidden_shape: Vec<usize>,
+    weight_shape: Vec<usize>,
+    hidden_dim: usize,
+    vocab: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SparseFusedLinearDistillShape {
+    hidden_shape: Vec<usize>,
+    weight_shape: Vec<usize>,
+    hidden_dim: usize,
+    vocab: usize,
+    topk: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GeneralizedJsdShape {
+    student_shape: Vec<usize>,
+    vocab: usize,
+}
+
+fn validate_logits_inputs(
+    student_logits: TensorId,
+    teacher_logits: TensorId,
+    num_positions: usize,
+    store: &TensorStore,
+) -> Result<GeneralizedJsdShape> {
+    let student = store
+        .get(student_logits)
+        .ok_or(AutogradError::InvalidTensorId(student_logits))?;
+    let teacher = store
+        .get(teacher_logits)
+        .ok_or(AutogradError::InvalidTensorId(teacher_logits))?;
+    if !student.requires_grad {
+        return Err(AutogradError::TapeInvariant(
+            "generalized_jsd_loss: student_logits must have requires_grad=true",
+        ));
+    }
+    if teacher.requires_grad {
+        return Err(AutogradError::TapeInvariant(
+            "generalized_jsd_loss: teacher_logits must have requires_grad=false",
+        ));
+    }
+    if student.shape != teacher.shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: student.shape.clone(),
+            got: teacher.shape.clone(),
+        });
+    }
+    let vocab = *student.shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if vocab == 0 || num_positions == 0 || student.size != num_positions * vocab {
+        return Err(AutogradError::TapeInvariant(
+            "generalized_jsd_loss: num_positions must match logits.numel() / vocab",
+        ));
+    }
+    Ok(GeneralizedJsdShape {
+        student_shape: student.shape.clone(),
+        vocab,
+    })
+}
+
+fn validate_inputs(
+    hidden: TensorId,
+    weight: TensorId,
+    teacher_logits: TensorId,
+    row_start: usize,
+    num_rows: usize,
+    store: &TensorStore,
+) -> Result<FusedLinearDistillShape> {
+    let hidden_tensor = store
+        .get(hidden)
+        .ok_or(AutogradError::InvalidTensorId(hidden))?;
+    let weight_tensor = store
+        .get(weight)
+        .ok_or(AutogradError::InvalidTensorId(weight))?;
+    let teacher_tensor = store
+        .get(teacher_logits)
+        .ok_or(AutogradError::InvalidTensorId(teacher_logits))?;
+    if hidden_tensor.shape.len() < 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 2",
+            got: hidden_tensor.shape.len(),
+        });
+    }
+    if weight_tensor.shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: weight_tensor.shape.len(),
+        });
+    }
+    if teacher_tensor.requires_grad {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: teacher_logits must have requires_grad=false",
+        ));
+    }
+    if num_rows == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: num_rows must be > 0",
+        ));
+    }
+
+    let hidden_dim = *hidden_tensor
+        .shape
+        .last()
+        .ok_or(AutogradError::InvalidRank {
+            expected: "at least 2",
+            got: 0,
+        })?;
+    let vocab = weight_tensor.shape[0];
+    if hidden_dim == 0 || vocab == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: hidden_dim and vocab must be non-zero",
+        ));
+    }
+    if weight_tensor.shape[1] != hidden_dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![vocab, hidden_dim],
+            got: weight_tensor.shape.clone(),
+        });
+    }
+    if teacher_tensor.size != num_rows * vocab {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![num_rows, vocab],
+            got: teacher_tensor.shape.clone(),
+        });
+    }
+    let total_rows = hidden_tensor.size / hidden_dim;
+    let row_end = row_start
+        .checked_add(num_rows)
+        .ok_or(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: row_start + num_rows overflows",
+        ))?;
+    if row_end > total_rows {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss: row_start + num_rows exceeds hidden rows",
+        ));
+    }
+
+    Ok(FusedLinearDistillShape {
+        hidden_shape: hidden_tensor.shape.clone(),
+        weight_shape: weight_tensor.shape.clone(),
+        hidden_dim,
+        vocab,
+    })
+}
+
+fn validate_sparse_inputs(
+    hidden: TensorId,
+    weight: TensorId,
+    teacher_topk_log_probs: TensorId,
+    teacher_topk_indices: &[i32],
+    row_start: usize,
+    num_rows: usize,
+    store: &mut TensorStore,
+) -> Result<(SparseFusedLinearDistillShape, Vec<f32>)> {
+    let hidden_tensor = store
+        .get(hidden)
+        .ok_or(AutogradError::InvalidTensorId(hidden))?;
+    let weight_tensor = store
+        .get(weight)
+        .ok_or(AutogradError::InvalidTensorId(weight))?;
+    let teacher_tensor = store
+        .get(teacher_topk_log_probs)
+        .ok_or(AutogradError::InvalidTensorId(teacher_topk_log_probs))?;
+    if hidden_tensor.shape.len() < 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 2",
+            got: hidden_tensor.shape.len(),
+        });
+    }
+    if weight_tensor.shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: weight_tensor.shape.len(),
+        });
+    }
+    if teacher_tensor.requires_grad {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: teacher_topk_log_probs must have requires_grad=false",
+        ));
+    }
+    if num_rows == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: num_rows must be > 0",
+        ));
+    }
+
+    let hidden_dim = *hidden_tensor
+        .shape
+        .last()
+        .ok_or(AutogradError::InvalidRank {
+            expected: "at least 2",
+            got: 0,
+        })?;
+    let vocab = weight_tensor.shape[0];
+    if hidden_dim == 0 || vocab == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: hidden_dim and vocab must be non-zero",
+        ));
+    }
+    if weight_tensor.shape[1] != hidden_dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![vocab, hidden_dim],
+            got: weight_tensor.shape.clone(),
+        });
+    }
+
+    let topk = *teacher_tensor
+        .shape
+        .last()
+        .ok_or(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        })?;
+    if topk == 0 || topk > vocab {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: top-k must be in 1..=vocab",
+        ));
+    }
+    let expected_teacher_size = num_rows
+        .checked_mul(topk)
+        .ok_or(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: num_rows * top-k overflows",
+        ))?;
+    if teacher_tensor.size != expected_teacher_size {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![num_rows, topk],
+            got: teacher_tensor.shape.clone(),
+        });
+    }
+    if teacher_topk_indices.len() != expected_teacher_size {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: expected_teacher_size,
+            got: teacher_topk_indices.len(),
+        });
+    }
+    for row in 0..num_rows {
+        let mut seen = vec![false; vocab];
+        for topk_offset in 0..topk {
+            let slot = row * topk + topk_offset;
+            let index = teacher_topk_indices[slot];
+            if index < 0 {
+                return Err(AutogradError::TapeInvariant(
+                    "fused_linear_distill_loss_sparse: teacher top-k indices must be non-negative",
+                ));
+            }
+            let index = index as usize;
+            if index >= vocab {
+                return Err(AutogradError::IndexOutOfBounds {
+                    index,
+                    upper: vocab,
+                });
+            }
+            if seen[index] {
+                return Err(AutogradError::TapeInvariant(
+                    "fused_linear_distill_loss_sparse: teacher top-k indices must be unique per row",
+                ));
+            }
+            seen[index] = true;
+        }
+    }
+
+    let total_rows = hidden_tensor.size / hidden_dim;
+    let row_end = row_start
+        .checked_add(num_rows)
+        .ok_or(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: row_start + num_rows overflows",
+        ))?;
+    if row_end > total_rows {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: row_start + num_rows exceeds hidden rows",
+        ));
+    }
+
+    let shape = SparseFusedLinearDistillShape {
+        hidden_shape: hidden_tensor.shape.clone(),
+        weight_shape: weight_tensor.shape.clone(),
+        hidden_dim,
+        vocab,
+        topk,
+    };
+    let teacher_topk_log_prob_data = store.to_host(teacher_topk_log_probs)?;
+    if teacher_topk_log_prob_data
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_distill_loss_sparse: teacher top-k log-probs must be finite",
+        ));
+    }
+
+    Ok((shape, teacher_topk_log_prob_data))
+}
+
+fn log_softmax_row(row: &[f32]) -> Vec<f32> {
+    let max_value = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let denom = row
+        .iter()
+        .map(|value| (*value - max_value).exp())
+        .sum::<f32>();
+    let log_denom = denom.ln();
+    row.iter()
+        .map(|value| (*value - max_value) - log_denom)
+        .collect()
+}
+
+fn logaddexp(a: f32, b: f32) -> f32 {
+    let max_value = a.max(b);
+    max_value + ((a - max_value).exp() + (b - max_value).exp()).ln()
+}

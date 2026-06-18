@@ -2835,6 +2835,10 @@ impl Qwen35Model {
         self.param_ids.clone()
     }
 
+    pub fn lm_head_weight_id(&self) -> TensorId {
+        self.lm_head
+    }
+
     fn share_base_parameters_from(&mut self, base: &Qwen35Model) -> Result<()> {
         if self.layers.len() != base.layers.len() {
             return Err(Qwen35Error::InvalidConfig(

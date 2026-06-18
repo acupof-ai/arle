@@ -8,7 +8,7 @@ criterion in docs/research/2026-05-28-opd-effect-axis-next.md.
 
 Usage:
     python scripts/analyze_multi_seed.py <out_base> [--baseline path ...]
-                                          [--task mmlu|gsm8k]
+                                          [--task mmlu|gsm8k|math500]
                                           [--threshold-mean 0.505]
                                           [--threshold-sigma 0.015]
 
@@ -343,7 +343,7 @@ def main() -> int:
                    help="path to another out_base; runs a per-seed paired (treated-control) "
                         "analysis where treated=out_base, control=this arg. Tightens the "
                         "estimate by canceling question-subset variance.")
-    p.add_argument("--task", choices=["mmlu", "gsm8k", "both"], default="both")
+    p.add_argument("--task", choices=["mmlu", "gsm8k", "math500", "both"], default="both")
     p.add_argument("--threshold-mean", type=float, default=0.505,
                    help="kill threshold for mean (default 0.505 = MMLU cross-base gate)")
     p.add_argument("--threshold-sigma", type=float, default=0.015,

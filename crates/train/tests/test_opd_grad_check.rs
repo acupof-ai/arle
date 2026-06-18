@@ -183,7 +183,7 @@ fn kl_distill_loss_wide_range_teacher_grad_matches_stable_reference() {
     );
     let student_probs = stable_softmax_rows(&student_logits, shape[1]);
     let teacher_probs = stable_softmax_rows(&teacher_logits, shape[1]);
-    let scale = 1.0_f64 / student_logits.len() as f64;
+    let scale = shape[1] as f64 / student_logits.len() as f64;
 
     let mut max_abs_err = 0.0_f64;
     for i in 0..grad.len() {
