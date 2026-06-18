@@ -532,7 +532,7 @@ fn qwen35_parity_bf16_round(id: TensorId, store: &mut TensorStore) -> Result<Ten
 }
 
 impl Qwen35Layer {
-    fn checkpoint_input_ids(&self, hidden: TensorId) -> Vec<TensorId> {
+    fn checkpoint_input_ids(&self, hidden: TensorId, store: &TensorStore) -> Vec<TensorId> {
         let mut ids = Vec::new();
         ids.push(hidden);
         ids.push(self.input_layernorm);
@@ -562,6 +562,7 @@ impl Qwen35Layer {
         let mut params = ids.split_off(1);
         params.sort_unstable();
         params.dedup();
+        params.retain(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
         ids.extend(params);
         ids
     }
@@ -3227,7 +3228,7 @@ impl Qwen35Model {
                 let tp = self.tp;
                 let cos_id = cos;
                 let sin_id = sin;
-                let input_ids = layer.checkpoint_input_ids(hidden);
+                let input_ids = layer.checkpoint_input_ids(hidden, store);
                 let hidden = checkpoint(input_ids, store, tape, move |store, tape, inputs| {
                     let hidden = *inputs.first().ok_or(AutogradError::TapeInvariant(
                         "qwen35 checkpoint missing hidden input",
@@ -3307,7 +3308,7 @@ impl Qwen35Model {
                 let tp = self.tp;
                 let cos_id = cos;
                 let sin_id = sin;
-                let input_ids = layer.checkpoint_input_ids(hidden);
+                let input_ids = layer.checkpoint_input_ids(hidden, store);
                 checkpoint(input_ids, store, tape, move |store, tape, inputs| {
                     let hidden = *inputs.first().ok_or(AutogradError::TapeInvariant(
                         "qwen35 checkpoint missing hidden input",
@@ -5053,6 +5054,7 @@ fn leak_name(name: String) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::error::Error;
     #[cfg(feature = "cuda")]
     use std::{env, sync::Arc};
@@ -5493,6 +5495,41 @@ mod tests {
         assert_eq!(
             checkpoint_entries, cfg.num_hidden_layers,
             "one checkpoint entry per transformer layer is required"
+        );
+        let adapter_ids = model
+            .adapter_name_map()
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        let frozen_param_ids = model
+            .param_name_map()
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut saw_checkpoint_adapter = false;
+        for entry in tape
+            .entries
+            .iter()
+            .filter(|entry| entry.op == BackwardOp::Checkpoint)
+        {
+            for &input_id in entry.input_ids.iter().skip(1) {
+                let tensor = store
+                    .get(input_id)
+                    .ok_or_else(|| format!("checkpoint input tensor {input_id} missing"))?;
+                assert!(
+                    tensor.requires_grad,
+                    "checkpoint input {input_id} must be trainable; frozen base params would force useless large gradient computation"
+                );
+                assert!(
+                    !frozen_param_ids.contains(&input_id),
+                    "checkpoint input {input_id} leaked a frozen base parameter"
+                );
+                saw_checkpoint_adapter |= adapter_ids.contains(&input_id);
+            }
+        }
+        assert!(
+            saw_checkpoint_adapter,
+            "checkpoint inputs must include trainable LoRA adapters"
         );
         let grads = tape.backward(loss, store)?;
 
