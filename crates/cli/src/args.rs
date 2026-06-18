@@ -464,13 +464,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Nccl)]
     pub(crate) comm_backend: ServeCommBackendArg,
 
-    /// Opt into the layer-major batched DSv4 decode path (CUDA only). Default
-    /// off keeps the per-row decode loop as the byte-identical correctness
-    /// reference. Batched decode measured +57% aggregate at c=8 (lockstep
-    /// admission, 2026-06-10).
-    #[arg(long)]
-    pub(crate) dsv4_batched_decode: bool,
-
     /// External split MTP drafter model path or HuggingFace repo.
     /// Parsed for compatibility, but rejected by the rewrite serve path until
     /// external draft-model speculative decode is re-ported.
