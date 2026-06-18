@@ -852,6 +852,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             }
             #[cfg(feature = "cuda")]
             {
+                maybe_preoffload_infer_student_before_teacher(&infer_student, &train_backend)?;
                 OpdCliTeacher::Infer(load_opd_infer_teacher(
                     teacher_dir,
                     args.prompt_max_tokens + args.rollout_len + 32,
@@ -1846,6 +1847,31 @@ fn load_opd_infer_student(
         train_backend,
         vocab_size,
     )))
+}
+
+#[cfg(feature = "cuda")]
+fn maybe_preoffload_infer_student_before_teacher(
+    infer_student: &Option<train::infer_student::InferStudent>,
+    train_backend: &std::sync::Arc<dyn autograd::Backend>,
+) -> Result<()> {
+    if !train::opd::engine_offload_mode().offloads_student() {
+        return Ok(());
+    }
+    let Some(student) = infer_student.as_ref() else {
+        return Ok(());
+    };
+
+    train_backend
+        .device_synchronize()
+        .context("synchronize train backend before infer rollout student pre-teacher offload")?;
+    let freed = student
+        .offload_engine_weights()
+        .context("offload infer rollout student before infer teacher load")?;
+    eprintln!(
+        "opd_engine_offload student_pre_teacher_offloaded freed_bytes={freed} freed_mib={:.1}",
+        freed as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
 }
 
 #[allow(unused_variables)]
