@@ -22,6 +22,18 @@ pub trait KvQuery {
     /// Return the number of logical tokens still allocatable without eviction.
     fn free_tokens(&self) -> usize;
 
+    /// Return pages currently resident in the fast working pool. Default 0 for
+    /// pools that do not expose a standard host-indexed page pool.
+    fn resident_pages(&self) -> usize {
+        0
+    }
+
+    /// Return resident pages retained only by the prefix cache and therefore
+    /// reclaimable by cache eviction. Default 0 for non-standard pools.
+    fn resident_evictable_pages(&self) -> usize {
+        0
+    }
+
     /// Return the logical sequence length for `slot`.
     fn seq_len(&self, slot: usize) -> usize;
 

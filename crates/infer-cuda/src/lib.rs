@@ -17,7 +17,9 @@ use std::fmt;
 use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, HostPagedKvPool, KvPool, PollResult, PrefixBlock};
+use infer_seam::{
+    BackendExecutor, HostPagedKvPool, KvPool, KvTierLocation, PollResult, PrefixBlock,
+};
 
 #[cfg(feature = "cuda")]
 mod attention;
@@ -98,7 +100,7 @@ pub use executor::CudaKvCacheDtype;
 pub use executor::dsv4_max_seq_len;
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
-/// Machine-derived T2 disk budget when `--kv-ssd-path` is given without
+/// Machine-derived disk budget when `--kv-ssd-path` is given without
 /// `--kv-ssd-max-bytes` (probes free disk; capped at the proven 20 GiB).
 pub use kv_tier::default_t2_budget_bytes;
 /// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
@@ -209,7 +211,7 @@ impl CudaExecutor {
         }
     }
 
-    /// Re-budget the T1 host KV tier (`0` disables). Pre-serve only — must be
+    /// Re-budget the host-demoted KV tier (`0` disables). Pre-serve only — must be
     /// called before the engine starts demoting; existing entries are dropped.
     pub fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         match &mut self.inner {
@@ -221,7 +223,7 @@ impl CudaExecutor {
         }
     }
 
-    /// Attach the opt-in T2 disk spill level under `root` (pre-serve only).
+    /// Attach the opt-in disk spill level under `root` (pre-serve only).
     /// Returns whether the loaded model's arm consumed it; callers fail
     /// closed on `false` so an explicit `--kv-ssd-path` is never a silent
     /// no-op.
@@ -449,6 +451,41 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Placeholder => 0,
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.kv_tier_capacity_pages(),
+        }
+    }
+
+    fn kv_tier_page_bytes(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_page_bytes(),
+        }
+    }
+
+    fn kv_tier_host_demoted_pages(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_host_demoted_pages(),
+        }
+    }
+
+    fn kv_tier_disk_pages(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 0,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_disk_pages(),
+        }
+    }
+
+    fn kv_tier_location(&self, key: u64) -> Option<KvTierLocation> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = key;
+                None
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_location(key),
         }
     }
 

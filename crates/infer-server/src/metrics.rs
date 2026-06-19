@@ -17,7 +17,8 @@ pub(crate) const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> String {
     let labels = format!("{{model_name=\"{}\"}}", escape_label_value(model));
     let prefix = &counters.prefix_cache;
-    let mut out = String::with_capacity(1536);
+    let kv_system = &counters.kv_system;
+    let mut out = String::with_capacity(4096);
     let mut push = |name: &str, kind: &str, help: &str, value: u64| {
         out.push_str("# HELP arle_");
         out.push_str(name);
@@ -155,6 +156,120 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Whole-slot promotions that failed (request recomputed).",
         counters.kv_tier.slot_promote_failures,
     );
+    push(
+        "kv_system_resident_pages",
+        "gauge",
+        "Prefix pages currently resident in the fast working pool.",
+        kv_system.resident_pages as u64,
+    );
+    push(
+        "kv_system_resident_evictable_pages",
+        "gauge",
+        "Resident prefix pages currently evictable.",
+        kv_system.resident_evictable_pages as u64,
+    );
+    push(
+        "kv_system_host_demoted_pages",
+        "gauge",
+        "KV pages currently demoted to host RAM.",
+        kv_system.host_demoted_pages as u64,
+    );
+    push(
+        "kv_system_host_demoted_pending_inflight",
+        "gauge",
+        "KV pages with an in-flight host-demoted transfer.",
+        kv_system.host_demoted_pending_inflight as u64,
+    );
+    push(
+        "kv_system_disk_pages",
+        "gauge",
+        "KV pages currently stored on disk.",
+        kv_system.disk_pages as u64,
+    );
+    push(
+        "kv_system_reuse_hit_resident_total",
+        "counter",
+        "Prefix blocks reused from resident pages.",
+        kv_system.reuse_hit_resident,
+    );
+    push(
+        "kv_system_reuse_hit_host_demoted_total",
+        "counter",
+        "Prefix blocks reused from host-demoted pages.",
+        kv_system.reuse_hit_host_demoted,
+    );
+    push(
+        "kv_system_reuse_hit_disk_total",
+        "counter",
+        "Prefix blocks reused from disk.",
+        kv_system.reuse_hit_disk,
+    );
+    push(
+        "kv_system_reuse_miss_total",
+        "counter",
+        "Prefix attach lookups with no reusable block.",
+        kv_system.reuse_miss,
+    );
+    push(
+        "kv_system_demote_mset_count_total",
+        "counter",
+        "Synchronous page-tier mset batches.",
+        kv_system.demote_mset_count,
+    );
+    push(
+        "kv_system_demote_mset_copy_bytes_total",
+        "counter",
+        "Bytes copied by synchronous page-tier mset.",
+        kv_system.demote_mset_copy_bytes,
+    );
+    push(
+        "kv_system_demote_mset_copy_ms_total",
+        "counter",
+        "Milliseconds spent in synchronous page-tier mset.",
+        kv_system.demote_mset_copy_ms,
+    );
+    push(
+        "kv_system_promote_mget_count_total",
+        "counter",
+        "Synchronous page-tier mget batches.",
+        kv_system.promote_mget_count,
+    );
+    push(
+        "kv_system_promote_mget_copy_bytes_total",
+        "counter",
+        "Bytes copied by synchronous page-tier mget.",
+        kv_system.promote_mget_copy_bytes,
+    );
+    push(
+        "kv_system_promote_mget_copy_ms_total",
+        "counter",
+        "Milliseconds spent in synchronous page-tier mget.",
+        kv_system.promote_mget_copy_ms,
+    );
+    push(
+        "kv_system_fetch_wait_ms_total",
+        "counter",
+        "Milliseconds spent waiting for synchronous KV fetch.",
+        kv_system.fetch_wait_ms,
+    );
+    push(
+        "kv_system_fallback_recompute_total",
+        "counter",
+        "KV restore failures that fell back to recompute.",
+        kv_system.fallback_recompute,
+    );
+    push(
+        "kv_system_prefix_match_full_blocks_total",
+        "counter",
+        "Prefix blocks matched before restore-boundary clamp.",
+        kv_system.prefix_match_full_blocks,
+    );
+    push(
+        "kv_system_prefix_match_clamped_blocks_total",
+        "counter",
+        "Prefix blocks left after restore-boundary clamp.",
+        kv_system.prefix_match_clamped_blocks,
+    );
     out
 }
 
@@ -174,11 +289,11 @@ fn escape_label_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use infer_core::{KvTierStats, PrefixCacheStats, ThroughputStats};
+    use infer_core::{KvSystemMetrics, KvTierStats, PrefixCacheStats, ThroughputStats};
 
     use super::*;
 
-    const METRIC_COUNT: usize = 20;
+    const METRIC_COUNT: usize = 39;
 
     #[test]
     fn renders_help_type_and_labelled_samples() {
@@ -208,6 +323,27 @@ mod tests {
                 demoted_slots: 3,
                 promoted_slots: 2,
                 slot_promote_failures: 1,
+            },
+            kv_system: KvSystemMetrics {
+                resident_pages: 11,
+                resident_evictable_pages: 9,
+                host_demoted_pages: 4,
+                host_demoted_pending_inflight: 0,
+                disk_pages: 2,
+                reuse_hit_resident: 7,
+                reuse_hit_host_demoted: 3,
+                reuse_hit_disk: 1,
+                reuse_miss: 5,
+                demote_mset_count: 2,
+                demote_mset_copy_bytes: 1024,
+                demote_mset_copy_ms: 8,
+                promote_mget_count: 1,
+                promote_mget_copy_bytes: 512,
+                promote_mget_copy_ms: 6,
+                fetch_wait_ms: 6,
+                fallback_recompute: 1,
+                prefix_match_full_blocks: 12,
+                prefix_match_clamped_blocks: 10,
             },
         };
         let body = render_prometheus(&counters, "qwen3-dense");
@@ -241,6 +377,16 @@ mod tests {
                 "arle_kv_tier_slot_promote_failures_total{model_name=\"qwen3-dense\"} 1\n"
             )
         );
+        assert!(body.contains("arle_kv_system_resident_pages{model_name=\"qwen3-dense\"} 11\n"));
+        assert!(body.contains(
+            "arle_kv_system_reuse_hit_host_demoted_total{model_name=\"qwen3-dense\"} 3\n"
+        ));
+        assert!(body.contains(
+            "arle_kv_system_demote_mset_copy_bytes_total{model_name=\"qwen3-dense\"} 1024\n"
+        ));
+        assert!(body.contains(
+            "arle_kv_system_prefix_match_clamped_blocks_total{model_name=\"qwen3-dense\"} 10\n"
+        ));
 
         // Every sample line carries the HELP/TYPE pair exactly once.
         assert_eq!(body.matches("# HELP ").count(), METRIC_COUNT);

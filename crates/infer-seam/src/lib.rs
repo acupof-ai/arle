@@ -60,6 +60,12 @@ pub enum PrefixBlock {
     DemotedKey(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvTierLocation {
+    HostDemoted,
+    Disk,
+}
+
 /// Count the largest leading prefix that is complete for a pages-only KV
 /// restore contract.
 ///
@@ -166,12 +172,32 @@ pub trait BackendExecutor {
     /// mirrors here; the default is a no-op for executors with no such mirrors.
     fn release_prefix_pages(&mut self, _pages: &[u32]) {}
 
-    /// Number of KV pages the backend's host-side tier store (T1 DRAM) can
+    /// Number of KV pages the backend's host-demoted store can
     /// hold. `0` (the default) means the backend has no tier store and the
     /// engine never calls the demote/promote hooks — the baseline eviction
     /// path stays byte-for-byte unchanged.
     fn kv_tier_capacity_pages(&self) -> usize {
         0
+    }
+
+    fn kv_tier_page_bytes(&self) -> usize {
+        0
+    }
+
+    fn kv_tier_host_demoted_pages(&self) -> usize {
+        0
+    }
+
+    fn kv_tier_disk_pages(&self) -> usize {
+        0
+    }
+
+    fn kv_tier_transfer_is_zero_copy(&self) -> bool {
+        false
+    }
+
+    fn kv_tier_location(&self, _key: u64) -> Option<KvTierLocation> {
+        None
     }
 
     /// Copy the contents of device KV pages into the backend's host tier

@@ -5,8 +5,10 @@
 //! publish sealed blocks on finish, release reused pages, and reclaim via LRU
 //! eviction when allocation would fail.
 
+use std::time::Instant;
+
 use anyhow::{Result, anyhow};
-use infer_seam::{BackendExecutor, KvPool, PrefixBlock};
+use infer_seam::{BackendExecutor, KvPool, KvTierLocation, PrefixBlock};
 
 use crate::{BlockId, Engine, PrefixMatch, RequestPhase, RequestState};
 
@@ -102,6 +104,36 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         Ok(())
     }
 
+    fn record_prefix_tier_hits(&mut self, blocks: &[PrefixBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+        for block in blocks {
+            match *block {
+                PrefixBlock::ResidentPage(_) => {
+                    self.kv_system_metrics.reuse_hit_resident =
+                        self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
+                }
+                PrefixBlock::DemotedKey(key) => match self
+                    .executor
+                    .kv_tier_location(key)
+                    .unwrap_or(KvTierLocation::HostDemoted)
+                {
+                    KvTierLocation::HostDemoted => {
+                        self.kv_system_metrics.reuse_hit_host_demoted = self
+                            .kv_system_metrics
+                            .reuse_hit_host_demoted
+                            .saturating_add(1);
+                    }
+                    KvTierLocation::Disk => {
+                        self.kv_system_metrics.reuse_hit_disk =
+                            self.kv_system_metrics.reuse_hit_disk.saturating_add(1);
+                    }
+                },
+            }
+        }
+    }
+
     pub(crate) fn alloc_with_prefix_reclaim(&mut self, slot: usize, tokens: usize) -> Result<()> {
         let needed = self.kv.append_pages_needed(slot, tokens);
         if needed > self.kv.free_pages() {
@@ -187,15 +219,33 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// way every page ends up free, so retraction releases the same device
     /// pages as a plain `free_slot` — only the contents' fate differs.
     pub(crate) fn demote_published_pages(&mut self, pages: &[BlockId]) {
-        for &page in pages.iter().rev() {
-            if !self.try_demote_page(page) && !self.radix.evict_page(page) {
+        let pages: Vec<_> = pages.iter().rev().copied().collect();
+        let mut offset = 0usize;
+        while offset < pages.len() {
+            let demoted = self.try_demote_pages(&pages[offset..]);
+            for &page in &pages[offset..offset + demoted] {
+                self.kv.release_pages(&[page]);
+                self.executor.release_prefix_pages(&[page]);
+            }
+            offset += demoted;
+            if offset >= pages.len() {
+                break;
+            }
+            if demoted > 0 {
+                continue;
+            }
+
+            let page = pages[offset];
+            if !self.radix.evict_page(page) {
                 // Defensive: a just-published page must be an idle leaf by
                 // construction; if not, leave it cache-resident rather than
                 // corrupt accounting.
+                offset += 1;
                 continue;
             }
             self.kv.release_pages(&[page]);
             self.executor.release_prefix_pages(&[page]);
+            offset += 1;
         }
         self.drain_dropped_tier_keys();
     }
@@ -227,16 +277,36 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // of dropping it; fall back to plain eviction when the store refuses.
         let mut reclaimed = 0usize;
         while reclaimed < pages_needed {
-            let Some(page) = self.radix.lru_evictable_page() else {
+            let pages = self.radix.lru_evictable_pages(pages_needed - reclaimed);
+            if pages.is_empty() {
                 break;
             };
-            if !self.try_demote_page(page) && !self.radix.evict_page(page) {
-                // Neither demotable nor severable — stop instead of spinning.
+            let demoted = self.try_demote_pages(&pages);
+            for &page in &pages[..demoted] {
+                self.kv.release_pages(&[page]);
+                self.executor.release_prefix_pages(&[page]);
+                reclaimed += 1;
+            }
+            if demoted > 0 {
+                continue;
+            }
+            let mut blocked = false;
+            for &page in &pages[demoted..] {
+                if !self.radix.evict_page(page) {
+                    // Neither demotable nor severable — stop instead of spinning.
+                    blocked = true;
+                    break;
+                }
+                self.kv.release_pages(&[page]);
+                self.executor.release_prefix_pages(&[page]);
+                reclaimed += 1;
+                if reclaimed >= pages_needed {
+                    break;
+                }
+            }
+            if blocked {
                 break;
             }
-            self.kv.release_pages(&[page]);
-            self.executor.release_prefix_pages(&[page]);
-            reclaimed += 1;
         }
         self.drain_dropped_tier_keys();
         reclaimed
@@ -299,42 +369,91 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Copy `page` into the backend host tier and mark its radix node demoted.
-    /// Makes room by severing the coldest demoted block when the tier is full.
-    fn try_demote_page(&mut self, page: BlockId) -> bool {
+    /// Copy pages into the backend host tier and mark accepted radix nodes
+    /// demoted. Makes room by severing cold demoted blocks before the batch.
+    fn try_demote_pages(&mut self, pages: &[BlockId]) -> usize {
         let capacity = self.executor.kv_tier_capacity_pages();
-        if self.radix.demoted_block_count() >= capacity {
-            match self.radix.lru_demoted_key() {
-                Some(coldest) => {
-                    self.radix.drop_demoted(coldest);
-                    // Drain immediately so the store slot is reusable for the
-                    // demote below, not only after the eviction batch.
-                    self.drain_dropped_tier_keys();
-                }
-                None => return false,
-            }
+        if capacity == 0 || pages.is_empty() {
+            return 0;
         }
-        let key = self.next_tier_key;
-        self.next_tier_key = self.next_tier_key.wrapping_add(1);
-        match self.executor.demote_prefix_pages(&[(page, key)]) {
-            Ok(accepted) if accepted >= 1 => {
-                if self.radix.demote_block(page, key) {
-                    self.kv_tier_stats.demoted_pages =
-                        self.kv_tier_stats.demoted_pages.saturating_add(1);
-                    true
-                } else {
-                    // The radix refused (page is not an idle cached leaf);
-                    // the store copy is unreachable — drop it.
-                    self.executor.drop_kv_tier_entries(&[key]);
-                    false
-                }
+
+        let mut entries = Vec::with_capacity(pages.len());
+        for &page in pages {
+            while self
+                .radix
+                .demoted_block_count()
+                .saturating_add(entries.len())
+                >= capacity
+            {
+                let Some(coldest) = self.radix.lru_demoted_key() else {
+                    break;
+                };
+                self.radix.drop_demoted(coldest);
+                // Drain immediately so the store slot is reusable for this
+                // mset batch, not only after the eviction batch.
+                self.drain_dropped_tier_keys();
             }
-            Ok(_) => false,
+            if self
+                .radix
+                .demoted_block_count()
+                .saturating_add(entries.len())
+                >= capacity
+            {
+                break;
+            }
+            let key = self.next_tier_key;
+            self.next_tier_key = self.next_tier_key.wrapping_add(1);
+            entries.push((page, key));
+        }
+        if entries.is_empty() {
+            return 0;
+        }
+
+        let started = Instant::now();
+        let result = self.executor.demote_prefix_pages(&entries);
+        let elapsed_ms = elapsed_ms(started);
+        let charge_copy = !self.executor.kv_tier_transfer_is_zero_copy();
+        self.kv_system_metrics.demote_mset_count =
+            self.kv_system_metrics.demote_mset_count.saturating_add(1);
+        if charge_copy {
+            self.kv_system_metrics.demote_mset_copy_ms = self
+                .kv_system_metrics
+                .demote_mset_copy_ms
+                .saturating_add(elapsed_ms);
+        }
+        let accepted = match result {
+            Ok(accepted) => accepted.min(entries.len()),
             Err(err) => {
-                log::warn!("KV tier demote failed for page {page}: {err:#}");
-                false
+                log::warn!("KV tier demote failed for {} pages: {err:#}", entries.len());
+                return 0;
+            }
+        };
+        if charge_copy {
+            let bytes = (accepted as u64).saturating_mul(self.executor.kv_tier_page_bytes() as u64);
+            self.kv_system_metrics.demote_mset_copy_bytes = self
+                .kv_system_metrics
+                .demote_mset_copy_bytes
+                .saturating_add(bytes);
+        }
+
+        let mut demoted = 0usize;
+        for (idx, &(page, key)) in entries.iter().take(accepted).enumerate() {
+            if self.radix.demote_block(page, key) {
+                self.kv_tier_stats.demoted_pages =
+                    self.kv_tier_stats.demoted_pages.saturating_add(1);
+                demoted += 1;
+            } else {
+                // The radix refused (page is not an idle cached leaf);
+                // accepted store copies from this point are unreachable.
+                let stale: Vec<_> = entries[idx..accepted]
+                    .iter()
+                    .map(|&(_, stale_key)| stale_key)
+                    .collect();
+                self.executor.drop_kv_tier_entries(&stale);
+                break;
             }
         }
+        demoted
     }
 
     /// Prefix lookup used at slot attach. With a host tier, demoted blocks in
@@ -343,7 +462,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// failure truncates the match there and the tail re-prefills.
     pub(crate) fn lookup_prefix_for_attach(&mut self, tokens: &[u32]) -> PrefixMatch {
         if self.kv_tier_capacity() == 0 {
-            return self.radix.longest_prefix_match(tokens);
+            let matched = self.radix.longest_prefix_match(tokens);
+            return self.clamp_prefix_to_backend(matched);
         }
         let mut blocks = self.radix.tiered_longest_prefix_match(tokens).blocks;
         let reusable = self
@@ -351,15 +471,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .reusable_prefix_blocks(&blocks)
             .min(blocks.len());
         blocks.truncate(reusable);
-        let mut block_ids = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            let page = match block {
-                PrefixBlock::ResidentPage(page) => Some(page),
-                PrefixBlock::DemotedKey(key) => self.promote_demoted_block(key),
-            };
-            let Some(page) = page else { break };
-            block_ids.push(page);
-        }
+        let block_ids = self.materialize_prefix_blocks(&blocks);
+        self.record_prefix_tier_hits(&blocks[..block_ids.len().min(blocks.len())]);
         self.drain_dropped_tier_keys();
         PrefixMatch {
             matched_len: block_ids.len() * self.radix.block_size(),
@@ -367,35 +480,125 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Promote one demoted block into a fresh device page and restore its
-    /// radix node to residency (cache-owned, like a published page).
-    fn promote_demoted_block(&mut self, key: u64) -> Option<BlockId> {
-        let page = match self.kv.alloc_detached_pages(1) {
-            Ok(mut pages) => pages.pop()?,
-            Err(_) => return None,
-        };
-        match self.executor.promote_prefix_pages(&[(key, page)]) {
-            Ok(()) if self.radix.promote_block(key, page) => {
-                self.kv.retain_pages(&[page]);
-                self.kv_tier_stats.promoted_pages =
-                    self.kv_tier_stats.promoted_pages.saturating_add(1);
-                Some(page)
-            }
-            Ok(()) => {
-                // Unknown key (should not happen for a key the match returned).
-                self.kv.free_detached_pages(&[page]);
-                self.executor.drop_kv_tier_entries(&[key]);
-                None
-            }
+    /// Materialize a backend-approved leading prefix into resident page ids.
+    ///
+    /// Resident blocks pass through. Demoted blocks are restored by one mget
+    /// batch before any attach; if the batch fails, only the leading resident
+    /// run before the first demoted block is returned.
+    fn materialize_prefix_blocks(&mut self, blocks: &[PrefixBlock]) -> Vec<BlockId> {
+        let demoted = blocks
+            .iter()
+            .filter_map(|block| match *block {
+                PrefixBlock::ResidentPage(_) => None,
+                PrefixBlock::DemotedKey(key) => Some(key),
+            })
+            .collect::<Vec<_>>();
+        if demoted.is_empty() {
+            return blocks
+                .iter()
+                .filter_map(|block| match *block {
+                    PrefixBlock::ResidentPage(page) => Some(page),
+                    PrefixBlock::DemotedKey(_) => None,
+                })
+                .collect();
+        }
+
+        let promoted_pages = match self.kv.alloc_detached_pages(demoted.len()) {
+            Ok(pages) => pages,
             Err(err) => {
-                log::warn!("KV tier promote failed for key {key}: {err:#}");
-                self.kv.free_detached_pages(&[page]);
-                self.radix.drop_demoted(key);
-                self.kv_tier_stats.promote_failures =
-                    self.kv_tier_stats.promote_failures.saturating_add(1);
-                None
+                log::warn!(
+                    "KV tier promote skipped: could not allocate {} pages: {err:#}",
+                    demoted.len()
+                );
+                self.kv_system_metrics.fallback_recompute =
+                    self.kv_system_metrics.fallback_recompute.saturating_add(1);
+                return leading_resident_pages(blocks);
+            }
+        };
+
+        let mut pages = promoted_pages.iter().copied();
+        let mut promote_entries = Vec::with_capacity(demoted.len());
+        for block in blocks {
+            if let PrefixBlock::DemotedKey(key) = *block {
+                let page = pages.next().expect("allocated one page per demoted key");
+                promote_entries.push((key, page));
             }
         }
+
+        let started = Instant::now();
+        let result = self.executor.promote_prefix_pages(&promote_entries);
+        let elapsed_ms = elapsed_ms(started);
+        let charge_copy = !self.executor.kv_tier_transfer_is_zero_copy();
+        self.kv_system_metrics.promote_mget_count =
+            self.kv_system_metrics.promote_mget_count.saturating_add(1);
+        if charge_copy {
+            self.kv_system_metrics.promote_mget_copy_ms = self
+                .kv_system_metrics
+                .promote_mget_copy_ms
+                .saturating_add(elapsed_ms);
+            self.kv_system_metrics.fetch_wait_ms = self
+                .kv_system_metrics
+                .fetch_wait_ms
+                .saturating_add(elapsed_ms);
+        }
+        if let Err(err) = result {
+            log::warn!(
+                "KV tier promote failed for {} pages: {err:#}; recomputing tail",
+                promote_entries.len()
+            );
+            self.executor.release_prefix_pages(&promoted_pages);
+            self.kv.free_detached_pages(&promoted_pages);
+            for &(key, _) in &promote_entries {
+                self.radix.drop_demoted(key);
+            }
+            self.kv_tier_stats.promote_failures = self
+                .kv_tier_stats
+                .promote_failures
+                .saturating_add(promote_entries.len() as u64);
+            self.kv_system_metrics.fallback_recompute =
+                self.kv_system_metrics.fallback_recompute.saturating_add(1);
+            return leading_resident_pages(blocks);
+        }
+        if charge_copy {
+            let bytes = (promote_entries.len() as u64)
+                .saturating_mul(self.executor.kv_tier_page_bytes() as u64);
+            self.kv_system_metrics.promote_mget_copy_bytes = self
+                .kv_system_metrics
+                .promote_mget_copy_bytes
+                .saturating_add(bytes);
+        }
+
+        let mut block_ids = Vec::with_capacity(blocks.len());
+        let mut promoted_idx = 0usize;
+        for block in blocks {
+            match *block {
+                PrefixBlock::ResidentPage(page) => block_ids.push(page),
+                PrefixBlock::DemotedKey(key) => {
+                    let page = promote_entries[promoted_idx].1;
+                    promoted_idx += 1;
+                    if self.radix.promote_block(key, page) {
+                        self.kv.retain_pages(&[page]);
+                        self.kv_tier_stats.promoted_pages =
+                            self.kv_tier_stats.promoted_pages.saturating_add(1);
+                        block_ids.push(page);
+                    } else {
+                        self.kv_system_metrics.fallback_recompute =
+                            self.kv_system_metrics.fallback_recompute.saturating_add(1);
+                        self.executor.release_prefix_pages(&[page]);
+                        self.kv.free_detached_pages(&[page]);
+                        self.executor.drop_kv_tier_entries(&[key]);
+                        let tail_pages: Vec<_> = promote_entries[promoted_idx..]
+                            .iter()
+                            .map(|&(_, tail_page)| tail_page)
+                            .collect();
+                        self.executor.release_prefix_pages(&tail_pages);
+                        self.kv.free_detached_pages(&tail_pages);
+                        break;
+                    }
+                }
+            }
+        }
+        block_ids
     }
 
     /// Forward tier keys invalidated by radix mutations (sever, revive,
@@ -407,4 +610,19 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.executor.drop_kv_tier_entries(&keys);
         }
     }
+}
+
+fn leading_resident_pages(blocks: &[PrefixBlock]) -> Vec<BlockId> {
+    blocks
+        .iter()
+        .take_while(|block| matches!(block, PrefixBlock::ResidentPage(_)))
+        .filter_map(|block| match *block {
+            PrefixBlock::ResidentPage(page) => Some(page),
+            PrefixBlock::DemotedKey(_) => None,
+        })
+        .collect()
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }

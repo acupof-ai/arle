@@ -76,6 +76,14 @@ impl KvQuery for HostPagedKvPool {
         self.free.len() * self.page_size
     }
 
+    fn resident_pages(&self) -> usize {
+        self.total_pages.saturating_sub(self.free.len())
+    }
+
+    fn resident_evictable_pages(&self) -> usize {
+        self.page_refs.values().filter(|&&count| count == 1).count()
+    }
+
     fn seq_len(&self, slot: usize) -> usize {
         self.slot_len.get(slot).copied().unwrap_or(0)
     }
@@ -254,15 +262,22 @@ mod tests {
         let prefix: Vec<u32> = pool.page_indices(0).to_vec();
         pool.retain_pages(&prefix);
         assert_eq!(pool.retained_count(), 2);
+        assert_eq!(pool.resident_pages(), 2);
+        assert_eq!(pool.resident_evictable_pages(), 2);
         let free_before = pool.free_pages();
         pool.free_slot(0);
         assert_eq!(pool.free_pages(), free_before);
         pool.attach_pages(1, &prefix, 32).unwrap();
+        pool.retain_pages(&prefix);
+        assert_eq!(pool.resident_evictable_pages(), 0);
         assert_eq!(pool.page_indices(1), prefix.as_slice());
         assert_eq!(pool.seq_len(1), 32);
         pool.free_slot(1);
         pool.release_pages(&prefix);
+        assert_eq!(pool.resident_evictable_pages(), 2);
+        pool.release_pages(&prefix);
         assert_eq!(pool.retained_count(), 0);
+        assert_eq!(pool.resident_pages(), 0);
         assert_eq!(pool.free_pages(), 8);
     }
 

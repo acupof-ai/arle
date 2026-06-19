@@ -215,6 +215,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 self.kv.free_slot(slot);
                 self.kv_tier_stats.slot_promote_failures =
                     self.kv_tier_stats.slot_promote_failures.saturating_add(1);
+                self.kv_system_metrics.fallback_recompute =
+                    self.kv_system_metrics.fallback_recompute.saturating_add(1);
                 let fresh = request.clone().reset_for_recompute();
                 *request = fresh;
                 let prefix_match = if self.config.enable_prefix_cache {

@@ -268,6 +268,34 @@ impl RealCudaExecutor {
         }
     }
 
+    pub(crate) fn kv_tier_page_bytes(&self) -> usize {
+        match self {
+            Self::Qwen(q) => q.kv_tier_page_bytes(),
+            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+        }
+    }
+
+    pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
+        match self {
+            Self::Qwen(q) => q.kv_tier_host_demoted_pages(),
+            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+        }
+    }
+
+    pub(crate) fn kv_tier_disk_pages(&self) -> usize {
+        match self {
+            Self::Qwen(q) => q.kv_tier_disk_pages(),
+            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+        }
+    }
+
+    pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        match self {
+            Self::Qwen(q) => q.kv_tier_location(key),
+            Self::Qwen35(_) | Self::Dsv4(_) => None,
+        }
+    }
+
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         match self {
             Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
@@ -330,7 +358,7 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Re-budget the T1 tier store (`0` disables; pre-serve only). No-op on
+    /// Re-budget the host-demoted tier store (`0` disables; pre-serve only). No-op on
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         if let Self::Qwen(q) = self {
@@ -338,7 +366,7 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Attach the opt-in T2 disk spill level (pre-serve only). Returns whether
+    /// Attach the opt-in disk spill level (pre-serve only). Returns whether
     /// any arm consumed it, so callers can fail closed instead of silently
     /// dropping an explicit `--kv-ssd-path` request.
     pub(crate) fn set_kv_tier_disk(
@@ -586,18 +614,34 @@ impl QwenCudaExecutor {
         self.tier.capacity_pages()
     }
 
+    pub(crate) fn kv_tier_page_bytes(&self) -> usize {
+        self.tier.page_bytes()
+    }
+
+    pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
+        self.tier.host_demoted_pages()
+    }
+
+    pub(crate) fn kv_tier_disk_pages(&self) -> usize {
+        self.tier.disk_pages()
+    }
+
+    pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        self.tier.location(key)
+    }
+
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         pages_only_reusable_prefix_blocks(blocks, |key| self.tier.contains(key))
     }
 
-    /// Re-budget the T1 tier store (`0` disables). Pre-serve only: any
+    /// Re-budget the host-demoted tier store (`0` disables). Pre-serve only: any
     /// existing entries are dropped, so callers configure this right after
     /// construction, before the engine demotes anything.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.tier = CudaKvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
     }
 
-    /// Attach the opt-in T2 disk spill level (`--kv-ssd-path`). Pre-serve only.
+    /// Attach the opt-in disk spill level (`--kv-ssd-path`). Pre-serve only.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,

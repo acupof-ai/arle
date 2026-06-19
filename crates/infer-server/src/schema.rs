@@ -352,6 +352,7 @@ pub struct StatsResponse {
     pub throughput: ThroughputStatsResponse,
     pub prefix_cache: PrefixCacheStatsResponse,
     pub kv_tier: KvTierStatsResponse,
+    pub kv_system: KvSystemMetricsResponse,
     pub ssd_recall: SsdRecallStats,
 }
 
@@ -381,6 +382,27 @@ impl StatsResponse {
                 promoted_slots: counters.kv_tier.promoted_slots,
                 slot_promote_failures: counters.kv_tier.slot_promote_failures,
             },
+            kv_system: KvSystemMetricsResponse {
+                resident_pages: counters.kv_system.resident_pages,
+                resident_evictable_pages: counters.kv_system.resident_evictable_pages,
+                host_demoted_pages: counters.kv_system.host_demoted_pages,
+                host_demoted_pending_inflight: counters.kv_system.host_demoted_pending_inflight,
+                disk_pages: counters.kv_system.disk_pages,
+                reuse_hit_resident: counters.kv_system.reuse_hit_resident,
+                reuse_hit_host_demoted: counters.kv_system.reuse_hit_host_demoted,
+                reuse_hit_disk: counters.kv_system.reuse_hit_disk,
+                reuse_miss: counters.kv_system.reuse_miss,
+                demote_mset_count: counters.kv_system.demote_mset_count,
+                demote_mset_copy_bytes: counters.kv_system.demote_mset_copy_bytes,
+                demote_mset_copy_ms: counters.kv_system.demote_mset_copy_ms,
+                promote_mget_count: counters.kv_system.promote_mget_count,
+                promote_mget_copy_bytes: counters.kv_system.promote_mget_copy_bytes,
+                promote_mget_copy_ms: counters.kv_system.promote_mget_copy_ms,
+                fetch_wait_ms: counters.kv_system.fetch_wait_ms,
+                fallback_recompute: counters.kv_system.fallback_recompute,
+                prefix_match_full_blocks: counters.kv_system.prefix_match_full_blocks,
+                prefix_match_clamped_blocks: counters.kv_system.prefix_match_clamped_blocks,
+            },
             prefix_cache: PrefixCacheStatsResponse {
                 lookups: counters.prefix_cache.lookups,
                 hits: counters.prefix_cache.hits,
@@ -396,7 +418,7 @@ impl StatsResponse {
                 hits: 0,
                 recall_rate: None,
                 not_available_reason: "per-level ssd recall counters are not split out yet; \
-                                       T2 disk spill activity is included in the kv_tier block",
+                                       disk spill activity is included in the kv_tier block",
             },
         }
     }
@@ -419,7 +441,7 @@ pub struct ThroughputStatsResponse {
     pub requests_completed: u64,
 }
 
-/// KV host-tier (T1 DRAM) counters. All zero until a backend with a tier
+/// KV host-demoted counters. All zero until a backend with a tier
 /// store is configured (`available` keys off observed tier activity).
 #[derive(Debug, Clone, Serialize)]
 pub struct KvTierStatsResponse {
@@ -431,6 +453,29 @@ pub struct KvTierStatsResponse {
     pub demoted_slots: u64,
     pub promoted_slots: u64,
     pub slot_promote_failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KvSystemMetricsResponse {
+    pub resident_pages: usize,
+    pub resident_evictable_pages: usize,
+    pub host_demoted_pages: usize,
+    pub host_demoted_pending_inflight: usize,
+    pub disk_pages: usize,
+    pub reuse_hit_resident: u64,
+    pub reuse_hit_host_demoted: u64,
+    pub reuse_hit_disk: u64,
+    pub reuse_miss: u64,
+    pub demote_mset_count: u64,
+    pub demote_mset_copy_bytes: u64,
+    pub demote_mset_copy_ms: u64,
+    pub promote_mget_count: u64,
+    pub promote_mget_copy_bytes: u64,
+    pub promote_mget_copy_ms: u64,
+    pub fetch_wait_ms: u64,
+    pub fallback_recompute: u64,
+    pub prefix_match_full_blocks: u64,
+    pub prefix_match_clamped_blocks: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -671,6 +716,27 @@ mod tests {
                 requests_completed: 3,
             },
             kv_tier: infer_core::KvTierStats::default(),
+            kv_system: infer_core::KvSystemMetrics {
+                resident_pages: 2,
+                resident_evictable_pages: 1,
+                host_demoted_pages: 3,
+                host_demoted_pending_inflight: 0,
+                disk_pages: 4,
+                reuse_hit_resident: 5,
+                reuse_hit_host_demoted: 6,
+                reuse_hit_disk: 7,
+                reuse_miss: 8,
+                demote_mset_count: 9,
+                demote_mset_copy_bytes: 10,
+                demote_mset_copy_ms: 11,
+                promote_mget_count: 12,
+                promote_mget_copy_bytes: 13,
+                promote_mget_copy_ms: 14,
+                fetch_wait_ms: 15,
+                fallback_recompute: 16,
+                prefix_match_full_blocks: 17,
+                prefix_match_clamped_blocks: 18,
+            },
         });
 
         let v = serde_json::to_value(&resp).expect("serialize");
@@ -681,6 +747,11 @@ mod tests {
         assert_eq!(v["throughput"]["requests_completed"], 3);
         assert_eq!(v["kv_tier"]["available"], false);
         assert_eq!(v["kv_tier"]["demoted_pages"], 0);
+        assert_eq!(v["kv_system"]["resident_pages"], 2);
+        assert_eq!(v["kv_system"]["host_demoted_pages"], 3);
+        assert_eq!(v["kv_system"]["disk_pages"], 4);
+        assert_eq!(v["kv_system"]["promote_mget_copy_bytes"], 13);
+        assert_eq!(v["kv_system"]["prefix_match_clamped_blocks"], 18);
         assert_eq!(v["ssd_recall"]["available"], false);
         assert!(v["ssd_recall"]["recall_rate"].is_null());
     }
