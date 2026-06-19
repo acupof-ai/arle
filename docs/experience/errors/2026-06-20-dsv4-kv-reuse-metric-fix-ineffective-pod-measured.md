@@ -1,4 +1,40 @@
-# WS2 KV reuse-metric "fix" (a45f3a29) is ineffective for DSv4 — reuse is real (~14×, after separating ~17s one-time warmup) but counters still read all-miss
+# RESOLVED (NOT A BUG): DSv4 has NO cross-request prefix reuse — the all-miss counter is HONEST; the "49×/14× reuse" was JIT/CUDA-graph warmup
+
+## RESOLUTION (2026-06-20, warm-JIT controlled probe — supersedes everything below)
+
+A clean probe with the DeepGEMM JIT + CUDA-graph cache fully warm
+(`A_cold=4.00s`, not the earlier 22s) and 5 DISTINCT same-length prefixes:
+
+```
+A_cold=4.00  A_warm=0.30  B=0.30  C=0.32  D=0.39  E=1.55  A_after_BCDE=0.30  B_after=0.30
+```
+
+`A_warm` (prefix identical to A) = `B`/`C`/`D` (different prefixes) = ~0.30s.
+**If prefix reuse existed, identical would beat different. They are EQUAL ⇒ no
+reuse.** DSv4 re-prefills every request at ~0.3s warm; the cold/warm "speedups"
+(22.5s→0.46s, 5.64s→0.40s) were entirely DeepGEMM-JIT + CUDA-graph *warmup*
+amortization, NOT KV reuse. The re-fix agent's code trace was correct:
+`reusable_prefix_blocks=0` (infer-cuda/src/executor.rs:302), radix off, no
+cross-request KV reuse — by design (DSv4 owns its MLA KV inside the forward).
+
+**Verdict: the `kv_system` all-miss reading is CORRECT. WS2 is closed — there is
+no metric bug; there is no reuse to count.** The L1/L2/L3→self-documenting rename
+(a45f3a29) stays. Separately, "DSv4 re-prefills every request" is a *feature gap*
+(no cross-request prefix cache) — adding one is a substantial correctness feature,
+not a monitoring fix.
+
+**Lesson (the load-bearing one): JIT/CUDA-graph warmup state is a massive
+confound for ANY cold/warm timing on DSv4.** I flip-flopped THREE times (49×
+reuse → no reuse → 14× reuse → no reuse) because each 2-point cold/warm probe sat
+at a different warmup state. The ONLY clean reuse test is identical-vs-different
+prefix at FULLY-warm JIT (`A_warm` vs `B_diff`); there they're equal. §0: a
+measurement at an uncontrolled confound is not evidence — isolate warmup first.
+
+---
+
+## (Superseded) Original framing — kept for the record
+
+WS2 KV reuse-metric "fix" (a45f3a29) is ineffective for DSv4 — reuse is real (~14×, after separating ~17s one-time warmup) but counters still read all-miss
 
 ## Context
 
