@@ -30,6 +30,7 @@ authority rather than defining a second equal architecture.
 | `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
 | `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
+| `agent-bench` | Agent/runtime benchmark harnesses (e.g. `dsv4_kv_precision_parity`) | Product runtime code |
 | `chat` | Shared protocol formatting/parsing, OpenAI chat surface types | Runtime scheduling and backend logic |
 | `infer-plan` | Backend-neutral data IR: `ForwardPlan`, `ForwardMode`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Any device or backend type |
 | `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll core + opt-in capability default-methods: stop ids, row/request caps, prefix reuse, KV page-tier and slot-tier hooks, OPD weight offload) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `KvBatchDescriptor` + `ResourceGovernor` + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
@@ -45,6 +46,8 @@ authority rather than defining a second equal architecture.
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
 | `mlx-sys` | MLX C++ bridge for the Metal backend | Anything that is not the Metal bridge |
+| `deepep-sys` | DeepEP/NVSHMEM FFI (`internode_ll` dispatch/combine) for EP collectives | Routing policy, scheduler |
+| `xgrammar-sys` | Grammar-constrained decode FFI (xgrammar) | Sampling policy, scheduler |
 | `hip-sys` / `hip-kernels` | Thin hand-declared HIP runtime FFI (stubs off-box) / HIP kernel build + FFI layer (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus, hipcc-gated) | Model code, scheduler logic |
 | `vulkan-sys` / `vulkan-kernels` | ash-backed Vulkan loader wrapper / glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` | Model code, scheduler logic |
 | `infer-gguf` | GGUF container reading (v2/v3 memmap reader), CPU dequant (llama.cpp ports), per-arch GGUF→spec-config mappers (`deepseek4`) | Model forward code, scheduler |
