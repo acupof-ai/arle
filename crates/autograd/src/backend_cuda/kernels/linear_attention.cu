@@ -475,6 +475,19 @@ extern "C" __global__ void linear_attention_scan_backward_f32(
     }
 }
 
+extern "C" __global__ void linear_attention_copy_f32(
+    unsigned long long dst_addr,
+    unsigned long long src_addr,
+    int len
+) {
+    float* __restrict__ dst = reinterpret_cast<float*>(dst_addr);
+    const float* __restrict__ src = reinterpret_cast<const float*>(src_addr);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        dst[idx] = src[idx];
+    }
+}
+
 extern "C" __global__ void linear_attention_rms_gated_forward_f32_from_bf16(
     float* __restrict__ out,
     const unsigned short* __restrict__ x_bf16,
@@ -536,6 +549,7 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
     const float* __restrict__ a_log,
     const float* __restrict__ norm_weight,
     const float* __restrict__ preact,
+    const unsigned short* __restrict__ qkv_conv,
     const float* __restrict__ beta,
     const float* __restrict__ g,
     const float* __restrict__ chunk_state,
@@ -612,11 +626,11 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
         for (int local_t = 0; local_t < limit; ++local_t) {
             int seq_idx = base + local_t;
             for (int i = tid; i < key_dim; i += blockDim.x) {
-                k_raw[i] = la_silu(preact[la_idx3(
+                k_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
                     batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len, qkv_dim)]);
             }
             for (int i = tid; i < value_dim; i += blockDim.x) {
-                v_raw[i] = la_silu(preact[la_idx3(
+                v_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
                     batch_idx, seq_idx, v_offset + value_head * value_dim + i, seq_len, qkv_dim)]);
             }
             __syncthreads();
@@ -674,13 +688,13 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
         for (int local_t = limit - 1; local_t >= 0; --local_t) {
             int seq_idx = base + local_t;
             for (int i = tid; i < key_dim; i += blockDim.x) {
-                q_raw[i] = la_silu(preact[la_idx3(
+                q_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
                     batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)]);
-                k_raw[i] = la_silu(preact[la_idx3(
+                k_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
                     batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len, qkv_dim)]);
             }
             for (int i = tid; i < value_dim; i += blockDim.x) {
-                v_raw[i] = la_silu(preact[la_idx3(
+                v_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
                     batch_idx, seq_idx, v_offset + value_head * value_dim + i, seq_len, qkv_dim)]);
             }
             __syncthreads();

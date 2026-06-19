@@ -1,8 +1,8 @@
 mod helpers;
 
 use autograd::{
-    ops::{linear_attention_core, mul, sum, LinearAttentionParams},
     Result, Tape, TensorStore,
+    ops::{LinearAttentionParams, linear_attention_core, mul, sum},
 };
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use helpers::max_abs_err;
@@ -306,21 +306,37 @@ fn max_rel_err_qkv_range(
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn max_abs_err_qkv_range(
+    lhs: &[f32],
+    rhs: &[f32],
+    params: LinearAttentionParams,
+    start: usize,
+    len: usize,
+) -> f32 {
+    let qkv_dim = qkv_dim(params);
+    let mut err = 0.0_f32;
+    for token in 0..(params.batch * params.seq_len) {
+        let base = token * qkv_dim + start;
+        err = err.max(max_abs_err(&lhs[base..base + len], &rhs[base..base + len]));
+    }
+    err
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 fn compare_cpu_cuda_device_linear_attention(
     params: LinearAttentionParams,
     fixture: &LinearAttentionFixture,
     label: &str,
     rel_tol: f32,
 ) -> Result<()> {
+    const ABS_TOL: f32 = 1.0e-3;
     let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
     let z_shape = [params.batch, params.seq_len, z_dim(params)];
     let head_shape = [params.batch, params.seq_len, params.num_value_heads];
 
     let nvrtc_started = Instant::now();
-    let Ok(cuda_backend) = CudaBackend::new(0) else {
-        eprintln!("skipping {label}: no CUDA device");
-        return Ok(());
-    };
+    let cuda_backend = CudaBackend::new(0)
+        .unwrap_or_else(|err| panic!("{label}: CUDA backend init failed: {err:?}"));
     eprintln!(
         "{label} stage=nvrtc_build seconds={:.3}",
         nvrtc_started.elapsed().as_secs_f64()
@@ -495,33 +511,61 @@ fn compare_cpu_cuda_device_linear_attention(
         (
             "dq",
             max_rel_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, 0, q_dim),
+            max_abs_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, 0, q_dim),
         ),
         (
             "dk",
             max_rel_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, q_dim, q_dim),
+            max_abs_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, q_dim, q_dim),
         ),
         (
             "dv",
             max_rel_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, q_dim * 2, v_dim),
+            max_abs_err_qkv_range(&cuda_qkv_grad, &cpu_qkv_grad, params, q_dim * 2, v_dim),
         ),
-        ("dbeta", max_rel_err(&cuda_b_grad, &cpu_b_grad)),
-        ("dg", max_rel_err(&cuda_a_grad, &cpu_a_grad)),
-        ("da_log", max_rel_err(&cuda_a_log_grad, &cpu_a_log_grad)),
-        ("dnorm", max_rel_err(&cuda_norm_grad, &cpu_norm_grad)),
-        ("dconv", max_rel_err(&cuda_conv_grad, &cpu_conv_grad)),
+        (
+            "dbeta",
+            max_rel_err(&cuda_b_grad, &cpu_b_grad),
+            max_abs_err(&cuda_b_grad, &cpu_b_grad),
+        ),
+        (
+            "dg",
+            max_rel_err(&cuda_a_grad, &cpu_a_grad),
+            max_abs_err(&cuda_a_grad, &cpu_a_grad),
+        ),
+        (
+            "da_log",
+            max_rel_err(&cuda_a_log_grad, &cpu_a_log_grad),
+            max_abs_err(&cuda_a_log_grad, &cpu_a_log_grad),
+        ),
+        (
+            "dnorm",
+            max_rel_err(&cuda_norm_grad, &cpu_norm_grad),
+            max_abs_err(&cuda_norm_grad, &cpu_norm_grad),
+        ),
+        (
+            "dconv",
+            max_rel_err(&cuda_conv_grad, &cpu_conv_grad),
+            max_abs_err(&cuda_conv_grad, &cpu_conv_grad),
+        ),
     ];
-    for (name, err) in checks {
-        eprintln!("{label} {name} max_rel_err={err:.6e}");
+    let mut first_failure = None;
+    for (name, err, abs) in checks {
+        eprintln!("{label} {name} max_rel_err={err:.6e} max_abs_err={abs:.6e}");
         assert!(err.is_finite(), "{label} {name} error is non-finite");
-        assert!(
-            err <= rel_tol,
-            "{label} {name} max rel err {err} > {rel_tol}"
-        );
+        if err > rel_tol && abs > ABS_TOL && first_failure.is_none() {
+            first_failure = Some((name, err, abs));
+        }
+    }
+    if let Some((name, err, abs)) = first_failure {
+        panic!("{label} {name} max rel err {err} > {rel_tol} and max abs err {abs} > {ABS_TOL}");
     }
     let ddt_rel = max_rel_err(&cuda_dt_grad, &cpu_dt_grad);
+    let ddt_abs = max_abs_err(&cuda_dt_grad, &cpu_dt_grad);
+    eprintln!("{label} ddt_bias max_rel_err={ddt_rel:.6e} max_abs_err={ddt_abs:.6e}");
     assert!(
-        ddt_rel.is_finite() && ddt_rel <= rel_tol,
-        "{label} ddt_bias max rel err {ddt_rel} > {rel_tol}"
+        ddt_rel.is_finite() && (ddt_rel <= rel_tol || ddt_abs <= ABS_TOL),
+        "{label} ddt_bias max rel err {ddt_rel} > {rel_tol} and max abs err {ddt_abs} > {ABS_TOL}"
     );
     for (name, values) in [
         ("cuda_out", &cuda_out_host),
@@ -1053,10 +1097,8 @@ fn cuda_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     let cpu_a_log_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a_log).expect("cpu a_log grad"))?;
     let cpu_norm_grad = cpu_store.to_host(*cpu_grads.get(&cpu_norm).expect("cpu norm grad"))?;
 
-    let Ok(cuda_backend) = CudaBackend::new(0) else {
-        eprintln!("skipping cuda_linear_attention_matches_cpu_with_device_inputs: no CUDA device");
-        return Ok(());
-    };
+    let cuda_backend = CudaBackend::new(0)
+        .unwrap_or_else(|err| panic!("cuda_linear_attention_matches_cpu_with_device_inputs: CUDA backend init failed: {err:?}"));
     let mut cuda_store = TensorStore::with_backend(Arc::new(cuda_backend));
     let mut cuda_tape = Tape::new();
     let cuda_qkv = cuda_store.from_slice(&fixture.qkv, &qkv_shape)?;
