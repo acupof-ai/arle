@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::Path;
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, HostPagedKvPool, KvPool, PollResult};
+use infer_seam::{BackendExecutor, HostPagedKvPool, KvPool, PollResult, PrefixBlock};
 
 #[cfg(feature = "cuda")]
 mod attention;
@@ -449,6 +449,17 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Placeholder => 0,
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.kv_tier_capacity_pages(),
+        }
+    }
+
+    fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = blocks;
+                0
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.reusable_prefix_blocks(blocks),
         }
     }
 

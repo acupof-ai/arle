@@ -63,10 +63,9 @@ pub struct SchedulerConfig {
     /// across multiple ticks so decode rows can interleave (chunked prefill).
     pub chunked_prefill_size: usize,
     /// Whether cross-request prompt-prefix reuse via the host radix cache is
-    /// enabled. Models whose per-slot KV is recurrent / not page-addressable
-    /// (DSv4's sliding-window ring + compressor/indexer running state) cannot
-    /// honor a partial-prefix start_pos, so they disable this and every request
-    /// resets at `start_pos == 0`.
+    /// enabled. Backends should only enable this when every attached prefix page
+    /// is a complete restore boundary, or when they can clamp matches to such
+    /// boundaries via `BackendExecutor::reusable_prefix_blocks`.
     pub enable_prefix_cache: bool,
 }
 
@@ -165,11 +164,11 @@ pub struct KvTierStats {
     pub promote_failures: u64,
     /// Blocks currently resident in the host tier.
     pub resident_blocks: usize,
-    /// Whole-slot images demoted on preemption (page-less model route).
+    /// Whole-slot restore images demoted on preemption.
     pub demoted_slots: u64,
-    /// Whole-slot images promoted back on re-admission (decode resumed).
+    /// Whole-slot restore images promoted back on re-admission.
     pub promoted_slots: u64,
-    /// Whole-slot promotions that failed (request fell back to recompute).
+    /// Whole-slot restore failures that fell back to recompute.
     pub slot_promote_failures: u64,
 }
 
@@ -221,11 +220,11 @@ struct RequestState {
     phase: RequestPhase,
     prefill_start_pos: usize,
     reused_prefix_pages: Vec<BlockId>,
-    /// Whole-slot tier key while this request's device state is swapped out
-    /// (preempted on a backend with [`infer_seam::BackendExecutor::kv_slot_tier_enabled`]).
-    /// Re-admission promotes and resumes decode; `generated_tokens` are kept.
+    /// Whole-slot tier key while this request's complete restore image is
+    /// swapped out. Re-admission promotes and resumes decode; generated tokens
+    /// are kept.
     swap_key: Option<u64>,
-    /// Host KV length captured at demote time, restored verbatim on promote.
+    /// Materialized sequence length captured at demote time.
     /// Captured (not derived from `prompt + generated`) because the last
     /// committed token's KV is not materialized yet — it is the next decode
     /// step's input — so the materialized length is one short of the token
@@ -1015,7 +1014,7 @@ mod testing {
     use infer_plan::{SamplingParams, SlotToken, StepOutput, sample_token};
     use infer_seam::{
         AdmissionVerdict, BackendExecutor, KvAllocator, KvPool, KvPrefixStore, KvQuery, PollResult,
-        ResourceGovernor, StepBudget,
+        PrefixBlock, ResourceGovernor, StepBudget, pages_only_reusable_prefix_blocks,
     };
 
     use super::ForwardPlan;
@@ -1355,6 +1354,10 @@ mod testing {
                 Ok(PollResult::Ready(inflight.output))
             }
         }
+
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            pages_only_reusable_prefix_blocks(blocks, |_| false)
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1427,21 +1430,21 @@ mod testing {
     }
 
     /// Mock executor that can only reuse a bounded number of leading prefix
-    /// pages, mirroring a backend (Metal GDR / linear attention) whose
-    /// prefix-wide recurrent state is snapshotted at only some page boundaries.
-    /// The engine must clamp the radix-offered prefix down to this count before
-    /// attaching, or it would ask the executor for a boundary it cannot serve.
+    /// pages, mirroring a backend whose complete restore state exists at only
+    /// some page boundaries. The engine must clamp the radix-offered prefix down
+    /// to this count before attaching, or it would ask the executor for a
+    /// boundary it cannot serve.
     #[derive(Debug, Clone)]
     pub(super) struct LimitedPrefixExecutor {
         inner: MockExecutor,
-        max_reuse_pages: usize,
+        max_reuse_blocks: usize,
     }
 
     impl LimitedPrefixExecutor {
-        pub(super) fn with_max_reuse_pages(max_reuse_pages: usize) -> Self {
+        pub(super) fn with_max_reuse_blocks(max_reuse_blocks: usize) -> Self {
             Self {
                 inner: MockExecutor::ready(),
-                max_reuse_pages,
+                max_reuse_blocks,
             }
         }
     }
@@ -1457,8 +1460,8 @@ mod testing {
             self.inner.poll(inflight)
         }
 
-        fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
-            block_ids.len().min(self.max_reuse_pages)
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            pages_only_reusable_prefix_blocks(blocks, |_| false).min(self.max_reuse_blocks)
         }
     }
 
@@ -1779,6 +1782,7 @@ mod testing {
         pub(super) store: BTreeMap<u64, u32>,
         pub(super) dropped: Vec<u64>,
         fail_promotes: bool,
+        pub(super) max_reuse_blocks: Option<usize>,
     }
 
     impl TierMockExecutor {
@@ -1789,6 +1793,7 @@ mod testing {
                 store: BTreeMap::new(),
                 dropped: Vec::new(),
                 fail_promotes: false,
+                max_reuse_blocks: None,
             }
         }
 
@@ -1813,6 +1818,13 @@ mod testing {
 
         fn kv_tier_capacity_pages(&self) -> usize {
             self.capacity
+        }
+
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            let reusable =
+                pages_only_reusable_prefix_blocks(blocks, |key| self.store.contains_key(&key));
+            self.max_reuse_blocks
+                .map_or(reusable, |max| reusable.min(max))
         }
 
         fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
@@ -1847,8 +1859,8 @@ mod testing {
         }
     }
 
-    /// Whole-slot tier mock (page-less model route): records demoted slot
-    /// images by key; forwards delegate to [`MockExecutor`].
+    /// Whole-slot tier mock: records demoted complete restore images by key;
+    /// forwards delegate to [`MockExecutor`].
     #[derive(Debug, Clone)]
     pub(super) struct SlotTierMockExecutor {
         inner: MockExecutor,
@@ -2215,6 +2227,51 @@ mod tests {
             "failed tier entry must not remain in the store: {:?}",
             engine.executor.store
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tier_lookup_checks_restore_boundary_before_promote() -> Result<()> {
+        let mut engine = Engine::with_config(
+            TierMockExecutor::with_capacity(8),
+            MockKvPool::with_capacity(1, 4, 4),
+            test_config(1),
+        );
+
+        let first = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(engine.prefix_cache_stats().published_pages, 2);
+        engine.executor.max_reuse_blocks = Some(1);
+
+        let reclaimed = engine.evict_prefix_cache_for_pages(2);
+        assert_eq!(reclaimed, 2);
+        assert_eq!(engine.kv_tier_stats().demoted_pages, 2);
+        assert_eq!(engine.executor.store.len(), 2);
+
+        let second = engine.submit_request((1..=8).collect(), 1);
+        engine.step()?;
+
+        let request = engine
+            .active
+            .values()
+            .find(|request| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(request.prefill_start_pos, 4);
+        assert_eq!(request.reused_prefix_pages.len(), 1);
+        assert_eq!(
+            engine.kv_tier_stats().promoted_pages,
+            1,
+            "only the mcheck-approved leading block should be promoted"
+        );
+        assert_eq!(
+            engine.executor.store.len(),
+            1,
+            "unusable demoted tail stays in the store, not promoted then discarded"
+        );
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
         Ok(())
     }
 
@@ -2953,15 +3010,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_match_clamped_to_backend_reusable_pages() -> Result<()> {
-        // Regression for the Metal GDR prefix-attach crash: the host radix
-        // caches every page boundary, but a recurrent-state backend only
-        // snapshots some of them. The engine must clamp the offered prefix to
-        // what the backend reports it can attach, or `materialize_slot_from_prefix`
-        // errors and the engine thread dies. page_size 4: turn 1 caches two full
-        // blocks ([1,2,3,4] and [5,6,7,8]); the executor here can attach only one.
+    fn prefix_match_clamped_to_backend_reusable_blocks() -> Result<()> {
+        // Regression for false prefix attach: the backend reports only one
+        // complete restore boundary, so both publish and attach stay at one
+        // block instead of caching an unusable tail.
         let mut engine = Engine::with_config(
-            LimitedPrefixExecutor::with_max_reuse_pages(1),
+            LimitedPrefixExecutor::with_max_reuse_blocks(1),
             MockKvPool::with_capacity(1, 4, 16),
             test_config(1),
         );
@@ -2969,15 +3023,12 @@ mod tests {
         engine.run_to_idle()?;
         assert_finished(engine.completed(first).expect("first completed"));
 
-        // The radix offers the full two-block (8-token) prefix.
         let hit = engine
             .radix
             .peek_longest_prefix_match(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(hit.matched_len, 8);
-        assert_eq!(hit.block_ids.len(), 2);
+        assert_eq!(hit.matched_len, 4);
+        assert_eq!(hit.block_ids.len(), 1);
 
-        // But the backend caps reuse at one page, so the engine clamps the
-        // attached prefix to 4 tokens / 1 page and re-prefills the rest.
         let second = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 101], 1);
         engine.step()?;
         let request = engine
@@ -3250,10 +3301,11 @@ mod tests {
     fn prefill_chunk_stops_on_page_boundary() -> Result<()> {
         // page_size 4, 10-token prompt, ample budget: the first chunk must stop
         // at the last page boundary (8) instead of crossing it to the prompt end
-        // (10), so a hybrid backend snapshots recurrent state at every page
-        // boundary the radix later caches. The 2-token sub-page tail follows next
-        // tick. Pairs with `prefix_match_clamped_to_backend_reusable_pages`: the
-        // clamp is the safety floor, this alignment is the reuse-coverage win.
+        // (10), so a restore-boundary-limited backend can snapshot state at the
+        // same page boundary the radix later caches. The 2-token sub-page tail
+        // follows next tick. Pairs with
+        // `prefix_match_clamped_to_backend_reusable_blocks`: the clamp is the
+        // safety floor, this alignment is the reuse-coverage win.
         let mut engine = Engine::with_config(
             MockExecutor::ready(),
             MockKvPool::with_capacity(1, 4, 16),
@@ -3501,7 +3553,7 @@ mod tests {
         let stats = engine.prefix_cache_stats();
         assert_eq!(stats.lookups, 2);
         assert_eq!(stats.hits, 0);
-        assert!(stats.published_pages > 0);
+        assert_eq!(stats.published_pages, 0);
         let model = engine.executor.into_inner();
         assert_eq!(model.prompts, vec![prompt.clone(), prompt]);
         Ok(())
