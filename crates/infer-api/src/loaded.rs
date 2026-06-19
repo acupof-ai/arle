@@ -905,7 +905,6 @@ mod backend {
         let mut scheduler = config.scheduler_config();
         scheduler.num_slots = 1;
         scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
-        scheduler.enable_prefix_cache = false;
         let page_size = config.page_size.max(1);
         let total_pages = config.total_pages.max(1);
         let low_impact = config.low_impact;
@@ -981,7 +980,6 @@ mod backend {
         let mut scheduler = config.scheduler_config();
         scheduler.num_slots = 1;
         scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
-        scheduler.enable_prefix_cache = false;
         let page_size = config.page_size.max(1);
         let total_pages = config.total_pages.max(1);
         let low_impact = config.low_impact;
@@ -1201,21 +1199,6 @@ mod backend {
             );
         }
         let mut scheduler = config.scheduler_config();
-        // Cross-request prompt-prefix reuse (the host radix cache) is only sound
-        // when a cached prefix's KV can be re-attached to a new slot and read
-        // back unchanged — i.e. a page-addressable full-attention pool. The
-        // hybrid / recurrent-KV models advance per-slot state in place and assert
-        // contiguous appends from a reset (`seq_len == start_pos`):
-        //   - DSv4: sliding-window ring + compressor/indexer running state,
-        //   - Qwen3.5/3.6 MoE: gated-delta linear-attention recurrent state +
-        //     conv ring (the majority of its layers).
-        // Neither can honor a prefix-cache `start_pos > 0`, so prefix reuse is
-        // disabled for them and every request resets at `start_pos == 0`. Only
-        // pure full-attention Qwen3-dense keeps it. (Default stays on — see
-        // `SchedulerConfig::enable_prefix_cache`.)
-        if matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen35) {
-            scheduler.enable_prefix_cache = false;
-        }
         // The 64-token `chunked_prefill_size` default is a Metal-interactivity
         // tune (small ticks keep the single-threaded MLX encode loop responsive
         // between decode steps); on CUDA the per-chunk cost is an entire engine
@@ -1231,9 +1214,9 @@ mod backend {
         // (`DSV4_PREFILL_QUERY_CHUNK` = 4096): the chunked-prefill forward asserts
         // each call passes <= that many query tokens, so long prompts MUST chunk
         // (single-chunk max_seq_len both trips that assert at >4096 and OOMs the
-        // M×K scratch at 900K). Contiguous chunks are recurrent-KV-safe now that
-        // cross-request prefix reuse is disabled above (each request still resets
-        // at start_pos==0; chunks advance start_pos contiguously). Cap at 4096.
+        // M×K scratch at 900K). Cap at 4096; cross-request prefix reuse is
+        // backend-gated by `reusable_prefix_blocks`, so non-page-addressable
+        // CUDA arms fail closed without an API-layer model branch.
         if matches!(kind, CudaModelKind::Dsv4) {
             scheduler.chunked_prefill_size = 4096;
             // Long-context: lift the prompt/total token caps to the model's
@@ -1461,11 +1444,7 @@ mod backend {
         let model_id = crate::serve_engine::model_id_from_path(model_path);
 
         let mut scheduler = config.scheduler_config();
-        // HIP serves DSv4 only: sliding-window ring + compressor running state
-        // cannot honor a prefix-cache `start_pos > 0`, exactly like the CUDA
-        // DSv4 arm (`build_cuda_engine`) — disable cross-request prefix reuse.
         scheduler.num_slots = 1;
-        scheduler.enable_prefix_cache = false;
         let num_slots = 1;
         let max_seq_len = config.max_total_tokens;
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(

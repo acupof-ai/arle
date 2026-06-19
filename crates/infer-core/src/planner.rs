@@ -58,17 +58,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 continue;
             }
             // Stop a prefill chunk on a page boundary when it would otherwise
-            // cross one mid-chunk. A hybrid backend (Metal GDR / linear
-            // attention) snapshots its prefix-wide recurrent state only at the
-            // page boundary a forward pass ends on, but the radix later caches a
-            // reusable block at *every* page boundary — a chunk that ends inside
-            // a page leaves that boundary without a snapshot, so a future prefix
-            // hit there must re-prefill (handled by `clamp_prefix_to_backend`)
-            // instead of reusing. Aligning chunk ends keeps the deepest cached
-            // boundary reusable. The final sub-page tail (no full boundary left,
-            // i.e. `aligned_end <= start_pos`) is emitted as-is. Page-sliceable
-            // backends (paged attention) are unaffected — the split is just an
-            // extra tiny tick at most.
+            // cross one mid-chunk. Some backends can only restore KV plus
+            // backend-owned side state at forward-end restore boundaries, while
+            // the radix can cache every page boundary. Aligning chunk ends keeps
+            // the deepest cached boundary reusable; `clamp_prefix_to_backend`
+            // remains the safety floor for boundaries the executor cannot
+            // restore. The final sub-page tail (no full boundary left, i.e.
+            // `aligned_end <= start_pos`) is emitted as-is. Page-sliceable
+            // backends are unaffected except for at most one extra tiny tick.
             let page_size = self.kv.page_size().max(1);
             let chunk_end = start_pos + chunk;
             let aligned_end = chunk_end - (chunk_end % page_size);
@@ -130,13 +127,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let Some(mut request) = self.active.remove(&slot) else {
             return;
         };
-        // Swap-style preemption (#84): with a page tier, seal the victim's
-        // prompt blocks into the radix and demote exactly those pages, so
-        // re-admission promotes the prefill back instead of recomputing it.
-        // On a page-less backend with a whole-slot tier (DSv4 route), demote
-        // the entire slot image instead — re-admission resumes decode with
-        // `generated_tokens` intact. Without any tier store the behavior is
-        // byte-for-byte unchanged.
+        // Swap-style preemption: page-tier backends seal the victim's prompt
+        // blocks into the radix and demote those pages, so re-admission can
+        // promote the prefill instead of recomputing it. Whole-slot route
+        // backends demote the complete slot restore image and resume decode
+        // with `generated_tokens` intact. Without a tier store the behavior is
+        // the plain recompute path.
         let mut published = Vec::new();
         let mut slot_swap_key = None;
         let demoted_seq_len = self.kv.seq_len(slot);
@@ -168,9 +164,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let request = if let Some(key) = slot_swap_key {
             // Keep the generation: decode resumes at the demoted position
             // after promote. Only slot-coupled bookkeeping resets. The
-            // MATERIALIZED host KV length is captured verbatim (it is one
-            // short of prompt+generated: the newest token's KV is the next
-            // step's write, not yet materialized) so restore re-allocates
+            // materialized restore length is captured verbatim (it is one short
+            // of prompt+generated: the newest token's KV is the next step's
+            // write, not yet materialized) so host accounting is rebuilt to
             // exactly what the device image holds.
             request.swap_key = Some(key);
             request.swap_seq_len = demoted_seq_len;

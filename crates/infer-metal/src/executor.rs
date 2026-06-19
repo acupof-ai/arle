@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use infer_plan::{ForwardPlan, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_seam::{BackendExecutor, KvPool, PollResult, PrefixBlock};
 
 #[cfg(feature = "metal")]
 use crate::{config, dflash, mlx, model_source, qwen35, wired_limit};
@@ -524,20 +524,19 @@ impl BackendExecutor for MetalExecutor {
         1
     }
 
-    fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
+    fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {
             if real.dflash.is_some() {
-                // DFlash decode needs the side-path target-hidden store plus
-                // draft KV state. The current prefix mirror has only target
-                // KV/GDR, so attaching it would enter decode without the
-                // DFlash state and fail after admission. Disable prefix reuse
-                // for the DFlash opt-in until those side-path snapshots exist.
+                // Prefix reuse is a restore-boundary promise. DFlash needs
+                // target-hidden features and draft KV in addition to target
+                // K/V plus recurrent state; the current snapshot publishes only
+                // the target restore image, so no DFlash boundary is complete.
                 return 0;
             }
-            return real.page_store.reusable_prefix_pages(block_ids);
+            return real.page_store.reusable_prefix_blocks(blocks);
         }
-        block_ids.len()
+        blocks.len()
     }
 
     fn release_prefix_pages(&mut self, _pages: &[u32]) {
@@ -912,7 +911,7 @@ impl RealMetalExecutor {
         // `publishable_tokens = request.prompt_len().min(self.kv.seq_len(slot))`),
         // so pages/snapshots covering generated tokens are unreachable. The old
         // decode-time publishes were a per-token O(full_pages) re-slice plus an
-        // unbounded GDR-snapshot leak (`prefixes` is never evicted).
+        // unbounded restore-snapshot leak (`prefixes` is never evicted).
         self.page_store.publish_slot(slot, kv)?;
         // A new prefill restarts this slot's token stream; any decode prequeue
         // from a prior turn is stale.
@@ -1469,6 +1468,10 @@ impl MetalSsdTier {
         self.read_page(logical_id)
     }
 
+    fn logical_id_for_tier_key(&self, tier_key: u64) -> Option<u64> {
+        self.tier_to_logical.get(&tier_key).copied()
+    }
+
     fn read_page(&mut self, logical_id: u64) -> anyhow::Result<MetalPageBlock> {
         let key = MetalDiskKey::Page(logical_id);
         self.read_record(&key)?;
@@ -1890,17 +1893,14 @@ impl MetalPageStore {
         self.ssd.as_ref().map_or(0, |ssd| ssd.capacity_pages)
     }
 
-    /// Largest leading page count of `block_ids` (in prompt order) for which a
-    /// GDR prefix snapshot exists. The host radix caches every page boundary,
-    /// but linear-attention (GDR) recurrent/conv state is only snapshotted at
-    /// the page boundaries a forward pass landed on; attaching at any other
-    /// boundary fails in `materialize_slot_from_prefix`. Engine-core clamps the
-    /// offered prefix to this so it never asks for a boundary we can't serve.
-    fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
-        (1..=block_ids.len())
+    /// Largest leading block count for which Metal has a complete restore
+    /// image. Demoted keys are checked before promotion, so an unusable prefix
+    /// tail is never read back from T2.
+    fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        (1..=blocks.len())
             .rev()
             .find(|&k| {
-                self.logical_key_for_pages(&block_ids[..k])
+                self.logical_key_for_prefix_blocks(&blocks[..k])
                     .is_some_and(|key| self.prefix_available(&key))
             })
             .unwrap_or(0)
@@ -1936,6 +1936,21 @@ impl MetalPageStore {
         let mut key = Vec::with_capacity(pages.len());
         for page in pages {
             key.push(self.pages.get(page)?.logical_id);
+        }
+        Some(key)
+    }
+
+    fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -> Option<Vec<u64>> {
+        let mut key = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let logical_id = match *block {
+                PrefixBlock::ResidentPage(page) => self.pages.get(&page)?.logical_id,
+                PrefixBlock::DemotedKey(tier_key) => self
+                    .ssd
+                    .as_ref()
+                    .and_then(|ssd| ssd.logical_id_for_tier_key(tier_key))?,
+            };
+            key.push(logical_id);
         }
         Some(key)
     }
@@ -2055,8 +2070,8 @@ impl MetalPageStore {
         {
             // Alias hazard: overwriting a logical page means this page id was
             // recycled to a new occupant. Any surviving prefix containing the old
-            // logical id would pair NEW K/V with a STALE GDR snapshot. Keep only
-            // exact prefixes of the live occupant's logical page list.
+            // logical id would pair NEW K/V with a STALE restore snapshot. Keep
+            // only exact prefixes of the live occupant's logical page list.
             self.prefixes.retain(|key, _| {
                 !overwritten_logical_ids
                     .iter()
@@ -2065,9 +2080,9 @@ impl MetalPageStore {
             });
         }
 
-        // GDR state is prefix-wide, not page-local. Only publish a hot-prefix
-        // snapshot at an exact page boundary where the exported recurrent/conv
-        // state corresponds to the same token length as the page-id prefix.
+        // A reusable prefix boundary is valid only when the page-id prefix and
+        // every prefix-wide side state describe the same token length. Publish
+        // that restore image only at exact page boundaries.
         if slot.cache_len.is_multiple_of(page_size) && publish_pages == full_pages {
             if let Some(key) = self.logical_key_for_pages(&page_ids[..full_pages]) {
                 let snapshot = MetalPrefixSnapshot {
@@ -2376,11 +2391,12 @@ impl MetalSlotState {
     /// arbitrarily long generations; without this the executor's `kv_flat` lags
     /// behind, `slice_update` silently drops out-of-range writes (corrupt output),
     /// and `publish_slot` eventually hard-errors at a page boundary
-    /// (`K/V slice token range [..] exceeds shape=[..]`). The GDR recurrent/conv
-    /// state is sequence-independent (see `MetalSlotState::new`) and is left
-    /// untouched, exactly as `materialize_slot_from_prefix` treats it. Growing
-    /// mutates `kv_flat`, which an open session owns, so the session is drained
-    /// first; the caller re-activates it via `ensure_session_active`.
+    /// (`K/V slice token range [..] exceeds shape=[..]`). The prefix-wide
+    /// recurrent/conv restore state is sequence-independent (see
+    /// `MetalSlotState::new`) and is left untouched, exactly as
+    /// `materialize_slot_from_prefix` treats it. Growing mutates `kv_flat`,
+    /// which an open session owns, so the session is drained first; the caller
+    /// re-activates it via `ensure_session_active`.
     fn ensure_kv_capacity(
         &mut self,
         model: &qwen35::CppQwen35Model,
@@ -2838,12 +2854,22 @@ mod tests {
         mlx::as_dtype(&arr, mlx::Dtype::Uint32)
     }
 
-    /// Tiny stand-in GDR state array carrying a distinguishable `fill` value so a
-    /// test can tell WHICH occupant's snapshot survives in `prefixes`.
+    /// Tiny stand-in restore-state array carrying a distinguishable `fill`
+    /// value so a test can tell WHICH occupant's snapshot survives in
+    /// `prefixes`.
     #[cfg(feature = "metal")]
     fn gdr_array(fill: i32) -> mlx::MlxArray {
         let arr = mlx::MlxArray::from_slice_i32(&[fill], &[1]);
         mlx::as_dtype(&arr, mlx::Dtype::Float32)
+    }
+
+    #[cfg(feature = "metal")]
+    fn resident_prefix_blocks(pages: &[u32]) -> Vec<PrefixBlock> {
+        pages
+            .iter()
+            .copied()
+            .map(PrefixBlock::ResidentPage)
+            .collect()
     }
 
     #[cfg(feature = "metal")]
@@ -2862,7 +2888,7 @@ mod tests {
     // Defect-2 regression guard (stale prefix snapshot aliasing): host page ids
     // are recycled LIFO after radix eviction, but `prefixes` keys used to live
     // forever. A later radix match colliding with a stale key would serve the
-    // NEW occupant's K/V pages with the OLD occupant's GDR snapshot. Publishing
+    // NEW occupant's K/V pages with the OLD occupant's restore state. Publishing
     // a second occupant under the same recycled page ids must prune the first
     // occupant's prefix key.
     #[cfg(feature = "metal")]
@@ -2874,7 +2900,7 @@ mod tests {
         let mut pool = MetalKvPool::new(2, 8, 4);
 
         // First occupant: slot 0, 8 tokens = 2 full pages, exact page boundary
-        // -> publishes both page blocks and a GDR prefix snapshot.
+        // -> publishes both page blocks and a restore snapshot.
         pool.alloc(0, 8).unwrap();
         let first_pages: Vec<u32> = pool.page_indices(0).to_vec();
         let state_a = MetalSlotState::from_arrays(
@@ -2888,7 +2914,10 @@ mod tests {
         let first_key = store
             .logical_key_for_pages(&first_pages)
             .expect("first occupant logical key");
-        assert_eq!(store.reusable_prefix_pages(&first_pages), 2);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&first_pages)),
+            2
+        );
 
         // Free slot 0 and allocate slot 1: the LIFO free list recycles the SAME
         // physical page ids (in reversed order) to the new occupant.
@@ -2925,11 +2954,17 @@ mod tests {
             !store.prefixes.contains_key(&first_key),
             "stale prefix key {first_key:?} must be pruned on page reuse"
         );
-        assert_eq!(store.reusable_prefix_pages(&first_pages), 0);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&first_pages)),
+            0
+        );
 
-        // The new occupant's own boundary snapshot survives and carries ITS GDR
-        // state, not the first occupant's.
-        assert_eq!(store.reusable_prefix_pages(&second_pages), 2);
+        // The new occupant's own boundary snapshot survives and carries ITS
+        // restore state, not the first occupant's.
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&second_pages)),
+            2
+        );
         let second_key = store
             .logical_key_for_pages(&second_pages)
             .expect("second occupant logical key");
@@ -2967,7 +3002,10 @@ mod tests {
         let one_key = store
             .logical_key_for_pages(&one_page)
             .expect("one-page logical key");
-        assert_eq!(store.reusable_prefix_pages(&one_page), 1);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&one_page)),
+            1
+        );
 
         // Second chunk: 8 tokens = 2 pages. Page p0's block is overwritten
         // (insert returns Some) but [p0] is an exact prefix of the live
@@ -2988,8 +3026,14 @@ mod tests {
 
         assert!(store.prefixes.contains_key(&one_key));
         assert!(store.prefixes.contains_key(&two_key));
-        assert_eq!(store.reusable_prefix_pages(&one_page), 1);
-        assert_eq!(store.reusable_prefix_pages(&two_pages), 2);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&one_page)),
+            1
+        );
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&two_pages)),
+            2
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -3014,7 +3058,10 @@ mod tests {
             .logical_key_for_pages(&pages)
             .expect("published logical key");
         assert_eq!(store.pages.len(), 2);
-        assert_eq!(store.reusable_prefix_pages(&pages), 2);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&pages)),
+            2
+        );
 
         store.release_pages(&[pages[0]]);
 
@@ -3026,7 +3073,10 @@ mod tests {
             !store.prefixes.contains_key(&key),
             "prefix snapshot containing the evicted page must be pruned"
         );
-        assert_eq!(store.reusable_prefix_pages(&pages), 0);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&pages)),
+            0
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -3072,12 +3122,24 @@ mod tests {
             store.prefixes.is_empty(),
             "release must drop RAM prefix snapshots"
         );
-        assert_eq!(store.reusable_prefix_pages(&pages), 0);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&pages)),
+            0
+        );
 
+        let demoted = [PrefixBlock::DemotedKey(10), PrefixBlock::DemotedKey(11)];
+        assert_eq!(
+            store.reusable_prefix_blocks(&demoted),
+            2,
+            "T2 mcheck must prove the prefix before mget/promote"
+        );
         store
             .promote_prefix_pages(&[(10, pages[0]), (11, pages[1])])
             .unwrap();
-        assert_eq!(store.reusable_prefix_pages(&pages), 2);
+        assert_eq!(
+            store.reusable_prefix_blocks(&resident_prefix_blocks(&pages)),
+            2
+        );
         let restored = store
             .materialize_slot_from_prefix(0, pool.slot_epoch(0), &pool, 8, 8)
             .unwrap();

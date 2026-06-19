@@ -2858,33 +2858,11 @@ pub(crate) struct Dsv4LayerAttentionState {
     dsa_official: Option<Dsv4DsaOfficialState>,
 }
 
-/// Per-layer K+1-slot snapshot of the speculative-verify ring writes (frozen-KV
-/// MTP P1-2). The depth-K verify forward over `[pending, d0..d_{depth-1}]` at
-/// absolute positions `[start_pos .. start_pos+depth]` writes the BF16 SW ring
-/// (`sw_window_cache`) and the FP8 ring (FlashMLA pool, block-table routed) for
-/// each of the K+1 tokens — the draft chain needs its own KV. On a partial-accept
-/// reject where `start_pos >= sliding_window`, the rejected drafts' ring writes
-/// alias still-active window slots; truncate alone only resets lengths, so the
-/// next decode would read corrupted slots. We snapshot ALL K+1 verify slots
-/// pre-verify and, after the commit truncate, restore the rejected tail
-/// `(accepted_n+1 ..= depth)`. The accepted slots `[0 ..= accepted_n]` are left
-/// to the commit re-forward (which overwrites them).
-///
-/// §0.1 buffer enumeration — every verify-mutated, NON-frozen device buffer this
-/// snapshot covers:
-/// - `sw_window_cache` (BF16 SW ring): `sw_slots` holds K+1 head-dim slots.
-/// - FP8 ring (FlashMLA pool data+scale bytes): `fp8_slots` holds K+1
-///   `fp8_bytes_per_token` slots (`None` when this layer has no FlashMLA/FP8).
-/// - `flash.fp8_kv_comp_packed_rows` (counter): `fp8_packed_rows_before` saves
-///   the pre-verify value so the re-forward re-advances from the correct base.
-///
-/// Buffers pre-allocated ONCE at slot construction (no per-step `CudaSlice`
-/// alloc — alloc churn + the disabled-event-tracking premature-free hazard). The
-/// per-slot D2D copy math is recovered verbatim from the deleted single-slot
-/// rollback snapshot (`Dsv4LayerAttentionSnapshot`, git 7f305a1e): SW slot =
-/// `(draft_abs_pos % sliding_window) * head_dim`; FP8 via `fp8_sw_offsets` →
-/// `physical_page(table, logical_page)` → block_base → data/scale byte D2D. The
-/// only change here: loop over the K+1 positions and store K+1 slots.
+/// Per-layer K+1-slot snapshot of speculative-verify ring writes. The verify
+/// forward can write BF16 SW-ring slots and FP8 FlashMLA ring bytes for
+/// `[pending, d0..]`; after truncate, rejected tail slots are restored before
+/// accepted rows are re-forwarded. Buffers are allocated once at slot
+/// construction and reused by D2D copy.
 pub(crate) struct Dsv4SpecRingSnapshot {
     /// `(max_depth+1) * head_dim` BF16 SW ring slots, slot `i` at `[i*head_dim..]`.
     sw_slots: CudaSlice<half::bf16>,
@@ -2893,15 +2871,11 @@ pub(crate) struct Dsv4SpecRingSnapshot {
     fp8_slots: Option<CudaSlice<u8>>,
     /// `flash.fp8_kv_comp_packed_rows` captured once pre-verify; restored on reject.
     fp8_packed_rows_before: Option<usize>,
-    /// `flash.fp8_kv_sw_bootstrapped` captured once pre-verify; restored on reject
-    /// (P1-B). On the first spec decode after a long prefill the flag is still
-    /// false, so the FP8 ring is unbootstrapped (stale) when captured. Restoring
-    /// the flag means a wrap-reject re-bootstraps the whole window on the next
-    /// decode (overwriting the stale FP8 bytes restore put back) instead of
-    /// skipping the repack and reading corruption.
+    /// `flash.fp8_kv_sw_bootstrapped` captured once pre-verify; restored on
+    /// reject so the next decode re-bootstrap decision matches the restored
+    /// bytes.
     fp8_bootstrapped_before: Option<bool>,
-    /// Layout metadata `fp8_sw_offsets` needs — copied verbatim from the deleted
-    /// single-slot snapshot struct's fields.
+    /// Layout metadata used by `fp8_sw_offsets`.
     head_dim: usize,
     sliding_window: usize,
     fp8_page_block_size: usize,
@@ -2926,11 +2900,9 @@ impl Dsv4SpecRingSnapshot {
     }
 
     /// `(logical ring block, data offset in block, scale offset in block)` for
-    /// one draft token's FP8 SW ring slot. Recovered verbatim from the deleted
-    /// `Dsv4LayerAttentionSnapshot::fp8_sw_offsets` (git 7f305a1e). The block id
-    /// is slot-LOGICAL — the caller translates it to a physical pool page through
-    /// the slot's block table (#85 P2), so this math never bakes in band
-    /// contiguity. Returns `None` when this layer has no FP8 ring.
+    /// one draft token's FP8 SW ring slot. The caller translates the logical
+    /// block through the slot's page table. Returns `None` when this layer has no
+    /// FP8 ring.
     fn fp8_sw_offsets(&self, draft_abs_pos: usize) -> Option<(usize, usize, usize)> {
         self.fp8_slots.as_ref()?;
         let ring_idx = draft_abs_pos % self.sliding_window;
@@ -2943,11 +2915,9 @@ impl Dsv4SpecRingSnapshot {
     }
 }
 
-/// Host-side image of one slot's per-layer device state for the whole-slot KV
-/// tier (#84/#85 Route B, `docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md`).
-/// Executor-internal, NOT byte-packed: plain host vectors per buffer.
-/// Full-allocation copies by construction — extent-proof for v1; computing
-/// written extents (e.g. `seq_len * 584B` of the FP8 band) is a perf TODO.
+/// Host-side image of one slot's per-layer device state for CUDA whole-slot
+/// swap. Executor-internal, not byte-packed: one host vector per stateful
+/// buffer. Current copy granularity is full allocation.
 pub(crate) struct Dsv4LayerImage {
     sw_window_cache: Vec<half::bf16>,
     compressor: Option<Dsv4CompressorImage>,
@@ -2958,11 +2928,9 @@ pub(crate) struct Dsv4LayerImage {
 
 /// Whole-slot host image of one [`Dsv4CompressorState`].
 ///
-/// Unlike spec-decode rollback (truncate + re-forward, which only ever SHRINKS
-/// a live slot so the rolled-back rows are overwritten by the next real
-/// decode), this MUST carry `compressed.data`: a swapped-out slot is freed and
-/// reused by another request, so every committed compressed row has to survive
-/// in the image.
+/// Whole-slot swap must carry `compressed.data`: the slot can be reused by
+/// another request while demoted, so committed compressed rows must survive in
+/// the image.
 struct Dsv4CompressorImage {
     pending_kv: Vec<half::bf16>,
     pending_score: Vec<half::bf16>,
@@ -3033,11 +3001,8 @@ impl Dsv4CompressorImage {
 struct Dsv4FlashMlaImage {
     fp8_kv_sw_bootstrapped: bool,
     fp8_kv_comp_packed_rows: usize,
-    /// Whole-band payload in slot-logical block order — the per-page host
-    /// images `TokenKVPool::copy_pages_to_host` produces. Slot-agnostic:
-    /// restore re-resolves the TARGET slot's block table. Perf TODO
-    /// unchanged: only `seq_len`-derived rows are written; v1 copies every
-    /// page (extent-proof by construction).
+    /// Whole-band payload in slot-logical block order. Restore re-resolves the
+    /// target slot's block table.
     fp8_kv_pool_pages: Vec<u8>,
 }
 
@@ -3047,10 +3012,8 @@ impl Dsv4FlashMlaImage {
         pool: &Dsv4LayerKvLayout,
         flash: &Dsv4FlashMlaDecodeState,
     ) -> Result<Self> {
-        // Table-routed (#85 P2): the image is the slot's PAGES (page-table lookup),
-        // moved by the pool's own per-page transport — the same
-        // `copy_pages_to_host` the page tier (#82/#83) consumes — so this
-        // path stays valid when Stage B fragments the table.
+        // The image is the slot's pages by page-table lookup; the pool owns the
+        // per-page transport.
         let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         let payload = pool
             .flashmla_pool()?
@@ -3075,9 +3038,7 @@ impl Dsv4FlashMlaImage {
         pool: &mut Dsv4LayerKvLayout,
         flash: &mut Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
-        // Table-routed (#85 P2): restore lands on the TARGET slot's pages
-        // (page-table lookup), mirroring capture; `copy_pages_from_host`
-        // re-validates payload length against the page count.
+        // Restore lands on the target slot's pages by page-table lookup.
         let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         ensure!(
             self.fp8_kv_pool_pages.len() == flash.fp8_kv_pool_len,
@@ -3099,14 +3060,11 @@ impl Dsv4FlashMlaImage {
 /// of the shared official-DSA key cache.
 struct Dsv4DsaOfficialImage {
     packed_rows: usize,
-    /// Incrementally-written rotated-key mirror. Already-packed rows are not
-    /// provably re-read (only the newly-packed slice feeds the cache store in
-    /// `csa_select_official`), so this MIGHT be reconstructible — uncertain
-    /// from source, so snapshot the full buffer (always safe).
+    /// Incrementally-written rotated-key mirror. Snapshot the full buffer
+    /// because old packed rows are not proven reconstructible from current state.
     rotated_keys: Vec<half::bf16>,
-    /// Full `dsa_slot_range` band: the FP8 indexer key cache the paged-MQA
-    /// logits kernel reads in full every step. Perf TODO: written extent is
-    /// `packed_rows`-derived; v1 copies the whole band.
+    /// Full `dsa_slot_range` band: the FP8 indexer key cache read by the
+    /// paged-MQA logits kernel.
     key_cache_slot: Vec<u8>,
 }
 
@@ -3386,57 +3344,11 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    /// Serialize this layer's COMPLETE per-slot device state into a host image
-    /// (whole-slot KV swap, #84/#85 Route B). The caller (slot-level entry in
-    /// `dsv4.rs`) syncs the stream once after all layers, so the D2H copies are
-    /// complete before the engine frees the slot.
-    ///
-    /// §0.1 per-buffer verdict — every `Dsv4LayerAttentionState` field:
-    /// - `sw_window_cache`: SNAPSHOT (full allocation). The live BF16 SW ring;
-    ///   whole-buffer copy is extent-proof by construction (the EAGLE lesson:
-    ///   ring self-heal only holds below `sliding_window`, so never infer a
-    ///   written extent).
-    /// - `compressor` / `indexer` ([`Dsv4CompressorState`]): SNAPSHOT (full) —
-    ///   `pending_kv`/`pending_score`/`prev_overlap_kv`/`prev_overlap_score`
-    ///   partial-row accumulators, plus `compressed.data` + `compressed.seq_len`
-    ///   (see [`Dsv4CompressorImage`] for why the rollback snapshot's data-skip
-    ///   does NOT apply to swap).
-    /// - `flashmla` ([`Dsv4FlashMlaDecodeState`]), field by field:
-    ///   - `fp8_kv_sw_bootstrapped` / `fp8_kv_comp_packed_rows`: SNAPSHOT — the
-    ///     only host scalars written after init (`flashmla_pack_sw_ring`,
-    ///     `flashmla_pack_compressed_delta`; everything else is set once in
-    ///     `new`/`init_constant_sched_meta`).
-    ///   - shared FP8 pool pages (the slot's `flashmla_page_table` into the
-    ///     packed `TokenKVPool`): SNAPSHOT via `copy_pages_to_host` (every
-    ///     page; perf TODO: written extent is `seq_len`-derived).
-    ///   - `topk_length`/`sched_meta`/`num_splits`: CONSTANT-after-init
-    ///     (`init_constant_sched_meta` — slot-shape constants, written once).
-    ///   - `slot_idx`/`fp8_kv_pool_len`/`sw_blocks`/`comp_blocks`/
-    ///     `max_compressed_keys`/`topk_unified`/`num_sm_parts`/
-    ///     `fixed_overhead_num_blocks`/`block_size_topk`: CONSTANT-after-init.
-    ///   - The 13 per-forward SCRATCH buffers (`sw_bulk_block_ids`/`sw_bulk_rows`,
-    ///     `one_block_id`/`one_row`, `comp_block_ids`/`comp_rows`, `indices`,
-    ///     `lse_out`/`lse_accum`/`o_accum`, `tp_gathered_q`/`tp_packed_q`/
-    ///     `tp_full_out`) were hoisted to the model-wide
-    ///     [`Dsv4FlashMlaDecodeScratch`] (#85 P3) — overwritten before read each
-    ///     layer step, NO cross-call/cross-slot state, so NOT per-slot and NOT
-    ///     snapshotted (mirrors the `Dsv4DsaSharedScratch` verdict below).
-    /// - `fused_wqkv` ([`Dsv4FusedWqkvDecodeScratch`]): SCRATCH — `input_fp8`/
-    ///   `input_scales`/`qkv_raw` are quantize→GEMM staging overwritten from
-    ///   the step's activations before every read; `active_experts`/
-    ///   `active_offsets`/`active_counts` are `[0]`/`[0]`/`[1]` constants.
-    /// - `prefill_linear` ([`Dsv4PrefillDeepGemmLinearScratch`]): SCRATCH —
-    ///   same quantize→GEMM staging pattern, M-chunk-bounded, fully written
-    ///   from the chunk's activations before read each call.
-    /// - `dsa_official` ([`Dsv4DsaOfficialState`]): SNAPSHOT — `packed_rows`
-    ///   (host progress counter), `rotated_keys` (incremental mirror; old rows
-    ///   not provably re-read → uncertain → snapshot full, always safe), and
-    ///   the shared `dsa_key_cache` band (`dsa_slot_range(slot_idx)`), which
-    ///   the paged-MQA logits kernel reads in full every step.
-    /// - [`Dsv4DsaSharedScratch`] / [`Dsv4FlashMlaDecodeScratch`] (adapter-level,
-    ///   NOT per-slot): NO SNAPSHOT — their docs prove "contents carry NO
-    ///   cross-call state" (per-forward scratch overwritten before read + config
-    ///   constants), shared across every slot and layer.
+    /// Serialize this layer's per-slot state into a host image for whole-slot
+    /// swap. The slot-level caller syncs once after all layers. Snapshotted:
+    /// BF16 SW ring, compressor/indexer state, FlashMLA slot pages/scalars, and
+    /// official DSA slot state. Not snapshotted: per-forward scratches and
+    /// constants that are overwritten before read.
     pub(crate) fn swap_out_image(
         &self,
         ctx: &DeviceContext,
@@ -3470,12 +3382,9 @@ impl Dsv4LayerAttentionState {
         })
     }
 
-    /// Exact inverse of [`Self::swap_out_image`] into (possibly another) slot's
-    /// state at the same per-buffer granularity. Every stateful buffer is fully
-    /// rewritten from the image, so leftover state from a previous occupant of
-    /// the target slot cannot leak; scratch buffers stay untouched (overwritten
-    /// before read per the verdicts above). The slot-level caller syncs once
-    /// after all layers, before the engine resumes decode / drops the image.
+    /// Restore the image into this layer's target-slot state. Stateful buffers
+    /// are fully rewritten; scratch buffers stay untouched because they are
+    /// overwritten before read. The slot-level caller syncs after all layers.
     pub(crate) fn swap_in_image(
         &mut self,
         ctx: &DeviceContext,
@@ -3539,29 +3448,18 @@ impl Dsv4LayerAttentionState {
         total_len: usize,
     ) {
         self.advance_decode_len(mode, ratio, total_len);
-        // SGLang frozen-KV discipline: the official DSA key cache is a
-        // deterministic function of committed `seq_len`. Truncating
-        // sw/fp8/compressor/indexer back to `total_len` is enough for them, but
-        // NOT for `dsa_official` — its `packed_rows` progress counter advances when a
-        // speculative draft crosses a compression boundary (csa_select_official,
-        // `packed_rows = indexer_rows_after`) and was never rolled back on draft
-        // rejection. The stale draft key then stays in `dsa_key_cache` and the
-        // next pack is skipped (`newly_packed == 0`), corrupting top-k selection
-        // and accumulating into degenerate output. Clamp `packed_rows` DOWN to
-        // the rolled-back compressed-row count so the next real decode re-packs
-        // (overwrites) the row from the restored indexer KV — self-heal, no
-        // snapshot (mirrors SGLang's seq_len-as-single-source-of-truth design).
+        // A rejected draft can advance the DSA packed-row counter past the
+        // committed compressed-row count. Clamp it down so the next real decode
+        // repacks the boundary row instead of reusing stale draft cache bytes.
         if let Some(dsa) = &mut self.dsa_official {
             let compressed_rows = total_len / ratio.max(1);
             dsa.packed_rows = dsa.packed_rows.min(compressed_rows);
         }
     }
 
-    /// Allocate this layer's K+1-slot spec-ring snapshot ONCE at slot
-    /// construction (no per-step alloc). Sizes mirror the deleted single-slot
-    /// `rollback_snapshot` (git 7f305a1e) ×(max_depth+1): the SW slot
-    /// (`config.head_dim` BF16) and — when this layer has a FlashMLA decode
-    /// state — the FP8 ring slot (`kv_arena.bytes_per_token` bytes, data+scale).
+    /// Allocate this layer's K+1-slot spec-ring snapshot at slot construction.
+    /// Each snapshot slot stores one BF16 SW-ring row and, when this layer has
+    /// FlashMLA decode state, one FP8 ring row.
     pub(crate) fn alloc_spec_ring_snapshot(
         &self,
         ctx: &DeviceContext,
@@ -3573,8 +3471,7 @@ impl Dsv4LayerAttentionState {
             .checked_add(1)
             .ok_or_else(|| anyhow!("DSv4 spec-ring max_depth {max_depth} overflow"))?;
         // FP8 token data bytes = NoPE FP8 (1 B/dim) + RoPE bf16 (2 B/dim);
-        // scale bytes = bytes_per_token - data bytes. Verbatim from the deleted
-        // `rollback_snapshot` (git 7f305a1e).
+        // scale bytes = bytes_per_token - data bytes.
         let fp8_token_data_bytes = kv_arena
             .nope_dim
             .checked_add(kv_arena.rope_dim * std::mem::size_of::<half::bf16>())
@@ -3614,12 +3511,9 @@ impl Dsv4LayerAttentionState {
         })
     }
 
-    /// Snapshot the K+1 verify ring slots BEFORE the frozen depth-K verify
-    /// forward. For `i in 0..=depth`: D2D the SW slot for `draft_abs_pos =
-    /// start_pos+i` into `snap.sw_slots[i*head_dim..]`, and — when this layer has
-    /// an FP8 ring — D2D the FP8 data+scale for that position into
-    /// `snap.fp8_slots[i*bytes_per_token..]`. Saves `flash.fp8_kv_comp_packed_rows`
-    /// once. Borrows match the deleted code: `pool: &mut`, `flash: &`.
+    /// Snapshot the K+1 verify ring slots before depth-K verify. For each
+    /// `start_pos+i`, copy the BF16 SW slot and optional FP8 data+scale bytes
+    /// into snapshot slot `i`; save FlashMLA progress scalars once.
     pub(crate) fn capture_spec_rings(
         &self,
         ctx: &DeviceContext,
@@ -3653,13 +3547,10 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    /// Restore the REJECTED tail ring slots `(accepted_n+1 ..= depth)` AFTER the
-    /// commit truncate and BEFORE the accepted-prefix re-forward. The accepted
-    /// slots `[0 ..= accepted_n]` are left to the re-forward (which overwrites
-    /// them). Restores `flash.fp8_kv_comp_packed_rows` to the pre-verify base.
-    /// `pool: &mut`; the FP8 `slot_idx` is read from `self.flashmla` up front so
-    /// the per-slot restore re-resolves the page table without a live `&flash`
-    /// borrow across the `&mut sw_window_cache` restore.
+    /// Restore rejected tail ring slots `(accepted_n+1 ..= depth)` after
+    /// truncate and before accepted-prefix re-forward. Accepted slots are left
+    /// for re-forward to overwrite. The FP8 slot id is read up front so page
+    /// lookup does not hold a `flashmla` borrow across SW-ring restore.
     pub(crate) fn restore_spec_ring_tail(
         &mut self,
         ctx: &DeviceContext,
@@ -3679,11 +3570,8 @@ impl Dsv4LayerAttentionState {
             accepted_n <= depth,
             "DSv4 spec-ring restore accepted_n {accepted_n} exceeds depth {depth}"
         );
-        // The FP8 ring is slot-pinned; its page table is keyed by the layer's
-        // `flash.slot_idx`. Read it once up front so the per-slot restore can
-        // re-resolve the physical page WITHOUT holding a `&self.flashmla` borrow
-        // across the `&mut self.sw_window_cache` restore (mirrors the deleted
-        // `restore_fp8_sw`, which re-read the table from `flash.slot_idx`).
+        // Read the FP8 slot id once up front so page lookup can run without
+        // holding a `flashmla` borrow across the SW-ring restore.
         let fp8_slot_idx = self.flashmla.as_ref().map(|f| f.slot_idx);
         for i in (accepted_n + 1)..=depth {
             let draft_abs_pos = start_pos + i;
@@ -3696,10 +3584,8 @@ impl Dsv4LayerAttentionState {
             if let Some(rows) = snap.fp8_packed_rows_before {
                 flash.fp8_kv_comp_packed_rows = rows;
             }
-            // P1-B: restore the bootstrap flag too. If it was false pre-verify the
-            // captured FP8 slots are stale, so leaving the flag true would skip the
-            // next decode's repack; restoring false forces a full re-bootstrap that
-            // overwrites the stale bytes restore_sw/fp8 put back.
+            // Restore the bootstrap flag too; otherwise the next decode may skip
+            // the repack that should overwrite restored stale FP8 bytes.
             if let Some(bootstrapped) = snap.fp8_bootstrapped_before {
                 flash.fp8_kv_sw_bootstrapped = bootstrapped;
             }
@@ -3709,9 +3595,7 @@ impl Dsv4LayerAttentionState {
 }
 
 impl Dsv4SpecRingSnapshot {
-    /// D2D the SW ring slot for `draft_abs_pos` into snapshot slot `i`. Ring
-    /// offset = `(draft_abs_pos % sliding_window) * head_dim` — verbatim from the
-    /// deleted `Dsv4LayerAttentionSnapshot::capture_sw` (git 7f305a1e).
+    /// D2D the SW ring slot for `draft_abs_pos` into snapshot slot `i`.
     fn capture_sw_slot(
         &mut self,
         ctx: &DeviceContext,
@@ -3749,7 +3633,6 @@ impl Dsv4SpecRingSnapshot {
     }
 
     /// Restore the SW ring slot for `draft_abs_pos` from snapshot slot `i`.
-    /// Verbatim ring math from the deleted `restore_sw`.
     fn restore_sw_slot(
         &self,
         ctx: &DeviceContext,
@@ -3779,9 +3662,7 @@ impl Dsv4SpecRingSnapshot {
     }
 
     /// D2D the FP8 ring data+scale bytes for `draft_abs_pos` into snapshot slot
-    /// `i`. Table-routed physical-page math verbatim from the deleted
-    /// `capture_fp8_sw` (git 7f305a1e); early-returns when this layer has no FP8
-    /// ring (`fp8_sw_offsets`/`fp8_slots` is `None`).
+    /// `i`. Early-returns when this layer has no FP8 ring.
     fn capture_fp8_slot(
         &mut self,
         ctx: &DeviceContext,
@@ -3790,18 +3671,14 @@ impl Dsv4SpecRingSnapshot {
         i: usize,
         draft_abs_pos: usize,
     ) -> Result<()> {
-        // `fp8_sw_offsets` returns `None` exactly when `fp8_slots` is `None`
-        // (SW-only / non-FlashMLA layer), so this early-return also guards the
-        // `as_mut().ok_or_else` below — verbatim shape from the deleted
-        // `capture_fp8_sw`.
+        // `fp8_sw_offsets` returns `None` exactly when `fp8_slots` is `None`,
+        // so this early-return also guards the `as_mut().ok_or_else` below.
         let Some((logical_page, data_in_block, scale_in_block)) =
             self.fp8_sw_offsets(draft_abs_pos)
         else {
             return Ok(());
         };
-        // Table-routed (#85 P2): the ring block's byte base is its PHYSICAL pool
-        // page (block-table lookup), so this path stays valid when Stage B
-        // fragments the table.
+        // The ring block's byte base is its physical pool page.
         let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, logical_page)?;
         let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
         let data_offset = block_base + data_in_block;
@@ -3838,10 +3715,8 @@ impl Dsv4SpecRingSnapshot {
     }
 
     /// Restore the FP8 ring data+scale bytes for `draft_abs_pos` from snapshot
-    /// slot `i`. Table-routed physical-page math verbatim from the deleted
-    /// `restore_fp8_sw`; early-returns when this layer has no FP8 ring. (The
-    /// `flash` slot index is re-resolved through the table by the page lookup;
-    /// the caller restores `fp8_kv_comp_packed_rows` separately.)
+    /// slot `i`. Early-returns when this layer has no FP8 ring. The caller
+    /// restores `fp8_kv_comp_packed_rows` separately.
     fn restore_fp8_slot(
         &self,
         ctx: &DeviceContext,
@@ -3858,10 +3733,8 @@ impl Dsv4SpecRingSnapshot {
         let Some(slots) = &self.fp8_slots else {
             return Ok(());
         };
-        // Table-routed (#85 P2): same physical-page translation as capture. The
-        // table is re-resolved from the layer's `slot_idx` (read by the caller
-        // before the `&mut sw_window_cache` borrow) — verbatim translation from
-        // the deleted `restore_fp8_sw`.
+        // Same physical-page translation as capture; the table is re-resolved
+        // from the caller-provided slot id.
         let page = physical_page(pool.flashmla_page_table(slot_idx)?, logical_page)?;
         let block_base = page as usize * (self.fp8_page_block_size * self.fp8_bytes_per_token);
         let data_offset = block_base + data_in_block;

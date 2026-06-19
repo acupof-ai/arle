@@ -191,6 +191,14 @@ impl CudaKvTierStore {
         t1_full && disk_full
     }
 
+    pub(crate) fn contains(&self, key: u64) -> bool {
+        self.t1.contains_key(&key)
+            || self
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.keys.contains(&key))
+    }
+
     /// Store a page payload. T1 takes it when it has room; a full (or
     /// disabled, `--kv-t1-budget-bytes 0`) T1 spills its coldest entry to
     /// disk — or, with no T1 at all, the payload writes straight to disk.

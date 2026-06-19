@@ -10,7 +10,7 @@ use infer_plan::{
     generate_diffusion_with_cancel,
 };
 
-use crate::{BackendExecutor, KvPool, PollResult};
+use crate::{BackendExecutor, KvPool, PollResult, PrefixBlock};
 
 #[derive(Debug, Clone)]
 struct BufferedToken {
@@ -273,7 +273,7 @@ where
         1
     }
 
-    fn reusable_prefix_pages(&self, _block_ids: &[u32]) -> usize {
+    fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
         0
     }
 }

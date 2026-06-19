@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use infer_seam::PrefixBlock;
+
 /// Host page id used as the prefix-cache block id.
 pub type BlockId = u32;
 
@@ -35,15 +37,6 @@ impl PrefixMatch {
     }
 }
 
-/// One block of a tier-aware prefix match, in prompt order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TierBlock {
-    /// Block is device-resident under this host page id.
-    Resident(BlockId),
-    /// Block was demoted to the backend's host tier store under this key.
-    Demoted(u64),
-}
-
 /// Longest cached prefix including demoted (host-tier) blocks.
 ///
 /// Used only by the tier-enabled engine path; the resident-only
@@ -51,7 +44,7 @@ pub enum TierBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TieredPrefixMatch {
     /// Matched blocks in prompt order (resident and demoted interleaved).
-    pub blocks: Vec<TierBlock>,
+    pub blocks: Vec<PrefixBlock>,
 }
 
 /// Fixed-block radix cache for prompt KV reuse.
@@ -212,9 +205,9 @@ impl RadixCache {
             };
             let child = &self.nodes[child_idx];
             let entry = if let Some(page_id) = child.page_id {
-                TierBlock::Resident(page_id)
+                PrefixBlock::ResidentPage(page_id)
             } else if let Some(tier_key) = child.tier_key {
-                TierBlock::Demoted(tier_key)
+                PrefixBlock::DemotedKey(tier_key)
             } else {
                 break;
             };
@@ -516,7 +509,7 @@ mod tests {
         let tiered = cache.tiered_longest_prefix_match(&[1, 2, 3, 4]);
         assert_eq!(
             tiered.blocks,
-            vec![TierBlock::Resident(10), TierBlock::Demoted(7)]
+            vec![PrefixBlock::ResidentPage(10), PrefixBlock::DemotedKey(7)]
         );
 
         // Promote restores residency under the new page and drops the key.
@@ -558,7 +551,7 @@ mod tests {
         let tiered = cache.tiered_longest_prefix_match(&[1, 2, 3, 4]);
         assert_eq!(
             tiered.blocks,
-            vec![TierBlock::Demoted(2), TierBlock::Demoted(1)]
+            vec![PrefixBlock::DemotedKey(2), PrefixBlock::DemotedKey(1)]
         );
 
         // Severing the parent cascades over the demoted child.

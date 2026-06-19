@@ -11,7 +11,9 @@ use anyhow::{Result, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{KvBatchDescriptor, KvBatchRowKind, KvPool};
+use infer_seam::{
+    KvBatchDescriptor, KvBatchRowKind, KvPool, PrefixBlock, pages_only_reusable_prefix_blocks,
+};
 use log::{info, warn};
 
 use crate::attention::ModelKvAdapter;
@@ -139,13 +141,9 @@ impl CudaKvCacheDtype {
     }
 }
 
-/// The real cuda-kernels executor. Dense Qwen3 runs the paged continuous-batching
-/// path ([`QwenCudaExecutor`]); Qwen3.5/3.6 HYBRID MoE runs the gated-delta +
-/// periodic-full-attention forward ([`Qwen35CudaExecutor`]), which owns its KV
-/// state (per-slot full-attn caches + recurrent state, no `PagedKVPool`);
-/// DSv4-Flash runs the MLA + hyper-connection + FP8 DeepGEMM MoE forward
-/// ([`Dsv4CudaExecutor`]), which also owns its own MLA KV state. Both
-/// state-owning executors disable the decode graph.
+/// The real cuda-kernels executor. Dense Qwen3 uses the paged KV pool;
+/// Qwen3.5/3.6 and DSv4 keep model-specific per-slot state inside their
+/// executor arms.
 pub(crate) enum RealCudaExecutor {
     Qwen(Box<QwenCudaExecutor>),
     Qwen35(Box<Qwen35CudaExecutor>),
@@ -260,14 +258,19 @@ impl RealCudaExecutor {
         }
     }
 
-    /// T1 host-tier hooks. Only dense Qwen3 has a page-addressable device
-    /// pool with cross-request prefix reuse, so it is the only arm with a
-    /// tier store; the hybrid/DSv4 arms (prefix cache disabled — recurrent /
-    /// ring sidecar state, see infer-api's carve-out) report capacity 0 and
-    /// the engine never calls the other hooks.
+    /// Page-granular host-tier hooks. Dense Qwen3 is the only CUDA arm with a
+    /// page-addressable device pool here; DSv4 whole-slot swap is a separate
+    /// hook below.
     pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_capacity_pages(),
+            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+        }
+    }
+
+    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        match self {
+            Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
             Self::Qwen35(_) | Self::Dsv4(_) => 0,
         }
     }
@@ -283,7 +286,9 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.promote_prefix_pages(entries),
             Self::Qwen35(_) | Self::Dsv4(_) => {
-                anyhow::bail!("KV tier store is only wired for the dense Qwen3 arm")
+                anyhow::bail!(
+                    "page-granular KV tier store is implemented only for dense Qwen3 CUDA"
+                )
             }
         }
     }
@@ -294,10 +299,8 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Whole-slot KV tier hooks (#84/#85 Route B). Only the DSv4 arm owns
-    /// page-less per-slot state it can demote/promote as one image; the Qwen
-    /// arms keep the page-granular tier above and report no slot tier, so the
-    /// engine never routes their preemptions here.
+    /// Whole-slot KV tier hooks. CUDA currently implements these only for the
+    /// DSv4 executor arm; other arms report no slot tier.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         match self {
             Self::Dsv4(d) => d.kv_slot_tier_enabled(),
@@ -316,7 +319,7 @@ impl RealCudaExecutor {
         match self {
             Self::Dsv4(d) => d.promote_slot(key, slot),
             Self::Qwen(_) | Self::Qwen35(_) => {
-                anyhow::bail!("whole-slot KV tier store is only wired for the DSv4 arm")
+                anyhow::bail!("whole-slot KV tier store is implemented only for DSv4 CUDA")
             }
         }
     }
@@ -581,6 +584,10 @@ impl QwenCudaExecutor {
 
     pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
         self.tier.capacity_pages()
+    }
+
+    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        pages_only_reusable_prefix_blocks(blocks, |key| self.tier.contains(key))
     }
 
     /// Re-budget the T1 tier store (`0` disables). Pre-serve only: any
@@ -972,13 +979,9 @@ pub(crate) struct Dsv4CudaExecutor {
     num_slots: usize,
     mtp_accepts: usize,
     mtp_rejects: usize,
-    /// Whole-slot KV tier store (#84/#85 Route B): host images of demoted
-    /// slots, keyed by the engine-minted swap key. Capacity is a v1 COUNT cap
-    /// of `2 * num_slots` images (each image ≈ one slot's device KV footprint,
-    /// so host RAM is bounded at ~2× the device arena; preemption churn beyond
-    /// that signals thrash where plain recompute is the better fallback). A
-    /// byte-budget cap (CudaKvTierStore reuse) is the follow-up tracked in
-    /// docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md.
+    /// Host images of demoted DSv4 slots, keyed by the engine-minted swap key.
+    /// The count cap bounds host RAM; beyond it, the engine falls back to
+    /// recompute instead of accumulating swap images.
     slot_swap_store: std::collections::BTreeMap<u64, Dsv4SlotSwapEntry>,
 }
 
@@ -1388,21 +1391,18 @@ impl Dsv4CudaExecutor {
         })
     }
 
-    /// Whole-slot KV tier gate (#84/#85 Route B): single-rank only for v1.
+    /// Whole-slot swap is single-rank today.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         let world_size = self.model.tp.config().world_size;
         if world_size > 1 {
             // Multi-rank demote/promote must execute on EVERY rank in lockstep
             // (the seam hooks fire on the coordinator only), or the
-            // deterministic planner diverges and NCCL deadlocks. The
-            // multiproc-relay SwapOut/SwapIn envelopes are the tracked
-            // follow-up in docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md.
+            // deterministic planner diverges and NCCL deadlocks.
             static MULTI_RANK_LOGGED: std::sync::Once = std::sync::Once::new();
             MULTI_RANK_LOGGED.call_once(|| {
                 info!(
                     "DSv4 whole-slot KV tier disabled at world_size={world_size}: \
-                     multi-rank lockstep swap envelopes are the tracked follow-up \
-                     (docs/plans/2026-06-11-dsv4-whole-slot-kv-swap.md)"
+                     multi-rank lockstep swap is not implemented"
                 );
             });
             return false;

@@ -51,6 +51,39 @@ pub enum PollResult<I> {
     NotReady(I),
 }
 
+/// One prefix-cache block offered to a backend for restore-boundary selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixBlock {
+    /// Block is already device-resident under this host page id.
+    ResidentPage(u32),
+    /// Block is demoted to the backend tier store under this key.
+    DemotedKey(u64),
+}
+
+/// Count the largest leading prefix that is complete for a pages-only KV
+/// restore contract.
+///
+/// Resident pages are already attachable. Demoted pages are attachable only
+/// when the backend tier store can materialize the key into a resident page
+/// before attach. Attention kernels never consume `PrefixBlock` or demoted
+/// keys; they consume the backend's resident page table after this lowering.
+/// The first missing demoted key truncates the prefix; the engine re-prefills
+/// the tail.
+pub fn pages_only_reusable_prefix_blocks(
+    blocks: &[PrefixBlock],
+    mut demoted_available: impl FnMut(u64) -> bool,
+) -> usize {
+    let mut reusable = 0usize;
+    for block in blocks {
+        match *block {
+            PrefixBlock::ResidentPage(_) => reusable += 1,
+            PrefixBlock::DemotedKey(key) if demoted_available(key) => reusable += 1,
+            PrefixBlock::DemotedKey(_) => break,
+        }
+    }
+    reusable
+}
+
 /// Host-only engine-core to backend-executor seam.
 ///
 /// The plan and step output contain only host data. Any device tensors needed
@@ -110,26 +143,27 @@ pub trait BackendExecutor {
         usize::MAX
     }
 
-    /// How many leading prefix-cache pages of `block_ids` (in prompt order) the
-    /// executor can actually reuse when attaching this prefix to a slot.
+    /// How many leading prefix-cache blocks are complete restore boundaries
+    /// that the executor can materialize and attach to a slot.
     ///
-    /// The host radix caches a block at every page boundary, but a backend
-    /// whose layers carry prefix-wide recurrent/conv state (e.g. Metal
-    /// linear-attention "GDR" layers) can only attach at boundaries where it
-    /// snapshotted that state during a forward pass — chunked prefill skips the
-    /// interior boundaries. Returning fewer pages than `block_ids.len()` tells
-    /// engine-core to re-prefill the unsnapshotted tail instead of asking the
-    /// executor for a boundary it cannot serve (which would error on attach).
-    /// The default reuses everything the radix offers, which is correct for
-    /// fully page-sliceable KV (paged attention).
-    fn reusable_prefix_pages(&self, block_ids: &[u32]) -> usize {
-        block_ids.len()
+    /// The host radix can match any page boundary, resident or demoted. A
+    /// backend may need more than page bytes to resume from a boundary:
+    /// recurrent state, ring cursors, compressor metadata, mirrored snapshots,
+    /// or other backend-owned side state. Returning fewer blocks tells
+    /// engine-core not to promote or attach the tail. A nonzero return value is
+    /// a promise that after promote/attach, the backend's attention path can
+    /// consume the resulting resident page table without any missing side state.
+    /// The default is fail-closed; pages-only executors explicitly opt in with
+    /// [`pages_only_reusable_prefix_blocks`].
+    fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        let _ = blocks;
+        0
     }
 
     /// Notify the backend that host prefix-cache pages were evicted from the
     /// radix cache and released by the host KV pool. Backends that mirror page
-    /// contents or prefix snapshots below the seam can drop those mirrors here;
-    /// the default is a no-op for page-sliceable or stateless executors.
+    /// contents or restore-boundary side state below the seam can drop those
+    /// mirrors here; the default is a no-op for executors with no such mirrors.
     fn release_prefix_pages(&mut self, _pages: &[u32]) {}
 
     /// Number of KV pages the backend's host-side tier store (T1 DRAM) can
@@ -170,26 +204,27 @@ pub trait BackendExecutor {
     /// device residency. The default is a no-op for backends without a tier.
     fn drop_kv_tier_entries(&mut self, _keys: &[u64]) {}
 
-    /// Whether the backend can demote/promote a whole slot's device state as
-    /// one image — the tier route for models whose KV is NOT page-addressable
-    /// (recurrent / ring / compressed-arena state, e.g. DSv4). Default: no.
+    /// Whether the backend can demote/promote a whole slot's complete restore
+    /// state as one image when page-addressed restore is not sufficient for
+    /// that model. Default: no.
     fn kv_slot_tier_enabled(&self) -> bool {
         false
     }
 
-    /// Snapshot the entire device state of `slot` (KV at its exact positions
-    /// plus every recurrent/ring/compressor sidecar) into the backend host
-    /// store under `key`. The copy MUST be complete before returning — the
-    /// engine frees the slot immediately after. Returns `false` when the
-    /// store has no room (the engine falls back to plain recompute).
+    /// Snapshot the complete restore state of `slot` into the backend host
+    /// store under `key`: KV at its exact positions plus every backend-owned
+    /// sidecar needed to resume from the materialized sequence position. The
+    /// copy MUST be complete before returning — the engine frees the slot
+    /// immediately after. Returns `false` when the store has no room (the
+    /// engine falls back to plain recompute).
     fn demote_slot(&mut self, _slot: usize, _key: u64) -> anyhow::Result<bool> {
         Ok(false)
     }
 
-    /// Restore a whole-slot image into `slot`. The engine resumes decode at
-    /// the exact demoted position right after, so the copy MUST be complete
-    /// before returning. Only called when
-    /// [`BackendExecutor::kv_slot_tier_enabled`] is `true`.
+    /// Restore a whole-slot image into `slot`. The engine resumes from the
+    /// exact demoted materialized position right after, so every byte of
+    /// required backend state MUST be restored before returning. Only called
+    /// when [`BackendExecutor::kv_slot_tier_enabled`] is `true`.
     fn promote_slot(&mut self, _key: u64, _slot: usize) -> anyhow::Result<()> {
         anyhow::bail!("backend has no whole-slot KV tier store")
     }
@@ -211,6 +246,35 @@ pub trait BackendExecutor {
     /// unaffected; idempotent if no offload is pending.
     fn reload_weights(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PrefixBlock, pages_only_reusable_prefix_blocks};
+
+    #[test]
+    fn pages_only_counts_resident_and_available_demoted_prefix() {
+        let blocks = [
+            PrefixBlock::ResidentPage(1),
+            PrefixBlock::DemotedKey(7),
+            PrefixBlock::ResidentPage(2),
+            PrefixBlock::DemotedKey(8),
+        ];
+        assert_eq!(
+            pages_only_reusable_prefix_blocks(&blocks, |key| key == 7),
+            3
+        );
+    }
+
+    #[test]
+    fn pages_only_truncates_at_first_missing_demoted_key() {
+        let blocks = [
+            PrefixBlock::ResidentPage(1),
+            PrefixBlock::DemotedKey(7),
+            PrefixBlock::ResidentPage(2),
+        ];
+        assert_eq!(pages_only_reusable_prefix_blocks(&blocks, |_| false), 1);
     }
 }
 
