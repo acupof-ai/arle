@@ -169,7 +169,16 @@ def _parse_inline_checkpoint(raw: str) -> Checkpoint:
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"inline checkpoint unknown keys {sorted(unknown)}; allowed {sorted(allowed)}")
-    cp = Checkpoint(**fields)  # type: ignore[arg-type]
+    kwargs: dict[str, object] = dict(fields)
+    seed_raw = fields.get("training_seed")
+    if seed_raw is not None:
+        try:
+            kwargs["training_seed"] = int(seed_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"inline checkpoint training_seed must be an integer, got {seed_raw!r}"
+            ) from exc
+    cp = Checkpoint(**kwargs)  # type: ignore[arg-type]
     cp.validate()
     return cp
 
