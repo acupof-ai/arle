@@ -100,6 +100,13 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 </p>
 <p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, base→step25→step50 trajectory · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
 
+**Does the same loop lift *agentic* (tool-use) capability?** The gate-zero check on BFCL (Berkeley Function-Calling) says yes — and shows *where*: the 4B already saturates synthetic single-call AST (0.87-0.93, no room), but on **realistic Live queries** the 35B teacher has large headroom — **+42pp on Live-Irrelevance** (base **0.46** → teacher **0.88**, CI-separated). That's the OPD target; the agentic capability curve is generating now.
+
+<p align="center">
+  <img src="docs/assets/opd-agentic-gate.png" alt="Agentic gate: base Qwen3.5-4B saturates synthetic BFCL AST but is weak on realistic Live queries, where the 35B teacher has +42pp headroom on Live-Irrelevance — the OPD target" width="680">
+</p>
+<p align="center"><sub>BFCL single-turn, no-think, base Qwen3.5-4B per category · teacher 35B measured on Live-Irrelevance (0.88, n=17, CI-separated from base 0.46) · the agentic OPD lift curve (student → teacher) lands next · 2026-06-20.</sub></p>
+
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash: bit-identical spec decode) · OPD train **Beta** (2.5–2.9× vs HF TRL `GKDTrainer`, LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
 ---
