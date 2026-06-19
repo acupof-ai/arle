@@ -6,9 +6,8 @@
 //! eviction when allocation would fail.
 
 use anyhow::{Result, anyhow};
-use infer_seam::{BackendExecutor, KvPool};
+use infer_seam::{BackendExecutor, KvPool, PrefixBlock};
 
-use crate::radix::TierBlock;
 use crate::{BlockId, Engine, PrefixMatch, RequestPhase, RequestState};
 
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
@@ -26,16 +25,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         tokens.div_ceil(page_size)
     }
 
-    /// Clamp a radix prefix match to the leading pages the backend can actually
-    /// attach. The host radix caches a block at every page boundary, but a
-    /// backend whose layers carry prefix-wide recurrent state (Metal GDR /
-    /// linear attention) only snapshots that state at the boundaries a forward
-    /// pass landed on. Chunked prefill skips interior boundaries, so the radix
-    /// can offer a prefix the executor cannot serve; attaching it errors in the
-    /// executor and kills the engine thread. Trim the match to the reusable
-    /// page count and re-prefill the unsnapshotted tail.
+    /// Clamp a radix prefix match to leading pages that are complete backend
+    /// restore boundaries. The host radix can cache every page boundary, while
+    /// a backend may only be able to restore KV plus side state at boundaries
+    /// it explicitly snapshotted. Trim the match to the executor-reported
+    /// reusable page count and re-prefill the tail.
     pub(crate) fn clamp_prefix_to_backend(&self, mut prefix_match: PrefixMatch) -> PrefixMatch {
-        let serveable = self.executor.reusable_prefix_pages(&prefix_match.block_ids);
+        let blocks: Vec<_> = prefix_match
+            .block_ids
+            .iter()
+            .copied()
+            .map(PrefixBlock::ResidentPage)
+            .collect();
+        let serveable = self
+            .executor
+            .reusable_prefix_blocks(&blocks)
+            .min(prefix_match.block_ids.len());
         if serveable < prefix_match.block_ids.len() {
             prefix_match.block_ids.truncate(serveable);
             prefix_match.matched_len = serveable.saturating_mul(self.radix.block_size());
@@ -143,7 +148,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .kv
             .page_indices_for_token_range(slot, 0, sealed_tokens)
             .to_vec();
-        let publish_blocks = sealed_blocks.min(pages.len());
+        let mut publish_blocks = sealed_blocks.min(pages.len());
+        let blocks: Vec<_> = pages
+            .iter()
+            .take(publish_blocks)
+            .copied()
+            .map(PrefixBlock::ResidentPage)
+            .collect();
+        publish_blocks = self
+            .executor
+            .reusable_prefix_blocks(&blocks)
+            .min(publish_blocks);
         if publish_blocks == 0 {
             return Vec::new();
         }
@@ -330,12 +345,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if self.kv_tier_capacity() == 0 {
             return self.radix.longest_prefix_match(tokens);
         }
-        let tiered = self.radix.tiered_longest_prefix_match(tokens);
-        let mut block_ids = Vec::with_capacity(tiered.blocks.len());
-        for block in tiered.blocks {
+        let mut blocks = self.radix.tiered_longest_prefix_match(tokens).blocks;
+        let reusable = self
+            .executor
+            .reusable_prefix_blocks(&blocks)
+            .min(blocks.len());
+        blocks.truncate(reusable);
+        let mut block_ids = Vec::with_capacity(blocks.len());
+        for block in blocks {
             let page = match block {
-                TierBlock::Resident(page) => Some(page),
-                TierBlock::Demoted(key) => self.promote_demoted_block(key),
+                PrefixBlock::ResidentPage(page) => Some(page),
+                PrefixBlock::DemotedKey(key) => self.promote_demoted_block(key),
             };
             let Some(page) = page else { break };
             block_ids.push(page);

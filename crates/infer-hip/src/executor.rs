@@ -12,7 +12,7 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
-use infer_seam::{BackendExecutor, KvPool, PollResult};
+use infer_seam::{BackendExecutor, KvPool, PollResult, PrefixBlock};
 
 use crate::kv_pool::HipKvPool;
 
@@ -73,6 +73,15 @@ impl HipDsv4Executor {
 
 impl BackendExecutor for HipDsv4Executor {
     type Inflight = HipInflight;
+
+    fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
+        // HIP DSv4 stores the real restore state in per-slot arenas
+        // (`slot.sw_window_ring`, compressor/indexer buffers, and seq_len).
+        // Host pages are bookkeeping only, so page-prefix attach is never a
+        // complete restore boundary. Add whole-slot restore when HIP needs
+        // preemption reuse.
+        0
+    }
 
     fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<HipInflight> {
         if plan.is_idle() {
@@ -277,6 +286,18 @@ mod tests {
         mixed.prefill_rows = one_row_plan(false).prefill_rows;
         mixed.mode = ForwardMode::Mixed;
         assert!(exec.submit(&mixed, &mut pool).is_err());
+    }
+
+    #[test]
+    fn page_prefix_reuse_is_fail_closed() {
+        let exec = HipDsv4Executor::unloaded();
+        assert_eq!(
+            exec.reusable_prefix_blocks(&[
+                PrefixBlock::ResidentPage(1),
+                PrefixBlock::DemotedKey(2)
+            ]),
+            0
+        );
     }
 
     #[cfg(not(feature = "hip"))]
