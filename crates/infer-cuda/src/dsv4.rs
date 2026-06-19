@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::tensor::{CudaPipelineStreamKind, Dsv4Fp8DeepGemmWeightCache};
@@ -1817,21 +1817,27 @@ impl Dsv4Model {
         Ok(logits)
     }
 
-    /// Verify `tokens` in ONE forward under `sched`'s per-row positions. Returns
-    /// the target logits matrix, its greedy top-1 view, and per-row MTP stream
-    /// hidden states.
+    /// Verify `tokens` in ONE scheduled sparse forward under `sched`'s per-row
+    /// positions. MTP schedules are chain-shaped (`depth + 1` rows), so this path
+    /// requires at least two rows and never falls back to a plain single-token
+    /// forward. Ordinary non-spec decode uses `forward_tokens_verify` /
+    /// `forward_tokens` instead.
     pub(crate) fn forward_tokens_verify_scheduled(
         &self,
         slot: &mut Dsv4SlotState,
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
-        position: u64,
+        _position: u64,
         sched: &SpecVerifySchedule,
     ) -> Result<SpecVerifyResult> {
         ensure!(
             !tokens.is_empty(),
             "DSv4 verify forward requires at least one token"
+        );
+        ensure!(
+            tokens.len() >= 2,
+            "DSv4 scheduled sparse verify requires at least 2 rows; use ordinary decode for single-token verify"
         );
         ensure!(
             sched.positions.len() == tokens.len() && sched.ancestors.len() == tokens.len(),
@@ -1842,65 +1848,40 @@ impl Dsv4Model {
         );
         let _nvtx = crate::nvtx::range("dsv4/lm_head_verify");
 
-        // Batched verify: ONE multi-row forward amortizes the weight read
-        // (proven +63%).
-        if tokens.len() >= 2 {
-            let stream_dim = self.config.hidden_size * self.config.hc_mult;
-            // `hiddens[j]` = row j's MTP stream; `argmax[j]` = the target's
-            // argmax AFTER `tokens[j]` (so `argmax[i]` is exactly what an
-            // accepted child of node i must equal). Attention uses the frozen
-            // sparse verify lane and does not commit slot KV state.
-            let was_frozen = crate::attention::dsv4_verify_frozen();
-            if !was_frozen {
-                crate::attention::set_dsv4_verify_frozen(true);
-            }
-            let result = (|| -> Result<SpecVerifyResult> {
-                let (stream, mut keepalive) = self.forward_tokens_stream_impl(
-                    slot,
-                    kv_adapter,
-                    tokens,
-                    start_pos,
-                    Some(sched),
-                )?;
-                let n = tokens.len();
-                let mut hiddens = Vec::with_capacity(n);
-                for i in 0..n {
-                    let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-                    self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
-                    hiddens.push(h);
-                }
-                let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
-                let argmax = self.mtp_argmax_batch(&logits)?;
-                std::hint::black_box(keepalive.len());
-                drop(keepalive);
-                Ok(SpecVerifyResult {
-                    logits,
-                    argmax,
-                    hiddens,
-                })
-            })();
-            if !was_frozen {
-                crate::attention::set_dsv4_verify_frozen(false);
-            }
-            return result;
+        // ONE scheduled sparse verify forward. `hiddens[j]` = row j's MTP
+        // stream; `argmax[j]` = the target's argmax AFTER `tokens[j]` (so
+        // `argmax[i]` is exactly what an accepted child of node i must equal).
+        // Attention uses the frozen sparse verify lane and does not commit slot
+        // KV state.
+        let stream_dim = self.config.hidden_size * self.config.hc_mult;
+        let was_frozen = crate::attention::dsv4_verify_frozen();
+        if !was_frozen {
+            crate::attention::set_dsv4_verify_frozen(true);
         }
-
-        // Single-token fallback.
-        let (stream, mut keepalive) =
-            self.forward_tokens_stream_impl(slot, kv_adapter, &[tokens[0]], start_pos, None)?;
-        let mut row_hidden =
-            DeviceVec::zeros(&self.ctx, self.config.hidden_size * self.config.hc_mult)?;
-        self.capture_mtp_stream_hidden(&stream, 0, &mut row_hidden, &mut keepalive)?;
-        let logits = self.verify_logits_from_stream(&stream, 1, &mut keepalive)?;
-        let argmax = self.mtp_argmax_batch(&logits)?;
-        std::hint::black_box(position);
-        std::hint::black_box(keepalive.len());
-        drop(keepalive);
-        Ok(SpecVerifyResult {
-            logits,
-            argmax,
-            hiddens: vec![row_hidden],
-        })
+        let result = (|| -> Result<SpecVerifyResult> {
+            let (stream, mut keepalive) =
+                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, Some(sched))?;
+            let n = tokens.len();
+            let mut hiddens = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
+                self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
+                hiddens.push(h);
+            }
+            let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
+            let argmax = self.mtp_argmax_batch(&logits)?;
+            std::hint::black_box(keepalive.len());
+            drop(keepalive);
+            Ok(SpecVerifyResult {
+                logits,
+                argmax,
+                hiddens,
+            })
+        })();
+        if !was_frozen {
+            crate::attention::set_dsv4_verify_frozen(false);
+        }
+        result
     }
 
     /// Layer-major batched decode over N independent slots (one decode token each).
@@ -1909,13 +1890,9 @@ impl Dsv4Model {
     /// point-wise pipeline (embed / HC wrap / rms_norm / MoE / shared expert /
     /// all-reduce) runs over the whole `seq_len = N` batch exactly as the prefill
     /// path does — those ops are token-independent, so stacking N rows is
-    /// math-identical to N separate single-row forwards. Attention is the only
-    /// per-row-dependent step (each row attends to its own slot's KV history);
-    /// Step A loops it per row (copy row r in/out of a `[hidden,1]` scratch and
-    /// call the existing single-row [`mla_attention`]) so this restructure changes
-    /// the *order* of work (row-major → layer-major) but not the math. Later
-    /// phases replace the per-row attention loop with batched DSA / FlashMLA and
-    /// the per-row MoE with grouped MoE. Returns one sampled token per row.
+    /// math-identical to N separate single-row forwards. For MODEL1 B>1, the
+    /// attention lane is the canonical batched FlashMLA sparse decode path; B=1
+    /// stays on the single-row reference path. Returns one sampled token per row.
     pub(crate) fn forward_decode_batch(
         &self,
         slots: &mut [Dsv4SlotState],
@@ -2022,13 +1999,9 @@ impl Dsv4Model {
         let ctx = &self.ctx;
 
         // Batched (b=N) FlashMLA decode lane (#60, the #1 concurrency lever).
-        // Default OFF. When ON AND the model-wide batched scratch is allocated,
-        // Phase A exercises the per-forward block_table + sched_meta(b=N)
-        // plumbing for the n>1 lane (the orphaned batched indices builder + the
-        // per-forward sched_meta — the cached-meta-is-b=1-only pitfall fix). The
-        // per-row attention kernel call is KEPT in Phase A; Phase B swaps it for
-        // one sparse_decode_fwd(b=N) at the marked site below. N=1 never reaches
-        // this function, so the single-row path is unaffected.
+        // MODEL1 B>1 uses this as the canonical path when the model-wide batched
+        // scratch exists. V32/GLM has no MODEL1 batch scratch and remains on the
+        // single-row fallback. N=1 never reaches this function.
         let batched_attn_lane = crate::attention::dsv4_flashmla_decode_batched_enabled()?
             && kv_adapter.has_flashmla_batch_scratch();
 
@@ -2116,13 +2089,10 @@ impl Dsv4Model {
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
 
-        // Opt-in full-flatten gate (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, the same
-        // gate the compressor projection pre-pass uses). When ON, the per-slot
-        // compressor STATE update, the FINISH inverse-RoPE, and the FINISH
-        // SW-window write are each batched into ONE launch over the N rows
-        // (replacing the N per-row launches). When OFF, every per-row path runs
-        // byte-identically. Computed once per forward.
-        let full_flatten = crate::attention::dsv4_decode_compressor_batch_enabled()?;
+        // Full-flatten is canonical for MODEL1 B>1 decode. Per layer it batches
+        // compressor state update (where a compressor exists), inverse-RoPE, and
+        // SW-window write into one launch over N rows. SparseIndexed has no main
+        // compressor and is explicitly excluded below.
         // Holds the host-uploaded per-row device-pointer ARRAYS for the batched
         // compressor/finish kernels alive to function return (the N>1 keepalive is
         // inert; pointer arrays must outlive their kernel launch under the
@@ -2149,6 +2119,8 @@ impl Dsv4Model {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
+            let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
+
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
             // GLM (hc_mult==1): no hyper-connection; the stream IS the hidden, so
             // the pre-mixer is identity. Replace the mhc pre+norm with a plain
@@ -2306,51 +2278,39 @@ impl Dsv4Model {
                     ctx.stream.synchronize().ok();
                     proj_ms += t.elapsed().as_secs_f64() * 1000.0;
                 }
-                // ── 0b. Opt-in batched (m=N) compressor/indexer projection
-                // pre-pass (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF). The
+                // ── 0b. Batched (m=N) compressor/indexer projection pre-pass. The
                 // per-row m=1 `compressor_forward` wkv/wgate GEMVs re-read the full
-                // weight per decode row (~54% of the decode step, DEAD-LINEAR in n);
-                // batch them into one DeepGEMM m=N (weight read ONCE) over the SAME
-                // `normed` batch the proj pre-pass used, reusing the model-wide
-                // shared FP8 prefill DeepGEMM scratch (called sequentially, after the
-                // proj batch released its borrow). Each row then reads its `[width,1]`
-                // column slice in the loop below; the per-slot state update stays
-                // per-row. `None` (gate off / caches absent) → byte-identical per-row
-                // GEMV path. Touches NO slot state.
-                let compressor_batch_enabled =
-                    crate::attention::dsv4_decode_compressor_batch_enabled()?;
-                let (compressor_kv_score, indexer_kv_score) = if compressor_batch_enabled {
-                    // `dsv4_linear` (bf16 → cublasLt) needs no FP8/deepgemm scratch.
-                    let main = match layer.attention.compressor.as_ref() {
-                        Some(compressor) => crate::attention::compressor_batch_prepass(
+                // weight per decode row; batch them over the same `normed` batch the
+                // proj pre-pass used. Each row then reads its `[width,1]` column slice
+                // below unless full-flatten consumes the batched outputs directly.
+                // Touches NO slot state.
+                let main = match layer.attention.compressor.as_ref() {
+                    Some(compressor) => crate::attention::compressor_batch_prepass(
+                        &self.ctx,
+                        compressor,
+                        &normed,
+                        &mut keepalive,
+                    )?,
+                    None => None,
+                };
+                let indexer = if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
+                    match layer.attention.indexer.as_ref() {
+                        Some(indexer) => crate::attention::compressor_batch_prepass(
                             &self.ctx,
-                            compressor,
+                            indexer
+                                .compressor
+                                .as_ref()
+                                .expect("DSv4 CSA indexer has a key compressor"),
                             &normed,
                             &mut keepalive,
                         )?,
                         None => None,
-                    };
-                    let indexer = if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
-                        match layer.attention.indexer.as_ref() {
-                            Some(indexer) => crate::attention::compressor_batch_prepass(
-                                &self.ctx,
-                                indexer
-                                    .compressor
-                                    .as_ref()
-                                    .expect("DSv4 CSA indexer has a key compressor"),
-                                &normed,
-                                &mut keepalive,
-                            )?,
-                            None => None,
-                        }
-                    } else {
-                        None
-                    };
-                    (main, indexer)
+                    }
                 } else {
-                    (None, None)
+                    None
                 };
-                // ── 0c. Full-flatten P1a (opt-in, default OFF): per-row compressor
+                let (compressor_kv_score, indexer_kv_score) = (main, indexer);
+                // ── 0c. Full-flatten P1a: per-row compressor
                 // STATE-update DEFER (gather each row's ring-state pointers + advance
                 // compressed.seq_len, NO per-row FFI) → ONE
                 // `dsv4_compressor_update_batched` over all N rows (main + indexer),
@@ -2360,8 +2320,7 @@ impl Dsv4Model {
                 // consumers (pack reads main `compressed`; csa cache-write reads
                 // indexer `compressed`), so they see the written keys. `indexer_rows_before`
                 // is captured per row here (P1a advances seq_len) and handed to P1b's
-                // CSA path. When the gate is OFF, this whole block is skipped and the
-                // P1b loop runs the per-row compressor (byte-identical).
+                // CSA path. SparseIndexed skips this path because it has no compressor.
                 let indexer_rows_before: Vec<usize> = if full_flatten {
                     let mut main_sink = crate::attention::Dsv4CompressorBatchPtrs::with_capacity(n);
                     let mut indexer_sink =
@@ -2566,8 +2525,8 @@ impl Dsv4Model {
                         // q_prepared_owned slice convention above: a fresh owned
                         // [width,1] bf16 buffer per row, filled by a single dtod copy,
                         // referenced (not consumed) by the precomputed struct so it
-                        // outlives the prepare call. `None` (gate off / no batch) →
-                        // byte-identical per-row GEMV path.
+                        // outlives the prepare call. `None` means no batched
+                        // projection exists for this layer.
                         let slice_row = |src: &HiddenStates| -> Result<HiddenStates> {
                             let width = src.hidden_dim;
                             // SAFETY: the dtod copy fills the full buffer before read.
@@ -2585,7 +2544,7 @@ impl Dsv4Model {
                         // batched in P1a, so the per-row `[width,1]` slice copies (the
                         // ∝n per-row work this campaign removes) are SKIPPED — pass
                         // `skip_compressor=true` + the P1a-captured `indexer_rows_before`
-                        // and NO precomputed slices. When the gate is OFF, build the
+                        // and NO precomputed slices. Without full-flatten, build the
                         // per-row slices and run the per-row compressor as before.
                         //
                         // The owned slice buffers are bound at iteration scope so they
@@ -2919,7 +2878,7 @@ impl Dsv4Model {
                             swcache_ptrs.push(cp);
                             drop(cg);
                         } else {
-                            // Per-row FINISH (gate OFF): byte-identical inverse-RoPE
+                            // Per-row FINISH: inverse-RoPE
                             // + SW-window write, one launch each per row.
                             let slot = &mut slots[slot_ids[r]];
                             let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
@@ -3459,7 +3418,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
 
-        // Per-slot chain verify: one FlashMLA sparse forward over each slot's
+        // Per-slot chain verify: one FlashMLA sparse forward over each slot
         // chunk per layer. The prefix metadata expresses row r -> ancestors
         // explicitly. Current topk does not add rows: D2 verifies 3 rows.
         let max_chunk = *lens.iter().max().unwrap_or(&1);
@@ -3871,8 +3830,8 @@ impl Dsv4Model {
         start_pos: usize,
         // `Some`: verify a scheduled row chunk. Ancestor metadata routes
         // attention through one FlashMLA sparse verify call per layer; point-wise
-        // and MoE stay batched for weight-read amortization. Tree top-k adds
-        // scheduled rows, not extra target forwards.
+        // and MoE stay batched for weight-read amortization. Current top-k only
+        // widens candidate matching; it does not add scheduled rows.
         verify: Option<&SpecVerifySchedule>,
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         ensure!(
@@ -3937,7 +3896,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
         let sparse_verify_meta = match verify {
-            Some(sched) if seq_len > 1 => {
+            Some(sched) => {
                 ensure!(
                     sched.positions.len() == seq_len && sched.ancestors.len() == seq_len,
                     "DSv4 sparse verify schedule rows ({}, {}) != token rows {seq_len}",
