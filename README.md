@@ -98,7 +98,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 <p align="center">
   <img src="docs/assets/opd-multiseed-curve.png" alt="OPD multi-seed lock: Qwen3.5-4B student lifts from 0.518 to 0.792 MATH-500 accuracy (reverse-KL best across 5 seeds), approaching the 35B teacher's 0.82" width="680">
 </p>
-<p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, step50 · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
+<p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, base→step25→step50 trajectory · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
 
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash: bit-identical spec decode) · OPD train **Beta** (2.5–2.9× vs HF TRL `GKDTrainer`, LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
