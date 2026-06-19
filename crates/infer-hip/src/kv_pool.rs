@@ -204,6 +204,14 @@ impl KvQuery for HipKvPool {
         self.free.len() * self.page_size
     }
 
+    fn resident_pages(&self) -> usize {
+        self.total_pages.saturating_sub(self.free.len())
+    }
+
+    fn resident_evictable_pages(&self) -> usize {
+        self.page_refs.values().filter(|&&count| count == 1).count()
+    }
+
     fn seq_len(&self, slot: usize) -> usize {
         self.slot_len.get(slot).copied().unwrap_or(0)
     }

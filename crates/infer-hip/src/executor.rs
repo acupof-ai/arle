@@ -83,6 +83,10 @@ impl BackendExecutor for HipDsv4Executor {
         0
     }
 
+    fn kv_tier_transfer_is_zero_copy(&self) -> bool {
+        true
+    }
+
     fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<HipInflight> {
         if plan.is_idle() {
             return Ok(HipInflight::Ready(StepOutput { tokens: Vec::new() }));
