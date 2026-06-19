@@ -1023,6 +1023,15 @@ pub(crate) struct Dsv4CudaExecutor {
     num_slots: usize,
     mtp_accepts: usize,
     mtp_rejects: usize,
+    /// Adaptive MTP gate (B=1): EMA of per-step accepted/depth, plus the count of
+    /// consecutive gated skips since the last real spec step (drives the periodic
+    /// probe). MTP only beats no-spec when it emits > t_mtp/t_nospec tok/step, so
+    /// below that acceptance the gate runs a warm no-spec step instead. Init
+    /// optimistic (1.0) so MTP runs until the running acceptance proves it loses.
+    /// See `mtp_should_speculate`. Opt-in via `ARLE_DSV4_MTP_ADAPTIVE` (bring-up;
+    /// promote to a `--mtp-adaptive` CLI flag once pod-calibrated).
+    mtp_accept_ema: f32,
+    mtp_skip_streak: usize,
     /// Host images of demoted DSv4 slots, keyed by the engine-minted swap key.
     /// The count cap bounds host RAM; beyond it, the engine falls back to
     /// recompute instead of accumulating swap images.
@@ -1431,6 +1440,8 @@ impl Dsv4CudaExecutor {
             num_slots,
             mtp_accepts: 0,
             mtp_rejects: 0,
+            mtp_accept_ema: 1.0,
+            mtp_skip_streak: 0,
             slot_swap_store: std::collections::BTreeMap::new(),
         })
     }
@@ -1527,6 +1538,31 @@ impl Dsv4CudaExecutor {
         }
     }
 
+    /// One no-spec greedy forward that ALSO stages the MTP draft state (pending
+    /// token + stream hidden) so a subsequent `spec_step` can resume. Shared by
+    /// final-prefill (seeds the first chain) and the adaptive gate's fallback (a
+    /// low-acceptance step runs at no-spec cost but keeps the draft head warm).
+    fn forward_mtp_warm_step(
+        &mut self,
+        slot_idx: usize,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        let (token, hidden) = self.model.forward_tokens_with_hidden(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            tokens,
+            start_pos,
+            params,
+            position,
+        )?;
+        self.spec_slots[slot_idx].pending = Some(token);
+        self.spec_slots[slot_idx].hidden = Some(hidden);
+        Ok(token)
+    }
+
     fn forward_prefill_tokens(
         &mut self,
         slot_idx: usize,
@@ -1538,20 +1574,21 @@ impl Dsv4CudaExecutor {
     ) -> Result<Vec<u32>> {
         let spec_on = self.spec_requested();
         if spec_on && params.is_greedy() {
-            let (token, hidden) = self.model.forward_tokens_with_hidden(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                tokens,
-                start_pos,
-                params,
-                position,
-            )?;
-            if final_prefill {
-                self.spec_slots[slot_idx].pending = Some(token);
-                self.spec_slots[slot_idx].hidden = Some(hidden);
+            let token = if final_prefill {
+                self.forward_mtp_warm_step(slot_idx, tokens, start_pos, params, position)?
             } else {
+                // Non-final chunk: emit the token, drop any stale draft state.
+                let (token, _hidden) = self.model.forward_tokens_with_hidden(
+                    &mut self.slots[slot_idx],
+                    &mut self.kv_adapter,
+                    tokens,
+                    start_pos,
+                    params,
+                    position,
+                )?;
                 self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
-            }
+                token
+            };
             Ok(vec![token])
         } else {
             if spec_on {
@@ -1607,6 +1644,21 @@ impl Dsv4CudaExecutor {
             pending == last_token,
             "DSv4 MTP pending token {pending} != DecodeRow.last_token {last_token}"
         );
+        // Adaptive gate (B=1): when the running acceptance EMA predicts MTP would
+        // lose to no-spec, run a warm no-spec step instead — keeps the draft head
+        // staged so MTP resumes the moment acceptance recovers (a periodic probe
+        // forces one real step to refresh the EMA). The warm step needs the MTP
+        // hidden so it takes the eager forward (not the decode-graph fast path):
+        // it costs eager-no-spec, a touch above t_nospec, which only narrows the
+        // win — calibrate MIN_ACCEPT against that. NOTE: the EMA + skip_streak are
+        // executor-global (fine for this B=1 bring-up flag); make them per-slot
+        // before promoting the gate to a default.
+        if self.mtp_adaptive_skip() {
+            self.mtp_skip_streak += 1;
+            let token =
+                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position)?;
+            return Ok(vec![token]);
+        }
         self.spec_step(slot_idx, start_pos, position)
     }
 
