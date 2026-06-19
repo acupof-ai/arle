@@ -898,6 +898,17 @@ pub(crate) struct Qwen35Model {
     /// resident weights) so every re-merge recomputes `W = base + scale·B·A`
     /// from the *original* checkpoint weight, never from an already-merged one.
     lora_base: HashMap<LoraBaseKey, LoraBaseSnapshot>,
+    /// Pristine *device* copy of each dense-BF16 base weight, captured on the
+    /// first touch (device→device clone of the resident matrix). The per-step
+    /// re-merge then runs entirely on-device: upload the tiny A/B, GEMM `B·A`,
+    /// scaled-add `W = base + scale·(B·A)` straight into the resident matrix —
+    /// no host triple-loop, no full-W host→device upload. FP8/grouped targets
+    /// fall back to the host [`LoraBaseSnapshot`] path (re-quant needs host
+    /// per-block scaling).
+    lora_base_dev: HashMap<LoraBaseKey, DeviceVec>,
+    /// Reusable device scratch for the `B·A` delta (sized to the largest dense
+    /// merged matrix seen). Avoids a per-projection device alloc each step.
+    lora_delta_scratch: Option<DeviceVec>,
     /// Projections whose resident device matrix currently includes a non-zero
     /// LoRA delta. Lets all-zero adapter steps skip weight uploads unless they
     /// need to restore a previously merged projection back to base.
@@ -1796,6 +1807,8 @@ impl Qwen35Model {
             max_seq_len,
             offloaded: None,
             lora_base: HashMap::new(),
+            lora_base_dev: HashMap::new(),
+            lora_delta_scratch: None,
             lora_dirty: HashSet::new(),
         })
     }
@@ -2592,29 +2605,17 @@ impl Qwen35Model {
             return Ok(());
         }
 
-        self.ensure_lora_base_cached(layer_idx, projection)?;
+        // Determine the resident storage format without forcing a host copy: a
+        // standalone dense-BF16 matrix takes the on-device merge path; FP8 /
+        // grouped targets fall back to the host snapshot path.
+        let target_is_dense = matches!(
+            self.lora_weight_target(layer_idx, projection)?,
+            LoraWeightTarget::Matrix(m) if m.is_dense_bf16()
+        );
 
-        // Clone the host snapshot before borrowing the model mutably for the
-        // upload. These snapshots are per touched projection; keeping the
-        // upload path simple is preferable to aliasing self across the hash map
-        // and the resident matrix.
-        let snapshot = self
-            .lora_base
-            .get(&key)
-            .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight not cached"))?
-            .clone();
-        let rows = snapshot.rows();
-        let cols = snapshot.cols();
-        ensure!(
-            adapter.in_features == cols,
-            "layer {layer_idx} {label}: lora_A in_features {} != base cols {cols}",
-            adapter.in_features
-        );
-        ensure!(
-            adapter.out_features == rows,
-            "layer {layer_idx} {label}: lora_B out_features {} != base rows {rows}",
-            adapter.out_features
-        );
+        // Shape checks against the adapter's declared features (cheap; no copy).
+        let rows = adapter.out_features;
+        let cols = adapter.in_features;
         ensure!(
             adapter.a.len() == adapter.rank * cols,
             "layer {layer_idx} {label}: lora_A len {} != rank*in {}",
@@ -2626,6 +2627,37 @@ impl Qwen35Model {
             "layer {layer_idx} {label}: lora_B len {} != out*rank {}",
             adapter.b.len(),
             rows * adapter.rank
+        );
+
+        if target_is_dense {
+            if adapter_is_zero {
+                // Restore the pristine *device* base (no host round-trip).
+                if self.lora_dirty.remove(&key) {
+                    self.restore_lora_base_dev(layer_idx, projection, &key)?;
+                }
+                return Ok(());
+            }
+            // Dense BF16 (the all-linear hot set): merge entirely on-device.
+            // `W = base_dev + scale·(B·A)` via one rank-`rank` GEMM + a
+            // full-buffer scaled-add into the resident matrix — replaces the
+            // O(rows·cols·rank) host triple-loop + full-W host→device upload.
+            return self.merge_lora_proj_device(layer_idx, projection, adapter, scale, &key);
+        }
+
+        // FP8 / grouped path: cache the pristine base host-side, validate
+        // against it, and recompute on host (re-quant needs host per-block
+        // scaling).
+        self.ensure_lora_base_cached(layer_idx, projection)?;
+        let snapshot = self
+            .lora_base
+            .get(&key)
+            .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight not cached"))?
+            .clone();
+        ensure!(
+            snapshot.rows() == rows && snapshot.cols() == cols,
+            "layer {layer_idx} {label}: FP8 base shape {}x{} != adapter {rows}x{cols}",
+            snapshot.rows(),
+            snapshot.cols()
         );
 
         if adapter_is_zero {
@@ -2643,8 +2675,9 @@ impl Qwen35Model {
             return Ok(());
         }
 
-        // W[r, c] = base[r, c] + scale · Σ_k B[r, k] · A[k, c].
         let rank = adapter.rank;
+
+        // W[r, c] = base[r, c] + scale · Σ_k B[r, k] · A[k, c].
         let mut merged = vec![bf16::ZERO; rows * cols];
         let base = snapshot.base();
         for row in 0..rows {
@@ -2670,6 +2703,177 @@ impl Qwen35Model {
             label.as_ref(),
         )?;
         self.lora_dirty.insert(key);
+        Ok(())
+    }
+
+    /// On-device dense-BF16 LoRA merge. Caches the pristine base on-device on
+    /// first touch, then per step uploads the tiny A/B, runs `B·A` on the GPU,
+    /// and folds `W = base + scale·(B·A)` straight into the resident matrix.
+    fn merge_lora_proj_device(
+        &mut self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+        adapter: &StudentLoraMatrices,
+        scale: f32,
+        key: &LoraBaseKey,
+    ) -> Result<()> {
+        let label = projection.label();
+        let rows = adapter.out_features;
+        let cols = adapter.in_features;
+        let rank = adapter.rank;
+
+        // Pristine device base (device→device clone of the resident matrix on
+        // first touch — runs before any merge mutates the weight).
+        self.ensure_lora_base_dev_cached(layer_idx, projection, key)?;
+
+        // Tiny host→device uploads. `a_t` is A transposed to [cols, rank]
+        // row-major (== W[c,k]=A[k,c] for `lora_device_gemm`); `b` uploads as-is
+        // ([rows, rank] row-major == col-major X[k,r]=B[r,k]).
+        let mut a_t = vec![bf16::ZERO; cols * rank];
+        for k in 0..rank {
+            let a_row = &adapter.a[k * cols..k * cols + cols];
+            for (c, &a_kc) in a_row.iter().enumerate() {
+                a_t[c * rank + k] = bf16::from_f32(a_kc);
+            }
+        }
+        let b_host: Vec<bf16> = adapter.b.iter().map(|&v| bf16::from_f32(v)).collect();
+        let a_t_dev = DeviceVec::from_host(&self.ctx, &a_t)?;
+        let b_dev = DeviceVec::from_host(&self.ctx, &b_host)?;
+
+        // Reusable delta scratch, grown to the largest dense matrix seen.
+        let needed = rows * cols;
+        if self
+            .lora_delta_scratch
+            .as_ref()
+            .map(|s| s.len < needed)
+            .unwrap_or(true)
+        {
+            self.lora_delta_scratch = Some(DeviceVec::zeros(&self.ctx, needed)?);
+        }
+        let ctx = self.ctx.clone();
+
+        // GEMM `B·A` into the scratch buffer.
+        {
+            let scratch = self
+                .lora_delta_scratch
+                .as_mut()
+                .expect("scratch allocated above");
+            crate::ops::lora_device_gemm(
+                &ctx,
+                &a_t_dev.data,
+                &b_dev.data,
+                &mut scratch.data,
+                rows,
+                cols,
+                rank,
+            )?;
+        }
+
+        // Clone the (cheap, Arc-backed) device handles for the pristine base and
+        // the delta scratch before taking the mutable target borrow — sidesteps
+        // the whole-`self` borrow `lora_weight_target_mut` requires.
+        let base_data = self
+            .lora_base_dev
+            .get(key)
+            .ok_or_else(|| anyhow!("layer {layer_idx} {label}: device base not cached"))?
+            .data
+            .clone();
+        let delta_data = self
+            .lora_delta_scratch
+            .as_ref()
+            .expect("scratch allocated above")
+            .data
+            .clone();
+        let delta_view = delta_data.slice(0..needed);
+
+        let target = self.lora_weight_target_mut(layer_idx, projection)?;
+        let LoraWeightTargetMut::Matrix(matrix) = target else {
+            return Err(anyhow!(
+                "layer {layer_idx} {label}: dense device merge requires a standalone matrix target"
+            ));
+        };
+        ensure!(
+            matrix.is_dense_bf16() && matrix.rows == rows && matrix.cols == cols,
+            "layer {layer_idx} {label}: dense device merge shape/format mismatch \
+             ({}x{} {:?} vs {rows}x{cols})",
+            matrix.rows,
+            matrix.cols,
+            matrix.weight_format()
+        );
+        crate::ops::lora_scaled_add_into(
+            &ctx,
+            &base_data,
+            &delta_view,
+            &mut matrix.data,
+            needed,
+            scale,
+        )?;
+
+        self.lora_dirty.insert(*key);
+        Ok(())
+    }
+
+    /// Capture a pristine *device* copy of one dense-BF16 base weight on first
+    /// touch (device→device clone of the resident matrix).
+    fn ensure_lora_base_dev_cached(
+        &mut self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+        key: &LoraBaseKey,
+    ) -> Result<()> {
+        if self.lora_base_dev.contains_key(key) {
+            return Ok(());
+        }
+        let label = projection.label();
+        let target = self.lora_weight_target(layer_idx, projection)?;
+        let LoraWeightTarget::Matrix(matrix) = target else {
+            return Err(anyhow!(
+                "layer {layer_idx} {label}: device base cache requires a standalone matrix target"
+            ));
+        };
+        ensure!(
+            matrix.is_dense_bf16(),
+            "layer {layer_idx} {label}: device base cache requires dense BF16; got {:?}",
+            matrix.weight_format()
+        );
+        let mut base = DeviceVec::zeros(&self.ctx, matrix.rows * matrix.cols)?;
+        self.ctx
+            .stream
+            .memcpy_dtod(&matrix.data, &mut base.data)
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: device base D2D clone failed: {e}"))?;
+        self.lora_base_dev.insert(*key, base);
+        Ok(())
+    }
+
+    /// Restore a dense projection's resident matrix from its pristine device
+    /// base (device→device copy; no host round-trip).
+    fn restore_lora_base_dev(
+        &mut self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+        key: &LoraBaseKey,
+    ) -> Result<()> {
+        let label = projection.label();
+        let ctx = self.ctx.clone();
+        let base_dev = self
+            .lora_base_dev
+            .get(key)
+            .ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: device base not cached for restore")
+            })?
+            .data
+            .clone();
+        let target = self.lora_weight_target_mut(layer_idx, projection)?;
+        let LoraWeightTargetMut::Matrix(matrix) = target else {
+            return Err(anyhow!(
+                "layer {layer_idx} {label}: dense device restore requires a standalone matrix target"
+            ));
+        };
+        ctx.stream
+            .memcpy_dtod(&base_dev, &mut matrix.data)
+            .map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: device base restore D2D failed: {e}")
+            })?;
         Ok(())
     }
 
@@ -5424,6 +5628,268 @@ mod tests {
         assert!(
             max_abs <= 8.0e-3,
             "FP8 roundtrip error {max_abs:e} exceeded bound"
+        );
+    }
+
+    /// Reference host merge: `W[r,c] = base[r,c] + scale·Σ_k B[r,k]·A[k,c]`.
+    /// Mirrors the (now FP8-only) host triple-loop in `merge_lora_proj`.
+    fn host_merge_reference(
+        base: &[bf16],
+        a: &[f32],
+        b: &[f32],
+        rows: usize,
+        cols: usize,
+        rank: usize,
+        scale: f32,
+    ) -> Vec<bf16> {
+        let mut merged = vec![bf16::ZERO; rows * cols];
+        for row in 0..rows {
+            let b_row = &b[row * rank..row * rank + rank];
+            for col in 0..cols {
+                let mut delta = 0.0f32;
+                for (k, &b_rk) in b_row.iter().enumerate() {
+                    delta += b_rk * a[k * cols + col];
+                }
+                let idx = row * cols + col;
+                merged[idx] = bf16::from_f32(base[idx].to_f32() + scale * delta);
+            }
+        }
+        merged
+    }
+
+    /// GPU gate: the on-device dense LoRA merge (`lora_device_gemm` +
+    /// `lora_scaled_add_into`, including the host-side A transpose used by
+    /// `merge_lora_proj_device`) must match the host triple-loop reference
+    /// within BF16 tolerance. Requires a real CUDA device (run on GPU7).
+    #[test]
+    fn device_lora_merge_matches_host_reference() {
+        let Ok(ctx) = DeviceContext::new() else {
+            eprintln!("[device_lora_merge] no CUDA device; skipping");
+            return;
+        };
+
+        // A representative dense projection shape (qkv-ish): rows=out, cols=in,
+        // rank=32. Deterministic pseudo-random A/B/base.
+        let rows = 512usize;
+        let cols = 384usize;
+        let rank = 32usize;
+        let scale = 0.5f32 / rank as f32; // alpha=0.5 / rank
+
+        let prng = |seed: usize| -> f32 {
+            // Cheap deterministic LCG-ish value in [-0.5, 0.5).
+            let x = (seed as u64).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9_7F4A_7C15;
+            ((x >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+
+        let base: Vec<bf16> = (0..rows * cols)
+            .map(|i| bf16::from_f32(prng(i + 1) * 2.0))
+            .collect();
+        let a: Vec<f32> = (0..rank * cols).map(|i| prng(i + 1_000_003)).collect();
+        let b: Vec<f32> = (0..rows * rank).map(|i| prng(i + 7_000_019)).collect();
+
+        let reference = host_merge_reference(&base, &a, &b, rows, cols, rank, scale);
+
+        // --- device path (replicates merge_lora_proj_device) ---
+        // A transposed to [cols, rank] row-major: a_t[c*rank+k] = a[k*cols+c].
+        let mut a_t = vec![bf16::ZERO; cols * rank];
+        for k in 0..rank {
+            for c in 0..cols {
+                a_t[c * rank + k] = bf16::from_f32(a[k * cols + c]);
+            }
+        }
+        let b_host: Vec<bf16> = b.iter().map(|&v| bf16::from_f32(v)).collect();
+
+        let a_t_dev = DeviceVec::from_host(&ctx, &a_t).unwrap();
+        let b_dev = DeviceVec::from_host(&ctx, &b_host).unwrap();
+        let base_dev = DeviceVec::from_host(&ctx, &base).unwrap();
+        let mut delta = DeviceVec::zeros(&ctx, rows * cols).unwrap();
+        let mut out = DeviceMatrix::from_host(&ctx, &base, rows, cols).unwrap();
+
+        crate::ops::lora_device_gemm(
+            &ctx,
+            &a_t_dev.data,
+            &b_dev.data,
+            &mut delta.data,
+            rows,
+            cols,
+            rank,
+        )
+        .unwrap();
+        crate::ops::lora_scaled_add_into(
+            &ctx,
+            &base_dev.data,
+            &delta.data,
+            &mut out.data,
+            rows * cols,
+            scale,
+        )
+        .unwrap();
+        ctx.sync().unwrap();
+
+        let device_merged = ctx.stream.clone_dtoh(&out.data).unwrap();
+        ctx.sync().unwrap();
+        assert_eq!(device_merged.len(), reference.len());
+
+        // Cosine similarity + max-abs-err vs the host reference.
+        let mut dot = 0.0f64;
+        let mut nr = 0.0f64;
+        let mut nd = 0.0f64;
+        let mut max_abs = 0.0f32;
+        for (r, d) in reference.iter().zip(device_merged.iter()) {
+            let rf = r.to_f32();
+            let df = d.to_f32();
+            dot += (rf as f64) * (df as f64);
+            nr += (rf as f64) * (rf as f64);
+            nd += (df as f64) * (df as f64);
+            max_abs = max_abs.max((rf - df).abs());
+        }
+        let cosine = dot / (nr.sqrt() * nd.sqrt());
+        eprintln!(
+            "[device_lora_merge] rows={rows} cols={cols} rank={rank} cosine={cosine:.8} max_abs_err={max_abs:e}"
+        );
+        assert!(
+            cosine >= 0.9999,
+            "device merge cosine {cosine:.8} < 0.9999 (max_abs_err {max_abs:e})"
+        );
+        // BF16 mantissa is 8 bits; a rank-32 reduction lands well within ~1e-2.
+        assert!(
+            max_abs <= 2.0e-2,
+            "device merge max-abs-err {max_abs:e} exceeds BF16 tolerance"
+        );
+    }
+
+    /// Microbench (ignored by default): replay the full per-step all-linear LoRA
+    /// merge at Qwen3.5-4B dense shapes and time host triple-loop vs the
+    /// on-device path. Run with `--ignored --nocapture` on GPU7.
+    #[test]
+    #[ignore = "GPU microbench; run explicitly with --ignored"]
+    fn bench_lora_remerge_host_vs_device() {
+        let Ok(ctx) = DeviceContext::new() else {
+            eprintln!("[lora_remerge_bench] no CUDA device; skipping");
+            return;
+        };
+        let hidden = 2560usize;
+        let rank = 32usize;
+        let scale = 16.0f32 / rank as f32;
+        // Qwen3.5-4B all-linear per-layer projection [out, in] shapes
+        // (full-attn QKVO + linear-attn in/out + dense MLP gate/up/down).
+        let proj_shapes: &[(usize, usize)] = &[
+            (4096, hidden), // q_proj  (32 heads × 128)
+            (1024, hidden), // k_proj  (8  × 128)
+            (1024, hidden), // v_proj
+            (hidden, 4096), // o_proj
+            (hidden, 9216), // mlp.down_proj
+            (9216, hidden), // mlp.gate_proj
+            (9216, hidden), // mlp.up_proj
+        ];
+        let num_layers = 40usize;
+
+        let prng = |seed: usize| -> f32 {
+            let x = (seed as u64).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9_7F4A_7C15;
+            ((x >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+
+        // Pre-stage device base + resident matrices once (the per-step cost is
+        // the merge, not the one-time base capture).
+        struct Proj {
+            rows: usize,
+            cols: usize,
+            base: Vec<bf16>,
+            a: Vec<f32>,
+            b: Vec<f32>,
+            base_dev: DeviceVec,
+            matrix: DeviceMatrix,
+        }
+        let mut projs: Vec<Proj> = Vec::new();
+        for layer in 0..num_layers {
+            for (pi, &(rows, cols)) in proj_shapes.iter().enumerate() {
+                let s = layer * 97 + pi * 13 + 1;
+                let base: Vec<bf16> = (0..rows * cols)
+                    .map(|i| bf16::from_f32(prng(i + s) * 2.0))
+                    .collect();
+                let a: Vec<f32> = (0..rank * cols).map(|i| prng(i + s + 11)).collect();
+                let b: Vec<f32> = (0..rows * rank).map(|i| prng(i + s + 23)).collect();
+                let base_dev = DeviceVec::from_host(&ctx, &base).unwrap();
+                let matrix = DeviceMatrix::from_host(&ctx, &base, rows, cols).unwrap();
+                projs.push(Proj {
+                    rows,
+                    cols,
+                    base,
+                    a,
+                    b,
+                    base_dev,
+                    matrix,
+                });
+            }
+        }
+        let max_n = proj_shapes.iter().map(|(r, c)| r * c).max().unwrap();
+        let mut delta = DeviceVec::zeros(&ctx, max_n).unwrap();
+
+        // --- HOST triple-loop path (the old merge) ---
+        let t0 = std::time::Instant::now();
+        for p in &projs {
+            let mut merged = vec![bf16::ZERO; p.rows * p.cols];
+            for row in 0..p.rows {
+                let b_row = &p.b[row * rank..row * rank + rank];
+                for col in 0..p.cols {
+                    let mut d = 0.0f32;
+                    for (k, &b_rk) in b_row.iter().enumerate() {
+                        d += b_rk * p.a[k * p.cols + col];
+                    }
+                    let idx = row * p.cols + col;
+                    merged[idx] = bf16::from_f32(p.base[idx].to_f32() + scale * d);
+                }
+            }
+            std::hint::black_box(&merged);
+        }
+        let host_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // --- DEVICE path (the new merge) ---
+        ctx.sync().unwrap();
+        let t1 = std::time::Instant::now();
+        for p in &mut projs {
+            let mut a_t = vec![bf16::ZERO; p.cols * rank];
+            for k in 0..rank {
+                for c in 0..p.cols {
+                    a_t[c * rank + k] = bf16::from_f32(p.a[k * p.cols + c]);
+                }
+            }
+            let b_host: Vec<bf16> = p.b.iter().map(|&v| bf16::from_f32(v)).collect();
+            let a_t_dev = DeviceVec::from_host(&ctx, &a_t).unwrap();
+            let b_dev = DeviceVec::from_host(&ctx, &b_host).unwrap();
+            let n = p.rows * p.cols;
+            crate::ops::lora_device_gemm(
+                &ctx,
+                &a_t_dev.data,
+                &b_dev.data,
+                &mut delta.data,
+                p.rows,
+                p.cols,
+                rank,
+            )
+            .unwrap();
+            let delta_view = delta.data.slice(0..n);
+            crate::ops::lora_scaled_add_into(
+                &ctx,
+                &p.base_dev.data,
+                &delta_view,
+                &mut p.matrix.data,
+                n,
+                scale,
+            )
+            .unwrap();
+        }
+        ctx.sync().unwrap();
+        let dev_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        eprintln!(
+            "[lora_remerge_bench] {} projections × {num_layers} layers ({} total)\n\
+             [lora_remerge_bench]   HOST triple-loop: {host_ms:.1} ms\n\
+             [lora_remerge_bench]   DEVICE merge:     {dev_ms:.1} ms\n\
+             [lora_remerge_bench]   speedup:          {:.1}×",
+            proj_shapes.len(),
+            projs.len(),
+            host_ms / dev_ms
         );
     }
 }
