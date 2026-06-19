@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """OPD capability curve — Qwen3.5-4B student distilled from Qwen3.6-35B-A3B teacher.
-MATH-500 greedy exact-match, n=100/point @4096 tokens, 0 request_error (retry-clean eval).
+MATH-500 greedy exact-match @4096 tokens, 0 request_error (retry-clean eval);
+student ckpts n=100/point, anchors base n=40 / teacher n=50.
 Single-seed bring-up run (2026-06-19). Regenerate: python3 docs/assets/plot_opd_capability_curve.py
 """
 import matplotlib
