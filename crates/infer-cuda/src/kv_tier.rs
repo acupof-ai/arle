@@ -1,9 +1,10 @@
 //! Two-level host store for demoted prefix-KV pages.
 //!
-//! T1 is a capacity-capped in-RAM map (default-on, 4 GiB). T2 is an optional
-//! disk spill on the `kv-native-sys` block substrate (`--kv-ssd-path`,
-//! opt-in): when T1 fills, the coldest T1 entry spills to a fingerprint-named
-//! block file, so the capacity the engine sees is T1 + T2. Payloads are full
+//! Host-demoted pages live in a capacity-capped in-RAM map (default-on, 4 GiB).
+//! Disk spill is optional on the `kv-native-sys` block substrate
+//! (`--kv-ssd-path`, opt-in): when host RAM fills, the coldest host entry spills
+//! to a fingerprint-named block file, so the capacity the engine sees is
+//! host-demoted + disk pages. Payloads are full
 //! `PagedKVPool` page images; this module never touches the device.
 
 use std::borrow::Cow;
@@ -60,7 +61,7 @@ fn free_disk_bytes(_path: &Path) -> Option<usize> {
     None
 }
 
-/// Machine-derived T1 (host-RAM) budget for the prefix tier — replaces the
+/// Machine-derived host-RAM budget for demoted prefix pages — replaces the
 /// hardcoded 4 GiB constant. Default-on (ckl 2026-06-11): evicted prefix pages
 /// demote into host RAM and promote back on the next prefix hit instead of
 /// re-prefilling (`--kv-t1-budget-bytes 0` opts out). Probes `MemAvailable`;
@@ -77,7 +78,7 @@ pub(crate) fn default_t1_budget_bytes() -> usize {
     .ram_bytes
 }
 
-/// Machine-derived T2 (SSD spill) budget for the disk tier rooted at `root` —
+/// Machine-derived SSD spill budget for the disk tier rooted at `root` —
 /// replaces the hardcoded 20 GiB constant. Applies when `--kv-ssd-path` is set
 /// without `--kv-ssd-max-bytes`. Probes free disk at the spill path; the
 /// neutral [`split_host_tiers`] policy caps it at the proven 20 GiB and scales
@@ -87,17 +88,18 @@ pub fn default_t2_budget_bytes(root: &Path) -> usize {
 }
 
 pub(crate) struct CudaKvTierStore {
-    t1_capacity_pages: usize,
-    /// T1 entries: key -> touch stamp + page payload.
-    t1: BTreeMap<u64, T1Entry>,
+    host_capacity_pages: usize,
+    bytes_per_page: usize,
+    /// Host-demoted entries: key -> touch stamp + page payload.
+    host: BTreeMap<u64, HostDemotedEntry>,
     /// Ordered by (touch stamp, key) for O(log n) coldest selection.
-    t1_lru: BTreeSet<(u64, u64)>,
+    host_lru: BTreeSet<(u64, u64)>,
     clock: u64,
     disk: Option<DiskTier>,
     read_scratch: Vec<u8>,
 }
 
-struct T1Entry {
+struct HostDemotedEntry {
     stamp: u64,
     payload: Vec<u8>,
 }
@@ -124,18 +126,19 @@ fn fingerprint(key: u64) -> [u8; 16] {
 
 impl CudaKvTierStore {
     pub(crate) fn with_budget(budget_bytes: usize, bytes_per_page: usize) -> Self {
-        let t1_capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
+        let host_capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
         Self {
-            t1_capacity_pages,
-            t1: BTreeMap::new(),
-            t1_lru: BTreeSet::new(),
+            host_capacity_pages,
+            bytes_per_page,
+            host: BTreeMap::new(),
+            host_lru: BTreeSet::new(),
             clock: 0,
             disk: None,
             read_scratch: Vec::new(),
         }
     }
 
-    /// Attach the T2 disk level (opt-in). Pre-serve only.
+    /// Attach the disk spill level (opt-in). Pre-serve only.
     ///
     /// Each serve process gets its own namespace under the operator-provided
     /// root because tier keys are engine-local. Sharing a flat root across two
@@ -150,7 +153,7 @@ impl CudaKvTierStore {
         let root = self.disk_namespace(root);
         if let Err(err) = std::fs::create_dir_all(&root) {
             log::warn!(
-                "KV T2 namespace creation failed under {}: {err}",
+                "KV disk namespace creation failed under {}: {err}",
                 root.display()
             );
             return false;
@@ -175,42 +178,65 @@ impl CudaKvTierStore {
         ))
     }
 
-    /// Total pages the store can hold (T1 + T2) — what the engine budgets
+    /// Total pages the store can hold (host-demoted + disk) — what the engine budgets
     /// demotion against.
     pub(crate) fn capacity_pages(&self) -> usize {
-        self.t1_capacity_pages
+        self.host_capacity_pages
             .saturating_add(self.disk.as_ref().map_or(0, |d| d.capacity_pages))
     }
 
+    pub(crate) fn page_bytes(&self) -> usize {
+        self.bytes_per_page
+    }
+
+    pub(crate) fn host_demoted_pages(&self) -> usize {
+        self.host.len()
+    }
+
+    pub(crate) fn disk_pages(&self) -> usize {
+        self.disk.as_ref().map_or(0, |d| d.keys.len())
+    }
+
+    pub(crate) fn location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        if self.host.contains_key(&key) {
+            return Some(infer_seam::KvTierLocation::HostDemoted);
+        }
+        self.disk.as_ref().and_then(|disk| {
+            disk.keys
+                .contains(&key)
+                .then_some(infer_seam::KvTierLocation::Disk)
+        })
+    }
+
     pub(crate) fn is_full(&self) -> bool {
-        let t1_full = self.t1.len() >= self.t1_capacity_pages;
+        let host_full = self.host.len() >= self.host_capacity_pages;
         let disk_full = self
             .disk
             .as_ref()
             .is_none_or(|d| d.keys.len() >= d.capacity_pages);
-        t1_full && disk_full
+        host_full && disk_full
     }
 
     pub(crate) fn contains(&self, key: u64) -> bool {
-        self.t1.contains_key(&key)
+        self.host.contains_key(&key)
             || self
                 .disk
                 .as_ref()
                 .is_some_and(|disk| disk.keys.contains(&key))
     }
 
-    /// Store a page payload. T1 takes it when it has room; a full (or
-    /// disabled, `--kv-t1-budget-bytes 0`) T1 spills its coldest entry to
-    /// disk — or, with no T1 at all, the payload writes straight to disk.
+    /// Store a page payload. Host RAM takes it when it has room; a full (or
+    /// disabled, `--kv-t1-budget-bytes 0`) host tier spills its coldest entry to
+    /// disk — or, with no host tier at all, the payload writes straight to disk.
     /// Returns `false` (payload dropped) only when no level has room or the
     /// disk write failed.
     pub(crate) fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
-        if self.t1.len() < self.t1_capacity_pages {
-            self.insert_t1(key, payload);
+        if self.host.len() < self.host_capacity_pages {
+            self.insert_host(key, payload);
             return true;
         }
-        if self.t1_capacity_pages > 0 && self.spill_coldest_to_disk() {
-            self.insert_t1(key, payload);
+        if self.host_capacity_pages > 0 && self.spill_coldest_to_disk() {
+            self.insert_host(key, payload);
             return true;
         }
         // Disk-only configuration (or the spill failed): write directly.
@@ -222,12 +248,12 @@ impl CudaKvTierStore {
         self.clock
     }
 
-    fn insert_t1(&mut self, key: u64, payload: Vec<u8>) {
+    fn insert_host(&mut self, key: u64, payload: Vec<u8>) {
         let stamp = self.next_stamp();
-        if let Some(old) = self.t1.insert(key, T1Entry { stamp, payload }) {
-            self.t1_lru.remove(&(old.stamp, key));
+        if let Some(old) = self.host.insert(key, HostDemotedEntry { stamp, payload }) {
+            self.host_lru.remove(&(old.stamp, key));
         }
-        self.t1_lru.insert((stamp, key));
+        self.host_lru.insert((stamp, key));
     }
 
     fn write_to_disk(&mut self, key: u64, payload: &[u8]) -> bool {
@@ -247,7 +273,7 @@ impl CudaKvTierStore {
             }
             Err(err) => {
                 log::warn!(
-                    "KV T2 write failed for key {key} under {}: {err}",
+                    "KV disk write failed for key {key} under {}: {err}",
                     disk.root.display()
                 );
                 false
@@ -256,11 +282,11 @@ impl CudaKvTierStore {
     }
 
     fn spill_coldest_to_disk(&mut self) -> bool {
-        let Some((stamp, key)) = self.t1_lru.iter().next().copied() else {
+        let Some((stamp, key)) = self.host_lru.iter().next().copied() else {
             return false;
         };
-        self.t1_lru.remove(&(stamp, key));
-        let Some(entry) = self.t1.remove(&key) else {
+        self.host_lru.remove(&(stamp, key));
+        let Some(entry) = self.host.remove(&key) else {
             return false;
         };
         debug_assert_eq!(entry.stamp, stamp);
@@ -268,20 +294,20 @@ impl CudaKvTierStore {
             true
         } else {
             // Keep the entry in RAM rather than lose it; report no room.
-            self.t1.insert(key, entry);
-            self.t1_lru.insert((stamp, key));
+            self.host.insert(key, entry);
+            self.host_lru.insert((stamp, key));
             false
         }
     }
 
-    /// Fetch a payload for promotion (T1 hit bumps recency; T2 reads from
+    /// Fetch a payload for promotion (host hit bumps recency; disk reads from
     /// disk without re-warming — the engine drops promoted keys right after).
     pub(crate) fn read(&mut self, key: u64) -> Result<Cow<'_, [u8]>> {
-        if let Some(old_stamp) = self.t1.get(&key).map(|entry| entry.stamp) {
+        if let Some(old_stamp) = self.host.get(&key).map(|entry| entry.stamp) {
             let stamp = self.next_stamp();
-            self.t1_lru.remove(&(old_stamp, key));
-            self.t1_lru.insert((stamp, key));
-            let entry = self.t1.get_mut(&key).expect("key observed above");
+            self.host_lru.remove(&(old_stamp, key));
+            self.host_lru.insert((stamp, key));
+            let entry = self.host.get_mut(&key).expect("key observed above");
             entry.stamp = stamp;
             return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
@@ -294,7 +320,7 @@ impl CudaKvTierStore {
         });
         if let Some(root) = disk_root {
             kv_native_sys::read_block_into_sharded(&root, fingerprint(key), &mut self.read_scratch)
-                .with_context(|| format!("KV T2 read for key {key}"))?;
+                .with_context(|| format!("KV disk read for key {key}"))?;
             return Ok(Cow::Borrowed(self.read_scratch.as_slice()));
         }
         Err(anyhow!("KV tier store has no entry for key {key}"))
@@ -303,8 +329,8 @@ impl CudaKvTierStore {
     /// Drop entries from both levels (disk files unlinked best-effort).
     pub(crate) fn remove(&mut self, keys: &[u64]) {
         for key in keys {
-            if let Some(entry) = self.t1.remove(key) {
-                self.t1_lru.remove(&(entry.stamp, *key));
+            if let Some(entry) = self.host.remove(key) {
+                self.host_lru.remove(&(entry.stamp, *key));
             }
             if let Some(disk) = &mut self.disk {
                 if disk.keys.remove(key) {
@@ -316,8 +342,8 @@ impl CudaKvTierStore {
     }
 
     #[cfg(test)]
-    fn t1_len(&self) -> usize {
-        self.t1.len()
+    fn host_len(&self) -> usize {
+        self.host.len()
     }
 
     #[cfg(test)]
@@ -331,8 +357,8 @@ impl CudaKvTierStore {
     }
 
     #[cfg(test)]
-    fn coldest_t1_key(&self) -> Option<u64> {
-        self.t1_lru.iter().next().map(|(_, key)| *key)
+    fn coldest_host_key(&self) -> Option<u64> {
+        self.host_lru.iter().next().map(|(_, key)| *key)
     }
 
     #[cfg(test)]
@@ -360,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn t1_only_store_caps_at_budget() {
+    fn host_only_store_caps_at_budget() {
         // 2 pages of 8 bytes.
         let mut store = CudaKvTierStore::with_budget(16, 8);
         assert_eq!(store.capacity_pages(), 2);
@@ -368,11 +394,11 @@ mod tests {
         assert!(store.insert(2, vec![2; 8]));
         assert!(store.is_full());
         assert!(!store.insert(3, vec![3; 8]), "no disk level: reject");
-        assert_eq!(store.read(1).expect("t1 read").as_ref(), &[1u8; 8]);
+        assert_eq!(store.read(1).expect("host read").as_ref(), &[1u8; 8]);
     }
 
     #[test]
-    fn t1_overflow_spills_coldest_to_disk_and_reads_back() {
+    fn host_overflow_spills_coldest_to_disk_and_reads_back() {
         let root = temp_root("spill");
         let mut store = CudaKvTierStore::with_budget(16, 8);
         assert!(store.set_disk(root.clone(), 32, 8));
@@ -380,12 +406,12 @@ mod tests {
 
         assert!(store.insert(1, vec![1; 8]));
         assert!(store.insert(2, vec![2; 8]));
-        assert_eq!(store.coldest_t1_key(), Some(1));
+        assert_eq!(store.coldest_host_key(), Some(1));
         // Touch key 1 so key 2 is the coldest when 3 arrives.
         store.read(1).expect("touch");
-        assert_eq!(store.coldest_t1_key(), Some(2));
+        assert_eq!(store.coldest_host_key(), Some(2));
         assert!(store.insert(3, vec![3; 8]));
-        assert_eq!(store.t1_len(), 2);
+        assert_eq!(store.host_len(), 2);
         assert_eq!(store.disk_len(), 1, "coldest entry spilled");
 
         // The spilled entry reads back from disk byte-identical.
@@ -452,14 +478,14 @@ mod tests {
 
     #[test]
     fn disk_only_config_writes_straight_to_disk() {
-        // --kv-t1-budget-bytes 0 --kv-ssd-path ...: T1 disabled, disk active.
+        // --kv-t1-budget-bytes 0 --kv-ssd-path ...: host tier disabled, disk active.
         let root = temp_root("disk_only");
         let mut store = CudaKvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 16, 8));
         assert_eq!(store.capacity_pages(), 2);
 
         assert!(store.insert(1, vec![1; 8]), "insert lands on disk");
-        assert_eq!(store.t1_len(), 0);
+        assert_eq!(store.host_len(), 0);
         assert_eq!(store.disk_len(), 1);
         assert_eq!(store.read(1).expect("disk read").as_ref(), &[1u8; 8]);
         assert!(store.insert(2, vec![2; 8]));
@@ -526,23 +552,23 @@ mod tests {
     const GIB: usize = 1 << 30;
 
     #[test]
-    fn t1_default_budget_within_policy_envelope() {
+    fn host_default_budget_within_policy_envelope() {
         // Probe miss (Mac) → 4 GiB cap; Linux MemAvailable → clamp(avail×0.25,
         // 1 GiB floor, 4 GiB cap). Either way: floored at 1 GiB, capped at 4 GiB.
         let b = default_t1_budget_bytes();
         assert!(
             (GIB..=4 * GIB).contains(&b),
-            "T1 budget {b} outside [1 GiB, 4 GiB]"
+            "host-demoted budget {b} outside [1 GiB, 4 GiB]"
         );
     }
 
     #[test]
-    fn t2_default_budget_capped_at_proven_constant() {
+    fn disk_default_budget_capped_at_proven_constant() {
         // statvfs on a real temp dir (or probe-miss fallback) → never exceeds
         // the proven 20 GiB cap.
-        let root = temp_root("t2_probe");
+        let root = temp_root("disk_probe");
         let b = default_t2_budget_bytes(&root);
-        assert!(b <= 20 * GIB, "T2 budget {b} exceeds 20 GiB cap");
+        assert!(b <= 20 * GIB, "disk budget {b} exceeds 20 GiB cap");
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 

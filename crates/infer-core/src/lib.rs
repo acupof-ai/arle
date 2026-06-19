@@ -150,7 +150,7 @@ pub struct ThroughputStats {
     pub requests_completed: u64,
 }
 
-/// KV host-tier (T1 DRAM) counters maintained by the backend-neutral
+/// KV host-demoted counters maintained by the backend-neutral
 /// scheduler. All zero unless the executor reports a nonzero
 /// [`infer_seam::BackendExecutor::kv_tier_capacity_pages`] (page route) or
 /// [`infer_seam::BackendExecutor::kv_slot_tier_enabled`] (whole-slot route).
@@ -170,6 +170,29 @@ pub struct KvTierStats {
     pub promoted_slots: u64,
     /// Whole-slot restore failures that fell back to recompute.
     pub slot_promote_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvSystemMetrics {
+    pub resident_pages: usize,
+    pub resident_evictable_pages: usize,
+    pub host_demoted_pages: usize,
+    pub host_demoted_pending_inflight: usize,
+    pub disk_pages: usize,
+    pub reuse_hit_resident: u64,
+    pub reuse_hit_host_demoted: u64,
+    pub reuse_hit_disk: u64,
+    pub reuse_miss: u64,
+    pub demote_mset_count: u64,
+    pub demote_mset_copy_bytes: u64,
+    pub demote_mset_copy_ms: u64,
+    pub promote_mget_count: u64,
+    pub promote_mget_copy_bytes: u64,
+    pub promote_mget_copy_ms: u64,
+    pub fetch_wait_ms: u64,
+    pub fallback_recompute: u64,
+    pub prefix_match_full_blocks: u64,
+    pub prefix_match_clamped_blocks: u64,
 }
 
 /// Prefix-cache counters maintained by the backend-neutral scheduler.
@@ -324,6 +347,7 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     prefix_cache_stats: PrefixCacheStats,
     throughput_stats: ThroughputStats,
     kv_tier_stats: KvTierStats,
+    kv_system_metrics: KvSystemMetrics,
     /// Next backend tier-store key; monotonically burned (failures included).
     next_tier_key: u64,
     /// Optional per-token observer invoked as each token is committed to a
@@ -385,6 +409,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prefix_cache_stats: PrefixCacheStats::default(),
             throughput_stats: ThroughputStats::default(),
             kv_tier_stats: KvTierStats::default(),
+            kv_system_metrics: KvSystemMetrics::default(),
             next_tier_key: 0,
             on_token: None,
         }
@@ -642,6 +667,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         stats
     }
 
+    #[must_use]
+    pub fn kv_system_metrics(&self) -> KvSystemMetrics {
+        let mut metrics = self.kv_system_metrics;
+        metrics.resident_pages = self.kv.resident_pages();
+        metrics.resident_evictable_pages = self.kv.resident_evictable_pages();
+        metrics.host_demoted_pages = self.executor.kv_tier_host_demoted_pages();
+        metrics.host_demoted_pending_inflight = 0;
+        metrics.disk_pages = self.executor.kv_tier_disk_pages();
+        metrics
+    }
+
     /// Return a completed request by handle.
     #[must_use]
     pub fn completed(&self, handle: RequestHandle) -> Option<&CompletedRequest> {
@@ -821,6 +857,31 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.completed.insert(request.handle, request.into());
     }
 
+    fn record_attached_prefix_metrics(&mut self, attached_pages: usize) {
+        if !self.config.enable_prefix_cache {
+            return;
+        }
+        if attached_pages == 0 {
+            self.kv_system_metrics.reuse_miss = self.kv_system_metrics.reuse_miss.saturating_add(1);
+            return;
+        }
+        let pages = attached_pages as u64;
+        self.kv_system_metrics.prefix_match_full_blocks = self
+            .kv_system_metrics
+            .prefix_match_full_blocks
+            .saturating_add(pages);
+        self.kv_system_metrics.prefix_match_clamped_blocks = self
+            .kv_system_metrics
+            .prefix_match_clamped_blocks
+            .saturating_add(pages);
+        if self.kv_tier_capacity() == 0 {
+            self.kv_system_metrics.reuse_hit_resident = self
+                .kv_system_metrics
+                .reuse_hit_resident
+                .saturating_add(pages);
+        }
+    }
+
     fn admit_waiting(&mut self) -> Result<()> {
         match self.governor.admission_gate() {
             AdmissionVerdict::Admit | AdmissionVerdict::ShedTo(_) => {}
@@ -892,6 +953,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     PrefixMatch::empty()
                 };
                 self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
+                self.record_attached_prefix_metrics(request.reused_prefix_pages.len());
             }
 
             remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
@@ -1157,6 +1219,20 @@ mod testing {
                 })
                 .sum::<usize>();
             self.free_pages.len() * self.page_size + partial_capacity
+        }
+
+        fn resident_pages(&self) -> usize {
+            self.total_pages.saturating_sub(self.free_pages.len())
+        }
+
+        fn resident_evictable_pages(&self) -> usize {
+            self.page_ref_counts
+                .iter()
+                .filter(|entry| {
+                    let (page, count) = *entry;
+                    *count > 0 && self.page_attach_counts.get(page).copied().unwrap_or(0) == 0
+                })
+                .count()
         }
 
         fn seq_len(&self, slot: usize) -> usize {
@@ -1781,6 +1857,8 @@ mod testing {
         capacity: usize,
         pub(super) store: BTreeMap<u64, u32>,
         pub(super) dropped: Vec<u64>,
+        pub(super) demote_batches: Vec<usize>,
+        pub(super) promote_batches: Vec<usize>,
         fail_promotes: bool,
         pub(super) max_reuse_blocks: Option<usize>,
     }
@@ -1792,6 +1870,8 @@ mod testing {
                 capacity,
                 store: BTreeMap::new(),
                 dropped: Vec::new(),
+                demote_batches: Vec::new(),
+                promote_batches: Vec::new(),
                 fail_promotes: false,
                 max_reuse_blocks: None,
             }
@@ -1820,6 +1900,20 @@ mod testing {
             self.capacity
         }
 
+        fn kv_tier_page_bytes(&self) -> usize {
+            16
+        }
+
+        fn kv_tier_host_demoted_pages(&self) -> usize {
+            self.store.len()
+        }
+
+        fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+            self.store
+                .contains_key(&key)
+                .then_some(infer_seam::KvTierLocation::HostDemoted)
+        }
+
         fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
             let reusable =
                 pages_only_reusable_prefix_blocks(blocks, |key| self.store.contains_key(&key));
@@ -1828,6 +1922,7 @@ mod testing {
         }
 
         fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
+            self.demote_batches.push(entries.len());
             let mut accepted = 0;
             for &(page, key) in entries {
                 if self.store.len() >= self.capacity {
@@ -1840,6 +1935,7 @@ mod testing {
         }
 
         fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
+            self.promote_batches.push(entries.len());
             if self.fail_promotes {
                 bail!("mock promote failure");
             }
@@ -2218,6 +2314,10 @@ mod tests {
         assert!(tier.promote_failures >= 1, "failure counted: {tier:?}");
         assert_eq!(tier.promoted_pages, 0);
         assert!(
+            engine.kv_system_metrics().fallback_recompute >= 1,
+            "failed promote should count recompute fallback"
+        );
+        assert!(
             engine.executor.dropped.contains(&0),
             "failed tier entry dropped: {:?}",
             engine.executor.dropped
@@ -2295,12 +2395,28 @@ mod tests {
             tier.demoted_pages, 2,
             "both sealed prompt blocks swapped to the host tier: {tier:?}"
         );
+        assert!(
+            engine.executor.demote_batches.iter().any(|&n| n == 2),
+            "prompt pages should demote through one mset batch: {:?}",
+            engine.executor.demote_batches
+        );
 
         // Re-admission promotes the prompt back instead of re-prefilling.
         engine.run_to_idle()?;
         assert_finished(engine.completed(handle).expect("completed"));
         let tier = engine.kv_tier_stats();
         assert!(tier.promoted_pages >= 2, "prompt promoted back: {tier:?}");
+        let kv_system = engine.kv_system_metrics();
+        assert!(kv_system.demote_mset_count >= 1, "{kv_system:?}");
+        assert!(kv_system.demote_mset_copy_bytes >= 32, "{kv_system:?}");
+        assert!(kv_system.promote_mget_count >= 1, "{kv_system:?}");
+        assert!(kv_system.promote_mget_copy_bytes >= 32, "{kv_system:?}");
+        assert!(kv_system.reuse_hit_host_demoted >= 1, "{kv_system:?}");
+        assert!(
+            engine.executor.promote_batches.iter().any(|&n| n == 2),
+            "prompt pages should promote through one mget batch: {:?}",
+            engine.executor.promote_batches
+        );
         assert!(engine.prefix_cache_stats().hits >= 1);
         Ok(())
     }
@@ -2978,6 +3094,10 @@ mod tests {
         assert_eq!(engine.prefix_cache_stats().lookups, 1);
         assert_eq!(engine.prefix_cache_stats().hits, 0);
         assert_eq!(engine.prefix_cache_stats().published_pages, 1);
+        assert!(
+            engine.kv_system_metrics().resident_pages > 0,
+            "published prefix page should stay resident"
+        );
 
         let hit = engine.radix.peek_longest_prefix_match(&[1, 2, 3, 4]);
         assert_eq!(hit.matched_len, 4);
@@ -3003,6 +3123,11 @@ mod tests {
         assert_eq!(stats.hit_tokens, 4);
         assert_eq!(stats.hit_pages, 1);
         assert_eq!(stats.cached_pages, 1);
+        let kv_system = engine.kv_system_metrics();
+        assert_eq!(kv_system.reuse_hit_resident, 1, "{kv_system:?}");
+        assert_eq!(kv_system.prefix_match_full_blocks, 1, "{kv_system:?}");
+        assert_eq!(kv_system.prefix_match_clamped_blocks, 1, "{kv_system:?}");
+        assert!(kv_system.resident_pages > 0, "{kv_system:?}");
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(second).expect("second completed"));

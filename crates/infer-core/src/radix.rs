@@ -265,6 +265,34 @@ impl RadixCache {
             .and_then(|idx| self.nodes[idx].page_id)
     }
 
+    #[must_use]
+    pub fn evictable_page_count(&self) -> usize {
+        (1..self.nodes.len())
+            .filter(|&idx| self.is_evictable_leaf(idx))
+            .count()
+    }
+
+    /// Return up to `limit` currently evictable resident pages in LRU order.
+    ///
+    /// This is a snapshot of the current frontier. Demoting a child can expose
+    /// its parent as a new frontier node, so callers that need more pages should
+    /// re-query after each accepted batch.
+    #[must_use]
+    pub fn lru_evictable_pages(&self, limit: usize) -> Vec<BlockId> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut pages =
+            self.evictable_pages_where(limit, |cache, idx| cache.is_strict_evictable_leaf(idx));
+        if pages.len() < limit {
+            let remaining = limit - pages.len();
+            pages.extend(self.evictable_pages_where(remaining, |cache, idx| {
+                cache.is_evictable_leaf(idx) && !cache.is_strict_evictable_leaf(idx)
+            }));
+        }
+        pages
+    }
+
     /// Peek the tier key of the least-recently-used demoted block whose
     /// subtree holds no resident pages (safe to sever for tier-store room).
     #[must_use]
@@ -471,6 +499,27 @@ impl RadixCache {
                     .filter(|&idx| self.is_evictable_leaf(idx))
                     .min_by_key(|&idx| self.nodes[idx].last_access)
             })
+    }
+
+    fn evictable_pages_where(
+        &self,
+        limit: usize,
+        predicate: impl Fn(&Self, usize) -> bool,
+    ) -> Vec<BlockId> {
+        let mut candidates: Vec<_> = (1..self.nodes.len())
+            .filter(|&idx| predicate(self, idx))
+            .filter_map(|idx| {
+                self.nodes[idx]
+                    .page_id
+                    .map(|page| (self.nodes[idx].last_access, page))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(last_access, _)| last_access);
+        candidates
+            .into_iter()
+            .take(limit)
+            .map(|(_, page)| page)
+            .collect()
     }
 
     fn tick(&mut self) -> u64 {

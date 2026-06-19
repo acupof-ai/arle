@@ -554,6 +554,35 @@ impl BackendExecutor for MetalExecutor {
         0
     }
 
+    fn kv_tier_page_bytes(&self) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.kv_tier_page_bytes();
+        }
+        0
+    }
+
+    fn kv_tier_transfer_is_zero_copy(&self) -> bool {
+        true
+    }
+
+    fn kv_tier_disk_pages(&self) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.kv_tier_disk_pages();
+        }
+        0
+    }
+
+    fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.kv_tier_location(key);
+        }
+        let _ = key;
+        None
+    }
+
     fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_mut() {
@@ -1376,6 +1405,7 @@ struct MetalDiskRecord {
 struct MetalSsdTier {
     root: PathBuf,
     budget_bytes: usize,
+    bytes_per_page: usize,
     capacity_pages: usize,
     used_bytes: usize,
     clock: u64,
@@ -1410,6 +1440,7 @@ impl MetalSsdTier {
         Some(Self {
             root,
             budget_bytes,
+            bytes_per_page,
             capacity_pages,
             used_bytes: 0,
             clock: 0,
@@ -1891,6 +1922,22 @@ impl MetalPageStore {
 
     fn kv_tier_capacity_pages(&self) -> usize {
         self.ssd.as_ref().map_or(0, |ssd| ssd.capacity_pages)
+    }
+
+    fn kv_tier_page_bytes(&self) -> usize {
+        self.ssd.as_ref().map_or(0, |ssd| ssd.bytes_per_page)
+    }
+
+    fn kv_tier_disk_pages(&self) -> usize {
+        self.ssd.as_ref().map_or(0, |ssd| ssd.tier_to_logical.len())
+    }
+
+    fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+        self.ssd.as_ref().and_then(|ssd| {
+            ssd.tier_to_logical
+                .contains_key(&key)
+                .then_some(infer_seam::KvTierLocation::Disk)
+        })
     }
 
     /// Largest leading block count for which Metal has a complete restore
