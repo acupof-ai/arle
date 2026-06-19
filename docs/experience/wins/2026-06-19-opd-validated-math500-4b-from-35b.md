@@ -8,17 +8,23 @@ ARLE's own serving runtime (`--teacher-runtime infer`). MATH-500 greedy
 exact-match, max_tokens=4096, single-seed bring-up.
 
 ## What Worked
-Capability curve (n=100/point, retry-clean, **0 request_error**):
+Capability curve (student ckpts n=100, anchors base n=40 / teacher n=50; retry-clean, **0 request_error**):
 
-| point | MATH-500 acc | CI95 |
-|---|---|---|
-| base 4B (step 0) | 0.60 | — |
-| fwd-KL @ step25 | 0.78 | [0.689, 0.850] |
-| fwd-KL @ step50 | 0.80 | [0.711, 0.867] |
-| fwd-KL @ step75 | 0.77 | [0.678, 0.842] |
-| reverse-KL @ step25 | 0.78 | [0.689, 0.850] |
-| reverse-KL @ step50 | 0.75 | [0.657, 0.825] |
-| teacher 35B (ceiling) | 0.82 | [0.69, 0.90] |
+| point | MATH-500 acc | n | CI95 |
+|---|---|---|---|
+| base 4B (step 0) | 0.60 | 40 | [0.45, 0.74] |
+| fwd-KL @ step25 | 0.78 | 100 | [0.689, 0.850] |
+| fwd-KL @ step50 | 0.80 | 100 | [0.711, 0.867] |
+| fwd-KL @ step75 | 0.77 | 100 | [0.678, 0.842] |
+| reverse-KL @ step25 | 0.78 | 100 | [0.689, 0.850] |
+| reverse-KL @ step50 | 0.75 | 100 | [0.657, 0.825] |
+| teacher 35B (ceiling) | 0.82 | 50 | [0.69, 0.90] |
+
+(Anchors are smaller-n than the student ckpts — base n=40, teacher n=50 — a
+known imprecision; the multi-seed run re-measures both at full n. The
+base/teacher CIs are wide enough that they overlap the student points' CIs at
+the edges, so "82% gap-closed" is a point-estimate headline, not yet a
+CI-separated claim. See caveats.)
 
 **0.60 → 0.78 = ~82% of the base→teacher gap closed in 25 OPD steps** — STRONG /
 SOTA-magnitude (the ≥0.71 bar). Curve plotted on the README
