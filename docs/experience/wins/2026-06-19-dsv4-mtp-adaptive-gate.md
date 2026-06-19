@@ -38,21 +38,44 @@ speed on typical prompts while keeping the MTP win on predictable text.
 Verified locally: Mac CUDA-Rust typecheck (`cuda,no-cuda`) clean; `cargo fmt`
 clean; unit test compiles (link needs CUDA → runs on pod/CI).
 
-## Results
+## Results — MEASURED on pod (2026-06-20, TP4 GPUs 0-3, 6 prompts ×2, best-of)
 
-**PENDING-REMOTE.** Pod A/B owed (same-binary, same-prompt, two env flips):
-1. Calibrate `MIN_ACCEPT` so the gate's emit/step ≥ no-spec on a *typical* SLO
-   prompt (not a counting smoke shape) — sweep 0.45–0.65.
-2. License gate-on as default only if: typical prompt ≈ no-spec (regression
-   gone) AND predictable prompt keeps the MTP win AND needle gate passes. Then
-   flip `--spec-type` default → MTP **together with** the gate default-on (the
-   held `cli/serve.rs` Auto→MTP flip stays uncommitted until this passes).
+| prompt | no-spec tok/s | MTP tok/s | accept | Δ |
+|--------|---------------|-----------|--------|---|
+| prose | 39.00 | 38.27 | 0.581 | −1.9% |
+| explain | 38.62 | 36.79 | 0.549 | −4.7% |
+| code | 38.30 | 39.29 | 0.638 | +2.6% |
+| reason | 38.64 | 39.06 | 0.618 | +1.1% |
+| list | 38.57 | 38.43 | 0.599 | −0.4% |
+| counting | 38.22 | 34.99 | 0.504 | −8.4% |
 
-## Problems / Learnings
+Gate@0.55 (separate 3-config run): pulled both a prose essay (raw MTP 42.26) and
+counting (raw MTP 35.11) to ~37 — i.e. it gave up MTP's win and only partly
+recovered the loss. **Net-negative / misfires.**
 
-- MTP-default-on is NOT licensed by a counting-shape sweep (44 t/s peak) — that's
-  a smoke shape; the SLO workload (typical chat, ~38% accept) is where it
-  regresses. SLO verdict from the SLO workload.
-- The gate is the responsible answer to the acceptance cap; the *other* path to
-  raw B=1 speed (55 t/s) needs a 2-head MTP draft head (training, out of
-  inference scope) — see `errors/2026-06-19-dsv4-b1-foundation-lever-search-exhausted.md`.
+## Verdict — DROP the gate, do NOT flip MTP default-on (1-head MTP is a wash)
+
+The load-bearing fact: **1-head MTP's break-even is ~0.59 acceptance, which sits
+dead in the middle of the natural-text acceptance distribution (0.55–0.64).** So
+MTP is structurally a wash (±5%) on natural text and a loss on low-acceptance
+content (counting 0.50). The pre-compaction "−13% typical" and the single-essay
+"+10.7%" were both prompt-specific outliers; the controlled 6-prompt run shows
+near-break-even. A gate cannot turn a wash into a win — and ours misfires.
+
+Decisions: (1) the held `spec_type Auto→MTP` default flip is DROPPED (keep MTP
+opt-in via explicit `--spec-type mtp` / `ARLE_DSV4_SPEC_DECODE=1`). (2) The gate
+code stays as a default-off opt-in (harmless, revisit only with a higher-
+acceptance draft head). (3) "投机解码默认好用" with the current head is NOT
+achievable by tuning — it needs a **2-head MTP draft head** to push acceptance
+clear of ~0.59 (training, out of inference scope) — see
+`errors/2026-06-19-dsv4-b1-foundation-lever-search-exhausted.md`.
+
+## Learnings
+
+- A decoding-default verdict needs the acceptance DISTRIBUTION, not one prompt:
+  MTP tok/s swung −8% to +11% across prompts; single-prompt A/Bs (both the −13%
+  and the +10.7%) were outliers that would have mis-set the default either way.
+- The break-even ACCEPTANCE (not tok/s) is the invariant to reason from: with
+  break-even ~0.59 inside the 0.55–0.64 natural-text band, no threshold gate
+  helps materially. Effects are <5pp → a firm ship/no-ship still wants multi-seed,
+  but the acceptance-physics verdict (wash) is already solid.

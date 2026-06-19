@@ -1,4 +1,4 @@
-# WS2 KV reuse-metric "fix" (a45f3a29) is ineffective for DSv4 — reuse is real (49×) but counters still read all-miss
+# WS2 KV reuse-metric "fix" (a45f3a29) is ineffective for DSv4 — reuse is real (~14×, after separating ~17s one-time warmup) but counters still read all-miss
 
 ## Context
 
@@ -15,34 +15,48 @@ the corrected counters still read all-miss. The L1/L2/L3 → self-documenting
 RENAME (a45f3a29) is correct and live in `/v1/stats` (names confirmed); the
 reuse-metric MIS-CLASSIFICATION is NOT fixed for DSv4.
 
-## Root Cause (measured, not yet code-traced)
+## Root Cause — REFINED by a 3-prefix control (2026-06-20)
 
-a45f3a29 hooked `record_attached_prefix_metrics` (infer-core/src/lib.rs:957) on
-the generic admit/attach path, incrementing `reuse_hit_resident` only when
-`reused_prefix_pages.len() >= 1`, and wired `resident_pages` to the
-`HostPagedKvPool` occupancy. DSv4's 49× reuse demonstrably takes a path that
-leaves `reused_prefix_pages` empty at that hook, and `resident_pages` reads a
-pool DSv4 does not populate (DSv4 uses `Dsv4KvAdapter` per-slot KV, not
-`HostPagedKvPool`). So the hook fires `reuse_miss` every request despite the
-real prefix-cache hit. The agent's fix was callgraph-inference-based and never
-pod-verified; measurement refutes it.
+The first "49×" conflated two effects. A decisive control — prefix A twice, then
+a DIFFERENT same-length prefix B — separates them:
+
+```
+A_cold=22.90s  A_warm=0.40s  B_diff=5.64s
+```
+
+- **One-time warmup ≈ 17s** = A_cold − B_diff (DeepGEMM JIT + CUDA-graph capture
+  for the prefill shape; paid once, not per request).
+- **Real prefix reuse ≈ 14×** = B_diff (5.64s, different prefix, full prefill) vs
+  A_warm (0.40s, identical prefix, prefill SKIPPED). An identical prefix
+  genuinely skips the ~5.6s prefill — reuse EXISTS.
+
+So both my first claim ("49× reuse") and the re-fix agent's counter-claim
+("zero reuse, all warmup") were partly wrong. The agent correctly traced that the
+RADIX path is off for DSv4 (`reusable_prefix_blocks` returns 0 at
+`infer-cuda/src/executor.rs:302`, radix trie never populated) — but wrongly
+concluded "re-prefills every request", which A_warm=0.40s refutes. DSv4 reuses
+via a NON-radix path (slot-level: the slot that served A_cold still holds its KV;
+an identical next prompt matches and skips prefill). a45f3a29 (radix attach) and
+the agent's swap-restore counter BOTH hook the wrong path → `reuse_miss` every
+request despite the real ~14× hit. `resident_pages=0` is a sampling artifact
+(`/v1/stats` read after the slot freed).
 
 ## Fix
 
-RE-OPEN WS2. Find the ACTUAL DSv4 prefix-reuse decision (the RadixCache token-
-match that yields the 49× prefill skip) and increment the reuse-hit +
-`prefix_match_full_blocks` counters THERE; wire `resident_pages` to DSv4's real
-resident KV occupancy (the `Dsv4KvAdapter` / slot pool), not `HostPagedKvPool`.
-Re-verify on the pod with the same `reuse_timing.py` until a 49× warm request
-shows `reuse_hit_resident >= 1` + `prefix_match_full_blocks > 0` +
-`resident_pages > 0`. The RENAME stays; only the metric wiring is wrong.
+WS2 STILL OPEN. The counter must hook the SLOT-LEVEL prefix-match (the path that
+makes A_warm skip prefill), not radix-attach nor swap-restore. Find where the
+DSv4 decode/admit path detects "this prompt's prefix matches the slot's resident
+KV → skip prefill" and increment reuse_hit_resident + prefix_match_full_blocks
+there. Re-verify with the 3-prefix control: A_warm must show the hit, B_diff must
+NOT (it's a genuine miss). DEFERRED as lower priority: reuse is functional (~14×),
+the bug is cosmetic (monitoring under-reports); the perf headline (MTP) took
+priority. The RENAME stays correct.
 
 ## Rule
 
-Pod-VERIFY a metric fix by MEASURING both the underlying behavior (here: the
-49× reuse timing) AND the counter side-by-side — never claim a metric fix from
-callgraph inference. A counter that reads "all-miss" while the behavior it
-counts is 49× live is the loudest possible "your hook is on the wrong path"
-signal; the in-process unit tests (58 green) passed precisely because they
-exercised the wrong path too. §0: measurement is evidence; the admit/attach
-callgraph was hypothesis.
+A single cold-vs-warm ratio conflates one-time warmup with per-request reuse —
+add a DIFFERENT-input control (B_diff) to separate them before attributing the
+speedup. Here it converted "49× reuse" / "0× reuse (all warmup)" into the true
+"~17s one-time warmup + ~14× genuine reuse." §0: even a measurement needs the
+right control; a 2-point cold/warm comparison is a confounded measurement, not
+ground truth.
