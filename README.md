@@ -93,12 +93,12 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 </p>
 <p align="center"><sub>DSv4 B=1 decode, <b>33.5 → 53.3 tok/s</b> across the 2026-06-13 → 06-14 campaign — every step traced to a <code>docs/experience/wins/</code> entry.</sub></p>
 
-**On-Policy Distillation — does it actually lift the student?** A Qwen3.5-4B LoRA student, distilled on its *own* rollouts against the Qwen3.6-35B-A3B teacher (the teacher runs on the same serving runtime), closes **~82% of the base→teacher MATH-500 gap in 25 steps** — base **0.60 → 0.78**, reaching the 35B teacher's neighborhood (**0.82**):
+**On-Policy Distillation — does it actually lift the student?** A Qwen3.5-4B LoRA student, distilled on its *own* rollouts against the Qwen3.6-35B-A3B teacher (the teacher runs on the same serving runtime), lifts MATH-500 from **0.518 → 0.792** — **+27pp, CI-separated** — locked across **5 seeds × 3 recipe arms** (reverse-KL wins), reaching the 35B teacher's neighborhood (**0.82**):
 
 <p align="center">
-  <img src="docs/assets/opd-capability-curve.png" alt="OPD capability curve: Qwen3.5-4B student lifts from 0.60 to ~0.78 MATH-500 accuracy in 25 OPD steps, approaching the 35B teacher's 0.82" width="660">
+  <img src="docs/assets/opd-multiseed-curve.png" alt="OPD multi-seed lock: Qwen3.5-4B student lifts from 0.518 to 0.792 MATH-500 accuracy (reverse-KL best across 5 seeds), approaching the 35B teacher's 0.82" width="680">
 </p>
-<p align="center"><sub>MATH-500 greedy exact-match @4096 tokens, 0 request-error · student ckpts n=100/point, anchors base n=40 / teacher n=50 · single-seed bring-up 2026-06-19 · error bars = Wilson 95% CI · forward-KL and reverse-KL arms (multi-seed differentiation pending).</sub></p>
+<p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, step50 · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
 
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash: bit-identical spec decode) · OPD train **Beta** (2.5–2.9× vs HF TRL `GKDTrainer`, LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
