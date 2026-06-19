@@ -295,6 +295,97 @@ pub(crate) fn silu_mul(
     Ok(())
 }
 
+/// On-device LoRA delta GEMM: `out = B · A` where `B` is `[rows, rank]` and
+/// `A` is `[rank, cols]`, producing `out` as a flat `[rows, cols]` **row-major**
+/// buffer (the same layout as a dense `DeviceMatrix.data`).
+///
+/// `gemm_cuda` computes `Y[M,N] col-major = W[M,K] row-major · X[K,N] col-major`.
+/// Mapping `M=cols, N=rows, K=rank` makes `Y` col-major `[cols, rows]` byte-
+/// identical to `out` row-major `[rows, cols]`, with `Y[c,r] = Σ_k W[c,k]·X[k,r]`.
+/// To get `Σ_k B[r,k]·A[k,c]` the caller must pass:
+///
+/// - `a_t` = transpose of `A`, i.e. `[cols, rank]` row-major (`W[c,k]=A[k,c]`);
+/// - `b`   = `B` `[rows, rank]` row-major as-is (col-major `X[k,r]=B[r,k]`).
+///
+/// `out` must hold at least `rows*cols` elements (only the first `rows*cols` are
+/// written). Generic over the buffer view so a reused (over-sized) scratch slice
+/// works without a copy.
+pub(crate) fn lora_device_gemm<A, B, O>(
+    ctx: &DeviceContext,
+    a_t: &A,
+    b: &B,
+    out: &mut O,
+    rows: usize,
+    cols: usize,
+    rank: usize,
+) -> Result<()>
+where
+    A: DevicePtr<bf16>,
+    B: DevicePtr<bf16>,
+    O: DevicePtrMut<bf16>,
+{
+    let (w_ptr, _gw) = a_t.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = b.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::gemm_cuda(
+            w_ptr as *const ffi::Half,
+            x_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            cols as i32,
+            rows as i32,
+            rank as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// In-place full-buffer scaled add over the first `n` elements:
+/// `out[i] = base[i] + scale·delta[i]`. `base` (len == `n`) is first copied into
+/// `out` (len == `n`) device→device, then the `add_scaled_row` kernel folds in
+/// `scale·delta` over the buffer treated as a single row of `hidden_dim = n`.
+/// Used for the device LoRA merge `W = base + scale·(B·A)`. `delta` is generic
+/// over the buffer view so a reused (over-sized) scratch slice works; only its
+/// first `n` elements are read.
+pub(crate) fn lora_scaled_add_into<D>(
+    ctx: &DeviceContext,
+    base: &CudaSlice<bf16>,
+    delta: &D,
+    out: &mut CudaSlice<bf16>,
+    n: usize,
+    scale: f32,
+) -> Result<()>
+where
+    D: DevicePtr<bf16>,
+{
+    ensure!(
+        base.len() == n && out.len() == n,
+        "lora_scaled_add_into: len mismatch base {} out {} n {}",
+        base.len(),
+        out.len(),
+        n
+    );
+    ctx.stream
+        .memcpy_dtod(base, out)
+        .map_err(|e| anyhow!("lora_scaled_add_into: base D2D copy failed: {e}"))?;
+    let (delta_ptr, _gd) = delta.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::add_scaled_row_cuda(
+            delta_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            0,
+            scale,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn copy_row_to_vec(
     ctx: &DeviceContext,
     batch: &HiddenStates,
