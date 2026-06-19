@@ -45,15 +45,6 @@ const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
 static DSV4_FLASHMLA_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 static DSV4_FUSED_WQKV_DECODE_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
 
-/// Batched (`b = N`) FlashMLA sparse decode lane (#60, the #1 concurrency
-/// lever). Default ON since 2026-06-15; opt out with
-/// `ARLE_DSV4_FLASHMLA_DECODE_BATCHED=0`. The n>1 lane routes attention through
-/// ONE `sparse_decode_fwd(b=N)` over the shared KV pool (the per-row pack ops
-/// stay a loop — each writes one slot's KV into the unified pool); the per-row
-/// `try_flashmla_decode_attention` loop remains the opt-out reference. N=1 is
-/// unaffected (always the cached-meta single-row path).
-static DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE: AtomicI8 = AtomicI8::new(DSV4_FLASHMLA_OVERRIDE_ENV);
-
 pub(crate) fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
     let value = match enabled {
         Some(true) => DSV4_FLASHMLA_OVERRIDE_ON,
@@ -341,11 +332,10 @@ impl Dsv4KvAdapter {
         // per-slot×per-layer `shared_decode_out` (#60), and keeping it
         // pre-allocated avoids a per-step `uninit` on the default decode path.
         let shared_expert_out = Some(unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? });
-        // One model-wide batched (b=N) FlashMLA decode scratch (#60). Built only
-        // when the FlashMLA decode arena is live (same gate as the per-slot
-        // single-row state) AND the build supports it; sized for max_batch =
-        // num_slots. When OFF this stays None, so the n>1 default per-row lane
-        // and the N=1 path are byte-identical to before.
+        // One model-wide batched (b=N) FlashMLA decode scratch (#60). Built for
+        // canonical MODEL1 FlashMLA decode when the arena is live; V32/GLM keeps
+        // the single-row path because the batched sparse-decode shim below is
+        // MODEL1-only.
         // Build the per-layer FlashMLA decode shapes ONCE (shared by the batched
         // scratch and the new single-row shared scratch). Both gate on the same
         // `dsv4_flashmla_decode_alloc_enabled` predicate as the per-slot state.
@@ -362,11 +352,20 @@ impl Dsv4KvAdapter {
                     tp_world,
                 )?);
             }
-            let batch = Dsv4FlashMlaDecodeBatchScratch::new(ctx, config, num_slots, &layer_shapes)?;
+            let batch = if config.head_dim == 512 {
+                Some(Dsv4FlashMlaDecodeBatchScratch::new(
+                    ctx,
+                    config,
+                    num_slots,
+                    &layer_shapes,
+                )?)
+            } else {
+                None
+            };
             // ONE model-wide single-row decode scratch (#85 P3), hoisted from the
             // per-(slot,layer) state. Worst-case-sized across all FlashMLA layers.
             let single = Dsv4FlashMlaDecodeScratch::new(ctx, config, &layer_shapes)?;
-            (Some(batch), Some(single))
+            (batch, Some(single))
         } else {
             (None, None)
         };
@@ -5498,36 +5497,11 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
-/// Batched (`b = N`) FlashMLA sparse decode lane gate (#60). Default OFF until
-/// the pod licenses the batched kernel; gated under `dsv4_flashmla_decode_enabled`
-/// so it can only engage where the single-row FlashMLA decode is itself live.
-/// N=1 forwards never consult this — they always take the cached-meta single-row
-/// path. The AtomicI8 override is for tests / `ARLE_DSV4_FLASHMLA_DECODE_BATCHED`
-/// A-B; without an override the lane stays OFF.
+/// Batched (`b = N`) FlashMLA sparse decode lane gate (#60). Canonical for
+/// MODEL1 n>1 decode when FlashMLA decode is available; N=1 forwards never
+/// consult this and always take the cached-meta single-row path.
 pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
-    match DSV4_FLASHMLA_DECODE_BATCHED_OVERRIDE.load(Ordering::Relaxed) {
-        DSV4_FLASHMLA_OVERRIDE_OFF => return Ok(false),
-        DSV4_FLASHMLA_OVERRIDE_ON => return dsv4_flashmla_decode_enabled(),
-        _ => {}
-    }
-    // Default ON (2026-06-15): Phase B batched `b=N` sparse decode is correct
-    // (indices reader-pitch == writer-pitch fix `b566b548`, decode-read coherent
-    // c=4) and +3% @c=8 on top of the batched lane. Opt out with
-    // `ARLE_DSV4_FLASHMLA_DECODE_BATCHED=0`. Still gated under
-    // `dsv4_flashmla_decode_enabled` (only engages where single-row FlashMLA
-    // decode is live) and the batch-scratch presence at the call site; N=1
-    // forwards never consult this.
-    match std::env::var("ARLE_DSV4_FLASHMLA_DECODE_BATCHED") {
-        Ok(v)
-            if matches!(
-                v.as_str(),
-                "0" | "false" | "FALSE" | "no" | "off" | "OFF" | ""
-            ) =>
-        {
-            Ok(false)
-        }
-        _ => dsv4_flashmla_decode_enabled(),
-    }
+    dsv4_flashmla_decode_enabled()
 }
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
@@ -5557,28 +5531,6 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
     // only in the free-continuation tail = legitimate FP8 numerics). Opt out with
     // ARLE_DSV4_DECODE_PROJ_DEEPGEMM=0.
     cuda_kernels::has_deepgemm_native()
-}
-
-/// Opt-in batched (m=N) decode compressor/indexer projection pre-pass. The
-/// per-row m=1 `compressor_forward` GEMVs (`wkv`/`wgate`) re-read the full weight
-/// per decode row (bandwidth-bound, zero amortization) — DEAD-LINEAR in batch
-/// size n (~7.4ms/row, ~54% of the decode step). When ON, the projections are
-/// batched into one DeepGEMM m=N (weight read ONCE across all N rows), mirroring
-/// `mla_attention_prepare_proj_batch`'s q/kv pre-pass. **Default OFF** (env unset
-/// → byte-identical baseline): returns `true` ONLY when
-/// `ARLE_DSV4_DECODE_COMPRESSOR_BATCH` is truthy AND native DeepGEMM is compiled
-/// in. The per-slot compressor state update (`dsv4_compressor_update_*`) stays
-/// per-row; only the SOURCE of `kv_raw`/`score_raw` changes (FP8-DeepGEMM column
-/// slice vs per-row bf16 GEMV) — needle-gated like every DSv4 projection lever.
-pub(crate) fn dsv4_decode_compressor_batch_enabled() -> Result<bool> {
-    // Default OFF (byte-identical baseline). The batched pre-pass uses `dsv4_linear`
-    // at m=N, which dispatches per `weight_format`: DenseBf16 → gemm_cuda
-    // (cublasLtMatmul, weight read ONCE across the N rows, amortized); Fp8BlockScaled
-    // → deepgemm. The DSv4 compressor weights are all bf16 (verified: 41 main + 21
-    // indexer layers), so this is the cublasLt amortized path with NO FP8-quant
-    // correctness shift and NO deepgemm-native build requirement. Mixed-precision
-    // safe by construction (per-weight format dispatch). Gate purely on the env flag.
-    env_flag("ARLE_DSV4_DECODE_COMPRESSOR_BATCH")
 }
 
 /// Prefill residual projections (wq_b now; wo/indexer next) → tensor-core DeepGEMM
@@ -7006,7 +6958,7 @@ pub(crate) fn flashmla_decode_finish_row(
     Ok(())
 }
 
-/// Opt-in batched FINISH tail (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):
+/// Canonical batched FINISH tail for the MODEL1 batched decode lane:
 /// ONE batched output inverse-RoPE over N rows' (non-contiguous) `local_attn`
 /// buffers, replacing the N per-row `arle_dsv4_output_inverse_rope_*` launches in
 /// [`flashmla_decode_finish_row`]. `out_ptrs` are this step's per-row `local_attn`
@@ -7058,7 +7010,7 @@ pub(crate) fn flashmla_decode_inverse_rope_batched(
     Ok(())
 }
 
-/// Opt-in batched FINISH tail (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):
+/// Canonical batched FINISH tail for the MODEL1 batched decode lane:
 /// ONE batched SW-window write over N rows' (non-contiguous) k_prepared / SW ring
 /// cache buffers, replacing the N per-row `dsv4_update_window_cache_*` launches in
 /// [`flashmla_decode_finish_row`]. `k_ptrs` / `cache_ptrs` are this step's per-row
@@ -8399,7 +8351,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     })
 }
 
-/// Full-flatten decode P1a (opt-in, default OFF): run ONE row's main + indexer
+/// Full-flatten decode P1a: run ONE row's main + indexer
 /// compressor STATE update in DEFER mode — skip the per-row FFI, push the row's
 /// ring-state device pointers into the batch sinks, and advance
 /// `compressed.seq_len` (host bookkeeping). Returns this row's `indexer_rows_before`
@@ -8426,12 +8378,12 @@ pub(crate) fn mla_attention_compressor_defer_row(
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<usize> {
     // GLM SparseIndexed has no compressor, and the batched-defer kernel is
-    // compressor-specific. Full-flatten is opt-in/default-OFF and never set for
-    // SparseIndexed; fail loud rather than silently mis-handle it.
+    // compressor-specific. The MODEL1-only batch scratch keeps GLM off this path;
+    // fail loud if a caller violates that boundary.
     ensure!(
         mode != DeepSeekV4AttentionMode::SparseIndexed,
         "DSv4 full-flatten compressor-defer path does not support SparseIndexed (no compressor); \
-         ARLE_DSV4_DECODE_COMPRESSOR_BATCH/full-flatten must be off for GLM"
+         full-flatten must stay off for GLM"
     );
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         return Ok(0);
@@ -8549,13 +8501,13 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     // `None` (the batched select fills selected_batched). `None` → byte-identical
     // single-row CSA prepare.
     batched_gather: Option<Dsv4DsaBatchedGather<'_>>,
-    // Opt-in batched decode pre-pass (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default
-    // OFF): when `Some`, this row's compressor/indexer `(kv_raw, score_raw)` were
-    // already projected batched (DeepGEMM m=N) and are passed to
+    // Canonical batched decode pre-pass: when `Some`, this row's
+    // compressor/indexer `(kv_raw, score_raw)` were already projected batched and
+    // are passed to
     // `compressor_forward`, skipping the per-row m=1 GEMVs. `None` → byte-identical
     // per-row `dsv4_linear` projection.
     compressor_precomputed: Option<Dsv4CompressorPrecomputed<'_>>,
-    // Full-flatten decode (opt-in, default OFF): when `true`, the per-row
+    // Full-flatten decode: when `true`, the per-row
     // compressor / indexer STATE updates already ran in ONE batched
     // `dsv4_compressor_update_batched` BEFORE this call (a P1a pre-pass), so the
     // two `compressor_forward` calls here are SKIPPED — only the CSA per-row
@@ -8611,7 +8563,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
         None
     } else {
         let overlap = compress_ratio < 16;
-        // Split the opt-in batched pre-pass slices into main + indexer (the inner
+        // Split the batched pre-pass slices into main + indexer (the inner
         // `(&HiddenStates, &HiddenStates)` pairs are `Copy` references, so reading
         // both fields does not conflict with the per-call `state` borrows below).
         // `None` everywhere → byte-identical per-row GEMV path. The
@@ -9925,14 +9877,14 @@ fn compressor_forward(
     start_pos_device: Option<&CudaSlice<i32>>,
     apply_rope: bool,
     rope_original_seq_len: i32,
-    // Batched decode pre-pass (opt-in, default OFF): when `Some`, the two m=1
+    // Batched decode pre-pass: when `Some`, the two m=1
     // `dsv4_linear` projection GEMVs are SKIPPED and the passed
     // `(kv_raw, score_raw)` — this row's `[width, 1]` slices of the batched
-    // DeepGEMM outputs — are used directly. Everything downstream (the per-slot
-    // `dsv4_compressor_update_*` FFI + state advance) is UNCHANGED. `None` →
-    // byte-identical legacy per-row GEMV path.
+    // batched `dsv4_linear` outputs — are used directly. Everything downstream
+    // (the per-slot `dsv4_compressor_update_*` FFI + state advance) is
+    // UNCHANGED. `None` → per-row GEMV path.
     precomputed: Option<(&HiddenStates, &HiddenStates)>,
-    // Full-flatten decode (opt-in, default OFF): when `Some`, the per-row
+    // Full-flatten decode: when `Some`, the per-row
     // `dsv4_compressor_update_*` FFI is SKIPPED and this row's five ring-state
     // device pointers are pushed into the batch sink instead — the actual state
     // update runs later in ONE `dsv4_compressor_update_batched` over all N rows.
@@ -10002,8 +9954,8 @@ fn compressor_forward(
     }
 
     // SOURCE of kv_raw/score_raw: either this row's `[width, 1]` slice of the
-    // batched DeepGEMM pre-pass (precomputed `Some`, opt-in) or the per-row m=1
-    // `dsv4_linear` GEMVs (precomputed `None`, byte-identical legacy default).
+    // batched pre-pass (precomputed `Some`) or the per-row m=1 `dsv4_linear`
+    // GEMVs (precomputed `None`).
     // `owned_*` hold the GEMV-produced buffers in the `None` branch (declared in
     // the outer scope so they outlive the FFI read below); `kv_raw` / `score_raw`
     // reference whichever source is active. The downstream
@@ -10148,20 +10100,18 @@ fn compressor_forward(
     Ok(())
 }
 
-/// Opt-in batched (m=N) decode compressor/indexer projection pre-pass
-/// (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF). Projects the N-row
+/// Batched (m=N) decode compressor/indexer projection pre-pass. Projects the N-row
 /// post-attn-LN `normed_batch` [hidden_size, N] through `compressor.wkv` /
-/// `compressor.wgate` ONCE via DeepGEMM (weight read once across all N rows),
+/// `compressor.wgate` ONCE via `dsv4_linear` (weight read once across all N rows),
 /// returning `kv_raw_batch [width, N]` and `score_raw_batch [width, N]`
 /// (`width = cache.rows`). Each row's `[width, 1]` column slice then feeds
 /// [`compressor_forward`] as `precomputed`, replacing the per-row m=1
 /// `dsv4_linear` GEMVs that re-read the full weight per row (bandwidth-bound,
 /// zero amortization, ~54% of the decode step, DEAD-LINEAR in N).
 ///
-/// Returns `None` when the DeepGEMM caches are absent (gate off / not compiled),
-/// so the caller falls back to the byte-identical per-row GEMV path. Both outputs
-/// are fresh per-step allocations kept alive via `keepalive.keep_hidden`. Mirrors
-/// `mla_attention_prepare_proj_batch`'s q/kv pre-pass; touches NO slot state.
+/// Both outputs are fresh per-step allocations kept alive via
+/// `keepalive.keep_hidden`. Mirrors `mla_attention_prepare_proj_batch`'s q/kv
+/// pre-pass; touches NO slot state.
 pub(crate) fn compressor_batch_prepass(
     ctx: &DeviceContext,
     compressor: &Dsv4Compressor,
@@ -10210,7 +10160,7 @@ pub(crate) fn compressor_batch_prepass(
 }
 
 /// Host-gathered per-row device pointer arrays for one compressor's batched
-/// state update (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF). Each `Vec`
+/// state update. Each `Vec`
 /// holds the N rows' `Dsv4CompressorState` ring-buffer pointers (as `u64`),
 /// uploaded to device `*_arr` arrays by [`dsv4_compressor_update_batched`]. Built
 /// over the prepare loop's row order (push exactly one entry per row).
@@ -10249,8 +10199,7 @@ impl Dsv4CompressorBatchPtrs {
     }
 }
 
-/// Opt-in batched (m=N) compressor STATE update
-/// (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF): ONE `<<<n, BLOCK>>>` launch
+/// Batched (m=N) compressor STATE update: ONE `<<<n, BLOCK>>>` launch
 /// running each row's per-slot compressor ring update (RoPE/RMSNorm/store into
 /// pending/overlap/compressed), replacing the N per-row
 /// `dsv4_compressor_update_start_pos_ptr_cuda` launches. `kv_raw_batch` /
@@ -10391,10 +10340,10 @@ pub(crate) fn dsv4_compressor_update_batched(
 /// ONE batched `csa_select_official_batched` after the prepare loop produces
 /// byte-equivalent context_lens. `selected` is then `None` (the batched select
 /// writes directly into `selected_batched`).
-/// Per-row precomputed compressor/indexer projection slices for the opt-in
-/// batched decode pre-pass (`ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF).
+/// Per-row precomputed compressor/indexer projection slices for the batched
+/// decode pre-pass.
 /// Each `(kv_raw, score_raw)` pair is this row's `[width, 1]` column slice of the
-/// batched DeepGEMM `prefill_proj_deepgemm` output. When threaded into
+/// batched `dsv4_linear` output. When threaded into
 /// [`mla_attention_prepare_compressed_only`], they replace the per-row m=1
 /// `dsv4_linear` GEMVs inside [`compressor_forward`]; the per-slot state update
 /// stays per-row. `main` feeds `attention.compressor`; `indexer` feeds

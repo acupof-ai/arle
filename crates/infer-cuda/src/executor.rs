@@ -952,12 +952,11 @@ impl QwenCudaExecutor {
 }
 
 /// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`].
-/// Prefill/mixed still run one scheduled row; pure decode can accept multiple
-/// rows and currently loops over the existing single-row forward as the
-/// correctness foundation for later true batched kernels. DSv4 owns its MLA KV
-/// state inside the forward (bf16 SW rings + compressor pending/compressed
-/// pools), so it does NOT use a [`PagedKVPool`]. The decode graph is disabled
-/// (MLA host-routing per step).
+/// Prefill/mixed still run one scheduled row. Pure decode uses B=1 as the
+/// single-row reference and B>1 as the canonical layer-major batched lane for
+/// MODEL1 FlashMLA decode. DSv4 owns its MLA KV state inside the forward (bf16
+/// SW rings + compressor pending/compressed pools), so it does NOT use a
+/// [`PagedKVPool`]. The decode graph is disabled (MLA host-routing per step).
 pub(crate) struct Dsv4CudaExecutor {
     model: crate::dsv4::Dsv4Model,
     slots: Vec<crate::dsv4::Dsv4SlotState>,

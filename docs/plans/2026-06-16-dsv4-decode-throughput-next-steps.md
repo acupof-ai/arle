@@ -55,7 +55,8 @@ Remaining: serve *my* `3e3e50e0`+compressor-batch binary on `.61` to get the
 compressor-batch × MTP combined number. **`.61` (gcc-13, 8×H20) is the MTP lane's
 serve host; `.62` (clang-11) cannot serve MTP.**
 
-**Committed levers (gated `ARLE_DSV4_DECODE_COMPRESSOR_BATCH`, default OFF):**
+**Committed levers (now canonical since `68261b28`; old
+`ARLE_DSV4_DECODE_COMPRESSOR_BATCH` gate removed):**
 - `a4239598` compressor-GEMV batch (bf16 cublasLt m=N): n=22 perrow 162→92, step
   302→237, +28% (profiling-on relative; re-confirm clean).
 - `3e3e50e0` full-flatten (batched per-slot compressor_update + inverse-rope +

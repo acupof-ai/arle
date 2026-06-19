@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::prelude::DeviceContext;
 
 use crate::dsv4::SpecVerifySchedule;
@@ -384,8 +384,8 @@ impl Dsv4CudaExecutor {
         let draft_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
         // ── 2. ONE batched verify over the N chains (MoE grouped over all rows,
-        // attention per slot/row). The verify persists per-slot spec_normed for
-        // the commit fold.
+        // attention currently runs once per slot chunk, not once per row). The
+        // verify persists per-slot spec_normed for the commit fold.
         let chain_tokens: Vec<Vec<u32>> = chains.iter().map(DraftChain::tokens).collect();
         let verified = self.model.forward_decode_batch_verify(
             &mut self.slots,
@@ -576,6 +576,23 @@ mod tests {
         let chain = d2k2_chain();
         chain.validate().unwrap();
         let sched = chain.verify_schedule(100);
+        assert_eq!(chain.nodes.len(), 3);
+        assert_eq!(chain.candidates.len(), 2);
+        assert_eq!(sched.positions.len(), 3);
+        assert_eq!(sched.ancestors.len(), 3);
+        assert_eq!(sched.positions, vec![100, 101, 102]);
+        assert_eq!(sched.ancestors, vec![vec![], vec![0], vec![0, 1]]);
+    }
+
+    #[test]
+    fn d2k2_candidate_width_does_not_expand_verify_rows() {
+        let mut chain = d2k2_chain();
+        chain.candidates[0].extend([31, 41]);
+        chain.candidates[1].extend([32, 42]);
+        chain.validate().unwrap();
+        let sched = chain.verify_schedule(100);
+        assert_eq!(chain.candidates[0], vec![11, 21, 31, 41]);
+        assert_eq!(chain.candidates[1], vec![12, 22, 32, 42]);
         assert_eq!(sched.positions, vec![100, 101, 102]);
         assert_eq!(sched.ancestors, vec![vec![], vec![0], vec![0, 1]]);
     }
@@ -595,7 +612,10 @@ mod tests {
     #[test]
     fn d2k2_topk_bonus_hit_stops_off_chain() {
         let chain = d2k2_chain();
+        let sched = chain.verify_schedule(100);
         let (path, bonus, parent, topk_bonus_hit) = chain.accept_path(&[21, 0, 0]).unwrap();
+        assert_eq!(sched.positions.len(), 3);
+        assert_eq!(sched.ancestors.len(), 3);
         assert_eq!(path, vec![0]);
         assert_eq!(chain.accepted_tokens(&path), Vec::<u32>::new());
         assert_eq!(bonus, 21);
