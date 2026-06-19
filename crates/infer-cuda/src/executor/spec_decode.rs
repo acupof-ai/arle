@@ -4,6 +4,7 @@
 //! the chain in one target pass, then matches target top-1 against those
 //! candidates. `topk` does not add verify rows on this path.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
@@ -36,6 +37,68 @@ fn mtp_phase_mark(ctx: &DeviceContext, last: &mut Instant, enabled: bool) -> f64
     let ms = now.duration_since(*last).as_secs_f64() * 1000.0;
     *last = now;
     ms
+}
+
+/// Adaptive MTP gate (B=1), opt-in via `ARLE_DSV4_MTP_ADAPTIVE` (bring-up flag;
+/// promote to `--mtp-adaptive` once pod-calibrated). MTP only beats no-spec when
+/// it emits more than `t_mtp/t_nospec` tok/step; below the matching acceptance
+/// rate the gate runs a warm no-spec step instead so typical prompts stop paying
+/// the speculation tax.
+fn mtp_adaptive_gate_enabled() -> bool {
+    // Cached: read once, then checked on every B=1 decode step (critical path).
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_DSV4_MTP_ADAPTIVE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
+/// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
+/// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
+/// accept >~0.55). Override with `ARLE_DSV4_MTP_MIN_ACCEPT` for other depths.
+/// ponytail: a fixed depth-tuned threshold; upgrade path is to self-calibrate
+/// from measured step times.
+fn mtp_min_accept() -> f32 {
+    static MIN_ACCEPT: OnceLock<f32> = OnceLock::new();
+    *MIN_ACCEPT.get_or_init(|| {
+        std::env::var("ARLE_DSV4_MTP_MIN_ACCEPT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.55)
+    })
+}
+
+/// Force one real spec step after this many consecutive gated skips, to refresh
+/// the acceptance EMA — else a dip below threshold never recovers (no new accept
+/// data arrives while skipping). Override with `ARLE_DSV4_MTP_PROBE`.
+fn mtp_probe_interval() -> usize {
+    static PROBE: OnceLock<usize> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        std::env::var("ARLE_DSV4_MTP_PROBE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8)
+    })
+}
+
+/// EMA smoothing for the per-step accept rate (accepted/depth): higher reacts
+/// faster to an acceptance shift, noisier.
+const MTP_ACCEPT_EMA_ALPHA: f32 = 0.25;
+
+/// Pure gate decision: speculate iff running acceptance clears the break-even
+/// threshold, OR a probe is due (force one step to refresh the EMA). Pure so the
+/// money path is unit-tested without a GPU.
+fn mtp_should_speculate(
+    accept_ema: f32,
+    skip_streak: usize,
+    min_accept: f32,
+    probe_interval: usize,
+) -> bool {
+    accept_ema >= min_accept || skip_streak >= probe_interval
 }
 
 struct DraftNode {
@@ -248,6 +311,7 @@ impl Dsv4CudaExecutor {
 
         self.mtp_accepts += accepted;
         self.mtp_rejects += depth - accepted;
+        self.mtp_note_accept(accepted, depth);
         if self.model.tp.config().rank == 0 {
             eprintln!(
                 "[dsv4-mtp] depth={} topk={} draft_rows={} verify_rows={} accepted={accepted} topk_bonus_hit={topk_bonus_hit} accept_total={} reject_total={} bonus={bonus}",
@@ -489,6 +553,32 @@ impl Dsv4CudaExecutor {
             || crate::dsv4::dsv4_spec_decode_enabled()
     }
 
+    /// Fold one spec step's acceptance (accepted/`depth`) into the running EMA and
+    /// clear the skip streak. Drives the adaptive gate; B=1 only — the batched
+    /// path is a win and is never gated, so it does not perturb this EMA.
+    fn mtp_note_accept(&mut self, accepted: usize, depth: usize) {
+        let rate = if depth > 0 {
+            accepted as f32 / depth as f32
+        } else {
+            1.0
+        };
+        self.mtp_accept_ema =
+            MTP_ACCEPT_EMA_ALPHA * rate + (1.0 - MTP_ACCEPT_EMA_ALPHA) * self.mtp_accept_ema;
+        self.mtp_skip_streak = 0;
+    }
+
+    /// Adaptive gate (B=1): true when MTP should be skipped for a warm no-spec
+    /// step this decode. Off unless `ARLE_DSV4_MTP_ADAPTIVE` is set.
+    pub(super) fn mtp_adaptive_skip(&self) -> bool {
+        mtp_adaptive_gate_enabled()
+            && !mtp_should_speculate(
+                self.mtp_accept_ema,
+                self.mtp_skip_streak,
+                mtp_min_accept(),
+                mtp_probe_interval(),
+            )
+    }
+
     fn draft_chain(
         &mut self,
         slot_idx: usize,
@@ -545,7 +635,21 @@ impl Dsv4CudaExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftChain, DraftNode};
+    use super::{DraftChain, DraftNode, mtp_should_speculate};
+
+    #[test]
+    fn mtp_gate_speculates_high_accept_skips_low_with_probe() {
+        let (min, probe) = (0.55_f32, 8_usize);
+        // High / at-threshold acceptance -> keep speculating.
+        assert!(mtp_should_speculate(0.80, 0, min, probe));
+        assert!(mtp_should_speculate(0.55, 0, min, probe));
+        // Below threshold, streak under the probe interval -> skip MTP.
+        assert!(!mtp_should_speculate(0.30, 0, min, probe));
+        assert!(!mtp_should_speculate(0.30, 7, min, probe));
+        // Below threshold but a probe is due -> force one step to refresh the EMA.
+        assert!(mtp_should_speculate(0.30, 8, min, probe));
+        assert!(mtp_should_speculate(0.00, 9, min, probe));
+    }
 
     fn d2k2_chain() -> DraftChain {
         DraftChain {

@@ -75,7 +75,10 @@ pub(crate) fn profile<T>(
 }
 
 pub(crate) fn print_rank0(tag: &str) {
-    if !enabled() || std::env::var("INFER_TP_RANK").as_deref() != Ok("0") {
+    // Print on rank 0 OR unset (the multiproc coordinator runs the forward but
+    // is not spawned with INFER_TP_RANK). Mirrors stage_profile.
+    let rank = std::env::var("INFER_TP_RANK").unwrap_or_default();
+    if !enabled() || (!rank.is_empty() && rank != "0") {
         return;
     }
     let Ok(guard) = stats().lock() else {

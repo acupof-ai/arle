@@ -474,10 +474,79 @@ pub(crate) fn head_hidden_from_stream(
     // Extract the single stream row, project it through mix_fn (batch=1).
     // SAFETY: copy_row_to_hidden writes the full one-token stream row.
     let mut stream_row = unsafe { HiddenStates::uninit(ctx, stream.hidden_dim, 1)? };
-    crate::ops::copy_row_to_hidden(ctx, stream, token_idx, &mut stream_row)?;
     // SAFETY: dsv4_linear writes the full head-HC mix buffer.
     let mut mixes = unsafe { HiddenStates::uninit(ctx, head_hc.mix_fn.rows, 1)? };
-    crate::attention::dsv4_linear(ctx, &head_hc.mix_fn, &stream_row, &mut mixes)?;
+    head_hidden_from_stream_into(
+        ctx,
+        config,
+        head_hc,
+        stream,
+        token_idx,
+        &mut stream_row,
+        &mut mixes,
+        out,
+    )
+}
+
+/// Graph-safe [`head_hidden_from_stream`] variant using caller-owned scratch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn head_hidden_from_stream_into(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    head_hc: &Dsv4HyperConnection,
+    stream: &HiddenStates,
+    token_idx: usize,
+    stream_row: &mut HiddenStates,
+    mixes: &mut HiddenStates,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    let hidden_size = config.hidden_size;
+    let hc_mult = config.hc_mult;
+    ensure!(
+        token_idx < stream.seq_len,
+        "DSv4 head token {token_idx} out of range for stream seq {}",
+        stream.seq_len
+    );
+    ensure!(
+        stream.hidden_dim == hidden_size * hc_mult,
+        "DSv4 head stream dim {} != hidden_size {hidden_size} * hc_mult {hc_mult}",
+        stream.hidden_dim
+    );
+    ensure!(
+        head_hc.mix_fn.cols == stream.hidden_dim && head_hc.mix_fn.rows >= hc_mult,
+        "DSv4 head HC mix shape {}x{} cannot produce {hc_mult} pre weights from stream dim {}",
+        head_hc.mix_fn.rows,
+        head_hc.mix_fn.cols,
+        stream.hidden_dim
+    );
+    ensure!(
+        head_hc.base.len >= hc_mult && head_hc.scale.len >= 1,
+        "DSv4 head HC base/scale too short: base={} scale={}",
+        head_hc.base.len,
+        head_hc.scale.len
+    );
+    ensure!(
+        stream_row.hidden_dim == stream.hidden_dim && stream_row.seq_len == 1,
+        "DSv4 head stream scratch shape {}x{} != {}x1",
+        stream_row.hidden_dim,
+        stream_row.seq_len,
+        stream.hidden_dim
+    );
+    ensure!(
+        mixes.hidden_dim == head_hc.mix_fn.rows && mixes.seq_len == 1,
+        "DSv4 head mix scratch shape {}x{} != {}x1",
+        mixes.hidden_dim,
+        mixes.seq_len,
+        head_hc.mix_fn.rows
+    );
+    ensure!(
+        out.len == hidden_size,
+        "DSv4 head out len {} != hidden_size {hidden_size}",
+        out.len
+    );
+
+    crate::ops::copy_row_to_hidden(ctx, stream, token_idx, stream_row)?;
+    crate::attention::dsv4_linear(ctx, &head_hc.mix_fn, stream_row, mixes)?;
 
     let (row_ptr, _gr) = stream_row.data.device_ptr(&ctx.stream);
     let (mixes_ptr, _gm) = mixes.data.device_ptr(&ctx.stream);

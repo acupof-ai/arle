@@ -17,6 +17,10 @@ struct Stat {
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STATS: OnceLock<Mutex<BTreeMap<&'static str, Stat>>> = OnceLock::new();
+// Serve auto-print: when ARLE_DSV4_STAGE_PROFILE is set, flush the per-stage
+// host/cuda breakdown every N decode steps (counted on the 1/step "sample"
+// stage). No external set_active/print trigger needed in the serve loop.
+static AUTO_WINDOW: OnceLock<Mutex<(Option<Instant>, u64)>> = OnceLock::new();
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("ARLE_DSV4_STAGE_PROFILE").is_some())
@@ -47,9 +51,10 @@ pub(crate) fn profile<T>(
     label: &'static str,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if !enabled() || !ACTIVE.load(Ordering::Relaxed) {
+    if !enabled() {
         return f();
     }
+    let _ = ACTIVE.load(Ordering::Relaxed); // retained for explicit-window callers
 
     let start = ctx
         .ctx
@@ -80,11 +85,45 @@ pub(crate) fn profile<T>(
         entry.cuda_ms += cuda_ms;
         entry.host_ms += host_ms;
     }
+    // Serve auto-flush: "embed" runs exactly once per forward (no-spec decode
+    // step AND the MTP verify forward), so it fires for both paths. Every 64
+    // forwards, print the accumulated per-stage host/cuda breakdown and reset.
+    if label == "dsv4/stage/embed" {
+        let win = AUTO_WINDOW.get_or_init(|| Mutex::new((None, 0)));
+        let flush = if let Ok(mut w) = win.lock() {
+            if w.0.is_none() {
+                w.0 = Some(Instant::now());
+            }
+            w.1 += 1;
+            if w.1 >= 64 {
+                let wall = w.0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+                let n = w.1 as usize;
+                *w = (Some(Instant::now()), 0);
+                Some((n, wall))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((n, wall)) = flush {
+            print_rank0("serve-auto", n, wall);
+            crate::linear_profile::print_rank0("serve-auto");
+            crate::linear_profile::reset();
+            if let Ok(mut guard) = stats().lock() {
+                guard.clear();
+            }
+        }
+    }
     result
 }
 
 pub(crate) fn print_rank0(tag: &str, timed_tokens: usize, timed_wall_ms: f64) {
-    if !enabled() || std::env::var("INFER_TP_RANK").as_deref() != Ok("0") {
+    // Print on the visible-output rank: INFER_TP_RANK="0" (explicit) OR unset
+    // (the multiproc COORDINATOR is the parent process — it runs the forward +
+    // sample but is not spawned with INFER_TP_RANK, so an unset value is rank 0).
+    let rank = std::env::var("INFER_TP_RANK").unwrap_or_default();
+    if !enabled() || (!rank.is_empty() && rank != "0") {
         return;
     }
     let Ok(guard) = stats().lock() else {

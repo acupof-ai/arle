@@ -432,7 +432,7 @@ pub(crate) struct MtpDraftRow {
 
 pub(crate) struct Dsv4SlotState {
     attention: Vec<crate::attention::Dsv4LayerAttentionState>,
-    /// Per-attention-layer K+1-slot snapshot of speculative-verify ring writes.
+    /// Per-attention-layer one-slot snapshot of speculative-verify ring writes.
     /// `Some` only when `model.spec_decode_on`; pre-allocated once and
     /// index-aligned with `attention`.
     spec_rings: Option<Vec<crate::attention::Dsv4SpecRingSnapshot>>,
@@ -442,6 +442,10 @@ pub(crate) struct Dsv4SlotState {
     /// K) without a second full forward. `Some` only when
     /// `model.spec_decode_on`.
     spec_normed: Option<Vec<HiddenStates>>,
+    /// Scheduled MTP verify forward workspace. The verifier runs a tiny
+    /// `depth + 1` row forward; keep the row-major layer temporaries resident so
+    /// it does not fall back to the generic prefill allocator on every layer.
+    spec_verify: Option<Dsv4SpecVerifyScratch>,
     start_pos_device: CudaSlice<i32>,
     decode_graph: Option<Dsv4DecodeGraphScratch>,
     /// Pre-allocated NVSHMEM low-latency MoE scratch, reused across all layers +
@@ -454,6 +458,107 @@ pub(crate) struct Dsv4SlotState {
     max_seq_len: usize,
 }
 
+struct Dsv4SpecVerifyScratch {
+    embeddings: HiddenStates,
+    initial_stream: HiddenStates,
+    layers: Vec<Dsv4SpecVerifyLayerScratch>,
+}
+
+struct Dsv4SpecVerifyLayerScratch {
+    attn_normed: HiddenStates,
+    attn_out: HiddenStates,
+    attn_stream: HiddenStates,
+    ffn_normed: HiddenStates,
+    moe_out: HiddenStates,
+    moe_with_shared: HiddenStates,
+    ffn_stream: HiddenStates,
+}
+
+impl Dsv4SpecVerifyScratch {
+    fn new(model: &Dsv4Model) -> Result<Self> {
+        let hidden_size = model.config.hidden_size;
+        let stream_dim = hidden_size * model.config.hc_mult;
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for _ in 0..model.layers.len() {
+            layers.push(Dsv4SpecVerifyLayerScratch::new(
+                &model.ctx,
+                hidden_size,
+                stream_dim,
+            )?);
+        }
+        Ok(Self {
+            embeddings: unsafe {
+                HiddenStates::uninit(&model.ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
+            },
+            initial_stream: unsafe {
+                HiddenStates::uninit(&model.ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)?
+            },
+            layers,
+        })
+    }
+
+    fn set_rows(&mut self, rows: usize) -> Result<()> {
+        ensure!(
+            rows > 0 && rows <= MAX_SPEC_VERIFY_ROWS,
+            "DSv4 spec-verify scratch rows {rows} exceed capacity {MAX_SPEC_VERIFY_ROWS}"
+        );
+        self.embeddings.seq_len = rows;
+        self.initial_stream.seq_len = rows;
+        for layer in &mut self.layers {
+            layer.set_rows(rows);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn device_bytes(&self) -> usize {
+        self.embeddings.device_bytes()
+            + self.initial_stream.device_bytes()
+            + self
+                .layers
+                .iter()
+                .map(Dsv4SpecVerifyLayerScratch::device_bytes)
+                .sum::<usize>()
+    }
+}
+
+impl Dsv4SpecVerifyLayerScratch {
+    fn new(ctx: &DeviceContext, hidden_size: usize, stream_dim: usize) -> Result<Self> {
+        Ok(Self {
+            attn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            attn_out: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            attn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)? },
+            ffn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            moe_out: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            moe_with_shared: unsafe {
+                HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
+            },
+            ffn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)? },
+        })
+    }
+
+    fn set_rows(&mut self, rows: usize) {
+        self.attn_normed.seq_len = rows;
+        self.attn_out.seq_len = rows;
+        self.attn_stream.seq_len = rows;
+        self.ffn_normed.seq_len = rows;
+        self.moe_out.seq_len = rows;
+        self.moe_with_shared.seq_len = rows;
+        self.ffn_stream.seq_len = rows;
+    }
+
+    #[allow(dead_code)]
+    fn device_bytes(&self) -> usize {
+        self.attn_normed.device_bytes()
+            + self.attn_out.device_bytes()
+            + self.attn_stream.device_bytes()
+            + self.ffn_normed.device_bytes()
+            + self.moe_out.device_bytes()
+            + self.moe_with_shared.device_bytes()
+            + self.ffn_stream.device_bytes()
+    }
+}
+
 pub(crate) struct Dsv4DecodeGraphScratch {
     token_ids: CudaSlice<i32>,
     token_ids_u32: CudaSlice<u32>,
@@ -462,6 +567,8 @@ pub(crate) struct Dsv4DecodeGraphScratch {
     layers: Vec<Dsv4DecodeLayerGraphScratch>,
     tail_graph: crate::graph::CudaGraphState,
     whole_graph: crate::graph::CudaGraphState,
+    head_stream_row: HiddenStates,
+    head_mixes: HiddenStates,
     last_hidden: DeviceVec,
     last_normed: DeviceVec,
     logits_batch: HiddenStates,
@@ -487,6 +594,7 @@ struct Dsv4DecodeLayerGraphScratch {
     moe_graph: crate::graph::CudaGraphState,
     attn_mhc: crate::hc::MhcDecodeScratch,
     ffn_mhc: crate::hc::MhcDecodeScratch,
+    mla: crate::attention::Dsv4MlaDecodeGraphScratch,
     // Kept for the unfused HC-pre path; current decode graph uses fused MHC pre RMS.
     #[allow(dead_code)]
     attn_in: HiddenStates,
@@ -525,6 +633,8 @@ impl Dsv4DecodeGraphScratch {
         }
         let last_hidden = DeviceVec::zeros(&model.ctx, hidden_size)?;
         let last_normed = DeviceVec::zeros(&model.ctx, hidden_size)?;
+        let head_stream_row = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
+        let head_mixes = unsafe { HiddenStates::uninit(&model.ctx, model.head_hc.mix_fn.rows, 1)? };
         let logits_batch = unsafe { HiddenStates::uninit(&model.ctx, model.lm_head.rows, 1)? };
         let logits = DeviceVec::zeros(&model.ctx, model.lm_head.rows)?;
         Ok(Self {
@@ -535,6 +645,8 @@ impl Dsv4DecodeGraphScratch {
             layers,
             tail_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
             whole_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
+            head_stream_row,
+            head_mixes,
             last_hidden,
             last_normed,
             logits_batch,
@@ -552,6 +664,13 @@ impl Dsv4DecodeLayerGraphScratch {
             moe_graph: crate::graph::CudaGraphState::new(model.ctx.stream.clone()),
             attn_mhc: crate::hc::MhcDecodeScratch::new(&model.ctx, &model.config, &layer.hc_attn)?,
             ffn_mhc: crate::hc::MhcDecodeScratch::new(&model.ctx, &model.config, &layer.hc_ffn)?,
+            mla: crate::attention::Dsv4MlaDecodeGraphScratch::new(
+                &model.ctx,
+                &model.config,
+                &layer.attention,
+                layer.mode,
+                layer.compress_ratio,
+            )?,
             attn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
             attn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
             attn_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
@@ -759,6 +878,11 @@ impl Dsv4SlotState {
         } else {
             None
         };
+        let spec_verify = if model.spec_decode_on {
+            Some(Dsv4SpecVerifyScratch::new(model)?)
+        } else {
+            None
+        };
         let start_pos_device = model
             .ctx
             .stream
@@ -783,6 +907,7 @@ impl Dsv4SlotState {
             attention,
             spec_rings,
             spec_normed,
+            spec_verify,
             start_pos_device,
             decode_graph: None,
             #[cfg(feature = "deepep")]
@@ -821,10 +946,15 @@ impl Dsv4SlotState {
             .spec_normed
             .as_ref()
             .map_or(0, |cache| cache.iter().map(|h| h.device_bytes()).sum());
+        let spec_verify_bytes = self
+            .spec_verify
+            .as_ref()
+            .map_or(0, Dsv4SpecVerifyScratch::device_bytes);
         vec![
             ("attention(per-layer)", attention_bytes),
             ("spec_rings", spec_rings_bytes),
             ("spec_normed", spec_normed_bytes),
+            ("spec_verify", spec_verify_bytes),
             (
                 "start_pos_device",
                 self.start_pos_device.len() * std::mem::size_of::<i32>(),
@@ -848,7 +978,7 @@ impl Dsv4SlotState {
         totals.into_iter().collect()
     }
 
-    /// Snapshot the K+1 speculative-verify ring slots across all attention
+    /// Snapshot the speculative-verify boundary ring slot across all attention
     /// layers before the depth-K verify forward. No-op when spec decode is off.
     pub(crate) fn capture_spec_rings(
         &mut self,
@@ -873,9 +1003,9 @@ impl Dsv4SlotState {
         Ok(())
     }
 
-    /// Restore the REJECTED ring tail across all attention layers AFTER the
-    /// commit truncate and BEFORE the accepted-prefix fold. No-op when spec
-    /// decode is off.
+    /// Restore the speculative boundary ring slot across all attention layers
+    /// AFTER the commit truncate and BEFORE the accepted-prefix fold. No-op
+    /// when spec decode is off.
     pub(crate) fn restore_spec_ring_tail(
         &mut self,
         ctx: &DeviceContext,
@@ -1253,6 +1383,23 @@ impl Dsv4Model {
                 local_width / self.config.head_dim,
             ));
         }
+        let mut mla_decode = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let model1 = layer.attention.w_kc.is_none()
+                && layer.attention.w_vc.is_none()
+                && layer.attention.o_proj.is_none();
+            mla_decode.push(if model1 {
+                Some(crate::attention::Dsv4MlaDecodeGraphScratch::new(
+                    &self.ctx,
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                    layer.compress_ratio,
+                )?)
+            } else {
+                None
+            });
+        }
         crate::attention::Dsv4KvAdapter::new(
             &self.ctx,
             &self.config,
@@ -1261,6 +1408,7 @@ impl Dsv4Model {
             &self.kv_arena,
             self.tp.config().world_size,
             num_slots,
+            mla_decode,
             if needs_moe_decode_shared {
                 self.layers.first().map(|layer| {
                     (
@@ -1272,6 +1420,7 @@ impl Dsv4Model {
             } else {
                 None
             },
+            self.layers.iter().find_map(|layer| layer.moe.as_ref()),
             self.config.hidden_size,
         )
     }
@@ -1355,15 +1504,39 @@ impl Dsv4Model {
         } else {
             0
         };
-        // The model-wide shared-expert decode output (HiddenStates hidden_size×1
-        // BF16) is allocated unconditionally on the adapter (#60); count it as a
-        // fixed term regardless of the GPU-router path.
+        // The model-wide shared-expert output is allocated unconditionally on
+        // the adapter (#60). It is sized for the bounded MTP verify chunk and
+        // reused by B=1 decode with `seq_len = 1`; count it as a fixed term
+        // regardless of the GPU-router path.
         let shared_expert_out_bytes = self
             .config
             .hidden_size
+            .saturating_mul(MAX_SPEC_VERIFY_ROWS)
             .saturating_mul(std::mem::size_of::<half::bf16>());
         let moe_decode_shared_bytes =
             moe_decode_shared_bytes.saturating_add(shared_expert_out_bytes);
+        let shared_expert_scratch_bytes = self
+            .layers
+            .iter()
+            .find_map(|layer| layer.moe.as_ref())
+            .map(|layer| {
+                crate::moe::Dsv4SharedDecodeScratch::device_bytes(
+                    layer.hidden_dim,
+                    layer.shared_w2.cols,
+                )
+            })
+            .unwrap_or(0);
+        let mla_decode_bytes: usize = self
+            .layers
+            .iter()
+            .map(|layer| {
+                crate::attention::Dsv4MlaDecodeGraphScratch::device_bytes_for(
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                )
+            })
+            .sum();
         // Per-slot stateful selector/compressor caches, itemized per layer:
         // rotated_keys + DSA key-cache band (CSA only), compressor compressed
         // cache (every cr>0 layer, head_dim wide) + indexer compressed cache
@@ -1446,12 +1619,15 @@ impl Dsv4Model {
                 let budget = infer_seam::SlotBudget::from_free(
                     free,
                     MEM_FRACTION,
-                    dsa_shared_bytes.saturating_add(moe_decode_shared_bytes),
+                    dsa_shared_bytes
+                        .saturating_add(moe_decode_shared_bytes)
+                        .saturating_add(shared_expert_scratch_bytes)
+                        .saturating_add(mla_decode_bytes),
                     per_slot,
                 );
                 log::info!(
                     "DSv4 KV budget: free {}MB, per_slot {}MB (arena×2 {}MB + rotated {}MB + \
-                     state caches {}MB), shared DSA {}MB, shared MoE decode {}MB",
+                     state caches {}MB), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, shared MLA decode {}MB",
                     free >> 20,
                     per_slot >> 20,
                     arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
@@ -1459,6 +1635,8 @@ impl Dsv4Model {
                     state_caches_per_slot >> 20,
                     dsa_shared_bytes >> 20,
                     moe_decode_shared_bytes >> 20,
+                    shared_expert_scratch_bytes >> 20,
+                    mla_decode_bytes >> 20,
                 );
                 budget
                     .affordable()
@@ -1481,10 +1659,12 @@ impl Dsv4Model {
             affordable > 0,
             "DSv4 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
              max_seq_len {max_seq_len} (per_slot ~{}MB + shared DSA {}MB + shared MoE decode {}MB \
-             exceed {MEM_FRACTION} of free). Lower INFER_DSV4_MAX_SEQ_LEN or free VRAM.",
+             + shared expert scratch {}MB + shared MLA decode {}MB exceed {MEM_FRACTION} of free). Lower INFER_DSV4_MAX_SEQ_LEN or free VRAM.",
             per_slot >> 20,
             dsa_shared_bytes >> 20,
             moe_decode_shared_bytes >> 20,
+            shared_expert_scratch_bytes >> 20,
+            mla_decode_bytes >> 20,
         );
         // Neutral clamp (infer-seam): planned = min(requested, affordable);
         // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
@@ -1509,7 +1689,7 @@ impl Dsv4Model {
         slot.truncate(&self.layers, new_len)
     }
 
-    /// Snapshot the K+1 speculative-verify ring slots before depth-K verify.
+    /// Snapshot the speculative-verify boundary ring slot before depth-K verify.
     /// No-op when spec decode is off.
     pub(crate) fn capture_spec_rings(
         &self,
@@ -1521,8 +1701,8 @@ impl Dsv4Model {
         slot.capture_spec_rings(&self.ctx, kv_adapter, start_pos, depth)
     }
 
-    /// Restore the rejected ring tail after truncate and before accepted-prefix
-    /// fold. No-op when spec decode is off.
+    /// Restore the speculative boundary ring slot after truncate and before
+    /// accepted-prefix fold. No-op when spec decode is off.
     pub(crate) fn restore_spec_ring_tail(
         &self,
         slot: &mut Dsv4SlotState,
@@ -3774,6 +3954,316 @@ impl Dsv4Model {
         Ok(token)
     }
 
+    fn forward_tokens_verify_stream_persistent(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        tokens: &[u32],
+        start_pos: usize,
+        sched: &SpecVerifySchedule,
+    ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
+        ensure!(
+            !tokens.is_empty(),
+            "DSv4 persistent verify forward requires at least one token"
+        );
+        ensure!(
+            slot.seq_len == start_pos,
+            "DSv4 slot seq_len {} != start_pos {start_pos}; decode requires contiguous appends",
+            slot.seq_len
+        );
+        ensure!(
+            start_pos + tokens.len() <= slot.max_seq_len,
+            "DSv4 sequence {} exceeds slot max_seq_len {}",
+            start_pos + tokens.len(),
+            slot.max_seq_len
+        );
+        let seq_len = tokens.len();
+        ensure!(
+            seq_len <= MAX_SPEC_VERIFY_ROWS,
+            "DSv4 persistent verify rows {seq_len} exceed capacity {MAX_SPEC_VERIFY_ROWS}"
+        );
+        ensure!(
+            sched.positions.len() == seq_len && sched.ancestors.len() == seq_len,
+            "DSv4 sparse verify schedule rows ({}, {}) != token rows {seq_len}",
+            sched.positions.len(),
+            sched.ancestors.len()
+        );
+        sched.validate_sparse_at(start_pos)?;
+        ensure!(
+            !dsv4_use_deepep_transport()?,
+            "DSv4 persistent MTP verify scratch currently supports allreduce transport"
+        );
+
+        let hidden_size = self.config.hidden_size;
+        let hc_mult = self.config.hc_mult;
+        let stream_dim = hidden_size * hc_mult;
+        let eps = self.config.rms_norm_eps;
+        let ctx = &self.ctx;
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        let scratch = slot
+            .spec_verify
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 scheduled verify missing persistent scratch"))?;
+        scratch.set_rows(seq_len)?;
+
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let nvtx_embed = crate::nvtx::range("dsv4/embed");
+        let token_ids = crate::ops::upload_i32(ctx, &token_ids_host)?;
+        crate::stage_profile::profile(ctx, "dsv4/stage/embed", || {
+            crate::ops::embedding_batch(
+                ctx,
+                &self.embed_tokens,
+                &token_ids,
+                &mut scratch.embeddings,
+            )
+        })?;
+        crate::stage_profile::profile(ctx, "dsv4/stage/embed_hc_expand", || {
+            crate::hc::initial_stream_from_embeddings(
+                ctx,
+                &scratch.embeddings,
+                hidden_size,
+                hc_mult,
+                &mut scratch.initial_stream,
+            )
+        })?;
+        drop(nvtx_embed);
+
+        let sparse_verify_meta = crate::attention::Dsv4ChainVerifyAttnMeta::new(
+            ctx,
+            &sched.positions,
+            &sched.ancestors,
+        )?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
+            let (prev_layers, current_and_rest) = scratch.layers.split_at_mut(layer_idx);
+            let current = current_and_rest
+                .first_mut()
+                .ok_or_else(|| anyhow!("DSv4 spec-verify layer scratch {layer_idx} missing"))?;
+
+            {
+                let stream = if layer_idx == 0 {
+                    &scratch.initial_stream
+                } else {
+                    &prev_layers[layer_idx - 1].ffn_stream
+                };
+                let normed = &mut current.attn_normed;
+                let attn_mhc = if self.config.hc_mult == 1 {
+                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
+                        crate::ops::rms_norm_batch(ctx, stream, &layer.attn_norm, eps, normed)
+                    })?;
+                    None
+                } else {
+                    let mhc =
+                        crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
+                            crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, stream)
+                        })?;
+                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
+                        crate::hc::mhc_pre_rms_norm(
+                            ctx,
+                            stream,
+                            &mhc.pre,
+                            &layer.attn_norm,
+                            eps,
+                            hidden_size,
+                            hc_mult,
+                            normed,
+                        )
+                    })?;
+                    Some(mhc)
+                };
+
+                if let Some(cache) = slot.spec_normed.as_mut() {
+                    let rows = seq_len * hidden_size;
+                    let src = normed.data.slice(0..rows);
+                    let mut dst = cache[layer_idx].data.slice_mut(0..rows);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
+                }
+
+                let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
+                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                    kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                crate::attention::mla_attention(
+                    ctx,
+                    &self.config,
+                    &layer.attention,
+                    layer.mode,
+                    layer.compress_ratio,
+                    layer_idx,
+                    normed,
+                    &mut slot.attention[layer_idx],
+                    layer_pool,
+                    dsa_shared,
+                    flashmla_scratch,
+                    prefill_shared,
+                    start_pos,
+                    None,
+                    Some(&sparse_verify_meta),
+                    &self.tp,
+                    &mut current.attn_out,
+                    &mut keepalive,
+                )?;
+
+                let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
+                crate::stage_profile::profile(ctx, "dsv4/stage/attn_allreduce", || {
+                    self.tp.all_reduce_sum(ctx, &mut current.attn_out)
+                })?;
+
+                if let Some(mhc) = attn_mhc.as_ref() {
+                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                        crate::hc::hc_post(
+                            ctx,
+                            &current.attn_out,
+                            stream,
+                            &mhc.post,
+                            &mhc.comb,
+                            hidden_size,
+                            hc_mult,
+                            &mut current.attn_stream,
+                        )
+                    })?;
+                } else {
+                    crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_post", || {
+                        crate::ops::add_batch(
+                            ctx,
+                            &current.attn_out,
+                            stream,
+                            &mut current.attn_stream,
+                        )
+                    })?;
+                }
+            }
+
+            {
+                let stream = &current.attn_stream;
+                let normed = &mut current.ffn_normed;
+                let ffn_mhc = if self.config.hc_mult == 1 {
+                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
+                        crate::ops::rms_norm_batch(ctx, stream, &layer.ffn_norm, eps, normed)
+                    })?;
+                    None
+                } else {
+                    let mhc =
+                        crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
+                            crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, stream)
+                        })?;
+                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
+                        crate::hc::mhc_pre_rms_norm(
+                            ctx,
+                            stream,
+                            &mhc.pre,
+                            &layer.ffn_norm,
+                            eps,
+                            hidden_size,
+                            hc_mult,
+                            normed,
+                        )
+                    })?;
+                    Some(mhc)
+                };
+
+                if let Some(dense) = layer.dense_mlp.as_ref() {
+                    dsv4_dense_mlp_forward(
+                        ctx,
+                        dense,
+                        normed,
+                        &mut current.moe_with_shared,
+                        self.config.swiglu_limit,
+                        &mut keepalive,
+                    )?;
+                } else {
+                    crate::moe::dsv4_moe_forward(
+                        self,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        tokens,
+                        normed,
+                        &mut current.moe_out,
+                        &mut keepalive,
+                    )?;
+
+                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                    crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
+                        self.tp.all_reduce_sum(ctx, &mut current.moe_out)
+                    })?;
+
+                    let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
+                    let (mut shared_out, mut shared_scratch) =
+                        kv_adapter.shared_expert_decode_mut();
+                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                        anyhow!("DSv4 verify requires shared-expert output buffer")
+                    })?;
+                    shared.seq_len = seq_len;
+                    ensure!(
+                        shared.hidden_dim == hidden_size,
+                        "DSv4 shared verify scratch hidden {} != {}",
+                        shared.hidden_dim,
+                        hidden_size
+                    );
+                    let shared_scratch = shared_scratch
+                        .as_deref_mut()
+                        .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
+                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
+                            ctx,
+                            &ctx.stream,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            normed,
+                            shared,
+                            self.config.swiglu_limit,
+                            shared_scratch,
+                        )
+                    })?;
+                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
+                        crate::ops::add_batch(
+                            ctx,
+                            &current.moe_out,
+                            shared,
+                            &mut current.moe_with_shared,
+                        )
+                    })?;
+                }
+
+                if let Some(mhc) = ffn_mhc.as_ref() {
+                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                        crate::hc::hc_post(
+                            ctx,
+                            &current.moe_with_shared,
+                            stream,
+                            &mhc.post,
+                            &mhc.comb,
+                            hidden_size,
+                            hc_mult,
+                            &mut current.ffn_stream,
+                        )
+                    })?;
+                } else {
+                    crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_post", || {
+                        crate::ops::add_batch(
+                            ctx,
+                            &current.moe_with_shared,
+                            stream,
+                            &mut current.ffn_stream,
+                        )
+                    })?;
+                }
+            }
+        }
+
+        let mut stream_out = unsafe { HiddenStates::uninit(ctx, stream_dim, seq_len)? };
+        let elems = stream_dim * seq_len;
+        let final_stream = scratch
+            .layers
+            .last()
+            .ok_or_else(|| anyhow!("DSv4 spec-verify scratch has no layers"))?;
+        let src = final_stream.ffn_stream.data.slice(0..elems);
+        ctx.stream
+            .memcpy_dtod(&src, &mut stream_out.data)
+            .map_err(|e| anyhow!("DSv4 persistent verify stream export failed: {e}"))?;
+        slot.seq_len += seq_len;
+        Ok((stream_out, keepalive))
+    }
+
     fn forward_tokens_stream_impl(
         &self,
         slot: &mut Dsv4SlotState,
@@ -3801,6 +4291,13 @@ impl Dsv4Model {
             start_pos + tokens.len(),
             slot.max_seq_len
         );
+        if let Some(sched) = verify {
+            if tokens.len() <= MAX_SPEC_VERIFY_ROWS && !dsv4_use_deepep_transport()? {
+                return self.forward_tokens_verify_stream_persistent(
+                    slot, kv_adapter, tokens, start_pos, sched,
+                );
+            }
+        }
 
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
@@ -3947,28 +4444,59 @@ impl Dsv4Model {
             } else {
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn");
                 crate::stage_profile::profile(ctx, "dsv4/stage/mla_attn", || {
-                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
-                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
-                    crate::attention::mla_attention(
-                        &self.ctx,
-                        &self.config,
-                        &layer.attention,
-                        layer.mode,
-                        layer.compress_ratio,
-                        layer_idx,
-                        &normed,
-                        &mut slot.attention[layer_idx],
-                        layer_pool,
-                        dsa_shared,
-                        flashmla_scratch,
-                        prefill_shared,
-                        start_pos,
-                        start_pos_device,
-                        None,
-                        &self.tp,
-                        &mut attn_out,
-                        &mut keepalive,
-                    )
+                    let model1_decode = seq_len == 1
+                        && start_pos_device.is_some()
+                        && layer.attention.w_kc.is_none()
+                        && layer.attention.w_vc.is_none()
+                        && layer.attention.o_proj.is_none();
+                    if model1_decode {
+                        let (layer_pool, flashmla_scratch, mla_scratch) =
+                            kv_adapter.layer_flashmla_and_mla_decode_mut(layer_idx)?;
+                        let mla_scratch = mla_scratch.ok_or_else(|| {
+                            anyhow!("DSv4 MODEL1 layer {layer_idx} missing MLA decode scratch")
+                        })?;
+                        crate::attention::mla_attention_decode_graph(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            &normed,
+                            &mut slot.attention[layer_idx],
+                            layer_pool,
+                            flashmla_scratch,
+                            start_pos,
+                            start_pos_device,
+                            &self.tp,
+                            mla_scratch,
+                            &mut attn_out,
+                            &mut keepalive,
+                        )
+                    } else {
+                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                            kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                        crate::attention::mla_attention(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                            layer_idx,
+                            &normed,
+                            &mut slot.attention[layer_idx],
+                            layer_pool,
+                            dsa_shared,
+                            flashmla_scratch,
+                            prefill_shared,
+                            start_pos,
+                            start_pos_device,
+                            None,
+                            &self.tp,
+                            &mut attn_out,
+                            &mut keepalive,
+                        )
+                    }
                 })?;
             }
             keepalive.keep_hidden(&attn_out);
@@ -4069,7 +4597,7 @@ impl Dsv4Model {
                 // DeepEP combine already reduces the EP-sharded routed output; the
                 // non-deepep path needs the explicit TP all-reduce below.
                 let needs_moe_allreduce = !use_deepep_transport;
-                let mut shared_out = kv_adapter.shared_expert_out_mut();
+                let (mut shared_out, mut shared_scratch) = kv_adapter.shared_expert_decode_mut();
                 if use_deepep_transport {
                     #[cfg(feature = "deepep")]
                     {
@@ -4192,6 +4720,7 @@ impl Dsv4Model {
                     let shared = shared_out.as_deref_mut().ok_or_else(|| {
                         anyhow!("DSv4 decode requires shared-expert output buffer")
                     })?;
+                    shared.seq_len = seq_len;
                     ensure!(
                         shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
                         "DSv4 shared decode scratch shape {}x{} != {}x{}",
@@ -4203,15 +4732,18 @@ impl Dsv4Model {
                     let _normed_ready = normed_ready
                         .as_ref()
                         .expect("comm-overlap path records normed fence");
+                    let scratch = shared_scratch
+                        .as_deref_mut()
+                        .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert scratch"))?;
                     crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                        crate::moe::dsv4_shared_expert_forward(
+                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
                             &self.ctx,
                             &self.ctx.comm_stream,
                             layer.moe.as_ref().expect("DSv4 layer.moe"),
                             &normed,
                             shared,
                             self.config.swiglu_limit,
-                            &mut keepalive,
+                            scratch,
                         )
                     })?;
                     Some(ctx.record_pipeline_fence(CudaPipelineStreamKind::Comm)?)
@@ -4234,6 +4766,7 @@ impl Dsv4Model {
                     let shared = shared_out.as_deref_mut().ok_or_else(|| {
                         anyhow!("DSv4 decode requires shared-expert output buffer")
                     })?;
+                    shared.seq_len = seq_len;
                     ensure!(
                         shared.hidden_dim == hidden_size && shared.seq_len == seq_len,
                         "DSv4 shared decode scratch shape {}x{} != {}x{}",
@@ -4242,15 +4775,46 @@ impl Dsv4Model {
                         hidden_size,
                         seq_len
                     );
+                    let scratch = shared_scratch
+                        .as_deref_mut()
+                        .ok_or_else(|| anyhow!("DSv4 decode requires shared-expert scratch"))?;
                     crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
-                        crate::moe::dsv4_shared_expert_forward(
+                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
                             &self.ctx,
                             &self.ctx.stream,
                             layer.moe.as_ref().expect("DSv4 layer.moe"),
                             &normed,
                             shared,
                             self.config.swiglu_limit,
-                            &mut keepalive,
+                            scratch,
+                        )
+                    })?;
+                } else if !use_deepep_transport
+                    && sparse_verify_meta.is_some()
+                    && seq_len <= MAX_SPEC_VERIFY_ROWS
+                {
+                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                        anyhow!("DSv4 verify requires shared-expert output buffer")
+                    })?;
+                    shared.seq_len = seq_len;
+                    ensure!(
+                        shared.hidden_dim == hidden_size,
+                        "DSv4 shared verify scratch hidden {} != {}",
+                        shared.hidden_dim,
+                        hidden_size
+                    );
+                    let scratch = shared_scratch
+                        .as_deref_mut()
+                        .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
+                    crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
+                        crate::moe::dsv4_shared_expert_forward_decode_scratch(
+                            &self.ctx,
+                            &self.ctx.stream,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            &normed,
+                            shared,
+                            self.config.swiglu_limit,
+                            scratch,
                         )
                     })?;
                 } else {
@@ -4274,7 +4838,11 @@ impl Dsv4Model {
                     })?;
                     shared_owned = Some(shared);
                 };
-                let shared = if seq_len == 1 {
+                let shared = if seq_len == 1
+                    || (!use_deepep_transport
+                        && sparse_verify_meta.is_some()
+                        && seq_len <= MAX_SPEC_VERIFY_ROWS)
+                {
                     shared_out.as_deref().ok_or_else(|| {
                         anyhow!("DSv4 decode requires shared-expert output buffer")
                     })?
@@ -4852,6 +5420,7 @@ impl Dsv4Model {
                         attn_in: _,
                         attn_normed,
                         attn_out,
+                        mla,
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
@@ -4888,7 +5457,7 @@ impl Dsv4Model {
                             hc_mult,
                             attn_normed,
                         )?;
-                        crate::attention::mla_attention(
+                        crate::attention::mla_attention_decode_graph(
                             &self.ctx,
                             &self.config,
                             &layer.attention,
@@ -4898,15 +5467,11 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
-                            None,
                             flashmla_scratch,
-                            // Decode-only graph capture (token_count=1): the
-                            // prefill DeepGEMM lane is never taken.
-                            None,
                             start_pos,
                             Some(&slot.start_pos_device),
-                            None,
                             &self.tp,
+                            mla,
                             attn_out,
                             &mut keepalive,
                         )
@@ -4921,6 +5486,7 @@ impl Dsv4Model {
                         attn_in: _,
                         attn_normed,
                         attn_out,
+                        mla,
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
@@ -4960,7 +5526,7 @@ impl Dsv4Model {
                             hc_mult,
                             attn_normed,
                         )?;
-                        crate::attention::mla_attention(
+                        crate::attention::mla_attention_decode_graph(
                             &self.ctx,
                             &self.config,
                             &layer.attention,
@@ -4970,15 +5536,11 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
-                            None,
                             flashmla_scratch,
-                            // Decode-only graph capture (token_count=1): the
-                            // prefill DeepGEMM lane is never taken.
-                            None,
                             start_pos,
                             Some(&slot.start_pos_device),
-                            None,
                             &self.tp,
+                            mla,
                             attn_out,
                             &mut keepalive,
                         )?;
@@ -5074,6 +5636,8 @@ impl Dsv4Model {
                 // Field-access (no destructure-move) so the outer `body` closure can borrow
                 // `graph` by disjoint fields. Nested tail capture (bypassed under whole_step).
                 let final_scratch = &mut graph.layers[final_idx];
+                let head_stream_row_ref = &mut graph.head_stream_row;
+                let head_mixes_ref = &mut graph.head_mixes;
                 let last_hidden_ref = &mut graph.last_hidden;
                 let last_normed_ref = &mut graph.last_normed;
                 let logits_batch_ref = &mut graph.logits_batch;
@@ -5095,12 +5659,14 @@ impl Dsv4Model {
                         hc_mult,
                         &mut final_scratch.ffn_stream,
                     )?;
-                    crate::hc::head_hidden_from_stream(
+                    crate::hc::head_hidden_from_stream_into(
                         &self.ctx,
                         &self.config,
                         &self.head_hc,
                         &final_scratch.ffn_stream,
                         0,
+                        head_stream_row_ref,
+                        head_mixes_ref,
                         last_hidden_ref,
                     )?;
                     crate::ops::rms_norm_vec(
