@@ -2003,7 +2003,7 @@ mod dsv4_gpu {
         active_counts: CudaSlice<i32>,
     }
 
-    struct Dsv4SharedDecodeScratch {
+    pub(crate) struct Dsv4SharedDecodeScratch {
         max_m: usize,
         scale_stride_m: usize,
         input_fp8: CudaSlice<u8>,
@@ -2430,7 +2430,11 @@ mod dsv4_gpu {
     }
 
     impl Dsv4SharedDecodeScratch {
-        fn new(ctx: &DeviceContext, hidden_dim: usize, shared_inter: usize) -> Result<Self> {
+        pub(crate) fn new(
+            ctx: &DeviceContext,
+            hidden_dim: usize,
+            shared_inter: usize,
+        ) -> Result<Self> {
             let max_m = 128usize;
             let scale_stride_m = max_m.div_ceil(4) * 4;
             let hidden_scale_cols = hidden_dim.div_ceil(128);
@@ -2473,9 +2477,33 @@ mod dsv4_gpu {
             })
         }
 
+        pub(crate) fn device_bytes(hidden_dim: usize, shared_inter: usize) -> usize {
+            let max_m = 128usize;
+            let scale_stride_m = max_m.div_ceil(4) * 4;
+            let hidden_scale_cols = hidden_dim.div_ceil(128);
+            let inter_scale_cols = shared_inter.div_ceil(128);
+            let b = |elems: usize, elem_bytes: usize| elems.saturating_mul(elem_bytes);
+            let bf16 = |hidden_dim: usize, seq_len: usize| {
+                hidden_dim.saturating_mul(seq_len).saturating_mul(2)
+            };
+            b(max_m.saturating_mul(hidden_dim), 1)
+                .saturating_add(b(
+                    scale_stride_m.saturating_mul(hidden_scale_cols),
+                    std::mem::size_of::<f32>(),
+                ))
+                .saturating_add(bf16(2usize.saturating_mul(shared_inter), max_m))
+                .saturating_add(b(max_m.saturating_mul(shared_inter), 1))
+                .saturating_add(b(
+                    scale_stride_m.saturating_mul(inter_scale_cols),
+                    std::mem::size_of::<f32>(),
+                ))
+                .saturating_add(bf16(hidden_dim, max_m))
+                .saturating_add(4usize.saturating_mul(std::mem::size_of::<i32>()))
+        }
+
         /// Exact requested device bytes (Σ over live `CudaSlice`/`HiddenStates`).
         #[allow(dead_code)]
-        fn device_bytes_live(&self) -> usize {
+        pub(crate) fn device_bytes_live(&self) -> usize {
             let f32_sz = std::mem::size_of::<f32>();
             let i32_sz = std::mem::size_of::<i32>();
             self.input_fp8.len() // u8
@@ -3341,28 +3369,33 @@ mod dsv4_gpu {
             Ok(())
         })?;
 
-        let expert_out = {
+        {
             let _nvtx = crate::nvtx::range("dsv4/deepgemm_grouped");
-            crate::stage_profile::profile(ctx, "dsv4/stage/moe_deepgemm_grouped", || {
-                if use_contiguous {
-                    deepgemm_grouped_experts_contiguous_pooled(
-                        ctx,
-                        layer,
-                        swiglu_limit,
-                        &mut scratch.grouped_contig,
-                    )
-                } else {
-                    deepgemm_grouped_experts_pooled(
-                        ctx,
-                        layer,
-                        &scratch.packed_hidden,
-                        &scratch.counts,
-                        &scratch.offsets,
-                        swiglu_limit,
-                        &mut scratch.grouped,
-                    )
-                }
-            })?
+            crate::stage_profile::profile(
+                ctx,
+                "dsv4/stage/moe_deepgemm_grouped",
+                || -> Result<()> {
+                    if use_contiguous {
+                        deepgemm_grouped_experts_contiguous_pooled(
+                            ctx,
+                            layer,
+                            swiglu_limit,
+                            &mut scratch.grouped_contig,
+                        )?;
+                    } else {
+                        deepgemm_grouped_experts_pooled(
+                            ctx,
+                            layer,
+                            &scratch.packed_hidden,
+                            &scratch.counts,
+                            &scratch.offsets,
+                            swiglu_limit,
+                            &mut scratch.grouped,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?
         };
 
         let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
@@ -3370,17 +3403,17 @@ mod dsv4_gpu {
             unsafe {
                 if use_contiguous {
                     moe::dsv4_scatter_all_route_slots(
-                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&scratch.grouped_contig.out.data, ctx),
                         cache_ptr(&scratch.route_out.data, ctx),
                         cache_ptr(&scratch.grouped_contig.packed_route_slot, ctx),
                         cache_ptr(&scratch.grouped_contig.packed_weight, ctx),
-                        expert_out.seq_len,
+                        scratch.grouped_contig.packed_hidden.seq_len,
                         hidden_dim,
                         ctx.stream.cu_stream(),
                     )?;
                 } else {
                     moe::dsv4_scatter_all_route_slots(
-                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(&scratch.grouped.out_compact.data, ctx),
                         cache_ptr(&scratch.route_out.data, ctx),
                         cache_ptr(&scratch.packed_route_slot, ctx),
                         cache_ptr(&scratch.packed_weight, ctx),
@@ -3661,6 +3694,18 @@ mod dsv4_gpu {
         Ok(())
     }
 
+    pub(crate) fn dsv4_shared_expert_forward_decode_scratch(
+        ctx: &DeviceContext,
+        stream: &Arc<CudaStream>,
+        layer: &Dsv4MoeLayer,
+        hidden: &HiddenStates,
+        out: &mut HiddenStates,
+        swiglu_limit: f32,
+        scratch: &mut Dsv4SharedDecodeScratch,
+    ) -> Result<()> {
+        dsv4_shared_expert_pooled(ctx, stream, layer, hidden, out, swiglu_limit, scratch)
+    }
+
     pub(crate) fn dsv4_shared_expert_forward_decode_graph(
         ctx: &DeviceContext,
         stream: &Arc<CudaStream>,
@@ -3869,7 +3914,7 @@ mod dsv4_gpu {
         offsets: &CudaSlice<i32>,
         swiglu_limit: f32,
         scratch: &mut Dsv4GroupedDecodeScratch,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         let num_groups = layer.num_groups;
         let hidden_dim = packed_hidden.hidden_dim;
         let intermediate = layer.intermediate;
@@ -3990,11 +4035,7 @@ mod dsv4_gpu {
             )?;
         }
 
-        Ok(HiddenStates {
-            data: scratch.out_compact.data.clone(),
-            hidden_dim,
-            seq_len: packed_hidden.seq_len,
-        })
+        Ok(())
     }
 
     fn deepgemm_grouped_experts_contiguous_pooled(
@@ -4002,7 +4043,7 @@ mod dsv4_gpu {
         layer: &Dsv4MoeLayer,
         swiglu_limit: f32,
         scratch: &mut Dsv4GroupedContiguousDecodeScratch,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         let num_groups = layer.num_groups;
         let packed_hidden = &scratch.packed_hidden;
         let hidden_dim = packed_hidden.hidden_dim;
@@ -4108,11 +4149,7 @@ mod dsv4_gpu {
             )?;
         }
 
-        Ok(HiddenStates {
-            data: scratch.out.data.clone(),
-            hidden_dim,
-            seq_len: packed_hidden.seq_len,
-        })
+        Ok(())
     }
 
     /// DSv4 dense shared expert via a single-group FP8 DeepGEMM pass: w13 fused
@@ -4134,10 +4171,11 @@ mod dsv4_gpu {
         );
         let shared_inter = layer.shared_w2.cols;
         ensure!(
-            num_tokens == 1
+            num_tokens <= scratch.max_m
                 && scratch.out.hidden_dim == hidden_dim
                 && scratch.w13_out.hidden_dim == 2 * shared_inter,
-            "DSv4 pooled shared scratch mismatch: tokens={num_tokens} H={hidden_dim} I={shared_inter}"
+            "DSv4 pooled shared scratch mismatch: tokens={num_tokens} max_m={} H={hidden_dim} I={shared_inter}",
+            scratch.max_m
         );
         ensure!(
             out.hidden_dim == hidden_dim && out.seq_len == num_tokens,
@@ -4147,6 +4185,17 @@ mod dsv4_gpu {
             hidden_dim,
             num_tokens
         );
+        if num_tokens != 1 {
+            let num_tokens_i32 = i32::try_from(num_tokens).map_err(|_| {
+                anyhow::anyhow!("DSv4 shared token count {num_tokens} overflows i32")
+            })?;
+            stream
+                .memcpy_htod(&[num_tokens_i32], &mut scratch.counts)
+                .map_err(|e| anyhow::anyhow!("DSv4 shared count scratch update failed: {e}"))?;
+            stream
+                .memcpy_htod(&[num_tokens_i32], &mut scratch.masked_m)
+                .map_err(|e| anyhow::anyhow!("DSv4 shared masked-m scratch update failed: {e}"))?;
+        }
         let p_hidden = cache_ptr(&hidden.data, ctx);
         let p_in_fp8 = cache_ptr(&scratch.input_fp8, ctx);
         let p_in_scales = cache_ptr(&scratch.input_scales, ctx);
@@ -4222,6 +4271,14 @@ mod dsv4_gpu {
         stream
             .memcpy_dtod(&src, &mut out.data)
             .map_err(|e| anyhow::anyhow!("DSv4 pooled shared output D2D failed: {e}"))?;
+        if num_tokens != 1 {
+            stream
+                .memcpy_htod(&[1i32], &mut scratch.counts)
+                .map_err(|e| anyhow::anyhow!("DSv4 shared count scratch reset failed: {e}"))?;
+            stream
+                .memcpy_htod(&[1i32], &mut scratch.masked_m)
+                .map_err(|e| anyhow::anyhow!("DSv4 shared masked-m scratch reset failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -4742,9 +4799,10 @@ mod dsv4_gpu {
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
-    Dsv4GemvTables, Dsv4MoeDecodeScratch, GroupedCache, build_grouped_cache, dsv4_moe_forward,
-    dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
-    dsv4_shared_expert_forward_decode_graph,
+    Dsv4GemvTables, Dsv4MoeDecodeScratch, Dsv4SharedDecodeScratch, GroupedCache,
+    build_grouped_cache, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
+    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
+    dsv4_shared_expert_forward_decode_scratch,
 };
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};

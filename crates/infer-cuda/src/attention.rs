@@ -182,8 +182,18 @@ pub(crate) struct Dsv4KvAdapter {
     /// One shared MoE decode-graph scratch for ALL layers and slots (issue #60).
     /// `None` unless the DSv4 decode-graph path is enabled.
     moe_decode_shared: Option<crate::moe::Dsv4MoeDecodeScratch>,
-    /// One shared-expert decode output for ALL layers and slots (issue #60).
+    /// One persistent B=1 MLA decode scratch per MODEL1 layer. This is not graph
+    /// state; eager no-spec decode reuses it to avoid allocating q/kv/CSA/O-proj
+    /// temporaries inside every per-layer MLA dispatch.
+    mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
+    /// One shared-expert output for ALL layers and slots. Capacity covers both
+    /// B=1 decode and the tiny multi-row MTP verify chunk; callers set
+    /// `seq_len` before dispatch.
     shared_expert_out: Option<HiddenStates>,
+    /// One shared-expert FP8 scratch for ALL layers and slots. Replaces the
+    /// per-layer `dsv4_shared_expert` temporary allocations on eager decode and
+    /// scheduled MTP verify.
+    shared_expert_scratch: Option<crate::moe::Dsv4SharedDecodeScratch>,
     /// One shared batched (`b = N`) FlashMLA sparse-decode scratch for ALL
     /// FlashMLA layers and slots (#60). `None` when FlashMLA decode is disabled
     /// at the build/override level (no arena), or when the model has no FlashMLA
@@ -267,14 +277,22 @@ impl Dsv4KvAdapter {
         kv_arena: &Dsv4MlaKvArena,
         tp_world: usize,
         num_slots: usize,
+        mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
         moe_decode: Option<(
             &infer_moe::MoeConfig,
             &ExpertSplit,
             &crate::dsv4::Dsv4MoeLayer,
         )>,
+        shared_expert_decode: Option<&crate::dsv4::Dsv4MoeLayer>,
         hidden_size: usize,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "DSv4 attention pool needs at least one slot");
+        ensure!(
+            mla_decode.len() == layer_specs.len(),
+            "DSv4 MLA decode scratch len {} != layer specs len {}",
+            mla_decode.len(),
+            layer_specs.len()
+        );
         let mut layers = Vec::with_capacity(layer_specs.len());
         for &(mode, compress_ratio, local_heads) in layer_specs {
             layers.push(Dsv4LayerKvLayout::new(
@@ -327,11 +345,23 @@ impl Dsv4KvAdapter {
                 crate::moe::Dsv4MoeDecodeScratch::new(ctx, cfg, split, layer)
             })
             .transpose()?;
-        // ALWAYS allocate the model-wide B=1 shared-expert decode output. One
-        // tiny instance (hidden_size×1 BF16 ≈ 14 KiB) replaces the old
-        // per-slot×per-layer `shared_decode_out` (#60), and keeping it
-        // pre-allocated avoids a per-step `uninit` on the default decode path.
-        let shared_expert_out = Some(unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? });
+        // ALWAYS allocate the model-wide shared-expert output. Capacity is the
+        // bounded MTP verify chunk (`MAX_SPEC_VERIFY_ROWS`); B=1 decode simply
+        // sets `seq_len = 1` before dispatch. Keeping it pre-allocated avoids a
+        // per-layer `uninit` on both the default decode and scheduled verify
+        // paths.
+        let shared_expert_out = Some(unsafe {
+            HiddenStates::uninit(ctx, hidden_size, crate::dsv4::MAX_SPEC_VERIFY_ROWS)?
+        });
+        let shared_expert_scratch = shared_expert_decode
+            .map(|layer| {
+                crate::moe::Dsv4SharedDecodeScratch::new(
+                    ctx,
+                    layer.hidden_dim,
+                    layer.shared_w2.cols,
+                )
+            })
+            .transpose()?;
         // One model-wide batched (b=N) FlashMLA decode scratch (#60). Built for
         // canonical MODEL1 FlashMLA decode when the arena is live; V32/GLM keeps
         // the single-row path because the batched sparse-decode shim below is
@@ -390,7 +420,9 @@ impl Dsv4KvAdapter {
             slot_epochs: vec![None; num_slots],
             dsa_shared,
             moe_decode_shared,
+            mla_decode,
             shared_expert_out,
+            shared_expert_scratch,
             flashmla_batch,
             flashmla_scratch,
             prefill_linear,
@@ -425,10 +457,24 @@ impl Dsv4KvAdapter {
                     .map_or(0, |s| s.device_bytes_live()),
             ),
             (
+                "mla_decode",
+                self.mla_decode
+                    .iter()
+                    .filter_map(Option::as_ref)
+                    .map(Dsv4MlaDecodeGraphScratch::device_bytes)
+                    .sum(),
+            ),
+            (
                 "shared_expert_out",
                 self.shared_expert_out
                     .as_ref()
                     .map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "shared_expert_scratch",
+                self.shared_expert_scratch
+                    .as_ref()
+                    .map_or(0, |s| s.device_bytes_live()),
             ),
             (
                 "flashmla_batch",
@@ -496,6 +542,30 @@ impl Dsv4KvAdapter {
         Ok((layer, self.flashmla_scratch.as_mut()))
     }
 
+    /// Split-borrow accessor for eager B=1 MODEL1 MLA decode: one layer's KV
+    /// layout + the model-wide FlashMLA scratch + that layer's persistent MLA
+    /// scratch.
+    pub(crate) fn layer_flashmla_and_mla_decode_mut(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(
+        &mut Dsv4LayerKvLayout,
+        Option<&mut Dsv4FlashMlaDecodeScratch>,
+        Option<&mut Dsv4MlaDecodeGraphScratch>,
+    )> {
+        let len = self.layers.len();
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
+        let scratch = self
+            .mla_decode
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 MLA decode scratch layer {layer_idx} outside len {len}"))?
+            .as_mut();
+        Ok((layer, self.flashmla_scratch.as_mut(), scratch))
+    }
+
     /// `&mut` accessor for the model-wide shared FP8 prefill DeepGEMM linear
     /// scratch alone (mirrors `dsa_shared`/`flashmla_batch` accessors). `None`
     /// when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
@@ -547,8 +617,16 @@ impl Dsv4KvAdapter {
         self.moe_decode_shared.as_mut()
     }
 
-    pub(crate) fn shared_expert_out_mut(&mut self) -> Option<&mut HiddenStates> {
-        self.shared_expert_out.as_mut()
+    pub(crate) fn shared_expert_decode_mut(
+        &mut self,
+    ) -> (
+        Option<&mut HiddenStates>,
+        Option<&mut crate::moe::Dsv4SharedDecodeScratch>,
+    ) {
+        (
+            self.shared_expert_out.as_mut(),
+            self.shared_expert_scratch.as_mut(),
+        )
     }
 
     pub(crate) fn layer_mut(&mut self, layer_idx: usize) -> Result<&mut Dsv4LayerKvLayout> {
@@ -2858,16 +2936,15 @@ pub(crate) struct Dsv4LayerAttentionState {
     dsa_official: Option<Dsv4DsaOfficialState>,
 }
 
-/// Per-layer K+1-slot snapshot of speculative-verify ring writes. The verify
-/// forward can write BF16 SW-ring slots and FP8 FlashMLA ring bytes for
-/// `[pending, d0..]`; after truncate, rejected tail slots are restored before
-/// accepted rows are re-forwarded. Buffers are allocated once at slot
-/// construction and reused by D2D copy.
+/// Per-layer one-slot snapshot of speculative-verify ring writes. The verify
+/// forward can write BF16 SW-ring slots and FP8 FlashMLA ring bytes. Only the
+/// boundary slot at `start_pos` must be protected; accepted rows are re-forwarded
+/// and rejected rows are discarded after truncate. Buffers are allocated once at
+/// slot construction and reused by D2D copy.
 pub(crate) struct Dsv4SpecRingSnapshot {
-    /// `(max_depth+1) * head_dim` BF16 SW ring slots, slot `i` at `[i*head_dim..]`.
+    /// One BF16 SW ring slot.
     sw_slots: CudaSlice<half::bf16>,
-    /// `(max_depth+1) * fp8_bytes_per_token` FP8 ring slots (data+scale per slot);
-    /// `None` when this layer has no FlashMLA/FP8 ring.
+    /// One FP8 ring slot (data+scale); `None` when this layer has no FlashMLA/FP8 ring.
     fp8_slots: Option<CudaSlice<u8>>,
     /// `flash.fp8_kv_comp_packed_rows` captured once pre-verify; restored on reject.
     fp8_packed_rows_before: Option<usize>,
@@ -2882,7 +2959,7 @@ pub(crate) struct Dsv4SpecRingSnapshot {
     fp8_token_data_bytes: usize,
     fp8_scale_bytes: usize,
     fp8_bytes_per_token: usize,
-    /// Max draft depth this snapshot was sized for (K); valid slot count is K+1.
+    /// Max draft depth this snapshot accepts for stale-window checks.
     max_depth: usize,
     /// Capture-time `start_pos`/`depth`, asserted in restore so a stale snapshot
     /// can never be replayed against a different verify window.
@@ -3457,9 +3534,9 @@ impl Dsv4LayerAttentionState {
         }
     }
 
-    /// Allocate this layer's K+1-slot spec-ring snapshot at slot construction.
-    /// Each snapshot slot stores one BF16 SW-ring row and, when this layer has
-    /// FlashMLA decode state, one FP8 ring row.
+    /// Allocate this layer's one-slot spec-ring snapshot at slot construction.
+    /// It stores one BF16 SW-ring row and, when this layer has FlashMLA decode
+    /// state, one FP8 ring row.
     pub(crate) fn alloc_spec_ring_snapshot(
         &self,
         ctx: &DeviceContext,
@@ -3467,9 +3544,7 @@ impl Dsv4LayerAttentionState {
         kv_arena: &Dsv4MlaKvArena,
         max_depth: usize,
     ) -> Result<Dsv4SpecRingSnapshot> {
-        let slots = max_depth
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("DSv4 spec-ring max_depth {max_depth} overflow"))?;
+        let slots = 1usize;
         // FP8 token data bytes = NoPE FP8 (1 B/dim) + RoPE bf16 (2 B/dim);
         // scale bytes = bytes_per_token - data bytes.
         let fp8_token_data_bytes = kv_arena
@@ -3511,9 +3586,9 @@ impl Dsv4LayerAttentionState {
         })
     }
 
-    /// Snapshot the K+1 verify ring slots before depth-K verify. For each
-    /// `start_pos+i`, copy the BF16 SW slot and optional FP8 data+scale bytes
-    /// into snapshot slot `i`; save FlashMLA progress scalars once.
+    /// Snapshot the one ring slot that can be observed after rollback. The
+    /// accepted prefix is re-forwarded after truncate, so copying the whole
+    /// depth window only burns commit time.
     pub(crate) fn capture_spec_rings(
         &self,
         ctx: &DeviceContext,
@@ -3535,21 +3610,17 @@ impl Dsv4LayerAttentionState {
         );
         snap.fp8_packed_rows_before = self.flashmla.as_ref().map(|f| f.fp8_kv_comp_packed_rows);
         snap.fp8_bootstrapped_before = self.flashmla.as_ref().map(|f| f.fp8_kv_sw_bootstrapped);
-        for i in 0..=depth {
-            let draft_abs_pos = start_pos + i;
-            snap.capture_sw_slot(ctx, &self.sw_window_cache, i, draft_abs_pos)?;
-            if let Some(flash) = &self.flashmla {
-                snap.capture_fp8_slot(ctx, pool, flash, i, draft_abs_pos)?;
-            }
+        snap.capture_sw_slot(ctx, &self.sw_window_cache, 0, start_pos)?;
+        if let Some(flash) = &self.flashmla {
+            snap.capture_fp8_slot(ctx, pool, flash, 0, start_pos)?;
         }
         snap.captured_start_pos = start_pos;
         snap.captured_depth = depth;
         Ok(())
     }
 
-    /// Restore rejected tail ring slots `(accepted_n+1 ..= depth)` after
-    /// truncate and before accepted-prefix re-forward. Accepted slots are left
-    /// for re-forward to overwrite. The FP8 slot id is read up front so page
+    /// Restore the single protected boundary slot after truncate and before
+    /// accepted-prefix re-forward. The FP8 slot id is read up front so page
     /// lookup does not hold a `flashmla` borrow across SW-ring restore.
     pub(crate) fn restore_spec_ring_tail(
         &mut self,
@@ -3573,12 +3644,9 @@ impl Dsv4LayerAttentionState {
         // Read the FP8 slot id once up front so page lookup can run without
         // holding a `flashmla` borrow across the SW-ring restore.
         let fp8_slot_idx = self.flashmla.as_ref().map(|f| f.slot_idx);
-        for i in (accepted_n + 1)..=depth {
-            let draft_abs_pos = start_pos + i;
-            snap.restore_sw_slot(ctx, &mut self.sw_window_cache, i, draft_abs_pos)?;
-            if let Some(slot_idx) = fp8_slot_idx {
-                snap.restore_fp8_slot(ctx, pool, slot_idx, i, draft_abs_pos)?;
-            }
+        snap.restore_sw_slot(ctx, &mut self.sw_window_cache, 0, start_pos)?;
+        if let Some(slot_idx) = fp8_slot_idx {
+            snap.restore_fp8_slot(ctx, pool, slot_idx, 0, start_pos)?;
         }
         if let Some(flash) = &mut self.flashmla {
             if let Some(rows) = snap.fp8_packed_rows_before {
@@ -6934,6 +7002,25 @@ fn mla_rms_norm(
 ) -> Result<HiddenStates> {
     // SAFETY: rms_norm_batched_cuda writes the full output buffer.
     let mut out = unsafe { HiddenStates::uninit(ctx, x.hidden_dim, x.seq_len)? };
+    mla_rms_norm_into(ctx, x, weight, eps, &mut out)?;
+    Ok(out)
+}
+
+fn mla_rms_norm_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "DSv4 MLA RMSNorm out {}x{} != input {}x{}",
+        out.hidden_dim,
+        out.seq_len,
+        x.hidden_dim,
+        x.seq_len
+    );
     {
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
@@ -6952,17 +7039,18 @@ fn mla_rms_norm(
             .result()?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-fn mla_rms_norm_decode_slice(
+fn mla_rms_norm_decode_slice_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
     offset: usize,
     width: usize,
     weight: &DeviceVec,
     eps: f32,
-) -> Result<HiddenStates> {
+    out: &mut HiddenStates,
+) -> Result<()> {
     ensure!(
         x.seq_len == 1,
         "DSv4 fused wqkv slice RMSNorm is decode-only, got seq_len={}",
@@ -6978,7 +7066,13 @@ fn mla_rms_norm_decode_slice(
         "DSv4 fused wqkv slice norm weight len {} != slice width {width}",
         weight.len
     );
-    let mut out = unsafe { HiddenStates::uninit(ctx, width, 1)? };
+    ensure!(
+        out.hidden_dim == width && out.seq_len == 1,
+        "DSv4 fused wqkv slice RMSNorm out {}x{} != {}x1",
+        out.hidden_dim,
+        out.seq_len,
+        width
+    );
     {
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
@@ -6997,7 +7091,7 @@ fn mla_rms_norm_decode_slice(
             .result()?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn run_fused_wqkv_decode(
@@ -7007,6 +7101,33 @@ fn run_fused_wqkv_decode(
     hidden: &HiddenStates,
     scratch: &mut Dsv4FusedWqkvDecodeScratch,
 ) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
+    let mut c_q_normed = unsafe { HiddenStates::uninit(ctx, scratch.q_lora_rank, 1)? };
+    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
+    let mut kv_normed = unsafe { HiddenStates::uninit(ctx, scratch.head_dim, 1)? };
+    run_fused_wqkv_decode_into(
+        ctx,
+        config,
+        attention,
+        hidden,
+        scratch,
+        &mut c_q_normed,
+        &mut q_raw,
+        &mut kv_normed,
+    )?;
+    Ok((c_q_normed, q_raw, kv_normed))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fused_wqkv_decode_into(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    hidden: &HiddenStates,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
+    c_q_normed: &mut HiddenStates,
+    q_raw: &mut HiddenStates,
+    kv_normed: &mut HiddenStates,
+) -> Result<()> {
     ensure!(
         hidden.seq_len == 1,
         "DSv4 fused wqkv decode path requires seq_len=1, got {}",
@@ -7043,6 +7164,27 @@ fn run_fused_wqkv_decode(
         scratch.input_scales.len() >= scratch.scale_stride_m * scale_cols,
         "DSv4 fused wqkv scale scratch too small"
     );
+    ensure!(
+        c_q_normed.hidden_dim == scratch.q_lora_rank && c_q_normed.seq_len == 1,
+        "DSv4 fused wqkv c_q_normed scratch {}x{} != {}x1",
+        c_q_normed.hidden_dim,
+        c_q_normed.seq_len,
+        scratch.q_lora_rank
+    );
+    ensure!(
+        q_raw.hidden_dim == attention.wq_b.rows && q_raw.seq_len == 1,
+        "DSv4 fused wqkv q_raw scratch {}x{} != {}x1",
+        q_raw.hidden_dim,
+        q_raw.seq_len,
+        attention.wq_b.rows
+    );
+    ensure!(
+        kv_normed.hidden_dim == scratch.head_dim && kv_normed.seq_len == 1,
+        "DSv4 fused wqkv kv_normed scratch {}x{} != {}x1",
+        kv_normed.hidden_dim,
+        kv_normed.seq_len,
+        scratch.head_dim
+    );
     let stream = ctx.stream.cu_stream();
     unsafe {
         cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
@@ -7073,24 +7215,25 @@ fn run_fused_wqkv_decode(
         )
         .map_err(|e| anyhow!("DSv4 fused wqkv DeepGEMM dense failed: {e}"))?;
     }
-    let c_q_normed = mla_rms_norm_decode_slice(
+    mla_rms_norm_decode_slice_into(
         ctx,
         &scratch.qkv_raw,
         0,
         scratch.q_lora_rank,
         &attention.q_norm,
         config.rms_norm_eps,
+        c_q_normed,
     )?;
-    let kv_normed = mla_rms_norm_decode_slice(
+    mla_rms_norm_decode_slice_into(
         ctx,
         &scratch.qkv_raw,
         scratch.q_lora_rank,
         scratch.head_dim,
         &attention.kv_norm,
         config.rms_norm_eps,
+        kv_normed,
     )?;
 
-    let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
     let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
     match (
         dsv4_decode_proj_deepgemm_enabled(),
@@ -7149,12 +7292,12 @@ fn run_fused_wqkv_decode(
         }
         _ => {
             crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-                dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+                dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut *q_raw)
             })?;
         }
     }
     drop(nvtx_wq_b);
-    Ok((c_q_normed, q_raw, kv_normed))
+    Ok(())
 }
 
 /// Prepared-but-not-attended MLA state, the boundary between `mla_attention`'s
@@ -7184,6 +7327,205 @@ pub(crate) struct Dsv4MlaPrepared {
     pub(crate) rope_base: f32,
     pub(crate) original_seq_len: i32,
     pub(crate) start_pos_i32: i32,
+}
+
+pub(crate) struct Dsv4MlaDecodeGraphScratch {
+    c_q: HiddenStates,
+    c_q_normed: HiddenStates,
+    q_raw: HiddenStates,
+    kv_raw: HiddenStates,
+    kv_normed: HiddenStates,
+    q_prepared: HiddenStates,
+    k_prepared: HiddenStates,
+    local_attn: HiddenStates,
+    oproj_latent: HiddenStates,
+    compressor_main_kv: Option<HiddenStates>,
+    compressor_main_score: Option<HiddenStates>,
+    compressor_index_kv: Option<HiddenStates>,
+    compressor_index_score: Option<HiddenStates>,
+    csa_q_i: Option<HiddenStates>,
+    csa_weights: Option<HiddenStates>,
+    csa_selected: Option<CudaSlice<i32>>,
+}
+
+impl Dsv4MlaDecodeGraphScratch {
+    pub(crate) fn device_bytes_for(
+        config: &DeepSeekV4Config,
+        attention: &Dsv4Attention,
+        mode: DeepSeekV4AttentionMode,
+    ) -> usize {
+        if attention.w_kc.is_some() || attention.w_vc.is_some() || attention.o_proj.is_some() {
+            return 0;
+        }
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let local_width = attention.wq_b.rows;
+        let mut elems = 0usize;
+        elems = elems
+            .saturating_add(attention.wq_a.rows) // c_q
+            .saturating_add(attention.wq_a.rows) // c_q_normed
+            .saturating_add(local_width) // q_raw
+            .saturating_add(config.head_dim) // kv_raw
+            .saturating_add(config.head_dim) // kv_normed
+            .saturating_add(local_width) // q_prepared
+            .saturating_add(config.head_dim) // k_prepared
+            .saturating_add(local_width) // local_attn
+            .saturating_add(attention.wo_a.as_ref().expect("DSv4 wo_a").rows); // oproj_latent
+        if mode.has_compressor() {
+            let compressor = attention
+                .compressor
+                .as_ref()
+                .expect("DSv4 compressor scratch requires compressor weights");
+            elems = elems
+                .saturating_add(compressor.wkv.rows)
+                .saturating_add(compressor.wgate.rows);
+        }
+        if mode == DeepSeekV4AttentionMode::CompressedSparse {
+            let indexer = attention
+                .indexer
+                .as_ref()
+                .expect("DSv4 CSA scratch requires indexer weights");
+            let compressor = indexer
+                .compressor
+                .as_ref()
+                .expect("DSv4 CSA scratch requires indexer compressor");
+            elems = elems
+                .saturating_add(compressor.wkv.rows)
+                .saturating_add(compressor.wgate.rows)
+                .saturating_add(indexer.wq_b.rows)
+                .saturating_add(indexer.weights_proj.rows);
+        }
+        elems.saturating_mul(bf16).saturating_add(
+            if mode == DeepSeekV4AttentionMode::CompressedSparse {
+                config.index_topk.saturating_mul(std::mem::size_of::<i32>())
+            } else {
+                0
+            },
+        )
+    }
+
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        attention: &Dsv4Attention,
+        mode: DeepSeekV4AttentionMode,
+        _compress_ratio: usize,
+    ) -> Result<Self> {
+        ensure!(
+            attention.w_kc.is_none() && attention.w_vc.is_none() && attention.o_proj.is_none(),
+            "DSv4 decode graph scratch is MODEL1-only; GLM/plain-o attention must use eager decode"
+        );
+        let local_width = attention.wq_b.rows;
+        let oproj_rows = attention.wo_a.as_ref().expect("DSv4 wo_a").rows;
+        let (compressor_main_kv, compressor_main_score) = if mode.has_compressor() {
+            let compressor = attention.compressor.as_ref().ok_or_else(|| {
+                anyhow!("DSv4 graph scratch mode {mode:?} requires compressor weights")
+            })?;
+            (
+                Some(unsafe { HiddenStates::uninit(ctx, compressor.wkv.rows, 1)? }),
+                Some(unsafe { HiddenStates::uninit(ctx, compressor.wgate.rows, 1)? }),
+            )
+        } else {
+            (None, None)
+        };
+        let (compressor_index_kv, compressor_index_score) =
+            if mode == DeepSeekV4AttentionMode::CompressedSparse {
+                let indexer = attention
+                    .indexer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 CSA graph scratch requires indexer weights"))?;
+                let compressor = indexer
+                    .compressor
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 CSA graph scratch requires indexer compressor"))?;
+                (
+                    Some(unsafe { HiddenStates::uninit(ctx, compressor.wkv.rows, 1)? }),
+                    Some(unsafe { HiddenStates::uninit(ctx, compressor.wgate.rows, 1)? }),
+                )
+            } else {
+                (None, None)
+            };
+        let (csa_q_i, csa_weights, csa_selected) = if mode.has_indexer() {
+            let indexer = attention
+                .indexer
+                .as_ref()
+                .ok_or_else(|| anyhow!("DSv4 graph scratch mode {mode:?} requires indexer"))?;
+            (
+                Some(unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? }),
+                Some(unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, 1)? }),
+                Some(
+                    ctx.stream
+                        .alloc_zeros::<i32>(config.index_topk)
+                        .map_err(|e| {
+                            anyhow!("DSv4 graph CSA selected scratch alloc failed: {e}")
+                        })?,
+                ),
+            )
+        } else {
+            (None, None, None)
+        };
+        Ok(Self {
+            c_q: unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, 1)? },
+            c_q_normed: unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, 1)? },
+            q_raw: unsafe { HiddenStates::uninit(ctx, local_width, 1)? },
+            kv_raw: unsafe { HiddenStates::uninit(ctx, config.head_dim, 1)? },
+            kv_normed: unsafe { HiddenStates::uninit(ctx, config.head_dim, 1)? },
+            q_prepared: unsafe { HiddenStates::uninit(ctx, local_width, 1)? },
+            k_prepared: unsafe { HiddenStates::uninit(ctx, config.head_dim, 1)? },
+            local_attn: unsafe { HiddenStates::uninit(ctx, local_width, 1)? },
+            oproj_latent: unsafe { HiddenStates::uninit(ctx, oproj_rows, 1)? },
+            compressor_main_kv,
+            compressor_main_score,
+            compressor_index_kv,
+            compressor_index_score,
+            csa_q_i,
+            csa_weights,
+            csa_selected,
+        })
+    }
+
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.c_q
+            .device_bytes()
+            .saturating_add(self.c_q_normed.device_bytes())
+            .saturating_add(self.q_raw.device_bytes())
+            .saturating_add(self.kv_raw.device_bytes())
+            .saturating_add(self.kv_normed.device_bytes())
+            .saturating_add(self.q_prepared.device_bytes())
+            .saturating_add(self.k_prepared.device_bytes())
+            .saturating_add(self.local_attn.device_bytes())
+            .saturating_add(self.oproj_latent.device_bytes())
+            .saturating_add(
+                self.compressor_main_kv
+                    .as_ref()
+                    .map_or(0, HiddenStates::device_bytes),
+            )
+            .saturating_add(
+                self.compressor_main_score
+                    .as_ref()
+                    .map_or(0, HiddenStates::device_bytes),
+            )
+            .saturating_add(
+                self.compressor_index_kv
+                    .as_ref()
+                    .map_or(0, HiddenStates::device_bytes),
+            )
+            .saturating_add(
+                self.compressor_index_score
+                    .as_ref()
+                    .map_or(0, HiddenStates::device_bytes),
+            )
+            .saturating_add(self.csa_q_i.as_ref().map_or(0, HiddenStates::device_bytes))
+            .saturating_add(
+                self.csa_weights
+                    .as_ref()
+                    .map_or(0, HiddenStates::device_bytes),
+            )
+            .saturating_add(
+                self.csa_selected
+                    .as_ref()
+                    .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
+            )
+    }
 }
 
 /// One DSv4 MLA attention block (SlidingWindow / CompressedSparse /
@@ -7269,6 +7611,562 @@ pub(crate) fn mla_attention(
         prepared,
         out,
         keepalive,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compressor_forward_decode_graph(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    compressor: &Dsv4Compressor,
+    hidden: &HiddenStates,
+    state: &mut Dsv4CompressorState,
+    head_dim: usize,
+    ratio: usize,
+    overlap: bool,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    apply_rope: bool,
+    rope_original_seq_len: i32,
+    kv_scratch: &mut HiddenStates,
+    score_scratch: &mut HiddenStates,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    let width = if overlap { 2 * head_dim } else { head_dim };
+    ensure!(
+        kv_scratch.hidden_dim == width
+            && kv_scratch.seq_len == 1
+            && score_scratch.hidden_dim == width
+            && score_scratch.seq_len == 1,
+        "DSv4 graph compressor scratch mismatch: kv={}x{} score={}x{} expected {width}x1",
+        kv_scratch.hidden_dim,
+        kv_scratch.seq_len,
+        score_scratch.hidden_dim,
+        score_scratch.seq_len
+    );
+    let nvtx_compressor_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv", || {
+        dsv4_linear(ctx, &compressor.wkv, hidden, kv_scratch)
+    })?;
+    drop(nvtx_compressor_wkv);
+    let nvtx_compressor_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate");
+    crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate", || {
+        dsv4_linear(ctx, &compressor.wgate, hidden, score_scratch)
+    })?;
+    drop(nvtx_compressor_wgate);
+    compressor_forward(
+        ctx,
+        config,
+        compressor,
+        hidden,
+        state,
+        head_dim,
+        ratio,
+        overlap,
+        start_pos,
+        start_pos_device,
+        apply_rope,
+        rope_original_seq_len,
+        Some((&*kv_scratch, &*score_scratch)),
+        None,
+        keepalive,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mla_attention_decode_graph(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    attention: &Dsv4Attention,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    layer_idx: usize,
+    hidden: &HiddenStates,
+    state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
+    flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    tp: &TpRuntime,
+    scratch: &mut Dsv4MlaDecodeGraphScratch,
+    out: &mut HiddenStates,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    ensure!(
+        hidden.hidden_dim == config.hidden_size && hidden.seq_len == 1,
+        "DSv4 graph MLA requires one hidden row [{}x1], got {}x{}",
+        config.hidden_size,
+        hidden.hidden_dim,
+        hidden.seq_len
+    );
+    ensure!(
+        attention.w_kc.is_none() && attention.w_vc.is_none() && attention.o_proj.is_none(),
+        "DSv4 decode graph MLA is MODEL1-only; GLM/plain-o uses eager decode"
+    );
+    ensure!(
+        start_pos_device.is_some(),
+        "DSv4 decode graph MLA requires device start_pos"
+    );
+    let head_dim = config.head_dim;
+    let local_width = attention.wq_b.rows;
+    ensure!(
+        local_width.is_multiple_of(head_dim),
+        "DSv4 graph MLA local q width {local_width} is not a multiple of head_dim {head_dim}"
+    );
+    let local_heads = local_width / head_dim;
+    ensure!(local_heads > 0, "DSv4 graph MLA requires local heads");
+    let tp_rank = tp.config().rank;
+    let sink_offset = tp_rank * local_heads;
+    ensure!(
+        attention.wkv.rows == head_dim,
+        "DSv4 graph MLA wkv rows {} != head_dim {head_dim}",
+        attention.wkv.rows
+    );
+    ensure!(
+        config.sliding_window > 0,
+        "DSv4 graph MLA requires a non-zero sliding_window"
+    );
+    ensure!(
+        config.qk_rope_head_dim <= head_dim,
+        "DSv4 graph MLA rope dim {} exceeds head_dim {head_dim}",
+        config.qk_rope_head_dim
+    );
+    ensure!(
+        state.sw_window_cache.len() == config.sliding_window * head_dim,
+        "DSv4 graph MLA SW window cache len {} != sliding_window*head_dim {}",
+        state.sw_window_cache.len(),
+        config.sliding_window * head_dim
+    );
+    ensure!(
+        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len >= sink_offset + local_heads,
+        "DSv4 graph MLA attn_sink len {} cannot cover rank {tp_rank} heads [{sink_offset}, {})",
+        attention.attn_sink.as_ref().expect("DSv4 attn_sink").len,
+        sink_offset + local_heads
+    );
+
+    let rope = &config.rope_parameters;
+    let (rope_base, original_seq_len) = if compress_ratio > 0 {
+        let osl = i32::try_from(rope.original_max_position_embeddings).map_err(|_| {
+            anyhow!(
+                "DSv4 original_max_position_embeddings {} overflows i32",
+                rope.original_max_position_embeddings
+            )
+        })?;
+        (config.compress_rope_theta, osl)
+    } else {
+        (config.rope_theta, 0i32)
+    };
+    if dsv4_fused_wqkv_decode_enabled()? {
+        let fused = state.fused_wqkv.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
+        })?;
+        let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused", || {
+            run_fused_wqkv_decode_into(
+                ctx,
+                config,
+                attention,
+                hidden,
+                fused,
+                &mut scratch.c_q_normed,
+                &mut scratch.q_raw,
+                &mut scratch.kv_normed,
+            )
+        })?;
+        drop(nvtx_wqkv);
+    } else {
+        let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
+            dsv4_linear(ctx, &attention.wq_a, hidden, &mut scratch.c_q)
+        })?;
+        drop(nvtx_wq_a);
+        mla_rms_norm_into(
+            ctx,
+            &scratch.c_q,
+            &attention.q_norm,
+            config.rms_norm_eps,
+            &mut scratch.c_q_normed,
+        )?;
+        let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
+            dsv4_linear(
+                ctx,
+                &attention.wq_b,
+                &scratch.c_q_normed,
+                &mut scratch.q_raw,
+            )
+        })?;
+        drop(nvtx_wq_b);
+        let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
+            dsv4_linear(ctx, &attention.wkv, hidden, &mut scratch.kv_raw)
+        })?;
+        drop(nvtx_wkv);
+        mla_rms_norm_into(
+            ctx,
+            &scratch.kv_raw,
+            &attention.kv_norm,
+            config.rms_norm_eps,
+            &mut scratch.kv_normed,
+        )?;
+    }
+
+    {
+        let (q_raw_ptr, _qr) = scratch.q_raw.data.device_ptr(&ctx.stream);
+        let (k_raw_ptr, _kr) = scratch.kv_normed.data.device_ptr(&ctx.stream);
+        let (q_out_ptr, _qo) = scratch.q_prepared.data.device_ptr_mut(&ctx.stream);
+        let (k_out_ptr, _ko) = scratch.k_prepared.data.device_ptr_mut(&ctx.stream);
+        let start_pos_device = start_pos_device.expect("checked above");
+        let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
+                q_raw_ptr as *const ffi::Half,
+                k_raw_ptr as *const ffi::Half,
+                q_out_ptr as *mut ffi::Half,
+                k_out_ptr as *mut ffi::Half,
+                1,
+                local_heads as i32,
+                head_dim as i32,
+                config.qk_rope_head_dim as i32,
+                start_ptr as *const i32,
+                config.rms_norm_eps,
+                rope_base,
+                original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    let mut selected_ready = false;
+    if mode.has_compressor() {
+        let compressor = attention.compressor.as_ref().ok_or_else(|| {
+            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
+        })?;
+        let kv = scratch
+            .compressor_main_kv
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph main compressor kv scratch missing"))?;
+        let score = scratch
+            .compressor_main_score
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph main compressor score scratch missing"))?;
+        compressor_forward_decode_graph(
+            ctx,
+            config,
+            compressor,
+            hidden,
+            state.compressor.as_mut().ok_or_else(|| {
+                anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+            })?,
+            head_dim,
+            compress_ratio,
+            compress_ratio < 16,
+            start_pos,
+            start_pos_device,
+            true,
+            original_seq_len,
+            kv,
+            score,
+            keepalive,
+        )?;
+    }
+    if mode.has_indexer() {
+        ensure!(
+            mode == DeepSeekV4AttentionMode::CompressedSparse,
+            "DSv4 decode graph does not support SparseIndexed/GLM indexer"
+        );
+        let indexer = attention.indexer.as_ref().ok_or_else(|| {
+            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
+        })?;
+        let indexer_state = state.indexer.as_mut().ok_or_else(|| {
+            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
+        })?;
+        let indexer_compressor = indexer
+            .compressor
+            .as_ref()
+            .expect("DSv4 CSA indexer has a key compressor");
+        let kv = scratch
+            .compressor_index_kv
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph indexer compressor kv scratch missing"))?;
+        let score = scratch
+            .compressor_index_score
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph indexer compressor score scratch missing"))?;
+        compressor_forward_decode_graph(
+            ctx,
+            config,
+            indexer_compressor,
+            hidden,
+            indexer_state,
+            config.index_head_dim,
+            compress_ratio,
+            true,
+            start_pos,
+            start_pos_device,
+            dsv4_dsa_official_enabled()?,
+            if dsv4_dsa_official_enabled()? {
+                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+                    |_| {
+                        anyhow!(
+                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                            config.rope_parameters.original_max_position_embeddings
+                        )
+                    },
+                )?
+            } else {
+                0
+            },
+            kv,
+            score,
+            keepalive,
+        )?;
+        let index_keys = &state
+            .indexer
+            .as_ref()
+            .expect("indexer state checked above")
+            .compressed;
+        let csa_q_i = scratch
+            .csa_q_i
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA q_i scratch missing"))?;
+        let csa_weights = scratch
+            .csa_weights
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA weights scratch missing"))?;
+        let csa_selected = scratch
+            .csa_selected
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA selected scratch missing"))?;
+        csa_select_decode_graph(
+            ctx,
+            config,
+            indexer,
+            hidden,
+            &scratch.c_q_normed,
+            index_keys,
+            start_pos,
+            start_pos_device,
+            compress_ratio,
+            csa_q_i,
+            csa_weights,
+            csa_selected,
+        )?;
+        selected_ready = true;
+    }
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let token_count = 1usize;
+    let selected = if selected_ready {
+        scratch.csa_selected.as_ref()
+    } else {
+        None
+    };
+    if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+            let flash = state.flashmla.as_mut().ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+            })?;
+            let flash_scratch = flashmla_scratch.ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+            })?;
+            try_flashmla_decode_attention(
+                ctx,
+                config,
+                attention,
+                mode,
+                compress_ratio,
+                &scratch.q_prepared,
+                &scratch.k_prepared,
+                None,
+                None,
+                &mut state.sw_window_cache,
+                flash,
+                flash_scratch,
+                pool,
+                start_pos,
+                start_pos_device,
+                tp,
+                local_heads,
+                &mut scratch.local_attn,
+                sm_scale,
+                rope_base,
+                original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+            )?
+        } else {
+            false
+        };
+        if !flashmla_used {
+            let (q_ptr, _qg) = scratch.q_prepared.data.device_ptr(&ctx.stream);
+            let (k_ptr, _kg) = scratch.k_prepared.data.device_ptr(&ctx.stream);
+            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+            let (sink_ptr, _sg) = attention
+                .attn_sink
+                .as_ref()
+                .expect("DSv4 attn_sink")
+                .data
+                .device_ptr(&ctx.stream);
+            let (out_ptr, _og) = scratch.local_attn.data.device_ptr_mut(&ctx.stream);
+            let start_pos_device = start_pos_device.expect("checked above");
+            let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_swa_attention_start_pos_ptr_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.sliding_window as i32,
+                    start_ptr as *const i32,
+                    sink_offset as i32,
+                    sm_scale,
+                    config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    1,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+    } else {
+        let compressed = Some(
+            &state
+                .compressor
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
+                    )
+                })?
+                .compressed,
+        );
+        let compressed_capacity = compressed.map_or(0, |c| c.data.len() / head_dim);
+        let compressed_count_arg = if start_pos_device.is_some() {
+            compressed_capacity
+        } else {
+            compressed.map_or(0, |c| c.seq_len)
+        };
+        let mode_int = match mode {
+            DeepSeekV4AttentionMode::CompressedSparse => 1,
+            DeepSeekV4AttentionMode::HybridCompressed => 2,
+            DeepSeekV4AttentionMode::SlidingWindow => unreachable!(),
+            DeepSeekV4AttentionMode::SparseIndexed => unreachable!(),
+        };
+        let flashmla_used = if dsv4_flashmla_decode_enabled()? {
+            let flash = state.flashmla.as_mut().ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+            })?;
+            let flash_scratch = flashmla_scratch.ok_or_else(|| {
+                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+            })?;
+            try_flashmla_decode_attention(
+                ctx,
+                config,
+                attention,
+                mode,
+                compress_ratio,
+                &scratch.q_prepared,
+                &scratch.k_prepared,
+                selected,
+                compressed,
+                &mut state.sw_window_cache,
+                flash,
+                flash_scratch,
+                pool,
+                start_pos,
+                start_pos_device,
+                tp,
+                local_heads,
+                &mut scratch.local_attn,
+                sm_scale,
+                rope_base,
+                original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+            )?
+        } else {
+            false
+        };
+        if !flashmla_used {
+            let (q_ptr, _qg) = scratch.q_prepared.data.device_ptr(&ctx.stream);
+            let (k_ptr, _kg) = scratch.k_prepared.data.device_ptr(&ctx.stream);
+            let (window_ptr, _wg) = state.sw_window_cache.device_ptr_mut(&ctx.stream);
+            let (sink_ptr, _sg) = attention
+                .attn_sink
+                .as_ref()
+                .expect("DSv4 attn_sink")
+                .data
+                .device_ptr(&ctx.stream);
+            let (out_ptr, _og) = scratch.local_attn.data.device_ptr_mut(&ctx.stream);
+            let (comp_ptr, _cguard) = compressed
+                .expect("compressed present for non-SW graph mode")
+                .data
+                .device_ptr(&ctx.stream);
+            let (sel_ptr, _sguard) = match selected {
+                Some(sel) => {
+                    let (p, g) = sel.device_ptr(&ctx.stream);
+                    (p as *const i32, Some(g))
+                }
+                None => (std::ptr::null(), None),
+            };
+            let start_pos_device = start_pos_device.expect("checked above");
+            let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    window_ptr as *mut ffi::Half,
+                    comp_ptr as *const ffi::Half,
+                    sel_ptr,
+                    sink_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    token_count as i32,
+                    local_heads as i32,
+                    head_dim as i32,
+                    config.sliding_window as i32,
+                    start_ptr as *const i32,
+                    sink_offset as i32,
+                    sm_scale,
+                    config.qk_rope_head_dim as i32,
+                    rope_base,
+                    original_seq_len,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
+                    mode_int,
+                    compress_ratio as i32,
+                    compressed_count_arg as i32,
+                    config.index_topk as i32,
+                    1,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+    }
+
+    mla_oproj_decode_graph(
+        ctx,
+        attention,
+        state,
+        &scratch.local_attn,
+        &mut scratch.oproj_latent,
+        out,
     )
 }
 
@@ -9628,6 +10526,143 @@ pub(crate) fn mla_oproj(
     Ok(())
 }
 
+fn mla_oproj_decode_graph(
+    ctx: &DeviceContext,
+    attention: &Dsv4Attention,
+    state: &mut Dsv4LayerAttentionState,
+    local_attn: &HiddenStates,
+    latent: &mut HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        attention.o_proj.is_none(),
+        "DSv4 decode graph O projection is MODEL1-only; GLM/plain-o uses eager decode"
+    );
+    let token_count = 1usize;
+    let shape = dsv4_oproj_group_shape(
+        attention.wo_a.as_ref().expect("DSv4 wo_a").rows,
+        attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .groups,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .rows_per_group,
+        attention
+            .wo_a_groups
+            .as_ref()
+            .expect("DSv4 wo_a_groups")
+            .cols_per_group,
+        local_attn.hidden_dim,
+        token_count,
+    )?;
+    ensure!(
+        latent.hidden_dim == attention.wo_a.as_ref().expect("DSv4 wo_a").rows
+            && latent.seq_len == token_count,
+        "DSv4 graph O-LoRA latent scratch {}x{} != {}x1",
+        latent.hidden_dim,
+        latent.seq_len,
+        attention.wo_a.as_ref().expect("DSv4 wo_a").rows
+    );
+    let wo_a_decode_dg = shape.groups == 1
+        && dsv4_decode_proj_deepgemm_enabled()
+        && state.fused_wqkv.is_some()
+        && attention.wo_a_deepgemm.is_some();
+    let wo_a_group_decode_dg = shape.groups > 1
+        && dsv4_decode_proj_deepgemm_enabled()
+        && state.fused_wqkv.is_some()
+        && attention.wo_a_group_deepgemm.is_some();
+    if wo_a_decode_dg {
+        let scratch = state.fused_wqkv.as_ref().expect("wo_dg gate checked");
+        let wo_a_cache = attention
+            .wo_a_deepgemm
+            .as_ref()
+            .expect("wo_dg gate checked");
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            decode_proj_deepgemm(
+                ctx,
+                scratch,
+                wo_a_cache,
+                local_attn,
+                latent,
+                attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
+            )
+        })?;
+        drop(nvtx_wo_a);
+    } else if wo_a_group_decode_dg {
+        let scratch = state
+            .fused_wqkv
+            .as_ref()
+            .expect("wo grouped dg gate checked");
+        let wo_a_caches = attention
+            .wo_a_group_deepgemm
+            .as_ref()
+            .expect("wo grouped dg gate checked");
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_wo_a_grouped_deepgemm_decode(ctx, scratch, wo_a_caches, local_attn, shape, latent)
+        })?;
+        drop(nvtx_wo_a);
+    } else if shape.groups == 1 {
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_linear(
+                ctx,
+                attention.wo_a.as_ref().expect("DSv4 wo_a"),
+                local_attn,
+                latent,
+            )
+        })?;
+        drop(nvtx_wo_a);
+    } else {
+        let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
+            dsv4_wo_a_grouped_linear(ctx, attention, local_attn, shape, latent)
+        })?;
+        drop(nvtx_wo_a);
+    }
+
+    let wo_b_decode_dg = dsv4_decode_proj_deepgemm_enabled()
+        && state.fused_wqkv.is_some()
+        && attention.wo_b_deepgemm.is_some();
+    if wo_b_decode_dg {
+        let scratch = state.fused_wqkv.as_ref().expect("wo_b dg gate checked");
+        let wo_b_cache = attention
+            .wo_b_deepgemm
+            .as_ref()
+            .expect("wo_b dg gate checked");
+        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+            decode_proj_deepgemm(
+                ctx,
+                scratch,
+                wo_b_cache,
+                latent,
+                out,
+                attention.wo_b.as_ref().expect("DSv4 wo_b").cols,
+            )
+        })?;
+        drop(nvtx_wo_b);
+    } else {
+        let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
+        crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
+            dsv4_linear(
+                ctx,
+                attention.wo_b.as_ref().expect("DSv4 wo_b"),
+                latent,
+                out,
+            )
+        })?;
+        drop(nvtx_wo_b);
+    }
+    Ok(())
+}
+
 /// GLM SparseIndexed only: build the full-sequence index KEY ring (ratio=1, no
 /// compressor). For each of `hidden`'s tokens, project a single MQA index key via
 /// `indexer.wk`, RMSNorm it with `indexer.k_norm` (width `index_head_dim`), and
@@ -10236,6 +11271,105 @@ pub(crate) struct Dsv4DsaBatchedGather<'a> {
     /// Per-row captured `key_count` (push exactly one per call), for the batched
     /// context_lens (`min(key_count_r, abs_pos_r/ratio)`).
     pub(crate) key_counts: &'a mut Vec<i32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csa_select_decode_graph(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    indexer: &Dsv4Indexer,
+    hidden: &HiddenStates,
+    c_q_normed: &HiddenStates,
+    keys: &HiddenStates,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    ratio: usize,
+    q_i: &mut HiddenStates,
+    weights: &mut HiddenStates,
+    selected: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        hidden.seq_len == 1 && c_q_normed.seq_len == 1,
+        "DSv4 graph CSA select is decode-only, hidden seq={} c_q seq={}",
+        hidden.seq_len,
+        c_q_normed.seq_len
+    );
+    ensure!(
+        selected.len() >= config.index_topk,
+        "DSv4 graph CSA selected scratch len {} < topk {}",
+        selected.len(),
+        config.index_topk
+    );
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+        dsv4_linear(ctx, &indexer.wq_b, c_q_normed, q_i)
+    })?;
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
+        dsv4_linear(ctx, &indexer.weights_proj, hidden, weights)
+    })?;
+    ensure!(
+        q_i.hidden_dim.is_multiple_of(config.index_head_dim),
+        "DSv4 graph CSA q_i width {} is not divisible by index_head_dim {}",
+        q_i.hidden_dim,
+        config.index_head_dim
+    );
+    let local_index_heads = q_i.hidden_dim / config.index_head_dim;
+    ensure!(
+        weights.hidden_dim == local_index_heads,
+        "DSv4 graph CSA weights width {} != local index heads {local_index_heads}",
+        weights.hidden_dim
+    );
+    let key_count = if start_pos_device.is_some() {
+        keys.data.len() / keys.hidden_dim
+    } else {
+        keys.seq_len
+    };
+    let score_scale =
+        (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
+    let (q_ptr, _qg) = q_i.data.device_ptr(&ctx.stream);
+    let (w_ptr, _wg) = weights.data.device_ptr(&ctx.stream);
+    let (keys_ptr, _kg) = keys.data.device_ptr(&ctx.stream);
+    let (sel_ptr, _sg) = selected.device_ptr_mut(&ctx.stream);
+    unsafe {
+        if let Some(start_pos_device) = start_pos_device {
+            let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+            ffi::dsv4_csa_select_start_pos_ptr_cuda(
+                q_ptr as *const ffi::Half,
+                w_ptr as *const ffi::Half,
+                keys_ptr as *const ffi::Half,
+                sel_ptr as *mut i32,
+                1,
+                q_i.hidden_dim as i32,
+                local_index_heads as i32,
+                config.index_head_dim as i32,
+                key_count as i32,
+                ratio as i32,
+                config.index_topk as i32,
+                score_scale,
+                start_ptr as *const i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        } else {
+            ffi::dsv4_csa_select_cuda(
+                q_ptr as *const ffi::Half,
+                w_ptr as *const ffi::Half,
+                keys_ptr as *const ffi::Half,
+                sel_ptr as *mut i32,
+                1,
+                q_i.hidden_dim as i32,
+                local_index_heads as i32,
+                config.index_head_dim as i32,
+                key_count as i32,
+                ratio as i32,
+                config.index_topk as i32,
+                score_scale,
+                start_pos as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(())
 }
 
 /// CSA top-k block selection: project the index query (`wq_b`) + per-head gating
