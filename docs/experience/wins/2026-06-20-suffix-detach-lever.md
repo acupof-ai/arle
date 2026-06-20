@@ -1,4 +1,4 @@
-# Suffix-LoRA + detach lever (--lora-layer-start) — landed, perf A/B pending-remote
+# Suffix-LoRA + detach lever (--lora-layer-start) — landed, measured at seq-649 and seq-2048
 
 ## Context
 Runtime change `c69ff813` (crates/train/src/qwen35.rs + qwen35_loader.rs, crates/cli
@@ -28,16 +28,33 @@ config except the lever (Arm A GPU4 all-layer attn-qv LoRA; Arm B GPU5
 | Arm B (suffix top-8/40) | **33.2** (34.3 / 32.2) | 132.3 / 121.6 |
 | **speedup** | **10.3×** backward | 1.05× (forward not detached, as expected) |
 
-Step total drops **2.88×** (500→174 s). The lever cuts the trainer-side wall ~10×: at
-the production rollout-2048 (all-layer backward was ~1333 s) the suffix path projects to
-~130 s → a 35B OPD step drops from ~35 min to a few min, making 35B-student OPD
-practical. Correctness intact: both arms finite + decreasing loss, **step-1
-byte-identical across arms** (clean controlled A/B); step-2 diverges only because arm A
-updated all-40 QV adapters vs arm B's 8 (expected). **New bottleneck: student_forward
-(~127 s)** is now dominant — the next D-infra lever is the forward (reuse the
-InferStudent inference forward for the KL logits). Default (None) byte-identical. Logs:
-/data01/lora_lever_arm{A,B}_v2.log; needs `ARLE_OPD_STEP_PROFILE=1` (timing line is
-gated off under `--json`).
+Step total drops **2.88×** (500→174 s) at seq-649.
+
+## Measured perf at PRODUCTION seq-2048 (2026-06-20, supersedes the projection)
+Same A/B, **seq pinned to 2048** (long-prompt corpus, all rows truncated to
+`--prompt-max-tokens 2048`, `--rollout-len 64` → `rollout_len 2112`), GPU4 (Arm A) /
+GPU5 (Arm B) in parallel, 2 steps each. The earlier "projects to ~130 s / ~10×" was
+**optimistic** — the measured numbers correct it:
+
+| seq-2048 | backward_seconds | student_forward_seconds | step total_seconds |
+|---|---|---|---|
+| Arm A (all-layer, 40) | **1196** (1277.2 / 1115.1) | 488 (519 / 458) | **1694** (1799 / 1589) = 28.2 min |
+| Arm B (suffix top-8/40) | **147** (154.5 / 139.9) | 464 (495 / 433) | **616** (652 / 579) = 10.3 min |
+| **speedup** | **8.1×** backward | ~1.0× (forward not detached) | **2.75×** step |
+
+The backward ratio **compressed 10.3× → 8.1×** going seq-649 → seq-2048: Arm B's top-8
+backward grew 4.4× (33→147 s) vs Arm A's 3.5× (341→1196 s) because the O(n²) attention
+backward in the retained suffix grows super-linearly with seq. **student_forward
+(~464 s = 75% of Arm B's step) is now the wall** — undetached, so the lever doesn't touch
+it. A 35B OPD step at seq-2048 drops **28.2 → 10.3 min** (2.75×); to go below ~10 min the
+next D-infra lever must cut the forward (reuse the InferStudent inference forward for the
+KL logits). Correctness intact: both arms finite + decreasing loss; **step-1
+byte-identical across arms** (the detach changes only the backward tape extent + which
+adapters get grads, not forward values — same code path as the seq-649 A/B that proved
+byte-identity); step-2 diverges only because Arm A updated all-40 QV adapters vs Arm B's
+8 (expected). Default (None) byte-identical. Logs: /data01/lora_lever_arm{A,B}_2048.log
+(seq-2048) and _v3.log (seq-649); needs `ARLE_OPD_STEP_PROFILE=1` and **no `--json`**
+(the timing line is gated off under `--json`).
 
 ## Rule
 A backward-pruning lever's correctness (tape cut + byte-identical default) can be
