@@ -118,6 +118,10 @@ pub struct RubricOpdConfig {
     pub samples_per_prompt: usize,
     /// Max new tokens per sampled rollout.
     pub max_new_tokens: usize,
+    /// Cap on CE writeback steps per round (`None` = train on all accepted). The
+    /// 27B-dense autograd CE is ~minutes/step (host-authoritative), so bounding the
+    /// accepted set keeps a round tractable; capped to the first N accepted.
+    pub writeback_cap: Option<usize>,
 }
 
 /// Per-round accounting. `distinct_accepted` is the RFT log-linear x-axis;
@@ -206,6 +210,18 @@ where
             rep.parse_errors += sel.parse_errors;
             for &idx in &sel.accepted {
                 accepted_pairs.push((prompt_ids.clone(), samples[idx].clone()));
+            }
+        }
+
+        // Cap the CE writeback set (the 27B-dense host-authoritative CE is
+        // ~minutes/step; bound it to keep a round tractable). Keep the first N.
+        if let Some(cap) = cfg.writeback_cap {
+            if accepted_pairs.len() > cap {
+                eprintln!(
+                    "[rubric] round {round} writeback-cap: {} accepted -> training first {cap}",
+                    accepted_pairs.len()
+                );
+                accepted_pairs.truncate(cap);
             }
         }
 
