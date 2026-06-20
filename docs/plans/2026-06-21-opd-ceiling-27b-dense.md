@@ -125,7 +125,48 @@ Build env proven in `pod_pipeline.sh`; profile via `ARLE_OPD_STEP_PROFILE=1` (no
 
 ---
 
-## 6. Status
+## 6. Critical (first-principles): the ceiling is best-of-N; the correction lever breaks it
 
-Plan + route decided (rubric-OPD). Next: implement I1–I6 (no GPU), then validate per §4–5.
-Same-vocab token-KL is already validated and is NOT re-run. Skills-SOPD deferred.
+**Selection-only rubric-OPD (RFT) structurally caps at the student's own best-of-N.**
+It only reinforces rollouts the student *already* produces, so it elicits latent
+capability but cannot exceed the student's ceiling — it cannot, on its own, answer
+"can OPD go *beyond* the student / approach the teacher." The research's actual
+exceed-teacher mechanism is token-KL + implicit-reward-scaling >1× (Rethinking-OPD),
+which is cross-vocab-blocked for DSv4→Qwen.
+
+**Two writeback modes (the plan supports both):**
+- **Mode A — select-only (RFT):** train on the student's *accepted* rollouts. Elicitation
+  baseline; ceiling = best-of-N. Safe, fully on-policy, no pattern-mismatch exposure.
+- **Mode B — judge + correct (回写):** on a rejected rollout, Flash *writes back a
+  corrected solution* (text → re-tokenized into Qwen → SFT). Breaks the best-of-N
+  ceiling by adding knowledge the student could not produce. This is **hybrid**:
+  on-policy *where* to teach (the prompts the student fails), off-policy *what* (Flash's
+  text) — i.e. the **selective off-policy cold-start** Rethinking-OPD prescribes to
+  bridge thinking-pattern gaps (grounded, not improvised). Matches ckl's "选择 回写".
+  Risk: Flash's correction carries DeepSeek reasoning style → thinking-pattern mismatch
+  (the #1 OPD-failure factor); mitigated because correctness + valid steps are
+  family-agnostic, but the overlap ratio is logged and watched.
+
+Honest framing of "验证 OPD 上限": Mode A measures *elicitation-to-best-of-N*; Mode B
+measures *can a cross-family frontier judge push the 27B beyond its own ceiling*. The
+fullest "超越 teacher" question still belongs to a same-vocab token-KL + reward-scale
+arm (the `--kl-reward-scale` knob), which "同词表已验证" did NOT test (it validated that
+OPD *works*, not that reward-scaling *exceeds*). Keep that arm alive as the dedicated
+exceed-teacher experiment; do not assume it is covered.
+
+Infra impact: `FlashJudge` gains a `correct()` method; the writeback step trains on the
+accepted student rollout (A) or the Flash correction (B), switched by a CLI flag
+(default A for the first smoke). The driver `run_rubric_rounds` already takes the
+writeback as a closure, so Mode B is a closure swap, not a rewrite.
+
+---
+
+## 7. Status
+
+Route + plan decided (rubric-OPD). Built + committed (typecheck cuda,no-cuda; 8 CPU
+tests): I1 `generate_samples`, I2 judge primitives + I2-wire `FlashJudge`, I3 `select`,
+I6 rubric library, I5 `run_rubric_rounds` driver. Remaining: I4 CE adapter + CLI handler
+(`run_rubric_opd` reusing `run_self_opd`), supporting Mode A now and Mode B via `correct()`.
+Then GPU smoke (GPUs 4-7) → capability curve. Same-vocab token-KL not re-run.
+Skills-SOPD deferred. Flash-throughput optimization runs in parallel on codex %2
+(crates/infer-cuda + infer-core; disjoint from this train/cli work).
