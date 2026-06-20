@@ -1302,6 +1302,87 @@ fn run_rubric_opd_impl(_args: TrainRubricOpdArgs) -> Result<()> {
     )
 }
 
+/// Load the in-process eval set (jsonl `{problem, answer}`), head-`n`, rendered with
+/// the same math prompt prefix the training corpus uses, tokenized. Returns
+/// `(prompt_ids, problem_text, gold_answer)`.
+#[cfg(feature = "cuda")]
+fn load_rubric_eval_items(
+    path: &Path,
+    n: usize,
+    tokenizer: &train::tokenizer::ChatTokenizer,
+    vocab: usize,
+) -> Result<Vec<(Vec<u32>, String, String)>> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read eval file {}", path.display()))?;
+    let mut items = Vec::new();
+    for line in raw.lines() {
+        if items.len() >= n {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).context("parse --eval-prompts-file JSONL line")?;
+        let problem = value.get("problem").and_then(|p| p.as_str()).unwrap_or("");
+        let gold = value.get("answer").and_then(|a| a.as_str()).unwrap_or("");
+        if problem.is_empty() {
+            continue;
+        }
+        let rendered = format!(
+            "Solve the following math problem. Show your reasoning, and put only the final \
+             answer in \\boxed{{}}.\n\nProblem:\n{problem}"
+        );
+        let ids = tokenizer
+            .encode(&rendered, true)
+            .map_err(|err| anyhow!("encode eval prompt: {err}"))?;
+        if ids.is_empty() || ids.iter().any(|&id| (id as usize) >= vocab) {
+            continue;
+        }
+        items.push((ids, problem.to_string(), gold.to_string()));
+    }
+    Ok(items)
+}
+
+/// Generate one greedy answer per eval item via the rollout engine (the trained
+/// student after `sync_lora`), and dump `{problem, gold, answer}` jsonl for scoring.
+#[cfg(feature = "cuda")]
+fn rubric_eval_pass(
+    infer_student: &train::infer_student::InferStudent,
+    eval_items: &[(Vec<u32>, String, String)],
+    tokenizer: &train::tokenizer::ChatTokenizer,
+    max_new: usize,
+    out_path: &Path,
+) -> Result<()> {
+    use std::io::Write;
+
+    let greedy = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let mut file = fs::File::create(out_path)
+        .with_context(|| format!("create eval out {}", out_path.display()))?;
+    for (prompt_ids, problem, gold) in eval_items {
+        let generated = infer_student.generate_samples(prompt_ids, max_new, 1, Some(&greedy))?;
+        let answer = match generated.first() {
+            Some(ids) => tokenizer
+                .decode(ids, true)
+                .map_err(|err| anyhow!("decode eval answer: {err}"))?,
+            None => String::new(),
+        };
+        let line = serde_json::json!({"problem": problem, "gold": gold, "answer": answer});
+        writeln!(file, "{line}")?;
+    }
+    file.flush()?;
+    eprintln!(
+        "[rubric eval] wrote {} answers -> {}",
+        eval_items.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
 /// Rubric-OPD RFT loop: the student samples N rollouts/prompt, DeepSeek-V4-Flash
 /// judges each against a text-level rubric (vocab-agnostic), and the accepted
 /// rollouts are written back as CE targets. Mode A (select-only) for now.
@@ -1480,6 +1561,26 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         max_new_tokens: args.max_new_tokens,
     };
 
+    // In-process eval (base + per-round) via the rollout engine — no checkpoint save.
+    let eval_items = match args.eval_prompts_file.as_deref() {
+        Some(path) => load_rubric_eval_items(path, args.eval_n, &tokenizer, vocab)?,
+        None => Vec::new(),
+    };
+    let eval_dir = args.eval_out_dir.clone();
+    if let Some(dir) = eval_dir.as_deref() {
+        if !eval_items.is_empty() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("create eval out dir {}", dir.display()))?;
+            rubric_eval_pass(
+                &infer_student,
+                &eval_items,
+                &tokenizer,
+                args.max_new_tokens,
+                &dir.join("eval_round_base.jsonl"),
+            )?;
+        }
+    }
+
     for round in 0..args.rounds {
         // Fresh closures each round so the &mut store / &mut optimizer borrows
         // are released before the per-round checkpoint reuses the store.
@@ -1523,13 +1624,24 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             rep.accepted, rep.distinct_accepted, rep.parse_errors, rep.trained, rep.mean_train_loss
         );
 
-        // Sync the trained LoRA into the rollout engine so the NEXT round samples
-        // from the improved student (iterative RFT). Round 0 sampled from base, as
-        // intended; skip the sync after the final round (no next rollout).
-        if round + 1 < args.rounds {
-            infer_student
-                .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
-                .context("sync trained LoRA into rollout engine between rounds")?;
+        // Sync the trained LoRA into the rollout engine (always): the eval below
+        // and the next round both need this round's improved student. Round 0
+        // sampled from base, as intended.
+        infer_student
+            .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
+            .context("sync trained LoRA into rollout engine")?;
+
+        // Eval this round's student in-process (rollout engine now holds round-N LoRA).
+        if let Some(dir) = eval_dir.as_deref() {
+            if !eval_items.is_empty() {
+                rubric_eval_pass(
+                    &infer_student,
+                    &eval_items,
+                    &tokenizer,
+                    args.max_new_tokens,
+                    &dir.join(format!("eval_round{round}.jsonl")),
+                )?;
+            }
         }
 
         let mut ckpt_tape = Tape::new();
