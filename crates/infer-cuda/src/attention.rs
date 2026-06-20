@@ -542,13 +542,14 @@ impl Dsv4KvAdapter {
     }
 
     /// Split-borrow accessor for eager B=1 MODEL1 MLA decode: one layer's KV
-    /// layout + the model-wide FlashMLA scratch + that layer's persistent MLA
-    /// scratch.
+    /// layout + shared DSA scratch + FlashMLA scratch + that layer's persistent
+    /// MLA scratch.
     pub(crate) fn layer_flashmla_and_mla_decode_mut(
         &mut self,
         layer_idx: usize,
     ) -> Result<(
         &mut Dsv4LayerKvLayout,
+        Option<&mut Dsv4DsaSharedScratch>,
         Option<&mut Dsv4FlashMlaDecodeScratch>,
         Option<&mut Dsv4MlaDecodeGraphScratch>,
     )> {
@@ -562,7 +563,12 @@ impl Dsv4KvAdapter {
             .get_mut(layer_idx)
             .ok_or_else(|| anyhow!("DSv4 MLA decode scratch layer {layer_idx} outside len {len}"))?
             .as_mut();
-        Ok((layer, self.flashmla_scratch.as_mut(), scratch))
+        Ok((
+            layer,
+            self.dsa_shared.as_mut(),
+            self.flashmla_scratch.as_mut(),
+            scratch,
+        ))
     }
 
     /// `&mut` accessor for the model-wide shared FP8 prefill DeepGEMM linear
@@ -7677,6 +7683,7 @@ pub(crate) fn mla_attention_decode_graph(
     hidden: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
     pool: &mut Dsv4LayerKvLayout,
+    dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
@@ -7834,7 +7841,7 @@ pub(crate) fn mla_attention_decode_graph(
         }
     }
 
-    let selected_ready = false;
+    let mut selected_ready = false;
     if mode.has_compressor() {
         let compressor = attention.compressor.as_ref().ok_or_else(|| {
             anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor weights")
@@ -7868,6 +7875,14 @@ pub(crate) fn mla_attention_decode_graph(
         )?;
     }
     if mode.has_indexer() {
+        if matches!(
+            std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        ) {
+            anyhow::bail!(
+                "DSv4 decode-graph does not support the official CSA select; run without ARLE_DSV4_DECODE_GRAPH=1"
+            );
+        }
         ensure!(
             mode == DeepSeekV4AttentionMode::CompressedSparse,
             "DSv4 decode graph does not support SparseIndexed/GLM indexer"
@@ -7875,9 +7890,12 @@ pub(crate) fn mla_attention_decode_graph(
         let indexer = attention.indexer.as_ref().ok_or_else(|| {
             anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer weights")
         })?;
-        let indexer_state = state.indexer.as_mut().ok_or_else(|| {
-            anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
-        })?;
+        let indexer_rows_before = state
+            .indexer
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state"))?
+            .compressed
+            .seq_len;
         let indexer_compressor = indexer
             .compressor
             .as_ref()
@@ -7890,34 +7908,89 @@ pub(crate) fn mla_attention_decode_graph(
             .compressor_index_score
             .as_mut()
             .ok_or_else(|| anyhow!("DSv4 graph indexer compressor score scratch missing"))?;
-        compressor_forward_decode_graph(
+        {
+            let indexer_state = state.indexer.as_mut().ok_or_else(|| {
+                anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no indexer state")
+            })?;
+            compressor_forward_decode_graph(
+                ctx,
+                config,
+                indexer_compressor,
+                hidden,
+                indexer_state,
+                config.index_head_dim,
+                compress_ratio,
+                true,
+                start_pos,
+                start_pos_device,
+                true,
+                i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
+                    |_| {
+                        anyhow!(
+                            "DSv4 official DSA original_max_position_embeddings {} overflows i32",
+                            config.rope_parameters.original_max_position_embeddings
+                        )
+                    },
+                )?,
+                kv,
+                score,
+                keepalive,
+            )?;
+        }
+        let indexer_rows_after = state
+            .indexer
+            .as_ref()
+            .expect("indexer state checked above")
+            .compressed
+            .seq_len;
+        let csa_q_i = scratch
+            .csa_q_i
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA q_i scratch missing"))?;
+        let csa_weights = scratch
+            .csa_weights
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA weights scratch missing"))?;
+        let csa_selected = scratch
+            .csa_selected
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA selected scratch missing"))?;
+        let shared =
+            dsa_shared.ok_or_else(|| anyhow!("DSv4 graph CSA shared DSA scratch missing"))?;
+        let Dsv4LayerAttentionState {
+            indexer: indexer_state_ref,
+            dsa_official,
+            ..
+        } = state;
+        let index_keys = &indexer_state_ref
+            .as_ref()
+            .expect("indexer state checked above")
+            .compressed;
+        let official = dsa_official
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA official DSA state missing"))?;
+        csa_select_decode_graph(
             ctx,
             config,
-            indexer_compressor,
+            indexer,
             hidden,
-            indexer_state,
-            config.index_head_dim,
-            compress_ratio,
-            true,
+            &scratch.c_q_normed,
+            index_keys,
+            official,
+            shared,
+            pool,
+            indexer_rows_before,
+            indexer_rows_after,
             start_pos,
             start_pos_device,
-            true,
-            i32::try_from(config.rope_parameters.original_max_position_embeddings).map_err(
-                |_| {
-                    anyhow!(
-                        "DSv4 official DSA original_max_position_embeddings {} overflows i32",
-                        config.rope_parameters.original_max_position_embeddings
-                    )
-                },
-            )?,
-            kv,
-            score,
+            compress_ratio,
+            csa_q_i,
+            csa_weights,
+            csa_selected,
+            layer_idx,
             keepalive,
         )?;
-        ensure!(
-            false,
-            "DSv4 decode-graph does not support the official CSA select; run without ARLE_DSV4_DECODE_GRAPH=1"
-        );
+        selected_ready = true;
     }
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -11232,6 +11305,94 @@ pub(crate) struct Dsv4DsaBatchedGather<'a> {
     /// Per-row captured `key_count` (push exactly one per call), for the batched
     /// context_lens (`min(key_count_r, abs_pos_r/ratio)`).
     pub(crate) key_counts: &'a mut Vec<i32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csa_select_decode_graph(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    indexer: &Dsv4Indexer,
+    hidden: &HiddenStates,
+    c_q_normed: &HiddenStates,
+    keys: &HiddenStates,
+    official: &mut Dsv4DsaOfficialState,
+    shared: &mut Dsv4DsaSharedScratch,
+    pool: &mut Dsv4LayerKvLayout,
+    indexer_rows_before: usize,
+    indexer_rows_after: usize,
+    start_pos: usize,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    ratio: usize,
+    q_i: &mut HiddenStates,
+    weights: &mut HiddenStates,
+    selected: &mut CudaSlice<i32>,
+    layer_idx: usize,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    ensure!(
+        hidden.seq_len == 1 && c_q_normed.seq_len == 1,
+        "DSv4 graph CSA select is decode-only, hidden seq={} c_q seq={}",
+        hidden.seq_len,
+        c_q_normed.seq_len
+    );
+    ensure!(
+        selected.len() >= config.index_topk,
+        "DSv4 graph CSA selected scratch len {} < topk {}",
+        selected.len(),
+        config.index_topk
+    );
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+        dsv4_linear(ctx, &indexer.wq_b, c_q_normed, q_i)
+    })?;
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
+        dsv4_linear(ctx, &indexer.weights_proj, hidden, weights)
+    })?;
+    ensure!(
+        q_i.hidden_dim.is_multiple_of(config.index_head_dim),
+        "DSv4 graph CSA q_i width {} is not divisible by index_head_dim {}",
+        q_i.hidden_dim,
+        config.index_head_dim
+    );
+    let local_index_heads = q_i.hidden_dim / config.index_head_dim;
+    ensure!(
+        weights.hidden_dim == local_index_heads,
+        "DSv4 graph CSA weights width {} != local index heads {local_index_heads}",
+        weights.hidden_dim
+    );
+    let key_count = if start_pos_device.is_some() {
+        keys.data.len() / keys.hidden_dim
+    } else {
+        keys.seq_len
+    };
+    let score_scale =
+        (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
+    let selected_return = csa_select_official(
+        ctx,
+        config,
+        q_i,
+        weights,
+        keys,
+        official,
+        shared,
+        pool,
+        indexer_rows_before,
+        indexer_rows_after,
+        key_count,
+        start_pos,
+        start_pos_device,
+        layer_idx,
+        ratio,
+        local_index_heads,
+        score_scale,
+        Some(selected),
+        /* cache_writes_only */ false,
+        keepalive,
+    )?;
+    ensure!(
+        selected_return.is_none(),
+        "DSv4 graph CSA official select unexpectedly allocated selected output"
+    );
+    Ok(())
 }
 
 /// CSA top-k block selection: project the index query (`wq_b`) + per-head gating

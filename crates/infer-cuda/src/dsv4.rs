@@ -4450,7 +4450,7 @@ impl Dsv4Model {
                         && layer.attention.w_vc.is_none()
                         && layer.attention.o_proj.is_none();
                     if model1_decode {
-                        let (layer_pool, flashmla_scratch, mla_scratch) =
+                        let (layer_pool, dsa_shared, flashmla_scratch, mla_scratch) =
                             kv_adapter.layer_flashmla_and_mla_decode_mut(layer_idx)?;
                         let mla_scratch = mla_scratch.ok_or_else(|| {
                             anyhow!("DSv4 MODEL1 layer {layer_idx} missing MLA decode scratch")
@@ -4465,6 +4465,7 @@ impl Dsv4Model {
                             &normed,
                             &mut slot.attention[layer_idx],
                             layer_pool,
+                            dsa_shared,
                             flashmla_scratch,
                             start_pos,
                             start_pos_device,
@@ -5467,6 +5468,7 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
+                            None,
                             flashmla_scratch,
                             start_pos,
                             Some(&slot.start_pos_device),
@@ -5536,6 +5538,7 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
+                            None,
                             flashmla_scratch,
                             start_pos,
                             Some(&slot.start_pos_device),
