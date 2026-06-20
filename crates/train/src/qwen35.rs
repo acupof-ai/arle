@@ -2090,6 +2090,7 @@ pub struct Qwen35Model {
     tp: Qwen35TensorParallelConfig,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
+    lora_layer_start: Option<usize>,
     layers: Vec<Qwen35Layer>,
     embed_tokens: TensorId,
     final_norm: TensorId,
@@ -2114,6 +2115,7 @@ impl Qwen35Model {
             cfg,
             None,
             LoraTargetSet::AllLinear,
+            None,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::ScratchTrain,
             store,
@@ -2130,6 +2132,10 @@ impl Qwen35Model {
 
     pub fn gradient_checkpointing(&self) -> bool {
         self.gradient_checkpointing
+    }
+
+    pub fn lora_layer_start(&self) -> Option<usize> {
+        self.lora_layer_start
     }
 
     pub fn set_gradient_checkpointing(&mut self, enabled: bool) {
@@ -2289,6 +2295,7 @@ impl Qwen35Model {
             cfg,
             None,
             LoraTargetSet::AllLinear,
+            None,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2305,6 +2312,7 @@ impl Qwen35Model {
             cfg,
             None,
             LoraTargetSet::AllLinear,
+            None,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: false,
@@ -2322,6 +2330,7 @@ impl Qwen35Model {
             cfg,
             lora,
             LoraTargetSet::AllLinear,
+            None,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2336,10 +2345,21 @@ impl Qwen35Model {
         target_set: LoraTargetSet,
         store: &mut TensorStore,
     ) -> Result<Self> {
+        Self::new_with_lora_targets_layer_start(cfg, lora, target_set, None, store)
+    }
+
+    pub fn new_with_lora_targets_layer_start(
+        cfg: &Qwen35Config,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        lora_layer_start: Option<usize>,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
         Self::new_internal(
             cfg,
             Some(lora),
             target_set,
+            lora_layer_start,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2354,10 +2374,23 @@ impl Qwen35Model {
         target_set: LoraTargetSet,
         store: &mut TensorStore,
     ) -> Result<Self> {
+        Self::new_with_lora_targets_for_checkpoint_load_layer_start(
+            cfg, lora, target_set, None, store,
+        )
+    }
+
+    pub(crate) fn new_with_lora_targets_for_checkpoint_load_layer_start(
+        cfg: &Qwen35Config,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        lora_layer_start: Option<usize>,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
         Self::new_internal(
             cfg,
             Some(lora),
             target_set,
+            lora_layer_start,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: false,
@@ -2374,10 +2407,23 @@ impl Qwen35Model {
         tp: Qwen35TensorParallelConfig,
         store: &mut TensorStore,
     ) -> Result<Self> {
+        Self::new_with_lora_targets_and_tp_layer_start(cfg, lora, target_set, None, tp, store)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_lora_targets_and_tp_layer_start(
+        cfg: &Qwen35Config,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        lora_layer_start: Option<usize>,
+        tp: Qwen35TensorParallelConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
         Self::new_internal(
             cfg,
             Some(lora),
             target_set,
+            lora_layer_start,
             tp,
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2392,8 +2438,24 @@ impl Qwen35Model {
         target_set: LoraTargetSet,
         store: &mut TensorStore,
     ) -> Result<Self> {
-        let mut model =
-            Self::new_with_lora_targets_and_tp(&base.config, lora, target_set, base.tp, store)?;
+        Self::new_lora_from_base_layer_start(base, lora, target_set, None, store)
+    }
+
+    pub fn new_lora_from_base_layer_start(
+        base: &Qwen35Model,
+        lora: LoraConfig,
+        target_set: LoraTargetSet,
+        lora_layer_start: Option<usize>,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        let mut model = Self::new_with_lora_targets_and_tp_layer_start(
+            &base.config,
+            lora,
+            target_set,
+            lora_layer_start,
+            base.tp,
+            store,
+        )?;
         model.gradient_checkpointing = base.gradient_checkpointing;
         model.share_base_parameters_from(base)?;
 
@@ -2410,6 +2472,7 @@ impl Qwen35Model {
         cfg: &Qwen35Config,
         lora: Option<LoraConfig>,
         lora_target_set: LoraTargetSet,
+        lora_layer_start: Option<usize>,
         tp: Qwen35TensorParallelConfig,
         mode: Qwen35InitMode,
         store: &mut TensorStore,
@@ -2419,6 +2482,13 @@ impl Qwen35Model {
             Qwen35InitMode::LoraOrFrozen { .. } => cfg.validate_train_lora_or_frozen_contract()?,
         }
         tp.validate(cfg)?;
+        if let Some(start) = lora_layer_start {
+            if start >= cfg.num_hidden_layers {
+                return Err(Qwen35Error::InvalidConfig(
+                    "lora_layer_start must be less than num_hidden_layers",
+                ));
+            }
+        }
         let mut param_names = HashMap::new();
         let mut adapter_names = HashMap::new();
         let mut param_ids = Vec::new();
@@ -2466,6 +2536,7 @@ impl Qwen35Model {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
+            let layer_lora = lora_for_layer(lora, lora_layer_start, layer_idx);
             let names = cfg.layer_tensor_names(layer_idx);
             let input_layernorm_name = leak_name(names.common.input_layernorm.clone());
             let post_attention_layernorm_name =
@@ -2495,7 +2566,7 @@ impl Qwen35Model {
                     cfg,
                     base_requires_grad,
                     materialize_frozen_base,
-                    lora,
+                    layer_lora,
                     lora_target_set,
                     store,
                 )?))
@@ -2509,7 +2580,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         tp.local_intermediate_size(cfg)?,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, gate_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, gate_proj_name),
                         materialize_frozen_base,
                         store,
                     )?,
@@ -2518,7 +2589,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         tp.local_intermediate_size(cfg)?,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, up_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, up_proj_name),
                         materialize_frozen_base,
                         store,
                     )?,
@@ -2527,7 +2598,7 @@ impl Qwen35Model {
                         tp.local_intermediate_size(cfg)?,
                         cfg.hidden_size,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, down_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, down_proj_name),
                         materialize_frozen_base,
                         store,
                     )?,
@@ -2568,7 +2639,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         tp.full_attn_q_proj_dim(cfg)?,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, q_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, q_proj_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2577,7 +2648,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         tp.full_attn_kv_dim(cfg)?,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, k_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, k_proj_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2586,7 +2657,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         tp.full_attn_kv_dim(cfg)?,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, v_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, v_proj_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2595,7 +2666,7 @@ impl Qwen35Model {
                         tp.full_attn_q_dim(cfg)?,
                         cfg.hidden_size,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, o_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, o_proj_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2666,7 +2737,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_attn_qkv_dim(),
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, in_proj_qkv_name),
+                        lora_for_name(layer_lora, lora_target_set, in_proj_qkv_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2675,7 +2746,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_attn_z_dim(),
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, in_proj_z_name),
+                        lora_for_name(layer_lora, lora_target_set, in_proj_z_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2684,7 +2755,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_num_value_heads,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, in_proj_b_name),
+                        lora_for_name(layer_lora, lora_target_set, in_proj_b_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2693,7 +2764,7 @@ impl Qwen35Model {
                         cfg.hidden_size,
                         cfg.linear_num_value_heads,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, in_proj_a_name),
+                        lora_for_name(layer_lora, lora_target_set, in_proj_a_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2733,7 +2804,7 @@ impl Qwen35Model {
                         cfg.linear_attn_z_dim(),
                         cfg.hidden_size,
                         base_requires_grad,
-                        lora_for_name(lora, lora_target_set, out_proj_name),
+                        lora_for_name(layer_lora, lora_target_set, out_proj_name),
                         materialize_frozen_base,
                         store,
                     )?;
@@ -2818,6 +2889,7 @@ impl Qwen35Model {
             tp,
             lora,
             lora_target_set,
+            lora_layer_start,
             layers,
             embed_tokens,
             final_norm,
@@ -2877,11 +2949,26 @@ impl Qwen35Model {
         Ok(())
     }
 
+    fn detach_before_lora_layer(
+        &self,
+        hidden: TensorId,
+        layer_index: usize,
+        store: &mut TensorStore,
+        tape: &Tape,
+    ) -> Result<TensorId> {
+        if tape.enabled && self.lora_layer_start == Some(layer_index) {
+            Ok(store.detach(hidden)?)
+        } else {
+            Ok(hidden)
+        }
+    }
+
     pub fn clone_frozen(&self, store: &mut TensorStore) -> Self {
         let cloned = Self::new_internal(
             &self.config,
             self.lora,
             self.lora_target_set,
+            self.lora_layer_start,
             self.tp,
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -3225,6 +3312,7 @@ impl Qwen35Model {
         trace_model_component(trace, "embedding", profile.embedding);
 
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
             let started = Instant::now();
             let (next_hidden, layer_profile) = if self.gradient_checkpointing && tape.enabled {
                 let layer = layer.clone();
@@ -3305,7 +3393,8 @@ impl Qwen35Model {
             store,
             tape,
         )?;
-        for layer in &self.layers {
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
             hidden = if self.gradient_checkpointing && tape.enabled {
                 let layer = layer.clone();
                 let cfg = self.config.clone();
@@ -4258,6 +4347,18 @@ fn share_base_mlp(mlp: &mut Qwen35Mlp, base_mlp: &Qwen35Mlp) -> Result<()> {
     }
 }
 
+fn lora_for_layer(
+    lora: Option<LoraConfig>,
+    lora_layer_start: Option<usize>,
+    layer_idx: usize,
+) -> Option<LoraConfig> {
+    if lora_layer_start.is_some_and(|start| layer_idx < start) {
+        None
+    } else {
+        lora
+    }
+}
+
 fn lora_for_name(
     lora: Option<LoraConfig>,
     target_set: LoraTargetSet,
@@ -5058,7 +5159,7 @@ fn leak_name(name: String) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::error::Error;
     #[cfg(feature = "cuda")]
     use std::{env, sync::Arc};
@@ -5234,6 +5335,95 @@ mod tests {
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx as u32)
             .expect("non-empty vocab")
+    }
+
+    #[test]
+    fn qwen35_lora_layer_start_limits_adapters_and_tape_prefix() -> TestResult {
+        let mut store = TensorStore::default();
+        let cfg = tiny_qwen35_config(8);
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let model = Qwen35Model::new_with_lora_targets_layer_start(
+            &cfg,
+            lora,
+            LoraTargetSet::AllLinear,
+            Some(1),
+            &mut store,
+        )?;
+        assert_eq!(model.lora_layer_start(), Some(1));
+
+        let adapters = model.adapter_name_map();
+        assert!(!adapters.is_empty(), "suffix LoRA must allocate adapters");
+        for (name, &id) in &adapters {
+            assert!(
+                !name.contains(".layers.0."),
+                "prefix layer adapter should not exist: {name}"
+            );
+            assert!(
+                name.contains(".layers.1."),
+                "suffix adapter must live in layer 1 for the tiny 2-layer config: {name}"
+            );
+            let tensor = store
+                .get(id)
+                .ok_or_else(|| format!("missing adapter {name}"))?;
+            assert!(tensor.requires_grad, "adapter {name} must be trainable");
+        }
+
+        let prefix_params = model
+            .param_name_map()
+            .into_iter()
+            .filter(|(name, _)| name.contains(".layers.0."))
+            .map(|(name, id)| (id, name))
+            .collect::<HashMap<_, _>>();
+        let prefix_param_ids = prefix_params.keys().copied().collect::<HashSet<_>>();
+        let suffix_adapter_ids = adapters.values().copied().collect::<HashSet<_>>();
+
+        let tokens = [1_u32, 3];
+        let positions = [0_u32, 1];
+        let mut tape = Tape::new();
+        let loss = squared_logits_loss(&model, &mut store, &mut tape, &tokens, &positions)?;
+
+        let mut prefix_refs = Vec::new();
+        let mut saw_suffix_adapter_site = false;
+        for entry in &tape.entries {
+            if let Some(site) = entry.profile_site() {
+                assert!(
+                    !site.contains(".layers.0."),
+                    "tape must not record prefix layer matmul site {site}"
+                );
+                saw_suffix_adapter_site |= site.contains(".layers.1.") && site.ends_with(".lora_b");
+            }
+            for input_id in entry.input_ids.iter().copied() {
+                if prefix_param_ids.contains(&input_id) {
+                    let name = prefix_params.get(&input_id).copied().unwrap_or("<unknown>");
+                    prefix_refs.push((entry.op.name(), name));
+                }
+            }
+        }
+        assert!(
+            prefix_refs.is_empty(),
+            "tape must not reference prefix layer params: {prefix_refs:?}"
+        );
+        assert!(
+            saw_suffix_adapter_site,
+            "tape must include trainable suffix LoRA adapter work"
+        );
+
+        let grads = tape.backward(loss, &mut store)?;
+        for (name, &id) in &adapters {
+            assert!(grads.contains_key(&id), "missing adapter grad for {name}");
+        }
+        assert!(
+            grads.keys().all(|id| !prefix_param_ids.contains(id)),
+            "prefix layer params must not receive gradients"
+        );
+        assert!(
+            grads.keys().any(|id| suffix_adapter_ids.contains(id)),
+            "at least one suffix adapter must receive a gradient"
+        );
+        Ok(())
     }
 
     #[test]

@@ -409,6 +409,13 @@ impl TensorStore {
         Ok(())
     }
 
+    pub fn detach(&mut self, id: TensorId) -> Result<TensorId> {
+        let detached = self.clone_tensor(id)?;
+        self.set_requires_grad(detached, false)?;
+        self.set_grad(detached, None)?;
+        Ok(detached)
+    }
+
     pub(crate) fn set_grad(&mut self, id: TensorId, grad: Option<TensorId>) -> Result<()> {
         self.raw_tensor_mut(id)?.grad = grad;
         Ok(())

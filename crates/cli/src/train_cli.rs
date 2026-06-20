@@ -715,7 +715,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     use train::{
         lora::LoraConfig,
         opd::{GkdLossConfig, OpdStepConfig, opd_step_with_teacher_forward_profiled_gkd_anchor},
-        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir},
+        qwen35_loader::{load_qwen35_from_hf_dir, load_qwen35_lora_from_hf_dir_with_layer_start},
     };
 
     let student_dir = args
@@ -759,8 +759,14 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         "[arle train opd] loading student from {}",
         student_dir.display()
     );
-    let student = load_qwen35_lora_from_hf_dir(student_dir, lora, target_set, &mut store)
-        .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    let student = load_qwen35_lora_from_hf_dir_with_layer_start(
+        student_dir,
+        lora,
+        target_set,
+        args.lora_layer_start,
+        &mut store,
+    )
+    .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
     let student_params: Vec<TensorId> = student
         .all_parameter_ids()
         .into_iter()
@@ -1044,6 +1050,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
             "lora_target_set": args.lora_target_set,
+            "lora_layer_start": args.lora_layer_start,
             "save_checkpoint": args.save_checkpoint.as_ref().map(|path| path.display().to_string()),
             "save_every": args.save_every,
             "final_nll_baseline": nll_baseline,
