@@ -1512,6 +1512,15 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             rep.accepted, rep.distinct_accepted, rep.parse_errors, rep.trained, rep.mean_train_loss
         );
 
+        // Sync the trained LoRA into the rollout engine so the NEXT round samples
+        // from the improved student (iterative RFT). Round 0 sampled from base, as
+        // intended; skip the sync after the final round (no next rollout).
+        if round + 1 < args.rounds {
+            infer_student
+                .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
+                .context("sync trained LoRA into rollout engine between rounds")?;
+        }
+
         let mut ckpt_tape = Tape::new();
         maybe_save_full_student_checkpoint(
             "rubric-opd",
