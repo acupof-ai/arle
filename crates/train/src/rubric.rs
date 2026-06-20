@@ -72,6 +72,19 @@ pub struct Verdict {
     pub parse_error: bool,
 }
 
+impl Verdict {
+    /// A verdict for a judge call that errored or produced unparseable output.
+    /// Never accepted, surfaced as a parse error (CLAUDE.md §0 case-as-fact: a
+    /// judge timeout/garbage is neither a pass nor a fail-class).
+    pub fn parse_error() -> Self {
+        Self {
+            passed: Vec::new(),
+            accepted: false,
+            parse_error: true,
+        }
+    }
+}
+
 impl Rubric {
     /// Render the prompt sent to the judge model. Asks for a single JSON object
     /// keyed by each criterion `key` with boolean values, emitted as the final line.
