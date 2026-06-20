@@ -122,6 +122,10 @@ pub struct RubricOpdConfig {
     /// 27B-dense autograd CE is ~minutes/step (host-authoritative), so bounding the
     /// accepted set keeps a round tractable; capped to the first N accepted.
     pub writeback_cap: Option<usize>,
+    /// Micro-batch size for the CE writeback. The CE is overhead-bound (GPU ~0%
+    /// util), so batching B accepted pairs into one forward+backward amortizes the
+    /// host op-dispatch (~B× throughput); B bounds the [B, seq, vocab] logit VRAM.
+    pub writeback_batch: usize,
 }
 
 /// Per-round accounting. `distinct_accepted` is the RFT log-linear x-axis;
@@ -161,7 +165,7 @@ pub fn run_rubric_rounds<D, T>(
 ) -> Result<Vec<RoundReport>>
 where
     D: FnMut(&[u32]) -> Result<String>,
-    T: FnMut(&[u32], &[u32]) -> Result<f32>,
+    T: FnMut(&[(Vec<u32>, Vec<u32>)]) -> Result<f32>,
 {
     let mut reports = Vec::with_capacity(cfg.rounds);
     for round in 0..cfg.rounds {
@@ -238,15 +242,20 @@ where
             "[rubric] round {round} phase-B done: freed rollout={freed_rollout} judge={freed_judge} bytes"
         );
 
-        // Phase C — CE writeback on all accepted pairs (engines offloaded).
-        for (i, (prompt_ids, completion_ids)) in accepted_pairs.iter().enumerate() {
+        // Phase C — CE writeback on accepted pairs, micro-batched (engines offloaded).
+        // Batching amortizes the overhead-bound host op-dispatch over the micro-batch.
+        let batch_size = cfg.writeback_batch.max(1);
+        let total_chunks = accepted_pairs.len().div_ceil(batch_size);
+        for (ci, chunk) in accepted_pairs.chunks(batch_size).enumerate() {
             eprintln!(
-                "[rubric] round {round} phase-C: CE {}/{}",
-                i + 1,
-                accepted_pairs.len()
+                "[rubric] round {round} phase-C: CE micro-batch {}/{} (size {})",
+                ci + 1,
+                total_chunks,
+                chunk.len()
             );
-            loss_sum += train_on_accepted(prompt_ids, completion_ids)?;
-            rep.trained += 1;
+            let chunk_loss = train_on_accepted(chunk)?;
+            loss_sum += chunk_loss * chunk.len() as f32;
+            rep.trained += chunk.len();
         }
 
         // Phase D — reload engines. Always: the caller drives rounds one-at-a-time

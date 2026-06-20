@@ -1003,6 +1003,12 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, value_name = "N")]
     pub(crate) writeback_cap: Option<usize>,
 
+    /// CE writeback micro-batch size. The CE is overhead-bound (GPU ~0% util), so
+    /// batching B accepted pairs into one forward+backward amortizes the host
+    /// op-dispatch (~B× faster); B bounds the [B, seq, vocab] logit VRAM.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) writeback_batch: usize,
+
     /// Max new tokens per sampled rollout.
     #[arg(long, default_value_t = 1024)]
     pub(crate) max_new_tokens: usize,
