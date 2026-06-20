@@ -2794,6 +2794,87 @@ pub fn rubric_writeback_ce_step<O: Optimizer>(
     Ok(loss_value)
 }
 
+/// Batched rubric-OPD writeback: one forward+backward over B accepted `(prompt,
+/// completion)` pairs (padded to a common length), completion-masked CE summed over
+/// rows. The 27B CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching
+/// amortizes the ~64-layer per-op host dispatch over B examples — near-B× throughput.
+/// Caller micro-batches B to bound the `[B, seq, vocab]` logit VRAM.
+#[allow(clippy::too_many_arguments)]
+pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
+    student: &Qwen35Model,
+    all_model_params: &[TensorId],
+    trainable_params: &[TensorId],
+    optimizer: &mut O,
+    batch: &[(Vec<u32>, Vec<u32>)],
+    vocab: usize,
+    store: &mut TensorStore,
+) -> Result<f32> {
+    if batch.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "rubric batched writeback requires a non-empty batch".to_owned(),
+        ));
+    }
+    let mut max_len = 0usize;
+    for (prompt, completion) in batch {
+        if prompt.is_empty() || completion.is_empty() {
+            return Err(OpdError::InvalidInput(
+                "rubric batched writeback: empty prompt or completion in batch".to_owned(),
+            ));
+        }
+        max_len = max_len.max(prompt.len() + completion.len());
+    }
+    let b = batch.len();
+
+    let mut tape = Tape::new();
+    // Flat [B * max_len] input, each row = prompt ++ completion ++ pad(0). Causal
+    // attention + right-padding means padding never affects earlier positions, and
+    // the per-row CE only targets completion positions, so padding is inert.
+    let mut flat: Vec<usize> = Vec::with_capacity(b * max_len);
+    for (prompt, completion) in batch {
+        flat.extend(prompt.iter().map(|&t| t as usize));
+        flat.extend(completion.iter().map(|&t| t as usize));
+        flat.extend(std::iter::repeat(0usize).take(max_len - prompt.len() - completion.len()));
+    }
+    let logits = student
+        .forward_batch_tokens(&flat, b, max_len, store, &mut tape)
+        .map_err(OpdError::from)?;
+
+    // Per-row completion-masked CE, summed (the heavy forward/backward is shared).
+    let mut total: Option<TensorId> = None;
+    for (i, (prompt, completion)) in batch.iter().enumerate() {
+        let row = slice(
+            logits,
+            &[i, 0, 0],
+            &[i + 1, max_len, vocab],
+            store,
+            &mut tape,
+        )
+        .map_err(OpdError::from)?;
+        let ce = next_token_sft_loss_from_logits(
+            row,
+            max_len,
+            prompt.len() - 1,
+            completion,
+            vocab,
+            store,
+            &mut tape,
+        )?;
+        total = Some(match total {
+            None => ce,
+            Some(prev) => add(prev, ce, store, &mut tape).map_err(OpdError::from)?,
+        });
+    }
+    let total = total.expect("batch is non-empty");
+    let mean = mul_scalar(total, 1.0 / b as f32, store, &mut tape).map_err(OpdError::from)?;
+    let loss_value = store.to_host(mean).map_err(OpdError::from)?[0];
+    backward_with_optional_profile(mean, loss_value, store, &mut tape)?;
+    optimizer.step(store, trainable_params)?;
+    optimizer.zero_grad(store, trainable_params);
+    let keep_extra: HashSet<TensorId> = HashSet::new();
+    cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
+    Ok(loss_value)
+}
+
 pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
