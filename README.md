@@ -100,12 +100,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 </p>
 <p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, base→step25→step50 trajectory · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
 
-**Does the same loop lift *agentic* (tool-use) capability?** Yes — once the gate is honest. The first BFCL gate was a *timeout artifact* (the slow no-think teacher's timeouts were scored as abstentions); a clean re-gate found the real lever: in **think-on** the teacher abstains 0.93 vs the base's 0.27. With **think-on OPD** the 4B student learns to **decline irrelevant tool-use queries: 0.60 → 1.00** (toward the teacher), lifting BFCL-live aggregate **0.786 → 0.825** — case-validated (the base reasons correctly then *tool-calls anyway*; the OPD student abstains):
-
-<p align="center">
-  <img src="docs/assets/opd-agentic-thinkon-curve.png" alt="Agentic OPD think-on: Qwen3.5-4B abstention on BFCL live_irrelevance rises 0.60 to 1.00 toward the 35B teacher; aggregate 0.786 to 0.825 at step25" width="680">
-</p>
-<p align="center"><sub>BFCL live, clean think-on eval (single-thread, 0 errors), 206 run-ids · base→step25→step50 · abstention (live_irrelevance) <b>0.60→1.00</b>; aggregate <b>0.786→0.825</b> at step25 (step50 over-trains — an over-thinking/length-cap artifact, not a capability loss) · 2026-06-20. <a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a> · <a href="docs/experience/errors/2026-06-20-agentic-opd-greedy-reverse-kl-overcalls.md">the no-think confound</a>.</sub></p>
+The same loop lifts *agentic* capability too: with think-on OPD the 4B student learns to **decline irrelevant tool-use queries — BFCL-live abstention 0.60 → 1.00**, toward the teacher. Case-validated: the base reasons correctly then tool-calls anyway; the OPD student abstains. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 

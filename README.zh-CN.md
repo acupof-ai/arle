@@ -93,14 +93,16 @@ print(client.chat.completions.create(
 </p>
 <p align="center"><sub>DSv4 B=1 decode,<b>33.5 → 53.3 tok/s</b>,2026-06-13 → 06-14 campaign —— 每一步都对应一条 <code>docs/experience/wins/</code> 记录。</sub></p>
 
-**On-Policy Distillation —— 真能提升 student 吗?** 一个 Qwen3.5-4B LoRA student,在自己的 rollout 上对 Qwen3.6-35B-A3B teacher 做蒸馏(teacher 就跑在同一套服务运行时上),**25 步内补齐了 base→teacher MATH-500 差距的 ~82%** —— base **0.60 → 0.78**,逼近 35B teacher 的水平(**0.82**):
+**On-Policy Distillation —— 真能提升 student 吗?** 一个 Qwen3.5-4B LoRA student,在自己的 rollout 上对 Qwen3.6-35B-A3B teacher 做蒸馏(teacher 就跑在同一套服务运行时上),把 MATH-500 从 **0.518 → 0.792** 提升 —— **+27pp、CI 完全分离** —— 在 **5 seed × 3 recipe** 上锁定(reverse-KL 最优),逼近 35B teacher 的水平(**0.82**):
 
 <p align="center">
-  <img src="docs/assets/opd-capability-curve.png" alt="OPD 能力曲线:Qwen3.5-4B student 在 25 个 OPD 步内从 0.60 提升到 ~0.78 MATH-500 准确率,逼近 35B teacher 的 0.82" width="660">
+  <img src="docs/assets/opd-multiseed-curve.png" alt="OPD 多 seed 锁定:Qwen3.5-4B student MATH-500 从 0.518 提升到 0.792(reverse-KL,5 seed 最优),逼近 35B teacher 的 0.82" width="680">
 </p>
-<p align="center"><sub>MATH-500 greedy exact-match,n=100/点 @4096 tokens,0 request-error · 单 seed bring-up 2026-06-19 · 误差棒 = Wilson 95% CI · forward-KL 与 reverse-KL 两组(多 seed 区分待补)。</sub></p>
+<p align="center"><sub>MATH-500 greedy exact-match,<b>n=500/seed</b> @4096 tokens,0 request-error · 3 recipe × 5 seed,base→step25→step50 · 误差棒 = ±1σ(跨 seed)· base <b>0.518</b> → reverse-KL <b>0.792</b>,CI 完全分离 · 2026-06-20。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>。</sub></p>
 
-**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 2.5–2.9×,LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5 全家族(CUDA + Metal)· Qwen3.6(Metal)· DeepSeek-V4-Flash(CUDA 8×H20)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
+同一套 loop 也提升 *agentic* 能力:think-on OPD 下 4B student 学会**拒绝不相关的工具调用 —— BFCL-live abstention 0.60 → 1.00**,逼近 teacher。case 验证:base 推理正确却仍强行调用工具,OPD student 则正确弃权。[<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
+
+**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5 全家族(CUDA + Metal)· Qwen3.6(Metal)· DeepSeek-V4-Flash(CUDA 8×H20)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
 
