@@ -1315,7 +1315,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         infer_student::InferStudent,
         lora::LoraConfig,
         opd::rubric_writeback_ce_step,
-        qwen35_loader::load_qwen35_lora_from_hf_dir,
+        qwen35_loader::load_qwen35_lora_from_hf_dir_with_layer_start,
         rubric::{bfcl_agentic_rubric, math_rubric},
         rubric_opd::{FlashJudge, RubricOpdConfig, run_rubric_rounds},
         tokenizer::ChatTokenizer,
@@ -1344,8 +1344,19 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         "[arle train rubric-opd] loading student from {}",
         student_dir.display()
     );
-    let student = load_qwen35_lora_from_hf_dir(student_dir, lora, target_set, &mut store)
-        .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    let mut student = load_qwen35_lora_from_hf_dir_with_layer_start(
+        student_dir,
+        lora,
+        target_set,
+        args.lora_layer_start,
+        &mut store,
+    )
+    .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
+    // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
+    if args.grad_checkpointing {
+        student.set_gradient_checkpointing(true);
+    }
     let all_params: Vec<TensorId> = student.all_parameter_ids();
     let trainable: Vec<TensorId> = all_params
         .iter()
