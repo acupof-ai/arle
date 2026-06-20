@@ -67,7 +67,15 @@ impl FlashJudge {
                 .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
             engine.complete(req)?
         };
-        Ok(rubric.parse_verdict(&output.text))
+        let verdict = rubric.parse_verdict(&output.text);
+        if std::env::var("ARLE_RUBRIC_DEBUG").is_ok() {
+            let snip: String = output.text.chars().take(900).collect();
+            eprintln!(
+                "[rubric judge] finish={:?} parse_err={} accepted={} raw_verdict={snip:?}",
+                output.finish_reason, verdict.parse_error, verdict.accepted
+            );
+        }
+        Ok(verdict)
     }
 
     /// Judge a rollout, mapping any transient engine error to a parse-error
@@ -153,6 +161,12 @@ where
                 .iter()
                 .map(|s| decode(s))
                 .collect::<Result<Vec<String>>>()?;
+            if std::env::var("ARLE_RUBRIC_DEBUG").is_ok() {
+                for (i, t) in texts.iter().enumerate() {
+                    let snip: String = t.chars().take(900).collect();
+                    eprintln!("[rubric rollout] sample{i} len={} text={snip:?}", t.len());
+                }
+            }
             let verdicts: Vec<Verdict> = texts
                 .iter()
                 .map(|t| judge.judge_resilient(rubric, problem, t))
