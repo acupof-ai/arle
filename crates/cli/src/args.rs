@@ -1056,6 +1056,20 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) save_every: usize,
 
+    /// Optional eval set (jsonl with `problem` + `answer` gold). Scored in-process
+    /// via the rollout engine BEFORE training (base) and after each round — no
+    /// checkpoint save (full-materialize is host-loop pathological at 27B).
+    #[arg(long, value_name = "FILE")]
+    pub(crate) eval_prompts_file: Option<PathBuf>,
+
+    /// Directory for per-round eval answer dumps (eval_round_base.jsonl, eval_round{N}.jsonl).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) eval_out_dir: Option<PathBuf>,
+
+    /// Number of eval problems (from the head of --eval-prompts-file).
+    #[arg(long, default_value_t = 50)]
+    pub(crate) eval_n: usize,
+
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
