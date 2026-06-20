@@ -1037,6 +1037,17 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value = "all-linear")]
     pub(crate) lora_target_set: String,
 
+    /// Suffix-detach: train LoRA only on layers >= N and detach the autograd
+    /// backward before layer N (cuts the backward to the top suffix). Needed to fit
+    /// a 27B dense student CE backward; unset = all layers (OOMs at 27B/seq~1k).
+    #[arg(long, value_name = "N")]
+    pub(crate) lora_layer_start: Option<usize>,
+
+    /// Gradient checkpointing for the CE backward (recompute activations). On by
+    /// default; `--grad-checkpointing false` to disable.
+    #[arg(long, default_value_t = true)]
+    pub(crate) grad_checkpointing: bool,
+
     /// Directory where servable full-materialized checkpoints are written.
     #[arg(long, value_name = "DIR")]
     pub(crate) save_checkpoint: Option<PathBuf>,
