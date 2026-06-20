@@ -129,6 +129,53 @@ impl InferStudent {
         Ok(rollout)
     }
 
+    /// Generate `n` **natural, EOS-respecting** completions of up to
+    /// `max_new_tokens` tokens each, for rubric-OPD rejection sampling. Returns the
+    /// GENERATED tokens per sample (prompt excluded), variable length.
+    ///
+    /// This is the rubric-OPD counterpart of [`Self::generate_rollout`]: that path
+    /// forces exact-length `ignore_eos` decoding for token-KL alignment, whereas the
+    /// rubric judge needs *complete* solutions (stop at EOS) and the writeback CE
+    /// trains the natural completion. Per-sample seeds (`base + i` when a seed is
+    /// set) give reproducible diversity at temperature > 0; with no seed the engine
+    /// RNG advances across calls. Samples are independent requests.
+    pub fn generate_samples(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        n: usize,
+        sampling: Option<&SamplingParams>,
+    ) -> Result<Vec<Vec<u32>>> {
+        if prompt_ids.is_empty() {
+            bail!("InferStudent rollout requires a non-empty prompt");
+        }
+        validate_token_ids("prompt", prompt_ids, self.vocab_size)?;
+        if max_new_tokens == 0 || n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let base = sampling.cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            // Natural generation: do NOT force ignore_eos (that is the token-KL
+            // exact-length path); the rubric judge needs complete answers.
+            let mut params = base.clone();
+            if let Some(seed) = base.seed {
+                params.seed = Some(seed.wrapping_add(i as u64));
+            }
+            let generated = {
+                let engine = self
+                    .engine
+                    .lock()
+                    .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+                engine.generate_token_ids(prompt_ids, max_new_tokens, params)?
+            };
+            validate_token_ids("generated sample", &generated, self.vocab_size)?;
+            out.push(generated);
+        }
+        Ok(out)
+    }
+
     /// Run a single forward over `input_ids` (with absolute `positions`) and
     /// return the next token over the **last** position's logits.
     ///
