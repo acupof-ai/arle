@@ -36,10 +36,21 @@ Decoding the actual outputs (base / step25 / step50 / teacher) on live_irrelevan
    generation is too slow to finish a thinking trace (the same slowness caused the
    timeouts).
 
+4. **The regression is broad, and all of it points at the noisy target.** Decoding
+   the OTHER regressing categories (live_multiple 0.70→0.54, live_parallel
+   0.75→0.56) shows it is NOT over-calling there — it is **arg-format drift**
+   (`"Shanghai, CN"`→`"Shanghai, China"`, `"QR"`→`"Q.R."`, units flipped),
+   **hallucinated args** (adding `url=...`, `unit="celsius"` not in the query), and
+   some **empty outputs**. Every failure mode (over-call, format drift,
+   hallucination, empties) is consistent with one thing: the no-think teacher is a
+   **noisy/bad distillation target** (it times out, over-calls, drifts), and OPD
+   faithfully distilled the noise. Only live_simple (the easiest single-call slice)
+   lifted (+14pp) — where even a noisy signal helps.
+
 The hypothesis ("OPD lifts agentic capability") is **NOT overturned** — the
-experiment was confounded: a fake gate (timeouts-as-abstention) + a wrong teacher
-mode (no-think over-calls). Tool-use categories *did* lift (live_simple 0.70→0.84,
-relevance 0.75→0.81), consistent with OPD working where the target is good.
+experiment was confounded: a fake gate (timeouts-as-abstention) + a noisy no-think
+teacher target across the board. live_simple's +14pp confirms the loop works where
+the target is clean.
 
 ## Fix
 1. **Timeout-clean gate** — exclude `Error during inference` / request-errors from
