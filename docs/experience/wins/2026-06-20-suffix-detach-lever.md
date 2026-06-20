@@ -17,13 +17,22 @@ OPD step ~2126 s (the trainer-side wall; the InferStudent rollout is only 42 s).
   test) passes — suffix-only LoRA grads, tape excludes prefix layers, default unchanged.
 - **Builds** via `scripts/pod_pipeline.sh` (incremental, INCR_BUILD_EXIT=0).
 
-## Pending-remote
-The **runtime perf claim** (does the suffix-detach actually cut the 1333 s backward,
-and by how much?) needs a **35B OPD A/B** (all-layer vs `--lora-layer-start K`,
-same shape, wall-clock backward_seconds from the opd_step_trace). That run is gated on
-the 35B-student (D) experiment, which follows the think-on agentic OPD (C) result.
-Default path is byte-identical, so no regression risk to current runs. Bench entry to
-be filled with the measured backward-time delta when the 35B A/B runs.
+## Measured perf (35B A/B, 2026-06-20)
+Qwen3.6-35B-A3B-FP8 student (40 layers), single-GPU autograd, rollout-649, identical
+config except the lever (Arm A GPU4 all-layer attn-qv LoRA; Arm B GPU5
+`--lora-layer-start 32` = top-8 layers). Same loss trajectory (0.242→0.185), both finite.
+
+| | backward_seconds | student_forward_seconds |
+|---|---|---|
+| Arm A (all-layer, 40) | **~355 s** | ~140 s |
+| Arm B (suffix top-8) | **33.2 s** (33.2/32.2 over 2 steps) | ~127 s |
+| **speedup** | **≈10.3× backward** | ~1.1× (forward not detached, as expected) |
+
+So the lever cuts the trainer-side wall ~10×: at the production rollout-2048 (where
+all-layer backward was ~1333 s) the suffix path projects to ~130 s → a 35B OPD step
+drops from ~35 min toward a few min, making 35B-student OPD practical. The forward is
+unchanged (correct — only the backward tape is cut). Default (None) byte-identical.
+Logs: /data01/lora_lever_arm{A,B}_v2.log.
 
 ## Rule
 A backward-pruning lever's correctness (tape cut + byte-identical default) can be
