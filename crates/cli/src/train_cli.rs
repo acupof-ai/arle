@@ -1559,6 +1559,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         rounds: 1,
         samples_per_prompt: args.samples_per_prompt,
         max_new_tokens: args.max_new_tokens,
+        writeback_cap: args.writeback_cap,
     };
 
     // In-process eval (base + per-round) via the rollout engine — no checkpoint save.
