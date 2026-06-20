@@ -89,6 +89,23 @@ impl FlashJudge {
             }
         }
     }
+
+    /// Offload the judge engine's device weights to host RAM, freeing VRAM for the
+    /// student CE backward (rubric-OPD time-share). Returns bytes freed.
+    pub fn offload_engine_weights(&self) -> Result<usize> {
+        self.engine
+            .lock()
+            .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+            .offload_engine_weights()
+    }
+
+    /// Reload the judge engine's device weights before the next judging phase.
+    pub fn reload_engine_weights(&self) -> Result<()> {
+        self.engine
+            .lock()
+            .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?
+            .reload_engine_weights()
+    }
 }
 
 /// Rubric-OPD round/sampling configuration.
@@ -149,6 +166,12 @@ where
             ..Default::default()
         };
         let mut loss_sum = 0.0f32;
+        let debug = std::env::var("ARLE_RUBRIC_DEBUG").is_ok();
+
+        // Phase A — sample + judge + select (BOTH inference engines resident).
+        // Accumulate accepted (prompt_ids, completion_ids) pairs; defer all CE so
+        // the engines can be offloaded as one block before the autograd backward.
+        let mut accepted_pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
         for (problem, prompt_ids) in prompts {
             rep.prompts += 1;
             let samples = student.generate_samples(
@@ -161,7 +184,7 @@ where
                 .iter()
                 .map(|s| decode(s))
                 .collect::<Result<Vec<String>>>()?;
-            if std::env::var("ARLE_RUBRIC_DEBUG").is_ok() {
+            if debug {
                 for (i, t) in texts.iter().enumerate() {
                     let snip: String = t.chars().take(900).collect();
                     eprintln!("[rubric rollout] sample{i} len={} text={snip:?}", t.len());
@@ -176,10 +199,34 @@ where
             rep.distinct_accepted += sel.distinct_accepted;
             rep.parse_errors += sel.parse_errors;
             for &idx in &sel.accepted {
-                loss_sum += train_on_accepted(prompt_ids, &samples[idx])?;
-                rep.trained += 1;
+                accepted_pairs.push((prompt_ids.clone(), samples[idx].clone()));
             }
         }
+
+        // Phase B — offload BOTH inference engines (rollout + judge) to host RAM,
+        // freeing their VRAM (~tens of GB) for the 27B autograd CE forward+backward.
+        // Without this the CE step OOMs (`cuda alloc_zeros failed`) at seq ~1k.
+        let freed_rollout = student.offload_engine_weights().unwrap_or(0);
+        let freed_judge = judge.offload_engine_weights().unwrap_or(0);
+        if debug {
+            eprintln!(
+                "[rubric offload] freed rollout={freed_rollout} judge={freed_judge} bytes; CE on {} accepted",
+                accepted_pairs.len()
+            );
+        }
+
+        // Phase C — CE writeback on all accepted pairs (engines offloaded).
+        for (prompt_ids, completion_ids) in &accepted_pairs {
+            loss_sum += train_on_accepted(prompt_ids, completion_ids)?;
+            rep.trained += 1;
+        }
+
+        // Phase D — reload engines. Always: the caller drives rounds one-at-a-time
+        // and relies on resident engines after the call (the between-round LoRA sync
+        // pushes into the rollout engine; the next call samples/judges from them).
+        student.reload_engine_weights()?;
+        judge.reload_engine_weights()?;
+
         rep.mean_train_loss = if rep.trained > 0 {
             loss_sum / rep.trained as f32
         } else {
