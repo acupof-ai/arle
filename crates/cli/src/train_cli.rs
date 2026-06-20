@@ -1490,9 +1490,12 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         args.writeback
     );
 
-    // Rollout engine (student) — own KV/scheduler path for N-sample generation.
+    // Rollout engine (student) — own KV/scheduler path for N-sample generation AND
+    // in-process eval. Size for the LARGER of rollout vs eval token budgets (eval
+    // generates up to --eval-max-new-tokens to reach the final \boxed{}).
     let max_prompt_len = prompts.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
-    let student_seq = (max_prompt_len + args.max_new_tokens + 32).max(128);
+    let gen_budget = args.max_new_tokens.max(args.eval_max_new_tokens);
+    let student_seq = (max_prompt_len + gen_budget + 32).max(128);
     eprintln!(
         "[arle train rubric-opd] loading rollout engine from {} (max_seq_len={student_seq})",
         student_dir.display()
@@ -1576,7 +1579,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                 &infer_student,
                 &eval_items,
                 &tokenizer,
-                args.max_new_tokens,
+                args.eval_max_new_tokens,
                 &dir.join("eval_round_base.jsonl"),
             )?;
         }
@@ -1639,7 +1642,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                     &infer_student,
                     &eval_items,
                     &tokenizer,
-                    args.max_new_tokens,
+                    args.eval_max_new_tokens,
                     &dir.join(format!("eval_round{round}.jsonl")),
                 )?;
             }

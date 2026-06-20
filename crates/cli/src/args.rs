@@ -1076,6 +1076,12 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 50)]
     pub(crate) eval_n: usize,
 
+    /// Max new tokens for EVAL generation (separate from rollout --max-new-tokens).
+    /// Must be large: the think-on student needs room to reach the final \boxed{}
+    /// answer; too small truncates mid-reasoning and scores a fake 0.
+    #[arg(long, default_value_t = 4096)]
+    pub(crate) eval_max_new_tokens: usize,
+
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
