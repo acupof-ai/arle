@@ -1069,8 +1069,8 @@ pub(crate) struct Dsv4CudaExecutor {
     /// Cross-request position-0 prefix store. Maps a full captured prompt to its
     /// whole-slot KV image; a new request whose leading tokens exactly equal a
     /// stored prompt restores that prefix and re-prefills only the tail. LRU over
-    /// a host-byte budget (see `Dsv4PrefixCache`). Bring-up gated by
-    /// `ARLE_DSV4_PREFIX_CACHE` (opt-in; default off) until pod-verified.
+    /// a host-byte budget (see `Dsv4PrefixCache`). Default-on (pod-verified:
+    /// correct + 11.7x prefill speedup); size knob `ARLE_DSV4_PREFIX_CACHE_BYTES`.
     prefix_cache: Dsv4PrefixCache,
 }
 
@@ -1101,41 +1101,29 @@ struct PrefixImageStore<P> {
     order: std::collections::VecDeque<u64>,
     budget_bytes: usize,
     used_bytes: usize,
-    enabled: bool,
 }
 
 impl<P> PrefixImageStore<P> {
-    /// Host-byte budget for the position-0 prefix store. Opt-in: the store is
-    /// inert (every match returns 0, capture is a no-op) unless
-    /// `ARLE_DSV4_PREFIX_CACHE=1`. The budget defaults to 4 GiB and is
-    /// overridable via `ARLE_DSV4_PREFIX_CACHE_BYTES` for pod sweeps.
+    /// Position-0 prefix store with an explicit host-byte budget. The store is
+    /// ALWAYS active — cross-request prefix KV reuse is default-on (verified
+    /// correct + 11.7x prefill speedup on pod; the on/off env tag was removed).
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            by_hash: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            budget_bytes,
+            used_bytes: 0,
+        }
+    }
+
+    /// Default 4 GiB budget, overridable via `ARLE_DSV4_PREFIX_CACHE_BYTES`
+    /// (a sizing knob for pod sweeps — NOT an on/off switch).
     fn from_env() -> Self {
-        let enabled = std::env::var("ARLE_DSV4_PREFIX_CACHE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         let budget_bytes = std::env::var("ARLE_DSV4_PREFIX_CACHE_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(4 * 1024 * 1024 * 1024);
-        Self {
-            by_hash: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            budget_bytes,
-            used_bytes: 0,
-            enabled,
-        }
-    }
-
-    /// Test-only enabled store with an explicit byte budget.
-    #[cfg(test)]
-    fn new_enabled(budget_bytes: usize) -> Self {
-        Self {
-            by_hash: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            budget_bytes,
-            used_bytes: 0,
-            enabled: true,
-        }
+        Self::new(budget_bytes)
     }
 
     fn hash_tokens(tokens: &[u32]) -> u64 {
@@ -1148,9 +1136,9 @@ impl<P> PrefixImageStore<P> {
     /// Longest stored prompt that is an exact leading prefix of `tokens`. The
     /// match must be a STRICT prefix or full equality: stored `prompt` with
     /// `prompt.len() <= tokens.len()` and `tokens[..prompt.len()] == prompt`.
-    /// Returns that length, or 0 on no match / store disabled.
+    /// Returns that length, or 0 on no match.
     fn match_len(&self, tokens: &[u32]) -> usize {
-        if !self.enabled || tokens.is_empty() {
+        if tokens.is_empty() {
             return 0;
         }
         let mut best = 0usize;
@@ -1184,7 +1172,7 @@ impl<P> PrefixImageStore<P> {
     /// executor. The caller MUST re-insert it via [`Self::reinsert`] after the
     /// restore to keep it hot. `None` when no exact entry exists.
     fn take(&mut self, tokens: &[u32], len: usize) -> Option<PrefixStoreEntry<P>> {
-        if !self.enabled || len == 0 || len > tokens.len() {
+        if len == 0 || len > tokens.len() {
             return None;
         }
         let key = &tokens[..len];
@@ -1217,9 +1205,6 @@ impl<P> PrefixImageStore<P> {
     /// entries until the new image fits the byte budget; a prompt larger than the
     /// whole budget is dropped.
     fn insert(&mut self, tokens: Vec<u32>, image: P, host_bytes: usize) {
-        if !self.enabled {
-            return;
-        }
         if host_bytes == 0 || host_bytes > self.budget_bytes {
             return;
         }
@@ -1801,7 +1786,7 @@ impl Dsv4CudaExecutor {
     /// at 0 (already had a reattached prefix) or generated past the prompt; we
     /// refuse to cache rather than store a misaligned image.
     pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
-        if !self.prefix_cache.enabled || tokens.is_empty() {
+        if tokens.is_empty() {
             return Ok(());
         }
         ensure!(
@@ -3253,27 +3238,7 @@ mod tests {
     // and pass an explicit host-byte size — exactly how the executor passes the
     // real `Dsv4SlotImage::host_bytes()`.
     fn store(budget_bytes: usize) -> PrefixImageStore<u32> {
-        PrefixImageStore::new_enabled(budget_bytes)
-    }
-
-    #[test]
-    fn disabled_store_never_matches_or_stores() {
-        // `from_env` with the gate unset yields a disabled store: every op is inert.
-        let mut s: PrefixImageStore<u32> = PrefixImageStore {
-            by_hash: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            budget_bytes: usize::MAX,
-            used_bytes: 0,
-            enabled: false,
-        };
-        s.insert(vec![1, 2, 3], 99, 1024);
-        assert_eq!(
-            s.match_len(&[1, 2, 3, 4]),
-            0,
-            "disabled store matches nothing"
-        );
-        assert!(s.take(&[1, 2, 3], 3).is_none());
-        assert_eq!(s.used_bytes, 0, "disabled store accumulates no bytes");
+        PrefixImageStore::new(budget_bytes)
     }
 
     #[test]
