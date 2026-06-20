@@ -549,6 +549,10 @@ pub(crate) enum TrainCommand {
     /// Self-training LoRA OPD (SOPD): the model self-updates its own LoRA
     /// adapter against an EMA self-teacher, with snapshot/revert on regress.
     SelfOpd(TrainSelfOpdArgs),
+    /// Rubric-OPD: the student samples N rollouts per prompt, a strong teacher
+    /// (DeepSeek-V4-Flash) judges each against a text-level rubric, and the
+    /// accepted rollouts are written back as CE targets (RFT). Cross-vocab-free.
+    RubricOpd(TrainRubricOpdArgs),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -931,6 +935,115 @@ pub(crate) struct TrainSelfOpdArgs {
     /// skipped (random tiny weights make held-out NLL meaningless).
     #[arg(long, default_value_t = false)]
     pub(crate) smoke: bool,
+
+    /// Compute backend for autograd (auto picks CUDA when built with cuda).
+    #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
+    pub(crate) backend: OpdBackendArg,
+
+    /// Render output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+}
+
+/// Which built-in rubric the Flash judge grades rollouts against.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum RubricTaskArg {
+    /// Math reasoning: factual answer-correctness gates acceptance.
+    Math,
+    /// Agentic tool-use (BFCL): correct call/abstain gates acceptance.
+    Agentic,
+}
+
+/// What the accepted set writes back as CE targets.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum RubricWritebackArg {
+    /// Mode A — train on the student's own accepted rollouts (RFT; caps at best-of-N).
+    Accepted,
+    /// Mode B — train on the teacher's corrected solution for rejected rollouts
+    /// (breaks the best-of-N ceiling). Requires the judge `correct()` path.
+    Correction,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Rubric-OPD: the student samples N rollouts/prompt; DeepSeek-V4-Flash judges\neach against a text-level rubric (vocab-agnostic, so a DeepSeek teacher can grade a\nQwen student); accepted rollouts are written back as CE targets (RFT). Selection-only\n(--writeback accepted) caps at the student's best-of-N; --writeback correction lets the\nteacher rewrite rejected rollouts to break that ceiling.\n\n  arle train rubric-opd --student-model <qwen3.6-27b-dir> --teacher-model <dsv4-flash-dir> \\\n    --prompts-file <jsonl> --rubric-task math --rounds 3 --samples-per-prompt 4"
+)]
+pub(crate) struct TrainRubricOpdArgs {
+    /// Student model directory (HF safetensors layout). The trained LoRA student.
+    #[arg(long, alias = "student")]
+    pub(crate) student_model: PathBuf,
+
+    /// Judge/teacher model directory (DeepSeek-V4-Flash). Used as a text judge only.
+    #[arg(long, alias = "teacher")]
+    pub(crate) teacher_model: PathBuf,
+
+    /// JSONL prompts file; each line `{"text": "<problem>"}`.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) prompts_file: PathBuf,
+
+    /// Which built-in rubric the judge grades against.
+    #[arg(long, value_enum, default_value_t = RubricTaskArg::Math)]
+    pub(crate) rubric_task: RubricTaskArg,
+
+    /// What the accepted set writes back (Mode A = accepted, Mode B = correction).
+    #[arg(long, value_enum, default_value_t = RubricWritebackArg::Accepted)]
+    pub(crate) writeback: RubricWritebackArg,
+
+    /// RFT rounds (generate → judge → select → writeback-CE).
+    #[arg(long, default_value_t = 3)]
+    pub(crate) rounds: usize,
+
+    /// On-policy samples generated per prompt each round.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) samples_per_prompt: usize,
+
+    /// Max new tokens per sampled rollout.
+    #[arg(long, default_value_t = 1024)]
+    pub(crate) max_new_tokens: usize,
+
+    /// Max tokens the judge may emit per verdict.
+    #[arg(long, default_value_t = 512)]
+    pub(crate) max_verdict_tokens: usize,
+
+    /// Rollout sampling temperature (>0 for rejection-sampling diversity).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
+    pub(crate) rollout_temperature: f32,
+
+    /// Rollout nucleus sampling threshold (1.0 disables top-p).
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) rollout_top_p: f32,
+
+    /// Rollout top-k filter (0 disables top-k).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) rollout_top_k: i32,
+
+    /// Optional deterministic base rollout seed (per-sample = base + i).
+    #[arg(long)]
+    pub(crate) rollout_seed: Option<u64>,
+
+    /// AdamW learning rate.
+    #[arg(long, default_value_t = 1.0e-5)]
+    pub(crate) lr: f32,
+
+    /// LoRA rank for the student adapter.
+    #[arg(long, default_value_t = 32)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha for the student adapter.
+    #[arg(long, default_value_t = 64.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set: `attention-qv` or `all-linear`.
+    #[arg(long, default_value = "all-linear")]
+    pub(crate) lora_target_set: String,
+
+    /// Directory where servable full-materialized checkpoints are written.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_checkpoint: Option<PathBuf>,
+
+    /// Save a checkpoint every N rounds (0 = final round only).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) save_every: usize,
 
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
