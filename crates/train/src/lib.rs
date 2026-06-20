@@ -34,6 +34,8 @@ pub mod qwen35_checkpoint;
 pub mod qwen35_loader;
 #[path = "rubric.rs"]
 pub mod rubric;
+#[path = "rubric_opd.rs"]
+pub mod rubric_opd;
 #[path = "server.rs"]
 pub mod server;
 #[path = "teacher_infer.rs"]
