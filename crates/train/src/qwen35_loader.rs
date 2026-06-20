@@ -1103,6 +1103,12 @@ fn is_fp8_cuda_frozen_base_tensor(train_name: &str, expected_shape: &[usize]) ->
             || train_name.ends_with(".linear_attn.in_proj_b.weight")
             || train_name.ends_with(".linear_attn.in_proj_a.weight")
             || train_name.ends_with(".linear_attn.out_proj.weight")
+            // Dense MLP (non-MoE students, e.g. Qwen3.x-27B dense). The whitelist
+            // predates dense FP8 students (only MoE/DSv4 were loaded), so the plain
+            // mlp.{gate,up,down}_proj had no FP8 path and fell to "unsupported dtype".
+            || train_name.ends_with(".mlp.gate_proj.weight")
+            || train_name.ends_with(".mlp.up_proj.weight")
+            || train_name.ends_with(".mlp.down_proj.weight")
             || train_name.ends_with(".mlp.shared_expert.gate_proj.weight")
             || train_name.ends_with(".mlp.shared_expert.up_proj.weight")
             || train_name.ends_with(".mlp.shared_expert.down_proj.weight")
