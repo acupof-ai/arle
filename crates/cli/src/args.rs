@@ -997,6 +997,12 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 4)]
     pub(crate) samples_per_prompt: usize,
 
+    /// Cap on CE writeback steps per round (unset = all accepted). The 27B-dense
+    /// autograd CE is ~minutes/step, so bounding the accepted set keeps a round
+    /// tractable (first N accepted).
+    #[arg(long, value_name = "N")]
+    pub(crate) writeback_cap: Option<usize>,
+
     /// Max new tokens per sampled rollout.
     #[arg(long, default_value_t = 1024)]
     pub(crate) max_new_tokens: usize,
