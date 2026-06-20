@@ -358,6 +358,36 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Cross-request position-0 prefix reuse. Only the DSv4 arm holds a store;
+    /// page-radix-reusing arms (dense Qwen) report no match here.
+    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
+        match self {
+            Self::Dsv4(d) => d.cached_prefix_match_len(tokens),
+            Self::Qwen(_) | Self::Qwen35(_) => 0,
+        }
+    }
+
+    pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
+        match self {
+            Self::Dsv4(d) => d.capture_cached_prefix(slot, tokens),
+            Self::Qwen(_) | Self::Qwen35(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn restore_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Dsv4(d) => d.restore_cached_prefix(slot, tokens, matched_len),
+            Self::Qwen(_) | Self::Qwen35(_) => {
+                anyhow::bail!("position-0 prefix store is implemented only for DSv4 CUDA")
+            }
+        }
+    }
+
     /// Re-budget the host-demoted tier store (`0` disables; pre-serve only). No-op on
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
@@ -1036,6 +1066,220 @@ pub(crate) struct Dsv4CudaExecutor {
     /// The count cap bounds host RAM; beyond it, the engine falls back to
     /// recompute instead of accumulating swap images.
     slot_swap_store: std::collections::BTreeMap<u64, Dsv4SlotSwapEntry>,
+    /// Cross-request position-0 prefix store. Maps a full captured prompt to its
+    /// whole-slot KV image; a new request whose leading tokens exactly equal a
+    /// stored prompt restores that prefix and re-prefills only the tail. LRU over
+    /// a host-byte budget (see `Dsv4PrefixCache`). Bring-up gated by
+    /// `ARLE_DSV4_PREFIX_CACHE` (opt-in; default off) until pod-verified.
+    prefix_cache: Dsv4PrefixCache,
+}
+
+/// Concrete DSv4 prefix store: the LRU keyed by full prompt, payload = the
+/// whole-slot KV image captured at absolute positions `[0, tokens.len())`.
+type Dsv4PrefixCache = PrefixImageStore<crate::dsv4::Dsv4SlotImage>;
+
+/// One position-0-anchored cached prefix: the full prompt tokens that produced
+/// the image plus the payload `image`. The store keeps `host_bytes` separately
+/// so the LRU/budget logic never inspects the payload (host-only testable).
+struct PrefixStoreEntry<P> {
+    tokens: Vec<u32>,
+    image: P,
+    host_bytes: usize,
+}
+
+/// LRU host-byte-bounded store of position-0 prefix images, generic over the
+/// payload `P` so the key/LRU/budget logic is unit-testable without a device.
+///
+/// Keyed by a token hash for candidate lookup, with an exact token-vector
+/// compare to reject hash collisions. `order` is the LRU recency list (front =
+/// coldest). Match returns the LONGEST stored prompt that is an exact leading
+/// prefix of the query — the longest skip-able prefill.
+struct PrefixImageStore<P> {
+    /// `hash(prompt) -> entries that hashed there` (collision chains rare).
+    by_hash: std::collections::HashMap<u64, Vec<PrefixStoreEntry<P>>>,
+    /// LRU recency: prompt hashes, coldest at front, hottest at back.
+    order: std::collections::VecDeque<u64>,
+    budget_bytes: usize,
+    used_bytes: usize,
+    enabled: bool,
+}
+
+impl<P> PrefixImageStore<P> {
+    /// Host-byte budget for the position-0 prefix store. Opt-in: the store is
+    /// inert (every match returns 0, capture is a no-op) unless
+    /// `ARLE_DSV4_PREFIX_CACHE=1`. The budget defaults to 4 GiB and is
+    /// overridable via `ARLE_DSV4_PREFIX_CACHE_BYTES` for pod sweeps.
+    fn from_env() -> Self {
+        let enabled = std::env::var("ARLE_DSV4_PREFIX_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let budget_bytes = std::env::var("ARLE_DSV4_PREFIX_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024 * 1024);
+        Self {
+            by_hash: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            budget_bytes,
+            used_bytes: 0,
+            enabled,
+        }
+    }
+
+    /// Test-only enabled store with an explicit byte budget.
+    #[cfg(test)]
+    fn new_enabled(budget_bytes: usize) -> Self {
+        Self {
+            by_hash: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            budget_bytes,
+            used_bytes: 0,
+            enabled: true,
+        }
+    }
+
+    fn hash_tokens(tokens: &[u32]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        tokens.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Longest stored prompt that is an exact leading prefix of `tokens`. The
+    /// match must be a STRICT prefix or full equality: stored `prompt` with
+    /// `prompt.len() <= tokens.len()` and `tokens[..prompt.len()] == prompt`.
+    /// Returns that length, or 0 on no match / store disabled.
+    fn match_len(&self, tokens: &[u32]) -> usize {
+        if !self.enabled || tokens.is_empty() {
+            return 0;
+        }
+        let mut best = 0usize;
+        // Exact prompts hash on their full content; a query that is a longer
+        // prompt sharing a stored prefix hashes differently, so we probe every
+        // stored prompt prefix length present. Since prompts are full keys, we
+        // scan candidate hashes for each prefix boundary the query could match.
+        // Bounded by the number of distinct stored prompt lengths, which is the
+        // store size — acceptable for the bring-up store; pod sweeps cap size by
+        // the byte budget.
+        for entries in self.by_hash.values() {
+            for entry in entries {
+                let len = entry.tokens.len();
+                if len > best && len <= tokens.len() && tokens[..len] == entry.tokens[..] {
+                    best = len;
+                }
+            }
+        }
+        best
+    }
+
+    fn touch(&mut self, hash: u64) {
+        if let Some(pos) = self.order.iter().position(|&h| h == hash) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(hash);
+    }
+
+    /// Remove and return the entry for the exact stored prompt `tokens[..len]`,
+    /// so the caller can borrow `&entry.image` without aliasing the rest of the
+    /// executor. The caller MUST re-insert it via [`Self::reinsert`] after the
+    /// restore to keep it hot. `None` when no exact entry exists.
+    fn take(&mut self, tokens: &[u32], len: usize) -> Option<PrefixStoreEntry<P>> {
+        if !self.enabled || len == 0 || len > tokens.len() {
+            return None;
+        }
+        let key = &tokens[..len];
+        let hash = Self::hash_tokens(key);
+        let entries = self.by_hash.get_mut(&hash)?;
+        let pos = entries.iter().position(|e| e.tokens == key)?;
+        let entry = entries.swap_remove(pos);
+        if entries.is_empty() {
+            self.by_hash.remove(&hash);
+            if let Some(order_pos) = self.order.iter().position(|&h| h == hash) {
+                self.order.remove(order_pos);
+            }
+        }
+        self.used_bytes = self.used_bytes.saturating_sub(entry.host_bytes);
+        Some(entry)
+    }
+
+    /// Re-insert an entry pulled out by [`Self::take`], marking it hottest.
+    fn reinsert(&mut self, entry: PrefixStoreEntry<P>) {
+        let hash = Self::hash_tokens(&entry.tokens);
+        self.used_bytes = self.used_bytes.saturating_add(entry.host_bytes);
+        self.by_hash.entry(hash).or_default().push(entry);
+        self.touch(hash);
+        self.evict_to_budget();
+    }
+
+    /// Insert (or replace) a position-0 prefix image keyed by its full prompt.
+    /// `host_bytes` is the payload's host RAM (the caller computes it from the
+    /// concrete image), keeping the LRU logic payload-agnostic. Evicts coldest
+    /// entries until the new image fits the byte budget; a prompt larger than the
+    /// whole budget is dropped.
+    fn insert(&mut self, tokens: Vec<u32>, image: P, host_bytes: usize) {
+        if !self.enabled {
+            return;
+        }
+        if host_bytes == 0 || host_bytes > self.budget_bytes {
+            return;
+        }
+        let hash = Self::hash_tokens(&tokens);
+        // Replace an existing identical-prompt entry in place.
+        if let Some(entries) = self.by_hash.get_mut(&hash) {
+            if let Some(existing) = entries.iter_mut().find(|e| e.tokens == tokens) {
+                self.used_bytes = self.used_bytes.saturating_sub(existing.host_bytes);
+                existing.image = image;
+                existing.host_bytes = host_bytes;
+                self.used_bytes = self.used_bytes.saturating_add(host_bytes);
+                self.touch(hash);
+                self.evict_to_budget();
+                return;
+            }
+        }
+        // Make room before inserting the new entry.
+        while self.used_bytes.saturating_add(host_bytes) > self.budget_bytes {
+            if !self.evict_one_coldest() {
+                break;
+            }
+        }
+        if self.used_bytes.saturating_add(host_bytes) > self.budget_bytes {
+            return;
+        }
+        self.by_hash
+            .entry(hash)
+            .or_default()
+            .push(PrefixStoreEntry {
+                tokens,
+                image,
+                host_bytes,
+            });
+        self.used_bytes = self.used_bytes.saturating_add(host_bytes);
+        self.touch(hash);
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.used_bytes > self.budget_bytes {
+            if !self.evict_one_coldest() {
+                break;
+            }
+        }
+    }
+
+    /// Drop the coldest hash bucket entirely. Returns false when nothing remains.
+    fn evict_one_coldest(&mut self) -> bool {
+        let Some(hash) = self.order.pop_front() else {
+            return false;
+        };
+        if let Some(entries) = self.by_hash.remove(&hash) {
+            for entry in entries {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.host_bytes);
+            }
+            true
+        } else {
+            // Stale order entry (hash already removed); keep draining.
+            self.evict_one_coldest()
+        }
+    }
 }
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
@@ -1443,6 +1687,7 @@ impl Dsv4CudaExecutor {
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
             slot_swap_store: std::collections::BTreeMap::new(),
+            prefix_cache: Dsv4PrefixCache::from_env(),
         })
     }
 
@@ -1536,6 +1781,101 @@ impl Dsv4CudaExecutor {
         for key in keys {
             self.slot_swap_store.remove(key);
         }
+    }
+
+    /// Length of the longest stored position-0 prompt that is an exact leading
+    /// prefix of `tokens`. `0` when the store is disabled or has no match.
+    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
+        self.prefix_cache.match_len(tokens)
+    }
+
+    /// Capture `slot`'s whole-slot KV image into the position-0 prefix store,
+    /// keyed by `tokens` (the full prompt).
+    ///
+    /// CORRECTNESS INVARIANT: the request must have prefilled from absolute
+    /// position 0, so the slot's materialized KV is exactly `tokens` at
+    /// positions `[0, tokens.len())`. We assert the slot's materialized length
+    /// equals the prompt length (start_pos==0 ⇒ every prompt token's KV is
+    /// resident and no generated token's KV is included — the engine calls this
+    /// before the next decode write). A mismatch means the request did not start
+    /// at 0 (already had a reattached prefix) or generated past the prompt; we
+    /// refuse to cache rather than store a misaligned image.
+    pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
+        if !self.prefix_cache.enabled || tokens.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 capture_cached_prefix slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        let materialized = self.slots[slot].seq_len();
+        // start_pos==0 anchor: the slot must hold exactly the prompt prefix.
+        // Caching is best-effort, so a misaligned slot is skipped (not fatal):
+        // the engine only loses the reuse opportunity for this request.
+        if materialized != tokens.len() {
+            return Ok(());
+        }
+        let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
+        debug_assert_eq!(
+            image.seq_len(),
+            tokens.len(),
+            "DSv4 position-0 prefix image seq_len must equal prompt length"
+        );
+        let host_bytes = image.host_bytes();
+        self.prefix_cache.insert(tokens.to_vec(), image, host_bytes);
+        Ok(())
+    }
+
+    /// Restore the cached position-0 prefix image for `tokens[..matched_len]`
+    /// into `slot`. The engine has already allocated `matched_len` tokens of
+    /// host KV pages on `slot` and resumes prefill from absolute position
+    /// `matched_len` right after.
+    ///
+    /// CORRECTNESS INVARIANT: the cached image was captured at start_pos==0, so
+    /// its KV lands at the SAME absolute positions `[0, matched_len)` here —
+    /// `swap_in_image` re-resolves the target slot's page table but never
+    /// re-rotates positions, so the RoPE-rotated K, the SW ring slot
+    /// (`abs_pos % window`), and the DSA indexer keys are all position-identical.
+    /// The spec (MTP) draft state is reset to empty: the tail prefill re-seeds it
+    /// (it is per-request, not part of the prefix KV).
+    pub(crate) fn restore_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 restore_cached_prefix slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        ensure!(
+            matched_len > 0 && matched_len <= tokens.len(),
+            "DSv4 restore_cached_prefix matched_len {matched_len} invalid for prompt len {}",
+            tokens.len()
+        );
+        // Take the image out of the store so the restore can mutably borrow
+        // `self.slots`/`self.kv_adapter` without aliasing `self.prefix_cache`;
+        // re-insert it after to keep the prefix hot for the next request.
+        let entry = self.prefix_cache.take(tokens, matched_len).ok_or_else(|| {
+            anyhow::anyhow!(
+                "DSv4 position-0 prefix store has no image for prompt prefix len {matched_len}"
+            )
+        })?;
+        ensure!(
+            entry.image.seq_len() == matched_len,
+            "DSv4 cached prefix image seq_len {} != requested matched_len {matched_len}",
+            entry.image.seq_len()
+        );
+        // Reset the slot's spec (MTP) draft state: the tail prefill re-seeds it.
+        self.spec_slots[slot] = Dsv4SpecSlotState::default();
+        let result =
+            self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &entry.image);
+        // Keep the entry hot regardless of restore outcome (the image is intact;
+        // a failure is a slot/device error, not a corrupt image).
+        self.prefix_cache.reinsert(entry);
+        result
     }
 
     /// One no-spec greedy forward that ALSO stages the MTP draft state (pending
@@ -2906,8 +3246,106 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
 
 #[cfg(test)]
 mod tests {
-    use super::CudaKvCacheDtype;
+    use super::{CudaKvCacheDtype, PrefixImageStore};
     use infer_seam::KvCacheDtype;
+
+    // The payload is opaque to the store, so tests use a `u32` tag as the image
+    // and pass an explicit host-byte size — exactly how the executor passes the
+    // real `Dsv4SlotImage::host_bytes()`.
+    fn store(budget_bytes: usize) -> PrefixImageStore<u32> {
+        PrefixImageStore::new_enabled(budget_bytes)
+    }
+
+    #[test]
+    fn disabled_store_never_matches_or_stores() {
+        // `from_env` with the gate unset yields a disabled store: every op is inert.
+        let mut s: PrefixImageStore<u32> = PrefixImageStore {
+            by_hash: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            budget_bytes: usize::MAX,
+            used_bytes: 0,
+            enabled: false,
+        };
+        s.insert(vec![1, 2, 3], 99, 1024);
+        assert_eq!(
+            s.match_len(&[1, 2, 3, 4]),
+            0,
+            "disabled store matches nothing"
+        );
+        assert!(s.take(&[1, 2, 3], 3).is_none());
+        assert_eq!(s.used_bytes, 0, "disabled store accumulates no bytes");
+    }
+
+    #[test]
+    fn exact_leading_prefix_matches_longest() {
+        let mut s = store(1 << 20);
+        s.insert(vec![10, 20], 1, 100);
+        s.insert(vec![10, 20, 30, 40], 2, 100);
+        // A query extending the longer stored prompt matches the longer one.
+        assert_eq!(s.match_len(&[10, 20, 30, 40, 50]), 4);
+        // A query that only extends the shorter prompt matches the shorter one.
+        assert_eq!(s.match_len(&[10, 20, 99]), 2);
+        // An exact full match returns the full length.
+        assert_eq!(s.match_len(&[10, 20]), 2);
+        // A divergent query matches nothing.
+        assert_eq!(s.match_len(&[10, 99]), 0);
+        // A query SHORTER than every stored prompt matches nothing (a stored
+        // prompt may only be reused as a leading prefix, never truncated).
+        assert_eq!(s.match_len(&[10]), 0);
+    }
+
+    #[test]
+    fn take_returns_image_and_reinsert_keeps_it_hot() {
+        let mut s = store(1 << 20);
+        s.insert(vec![5, 6, 7], 42, 100);
+        let entry = s
+            .take(&[5, 6, 7, 8], 3)
+            .expect("exact prefix entry present");
+        assert_eq!(entry.image, 42, "take returns the stored payload");
+        assert_eq!(s.used_bytes, 0, "take debits the byte accounting");
+        assert_eq!(
+            s.match_len(&[5, 6, 7]),
+            0,
+            "taken entry is gone until reinserted"
+        );
+        s.reinsert(entry);
+        assert_eq!(s.match_len(&[5, 6, 7]), 3, "reinsert restores the entry");
+        assert_eq!(s.used_bytes, 100, "reinsert re-credits the bytes");
+    }
+
+    #[test]
+    fn lru_evicts_coldest_when_over_budget() {
+        // Budget holds two 100-byte entries; a third evicts the coldest.
+        let mut s = store(250);
+        s.insert(vec![1], 1, 100);
+        s.insert(vec![2], 2, 100);
+        // Touch entry 1 so entry 2 becomes the coldest.
+        assert_eq!(s.match_len(&[1]), 1);
+        let _ = s.take(&[1], 1).map(|e| s.reinsert(e)); // mark 1 hottest
+        s.insert(vec![3], 3, 100); // over budget → evict coldest (entry 2)
+        assert_eq!(s.match_len(&[1]), 1, "hot entry survives");
+        assert_eq!(s.match_len(&[3]), 1, "new entry present");
+        assert_eq!(s.match_len(&[2]), 0, "coldest entry evicted");
+        assert!(s.used_bytes <= 250, "store stays within budget");
+    }
+
+    #[test]
+    fn oversized_image_is_rejected() {
+        let mut s = store(100);
+        s.insert(vec![1, 2, 3], 7, 200); // larger than the whole budget
+        assert_eq!(s.match_len(&[1, 2, 3]), 0, "oversized image is not stored");
+        assert_eq!(s.used_bytes, 0);
+    }
+
+    #[test]
+    fn reinsert_of_identical_prompt_replaces_in_place() {
+        let mut s = store(1 << 20);
+        s.insert(vec![1, 2], 1, 100);
+        s.insert(vec![1, 2], 2, 150); // same key, new image + size
+        assert_eq!(s.used_bytes, 150, "in-place replace re-accounts bytes");
+        let entry = s.take(&[1, 2], 2).expect("present");
+        assert_eq!(entry.image, 2, "replaced payload is the latest");
+    }
 
     #[test]
     fn resolve_cuda_support_matrix() {

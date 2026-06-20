@@ -361,6 +361,22 @@ pub(crate) struct Dsv4SlotImage {
     layers: Vec<crate::attention::Dsv4LayerImage>,
 }
 
+impl Dsv4SlotImage {
+    /// Materialized sequence length the image was captured at.
+    pub(crate) fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Total host RAM owned by this whole-slot image, summed over every layer's
+    /// snapshotted host vectors. Bounds the executor's position-0 prefix store.
+    pub(crate) fn host_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(crate::attention::Dsv4LayerImage::host_bytes)
+            .sum()
+    }
+}
+
 /// Max depth for the per-slot spec-ring snapshot. `topk` widens candidate
 /// matching only; verifier rows remain chain-shaped. `spec_depth` clamps
 /// runtime requests to this ceiling before capture.

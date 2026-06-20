@@ -258,6 +258,51 @@ pub trait BackendExecutor {
     /// Drop whole-slot store entries (promoted, cancelled, or abandoned).
     fn drop_kv_slot_entries(&mut self, _keys: &[u64]) {}
 
+    /// Length of the longest leading prefix of `tokens` for which the backend
+    /// holds a position-0-anchored cached KV image it can restore into a fresh
+    /// slot.
+    ///
+    /// This is the cross-request prefix-reuse seam for backends whose KV cannot
+    /// be page-reattached at arbitrary positions (DSv4's RoPE-rotated K, the
+    /// sliding-window ring indexed by `abs_pos % window`, and the DSA indexer
+    /// keys are all position-locked). The only safe reuse is a prefix captured
+    /// at absolute positions `[0, len)` and reattached as the leading prefix of
+    /// a new request that also starts at position 0. The default `0` means the
+    /// backend has no such store and the engine never calls the capture/restore
+    /// hooks — the page-radix reuse path stays byte-for-byte unchanged.
+    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> usize {
+        0
+    }
+
+    /// Capture `slot`'s complete restore image into the backend's
+    /// position-0-anchored prefix store, keyed by `tokens`.
+    ///
+    /// Called on request finish ONLY when the request's prefill started at
+    /// absolute position 0, so the captured KV is exactly the materialization of
+    /// `tokens` at positions `[0, tokens.len())`. The copy MUST be complete
+    /// before returning (the engine frees the slot right after). The default is
+    /// a no-op for backends without the store.
+    fn capture_cached_prefix(&mut self, _slot: usize, _tokens: &[u32]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Restore the cached position-0 prefix image for `tokens[..matched_len]`
+    /// into `slot`, setting the slot's materialized length to `matched_len`.
+    ///
+    /// `matched_len` is the value returned by [`Self::cached_prefix_match_len`].
+    /// The engine has already allocated `matched_len` tokens of host KV pages on
+    /// `slot` and resumes prefill from absolute position `matched_len` right
+    /// after, so every byte of restored KV/side state MUST land before
+    /// returning. Only called when `cached_prefix_match_len > 0`.
+    fn restore_cached_prefix(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("backend has no position-0 prefix store")
+    }
+
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
     /// time-share), returning the device bytes freed. The default is a no-op
     /// (returns 0) so backends that do not support weight offload are unaffected.
