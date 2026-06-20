@@ -118,5 +118,36 @@ occupancy → 抽不满 HBM)+ foundation(ctx.sync+barrier)禁止 overlap → HBM
    select correctness-only / graph −41%(KILL)/ 单进程 TP wall-neutral(KILL)。
 2. **MTP d2**:接受率门控(>57% 赢);高接受 workload(code/ShareGPT)+14%,低接受 wash。
 3. **2-head MTP**:唯一稳健 B=1 杠杆(把接受率推过 break-even)→ 训练。
-4. **待办**:① 补测 TP4+fused-dispatch 的真 baseline ② 修 nsys(per-rank wrap workers)钉
-   注意力数学 7.8ms 的 kernel。
+4. 见下"未分析空缺"。
+
+## 未分析空缺(self-audit;§0:每条要么补、要么明确 defer —— 不静默 pass)
+
+**P0 — 阻塞分析的硬空缺:**
+- **G1. mla_attn 70% 内部没拆到 kernel.** 主拖累的内部(FlashMLA / DSA select /
+  compressor_update / indexer 谁占大头)还是黑盒 —— nsys 在 multiproc TP4 上 **4 次失败**
+  (stale/export/empty/--inherit 没抓 worker)。**补法**:改 `serve_multiproc.rs:474`
+  给每个 fork+exec 的 worker 包一层 nsys(per-rank wrap,≤10 行)→ 8 卡 kernel 分解。**最大空缺。**
+- **G2. PREFILL 链路完全没分析.** 整张图只有 decode。prefill 是**另一个 regime**
+  (M=prompt_len → **compute-bound 不是 memory-bound**,roofline 完全不同),而且**输入敏感性 +
+  prefix-reuse win 都在 prefill**。缺:prefill 分阶段 / prefill roofline / chunked-prefill /
+  TTFT 分解。**半张延迟图缺失。**
+
+**P1 — 量化空缺(数有了但没拆透):**
+- **G3. "36× = latency 税"没拆.** 距 HBM floor 的 gap 归给"latency"但没分解成 kernel 发射延迟
+  (×N kernel)+ 访存延迟(每散乱访问一次)+ occupancy(M=1 只占几个 SM)。缺:数每 token 的
+  kernel 数 + 每 kernel 发射+延迟(需 G1 的 nsys)。
+- **G4. host 路径 + 跨进程 barrier 是推断未实测.** "除 ctx.sync 外全 overlap" + barrier 成本都
+  推断。缺:nsys CPU/host 时间线 + 量 barrier 的 µs/token。
+- **G5. stage-profiler 绝对值 sync 虚高.** 每阶段绝对 ms 只能信相对;真实 overlapped 绝对值要干净 nsys。
+
+**P2 — 完整性空缺:**
+- **G6. batched-decode(c>1)链路没画.** 36× 头寸在批量,但逐行循环怎么挥霍它(重读权重)没进链路。
+- **G7. MoE EP 不均(b=1)** 代码确认了(`moe.rs:675`),量级没进图。
+- **G8. KV-read bytes 不在 roofline.** 只算权重;sparse-512/window-128 的 KV 读没进 floor。
+- **G9. MTP step 分解可能 stale.** verify≈52ms 偏大(no-spec 步才 26ms),earlier profiler 数可能
+  confounded,要干净重测。
+- **G10. vs 工业 baseline.** 我们 36×-above-floor 是正常还是差?SGLang/vLLM 在这条 roofline 哪?
+- **G11. TP4 vs TP8 没拆.** 为什么 37 vs 44、哪个阶段受益于 TP8 分片。
+- **G12. 无方差/error bar.** 单次数;§0 要 ≥3 次 + σ 才能下 kernel-efficiency 结论。
+
+**填空缺的关键路径:G1(修 nsys)解锁 G3/G4/G5;G2(prefill 链路)是独立的另一半。其余 P2 跟随。**
