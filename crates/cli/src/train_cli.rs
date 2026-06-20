@@ -23,7 +23,8 @@ use crate::{
     args::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
         OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainArgs,
-        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainSelfOpdArgs,
+        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainRubricOpdArgs,
+        TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -81,6 +82,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
         TrainCommand::Opd(args) => run_opd(args),
         TrainCommand::SelfOpd(args) => run_self_opd(args),
+        TrainCommand::RubricOpd(args) => run_rubric_opd(args),
     }
 }
 
@@ -1286,6 +1288,246 @@ fn run_self_opd(args: TrainSelfOpdArgs) -> ExitCode {
          See `arle train self-opd --help` for the full surface."
     );
     ExitCode::FAILURE
+}
+
+fn run_rubric_opd(args: TrainRubricOpdArgs) -> ExitCode {
+    exit_from_result(run_rubric_opd_impl(args))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_rubric_opd_impl(_args: TrainRubricOpdArgs) -> Result<()> {
+    bail!(
+        "rubric-opd requires the cuda feature (the Flash judge + rollout engines are \
+         CUDA-only). Build with --features cuda,nccl."
+    )
+}
+
+/// Rubric-OPD RFT loop: the student samples N rollouts/prompt, DeepSeek-V4-Flash
+/// judges each against a text-level rubric (vocab-agnostic), and the accepted
+/// rollouts are written back as CE targets. Mode A (select-only) for now.
+#[cfg(feature = "cuda")]
+fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    use autograd::optim::AdamW;
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+    use train::{
+        infer_student::InferStudent,
+        lora::LoraConfig,
+        opd::rubric_writeback_ce_step,
+        qwen35_loader::load_qwen35_lora_from_hf_dir,
+        rubric::{bfcl_agentic_rubric, math_rubric},
+        rubric_opd::{FlashJudge, RubricOpdConfig, run_rubric_rounds},
+        tokenizer::ChatTokenizer,
+    };
+
+    use crate::args::{RubricTaskArg, RubricWritebackArg};
+
+    if matches!(args.writeback, RubricWritebackArg::Correction) {
+        bail!(
+            "--writeback correction (Mode B: teacher rewrites rejected rollouts) is not yet \
+             wired; use --writeback accepted (Mode A, RFT) for now."
+        );
+    }
+
+    let student_dir = args.student_model.as_path();
+    let teacher_dir = args.teacher_model.as_path();
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
+
+    let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
+
+    eprintln!(
+        "[arle train rubric-opd] loading student from {}",
+        student_dir.display()
+    );
+    let student = load_qwen35_lora_from_hf_dir(student_dir, lora, target_set, &mut store)
+        .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    let all_params: Vec<TensorId> = student.all_parameter_ids();
+    let trainable: Vec<TensorId> = all_params
+        .iter()
+        .copied()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    if trainable.is_empty() {
+        bail!("rubric-opd student has no trainable (LoRA) parameters; check --lora-target-set");
+    }
+    let cfg = student.config().clone();
+    let vocab = cfg.vocab_size;
+
+    // Student tokenizer: encodes problems, decodes rollouts for the judge.
+    let tokenizer_path = resolve_local_tokenizer_path(student_dir)?;
+    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)
+        .with_context(|| format!("load tokenizer from {}", tokenizer_path.display()))?;
+
+    // Corpus: each JSONL line is {"text": "<problem>"}.
+    let raw = fs::read_to_string(&args.prompts_file)
+        .with_context(|| format!("read prompts file {}", args.prompts_file.display()))?;
+    let mut prompts: Vec<(String, Vec<u32>)> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).context("parse --prompts-file JSONL line")?;
+        let text = value
+            .get("text")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| anyhow!("--prompts-file line missing a string `text` field"))?;
+        let ids = tokenizer
+            .encode(text, true)
+            .map_err(|err| anyhow!("encode prompt: {err}"))?;
+        if ids.iter().any(|&id| (id as usize) >= vocab) {
+            bail!("prompt token id >= vocab {vocab} in --prompts-file");
+        }
+        if !ids.is_empty() {
+            prompts.push((text.to_string(), ids));
+        }
+    }
+    if prompts.is_empty() {
+        bail!("no usable prompts in {}", args.prompts_file.display());
+    }
+    eprintln!(
+        "[arle train rubric-opd] loaded {} prompts; rubric={:?} writeback={:?}",
+        prompts.len(),
+        args.rubric_task,
+        args.writeback
+    );
+
+    // Rollout engine (student) — own KV/scheduler path for N-sample generation.
+    let max_prompt_len = prompts.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
+    let student_seq = (max_prompt_len + args.max_new_tokens + 32).max(128);
+    eprintln!(
+        "[arle train rubric-opd] loading rollout engine from {} (max_seq_len={student_seq})",
+        student_dir.display()
+    );
+    let student_engine = LoadedInferenceEngine::load_with_config(
+        student_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
+        true,
+        EngineLoadConfig {
+            num_slots: 1,
+            page_size: 16,
+            total_pages: student_seq.div_ceil(16),
+            max_prompt_tokens: student_seq,
+            max_total_tokens: student_seq,
+            chunked_prefill_size: student_seq,
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
+    let infer_student = InferStudent::new(
+        Arc::new(Mutex::new(student_engine)),
+        train_backend.clone(),
+        vocab,
+    );
+
+    // Judge engine (DeepSeek-V4-Flash) — text in, verdict out (own tokenizer).
+    let judge_prompt_cap = (student_seq * 2 + 1024).max(2048);
+    let judge_total = judge_prompt_cap + args.max_verdict_tokens;
+    eprintln!(
+        "[arle train rubric-opd] loading Flash judge from {} (max_total={judge_total})",
+        teacher_dir.display()
+    );
+    let judge_engine = LoadedInferenceEngine::load_with_config(
+        teacher_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?,
+        true,
+        EngineLoadConfig {
+            num_slots: 1,
+            page_size: 16,
+            total_pages: judge_total.div_ceil(16),
+            max_prompt_tokens: judge_prompt_cap,
+            max_total_tokens: judge_total,
+            chunked_prefill_size: judge_prompt_cap,
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load Flash judge from {}", teacher_dir.display()))?;
+    let judge = FlashJudge::new(Arc::new(Mutex::new(judge_engine)), args.max_verdict_tokens);
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let rubric = match args.rubric_task {
+        RubricTaskArg::Math => math_rubric(),
+        RubricTaskArg::Agentic => bfcl_agentic_rubric(),
+    };
+    let sampling = rollout_sampling_params(
+        args.rollout_temperature,
+        args.rollout_top_p,
+        args.rollout_top_k,
+        args.rollout_seed,
+    );
+    let round_cfg = RubricOpdConfig {
+        rounds: 1,
+        samples_per_prompt: args.samples_per_prompt,
+        max_new_tokens: args.max_new_tokens,
+    };
+
+    for round in 0..args.rounds {
+        // Fresh closures each round so the &mut store / &mut optimizer borrows
+        // are released before the per-round checkpoint reuses the store.
+        let reports = {
+            let student_ref = &student;
+            let all_ref = all_params.as_slice();
+            let trainable_ref = trainable.as_slice();
+            let store_ref = &mut store;
+            let opt_ref = &mut optimizer;
+            let tok_ref = &tokenizer;
+            run_rubric_rounds(
+                &infer_student,
+                &judge,
+                &rubric,
+                &prompts,
+                &round_cfg,
+                sampling.as_ref(),
+                |ids| {
+                    tok_ref
+                        .decode(ids, true)
+                        .map_err(|err| anyhow!("decode rollout: {err}"))
+                },
+                |prompt_ids, completion_ids| {
+                    rubric_writeback_ce_step(
+                        student_ref,
+                        all_ref,
+                        trainable_ref,
+                        opt_ref,
+                        prompt_ids,
+                        completion_ids,
+                        vocab,
+                        store_ref,
+                    )
+                    .map_err(anyhow::Error::from)
+                },
+            )?
+        };
+        let rep = &reports[0];
+        eprintln!(
+            "[arle train rubric-opd] round {round}: accepted={} distinct={} parse_err={} trained={} mean_loss={:.4}",
+            rep.accepted, rep.distinct_accepted, rep.parse_errors, rep.trained, rep.mean_train_loss
+        );
+
+        let mut ckpt_tape = Tape::new();
+        maybe_save_full_student_checkpoint(
+            "rubric-opd",
+            args.save_checkpoint.as_deref(),
+            args.save_every,
+            round + 1,
+            args.rounds,
+            student_dir,
+            &student,
+            &mut store,
+            &mut ckpt_tape,
+        )?;
+    }
+
+    eprintln!("[arle train rubric-opd] done ({} rounds)", args.rounds);
+    Ok(())
 }
 
 /// Forward-only held-out NLL: mean next-token cross-entropy of predicting
