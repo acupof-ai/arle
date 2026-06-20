@@ -749,6 +749,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .push_back(token);
         }
         let mut finished_slots = Vec::new();
+        // Slots whose prefill completed this step: capture their position-0
+        // prefix image AFTER the prefill loop so the capture's `&mut self` does
+        // not collide with the `self.active` request borrow inside the loop.
+        let mut prefill_completed_slots: Vec<usize> = Vec::new();
         // Tokens committed this step, in commit order (prefill rows then decode
         // rows), forwarded to `on_token` after the request-borrowing loops so the
         // `self.active` and `self.on_token` borrows stay disjoint.
@@ -773,6 +777,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.prefill_start_pos = new_start;
             if new_start >= prompt_len {
                 request.phase = RequestPhase::Decoding;
+                // Capture-on-prefill-complete for the position-0 prefix store.
+                // At this exact moment the slot's KV holds the full prompt at
+                // absolute positions [0, prompt_len): the final prefill chunk is
+                // committed and no decode token's KV is written yet. This is the
+                // only moment the slot is a clean position-0 prompt image — a
+                // later finish_slot would see prompt+generated KV. Deferred to
+                // after the loop to keep the `&mut self` capture call disjoint
+                // from the request borrow; the executor re-asserts
+                // `slot.seq_len == prompt_len` and stores nothing if the slot is
+                // misaligned (no-op when the store is disabled).
+                prefill_completed_slots.push(row.slot);
                 if let Some(token) = tokens_by_slot
                     .get_mut(&row.slot)
                     .and_then(VecDeque::pop_front)
@@ -789,6 +804,23 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 };
                 // A non-final chunk produces no committed token.
                 tokens_by_slot.remove(&row.slot);
+            }
+        }
+
+        // Capture the just-completed prefills into the position-0 prefix store.
+        // The request borrow from the prefill loop has ended, so the capture's
+        // `&mut self` is free. Clone the prompt tokens (the store needs the key)
+        // and skip vanished slots defensively.
+        for slot in prefill_completed_slots {
+            let Some(prompt_tokens) = self
+                .active
+                .get(&slot)
+                .map(|request| request.prompt_tokens.clone())
+            else {
+                continue;
+            };
+            if let Err(err) = self.executor.capture_cached_prefix(slot, &prompt_tokens) {
+                log::warn!("position-0 prefix capture failed for slot {slot}: {err:#}");
             }
         }
 
@@ -911,9 +943,26 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             } else {
                 PrefixMatch::empty()
             };
-            let prefill_tokens = candidate
-                .prompt_len()
-                .saturating_sub(prefix_match.matched_len);
+            // Backends without page-radix reuse (DSv4) may still hold a
+            // position-0 whole-slot prefix image. The page route reports
+            // `matched_len == 0` for them, so budget the prefill/pages against
+            // the executor's cached prefix length when it is longer. This only
+            // affects budgeting; the actual restore happens at attach below.
+            // Skipped for swap re-admissions: they restore the FULL sequence via
+            // `restore_swapped_slot` (consuming the slot) and never take the
+            // cached-prefix attach path, so the cached length is irrelevant to
+            // their prefill (which is 0).
+            let reuse_matched_len =
+                if self.config.enable_prefix_cache && candidate.swap_key.is_none() {
+                    prefix_match.matched_len.max(
+                        self.executor
+                            .cached_prefix_match_len(&candidate.prompt_tokens)
+                            .min(candidate.prompt_len()),
+                    )
+                } else {
+                    prefix_match.matched_len
+                };
+            let prefill_tokens = candidate.prompt_len().saturating_sub(reuse_matched_len);
             if prefill_tokens > 0 && active_prefills >= max_prefills {
                 break;
             }
@@ -924,8 +973,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 break;
             }
 
-            let pages_needed =
-                self.request_pages_needed_after_prefix(candidate, prefix_match.matched_len);
+            let pages_needed = self.request_pages_needed_after_prefix(candidate, reuse_matched_len);
             if self.kv.is_active() && pages_needed > remaining_pages {
                 let reclaimed = self.evict_prefix_cache_for_pages(pages_needed - remaining_pages);
                 remaining_pages = remaining_pages.saturating_add(reclaimed);
@@ -943,6 +991,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 // Whole-slot re-admission: restore the swapped device image
                 // and resume decode (falls back to recompute internally).
                 self.restore_swapped_slot(slot, &mut request, key)?;
+            } else if self.attach_cached_prefix(slot, &mut request)? > 0 {
+                // Position-0 whole-slot prefix reuse (DSv4): the executor
+                // restored the cached prefix image and set `prefill_start_pos`;
+                // the tail re-prefills. No page-radix attach for this request.
             } else {
                 let prefix_match = if self.config.enable_prefix_cache {
                     // Tier-aware: demoted blocks in the match are promoted
@@ -1433,6 +1485,81 @@ mod testing {
 
         fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
             pages_only_reusable_prefix_blocks(blocks, |_| false)
+        }
+    }
+
+    /// Executor emulating the DSv4 prefix-reuse seam: the page-radix route is
+    /// always empty (`reusable_prefix_blocks == 0`, like DSv4), and reuse rides
+    /// the position-0 whole-slot prefix store instead. `store` maps a captured
+    /// full prompt to a marker; `restored`/`captured` record the wiring so the
+    /// scheduler test can assert the engine drove the right hooks.
+    pub(super) struct PrefixStoreMockExecutor {
+        inner: MockExecutor,
+        store: std::cell::RefCell<Vec<Vec<u32>>>,
+        pub(super) captured: std::rc::Rc<std::cell::RefCell<Vec<Vec<u32>>>>,
+        pub(super) restored: std::rc::Rc<std::cell::RefCell<Vec<(usize, usize)>>>,
+    }
+
+    impl PrefixStoreMockExecutor {
+        pub(super) fn new() -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                store: std::cell::RefCell::new(Vec::new()),
+                captured: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                restored: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl BackendExecutor for PrefixStoreMockExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        // Page-radix reuse is unavailable (DSv4 shape): every block clamps to 0.
+        fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
+            0
+        }
+
+        fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
+            self.store
+                .borrow()
+                .iter()
+                .filter(|stored| {
+                    stored.len() <= tokens.len() && tokens[..stored.len()] == stored[..]
+                })
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn capture_cached_prefix(&mut self, _slot: usize, tokens: &[u32]) -> Result<()> {
+            self.captured.borrow_mut().push(tokens.to_vec());
+            let mut store = self.store.borrow_mut();
+            if !store.iter().any(|s| s == tokens) {
+                store.push(tokens.to_vec());
+            }
+            Ok(())
+        }
+
+        fn restore_cached_prefix(
+            &mut self,
+            slot: usize,
+            tokens: &[u32],
+            matched_len: usize,
+        ) -> Result<()> {
+            let key = &tokens[..matched_len];
+            if !self.store.borrow().iter().any(|s| s == key) {
+                bail!("restore of unknown prefix len {matched_len}");
+            }
+            self.restored.borrow_mut().push((slot, matched_len));
+            Ok(())
         }
     }
 
@@ -2044,8 +2171,9 @@ mod tests {
 
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
-        SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor,
-        StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
+        PrefixStoreMockExecutor, SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor,
+        SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor,
+        WarmupCountingExecutor,
     };
     use super::*;
 
@@ -2284,6 +2412,80 @@ mod tests {
             engine.executor.dropped.len() as u64 >= tier.promoted_pages,
             "store entries dropped after promote: {:?}",
             engine.executor.dropped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn position0_prefix_store_captures_then_restores_leading_prefix() -> Result<()> {
+        // DSv4-shaped reuse: page-radix is always empty, so reuse rides the
+        // executor's position-0 whole-slot prefix store. 8 pages of 4 tokens.
+        let mut engine = Engine::with_config(
+            PrefixStoreMockExecutor::new(),
+            MockKvPool::with_capacity(2, 4, 16),
+            test_config(2),
+        );
+        let captured = engine.executor.captured.clone();
+        let restored = engine.executor.restored.clone();
+
+        // First request: an 8-token prompt prefills from position 0 and on
+        // prefill completion the engine captures it into the position-0 store.
+        let first = engine.submit_request((1..=8).collect(), 2);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(
+            captured.borrow().as_slice(),
+            &[vec![1, 2, 3, 4, 5, 6, 7, 8]],
+            "prefill completion captured the position-0 prompt image"
+        );
+        assert!(
+            restored.borrow().is_empty(),
+            "no restore on the first (cold) request"
+        );
+
+        // Second request: its leading 8 tokens equal the cached prompt, so the
+        // engine restores the cached prefix and re-prefills only the tail.
+        let before_hits = engine.kv_system_metrics().reuse_hit_resident;
+        let second = engine.submit_request((1..=12).collect(), 2);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        let restores = restored.borrow();
+        assert_eq!(restores.len(), 1, "exactly one cached-prefix restore fired");
+        assert_eq!(
+            restores[0].1, 8,
+            "restored the full 8-token cached leading prefix"
+        );
+        assert!(
+            engine.kv_system_metrics().reuse_hit_resident > before_hits,
+            "DSv4 cached-prefix reuse bumps reuse_hit_resident (closes the WS2 counter gap)"
+        );
+        assert!(
+            engine.prefix_cache_stats().hits >= 1,
+            "cached-prefix reuse counts as a prefix hit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn position0_prefix_store_no_match_reprefills_whole_prompt() -> Result<()> {
+        let mut engine = Engine::with_config(
+            PrefixStoreMockExecutor::new(),
+            MockKvPool::with_capacity(2, 4, 16),
+            test_config(2),
+        );
+        let restored = engine.executor.restored.clone();
+
+        let first = engine.submit_request((1..=8).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        // A prompt that shares no leading prefix never matches the store.
+        let second = engine.submit_request((50..=57).collect(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        assert!(
+            restored.borrow().is_empty(),
+            "divergent prompt drove no cached-prefix restore"
         );
         Ok(())
     }

@@ -97,30 +97,30 @@ pub fn clamp_to_affordable(requested: usize, affordable: usize) -> (usize, bool)
     (planned, planned < requested)
 }
 
-/// Host RAM (T1) + SSD (T2) tier budgets, derived from machine state instead of
+/// Host-demoted RAM + disk budgets, derived from machine state instead of
 /// hardcoded constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostTierBudget {
-    /// In-RAM (T1) budget, bytes.
+    /// Host-demoted RAM budget, bytes.
     pub ram_bytes: usize,
-    /// On-disk (T2) budget, bytes (0 when no disk path is configured).
+    /// Disk budget, bytes (0 when no disk path is configured).
     pub ssd_bytes: usize,
 }
 
 /// Inputs/policy for [`split_host_tiers`].
 #[derive(Debug, Clone, Copy)]
 pub struct HostTierPolicy {
-    /// Fraction of *available* system RAM the T1 prefix tier may claim.
+    /// Fraction of *available* system RAM the host-demoted prefix tier may claim.
     pub ram_fraction: f64,
-    /// Hard cap on the T1 RAM budget (the proven default, never exceeded so we
+    /// Hard cap on the host-demoted RAM budget (the proven default, never exceeded so we
     /// cannot regress an ample machine into over-claiming RAM).
     pub ram_cap_bytes: usize,
-    /// Floor on the T1 RAM budget when *some* RAM is available, so tiny
+    /// Floor on the host-demoted RAM budget when *some* RAM is available, so tiny
     /// available-RAM readings don't collapse the tier to nothing.
     pub ram_floor_bytes: usize,
-    /// Fraction of *free* disk the T2 spill tier may claim.
+    /// Fraction of *free* disk the spill tier may claim.
     pub ssd_fraction: f64,
-    /// Hard cap on the T2 SSD budget (the proven default).
+    /// Hard cap on the disk budget (the proven default).
     pub ssd_cap_bytes: usize,
 }
 
@@ -139,7 +139,7 @@ impl Default for HostTierPolicy {
     }
 }
 
-/// Derive T1 (RAM) and T2 (SSD) tier budgets from system memory and free disk.
+/// Derive host-demoted RAM and disk budgets from system memory and free disk.
 ///
 /// Replaces the hardcoded `DEFAULT_KV_TIER_BUDGET_BYTES` / `DEFAULT_KV_SSD_BUDGET_BYTES`:
 /// each tier is `clamp(resource × fraction, floor, cap)`, capped at the proven

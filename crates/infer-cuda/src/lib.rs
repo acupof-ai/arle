@@ -580,6 +580,44 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = tokens;
+                0
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.cached_prefix_match_len(tokens),
+        }
+    }
+
+    fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, tokens);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.capture_cached_prefix(slot, tokens),
+        }
+    }
+
+    fn restore_cached_prefix(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, tokens, matched_len);
+                anyhow::bail!("placeholder CUDA executor has no position-0 prefix store")
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.restore_cached_prefix(slot, tokens, matched_len),
+        }
+    }
+
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.
