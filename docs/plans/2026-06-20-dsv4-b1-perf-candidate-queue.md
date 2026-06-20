@@ -11,7 +11,7 @@ any code, and cost is stated only AFTER the decomposition (per `feedback_no_ungr
   See `errors/2026-06-20-host-launch-bound-misinference-decode-is-foundation-bound.md`.
 - My earlier "csa_select = 70%" was measured on the **legacy fallback** path — a
   footgun now DELETED (`16a4ada2`, B=1 routed to the official DSA select). **The real
-  official-path B=1 bottleneck is being re-measured by the pipeline** (`scripts/pod_verify.sh`).
+  official-path B=1 bottleneck is being re-measured on pod** (sync→build→serve→needle+tok/s recipe).
   Update this queue with the real breakdown when it lands.
 - **The full per-worker decode CUDA graph is dead** (3 kill records): it can't remove
   the per-step `ctx.sync` (host already blocks) nor the cross-process per-tick lockstep
@@ -72,5 +72,5 @@ any code, and cost is stated only AFTER the decomposition (per `feedback_no_ungr
 ## Process
 
 Pull from this queue only AFTER the pipeline re-nsys names the real bottleneck — pick the
-candidate that the measurement says owns the wall, decompose it, A-B it via
-`scripts/pod_verify.sh <label> --nsys`. Do not implement on inference.
+candidate that the measurement says owns the wall, decompose it, A-B it via the canonical
+`scripts/bench_guidellm.sh` (or the pod sync→build→serve→profile recipe). Do not implement on inference.
