@@ -773,6 +773,10 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value = "attention-qv")]
     pub(crate) lora_target_set: String,
 
+    /// First transformer layer index that receives LoRA adapters.
+    #[arg(long)]
+    pub(crate) lora_layer_start: Option<usize>,
+
     /// Directory where servable full-materialized OPD checkpoints are written.
     #[arg(long, value_name = "DIR")]
     pub(crate) save_checkpoint: Option<PathBuf>,
@@ -1280,6 +1284,7 @@ mod tests {
         assert_eq!(opd.lora_rank, 16);
         assert_eq!(opd.lora_alpha, 32.0);
         assert_eq!(opd.lora_target_set, "attention-qv");
+        assert_eq!(opd.lora_layer_start, None);
         assert_eq!(
             opd.save_checkpoint.as_deref(),
             Some(std::path::Path::new("/tmp/opd-save"))

@@ -627,8 +627,26 @@ pub fn load_qwen35_lora_from_hf_dir(
     target_set: LoraTargetSet,
     store: &mut TensorStore,
 ) -> Result<Qwen35Model> {
+    load_qwen35_lora_from_hf_dir_with_layer_start(dir, lora, target_set, None, store)
+}
+
+pub fn load_qwen35_lora_from_hf_dir_with_layer_start(
+    dir: &Path,
+    lora: LoraConfig,
+    target_set: LoraTargetSet,
+    lora_layer_start: Option<usize>,
+    store: &mut TensorStore,
+) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
-    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::LoraStudent { lora, target_set }) {
+    match load_qwen35_from_hf_dir_inner(
+        dir,
+        store,
+        LoadMode::LoraStudent {
+            lora,
+            target_set,
+            lora_layer_start,
+        },
+    ) {
         Ok(model) => Ok(model),
         Err(err) => {
             rollback.restore(store);
@@ -644,6 +662,7 @@ enum LoadMode {
     LoraStudent {
         lora: LoraConfig,
         target_set: LoraTargetSet,
+        lora_layer_start: Option<usize>,
     },
 }
 
@@ -700,8 +719,24 @@ fn load_qwen35_from_hf_dir_inner(
     let mut model = match mode {
         LoadMode::FrozenEval => Qwen35Model::new_for_checkpoint_load(&cfg, store)?,
         LoadMode::TrainableStudent => Qwen35Model::new(&cfg, store)?,
-        LoadMode::LoraStudent { lora, target_set } => {
-            Qwen35Model::new_with_lora_targets_for_checkpoint_load(&cfg, lora, target_set, store)?
+        LoadMode::LoraStudent {
+            lora,
+            target_set,
+            lora_layer_start,
+        } => {
+            if let Some(start) = lora_layer_start {
+                Qwen35Model::new_with_lora_targets_for_checkpoint_load_layer_start(
+                    &cfg,
+                    lora,
+                    target_set,
+                    Some(start),
+                    store,
+                )?
+            } else {
+                Qwen35Model::new_with_lora_targets_for_checkpoint_load(
+                    &cfg, lora, target_set, store,
+                )?
+            }
         }
     };
     if !matches!(mode, LoadMode::FrozenEval) && opd_gradient_checkpointing_enabled() {
