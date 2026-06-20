@@ -24,15 +24,20 @@ config except the lever (Arm A GPU4 all-layer attn-qv LoRA; Arm B GPU5
 
 | | backward_seconds | student_forward_seconds |
 |---|---|---|
-| Arm A (all-layer, 40) | **~355 s** | ~140 s |
-| Arm B (suffix top-8) | **33.2 s** (33.2/32.2 over 2 steps) | ~127 s |
-| **speedup** | **≈10.3× backward** | ~1.1× (forward not detached, as expected) |
+| Arm A (all-layer, 40) | **340.9** (354.6 / 327.4) | 138.4 / 128.5 |
+| Arm B (suffix top-8/40) | **33.2** (34.3 / 32.2) | 132.3 / 121.6 |
+| **speedup** | **10.3×** backward | 1.05× (forward not detached, as expected) |
 
-So the lever cuts the trainer-side wall ~10×: at the production rollout-2048 (where
-all-layer backward was ~1333 s) the suffix path projects to ~130 s → a 35B OPD step
-drops from ~35 min toward a few min, making 35B-student OPD practical. The forward is
-unchanged (correct — only the backward tape is cut). Default (None) byte-identical.
-Logs: /data01/lora_lever_arm{A,B}_v2.log.
+Step total drops **2.88×** (500→174 s). The lever cuts the trainer-side wall ~10×: at
+the production rollout-2048 (all-layer backward was ~1333 s) the suffix path projects to
+~130 s → a 35B OPD step drops from ~35 min to a few min, making 35B-student OPD
+practical. Correctness intact: both arms finite + decreasing loss, **step-1
+byte-identical across arms** (clean controlled A/B); step-2 diverges only because arm A
+updated all-40 QV adapters vs arm B's 8 (expected). **New bottleneck: student_forward
+(~127 s)** is now dominant — the next D-infra lever is the forward (reuse the
+InferStudent inference forward for the KL logits). Default (None) byte-identical. Logs:
+/data01/lora_lever_arm{A,B}_v2.log; needs `ARLE_OPD_STEP_PROFILE=1` (timing line is
+gated off under `--json`).
 
 ## Rule
 A backward-pruning lever's correctness (tape cut + byte-identical default) can be
