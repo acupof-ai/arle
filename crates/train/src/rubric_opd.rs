@@ -174,6 +174,12 @@ where
         let mut accepted_pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
         for (problem, prompt_ids) in prompts {
             rep.prompts += 1;
+            eprintln!(
+                "[rubric] round {round} phase-A: sampling prompt {}/{} ({} samples)",
+                rep.prompts,
+                prompts.len(),
+                cfg.samples_per_prompt
+            );
             let samples = student.generate_samples(
                 prompt_ids,
                 cfg.max_new_tokens,
@@ -206,17 +212,23 @@ where
         // Phase B — offload BOTH inference engines (rollout + judge) to host RAM,
         // freeing their VRAM (~tens of GB) for the 27B autograd CE forward+backward.
         // Without this the CE step OOMs (`cuda alloc_zeros failed`) at seq ~1k.
+        eprintln!(
+            "[rubric] round {round} phase-B: offloading engines ({} accepted to train)",
+            accepted_pairs.len()
+        );
         let freed_rollout = student.offload_engine_weights().unwrap_or(0);
         let freed_judge = judge.offload_engine_weights().unwrap_or(0);
-        if debug {
-            eprintln!(
-                "[rubric offload] freed rollout={freed_rollout} judge={freed_judge} bytes; CE on {} accepted",
-                accepted_pairs.len()
-            );
-        }
+        eprintln!(
+            "[rubric] round {round} phase-B done: freed rollout={freed_rollout} judge={freed_judge} bytes"
+        );
 
         // Phase C — CE writeback on all accepted pairs (engines offloaded).
-        for (prompt_ids, completion_ids) in &accepted_pairs {
+        for (i, (prompt_ids, completion_ids)) in accepted_pairs.iter().enumerate() {
+            eprintln!(
+                "[rubric] round {round} phase-C: CE {}/{}",
+                i + 1,
+                accepted_pairs.len()
+            );
             loss_sum += train_on_accepted(prompt_ids, completion_ids)?;
             rep.trained += 1;
         }
@@ -224,6 +236,7 @@ where
         // Phase D — reload engines. Always: the caller drives rounds one-at-a-time
         // and relies on resident engines after the call (the between-round LoRA sync
         // pushes into the rollout engine; the next call samples/judges from them).
+        eprintln!("[rubric] round {round} phase-D: reloading engines");
         student.reload_engine_weights()?;
         judge.reload_engine_weights()?;
 
