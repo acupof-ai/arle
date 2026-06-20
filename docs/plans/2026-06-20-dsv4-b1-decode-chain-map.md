@@ -151,3 +151,46 @@ occupancy → 抽不满 HBM)+ foundation(ctx.sync+barrier)禁止 overlap → HBM
 - **G12. 无方差/error bar.** 单次数;§0 要 ≥3 次 + σ 才能下 kernel-efficiency 结论。
 
 **填空缺的关键路径:G1(修 nsys)解锁 G3/G4/G5;G2(prefill 链路)是独立的另一半。其余 P2 跟随。**
+
+## 高并发吞吐 gap(c≥4)—— 另一个 regime,墙不同,36× 头寸全在这里
+
+**为什么单独分析:** B=1 是 latency-bound(HBM 2.8% util);**高 c 本该把 M=1 GEMV 抬成
+bandwidth-bound、把 36× 头寸变成吞吐**。regime 变了 → 墙变了。
+
+**测量的 c-scaling**(`2026-06-16-dsv4-c1-8-baseline-clean-ab`,TP8,compressor-batch ON,profiling OFF):
+| c | aggregate tok/s | per-req tok/s | vs c1 |
+|---|---|---|---|
+| 1 | 44 | 44.9 | 1× |
+| 4 | 69.8 | 17.4 | 1.6× |
+| 8 | 77.6 | 9.7 | **1.75×** |
+
+**8× 的请求只换 1.75× 吞吐;per-req 掉 4.6×。** 这是核心 gap。
+
+**理想 roofline(高 c):** dense 权重(attention 70% + shared expert + router,约 40MB/层)
+**读一次喂 c 个 token**。完美摊薄下 c=8 的 step ≈ c=1 的 step(~26ms,仍 latency-bound)→
+aggregate ≈ 8×(1000/26)= **~300 tok/s**。**actual c8 = 77.6 → gap ~4×,只拿到 ~25% 的头寸。**
+
+**丢在哪(hypothesis,code-grounded,需 c>1 stage profile 确认 = H1):**
+- **attention 逐行循环(主因).** `project_decode_attention_throws_away_batch`:注意力跑 c 个
+  独立单行 kernel(seq_len=1)→ **占 70% 的那块不摊薄 → step ∝ c → aggregate 趋平**。
+  **批量 MLA decode kernel `fused_gqa_attention_decode_batched` 存在但没接线**
+  (`reference_dsv4_concurrency_serial_capped_dp_attn_next`)。
+- **MoE 部分批量.** expert GEMV 按 expert 分组能批,但 EP 不均 + 逐行 dispatch 限制;且 routed
+  expert 随 c 增长(更多 distinct expert 被激活)→ 摊薄递减。
+- **lockstep barrier + 43 层串行链.** 每 tick 固定、与 c 无关 → 高 c 摊薄但不消失。
+
+**lever:** 接线批量 MLA decode → 70% 注意力批量化 → c-scaling 从 1.75× 朝 ~5-8× 跳。
+**这是 #1 杠杆(物理证明头寸 + kernel 已存在,只差接线)。**
+
+**本节自己的空缺(诚实,§0):**
+- **H1. c>1 的逐阶段归因没测干净(尝试过,confounded).** "attention 逐行是主因"仍是
+  code-grounded 推断。**2026-06-21 尝试**:① stage-profile c=1 vs c=8 → 每 stage ratio
+  精确 1.000、wall 持平 —— **但这无法区分"B=8 逐行"和"client 根本没形成并发",两者 profiler
+  同值,且与 wins 的 c8=1.75× 矛盾**;② 重测干净 aggregate → ad-hoc 多线程 client 触发 serve
+  不稳(0 tokens)。**教训:high-c 不能用 ad-hoc threaded client(并发验证不了 + 不稳),
+  必须用 canonical `scripts/bench_guidellm.sh`(guidellm,正经并发 sweep + 已验证)。** H1
+  仍是本节最大空缺,正确测法 = guidellm c-sweep + 同时 stage-profile。
+- **H2. 理想 ~300 是简化.** 假设 dense 完美摊薄 + 仍 latency-bound;MoE routed expert 随 c
+  增长没算进理想(真实理想会低于 300)。
+- **H3. TP8 vs TP4 的 c-scaling 可能不同**(EP 分片粒度不同),上表是 TP8;我约束在 TP4 要单测。
+- **H4. c-scaling 非单调存疑.** wins 自己标了 c4 +58% vs c8 +5% 的非单调只单次、未 ≥3 次定。
