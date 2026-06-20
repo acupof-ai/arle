@@ -3008,6 +3008,30 @@ pub(crate) struct Dsv4LayerImage {
     dsa_official: Option<Dsv4DsaOfficialImage>,
 }
 
+impl Dsv4LayerImage {
+    /// Host RAM owned by this per-layer image: every snapshotted host vector.
+    /// Used by the executor's position-0 prefix store to bound its LRU budget.
+    pub(crate) fn host_bytes(&self) -> usize {
+        self.sw_window_cache.len() * std::mem::size_of::<half::bf16>()
+            + self
+                .compressor
+                .as_ref()
+                .map_or(0, Dsv4CompressorImage::host_bytes)
+            + self
+                .indexer
+                .as_ref()
+                .map_or(0, Dsv4CompressorImage::host_bytes)
+            + self
+                .flashmla
+                .as_ref()
+                .map_or(0, Dsv4FlashMlaImage::host_bytes)
+            + self
+                .dsa_official
+                .as_ref()
+                .map_or(0, Dsv4DsaOfficialImage::host_bytes)
+    }
+}
+
 /// Whole-slot host image of one [`Dsv4CompressorState`].
 ///
 /// Whole-slot swap must carry `compressed.data`: the slot can be reused by
@@ -3076,6 +3100,15 @@ impl Dsv4CompressorImage {
         state.compressed.seq_len = self.compressed_seq_len;
         Ok(())
     }
+
+    fn host_bytes(&self) -> usize {
+        (self.pending_kv.len()
+            + self.pending_score.len()
+            + self.prev_overlap_kv.len()
+            + self.prev_overlap_score.len()
+            + self.compressed_data.len())
+            * std::mem::size_of::<half::bf16>()
+    }
 }
 
 /// Whole-slot host image of one [`Dsv4FlashMlaDecodeState`]: the two mutable
@@ -3134,6 +3167,10 @@ impl Dsv4FlashMlaImage {
         flash.fp8_kv_sw_bootstrapped = self.fp8_kv_sw_bootstrapped;
         flash.fp8_kv_comp_packed_rows = self.fp8_kv_comp_packed_rows;
         Ok(())
+    }
+
+    fn host_bytes(&self) -> usize {
+        self.fp8_kv_pool_pages.len()
     }
 }
 
@@ -3216,6 +3253,10 @@ impl Dsv4DsaOfficialImage {
             .map_err(|e| anyhow!("DSv4 swap DSA key-cache band H2D failed: {e}"))?;
         official.packed_rows = self.packed_rows;
         Ok(())
+    }
+
+    fn host_bytes(&self) -> usize {
+        self.rotated_keys.len() * std::mem::size_of::<half::bf16>() + self.key_cache_slot.len()
     }
 }
 
