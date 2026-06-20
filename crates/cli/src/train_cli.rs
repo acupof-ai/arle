@@ -1395,7 +1395,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     use train::{
         infer_student::InferStudent,
         lora::LoraConfig,
-        opd::rubric_writeback_ce_step,
+        opd::rubric_writeback_ce_step_batched,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_layer_start,
         rubric::{bfcl_agentic_rubric, math_rubric},
         rubric_opd::{FlashJudge, RubricOpdConfig, run_rubric_rounds},
@@ -1563,6 +1563,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         samples_per_prompt: args.samples_per_prompt,
         max_new_tokens: args.max_new_tokens,
         writeback_cap: args.writeback_cap,
+        writeback_batch: args.writeback_batch,
     };
 
     // In-process eval (base + per-round) via the rollout engine — no checkpoint save.
@@ -1607,14 +1608,13 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                         .decode(ids, true)
                         .map_err(|err| anyhow!("decode rollout: {err}"))
                 },
-                |prompt_ids, completion_ids| {
-                    rubric_writeback_ce_step(
+                |chunk: &[(Vec<u32>, Vec<u32>)]| {
+                    rubric_writeback_ce_step_batched(
                         student_ref,
                         all_ref,
                         trainable_ref,
                         opt_ref,
-                        prompt_ids,
-                        completion_ids,
+                        chunk,
                         vocab,
                         store_ref,
                     )
