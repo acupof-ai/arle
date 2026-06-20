@@ -16,7 +16,9 @@ use anyhow::{Result, anyhow};
 use infer_api::{CompletionRequest, InferenceEngine, LoadedInferenceEngine, SamplingParams};
 
 #[cfg(feature = "cuda")]
-use crate::rubric::{Rubric, Verdict};
+use crate::infer_student::InferStudent;
+#[cfg(feature = "cuda")]
+use crate::rubric::{Rubric, Verdict, select};
 
 /// A text judge backed by a strong teacher engine (DeepSeek-V4-Flash). Renders the
 /// rubric judge prompt, generates a greedy verdict, and parses it. Vocab-agnostic.
@@ -79,4 +81,106 @@ impl FlashJudge {
             }
         }
     }
+}
+
+/// Rubric-OPD round/sampling configuration.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug)]
+pub struct RubricOpdConfig {
+    /// RFT rounds (generate → judge → select → writeback-CE).
+    pub rounds: usize,
+    /// On-policy samples generated per prompt each round (rejection sampling).
+    pub samples_per_prompt: usize,
+    /// Max new tokens per sampled rollout.
+    pub max_new_tokens: usize,
+}
+
+/// Per-round accounting. `distinct_accepted` is the RFT log-linear x-axis;
+/// `parse_errors` surfaces judge timeouts/garbage (never bucketed as fail).
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Default)]
+pub struct RoundReport {
+    pub round: usize,
+    pub prompts: usize,
+    pub accepted: usize,
+    pub distinct_accepted: usize,
+    pub parse_errors: usize,
+    pub trained: usize,
+    pub mean_train_loss: f32,
+}
+
+/// The rubric-OPD RFT driver: for each round, sample N rollouts per prompt, judge
+/// each with Flash, select the accepted, and write them back via `train_on_accepted`.
+///
+/// `decode` turns generated student token ids into the text the judge reads;
+/// `train_on_accepted(prompt_ids, completion_ids)` runs one student CE step on an
+/// accepted rollout and returns its loss. Both are supplied by the CLI handler
+/// (tokenizer + autograd CE step), keeping this driver free of the heavy wiring so
+/// the GPU operations it composes (`generate_samples`, `FlashJudge`, `select`) stay
+/// independently testable.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_rubric_rounds<D, T>(
+    student: &InferStudent,
+    judge: &FlashJudge,
+    rubric: &Rubric,
+    prompts: &[(String, Vec<u32>)],
+    cfg: &RubricOpdConfig,
+    sampling: Option<&SamplingParams>,
+    mut decode: D,
+    mut train_on_accepted: T,
+) -> Result<Vec<RoundReport>>
+where
+    D: FnMut(&[u32]) -> Result<String>,
+    T: FnMut(&[u32], &[u32]) -> Result<f32>,
+{
+    let mut reports = Vec::with_capacity(cfg.rounds);
+    for round in 0..cfg.rounds {
+        let mut rep = RoundReport {
+            round,
+            ..Default::default()
+        };
+        let mut loss_sum = 0.0f32;
+        for (problem, prompt_ids) in prompts {
+            rep.prompts += 1;
+            let samples = student.generate_samples(
+                prompt_ids,
+                cfg.max_new_tokens,
+                cfg.samples_per_prompt,
+                sampling,
+            )?;
+            let texts = samples
+                .iter()
+                .map(|s| decode(s))
+                .collect::<Result<Vec<String>>>()?;
+            let verdicts: Vec<Verdict> = texts
+                .iter()
+                .map(|t| judge.judge_resilient(rubric, problem, t))
+                .collect();
+            let sel = select(&texts, &verdicts);
+            rep.accepted += sel.accepted.len();
+            rep.distinct_accepted += sel.distinct_accepted;
+            rep.parse_errors += sel.parse_errors;
+            for &idx in &sel.accepted {
+                loss_sum += train_on_accepted(prompt_ids, &samples[idx])?;
+                rep.trained += 1;
+            }
+        }
+        rep.mean_train_loss = if rep.trained > 0 {
+            loss_sum / rep.trained as f32
+        } else {
+            0.0
+        };
+        eprintln!(
+            "rubric_opd round {round}: prompts={} accepted={} distinct={} parse_err={} trained={} mean_loss={:.4}",
+            rep.prompts,
+            rep.accepted,
+            rep.distinct_accepted,
+            rep.parse_errors,
+            rep.trained,
+            rep.mean_train_loss
+        );
+        reports.push(rep);
+    }
+    Ok(reports)
 }
