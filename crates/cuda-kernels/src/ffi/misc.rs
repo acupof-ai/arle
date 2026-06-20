@@ -668,40 +668,6 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    pub fn dsv4_csa_select_cuda(
-        q: *const super::Half,
-        weights: *const super::Half,
-        keys: *const super::Half,
-        selected: *mut i32,
-        num_tokens: i32,
-        q_width: i32,
-        local_heads: i32,
-        index_dim: i32,
-        key_count: i32,
-        ratio: i32,
-        topk: i32,
-        score_scale: f32,
-        start_pos: i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
-    pub fn dsv4_csa_select_start_pos_ptr_cuda(
-        q: *const super::Half,
-        weights: *const super::Half,
-        keys: *const super::Half,
-        selected: *mut i32,
-        num_tokens: i32,
-        q_width: i32,
-        local_heads: i32,
-        index_dim: i32,
-        key_count: i32,
-        ratio: i32,
-        topk: i32,
-        score_scale: f32,
-        start_pos: *const i32,
-        stream: super::CUstream,
-    ) -> super::CUresult;
-
     pub fn dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
         q_input: *const super::Half,
         q_fp8: *mut u8,
