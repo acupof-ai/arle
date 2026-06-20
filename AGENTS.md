@@ -34,8 +34,27 @@ Not a suggestion — the quality bar.
   **wall-clock / per-request framing is ground truth**. A narrow-window X% share
   ≠ the actual X% wall-clock impact. License-or-kill must use the wall-clock
   framing — never deceive yourself with the narrow-window framing.
+- **Case-as-fact — attribute from decoded cases before overturning a hypothesis
+  (做算法以 case 为事实)**: a negative / bug result (a regression, a failed metric,
+  a subagent's "it's structural" summary) is a **case to debug at the token
+  level**, NOT a license to generalize into a structural conclusion that kills the
+  hypothesis. Before trusting any aggregate: ① **decode the actual model outputs**
+  per-case, per-step (base vs each checkpoint, on the *failing* slice); ② **audit
+  the eval harness for artifacts** — timeouts/errors silently bucketed as a class,
+  request-errors counted as wrong, a metric that rewards the wrong thing. The
+  aggregate **and** a plausible mechanism can *both* lie; the decoded cases are
+  ground truth. Once attributed at case level, the fix usually falls out — never
+  kill a hypothesis on a confounded experiment. **先归因清楚再推翻。**
 
 Empirical anchors:
+- **Agentic-OPD "structural" false-KILL** (2026-06-20): a −14pp agentic-OPD
+  regression + a plausible mechanism ("on-policy can't teach abstention") was
+  written up as a structural KILL — **wrong**. Decoding the cases: the gate's
+  "+42pp teacher abstention" was **14/17 teacher TIMEOUTS counted as abstention**
+  (a fake gate); the no-think teacher actually *over-calls* (33% abstain < base
+  46%); OPD faithfully distilled that bad target. Fixable (timeout-clean gate +
+  think-on teacher), hypothesis intact. The aggregate metric **and** the subagent
+  summary both misled; only the decoded cases were true.
 - **M_pf-graph Phase 0 KILL** (2026-05-08): the errors entry was 80% SOLID and
   still fell — 3 gaps: launch-overhead share not nsys-verified / SGLang
   graph-trigger count not measured against a control / 4 variables changed at once
@@ -103,6 +122,20 @@ measured number** and name the next wall. **Still saying "hard / tough / complex
 multi-day" means you haven't decomposed enough — "hard" is a confession of
 not-yet-decomposed, not a property of the problem; keep decomposing.** Can't
 compress it to one sentence = you don't understand it yet, no code.
+
+**Cost comes AFTER the concrete work, never before (ckl 2026-06-20).** Sequence
+is mandatory: ① investigate to the file:line decomposition first → ② only THEN
+evaluate cost. **Do not label difficulty / risk / "infeasible" / "multi-day"
+before the steps are concrete** — a cost guessed ahead of the decomposition adds
+confusion, not information (it raises perplexity, biases the work down, and
+pre-commits you to a wrong size). When the work is clear the plan is usually
+*simple*; state the steps and proceed. If you catch yourself ranking risk or
+estimating effort before you can name the file:line steps, stop and go decompose
+— the estimate is noise. Empirical: the DSv4 prefix-reuse investigation
+(2026-06-20) decomposed cleanly into 6 file:line steps reusing the existing
+`Dsv4LayerImage` capture/restore, yet still got wrapped in "hard / likely
+infeasible cheaply / HIGH risk" — the hedging was pure noise on top of a clear plan.
+
 Empirical: DSv4 batched decode (2026-06-14) was hand-waved as "very hard,
 multi-day new infra"; reading the code + measuring the step decomposition
 collapsed it to "one per-row `for` loop at `dsv4.rs:1872` → batch it → ~2×
