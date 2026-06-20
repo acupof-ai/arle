@@ -176,19 +176,91 @@ fn last_json_object(text: &str) -> Option<String> {
     None
 }
 
+/// Result of applying a rubric to one prompt's N rollouts (RFT selection step).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selection {
+    /// Indices into the rollout slice the judge accepted.
+    pub accepted: Vec<usize>,
+    /// Count of *distinct* accepted rollout texts — the RFT log-linear x-axis: the
+    /// gain scales with distinct accepted CoTs per prompt, not the raw accept count.
+    pub distinct_accepted: usize,
+    /// Rollouts whose verdict failed to parse (judge timeout/garbage), surfaced for
+    /// monitoring; excluded from acceptance, never bucketed as a fail.
+    pub parse_errors: usize,
+}
+
+/// Select accepted rollouts for one prompt. `rollouts` and `verdicts` are
+/// index-aligned; acceptance = `verdict.accepted`; `distinct_accepted` dedups
+/// identical accepted texts.
+pub fn select(rollouts: &[String], verdicts: &[Verdict]) -> Selection {
+    assert_eq!(
+        rollouts.len(),
+        verdicts.len(),
+        "select: rollouts/verdicts length mismatch"
+    );
+    let mut accepted = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut distinct_accepted = 0usize;
+    let mut parse_errors = 0usize;
+    for (i, v) in verdicts.iter().enumerate() {
+        if v.parse_error {
+            parse_errors += 1;
+        }
+        if v.accepted {
+            accepted.push(i);
+            if seen.insert(rollouts[i].as_str()) {
+                distinct_accepted += 1;
+            }
+        }
+    }
+    Selection {
+        accepted,
+        distinct_accepted,
+        parse_errors,
+    }
+}
+
+/// Built-in rubric for math reasoning (MATH-500 style): factual answer correctness
+/// gates acceptance; reasoning validity is logged.
+pub fn math_rubric() -> Rubric {
+    Rubric {
+        task: "math reasoning".to_string(),
+        criteria: vec![
+            Criterion::factual(
+                "answer_correct",
+                "The final \\boxed{} answer is mathematically correct for the problem.",
+            ),
+            Criterion::process(
+                "steps_valid",
+                "Each reasoning step follows logically from the previous; no unjustified leaps.",
+            ),
+        ],
+    }
+}
+
+/// Built-in rubric for agentic tool-use (BFCL live): the call decision gates
+/// acceptance (right tool+args, or correctly abstain on irrelevant queries);
+/// reason-before-act is logged.
+pub fn bfcl_agentic_rubric() -> Rubric {
+    Rubric {
+        task: "agentic tool-use".to_string(),
+        criteria: vec![
+            Criterion::factual(
+                "call_correct",
+                "If the query is answerable with the given tools, the response calls the correct \
+                 tool(s) with correct arguments; if NOT answerable, it abstains and emits no tool call.",
+            ),
+            Criterion::process(
+                "reasons_before_acting",
+                "The response reasons about tool relevance before deciding to call or abstain.",
+            ),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn math_rubric() -> Rubric {
-        Rubric {
-            task: "math reasoning".to_string(),
-            criteria: vec![
-                Criterion::factual("answer_correct", "The final boxed answer is correct."),
-                Criterion::process("steps_valid", "Each step follows from the previous."),
-            ],
-        }
-    }
 
     #[test]
     fn judge_prompt_contains_problem_rollout_and_keys() {
@@ -250,5 +322,59 @@ mod tests {
         let out = "draft {\"answer_correct\": false, \"steps_valid\": false} final {\"answer_correct\": true, \"steps_valid\": true}";
         let v = r.parse_verdict(out);
         assert!(v.accepted);
+    }
+
+    fn verdict(accepted: bool, parse_error: bool) -> Verdict {
+        Verdict {
+            passed: Vec::new(),
+            accepted,
+            parse_error,
+        }
+    }
+
+    #[test]
+    fn select_keeps_accepted_and_counts_distinct() {
+        let rollouts = vec![
+            "A".to_string(), // accepted
+            "B".to_string(), // accepted (distinct)
+            "A".to_string(), // accepted but duplicate text
+            "C".to_string(), // rejected
+            "D".to_string(), // parse error
+        ];
+        let verdicts = vec![
+            verdict(true, false),
+            verdict(true, false),
+            verdict(true, false),
+            verdict(false, false),
+            verdict(false, true),
+        ];
+        let s = select(&rollouts, &verdicts);
+        assert_eq!(s.accepted, vec![0, 1, 2]);
+        assert_eq!(s.distinct_accepted, 2); // "A","B" — duplicate "A" not double-counted
+        assert_eq!(s.parse_errors, 1);
+    }
+
+    #[test]
+    fn presets_have_one_gating_factual_criterion() {
+        for r in [math_rubric(), bfcl_agentic_rubric()] {
+            let factual = r
+                .criteria
+                .iter()
+                .filter(|c| c.kind == CriterionKind::Factual)
+                .count();
+            assert_eq!(
+                factual, 1,
+                "{} should gate on exactly one factual criterion",
+                r.task
+            );
+            // a clean all-true verdict is accepted; a factual-false verdict is not
+            let keys: Vec<_> = r
+                .criteria
+                .iter()
+                .map(|c| format!("\"{}\": true", c.key))
+                .collect();
+            let all_true = format!("{{{}}}", keys.join(", "));
+            assert!(r.parse_verdict(&all_true).accepted);
+        }
     }
 }
