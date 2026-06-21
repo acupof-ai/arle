@@ -3474,12 +3474,10 @@ fn cuda_linear_attention_forward_device(
     args: LinearAttentionDeviceForwardArgs<'_>,
 ) -> Result<Option<LinearAttentionDeviceForwardResult>> {
     let p = args.params;
-    if p.batch != 1
-        || p.num_value_heads != 32
-        || p.key_dim != 128
-        || p.value_dim != 128
-        || p.conv_kernel > 5
-    {
+    // num_value_heads is a runtime param (per-head grid blocks + dim-sized shared
+    // mem); only the head DIM is baked into the kernel (GDR_KEY_DIM/VAL_DIM=128).
+    // Qwen3.6-27B uses 48 value heads, 35B-A3B uses 32 — both ride the same kernel.
+    if p.batch != 1 || p.key_dim != 128 || p.value_dim != 128 || p.conv_kernel > 5 {
         return Ok(None);
     }
 
@@ -3934,12 +3932,10 @@ fn cuda_linear_attention_backward_device(
     args: LinearAttentionDeviceBackwardArgs<'_>,
 ) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
     let p = args.params;
-    if p.batch != 1
-        || p.num_value_heads != 32
-        || p.key_dim != 128
-        || p.value_dim != 128
-        || p.conv_kernel > 5
-    {
+    // num_value_heads is a runtime param (per-head grid blocks + dim-sized shared
+    // mem); only the head DIM is baked into the kernel (GDR_KEY_DIM/VAL_DIM=128).
+    // Qwen3.6-27B uses 48 value heads, 35B-A3B uses 32 — both ride the same kernel.
+    if p.batch != 1 || p.key_dim != 128 || p.value_dim != 128 || p.conv_kernel > 5 {
         return Ok(None);
     }
 
