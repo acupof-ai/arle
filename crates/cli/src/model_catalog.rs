@@ -24,6 +24,9 @@ pub(crate) struct CatalogEntry {
     pub(crate) backends: &'static [CompiledBackend],
     /// Whether ARLE has a working implementation for this arch.
     pub(crate) implemented: bool,
+    /// Set on the flagship picks ARLE leads with — a one-line reason shown in
+    /// the picker (e.g. "best quality · spec decode"). `None` for the rest.
+    pub(crate) recommended: Option<&'static str>,
 }
 
 impl CatalogEntry {
@@ -37,8 +40,8 @@ impl CatalogEntry {
 
 use CompiledBackend::{Cpu, Cuda, Metal};
 
-/// Curated catalog of recommended models — ordered by preference (smallest
-/// viable first for each family).
+/// Curated catalog of selectable models. Display order is decided by
+/// `recommend_models` (flagship picks first), not by position here.
 pub(crate) const CATALOG: &[CatalogEntry] = &[
     // ── MLX quantized (Metal-optimized) ──────────────────────────────────
     CatalogEntry {
@@ -51,6 +54,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 1.0,
         backends: &[Metal],
         implemented: true,
+        recommended: None,
     },
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-0.6B-bf16",
@@ -62,6 +66,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 2.0,
         backends: &[Metal],
         implemented: true,
+        recommended: None,
     },
     // ── Full-precision (CUDA + CPU) ──────────────────────────────────────
     CatalogEntry {
@@ -74,6 +79,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 2.5,
         backends: &[Cuda, Metal, Cpu],
         implemented: true,
+        recommended: None,
     },
     CatalogEntry {
         hf_id: "Qwen/Qwen3-4B",
@@ -85,6 +91,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 10.0,
         backends: &[Cuda, Metal, Cpu],
         implemented: true,
+        recommended: None,
     },
     CatalogEntry {
         hf_id: "Qwen/Qwen3-8B",
@@ -96,6 +103,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 18.0,
         backends: &[Cuda, Metal],
         implemented: true,
+        recommended: None,
     },
     CatalogEntry {
         hf_id: "Qwen/Qwen3.5-4B",
@@ -107,6 +115,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 10.5,
         backends: &[Cuda, Metal],
         implemented: true,
+        recommended: None,
     },
     // ── Community quantized (popular picks) ──────────────────────────────
     CatalogEntry {
@@ -119,6 +128,7 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 4.0,
         backends: &[Metal],
         implemented: true,
+        recommended: None,
     },
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-8B-4bit",
@@ -130,6 +140,22 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 6.0,
         backends: &[Metal],
         implemented: true,
+        recommended: None,
+    },
+    // ── Qwen3.6 dense (GatedDeltaNet) — highest quality, self-speculative ─
+    // OptiQ mixed 4/8-bit: PPL 7.82 (vs uniform-4bit 8.56). Its own NextN-MTP
+    // head is auto-enabled for spec decode (~18 tok/s, past the bandwidth floor).
+    CatalogEntry {
+        hf_id: "mlx-community/Qwen3.6-27B-OptiQ-4bit",
+        display_name: "Qwen3.6 27B",
+        family: "Qwen3.6",
+        param_count: "27B",
+        quantization: Some("OptiQ 4/8-bit"),
+        size_gb: 19.0,
+        min_memory_gb: 31.0,
+        backends: &[Metal],
+        implemented: true,
+        recommended: Some("best quality · spec decode"),
     },
     // ── Qwen3.5 / Qwen3.6 Mixture-of-Experts (Metal-only, Phase 1). ──────
     CatalogEntry {
@@ -142,21 +168,35 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         min_memory_gb: 24.0,
         backends: &[Metal],
         implemented: true,
+        recommended: Some("fastest · MoE"),
     },
 ];
 
-/// Return catalog entries that can run on this system, sorted by quality
-/// (larger models first among those that fit).
+/// Return catalog entries that can run on this system, best first: the
+/// flagship `recommended` picks lead (so Enter lands on a great model),
+/// then the rest by capacity (larger / higher quality first).
 pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> {
     let mut fits: Vec<&CatalogEntry> = CATALOG.iter().filter(|e| e.fits(info)).collect();
-    // Sort: larger param count first (better quality), then prefer quantized
-    // (smaller download) when same param count.
     fits.sort_by(|a, b| {
-        b.min_memory_gb
-            .partial_cmp(&a.min_memory_gb)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // Flagship picks first; within each group, larger memory (= higher
+        // quality) first.
+        b.recommended
+            .is_some()
+            .cmp(&a.recommended.is_some())
+            .then_with(|| {
+                b.min_memory_gb
+                    .partial_cmp(&a.min_memory_gb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     fits
+}
+
+/// Look up a catalog entry by its exact HuggingFace id. Lets the picker
+/// surface a flagship `recommended` note on a model the user already has
+/// on disk.
+pub(crate) fn find_by_hf_id(hf_id: &str) -> Option<&'static CatalogEntry> {
+    CATALOG.iter().find(|e| e.hf_id == hf_id)
 }
 
 #[cfg(test)]
@@ -233,6 +273,40 @@ mod tests {
             assert!(entry.size_gb > 0.0);
             assert!(entry.min_memory_gb > 0.0);
             assert!(!entry.backends.is_empty());
+            // A recommended note, when present, must be a non-empty one-liner.
+            if let Some(note) = entry.recommended {
+                assert!(!note.is_empty());
+                assert!(!note.contains('\n'));
+            }
         }
+    }
+
+    #[test]
+    fn flagship_picks_are_marked_recommended() {
+        // The two models ARLE leads with must carry a one-line reason.
+        for id in [
+            "mlx-community/Qwen3.6-27B-OptiQ-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+        ] {
+            let entry = find_by_hf_id(id).expect("flagship in catalog");
+            assert!(
+                entry.recommended.is_some(),
+                "{id} should be a recommended flagship"
+            );
+        }
+    }
+
+    #[test]
+    fn recommend_lists_flagships_before_the_rest() {
+        // A big Metal box fits both flagships and the smaller models; the
+        // flagships must lead so Enter lands on a great model.
+        let info = make_info(CompiledBackend::Metal, 64.0);
+        let recs = recommend_models(&info);
+        let first = recs.first().expect("at least one recommendation");
+        assert!(
+            first.recommended.is_some(),
+            "first recommendation should be a flagship, got {}",
+            first.hf_id
+        );
     }
 }
