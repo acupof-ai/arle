@@ -90,6 +90,49 @@ impl FlashJudge {
         }
     }
 
+    /// Batched [`judge`]: judges N rollouts of the SAME problem in one engine
+    /// batch (the judge engine decodes them concurrently). Returns one Verdict per
+    /// rollout, in order; a per-request engine/parse failure maps to
+    /// `Verdict::parse_error()` (never aborts the round). Vocab-agnostic.
+    pub fn judge_batch(&self, rubric: &Rubric, problem: &str, rollouts: &[String]) -> Vec<Verdict> {
+        if rollouts.is_empty() {
+            return Vec::new();
+        }
+        let reqs: Vec<CompletionRequest> = rollouts
+            .iter()
+            .map(|r| CompletionRequest {
+                prompt: rubric.judge_prompt(problem, r),
+                max_tokens: self.max_verdict_tokens,
+                sampling: SamplingParams {
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                stop: None,
+                logprobs: false,
+                session_id: None,
+                trace_context: None,
+                cancel: None,
+            })
+            .collect();
+        let outputs = {
+            let engine = match self.engine.lock() {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("rubric_opd: judge_batch lock poisoned: {err}");
+                    return vec![Verdict::parse_error(); rollouts.len()];
+                }
+            };
+            engine.complete_batch(reqs)
+        };
+        match outputs {
+            Ok(outs) => outs.iter().map(|o| rubric.parse_verdict(&o.text)).collect(),
+            Err(err) => {
+                eprintln!("rubric_opd: judge_batch failed (all parse_error): {err}");
+                vec![Verdict::parse_error(); rollouts.len()]
+            }
+        }
+    }
+
     /// Mode B: generate a correct solution for a (rejected) prompt and return it
     /// only if the teacher's own solution passes the rubric self-check (quality
     /// gate). `None` = the teacher could not produce a passing solution; never
@@ -248,10 +291,7 @@ where
                     eprintln!("[rubric rollout] sample{i} len={} text={snip:?}", t.len());
                 }
             }
-            let verdicts: Vec<Verdict> = texts
-                .iter()
-                .map(|t| judge.judge_resilient(rubric, problem, t))
-                .collect();
+            let verdicts: Vec<Verdict> = judge.judge_batch(rubric, problem, &texts);
             let sel = select(&texts, &verdicts);
             rep.accepted += sel.accepted.len();
             rep.distinct_accepted += sel.distinct_accepted;
