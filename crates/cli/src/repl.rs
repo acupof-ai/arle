@@ -395,29 +395,25 @@ pub(crate) fn run_one_shot(
     Ok(())
 }
 
+/// One dim config line for the REPL. Model / backend / commands / Ctrl-C are
+/// already covered by the loaded line and the welcome banner, so this only
+/// surfaces the runtime knobs that aren't shown elsewhere. `/help` re-prints
+/// the full reference on demand.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_banner(
-    engine: &dyn InferenceEngine,
-    backend_name: &str,
     mode_name: &str,
     tools: &[ToolDefinition],
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
 ) {
-    println!();
-    println!("=== ARLE REPL ===");
-    println!("Model: {}", engine.model_id());
-    println!("Backend: {}", backend_name);
-    println!("Mode: {}", mode_name);
-    println!("Tools available: {}", tools.len());
+    // Dim the whole line; bold the values via nested SGR.
     println!(
-        "Max turns: {}, Max tokens: {}, Temperature: {}",
-        max_turns, max_tokens, temperature
+        "\x1b[2mmode \x1b[0;1m{mode_name}\x1b[0;2m · tools \x1b[0;1m{}\x1b[0;2m · \
+         turns \x1b[0;1m{max_turns}\x1b[0;2m · tokens \x1b[0;1m{max_tokens}\x1b[0;2m · \
+         temp \x1b[0;1m{temperature}\x1b[0m",
+        tools.len()
     );
-    println!("End a line with `\\` to continue input on the next line.");
-    println!("Press Ctrl-C to cancel a running generation; press it twice within 2s to exit.");
-    println!("Type '/help' for commands, '/quit' or '/exit' to leave.");
     println!();
 }
 
@@ -589,8 +585,6 @@ fn run_interactive_repl(
     exit.store(false, Ordering::Relaxed);
 
     print_repl_banner(
-        engine,
-        backend_name,
         if direct_chat { "chat" } else { "agent" },
         &tools,
         max_turns,

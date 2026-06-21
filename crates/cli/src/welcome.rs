@@ -62,14 +62,18 @@ pub(crate) fn print_welcome_banner(model_id: &str) {
     let first_run = !marker_seen && !legacy_seen;
 
     if first_run {
-        eprintln!("{}", dim.apply_to(format!("▎ ARLE · model: {model_id}")));
         eprintln!(
             "{}",
-            dim.apply_to("▎ commands: /help  /reset  /tools  /quit      \\ at EOL = multi-line")
+            dim.apply_to("▎ Welcome to ARLE — type a message to begin, or /help for commands.")
+        );
+        eprintln!("{}", dim.apply_to(format!("▎ model: {model_id}")));
+        eprintln!(
+            "{}",
+            dim.apply_to("▎ /help  /reset  /tools  /quit · end a line with \\ for multi-line")
         );
         eprintln!(
             "{}",
-            dim.apply_to("▎ Ctrl-C to cancel generation · Ctrl-D to exit")
+            dim.apply_to("▎ Ctrl-C cancels a reply · Ctrl-D exits")
         );
     } else {
         eprintln!("{}", dim.apply_to(format!("▎ ARLE · model: {model_id}")));
