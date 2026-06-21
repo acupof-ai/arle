@@ -42,7 +42,11 @@
 #include <cstdint>
 
 #define MMA_BLOCK_M 16
-#define MMA_BLOCK_N 64
+// 4 warps × n8 = 32 N columns per block, so the grid MUST stride by 32. Was 64
+// — a latent bug: warps cover only n_block..n_block+31, leaving +32..+63
+// uncomputed for N>32 (half the output zero → cosine √(1/2)≈0.707 vs scalar).
+// Shared by the DSv4 and Qwen f32-block MMA kernels.
+#define MMA_BLOCK_N 32
 #define MMA_BLOCK_K 128
 #define MMA_WARPS 4
 #define MMA_THREADS (MMA_WARPS * 32)
@@ -322,5 +326,220 @@ extern "C" cudaError_t dsv4_fp8_gemv_batch_mma_launch(
     dim3 block(MMA_THREADS);
     dsv4_fp8_gemv_batch_mma_kernel<<<grid, block, 0, stream>>>(
         weight, scales, input, output, B, N, K, scale_rows, scale_cols);
+    return cudaGetLastError();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Qwen f32-block-scale port of dsv4_fp8_gemv_batch_mma_kernel.
+//
+// IDENTICAL to dsv4_fp8_gemv_batch_mma_kernel above — same FP8E4M3 weight
+// dequant, same mma.m16n8k16 BF16×BF16→FP32 mainloop, same A/B fragment
+// layout, same epilogue — EXCEPT the per-block weight scale is read from the
+// Qwen f32 block-scale tensor instead of the DSv4 E8M0 tensor:
+//
+//   DSv4 (above):  scales is `const uint8_t*` E8M0; block size derived from
+//                  scale_rows/scale_cols via block_h=⌈N/scale_rows⌉,
+//                  block_w=⌈K/scale_cols⌉; value = gemv_mma_decode_e8m0(bits).
+//   Qwen (here):   scales is `const float*` block-scale; block size given
+//                  EXPLICITLY as block_m × block_k (matching
+//                  fp8_f32_block_scale in quantized_gemv.cu:281-295); value =
+//                  the float itself (no E8M0 decode).
+//
+// The scale-decode swap mirrors the scalar Qwen kernel
+// (fp8_f32_block_gemv_batch_kernel, quantized_gemv.cu:791) which calls
+// fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m,
+// block_k). Here, like the DSv4 MMA kernel, we look up ONE scale per
+// (warp-N-row, MMA_BLOCK_K=128 K-chunk). That single lookup is only correct
+// when one block scale spans the whole 128-wide chunk, i.e. when block_k is a
+// multiple of MMA_BLOCK_K (128). Canonical Qwen3.6-27B-FP8 quant = 128×128 →
+// block_k == 128 → exactly one scale per kb (exact). The launcher REJECTS
+// (returns cudaErrorInvalidValue) any block_k % 128 != 0 so the caller falls
+// back to the scalar kernel, which does the finer per-16 lookup.
+__global__ void fp8_f32_block_gemv_batch_mma_kernel(
+    const uint8_t* __restrict__ weight,   // [N, K] FP8E4M3
+    const float* __restrict__ scales,     // [scale_rows, scale_cols] f32 block-scale
+    const __nv_bfloat16* __restrict__ input,  // [B, K] BF16
+    __nv_bfloat16* __restrict__ output,   // [B, N] BF16
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k)
+{
+    const int n_block = blockIdx.x * MMA_BLOCK_N;  // base N for this block
+    const int m_block = blockIdx.y * MMA_BLOCK_M;  // base B for this block
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int n_warp_base = n_block + warp_id * 8;  // each warp owns 8 N rows
+
+    if (n_warp_base >= N || m_block >= B) return;
+
+    // Qwen f32-block scale layout: block dimensions are passed explicitly
+    // (block_m × block_k), NOT derived from scale_rows/scale_cols. This is the
+    // ONLY structural difference vs the DSv4 MMA kernel. The scale-block row
+    // for this warp's 8 N rows is n_warp_base / block_m (all 8 share a row
+    // when block_m=128 and BLOCK_N=64).
+    const int sr_raw = n_warp_base / block_m;
+    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
+
+    // FP32 accumulator: 4 floats per warp (one m16n8 tile, 16 elements split
+    // across 32 threads → 4 per thread).
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+
+    // Iterate over K in BLOCK_K=128 chunks (matches Qwen quant block_k=128 at
+    // the canonical shape → one scale per chunk).
+    const int n_k_blocks = (K + MMA_BLOCK_K - 1) / MMA_BLOCK_K;
+    for (int kb = 0; kb < n_k_blocks; ++kb) {
+        const int k_base = kb * MMA_BLOCK_K;
+        // f32 block-scale lookup: scales[sr * scale_cols + sc], where sc is
+        // the column block index for this K chunk. value IS the scale (no
+        // E8M0 decode) — this is the DSv4→Qwen swap.
+        const int sc_raw = k_base / block_k;
+        const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
+        const float w_scale_f = scales[sr * scale_cols + sc];
+
+        // Inner k-loop: BLOCK_K=128 = 8 × k16 steps.
+        #pragma unroll
+        for (int ki = 0; ki < MMA_BLOCK_K; ki += 16) {
+            // ---- Load A fragment (activation = X, [BLOCK_M, k16]) ----
+            // Identical to dsv4_fp8_gemv_batch_mma_kernel.
+            const int m_row = lane_id / 4;        // 0..7
+            const int k_col_pair = (lane_id % 4) * 2;  // 0, 2, 4, 6
+
+            __nv_bfloat16 a_hi[2][2];  // [bank, pair]
+            __nv_bfloat16 a_lo[2][2];
+
+            #pragma unroll
+            for (int bank = 0; bank < 2; ++bank) {
+                const int m = m_block + m_row + bank * 8;
+                #pragma unroll
+                for (int pair = 0; pair < 2; ++pair) {
+                    const int k = k_base + ki + k_col_pair + pair * 8;
+                    if (m < B && m < m_block + MMA_BLOCK_M && k < K) {
+                        a_lo[bank][pair] = input[m * K + k];
+                        if (k + 1 < K) {
+                            a_hi[bank][pair] = input[m * K + k + 1];
+                        } else {
+                            a_hi[bank][pair] = __float2bfloat16(0.f);
+                        }
+                    } else {
+                        a_lo[bank][pair] = __float2bfloat16(0.f);
+                        a_hi[bank][pair] = __float2bfloat16(0.f);
+                    }
+                }
+            }
+
+            uint32_t a0 = pack_bf16x2(a_lo[0][0], a_hi[0][0]);
+            uint32_t a1 = pack_bf16x2(a_lo[1][0], a_hi[1][0]);
+            uint32_t a2 = pack_bf16x2(a_lo[0][1], a_hi[0][1]);
+            uint32_t a3 = pack_bf16x2(a_lo[1][1], a_hi[1][1]);
+
+            // ---- Load + dequant B fragment (weight = W, [k16, n8]) ----
+            // Identical to dsv4_fp8_gemv_batch_mma_kernel; only w_scale_f
+            // differs (f32 block-scale vs E8M0-decoded).
+            const int n_inwarp = lane_id / 4;         // 0..7 (which N within warp)
+            const int k_inwarp_lo = (lane_id % 4) * 2;  // 0, 2, 4, 6 (low half)
+
+            const int n_global = n_warp_base + n_inwarp;
+            uint32_t b0 = 0;
+            uint32_t b1 = 0;
+
+            if (n_global < N) {
+                const uint8_t* w_row = weight + (int64_t)n_global * K + k_base + ki;
+                // Low pair: k = k_inwarp_lo .. k_inwarp_lo + 1
+                float w0f = gemv_mma_decode_fp8_e4m3(w_row[k_inwarp_lo]) * w_scale_f;
+                float w1f = gemv_mma_decode_fp8_e4m3(w_row[k_inwarp_lo + 1]) * w_scale_f;
+                __nv_bfloat16 w0 = __float2bfloat16(w0f);
+                __nv_bfloat16 w1 = __float2bfloat16(w1f);
+                b0 = pack_bf16x2(w0, w1);
+
+                // High pair: k = k_inwarp_lo + 8 .. k_inwarp_lo + 9
+                if (k_base + ki + k_inwarp_lo + 8 < K) {
+                    float w8f = gemv_mma_decode_fp8_e4m3(w_row[k_inwarp_lo + 8]) * w_scale_f;
+                    float w9f = gemv_mma_decode_fp8_e4m3(w_row[k_inwarp_lo + 9]) * w_scale_f;
+                    __nv_bfloat16 w8 = __float2bfloat16(w8f);
+                    __nv_bfloat16 w9 = __float2bfloat16(w9f);
+                    b1 = pack_bf16x2(w8, w9);
+                }
+            }
+
+            // ---- Issue MMA ----
+            mma_m16n8k16_bf16(a0, a1, a2, a3, b0, b1, d0, d1, d2, d3);
+        }
+    }
+
+    // Epilogue: write D (FP32) → BF16 output[B, N]. Identical to
+    // dsv4_fp8_gemv_batch_mma_kernel.
+    {
+        const int m_row = lane_id / 4;          // 0..7
+        const int n_col_base = (lane_id % 4) * 2;  // 0, 2, 4, 6 within warp's 8-N slot
+
+        #pragma unroll
+        for (int bank = 0; bank < 2; ++bank) {
+            const int m = m_block + m_row + bank * 8;
+            if (m >= B || m >= m_block + MMA_BLOCK_M) continue;
+            #pragma unroll
+            for (int col = 0; col < 2; ++col) {
+                const int n = n_warp_base + n_col_base + col;
+                if (n >= N || n >= n_warp_base + 8) continue;
+                float val;
+                if (bank == 0 && col == 0) val = d0;
+                else if (bank == 0 && col == 1) val = d1;
+                else if (bank == 1 && col == 0) val = d2;
+                else val = d3;
+                output[m * N + n] = __float2bfloat16(val);
+            }
+        }
+    }
+}
+
+// Host entry point for the Qwen f32-block-scale FP8 MMA GEMV. Mirrors
+// dsv4_fp8_gemv_batch_mma_launch plus the explicit block_m/block_k args of the
+// Qwen scalar path (gemv_fp8_block_scaled_batch_cuda, quantized_gemv.cu:3141).
+// Dispatched from quant_linear.rs as the DEFAULT decode path; self-gates on
+// N%8 / K%16 AND on the scale granularity matching the MMA K-tile (block_k a
+// multiple of MMA_BLOCK_K=128, so one scale covers a full kb chunk), returning
+// cudaErrorInvalidValue otherwise so the caller falls back to the scalar
+// kernel.
+extern "C" cudaError_t gemv_fp8_block_scaled_batch_mma_launch(
+    const uint8_t* weight,
+    const float* scales,
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k,
+    cudaStream_t stream)
+{
+    if (B <= 0 || N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0 ||
+        block_m <= 0 || block_k <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    // MMA tile requires N % 8 == 0 and K % 16 == 0. Qwen3.6-27B-FP8 hidden
+    // dims satisfy this. Caller falls back to scalar otherwise.
+    if ((N & 7) != 0 || (K & 15) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    // The kernel reads ONE block scale per MMA_BLOCK_K (=128) K-chunk. That is
+    // only correct when block_k is a multiple of MMA_BLOCK_K (so a single
+    // (sr,sc) scale spans the whole 128-wide chunk). Canonical Qwen FP8 is
+    // block_k = 128 (== MMA_BLOCK_K) → exact. Reject other granularities so
+    // the scalar fallback handles them.
+    if ((block_k % MMA_BLOCK_K) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid((N + MMA_BLOCK_N - 1) / MMA_BLOCK_N,
+              (B + MMA_BLOCK_M - 1) / MMA_BLOCK_M);
+    dim3 block(MMA_THREADS);
+    fp8_f32_block_gemv_batch_mma_kernel<<<grid, block, 0, stream>>>(
+        weight, scales, input, output, B, N, K, scale_rows, scale_cols,
+        block_m, block_k);
     return cudaGetLastError();
 }
