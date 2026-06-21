@@ -1440,9 +1440,10 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
     // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
     // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
-    // Self-consistency mode frees the ~35GB judge VRAM, so checkpointing is off
-    // there (faster backward — no activation recompute).
-    if args.grad_checkpointing && !args.self_consistency {
+    // This holds in self-consistency mode too: freeing the judge inference VRAM
+    // does NOT cover the full no-checkpoint activation set, so the CE micro-batch
+    // still OOMs at alloc_zeros (observed). Always honor the flag.
+    if args.grad_checkpointing {
         student.set_gradient_checkpointing(true);
     }
     let all_params: Vec<TensorId> = student.all_parameter_ids();
