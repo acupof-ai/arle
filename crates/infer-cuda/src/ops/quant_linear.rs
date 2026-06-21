@@ -94,13 +94,18 @@ fn qwen_fp8_deepgemm_dense_enabled() -> bool {
     })
 }
 
-/// Log exactly once which Qwen FP8 dense decode GEMV path is taken (MMA vs
-/// scalar fallback), mirroring the one-shot `log::warn!` discipline used by
-/// `qwen_fp8_deepgemm_dense_enabled`.
-fn log_qwen_fp8_gemv_path(mma: bool) {
+/// Log exactly once which path the *decode* GEMV (seq_len <= 16) takes — MMA vs
+/// scalar fallback. Prefill (seq_len > 16) always uses the scalar kernel by
+/// design and is NOT logged here: logging the prefill call first would consume
+/// the OnceLock with a "scalar fallback" line and mask the decode path, which
+/// reads (wrongly) as "MMA never engages".
+fn log_qwen_fp8_gemv_path(attempted_mma: bool, mma_ok: bool) {
+    if !attempted_mma {
+        return;
+    }
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
-        if mma {
+        if mma_ok {
             log::info!(
                 "Qwen FP8 dense decode GEMV: tensor-core MMA path (default; \
                  gemv_fp8_block_scaled_batch_mma_launch)"
@@ -108,7 +113,7 @@ fn log_qwen_fp8_gemv_path(mma: bool) {
         } else {
             log::info!(
                 "Qwen FP8 dense decode GEMV: scalar fallback \
-                 (gemv_fp8_block_scaled_batch_cuda; shape not MMA-tileable)"
+                 (gemv_fp8_block_scaled_batch_cuda; MMA launch rejected this decode shape)"
             );
         }
     });
@@ -447,7 +452,7 @@ pub(super) fn gemm_batch(
                 } else {
                     false
                 };
-                log_qwen_fp8_gemv_path(mma_ok);
+                log_qwen_fp8_gemv_path(mma, mma_ok);
                 if !mma_ok {
                     qwen_quant_profile(
                         ctx,
