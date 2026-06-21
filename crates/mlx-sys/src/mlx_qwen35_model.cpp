@@ -452,6 +452,30 @@ CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits) {
     return cache.emplace(key, mlx::core::compile(impl, false)).first->second;
 }
 
+// Compiled fused separate-MLP: gate matmul + up matmul -> swiglu -> down matmul.
+// Used for mixed-bit MLP (OptiQ gate=4-bit/up=8-bit) where gate/up are kept as
+// two separate quantized weights (no merged gate_up). Encoded ONCE per
+// (gate_dim, gate_bits, up_bits, down_bits, gs) — no split needed since gate and
+// up are already separate. Mirrors compiled_mlp_fn (shaped, decode S=1 only).
+CompiledFn& compiled_mlp_separate_fn(
+    int gate_dim, int gate_bits, int up_bits, int down_bits, int gs) {
+    static std::map<std::tuple<int, int, int, int, int>, CompiledFn> cache;
+    auto key = std::make_tuple(gate_dim, gate_bits, up_bits, down_bits, gs);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    auto impl = [gs, gate_bits, up_bits, down_bits](
+                    const std::vector<array>& in) -> std::vector<array> {
+        // in = [x, gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b]
+        auto g = quantized_matmul(in[0], in[1], in[2], in[3], true, gs, gate_bits);
+        auto u = quantized_matmul(in[0], in[4], in[5], in[6], true, gs, up_bits);
+        auto h = (g * sigmoid(g)) * u;  // swiglu, inlined for fusion
+        return {quantized_matmul(h, in[7], in[8], in[9], true, gs, down_bits)};
+    };
+    return cache.emplace(key, mlx::core::compile(impl, false)).first->second;
+}
+
 // Compiled precise SiLU-mul: silu(gate.f32) * x.f32 -> x.dtype
 std::vector<array> precise_silu_mul_impl(const std::vector<array>& inputs) {
     auto gate = astype(inputs[0], float32);
@@ -562,6 +586,12 @@ struct FullAttnLayerWeights {
     QWeight q_proj, k_proj, v_proj, o_proj;
     array q_norm_w = array(0), k_norm_w = array(0);
     QWeight gate_up, down;
+    // Separate gate/up projections for mixed-bit MLP (e.g. OptiQ gate=4-bit,
+    // up=8-bit) that cannot row-merge into a single quantized gate_up. When set,
+    // forward routes through mlp_separate (two quantized matmuls) instead of the
+    // merged-then-dequantized dense gate_up path.
+    QWeight gate_proj, up_proj;
+    bool has_separate_mlp = false;
     bool has_qk_gate = true;  // true for Qwen3.5 (q_dim = nh*hd*2), false for Qwen3
     int gate_dim = 0;
 };
@@ -753,7 +783,10 @@ struct Qwen35CompiledModel {
     }
 
     bool use_separate_mlp_for_current_step(const GdrLayerWeights& lw) const {
-        return lw.has_separate_mlp && use_qwen35_cpp_separate_mlp();
+        // Env-gated when a merged gate_up exists (gate_dim > 0); unconditional when
+        // only separate gate/up were registered (mixed-bit MLP has no merged path).
+        return lw.has_separate_mlp
+            && (use_qwen35_cpp_separate_mlp() || lw.gate_dim == 0);
     }
 
     static bool contains_layer_id(const std::vector<int>* layer_ids, int layer_id) {
@@ -1457,6 +1490,26 @@ struct Qwen35CompiledModel {
         const QWeight& down,
         bool prefer_verify_m16
     ) const {
+        // Compiled fast path: standard quantized weights at decode (S=1) — the two
+        // matmuls + swiglu + down matmul encode once per (gate_dim, bits..., gs).
+        // Falls back to the per-op path for gguf/dense/verify/reordered weights.
+        // Gated under INFER_METAL_NO_MLP_COMPILE (same flag as compiled_mlp_fn) so
+        // it can be A/B'd against the uncompiled path.
+        static const bool mlp_compile = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
+        if (mlp_compile && !prefer_verify_m16
+            && x.ndim() == 3 && x.shape(1) == 1  // decode only (fixed shape for the shaped compile)
+            && gate.gguf_format == 0 && up.gguf_format == 0 && down.gguf_format == 0
+            && !gate.is_dense && !up.is_dense && !down.is_dense
+            && !gate.reorder_input_v_cols && !up.reorder_input_v_cols
+            && !down.reorder_input_v_cols
+            && gate.group_size == up.group_size && gate.group_size == down.group_size) {
+            int gate_dim = gate.w.shape(0);  // output rows of the gate projection
+            return compiled_mlp_separate_fn(
+                gate_dim, gate.bits, up.bits, down.bits, gate.group_size)(
+                {x, gate.w, gate.scales, gate.biases,
+                 up.w, up.scales, up.biases,
+                 down.w, down.scales, down.biases})[0];
+        }
         auto g = gate.apply(x, prefer_verify_m16);
         auto u = up.apply(x, prefer_verify_m16);
         auto h = compiled_swiglu()({g, u})[0];
@@ -1658,6 +1711,18 @@ struct Qwen35CompiledModel {
                         layer.gdr.gate_proj,
                         layer.gdr.up_proj,
                         layer.gdr.down,
+                        prefer_verify_m16);
+            } else if (!layer.is_gdr && layer.full.has_separate_mlp) {
+                // Mixed-bit MLP (e.g. OptiQ gate=4-bit/up=8-bit): gate and up
+                // cannot row-merge into one quantized gate_up, so they run as two
+                // separate quantized matmuls. This is unconditional (no env gate):
+                // a separate-mlp full-attn layer has no merged gate_up fallback.
+                x = residual2
+                    + mlp_separate(
+                        xn2,
+                        layer.full.gate_proj,
+                        layer.full.up_proj,
+                        layer.full.down,
                         prefer_verify_m16);
             } else {
                 auto& gu = layer.is_gdr ? layer.gdr.gate_up : layer.full.gate_up;
@@ -2090,9 +2155,13 @@ void qwen35_compiled_push_full_attn_v2(
         lw.full.o_proj = qwen35_weight_by_id(m, o_id);
         lw.full.q_norm_w = *to_arr(q_norm);
         lw.full.k_norm_w = *to_arr(k_norm);
-        if (gate_up_id >= 0 && down_id >= 0) {
-            lw.full.gate_up = qwen35_weight_by_id(m, gate_up_id);
+        // down is always set when present; gate_up only when a merged projection
+        // exists (gate_up_id < 0 for mixed-bit MLP, which uses set_full_separate_mlp).
+        if (down_id >= 0) {
             lw.full.down = qwen35_weight_by_id(m, down_id);
+        }
+        if (gate_up_id >= 0) {
+            lw.full.gate_up = qwen35_weight_by_id(m, gate_up_id);
             lw.full.gate_dim = gate_dim;
         }
         m->layers.push_back(std::move(lw));
@@ -2152,9 +2221,13 @@ void qwen35_compiled_push_gdr_v2(
         float inv = 1.0f / std::sqrt((float)key_dim);
         lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
         lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
-        if (gate_up_id >= 0 && down_id >= 0) {
-            lw.gdr.gate_up = qwen35_weight_by_id(m, gate_up_id);
+        // down is always set when present; gate_up only when a merged projection
+        // exists (gate_up_id < 0 for mixed-bit MLP, which uses set_separate_mlp).
+        if (down_id >= 0) {
             lw.gdr.down = qwen35_weight_by_id(m, down_id);
+        }
+        if (gate_up_id >= 0) {
+            lw.gdr.gate_up = qwen35_weight_by_id(m, gate_up_id);
             lw.gdr.gate_dim = gate_dim;
         }
         m->layers.push_back(std::move(lw));
@@ -2277,6 +2350,23 @@ void qwen35_compiled_set_separate_mlp_v2(
     MLX_TRY_VOID({
         auto* m = static_cast<Qwen35CompiledModel*>(model);
         auto& lw = m->layers.back().gdr;
+        lw.gate_proj = qwen35_weight_by_id(m, gate_id);
+        lw.up_proj = qwen35_weight_by_id(m, up_id);
+        lw.has_separate_mlp = true;
+    });
+}
+
+// Set separate gate/up MLP projections for the last-pushed FULL-ATTENTION layer.
+// Used for mixed-bit MLP (OptiQ gate=4-bit/up=8-bit) that cannot row-merge into
+// a single quantized gate_up. Call AFTER qwen35_compiled_push_full_attn_v2 with
+// gate_up_id=-1/down_id passed for the down projection only.
+void qwen35_compiled_set_full_separate_mlp_v2(
+    void* model,
+    int32_t gate_id,
+    int32_t up_id) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        auto& lw = m->layers.back().full;
         lw.gate_proj = qwen35_weight_by_id(m, gate_id);
         lw.up_proj = qwen35_weight_by_id(m, up_id);
         lw.has_separate_mlp = true;
