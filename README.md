@@ -86,7 +86,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 <sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="benchmarks/README.md">snapshot + method</a></sub>
 
-**Speculative decode breaks the memory-bandwidth wall — Qwen3.6-27B (OptiQ mixed-4/8-bit, dense GatedDeltaNet).** The model's own NextN/MTP head drafts and the base verifies (output bit-identical to greedy): **12.3 → 17.75 tok/s, +44%** — *past* the **15.2 tok/s HBM floor** (M4 Pro 273 GB/s ÷ ~18 GB weights), the one lever no kernel or framework can reach. Quality held: **PPL 7.82** (vs uniform-4bit's 8.56) · 68.8% draft acceptance.
+**Speculative decode breaks the memory-bandwidth wall — Qwen3.6-27B (OptiQ mixed-4/8-bit, dense GatedDeltaNet).** The model's own NextN/MTP head drafts and the base verifies (output bit-identical to greedy): **12.3 → 18.1 tok/s (+47%)** at depth 2 — *past* the **15.2 tok/s HBM floor** (M4 Pro 273 GB/s ÷ ~18 GB weights), the one lever no kernel or framework can reach. Quality held: **PPL 7.82** (vs uniform-4bit's 8.56) · 68.8% draft acceptance. **Default-on**: `arle serve --backend metal --model-path mlx-community/Qwen3.6-27B-OptiQ-4bit` auto-downloads the NextN-MTP head and enables it; pass `--no-speculative` to disable, or `--draft-model <id> --speculative-tokens <N>` to override.
 
 **NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8.
 

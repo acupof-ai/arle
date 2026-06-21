@@ -26,6 +26,19 @@ fn parse_max_tokens_or_auto(value: &str) -> Result<usize, String> {
     parse_positive_usize(trimmed)
 }
 
+/// `--speculative-tokens` draft depth. The Metal DFlash runtime clamps the
+/// effective block size into `[2, draft_head_block_size]` and rejects a depth
+/// below 2, so reject `0`/`1` at the CLI boundary with a clear message.
+fn parse_speculative_tokens(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got '{value}'"))?;
+    if parsed < 2 {
+        return Err("speculative draft depth must be at least 2".to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_temperature(value: &str) -> Result<f32, String> {
     let parsed = value
         .parse::<f32>()
@@ -483,6 +496,23 @@ pub(crate) struct ServeArgs {
     /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
+
+    /// Metal speculative-decode draft head (HF id or local dir). When set, the
+    /// Metal backend drafts with this NextN/MTP head and verifies on the base
+    /// (bit-identical to greedy). Overrides the `INFER_METAL_DFLASH_DRAFT_MODEL`
+    /// env fallback. Auto-resolved for Qwen3.6-27B unless `--no-speculative`.
+    #[arg(long, value_name = "HF_ID_OR_PATH")]
+    pub(crate) draft_model: Option<String>,
+
+    /// Metal speculative draft depth (NextN/MTP tokens proposed per verify
+    /// block). Default 2 is the measured optimum on Qwen3.6-27B (~18.1 tok/s).
+    #[arg(long, default_value_t = 2, value_parser = parse_speculative_tokens, value_name = "N")]
+    pub(crate) speculative_tokens: usize,
+
+    /// Disable Metal speculative decode, including the Qwen3.6-27B default-on
+    /// auto-enable. Forces plain single-token decode.
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_speculative: bool,
 
     /// MTP root-branch top-k width on CUDA D2; D2/T2 verifies root + candidates.
     #[arg(long, value_name = "K")]
@@ -1191,6 +1221,84 @@ mod tests {
                 assert_eq!(serve.extra_args, ["--max-waiting", "8"]);
             }
             other => panic!("expected serve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_serve_speculative_flags() {
+        let args = Args::try_parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "models/qwen36-27b",
+            "--draft-model",
+            "mlx-community/Qwen3.6-27B-MTP-4bit",
+            "--speculative-tokens",
+            "3",
+        ])
+        .expect("serve speculative flags should parse");
+        match args.command.expect("serve command") {
+            CliCommand::Serve(serve) => {
+                assert_eq!(
+                    serve.draft_model.as_deref(),
+                    Some("mlx-community/Qwen3.6-27B-MTP-4bit")
+                );
+                assert_eq!(serve.speculative_tokens, 3);
+                assert!(!serve.no_speculative);
+            }
+            other => panic!("expected serve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_speculative_tokens_defaults_to_two() {
+        let args = Args::try_parse_from(["arle", "serve", "--model-path", "models/qwen36-27b"])
+            .expect("serve should parse");
+        match args.command.expect("serve command") {
+            CliCommand::Serve(serve) => {
+                assert_eq!(serve.speculative_tokens, 2);
+                assert!(serve.draft_model.is_none());
+                assert!(!serve.no_speculative);
+            }
+            other => panic!("expected serve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_serve_no_speculative_flag() {
+        let args = Args::try_parse_from([
+            "arle",
+            "serve",
+            "--model-path",
+            "models/qwen36-27b",
+            "--no-speculative",
+        ])
+        .expect("serve --no-speculative should parse");
+        match args.command.expect("serve command") {
+            CliCommand::Serve(serve) => assert!(serve.no_speculative),
+            other => panic!("expected serve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_serve_speculative_tokens_below_two() {
+        for bad in ["0", "1"] {
+            let err = Args::try_parse_from([
+                "arle",
+                "serve",
+                "--model-path",
+                "models/qwen36-27b",
+                "--speculative-tokens",
+                bad,
+            ])
+            .err()
+            .unwrap_or_else(|| panic!("speculative depth `{bad}` should be rejected"));
+            assert!(
+                err.to_string().contains("at least 2"),
+                "unexpected error for `{bad}`: {err}"
+            );
         }
     }
 

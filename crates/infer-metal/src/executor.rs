@@ -407,7 +407,7 @@ impl MetalExecutor {
         }
         eprintln!("[infer-metal] kv cache dtype = {}", kv_cache_dtype.label());
         let weights = qwen35::load_qwen35_metal_weights(resolved, &config)?;
-        let dflash = load_dflash_from_env(&config)?;
+        let dflash = resolve_dflash(resolved, &config)?;
         Ok(Self {
             real: Some(RealMetalExecutor {
                 config,
@@ -2568,24 +2568,73 @@ fn round_up_capacity(tokens: usize) -> i32 {
     ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
 }
 
+/// NextN/MTP draft head auto-resolved for the Qwen3.6-27B family when the user
+/// gives no explicit draft and does not opt out. Auto-downloads through the same
+/// `model_source::resolve_model_path` hf_hub path as `--model-path`.
 #[cfg(feature = "metal")]
-fn load_dflash_from_env(
+const QWEN36_27B_DEFAULT_DRAFT_MODEL: &str = "mlx-community/Qwen3.6-27B-MTP-4bit";
+
+/// Default speculative draft depth (measured optimum on Qwen3.6-27B: ~18.1 tok/s
+/// vs ~12.3 no-spec). Matches the `arle serve --speculative-tokens` default.
+#[cfg(feature = "metal")]
+const METAL_DEFAULT_SPECULATIVE_TOKENS: usize = 2;
+
+/// True when the served model is Qwen3.6-27B-family, so its NextN/MTP draft head
+/// should be auto-enabled. Matches on the resolved id/path containing
+/// `Qwen3.6-27B` — OptiQ (`...-27B-OptiQ-4bit`) and MTP variants match; Qwen3.5
+/// and the 35B-A3B MoE do not. The cache snapshot dir name
+/// (`models--mlx-community--Qwen3.6-27B-OptiQ-4bit`) carries the substring, as do
+/// local dirs (`models/Qwen3.6-27B-...`).
+#[cfg(feature = "metal")]
+fn is_qwen36_27b_model(resolved: &Path) -> bool {
+    resolved.to_string_lossy().contains("Qwen3.6-27B")
+}
+
+/// Resolve the Metal DFlash speculative-decode runtime for the served model.
+///
+/// Precedence (single canonical path; the CLI lowers its flags into the same env
+/// before this runs, so a CLI flag wins over a stale user env value):
+///   1. `INFER_METAL_NO_SPECULATIVE` set → speculative decode disabled (the
+///      `--no-speculative` opt-out, also suppressing the Qwen3.6-27B auto-enable).
+///   2. `INFER_METAL_DFLASH_DRAFT_MODEL` non-empty → explicit draft head.
+///   3. Qwen3.6-27B-family served model → auto-enable the NextN-MTP draft head at
+///      the default depth, downloading it on first use.
+///   4. otherwise → no speculative decode.
+#[cfg(feature = "metal")]
+fn resolve_dflash(
+    resolved: &Path,
     config: &config::MetalModelConfig,
 ) -> anyhow::Result<Option<dflash::MetalDflashRuntime>> {
-    let Ok(draft_model) = std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL") else {
-        return Ok(None);
-    };
-    let draft_model = draft_model.trim().to_string();
-    if draft_model.is_empty() {
+    if env_flag_set("INFER_METAL_NO_SPECULATIVE") {
         return Ok(None);
     }
+
+    let env_draft = std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let (draft_model, default_tokens) = match env_draft {
+        Some(draft) => (draft, None),
+        None if is_qwen36_27b_model(resolved) => {
+            eprintln!(
+                "[infer-metal] speculative decode auto-enabled: NextN-MTP head {QWEN36_27B_DEFAULT_DRAFT_MODEL}, depth {METAL_DEFAULT_SPECULATIVE_TOKENS}"
+            );
+            (
+                QWEN36_27B_DEFAULT_DRAFT_MODEL.to_string(),
+                Some(METAL_DEFAULT_SPECULATIVE_TOKENS),
+            )
+        }
+        None => return Ok(None),
+    };
+
     let speculative_tokens = match std::env::var("INFER_METAL_DFLASH_TOKENS") {
         Ok(value) if !value.trim().is_empty() => {
             Some(value.trim().parse::<usize>().map_err(|err| {
                 anyhow::anyhow!("invalid INFER_METAL_DFLASH_TOKENS='{value}': {err}")
             })?)
         }
-        _ => None,
+        _ => default_tokens,
     };
     let max_rows = match std::env::var("INFER_METAL_DFLASH_MAX_ROWS") {
         Ok(value) if !value.trim().is_empty() => value.trim().parse::<usize>().map_err(|err| {
@@ -2599,6 +2648,16 @@ fn load_dflash_from_env(
         max_rows,
     };
     dflash::MetalDflashRuntime::load(&options, config).map(Some)
+}
+
+/// True when an env var is set to a non-empty, non-`0`/`false` value. Used for
+/// the `--no-speculative` opt-out marker the CLI exports.
+#[cfg(feature = "metal")]
+fn env_flag_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let v = value.trim();
+        !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+    })
 }
 
 #[cfg(feature = "metal")]
@@ -2728,6 +2787,38 @@ mod tests {
         );
         assert!(MetalKvCacheDtype::resolve(KvCacheDtype::Fp8).is_err());
         assert!(MetalKvCacheDtype::resolve(KvCacheDtype::Tq4).is_err());
+    }
+
+    // Qwen3.6-27B-family auto-enable detection must fire for OptiQ + MTP variants
+    // (whose cache-dir / id carries `Qwen3.6-27B`) and must NOT misfire on
+    // Qwen3.5 or the 35B-A3B MoE — otherwise a non-MTP model would try to load a
+    // mismatched draft head.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qwen36_27b_detection_matches_family_and_rejects_others() {
+        use std::path::Path;
+        // Positive: OptiQ + MTP, both HF cache-dir and local-dir shapes.
+        for p in [
+            "/u/.cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-OptiQ-4bit/snapshots/abc",
+            "/u/.cache/huggingface/hub/models--mlx-community--Qwen3.6-27B-MTP-4bit/snapshots/abc",
+            "models/Qwen3.6-27B-OptiQ-4bit",
+        ] {
+            assert!(
+                is_qwen36_27b_model(Path::new(p)),
+                "expected Qwen3.6-27B detection for {p}"
+            );
+        }
+        // Negative: Qwen3.5 and the 35B-A3B MoE must not auto-enable.
+        for p in [
+            "models/Qwen3.5-0.8B-MLX-4bit",
+            "models/Qwen3.5-4B",
+            "/u/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/abc",
+        ] {
+            assert!(
+                !is_qwen36_27b_model(Path::new(p)),
+                "expected NO Qwen3.6-27B detection for {p}"
+            );
+        }
     }
 
     // Regression guard for the "K/V slice token range [..] exceeds shape=[..]"
