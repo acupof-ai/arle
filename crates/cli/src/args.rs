@@ -1009,6 +1009,14 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 4)]
     pub(crate) writeback_batch: usize,
 
+    /// Mode B: max Flash corrections written back per round (0 = select-only Mode A).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) correction_cap: usize,
+
+    /// Max new tokens for a Mode B correction solution.
+    #[arg(long, default_value_t = 1024)]
+    pub(crate) correction_max_tokens: usize,
+
     /// Max new tokens per sampled rollout.
     #[arg(long, default_value_t = 1024)]
     pub(crate) max_new_tokens: usize,
@@ -1067,6 +1075,12 @@ pub(crate) struct TrainRubricOpdArgs {
     /// Save a checkpoint every N rounds (0 = final round only).
     #[arg(long, default_value_t = 1)]
     pub(crate) save_every: usize,
+
+    /// Directory for fast adapter-only (LoRA) safetensors saves
+    /// (adapters_round{N}.safetensors). The full-materialize save host-loops the
+    /// merged 27B weights and hangs; this writes only the tiny adapter matrices.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_lora_adapters: Option<PathBuf>,
 
     /// Optional eval set (jsonl with `problem` + `answer` gold). Scored in-process
     /// via the rollout engine BEFORE training (base) and after each round — no
