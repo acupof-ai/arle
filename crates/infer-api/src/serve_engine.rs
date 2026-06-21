@@ -123,7 +123,58 @@ where
             )
             .map_err(|err| anyhow!("request submission failed: {err}"))?;
         let completed: CompletedRequest = ticket.collect()?;
+        self.project_completion(prompt_token_ids, req, completed)
+    }
 
+    /// Batched sibling of [`run`]: submit ALL completion requests first
+    /// (non-blocking) so the continuous-batching engine thread decodes them
+    /// together, then collect + post-process each in order. The OPD judge ran
+    /// one verdict at a time (submit→collect per rollout), which left the
+    /// batcher idle and made the judge decode memory-bandwidth-bound at B=1;
+    /// batching amortizes the weight reads across the rollout set. Each result
+    /// is byte-for-byte what `run(&req)` would produce for that request.
+    #[cfg(feature = "cuda")]
+    pub fn complete_batch(&self, reqs: Vec<CompletionRequest>) -> Result<Vec<CompletionOutput>> {
+        // Pass 1: tokenize + submit every request without waiting (fills the
+        // batcher). Keep the request + its prompt token ids alongside the ticket
+        // so pass 2 reproduces `run`'s post-processing exactly.
+        let mut pending = Vec::with_capacity(reqs.len());
+        for req in reqs {
+            let prompt_token_ids = self
+                .tokenizer
+                .encode(&req.prompt)
+                .map_err(|err| anyhow!("tokenize prompt failed: {err}"))?;
+            let ticket = self
+                .serve
+                .submit(
+                    prompt_token_ids.clone(),
+                    req.max_tokens,
+                    req.sampling.clone(),
+                )
+                .map_err(|err| anyhow!("request submission failed: {err}"))?;
+            pending.push((ticket, prompt_token_ids, req));
+        }
+        // Pass 2: collect each ticket and project to `CompletionOutput` with the
+        // same stop-string truncation + finish-reason logic as `run`.
+        pending
+            .into_iter()
+            .map(|(ticket, prompt_token_ids, req)| {
+                let completed: CompletedRequest = ticket.collect()?;
+                Ok(self.project_completion(prompt_token_ids, &req, completed)?)
+            })
+            .collect()
+    }
+
+    /// Project a collected [`CompletedRequest`] into the public
+    /// [`CompletionOutput`]: decode the response, apply host-side stop-string
+    /// truncation, and resolve the finish reason. Shared by `run` and
+    /// `complete_batch` so both paths produce identical outputs.
+    fn project_completion(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        req: &CompletionRequest,
+        completed: CompletedRequest,
+    ) -> Result<CompletionOutput> {
         let response_token_ids = completed.generated_tokens.clone();
         let raw_text = self
             .tokenizer

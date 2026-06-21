@@ -1025,6 +1025,10 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 512)]
     pub(crate) max_verdict_tokens: usize,
 
+    /// KV slots for the judge engine (>1 batches judging; VRAM-gated at 3-model residency).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) judge_num_slots: usize,
+
     /// Rollout sampling temperature (>0 for rejection-sampling diversity).
     #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
     pub(crate) rollout_temperature: f32,
