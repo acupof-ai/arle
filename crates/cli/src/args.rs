@@ -1029,6 +1029,16 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) judge_num_slots: usize,
 
+    /// Self-consistency mode: one model judges itself via majority-vote on \boxed
+    /// (no 35B judge loaded; frees ~35GB). teacher-model is ignored.
+    #[arg(long, default_value_t = false)]
+    pub(crate) self_consistency: bool,
+
+    /// KV slots for the rollout engine (self-consistency frees VRAM -> set higher,
+    /// e.g. 16, for batched sampling/eval).
+    #[arg(long, default_value_t = 2)]
+    pub(crate) rollout_num_slots: usize,
+
     /// Rollout sampling temperature (>0 for rejection-sampling diversity).
     #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
     pub(crate) rollout_temperature: f32,

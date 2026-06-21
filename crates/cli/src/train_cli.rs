@@ -1440,7 +1440,9 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
     // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
     // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
-    if args.grad_checkpointing {
+    // Self-consistency mode frees the ~35GB judge VRAM, so checkpointing is off
+    // there (faster backward — no activation recompute).
+    if args.grad_checkpointing && !args.self_consistency {
         student.set_gradient_checkpointing(true);
     }
     let all_params: Vec<TensorId> = student.all_parameter_ids();
@@ -1517,9 +1519,9 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             // load, and three models are co-resident (~92/96 GB): num_slots=4
             // OOM'd the 35B-judge weight upload, so 2 is the headroom-safe max
             // (eval scheduler runs 2 at a time + queues the rest).
-            num_slots: 2,
+            num_slots: args.rollout_num_slots,
             page_size: 16,
-            total_pages: 2 * student_seq.div_ceil(16),
+            total_pages: args.rollout_num_slots.max(1) * student_seq.div_ceil(16),
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: student_seq,
@@ -1534,29 +1536,41 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     );
 
     // Judge engine (DeepSeek-V4-Flash) — text in, verdict out (own tokenizer).
-    let judge_prompt_cap = (student_seq * 2 + 1024).max(2048);
-    let judge_total = judge_prompt_cap + args.max_verdict_tokens;
-    eprintln!(
-        "[arle train rubric-opd] loading Flash judge from {} (max_total={judge_total})",
-        teacher_dir.display()
-    );
-    let judge_engine = LoadedInferenceEngine::load_with_config(
-        teacher_dir
-            .to_str()
-            .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?,
-        true,
-        EngineLoadConfig {
-            num_slots: args.judge_num_slots,
-            page_size: 16,
-            total_pages: args.judge_num_slots.max(1) * judge_total.div_ceil(16),
-            max_prompt_tokens: judge_prompt_cap,
-            max_total_tokens: judge_total,
-            chunked_prefill_size: judge_prompt_cap,
-            ..EngineLoadConfig::default()
-        },
-    )
-    .with_context(|| format!("load Flash judge from {}", teacher_dir.display()))?;
-    let judge = FlashJudge::new(Arc::new(Mutex::new(judge_engine)), args.max_verdict_tokens);
+    // Self-consistency mode loads NO judge (the student majority-votes on its own
+    // \boxed answer), freeing the ~35GB judge VRAM; teacher-model is ignored.
+    let judge = if args.self_consistency {
+        eprintln!(
+            "[arle train rubric-opd] self-consistency mode: no judge engine loaded (majority-vote on \\boxed)"
+        );
+        None
+    } else {
+        let judge_prompt_cap = (student_seq * 2 + 1024).max(2048);
+        let judge_total = judge_prompt_cap + args.max_verdict_tokens;
+        eprintln!(
+            "[arle train rubric-opd] loading Flash judge from {} (max_total={judge_total})",
+            teacher_dir.display()
+        );
+        let judge_engine = LoadedInferenceEngine::load_with_config(
+            teacher_dir
+                .to_str()
+                .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?,
+            true,
+            EngineLoadConfig {
+                num_slots: args.judge_num_slots,
+                page_size: 16,
+                total_pages: args.judge_num_slots.max(1) * judge_total.div_ceil(16),
+                max_prompt_tokens: judge_prompt_cap,
+                max_total_tokens: judge_total,
+                chunked_prefill_size: judge_prompt_cap,
+                ..EngineLoadConfig::default()
+            },
+        )
+        .with_context(|| format!("load Flash judge from {}", teacher_dir.display()))?;
+        Some(FlashJudge::new(
+            Arc::new(Mutex::new(judge_engine)),
+            args.max_verdict_tokens,
+        ))
+    };
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let rubric = match args.rubric_task {
@@ -1611,7 +1625,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             let tok_ref = &tokenizer;
             run_rubric_rounds(
                 &infer_student,
-                &judge,
+                judge.as_ref(),
                 &rubric,
                 &prompts,
                 &round_cfg,
