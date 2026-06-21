@@ -18,7 +18,7 @@ use infer_api::{CompletionRequest, InferenceEngine, LoadedInferenceEngine, Sampl
 #[cfg(feature = "cuda")]
 use crate::infer_student::InferStudent;
 #[cfg(feature = "cuda")]
-use crate::rubric::{Rubric, Verdict, select};
+use crate::rubric::{Rubric, Verdict, select, select_by_self_consistency};
 
 /// A text judge backed by a strong teacher engine (DeepSeek-V4-Flash). Renders the
 /// rubric judge prompt, generates a greedy verdict, and parses it. Vocab-agnostic.
@@ -227,7 +227,12 @@ pub struct RoundReport {
 }
 
 /// The rubric-OPD RFT driver: for each round, sample N rollouts per prompt, judge
-/// each with Flash, select the accepted, and write them back via `train_on_accepted`.
+/// each with Flash (or, with `judge = None`, self-consistency majority-vote on the
+/// `\boxed` answer), select the accepted, and write them back via `train_on_accepted`.
+///
+/// `judge = None` is SELF-CONSISTENCY mode: one model judges itself by
+/// majority-vote — no separate judge engine is loaded (frees its VRAM) and Mode B
+/// corrections are disabled (a corrector requires the judge).
 ///
 /// `decode` turns generated student token ids into the text the judge reads;
 /// `train_on_accepted(prompt_ids, completion_ids)` runs one student CE step on an
@@ -239,7 +244,7 @@ pub struct RoundReport {
 #[allow(clippy::too_many_arguments)]
 pub fn run_rubric_rounds<D, T, E>(
     student: &InferStudent,
-    judge: &FlashJudge,
+    judge: Option<&FlashJudge>,
     rubric: &Rubric,
     prompts: &[(String, Vec<u32>)],
     cfg: &RubricOpdConfig,
@@ -291,8 +296,13 @@ where
                     eprintln!("[rubric rollout] sample{i} len={} text={snip:?}", t.len());
                 }
             }
-            let verdicts: Vec<Verdict> = judge.judge_batch(rubric, problem, &texts);
-            let sel = select(&texts, &verdicts);
+            let sel = match judge {
+                Some(j) => {
+                    let verdicts: Vec<Verdict> = j.judge_batch(rubric, problem, &texts);
+                    select(&texts, &verdicts)
+                }
+                None => select_by_self_consistency(&texts),
+            };
             rep.accepted += sel.accepted.len();
             rep.distinct_accepted += sel.distinct_accepted;
             rep.parse_errors += sel.parse_errors;
@@ -304,31 +314,35 @@ where
             }
         }
 
-        // Mode B — Flash correction for rejected prompts (breaks the best-of-N ceiling).
-        if cfg.correction_cap > 0 {
-            let mut made = 0usize;
-            for (problem, prompt_ids) in &rejected {
-                if made >= cfg.correction_cap {
-                    break;
+        // Mode B — Flash correction for rejected prompts (breaks the best-of-N
+        // ceiling). Requires a judge; self-consistency (judge=None) does no
+        // corrections.
+        if let Some(j) = judge {
+            if cfg.correction_cap > 0 {
+                let mut made = 0usize;
+                for (problem, prompt_ids) in &rejected {
+                    if made >= cfg.correction_cap {
+                        break;
+                    }
+                    match j.correct(rubric, problem, cfg.correction_max_tokens) {
+                        Ok(Some(solution)) => match encode(&solution) {
+                            Ok(tokens) if !tokens.is_empty() => {
+                                accepted_pairs.push((prompt_ids.clone(), tokens));
+                                rep.corrected += 1;
+                                made += 1;
+                            }
+                            Ok(_) => {}
+                            Err(err) => eprintln!("rubric_opd: correction encode failed: {err}"),
+                        },
+                        Ok(None) => {}
+                        Err(err) => eprintln!("rubric_opd: correction failed (skipped): {err}"),
+                    }
                 }
-                match judge.correct(rubric, problem, cfg.correction_max_tokens) {
-                    Ok(Some(solution)) => match encode(&solution) {
-                        Ok(tokens) if !tokens.is_empty() => {
-                            accepted_pairs.push((prompt_ids.clone(), tokens));
-                            rep.corrected += 1;
-                            made += 1;
-                        }
-                        Ok(_) => {}
-                        Err(err) => eprintln!("rubric_opd: correction encode failed: {err}"),
-                    },
-                    Ok(None) => {}
-                    Err(err) => eprintln!("rubric_opd: correction failed (skipped): {err}"),
-                }
+                eprintln!(
+                    "[rubric] round {round} Mode-B: {made} corrections added (of {} rejected prompts)",
+                    rejected.len()
+                );
             }
-            eprintln!(
-                "[rubric] round {round} Mode-B: {made} corrections added (of {} rejected prompts)",
-                rejected.len()
-            );
         }
 
         // Cap the CE writeback set (the 27B-dense host-authoritative CE is
@@ -351,7 +365,10 @@ where
             accepted_pairs.len()
         );
         let freed_rollout = student.offload_engine_weights().unwrap_or(0);
-        let freed_judge = judge.offload_engine_weights().unwrap_or(0);
+        let freed_judge = match judge {
+            Some(j) => j.offload_engine_weights().unwrap_or(0),
+            None => 0,
+        };
         eprintln!(
             "[rubric] round {round} phase-B done: freed rollout={freed_rollout} judge={freed_judge} bytes"
         );
@@ -377,7 +394,9 @@ where
         // pushes into the rollout engine; the next call samples/judges from them).
         eprintln!("[rubric] round {round} phase-D: reloading engines");
         student.reload_engine_weights()?;
-        judge.reload_engine_weights()?;
+        if let Some(j) = judge {
+            j.reload_engine_weights()?;
+        }
 
         rep.mean_train_loss = if rep.trained > 0 {
             loss_sum / rep.trained as f32
