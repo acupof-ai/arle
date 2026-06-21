@@ -1546,9 +1546,9 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("teacher path is not valid UTF-8"))?,
         true,
         EngineLoadConfig {
-            num_slots: 1,
+            num_slots: args.judge_num_slots,
             page_size: 16,
-            total_pages: judge_total.div_ceil(16),
+            total_pages: args.judge_num_slots.max(1) * judge_total.div_ceil(16),
             max_prompt_tokens: judge_prompt_cap,
             max_total_tokens: judge_total,
             chunked_prefill_size: judge_prompt_cap,

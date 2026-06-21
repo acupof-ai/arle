@@ -491,6 +491,44 @@ mod backend {
             }
         }
 
+        /// Batched text completion: submit all `CompletionRequest`s to the
+        /// continuous-batching engine at once, then collect each. Used by
+        /// rubric-OPD judging to decode N rollout verdicts of the same problem
+        /// concurrently instead of one verdict at a time.
+        #[cfg(feature = "cuda")]
+        pub fn complete_batch(
+            &self,
+            reqs: Vec<CompletionRequest>,
+        ) -> Result<Vec<CompletionOutput>> {
+            match self {
+                Self::Cuda(engine) => engine.complete_batch(reqs),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
+            }
+        }
+
         /// Offload the engine's device weights to host RAM (OPD teacher weight
         /// time-share), returning the device bytes freed. CUDA-only: the
         /// Qwen3.5/3.6 hybrid OPD teacher path moves its weights off-device so a
