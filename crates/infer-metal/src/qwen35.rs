@@ -432,7 +432,7 @@ fn load_conv1d_weight(weight: &MlxArray, linear_cfg: &MetalGdrConfig) -> Result<
     }
 }
 
-fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
+pub(crate) fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
     let weight_f32 = as_dtype(weight, Dtype::Float32);
     mlx::eval(&[&weight_f32]);
     let slice = weight_f32.as_slice_f32();
@@ -440,7 +440,7 @@ fn qwen35_norm_needs_offset_correction(weight: &MlxArray) -> bool {
     mean_abs < 0.75
 }
 
-fn qwen35_normalize_direct_norm_weight(
+pub(crate) fn qwen35_normalize_direct_norm_weight(
     weight: &MlxArray,
     needs_offset_correction: bool,
 ) -> MlxArray {

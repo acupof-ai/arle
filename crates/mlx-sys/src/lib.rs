@@ -302,6 +302,7 @@ unsafe extern "C" {
 
     pub fn dflash_draft_new() -> *mut std::ffi::c_void;
     pub fn dflash_draft_free(model: *mut std::ffi::c_void);
+    #[allow(clippy::too_many_arguments)]
     pub fn dflash_draft_set_config(
         model: *mut std::ffi::c_void,
         hidden_size: i32,
@@ -309,8 +310,16 @@ unsafe extern "C" {
         num_kv_heads: i32,
         head_dim: i32,
         num_layers: i32,
+        rotary_dim: i32,
+        attn_output_gate: i32,
+        draft_kind: i32,
         rope_theta: f32,
         rms_eps: f32,
+    );
+    pub fn dflash_draft_set_qwen35_mtp_norms(
+        model: *mut std::ffi::c_void,
+        pre_fc_norm_embedding: *mut mlx_array,
+        pre_fc_norm_hidden: *mut mlx_array,
     );
     #[allow(clippy::too_many_arguments)]
     pub fn dflash_draft_push_layer(
