@@ -520,6 +520,25 @@ impl RealCudaExecutor {
             ),
         }
     }
+
+    /// Read-only borrow of resident FP8 block-scaled base projection pointers
+    /// for train-infer weight sharing (`--share-frozen-base`). Only the
+    /// Qwen3.5/3.6 hybrid student carries shareable FP8 base weights.
+    pub(crate) fn frozen_base_fp8_pointers(
+        &self,
+    ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {
+        match self {
+            Self::Qwen35(q) => q.frozen_base_fp8_pointers(),
+            Self::Qwen(_) => anyhow::bail!(
+                "frozen-base FP8 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
+                 the dense Qwen3 executor is not a student target"
+            ),
+            Self::Dsv4(_) => anyhow::bail!(
+                "frozen-base FP8 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
+                 the DSv4-Flash executor is not a student target"
+            ),
+        }
+    }
 }
 
 use crate::kv_tier::{CudaKvTierStore, default_t1_budget_bytes};
@@ -3130,6 +3149,17 @@ impl Qwen35CudaExecutor {
         // captured decode graphs bake the old ones — drop and recapture lazily.
         self.decode_graph = None;
         self.model.remerge_student_lora(update)
+    }
+
+    /// Read-only borrow of resident FP8 block-scaled base projection pointers
+    /// (train-infer weight sharing, `--share-frozen-base`). Delegates to
+    /// [`crate::qwen35::Qwen35Model`]. Read-only; does not mutate resident
+    /// weights, so no decode-graph invalidation is needed.
+    pub(crate) fn frozen_base_fp8_pointers(
+        &self,
+    ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {
+        self.ensure_not_collective("frozen_base_fp8_pointers")?;
+        self.model.frozen_base_fp8_pointers()
     }
 }
 
