@@ -176,6 +176,38 @@ impl InferStudent {
         Ok(out)
     }
 
+    /// Batched generation: each `(prompt, sampling)` is an independent request
+    /// submitted together to the continuous-batching engine, then collected in
+    /// order. Used by rubric-OPD eval to decode all N prompts concurrently —
+    /// per-request B=1 decode is memory-bandwidth-bound, so batching amortizes
+    /// the weight reads. Engine is locked once for the whole batch.
+    pub fn generate_batch(
+        &self,
+        requests: &[(Vec<u32>, SamplingParams)],
+        max_new_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        if requests.is_empty() || max_new_tokens == 0 {
+            return Ok(vec![Vec::new(); requests.len()]);
+        }
+        for (prompt, _) in requests {
+            if prompt.is_empty() {
+                bail!("InferStudent batch generate requires non-empty prompts");
+            }
+            validate_token_ids("prompt", prompt, self.vocab_size)?;
+        }
+        let generated = {
+            let engine = self
+                .engine
+                .lock()
+                .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+            engine.generate_token_ids_batch(requests, max_new_tokens)?
+        };
+        for ids in &generated {
+            validate_token_ids("generated sample", ids, self.vocab_size)?;
+        }
+        Ok(generated)
+    }
+
     /// Run a single forward over `input_ids` (with absolute `positions`) and
     /// return the next token over the **last** position's logits.
     ///
