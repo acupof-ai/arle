@@ -94,6 +94,26 @@ fn qwen_fp8_deepgemm_dense_enabled() -> bool {
     })
 }
 
+/// Log exactly once which Qwen FP8 dense decode GEMV path is taken (MMA vs
+/// scalar fallback), mirroring the one-shot `log::warn!` discipline used by
+/// `qwen_fp8_deepgemm_dense_enabled`.
+fn log_qwen_fp8_gemv_path(mma: bool) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        if mma {
+            log::info!(
+                "Qwen FP8 dense decode GEMV: tensor-core MMA path (default; \
+                 gemv_fp8_block_scaled_batch_mma_launch)"
+            );
+        } else {
+            log::info!(
+                "Qwen FP8 dense decode GEMV: scalar fallback \
+                 (gemv_fp8_block_scaled_batch_cuda; shape not MMA-tileable)"
+            );
+        }
+    });
+}
+
 fn qwen_quant_profile<T>(
     ctx: &DeviceContext,
     label: &'static str,
@@ -381,30 +401,79 @@ pub(super) fn gemm_batch(
                 let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
                 let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
                 let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                qwen_quant_profile(
-                    ctx,
-                    "qwen/fp8/gemv_batch",
-                    x.seq_len,
-                    weight.rows,
-                    weight.cols,
-                    || {
-                        Ok(ffi::gemv_fp8_block_scaled_batch_cuda(
-                            qw_ptr as *const u8,
-                            scales_ptr as *const f32,
-                            x_ptr as *const ffi::Half,
-                            out_ptr as *mut ffi::Half,
-                            x.seq_len as i32,
-                            weight.rows as i32,
-                            weight.cols as i32,
-                            scale_rows,
-                            scale_cols,
-                            block_m,
-                            block_k,
-                            stream,
-                        )
-                        .result()?)
-                    },
-                )?;
+                // DEFAULT tensor-core MMA path (decode shape B <= 16). Parity vs
+                // the scalar kernel: cosine 1.0 / max_abs 0. The MMA launch
+                // self-gates on N%8 / K%16 / block_k%128 and returns a
+                // non-success CUresult for shapes it can't tile; on that signal
+                // we reset the sticky error and fall through to the scalar kernel
+                // below — the only remaining use of the scalar GEMV (uncovered
+                // shapes + prefill seq_len>16).
+                let mma = x.seq_len <= 16;
+                let mma_ok = if mma {
+                    let res = qwen_quant_profile(
+                        ctx,
+                        "qwen/fp8/gemv_batch_mma",
+                        x.seq_len,
+                        weight.rows,
+                        weight.cols,
+                        || {
+                            Ok(ffi::gemv_fp8_block_scaled_batch_mma_launch(
+                                qw_ptr as *const u8,
+                                scales_ptr as *const f32,
+                                x_ptr as *const ffi::Half,
+                                out_ptr as *mut ffi::Half,
+                                x.seq_len as i32,
+                                weight.rows as i32,
+                                weight.cols as i32,
+                                scale_rows,
+                                scale_cols,
+                                block_m,
+                                block_k,
+                                stream,
+                            ))
+                        },
+                    )?;
+                    // CUresult::InvalidValue (1) is the kernel's "can't tile
+                    // this shape" fall-through signal; any other error is real.
+                    match res.result() {
+                        Ok(()) => true,
+                        Err(_)
+                            if res == cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE =>
+                        {
+                            false
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                } else {
+                    false
+                };
+                log_qwen_fp8_gemv_path(mma_ok);
+                if !mma_ok {
+                    qwen_quant_profile(
+                        ctx,
+                        "qwen/fp8/gemv_batch",
+                        x.seq_len,
+                        weight.rows,
+                        weight.cols,
+                        || {
+                            Ok(ffi::gemv_fp8_block_scaled_batch_cuda(
+                                qw_ptr as *const u8,
+                                scales_ptr as *const f32,
+                                x_ptr as *const ffi::Half,
+                                out_ptr as *mut ffi::Half,
+                                x.seq_len as i32,
+                                weight.rows as i32,
+                                weight.cols as i32,
+                                scale_rows,
+                                scale_cols,
+                                block_m,
+                                block_k,
+                                stream,
+                            )
+                            .result()?)
+                        },
+                    )?;
+                }
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(
