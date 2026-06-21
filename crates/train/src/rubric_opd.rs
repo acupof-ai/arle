@@ -90,6 +90,42 @@ impl FlashJudge {
         }
     }
 
+    /// Mode B: generate a correct solution for a (rejected) prompt and return it
+    /// only if the teacher's own solution passes the rubric self-check (quality
+    /// gate). `None` = the teacher could not produce a passing solution; never
+    /// trains on an unvalidated target. Caller re-tokenizes the returned text.
+    pub fn correct(
+        &self,
+        rubric: &Rubric,
+        problem: &str,
+        max_tokens: usize,
+    ) -> Result<Option<String>> {
+        let req = CompletionRequest {
+            prompt: rubric.solve_prompt(problem),
+            max_tokens,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: None,
+            logprobs: false,
+            session_id: None,
+            trace_context: None,
+            cancel: None,
+        };
+        let output = {
+            let mut engine = self
+                .engine
+                .lock()
+                .map_err(|err| anyhow!("Flash judge engine lock poisoned: {err}"))?;
+            engine.complete(req)?
+        };
+        let solution = output.text;
+        // Quality gate: the teacher must pass its own solution (objective for math).
+        let verdict = self.judge_resilient(rubric, problem, &solution);
+        Ok(verdict.accepted.then_some(solution))
+    }
+
     /// Offload the judge engine's device weights to host RAM, freeing VRAM for the
     /// student CE backward (rubric-OPD time-share). Returns bytes freed.
     pub fn offload_engine_weights(&self) -> Result<usize> {
@@ -126,6 +162,10 @@ pub struct RubricOpdConfig {
     /// util), so batching B accepted pairs into one forward+backward amortizes the
     /// host op-dispatch (~B× throughput); B bounds the [B, seq, vocab] logit VRAM.
     pub writeback_batch: usize,
+    /// Mode B: max Flash corrections to add per round (0 = Mode A / select-only).
+    pub correction_cap: usize,
+    /// Max new tokens for a Mode B correction solution.
+    pub correction_max_tokens: usize,
 }
 
 /// Per-round accounting. `distinct_accepted` is the RFT log-linear x-axis;
@@ -139,6 +179,7 @@ pub struct RoundReport {
     pub distinct_accepted: usize,
     pub parse_errors: usize,
     pub trained: usize,
+    pub corrected: usize,
     pub mean_train_loss: f32,
 }
 
@@ -153,7 +194,7 @@ pub struct RoundReport {
 /// independently testable.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub fn run_rubric_rounds<D, T>(
+pub fn run_rubric_rounds<D, T, E>(
     student: &InferStudent,
     judge: &FlashJudge,
     rubric: &Rubric,
@@ -162,10 +203,12 @@ pub fn run_rubric_rounds<D, T>(
     sampling: Option<&SamplingParams>,
     mut decode: D,
     mut train_on_accepted: T,
+    mut encode: E,
 ) -> Result<Vec<RoundReport>>
 where
     D: FnMut(&[u32]) -> Result<String>,
     T: FnMut(&[(Vec<u32>, Vec<u32>)]) -> Result<f32>,
+    E: FnMut(&str) -> Result<Vec<u32>>,
 {
     let mut reports = Vec::with_capacity(cfg.rounds);
     for round in 0..cfg.rounds {
@@ -180,6 +223,7 @@ where
         // Accumulate accepted (prompt_ids, completion_ids) pairs; defer all CE so
         // the engines can be offloaded as one block before the autograd backward.
         let mut accepted_pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+        let mut rejected: Vec<(&str, Vec<u32>)> = Vec::new();
         for (problem, prompt_ids) in prompts {
             rep.prompts += 1;
             eprintln!(
@@ -215,6 +259,36 @@ where
             for &idx in &sel.accepted {
                 accepted_pairs.push((prompt_ids.clone(), samples[idx].clone()));
             }
+            if sel.accepted.is_empty() {
+                rejected.push((problem.as_str(), prompt_ids.clone()));
+            }
+        }
+
+        // Mode B — Flash correction for rejected prompts (breaks the best-of-N ceiling).
+        if cfg.correction_cap > 0 {
+            let mut made = 0usize;
+            for (problem, prompt_ids) in &rejected {
+                if made >= cfg.correction_cap {
+                    break;
+                }
+                match judge.correct(rubric, problem, cfg.correction_max_tokens) {
+                    Ok(Some(solution)) => match encode(&solution) {
+                        Ok(tokens) if !tokens.is_empty() => {
+                            accepted_pairs.push((prompt_ids.clone(), tokens));
+                            rep.corrected += 1;
+                            made += 1;
+                        }
+                        Ok(_) => {}
+                        Err(err) => eprintln!("rubric_opd: correction encode failed: {err}"),
+                    },
+                    Ok(None) => {}
+                    Err(err) => eprintln!("rubric_opd: correction failed (skipped): {err}"),
+                }
+            }
+            eprintln!(
+                "[rubric] round {round} Mode-B: {made} corrections added (of {} rejected prompts)",
+                rejected.len()
+            );
         }
 
         // Cap the CE writeback set (the 27B-dense host-authoritative CE is
@@ -271,12 +345,13 @@ where
             0.0
         };
         eprintln!(
-            "rubric_opd round {round}: prompts={} accepted={} distinct={} parse_err={} trained={} mean_loss={:.4}",
+            "rubric_opd round {round}: prompts={} accepted={} distinct={} parse_err={} trained={} corrected={} mean_loss={:.4}",
             rep.prompts,
             rep.accepted,
             rep.distinct_accepted,
             rep.parse_errors,
             rep.trained,
+            rep.corrected,
             rep.mean_train_loss
         );
         reports.push(rep);

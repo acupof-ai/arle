@@ -1398,7 +1398,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     use autograd::optim::AdamW;
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
-        infer_student::InferStudent,
+        infer_student::{InferStudent, save_lora_adapters},
         lora::LoraConfig,
         opd::rubric_writeback_ce_step_batched,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_layer_start,
@@ -1511,9 +1511,15 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
         true,
         EngineLoadConfig {
-            num_slots: 1,
+            // num_slots>1 lets batched eval (generate_batch) decode multiple
+            // prompts concurrently — B=1 decode is memory-bandwidth-bound, so
+            // concurrency amortizes the 27B weight reads. KV pool is allocated at
+            // load, and three models are co-resident (~92/96 GB): num_slots=4
+            // OOM'd the 35B-judge weight upload, so 2 is the headroom-safe max
+            // (eval scheduler runs 2 at a time + queues the rest).
+            num_slots: 2,
             page_size: 16,
-            total_pages: student_seq.div_ceil(16),
+            total_pages: 2 * student_seq.div_ceil(16),
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: student_seq,
@@ -1569,6 +1575,8 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         max_new_tokens: args.max_new_tokens,
         writeback_cap: args.writeback_cap,
         writeback_batch: args.writeback_batch,
+        correction_cap: args.correction_cap,
+        correction_max_tokens: args.correction_max_tokens,
     };
 
     // In-process eval (base + per-round) via the rollout engine — no checkpoint save.
@@ -1625,12 +1633,22 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                     )
                     .map_err(anyhow::Error::from)
                 },
+                |text: &str| {
+                    tok_ref
+                        .encode(text, false)
+                        .map_err(|err| anyhow!("encode correction: {err}"))
+                },
             )?
         };
         let rep = &reports[0];
         eprintln!(
-            "[arle train rubric-opd] round {round}: accepted={} distinct={} parse_err={} trained={} mean_loss={:.4}",
-            rep.accepted, rep.distinct_accepted, rep.parse_errors, rep.trained, rep.mean_train_loss
+            "[arle train rubric-opd] round {round}: accepted={} distinct={} parse_err={} trained={} corrected={} mean_loss={:.4}",
+            rep.accepted,
+            rep.distinct_accepted,
+            rep.parse_errors,
+            rep.trained,
+            rep.corrected,
+            rep.mean_train_loss
         );
 
         // Sync the trained LoRA into the rollout engine (always): the eval below
@@ -1650,6 +1668,25 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                     args.eval_max_new_tokens,
                     &dir.join(format!("eval_round{round}.jsonl")),
                 )?;
+            }
+        }
+
+        // Fast adapter-only (LoRA) save — avoids the full-materialize host-loop hang.
+        if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
+            if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
+                fs::create_dir_all(adapter_dir).with_context(|| {
+                    format!("create LoRA adapter dir {}", adapter_dir.display())
+                })?;
+                let out = adapter_dir.join(format!("adapters_round{}.safetensors", round + 1));
+                let started = Instant::now();
+                save_lora_adapters(&mut store, &student.adapter_name_map(), &out)
+                    .with_context(|| format!("save LoRA adapters at round {}", round + 1))?;
+                println!(
+                    "checkpoint_saved kind=lora_adapters mode=rubric-opd step={} dir={} seconds={:.6}",
+                    round + 1,
+                    out.display(),
+                    started.elapsed().as_secs_f64()
+                );
             }
         }
 
