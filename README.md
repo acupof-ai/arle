@@ -86,6 +86,8 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 <sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="benchmarks/README.md">snapshot + method</a></sub>
 
+**Speculative decode breaks the memory-bandwidth wall — Qwen3.6-27B (OptiQ mixed-4/8-bit, dense GatedDeltaNet).** The model's own NextN/MTP head drafts and the base verifies (output bit-identical to greedy): **12.3 → 17.75 tok/s, +44%** — *past* the **15.2 tok/s HBM floor** (M4 Pro 273 GB/s ÷ ~18 GB weights), the one lever no kernel or framework can reach. Quality held: **PPL 7.82** (vs uniform-4bit's 8.56) · 68.8% draft acceptance.
+
 **NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8.
 
 <p align="center">
@@ -102,7 +104,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 The same loop lifts *agentic* capability too: with think-on OPD the 4B student learns to **decline irrelevant tool-use queries — BFCL-live abstention 0.60 → 1.00**, toward the teacher. Case-validated: the base reasons correctly then tool-calls anyway; the OPD student abstains. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
-**Stability:** CUDA **Stable** · Metal **Beta** (DFlash: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
+**Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
 ---
 
