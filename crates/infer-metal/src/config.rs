@@ -6,10 +6,18 @@ use anyhow::{Context, Result};
 use infer_plan::DiffusionGenerationConfig;
 
 /// MLX affine quantization settings.
-#[derive(Debug, Clone, Copy)]
+///
+/// `group_size`/`bits` are the *global* (default) quant params from
+/// `config.json`'s `quantization` dict. `per_weight` carries the per-tensor
+/// overrides some MLX checkpoints (e.g. OptiQ) ship: the override key is the
+/// full tensor name (the loader's `base`), mapping to `(bits, group_size)`.
+#[derive(Debug, Clone)]
 pub(crate) struct QuantConfig {
     pub(crate) group_size: i32,
     pub(crate) bits: i32,
+    /// name -> (bits, group_size) overrides; empty when the checkpoint uses a
+    /// single global quant config for every weight.
+    pub(crate) per_weight: std::sync::Arc<std::collections::HashMap<String, (i32, i32)>>,
 }
 
 /// Qwen3.5 layer type.
@@ -354,15 +362,41 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let quantization = root
         .get("quantization")
         .or_else(|| root.get("quantization_config"))
-        .map(|q| QuantConfig {
-            group_size: q
+        .map(|q| {
+            let group_size = q
                 .get("group_size")
                 .and_then(serde_json::Value::as_i64)
-                .map_or(64, |n| n as i32),
-            bits: q
+                .map_or(64, |n| n as i32);
+            let bits = q
                 .get("bits")
                 .and_then(serde_json::Value::as_i64)
-                .map_or(4, |n| n as i32),
+                .map_or(4, |n| n as i32);
+            // Per-weight overrides: the `quantization` dict's object-valued
+            // entries are keyed by the full tensor name and carry their own
+            // `bits`/`group_size`. Scalar/string keys (group_size, bits, mode)
+            // are skipped because they are not JSON objects.
+            let mut per_weight = std::collections::HashMap::new();
+            if let Some(obj) = q.as_object() {
+                for (name, value) in obj {
+                    let Some(entry) = value.as_object() else {
+                        continue;
+                    };
+                    let w_bits = entry
+                        .get("bits")
+                        .and_then(serde_json::Value::as_i64)
+                        .map_or(bits, |n| n as i32);
+                    let w_gs = entry
+                        .get("group_size")
+                        .and_then(serde_json::Value::as_i64)
+                        .map_or(group_size, |n| n as i32);
+                    per_weight.insert(name.clone(), (w_bits, w_gs));
+                }
+            }
+            QuantConfig {
+                group_size,
+                bits,
+                per_weight: std::sync::Arc::new(per_weight),
+            }
         });
 
     let moe = {
@@ -406,8 +440,9 @@ pub(crate) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         }
 
         if raw_num_experts > 0 {
-            let (group_size_default, bits_default) =
-                quantization.map_or((64, 4), |qc| (qc.group_size, qc.bits));
+            let (group_size_default, bits_default) = quantization
+                .as_ref()
+                .map_or((64, 4), |qc| (qc.group_size, qc.bits));
             Some(MetalQwen35MoeConfig {
                 num_experts: raw_num_experts,
                 num_experts_per_tok: raw_top_k,
