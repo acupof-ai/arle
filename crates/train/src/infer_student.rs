@@ -154,26 +154,22 @@ impl InferStudent {
             return Ok(Vec::new());
         }
 
+        // Natural generation: do NOT force ignore_eos (that is the token-KL
+        // exact-length path); the rubric judge needs complete answers. The N
+        // per-seed samples are submitted together so the continuous-batching
+        // rollout engine (num_slots=2) decodes them concurrently instead of one
+        // at a time. `generate_batch` validates each result.
         let base = sampling.cloned().unwrap_or_default();
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            // Natural generation: do NOT force ignore_eos (that is the token-KL
-            // exact-length path); the rubric judge needs complete answers.
-            let mut params = base.clone();
-            if let Some(seed) = base.seed {
-                params.seed = Some(seed.wrapping_add(i as u64));
-            }
-            let generated = {
-                let engine = self
-                    .engine
-                    .lock()
-                    .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
-                engine.generate_token_ids(prompt_ids, max_new_tokens, params)?
-            };
-            validate_token_ids("generated sample", &generated, self.vocab_size)?;
-            out.push(generated);
-        }
-        Ok(out)
+        let requests: Vec<(Vec<u32>, SamplingParams)> = (0..n)
+            .map(|i| {
+                let mut params = base.clone();
+                if let Some(seed) = base.seed {
+                    params.seed = Some(seed.wrapping_add(i as u64));
+                }
+                (prompt_ids.to_vec(), params)
+            })
+            .collect();
+        self.generate_batch(&requests, max_new_tokens)
     }
 
     /// Batched generation: each `(prompt, sampling)` is an independent request
