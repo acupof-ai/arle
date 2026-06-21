@@ -20,6 +20,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <map>
+#include <tuple>
 #include <mutex>
 #include <stdexcept>
 
@@ -424,6 +427,29 @@ std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
 auto& compiled_swiglu() {
     static auto fn = mlx::core::compile(swiglu_impl, true /*shapeless*/);
     return fn;
+}
+
+// Compiled fused MLP: gate_up matmul -> split -> swiglu -> down matmul. Encoded ONCE per
+// (gate_dim, gs, bits) — all MLP layers share the config, so one cached graph serves every
+// layer, cutting the per-step re-encode of the matmul-heavy MLP (~51% of the decode step).
+using CompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
+CompiledFn& compiled_mlp_fn(int gate_dim, int gs, int bits) {
+    static std::map<std::tuple<int, int, int>, CompiledFn> cache;
+    auto key = std::make_tuple(gate_dim, gs, bits);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    auto impl = [gate_dim, gs, bits](const std::vector<array>& in) -> std::vector<array> {
+        // in = [x, gate_up_w, gate_up_scales, gate_up_biases, down_w, down_scales, down_biases]
+        auto gu = quantized_matmul(in[0], in[1], in[2], in[3], true, gs, bits);
+        auto parts = split(gu, Shape{gate_dim}, -1);
+        auto h = (parts[0] * sigmoid(parts[0])) * parts[1];  // swiglu, inlined for fusion
+        return {quantized_matmul(h, in[4], in[5], in[6], true, gs, bits)};
+    };
+    // SHAPED (not shapeless): the split needs concrete shapes. Gated to decode (S=1) at the
+    // call site, so the shape is fixed [1,1,hidden] → compiled once, reused every step.
+    return cache.emplace(key, mlx::core::compile(impl, false)).first->second;
 }
 
 // Compiled precise SiLU-mul: silu(gate.f32) * x.f32 -> x.dtype
@@ -1445,6 +1471,20 @@ struct Qwen35CompiledModel {
         int gate_dim,
         bool prefer_verify_m16
     ) const {
+        // Compiled fast path: standard quantized weights (the common decode case) — the two
+        // matmuls + split + swiglu encode once. Falls back to the per-op path for
+        // gguf/dense/verify/reordered weights, which the compiled graph does not cover.
+        static const bool mlp_compile = std::getenv("INFER_METAL_NO_MLP_COMPILE") == nullptr;
+        if (mlp_compile && !prefer_verify_m16
+            && x.ndim() == 3 && x.shape(1) == 1  // decode only (fixed shape for the shaped compile)
+            && gate_up.gguf_format == 0 && down.gguf_format == 0
+            && !gate_up.is_dense && !down.is_dense
+            && !gate_up.reorder_input_v_cols && !down.reorder_input_v_cols
+            && gate_up.group_size == down.group_size && gate_up.bits == down.bits) {
+            return compiled_mlp_fn(gate_dim, gate_up.group_size, gate_up.bits)(
+                {x, gate_up.w, gate_up.scales, gate_up.biases,
+                 down.w, down.scales, down.biases})[0];
+        }
         auto gu = gate_up.apply(x, prefer_verify_m16);
         auto gu_parts = split(gu, Shape{gate_dim}, -1);
         auto& g = gu_parts[0];
@@ -1525,6 +1565,17 @@ struct Qwen35CompiledModel {
             ? gguf_embedding_cpp(token_id, embed_packed.w, embed_packed.gguf_format, embed_packed.rows, embed_packed.cols)
             : take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {B, S, hidden_size});
+        // op-profile (INFER_METAL_OP_PROFILE): eval-based per-section breakdown of the decode
+        // forward. Serializes the step (sync per section) — RELATIVE breakdown only. Default-off.
+        static const bool op_prof = std::getenv("INFER_METAL_OP_PROFILE") != nullptr;
+        static thread_local double op_ms[5] = {0, 0, 0, 0, 0};  // embed, gdr, full, mlp, head
+        static thread_local long op_steps = 0;
+        if (op_prof) {
+            auto s = std::chrono::high_resolution_clock::now();
+            eval(x);
+            op_ms[0] += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - s).count();
+        }
         bool keep_intermediates = ctx.keep_intermediates && artifacts;
         bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
         auto gdr_t_arr = array(S);
@@ -1549,6 +1600,8 @@ struct Qwen35CompiledModel {
             auto xn = fast::rms_norm(x, ln_w, rms_eps);
 
             // Attention
+            auto op_attn_s = op_prof ? std::chrono::high_resolution_clock::now()
+                                     : std::chrono::high_resolution_clock::time_point{};
             array attn_out(0);
             if (layer.is_gdr) {
                 int si = 1 + full_kv_count + 2*gdr_idx;
@@ -1583,9 +1636,16 @@ struct Qwen35CompiledModel {
                 full_idx++;
             }
 
+            if (op_prof) {
+                eval(attn_out);
+                op_ms[layer.is_gdr ? 1 : 2] += std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - op_attn_s).count();
+            }
             x = residual + attn_out;
 
             // MLP
+            auto op_mlp_s = op_prof ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
             auto residual2 = x;
             auto post_ln_w = layer.is_gdr ? layer.gdr.post_attn_ln_w : layer.full.post_attn_ln_w;
             auto xn2 = fast::rms_norm(x, post_ln_w, rms_eps);
@@ -1604,6 +1664,11 @@ struct Qwen35CompiledModel {
                 auto& dw = layer.is_gdr ? layer.gdr.down : layer.full.down;
                 int gd = layer.is_gdr ? layer.gdr.gate_dim : layer.full.gate_dim;
                 x = residual2 + mlp(xn2, gu, dw, gd, prefer_verify_m16);
+            }
+            if (op_prof) {
+                eval(x);
+                op_ms[3] += std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - op_mlp_s).count();
             }
 
             // Keep key intermediates alive for GPU buffer reuse.
@@ -1637,6 +1702,21 @@ struct Qwen35CompiledModel {
         auto logits = use_embed_as_linear
             ? embed_as_linear.apply(final_x, prefer_verify_m16)
             : lm_head.apply(final_x, prefer_verify_m16);
+        if (op_prof) {
+            auto s = std::chrono::high_resolution_clock::now();
+            eval(logits);
+            op_ms[4] += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - s).count();
+            if (++op_steps % 16 == 0) {
+                double n = (double)op_steps;
+                fprintf(stderr,
+                    "[op-profile] %ld steps avg/step: embed=%.2f gdr=%.2f full=%.2f "
+                    "mlp=%.2f head=%.2f total=%.2f ms\n",
+                    op_steps, op_ms[0] / n, op_ms[1] / n, op_ms[2] / n, op_ms[3] / n,
+                    op_ms[4] / n,
+                    (op_ms[0] + op_ms[1] + op_ms[2] + op_ms[3] + op_ms[4]) / n);
+            }
+        }
 
         // Build output: [logits, kv_caches..., gdr_states..., captured_hidden...]
         std::vector<array> outputs;
