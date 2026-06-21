@@ -452,6 +452,45 @@ mod backend {
             }
         }
 
+        /// Batched [`generate_token_ids`]: submit all `(prompt, sampling)`
+        /// requests to the continuous-batching engine at once, then collect each.
+        /// Used by rubric-OPD eval (16 prompts) and rollout (N samples) to keep
+        /// the batcher busy instead of decoding one request at a time.
+        #[cfg(feature = "cuda")]
+        pub fn generate_token_ids_batch(
+            &self,
+            requests: &[(Vec<u32>, infer_plan::SamplingParams)],
+            max_tokens: usize,
+        ) -> Result<Vec<Vec<u32>>> {
+            match self {
+                Self::Cuda(engine) => engine.generate_token_ids_batch(requests, max_tokens),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+            }
+        }
+
         /// Offload the engine's device weights to host RAM (OPD teacher weight
         /// time-share), returning the device bytes freed. CUDA-only: the
         /// Qwen3.5/3.6 hybrid OPD teacher path moves its weights off-device so a

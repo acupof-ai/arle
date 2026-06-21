@@ -71,6 +71,40 @@ where
         Ok(completed.generated_tokens)
     }
 
+    /// Batched sibling of [`generate_token_ids`]: submit ALL requests first
+    /// (non-blocking) so the `ServeHandle`'s continuous-batching engine thread
+    /// decodes them together, then collect each in order. OPD eval/rollout used
+    /// submit→collect→submit→collect (one in-flight request at a time), which
+    /// left the batcher idle and made decode memory-bandwidth-bound at B=1;
+    /// batching amortizes the weight reads across the set. Each `(prompt,
+    /// sampling)` pair is an independent request (own KV slot, own seed), so the
+    /// per-request outputs are identical to the serial path.
+    #[cfg(feature = "cuda")]
+    pub fn generate_token_ids_batch(
+        &self,
+        requests: &[(Vec<u32>, infer_plan::SamplingParams)],
+        max_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        if max_tokens == 0 {
+            return Ok(vec![Vec::new(); requests.len()]);
+        }
+        let tickets = requests
+            .iter()
+            .map(|(prompt, sampling)| {
+                self.serve
+                    .submit(prompt.clone(), max_tokens, sampling.clone())
+                    .map_err(|err| anyhow!("batch request submission failed: {err}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        tickets
+            .into_iter()
+            .map(|ticket| {
+                let completed: CompletedRequest = ticket.collect()?;
+                Ok(completed.generated_tokens)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     /// Shared `tokenize -> submit -> collect -> detokenize` body returning the
     /// projected [`CompletionOutput`]; both `complete` and `complete_stream`
     /// build on it.
