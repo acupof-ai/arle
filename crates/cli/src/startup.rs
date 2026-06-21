@@ -61,8 +61,10 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
         return Ok(name.clone());
     }
 
-    // Show the interactive picker.
-    match model_picker::pick_model(&local_models, &recommended)? {
+    // Show the interactive picker, pre-selecting the best available option so
+    // that pressing Enter lands on a great model ("开箱即用").
+    let default_index = model_picker::default_picker_index(&local_models, &recommended);
+    match model_picker::pick_model(&local_models, &recommended, default_index)? {
         PickerResult::LocalModel(name) => Ok(name),
         PickerResult::RemoteModel(hf_id) => {
             download::download_model_with_progress(&hf_id)?;
