@@ -36,6 +36,15 @@ impl WeightTensor {
         }
     }
 
+    /// Quantization bit width, or `None` for a dense weight. Used to detect
+    /// mixed-bit gate/up pairs (OptiQ) that cannot row-merge.
+    pub(crate) fn quant_bits(&self) -> Option<i32> {
+        match self {
+            WeightTensor::Dense(_) => None,
+            WeightTensor::Quantized { bits, .. } => Some(*bits),
+        }
+    }
+
     /// Pre-transposed dense `[in, out]` array for this weight. A quantized
     /// weight is dequantized (raw layout `[out, in]`) then transposed to match
     /// the `Dense` convention. Used to row-concatenate projections whose
@@ -119,11 +128,20 @@ pub(crate) fn load_stacked_quantized(tensors: &TensorMap, base: &str) -> Result<
     })
 }
 
-/// Merged gate+up input projection for one dense Qwen3.5 layer. Dense bf16
-/// weights concat by output rows; quantized weights merge in place.
+/// Gate+up input projection for one dense Qwen3.5 layer.
+///
+/// `MergedQuantized` row-merges gate and up into a single projection (matching
+/// quantized layouts merge in place; same-bit dense bf16 concat by output rows).
+/// `Separate` keeps gate and up as two distinct quantized weights — used for
+/// mixed-bit per-weight quant (e.g. OptiQ gate=4-bit/up=8-bit) which cannot
+/// row-merge, so each runs as its own quantized matmul instead of being
+/// dequantized to a dense merged projection.
 pub(crate) enum MlpInputProjection {
     MergedQuantized {
         gate_up_proj: WeightTensor,
+        gate_dim: i32,
+    },
+    Separate {
         gate_dim: i32,
     },
 }

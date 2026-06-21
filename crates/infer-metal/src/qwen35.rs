@@ -307,17 +307,27 @@ fn build_qwen35_dense_mlp(
     down_proj: WeightTensor,
 ) -> Result<MlpKind> {
     let gate_dim = gate_proj.output_dim()?;
-    // Merge gate+up into a single projection. Matching quantized layouts merge
-    // in place; mismatched layouts (mixed-bit per-weight quant such as OptiQ:
-    // gate 4-bit, up 8-bit) are dequantized to a dense merged projection inside
-    // concat_weight_rows.
-    let gate_up_proj = match merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
-        Some(gate_up_proj) => gate_up_proj,
-        None => concat_weight_rows(&gate_proj, &up_proj)?,
-    };
-    let inputs = MlpInputProjection::MergedQuantized {
-        gate_up_proj,
-        gate_dim,
+    // Mixed-bit per-weight quant (OptiQ: gate 4-bit, up 8-bit) cannot row-merge
+    // into one quantized projection. Keep gate/up as separate quantized weights
+    // so each runs as its own quantized matmul (the C++ mlp_separate path),
+    // instead of dequantizing both to a dense merged projection (3-4x heavier).
+    let mixed_bit = matches!(
+        (gate_proj.quant_bits(), up_proj.quant_bits()),
+        (Some(g), Some(u)) if g != u
+    );
+    let inputs = if mixed_bit {
+        MlpInputProjection::Separate { gate_dim }
+    } else {
+        // Matching quantized layouts merge in place; same-bit dense bf16 concat
+        // by output rows inside concat_weight_rows.
+        let gate_up_proj = match merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
+            Some(gate_up_proj) => gate_up_proj,
+            None => concat_weight_rows(&gate_proj, &up_proj)?,
+        };
+        MlpInputProjection::MergedQuantized {
+            gate_up_proj,
+            gate_dim,
+        }
     };
     Ok(MlpKind::Dense(MetalQwen35DenseMlpWeights {
         inputs,
@@ -661,18 +671,25 @@ impl CppQwen35Model {
                 MlpKind::Dense(dense) => Some(dense),
                 MlpKind::Moe(_) => None,
             };
-            let (gate_up_id, gate_dim, down_id) = if let Some(dense) = dense {
-                let MlpInputProjection::MergedQuantized {
-                    gate_up_proj,
-                    gate_dim,
-                } = &dense.inputs;
-                (
-                    add_or_free!(gate_up_proj),
-                    *gate_dim,
-                    add_or_free!(&dense.down_proj),
-                )
+            // For mixed-bit MLP (OptiQ), gate/up cannot row-merge: gate_up_id stays
+            // -1 (no merged projection) and gate/up are registered separately below.
+            let (gate_up_id, gate_dim, down_id, mlp_is_separate) = if let Some(dense) = dense {
+                match &dense.inputs {
+                    MlpInputProjection::MergedQuantized {
+                        gate_up_proj,
+                        gate_dim,
+                    } => (
+                        add_or_free!(gate_up_proj),
+                        *gate_dim,
+                        add_or_free!(&dense.down_proj),
+                        false,
+                    ),
+                    MlpInputProjection::Separate { gate_dim } => {
+                        (-1, *gate_dim, add_or_free!(&dense.down_proj), true)
+                    }
+                }
             } else {
-                (-1, 0, -1)
+                (-1, 0, -1, false)
             };
 
             match &layer.attention {
@@ -696,6 +713,17 @@ impl CppQwen35Model {
                             gate_dim,
                             down_id,
                         );
+                    }
+                    // Mixed-bit MLP: register gate/up separately and route this
+                    // full-attn layer through the C++ mlp_separate path.
+                    if mlp_is_separate && let Some(dense) = dense {
+                        let gate_id = add_or_free!(&dense.gate_proj);
+                        let up_id = add_or_free!(&dense.up_proj);
+                        unsafe {
+                            mlx_sys::qwen35_compiled_set_full_separate_mlp_v2(
+                                model, gate_id, up_id,
+                            );
+                        }
                     }
                 }
                 MetalQwen35Attention::Linear(attn) => {
