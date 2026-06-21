@@ -64,11 +64,51 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
             },
         );
     }
+    // Lower the Metal speculative-decode CLI flags into the env the Metal
+    // executor reads at construction (the executor also auto-resolves the
+    // Qwen3.6-27B NextN-MTP head when neither a flag nor env draft is given).
+    // CLI flag wins over a pre-existing env value; env is the fallback.
+    apply_metal_speculative_env(&serve_args);
     match resolve_config(args, &serve_args) {
         Ok(config) => run_config(config),
         Err(err) => {
             eprintln!("[ARLE serve] error: {err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Lower the Metal speculative-decode flags into the env the `infer-metal`
+/// executor reads at construction. The flag is the authority; a pre-existing
+/// env value is the fallback (only overwritten when the corresponding flag is
+/// given). `--no-speculative` sets a disable marker that the executor honors
+/// before any auto-resolve, so it overrides both flags and env.
+///
+/// SAFETY: single CLI thread, pre-tokio, pre-engine-build (same contract as the
+/// `ARLE_COMM_BACKEND` export above).
+fn apply_metal_speculative_env(serve_args: &ServeArgs) {
+    unsafe {
+        if serve_args.no_speculative {
+            std::env::set_var("INFER_METAL_NO_SPECULATIVE", "1");
+            return;
+        }
+        std::env::remove_var("INFER_METAL_NO_SPECULATIVE");
+        if let Some(draft) = serve_args
+            .draft_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            std::env::set_var("INFER_METAL_DFLASH_DRAFT_MODEL", draft);
+        }
+        // The depth flag defaults to 2; export it whenever a draft is active so
+        // the executor's resolver gets the CLI value (env stays the fallback for
+        // the auto-resolve-only path, where no draft flag was passed).
+        if serve_args.draft_model.is_some() {
+            std::env::set_var(
+                "INFER_METAL_DFLASH_TOKENS",
+                serve_args.speculative_tokens.to_string(),
+            );
         }
     }
 }
@@ -1108,6 +1148,78 @@ mod tests {
             err,
             "--mtp-draft-model is not supported by the rewrite serve stack"
         );
+    }
+
+    #[test]
+    fn metal_speculative_env_lowers_flags_and_honors_no_spec() {
+        // env is process-global, so this single test drives all three states in
+        // sequence (flag -> no-spec -> clean default) to stay self-contained.
+        let clear = || unsafe {
+            std::env::remove_var("INFER_METAL_DFLASH_DRAFT_MODEL");
+            std::env::remove_var("INFER_METAL_DFLASH_TOKENS");
+            std::env::remove_var("INFER_METAL_NO_SPECULATIVE");
+        };
+
+        // Explicit draft + depth: both env vars set from the flags.
+        clear();
+        let (_args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "models/qwen36-27b",
+            "--draft-model",
+            "mlx-community/Qwen3.6-27B-MTP-4bit",
+            "--speculative-tokens",
+            "3",
+        ]);
+        apply_metal_speculative_env(&serve);
+        assert_eq!(
+            std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").as_deref(),
+            Ok("mlx-community/Qwen3.6-27B-MTP-4bit")
+        );
+        assert_eq!(
+            std::env::var("INFER_METAL_DFLASH_TOKENS").as_deref(),
+            Ok("3")
+        );
+        assert!(std::env::var("INFER_METAL_NO_SPECULATIVE").is_err());
+
+        // --no-speculative sets the disable marker and short-circuits.
+        clear();
+        let (_args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            "metal",
+            "--model-path",
+            "models/qwen36-27b",
+            "--no-speculative",
+        ]);
+        apply_metal_speculative_env(&serve);
+        assert_eq!(
+            std::env::var("INFER_METAL_NO_SPECULATIVE").as_deref(),
+            Ok("1")
+        );
+        assert!(std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").is_err());
+
+        // No spec flags: no draft is exported (auto-resolve path), the disable
+        // marker is cleared, and any pre-existing env draft survives as fallback.
+        clear();
+        unsafe { std::env::set_var("INFER_METAL_DFLASH_DRAFT_MODEL", "env-fallback-draft") };
+        let (_args, serve) = parse_serve(&["arle", "serve", "--model-path", "models/qwen36-27b"]);
+        apply_metal_speculative_env(&serve);
+        assert!(std::env::var("INFER_METAL_NO_SPECULATIVE").is_err());
+        assert_eq!(
+            std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").as_deref(),
+            Ok("env-fallback-draft"),
+            "env draft must survive as the fallback when no flag is given"
+        );
+        assert!(
+            std::env::var("INFER_METAL_DFLASH_TOKENS").is_err(),
+            "depth is not exported on the auto-resolve-only path"
+        );
+        clear();
     }
 
     #[test]
