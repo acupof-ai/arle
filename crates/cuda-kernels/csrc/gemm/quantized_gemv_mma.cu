@@ -522,9 +522,28 @@ extern "C" cudaError_t gemv_fp8_block_scaled_batch_mma_launch(
         block_m <= 0 || block_k <= 0) {
         return cudaErrorInvalidValue;
     }
-    // MMA tile requires N % 8 == 0 and K % 16 == 0. Qwen3.6-27B-FP8 hidden
-    // dims satisfy this. Caller falls back to scalar otherwise.
-    if ((N & 7) != 0 || (K & 15) != 0) {
+    // mma.m16n8k16 is SM80+; on <SM80 (e.g. V100 sm_70) the MMA macro compiles to
+    // a no-op that leaves the accumulator at 0 and returns success — which would
+    // silently write zeros. Refuse so the caller uses the scalar kernel. Cached
+    // (ARLE GPUs are homogeneous per process / TP group).
+    static int s_cc_major = -2;  // -2 = unqueried, -1 = query failed
+    if (s_cc_major == -2) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev) !=
+                cudaSuccess) {
+            s_cc_major = -1;
+        }
+    }
+    if (s_cc_major < 8) {
+        return cudaErrorInvalidValue;
+    }
+    // MMA tile requires N % 8 == 0. K must be a multiple of MMA_BLOCK_K (128):
+    // the K-loop strides in full 128-chunks and the weight load has no per-k tail
+    // guard, so a K that is %16 but not %128 would overread the final chunk into
+    // the next weight row (cross-row OOB / IMA / corrupt FP8 decode). Qwen3.6-27B
+    // dims (5120/6144/17408) are all %128==0; anything else uses the scalar kernel.
+    if ((N & 7) != 0 || (K % MMA_BLOCK_K) != 0) {
         return cudaErrorInvalidValue;
     }
     // The kernel reads ONE block scale per MMA_BLOCK_K (=128) K-chunk. That is
