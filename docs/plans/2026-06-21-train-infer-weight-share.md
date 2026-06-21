@@ -91,3 +91,40 @@ LoRA consistency is already in-memory + idempotent (`sync_lora_from_store` →
 
 Needle ladder ×3 same-config + self-consistency (NOT byte-identity) on the
 shared-FP8-base forward vs the current path, per CLAUDE.md KV-precision gate.
+
+## Review findings (post-impl, 2026-06-21) — agent diff in worktree-agent-ad159d818cedd561e
+
+Implemented behind `--share-frozen-base` (default off), 13 files, typechecks pass.
+Critical review (Claude; no codex credits) found:
+
+1. **[FIXED in worktree] Borrowed-FP8 `Drop` double-free.** `backend.rs` used
+   `ptr::read(&self.weight)` + `forget` to "leak" the foreign-owned `Arc`s — but
+   `ptr::read` copies (refcount unchanged); the original field is still dropped by
+   drop-glue → `Arc` 1→0 → `CudaSlice::Drop` `cuMemFree`s the **infer engine's**
+   bytes → double-free / UAF at shutdown. Fixed to `mem::forget(self.weight.clone())`
+   (bump strong count + leak the bump → drop-glue decrement lands at ≥1, never frees;
+   infer engine frees once).
+
+2. **[TODO] Load-order is NOT byte-identical for the default path.** The diff loads
+   the rollout engine FIRST in BOTH paths. The engine's `num_slots` clamp is computed
+   from *post-weights free VRAM*; engine-first sees ~96 GB free (student not yet
+   loaded) → clamps high (~16 slots / ~58 GB KV) → the student then loads into the
+   remainder → **default-path OOM** (original student-first order saw less free →
+   ~10 slots → fit). FIX: make the order conditional — default = student-first
+   (preserve clamp); `--share-frozen-base` = engine-first. (Single if/else around the
+   two loads in `train_cli.rs:1486-1573`; duplicate the ~20-line engine-load block or
+   extract a closure.)
+
+3. **[TODO, GPU-measure] num_slots vs CE headroom in the shared path.** Sharing SKIPS
+   the Phase-B rollout offload (base stays resident, aliased). So during CE the engine
+   KV (num_slots × slot) competes with CE activations — unlike the default path which
+   offloads the engine. If the engine over-reserves KV (engine-first seeing 96 GB
+   free), the shared CE can OOM. The shared run needs a CONSERVATIVE `--rollout-num-slots`
+   (or offload only KV during CE, keeping the base). Resolve empirically on GPU7:
+   build the worktree, run `--share-frozen-base` with small `--rollout-num-slots`,
+   measure (a) base VRAM ~27 GB lower than flag-off, (b) CE does not OOM, (c) needle/
+   self-consistency gate. Then tune slots / decide default.
+
+Status: scaffolding + Drop fix done; items 2-3 are the focused finish (load-order
+conditional + GPU-verify the shared path + tune num_slots), then needle gate + wins
+entry before any default consideration. Default stays opt-in/off throughout.
