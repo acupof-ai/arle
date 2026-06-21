@@ -1,4 +1,4 @@
-# Rubric-OPD 27B-dense loop validated end-to-end (capability curve pending)
+# Rubric-OPD 27B-dense loop validated end-to-end — capability flat within noise (7-seed)
 
 ## Context
 New `arle train rubric-opd` subcommand (rubric-OPD / RFT): the Qwen3.6-27B dense student
@@ -96,6 +96,73 @@ not blocking): backward 70 s is still 100% checkpoint recompute → disable grad
 clap `Set` fix + VRAM check); forward ~100 s unattributed (frozen FP8 GEMM L1?). Plan:
 [2026-06-21-autograd-gpu-ce-speedup.md](../../plans/2026-06-21-autograd-gpu-ce-speedup.md).
 
-## Pending — clean capability curve (now affordable)
-Relaunch with larger n + budget + saved checkpoints (the eval-confound fix is larger think-on budget +
-larger n, per the confound analysis above). DSv4-Flash judge (needs multi-engine-TP) deferred.
+## Capability verdict — 7-seed one-model self-consistency, FLAT within noise
+
+Final clean run: **one-model self-consistency** (`--self-consistency`, no separate
+35B judge — the 27B self-judges by majority-vote on `\boxed`), 7 seeds × 3 rounds
+on GPU0–6, 16 train prompts, MATH-500 pass@1 (n=50, greedy), `--rollout-temperature
+0.7 --writeback-cap 24 --writeback-batch 1 --lora-layer-start 48 --grad-checkpointing`.
+
+7-seed pass@1 (mean ± std; 95% CI is t, df=6):
+
+| round | mean | std | 95% CI | includes base 0.160? |
+|-------|------|-----|--------|----------------------|
+| base  | 0.160 | 0.000 | (deterministic greedy) | — |
+| 0     | 0.177 | 0.031 | [0.148, 0.206] | **yes** |
+| 1     | 0.149 | 0.038 | [0.113, 0.184] | **yes** |
+| 2     | 0.174 | 0.030 | [0.147, 0.202] | **yes** |
+
+Base is identical across all 7 seeds (8/50) — greedy eval is deterministic; the
+seed only perturbs training rollouts. **Every round's 7-seed CI includes base
+0.160; no monotonic trend (round 1 dips below base); the r2 +1.4pp is noise.**
+At 16-prompt / 3-round / n=50, one-model self-consistency rubric-OPD produces **no
+detectable pass@1 lift** on Qwen3.6-27B-FP8.
+
+![capability curve](../../assets/opd-rubric-27b-curve.png)
+
+### §0 case-as-fact — decoded the base eval; metric is `\boxed`-format-confounded
+
+Before calling 16% a ceiling, decoded the actual base generations (seed0; base
+is identical across seeds):
+
+- **NOT a 1536-token-cap artifact.** Longest base answer is 5093 chars (~1270
+  tokens) — **0/50 reach the 1536-tok cap**; generations finish on their own.
+- **It IS a `\boxed`-compliance floor.** Only **17/50 base answers emit `\boxed`**;
+  the other **33/50 (66%) are unscorable** (no extractable answer → counted wrong).
+  Of the 17 boxed, 8 are correct (47% of *boxed* right). "16%" = 8/50 where 33 of
+  the 50 never entered the scorer — it understates real math ability.
+- **OPD shifts neither.** `\boxed`-emission rate stays 14–20/50 across all rounds
+  (base 17), no round nears the cap. The loop teaches neither format nor pass@1.
+
+**Implication:** at this scale the experiment can't cleanly *measure* capability —
+the dominant variable is `\boxed`-format compliance, not math skill. Honest next
+step: a format-robust extractor (or a `\boxed` training/prompt signal) **before**
+re-running for a capability verdict, plus ≫16 train prompts.
+
+### The day's durable output = infra (all committed, independent of the null)
+
+- **One-model self-consistency** path (`--self-consistency`): N temp rollouts →
+  majority-vote on `\boxed` → completion-masked CE writeback, no judge engine.
+- **Temperature-sampled rollout** (`--rollout-temperature 0.7`): greedy SC is
+  degenerate (identical samples → vote no-op); temp gives 33–42 distinct/round.
+- **Decode FP8 GEMV tensor-core MMA confirmed engaging** (the "scalar fallback"
+  was a prefill-only `OnceLock`; decode-specific probe shows MMA — fix 77b5e2f2).
+- **Batched-decode attention default-on** Qwen3.5/3.6 (corrected stale memory).
+- **Train-infer FP8 weight-share** (`--share-frozen-base`, 2cff1465): zero-copy
+  one shared base, **~27 GB saved** ([wins](2026-06-22-train-infer-weight-share.md)).
+- **Two CE-OOM fixes** (b0e3e2d9 + `--writeback-batch 1`): honor grad-ckpt under
+  SC; halve the `[B,S,V]` logits-grad peak so the 27B CE backward fits.
+
+### Rule
+A capability curve is only as honest as its eval: **decode the actual generations
+before trusting pass@1.** The base "16%" was 66% unscorable-`\boxed`, not a
+1536-cap truncation and not a math ceiling — the metric measured format compliance.
+Report the format-confound and the flat-within-noise verdict; never dress a +1.4pp
+noise band as a lift. Cross-links: weight-share 2cff1465; day-of-detours
+[errors](../errors/2026-06-21-rubric-opd-debugging.md) (997caa39).
+
+### Follow-ups
+- Format-robust extractor (last number / `Answer:` / `=` when `\boxed` absent);
+  re-score all 4 rounds — the capability delta may be masked by the 66% floor.
+- Scale train prompts ≫16 + rounds, with the format-robust eval, before any claim.
+- DSv4-Flash judge (needs multi-engine-TP) and shared-base needle gate deferred.
