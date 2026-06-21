@@ -1401,7 +1401,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         infer_student::{InferStudent, save_lora_adapters},
         lora::LoraConfig,
         opd::rubric_writeback_ce_step_batched,
-        qwen35_loader::load_qwen35_lora_from_hf_dir_with_layer_start,
+        qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         rubric::{bfcl_agentic_rubric, math_rubric},
         rubric_opd::{FlashJudge, RubricOpdConfig, run_rubric_rounds},
         tokenizer::ChatTokenizer,
@@ -1426,37 +1426,14 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
 
     let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
 
-    eprintln!(
-        "[arle train rubric-opd] loading student from {}",
-        student_dir.display()
-    );
-    let mut student = load_qwen35_lora_from_hf_dir_with_layer_start(
-        student_dir,
-        lora,
-        target_set,
-        args.lora_layer_start,
-        &mut store,
-    )
-    .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
-    // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
-    // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
-    // This holds in self-consistency mode too: freeing the judge inference VRAM
-    // does NOT cover the full no-checkpoint activation set, so the CE micro-batch
-    // still OOMs at alloc_zeros (observed). Always honor the flag.
-    if args.grad_checkpointing {
-        student.set_gradient_checkpointing(true);
-    }
-    let all_params: Vec<TensorId> = student.all_parameter_ids();
-    let trainable: Vec<TensorId> = all_params
-        .iter()
-        .copied()
-        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
-        .collect();
-    if trainable.is_empty() {
-        bail!("rubric-opd student has no trainable (LoRA) parameters; check --lora-target-set");
-    }
-    let cfg = student.config().clone();
-    let vocab = cfg.vocab_size;
+    // Vocab is read from the checkpoint config (not the autograd student) so the
+    // rollout engine can load BEFORE the autograd student when `--share-frozen-base`
+    // is set — the student must then import the engine's resident FP8 base ptrs.
+    // Same value the autograd `Qwen35Model::config()` exposes (both built from the
+    // same config.json), so the default path is unchanged.
+    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
+        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
+    let vocab = hf_config.vocab_size;
 
     // Student tokenizer: encodes problems, decodes rollouts for the judge.
     let tokenizer_path = resolve_local_tokenizer_path(student_dir)?;
@@ -1501,9 +1478,41 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // Rollout engine (student) — own KV/scheduler path for N-sample generation AND
     // in-process eval. Size for the LARGER of rollout vs eval token budgets (eval
     // generates up to --eval-max-new-tokens to reach the final \boxed{}).
+    //
+    // Load order: when `--share-frozen-base`, the rollout engine loads FIRST so the
+    // autograd student can import (zero-copy) its resident FP8 base. In the default
+    // path the relative order of the two loads is immaterial (each allocates its
+    // own copy); building the engine first is byte-identical for the default.
     let max_prompt_len = prompts.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
     let gen_budget = args.max_new_tokens.max(args.eval_max_new_tokens);
     let student_seq = (max_prompt_len + gen_budget + 32).max(128);
+
+    // Load order matters for the rollout engine's num_slots clamp (computed from
+    // post-weights free VRAM). Default: load the autograd student FIRST so the
+    // engine then sees post-student free VRAM — byte-identical to the
+    // pre-weight-share order. --share-frozen-base: the engine must load FIRST so
+    // the student can import (zero-copy) its resident FP8 base, so the student
+    // load is deferred to the `match` below.
+    let prebuilt_student = if args.share_frozen_base {
+        None
+    } else {
+        eprintln!(
+            "[arle train rubric-opd] loading student from {}",
+            student_dir.display()
+        );
+        Some(
+            load_qwen35_lora_from_hf_dir_with_shared_base(
+                student_dir,
+                lora.clone(),
+                target_set,
+                args.lora_layer_start,
+                None,
+                &mut store,
+            )
+            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?,
+        )
+    };
+
     eprintln!(
         "[arle train rubric-opd] loading rollout engine from {} (max_seq_len={student_seq})",
         student_dir.display()
@@ -1530,6 +1539,92 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         },
     )
     .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
+
+    // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
+    // engine's resident FP8 base pointers, map to the loader's backend-agnostic
+    // table, and pass it into the autograd student load so its frozen FP8 base
+    // projections import a NON-OWNING view instead of allocating ~27 GB.
+    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if args.share_frozen_base {
+        let table = student_engine
+            .frozen_base_fp8_pointers()
+            .context("borrow rollout-engine FP8 base pointers for --share-frozen-base")?;
+        eprintln!(
+            "[arle train rubric-opd] --share-frozen-base: borrowing {} resident FP8 base projections from the rollout engine (zero-copy)",
+            table.len()
+        );
+        table
+            .into_iter()
+            .map(|p| SharedFrozenBaseEntry {
+                layer_idx: p.layer_idx,
+                proj_suffix: p.proj_suffix,
+                weight_ptr: p.weight_ptr,
+                scale_ptr: p.scale_ptr,
+                rows: p.rows,
+                cols: p.cols,
+                block_m: p.block_m,
+                block_k: p.block_k,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let shared_base = if args.share_frozen_base {
+        Some(shared_base_entries.as_slice())
+    } else {
+        None
+    };
+
+    let mut student = match prebuilt_student {
+        // Default path: the student was already loaded first (above), engine second.
+        Some(s) => s,
+        // --share-frozen-base: load the student now, AFTER the engine, importing
+        // its resident FP8 base pointers (zero-copy) for the frozen projections.
+        None => {
+            eprintln!(
+                "[arle train rubric-opd] loading student from {}",
+                student_dir.display()
+            );
+            load_qwen35_lora_from_hf_dir_with_shared_base(
+                student_dir,
+                lora,
+                target_set,
+                args.lora_layer_start,
+                shared_base,
+                &mut store,
+            )
+            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?
+        }
+    };
+
+    // When sharing, the autograd student's frozen base now ALIASES the engine's
+    // resident FP8 bytes. Drain all in-flight device work (the engine upload + the
+    // student's own trainable-suffix uploads) before the first autograd forward so
+    // the shared bytes are guaranteed valid across the (separate) train/infer
+    // streams on the shared primary context (cross-stream handoff fence).
+    if args.share_frozen_base {
+        train_backend
+            .device_synchronize()
+            .context("device sync before first shared-base autograd forward")?;
+    }
+
+    // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
+    // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
+    // This holds in self-consistency mode too: freeing the judge inference VRAM
+    // does NOT cover the full no-checkpoint activation set, so the CE micro-batch
+    // still OOMs at alloc_zeros (observed). Always honor the flag.
+    if args.grad_checkpointing {
+        student.set_gradient_checkpointing(true);
+    }
+    let all_params: Vec<TensorId> = student.all_parameter_ids();
+    let trainable: Vec<TensorId> = all_params
+        .iter()
+        .copied()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    if trainable.is_empty() {
+        bail!("rubric-opd student has no trainable (LoRA) parameters; check --lora-target-set");
+    }
+
     let infer_student = InferStudent::new(
         Arc::new(Mutex::new(student_engine)),
         train_backend.clone(),
@@ -1592,6 +1687,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         writeback_batch: args.writeback_batch,
         correction_cap: args.correction_cap,
         correction_max_tokens: args.correction_max_tokens,
+        share_frozen_base: args.share_frozen_base,
     };
 
     // In-process eval (base + per-round) via the rollout engine — no checkpoint save.

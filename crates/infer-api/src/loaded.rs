@@ -642,6 +642,43 @@ mod backend {
             }
         }
 
+        /// Read-only borrow of resident FP8 block-scaled base projection
+        /// pointers for train-infer weight sharing (`--share-frozen-base`).
+        /// CUDA-only: only the Qwen3.5/3.6 hybrid student carries shareable FP8
+        /// base weights. Returns the pointer table (raw device `u64`s + dims);
+        /// the train loader imports a NON-OWNING view over these instead of
+        /// allocating its own copy of the shared frozen base.
+        #[cfg(feature = "cuda")]
+        pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
+            match self {
+                Self::Cuda(engine) => engine.frozen_base_fp8_pointers(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is Metal")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => anyhow::bail!(
+                    "frozen-base FP8 sharing is CUDA-only; active backend is Metal DiffusionGemma"
+                ),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => anyhow::bail!(
+                    "frozen-base FP8 sharing is CUDA-only; active backend is Metal Gemma4"
+                ),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is HIP")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is Vulkan")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("frozen-base FP8 sharing is CUDA-only; active backend is CPU")
+                }
+            }
+        }
+
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             let kv_ssd = crate::serve::ServeKvSsdOptions::default();

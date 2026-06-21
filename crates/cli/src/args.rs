@@ -1092,6 +1092,16 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 2)]
     pub(crate) rollout_num_slots: usize,
 
+    /// Train-infer FP8 weight sharing (训推一体). When set, the autograd LoRA
+    /// student's FROZEN FP8 base projections do NOT allocate their own weights —
+    /// they point (zero-copy) at the resident FP8 base of the co-resident rollout
+    /// engine on the same GPU/primary context, removing one ~27 GB copy. Only the
+    /// trained suffix + LoRA + optimizer + KV stay separate. Requires the student
+    /// to be an FP8 checkpoint (e.g. Qwen3.6-27B-FP8) and single-GPU. Off by
+    /// default — the default load path is unchanged and byte-identical.
+    #[arg(long, default_value_t = false)]
+    pub(crate) share_frozen_base: bool,
+
     /// Rollout sampling temperature (>0 for rejection-sampling diversity).
     #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
     pub(crate) rollout_temperature: f32,

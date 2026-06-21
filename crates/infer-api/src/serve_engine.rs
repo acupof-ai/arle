@@ -301,6 +301,16 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
             Ok(())
         })?
     }
+
+    /// Read-only borrow of resident FP8 block-scaled base projection pointers
+    /// for train-infer weight sharing (`--share-frozen-base`). Runs on the
+    /// engine thread via the control seam (exclusive `&mut E`) and returns the
+    /// pointer table — raw `u64` device pointers + dims, all `Send`. The borrow
+    /// is read-only; resident weights are not mutated, so no prefix-cache drop.
+    pub fn frozen_base_fp8_pointers(&self) -> Result<Vec<infer_cuda::SharedFp8BaseProjection>> {
+        self.serve
+            .run_on_executor(|executor| executor.frozen_base_fp8_pointers())?
+    }
 }
 
 // `Send` holds via the auto-trait: `ServeInferenceEngine` stores only a

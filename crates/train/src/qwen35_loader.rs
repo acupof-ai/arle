@@ -63,6 +63,45 @@ use crate::{
     qwen35::{Qwen35Error, Qwen35Model},
 };
 
+/// One frozen base projection's resident FP8 block-scaled device pointers,
+/// borrowed read-only from a co-resident infer-cuda engine for train-infer
+/// weight sharing (`--share-frozen-base`).
+///
+/// Backend-agnostic by design: the loader must not depend on `infer` (OPD-only
+/// pivot contract), so `train_cli` maps the infer-api `SharedFp8BaseProjection`
+/// into this plain struct. `layer_idx` + `proj_suffix` (e.g.
+/// `"self_attn.q_proj"`) form the key the loader matches against a planned
+/// tensor's `train_name` (`*.layers.{layer_idx}.{proj_suffix}.weight`).
+#[derive(Debug, Clone, Copy)]
+pub struct SharedFrozenBaseEntry {
+    pub layer_idx: usize,
+    pub proj_suffix: &'static str,
+    pub weight_ptr: u64,
+    pub scale_ptr: u64,
+    pub rows: usize,
+    pub cols: usize,
+    pub block_m: usize,
+    pub block_k: usize,
+}
+
+impl SharedFrozenBaseEntry {
+    /// True iff this entry is the shared base for the given autograd
+    /// `train_name`. Matches `*.layers.{layer_idx}.{proj_suffix}.weight`, robust
+    /// to both the `model.language_model.*` (Qwen3.5/3.6) and `model.*`
+    /// (vanilla Qwen3) name prefixes.
+    fn matches(&self, train_name: &str) -> bool {
+        train_name.ends_with(&format!(
+            ".layers.{}.{}.weight",
+            self.layer_idx, self.proj_suffix
+        ))
+    }
+}
+
+/// Lookup table of shared frozen base projections, keyed by `train_name` match.
+/// `None`/empty = the default (no sharing) path — every frozen FP8 base tensor
+/// uploads its own copy, byte-identical to today.
+pub type SharedFrozenBaseTable<'a> = &'a [SharedFrozenBaseEntry];
+
 #[derive(Debug, Error)]
 pub enum LoaderError {
     #[error("io: {0}")]
@@ -587,7 +626,7 @@ fn dtype_to_bf16_bits(view: &TensorView<'_>, name: &str) -> Result<Vec<u16>> {
 /// a failed OPD checkpoint load.
 pub fn load_qwen35_from_hf_dir(dir: &Path, store: &mut TensorStore) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
-    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::FrozenEval) {
+    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::FrozenEval, None) {
         Ok(model) => Ok(model),
         Err(err) => {
             rollback.restore(store);
@@ -608,7 +647,7 @@ pub fn load_qwen35_trainable_from_hf_dir(
     store: &mut TensorStore,
 ) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
-    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::TrainableStudent) {
+    match load_qwen35_from_hf_dir_inner(dir, store, LoadMode::TrainableStudent, None) {
         Ok(model) => Ok(model),
         Err(err) => {
             rollback.restore(store);
@@ -637,6 +676,34 @@ pub fn load_qwen35_lora_from_hf_dir_with_layer_start(
     lora_layer_start: Option<usize>,
     store: &mut TensorStore,
 ) -> Result<Qwen35Model> {
+    load_qwen35_lora_from_hf_dir_with_shared_base(
+        dir,
+        lora,
+        target_set,
+        lora_layer_start,
+        None,
+        store,
+    )
+}
+
+/// LoRA-student load with optional train-infer FP8 base sharing
+/// (`--share-frozen-base`).
+///
+/// When `shared_base` is `Some(table)`, every frozen FP8 block-scaled base
+/// projection whose `train_name` matches a table entry imports a NON-OWNING
+/// device view over the co-resident infer engine's resident base weight
+/// (zero-copy) instead of uploading its own ~27 GB copy. Unmatched frozen FP8
+/// tensors, and all tensors when `shared_base` is `None`, take the existing
+/// `upload_fp8_block_scaled` path — so the default (`None`) is byte-identical
+/// to [`load_qwen35_lora_from_hf_dir_with_layer_start`].
+pub fn load_qwen35_lora_from_hf_dir_with_shared_base(
+    dir: &Path,
+    lora: LoraConfig,
+    target_set: LoraTargetSet,
+    lora_layer_start: Option<usize>,
+    shared_base: Option<SharedFrozenBaseTable<'_>>,
+    store: &mut TensorStore,
+) -> Result<Qwen35Model> {
     let rollback = TensorStoreRollback::capture(store);
     match load_qwen35_from_hf_dir_inner(
         dir,
@@ -646,6 +713,7 @@ pub fn load_qwen35_lora_from_hf_dir_with_layer_start(
             target_set,
             lora_layer_start,
         },
+        shared_base,
     ) {
         Ok(model) => Ok(model),
         Err(err) => {
@@ -676,6 +744,7 @@ fn load_qwen35_from_hf_dir_inner(
     dir: &Path,
     store: &mut TensorStore,
     mode: LoadMode,
+    shared_base: Option<SharedFrozenBaseTable<'_>>,
 ) -> Result<Qwen35Model> {
     if !dir.is_dir() {
         return Err(LoaderError::Custom(format!(
@@ -759,7 +828,7 @@ fn load_qwen35_from_hf_dir_inner(
 
     // 5) Materialize each train parameter from the safetensors.
     for planned in &load_plan {
-        load_planned_tensor_into_slot(planned, &safetensors_views, store)?;
+        load_planned_tensor_into_slot(planned, &safetensors_views, shared_base, store)?;
     }
 
     Ok(model)
@@ -1132,12 +1201,45 @@ fn validate_supported_dtype(view: &impl safetensors::View, name: &str) -> Result
 fn load_planned_tensor_into_slot(
     planned: &PlannedTensorLoad,
     safetensors_views: &[SafeTensors<'_>],
+    shared_base: Option<SharedFrozenBaseTable<'_>>,
     store: &mut TensorStore,
 ) -> Result<()> {
     let view = safetensors_views[planned.shard_idx]
         .tensor(&planned.hf_name)
         .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", planned.hf_name)))?;
     if let Some(fp8) = &planned.fp8_cuda_frozen_base {
+        // Train-infer weight sharing (`--share-frozen-base`): if a co-resident
+        // infer engine exposes the resident FP8 base for THIS frozen projection
+        // and the dims match, import a NON-OWNING device view (zero-copy)
+        // instead of uploading a private ~27 GB copy. Default (`None`) and any
+        // unmatched tensor fall through to the byte-identical upload below.
+        if let Some(entry) = shared_base.and_then(|table| {
+            table.iter().find(|e| {
+                e.matches(&planned.train_name)
+                    && e.rows == planned.expected_shape[0]
+                    && e.cols == planned.expected_shape[1]
+                    && e.block_m == fp8.block_m
+                    && e.block_k == fp8.block_k
+            })
+        }) {
+            let handle = store
+                .backend()
+                .import_fp8_block_scaled_device_ptr(
+                    entry.weight_ptr,
+                    entry.scale_ptr,
+                    &planned.expected_shape,
+                    fp8.block_m,
+                    fp8.block_k,
+                )
+                .map_err(LoaderError::Autograd)?;
+            store
+                .replace_device_handle(planned.id, handle)
+                .map_err(LoaderError::Autograd)?;
+            store
+                .set_requires_grad(planned.id, false)
+                .map_err(LoaderError::Autograd)?;
+            return Ok(());
+        }
         let scale_view = safetensors_views[fp8.scale_shard_idx]
             .tensor(&fp8.scale_name)
             .map_err(|err| LoaderError::Safetensors(format!("{}: {err}", fp8.scale_name)))?;

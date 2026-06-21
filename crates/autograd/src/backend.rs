@@ -140,6 +140,36 @@ pub struct CudaFp8BlockScaledStorage {
     cols: usize,
     block_m: usize,
     block_k: usize,
+    /// `true` when `weight`/`scales` are NON-OWNING views over device memory
+    /// owned by a *foreign* allocator (the infer-cuda rollout/eval engine's
+    /// resident FP8 base `DeviceMatrix`, shared via `--share-frozen-base`). The
+    /// backing bytes belong to the other engine; this handle must NEVER free
+    /// them. The custom `Drop` below leaks the inner `Arc`s so the foreign
+    /// allocation survives this handle (the infer engine frees them at its own
+    /// teardown). Default `false` (owned) keeps the existing path byte-identical.
+    borrowed: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaFp8BlockScaledStorage {
+    fn drop(&mut self) {
+        if !self.borrowed {
+            return;
+        }
+        // Foreign-borrowed view: the inner `CudaSlice`s wrap device pointers
+        // OWNED by the infer engine (built via `upgrade_device_ptr`); a
+        // `CudaSlice::Drop` would `cuMemFree` the foreign bytes. After this
+        // `drop()` returns, Rust's drop-glue still drops `self.weight`/
+        // `self.scales` (one `Arc` strong-count decrement each). Bump each
+        // strong count and leak the bump so that decrement lands at >= 1 — the
+        // inner `CudaSlice` is never dropped here, and the infer engine frees the
+        // bytes exactly once when IT drops.
+        //
+        // NOTE: `ptr::read(&field)` + `forget` does NOT work — it leaks a bitwise
+        // *copy* while drop-glue still drops the original field → double-free.
+        std::mem::forget(self.weight.clone());
+        std::mem::forget(self.scales.clone());
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -160,6 +190,33 @@ impl CudaFp8BlockScaledStorage {
             cols,
             block_m,
             block_k,
+            borrowed: false,
+        }
+    }
+
+    /// Construct a NON-OWNING block-scaled FP8 view over device buffers owned by
+    /// a foreign allocator. The caller guarantees `weight`/`scales` were built
+    /// from foreign device pointers (e.g. via `CudaStream::upgrade_device_ptr`)
+    /// in the same primary context, and that the foreign owner keeps them
+    /// resident for the lifetime of this handle. On drop the inner `Arc`s are
+    /// leaked (never freed) — see the [`Drop`] impl. Used by the
+    /// `--share-frozen-base` train-infer weight-sharing path.
+    pub(crate) fn new_borrowed(
+        weight: cudarc::driver::CudaSlice<u8>,
+        scales: cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        block_m: usize,
+        block_k: usize,
+    ) -> Self {
+        Self {
+            weight: Arc::new(weight),
+            scales: Arc::new(scales),
+            rows,
+            cols,
+            block_m,
+            block_k,
+            borrowed: true,
         }
     }
 
@@ -384,6 +441,33 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         let _ = (src_device_ptr, len, shape);
         Err(crate::AutogradError::TapeInvariant(
             "backend does not support importing bf16 device pointers",
+        ))
+    }
+
+    /// Import a frozen FP8 block-scaled base weight as a NON-OWNING device view
+    /// over buffers owned by a foreign allocator (the infer-cuda rollout/eval
+    /// engine's resident base `DeviceMatrix`), for the `--share-frozen-base`
+    /// train-infer weight-sharing path.
+    ///
+    /// `weight_device_ptr` / `scale_device_ptr` are raw CUDA device pointers
+    /// (`CUdeviceptr` as `u64`) into the foreign engine's resident FP8 weight
+    /// (`rows*cols` u8 bytes, E4M3) and its block scales (`ceil(rows/block_m) *
+    /// ceil(cols/block_k)` f32). The returned handle borrows those bytes
+    /// **without copying** — the caller must keep the foreign owner resident for
+    /// the handle's lifetime (the OPD Phase-B offload must skip the shared base).
+    /// The handle is created with `requires_grad = false` semantics by the
+    /// caller (frozen base). The default trait impl errors; CUDA overrides.
+    fn import_fp8_block_scaled_device_ptr(
+        &self,
+        weight_device_ptr: u64,
+        scale_device_ptr: u64,
+        shape: &[usize],
+        block_m: usize,
+        block_k: usize,
+    ) -> Result<DeviceHandle> {
+        let _ = (weight_device_ptr, scale_device_ptr, shape, block_m, block_k);
+        Err(crate::AutogradError::TapeInvariant(
+            "backend does not support importing fp8 block-scaled device pointers",
         ))
     }
 

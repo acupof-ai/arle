@@ -1934,6 +1934,40 @@ impl DeviceMatrix {
         ptr
     }
 
+    /// Resident FP8 block-scaled weight pointers for read-only foreign borrow
+    /// (train-infer weight sharing, `--share-frozen-base`).
+    ///
+    /// Returns `Some((qweight_u8_ptr, scale_f32_ptr, rows, cols, block_m,
+    /// block_k))` ONLY when this matrix is stored as block-scaled FP8 with both
+    /// the `qweight_u8` byte buffer and the `scale_f32` scale buffer resident
+    /// (the layout `from_fp8_block_scaled` produces). Any other weight format —
+    /// or a matrix currently offloaded (placeholder buffers) — yields `None`.
+    ///
+    /// The returned `u64`s are raw `CUdeviceptr`s into THIS matrix's resident
+    /// VRAM; the borrower must keep this `DeviceMatrix` resident (no offload,
+    /// no LoRA re-merge replacing the buffers) for the borrow's lifetime.
+    pub fn fp8_block_scaled_ptrs(
+        &self,
+        ctx: &DeviceContext,
+    ) -> Option<(u64, u64, usize, usize, usize, usize)> {
+        use cudarc::driver::DevicePtr;
+        if self.weight_format != WeightFormat::Fp8BlockScaled {
+            return None;
+        }
+        let qweight = self.qweight_u8.as_ref()?;
+        let scales = self.scale_f32.as_ref()?;
+        let (wptr, _wsync) = qweight.device_ptr(&ctx.stream);
+        let (sptr, _ssync) = scales.device_ptr(&ctx.stream);
+        Some((
+            wptr,
+            sptr,
+            self.rows,
+            self.cols,
+            self.quant_block_m,
+            self.quant_block_k,
+        ))
+    }
+
     /// Move every device weight buffer to host RAM and free the VRAM.
     ///
     /// Returns a [`HostMatrixSnapshot`] the caller holds until reload. The
