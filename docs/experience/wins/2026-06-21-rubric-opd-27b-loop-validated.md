@@ -74,12 +74,28 @@ on a confounded number. The cosmetic round-label bug (inner `run_rubric_rounds(r
 "round 0" every outer round; eval files correctly use the outer index `eval_round{0,1,2}.jsonl`)
 is harmless to data.
 
-## Pending — infra-first (throughput is the wall to a trustworthy curve)
-A trustworthy curve needs larger n + larger think-on budget → **throughput-bound** on one GPU
-(CE ~4.5 min/step; eval 12×4096-tok ≈ 30 min). So the next step is the §0 GPU-CE measurement
-(`ARLE_OPD_STEP_PROFILE` forward/backward attribution on a 27B-dense CE step) → pick the #1
-speedup lever (L3b completion-only-logits confirmed: `forward_batch_tokens` at opd.rs:2838
-materializes full `[B,max_len,vocab=248320]` logits + wastes lm_head FLOPs on prompt positions;
-fix = lm_head on completion positions only via `forward_batch_hidden_indices` qwen35.rs:3371).
-Plan: [2026-06-21-autograd-gpu-ce-speedup.md](../../plans/2026-06-21-autograd-gpu-ce-speedup.md).
-DSv4-Flash judge (needs multi-engine-TP) deferred.
+## Infra-first GPU-CE speedup — LANDED 2.6× (892f3f9a)
+§0 profiling (`ARLE_OPD_BACKWARD_PROFILE=1`) attributed the 441 s CE step: **backward 164 s = 100%
+gradient-checkpoint recompute**, with the **linear-attention (GatedDeltaNet) layers on a HOST CPU scan**
+(`host_materialize` 25 s + `fwd_recompute` 42 s). lm_head backward = 0.013% → the design-doc L1/L2/L3b
+GEMM levers were noise. **Root cause:** the device LA dispatch (`cuda_linear_attention_{forward,backward}_device`)
+hardcoded `num_value_heads==32` (35B-A3B); **Qwen3.6-27B has 48** → 48 of 64 layers fell to the host scan.
+
+**Fix** (892f3f9a): dropped the over-conservative head-count guard (kernels are head-count-generic;
+only `key/value_dim==128` is baked in, which the 27B satisfies) + a 48-value-head device-vs-CPU parity
+test (out max_abs_err 1.2e-4, PASS). Measured re-profile (B=1, same config):
+
+| | baseline | post-fix | Δ |
+|---|---|---|---|
+| step | 441 s | **170 s** | **2.6×** |
+| forward | 277 s | ~100 s | 2.8× |
+| backward | 164 s | 70 s | 2.3× |
+
+Loss 0.151 (baseline) ≈ 0.151/0.189 (post-fix) → device LA correct end-to-end. **Next levers** (documented,
+not blocking): backward 70 s is still 100% checkpoint recompute → disable grad-ckpt (needs the `--grad-checkpointing`
+clap `Set` fix + VRAM check); forward ~100 s unattributed (frozen FP8 GEMM L1?). Plan:
+[2026-06-21-autograd-gpu-ce-speedup.md](../../plans/2026-06-21-autograd-gpu-ce-speedup.md).
+
+## Pending — clean capability curve (now affordable)
+Relaunch with larger n + budget + saved checkpoints (the eval-confound fix is larger think-on budget +
+larger n, per the confound analysis above). DSv4-Flash judge (needs multi-engine-TP) deferred.
