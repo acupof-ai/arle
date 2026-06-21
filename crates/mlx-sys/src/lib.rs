@@ -906,6 +906,11 @@ unsafe extern "C" {
         gate_id: i32,
         up_id: i32,
     );
+    pub fn qwen35_compiled_set_full_separate_mlp_v2(
+        model: *mut std::ffi::c_void,
+        gate_id: i32,
+        up_id: i32,
+    );
     pub fn qwen35_compiled_finalize(model: *mut std::ffi::c_void) -> i32;
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_step(
