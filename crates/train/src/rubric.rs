@@ -256,6 +256,184 @@ pub fn select(rollouts: &[String], verdicts: &[Verdict]) -> Selection {
     }
 }
 
+/// Content of the last balanced `{...}` following the last occurrence of `marker`
+/// (e.g. `"\\boxed{"`). Returns `None` if absent/empty. Ports
+/// `_extract_last_braced` from `scripts/arle_capability_eval.py`: it scans every
+/// `marker` occurrence and keeps the LAST one whose balanced body is non-empty
+/// (after trimming).
+pub fn extract_last_braced(text: &str, marker: &str) -> Option<String> {
+    if marker.is_empty() {
+        return None;
+    }
+    let mut last: Option<String> = None;
+    let mut start = 0usize;
+    loop {
+        let Some(rel) = text[start..].find(marker) else {
+            return last;
+        };
+        let pos = start + rel;
+        let body_start = pos + marker.len();
+        let mut depth = 1i32;
+        let mut out = String::new();
+        let mut iter = text[body_start..].char_indices();
+        for (_, ch) in iter.by_ref() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    out.push(ch);
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let candidate = out.trim();
+                        if !candidate.is_empty() {
+                            last = Some(candidate.to_string());
+                        }
+                        break;
+                    }
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        // Mirror the Python `start = pos + len(marker)`: advance past this marker.
+        start = body_start;
+    }
+}
+
+/// Normalize a math answer for exact-match. Ports `_math_normalize_answer` from
+/// `scripts/arle_capability_eval.py`: extract `\boxed{}` first if present, then
+/// strip `$`, drop spacing macros, fold `\dfrac`/`\tfrac` -> `\frac`, unwrap
+/// non-nested `\text{X}` -> `X`, remove commas, remove all whitespace, rstrip `.`,
+/// lowercase.
+pub fn normalize_math_answer(answer: &str) -> String {
+    let mut s = answer.trim().to_string();
+    if let Some(boxed) = extract_last_braced(&s, "\\boxed{") {
+        s = boxed;
+    }
+    // s.replace("\\$", "").strip("$")
+    s = s.replace("\\$", "");
+    s = s.trim_matches('$').to_string();
+    for (old, new) in [
+        ("\\left", ""),
+        ("\\right", ""),
+        ("\\!", ""),
+        ("\\,", ""),
+        ("\\;", ""),
+        ("\\:", ""),
+        ("\\dfrac", "\\frac"),
+        ("\\tfrac", "\\frac"),
+    ] {
+        s = s.replace(old, new);
+    }
+    // re.sub(r"\\text\{([^{}]*)\}", r"\1", s): unwrap non-nested \text{...}.
+    s = unwrap_text_macro(&s);
+    s = s.replace(',', "");
+    // re.sub(r"\s+", "", s): remove ALL whitespace.
+    s = s.chars().filter(|c| !c.is_whitespace()).collect();
+    s = s.trim_end_matches('.').to_string();
+    s.to_lowercase()
+}
+
+/// Replace every non-nested `\text{X}` with its inner `X` (the regex
+/// `\\text\{([^{}]*)\}` only matches bodies free of braces, so nested cases are
+/// left untouched, matching the Python port).
+fn unwrap_text_macro(s: &str) -> String {
+    let pat = "\\text{";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(pat) {
+        let body_start = pos + pat.len();
+        // Find the closing `}`; bail (leave literal) if the body contains a brace.
+        if let Some(close_rel) = rest[body_start..].find('}') {
+            let body = &rest[body_start..body_start + close_rel];
+            if body.contains('{') {
+                // Nested -> regex would not match; copy the marker literally and
+                // continue scanning after it.
+                out.push_str(&rest[..body_start]);
+                rest = &rest[body_start..];
+                continue;
+            }
+            out.push_str(&rest[..pos]);
+            out.push_str(body);
+            rest = &rest[body_start + close_rel + 1..];
+        } else {
+            // No closing brace -> no match; copy the rest verbatim.
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Self-consistency selection: extract+normalize each rollout's `\boxed` answer,
+/// take the majority (most common non-empty normalized answer), and accept every
+/// rollout whose answer == the majority. No external judge.
+///
+/// `parse_errors` = rollouts with no extractable answer. `distinct_accepted` =
+/// count of distinct rollout TEXTS among accepted. Empty / all-unparseable input
+/// yields an empty `Selection` with `parse_errors == rollouts.len()`.
+pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
+    // Normalize each rollout; an empty normalized string = unparseable (no
+    // extractable answer), surfaced as a parse error and never voted/accepted.
+    let answers: Vec<Option<String>> = rollouts
+        .iter()
+        .map(|r| {
+            let norm = normalize_math_answer(r);
+            if norm.is_empty() { None } else { Some(norm) }
+        })
+        .collect();
+
+    let parse_errors = answers.iter().filter(|a| a.is_none()).count();
+
+    // Majority vote over non-empty answers; ties -> first-seen (deterministic).
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for a in answers.iter().flatten() {
+        let key = a.as_str();
+        if !counts.contains_key(key) {
+            order.push(key);
+        }
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    // Pick the most-supported answer; on a tie of counts keep the first-seen
+    // (iterate insertion order, only replace on a STRICTLY greater count).
+    let mut majority: Option<&str> = None;
+    let mut best = 0usize;
+    for &k in &order {
+        let c = counts[k];
+        if c > best {
+            best = c;
+            majority = Some(k);
+        }
+    }
+    let Some(majority) = majority.map(str::to_string) else {
+        // No rollout had an answer.
+        return Selection {
+            accepted: Vec::new(),
+            distinct_accepted: 0,
+            parse_errors,
+        };
+    };
+
+    let mut accepted = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut distinct_accepted = 0usize;
+    for (i, a) in answers.iter().enumerate() {
+        if a.as_deref() == Some(majority.as_str()) {
+            accepted.push(i);
+            if seen.insert(rollouts[i].as_str()) {
+                distinct_accepted += 1;
+            }
+        }
+    }
+    Selection {
+        accepted,
+        distinct_accepted,
+        parse_errors,
+    }
+}
+
 /// Built-in rubric for math reasoning (MATH-500 style): factual answer correctness
 /// gates acceptance; reasoning validity is logged.
 pub fn math_rubric() -> Rubric {
@@ -421,5 +599,75 @@ mod tests {
             let all_true = format!("{{{}}}", keys.join(", "));
             assert!(r.parse_verdict(&all_true).accepted);
         }
+    }
+
+    #[test]
+    fn extract_last_braced_basic() {
+        assert_eq!(
+            extract_last_braced("x \\boxed{42} y", "\\boxed{"),
+            Some("42".to_string())
+        );
+        // No marker -> None.
+        assert_eq!(extract_last_braced("no answer here", "\\boxed{"), None);
+        // Empty body -> None (matches the Python non-empty candidate filter).
+        assert_eq!(extract_last_braced("\\boxed{}", "\\boxed{"), None);
+        // Last non-empty wins across multiple markers.
+        assert_eq!(
+            extract_last_braced("\\boxed{1} then \\boxed{2}", "\\boxed{"),
+            Some("2".to_string())
+        );
+        // Nested braces are balanced correctly.
+        assert_eq!(
+            extract_last_braced("\\boxed{\\frac{1}{2}}", "\\boxed{"),
+            Some("\\frac{1}{2}".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_math_answer_examples() {
+        assert_eq!(
+            normalize_math_answer("The answer is \\boxed{\\frac{1}{2}}"),
+            "\\frac{1}{2}"
+        );
+        assert_eq!(normalize_math_answer("\\boxed{ 3,000 }"), "3000");
+    }
+
+    #[test]
+    fn normalize_math_answer_folds_macros_and_text() {
+        // \dfrac -> \frac, \text{X} unwrap, whitespace strip, trailing dot, lower.
+        assert_eq!(
+            normalize_math_answer("\\boxed{\\dfrac{1}{2} \\text{cm}.}"),
+            "\\frac{1}{2}cm"
+        );
+        // Two rollouts with the SAME boxed answer normalize equal.
+        let a = normalize_math_answer("So the result is \\boxed{42}.");
+        let b = normalize_math_answer("Therefore \\boxed{42}");
+        assert_eq!(a, b);
+        assert_eq!(a, "42");
+    }
+
+    #[test]
+    fn self_consistency_majority_accepts_agreeing_rollouts() {
+        let rollouts = vec![
+            "step ... \\boxed{4}".to_string(),
+            "alt ... \\boxed{4}".to_string(),
+            "wrong ... \\boxed{5}".to_string(),
+        ];
+        let s = select_by_self_consistency(&rollouts);
+        assert_eq!(s.accepted, vec![0, 1]);
+        assert_eq!(s.parse_errors, 0);
+        assert_eq!(s.distinct_accepted, 2);
+    }
+
+    #[test]
+    fn self_consistency_all_unparseable_is_empty() {
+        // A rollout is unparseable iff its normalized answer is empty. With no
+        // \boxed, the normalizer folds the WHOLE text, so only empty /
+        // whitespace-only rollouts have no extractable answer.
+        let rollouts = vec![String::new(), "   ".to_string(), "\n\t  \n".to_string()];
+        let s = select_by_self_consistency(&rollouts);
+        assert!(s.accepted.is_empty());
+        assert_eq!(s.parse_errors, 3);
+        assert_eq!(s.distinct_accepted, 0);
     }
 }
