@@ -121,7 +121,8 @@ pub(crate) fn load_qwen35_metal_weights(
         .context("could not detect Qwen3.5 text weight prefix")?;
 
     let get = |name: &str| tensor_get(&tensors, name);
-    let load_proj = |base: &str| load_proj_from_tensors(&tensors, base, config.quantization);
+    let load_proj =
+        |base: &str| load_proj_from_tensors(&tensors, base, config.quantization.clone());
     let norms_need_offset_correction = {
         let sample = get(&format!("{prefix}.layers.0.input_layernorm.weight"))?;
         qwen35_norm_needs_offset_correction(&sample)
@@ -140,9 +141,10 @@ pub(crate) fn load_qwen35_metal_weights(
     };
 
     let embed_base = format!("{prefix}.embed_tokens");
-    let embed_tokens = load_embed_tokens_from_tensors(&tensors, &embed_base, config.quantization)?;
+    let embed_tokens =
+        load_embed_tokens_from_tensors(&tensors, &embed_base, config.quantization.clone())?;
     let embed_quantized = if config.quantization.is_some() {
-        load_proj_from_tensors(&tensors, &embed_base, config.quantization).ok()
+        load_proj_from_tensors(&tensors, &embed_base, config.quantization.clone()).ok()
     } else {
         None
     };
@@ -305,6 +307,10 @@ fn build_qwen35_dense_mlp(
     down_proj: WeightTensor,
 ) -> Result<MlpKind> {
     let gate_dim = gate_proj.output_dim()?;
+    // Merge gate+up into a single projection. Matching quantized layouts merge
+    // in place; mismatched layouts (mixed-bit per-weight quant such as OptiQ:
+    // gate 4-bit, up 8-bit) are dequantized to a dense merged projection inside
+    // concat_weight_rows.
     let gate_up_proj = match merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
         Some(gate_up_proj) => gate_up_proj,
         None => concat_weight_rows(&gate_proj, &up_proj)?,
