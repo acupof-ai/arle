@@ -188,6 +188,7 @@ impl QuantRegistry {
                     .get("bits")
                     .and_then(serde_json::Value::as_i64)
                     .map_or(4, |n| n as i32),
+                per_weight: std::sync::Arc::new(HashMap::new()),
             })
         };
 
@@ -200,6 +201,7 @@ impl QuantRegistry {
                 .get("bits")
                 .and_then(serde_json::Value::as_i64)
                 .map_or(4, |n| n as i32),
+            per_weight: std::sync::Arc::new(HashMap::new()),
         });
         let overrides = obj
             .iter()
@@ -209,7 +211,10 @@ impl QuantRegistry {
     }
 
     pub(crate) fn for_base(&self, base: &str) -> Option<QuantConfig> {
-        self.overrides.get(base).copied().or(self.default)
+        self.overrides
+            .get(base)
+            .cloned()
+            .or_else(|| self.default.clone())
     }
 }
 

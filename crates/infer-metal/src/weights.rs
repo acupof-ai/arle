@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 
 use crate::loader::TensorMap;
-use crate::mlx::{MlxArray, concatenate_axis, eval};
+use crate::mlx::{MlxArray, concatenate_axis, dequantize, eval, transpose_all};
 
 /// A projection weight registered with the Qwen35 compiled model.
 #[derive(Clone)]
@@ -33,6 +33,26 @@ impl WeightTensor {
                 .first()
                 .copied()
                 .context("quantized projection missing output dimension"),
+        }
+    }
+
+    /// Pre-transposed dense `[in, out]` array for this weight. A quantized
+    /// weight is dequantized (raw layout `[out, in]`) then transposed to match
+    /// the `Dense` convention. Used to row-concatenate projections whose
+    /// quantized layouts cannot be merged in place (mixed-bit per-weight quant).
+    fn to_dense_in_out(&self) -> MlxArray {
+        match self {
+            WeightTensor::Dense(w_t) => w_t.clone(),
+            WeightTensor::Quantized {
+                w,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => {
+                let dense = dequantize(w, scales, biases, *group_size, *bits);
+                transpose_all(&dense)
+            }
         }
     }
 }
@@ -189,15 +209,20 @@ pub(crate) fn merge_quantized_projection_rows(
 }
 
 /// Concatenate projection output rows for dense or mergeable quantized weights.
+///
+/// Quantized weights with matching layouts merge in place. Otherwise -- dense
+/// inputs, or quantized inputs whose layouts differ (mixed-bit per-weight quant
+/// such as OptiQ's gate 4-bit / up 8-bit) -- each operand is dequantized to
+/// dense `[in, out]` and concatenated on the output axis, yielding a single
+/// dense merged projection the C++ MLP consumes via its dense fallback.
 pub(crate) fn concat_weight_rows(lhs: &WeightTensor, rhs: &WeightTensor) -> Result<WeightTensor> {
     if let Some(merged) = merge_quantized_projection_rows(&[lhs, rhs])? {
         return Ok(merged);
     }
 
-    match (lhs, rhs) {
-        (WeightTensor::Dense(lhs), WeightTensor::Dense(rhs)) => Ok(WeightTensor::Dense(
-            concatenate_axis(&[lhs.clone(), rhs.clone()], 1),
-        )),
-        _ => anyhow::bail!("cannot row-concatenate mixed weight formats"),
-    }
+    let lhs_dense = lhs.to_dense_in_out();
+    let rhs_dense = rhs.to_dense_in_out();
+    let merged = concatenate_axis(&[lhs_dense, rhs_dense], 1);
+    eval(&[&merged]);
+    Ok(WeightTensor::Dense(merged))
 }

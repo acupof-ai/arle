@@ -275,6 +275,7 @@ impl DFlashDraftConfig {
             .map(|q| QuantConfig {
                 group_size: q.group_size.unwrap_or(64),
                 bits: q.bits.unwrap_or(4),
+                per_weight: std::sync::Arc::new(std::collections::HashMap::new()),
             });
         Ok(Self {
             hidden_size: raw.hidden_size,
@@ -317,7 +318,8 @@ impl DFlashDraftWeights {
     fn load(model_dir: &Path, config: &DFlashDraftConfig) -> Result<Self> {
         let tensors = load_tensor_map(model_dir)?;
         let get = |name: &str| tensor_get(&tensors, name);
-        let load_proj = |base: &str| load_proj_from_tensors(&tensors, base, config.quantization);
+        let load_proj =
+            |base: &str| load_proj_from_tensors(&tensors, base, config.quantization.clone());
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let p = |suffix: &str| format!("layers.{i}.{suffix}");
