@@ -63,11 +63,13 @@ Build from source, full install matrix, uninstall: [docs/install.md](docs/instal
 
 | Command | What it does |
 |---|---|
-| `arle` (no args) | Interactive agent REPL with `python` and `shell` tools. |
+| `arle` (no args) | Picks a model, serves it locally, and hands the session to the [Eli](https://github.com/cklxx/eli) agent framework against it — or the built-in `python`/`shell` REPL if Eli isn't installed. `--agent arle` forces the REPL; `--gateway` runs Eli's serve mode. Remembers the choice (defaults to Eli next run). |
 | `arle run --prompt "…"` | One-shot agent prompt. `--no-tools` to disable tools. |
 | `arle serve --backend …` | OpenAI-compatible HTTP server. |
 | `arle train opd` | **On-Policy Distillation** — teacher on the serving runtime, student in `train`. [Manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
 | `arle --doctor [--json]` | Backend / hardware / model-resolution self-check. |
+
+<sub><b>Eli is an optional runtime dependency</b> — discovered via <code>$ELI_BIN</code>, <code>PATH</code>, or a sibling <code>../eli</code> build; never a Cargo build-dep. Install it for the full agent runtime (governed self-evolution, gateway channels); without it <code>arle</code> uses its own REPL. arle points Eli at the local server through Eli's keyless <code>local</code> provider, leaving <code>~/.eli/config.toml</code> untouched.</sub>
 
 ---
 
