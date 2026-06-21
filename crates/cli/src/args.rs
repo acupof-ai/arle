@@ -299,6 +299,29 @@ pub(crate) struct Args {
     /// leak operator data.
     #[arg(long, value_enum, default_value_t = TracePromptsMode::On)]
     pub(crate) trace_prompts: TracePromptsMode,
+
+    /// Front-end agent to launch on a no-args interactive start. `eli` serves
+    /// the picked model locally and hands the session to the sibling Eli agent
+    /// framework; `arle` uses the built-in REPL. When omitted, the choice is
+    /// read from `~/.config/arle/agent.toml` (set on the first Eli launch so
+    /// subsequent runs default to Eli).
+    #[arg(long, value_enum)]
+    pub(crate) agent: Option<AgentFrontendArg>,
+
+    /// Launch the Eli front-end in gateway (serve) mode instead of the
+    /// interactive chat REPL. Only meaningful with `--agent eli` (or a saved
+    /// Eli default). Persisted as the launch mode for subsequent runs.
+    #[arg(long, default_value_t = false)]
+    pub(crate) gateway: bool,
+}
+
+/// Which front-end agent the no-args `arle` start launches.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum AgentFrontendArg {
+    /// Built-in ARLE REPL (in-process model load).
+    Arle,
+    /// Sibling Eli agent framework against a local `arle serve`.
+    Eli,
 }
 
 #[derive(Debug, Clone, Subcommand)]

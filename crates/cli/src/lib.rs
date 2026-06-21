@@ -4,6 +4,8 @@ mod banner;
 mod doctor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod download;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod eli;
 mod hardware;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod hf_search;
@@ -132,6 +134,25 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
 
         // Logger already installed at the top of `run()` (quiet "warn" default;
         // RUST_LOG overrides). No re-init here.
+
+        // Eli front-end hand-off. On an interactive no-args (or bare `run`)
+        // start, `arle` can serve the picked model locally and hand the
+        // session to the sibling Eli agent framework instead of the built-in
+        // REPL. Decision precedence: `--agent` flag > saved
+        // `~/.config/arle/agent.toml` > built-in REPL. One-shot runs
+        // (`run --prompt`/`--stdin`) and non-interactive/piped invocations
+        // always use the in-process REPL — Eli is for interactive sessions.
+        let one_shot = run_args
+            .as_ref()
+            .is_some_and(|r| r.prompt.is_some() || r.stdin || !r.image.is_empty());
+        let interactive_tty = !args.non_interactive
+            && std::io::stdin().is_terminal()
+            && std::io::stderr().is_terminal();
+        if !one_shot && interactive_tty {
+            if let Some(action) = decide_eli_launch(&args) {
+                return run_eli_frontend(&args, action);
+            }
+        }
 
         // Interactive startup: hardware detection + model picker + download.
         // Falls back to resolve_model_source() when non-interactive.
@@ -275,6 +296,123 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
 
         Ok(())
     }
+}
+
+/// What the Eli front-end hand-off should do this run.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+enum EliLaunch {
+    /// A saved Eli default exists: serve this model and launch Eli directly,
+    /// skipping the model picker.
+    Saved { model: String, mode: eli::EliMode },
+    /// Launch Eli but resolve the model interactively first (picker), then
+    /// persist the choice so subsequent runs take the `Saved` path.
+    Pick { mode: eli::EliMode },
+}
+
+/// Decide whether (and how) to hand this interactive start to Eli.
+///
+/// Precedence:
+/// 1. `--agent arle` → `None` (built-in REPL, explicit opt-out).
+/// 2. `--agent eli` → `Pick` (force Eli; picker selects the model).
+/// 3. no flag + saved `agent.toml` selects Eli → `Saved` (launch directly).
+/// 4. no flag + no saved Eli default → `Pick` (Eli is the default front-end;
+///    the first run picks a model then persists Eli as the default).
+///
+/// Non-explicit paths (3, 4) fall back to the built-in REPL (`None`) when the
+/// Eli binary isn't installed — arle stays usable standalone (Eli is an
+/// optional runtime dependency, discovered, never a build dep).
+/// `--gateway` overrides the persisted/derived mode when present.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn decide_eli_launch(args: &Args) -> Option<EliLaunch> {
+    use args::AgentFrontendArg;
+
+    // Explicit opt-out: built-in REPL.
+    if matches!(args.agent, Some(AgentFrontendArg::Arle)) {
+        return None;
+    }
+
+    let saved = eli::AgentConfig::load();
+    let flag_mode = if args.gateway {
+        Some(eli::EliMode::Gateway)
+    } else {
+        None
+    };
+
+    // Forced Eli via flag → always pick a model fresh (errors later if Eli is
+    // not installed — the user asked for it explicitly).
+    if matches!(args.agent, Some(AgentFrontendArg::Eli)) {
+        return Some(EliLaunch::Pick {
+            mode: flag_mode.unwrap_or(eli::EliMode::Chat),
+        });
+    }
+
+    // No explicit `--agent` below this point. Eli is the default front-end, but
+    // ONLY when it's actually installed: a missing Eli falls back to the
+    // built-in REPL (graceful, no error). This is the optional-runtime-dependency
+    // contract — arle works standalone; Eli is an opt-in enhancement.
+    if eli::find_eli_binary().is_err() {
+        return None;
+    }
+
+    // No flag: a saved Eli default launches directly with the saved model;
+    // `--gateway` (if passed) still overrides the saved mode for this run.
+    if saved.selects_eli() {
+        let model = saved.model.clone().unwrap_or_default();
+        let mode = flag_mode.unwrap_or_else(|| saved.launch_mode());
+        return Some(EliLaunch::Saved { model, mode });
+    }
+
+    // No flag, no saved Eli default: Eli is the default front-end. Pick a
+    // model, launch Eli, and persist Eli as the default for next time.
+    Some(EliLaunch::Pick {
+        mode: flag_mode.unwrap_or(eli::EliMode::Chat),
+    })
+}
+
+/// Resolve the model (saved or picked), launch Eli against a local serve, and
+/// persist the choice on the `Pick` path so subsequent runs default to Eli.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn run_eli_frontend(args: &Args, action: EliLaunch) -> Result<()> {
+    // Eli serves through `arle serve --backend <b>`; mirror the picker's
+    // backend selection. The serve `auto` backend resolves to the single
+    // compiled backend, which matches this interactive build.
+    let backend = "auto";
+
+    let (model, mode, persist) = match action {
+        EliLaunch::Saved { model, mode } => (model, mode, false),
+        EliLaunch::Pick { mode } => {
+            // Reuse the polished interactive picker/download to resolve a model
+            // source (local dir path or HF id).
+            let model = match startup::resolve_model_interactive(args) {
+                Ok(src) => src,
+                Err(err) => match startup::run_hub_wizard()? {
+                    Some(path) => path,
+                    None => {
+                        eprintln!(
+                            "No model selected. Pass --model-path <dir-or-hf-id> \
+                             or rerun to use the model picker."
+                        );
+                        return Err(err);
+                    }
+                },
+            };
+            (model, mode, true)
+        }
+    };
+
+    if persist {
+        let cfg = eli::AgentConfig {
+            agent: Some("eli".to_string()),
+            model: Some(model.clone()),
+            mode: Some(mode.config_value().to_string()),
+        };
+        // A persistence failure must not block the launch; warn and continue.
+        if let Err(err) = cfg.save() {
+            log::warn!("could not persist arle agent config: {err:#}");
+        }
+    }
+
+    eli::launch_eli(&model, mode, backend)
 }
 
 /// Resolve the per-turn token cap. `requested == 0` means "auto" — read
