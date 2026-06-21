@@ -1361,16 +1361,21 @@ fn rubric_eval_pass(
         temperature: 0.0,
         ..SamplingParams::default()
     };
+    // Batch all eval prompts through the continuous-batching engine instead of
+    // decoding one at a time (per-request B=1 decode is memory-bandwidth-bound;
+    // the scheduler admits as many as KV fits and queues the rest).
+    let requests: Vec<(Vec<u32>, SamplingParams)> = eval_items
+        .iter()
+        .map(|(prompt_ids, _, _)| (prompt_ids.clone(), greedy.clone()))
+        .collect();
+    let generated = infer_student.generate_batch(&requests, max_new)?;
+
     let mut file = fs::File::create(out_path)
         .with_context(|| format!("create eval out {}", out_path.display()))?;
-    for (prompt_ids, problem, gold) in eval_items {
-        let generated = infer_student.generate_samples(prompt_ids, max_new, 1, Some(&greedy))?;
-        let answer = match generated.first() {
-            Some(ids) => tokenizer
-                .decode(ids, true)
-                .map_err(|err| anyhow!("decode eval answer: {err}"))?,
-            None => String::new(),
-        };
+    for ((_, problem, gold), ids) in eval_items.iter().zip(generated.iter()) {
+        let answer = tokenizer
+            .decode(ids, true)
+            .map_err(|err| anyhow!("decode eval answer: {err}"))?;
         let line = serde_json::json!({"problem": problem, "gold": gold, "answer": answer});
         writeln!(file, "{line}")?;
     }
