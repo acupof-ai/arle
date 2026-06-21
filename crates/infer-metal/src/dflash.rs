@@ -12,7 +12,10 @@ use crate::{
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
     mlx::{self, MlxArray},
     model_source,
-    qwen35::{CppQwen35Model, Qwen35GdrTape},
+    qwen35::{
+        CppQwen35Model, Qwen35GdrTape, qwen35_norm_needs_offset_correction,
+        qwen35_normalize_direct_norm_weight,
+    },
     weights::WeightTensor,
 };
 
@@ -79,7 +82,7 @@ impl MetalDflashRuntime {
                     options.draft_model
                 )
             })?;
-        let draft_config = DFlashDraftConfig::load(&draft_dir)?;
+        let draft_config = DFlashDraftConfig::load(&draft_dir, target_config.num_hidden_layers)?;
         check_compatibility(target_config, &draft_config, &options.draft_model)?;
         let draft_weights =
             DFlashDraftWeights::load(&draft_dir, &draft_config).with_context(|| {
@@ -159,8 +162,15 @@ impl MetalDflashRuntime {
             &mut kv_flat,
         )?;
         state.replace_active_kv_flat(kv_flat)?;
-        state.len += context_len + seq;
-        state.rope_offset += context_len + seq;
+        // The z-lab DFlash forward writes the fc-projected target context AND the
+        // `seq` draft rows into its KV (the dual-stream concat). The Qwen35Mtp head
+        // has no context prepend — only the `seq` draft rows enter the head's KV.
+        let written = match self.draft_config.draft_kind {
+            DraftKind::DFlashEagle => context_len + seq,
+            DraftKind::Qwen35Mtp => seq,
+        };
+        state.len += written;
+        state.rope_offset += written;
         Ok(hidden)
     }
 }
@@ -181,13 +191,9 @@ fn check_compatibility(
     draft: &DFlashDraftConfig,
     draft_model_id: &str,
 ) -> std::result::Result<(), DflashCompatError> {
-    let target_q_width = target.num_attention_heads.saturating_mul(target.head_dim);
-    let draft_q_width = draft.num_attention_heads.saturating_mul(draft.head_dim);
-    let target_kv_width = target.num_key_value_heads.saturating_mul(target.head_dim);
-    let draft_kv_width = draft.num_key_value_heads.saturating_mul(draft.head_dim);
     if draft.target_layer_ids.is_empty() {
         return Err(DflashCompatError(format!(
-            "DFlash draft '{draft_model_id}' has empty dflash_config.target_layer_ids"
+            "DFlash draft '{draft_model_id}' has empty target_layer_ids"
         )));
     }
     if let Some(&max_layer) = draft.target_layer_ids.iter().max()
@@ -198,34 +204,62 @@ fn check_compatibility(
             target.num_hidden_layers
         )));
     }
+    // The only hard cross-model contract is the hidden width: the head reads the
+    // base's hidden (and, for Qwen35Mtp, the base token embedding) at this dim.
     if draft.hidden_size != target.hidden_size {
         return Err(DflashCompatError(format!(
             "DFlash draft/target hidden_size mismatch: target={}, draft={}",
             target.hidden_size, draft.hidden_size
         )));
     }
-    if draft_q_width != target_q_width {
-        return Err(DflashCompatError(format!(
-            "DFlash draft/target q_proj width mismatch: target={}, draft={draft_q_width}",
-            target_q_width
-        )));
-    }
-    if draft_kv_width != target_kv_width {
-        return Err(DflashCompatError(format!(
-            "DFlash draft/target kv_proj width mismatch: target={}, draft={draft_kv_width}",
-            target_kv_width
-        )));
+    // The Qwen35Mtp head has its OWN attention (q/k/v/o proj sized to the head's
+    // own num_heads/head_dim, independent of the base). Only DFlashEagle shares
+    // the base attention projection widths and must match them.
+    if draft.draft_kind == DraftKind::DFlashEagle {
+        let target_q_width = target.num_attention_heads.saturating_mul(target.head_dim);
+        let draft_q_width = draft.num_attention_heads.saturating_mul(draft.head_dim);
+        let target_kv_width = target.num_key_value_heads.saturating_mul(target.head_dim);
+        let draft_kv_width = draft.num_key_value_heads.saturating_mul(draft.head_dim);
+        if draft_q_width != target_q_width {
+            return Err(DflashCompatError(format!(
+                "DFlash draft/target q_proj width mismatch: target={target_q_width}, draft={draft_q_width}"
+            )));
+        }
+        if draft_kv_width != target_kv_width {
+            return Err(DflashCompatError(format!(
+                "DFlash draft/target kv_proj width mismatch: target={target_kv_width}, draft={draft_kv_width}"
+            )));
+        }
     }
     Ok(())
 }
 
+/// One EAGLE draft head, two configs.
+///
+/// `DFlashEagle` is the z-lab DFlash head: `fc` consumes the base hidden only, a
+/// single `hidden_norm`, a non-gated layer with full rotary, and the draft block
+/// is produced in one parallel forward. `Qwen35Mtp` is the Qwen3.5/3.6 NextN/MTP
+/// head: `fc` consumes `concat[pre_fc_norm_embedding(embed), pre_fc_norm_hidden(
+/// hidden)]`, the single layer is a gated full-attention layer (partial rotary),
+/// and the draft block is produced by sequential autoregressive steps chaining the
+/// head's own hidden output. The two branch once for the fc-input/norm + layer
+/// step and share the KV/rollback/verify machinery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DraftKind {
+    DFlashEagle,
+    Qwen35Mtp,
+}
+
 #[derive(Clone, Debug)]
 struct DFlashDraftConfig {
+    draft_kind: DraftKind,
     hidden_size: usize,
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
+    rotary_dim: usize,
+    attn_output_gate: bool,
     rms_norm_eps: f32,
     rope_theta: f32,
     block_size: usize,
@@ -261,33 +295,158 @@ struct RawDraftConfig {
     quantization_config: Option<RawDraftQuantConfig>,
 }
 
+// Qwen3.5/3.6 NextN/MTP head config (model_type == "qwen3_5_mtp"). The real
+// attention dims live under `text_config`; rope parameters carry the partial
+// rotary factor + theta. There is no `dflash_config`/`mask_token_id` — the MTP
+// draft is autoregressive, not masked.
+#[derive(Debug, Deserialize)]
+struct RawMtpRopeParams {
+    rope_theta: f64,
+    #[serde(default = "default_partial_rotary")]
+    partial_rotary_factor: f64,
+}
+
+fn default_partial_rotary() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMtpTextConfig {
+    hidden_size: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rms_norm_eps: f64,
+    #[serde(default)]
+    attn_output_gate: bool,
+    rope_parameters: RawMtpRopeParams,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMtpConfig {
+    block_size: Option<usize>,
+    text_config: RawMtpTextConfig,
+    quantization: Option<RawDraftQuantConfig>,
+    quantization_config: Option<RawDraftQuantConfig>,
+}
+
+// Probe the model_type / tensor inventory without committing to one schema.
+#[derive(Debug, Deserialize)]
+struct RawConfigProbe {
+    model_type: Option<String>,
+}
+
+// Fallback head-kind detector: the Qwen3.5/3.6 MTP head carries
+// `pre_fc_norm_embedding.weight`; the z-lab DFlash head does not. We look in the
+// safetensors index (sharded) or the single-shard header without loading weights.
+fn draft_head_has_pre_fc_norm(model_dir: &Path) -> bool {
+    const NEEDLE: &str = "pre_fc_norm_embedding.weight";
+    let index = model_dir.join("model.safetensors.index.json");
+    if let Ok(text) = std::fs::read_to_string(&index) {
+        return text.contains(NEEDLE);
+    }
+    let single = model_dir.join("model.safetensors");
+    if let Ok(bytes) = std::fs::read(&single) {
+        if bytes.len() >= 8 {
+            let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+            let end = (8 + header_len).min(bytes.len());
+            if let Ok(header) = std::str::from_utf8(&bytes[8..end]) {
+                return header.contains(NEEDLE);
+            }
+        }
+    }
+    false
+}
+
+fn raw_quant(
+    quantization: Option<RawDraftQuantConfig>,
+    quantization_config: Option<RawDraftQuantConfig>,
+) -> Option<QuantConfig> {
+    quantization.or(quantization_config).map(|q| QuantConfig {
+        group_size: q.group_size.unwrap_or(64),
+        bits: q.bits.unwrap_or(4),
+        per_weight: std::sync::Arc::new(std::collections::HashMap::new()),
+    })
+}
+
 impl DFlashDraftConfig {
-    fn load(model_dir: &Path) -> Result<Self> {
+    fn load(model_dir: &Path, target_num_layers: usize) -> Result<Self> {
         let config_path = model_dir.join("config.json");
-        let raw: RawDraftConfig = serde_json::from_str(
-            &std::fs::read_to_string(&config_path)
-                .with_context(|| format!("cannot read {}", config_path.display()))?,
-        )
-        .with_context(|| format!("cannot parse {}", config_path.display()))?;
-        let quantization = raw
-            .quantization
-            .or(raw.quantization_config)
-            .map(|q| QuantConfig {
-                group_size: q.group_size.unwrap_or(64),
-                bits: q.bits.unwrap_or(4),
-                per_weight: std::sync::Arc::new(std::collections::HashMap::new()),
-            });
+        let config_text = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        let probe: RawConfigProbe = serde_json::from_str(&config_text)
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        // Auto-detect the Qwen3.5/3.6 NextN/MTP head: its model_type is
+        // `qwen3_5_mtp` and it carries the two pre_fc norms that the z-lab DFlash
+        // head does not (see DraftKind docs).
+        let is_mtp = probe
+            .model_type
+            .as_deref()
+            .is_some_and(|t| t.contains("qwen3_5_mtp"))
+            || draft_head_has_pre_fc_norm(model_dir);
+        if is_mtp {
+            Self::load_qwen35_mtp(&config_text, &config_path, target_num_layers)
+        } else {
+            Self::load_dflash_eagle(&config_text, &config_path)
+        }
+    }
+
+    fn load_dflash_eagle(config_text: &str, config_path: &Path) -> Result<Self> {
+        let raw: RawDraftConfig = serde_json::from_str(config_text)
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        let quantization = raw_quant(raw.quantization, raw.quantization_config);
         Ok(Self {
+            draft_kind: DraftKind::DFlashEagle,
             hidden_size: raw.hidden_size,
             num_hidden_layers: raw.num_hidden_layers,
             num_attention_heads: raw.num_attention_heads,
             num_key_value_heads: raw.num_key_value_heads,
             head_dim: raw.head_dim,
+            rotary_dim: raw.head_dim,
+            attn_output_gate: false,
             rms_norm_eps: raw.rms_norm_eps as f32,
             rope_theta: raw.rope_theta as f32,
             block_size: raw.block_size.unwrap_or(16),
             mask_token_id: raw.dflash_config.mask_token_id,
             target_layer_ids: raw.dflash_config.target_layer_ids,
+            quantization,
+        })
+    }
+
+    fn load_qwen35_mtp(
+        config_text: &str,
+        config_path: &Path,
+        target_num_layers: usize,
+    ) -> Result<Self> {
+        let raw: RawMtpConfig = serde_json::from_str(config_text)
+            .with_context(|| format!("cannot parse {}", config_path.display()))?;
+        let t = raw.text_config;
+        let quantization = raw_quant(raw.quantization, raw.quantization_config);
+        let rotary_dim = (t.head_dim as f64 * t.rope_parameters.partial_rotary_factor) as usize;
+        ensure!(
+            target_num_layers >= 1,
+            "Qwen3.5 MTP head requires target with at least one layer"
+        );
+        Ok(Self {
+            draft_kind: DraftKind::Qwen35Mtp,
+            hidden_size: t.hidden_size,
+            // The MTP head ships exactly one decoder layer (mtp_num_hidden_layers=1).
+            num_hidden_layers: 1,
+            num_attention_heads: t.num_attention_heads,
+            num_key_value_heads: t.num_key_value_heads,
+            head_dim: t.head_dim,
+            rotary_dim,
+            attn_output_gate: t.attn_output_gate,
+            rms_norm_eps: t.rms_norm_eps as f32,
+            rope_theta: t.rope_parameters.rope_theta as f32,
+            block_size: raw.block_size.unwrap_or(3),
+            // No mask token — the MTP draft is autoregressive. Use a sentinel that
+            // the draft loop never emits/checks.
+            mask_token_id: u32::MAX,
+            // The head consumes the BASE residual stream after the final decoder
+            // layer (its own pre_fc_norm_hidden re-norms it), which is exactly the
+            // capture at the last target layer.
+            target_layer_ids: vec![target_num_layers - 1],
             quantization,
         })
     }
@@ -310,7 +469,10 @@ struct DFlashDraftLayerWeights {
 struct DFlashDraftWeights {
     layers: Vec<DFlashDraftLayerWeights>,
     fc: WeightTensor,
+    // DFlashEagle: the single `hidden_norm`. Qwen35Mtp: the two pre_fc norms.
     hidden_norm: MlxArray,
+    pre_fc_norm_embedding: MlxArray,
+    pre_fc_norm_hidden: MlxArray,
     norm: MlxArray,
 }
 
@@ -320,6 +482,26 @@ impl DFlashDraftWeights {
         let get = |name: &str| tensor_get(&tensors, name);
         let load_proj =
             |base: &str| load_proj_from_tensors(&tensors, base, config.quantization.clone());
+
+        let is_mtp = config.draft_kind == DraftKind::Qwen35Mtp;
+        // The Qwen3.5/3.6 head's RMSNorms are GemmaRMSNorm `(1+w)`; reuse the base
+        // model's per-conversion offset detection (sampled on input_layernorm and
+        // applied uniformly, exactly as qwen35.rs does). DFlashEagle norms are
+        // loaded raw (unchanged from prior behavior).
+        let mtp_offset = if is_mtp {
+            qwen35_norm_needs_offset_correction(&get("layers.0.input_layernorm.weight")?)
+        } else {
+            false
+        };
+        let load_norm = |name: &str| -> Result<MlxArray> {
+            let w = get(name)?;
+            Ok(if is_mtp {
+                qwen35_normalize_direct_norm_weight(&w, mtp_offset)
+            } else {
+                w
+            })
+        };
+
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let p = |suffix: &str| format!("layers.{i}.{suffix}");
@@ -328,20 +510,34 @@ impl DFlashDraftWeights {
                 k_proj: load_proj(&p("self_attn.k_proj"))?,
                 v_proj: load_proj(&p("self_attn.v_proj"))?,
                 o_proj: load_proj(&p("self_attn.o_proj"))?,
-                input_layernorm: get(&p("input_layernorm.weight"))?,
-                post_attention_layernorm: get(&p("post_attention_layernorm.weight"))?,
-                q_norm: get(&p("self_attn.q_norm.weight"))?,
-                k_norm: get(&p("self_attn.k_norm.weight"))?,
+                input_layernorm: load_norm(&p("input_layernorm.weight"))?,
+                post_attention_layernorm: load_norm(&p("post_attention_layernorm.weight"))?,
+                q_norm: load_norm(&p("self_attn.q_norm.weight"))?,
+                k_norm: load_norm(&p("self_attn.k_norm.weight"))?,
                 gate_proj: load_proj(&p("mlp.gate_proj"))?,
                 up_proj: load_proj(&p("mlp.up_proj"))?,
                 down_proj: load_proj(&p("mlp.down_proj"))?,
             });
         }
+
+        let zero = || mlx::zeros(&[1], mlx::Dtype::Bfloat16);
+        let (hidden_norm, pre_fc_norm_embedding, pre_fc_norm_hidden) = if is_mtp {
+            (
+                zero(),
+                load_norm("pre_fc_norm_embedding.weight")?,
+                load_norm("pre_fc_norm_hidden.weight")?,
+            )
+        } else {
+            (get("hidden_norm.weight")?, zero(), zero())
+        };
+
         Ok(Self {
             layers,
             fc: load_proj("fc")?,
-            hidden_norm: get("hidden_norm.weight")?,
-            norm: get("norm.weight")?,
+            hidden_norm,
+            pre_fc_norm_embedding,
+            pre_fc_norm_hidden,
+            norm: load_norm("norm.weight")?,
         })
     }
 }
@@ -400,6 +596,12 @@ impl DFlashDraftCppModel {
                 config.num_key_value_heads as i32,
                 config.head_dim as i32,
                 config.num_hidden_layers as i32,
+                config.rotary_dim as i32,
+                i32::from(config.attn_output_gate),
+                match config.draft_kind {
+                    DraftKind::DFlashEagle => 0,
+                    DraftKind::Qwen35Mtp => 1,
+                },
                 config.rope_theta,
                 config.rms_norm_eps,
             );
@@ -469,6 +671,15 @@ impl DFlashDraftCppModel {
                 weights.hidden_norm.as_raw(),
                 weights.norm.as_raw(),
             );
+        }
+        if config.draft_kind == DraftKind::Qwen35Mtp {
+            unsafe {
+                mlx_sys::dflash_draft_set_qwen35_mtp_norms(
+                    model,
+                    weights.pre_fc_norm_embedding.as_raw(),
+                    weights.pre_fc_norm_hidden.as_raw(),
+                );
+            }
         }
         let rc = unsafe { mlx_sys::dflash_draft_finalize(model) };
         if rc != 0 {
@@ -546,6 +757,14 @@ impl DFlashDraftState {
             head_dim,
             rope_offset: 0,
         }
+    }
+
+    /// Drop all written KV: the next `active_kv_flat` returns empty slices so the
+    /// head's KV is rebuilt from scratch. Used by the Qwen35Mtp draft, which seeds
+    /// a fresh head KV each block (see prepare_draft_block_mtp).
+    fn reset(&mut self) {
+        self.len = 0;
+        self.rope_offset = 0;
     }
 
     fn active_kv_flat(&self) -> Vec<MlxArray> {
@@ -850,9 +1069,21 @@ fn prepare_draft_block(
     embed_table: &MlxArray,
     lm_head: &WeightTensor,
     target_config: &MetalModelConfig,
-    _params: &SamplingParams,
+    params: &SamplingParams,
     draft_state: &mut DFlashDraftState,
 ) -> Result<MlxArray> {
+    if runtime.draft_config.draft_kind == DraftKind::Qwen35Mtp {
+        return prepare_draft_block_mtp(
+            runtime,
+            current_token,
+            target_hidden,
+            embed_table,
+            lm_head,
+            target_config,
+            params,
+            draft_state,
+        );
+    }
     let block_size_i32 =
         i32::try_from(runtime.block_size).context("DFlash block_size does not fit in i32")?;
     let draft_trace = dflash_draft_trace_enabled();
@@ -922,6 +1153,90 @@ fn prepare_draft_block(
             millis(t_argmax - t_lm_head),
             millis(t_tokens - t_argmax),
             millis(t_tokens - t0)
+        );
+    }
+    Ok(tokens)
+}
+
+/// Qwen3.5/3.6 NextN/MTP draft block.
+///
+/// The MTP head is autoregressive (one next-token per forward), so a depth-`d`
+/// block is `d-1` sequential head forwards chaining the head's own hidden output
+/// (the SGLang EAGLE draft loop, `draft_forward`). Unlike the z-lab DFlash head
+/// there is no parallel masked block and no re-fed KV context: the head KV is
+/// seeded fresh each block from the single last-accepted position
+/// (`current_token` + its base hidden), and each step extends it by one. The verify
+/// guarantees target-correct accepted tokens regardless, so a shorter head context
+/// only trades acceptance rate, never correctness.
+#[allow(clippy::too_many_arguments)]
+fn prepare_draft_block_mtp(
+    runtime: &MetalDflashRuntime,
+    current_token: u32,
+    target_hidden: &MlxArray,
+    embed_table: &MlxArray,
+    lm_head: &WeightTensor,
+    _target_config: &MetalModelConfig,
+    _params: &SamplingParams,
+    draft_state: &mut DFlashDraftState,
+) -> Result<MlxArray> {
+    let draft_trace = dflash_draft_trace_enabled();
+    let t0 = Instant::now();
+
+    // Fresh head KV per block: drop everything written by the prior block so the
+    // head attends only over this block's draft chain seeded by the current token.
+    draft_state.reset();
+
+    let hidden_size = target_hidden.shape().get(1).copied().unwrap_or(0);
+    let ctx_rows = target_hidden.shape().first().copied().unwrap_or(0);
+    ensure!(
+        ctx_rows >= 1 && hidden_size > 0,
+        "DFlash MTP target_hidden must have at least one row, got shape {:?}",
+        target_hidden.shape()
+    );
+    // Seed from the LAST accepted position — the hidden that produced current_token.
+    let mut step_hidden = mlx::slice(
+        target_hidden,
+        &[ctx_rows - 1, 0],
+        &[ctx_rows, hidden_size],
+        &[1, 1],
+    );
+
+    let mut input_tokens = vec![0u32; runtime.block_size];
+    input_tokens[0] = current_token;
+    let mut prev_token = current_token;
+
+    // Produce block_size - 1 draft tokens, chaining hidden across steps.
+    for slot in input_tokens.iter_mut().skip(1) {
+        let noise_embedding = embed_token_rows(embed_table, &[prev_token]);
+        let draft_hidden = runtime.forward_draft(&noise_embedding, &step_hidden, draft_state)?;
+        // The head returns [1, H] (rank-2) for a single position; keep that shape.
+        let flat = mlx::reshape(&draft_hidden, &[1, hidden_size]);
+        let logits = apply_weight(&flat, lm_head);
+        let argmax = mlx::argmax_axis(&logits, -1);
+        let next = materialize_i32_tokens(&argmax)?
+            .first()
+            .copied()
+            .context("DFlash MTP argmax produced no token")?;
+        ensure!(
+            next >= 0,
+            "DFlash MTP draft emitted negative token id: {next}"
+        );
+        let next = next as u32;
+        *slot = next;
+        prev_token = next;
+        step_hidden = flat;
+        if draft_trace {
+            mlx::eval(&[&step_hidden]);
+        }
+    }
+
+    let tokens = tokens_to_array(&input_tokens);
+    if draft_trace {
+        log::info!(
+            "Metal DFlash MTP draft trace ctx_rows={} block={} total_ms={:.3}",
+            ctx_rows,
+            runtime.block_size,
+            millis(Instant::now() - t0)
         );
     }
     Ok(tokens)
