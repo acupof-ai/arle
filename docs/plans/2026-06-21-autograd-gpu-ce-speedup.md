@@ -42,10 +42,18 @@ The lever ranking below is the **hypothesis order**; the measurement re-ranks it
   go through FP32 `sgemm` (backend_cuda.rs:595), H20 FP32 throughput is a fraction of
   bf16; a bf16 GEMM path exists (`matmul_bt_device_f32_bf16`). Switch compute to bf16
   (f32 accumulate). Tractable; impact depends on the FP32-GEMM share.
-- **L3 — batched CE writeback.** Train B accepted rollouts in ONE forward+backward
-  (batch dim; `forward_batch_indices` already batches) instead of B sequential steps →
-  amortize per-op host dispatch over B. Tractable, high-value if host-dispatch is a
-  large share; needs length padding/bucketing for variable rollouts.
+- **L3 — batched CE writeback.** DONE + MEASURED: `rubric_writeback_ce_step_batched`
+  amortizes the host dispatch — **batch-4 = 2.7×** (400 s/4 vs 270 s/1), confirming the
+  overhead-bound diagnosis. BUT it **OOMs at B>1 on long prompts**: the `[B, seq, vocab]`
+  logits with **vocab=248320** is huge (a batch hitting a ~2800-tok math prompt →
+  `[4,2866,248320]` = 11.4 GB device upload → OOM; the engine-offload frees to a pool the
+  autograd allocator can't fully reuse, ~4 GB device headroom). batch-1 fits (~2.85 GB).
+  → **L3b (the real fix): completion-only logits** — run `lm_head` only on the completion
+  positions (forward to hidden via `forward_batch_hidden_indices`, slice completion-pos
+  hidden, then lm_head), so CE device memory is `[Σ completion_tok, vocab]` (~3 GB at
+  B=4) — independent of prompt length × B. Then B>1 batching is safe. OR token-budget
+  micro-batch grouping (group by `count×maxlen ≤ budget`). The current curve runs at
+  batch-1 (proven-fit) to deliver a result; L3b makes batching usable.
 - **L4 — op fusion.** Fuse rmsnorm/rope/silu·mul elementwise chains into fewer kernels
   (cuts launch + dispatch count). Moderate.
 - **L5 — CUDA-graph capture.** Capture the tape's kernel stream once, replay
