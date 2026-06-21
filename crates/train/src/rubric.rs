@@ -127,6 +127,29 @@ impl Rubric {
         s
     }
 
+    /// Render a prompt asking a strong solver to PRODUCE a correct solution
+    /// (Mode B corrector for rejected prompts). Lists the Factual requirements so
+    /// the solution carries the answer format the rubric checks. Vocab-agnostic:
+    /// the solver's text is re-tokenized into the student vocab as a CE target.
+    pub fn solve_prompt(&self, problem: &str) -> String {
+        let mut s = String::new();
+        s.push_str("You are an expert solving a ");
+        s.push_str(&self.task);
+        s.push_str(" problem. Produce a correct, complete, self-contained solution.\n\n");
+        s.push_str("PROBLEM:\n");
+        s.push_str(problem);
+        s.push_str("\n\nThe solution MUST satisfy:\n");
+        for c in &self.criteria {
+            if c.kind == CriterionKind::Factual {
+                s.push_str("- ");
+                s.push_str(&c.description);
+                s.push('\n');
+            }
+        }
+        s.push_str("\nThink step by step, then state the final answer.\n");
+        s
+    }
+
     /// Parse a judge output into a [`Verdict`]. Extracts the last balanced `{...}`
     /// JSON object, requires a boolean for every criterion key; any missing key or
     /// unparseable JSON yields `parse_error = true` (never accepted).
@@ -284,6 +307,15 @@ mod tests {
         assert!(p.contains("answer_correct"));
         assert!(p.contains("steps_valid"));
         assert!(p.contains("math reasoning"));
+    }
+
+    #[test]
+    fn solve_prompt_lists_problem_and_factual_requirements() {
+        let r = math_rubric();
+        let p = r.solve_prompt("2+2?");
+        assert!(p.contains("PROBLEM:"));
+        assert!(p.contains("2+2?"));
+        assert!(p.contains("boxed"));
     }
 
     #[test]
