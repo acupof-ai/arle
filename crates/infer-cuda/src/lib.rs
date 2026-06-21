@@ -85,8 +85,8 @@ mod workspace;
 // the train crate pushes into the student engine; re-exported from `infer-api`.
 #[cfg(feature = "cuda")]
 pub use qwen35::{
-    StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate,
-    StudentLoraUpdate,
+    SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
+    StudentLoraProjectionUpdate, StudentLoraUpdate,
 };
 
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
@@ -381,6 +381,20 @@ impl CudaExecutor {
                  the no-GPU placeholder has no resident weights"
             ),
             CudaExecutorInner::Real(real) => real.remerge_student_lora(update),
+        }
+    }
+
+    /// Read-only borrow of resident FP8 block-scaled base projection pointers
+    /// for train-infer weight sharing (`--share-frozen-base`). Errors on the
+    /// no-GPU placeholder and on non-student CUDA models.
+    #[cfg(feature = "cuda")]
+    pub fn frozen_base_fp8_pointers(&self) -> anyhow::Result<Vec<qwen35::SharedFp8BaseProjection>> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "frozen-base FP8 sharing requires the real CUDA executor; \
+                 the no-GPU placeholder has no resident weights"
+            ),
+            CudaExecutorInner::Real(real) => real.frozen_base_fp8_pointers(),
         }
     }
 

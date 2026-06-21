@@ -1140,6 +1140,82 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn import_fp8_block_scaled_device_ptr(
+        &self,
+        weight_device_ptr: u64,
+        scale_device_ptr: u64,
+        shape: &[usize],
+        block_m: usize,
+        block_k: usize,
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (weight_device_ptr, scale_device_ptr, shape, block_m, block_k);
+            todo!(
+                "GPU required: cuda fp8 block-scaled device import is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            if shape.len() != 2 {
+                return Err(AutogradError::InvalidRank {
+                    expected: "2",
+                    got: shape.len(),
+                });
+            }
+            if block_m == 0 || block_k == 0 {
+                return Err(AutogradError::TapeInvariant(
+                    "fp8 block-scaled import block_m/block_k must be non-zero",
+                ));
+            }
+            let rows = shape[0];
+            let cols = shape[1];
+            let weight_len = rows.checked_mul(cols).ok_or(AutogradError::TapeInvariant(
+                "fp8 import weight len overflow",
+            ))?;
+            let scale_len = rows
+                .div_ceil(block_m)
+                .checked_mul(cols.div_ceil(block_k))
+                .ok_or(AutogradError::TapeInvariant(
+                    "fp8 import scale len overflow",
+                ))?;
+
+            // NON-OWNING view over the foreign engine's resident FP8 base bytes.
+            // `upgrade_device_ptr` wraps the raw `CUdeviceptr` in a `CudaSlice`
+            // bound to THIS backend's stream/primary context — so the
+            // context-equality guard in `cuda_fp8_block_scaled_storage`
+            // (`weight.context() == self.stream.context()`) passes (both engines
+            // retain the same device primary context on the same ordinal). The
+            // `CudaFp8BlockScaledStorage::new_borrowed` handle leaks these slices
+            // on drop instead of freeing — the infer engine owns the bytes.
+            //
+            // Safety: the caller (`--share-frozen-base` loader wiring) guarantees
+            // `weight_device_ptr` / `scale_device_ptr` are valid resident
+            // allocations on this ordinal of at least `weight_len` u8 /
+            // `scale_len` f32 elements, kept resident for the handle's lifetime
+            // (the OPD Phase-B offload skips the shared base when sharing).
+            let weight_slice: CudaSlice<u8> = unsafe {
+                self.stream
+                    .upgrade_device_ptr::<u8>(weight_device_ptr as CUdeviceptr, weight_len)
+            };
+            let scale_slice: CudaSlice<f32> = unsafe {
+                self.stream
+                    .upgrade_device_ptr::<f32>(scale_device_ptr as CUdeviceptr, scale_len)
+            };
+            Ok(DeviceHandle::CudaFp8BlockScaled(
+                crate::backend::CudaFp8BlockScaledStorage::new_borrowed(
+                    weight_slice,
+                    scale_slice,
+                    rows,
+                    cols,
+                    block_m,
+                    block_k,
+                ),
+            ))
+        }
+    }
+
     fn zeros(&self, shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {

@@ -209,6 +209,13 @@ pub struct RubricOpdConfig {
     pub correction_cap: usize,
     /// Max new tokens for a Mode B correction solution.
     pub correction_max_tokens: usize,
+    /// Train-infer FP8 weight sharing (`--share-frozen-base`). When `true`, the
+    /// autograd student's frozen FP8 base ALIASES the rollout engine's resident
+    /// base bytes, so the Phase-B rollout-engine weight offload is SKIPPED
+    /// (freeing those bytes would crash the CE forward reading the alias). The
+    /// VRAM the offload used to free is already saved by sharing the single copy.
+    /// The judge offload still runs. Default `false` = offload as today.
+    pub share_frozen_base: bool,
 }
 
 /// Per-round accounting. `distinct_accepted` is the RFT log-linear x-axis;
@@ -357,14 +364,29 @@ where
             }
         }
 
-        // Phase B — offload BOTH inference engines (rollout + judge) to host RAM,
-        // freeing their VRAM (~tens of GB) for the 27B autograd CE forward+backward.
-        // Without this the CE step OOMs (`cuda alloc_zeros failed`) at seq ~1k.
+        // Phase B — offload the inference engines to host RAM, freeing their VRAM
+        // (~tens of GB) for the 27B autograd CE forward+backward. Without this the
+        // CE step OOMs (`cuda alloc_zeros failed`) at seq ~1k.
+        //
+        // `--share-frozen-base`: the autograd student's frozen FP8 base ALIASES the
+        // rollout engine's resident base bytes, so offloading (freeing) the rollout
+        // weights would crash the CE forward reading the alias. SKIP the rollout
+        // offload when sharing — the single shared copy already saves that VRAM. The
+        // judge engine is independent and still offloads.
         eprintln!(
-            "[rubric] round {round} phase-B: offloading engines ({} accepted to train)",
-            accepted_pairs.len()
+            "[rubric] round {round} phase-B: offloading engines ({} accepted to train){}",
+            accepted_pairs.len(),
+            if cfg.share_frozen_base {
+                " [share-frozen-base: rollout base kept resident]"
+            } else {
+                ""
+            }
         );
-        let freed_rollout = student.offload_engine_weights().unwrap_or(0);
+        let freed_rollout = if cfg.share_frozen_base {
+            0
+        } else {
+            student.offload_engine_weights().unwrap_or(0)
+        };
         let freed_judge = match judge {
             Some(j) => j.offload_engine_weights().unwrap_or(0),
             None => 0,
@@ -392,8 +414,13 @@ where
         // Phase D — reload engines. Always: the caller drives rounds one-at-a-time
         // and relies on resident engines after the call (the between-round LoRA sync
         // pushes into the rollout engine; the next call samples/judges from them).
+        // `--share-frozen-base`: the rollout engine was never offloaded (its base
+        // stays resident, aliased by the student), so skip its reload — symmetric
+        // with the Phase-B skip. The judge still reloads.
         eprintln!("[rubric] round {round} phase-D: reloading engines");
-        student.reload_engine_weights()?;
+        if !cfg.share_frozen_base {
+            student.reload_engine_weights()?;
+        }
         if let Some(j) = judge {
             j.reload_engine_weights()?;
         }
