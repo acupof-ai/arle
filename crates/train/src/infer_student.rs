@@ -380,6 +380,31 @@ impl InferStudent {
     }
 }
 
+/// Fast adapter-only (LoRA) checkpoint save. D2H-reads each adapter A/B
+/// `TensorId` from the store and writes them to a single safetensors file, keyed
+/// by adapter name. This is the cheap alternative to the full-materialize save,
+/// which host-loops the merged base+LoRA weights and hangs at 27B; the adapter
+/// matrices are tiny, so this is fast. The saved file can be re-merged onto the
+/// base model for eval. bf16 so a downstream infer loader can consume it.
+#[cfg(feature = "cuda")]
+pub fn save_lora_adapters(
+    store: &mut TensorStore,
+    adapter_map: &HashMap<&'static str, TensorId>,
+    out_path: &std::path::Path,
+) -> Result<()> {
+    use autograd::SafetensorsRegistry;
+    if adapter_map.is_empty() {
+        bail!("save_lora_adapters: adapter_map is empty (no LoRA tensors to save)");
+    }
+    let mut registry = SafetensorsRegistry::new();
+    for (&name, &tensor_id) in adapter_map {
+        registry.insert(name, tensor_id);
+    }
+    registry
+        .save_from_bf16(store, out_path)
+        .map_err(|err| anyhow!("save_lora_adapters to {}: {err}", out_path.display()))
+}
+
 /// Adapter accumulator for one layer during the store scan.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
