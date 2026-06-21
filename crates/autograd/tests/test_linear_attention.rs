@@ -65,6 +65,21 @@ fn qwen35_chunked_params(seq_len: usize) -> LinearAttentionParams {
     }
 }
 
+// Qwen3.6-27B GatedDeltaNet: 48 value heads / 16 key heads (vs 35B-A3B's 32/8).
+// Guards the relaxed head-count check in the device LA dispatch.
+fn qwen36_27b_chunked_params(seq_len: usize) -> LinearAttentionParams {
+    LinearAttentionParams {
+        batch: 1,
+        seq_len,
+        num_key_heads: 16,
+        num_value_heads: 48,
+        key_dim: 128,
+        value_dim: 128,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    }
+}
+
 fn qkv_dim(params: LinearAttentionParams) -> usize {
     params.num_key_heads * params.key_dim * 2 + params.num_value_heads * params.value_dim
 }
@@ -1190,6 +1205,23 @@ fn cuda_linear_attention_hard_forget_grad_matches_cpu_and_stays_finite() -> Resu
         params,
         &fixture,
         "cuda qwen35 hard-forget linear_attention",
+        2.0e-2,
+    )
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_qwen36_27b_chunked_grad_matches_cpu() -> Result<()> {
+    // 48 value heads — exercises the device LA kernel after the head-count guard
+    // was relaxed from the hardcoded 32. Falls back to the host path (still
+    // CPU-matched) if the guard rejects, so a regression surfaces as a perf, not
+    // correctness, signal — but the device path must match CPU when taken.
+    let params = qwen36_27b_chunked_params(80);
+    let fixture = LinearAttentionFixture::new(params);
+    compare_cpu_cuda_device_linear_attention(
+        params,
+        &fixture,
+        "cuda qwen36-27b chunked linear_attention",
         2.0e-2,
     )
 }
