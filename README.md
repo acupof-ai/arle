@@ -88,7 +88,9 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 <sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="benchmarks/README.md">snapshot + method</a></sub>
 
-**Speculative decode breaks the memory-bandwidth wall — Qwen3.6-27B (OptiQ mixed-4/8-bit, dense GatedDeltaNet).** The model's own NextN/MTP head drafts and the base verifies (output bit-identical to greedy): **12.3 → 18.1 tok/s (+47%)** at depth 2 — *past* the **15.2 tok/s HBM floor** (M4 Pro 273 GB/s ÷ ~18 GB weights), the one lever no kernel or framework can reach. Quality held: **PPL 7.82** (vs uniform-4bit's 8.56) · 68.8% draft acceptance. **Default-on**: `arle serve --backend metal --model-path mlx-community/Qwen3.6-27B-OptiQ-4bit` auto-downloads the NextN-MTP head and enables it; pass `--no-speculative` to disable, or `--draft-model <id> --speculative-tokens <N>` to override.
+**Speculative decode beats the HBM-bandwidth wall.** Qwen3.6-27B (OptiQ 4/8-bit): the model's own NextN/MTP head drafts, the base verifies, **output bit-identical to greedy** — **12.3 → 18.1 tok/s (+47%)**, past the 15.2 tok/s HBM floor no kernel can reach.
+
+<sub>Quality held: PPL 7.82 (vs 8.56 uniform-4bit) · 68.8% draft acceptance · default-on, <code>--no-speculative</code> to disable.</sub>
 
 **NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8.
 
@@ -97,14 +99,14 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 </p>
 <p align="center"><sub>DSv4 B=1 decode, <b>33.5 → 53.3 tok/s</b> across the 2026-06-13 → 06-14 campaign — every step traced to a <code>docs/experience/wins/</code> entry.</sub></p>
 
-**On-Policy Distillation — does it actually lift the student?** A Qwen3.5-4B LoRA student, distilled on its *own* rollouts against the Qwen3.6-35B-A3B teacher (the teacher runs on the same serving runtime), lifts MATH-500 from **0.518 → 0.792** — **+27pp, CI-separated** — locked across **5 seeds × 3 recipe arms** (reverse-KL wins), reaching the 35B teacher's neighborhood (**0.82**):
+**On-Policy Distillation lifts the student for real.** A Qwen3.5-4B LoRA student distilled on its *own* rollouts against the Qwen3.6-35B-A3B teacher (same serving runtime) lifts MATH-500 **0.518 → 0.792** (**+27pp, CI-separated**), reaching the teacher's neighborhood (**0.82**):
 
 <p align="center">
   <img src="docs/assets/opd-multiseed-curve.png" alt="OPD multi-seed lock: Qwen3.5-4B student lifts from 0.518 to 0.792 MATH-500 accuracy (reverse-KL best across 5 seeds), approaching the 35B teacher's 0.82" width="680">
 </p>
 <p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, base→step25→step50 trajectory · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
 
-The same loop lifts *agentic* capability too: with think-on OPD the 4B student learns to **decline irrelevant tool-use queries — BFCL-live abstention 0.60 → 1.00**, toward the teacher. Case-validated: the base reasons correctly then tool-calls anyway; the OPD student abstains. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
+The same loop lifts *agentic* capability: with think-on OPD the 4B student learns to **decline irrelevant tool calls — BFCL-live abstention 0.60 → 1.00**. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
@@ -114,8 +116,8 @@ The same loop lifts *agentic* capability too: with think-on OPD the 4B student l
 
 Agent and RL workloads waste compute re-processing the same prompt + history + tool output every turn. ARLE fixes this once and shares the fix across serving and training:
 
-- **KV stays hot across turns.** Prior-turn KV stays in its slot on GPU so only new tokens prefill; page-aligned prefix pages are shared across requests through the host radix cache. Under memory pressure, evicted prefix blocks demote into a host-RAM tier (default-on, 4 GiB; `--kv-t1-budget-bytes 0` opts out) with opt-in disk spill (`--kv-ssd-path`), and promote back on the next hit instead of re-prefilling — preempted requests get the same treatment (Qwen3-dense CUDA today, pod gate pending; DSv4/hybrid via #85 — [support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix)).
-- **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV kernels ship in `cuda-kernels`; the rewrite serve flag (`--kv-cache-dtype`) landed via the model-generic parity gate (#68) — INT8/FP8 correctness licensed, opt-in (default stays BF16).
+- **KV stays hot across turns.** Prior-turn KV stays on GPU so only new tokens prefill; prefix pages are shared across requests via the host radix cache, demote to a host-RAM tier under pressure (opt-in disk spill), and promote back on the next hit instead of re-prefilling. ([support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix))
+- **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV kernels behind a `--kv-cache-dtype` serve flag — correctness-gated, opt-in (default stays BF16).
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code — the OPD teacher *is* the production server.
 
 ```mermaid
