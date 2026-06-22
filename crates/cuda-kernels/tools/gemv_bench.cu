@@ -107,6 +107,345 @@ __device__ __forceinline__ float fp8_f32_dot16(
         + wf3.w * __bfloat162float(xb1[7]);
 }
 
+// Dot 16 fp8 weights against an ALREADY-LOADED bf16 x16 (passed as two uint4
+// registers). Identical math to fp8_f32_dot16, but the activation is loaded by
+// the CALLER once and reused across N-blocked output rows — so the activation
+// L1TEX load (2 × 128-bit per chunk) is issued ONCE per chunk instead of once
+// per output row. Same accumulation order → numerically identical.
+__device__ __forceinline__ float dot16_xreg(
+    const uint8_t* __restrict__ weight,
+    const uint4& x0,
+    const uint4& x1)
+{
+    const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight);
+    const float4 wf0 = static_cast<float4>(w4[0]);
+    const float4 wf1 = static_cast<float4>(w4[1]);
+    const float4 wf2 = static_cast<float4>(w4[2]);
+    const float4 wf3 = static_cast<float4>(w4[3]);
+    const auto* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
+    const auto* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
+    return wf0.x * __bfloat162float(xb0[0]) + wf0.y * __bfloat162float(xb0[1])
+        + wf0.z * __bfloat162float(xb0[2]) + wf0.w * __bfloat162float(xb0[3])
+        + wf1.x * __bfloat162float(xb0[4]) + wf1.y * __bfloat162float(xb0[5])
+        + wf1.z * __bfloat162float(xb0[6]) + wf1.w * __bfloat162float(xb0[7])
+        + wf2.x * __bfloat162float(xb1[0]) + wf2.y * __bfloat162float(xb1[1])
+        + wf2.z * __bfloat162float(xb1[2]) + wf2.w * __bfloat162float(xb1[3])
+        + wf3.x * __bfloat162float(xb1[4]) + wf3.y * __bfloat162float(xb1[5])
+        + wf3.z * __bfloat162float(xb1[6]) + wf3.w * __bfloat162float(xb1[7]);
+}
+
+// N register-blocked GEMV: each 64-thread group computes R consecutive output
+// rows, loading the activation chunk ONCE into registers (x0/x1) and reusing it
+// across all R weight rows. Attacks the measured L1TEX-load bottleneck (ncu:
+// L1/TEX 78%, DRAM 35%, top stall = L1TEX scoreboard) by cutting activation
+// loads R×. blocks = ceil(N/(GEMV_ROWS*R)) — still ≫ #SM at R≤8, so occupancy
+// holds (unlike the N/32-block MMA tile). B=1 decode shape (grid.y = B).
+template <int R>
+__global__ void fp8_f32_block_gemv_nblock_kernel(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int scale_rows, int scale_cols, int block_m, int block_k)
+{
+    const int threads_per_group = GEMV_THREADS / GEMV_ROWS;  // 64
+    const int group_in_block = threadIdx.x / threads_per_group;  // 0..GEMV_ROWS-1
+    const int tid_in_group = threadIdx.x % threads_per_group;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warps_per_group = threads_per_group / WARP_SIZE;  // 2
+    const int warp_in_group = tid_in_group / WARP_SIZE;
+    const int row_base = (blockIdx.x * GEMV_ROWS + group_in_block) * R;
+    const int batch_idx = blockIdx.y;
+    if (row_base >= N || batch_idx >= B) return;
+
+    const __nv_bfloat16* x = input + (int64_t)batch_idx * K;
+    float sums[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) sums[r] = 0.0f;
+
+    const int kv = K / 16;  // Qwen shapes: K % 16 == 0
+    for (int v = tid_in_group; v < kv; v += threads_per_group) {
+        const int k = v * 16;
+        const uint4 x0 = *reinterpret_cast<const uint4*>(x + k);
+        const uint4 x1 = *reinterpret_cast<const uint4*>(x + k + 8);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = row_base + r;
+            if (row < N) {
+                const float scale = fp8_f32_block_scale(
+                    scales, row, k, scale_rows, scale_cols, block_m, block_k);
+                sums[r] += scale * dot16_xreg(weight + (int64_t)row * K + k, x0, x1);
+            }
+        }
+    }
+
+    // Reduce each row's partial sum across the 64-thread group (warp + smem).
+    __shared__ float smem[GEMV_ROWS * 2 * R];  // [group][warp_in_group][r]
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float s = warp_reduce_sum(sums[r]);
+        if (lane_id == 0)
+            smem[(group_in_block * warps_per_group + warp_in_group) * R + r] = s;
+    }
+    __syncthreads();
+    if (tid_in_group == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = row_base + r;
+            if (row >= N) continue;
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_group; ++w)
+                total += smem[(group_in_block * warps_per_group + w) * R + r];
+            output[(int64_t)batch_idx * N + row] = __float2bfloat16(total);
+        }
+    }
+}
+
+// dot16 of PRE-DECODED weight (4 float4, decoded once) against a bf16 x16.
+// Lets the batched kernel decode each weight chunk ONCE and MAC it across all
+// batch columns — the weight HBM read + fp8 decode are amortized over B.
+__device__ __forceinline__ float dot16_dec(
+    const float4& wf0, const float4& wf1, const float4& wf2, const float4& wf3,
+    const __nv_bfloat16* __restrict__ x)
+{
+    const uint4 x0 = *reinterpret_cast<const uint4*>(x);
+    const uint4 x1 = *reinterpret_cast<const uint4*>(x + 8);
+    const auto* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
+    const auto* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
+    return wf0.x * __bfloat162float(xb0[0]) + wf0.y * __bfloat162float(xb0[1])
+        + wf0.z * __bfloat162float(xb0[2]) + wf0.w * __bfloat162float(xb0[3])
+        + wf1.x * __bfloat162float(xb0[4]) + wf1.y * __bfloat162float(xb0[5])
+        + wf1.z * __bfloat162float(xb0[6]) + wf1.w * __bfloat162float(xb0[7])
+        + wf2.x * __bfloat162float(xb1[0]) + wf2.y * __bfloat162float(xb1[1])
+        + wf2.z * __bfloat162float(xb1[2]) + wf2.w * __bfloat162float(xb1[3])
+        + wf3.x * __bfloat162float(xb1[4]) + wf3.y * __bfloat162float(xb1[5])
+        + wf3.z * __bfloat162float(xb1[6]) + wf3.w * __bfloat162float(xb1[7]);
+}
+
+// Weight-AMORTIZING batched GEMV (the MTP-verify lever): grid.y = 1, each thread
+// reads+decodes each weight chunk ONCE and MACs it across all B columns. Weight
+// HBM read is shared over B (vs the default grid.y=B kernel that re-reads weight
+// B times). Mirrors the production fp8_f32_block_gemv_batch_tiled_kernel.
+template <int TILE>
+__global__ void fp8_f32_block_gemv_amort_kernel(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int scale_rows, int scale_cols, int block_m, int block_k)
+{
+    const int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    const int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    const int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+    const int bn = B < TILE ? B : TILE;
+
+    float sums[TILE];
+#pragma unroll
+    for (int b = 0; b < TILE; ++b) sums[b] = 0.0f;
+
+    const int kv = K / 16;
+    const uint8_t* weight_row = weight + (int64_t)row * K;
+    for (int v = tid_in_row; v < kv; v += threads_per_row) {
+        const int k = v * 16;
+        const float scale =
+            fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+        const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight_row + k);
+        const float4 wf0 = static_cast<float4>(w4[0]);
+        const float4 wf1 = static_cast<float4>(w4[1]);
+        const float4 wf2 = static_cast<float4>(w4[2]);
+        const float4 wf3 = static_cast<float4>(w4[3]);
+#pragma unroll
+        for (int b = 0; b < TILE; ++b)
+            if (b < bn)
+                sums[b] += scale * dot16_dec(wf0, wf1, wf2, wf3, input + (int64_t)b * K + k);
+    }
+
+    __shared__ float smem[GEMV_ROWS * 2 * TILE];
+    const int warps_per_row = threads_per_row / WARP_SIZE;
+    const int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+#pragma unroll
+    for (int b = 0; b < TILE; ++b) {
+        float s = warp_reduce_sum(sums[b]);
+        if (lane_id == 0)
+            smem[(row_in_block * warps_per_row + warp_in_row) * TILE + b] = s;
+    }
+    __syncthreads();
+    if (tid_in_row == 0) {
+#pragma unroll
+        for (int b = 0; b < TILE; ++b) {
+            if (b >= bn) continue;
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_row; ++w)
+                total += smem[(row_in_block * warps_per_row + w) * TILE + b];
+            output[(int64_t)b * N + row] = __float2bfloat16(total);
+        }
+    }
+}
+
+// Practical HBM-ceiling probe: read exactly the N*K weight bytes (coalesced
+// uint4), XOR-reduce (defeat DCE), no activation / no fp8 decode / no FMA. Its
+// GB/s = the best this shape+duration can do on this GPU — the ceiling any real
+// GEMV is bounded by. (cosine will FAIL; only the GB/s line is meaningful.)
+__global__ void weight_stream_kernel(
+    const uint8_t* __restrict__ weight, __nv_bfloat16* __restrict__ output, int N, int K)
+{
+    const int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    const int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    const int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    if (row >= N) return;
+    const uint8_t* wr = weight + (int64_t)row * K;
+    uint4 acc = make_uint4(0, 0, 0, 0);
+    for (int k = tid_in_row * 16; k < K; k += threads_per_row * 16) {
+        const uint4 w = *reinterpret_cast<const uint4*>(wr + k);
+        acc.x ^= w.x; acc.y ^= w.y; acc.z ^= w.z; acc.w ^= w.w;
+    }
+    unsigned r = acc.x ^ acc.y ^ acc.z ^ acc.w;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) r ^= __shfl_xor_sync(0xffffffff, r, o);
+    if (tid_in_row == 0) output[(int64_t)row] = __float2bfloat16((float)(r & 0xFF));
+}
+
+// dot16 from an ALREADY-LOADED raw fp8x16 (one uint4 = 16 fp8 bytes). Lets the
+// caller issue the weight DRAM load AHEAD of the convert+FMA (software prefetch),
+// so the cold-weight Long-Scoreboard latency (ncu: 6.55 cyc/issue, the dominant
+// stall) is hidden behind the current chunk's compute. Math identical to
+// fp8_f32_dot16.
+__device__ __forceinline__ float dot16_from_raw(
+    const uint4& wraw, const __nv_bfloat16* __restrict__ x)
+{
+    const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(&wraw);
+    const float4 wf0 = static_cast<float4>(w4[0]);
+    const float4 wf1 = static_cast<float4>(w4[1]);
+    const float4 wf2 = static_cast<float4>(w4[2]);
+    const float4 wf3 = static_cast<float4>(w4[3]);
+    const uint4 x0 = *reinterpret_cast<const uint4*>(x);
+    const uint4 x1 = *reinterpret_cast<const uint4*>(x + 8);
+    const auto* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
+    const auto* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
+    return wf0.x * __bfloat162float(xb0[0]) + wf0.y * __bfloat162float(xb0[1])
+        + wf0.z * __bfloat162float(xb0[2]) + wf0.w * __bfloat162float(xb0[3])
+        + wf1.x * __bfloat162float(xb0[4]) + wf1.y * __bfloat162float(xb0[5])
+        + wf1.z * __bfloat162float(xb0[6]) + wf1.w * __bfloat162float(xb0[7])
+        + wf2.x * __bfloat162float(xb1[0]) + wf2.y * __bfloat162float(xb1[1])
+        + wf2.z * __bfloat162float(xb1[2]) + wf2.w * __bfloat162float(xb1[3])
+        + wf3.x * __bfloat162float(xb1[4]) + wf3.y * __bfloat162float(xb1[5])
+        + wf3.z * __bfloat162float(xb1[6]) + wf3.w * __bfloat162float(xb1[7]);
+}
+
+// Weight-prefetch GEMV: SAME geometry/occupancy as the scalar kernel, but a
+// depth-2 software pipeline keeps the NEXT weight chunk's DRAM load in flight
+// (named registers w_cur/w_next — no array → no local-memory spill) while the
+// current chunk converts+FMAs. Hides the cold-weight Long-Scoreboard latency
+// (ncu: 6.55 cyc/issue, the dominant stall) to fill DRAM BW. Activation (L1-hit,
+// Short-Scoreboard negligible) left as a normal load.
+__global__ void fp8_f32_block_gemv_prefetch_kernel(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int scale_rows, int scale_cols, int block_m, int block_k)
+{
+    const int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    const int batch_idx = blockIdx.y;
+    const int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    const int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N || batch_idx >= B) return;
+
+    const __nv_bfloat16* x = input + (int64_t)batch_idx * K;
+    const uint8_t* weight_row = weight + (int64_t)row * K;
+    const int kv = K / 16;
+    float sum = 0.0f;
+
+    if (tid_in_row < kv) {
+        int k_cur = tid_in_row * 16;
+        uint4 w_cur = *reinterpret_cast<const uint4*>(weight_row + k_cur);
+        for (int v = tid_in_row + threads_per_row;; v += threads_per_row) {
+            const bool has_next = v < kv;
+            uint4 w_next;
+            int k_next = v * 16;
+            if (has_next)  // issue next load AHEAD of consuming w_cur
+                w_next = *reinterpret_cast<const uint4*>(weight_row + k_next);
+            const float scale =
+                fp8_f32_block_scale(scales, row, k_cur, scale_rows, scale_cols, block_m, block_k);
+            sum += scale * dot16_from_raw(w_cur, x + k_cur);
+            if (!has_next) break;
+            w_cur = w_next;
+            k_cur = k_next;
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float rsmem[GEMV_ROWS * 8];
+    const int warps_per_row = threads_per_row / WARP_SIZE;
+    const int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) rsmem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; ++w)
+            total += rsmem[row_in_block * warps_per_row + w];
+        output[(int64_t)batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+
+// Shared-memory activation-staged GEMV: SAME block geometry as the scalar
+// kernel (GEMV_ROWS rows/block, N/GEMV_ROWS blocks → occupancy unchanged), but
+// the activation K-vector is loaded into dynamic smem ONCE per block (256
+// threads cooperatively) and all GEMV_ROWS rows read it from smem. The activation
+// is ~2/3 of the scalar kernel's L1TEX load instructions (ncu: L1/TEX 78% =
+// bottleneck) and smem accesses use a SEPARATE pipe — so this cuts L1TEX traffic
+// ~2× without losing the occupancy that N-blocking sacrificed. Weight still
+// streams cold from HBM (the irreducible N*K read). K%16==0 required.
+__global__ void fp8_f32_block_gemv_smem_kernel(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int scale_rows, int scale_cols, int block_m, int block_k)
+{
+    extern __shared__ __nv_bfloat16 xs[];  // K bf16 activations for this batch col
+    const int batch_idx = blockIdx.y;
+    if (batch_idx >= B) return;
+    const __nv_bfloat16* x = input + (int64_t)batch_idx * K;
+    // Cooperative coalesced fill (once per block).
+    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    const int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    const int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int row_in_block = threadIdx.x / threads_per_row;
+    float sum = 0.0f;
+    if (row < N) {
+        const int kv = K / 16;
+        const uint8_t* weight_row = weight + (int64_t)row * K;
+        for (int v = tid_in_row; v < kv; v += threads_per_row) {
+            const int k = v * 16;
+            const float scale =
+                fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+            sum += scale * fp8_f32_dot16(weight_row + k, xs + k);  // activation from smem
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    __shared__ float rsmem[GEMV_ROWS * 8];
+    const int warps_per_row = threads_per_row / WARP_SIZE;
+    const int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) rsmem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0 && row < N) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; ++w)
+            total += rsmem[row_in_block * warps_per_row + w];
+        output[(int64_t)batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+
 __global__ void fp8_f32_block_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
     const float* __restrict__ scales,
@@ -198,6 +537,70 @@ extern "C" cudaError_t gemv_fp8_block_scaled_batch_cuda(
     if (B <= 0 || N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0 ||
         block_m <= 0 || block_k <= 0) {
         return cudaErrorInvalidValue;
+    }
+    // GEMV_NBLOCK=R routes to the N register-blocked kernel (R output rows per
+    // 64-thread group, activation reused R× in registers). Default (unset/0) =
+    // the proven scalar warp-per-row kernel, byte-for-byte. K%16==0 required.
+    static int nblock = -1;
+    static int use_smem = -1;
+    if (nblock < 0) {
+        const char* e = getenv("GEMV_NBLOCK");
+        nblock = (e && e[0]) ? atoi(e) : 0;
+        const char* es = getenv("GEMV_SMEM");
+        use_smem = (es && es[0] && es[0] != '0') ? 1 : 0;
+    }
+    static int use_prefetch = -1;
+    if (use_prefetch < 0) {
+        const char* ep = getenv("GEMV_PREFETCH");
+        use_prefetch = (ep && ep[0] && ep[0] != '0') ? 1 : 0;
+    }
+    if (use_prefetch && (K % 16) == 0) {
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
+        dim3 block(GEMV_THREADS);
+        fp8_f32_block_gemv_prefetch_kernel<<<grid, block, 0, stream>>>(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+        return cudaGetLastError();
+    }
+    if (getenv("GEMV_AMORT") && (K % 16) == 0) {  // weight-amortizing batched GEMV
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, 1);  // grid.y=1: weight read ONCE
+        dim3 block(GEMV_THREADS);
+        fp8_f32_block_gemv_amort_kernel<16><<<grid, block, 0, stream>>>(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+        return cudaGetLastError();
+    }
+    if (getenv("GEMV_STREAM") && (K % 16) == 0) {  // HBM-ceiling probe (cosine FAILs)
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
+        dim3 block(GEMV_THREADS);
+        weight_stream_kernel<<<grid, block, 0, stream>>>(weight, output, N, K);
+        return cudaGetLastError();
+    }
+    if (use_smem && (K % 16) == 0) {
+        const size_t smem_bytes = (size_t)K * sizeof(__nv_bfloat16);
+        cudaFuncSetAttribute(fp8_f32_block_gemv_smem_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)smem_bytes);
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
+        dim3 block(GEMV_THREADS);
+        fp8_f32_block_gemv_smem_kernel<<<grid, block, smem_bytes, stream>>>(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+        return cudaGetLastError();
+    }
+    if (nblock > 0 && (K % 16) == 0) {
+        dim3 block(GEMV_THREADS);
+        auto launch = [&](auto kern, int R) {
+            dim3 grid((N + GEMV_ROWS * R - 1) / (GEMV_ROWS * R), B);
+            kern<<<grid, block, 0, stream>>>(
+                weight, scales, input, output, B, N, K, scale_rows, scale_cols,
+                block_m, block_k);
+        };
+        switch (nblock) {
+            case 2: launch(fp8_f32_block_gemv_nblock_kernel<2>, 2); break;
+            case 4: launch(fp8_f32_block_gemv_nblock_kernel<4>, 4); break;
+            case 8: launch(fp8_f32_block_gemv_nblock_kernel<8>, 8); break;
+            case 16: launch(fp8_f32_block_gemv_nblock_kernel<16>, 16); break;
+            default: launch(fp8_f32_block_gemv_nblock_kernel<4>, 4); break;
+        }
+        return cudaGetLastError();
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
