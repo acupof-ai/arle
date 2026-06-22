@@ -1,8 +1,26 @@
 # Qwen3.6 NextN-MTP Speculative Decode — CUDA Port Plan
 
 **Status:** scoped 2026-06-22 (parallel 4-reference Workflow); implementation in progress.
+Increment 1 (tensor names) + increment 2 (`Qwen35MtpHead` struct + gated FP8 load)
+**LANDED** (`0a57ce35`, `e1897d50`).
 **Lever:** ~2-3x decode on Qwen3.6-27B-FP8, FP8-preserving. MTP head present in the
 27B-FP8 checkpoint (mtp.fc + mtp.layers.0.*; mtp_num_hidden_layers=1).
+
+## Measured facts (checkpoint + config, not inferred) — 2026-06-22
+
+- **MTP tensors present & named correctly.** `model.safetensors.index.json` has
+  **22** `mtp.*` tensors = the **15 logical** names `mtp_tensor_names()` generates
+  + **7** `_scale_inv` companions. q/k/v/o + gate/up/down are **FP8** (scale_inv
+  present); `mtp.fc.weight` has **no** scale_inv → **BF16**. `load_matrix_quant_aware`
+  auto-selects FP8 vs BF16 per tensor → increment 2's load finds every tensor.
+  Risk #1 reduced to *fc-concat-order + partial-rotary fidelity* (name existence
+  is settled).
+- **The MTP head layer is FULL attention** (`mtp.layers.0.self_attn.{q,k,v,o}_proj`)
+  — the draft head never touches trunk linear-attn state.
+- **The TRUNK is HYBRID: `layer_types` = 48 `linear_attention` + 16 `full_attention`.**
+  ⇒ the verify pass (step 3) advances 48 layers' gated-delta recurrent state +
+  conv ring. **Risk #2 (linear-attn rollback) is REAL — it does NOT evaporate.**
+  This is the dominant difficulty of the port (see §3 + risk #2, rewritten below).
 
 ---
 
@@ -15,7 +33,7 @@ I have all the evidence needed. The DSv4 executor's `mtp_draft_tokens` already f
 ## Reference architecture (grounded, not inferred)
 - The seam is `submit(plan)`→`StepOutput { tokens: Vec<u32> }` (`infer-seam/src/lib.rs:97`; emit site `executor.rs:848`). **Spec decode is 100% executor-internal** — a decode row commits N tokens instead of 1; the engine/scheduler never learns it was speculative. No seam change.
 - DSv4's `executor/spec_decode.rs` is the exact orchestration template: `spec_step` (B=1) and `spec_step_batched` (B>1), with `DraftChain`/`accept_path`/`verify_schedule` as pure host logic (already unit-tested without a GPU).
-- **Two architectural deltas vs DSv4** that make this NOT a copy-paste: (a) DSv4 MTP is a hyper-connection wide-stream head reading `e_proj+h_proj`; Qwen3.6 NextN is the `qwen3_5_mtp` head: `fc(concat[pre_fc_norm_embedding(embed(tok)), pre_fc_norm_hidden(h)])` → one **gated full-attention partial-rotary** transformer layer → its own hidden → shared `norm`+`lm_head` (canonical shape at `infer-metal/src/dflash.rs:239-246`). (b) Qwen runs **single-GPU dense/MoE on a contiguous full-attn KV cache**, not FlashMLA sparse rings — so KV rollback is `truncate_slot`-style length reset, far simpler than DSv4's ring snapshot/restore.
+- **Two architectural deltas vs DSv4** that make this NOT a copy-paste: (a) DSv4 MTP is a hyper-connection wide-stream head reading `e_proj+h_proj`; Qwen3.6 NextN is the `qwen3_5_mtp` head: `fc(concat[pre_fc_norm_embedding(embed(tok)), pre_fc_norm_hidden(h)])` → one **gated full-attention partial-rotary** transformer layer → its own hidden → shared `norm`+`lm_head` (canonical shape at `infer-metal/src/dflash.rs:239-246`). (b) Qwen runs **single-GPU dense/MoE on a contiguous full-attn KV cache**, not FlashMLA sparse rings — so the **full-attn** KV rollback is `truncate_slot`-style length reset. **BUT** the trunk is hybrid (48/64 layers linear-attn), so the **linear-attn** recurrent + conv state DOES need snapshot/restore on partial accept — like DSv4's ring, not simpler. The rollback is hybrid: length-reset for 16 full layers + snapshot/restore for 48 linear layers (see §3 buffer enumeration).
 
 ---
 
@@ -54,7 +72,14 @@ Op sequence per draft level (reuse existing primitives, all already imported at 
 
 - **Verify pass**: ONE `Qwen35Model::forward_token_logits_full(slot, ws, &chain.tokens(), start_pos)` — **this primitive already exists** (`qwen35.rs:2506`, returns `[seq_len, vocab]` device logits, every row, no sampling). It runs the **base** model layer stack over the draft chain at positions `start_pos..start_pos+depth`, writing the base KV cache for those rows. Then host-argmax each row.
 - **Accept**: reuse `DraftChain::accept_path` (`spec_decode.rs:190`) verbatim — pure, already unit-tested. Returns accepted prefix + bonus.
-- **KV rollback** (this is where Qwen is *simpler* than DSv4): the verify wrote `depth+1` base-KV rows; accepted = `k`. Reset `slot.seq_len` to `start_pos + k + 1` (the committed prefix + bonus). The base full-attn KV is a contiguous cache, so a **length truncation is the entire rollback** — no ring snapshot/restore (`capture_spec_rings`/`restore_spec_ring_tail` are NOT needed). The MTP head's own draft KV: reset its head-KV `seq_len` to `start_pos + k` the same way. **§0.1 buffer enumeration**: (i) base full-attn K/V cache → truncate seq_len (self-heals: contiguous, later writes overwrite); (ii) MTP-head K/V cache → truncate seq_len; (iii) `spec_slot.pending`/`.hidden` → set to bonus token + accepted row's base hidden; (iv) recurrent/linear-attn conv state IF any layer is linear-attn → **MUST snapshot/restore** (a gated-delta-rule ring does NOT self-heal under rollback). **Flag: confirm whether Qwen3.6-27B-MTP has linear-attn layers — if yes this is risk #2 below.**
+- **KV rollback** (HYBRID — measured: 48 linear + 16 full trunk layers, so NOT pure length-reset): the verify wrote `depth+1` rows; accepted = `k`. **§0.1 buffer enumeration** (the buffers `Qwen35SlotState` mutates per verify token, `qwen35.rs:352`):
+  - (i) **`k_caches`/`v_caches`** (16 full-attn layers, `max_seq_len*kv_dim` bf16) → **self-heal**: position-indexed; reset `slot.seq_len` to `start_pos + k + 1` and the stale rows `[start_pos+k, start_pos+depth]` are overwritten by the next real token at that position. Precondition: next write targets the same positions (true after the seq_len rewind). No snapshot.
+  - (ii) **`gdr_states`** (48 linear layers, `Vh*Kd*Vd` **f32** gated-delta recurrent) → **MUST snapshot/restore**: advanced **in-place, content-based, no position index** (`gated_delta_rule_decode_cuda`/`_prefill_recurrent_cuda`, `qwen35.rs:4051/4067`) → cannot self-heal by rewinding a cursor.
+  - (iii) **`conv_states`** (48 linear layers, `qkv_dim*(kernel-1)` bf16 ring) → **MUST snapshot/restore**: the ring window (`kernel-1`, tiny) is narrower than a multi-token draft burst → speculative shifts alias live slots → no self-heal (exactly the DSv4 EAGLE `sw_window` ring-slot lesson).
+  - (iv) **`seq_len`** (host) → rewind to `start_pos + k + 1`. Trivial.
+  - (v) **`spec_slot.pending`/`.hidden`** → bonus token + accepted row's base hidden.
+- **MVP de-risk — start at `depth=1`** (single draft token): accept ∈ {0,1}, so the worst case is undoing **one** speculative advance → a **single pre-verify snapshot** of the 48 layers' (`gdr_states` f32 + `conv_states` bf16) into reusable scratch (sized once), restored only on reject. No per-token ladder, no re-run. Prove accept-rate + tok/s at depth=1 first, THEN extend.
+- **depth>1 (the surfaced design decision — needs a parent call + GPU iteration):** verify runs `depth+1` tokens through the linear layers in ONE prefill-recurrent launch (advances state by `depth+1` atomically), so per-token rollback can't read an intermediate state. Two options: **(A) snapshot-once + re-run the `k` accepted** through the linear in_proj→conv→gdr path (`k` tiny; cost ≈ `k/(depth+1)` of the linear verify); **(B) per-token snapshot ladder** — break verify into `depth+1` single-token recurrent steps, snapshotting after each (no re-run, `depth+1`× scratch, loses the batched-prefill speedup). Pick after measuring the depth=1 accept-rate — if accept-rate is high, (A)'s re-run is cheap; if low, depth>1 may not be worth it at all.
 - `spec.hidden = base verify hidden of the accepted row` (seed for next step's level-0 draft), exactly `spec_decode.rs:348`.
 
 ---
@@ -79,9 +104,9 @@ Op sequence per draft level (reuse existing primitives, all already imported at 
 
 1. **qwen35-spec MTP config/names** (step 1.5). Test: unit-parse a `Qwen3.6-27B-MTP` `config.json`, assert `num_nextn_predict_layers==1` + tensor names. No GPU. **Commit.**
 2. **Extract `DraftChain`/`accept_path`/`verify_schedule` to shared `executor/spec_chain.rs`**, re-export into DSv4 (no behavior change). Test: the existing DSv4 unit tests still pass. **Commit.**
-3. **`Qwen35MtpHead` struct + load** (step 1). Test: load `Qwen3.6-27B-MTP`, assert head tensors resident + correct shapes; `mtp_draft_tokens=None` path unchanged. **Commit.**
-4. **`mtp_forward_level`** (step 2). Test: single draft step produces a finite top-1 token; shapes match. **Commit.**
-5. **`forward_token_logits_full` verify reuse + `spec_step` (B=1) + rollback** (steps 3-4 B=1). **Commit.**
+3. ✅ **DONE (`e1897d50`)** — **`Qwen35MtpHead` struct + gated FP8 load** (step 1). Single-GPU only (TP errors loudly, deferred); `mtp_draft_tokens=None` path byte-identical. Tensor names verified against the live checkpoint index (22 tensors, FP8/BF16 split correct). Mac-typecheck + clippy clean. (Device-load smoke deferred: load path is reachable only via the param, which the executor passes `None` until step 7 wires the flag — first real device load happens at step 4's `mtp_forward_level` test.)
+4. **`mtp_forward_level`** (step 2). Test: single draft step produces a finite top-1 token; shapes match. **First real device load of the head** (gate it behind the env fallback or a temp `Some(1)` to reach the load path). **Commit.**
+5. **`forward_token_logits_full` verify reuse + `spec_step` (B=1, depth=1) + hybrid rollback** (steps 3-4 B=1, depth=1). The depth=1 MVP rollback is a **single pre-verify snapshot/restore** of the 48 linear layers' `gdr_states`+`conv_states` (§3) — no ladder, no re-run. **Commit.** depth>1 (option A/B, §3) is a separate increment after the depth=1 accept-rate is measured.
 6. **`spec_step_batched` (B>1)** + executor `submit` multi-token wiring. **Commit.**
 7. **CLI routing to Qwen35 executor** (step 4 wiring) + bench entry. **Commit.**
 
@@ -92,7 +117,7 @@ Op sequence per draft level (reuse existing primitives, all already imported at 
 
 ## 3 hardest / riskiest steps
 1. **The NextN head shape + tensor-name fidelity (step 1/1.5)** — Qwen3.6 NextN ≠ DSv4 MTP (it's `concat[pre_fc_norm_emb, pre_fc_norm_hidden]→fc→gated-partial-rotary layer`, not the hyper-connection `e_proj+h_proj`). Getting `fc` input concat order, the two pre-fc norms, and partial-rotary wrong = silent garbage drafts (0% accept, not a crash). **Mitigation: lift the exact layout from the Metal `qwen3_5_mtp` loader (`dflash.rs:298`) which already runs this head correctly; A/B the draft's level-0 top-1 against the base model's next-token on a warm prompt — they should frequently agree.**
-2. **KV rollback completeness if any MTP/base layer is linear-attn (step 3 buffer (iv))** — a gated-delta-rule recurrent ring does NOT self-heal under truncation (per `reference_disabled_event_tracking_premature_buffer_free` + the DSv4 EAGLE-rollback empirical anchor). Must enumerate every layer's state and snapshot/restore the recurrent ones. **Mitigation: confirm the 27B-MTP layer types first; if all full-attn, rollback is pure length-reset and this risk evaporates.**
+2. **Hybrid KV rollback — the dominant risk, MEASURED REAL (step 5).** The trunk is **48 linear-attn + 16 full-attn** layers (config `layer_types`), so verify advances 48 layers' `gdr_states` (f32 recurrent) + `conv_states` (bf16 ring) **in-place, content-based, no position** — they do NOT self-heal under a length truncation (per `reference_disabled_event_tracking_premature_buffer_free` + the DSv4 EAGLE-rollback anchor). The full-attn K/V caches DO self-heal (position-indexed). **This risk does NOT evaporate.** **Mitigation (de-risked): start at `depth=1`** → worst-case undo is ONE speculative advance → a single pre-verify snapshot/restore of the 48 layers' (gdr+conv) into reusable scratch (§3 buffer enumeration). Prove depth=1 accept-rate + tok/s, then decide depth>1 (option A re-run / option B ladder) — **surface to ckl before committing depth>1** (the prefill-recurrent kernel advances all `depth+1` atomically, so the intermediate-state design is a real fork in the road).
 3. **Trunk-hidden plumbing for level-0 draft seed (step 2/4)** — Qwen35 currently exposes the trunk hidden only *inside* `lm_head_logits` (`qwen35.rs:2371`, `last_hidden`); there is no public `forward_tokens_with_hidden` like DSv4 has (`executor.rs:1897`). The decode step that produces the pending token must also return its post-final-norm-pre-lm_head hidden as the MTP `h_prev`. **Mitigation: add a thin `forward_tokens_with_hidden` returning `(token, last_hidden_clone)` — small, mirrors the DSv4 method exactly.**
 
 ## Files to touch
