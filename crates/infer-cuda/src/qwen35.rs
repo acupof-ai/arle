@@ -2808,6 +2808,51 @@ impl Qwen35Model {
         Ok((logits_vec, [seq_len, vocab], last_hidden))
     }
 
+    /// Like [`Self::forward_token_logits_full`] but ALSO returns EVERY row's raw
+    /// trunk hidden (pre-final-norm) as one owned `[seq_len, hidden]` (token-major)
+    /// `DeviceVec`. The depth>1 spec-decode verify needs the ACCEPTED row's hidden
+    /// (not just the last) to seed the next block's level-0 draft — the accepted
+    /// prefix length is only known after host-argmax, so all rows are captured.
+    /// Byte-identical logits to `forward_token_logits_full`; the extra D2D copy of
+    /// `ws.hidden` happens BEFORE the lm-head norm reuses the workspace.
+    #[allow(dead_code)] // consumed by spec_step (next increment)
+    pub(crate) fn forward_tokens_verify(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
+        self.forward_hidden(slot, ws, tokens, start_pos)?;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
+        // Capture ALL rows' raw trunk hidden ([seq_len, hidden] token-major) before
+        // the lm-head norm overwrites the workspace.
+        let mut hiddens = DeviceVec::zeros(&self.ctx, seq_len * hidden_size)?;
+        {
+            let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
+            self.ctx
+                .stream
+                .memcpy_dtod(&hidden.data, &mut hiddens.data)
+                .map_err(|e| anyhow!("verify hidden batch capture failed: {e}"))?;
+        }
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        self.ctx.sync()?;
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: seq_len * vocab,
+            label: "qwen35_verify_logits[seq,vocab]",
+        };
+        Ok((logits_vec, [seq_len, vocab], hiddens))
+    }
+
     /// One NextN-MTP draft level: given the previous chain token `token` and its
     /// hidden `h_prev`, produce the next greedy draft token + the head's output
     /// hidden (the input to the next level). The head is a single full-attention
@@ -2940,32 +2985,35 @@ impl Qwen35Model {
         Ok((next, h_out))
     }
 
-    /// One depth-1 NextN-MTP speculative decode step (greedy).
+    /// One depth-`depth` NextN-MTP speculative decode step (greedy, single CHAIN).
     ///
-    /// Drafts ONE token with the MTP head, verifies `[pending, draft]` in a
-    /// SINGLE trunk forward, and commits the trunk's real next token (always)
-    /// plus the draft (iff the trunk agrees). The output is therefore
-    /// **token-exact to greedy no-spec decode** — the trunk argmax is the source
-    /// of truth; the draft only buys a 2nd token for free on a hit. This is the
-    /// correctness gate (`feedback_correct_inference_not_baseline_identity`):
-    /// spec greedy ≡ no-spec greedy, token-for-token (dense projections; the MoE
-    /// non-determinism caveat applies only to the 35B/27B MoE shapes).
+    /// Drafts a `depth`-token chain with the MTP head (each level autoregressive
+    /// on the previous level's head hidden), verifies `[pending, d1..dD]` in a
+    /// SINGLE trunk forward, accepts the longest prefix whose draft token equals
+    /// the trunk's argmax at that row (STRICT, k=1 top-1 match), and commits the
+    /// accepted drafts + the trunk's bonus. The output is therefore **token-exact
+    /// to greedy no-spec decode** (every committed token is a trunk argmax) — the
+    /// correctness gate is spec greedy ≡ no-spec greedy (MoE non-determinism
+    /// caveat applies to the 35B/27B MoE shapes). A single chain (no sibling
+    /// branching) keeps the 48 gated-delta linear layers' sequential recurrence
+    /// correct; tree/top-k acceptance is a later, lossy increment.
     ///
     /// State contract (caller threads `pending`/`hidden` across steps):
-    /// - `pending`: the last already-emitted token, written into the KV at
+    /// - `pending`: the last already-emitted token, (re)written into the KV at
     ///   `start_pos` by the verify (its KV is not yet materialized).
-    /// - `hidden`: the trunk hidden that PRODUCED `pending` — the MTP head's
-    ///   level-0 seed (matches Metal `prepare_draft_block_mtp` + DSv4 `spec.hidden`).
+    /// - `hidden`: the trunk hidden that PRODUCED `pending` — the head's level-0
+    ///   seed (matches Metal `prepare_draft_block_mtp` + DSv4 `spec.hidden`).
     /// - entry invariant: `slot.seq_len() == start_pos`.
     ///
-    /// Returns `(emitted_tokens, next_pending, next_hidden)`:
-    /// - HIT  (`argmax0 == draft`): emitted `[draft, argmax1]`; seq_len → `start_pos+2`.
-    /// - MISS: emitted `[argmax0]`; the draft's KV row self-heals (position-indexed)
-    ///   and the trunk linear state is rolled back to post-`pending` via the
-    ///   pre-verify snapshot + a 1-token replay of `pending` (identical to the
-    ///   verify's first recurrent step), seq_len → `start_pos+1`.
+    /// Returns `(emitted_tokens, next_pending, next_hidden)` with `k` = accepted
+    /// draft count: emitted `[d1..dk, bonus]` (k+1 tokens); next_pending = bonus;
+    /// next_hidden = the verify hidden of accepted row `k`. seq_len → `start_pos+k+1`.
+    /// On full accept (`k==depth`) the verify already left the trunk state correct;
+    /// on partial accept the trunk linear state is rolled back to post-`[pending,
+    /// d1..dk]` via the pre-verify snapshot + a `(k+1)`-token replay (the full-attn
+    /// KV self-heals via the seq_len rewind).
     #[allow(dead_code)] // wired into the executor decode dispatch in a later increment
-    pub(crate) fn spec_step_depth1(
+    pub(crate) fn spec_step(
         &self,
         slot: &mut Qwen35SlotState,
         spec: &mut Qwen35SpecSlotState,
@@ -2973,67 +3021,95 @@ impl Qwen35Model {
         pending: u32,
         hidden: &DeviceVec,
         start_pos: usize,
+        depth: usize,
     ) -> Result<(Vec<u32>, u32, DeviceVec)> {
+        ensure!(depth >= 1, "spec_step requires depth >= 1, got {depth}");
         ensure!(
             slot.seq_len() == start_pos,
             "spec_step entry seq_len {} != start_pos {start_pos}",
             slot.seq_len()
         );
         let vocab = self.output_projection().rows;
+        let hidden_size = self.config.hidden_size;
         let mut pt = mtp_phase_start(&self.ctx);
 
-        // 1. Draft one token with the MTP head (level 0, seeded from pending+hidden).
-        let (draft, _h0) = self.mtp_forward_level(spec, ws, pending, hidden, 0)?;
+        // 1. Draft a depth-token chain: each level feeds the prior level's head
+        //    hidden (autoregressive), starting from (pending, seed hidden).
+        let mut h_prev = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        self.ctx
+            .stream
+            .memcpy_dtod(&hidden.data, &mut h_prev.data)
+            .map_err(|e| anyhow!("spec seed hidden copy failed: {e}"))?;
+        let mut chain: Vec<u32> = Vec::with_capacity(depth + 1);
+        chain.push(pending);
+        for level in 0..depth {
+            let last_tok = *chain.last().unwrap();
+            let (tok, h_out) = self.mtp_forward_level(spec, ws, last_tok, &h_prev, level)?;
+            chain.push(tok);
+            h_prev = h_out;
+        }
         let draft_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 2. Snapshot the trunk linear state BEFORE the verify (reject base).
+        // 2. Snapshot the trunk linear state BEFORE the verify (partial-accept base).
         spec.snapshot_trunk(&self.ctx, slot)?;
         let snap_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 3. Verify [pending, draft] in ONE trunk forward — writes full-attn KV at
-        //    [start_pos, start_pos+1] and advances the 48 linear states by 2.
-        let (logits, dims, h_row1) =
-            self.forward_tokens_with_hidden(slot, ws, &[pending, draft], start_pos)?;
+        // 3. Verify the whole chain in ONE trunk forward → per-row logits + hiddens.
+        //    Advances the full-attn KV + 48 linear states by depth+1 tokens.
+        let (logits, dims, hiddens) = self.forward_tokens_verify(slot, ws, &chain, start_pos)?;
         ensure!(
-            dims == [2, vocab],
-            "spec verify dims {dims:?} != [2, {vocab}]"
+            dims == [depth + 1, vocab],
+            "spec verify dims {dims:?} != [{}, {vocab}]",
+            depth + 1
         );
         let verify_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 4. On-device argmax of both verify rows (the trunk's real next tokens)
-        //    — no full [2, vocab] D2H + host scan; only the two 1-int argmax
-        //    results cross to the host, the same fused kernel no-spec decode uses.
-        let argmax0 = argmax_row_into(&self.ctx, &logits, 0, vocab, &mut spec.argmax_scratch)?;
-        let argmax1 = argmax_row_into(&self.ctx, &logits, 1, vocab, &mut spec.argmax_scratch)?;
+        // 4. Accept the longest prefix where the draft == the trunk's argmax at
+        //    that row (on-device per-row argmax; stops at the first mismatch).
+        let mut k = 0usize;
+        let bonus;
+        loop {
+            let am = argmax_row_into(&self.ctx, &logits, k, vocab, &mut spec.argmax_scratch)?;
+            if k < depth && am == chain[k + 1] {
+                k += 1;
+            } else {
+                bonus = am;
+                break;
+            }
+        }
         let argmax_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        if argmax0 == draft {
-            // HIT: the trunk agrees pending→draft; emit draft + the bonus argmax1.
-            // The verify forward already advanced slot.seq_len to start_pos+2
-            // (forward_hidden does `slot.seq_len += seq_len`); do NOT advance again.
-            if pt.is_some() {
-                eprintln!(
-                    "[mtp-phase] HIT  draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} argmax={argmax_ms:.2} replay=0.00 ms"
-                );
-            }
-            Ok((vec![draft, argmax1], argmax1, h_row1))
-        } else {
-            // MISS: draft wrong; emit the trunk's real next token argmax0 only.
-            // Restore the linear state to pre-verify, rewind the cursor, then replay
-            // `pending` alone (== the verify's first recurrent step) — that replay's
-            // forward_hidden leaves slot.seq_len at start_pos+1, so no extra advance.
+        // next_hidden = the verify hidden of accepted row k (produced `bonus`).
+        let mut next_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        {
+            let src = hiddens.data.slice(k * hidden_size..(k + 1) * hidden_size);
+            self.ctx
+                .stream
+                .memcpy_dtod(&src, &mut next_hidden.data)
+                .map_err(|e| anyhow!("spec next-hidden copy failed: {e}"))?;
+        }
+
+        // 5. Commit: emitted = accepted drafts + bonus. Roll back the trunk state
+        //    on partial accept (the verify over-advanced by depth+1 > k+1).
+        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
+        emitted.push(bonus);
+        if k < depth {
             spec.restore_trunk(&self.ctx, slot)?;
             slot.set_seq_len(start_pos);
-            let (_l0, _d0, h_row0) =
-                self.forward_tokens_with_hidden(slot, ws, &[pending], start_pos)?;
-            let replay_ms = mtp_phase_lap(&self.ctx, &mut pt);
-            if pt.is_some() {
-                eprintln!(
-                    "[mtp-phase] MISS draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} argmax={argmax_ms:.2} replay={replay_ms:.2} ms"
-                );
-            }
-            Ok((vec![argmax0], argmax0, h_row0))
+            // Replay [pending, d1..dk] (k+1 tokens) — forward_hidden re-advances the
+            // linear state + full-attn KV + seq_len to start_pos+k+1, identical to
+            // the verify's first k+1 recurrent steps.
+            self.forward_hidden(slot, ws, &chain[0..=k], start_pos)?;
         }
+        // else k==depth: verify already left seq_len=start_pos+depth+1, state correct.
+        let replay_ms = mtp_phase_lap(&self.ctx, &mut pt);
+
+        if pt.is_some() {
+            eprintln!(
+                "[mtp-phase] depth={depth} accept={k} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} argmax={argmax_ms:.2} replay={replay_ms:.2} ms"
+            );
+        }
+        Ok((emitted, bonus, next_hidden))
     }
 
     /// Per-step student LoRA re-merge (OPD P2).
@@ -6311,6 +6387,11 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(128);
+        let depth: usize = std::env::var("INFER_MTP_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .max(1);
         let max_seq = (prompt.len() + n_decode + 8).next_power_of_two().max(2048);
         let greedy = SamplingParams {
             temperature: 0.0,
@@ -6318,7 +6399,9 @@ mod tests {
             ..Default::default()
         };
 
-        let model = Qwen35Model::from_safetensors(Path::new(&path), max_seq, Some(1))
+        // Load with the MTP head sized for `depth` draft tokens (the head KV
+        // needs depth+1 slots; new_spec_slot_state derives this from the param).
+        let model = Qwen35Model::from_safetensors(Path::new(&path), max_seq, Some(depth))
             .expect("load Qwen3.6-27B-FP8 with MTP head");
 
         // Greedy no-spec: prefill the prompt, then decode `n_decode` tokens.
@@ -6343,7 +6426,7 @@ mod tests {
             (out, t0.elapsed().as_secs_f64())
         };
 
-        // Spec: prefill seeds (pending, hidden), then loop spec_step_depth1.
+        // Spec: prefill seeds (pending, hidden), then loop spec_step(depth).
         let run_spec = || -> (Vec<u32>, f64, usize, usize) {
             let mut slot = model.new_slot_state().unwrap();
             let mut spec = model.new_spec_slot_state().unwrap();
@@ -6372,11 +6455,11 @@ mod tests {
             while out.len() < n_decode {
                 let sp = slot.seq_len();
                 let (emitted, next_pending, next_hidden) = model
-                    .spec_step_depth1(&mut slot, &mut spec, &mut ws, pending, &hidden, sp)
+                    .spec_step(&mut slot, &mut spec, &mut ws, pending, &hidden, sp, depth)
                     .unwrap();
-                if emitted.len() >= 2 {
-                    accepts += 1;
-                }
+                // Accepted drafts this step = emitted.len() - 1 (the bonus is the
+                // trunk's own token, not a draft). accept_rate = accepts/(steps*depth).
+                accepts += emitted.len().saturating_sub(1);
                 steps += 1;
                 out.extend_from_slice(&emitted);
                 pending = next_pending;
@@ -6394,8 +6477,10 @@ mod tests {
         let spec_div = first_divergence(&ref1, &spec_out);
 
         let n = n_decode as f64;
+        let drafted = (steps * depth).max(1);
         eprintln!(
-            "[mtp-bench] no-spec {:.1} tok/s ({:.3}s/{} tok) | spec {:.1} tok/s ({:.3}s) | speedup {:.2}x | accept_rate {}/{} = {:.1}%",
+            "[mtp-bench] depth={} | no-spec {:.1} tok/s ({:.3}s/{} tok) | spec {:.1} tok/s ({:.3}s) | speedup {:.2}x | accept {}/{} drafts = {:.1}% | {:.2} tok/step",
+            depth,
             n / t_nospec,
             t_nospec,
             n_decode,
@@ -6403,8 +6488,9 @@ mod tests {
             t_spec,
             t_nospec / t_spec,
             accepts,
-            steps,
-            100.0 * accepts as f64 / steps.max(1) as f64,
+            drafted,
+            100.0 * accepts as f64 / drafted as f64,
+            spec_out.len() as f64 / steps.max(1) as f64,
         );
         eprintln!(
             "[mtp-gate] MoE self-consistency floor: no-spec runs diverge @{floor}/{} | spec-vs-ref diverge @{spec_div}/{}",
