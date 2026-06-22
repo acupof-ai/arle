@@ -2930,6 +2930,84 @@ impl Qwen35Model {
         Ok((next, h_out))
     }
 
+    /// One depth-1 NextN-MTP speculative decode step (greedy).
+    ///
+    /// Drafts ONE token with the MTP head, verifies `[pending, draft]` in a
+    /// SINGLE trunk forward, and commits the trunk's real next token (always)
+    /// plus the draft (iff the trunk agrees). The output is therefore
+    /// **token-exact to greedy no-spec decode** — the trunk argmax is the source
+    /// of truth; the draft only buys a 2nd token for free on a hit. This is the
+    /// correctness gate (`feedback_correct_inference_not_baseline_identity`):
+    /// spec greedy ≡ no-spec greedy, token-for-token (dense projections; the MoE
+    /// non-determinism caveat applies only to the 35B/27B MoE shapes).
+    ///
+    /// State contract (caller threads `pending`/`hidden` across steps):
+    /// - `pending`: the last already-emitted token, written into the KV at
+    ///   `start_pos` by the verify (its KV is not yet materialized).
+    /// - `hidden`: the trunk hidden that PRODUCED `pending` — the MTP head's
+    ///   level-0 seed (matches Metal `prepare_draft_block_mtp` + DSv4 `spec.hidden`).
+    /// - entry invariant: `slot.seq_len() == start_pos`.
+    ///
+    /// Returns `(emitted_tokens, next_pending, next_hidden)`:
+    /// - HIT  (`argmax0 == draft`): emitted `[draft, argmax1]`; seq_len → `start_pos+2`.
+    /// - MISS: emitted `[argmax0]`; the draft's KV row self-heals (position-indexed)
+    ///   and the trunk linear state is rolled back to post-`pending` via the
+    ///   pre-verify snapshot + a 1-token replay of `pending` (identical to the
+    ///   verify's first recurrent step), seq_len → `start_pos+1`.
+    #[allow(dead_code)] // wired into the executor decode dispatch in a later increment
+    pub(crate) fn spec_step_depth1(
+        &self,
+        slot: &mut Qwen35SlotState,
+        spec: &mut Qwen35SpecSlotState,
+        ws: &mut Qwen35Workspace,
+        pending: u32,
+        hidden: &DeviceVec,
+        start_pos: usize,
+    ) -> Result<(Vec<u32>, u32, DeviceVec)> {
+        ensure!(
+            slot.seq_len() == start_pos,
+            "spec_step entry seq_len {} != start_pos {start_pos}",
+            slot.seq_len()
+        );
+        let vocab = self.output_projection().rows;
+
+        // 1. Draft one token with the MTP head (level 0, seeded from pending+hidden).
+        let (draft, _h0) = self.mtp_forward_level(spec, ws, pending, hidden, 0)?;
+
+        // 2. Snapshot the trunk linear state BEFORE the verify (reject base).
+        spec.snapshot_trunk(&self.ctx, slot)?;
+
+        // 3. Verify [pending, draft] in ONE trunk forward — writes full-attn KV at
+        //    [start_pos, start_pos+1] and advances the 48 linear states by 2.
+        let (logits, dims, h_row1) =
+            self.forward_tokens_with_hidden(slot, ws, &[pending, draft], start_pos)?;
+        ensure!(
+            dims == [2, vocab],
+            "spec verify dims {dims:?} != [2, {vocab}]"
+        );
+
+        // 4. Host-argmax both verify rows (the trunk's real next tokens).
+        let host = logits.to_host(&self.ctx)?;
+        let argmax0 = argmax_row(&host[0..vocab]);
+        let argmax1 = argmax_row(&host[vocab..2 * vocab]);
+
+        if argmax0 == draft {
+            // HIT: the trunk agrees pending→draft; emit draft + the bonus argmax1.
+            slot.advance_seq_len(2);
+            Ok((vec![draft, argmax1], argmax1, h_row1))
+        } else {
+            // MISS: draft wrong; emit the trunk's real next token argmax0 only.
+            // Restore the linear state to pre-verify, then replay `pending` alone
+            // (1 token = the verify's first recurrent step) to land on post-pending.
+            spec.restore_trunk(&self.ctx, slot)?;
+            slot.set_seq_len(start_pos);
+            let (_l0, _d0, h_row0) =
+                self.forward_tokens_with_hidden(slot, ws, &[pending], start_pos)?;
+            slot.advance_seq_len(1);
+            Ok((vec![argmax0], argmax0, h_row0))
+        }
+    }
+
     /// Per-step student LoRA re-merge (OPD P2).
     ///
     /// Folds a fresh [`StudentLoraUpdate`] into the resident student projection
@@ -6038,6 +6116,21 @@ fn f32_to_fp8_e4m3fn(value: f32) -> u8 {
 }
 
 /// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.
+/// Host argmax over one logits row — the greedy spec-verify accept test (the
+/// trunk's real next token). `f32::NEG_INFINITY` seed handles an all-(-inf) row
+/// by returning index 0.
+fn argmax_row(row: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
 fn rms_norm_offset(
     ctx: &DeviceContext,
     x: &HiddenStates,
