@@ -12017,7 +12017,7 @@ fn csa_select_official(
                     .slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
                 let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
                 unsafe {
-                    ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
+                    ffi::dsv4_deepseek_v4_topk_transform_cuda(
                         logits_ptr as *const f32,
                         lens_ptr as *const i32,
                         page_ptr as *const i32,
@@ -12288,7 +12288,7 @@ pub(crate) fn csa_select_official_batched(
         let mut raw = shared.raw_indices_batch.slice_mut(0..n * config.index_topk);
         let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
         unsafe {
-            ffi::dsv4_deepseek_v4_topk_transform_512_cuda(
+            ffi::dsv4_deepseek_v4_topk_transform_cuda(
                 logits_ptr as *const f32,
                 lens_ptr as *const i32,
                 page_ptr as *const i32,
