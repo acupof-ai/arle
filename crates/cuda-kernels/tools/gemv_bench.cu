@@ -562,10 +562,21 @@ extern "C" cudaError_t gemv_fp8_block_scaled_batch_cuda(
         return cudaGetLastError();
     }
     if (getenv("GEMV_AMORT") && (K % 16) == 0) {  // weight-amortizing batched GEMV
-        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, 1);  // grid.y=1: weight read ONCE
+        // grid.y=1: weight read ONCE, MAC'd across all B columns. TILE is
+        // instantiated == B (small spec-decode depth) so sums[TILE] uses exactly
+        // B registers — NOT a fixed-16 array that craters occupancy at small B.
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, 1);
         dim3 block(GEMV_THREADS);
-        fp8_f32_block_gemv_amort_kernel<16><<<grid, block, 0, stream>>>(
-            weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+        switch (B) {
+            case 1:  fp8_f32_block_gemv_amort_kernel<1><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            case 2:  fp8_f32_block_gemv_amort_kernel<2><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            case 3:  fp8_f32_block_gemv_amort_kernel<3><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            case 4:  fp8_f32_block_gemv_amort_kernel<4><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            case 5:  fp8_f32_block_gemv_amort_kernel<5><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            case 6:  fp8_f32_block_gemv_amort_kernel<6><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            case 8:  fp8_f32_block_gemv_amort_kernel<8><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+            default: fp8_f32_block_gemv_amort_kernel<16><<<grid,block,0,stream>>>(weight,scales,input,output,B,N,K,scale_rows,scale_cols,block_m,block_k); break;
+        }
         return cudaGetLastError();
     }
     if (getenv("GEMV_STREAM") && (K % 16) == 0) {  // HBM-ceiling probe (cosine FAILs)
