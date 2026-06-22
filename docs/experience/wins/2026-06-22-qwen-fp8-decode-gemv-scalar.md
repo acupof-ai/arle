@@ -83,6 +83,33 @@ The one-warp-per-row lever (the synthesis' top pick) measured a wash — lowerin
 confidence that the ~41% plateau has an easy GEMV-micro-opt win. **The 5.5× scalar
 default is the structural win; further GEMV tuning is low-yield.**
 
+## DEFINITIVE: the scalar GEMV is near-optimal (ncu, Colab Pro 6000 proxy)
+
+After the pod was reclaimed, re-ran the kernel A/B on a **Colab RTX PRO 6000
+Blackwell** (sm_120, native FP8) via the standalone `tools/gemv_bench.cu`
+micro-bench (no 27B needed). The Pro 6000 with an L2-flush reproduces the H20
+**occupancy-bound regime** (avg ~48% of an optimistic 1790 GB/s roofline, vs L4's
+86% bandwidth-bound — L4 is the wrong regime). On that proxy:
+
+- `GEMV_ROWS` sweep {1,2,4,8}: **all wash** (~48-49%).
+- 4-way **ILP unroll**: **wash** (~48%).
+- **`ncu` verdict** (the definitive one): `gpu__dram_throughput = 80.8%`,
+  `sm__throughput = 22.6%` (compute idle), `warps_active = 84%`. The kernel is
+  **memory-bound at 80% of DRAM peak with 84% occupancy** → near-optimal. The "55%
+  of 1790" was an optimistic marketing roofline; 80% of achievable DRAM is the real
+  ceiling for a read-once streaming GEMV. **No kernel-level headroom remains.**
+
+So the 5.5× scalar default IS the structural win; **further GEMV micro-opt is
+futile** (ncu-confirmed, not just A/B-washed). All 4 shapes cosine=1.0 — correctness
+of the kernel (and the no-headroom verdict) verified on representative HW cheaply,
+without burning H20 time. The reusable harness + proxy method is the lasting infra.
+
+**One residual (untestable here):** the H20 (78 cut-down SMs vs Pro 6000's ~188)
+may be slightly *under*-saturated (~50% of *achievable* DRAM vs the proxy's 80%),
+so ILP/more-loads-per-SM *might* help on H20 specifically even though it washed on
+the already-saturated proxy. Worth one quick H20 A/B when the pod returns — but
+low-confidence; the GEMV is essentially done.
+
 ## Follow-ups (next GPU — pod reclaimed 2026-06-22)
 
 - **ILP-unroll** re-test (patch saved); if wash, the GEMV is at its practical floor.
