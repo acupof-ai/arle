@@ -53,8 +53,8 @@ use crate::moe::{
 };
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
-    add_batch, argmax, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul, upload_i32,
-    warm_fp8_deepgemm_dense,
+    add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv,
+    silu_mul, upload_i32, warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
@@ -518,6 +518,10 @@ pub(crate) struct Qwen35SpecSlotState {
     gdr_snap: Vec<CudaSlice<f32>>,
     /// Pre-verify snapshot of the trunk linear-attn conv rings (bf16).
     conv_snap: Vec<DeviceVec>,
+    /// Persistent 1-element argmax scratch shared by the draft + the two verify
+    /// rows, so a spec step performs ZERO per-token argmax allocations and the
+    /// verify argmax stays on-device (no full `[seq, vocab]` D2H).
+    argmax_scratch: CudaSlice<i32>,
 }
 
 #[allow(dead_code)] // consumed by mtp_forward_level + spec_step (next increments)
@@ -1330,6 +1334,11 @@ impl Qwen35Model {
             head_v: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
             gdr_snap,
             conv_snap,
+            argmax_scratch: self
+                .ctx
+                .stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow!("alloc spec argmax scratch failed: {e}"))?,
         })
     }
 
@@ -2922,7 +2931,7 @@ impl Qwen35Model {
             len: vocab,
             label: "qwen35_mtp_draft_logits",
         };
-        let next = argmax(&self.ctx, &logits_vec)?;
+        let next = argmax_into(&self.ctx, &logits_vec, &mut spec.argmax_scratch)?;
 
         // The head's own output hidden seeds the next level (autoregressive chain,
         // per `dflash.rs` `step_hidden = flat`).
@@ -2971,12 +2980,15 @@ impl Qwen35Model {
             slot.seq_len()
         );
         let vocab = self.output_projection().rows;
+        let mut pt = mtp_phase_start(&self.ctx);
 
         // 1. Draft one token with the MTP head (level 0, seeded from pending+hidden).
         let (draft, _h0) = self.mtp_forward_level(spec, ws, pending, hidden, 0)?;
+        let draft_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         // 2. Snapshot the trunk linear state BEFORE the verify (reject base).
         spec.snapshot_trunk(&self.ctx, slot)?;
+        let snap_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         // 3. Verify [pending, draft] in ONE trunk forward — writes full-attn KV at
         //    [start_pos, start_pos+1] and advances the 48 linear states by 2.
@@ -2986,16 +2998,24 @@ impl Qwen35Model {
             dims == [2, vocab],
             "spec verify dims {dims:?} != [2, {vocab}]"
         );
+        let verify_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 4. Host-argmax both verify rows (the trunk's real next tokens).
-        let host = logits.to_host(&self.ctx)?;
-        let argmax0 = argmax_row(&host[0..vocab]);
-        let argmax1 = argmax_row(&host[vocab..2 * vocab]);
+        // 4. On-device argmax of both verify rows (the trunk's real next tokens)
+        //    — no full [2, vocab] D2H + host scan; only the two 1-int argmax
+        //    results cross to the host, the same fused kernel no-spec decode uses.
+        let argmax0 = argmax_row_into(&self.ctx, &logits, 0, vocab, &mut spec.argmax_scratch)?;
+        let argmax1 = argmax_row_into(&self.ctx, &logits, 1, vocab, &mut spec.argmax_scratch)?;
+        let argmax_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         if argmax0 == draft {
             // HIT: the trunk agrees pending→draft; emit draft + the bonus argmax1.
             // The verify forward already advanced slot.seq_len to start_pos+2
             // (forward_hidden does `slot.seq_len += seq_len`); do NOT advance again.
+            if pt.is_some() {
+                eprintln!(
+                    "[mtp-phase] HIT  draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} argmax={argmax_ms:.2} replay=0.00 ms"
+                );
+            }
             Ok((vec![draft, argmax1], argmax1, h_row1))
         } else {
             // MISS: draft wrong; emit the trunk's real next token argmax0 only.
@@ -3006,6 +3026,12 @@ impl Qwen35Model {
             slot.set_seq_len(start_pos);
             let (_l0, _d0, h_row0) =
                 self.forward_tokens_with_hidden(slot, ws, &[pending], start_pos)?;
+            let replay_ms = mtp_phase_lap(&self.ctx, &mut pt);
+            if pt.is_some() {
+                eprintln!(
+                    "[mtp-phase] MISS draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} argmax={argmax_ms:.2} replay={replay_ms:.2} ms"
+                );
+            }
             Ok((vec![argmax0], argmax0, h_row0))
         }
     }
@@ -6118,19 +6144,30 @@ fn f32_to_fp8_e4m3fn(value: f32) -> u8 {
 }
 
 /// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.
-/// Host argmax over one logits row — the greedy spec-verify accept test (the
-/// trunk's real next token). `f32::NEG_INFINITY` seed handles an all-(-inf) row
-/// by returning index 0.
-fn argmax_row(row: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in row.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
+/// Spec-decode phase attribution: returns `Some(Instant)` only when
+/// `ARLE_MTP_PHASE` is set (the per-phase sync needed for accurate GPU timing is
+/// opt-in, so the default spec-decode path pays nothing).
+fn mtp_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
+    if std::env::var("ARLE_MTP_PHASE").is_ok() {
+        let _ = ctx.sync();
+        Some(std::time::Instant::now())
+    } else {
+        None
     }
-    best as u32
+}
+
+/// Sync + return ms since the last lap (or 0.0 when phase timing is off).
+fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Instant>) -> f64 {
+    match t {
+        Some(prev) => {
+            let _ = ctx.sync();
+            let now = std::time::Instant::now();
+            let ms = now.duration_since(*prev).as_secs_f64() * 1000.0;
+            *t = Some(now);
+            ms
+        }
+        None => 0.0,
+    }
 }
 
 fn rms_norm_offset(
@@ -6316,10 +6353,17 @@ mod tests {
                 .forward_tokens_with_hidden(&mut slot, &mut ws, &prompt, 0)
                 .unwrap();
             let vocab = dims[1];
-            let host = logits.to_host(&model.ctx).unwrap();
             // The prefill's last-row argmax IS the first decoded token = the seed
             // `pending`; `hidden` is its producing trunk hidden (last prompt row).
-            let mut pending = argmax_row(&host[(dims[0] - 1) * vocab..dims[0] * vocab]);
+            // On-device argmax (same path as the live decode), no full-logits D2H.
+            let mut pending = argmax_row_into(
+                &model.ctx,
+                &logits,
+                dims[0] - 1,
+                vocab,
+                &mut spec.argmax_scratch,
+            )
+            .unwrap();
             let mut out = vec![pending];
             let mut accepts = 0usize;
             let mut steps = 0usize;
