@@ -537,6 +537,17 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) no_speculative: bool,
 
+    /// Metal speculative-decode acceptance width. A drafted token is accepted when
+    /// it lies in the target model's top-K for that position. `1` (default) = exact
+    /// greedy verify, bit-identical to no-speculation output. `K>1` raises the
+    /// acceptance rate (longer accepted prefixes → faster) but is LOSSY: the
+    /// committed token may be the target's 2nd/3rd choice, so the output deviates
+    /// from exact greedy — validate with the correct-inference (needle) gate, not
+    /// byte-identity vs baseline. Verify cost is unchanged (the target logits are
+    /// already computed; top-K is a free membership test).
+    #[arg(long, default_value_t = 1, value_name = "K")]
+    pub(crate) spec_accept_topk: usize,
+
     /// MTP root-branch top-k width on CUDA D2; D2/T2 verifies root + candidates.
     #[arg(long, value_name = "K")]
     pub(crate) mtp_draft_topk: Option<usize>,
