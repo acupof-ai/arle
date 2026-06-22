@@ -123,6 +123,24 @@ at **27.8× less KV**. stream, blind to the mid-context preconditions, emits the
 deploy command the rules forbid — the canonical agentic failure. Single scenario /
 single phrasing → directional, not a graded agentic suite.
 
+## Aggregation: the first crack (recall < full)
+
+12 distinct IDs scattered across a diverse 15K haystack, top_k=8 budget, "list all":
+
+```
+full    12/12  kv=15420   all exact
+stream   0/12  kv=288     garbage loop ("728193, 482917, 192837, ..." repeated)
+recall  10/12  kv=544     dropped #5 (472916) + corrupted #11 (629053→629103)
+```
+
+First measured `recall < full`: when items (12) exceed the recall budget (top_k=8),
+recall degrades to 10/12 — one omission + one digit-corruption — the literature's
+aggregation weakness ([SCBench arXiv:2412.10319]). But **graceful** (83%, not collapse
+— per-step re-selection recovers most), not a cliff. Retrieval/agentic = recall's sweet
+spot; list-all-many / count-all = where it cracks. The late-position corruption (#11)
+weakly hints at long-generation drift but isn't cleanly isolated (a ~150-tok list is
+too short; real drift needs hundreds of generated tokens). stream collapses (0/12).
+
 ## Verdict / Next
 
 Phase-0 PASS, strengthened well past a mechanism license: depth profile @5.7K, ctx→16K,
