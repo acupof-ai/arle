@@ -41,14 +41,38 @@ falls back to the fixed-8 tile). Behind the existing opt-in `ARLE_QWEN_GEMV_TILE
 (default decode path byte-unchanged). nvcc sm_89 `-c` compile-clean; kernel math
 byte-identical to the scalar GEMV (`dot16_with_decoded`).
 
+## 27B e2e on A100-40GB (sm_80) — amortizing verify validated end-to-end
+
+Built the full `infer-cuda` + cuda-kernels (tilelang==0.1.11 regen for sm_80) on
+a Colab A100-40GB and ran `mtp_spec_decode_gate_and_bench` on the real
+Qwen3.6-27B-FP8 (29 GB, fits 40 GB), depth=4, `ARLE_QWEN_GEMV_TILED=1`, 28-token
+chat prompt, 128 decode tokens:
+
+```
+no-spec 18.2 tok/s | spec 17.4 tok/s | speedup 0.96× | accept 44% | 2.78 tok/step | gate PASS
+```
+
+The amortizing verify is validated e2e: back-solving the macro-step (160 ms =
+4×draft + ~59 ms verify) puts verify(B=5) at ~1.07× a single decode — exactly
+the gemv_bench number. WITHOUT the tiled kernel the verify(B=5) would be ~5×
+(grid.y=B re-read) → macro-step ~0.41×; the amortizing kernel lifts the whole
+thing ~2.3× to 0.96×.
+
+The remaining cap is the **draft cost**: each MTP-head draft ≈ 25 ms ≈ half a
+full decode, dominated by the shared 248K-vocab lm_head GEMV computed every draft
+step; 4 drafts eat the verify savings. **A100 sm_80 has no FP8 tensor cores**, so
+every FP8 GEMV (especially the big lm_head) runs the software-dequant scalar path
+— the draft is inflated here vs a sm_90 (H20) FP8-HW run. This 0.96× is a
+PESSIMISTIC lower bound: the same model's NextN-MTP is +47% on Metal (README), so
+an efficient FP8 runtime nets a win. The CUDA >1.0× and the depth sweep
+(depth 1/2/3 + the no-tiled contrast) were lost to an A100 preemption mid-sweep.
+
 ## pending-remote
 
-The 27B-FP8 MTP **end-to-end net-win re-bench** (depth-sweep tok/s with the
-amortizing verify, `ARLE_QWEN_GEMV_TILED=1`) needs an H20-class GPU — the H20
-pod was decommissioned mid-session (tunnel to 180.184.176.218 went dark). Colab
-L4 validated the kernel/amortization but can't hold the 27GB model. Re-run the
-`mtp_spec_decode_gate_and_bench` depth-sweep when H20-class hardware is back;
-expect the depth-2/3 rows to cross above 1.0× given verify is now ~1.05×.
+- CUDA spec-decode **>1.0×** + depth sweep on **H20-class FP8 HW** (sm_90 makes
+  the draft lm_head cheap) — H20 pod decommissioned, Colab A100 is sm_80-pessimistic.
+- The **draft-cost lever** (cut the per-draft 248K-vocab lm_head GEMV — it's the
+  binding constraint once verify amortizes) is the next optimization regardless of HW.
 
 ## Rule
 
