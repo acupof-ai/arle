@@ -113,31 +113,51 @@ on GPU0–6, 16 train prompts, MATH-500 pass@1 (n=50, greedy), `--rollout-temper
 | 2     | 0.174 | 0.030 | [0.147, 0.202] | **yes** |
 
 Base is identical across all 7 seeds (8/50) — greedy eval is deterministic; the
-seed only perturbs training rollouts. **Every round's 7-seed CI includes base
-0.160; no monotonic trend (round 1 dips below base); the r2 +1.4pp is noise.**
-At 16-prompt / 3-round / n=50, one-model self-consistency rubric-OPD produces **no
-detectable pass@1 lift** on Qwen3.6-27B-FP8.
+seed only perturbs training rollouts. Every round's 7-seed CI includes base
+0.160; no monotonic trend (round 1 dips below base); the r2 +1.4pp is noise.
+**But these numbers are on a token-budget-truncated eval (see §0 below) — the
+capability is unmeasured, not flat.** At 16-prompt / 3-round / n=50 with
+rollout/eval budgets of 1024/1536, one-model self-consistency rubric-OPD shows no
+pass@1 movement — but the dominant variable was truncation, not the method.
 
 ![capability curve](../../assets/opd-rubric-27b-curve.png)
 
-### §0 case-as-fact — decoded the base eval; metric is `\boxed`-format-confounded
+### §0 case-as-fact — decoded the base eval; the metric is TOKEN-BUDGET TRUNCATED
 
-Before calling 16% a ceiling, decoded the actual base generations (seed0; base
-is identical across seeds):
+> **Correction (2026-06-22).** An earlier version of this entry claimed the base
+> 16% was a `\boxed`-format-compliance floor and "NOT a 1536-tok-cap artifact",
+> based on a **char-length proxy** (`>5000 chars = near cap`). That proxy was
+> wrong: 1536 tokens of LaTeX-dense math is only ~3–5k **chars** (LaTeX is
+> token-dense), so the threshold never fired. The **real tokenizer** tells the
+> truth — see below. The aggregate proxy lied; the decoded cases are ground truth.
 
-- **NOT a 1536-token-cap artifact.** Longest base answer is 5093 chars (~1270
-  tokens) — **0/50 reach the 1536-tok cap**; generations finish on their own.
-- **It IS a `\boxed`-compliance floor.** Only **17/50 base answers emit `\boxed`**;
-  the other **33/50 (66%) are unscorable** (no extractable answer → counted wrong).
-  Of the 17 boxed, 8 are correct (47% of *boxed* right). "16%" = 8/50 where 33 of
-  the 50 never entered the scorer — it understates real math ability.
-- **OPD shifts neither.** `\boxed`-emission rate stays 14–20/50 across all rounds
-  (base 17), no round nears the cap. The loop teaches neither format nor pass@1.
+Tokenizing the base generations with the model's own tokenizer
+(`Qwen3.6-27B-FP8/tokenizer.json`):
 
-**Implication:** at this scale the experiment can't cleanly *measure* capability —
-the dominant variable is `\boxed`-format compliance, not math skill. Honest next
-step: a format-robust extractor (or a `\boxed` training/prompt signal) **before**
-re-running for a capability verdict, plus ≫16 train prompts.
+| group | n | token min/median/max | ≥1500 tok (cap=1536) |
+|-------|---|----------------------|----------------------|
+| has `\boxed`   | 17 | 303 / 1536 / 1536 | 14/17 |
+| no `\boxed`    | 33 | **1536 / 1536 / 1536** | **33/33** |
+
+- **It IS a 1536-token-cap truncation artifact.** ALL 33 no-`\boxed` answers are
+  at **exactly 1536 tokens** — cut mid-reasoning, mid-equation ("`= \frac{-6`"…
+  "`We need three`"… "`Carla:`"). They never reach `\boxed` because the budget
+  ends first. Even 14/17 of the *boxed* answers are at the cap.
+- **The training was budget-crippled too.** Rollouts ran at `--max-new-tokens
+  1024` (smaller than eval's 1536); self-consistency majority-vote only saw the
+  few rollouts that happened to finish + box within 1024 — a tiny, biased signal.
+  That is why the loop didn't move pass@1.
+- **Qwen3.6-27B is a heavy-CoT thinker:** it ramble-verifies ("double check /
+  alternative approach / re-read") and overruns any small budget. The capability
+  is **budget-masked, not measured**.
+
+**Implication:** the whole experiment (rollout 1024 / eval 1536) is
+truncation-confounded. The base "16%" is 8/50 where 33 of the 50 were cut off
+before answering — it does **not** reflect the model's real math ability, and the
+flat-within-noise round curve is on a crippled metric. **Re-scoring the existing
+dumps cannot fix this** (truncated text has no final answer to extract). The fix
+is to **re-generate at an adequate budget** (eval ≥8192, rollout ≥4096) ±
+thinking control — i.e. a re-eval (per-round adapters are saved) and a retrain.
 
 ### The day's durable output = infra (all committed, independent of the null)
 
@@ -154,15 +174,23 @@ re-running for a capability verdict, plus ≫16 train prompts.
   SC; halve the `[B,S,V]` logits-grad peak so the 27B CE backward fits.
 
 ### Rule
-A capability curve is only as honest as its eval: **decode the actual generations
-before trusting pass@1.** The base "16%" was 66% unscorable-`\boxed`, not a
-1536-cap truncation and not a math ceiling — the metric measured format compliance.
-Report the format-confound and the flat-within-noise verdict; never dress a +1.4pp
-noise band as a lift. Cross-links: weight-share 2cff1465; day-of-detours
-[errors](../errors/2026-06-21-rubric-opd-debugging.md) (997caa39).
+A capability curve is only as honest as its eval — and **measure tokens with the
+tokenizer, never a char-length proxy.** The base "16%" was 33/50 answers cut at
+exactly 1536 tokens before reaching `\boxed`; the model's real math ability was
+budget-masked, not measured. A char-proxy (`>5000 chars`) for "near the token cap"
+gave the opposite, wrong conclusion (LaTeX is ~2–3 char/token, so 1536 tok ≈ 4k
+chars). Decode the cases **and** count real tokens before shipping a root cause —
+this entry shipped the wrong one once. Cross-links: weight-share 2cff1465;
+day-of-detours [errors](../errors/2026-06-21-rubric-opd-debugging.md) (997caa39);
+the char-proxy mistake [errors](../errors/2026-06-22-token-budget-truncation-char-proxy.md).
 
-### Follow-ups
-- Format-robust extractor (last number / `Answer:` / `=` when `\boxed` absent);
-  re-score all 4 rounds — the capability delta may be masked by the 66% floor.
-- Scale train prompts ≫16 + rounds, with the format-robust eval, before any claim.
+### Follow-ups (the real next run)
+- **Re-eval the saved per-round adapters at eval budget ≥8192** (training-free —
+  `adapters_round{1,2,3}.safetensors` are saved per seed) → a clean base→r2 curve
+  on un-truncated generations. This is the meaningful "re-score."
+- **Retrain with rollout budget ≥4096** (so the self-consistency vote sees
+  finished rollouts) + ≫16 train prompts. The 1024 rollout budget starved the
+  training signal.
+- Investigate thinking control: the 27B overruns even 4096 with verify-rambling;
+  a `/no_think` or concise-answer prompt may be needed to keep eval tractable.
 - DSv4-Flash judge (needs multi-engine-TP) and shared-base needle gate deferred.
