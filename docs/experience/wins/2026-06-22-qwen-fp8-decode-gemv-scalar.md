@@ -64,10 +64,34 @@ coalescing. For a memory-bound B=1 GEMV the right kernel is coalesced
 warp-per-row with `N/rows` blocks. Always profile the **actual decode shape**;
 the block-count↔bandwidth correlation is the occupancy fingerprint.
 
-## Follow-ups (in progress — multi-front, ckl "多线开花")
+## Second-front results (parallel-analysis Workflow + measured A/B)
 
-- **GEMV vectorization** 41%→60-80% BW (1-byte→uint32/uint4 loads).
-- **linear-attn `in_proj`** 0.176ms/layer outlier — likely off the scalar path.
-- **lm_head** 1.37ms/step (vocab 248320) — FP8/vectorize.
-- **norm/RoPE/residual** fusion to cut B=1 launches.
-- **Deletion-refactor**: remove the dead MMA Qwen path (collapse to one scalar path).
+A 5-agent Workflow analyzed the remaining fronts. **Key §0 correction it caught:**
+the live Qwen FP8 decode kernel is `fp8_f32_block_gemv_batch_kernel`, which is
+**already 16-wide vectorized** (`fp8_f32_dot16`, committed `26014f4e`) — NOT the
+1-byte `dsv4_fp8_gemv_kernel` I'd been reading. So "vectorize the byte loop" is
+void for Qwen. The plateau at ~41% HBM is latency/occupancy, not load width.
+
+Measured A/B on H20 (single-stream, vs the 41.3 baseline):
+
+| lever | change | result | verdict |
+|-------|--------|--------|---------|
+| one-warp-per-row | `FP8_GEMV_ROWS=8`, drop cross-warp `__syncthreads` | 39.9 tok/s | **WASH/slightly worse → KILLED** (halved blocks offset the barrier removal) |
+| ILP-unroll K-loop | 4-way unroll of the `dot16` walk | **unmeasured** (pod reclaimed mid-A/B) | patch saved `/tmp/lever2-ilp-unroll.patch`; re-test next GPU |
+
+The one-warp-per-row lever (the synthesis' top pick) measured a wash — lowering
+confidence that the ~41% plateau has an easy GEMV-micro-opt win. **The 5.5× scalar
+default is the structural win; further GEMV tuning is low-yield.**
+
+## Follow-ups (next GPU — pod reclaimed 2026-06-22)
+
+- **ILP-unroll** re-test (patch saved); if wash, the GEMV is at its practical floor.
+- **lm_head** 1.37ms/step (bf16, vocab 248320) → FP8 reload halves the read (~+1 tok/s).
+- **norm+residual fusion** (`fused_add_rms_norm_offset_cuda` exists, unwired) — ~1%.
+- **linear-attn `in_proj`** 0.176ms — re-profile whether it's off the FP8 fast path.
+- **Deletion-refactor** (ckl): collapse the dead MMA Qwen path to one scalar path
+  (zero perf; `quant_linear.rs` mma branch + `quantized_gemv_mma.cu` Qwen clone +
+  FFI + parity test) — needs a full `--features cuda` build to verify, so deferred.
+- **Colab continuation caveat**: the 27B-FP8 (~27 GB) needs a big GPU; the Colab
+  `<8s-exec` verification lane can't serve it (model load ≫8s). Colab is for kernel
+  *correctness* unit-tests (sm_80+), not 27B serving-perf — that needs an H20/A100-80.
