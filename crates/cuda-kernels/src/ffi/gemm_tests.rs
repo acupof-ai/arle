@@ -632,3 +632,184 @@ fn fp8_block_scaled_gemv_mma_matches_scalar() {
         "MMA vs scalar max_abs_err {max_abs:.4} above 0.5 — kernel parity broken"
     );
 }
+
+// Pre-Hopper dense FP8 fallback parity: the dequant→BF16 cuBLAS GEMM path
+// (`dequantize_fp8_block_scaled_to_bf16_cuda` + `gemm_cuda`, used by infer-cuda's
+// `try_fp8_dequant_bf16_gemm_batch` on sm < 9) vs the scalar block-scaled GEMV
+// reference (`gemv_fp8_block_scaled_batch_cuda`), on the SAME fp8 block-scaled
+// weights + input. Verifies TWO things on a pre-Hopper Ampere/Ada box (sm_80-89):
+//   1. `gemm_cuda` (bf16 cuBLASLt) actually runs — settles the open hypothesis
+//      that CUBLAS_GEMM_DEFAULT_TENSOR_OP bf16 might be NOT_SUPPORTED below sm_90
+//      (the `.expect` on the gemm_cuda result panics if it errors).
+//   2. dequant→BF16→GEMM is numerically equivalent to the scalar GEMV.
+//
+// Layout: gemm_cuda computes Y[M,N] col-major = W[M,K] row-major @ X[K,N]
+// col-major. With M=n, N=b, K=k the col-major X[k,b] / Y[n,b] are byte-identical
+// in memory to the scalar path's row-major input[b,k] / output[b,n]
+// (index k_idx + batch*k ≡ batch*k + k_idx), so the same buffers drive both
+// paths — an exact A/B. Mirrors the production call (M=weight.rows, N=seq,
+// K=weight.cols). b=1024 matches the QWEN_FP8_DEEPGEMM_DENSE_MIN_M prefill gate.
+//
+// Run on the CUDA box (L4 / A100, sm_80-89):
+//   CUDA_HOME=/usr/local/cuda cargo test -p cuda-kernels --release \
+//     --features cuda fp8_dequant_bf16_gemm_matches_scalar -- --nocapture
+#[test]
+fn fp8_dequant_bf16_gemm_matches_scalar() {
+    let ctx = DeviceContext::new().expect("failed to create CUDA context");
+    let b = 1024usize; // prefill shape (>= QWEN_FP8_DEEPGEMM_DENSE_MIN_M)
+    let n = 256usize; // weight rows / out features (N % 8 == 0, % 128 == 0)
+    let k = 256usize; // weight cols / contraction (= 2 × block_k)
+    let block_m = 128usize; // canonical Qwen FP8 quant block
+    let block_k = 128usize;
+    let scale_rows = n.div_ceil(block_m); // = 2
+    let scale_cols = k.div_ceil(block_k); // = 2
+
+    // Finite, in-range e4m3 weight bytes (avoid NaN 0x7f/0xff).
+    let fp8_pool: [u8; 12] = [
+        0x38, 0x40, 0x30, 0x48, 0x34, 0x3c, // +1, +2, +0.5, +3, +0.75, +1.5
+        0xb8, 0xc0, 0xb0, 0xc8, 0xb4, 0xbc, // negatives of the above
+    ];
+    let mut weight = vec![0u8; n * k];
+    for row in 0..n {
+        for col in 0..k {
+            weight[row * k + col] = fp8_pool[(row * 31 + col * 17 + 5) % fp8_pool.len()];
+        }
+    }
+    let mut scales = vec![0.0f32; scale_rows * scale_cols];
+    for (i, s) in scales.iter_mut().enumerate() {
+        *s = 0.125 * ((i % 5) as f32 + 1.0); // 0.125 .. 0.625
+    }
+    let mut input_host = vec![bf16::ZERO; b * k];
+    for batch in 0..b {
+        for col in 0..k {
+            let raw = ((batch * 13 + col * 7) % 23) as f32 - 11.0;
+            input_host[batch * k + col] = bf16::from_f32(raw * 0.0625);
+        }
+    }
+
+    let weight_dev = ctx.stream.clone_htod(&weight).expect("weight H2D");
+    let scales_dev = ctx.stream.clone_htod(&scales).expect("scales H2D");
+    let input_dev = ctx.stream.clone_htod(&input_host).expect("input H2D");
+    let mut scalar_out = ctx
+        .stream
+        .alloc_zeros::<bf16>(b * n)
+        .expect("scalar out alloc");
+    let mut fallback_out = ctx
+        .stream
+        .alloc_zeros::<bf16>(b * n)
+        .expect("fallback out alloc");
+    let mut weight_bf16 = ctx
+        .stream
+        .alloc_zeros::<bf16>(n * k)
+        .expect("weight bf16 alloc");
+
+    // ---- Scalar reference (gemv_fp8_block_scaled_batch_cuda) ----
+    {
+        let (weight_ptr, _wg) = weight_dev.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales_dev.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input_dev.device_ptr(&ctx.stream);
+        let (out_ptr, _og) = scalar_out.device_ptr_mut(&ctx.stream);
+        unsafe {
+            gemv_fp8_block_scaled_batch_cuda(
+                weight_ptr as *const u8,
+                scales_ptr as *const f32,
+                input_ptr as *const Half,
+                out_ptr as *mut Half,
+                b as i32,
+                n as i32,
+                k as i32,
+                scale_rows as i32,
+                scale_cols as i32,
+                block_m as i32,
+                block_k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("scalar fp8 block GEMV");
+        }
+    }
+    ctx.sync().expect("sync scalar GEMV");
+
+    // ---- Fallback: dequant fp8 → bf16 weight, then bf16 cuBLAS GEMM ----
+    {
+        let (weight_ptr, _wg) = weight_dev.device_ptr(&ctx.stream);
+        let (scales_ptr, _sg) = scales_dev.device_ptr(&ctx.stream);
+        let (wbf16_ptr, _bg) = weight_bf16.device_ptr_mut(&ctx.stream);
+        unsafe {
+            dequantize_fp8_block_scaled_to_bf16_cuda(
+                weight_ptr as *const u8,
+                scales_ptr as *const f32,
+                wbf16_ptr as *mut Half,
+                n as i32,
+                k as i32,
+                scale_rows as i32,
+                scale_cols as i32,
+                block_m as i32,
+                block_k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("dequant fp8 → bf16");
+        }
+    }
+    ctx.sync().expect("sync dequant");
+    {
+        let (wbf16_ptr, _bg) = weight_bf16.device_ptr(&ctx.stream);
+        let (input_ptr, _ig) = input_dev.device_ptr(&ctx.stream);
+        let (out_ptr, _og) = fallback_out.device_ptr_mut(&ctx.stream);
+        unsafe {
+            // gemm_cuda(W[M,K], X[K,N], Y[M,N], M=n, N=b, K=k). This bf16
+            // cuBLASLt call is the one under test for the sm<90 NOT_SUPPORTED
+            // hypothesis — `.expect` panics if it errors.
+            gemm_cuda(
+                wbf16_ptr as *const Half,
+                input_ptr as *const Half,
+                out_ptr as *mut Half,
+                n as i32,
+                b as i32,
+                k as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .expect("bf16 cuBLAS GEMM (settles sm<90 NOT_SUPPORTED hypothesis)");
+        }
+    }
+    ctx.sync().expect("sync fallback GEMM");
+
+    let scalar = ctx.stream.clone_dtoh(&scalar_out).expect("scalar D2H");
+    let fallback = ctx.stream.clone_dtoh(&fallback_out).expect("fallback D2H");
+
+    let mut dot = 0.0f64;
+    let mut norm_s = 0.0f64;
+    let mut norm_f = 0.0f64;
+    let mut max_abs = 0.0f64;
+    for (s, f) in scalar.iter().zip(fallback.iter()) {
+        let sf = s.to_f32() as f64;
+        let ff = f.to_f32() as f64;
+        dot += sf * ff;
+        norm_s += sf * sf;
+        norm_f += ff * ff;
+        max_abs = max_abs.max((sf - ff).abs());
+    }
+    let cosine = if norm_s > 0.0 && norm_f > 0.0 {
+        dot / (norm_s.sqrt() * norm_f.sqrt())
+    } else {
+        1.0
+    };
+    eprintln!(
+        "[fp8-dequant-bf16-parity] B={b} N={n} K={k} block={block_m}x{block_k} \
+         cosine={cosine:.6} max_abs_err={max_abs:.4}"
+    );
+
+    // Both paths f32-accumulate; the fallback additionally rounds the
+    // dequantized weight to bf16, so allow a slightly looser max_abs than the
+    // MMA test while keeping cosine as the strong parity gate.
+    assert!(
+        cosine >= 0.999,
+        "dequant→bf16 GEMM vs scalar cosine {cosine:.6} below 0.999 — fallback parity broken"
+    );
+    assert!(
+        max_abs <= 1.0,
+        "dequant→bf16 GEMM vs scalar max_abs_err {max_abs:.4} above 1.0 — fallback parity broken"
+    );
+}
