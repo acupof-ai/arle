@@ -46,6 +46,22 @@ static bool dsv4_fp8_gemv_mma_enabled() {
 #define GEMV_THREADS 256
 #define GEMV_ROWS 4
 #define DSV4_BATCH_TILE 32
+#define QWEN_GEMV_BATCH_TILE 8
+
+// Opt-in (ARLE_QWEN_GEMV_TILED=1): route the Qwen FP8 block-scaled B>1 decode
+// GEMV through the weight-amortizing tiled kernel — one weight-row HBM read per
+// tile of QWEN_GEMV_BATCH_TILE columns, vs the per-batch-element kernel (grid.y
+// = B, one weight-row read per column). REDUCES the spec-decode verify cost at
+// B>1; B==1 keeps the proven B=1-tuned path byte-for-byte (no added cost to the
+// no-spec hot path). Latched once (decode is hot).
+static bool qwen_gemv_tiled_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("ARLE_QWEN_GEMV_TILED");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
 
 __device__ __constant__ float DSV4_FP4_E2M1_LUT[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -894,6 +910,95 @@ __global__ void fp8_f32_block_gemv_batch_kernel(
         for (int w = 0; w < warps_per_row; w++)
             total += smem[row_in_block * warps_per_row + w];
         output[batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+
+// Weight-amortizing batch GEMV for the Qwen FP8 block-scaled decode path
+// (opt-in via qwen_gemv_tiled_enabled). grid.y maps to a tile of
+// QWEN_GEMV_BATCH_TILE columns: each 16-byte weight chunk is read once
+// (L1-resident across the inner batch loop) and MAC'd against every column in
+// the tile, vs fp8_f32_block_gemv_batch_kernel which re-streams the weight row
+// per batch element. Numerics identical (same scale, same fp8_f32_dot16, same
+// per-column accumulation order). Mirrors dsv4_fp8_gemv_batch_tiled_kernel.
+__global__ void fp8_f32_block_gemv_batch_tiled_kernel(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_base = blockIdx.y * QWEN_GEMV_BATCH_TILE;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+    const int tile_batches_raw = B - batch_base;
+    const int tile_batches =
+        tile_batches_raw < QWEN_GEMV_BATCH_TILE ? tile_batches_raw : QWEN_GEMV_BATCH_TILE;
+
+    float sums[QWEN_GEMV_BATCH_TILE];
+#pragma unroll
+    for (int b = 0; b < QWEN_GEMV_BATCH_TILE; ++b) sums[b] = 0.0f;
+
+    const uint8_t* weight_row = weight + (int64_t)row * K;
+    if ((K % 16) == 0 && (block_k % 16) == 0) {
+        const int kv = K / 16;
+        for (int v = tid_in_row; v < kv; v += threads_per_row) {
+            const int k = v * 16;
+            const float scale =
+                fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+#pragma unroll
+            for (int b = 0; b < QWEN_GEMV_BATCH_TILE; ++b) {
+                if (b < tile_batches) {
+                    const __nv_bfloat16* x_b = input + (int64_t)(batch_base + b) * K;
+                    sums[b] += scale * fp8_f32_dot16(weight_row + k, x_b + k);
+                }
+            }
+        }
+    } else {
+        for (int k = tid_in_row; k < K; k += threads_per_row) {
+            const float w = dsv4_decode_fp8_e4m3(weight_row[k])
+                * fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+#pragma unroll
+            for (int b = 0; b < QWEN_GEMV_BATCH_TILE; ++b) {
+                if (b < tile_batches) {
+                    const int64_t batch_idx = (int64_t)(batch_base + b);
+                    sums[b] += w * __bfloat162float(input[batch_idx * K + k]);
+                }
+            }
+        }
+    }
+
+    __shared__ float smem[GEMV_ROWS * 8 * QWEN_GEMV_BATCH_TILE];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+#pragma unroll
+    for (int b = 0; b < QWEN_GEMV_BATCH_TILE; ++b) {
+        sums[b] = warp_reduce_sum(sums[b]);
+        if (lane_id == 0) {
+            smem[(row_in_block * warps_per_row + warp_in_row) * QWEN_GEMV_BATCH_TILE + b] = sums[b];
+        }
+    }
+    __syncthreads();
+    if (tid_in_row == 0) {
+#pragma unroll
+        for (int b = 0; b < QWEN_GEMV_BATCH_TILE; ++b) {
+            if (b >= tile_batches) continue;
+            const int64_t batch_idx = (int64_t)(batch_base + b);
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_row; ++w) {
+                total += smem[(row_in_block * warps_per_row + w) * QWEN_GEMV_BATCH_TILE + b];
+            }
+            output[batch_idx * N + row] = __float2bfloat16(total);
+        }
     }
 }
 
@@ -3200,6 +3305,17 @@ cudaError_t gemv_fp8_block_scaled_batch_cuda(
     if (B <= 0 || N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0 ||
         block_m <= 0 || block_k <= 0) {
         return cudaErrorInvalidValue;
+    }
+    // B>1 (the spec-decode verify, B=2..) + opt-in: tile the batch so each weight
+    // row streams from HBM once per tile instead of once per column. B==1 keeps
+    // the optimized single-column decode kernel byte-for-byte.
+    if (B > 1 && qwen_gemv_tiled_enabled()) {
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS,
+                  (B + QWEN_GEMV_BATCH_TILE - 1) / QWEN_GEMV_BATCH_TILE);
+        dim3 block(GEMV_THREADS);
+        fp8_f32_block_gemv_batch_tiled_kernel<<<grid, block, 0, stream>>>(
+            weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+        return cudaGetLastError();
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
