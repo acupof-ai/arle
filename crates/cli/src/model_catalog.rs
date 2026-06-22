@@ -194,7 +194,9 @@ pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> 
 
 /// Look up a catalog entry by its exact HuggingFace id. Lets the picker
 /// surface a flagship `recommended` note on a model the user already has
-/// on disk.
+/// on disk. Only reachable when a backend is compiled — `model_picker`, its
+/// sole non-test caller, carries the same gate.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn find_by_hf_id(hf_id: &str) -> Option<&'static CatalogEntry> {
     CATALOG.iter().find(|e| e.hf_id == hf_id)
 }
@@ -281,6 +283,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     #[test]
     fn flagship_picks_are_marked_recommended() {
         // The two models ARLE leads with must carry a one-line reason.

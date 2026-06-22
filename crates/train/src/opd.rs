@@ -2833,7 +2833,10 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     for (prompt, completion) in batch {
         flat.extend(prompt.iter().map(|&t| t as usize));
         flat.extend(completion.iter().map(|&t| t as usize));
-        flat.extend(std::iter::repeat(0usize).take(max_len - prompt.len() - completion.len()));
+        flat.extend(std::iter::repeat_n(
+            0usize,
+            max_len - prompt.len() - completion.len(),
+        ));
     }
     let logits = student
         .forward_batch_tokens(&flat, b, max_len, store, &mut tape)
