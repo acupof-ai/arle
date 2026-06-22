@@ -2609,6 +2609,49 @@ impl Qwen35Model {
         Ok((logits_vec, [seq_len, vocab]))
     }
 
+    /// Like [`Self::forward_token_logits_full`] but ALSO returns the LAST token's
+    /// RAW trunk hidden (pre-final-norm) in a freshly-owned `DeviceVec`. The
+    /// NextN-MTP draft head consumes that hidden as its level-0 input
+    /// (`fc(concat[embed(tok), h])`), so spec-decode needs both the verify logits
+    /// and the trunk hidden from a single forward. Byte-identical to
+    /// `forward_token_logits_full` for the logits; the extra `copy_row_to_vec`
+    /// captures the hidden BEFORE the lm-head norm reuses the workspace.
+    /// (Spec-decode port increment 3a; gated path, no default-decode change.)
+    #[allow(dead_code)] // consumed by mtp_forward_level / spec_step (next increment)
+    pub(crate) fn forward_tokens_with_hidden(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
+        self.forward_hidden(slot, ws, tokens, start_pos)?;
+        let seq_len = tokens.len();
+        let eps = self.config.rms_norm_eps;
+        let hidden_size = self.config.hidden_size;
+        // Capture the last row's raw trunk hidden into an OWNED buffer first —
+        // the lm-head norm below overwrites `ws.normed` from `ws.hidden`.
+        let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
+        {
+            let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
+            copy_row_to_vec(&self.ctx, hidden, seq_len - 1, &mut last_hidden)?;
+        }
+        let Qwen35Workspace { hidden, normed, .. } = ws;
+        let hidden = hidden.get(&self.ctx, hidden_size, seq_len)?;
+        let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, seq_len)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, &mut logits)?;
+        self.ctx.sync()?;
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: seq_len * vocab,
+            label: "qwen35_token_logits[seq,vocab]",
+        };
+        Ok((logits_vec, [seq_len, vocab], last_hidden))
+    }
+
     /// Per-step student LoRA re-merge (OPD P2).
     ///
     /// Folds a fresh [`StudentLoraUpdate`] into the resident student projection
