@@ -708,7 +708,7 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
-    pub fn dsv4_deepseek_v4_topk_transform_512_cuda(
+    pub fn dsv4_deepseek_v4_topk_transform_cuda(
         scores: *const f32,
         seq_lens: *const i32,
         page_table: *const i32,
