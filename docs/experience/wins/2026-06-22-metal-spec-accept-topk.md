@@ -32,13 +32,34 @@ is only exported when speculation is active. Opt-in; baseline unchanged.
 Compiles clean (mlx-sys C++ + infer-metal); `cli` env-flag test passes (flag→"2",
 `--no-speculative`→absent, auto-resolve→default "1").
 
-## Pending (pending-remote)
+## e2e measured on Qwen3.6-27B (2026-06-22)
 
-**e2e DFlash gate NOT run** — the draft model `z-lab/Qwen3.6-35B-A3B-DFlash` is not
-cached locally (no DFlash draft → `self.dflash=None` → verify path never executes).
-Needs a DFlash-enabled Metal serve: `--spec-accept-topk 2` vs `1`, measure
-acceptance-rate↑ / tok/s, and a **correct-inference needle gate** (NOT byte-identity
-vs baseline — top-k accept deliberately deviates). Cross-link this entry on landing.
+Ran on `mlx-community/Qwen3.6-27B-OptiQ-4bit` (target) + auto-resolved
+`Qwen3.6-27B-MTP-4bit` draft, depth-2 MTP, `arle run --no-tools`, 256 tok, same
+prompt, `RUST_LOG=infer_metal=info INFER_METAL_DFLASH_TRACE=1` for per-block accept:
+
+| | mean accepted/block | mean matched/block | accepted hist |
+|---|---|---|---|
+| topk=1 (exact) | 1.700 | 0.700 | {1:45, 2:105} |
+| topk=2 | **1.861** | **0.861** | {1:19, 2:118} |
+
+**topk=2 raises accepted/block +9.5% (matched +23%)** — "reject at first draft"
+dropped 45→19 blocks; 137 vs 150 blocks for similar output → ~+9.5% fewer target
+forwards → ~+9.5% expected throughput. Mechanism confirmed.
+
+**Two caveats (SOLID):**
+- **Bounded lever.** `accepted=3` (both drafts) NEVER occurs in either — once the
+  first draft is rescued by top-2, the second rarely survives even top-2. On depth-2
+  MTP self-spec the draft is target-aligned (top-1 already accepts most), so top-k
+  only rescues the first draft; gain caps ~9.5%. Deeper drafts may benefit more.
+- **tok/s not cleanly resolved.** Single-shot diff-method (192/(wall₂₅₆−wall₆₄))
+  showed a spurious −11% — cold-process warmup jitter + lossy-content confound swamp
+  a ~9.5% signal. Clean tok/s needs a warm same-binary matched A/B
+  ([[feedback_matched_ab_for_small_bench_effects]]); local memory flakiness (27B at
+  the 48 GiB Mac's edge) made that impractical. accepted/block is the robust evidence.
+
+Correctness: outputs stayed coherent (valid technical answers) at topk=2; lossy, so a
+needle gate is the proper check (not run; no degeneration observed).
 
 ## Rule
 
