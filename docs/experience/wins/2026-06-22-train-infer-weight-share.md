@@ -1,7 +1,27 @@
 # Train-Infer FP8 Weight Sharing (训推一体) — opt-in, one shared frozen base
 
 **Commit:** 2cff1465 (`feat(train): opt-in train-infer FP8 weight-share (--share-frozen-base)`).
-**Status:** landed opt-in (default OFF, byte-identical); correctness needle gate = follow-up.
+**Status:** landed opt-in (default OFF, byte-identical); correctness parity gate = in progress.
+
+## Default status & how to enable (训推一体)
+
+- **Currently OPT-IN, NOT default.** Pass `--share-frozen-base` to
+  `arle train rubric-opd` (`args.rs:1102`, `default_value_t = false`). Without it
+  the loop loads two FP8 base copies (byte-identical default path, unchanged).
+- **Preconditions** (the flag only helps, and is only sound, when these hold):
+  FP8 student checkpoint (e.g. `Qwen3.6-27B-FP8`) **and** single GPU (same primary
+  CUDA context — the zero-copy import compares context by ordinal). A bf16 student
+  or multi-GPU TP cannot share; the flag is a no-op / unsupported there.
+- **Why not default yet:** a default flip needs a *correctness license* — a
+  controlled share-vs-no-share forward-parity check (the shared FP8 base must
+  produce the same logits as a private copy). 2cff1465 showed the loop runs stable
+  with CE loss in the two-copy range (~0.066), but that is suggestive, not a parity
+  proof. The parity A/B (greedy, `rounds=1`, same prompts, share vs no-share,
+  compare per-round `mean_loss`) is running now; **identical loss → flip default-on
+  with a `--no-share-frozen-base` opt-out** (per the KV-features "default-on +
+  opt-out + scheduled gate + one-line revert" precedent).
+- **What it buys:** one base instead of two → **~27 GB freed** on the shared GPU,
+  which is exactly the CE-backward headroom a larger-budget retrain needs.
 
 ## Context
 
@@ -51,6 +71,8 @@ no longer frees the base).
 
 ## Follow-ups
 
-- Needle/self-consistency correctness gate on the shared-base forward vs two-copy.
+- **In progress:** share-vs-no-share forward-parity gate (greedy `rounds=1`, same
+  16 prompts, compare per-round `mean_loss`); pass → flip default-on with a
+  `--no-share-frozen-base` opt-out + update this entry with the verdict.
 - num_slots vs CE-headroom sweep in shared mode (offload-skip keeps base resident).
 - pending-remote: a guidellm/throughput bench (more KV slots from the freed ~27 GB).
