@@ -69,17 +69,50 @@ just in-the-top-k. The Metal-feasible representative is sharply discriminative h
 **Caveat — this is the easy task.** passkey-in-uniform-filler makes the needle's
 mean-key trivially distinct from repetitive filler, so #1-ranking is expected-easy.
 top_k=1 @ 0.2% is impressive *on a needle among uniform distractors*, NOT a general
-claim. A needle among *diverse* distractors (real LongBench/∞-Bench docs) is the
-binding test and is not yet run.
+claim — so the two harder tests below were run to settle it.
+
+## Memory benchmark: diverse distractors + multi-needle
+
+`--distractor diverse` fills the haystack with a varied sentence pool incl.
+number-bearing decoys ("serial 48213", "invoice 55820", "balance 71640");
+`--needles N` buries N keys at even depths under one list-all Q; thinking disabled
+via chat template (`enable_thinking=False`) so the answer is direct (a 0/N from
+`<think>` truncation is a harness artifact). `kv_attended` is now MEASURED.
+
+```
+ctx~2.9K diverse 3-needle   full 3/3   stream 0/3   recall 3/3   kv/layer: 2937 / 288 / 544
+ctx~15K  diverse 4-needle   full 4/4   stream 0/4   recall 4/4   kv/layer: 15156 / 288 / 544
+```
+
+recall = full = exact on a diverse 15K haystack with 4 simultaneous objects, at
+**544 vs 15156 KV/layer = 27.9× less**. stream confabulates fake keys ("729104,
+196906, 196906"). Measured kv_attended matches the formula exactly (full=S,
+stream=288=n_init+n_local, recall=544=n_init+top_k·l_bs+n_local).
+
+## Real-content quality: hard QA over a 29K repo doc
+
+`--doc docs/projects/tiered-kv-cache.md` (~29K tok, repo-specific → unknowable
+parametrically), two hard comprehension Qs; `full` (attend-all) is the quality ceiling.
+
+```
+Q "tiers T0–T3 + storage"    full ✅ HBM/DRAM/NVMe/remote   stream ❌ confabulates (vague T0 only)   recall ✅ exact=full
+Q "4 shipped EvictionPolicy" full ✅ Lru/ReuseBiasedLru/HitCountLru/SessionBiasedLru   stream ❌ "L, L, L, L"   recall ✅ exact=full
+kv_attended/layer:  full ~29.3K   stream 288   recall 544   →  recall = 53.9× less than full
+```
+
+recall reproduces full's answer **quality** (not just a planted needle) at 1.9% of the
+KV; stream confabulates (Q1) and degenerates (Q2). This is the binding LongBench-style
+test, and recall passes it.
 
 ## Verdict / Next
 
-Phase-0 PASS licenses the Phase-1 Metal integration. Done so far: depth profile at
-5.7K, ctx step to 16K, top_k floor (holds to top_k=1) — all on passkey-in-uniform-
-filler, `mean-key` + absolute-position. Still open before a general quality *number*:
-the binding test is a needle among **diverse distractors** (RULER/LongBench/∞-Bench),
-not uniform filler; plus 32K–128K, multi-needle, multi-seed, and an A/B of
-recall-absolute vs recall-repositioned (§5) — expected null on this partial-RoPE model.
+Phase-0 PASS, strengthened well past a mechanism license: depth profile @5.7K, ctx→16K,
+top_k floor (holds to top_k=1), **diverse-distractor 4-needle (4/4 @15K)**, and
+**real-doc hard-QA quality (recall = full exact @29K, 53.9× less KV)**. Open: 32K–128K,
+multi-seed, free-form long QA with a graded rubric (vs the checkable-fact QA here), and
+a §5 recall-absolute-vs-repositioned A/B (expected null). recall here is scope-only —
+flat-VRAM needs the Phase-1 evict path (`executor.rs:2357-2430` contiguous-attn → Rust
+page-gather; prefill scores unreachable → keep mean-key, validated).
 
 Phase-1 in-stack constraints already mapped (Metal): decode attention is
 contiguous-range only (`infer-metal/src/executor.rs:2357-2430`), no per-row page
