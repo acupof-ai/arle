@@ -1593,6 +1593,15 @@ fn compile_tilelang_aot_kernels(
         }
     }
 
+    // Vendor the freshly-generated per-SM TileLang artifacts back into the
+    // source tree BEFORE cc compiles them, so a regen run captures the exact
+    // `.cu`/`.c`/`.cubin` triples that just compiled clean. Opt-in via
+    // ARLE_TILELANG_REGEN=1 — the default build never writes into the tree.
+    println!("cargo:rerun-if-env-changed=ARLE_TILELANG_REGEN");
+    if env_truthy("ARLE_TILELANG_REGEN") {
+        vendor_tilelang_generated(out_dir, sm_targets);
+    }
+
     let mut build = cc::Build::new();
     build
         .cuda(false)
@@ -1694,6 +1703,91 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`,
+/// case-insensitive). Used by opt-in build toggles like ARLE_TILELANG_REGEN.
+fn env_truthy(name: &str) -> bool {
+    match env_nonempty(name) {
+        Some(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Recursively copy `src` into `dst`, creating `dst` and any parents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Vendor the per-SM TileLang AOT artifacts (the `*_device_kernel.cu` device
+/// sources, their `.c` host launchers, `.cubin` blobs, and the `*_dispatch`
+/// wrappers) from the ephemeral `$OUT_DIR/tilelang_aot/` into the source tree
+/// at `crates/cuda-kernels/generated/`, one subdirectory per artifact_dir
+/// (which is already suffixed `_sm{token}` / `_dispatch`).
+///
+/// Opt-in (ARLE_TILELANG_REGEN=1). The freshly-generated tree is the source of
+/// truth — every regen mirrors exactly what just compiled clean for the
+/// requested SM targets, so the checked-in `.cu` is reproducible. A vendoring
+/// run on a Blackwell box (TORCH_CUDA_ARCH_LIST="10.0;12.0") populates the
+/// `*_sm100/` and `*_sm120/` directories; a Hopper/Ampere box populates its own.
+fn vendor_tilelang_generated(out_dir: &Path, sm_targets: &[SmSpec]) {
+    let aot_root = out_dir.join("tilelang_aot");
+    if !aot_root.is_dir() {
+        println!(
+            "cargo:warning=ARLE_TILELANG_REGEN set but {} is absent; nothing to vendor.",
+            aot_root.display()
+        );
+        return;
+    }
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let generated_root = manifest_dir.join("generated");
+    let sm_tokens: Vec<String> = sm_targets.iter().map(|s| format!("sm{}", s.sm)).collect();
+
+    let mut copied = 0usize;
+    for entry in std::fs::read_dir(&aot_root)
+        .unwrap_or_else(|err| panic!("read {} for regen: {err}", aot_root.display()))
+        .flatten()
+    {
+        let from = entry.path();
+        if !from.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only vendor artifacts for the SM targets just built (or the dispatch
+        // wrappers, which are SM-independent C glue). This keeps a Blackwell
+        // regen from clobbering vendored Hopper/Ampere dirs that weren't rebuilt.
+        let is_dispatch = name_str.ends_with("_dispatch");
+        let is_target_sm = sm_tokens.iter().any(|tok| name_str.ends_with(tok));
+        if !is_dispatch && !is_target_sm {
+            continue;
+        }
+        let to = generated_root.join(name);
+        copy_dir_recursive(&from, &to)
+            .unwrap_or_else(|err| panic!("vendor {} -> {}: {err}", from.display(), to.display()));
+        copied += 1;
+    }
+    println!(
+        "cargo:warning=ARLE_TILELANG_REGEN: vendored {copied} TileLang artifact dir(s) for SM target(s) [{}] into {}.",
+        sm_tokens.join(","),
+        generated_root.display()
+    );
 }
 
 fn emit_cuda_system_link_libs(cuda_path: &str) {
