@@ -427,6 +427,118 @@ impl Qwen35SlotState {
         }
         Ok(())
     }
+
+    /// Snapshot the linear-attention recurrent + conv-ring state into caller
+    /// scratch, before a speculative verify pass. The 48 gated-delta layers
+    /// advance their state **in place, content-based, no position index**
+    /// (`gated_delta_rule_decode_cuda` / `_prefill_recurrent_cuda`), so they do
+    /// NOT self-heal under a seq_len rewind — they must be restored on reject.
+    /// The full-attn K/V caches are position-indexed and self-heal via the
+    /// rewind, so they are intentionally not copied here.
+    pub(crate) fn snapshot_linear_into(
+        &self,
+        ctx: &DeviceContext,
+        gdr_snap: &mut [CudaSlice<f32>],
+        conv_snap: &mut [DeviceVec],
+    ) -> Result<()> {
+        ensure!(
+            gdr_snap.len() == self.gdr_states.len() && conv_snap.len() == self.conv_states.len(),
+            "spec snapshot scratch sized {}/{} != slot linear layers {}/{}",
+            gdr_snap.len(),
+            conv_snap.len(),
+            self.gdr_states.len(),
+            self.conv_states.len()
+        );
+        for (dst, src) in gdr_snap.iter_mut().zip(self.gdr_states.iter()) {
+            ctx.stream
+                .memcpy_dtod(src, dst)
+                .map_err(|e| anyhow!("snapshot gated-delta state failed: {e}"))?;
+        }
+        for (dst, src) in conv_snap.iter_mut().zip(self.conv_states.iter()) {
+            ctx.stream
+                .memcpy_dtod(&src.data, &mut dst.data)
+                .map_err(|e| anyhow!("snapshot conv state failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Restore the linear-attention recurrent + conv-ring state from a snapshot
+    /// taken by [`Self::snapshot_linear_into`] (speculative verify rejected).
+    pub(crate) fn restore_linear_from(
+        &mut self,
+        ctx: &DeviceContext,
+        gdr_snap: &[CudaSlice<f32>],
+        conv_snap: &[DeviceVec],
+    ) -> Result<()> {
+        ensure!(
+            gdr_snap.len() == self.gdr_states.len() && conv_snap.len() == self.conv_states.len(),
+            "spec restore scratch sized {}/{} != slot linear layers {}/{}",
+            gdr_snap.len(),
+            conv_snap.len(),
+            self.gdr_states.len(),
+            self.conv_states.len()
+        );
+        for (dst, src) in self.gdr_states.iter_mut().zip(gdr_snap.iter()) {
+            ctx.stream
+                .memcpy_dtod(src, dst)
+                .map_err(|e| anyhow!("restore gated-delta state failed: {e}"))?;
+        }
+        for (dst, src) in self.conv_states.iter_mut().zip(conv_snap.iter()) {
+            ctx.stream
+                .memcpy_dtod(&src.data, &mut dst.data)
+                .map_err(|e| anyhow!("restore conv state failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Rewind the full-attn cache cursor (speculative verify accepted `len`
+    /// tokens). Stale rows `[len, prev_seq_len)` are position-indexed and get
+    /// overwritten by the next real token at that position — no copy needed.
+    pub(crate) fn set_seq_len(&mut self, len: usize) {
+        self.seq_len = len;
+    }
+}
+
+/// Per-request speculative-decode state for the Qwen3.6 NextN-MTP draft head.
+///
+/// Holds (a) the draft head's **fresh per-block** K/V cache — the head is a
+/// single full-attention layer that attends only over the current draft chain,
+/// seeded each block from the last-accepted trunk hidden (the trunk context is
+/// baked into that hidden via the `fc` concat, not re-attended); and (b) the
+/// pre-verify **snapshot** of the trunk's linear-attn recurrent + conv state,
+/// restored on a rejected draft. Allocated only when spec-decode is on, one per
+/// concurrent slot, so the baseline decode path never pays for it.
+#[allow(dead_code)] // head_k/head_v read by mtp_forward_level; snap by spec_step (next increments)
+pub(crate) struct Qwen35SpecSlotState {
+    /// Draft head K cache `(depth+1)*kv_dim` bf16, rewritten each draft block.
+    head_k: DeviceVec,
+    head_v: DeviceVec,
+    /// Pre-verify snapshot of the trunk linear-attn recurrent states (f32),
+    /// one per linear layer, sized like [`Qwen35SlotState::gdr_states`].
+    gdr_snap: Vec<CudaSlice<f32>>,
+    /// Pre-verify snapshot of the trunk linear-attn conv rings (bf16).
+    conv_snap: Vec<DeviceVec>,
+}
+
+#[allow(dead_code)] // consumed by mtp_forward_level + spec_step (next increments)
+impl Qwen35SpecSlotState {
+    /// Snapshot the trunk linear state before a verify pass (reject rollback).
+    pub(crate) fn snapshot_trunk(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: &Qwen35SlotState,
+    ) -> Result<()> {
+        slot.snapshot_linear_into(ctx, &mut self.gdr_snap, &mut self.conv_snap)
+    }
+
+    /// Restore the trunk linear state after a rejected verify pass.
+    pub(crate) fn restore_trunk(
+        &self,
+        ctx: &DeviceContext,
+        slot: &mut Qwen35SlotState,
+    ) -> Result<()> {
+        slot.restore_linear_from(ctx, &self.gdr_snap, &self.conv_snap)
+    }
 }
 
 /// Persistent device workspace for the Qwen3.5/3.6 hybrid forward.
@@ -1184,6 +1296,40 @@ impl Qwen35Model {
             self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim,
             self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1),
         )
+    }
+
+    /// Allocate per-slot speculative-decode state (draft head KV + trunk linear
+    /// snapshot scratch), sized from this rank's local shard widths and the
+    /// requested draft depth. Snapshot scratch matches [`Self::new_slot_state`]'s
+    /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
+    pub(crate) fn new_spec_slot_state(&self) -> Result<Qwen35SpecSlotState> {
+        let c = &self.config;
+        let num_full = c.num_full_attention_layers();
+        let num_linear = c.num_hidden_layers - num_full;
+        // depth >= 1: the head cache holds the draft chain (level positions
+        // 0..depth); +1 leaves room for the seed row at position 0.
+        let depth = self.spec_draft_tokens.max(1);
+        let kv_dim = self.local_full_attn_kv_dim();
+        let gdr_state_len =
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
+        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        let mut gdr_snap = Vec::with_capacity(num_linear);
+        let mut conv_snap = Vec::with_capacity(num_linear);
+        for _ in 0..num_linear {
+            gdr_snap.push(
+                self.ctx
+                    .stream
+                    .alloc_zeros::<f32>(gdr_state_len)
+                    .map_err(|e| anyhow!("alloc spec gated-delta snapshot failed: {e}"))?,
+            );
+            conv_snap.push(DeviceVec::zeros(&self.ctx, conv_len)?);
+        }
+        Ok(Qwen35SpecSlotState {
+            head_k: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
+            head_v: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
+            gdr_snap,
+            conv_snap,
+        })
     }
 
     /// Warm the Qwen FP8 dense DeepGEMM JIT for the CUDA default prefill chunk.
@@ -3578,11 +3724,48 @@ impl Qwen35Model {
     /// fwd when [`qwen35_fa3_enabled`]; decode keeps the devpos kernel
     /// (graph-captured) untouched.
     #[allow(clippy::too_many_arguments)]
+    /// Thin trunk wrapper: full attention writing this rank's per-slot K/V cache
+    /// for full-attn layer `full_idx`. The MTP draft head bypasses this and calls
+    /// [`Self::full_attention_into`] directly with its own per-block KV.
+    #[allow(clippy::too_many_arguments)]
     fn full_attention(
         &self,
         attn: &FullAttn,
         normed: &HiddenStates,
         slot: &mut Qwen35SlotState,
+        full_idx: usize,
+        start_pos: usize,
+        start_pos_dev: &CudaSlice<i32>,
+        fw: &mut FullAttnScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let k_cache = &mut slot.k_caches[full_idx];
+        let v_cache = &mut slot.v_caches[full_idx];
+        self.full_attention_into(
+            attn,
+            normed,
+            k_cache,
+            v_cache,
+            full_idx,
+            start_pos,
+            start_pos_dev,
+            fw,
+            out,
+        )
+    }
+
+    /// Gated full attention over an explicit contiguous K/V cache (`max_seq_len`
+    /// derived from `k_cache.len / kv_dim`). The trunk passes its per-slot cache
+    /// via [`Self::full_attention`]; the MTP draft head passes its own fresh
+    /// per-block cache. `full_idx` is only a profiling label. Numerics, kernels,
+    /// and launch order are identical to the pre-extraction trunk path.
+    #[allow(clippy::too_many_arguments)]
+    fn full_attention_into(
+        &self,
+        attn: &FullAttn,
+        normed: &HiddenStates,
+        k_cache: &mut DeviceVec,
+        v_cache: &mut DeviceVec,
         full_idx: usize,
         start_pos: usize,
         start_pos_dev: &CudaSlice<i32>,
@@ -3630,8 +3813,6 @@ impl Qwen35Model {
 
         let q_prepped = q_prepped.get(&self.ctx, q_dim, seq_len)?;
         let attn_out = attn_heads.get(&self.ctx, q_dim, seq_len)?;
-        let k_cache = &mut slot.k_caches[full_idx];
-        let v_cache = &mut slot.v_caches[full_idx];
 
         let max_seq_len = k_cache.len / kv_dim;
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
