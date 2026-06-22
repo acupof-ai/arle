@@ -1102,6 +1102,13 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) share_frozen_base: bool,
 
+    /// SOPD 对且短: among the accepted (self-consistency-correct) rollouts for a
+    /// prompt, distill ONLY the shortest (fewest tokens) instead of all of them —
+    /// teaches concise correct reasoning (thinking efficiency). Off by default =
+    /// write back every accepted rollout (correctness only).
+    #[arg(long, default_value_t = false)]
+    pub(crate) distill_shortest: bool,
+
     /// Rollout sampling temperature (>0 for rejection-sampling diversity).
     #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
     pub(crate) rollout_temperature: f32,
