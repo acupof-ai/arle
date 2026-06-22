@@ -2533,7 +2533,10 @@ impl Qwen35CudaExecutor {
         // contiguous full-attn cache to the same token budget.
         let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
         let model_t0 = Instant::now();
-        let model = crate::qwen35::Qwen35Model::from_safetensors(model_path.as_ref(), max_seq_len)?;
+        // `None`: MTP spec-decode flag wiring lands in a later increment; the
+        // baseline load is byte-identical (no draft head loaded).
+        let model =
+            crate::qwen35::Qwen35Model::from_safetensors(model_path.as_ref(), max_seq_len, None)?;
         cuda_startup_log(
             "qwen35_model_load",
             model_t0,
