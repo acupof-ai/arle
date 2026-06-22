@@ -162,6 +162,8 @@ def main():
     ap.add_argument("--nlocal", type=int, default=256)
     ap.add_argument("--needles", type=int, default=1)
     ap.add_argument("--distractor", choices=["uniform", "diverse"], default="uniform")
+    ap.add_argument("--doc", default=None, help="real-content mode: file used as the context")
+    ap.add_argument("--question", action="append", default=[], help="question(s) for --doc mode")
     args = ap.parse_args()
     CFG.update(n_init=args.ninit, n_local=args.nlocal, l_bs=args.lbs, top_k=args.topk)
     diverse = args.distractor == "diverse"
@@ -171,6 +173,28 @@ def main():
     model, tok = load(args.model)
     print(f"loaded in {time.time()-t0:.1f}s", flush=True)
     modes = args.modes.split(",")
+
+    if args.doc:
+        # Real-content mode: hard comprehension questions over a real long doc.
+        # `full` (attend everything) is the quality ceiling; compare recall/stream to it.
+        text = open(args.doc).read()
+        qs = args.question or [
+            "List the KV cache tier numbers (T0, T1, T2, T3) and the exact storage medium each maps to.",
+            "Name the four EvictionPolicy implementations the document says are already shipped.",
+        ]
+        for q in qs:
+            body = text + f"\n\nQuestion: {q}\nAnswer concisely using ONLY the document above."
+            prompt = tok.apply_chat_template(
+                [{"role": "user", "content": body}],
+                add_generation_prompt=True, tokenize=False, enable_thinking=False,
+            )
+            ntok = len(tok.encode(prompt))
+            print(f"\nQ: {q}\n   (ctx~{ntok} tok)", flush=True)
+            for mode in modes:
+                CFG["mode"] = mode
+                out = run(model, tok, prompt, max_tokens=160)
+                print(f"  [{mode:<6} kv={KV_ATTENDED.get(mode,'?'):>6}/layer] {out.strip()[:260]!r}", flush=True)
+        return
 
     if args.needles > 1:
         n = min(args.needles, len(KEYS))
