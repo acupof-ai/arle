@@ -44,22 +44,31 @@ prompt, `RUST_LOG=infer_metal=info INFER_METAL_DFLASH_TRACE=1` for per-block acc
 | topk=2 | **1.861** | **0.861** | {1:19, 2:118} |
 
 **topk=2 raises accepted/block +9.5% (matched +23%)** — "reject at first draft"
-dropped 45→19 blocks; 137 vs 150 blocks for similar output → ~+9.5% fewer target
-forwards → ~+9.5% expected throughput. Mechanism confirmed.
+dropped 45→19 blocks. This is the only robust number (a count). The model is
+**DENSE** (`Qwen3.6-27B-OptiQ`: `model_type=qwen3_5`, `num_experts=None`, dense FFN +
+hybrid linear/full attention — NOT MoE), so per-block forward cost is
+content-independent → +9.5% acceptance ≈ **~+9.5% expected throughput**.
 
 **Two caveats (SOLID):**
 - **Bounded lever.** `accepted=3` (both drafts) NEVER occurs in either — once the
   first draft is rescued by top-2, the second rarely survives even top-2. On depth-2
   MTP self-spec the draft is target-aligned (top-1 already accepts most), so top-k
   only rescues the first draft; gain caps ~9.5%. Deeper drafts may benefit more.
-- **tok/s not cleanly resolved.** Single-shot diff-method (192/(wall₂₅₆−wall₆₄))
-  showed a spurious −11% — cold-process warmup jitter + lossy-content confound swamp
-  a ~9.5% signal. Clean tok/s needs a warm same-binary matched A/B
-  ([[feedback_matched_ab_for_small_bench_effects]]); local memory flakiness (27B at
-  the 48 GiB Mac's edge) made that impractical. accepted/block is the robust evidence.
+- **NO trustworthy real tok/s was obtained.** Both attempts were noise: the
+  diff-method (192/(wall₂₅₆−wall₆₄)) gave −11% (cold-process / thermal run-to-run
+  jitter); the trace-derived "eff tok/s" (12.5→17.4) is an ARTIFACT — `INFER_METAL_
+  DFLASH_TRACE=1` forces a per-block sync that breaks the async pipeline and inflates
+  `total_ms` to ~135 ms/block (not real decode). On a DENSE model the verify_ms swing
+  (123 vs 97 ms) cannot be content — it is run-to-run/thermal noise. Clean tok/s needs
+  a warm, trace-off, same-binary repeated matched A/B
+  ([[feedback_matched_ab_for_small_bench_effects]]); not done.
 
 Correctness: outputs stayed coherent (valid technical answers) at topk=2; lossy, so a
 needle gate is the proper check (not run; no degeneration observed).
+
+**Process error logged:** earlier in this session the analysis (a) asserted the model
+was MoE without reading its config and (b) reported trace-inflated per-block time as
+"tok/s" — both violate case-as-fact (theorize before measuring). Corrected here.
 
 ## Rule
 
