@@ -294,6 +294,59 @@ __device__ __forceinline__ float fp8_f32_block_scale(
     return scales[sr * scale_cols + sc];
 }
 
+// Software dequant of an FP8 E4M3 2D-block-scaled weight matrix [N, K]
+// (row-major) into a dense BF16 matrix [N, K]. The block-scale layout matches
+// fp8_f32_block_scale / the autograd reference (fp8_block_scaled.cu):
+//   scale[(row/block_m)*scale_cols + (col/block_k)].
+// One thread per (row, col) element. Used by the infer-cuda dense FP8 GEMM
+// fallback on pre-Hopper GPUs (sm < 9.0), where DeepGEMM's wgmma path is
+// unavailable: dequant once → reuse the existing BF16 cuBLAS GEMM (gemm_cuda).
+__global__ void dequantize_fp8_block_scaled_to_bf16_kernel(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)N * K;
+    if (idx >= total) return;
+    const int row = (int)(idx / K);
+    const int col = (int)(idx % K);
+    const float scale =
+        fp8_f32_block_scale(scales, row, col, scale_rows, scale_cols, block_m, block_k);
+    const float w = dsv4_decode_fp8_e4m3(weight[idx]) * scale;
+    output[idx] = __float2bfloat16(w);
+}
+
+extern "C" cudaError_t dequantize_fp8_block_scaled_to_bf16_cuda(
+    const uint8_t* weight,
+    const float* scales,
+    __nv_bfloat16* output,
+    int N,
+    int K,
+    int scale_rows,
+    int scale_cols,
+    int block_m,
+    int block_k,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || scale_rows <= 0 || scale_cols <= 0 || block_m <= 0 ||
+        block_k <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    const long total = (long)N * K;
+    const int threads = 256;
+    const long blocks = (total + threads - 1) / threads;
+    dequantize_fp8_block_scaled_to_bf16_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+        weight, scales, output, N, K, scale_rows, scale_cols, block_m, block_k);
+    return cudaGetLastError();
+}
+
 __device__ __forceinline__ float fp8_f32_dot16(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ x)
