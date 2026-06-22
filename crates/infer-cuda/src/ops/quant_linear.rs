@@ -22,6 +22,22 @@ struct QwenFp8DenseScratch {
     active_counts: Option<CudaSlice<i32>>,
 }
 
+/// Reusable per-thread BF16 weight scratch for the pre-Hopper dense FP8
+/// fallback (`dequantize_fp8_block_scaled_to_bf16` → `gemm_cuda`). Sized to the
+/// largest dense FP8 projection `[rows, cols]` seen; grows monotonically so the
+/// dequant is a single device-resident buffer reused across steps (no per-step
+/// alloc churn). Only allocated on sm < 9 — Hopper never touches this.
+#[derive(Default)]
+struct QwenFp8DequantScratch {
+    weight_bf16: Option<CudaSlice<bf16>>,
+    capacity: usize,
+}
+
+thread_local! {
+    static QWEN_FP8_DEQUANT_SCRATCH: RefCell<QwenFp8DequantScratch> =
+        RefCell::new(QwenFp8DequantScratch::default());
+}
+
 thread_local! {
     static QWEN_FP8_DENSE_SCRATCH: RefCell<QwenFp8DenseScratch> =
         RefCell::new(QwenFp8DenseScratch::default());
@@ -91,6 +107,30 @@ fn qwen_fp8_deepgemm_dense_enabled() -> bool {
                 false
             }
         }
+    })
+}
+
+/// DeepGEMM's dense FP8 GEMM is Hopper-only (`wgmma`, sm_90a). On pre-Hopper
+/// GPUs (A100 = sm_80, V100 = sm_70) the native kernel returns
+/// `CUDA_ERROR_NOT_SUPPORTED` at launch (`deepgemm_native.cu` hard-checks
+/// `prop.major == 9`). Cache the device compute-capability major ONCE here so
+/// the dense FP8 dispatch can SM-gate the DeepGEMM path without a per-step
+/// `cuDeviceGetAttribute` (the known per-step device-property query perf bug).
+/// On sm < 9 the caller routes the dense FP8 GEMM to the software-dequant →
+/// BF16 cuBLAS path (large M) or the portable scalar block-scaled GEMV (small
+/// M) — both run on sm_70+. The sm >= 9 path is byte-identical to before.
+fn qwen_fp8_dense_sm_supports_deepgemm(ctx: &DeviceContext) -> bool {
+    static SUPPORTS: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS.get_or_init(|| {
+        let (major, minor) = ctx.compute_capability();
+        let supports = major >= 9;
+        if !supports {
+            log::info!(
+                "Qwen FP8 dense DeepGEMM SM-gated OFF on sm_{major}{minor} (Hopper sm_90 \
+                 required for wgmma); using dequant→BF16 GEMM / scalar GEMV fallback"
+            );
+        }
+        supports
     })
 }
 
@@ -203,13 +243,14 @@ fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
     }
 }
 
-fn fp8_deepgemm_dense_shape(weight: &DeviceMatrix, seq_len: usize) -> bool {
+fn fp8_deepgemm_dense_shape(ctx: &DeviceContext, weight: &DeviceMatrix, seq_len: usize) -> bool {
     weight.weight_format == WeightFormat::Fp8BlockScaled
         && seq_len >= QWEN_FP8_DEEPGEMM_DENSE_MIN_M
         && weight.quant_block_m == 128
         && weight.quant_block_k == 128
         && weight.rows.is_multiple_of(8)
         && weight.cols.is_multiple_of(128)
+        && qwen_fp8_dense_sm_supports_deepgemm(ctx)
         && qwen_fp8_deepgemm_dense_enabled()
 }
 
@@ -218,7 +259,7 @@ pub(super) fn warm_fp8_deepgemm_dense(
     weight: &DeviceMatrix,
     seq_len: usize,
 ) -> Result<bool> {
-    if !fp8_deepgemm_dense_shape(weight, seq_len) {
+    if !fp8_deepgemm_dense_shape(ctx, weight, seq_len) {
         return Ok(false);
     }
     let qw = weight
@@ -269,7 +310,7 @@ fn try_fp8_deepgemm_dense_batch(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<bool> {
-    if !fp8_deepgemm_dense_shape(weight, x.seq_len) {
+    if !fp8_deepgemm_dense_shape(ctx, weight, x.seq_len) {
         return Ok(false);
     }
     let qw = weight
@@ -351,6 +392,114 @@ fn try_fp8_deepgemm_dense_batch(
     Ok(true)
 }
 
+/// Pre-Hopper dense FP8 GEMM fallback for the DeepGEMM-shaped path: on sm < 9
+/// (A100/V100), where DeepGEMM's `wgmma` kernel is unavailable, dequantize the
+/// FP8 E4M3 block-scaled weight `[rows, cols]` to a resident BF16 scratch ONCE,
+/// then run the existing BF16 cuBLAS GEMM (`gemm_cuda`). This is the large-M
+/// (prefill) path: dequant is `rows*cols` work amortized over the `M` GEMM rows,
+/// far cheaper than the warp-per-row scalar GEMV at large M.
+///
+/// Only engages when:
+///  - the device is pre-Hopper (`!qwen_fp8_dense_sm_supports_deepgemm`),
+///  - the weight is `Fp8BlockScaled` with the canonical 128x128 block shape,
+///  - `M >= QWEN_FP8_DEEPGEMM_DENSE_MIN_M` (small-M decode keeps the scalar GEMV,
+///    which is already coalesced + occupancy-friendly there).
+///
+/// Returns `Ok(false)` when it does not apply, leaving `gemm_batch` to fall
+/// through to the scalar/MMA block-scaled GEMV (also sm_70+).
+fn try_fp8_dequant_bf16_gemm_batch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    if weight.weight_format != WeightFormat::Fp8BlockScaled
+        || qwen_fp8_dense_sm_supports_deepgemm(ctx)
+        || x.seq_len < QWEN_FP8_DEEPGEMM_DENSE_MIN_M
+        || weight.quant_block_m != 128
+        || weight.quant_block_k != 128
+    {
+        return Ok(false);
+    }
+    let qw = weight
+        .qweight_u8
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp8_block_scaled missing qweight_u8"))?;
+    let scales = weight
+        .scale_f32
+        .as_ref()
+        .ok_or_else(|| anyhow!("fp8_block_scaled missing scale_f32"))?;
+    let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
+    let n = weight.rows; // GEMM M dim (weight rows)
+    let k = weight.cols; // GEMM K dim (contraction)
+    let weight_elems = n * k;
+
+    QWEN_FP8_DEQUANT_SCRATCH.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        if scratch.capacity < weight_elems {
+            scratch.weight_bf16 =
+                Some(ctx.stream.alloc_zeros::<bf16>(weight_elems).map_err(|e| {
+                    anyhow!("Qwen FP8 dense dequant BF16 scratch alloc failed: {e}")
+                })?);
+            scratch.capacity = weight_elems;
+        }
+        let weight_bf16 = scratch
+            .weight_bf16
+            .as_ref()
+            .ok_or_else(|| anyhow!("Qwen FP8 dense dequant BF16 scratch missing"))?;
+        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+        let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+        let (wbf16_ptr, _gw) = weight_bf16.device_ptr(&ctx.stream);
+        let stream = ctx.stream.cu_stream();
+        qwen_quant_profile(
+            ctx,
+            "qwen/fp8/dense_dequant_bf16",
+            x.seq_len,
+            n,
+            k,
+            || unsafe {
+                ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
+                    qw_ptr as *const u8,
+                    scales_ptr as *const f32,
+                    wbf16_ptr as *mut ffi::Half,
+                    n as i32,
+                    k as i32,
+                    scale_rows,
+                    scale_cols,
+                    block_m,
+                    block_k,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("Qwen FP8 dense dequant kernel failed: {e}"))
+            },
+        )?;
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+        qwen_quant_profile(
+            ctx,
+            "qwen/fp8/dense_dequant_gemm",
+            x.seq_len,
+            n,
+            k,
+            || unsafe {
+                ffi::gemm_cuda(
+                    wbf16_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    n as i32,
+                    x.seq_len as i32,
+                    k as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("Qwen FP8 dense dequant BF16 GEMM failed: {e}"))
+            },
+        )
+    })?;
+    Ok(true)
+}
+
 pub(super) fn gemm_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -362,6 +511,13 @@ pub(super) fn gemm_batch(
         WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
     ) && try_fp8_deepgemm_dense_batch(ctx, weight, x, out)?
     {
+        return Ok(());
+    }
+
+    // Pre-Hopper (sm < 9) large-M dense FP8: DeepGEMM's wgmma path is gated off
+    // above, so dequant → BF16 cuBLAS GEMM here (small-M decode keeps the scalar
+    // GEMV below). No-op on Hopper (returns false).
+    if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
 
