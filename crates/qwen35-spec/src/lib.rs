@@ -99,6 +99,22 @@ pub struct Qwen35LayerTensorNames {
     pub attention: Qwen35AttentionTensorNames,
 }
 
+/// NextN-MTP draft-head tensor names for Qwen3.6 speculative decode. The head is
+/// a single FULL-attention transformer layer (`mtp.layers.0.*`) plus the `fc`
+/// concat-projection (`[hidden, 2*hidden]`), two pre-`fc` RMSNorms over the
+/// candidate embedding + previous hidden, and a final RMSNorm before the SHARED
+/// lm_head. All names are top-level `mtp.*` (verified against Qwen3.6-27B-FP8;
+/// 15 tensors). `lm_head` + `embed_tokens` are shared with the base model and
+/// are NOT part of this set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35MtpTensorNames {
+    pub fc: String,
+    pub pre_fc_norm_embedding: String,
+    pub pre_fc_norm_hidden: String,
+    pub norm: String,
+    pub layer: Qwen35LayerTensorNames,
+}
+
 /// MoE block tensor names for one sparse layer (Qwen3.6 / Qwen3_5_Moe).
 ///
 /// Router + shared expert are common to both routed-expert layouts:
@@ -1063,6 +1079,41 @@ impl Qwen35Config {
         };
 
         Qwen35LayerTensorNames { common, attention }
+    }
+
+    /// Tensor names for the NextN-MTP draft head (Qwen3.6 speculative decode).
+    /// The head's single transformer layer is ALWAYS full attention, regardless
+    /// of the base `layer_types` mix. Top-level `mtp.*` per the checkpoint.
+    pub fn mtp_tensor_names(&self) -> Qwen35MtpTensorNames {
+        let lp = "mtp.layers.0".to_string();
+        let mlp_prefix = format!("{lp}.mlp");
+        let ap = format!("{lp}.self_attn");
+        Qwen35MtpTensorNames {
+            fc: "mtp.fc.weight".to_string(),
+            pre_fc_norm_embedding: "mtp.pre_fc_norm_embedding.weight".to_string(),
+            pre_fc_norm_hidden: "mtp.pre_fc_norm_hidden.weight".to_string(),
+            norm: "mtp.norm.weight".to_string(),
+            layer: Qwen35LayerTensorNames {
+                common: Qwen35CommonLayerTensorNames {
+                    layer_prefix: lp.clone(),
+                    mlp_prefix: mlp_prefix.clone(),
+                    input_layernorm: format!("{lp}.input_layernorm.weight"),
+                    post_attention_layernorm: format!("{lp}.post_attention_layernorm.weight"),
+                    mlp_gate_proj: format!("{mlp_prefix}.gate_proj.weight"),
+                    mlp_up_proj: format!("{mlp_prefix}.up_proj.weight"),
+                    mlp_down_proj: format!("{mlp_prefix}.down_proj.weight"),
+                },
+                attention: Qwen35AttentionTensorNames::Full(Qwen35FullAttentionTensorNames {
+                    attention_prefix: ap.clone(),
+                    q_proj: format!("{ap}.q_proj.weight"),
+                    k_proj: format!("{ap}.k_proj.weight"),
+                    v_proj: format!("{ap}.v_proj.weight"),
+                    o_proj: format!("{ap}.o_proj.weight"),
+                    q_norm: format!("{ap}.q_norm.weight"),
+                    k_norm: format!("{ap}.k_norm.weight"),
+                }),
+            },
+        }
     }
 }
 
