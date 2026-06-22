@@ -40,7 +40,8 @@ from mlx_lm.models import qwen3_next as qn
 
 CFG = {"mode": "full", "n_init": 32, "n_local": 256, "l_bs": 32, "top_k": 8}
 KV_ATTENDED = {}  # mode -> tokens attended per full-attn layer at the last decode step
-KEYS = ["739154", "281607", "930472", "615838", "472916", "108253", "664019", "357284"]
+KEYS = ["739154", "281607", "930472", "615838", "472916", "108253", "664019", "357284",
+        "850291", "317864", "629053", "194738", "573916", "482067", "916354", "205879"]
 UNIFORM = "The grass is green and the sky is blue. The sun is bright today. "
 DISTRACTORS = [
     "The capital of France is Paris.", "Photosynthesis converts sunlight into energy.",
