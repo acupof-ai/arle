@@ -493,6 +493,82 @@ fn find_tilelang_python() -> Result<String, String> {
     ))
 }
 
+/// Lazy TileLang toolchain resolver. Resolves the Python interpreter and the
+/// TileLang/cutlass include dirs ONCE, on first actual (re)generation, and
+/// caches the result. A fully-vendored build (every per-(kernel, SM) artifact
+/// present and source-unchanged) consumes the checked-in `.c` directly and
+/// never calls `get()`, so it never needs `tilelang` installed at all.
+struct LazyTilelang {
+    cell: std::cell::OnceCell<(String, std::path::PathBuf, std::path::PathBuf)>, // (python, tilelang_src, cutlass_include)
+}
+
+impl LazyTilelang {
+    fn new() -> Self {
+        Self {
+            cell: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Resolve python + include dirs lazily — called ONLY when a kernel must be
+    /// regenerated. A fully-vendored build never calls this, so it never needs
+    /// tilelang.
+    fn get(&self) -> &(String, std::path::PathBuf, std::path::PathBuf) {
+        self.cell.get_or_init(|| {
+            let python = find_tilelang_python().unwrap_or_else(|m| {
+                panic!(
+                    "TileLang is required to (re)generate a missing or source-changed AOT kernel, but it is unavailable: {m}"
+                )
+            });
+            let (src, cutlass) = tilelang_include_dirs(&python);
+            (python, src, cutlass)
+        })
+    }
+}
+
+/// FNV-1a-64 incremental update over `bytes`.
+fn fnv1a_update(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+}
+
+/// Hash the generation inputs for one (kernel, SM) so a changed kernel `.py`
+/// (or the generator, or the spec params) forces a regen instead of consuming
+/// a stale vendored `.c`.
+fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for path in [
+        base_spec.kernel_path,
+        "tools/tilelang/gen_tilelang_aot.py",
+    ] {
+        let bytes = std::fs::read(path).unwrap_or_else(|_| b"<missing-source>".to_vec());
+        fnv1a_update(&mut h, &bytes);
+    }
+    fnv1a_update(&mut h, base_spec.kernel_name.as_bytes());
+    fnv1a_update(&mut h, base_spec.out_name.as_bytes());
+    fnv1a_update(&mut h, base_spec.kernel_family.as_bytes());
+    fnv1a_update(&mut h, base_spec.kernel_key.unwrap_or("").as_bytes());
+    fnv1a_update(
+        &mut h,
+        base_spec
+            .num_q_heads
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    fnv1a_update(
+        &mut h,
+        base_spec
+            .num_kv_heads
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    fnv1a_update(&mut h, sm_token.as_bytes());
+    format!("{h:016x}")
+}
+
 /// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
 type TileLangPerSmArtifact = (String, String, PathBuf);
 
@@ -660,15 +736,17 @@ print(json.dumps({
 /// Hard-fail on any (kernel, SM) compile failure; suggest a
 /// `TORCH_CUDA_ARCH_LIST=...` value that excludes the failing SM.
 fn generate_tilelang_artifacts_per_sm(
-    python: &str,
+    tl: &LazyTilelang,
     out_dir: &Path,
     sm_targets: &[SmSpec],
     cuda_path: &str,
-    tilelang_src: &Path,
-    cutlass_include: &Path,
     base_spec: &TileLangKernelSpec,
 ) -> Vec<TileLangPerSmArtifact> {
     let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let force_regen = env_truthy("ARLE_TILELANG_REGEN");
     let mut results = Vec::new();
 
     for sm in sm_targets {
@@ -678,10 +756,61 @@ fn generate_tilelang_artifacts_per_sm(
             .expect("SmSpec.sm passed whitelist; must parse as u32");
         let target = format!("cuda -arch=sm_{sm_token}");
 
+        let src_hash = tilelang_kernel_src_hash(base_spec, sm_token);
+        // The dispatch wrapper calls `<kernel_name>_sm<sm>_cuda` (e.g.
+        // `tilelang_batch_decode_paged_hd128_fp8_q32_kv8_run_sm120_cuda`). The
+        // generator's own FUNC_NAME equals this; we derive it for consumed
+        // legacy dirs that don't record a FUNC_NAME in meta.txt.
+        let func_name = format!("{}_sm{sm_token}_cuda", base_spec.kernel_name);
+
         let per_sm_artifact_dir = format!("{}_sm{sm_token}", base_spec.artifact_dir);
         let per_sm_out_name = format!("{}_sm{sm_token}", base_spec.out_name);
         let per_sm_kernel_name = format!("{}_sm{sm_token}", base_spec.kernel_name);
-        let artifact_dir = out_dir.join("tilelang_aot").join(&per_sm_artifact_dir);
+        let vendored_dir = manifest_dir.join("generated").join(&per_sm_artifact_dir);
+        let out_artifact_dir = out_dir.join("tilelang_aot").join(&per_sm_artifact_dir);
+        let vendored_c = vendored_dir.join(format!("{per_sm_out_name}.c"));
+
+        // Decide consume-vs-regen: a vendored `.c` plus a matching (or
+        // legacy-absent) SRC_HASH lets us skip tilelang entirely.
+        let meta_path = vendored_dir.join("meta.txt");
+        let vendored_meta = std::fs::read_to_string(&meta_path).ok();
+        let vendored_src_hash = vendored_meta.as_deref().and_then(|m| {
+            m.lines()
+                .find_map(|line| line.strip_prefix("SRC_HASH=").map(|h| h.trim().to_string()))
+        });
+        let hash_ok = match &vendored_src_hash {
+            Some(h) => h == &src_hash, // recorded hash must match the current source
+            None => true,              // legacy / no SRC_HASH line — trust the vendored artifact
+        };
+        let can_consume = !force_regen && vendored_c.is_file() && hash_ok;
+
+        if can_consume {
+            copy_dir_recursive(&vendored_dir, &out_artifact_dir).unwrap_or_else(|err| {
+                panic!(
+                    "consume vendored TileLang artifact {} -> {}: {err}",
+                    vendored_dir.display(),
+                    out_artifact_dir.display()
+                )
+            });
+            let func = vendored_meta
+                .as_deref()
+                .and_then(|m| {
+                    m.lines().find_map(|line| {
+                        line.strip_prefix("FUNC_NAME=").map(|f| f.trim().to_string())
+                    })
+                })
+                .unwrap_or_else(|| func_name.clone());
+            let consumed_c = out_artifact_dir.join(format!("{per_sm_out_name}.c"));
+            // Re-trigger build.rs if the vendored `.c` or the kernel source changes.
+            println!("cargo:rerun-if-changed={}", vendored_c.display());
+            println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
+            results.push((sm_token.clone(), func, consumed_c));
+            continue;
+        }
+
+        // Regen: resolve tilelang lazily (panics if unavailable) and run the
+        // generator exactly as before.
+        let (python, tilelang_src, cutlass_include) = tl.get();
 
         let output = Command::new(python)
             .arg(&generator_path)
@@ -692,7 +821,7 @@ fn generate_tilelang_artifacts_per_sm(
             .arg("--out-name")
             .arg(&per_sm_out_name)
             .arg("--out-dir")
-            .arg(&artifact_dir)
+            .arg(&out_artifact_dir)
             .arg("--target")
             .arg(&target)
             .arg("--kernel-family")
@@ -757,21 +886,33 @@ fn generate_tilelang_artifacts_per_sm(
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut func_name = None;
+        let mut gen_func_name = None;
         let mut c_path = None;
         for line in stdout.lines() {
             if let Some(value) = line.strip_prefix("FUNC_NAME=") {
-                func_name = Some(value.trim().to_string());
+                gen_func_name = Some(value.trim().to_string());
             } else if let Some(value) = line.strip_prefix("C_PATH=") {
                 c_path = Some(PathBuf::from(value.trim()));
             }
         }
+        let gen_func_name =
+            gen_func_name.expect("TileLang generator did not print FUNC_NAME");
+        let c_path = c_path.expect("TileLang generator did not print C_PATH");
 
-        results.push((
-            sm_token.clone(),
-            func_name.expect("TileLang generator did not print FUNC_NAME"),
-            c_path.expect("TileLang generator did not print C_PATH"),
-        ));
+        // Record the generator's authoritative FUNC_NAME + the source hash so the
+        // export path vendors them and future builds can verify consume-safety.
+        std::fs::write(
+            out_artifact_dir.join("meta.txt"),
+            format!("FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\n"),
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "write meta.txt for {}: {err}",
+                out_artifact_dir.display()
+            )
+        });
+
+        results.push((sm_token.clone(), gen_func_name, c_path));
     }
 
     results
@@ -782,12 +923,10 @@ fn generate_tilelang_artifacts_per_sm(
 /// `<base_kernel_name>_cuda`, and append all sources to
 /// `generated_sources` for cc::Build to compile.
 fn build_tilelang_kernel(
-    python: &str,
+    tl: &LazyTilelang,
     out_dir: &Path,
     sm_targets: &[SmSpec],
     cuda_path: &str,
-    tilelang_src: &Path,
-    cutlass_include: &Path,
     base_spec: &TileLangKernelSpec,
     generated_sources: &mut Vec<PathBuf>,
 ) {
@@ -797,12 +936,10 @@ fn build_tilelang_kernel(
         .cloned()
         .collect();
     let per_sm = generate_tilelang_artifacts_per_sm(
-        python,
+        tl,
         out_dir,
         &eligible_targets,
         cuda_path,
-        tilelang_src,
-        cutlass_include,
         base_spec,
     );
     let pairs: Vec<(String, String)> = per_sm
@@ -1144,8 +1281,7 @@ fn compile_tilelang_aot_kernels(
     sm_targets: &[SmSpec],
     gdr_only: bool,
 ) {
-    let python = find_tilelang_python().unwrap_or_else(|message| panic!("{message}"));
-    let (tilelang_src, cutlass_include) = tilelang_include_dirs(&python);
+    let tl = LazyTilelang::new();
     let mut generated_sources = Vec::new();
 
     if gdr_only {
@@ -1171,12 +1307,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: sm70_qwen35_dense_head_config(q, kv),
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1199,12 +1333,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1227,12 +1359,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1255,12 +1385,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: sm70_qwen35_dense_head_config(q, kv),
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1286,12 +1414,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: false,
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1314,12 +1440,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: false,
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1344,12 +1468,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: sm70_qwen35_dense_head_config(q, kv),
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &partial_spec,
                 &mut generated_sources,
             );
@@ -1369,12 +1491,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: sm70_qwen35_dense_head_config(q, kv),
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &merge_spec,
                 &mut generated_sources,
             );
@@ -1398,12 +1518,10 @@ fn compile_tilelang_aot_kernels(
                 allow_sm70: false,
             };
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 sm_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 &spec,
                 &mut generated_sources,
             );
@@ -1498,12 +1616,10 @@ fn compile_tilelang_aot_kernels(
     ];
     for spec in &gdr_specs {
         build_tilelang_kernel(
-            &python,
+            &tl,
             out_dir,
             sm_targets,
             cuda_path,
-            &tilelang_src,
-            &cutlass_include,
             spec,
             &mut generated_sources,
         );
@@ -1581,12 +1697,10 @@ fn compile_tilelang_aot_kernels(
             );
         } else {
             build_tilelang_kernel(
-                &python,
+                &tl,
                 out_dir,
                 &sm90_targets,
                 cuda_path,
-                &tilelang_src,
-                &cutlass_include,
                 spec,
                 &mut generated_sources,
             );
