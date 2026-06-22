@@ -216,6 +216,12 @@ pub struct RubricOpdConfig {
     /// VRAM the offload used to free is already saved by sharing the single copy.
     /// The judge offload still runs. Default `false` = offload as today.
     pub share_frozen_base: bool,
+    /// SOPD 对且短 ("correct AND short"): when `true`, among the accepted
+    /// (self-consistency-correct) rollouts for a prompt, distill ONLY the SHORTEST
+    /// (fewest tokens) instead of all of them — biases CE toward the most
+    /// token-efficient correct reasoning, teaching the student to think concisely.
+    /// Default `false` = write back every accepted rollout (correctness only).
+    pub distill_shortest: bool,
 }
 
 /// Per-round accounting. `distinct_accepted` is the RFT log-linear x-axis;
@@ -313,8 +319,17 @@ where
             rep.accepted += sel.accepted.len();
             rep.distinct_accepted += sel.distinct_accepted;
             rep.parse_errors += sel.parse_errors;
-            for &idx in &sel.accepted {
-                accepted_pairs.push((prompt_ids.clone(), samples[idx].clone()));
+            if cfg.distill_shortest {
+                // 对且短: the shortest correct rollout is the most token-efficient path
+                // to the consensus answer; distilling only it teaches the student to
+                // reach the same answer with less reasoning (thinking efficiency).
+                if let Some(&idx) = sel.accepted.iter().min_by_key(|&&i| samples[i].len()) {
+                    accepted_pairs.push((prompt_ids.clone(), samples[idx].clone()));
+                }
+            } else {
+                for &idx in &sel.accepted {
+                    accepted_pairs.push((prompt_ids.clone(), samples[idx].clone()));
+                }
             }
             if sel.accepted.is_empty() {
                 rejected.push((problem.as_str(), prompt_ids.clone()));
