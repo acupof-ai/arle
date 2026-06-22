@@ -135,6 +135,18 @@ impl OpenAiTokenizer {
             !messages.is_empty(),
             "messages must contain at least one message"
         );
+        // Strict checkpoint templates (e.g. Qwen) `raise_exception` unless every
+        // system message is at the front; some clients (e.g. the Eli agent
+        // framework) place the system prompt after prior context. Hoist system
+        // messages to the front (stable) so any reasonable order renders — no clone
+        // when already ordered.
+        let hoisted;
+        let messages: &[ChatMessage] = if needs_system_hoist(messages) {
+            hoisted = hoist_system_first(messages);
+            &hoisted
+        } else {
+            messages
+        };
         match &self.template {
             ChatTemplate::Jinja {
                 source,
@@ -148,6 +160,30 @@ impl OpenAiTokenizer {
             }
         }
     }
+}
+
+/// `true` if any system message follows a non-system message — i.e. the system
+/// block isn't already at the front (so a hoist is needed).
+fn needs_system_hoist(messages: &[ChatMessage]) -> bool {
+    let mut seen_non_system = false;
+    for m in messages {
+        if m.role == "system" {
+            if seen_non_system {
+                return true;
+            }
+        } else {
+            seen_non_system = true;
+        }
+    }
+    false
+}
+
+/// All system messages first (original order), then the rest (original order).
+fn hoist_system_first(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len());
+    out.extend(messages.iter().filter(|m| m.role == "system").cloned());
+    out.extend(messages.iter().filter(|m| m.role != "system").cloned());
+    out
 }
 
 /// Render the checkpoint's Jinja template with the standard HF context.
@@ -370,6 +406,28 @@ mod tests {
             role: role.to_string(),
             content: Some(ChatContent::Text(content.to_string())),
         }
+    }
+
+    #[test]
+    fn system_messages_hoisted_to_front_for_strict_templates() {
+        // Eli-style order: context/user before the system prompt.
+        let out = hoist_system_first(&[
+            msg("user", "hi"),
+            msg("system", "be brief"),
+            msg("assistant", "ok"),
+        ]);
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[1].role, "user");
+        assert_eq!(out[2].role, "assistant");
+        assert!(needs_system_hoist(&[msg("user", "hi"), msg("system", "s")]));
+        assert!(!needs_system_hoist(&[
+            msg("system", "s"),
+            msg("user", "hi")
+        ]));
+        assert!(!needs_system_hoist(&[
+            msg("user", "hi"),
+            msg("assistant", "yo")
+        ]));
     }
 
     // A trimmed Qwen-style ChatML jinja template exercising the standard HF
