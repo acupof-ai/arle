@@ -104,11 +104,32 @@ recall reproduces full's answer **quality** (not just a planted needle) at 1.9% 
 KV; stream confabulates (Q1) and degenerates (Q2). This is the binding LongBench-style
 test, and recall passes it.
 
+## Agentic: multi-hop next-step decision
+
+Beyond retrieval/QA: a 3-hop dependency chain scattered at depths 0.25/0.5/0.75 in a
+diverse 15K haystack — deploy ⇐ smoke-test ⇐ feature-flag ⇐ approval-token — asked
+"what is the FIRST action to deploy?" (correct: run `/approve` in #ops, the root
+prerequisite, reachable only by chaining all three rules backward).
+
+```
+full   (kv 15149)  ✅ "Run /approve in the #ops channel to obtain the approval token"
+stream (kv   288)  ❌ "Run ./deploy.sh --env production"   (naive WRONG action; rules reject it)
+recall (kv   544)  ✅ "Run /approve in the #ops channel ..."   (exact = full)
+```
+
+recall **assembled the transitive 3-hop chain** — it pulled all three scattered rule
+blocks (not just the query-similar DEPLOY one) and reproduced full's next-step decision
+at **27.8× less KV**. stream, blind to the mid-context preconditions, emits the naive
+deploy command the rules forbid — the canonical agentic failure. Single scenario /
+single phrasing → directional, not a graded agentic suite.
+
 ## Verdict / Next
 
 Phase-0 PASS, strengthened well past a mechanism license: depth profile @5.7K, ctx→16K,
-top_k floor (holds to top_k=1), **diverse-distractor 4-needle (4/4 @15K)**, and
-**real-doc hard-QA quality (recall = full exact @29K, 53.9× less KV)**. Open: 32K–128K,
+top_k floor (holds to top_k=1), **diverse-distractor 4-needle (4/4 @15K)**,
+**real-doc hard-QA quality (recall = full exact @29K, 53.9× less KV)**, and
+**agentic 3-hop next-step (recall = full @15K; stream takes the forbidden action)**.
+Open: 32K–128K,
 multi-seed, free-form long QA with a graded rubric (vs the checkable-fact QA here), and
 a §5 recall-absolute-vs-repositioned A/B (expected null). recall here is scope-only —
 flat-VRAM needs the Phase-1 evict path (`executor.rs:2357-2430` contiguous-attn → Rust
