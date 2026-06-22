@@ -16,8 +16,18 @@ use crate::executor::MetalKvCacheDtype;
 const GIB: usize = 1 << 30;
 const MIB: usize = 1 << 20;
 const WIRED_HEADROOM_BYTES: usize = GIB;
-const DEFAULT_RUNTIME_HEADROOM_BYTES: usize = 6 * GIB;
-const LOW_IMPACT_RUNTIME_HEADROOM_BYTES: usize = 8 * GIB;
+// Non-KV runtime scratch reserved ABOVE weights (activations, MLX command buffers).
+// KV is budgeted separately (`kv_budget = memory_limit − fixed`) and clamped to fit,
+// and `*_AVAILABLE_RESERVE_BYTES` below is a *second*, independent anti-swap buffer
+// kept free for the OS. So this term only needs to cover non-KV transients. A c=1 27B
+// load measured ~3–5 GiB of runtime+KV TOTAL above the 18 GiB weights (non-KV < 3),
+// yet 6 GiB here stacked on the 6 GiB anti-swap reserve required available ≈ weights
+// + 12 GiB — over-reserving ~2× and falsely rejecting loads that fit (the 27B was
+// rejected by a 0.6 GiB margin at 29.4 GiB available). 4 GiB covers the scratch with
+// margin; the anti-swap reserve remains the swap backstop. (TODO: scale by
+// num_slots/context instead of a flat constant.)
+const DEFAULT_RUNTIME_HEADROOM_BYTES: usize = 4 * GIB;
+const LOW_IMPACT_RUNTIME_HEADROOM_BYTES: usize = 6 * GIB;
 const DEFAULT_AVAILABLE_RESERVE_BYTES: usize = 6 * GIB;
 const LOW_IMPACT_AVAILABLE_RESERVE_BYTES: usize = 8 * GIB;
 const DEFAULT_CACHE_LIMIT_BYTES: usize = GIB;
