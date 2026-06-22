@@ -313,6 +313,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // Software dequant of an FP8 E4M3 2D-block-scaled weight `[n, k]` (row-major)
+    // into a dense BF16 weight `[n, k]` (`output`, `Half` = bf16 raw bits). Block
+    // scale layout: `scales[(row/block_m)*scale_cols + (col/block_k)]` (matches
+    // `fp8_f32_block_scale` / the autograd `fp8_block_scaled.cu` reference). Used
+    // by the infer-cuda dense FP8 GEMM fallback on pre-Hopper GPUs (sm < 9.0)
+    // where DeepGEMM's wgmma path is unavailable: dequant once → reuse the BF16
+    // cuBLAS GEMM (`gemm_cuda`). No arch guard — runs on sm_70+.
+    pub fn dequantize_fp8_block_scaled_to_bf16_cuda(
+        weight: *const u8,
+        scales: *const f32,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        scale_rows: i32,
+        scale_cols: i32,
+        block_m: i32,
+        block_k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // CUTLASS-MMA port of the Qwen f32-block-scale FP8 batched GEMV (decode
     // shape B <= 16). Clone of `dsv4_fp8_gemv_batch_mma_launch` with the scale
     // decode swapped from E8M0 (`*const u8`) to the Qwen f32 block-scale
