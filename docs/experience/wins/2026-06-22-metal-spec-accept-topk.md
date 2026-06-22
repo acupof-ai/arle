@@ -50,10 +50,14 @@ hybrid linear/full attention — NOT MoE), so per-block forward cost is
 content-independent → +9.5% acceptance ≈ **~+9.5% expected throughput**.
 
 **Two caveats (SOLID):**
-- **Bounded lever.** `accepted=3` (both drafts) NEVER occurs in either — once the
-  first draft is rescued by top-2, the second rarely survives even top-2. On depth-2
-  MTP self-spec the draft is target-aligned (top-1 already accepts most), so top-k
-  only rescues the first draft; gain caps ~9.5%. Deeper drafts may benefit more.
+- **Bounded lever — verified `block_size=2` = ONE draft token/step.** (Load log:
+  `block_size=2`; trace `matched ∈ {0,1}` always.) So `accepted ∈ {1,2}` by
+  construction (draft + posterior), NOT because "a 2nd draft fails" — there is no 2nd
+  draft. top-k's whole effect is raising that single draft's hit-rate: topk=1 70%
+  (105/150 matched=1) → topk=2 86% (118/137), i.e. mean 1.70→1.86. Per-forward ceiling
+  is 2 tokens. Bigger speedup needs a DEEPER draft (`block_size>2`, speculate 2-3
+  tokens) — only then does top-k get to rescue later drafts. (An earlier version of
+  this entry wrongly said "depth-2 / 2nd draft never survives" — corrected.)
 - **NO trustworthy real tok/s was obtained.** Both attempts were noise: the
   diff-method (192/(wall₂₅₆−wall₆₄)) gave −11% (cold-process / thermal run-to-run
   jitter); the trace-derived "eff tok/s" (12.5→17.4) is an ARTIFACT — `INFER_METAL_
