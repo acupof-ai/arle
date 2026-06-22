@@ -31,8 +31,12 @@
 // ============================================================================
 
 #define WARP_SIZE 32
+#ifndef GEMV_THREADS
 #define GEMV_THREADS 256
+#endif
+#ifndef GEMV_ROWS
 #define GEMV_ROWS 4
+#endif
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -131,12 +135,38 @@ __global__ void fp8_f32_block_gemv_batch_kernel(
     if ((K % 16) == 0 && (block_k % 16) == 0) {
         const int kv = K / 16;
         const uint8_t* weight_row = weight + (int64_t)row * K;
+#ifdef ILP_UNROLL
+        // 4 independent accumulators -> 4 dot16 loads in flight before any
+        // dependent add, hiding HBM latency on the short K-walk.
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+        const int step = threads_per_row;
+        int v = tid_in_row;
+        for (; v + 3 * step < kv; v += 4 * step) {
+            const int k0 = v * 16, k1 = (v + step) * 16;
+            const int k2 = (v + 2 * step) * 16, k3 = (v + 3 * step) * 16;
+            s0 += fp8_f32_block_scale(scales, row, k0, scale_rows, scale_cols, block_m, block_k)
+                  * fp8_f32_dot16(weight_row + k0, x + k0);
+            s1 += fp8_f32_block_scale(scales, row, k1, scale_rows, scale_cols, block_m, block_k)
+                  * fp8_f32_dot16(weight_row + k1, x + k1);
+            s2 += fp8_f32_block_scale(scales, row, k2, scale_rows, scale_cols, block_m, block_k)
+                  * fp8_f32_dot16(weight_row + k2, x + k2);
+            s3 += fp8_f32_block_scale(scales, row, k3, scale_rows, scale_cols, block_m, block_k)
+                  * fp8_f32_dot16(weight_row + k3, x + k3);
+        }
+        for (; v < kv; v += step) {
+            const int k = v * 16;
+            s0 += fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k)
+                  * fp8_f32_dot16(weight_row + k, x + k);
+        }
+        sum = (s0 + s1) + (s2 + s3);
+#else
         for (int v = tid_in_row; v < kv; v += threads_per_row) {
             const int k = v * 16;
             const float scale =
                 fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
             sum += scale * fp8_f32_dot16(weight_row + k, x + k);
         }
+#endif
     } else {
         for (int k = tid_in_row; k < K; k += threads_per_row) {
             const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
