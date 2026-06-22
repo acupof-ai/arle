@@ -53,7 +53,7 @@ use crate::moe::{
 };
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
-    add_batch, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul,
+    add_batch, argmax, copy_row_to_vec, embedding_batch, gemm_batch, gemv, silu_mul, upload_i32,
     warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
@@ -2798,6 +2798,138 @@ impl Qwen35Model {
         Ok((logits_vec, [seq_len, vocab], last_hidden))
     }
 
+    /// One NextN-MTP draft level: given the previous chain token `token` and its
+    /// hidden `h_prev`, produce the next greedy draft token + the head's output
+    /// hidden (the input to the next level). The head is a single full-attention
+    /// transformer block attending only over the **fresh per-block** draft chain
+    /// at **local** positions `0..depth` (verified against the Metal
+    /// `prepare_draft_block_mtp` reference: `draft_state.reset()` + rope_offset
+    /// starts at 0), with the trunk context injected via
+    /// `fc(concat[norm(embed(token)), norm(h_prev)])` — NOT re-attended. `level`
+    /// is the 0-based position within the draft block (RoPE position + head-KV
+    /// row). Greedy (argmax) draft; top-k is a later increment.
+    ///
+    /// The head's KV is `spec.head_k`/`head_v`; processing levels `0,1,2,…` in
+    /// order overwrites rows `0,1,2,…`, so each block self-seeds without an
+    /// explicit reset (rows beyond the current chain are never read).
+    //
+    // ponytail: per-level owned scratch (emb/concat/normed/logits/…). Correct &
+    // simple for the correctness gate; fold into a spec workspace before the
+    // perf bench (the [vocab,1] logits alloc is the only non-trivial one).
+    #[allow(dead_code)] // consumed by spec_step (next increment)
+    fn mtp_forward_level(
+        &self,
+        spec: &mut Qwen35SpecSlotState,
+        ws: &mut Qwen35Workspace,
+        token: u32,
+        h_prev: &DeviceVec,
+        level: usize,
+    ) -> Result<(u32, DeviceVec)> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| anyhow!("mtp_forward_level called without a loaded MTP head"))?;
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        let hidden = c.hidden_size;
+        ensure!(
+            h_prev.len == hidden,
+            "mtp_forward_level h_prev len {} != hidden {hidden}",
+            h_prev.len
+        );
+
+        // ── 1. Candidate token embedding. ──
+        let token_ids = upload_i32(&self.ctx, &[token as i32])?;
+        let mut emb = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)?;
+
+        // ── 2. Pre-fc RMSNorms over [embedding ; previous hidden], concat. ──
+        // fc is [hidden, 2*hidden]; the concat input is [norm(emb) ; norm(h_prev)]
+        // (embedding first — matches the Metal `qwen3_5_mtp` loader order).
+        let mut concat = HiddenStates::zeros(&self.ctx, 2 * hidden, 1)?;
+        let mut emb_n = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        rms_norm_offset(&self.ctx, &emb, &mtp.pre_fc_norm_embedding, eps, &mut emb_n)?;
+        {
+            let mut dst = concat.data.slice_mut(0..hidden);
+            self.ctx
+                .stream
+                .memcpy_dtod(&emb_n.data, &mut dst)
+                .map_err(|e| anyhow!("mtp concat emb half failed: {e}"))?;
+        }
+        let mut h_n = DeviceVec::zeros(&self.ctx, hidden)?;
+        rms_norm_offset_vec(&self.ctx, h_prev, &mtp.pre_fc_norm_hidden, eps, &mut h_n)?;
+        {
+            let mut dst = concat.data.slice_mut(hidden..2 * hidden);
+            self.ctx
+                .stream
+                .memcpy_dtod(&h_n.data, &mut dst)
+                .map_err(|e| anyhow!("mtp concat hidden half failed: {e}"))?;
+        }
+        let mut h_fc = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)?;
+
+        // ── 3. One transformer block (Full attn over the head's own per-block
+        //       KV + dense MLP), mirroring the trunk layer body. ──
+        let layer = &mtp.layer;
+        let Qwen35Attn::Full(full_attn) = &layer.attn else {
+            unreachable!("MTP head layer is always full attention");
+        };
+        let mlp = layer
+            .mlp
+            .as_ref()
+            .ok_or_else(|| anyhow!("MTP head layer missing dense MLP"))?;
+
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        rms_norm_offset(&self.ctx, &h_fc, &layer.input_layernorm, eps, &mut normed)?;
+
+        // Local position within the fresh draft block (== head-KV row + RoPE pos).
+        let start_pos_dev = upload_i32(&self.ctx, &[level as i32])?;
+        let mut attn_out = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        self.full_attention_into(
+            full_attn,
+            &normed,
+            &mut spec.head_k,
+            &mut spec.head_v,
+            0, // profiling label
+            level,
+            &start_pos_dev,
+            &mut ws.full,
+            &mut attn_out,
+        )?;
+
+        let mut hidden_mid = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        add_batch(&self.ctx, &h_fc, &attn_out, &mut hidden_mid)?;
+        rms_norm_offset(
+            &self.ctx,
+            &hidden_mid,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut normed,
+        )?;
+        let mut mlp_out = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out)?;
+        let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
+        add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
+
+        // ── 4. Final head RMSNorm + SHARED lm_head + greedy argmax. ──
+        rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)?;
+        let vocab = self.output_projection().rows;
+        let mut logits = HiddenStates::zeros(&self.ctx, vocab, 1)?;
+        gemm_batch(&self.ctx, self.output_projection(), &normed, &mut logits)?;
+        let logits_vec = DeviceVec {
+            data: logits.data,
+            len: vocab,
+            label: "qwen35_mtp_draft_logits",
+        };
+        let next = argmax(&self.ctx, &logits_vec)?;
+
+        // The head's own output hidden seeds the next level (autoregressive chain,
+        // per `dflash.rs` `step_hidden = flat`).
+        let mut h_out = DeviceVec::zeros(&self.ctx, hidden)?;
+        copy_row_to_vec(&self.ctx, &h_layer, 0, &mut h_out)?;
+        Ok((next, h_out))
+    }
+
     /// Per-step student LoRA re-merge (OPD P2).
     ///
     /// Folds a fresh [`StudentLoraUpdate`] into the resident student projection
@@ -3713,17 +3845,6 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Gated full attention over the contiguous per-slot K/V cache (uncached
-    /// recompute over `[0, start_pos+seq_len)` each call) into `out`
-    /// (`[hidden, seq]`, beta=0 o_proj GEMM). The prep kernel fuses q/k RMSNorm +
-    /// RoPE + cache write; the gate kernel applies the per-head sigmoid gate
-    /// carried in `q_full`. `start_pos_dev` is the forward-level GPU-resident
-    /// `start_pos` (identical for every layer of one call).
-    ///
-    /// Prefill chunks (`seq_len > 1`) route through the vendored FA3 hopper
-    /// fwd when [`qwen35_fa3_enabled`]; decode keeps the devpos kernel
-    /// (graph-captured) untouched.
-    #[allow(clippy::too_many_arguments)]
     /// Thin trunk wrapper: full attention writing this rank's per-slot K/V cache
     /// for full-attn layer `full_idx`. The MTP draft head bypasses this and calls
     /// [`Self::full_attention_into`] directly with its own per-block KV.
@@ -3755,8 +3876,15 @@ impl Qwen35Model {
     }
 
     /// Gated full attention over an explicit contiguous K/V cache (`max_seq_len`
-    /// derived from `k_cache.len / kv_dim`). The trunk passes its per-slot cache
-    /// via [`Self::full_attention`]; the MTP draft head passes its own fresh
+    /// derived from `k_cache.len / kv_dim`), uncached recompute over
+    /// `[0, start_pos+seq_len)` each call, into `out` (`[hidden, seq]`, beta=0
+    /// o_proj GEMM). The prep kernel fuses q/k RMSNorm + RoPE + cache write; the
+    /// gate kernel applies the per-head sigmoid gate carried in `q_full`.
+    /// `start_pos_dev` is the GPU-resident `start_pos` (same for every layer of
+    /// one call). Prefill chunks (`seq_len > 1`) route through the vendored FA3
+    /// hopper fwd when [`qwen35_fa3_enabled`]; decode keeps the devpos kernel
+    /// (graph-captured) untouched. The trunk passes its per-slot cache via
+    /// [`Self::full_attention`]; the MTP draft head passes its own fresh
     /// per-block cache. `full_idx` is only a profiling label. Numerics, kernels,
     /// and launch order are identical to the pre-extraction trunk path.
     #[allow(clippy::too_many_arguments)]
