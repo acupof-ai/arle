@@ -2993,17 +2993,18 @@ impl Qwen35Model {
 
         if argmax0 == draft {
             // HIT: the trunk agrees pending→draft; emit draft + the bonus argmax1.
-            slot.advance_seq_len(2);
+            // The verify forward already advanced slot.seq_len to start_pos+2
+            // (forward_hidden does `slot.seq_len += seq_len`); do NOT advance again.
             Ok((vec![draft, argmax1], argmax1, h_row1))
         } else {
             // MISS: draft wrong; emit the trunk's real next token argmax0 only.
-            // Restore the linear state to pre-verify, then replay `pending` alone
-            // (1 token = the verify's first recurrent step) to land on post-pending.
+            // Restore the linear state to pre-verify, rewind the cursor, then replay
+            // `pending` alone (== the verify's first recurrent step) — that replay's
+            // forward_hidden leaves slot.seq_len at start_pos+1, so no extra advance.
             spec.restore_trunk(&self.ctx, slot)?;
             slot.set_seq_len(start_pos);
             let (_l0, _d0, h_row0) =
                 self.forward_tokens_with_hidden(slot, ws, &[pending], start_pos)?;
-            slot.advance_seq_len(1);
             Ok((vec![argmax0], argmax0, h_row0))
         }
     }
