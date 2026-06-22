@@ -94,6 +94,23 @@ fn qwen_fp8_deepgemm_dense_enabled() -> bool {
     })
 }
 
+/// Opt INTO the tensor-core MMA decode GEMV (default = the coalesced scalar
+/// kernel). Measured on Qwen3.6-27B-FP8 / H20: the MMA tile is built for DSv4
+/// batched decode (B<=16) and is occupancy-starved + uncoalesced at B=1 (only
+/// N/32 blocks, ~3-9% HBM BW), while the scalar warp-per-row kernel has
+/// N/GEMV_ROWS blocks (~16x) + coalesced byte loads → 3.6x single-stream
+/// (7.5→27.2 tok/s), 2.8x at conc=8 (17.6→50). So scalar is the DEFAULT; this
+/// flag is an A/B escape hatch (e.g. for shapes where MMA might still win).
+fn qwen_fp8_gemv_use_mma() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_QWEN35_FP8_GEMV_MMA").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
 /// Log exactly once which path the *decode* GEMV (seq_len <= 16) takes — MMA vs
 /// scalar fallback. Prefill (seq_len > 16) always uses the scalar kernel by
 /// design and is NOT logged here: logging the prefill call first would consume
@@ -406,14 +423,16 @@ pub(super) fn gemm_batch(
                 let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
                 let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
                 let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                // DEFAULT tensor-core MMA path (decode shape B <= 16). Parity vs
-                // the scalar kernel: cosine 1.0 / max_abs 0. The MMA launch
-                // self-gates on N%8 / K%16 / block_k%128 and returns a
-                // non-success CUresult for shapes it can't tile; on that signal
-                // we reset the sticky error and fall through to the scalar kernel
-                // below — the only remaining use of the scalar GEMV (uncovered
-                // shapes + prefill seq_len>16).
-                let mma = x.seq_len <= 16;
+                // DEFAULT = the coalesced scalar warp-per-row GEMV below; it is
+                // 3.6x faster than the MMA tile at B=1 decode on H20 (the MMA is
+                // occupancy-starved + uncoalesced off its batched B<=16 design
+                // point — see qwen_fp8_gemv_use_mma). MMA is opt-in via
+                // ARLE_QWEN35_FP8_GEMV_MMA=1. Parity: cosine 1.0 / max_abs 0 (the
+                // MMA was built to match this scalar kernel). When MMA is opted in
+                // it self-gates on N%8 / K%16 / block_k%128 and returns a
+                // non-success CUresult for shapes it can't tile; on that signal we
+                // reset the sticky error and fall through to the scalar kernel.
+                let mma = x.seq_len <= 16 && qwen_fp8_gemv_use_mma();
                 let mma_ok = if mma {
                     let res = qwen_quant_profile(
                         ctx,
