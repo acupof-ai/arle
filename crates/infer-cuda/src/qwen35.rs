@@ -886,6 +886,28 @@ pub(crate) struct DenseMlp {
     down_proj: DeviceMatrix,
 }
 
+/// NextN-MTP draft head for Qwen3.6 speculative decode: one full-attention
+/// transformer block (`mtp.layers.0.*`, always Full + dense MLP) preceded by the
+/// `fc` concat-projection over `[norm(candidate_embedding); norm(previous_hidden)]`
+/// and its two pre-`fc` RMSNorms, with a final RMSNorm before the SHARED
+/// `lm_head`. `lm_head` + `embed_tokens` are the base model's and are not stored
+/// here. Loaded only when spec-decode is requested; fields are consumed by the
+/// draft forward in the next increment.
+#[allow(dead_code)] // populated here; read by mtp_forward_level (next increment)
+pub(crate) struct Qwen35MtpHead {
+    /// RMSNorm over the candidate token embedding, pre-`fc`.
+    pre_fc_norm_embedding: DeviceVec,
+    /// RMSNorm over the previous-step trunk hidden, pre-`fc`.
+    pre_fc_norm_hidden: DeviceVec,
+    /// Concat projection `[hidden, 2*hidden]` mapping the two normed inputs to
+    /// the transformer-block input.
+    fc: DeviceMatrix,
+    /// The head's single transformer block (Full attention + dense MLP).
+    layer: Qwen35Layer,
+    /// Final RMSNorm before the shared lm_head.
+    norm: DeviceVec,
+}
+
 pub(crate) struct Qwen35Model {
     pub(crate) ctx: DeviceContext,
     pub(crate) config: Qwen35Config,
@@ -911,6 +933,15 @@ pub(crate) struct Qwen35Model {
     expert_split: ExpertSplit,
     /// Per-slot cache capacity (full-attn contiguous cache rows).
     max_seq_len: usize,
+    /// NextN-MTP draft head for speculative decode. `Some` (and
+    /// `spec_draft_tokens > 0`) only when the constructor was asked to load it;
+    /// the default decode path never reads it, so the baseline stays
+    /// byte-identical when spec-decode is off.
+    #[allow(dead_code)] // read by the spec-decode draft/verify path (next increment)
+    mtp: Option<Qwen35MtpHead>,
+    /// Requested MTP draft depth (`0` = spec-decode off).
+    #[allow(dead_code)] // read by the spec-decode orchestrator (next increment)
+    spec_draft_tokens: usize,
     /// Host-resident weight snapshot while the engine is offloaded for the OPD
     /// teacher time-share. `Some` iff [`Qwen35Model::offload_engine_weights`] ran
     /// without a matching [`Qwen35Model::reload_engine_weights`]; the device
@@ -1437,17 +1468,26 @@ impl Qwen35Model {
     /// runtime from the environment (single-GPU when no TP env is set).
     ///
     /// `max_seq_len` sizes the per-slot full-attn contiguous K/V cache.
-    pub(crate) fn from_safetensors(model_path: &Path, max_seq_len: usize) -> Result<Self> {
+    pub(crate) fn from_safetensors(
+        model_path: &Path,
+        max_seq_len: usize,
+        mtp_draft_tokens: Option<usize>,
+    ) -> Result<Self> {
         let tp = crate::loader::build_tp_runtime()?;
-        Self::from_safetensors_with_tp(model_path, max_seq_len, tp)
+        Self::from_safetensors_with_tp(model_path, max_seq_len, tp, mtp_draft_tokens)
     }
 
     /// Load with an explicit [`crate::tp::TpRuntime`] (tests inject a single-GPU
     /// runtime — mirrors the dense loader's `from_safetensors_with_tp`).
+    ///
+    /// `mtp_draft_tokens`: `Some(n)` loads the NextN-MTP draft head for
+    /// speculative decode (draft depth `n`); `None` keeps the baseline decode
+    /// path (no MTP head loaded, byte-identical).
     pub(crate) fn from_safetensors_with_tp(
         model_path: &Path,
         max_seq_len: usize,
         tp: crate::tp::TpRuntime,
+        mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
         let config_t0 = Instant::now();
@@ -1813,6 +1853,30 @@ impl Qwen35Model {
             format_args!("layers={} max_seq_len={max_seq_len}", m.num_hidden_layers),
         );
 
+        // NextN-MTP draft head (speculative decode). Loaded only on request; the
+        // default decode path never touches it, so the baseline stays
+        // byte-identical when off. Single-GPU only for now — the head shares the
+        // base lm_head/embed and the 27B-FP8 fits on one H20; TP-sharded MTP is a
+        // follow-up once spec-decode proves out single-GPU.
+        let mtp = if mtp_draft_tokens.is_some() {
+            let mtp_t0 = Instant::now();
+            ensure!(
+                tp_cfg.is_single(),
+                "Qwen3.5 MTP spec-decode is single-GPU only for now \
+                 (TP-sharded MTP draft head not yet wired)"
+            );
+            let head = load_qwen35_mtp_head(&loader, &ctx, &m)?;
+            qwen35_startup_log(
+                "mtp_head",
+                mtp_t0,
+                format_args!("draft_tokens={}", mtp_draft_tokens.unwrap_or(0)),
+            );
+            Some(head)
+        } else {
+            None
+        };
+        let spec_draft_tokens = mtp_draft_tokens.unwrap_or(0);
+
         Ok(Self {
             ctx,
             config: m,
@@ -1830,6 +1894,8 @@ impl Qwen35Model {
             local_linear_v_heads,
             expert_split: split,
             max_seq_len,
+            mtp,
+            spec_draft_tokens,
             offloaded: None,
             lora_base: HashMap::new(),
             lora_base_dev: HashMap::new(),
@@ -4875,6 +4941,51 @@ fn load_v_head_f32_sharded(
     ctx.stream
         .clone_htod(&host[start..start + len])
         .map_err(|e| anyhow!("upload sharded per-v-head f32 {name}: {e}"))
+}
+
+/// Load the NextN-MTP draft head (single-GPU): one Full-attention + dense-MLP
+/// transformer block, the `fc` concat-projection, two pre-`fc` RMSNorms, and the
+/// final pre-lm_head RMSNorm. Mirrors the single-GPU Full-attn + dense-MLP
+/// branches in the main loader (`load_matrix_quant_aware` auto-detects FP8 vs
+/// BF16 per tensor). `lm_head`/`embed_tokens` are SHARED with the base model and
+/// are not reloaded here.
+fn load_qwen35_mtp_head(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    m: &Qwen35Config,
+) -> Result<Qwen35MtpHead> {
+    let names = m.mtp_tensor_names();
+    let Qwen35AttentionTensorNames::Full(full) = &names.layer.attention else {
+        unreachable!("MTP head layer is always full attention");
+    };
+    let attn = Qwen35Attn::Full(Box::new(FullAttn {
+        q_proj: loader.load_matrix_quant_aware(ctx, &full.q_proj)?,
+        k_proj: loader.load_matrix_quant_aware(ctx, &full.k_proj)?,
+        v_proj: loader.load_matrix_quant_aware(ctx, &full.v_proj)?,
+        o_proj: loader.load_matrix_quant_aware(ctx, &full.o_proj)?,
+        q_norm: loader.load_vec(ctx, &full.q_norm)?,
+        k_norm: loader.load_vec(ctx, &full.k_norm)?,
+    }));
+    let mlp = DenseMlp {
+        gate_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_gate_proj)?,
+        up_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_up_proj)?,
+        down_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_down_proj)?,
+    };
+    let layer = Qwen35Layer {
+        input_layernorm: loader.load_vec(ctx, &names.layer.common.input_layernorm)?,
+        attn,
+        post_attention_layernorm: loader
+            .load_vec(ctx, &names.layer.common.post_attention_layernorm)?,
+        mlp: Some(mlp),
+        moe: None,
+    };
+    Ok(Qwen35MtpHead {
+        pre_fc_norm_embedding: loader.load_vec(ctx, &names.pre_fc_norm_embedding)?,
+        pre_fc_norm_hidden: loader.load_vec(ctx, &names.pre_fc_norm_hidden)?,
+        fc: loader.load_matrix_quant_aware(ctx, &names.fc)?,
+        layer,
+        norm: loader.load_vec(ctx, &names.norm)?,
+    })
 }
 
 /// This rank's contiguous v-head range `(start, len)` within `[0, total_v_heads)`.
