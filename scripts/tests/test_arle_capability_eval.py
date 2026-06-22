@@ -14,6 +14,7 @@ or:
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -122,6 +123,47 @@ class GSM8KPredExtraction(unittest.TestCase):
     def test_empty_returns_none(self):
         self.assertIsNone(eval_mod._gsm8k_extract_answer(""))
         self.assertIsNone(eval_mod._gsm8k_extract_answer("no numbers here"))
+
+
+class Math500Extraction(unittest.TestCase):
+    def test_gold_escaped_dollar_matches_plain_prediction(self):
+        self.assertEqual(eval_mod._math_normalize_answer(r"\$18.90"), "18.90")
+        self.assertEqual(eval_mod._math_extract_answer(r"\boxed{18.90}"), "18.90")
+
+    def test_last_boxed_answer_wins(self):
+        text = r"scratch \boxed{8.64} corrected final \boxed{\$18.90}"
+        self.assertEqual(eval_mod._math_extract_answer(text), "18.90")
+
+    def test_trailing_incomplete_box_does_not_hide_complete_answer(self):
+        text = r"final \boxed{600} repeated \boxed{"
+        self.assertEqual(eval_mod._math_extract_answer(text), "600")
+
+    def test_empty_box_from_repeated_prompt_is_ignored(self):
+        text = r"answer \boxed{600} repeated prompt says \boxed{}"
+        self.assertEqual(eval_mod._math_extract_answer(text), "600")
+
+    def test_local_jsonl_runner_scores_and_preserves_raw_response(self):
+        class FakeClient:
+            def completion(self, prompt, max_tokens=64, temperature=0.0):
+                self.prompt = prompt
+                return r"short solution \boxed{\$18.90}"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "math500.jsonl"
+            data.write_text('{"problem":"cost?","answer":"\\\\$18.90"}\n')
+            out = root / "out"
+            out.mkdir()
+            report = eval_mod.run_math500(
+                FakeClient(),
+                1,
+                out,
+                seed=0,
+                local_jsonl=data,
+            )
+            self.assertEqual(report["n_correct"], 1)
+            per_question = (out / "math500_perquestion.json").read_text()
+            self.assertIn(r"short solution \\boxed{\\$18.90}", per_question)
 
 
 class MMLUShotFormatting(unittest.TestCase):
