@@ -86,6 +86,10 @@ print(client.chat.completions.create(
 
 <sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = 单流生成速率 · <a href="benchmarks/README.md">快照 + 方法</a></sub>
 
+**推测解码击穿 HBM 带宽墙。** Qwen3.6-27B(OptiQ 4/8-bit):模型自带的 NextN/MTP 头出草稿、base 校验,**输出与 greedy 比特一致** —— **12.3 → 18.1 tok/s(+47%)**,越过任何 kernel 都够不到的 15.2 tok/s HBM 下限。
+
+<sub>质量不掉:PPL 7.82(vs uniform-4bit 8.56)· 68.8% 草稿接受率 · 默认开,<code>--no-speculative</code> 可关。</sub>
+
 **NVIDIA —— DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
 
 <p align="center">
@@ -93,16 +97,16 @@ print(client.chat.completions.create(
 </p>
 <p align="center"><sub>DSv4 B=1 decode,<b>33.5 → 53.3 tok/s</b>,2026-06-13 → 06-14 campaign —— 每一步都对应一条 <code>docs/experience/wins/</code> 记录。</sub></p>
 
-**On-Policy Distillation —— 真能提升 student 吗?** 一个 Qwen3.5-4B LoRA student,在自己的 rollout 上对 Qwen3.6-35B-A3B teacher 做蒸馏(teacher 就跑在同一套服务运行时上),把 MATH-500 从 **0.518 → 0.792** 提升 —— **+27pp、CI 完全分离** —— 在 **5 seed × 3 recipe** 上锁定(reverse-KL 最优),逼近 35B teacher 的水平(**0.82**):
+**On-Policy Distillation 真能提升 student。** 一个 Qwen3.5-4B LoRA student,在自己的 rollout 上对 Qwen3.6-35B-A3B teacher 做蒸馏(teacher 就跑在同一套服务运行时上),把 MATH-500 从 **0.518 → 0.792**(**+27pp、CI 完全分离**),逼近 teacher 的水平(**0.82**):
 
 <p align="center">
   <img src="docs/assets/opd-multiseed-curve.png" alt="OPD 多 seed 锁定:Qwen3.5-4B student MATH-500 从 0.518 提升到 0.792(reverse-KL,5 seed 最优),逼近 35B teacher 的 0.82" width="680">
 </p>
 <p align="center"><sub>MATH-500 greedy exact-match,<b>n=500/seed</b> @4096 tokens,0 request-error · 3 recipe × 5 seed,base→step25→step50 · 误差棒 = ±1σ(跨 seed)· base <b>0.518</b> → reverse-KL <b>0.792</b>,CI 完全分离 · 2026-06-20。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>。</sub></p>
 
-同一套 loop 也提升 *agentic* 能力:think-on OPD 下 4B student 学会**拒绝不相关的工具调用 —— BFCL-live abstention 0.60 → 1.00**,逼近 teacher。case 验证:base 推理正确却仍强行调用工具,OPD student 则正确弃权。[<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
+同一套 loop 也提升 *agentic* 能力:think-on OPD 下 4B student 学会**拒绝不相关的工具调用 —— BFCL-live abstention 0.60 → 1.00**。[<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
-**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5 全家族(CUDA + Metal)· Qwen3.6(Metal)· DeepSeek-V4-Flash(CUDA 8×H20)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
+**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5 全家族(CUDA + Metal)· Qwen3.6(Metal)· DeepSeek-V4-Flash(CUDA 8×H20)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
 
@@ -110,9 +114,8 @@ print(client.chat.completions.create(
 
 agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工具输出。ARLE 把这件事解决一次,serving 与训练共享:
 
-- **跨轮 KV 常驻。** 上一轮 KV 留在 GPU,内存压力下才下沉 host / 盘;共享前缀按页复用 —— 不重复计算、不重复占内存。
-- **KV 分层有预算。** Metal 自动确定内存前缀层大小,SSD 快照 20 GiB LRU 预算(CRC32C 校验的 64 KiB 段);`--kv-memory-max-bytes 0` / `--no-kv-disk` 可关。
-- **CUDA 量化 KV。** `--kv-cache-dtype int8|fp8|tq4`。
+- **跨轮 KV 常驻。** 上一轮 KV 留在 GPU,只 prefill 新 token;前缀页经 host radix cache 跨请求共享,内存压力下下沉到 host-RAM 层(可选盘 spill),下次命中再提回,不重复 prefill。([support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix))
+- **CUDA 量化 KV。** INT8/FP8/INT4 paged-KV kernel,`--kv-cache-dtype` serve flag —— 正确性 gate 过、opt-in(默认仍 BF16)。
 - **一套运行时、三个表面。** serving、本地 agent、OPD 训练共用同一套 Rust + 模型代码 —— OPD teacher 就是生产 server。
 
 ```mermaid
