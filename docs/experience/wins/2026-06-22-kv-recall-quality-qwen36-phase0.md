@@ -49,14 +49,37 @@ InfLLM attention-influence score, which is unreachable behind the fused
 stream misses emit "7391" (first 4 of 6 digits) — the GDN linear layers leak
 *partial* long-range info; full-attn recall completes the exact match.
 
+## Scale: ctx 16K + top_k floor (single-variable steps from 5.7K)
+
+ctx 5.7K→**15.1K** (depth 0.5, all else fixed): `full=OK, stream=MISS, recall=OK`.
+At top_k=8 that is 256 recalled tokens / ~14.8K middle = **1.6% recall fraction** —
+mean-key ranks the needle block in the top-8 among ~480 blocks.
+
+top_k floor at 16K/depth-0.5 (sweep top_k, recall mode):
+
+```
+top_k:   1     2     4     8
+recall:  OK    OK    OK    OK      (full=OK, stream=MISS anchors)
+```
+
+**recall holds down to top_k=1** — recalling ONE 32-token block (~0.2% of context)
+still returns the full passkey. Mean-key recall ranks the needle block **#1**, not
+just in-the-top-k. The Metal-feasible representative is sharply discriminative here.
+
+**Caveat — this is the easy task.** passkey-in-uniform-filler makes the needle's
+mean-key trivially distinct from repetitive filler, so #1-ranking is expected-easy.
+top_k=1 @ 0.2% is impressive *on a needle among uniform distractors*, NOT a general
+claim. A needle among *diverse* distractors (real LongBench/∞-Bench docs) is the
+binding test and is not yet run.
+
 ## Verdict / Next
 
-Phase-0 PASS licenses the Phase-1 Metal integration. Open (do NOT overclaim from
-this): ctx only ~5.7K (not 128K/10M), passkey is the easiest probe (single needle,
-exact digits), single seed/key, `mean-key` + absolute-position only. Before a
-quality *number* (vs a mechanism license): RULER/LongBench at ≥32K, multi-needle,
-top_k sensitivity, and an A/B of recall-absolute vs recall-repositioned (§5) —
-expected null on this partial-RoPE model.
+Phase-0 PASS licenses the Phase-1 Metal integration. Done so far: depth profile at
+5.7K, ctx step to 16K, top_k floor (holds to top_k=1) — all on passkey-in-uniform-
+filler, `mean-key` + absolute-position. Still open before a general quality *number*:
+the binding test is a needle among **diverse distractors** (RULER/LongBench/∞-Bench),
+not uniform filler; plus 32K–128K, multi-needle, multi-seed, and an A/B of
+recall-absolute vs recall-repositioned (§5) — expected null on this partial-RoPE model.
 
 Phase-1 in-stack constraints already mapped (Metal): decode attention is
 contiguous-range only (`infer-metal/src/executor.rs:2357-2430`), no per-row page
