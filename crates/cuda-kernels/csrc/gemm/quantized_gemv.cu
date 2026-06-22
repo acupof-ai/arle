@@ -394,6 +394,40 @@ __device__ __forceinline__ float fp8_f32_dot16(
         + wf3.w * __bfloat162float(xb1[7]);
 }
 
+// Dot 16 ALREADY-DECODED fp8 weights (4 float4, decoded once by the caller)
+// against one bf16 x16. The batched tiled GEMV decodes each weight chunk ONCE
+// and calls this per batch column, so the fp8->fp32 conversion is not repeated
+// per column (unlike fp8_f32_dot16). Same arithmetic + accumulation order as
+// fp8_f32_dot16, so numerics are identical.
+__device__ __forceinline__ float dot16_with_decoded(
+    const float4& wf0,
+    const float4& wf1,
+    const float4& wf2,
+    const float4& wf3,
+    const __nv_bfloat16* __restrict__ x)
+{
+    const uint4 x0 = *reinterpret_cast<const uint4*>(x);
+    const uint4 x1 = *reinterpret_cast<const uint4*>(x + 8);
+    const auto* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
+    const auto* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
+    return wf0.x * __bfloat162float(xb0[0])
+        + wf0.y * __bfloat162float(xb0[1])
+        + wf0.z * __bfloat162float(xb0[2])
+        + wf0.w * __bfloat162float(xb0[3])
+        + wf1.x * __bfloat162float(xb0[4])
+        + wf1.y * __bfloat162float(xb0[5])
+        + wf1.z * __bfloat162float(xb0[6])
+        + wf1.w * __bfloat162float(xb0[7])
+        + wf2.x * __bfloat162float(xb1[0])
+        + wf2.y * __bfloat162float(xb1[1])
+        + wf2.z * __bfloat162float(xb1[2])
+        + wf2.w * __bfloat162float(xb1[3])
+        + wf3.x * __bfloat162float(xb1[4])
+        + wf3.y * __bfloat162float(xb1[5])
+        + wf3.z * __bfloat162float(xb1[6])
+        + wf3.w * __bfloat162float(xb1[7]);
+}
+
 __device__ __forceinline__ float fp4_e2m1_group_scale(
     const uint8_t* __restrict__ scales,
     const float* __restrict__ global_scales,
@@ -955,11 +989,20 @@ __global__ void fp8_f32_block_gemv_batch_tiled_kernel(
             const int k = v * 16;
             const float scale =
                 fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+            // Decode the 16 fp8 weights ONCE (HBM read amortized via L1 + the
+            // fp8->fp32 conversion done once), then MAC against every batch
+            // column in the tile — the per-column re-decode is what made the
+            // naive tiled variant compute-bound at B>1.
+            const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight_row + k);
+            const float4 wf0 = static_cast<float4>(w4[0]);
+            const float4 wf1 = static_cast<float4>(w4[1]);
+            const float4 wf2 = static_cast<float4>(w4[2]);
+            const float4 wf3 = static_cast<float4>(w4[3]);
 #pragma unroll
             for (int b = 0; b < QWEN_GEMV_BATCH_TILE; ++b) {
                 if (b < tile_batches) {
                     const __nv_bfloat16* x_b = input + (int64_t)(batch_base + b) * K;
-                    sums[b] += scale * fp8_f32_dot16(weight_row + k, x_b + k);
+                    sums[b] += scale * dot16_with_decoded(wf0, wf1, wf2, wf3, x_b + k);
                 }
             }
         }
