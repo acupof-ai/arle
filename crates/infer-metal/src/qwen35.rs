@@ -1086,6 +1086,7 @@ impl CppQwen35Model {
         gdr_states: &mut [MlxArray],
         params: &infer_plan::SamplingParams,
         suppress_token_id: Option<u32>,
+        accept_topk: i32,
     ) -> Result<Qwen35VerifySummary> {
         let n_kv = kv_caches.len() as i32;
         let n_gdr = gdr_states.len() as i32;
@@ -1111,6 +1112,7 @@ impl CppQwen35Model {
                 params.temperature,
                 params.is_greedy(),
                 suppress_token_id.map_or(-1, |token_id| token_id as i32),
+                accept_topk,
                 &raw mut matched_prefix_len,
                 &raw mut next_token,
                 out_kv.as_mut_ptr(),
