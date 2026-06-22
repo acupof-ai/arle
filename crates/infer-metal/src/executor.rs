@@ -2642,10 +2642,21 @@ fn resolve_dflash(
         })?,
         _ => 4,
     };
+    let accept_topk = match std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<i32>()
+            .map_err(|err| {
+                anyhow::anyhow!("invalid INFER_METAL_DFLASH_ACCEPT_TOPK='{value}': {err}")
+            })?
+            .max(1),
+        _ => 1,
+    };
     let options = dflash::MetalDflashOptions {
         draft_model,
         speculative_tokens,
         max_rows,
+        accept_topk,
     };
     dflash::MetalDflashRuntime::load(&options, config).map(Some)
 }

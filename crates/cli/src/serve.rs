@@ -93,6 +93,13 @@ fn apply_metal_speculative_env(serve_args: &ServeArgs) {
             return;
         }
         std::env::remove_var("INFER_METAL_NO_SPECULATIVE");
+        // Acceptance width applies on both the explicit-draft and auto-resolve
+        // paths, so export it whenever speculation is active. Default 1 keeps the
+        // verify bit-identical to exact greedy.
+        std::env::set_var(
+            "INFER_METAL_DFLASH_ACCEPT_TOPK",
+            serve_args.spec_accept_topk.to_string(),
+        );
         if let Some(draft) = serve_args
             .draft_model
             .as_deref()
@@ -1158,6 +1165,7 @@ mod tests {
             std::env::remove_var("INFER_METAL_DFLASH_DRAFT_MODEL");
             std::env::remove_var("INFER_METAL_DFLASH_TOKENS");
             std::env::remove_var("INFER_METAL_NO_SPECULATIVE");
+            std::env::remove_var("INFER_METAL_DFLASH_ACCEPT_TOPK");
         };
 
         // Explicit draft + depth: both env vars set from the flags.
@@ -1173,6 +1181,8 @@ mod tests {
             "mlx-community/Qwen3.6-27B-MTP-4bit",
             "--speculative-tokens",
             "3",
+            "--spec-accept-topk",
+            "2",
         ]);
         apply_metal_speculative_env(&serve);
         assert_eq!(
@@ -1182,6 +1192,10 @@ mod tests {
         assert_eq!(
             std::env::var("INFER_METAL_DFLASH_TOKENS").as_deref(),
             Ok("3")
+        );
+        assert_eq!(
+            std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK").as_deref(),
+            Ok("2")
         );
         assert!(std::env::var("INFER_METAL_NO_SPECULATIVE").is_err());
 
@@ -1202,6 +1216,10 @@ mod tests {
             Ok("1")
         );
         assert!(std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").is_err());
+        assert!(
+            std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK").is_err(),
+            "--no-speculative short-circuits before exporting acceptance width"
+        );
 
         // No spec flags: no draft is exported (auto-resolve path), the disable
         // marker is cleared, and any pre-existing env draft survives as fallback.
@@ -1218,6 +1236,11 @@ mod tests {
         assert!(
             std::env::var("INFER_METAL_DFLASH_TOKENS").is_err(),
             "depth is not exported on the auto-resolve-only path"
+        );
+        assert_eq!(
+            std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK").as_deref(),
+            Ok("1"),
+            "acceptance width is always exported (default 1) when speculation is active"
         );
         clear();
     }

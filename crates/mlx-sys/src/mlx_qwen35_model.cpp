@@ -3349,6 +3349,7 @@ int32_t qwen35_compiled_verify_block_summary(
     float temperature,
     bool greedy,
     int32_t suppress_token_id,
+    int32_t accept_topk,
     int32_t* out_matched_prefix_len,
     int32_t* out_next_token,
     mlx_array** out_kv_caches,
@@ -3406,10 +3407,32 @@ int32_t qwen35_compiled_verify_block_summary(
         const int32_t* token_data = tokens.data<int32_t>();
 
         int32_t matched_prefix_len = 0;
-        int32_t drafted_len = block_size - 1;
-        while (matched_prefix_len < drafted_len &&
-               sampled_data[matched_prefix_len] == token_data[matched_prefix_len + 1]) {
-            matched_prefix_len += 1;
+        const int32_t drafted_len = block_size - 1;
+        if (accept_topk > 1) {
+            // Top-k acceptance (option A): accept a draft token iff it lies in the
+            // target's top-k for that position, then commit the DRAFT token. Lossy
+            // vs exact greedy spec-decode (deviates from target argmax) — a
+            // speed-vs-quality knob. Tie-robust: count tokens strictly greater than
+            // the draft's logit; in top-k iff that count < k.
+            const int32_t vocab = static_cast<int32_t>(logits.shape(-1));
+            const int32_t kk = std::min(accept_topk, vocab);
+            // logits may be [1, block_size, vocab]; normalise to [block_size, vocab].
+            auto logits2d = reshape(logits, {block_size, vocab});
+            auto draft_ids = reshape(slice(tokens, {1}, {block_size}), {drafted_len, 1});
+            auto logits_pref = slice(logits2d, {0, 0}, {drafted_len, vocab});
+            auto v_draft = take_along_axis(logits_pref, draft_ids, -1);
+            auto num_greater = sum(astype(greater(logits_pref, v_draft), int32), -1, false);
+            auto accept = astype(less(num_greater, array(kk)), int32);
+            eval(accept);
+            const int32_t* acc = accept.data<int32_t>();
+            while (matched_prefix_len < drafted_len && acc[matched_prefix_len] != 0) {
+                matched_prefix_len += 1;
+            }
+        } else {
+            while (matched_prefix_len < drafted_len &&
+                   sampled_data[matched_prefix_len] == token_data[matched_prefix_len + 1]) {
+                matched_prefix_len += 1;
+            }
         }
         *out_matched_prefix_len = matched_prefix_len;
         *out_next_token = sampled_data[matched_prefix_len];

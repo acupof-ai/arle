@@ -1091,6 +1091,7 @@ unsafe extern "C" {
         temperature: f32,
         greedy: bool,
         suppress_token_id: i32,
+        accept_topk: i32,
         out_matched_prefix_len: *mut i32,
         out_next_token: *mut i32,
         out_kv_caches: *mut *mut mlx_array,
