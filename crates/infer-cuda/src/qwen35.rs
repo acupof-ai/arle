@@ -1302,6 +1302,7 @@ impl Qwen35Model {
     /// snapshot scratch), sized from this rank's local shard widths and the
     /// requested draft depth. Snapshot scratch matches [`Self::new_slot_state`]'s
     /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
+    #[allow(dead_code)] // called by the executor spec-slot init in a later increment
     pub(crate) fn new_spec_slot_state(&self) -> Result<Qwen35SpecSlotState> {
         let c = &self.config;
         let num_full = c.num_full_attention_layers();
