@@ -164,6 +164,7 @@ def main():
     ap.add_argument("--distractor", choices=["uniform", "diverse"], default="uniform")
     ap.add_argument("--doc", default=None, help="real-content mode: file used as the context")
     ap.add_argument("--question", action="append", default=[], help="question(s) for --doc mode")
+    ap.add_argument("--agentic", action="store_true", help="multi-hop next-step decision over scattered rules")
     args = ap.parse_args()
     CFG.update(n_init=args.ninit, n_local=args.nlocal, l_bs=args.lbs, top_k=args.topk)
     diverse = args.distractor == "diverse"
@@ -173,6 +174,33 @@ def main():
     model, tok = load(args.model)
     print(f"loaded in {time.time()-t0:.1f}s", flush=True)
     modes = args.modes.split(",")
+
+    if args.agentic:
+        # 3-hop backward chain scattered across a diverse haystack. Correct next
+        # step requires combining ALL three rules: deploy<-smoke<-flag<-approval,
+        # so the FIRST action is "/approve in #ops". Tests multi-context synthesis.
+        rules = [
+            (0.25, "DEPLOY POLICY: the production deploy command `ship prod` is rejected unless a staging smoke test has passed within the last 2 hours."),
+            (0.50, "SMOKE POLICY: the staging smoke test cannot start until the `new_pipeline` feature flag is turned ON in the config service."),
+            (0.75, "FLAG POLICY: turning ON any feature flag in the config service first requires an approval token, obtained by running `/approve` in the #ops channel."),
+        ]
+        avg = sum(len(tok.encode(s + " ")) for s in DISTRACTORS) // len(DISTRACTORS)
+        unit = max(1, args.ctx // avg)
+        sents = [DISTRACTORS[i % len(DISTRACTORS)] + " " for i in range(unit)]
+        for d, txt in rules:
+            sents[min(unit - 1, int(unit * d))] += f"\n\n{txt}\n\n"
+        q = ("I need to deploy to production right now. Nothing has been set up yet. "
+             "What is the single FIRST concrete action I must take? Answer in one sentence.")
+        body = "".join(sents) + "\n\n" + q
+        prompt = tok.apply_chat_template([{"role": "user", "content": body}],
+                                         add_generation_prompt=True, tokenize=False, enable_thinking=False)
+        ntok = len(tok.encode(prompt))
+        print(f"agentic 3-hop (rules @0.25/0.5/0.75) | ctx~{ntok} | correct: run /approve in #ops", flush=True)
+        for mode in modes:
+            CFG["mode"] = mode
+            out = run(model, tok, prompt, max_tokens=120)
+            print(f"  [{mode:<6} kv={KV_ATTENDED.get(mode,'?'):>6}/layer] {out.strip()[:240]!r}", flush=True)
+        return
 
     if args.doc:
         # Real-content mode: hard comprehension questions over a real long doc.
