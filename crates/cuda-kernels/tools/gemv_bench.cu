@@ -267,8 +267,11 @@ int main(int argc, char** argv) {
     unsigned char* d_flush = nullptr;
     CUDA_CHECK(cudaMalloc(&d_flush, flush_bytes));
 
-    // Qwen3.6-27B decode GEMV shapes, B=1, block_m = block_k = 128.
-    const int B = 1;
+    // Qwen3.6-27B decode GEMV shapes, block_m = block_k = 128.
+    // B (batch / spec-verify width) is argv[2] (default 1 = no-spec decode);
+    // sweep e.g. `gemv_bench 4000 1`, `... 4000 2`, `... 4000 5` to see how the
+    // GEMV scales with the spec-decode verify batch.
+    const int B = (argc > 2) ? std::max(1, atoi(argv[2])) : 1;
     const int block_m = 128;
     const int block_k = 128;
     const Shape shapes[] = {
@@ -302,7 +305,7 @@ int main(int argc, char** argv) {
         // ---------------- Host init ----------------
         std::vector<uint8_t> h_weight(weight_elems);
         std::vector<float> h_scales(scale_elems);
-        std::vector<__nv_bfloat16> h_input(K);
+        std::vector<__nv_bfloat16> h_input((size_t)K * B);
 
         // Deterministic LCG byte pattern mapped to a SAFE FP8 E4M3 value:
         //   b in [1, 120], then keep |code & 0x7f| in [1, 0x7e] (avoid 0/NaN/Inf),
@@ -325,8 +328,8 @@ int main(int argc, char** argv) {
             h_scales[i] = (float)(1.0 + (frac - 0.5) * 0.2);  // [0.9, 1.1)
         }
 
-        // Input bf16 pseudo-random in [-1, 1].
-        for (int k = 0; k < K; ++k) {
+        // Input bf16 pseudo-random in [-1, 1], B independent columns.
+        for (size_t k = 0; k < (size_t)K * B; ++k) {
             rng = rng * 6364136223846793005ull + 1442695040888963407ull;
             double frac = (double)((rng >> 11) & 0xFFFFF) / (double)0xFFFFF;  // [0,1)
             h_input[k] = __float2bfloat16((float)(frac * 2.0 - 1.0));
@@ -340,24 +343,28 @@ int main(int argc, char** argv) {
         __nv_bfloat16* d_ref = nullptr;
         CUDA_CHECK(cudaMalloc(&d_weight, weight_elems * sizeof(uint8_t)));
         CUDA_CHECK(cudaMalloc(&d_scales, scale_elems * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_input, (size_t)K * sizeof(__nv_bfloat16)));
-        CUDA_CHECK(cudaMalloc(&d_out, (size_t)N * sizeof(__nv_bfloat16)));
-        CUDA_CHECK(cudaMalloc(&d_ref, (size_t)N * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&d_input, (size_t)K * B * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&d_out, (size_t)N * B * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&d_ref, (size_t)N * B * sizeof(__nv_bfloat16)));
 
         CUDA_CHECK(cudaMemcpy(d_weight, h_weight.data(),
                               weight_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_scales, h_scales.data(),
                               scale_elems * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_input, h_input.data(),
-                              (size_t)K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+                              (size_t)K * B * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
         // ---------------- Reference (oracle) ----------------
         {
             const int threads = 128;
             const int blocks = (N + threads - 1) / threads;
-            gemv_reference_kernel<<<blocks, threads>>>(
-                d_weight, d_scales, d_input, d_ref, N, K, scale_rows, scale_cols,
-                block_m, block_k);
+            // Oracle per batch column (batch-major output [B, N], matching the
+            // optimized kernel's output[batch_idx*N + row]).
+            for (int b = 0; b < B; ++b) {
+                gemv_reference_kernel<<<blocks, threads>>>(
+                    d_weight, d_scales, d_input + (size_t)b * K, d_ref + (size_t)b * N,
+                    N, K, scale_rows, scale_cols, block_m, block_k);
+            }
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -370,14 +377,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // ---------------- D2H + correctness ----------------
-        std::vector<__nv_bfloat16> h_out(N), h_ref(N);
-        CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, (size_t)N * sizeof(__nv_bfloat16),
+        std::vector<__nv_bfloat16> h_out((size_t)N * B), h_ref((size_t)N * B);
+        CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, (size_t)N * B * sizeof(__nv_bfloat16),
                               cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_ref.data(), d_ref, (size_t)N * sizeof(__nv_bfloat16),
+        CUDA_CHECK(cudaMemcpy(h_ref.data(), d_ref, (size_t)N * B * sizeof(__nv_bfloat16),
                               cudaMemcpyDeviceToHost));
 
         double dot = 0.0, na = 0.0, nb = 0.0, max_err = 0.0;
-        for (int i = 0; i < N; ++i) {
+        for (int i = 0; i < N * B; ++i) {
             double a = (double)__bfloat162float(h_out[i]);
             double b = (double)__bfloat162float(h_ref[i]);
             dot += a * b;
