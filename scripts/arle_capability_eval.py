@@ -667,29 +667,36 @@ def run_gsm8k(
 
 MATH500_PROMPT_TEMPLATE = (
     "Problem:\n{problem}\n\n"
-    "Solve the problem. Put the final answer in \\boxed{{}}.\n"
+    "Solve the problem. Put the final answer in \\boxed{{}}. "
+    "Do not write anything after the boxed answer.\n"
     "Solution:\n"
 )
 
 
 def _extract_last_braced(text: str, marker: str) -> str | None:
-    start = text.rfind(marker)
-    if start < 0:
-        return None
-    i = start + len(marker)
-    depth = 1
-    out: list[str] = []
-    while i < len(text):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return "".join(out).strip()
-        out.append(ch)
-        i += 1
-    return None
+    last: str | None = None
+    start = 0
+    while True:
+        pos = text.find(marker, start)
+        if pos < 0:
+            return last
+        i = pos + len(marker)
+        depth = 1
+        out: list[str] = []
+        while i < len(text):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = "".join(out).strip()
+                    if candidate:
+                        last = candidate
+                    break
+            out.append(ch)
+            i += 1
+        start = pos + len(marker)
 
 
 def _math_normalize_answer(answer: str) -> str:
@@ -697,7 +704,7 @@ def _math_normalize_answer(answer: str) -> str:
     boxed = _extract_last_braced(s, "\\boxed{")
     if boxed is not None:
         s = boxed
-    s = s.strip("$")
+    s = s.replace("\\$", "").strip("$")
     for old, new in (
         ("\\left", ""),
         ("\\right", ""),
@@ -753,18 +760,29 @@ def run_math500(
     seed: int | None = None,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     max_tokens: int = 4096,
+    local_jsonl: Path | None = None,
 ) -> dict:
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        return {
-            "task": "math500",
-            "status": "skipped",
-            "reason": "datasets package not installed; pip install datasets",
-        }
-
     print("[math500] loading dataset...", flush=True)
-    ds_test = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=dataset_revision)
+    if local_jsonl is not None:
+        ds_test = [
+            json.loads(line)
+            for line in local_jsonl.read_text().splitlines()
+            if line.strip()
+        ]
+        dataset_name = str(local_jsonl)
+        split = "jsonl"
+    else:
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            return {
+                "task": "math500",
+                "status": "skipped",
+                "reason": "datasets package not installed; pip install datasets",
+            }
+        ds_test = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=dataset_revision)
+        dataset_name = "HuggingFaceH4/MATH-500"
+        split = "test"
     indices = list(range(len(ds_test)))
     if seed is not None:
         random.Random(f"math500-{seed}").shuffle(indices)
@@ -808,6 +826,7 @@ def run_math500(
             "predicted": pred,
             "correct": pred == gold if pred is not None else False,
             "status": status,
+            "response": resp,
         })
         if i < debug_samples:
             debug_records.append(
@@ -834,8 +853,8 @@ def run_math500(
         "schema_version": SCRIPT_SCHEMA_VERSION,
         "final_result_contract": FINAL_RESULT_CONTRACT,
         "dataset": {
-            "name": "HuggingFaceH4/MATH-500",
-            "split": "test",
+            "name": dataset_name,
+            "split": split,
             "revision": dataset_revision,
             "sample_fingerprint": sample_fingerprint,
         },
@@ -918,6 +937,7 @@ def _run_suite_once(args: argparse.Namespace, client, requested: list[str], outp
                 seed=seed,
                 dataset_revision=args.math500_revision,
                 max_tokens=args.math_max_tokens,
+                local_jsonl=args.math500_jsonl,
             )
         else:
             report = TASK_RUNNERS[task](client, args.n_samples, output_dir, seed=seed)
@@ -979,6 +999,8 @@ def main(argv: list[str]) -> int:
                         help="Hugging Face revision for openai/gsm8k")
     parser.add_argument("--math500-revision", default=os.environ.get("ARLE_MATH500_REVISION", DEFAULT_DATASET_REVISION),
                         help="Hugging Face revision for HuggingFaceH4/MATH-500")
+    parser.add_argument("--math500-jsonl", type=Path, default=os.environ.get("ARLE_MATH500_JSONL"),
+                        help="local MATH-500 jsonl; avoids Hugging Face network access")
     parser.add_argument("--output", type=Path, required=True, help="output directory for per-task reports")
     args = parser.parse_args(argv)
 
