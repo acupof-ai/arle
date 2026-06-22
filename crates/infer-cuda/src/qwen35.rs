@@ -2827,8 +2827,9 @@ impl Qwen35Model {
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
-        // Capture ALL rows' raw trunk hidden ([seq_len, hidden] token-major) before
-        // the lm-head norm overwrites the workspace.
+        // Capture ALL rows' raw (pre-final-norm) trunk hidden into an owned
+        // [seq_len, hidden] (token-major) buffer — the spec step seeds the next
+        // block's level-0 draft from the accepted row's hidden.
         let mut hiddens = DeviceVec::zeros(&self.ctx, seq_len * hidden_size)?;
         {
             let hidden = ws.hidden.get(&self.ctx, hidden_size, seq_len)?;
@@ -3024,6 +3025,14 @@ impl Qwen35Model {
         depth: usize,
     ) -> Result<(Vec<u32>, u32, DeviceVec)> {
         ensure!(depth >= 1, "spec_step requires depth >= 1, got {depth}");
+        // The MTP head KV (spec.head_k/head_v) was sized (spec_draft_tokens+1)
+        // rows by new_spec_slot_state; a depth beyond that would overflow the
+        // head KV in mtp_forward_level (row = level, 0..depth-1). Guard it.
+        ensure!(
+            depth <= self.spec_draft_tokens.max(1),
+            "spec_step depth {depth} exceeds the MTP head KV capacity (model built for {} draft tokens)",
+            self.spec_draft_tokens.max(1)
+        );
         ensure!(
             slot.seq_len() == start_pos,
             "spec_step entry seq_len {} != start_pos {start_pos}",
