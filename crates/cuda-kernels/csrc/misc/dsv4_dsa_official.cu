@@ -17,7 +17,7 @@
  * SGLang / sgl-kernel:
  *   - dsv4_fused_q_indexer_rope_hadamard_quant
  *   - fused_store_index_k_cache
- *   - deepseek_v4_topk_transform_512
+ *   - deepseek_v4_topk_transform_512  (exported as dsv4_deepseek_v4_topk_transform_cuda)
  *
  * The kernel bodies below are direct ports of those OSS kernels with Torch/TVM
  * wrappers replaced by ARLE's raw CUDA ABI.
@@ -296,7 +296,9 @@ __global__ void fused_store_indexer_cache_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// SGLang deepseek_v4_topk_transform_512, raw C ABI.
+// SGLang deepseek_v4_topk_transform_512 port, raw C ABI. Our symbol drops the
+// `_512` suffix: `topk` is a runtime arg (`params.topk`, ≤ kMaxTopK=1024), NOT
+// fixed at 512 — upstream only baked the canonical CSA k into the name.
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kMaxTopK = 1024;
@@ -601,7 +603,7 @@ extern "C" CUresult dsv4_dsa_fused_store_index_k_cache_cuda(
   return static_cast<CUresult>(cudaGetLastError());
 }
 
-extern "C" CUresult dsv4_deepseek_v4_topk_transform_512_cuda(
+extern "C" CUresult dsv4_deepseek_v4_topk_transform_cuda(
     const float* scores,
     const int32_t* seq_lens,
     const int32_t* page_table,
