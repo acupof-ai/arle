@@ -6233,6 +6233,148 @@ mod tests {
         validate_qwen35_cuda_config(&cfg).unwrap();
     }
 
+    /// First index where two token streams differ (or the shorter length).
+    fn first_divergence(a: &[u32], b: &[u32]) -> usize {
+        a.iter()
+            .zip(b.iter())
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()))
+    }
+
+    /// On-GPU correctness gate + perf A/B for the depth-1 NextN-MTP spec decode.
+    ///
+    /// Gated by `INFER_MTP_BENCH=1` (a no-op otherwise, so CI stays green). Run on
+    /// a CUDA box with the 27B-FP8 checkpoint:
+    /// ```text
+    /// INFER_MTP_BENCH=1 INFER_MTP_MODEL=/data01/models/Qwen3.6-27B-FP8 \
+    ///   INFER_MTP_PROMPT_IDS="<comma-separated real prompt token ids>" \
+    ///   cargo test -p infer-cuda --release --features cuda \
+    ///   mtp_spec_decode_gate_and_bench -- --ignored --nocapture
+    /// ```
+    /// Correctness (MoE → token-exact is confounded by atomic-scatter
+    /// non-determinism, per the KV parity gate): run greedy no-spec TWICE to
+    /// measure the self-consistency floor, then assert spec greedy diverges from
+    /// the no-spec reference NO EARLIER than that floor. Perf: same binary, same
+    /// prompt, same token budget — clean in-process A/B (no HTTP/scheduler noise).
+    #[test]
+    #[ignore = "GPU + 27B-FP8 checkpoint; opt in via INFER_MTP_BENCH=1"]
+    fn mtp_spec_decode_gate_and_bench() {
+        use std::time::Instant;
+        if std::env::var("INFER_MTP_BENCH").is_err() {
+            return;
+        }
+        let path = std::env::var("INFER_MTP_MODEL")
+            .unwrap_or_else(|_| "/data01/models/Qwen3.6-27B-FP8".to_string());
+        let prompt: Vec<u32> = std::env::var("INFER_MTP_PROMPT_IDS")
+            .expect("INFER_MTP_PROMPT_IDS (comma-separated token ids) required")
+            .split(',')
+            .map(|s| s.trim().parse::<u32>().expect("token id"))
+            .collect();
+        let n_decode: usize = std::env::var("INFER_MTP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
+        let max_seq = (prompt.len() + n_decode + 8).next_power_of_two().max(2048);
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            top_k: -1,
+            ..Default::default()
+        };
+
+        let model = Qwen35Model::from_safetensors(Path::new(&path), max_seq, Some(1))
+            .expect("load Qwen3.6-27B-FP8 with MTP head");
+
+        // Greedy no-spec: prefill the prompt, then decode `n_decode` tokens.
+        let run_nospec = || -> (Vec<u32>, f64) {
+            let mut slot = model.new_slot_state().unwrap();
+            let mut ws = Qwen35Workspace::new();
+            let mut out = Vec::with_capacity(n_decode);
+            let mut tok = model
+                .forward_tokens(&mut slot, &mut ws, &prompt, 0, &greedy, 0)
+                .unwrap();
+            out.push(tok);
+            model.ctx.sync().unwrap();
+            let t0 = Instant::now();
+            for step in 1..n_decode {
+                let sp = slot.seq_len();
+                tok = model
+                    .forward_tokens(&mut slot, &mut ws, &[tok], sp, &greedy, step as u64)
+                    .unwrap();
+                out.push(tok);
+            }
+            model.ctx.sync().unwrap();
+            (out, t0.elapsed().as_secs_f64())
+        };
+
+        // Spec: prefill seeds (pending, hidden), then loop spec_step_depth1.
+        let run_spec = || -> (Vec<u32>, f64, usize, usize) {
+            let mut slot = model.new_slot_state().unwrap();
+            let mut spec = model.new_spec_slot_state().unwrap();
+            let mut ws = Qwen35Workspace::new();
+            // Prefill returns the next token's logits + the producing hidden.
+            let (logits, dims, mut hidden) = model
+                .forward_tokens_with_hidden(&mut slot, &mut ws, &prompt, 0)
+                .unwrap();
+            let vocab = dims[1];
+            let host = logits.to_host(&model.ctx).unwrap();
+            // The prefill's last-row argmax IS the first decoded token = the seed
+            // `pending`; `hidden` is its producing trunk hidden (last prompt row).
+            let mut pending = argmax_row(&host[(dims[0] - 1) * vocab..dims[0] * vocab]);
+            let mut out = vec![pending];
+            let mut accepts = 0usize;
+            let mut steps = 0usize;
+            model.ctx.sync().unwrap();
+            let t0 = Instant::now();
+            while out.len() < n_decode {
+                let sp = slot.seq_len();
+                let (emitted, next_pending, next_hidden) = model
+                    .spec_step_depth1(&mut slot, &mut spec, &mut ws, pending, &hidden, sp)
+                    .unwrap();
+                if emitted.len() >= 2 {
+                    accepts += 1;
+                }
+                steps += 1;
+                out.extend_from_slice(&emitted);
+                pending = next_pending;
+                hidden = next_hidden;
+            }
+            model.ctx.sync().unwrap();
+            (out, t0.elapsed().as_secs_f64(), accepts, steps)
+        };
+
+        let (ref1, _) = run_nospec();
+        let (ref2, t_nospec) = run_nospec();
+        let floor = first_divergence(&ref1, &ref2);
+
+        let (spec_out, t_spec, accepts, steps) = run_spec();
+        let spec_div = first_divergence(&ref1, &spec_out);
+
+        let n = n_decode as f64;
+        eprintln!(
+            "[mtp-bench] no-spec {:.1} tok/s ({:.3}s/{} tok) | spec {:.1} tok/s ({:.3}s) | speedup {:.2}x | accept_rate {}/{} = {:.1}%",
+            n / t_nospec,
+            t_nospec,
+            n_decode,
+            n / t_spec,
+            t_spec,
+            t_nospec / t_spec,
+            accepts,
+            steps,
+            100.0 * accepts as f64 / steps.max(1) as f64,
+        );
+        eprintln!(
+            "[mtp-gate] MoE self-consistency floor: no-spec runs diverge @{floor}/{} | spec-vs-ref diverge @{spec_div}/{}",
+            ref1.len(),
+            ref1.len(),
+        );
+        // Spec is correct iff it tracks the no-spec reference at least as far as
+        // two no-spec runs track each other (the MoE non-determinism floor).
+        assert!(
+            spec_div >= floor,
+            "MTP spec greedy diverged from no-spec @{spec_div} BEFORE the MoE floor @{floor} — real spec bug, not non-determinism"
+        );
+    }
+
     #[test]
     fn cuda_qwen35_guard_rejects_unknown_full_attention_head_dim() {
         let mut cfg = qwen35_dense_4b_config();
