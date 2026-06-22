@@ -27,6 +27,9 @@ pub(crate) struct MetalDflashOptions {
     pub(crate) draft_model: String,
     pub(crate) speculative_tokens: Option<usize>,
     pub(crate) max_rows: usize,
+    /// Spec-decode acceptance width: accept a draft token if it lies in the
+    /// target's top-k for that position (1 = exact greedy, bit-identical).
+    pub(crate) accept_topk: i32,
 }
 
 impl MetalDflashOptions {
@@ -51,6 +54,7 @@ impl MetalDflashOptions {
 
 pub(crate) struct MetalDflashRuntime {
     block_size: usize,
+    accept_topk: i32,
     mask_token_id: u32,
     max_rows: usize,
     target_layer_ids: Vec<usize>,
@@ -106,6 +110,7 @@ impl MetalDflashRuntime {
         );
         Ok(Self {
             block_size,
+            accept_topk: options.accept_topk.max(1),
             mask_token_id: draft_config.mask_token_id,
             max_rows: options.max_rows,
             target_layer_ids: draft_config.target_layer_ids.clone(),
@@ -113,6 +118,10 @@ impl MetalDflashRuntime {
             _draft_weights: draft_weights,
             draft_cpp_model,
         })
+    }
+
+    pub(crate) fn accept_topk(&self) -> i32 {
+        self.accept_topk
     }
 
     pub(crate) fn block_size(&self) -> usize {
@@ -924,6 +933,7 @@ pub(crate) fn qwen35_speculative_block(
             target_gdr_flat,
             params,
             Some(runtime.mask_token_id()),
+            runtime.accept_topk(),
         )
         .map_err(|err| anyhow::anyhow!("DFlash target verify summary failed: {err:#}"))?;
     let t_verify = Instant::now();
