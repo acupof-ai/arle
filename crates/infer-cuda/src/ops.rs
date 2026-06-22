@@ -471,3 +471,50 @@ pub(crate) fn argmax_into(
         .map_err(|e| anyhow!("D2H argmax token failed: {e}"))?;
     Ok(token[0] as u32)
 }
+
+/// On-device argmax over ONE row of a `[seq, vocab]` bf16 logits buffer, into a
+/// caller-provided 1-element scratch. The spec-decode verify needs the argmax of
+/// each verify row WITHOUT a full `[seq, vocab]` D2H + host scan — this offsets
+/// the device pointer to `row * vocab` and argmaxes `vocab` elements on-device
+/// (only the 1-int result crosses to the host), the same fused kernel the
+/// steady-state decode sampler uses.
+pub(crate) fn argmax_row_into(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    row: usize,
+    vocab: usize,
+    out: &mut CudaSlice<i32>,
+) -> Result<u32> {
+    ensure!(
+        out.len() == 1,
+        "argmax scratch must be one i32, got {}",
+        out.len()
+    );
+    ensure!(
+        (row + 1) * vocab <= logits.len,
+        "argmax_row_into row {row} (vocab {vocab}) exceeds logits len {}",
+        logits.len
+    );
+    {
+        let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+        let row_ptr = logits_ptr + (row * vocab * std::mem::size_of::<ffi::Half>()) as u64;
+        let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+        // SAFETY: row_ptr is within `logits` (bounds-checked above); argmax_cuda
+        // reads `vocab` bf16 elements from it and writes one i32.
+        unsafe {
+            ffi::argmax_cuda(
+                row_ptr as *const ffi::Half,
+                out_ptr as *mut i32,
+                vocab as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    ctx.sync()?;
+    let token = ctx
+        .stream
+        .clone_dtoh(out)
+        .map_err(|e| anyhow!("D2H argmax row token failed: {e}"))?;
+    Ok(token[0] as u32)
+}
