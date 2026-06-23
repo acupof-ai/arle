@@ -124,8 +124,7 @@ cudaError_t conv1d_prefill_cuda(
     }
     // Ring update only after every (channel, position) thread has consumed the
     // previous state (same-stream ordering). Launched here, inside the
-    // launcher, so every consumer — including the per-request delegation in
-    // conv1d_prefill_packed_batch_cuda — keeps the original FFI contract
+    // launcher, so every consumer keeps the original FFI contract
     // "state is advanced when the call's stream work completes".
     int state_blocks = (num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_state_update_kernel<<<state_blocks, CONV1D_BLOCK, 0, stream>>>(

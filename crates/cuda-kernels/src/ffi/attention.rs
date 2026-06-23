@@ -1,27 +1,6 @@
 use super::{CUresult, CUstream, Half};
 
-#[allow(dead_code)]
 unsafe extern "C" {
-    pub fn prefill_attention_prep_cuda(
-        q_batch: *mut Half,
-        k_batch: *mut Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        start_pos: i32,
-        max_seq_len: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn prefill_attention_paged_prep_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
@@ -63,28 +42,6 @@ unsafe extern "C" {
         rotary_dim: i32,
         rms_eps: f32,
         max_seq_len: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn prefill_attention_paged_prep_hd256_cuda(
-        q_full_batch: *const Half,
-        q_out_batch: *mut Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        page_table: *const i32,
-        page_size: i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        start_pos_ptr: *const i32,
-        rotary_dim: i32,
-        rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -131,36 +88,6 @@ unsafe extern "C" {
         num_qheads: i32,
         head_dim: i32,
         batch_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn fused_gqa_attention_decode(
-        q_full: *const Half,
-        k_full: *const Half,
-        v_full: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache_base: *const Half,
-        sin_cache_base: *const Half,
-        decode_meta: *const i32,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        num_qheads: i32,
-        num_kvheads: i32,
-        gqa_ratio: i32,
-        max_seq_len: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn attention_decode_reduce(
-        partial_out: *mut f32,
-        partial_m: *mut f32,
-        partial_l: *mut f32,
-        output: *mut Half,
-        num_qheads: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -222,32 +149,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// Fused QKV variant: reads Q/K/V from merged buffer, writes RoPE'd Q to
-    /// separate output. Eliminates the split_qkv kernel launch.
-    pub fn decode_prep_paged_fused_qkv_cuda(
-        qkv_batch: *const Half,
-        q_out: *mut Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        positions: *const i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        page_table: *const i32,
-        page_indptr: *const i32,
-        last_page_len: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        stride_page: i32,
-        batch_size: i32,
-        rms_eps: f32,
-        qkv_stride: i32,
-        q_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn paged_kv_append_last_token_indices_cuda(
         kv_indices: *mut i32,
         kv_indptr: *const i32,
@@ -262,39 +163,6 @@ unsafe extern "C" {
         next_kv_indptr: *const i32,
         append_indptr: *const i32,
         appended_page_indices: *const i32,
-        batch_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn decode_prep_paged_hd256_cuda(
-        q_full_batch: *const Half,
-        q_out_batch: *mut Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        positions: *const i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        page_table: *const i32,
-        page_indptr: *const i32,
-        last_page_len: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        stride_page: i32,
-        batch_size: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn attention_gate_paged_hd256_cuda(
-        q_full_batch: *const Half,
-        attn_out: *mut Half,
-        num_q_heads: i32,
         batch_size: i32,
         stream: CUstream,
     ) -> CUresult;
