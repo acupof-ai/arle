@@ -11,6 +11,18 @@ use anyhow::bail;
 
 use crate::{KvAllocator, KvPrefixStore, KvQuery};
 
+/// Logical-page slot marker for a page that has been **evict-dropped** out of
+/// HBM under the write-through tiered KV model (`KvAllocator::evict_slot_page`).
+///
+/// A recall slot keeps its `slot_pages` vector at full *logical* length (one
+/// entry per `ceil(seq_len / page_size)` page) so that token positions still map
+/// to the right logical page index; an evicted middle page leaves this sentinel
+/// in its logical slot while its physical page id is returned to the free pool.
+/// The sentinel never names a real page (`total_pages` is far below `u32::MAX`),
+/// and it only ever appears on the opt-in recall path — the default decode path
+/// has byte-identical contiguous `slot_pages` with no sentinels.
+pub const EVICTED_PAGE: u32 = u32::MAX;
+
 /// Host-side paged KV bookkeeping for a backend executor.
 ///
 /// Pages are logical `u32` ids. The executor decides how those ids map to
@@ -53,6 +65,13 @@ impl HostPagedKvPool {
     }
 
     fn reclaim_page(&mut self, page: u32) {
+        // An evict-dropped logical slot holds the sentinel, not a live page: its
+        // physical page was already returned to `free` at evict time, so freeing a
+        // slot/range that still carries the sentinel must skip it (never push it
+        // back — that would corrupt the free stack).
+        if page == EVICTED_PAGE {
+            return;
+        }
         if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
             self.free.push(page);
         }
@@ -163,10 +182,26 @@ impl KvAllocator for HostPagedKvPool {
         };
         let taken = std::mem::take(pages);
         for page in taken {
+            // `reclaim_page` skips the evict sentinel (already freed at evict time).
             self.reclaim_page(page);
         }
         self.slot_len[slot] = 0;
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
+    }
+
+    fn evict_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+        let pages = self.slot_pages.get_mut(slot)?;
+        let page = *pages.get(logical_page)?;
+        // Already evicted (sentinel) or retained by the prefix store (a pinned
+        // sink page lives in the radix) → not a free-able middle page.
+        if page == EVICTED_PAGE || self.page_refs.get(&page).copied().unwrap_or(0) != 0 {
+            return None;
+        }
+        // Keep the logical length intact so token→logical-page mapping stays
+        // valid for the surviving pages; the physical page goes back to the pool.
+        pages[logical_page] = EVICTED_PAGE;
+        self.free.push(page);
+        Some(page)
     }
 
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
@@ -290,5 +325,91 @@ mod tests {
         assert_eq!(pool.page_indices(0).len(), 1);
         assert_eq!(pool.seq_len(0), 16);
         assert_eq!(pool.free_pages(), 7);
+    }
+
+    #[test]
+    fn evict_slot_page_returns_real_page_and_keeps_logical_length() {
+        // 4 pages allocated (page_size 16, 64 tokens). Evict the logical middle
+        // page (index 1): the physical page returns to the free pool, the logical
+        // slot keeps length 4 (sentinel in the freed slot), seq_len is unchanged.
+        let mut pool = HostPagedKvPool::new(1, 8, 16);
+        pool.alloc(0, 64).unwrap();
+        let pages: Vec<u32> = pool.page_indices(0).to_vec();
+        assert_eq!(pages.len(), 4);
+        let free_before = pool.free_pages();
+        let freed = pool.evict_slot_page(0, 1).expect("middle page evicts");
+        assert_eq!(
+            freed, pages[1],
+            "returned the physical page that was at logical 1"
+        );
+        // The physical page actually came back to the pool (the VRAM win).
+        assert_eq!(pool.free_pages(), free_before + 1, "page freed to the pool");
+        // Logical length intact so surviving pages stay logically addressable.
+        assert_eq!(pool.page_indices(0).len(), 4);
+        assert_eq!(pool.page_indices(0)[1], EVICTED_PAGE);
+        assert_eq!(pool.page_indices(0)[0], pages[0]);
+        assert_eq!(pool.page_indices(0)[2], pages[2]);
+        assert_eq!(pool.seq_len(0), 64);
+        // Re-evicting the same logical page is a no-op (already a sentinel).
+        assert_eq!(pool.evict_slot_page(0, 1), None);
+        assert_eq!(pool.free_pages(), free_before + 1);
+        // free_slot must not double-free the sentinel slot.
+        pool.free_slot(0);
+        assert_eq!(
+            pool.free_pages(),
+            8,
+            "all live pages back, sentinel not double-freed"
+        );
+    }
+
+    #[test]
+    fn evicting_middle_pages_keeps_resident_set_bounded_as_session_grows() {
+        // The flat-VRAM invariant at the allocator level: as the session grows,
+        // evicting the coldest middle page each time a new page rolls keeps the
+        // number of physically-resident pages bounded, even though the logical
+        // length (and the logical slot-page count) climbs without limit.
+        let total_pages = 64;
+        let mut pool = HostPagedKvPool::new(1, total_pages, 16);
+        let budget_pages = 8; // sink(1) + local-ish window; just a bound to prove.
+        let mut resident_high_water = 0usize;
+        // Grow to 50 pages' worth of tokens, evicting to stay within budget.
+        for page_no in 0..50 {
+            pool.alloc(0, 16).unwrap(); // one fresh page each iteration
+            let logical = pool.page_indices(0).len();
+            assert_eq!(logical, page_no + 1, "logical length climbs every step");
+            // Count physically-resident (non-sentinel) pages.
+            let resident = pool
+                .page_indices(0)
+                .iter()
+                .filter(|&&p| p != EVICTED_PAGE)
+                .count();
+            resident_high_water = resident_high_water.max(resident);
+            // Over budget → evict the oldest still-resident non-pinned middle page
+            // (logical index 1; logical 0 is the "sink" we keep), proving the
+            // page is RELEASED, not merely un-attended.
+            if resident > budget_pages {
+                let evict_at = (1..logical)
+                    .find(|&i| pool.page_indices(0)[i] != EVICTED_PAGE)
+                    .expect("a resident middle page to evict");
+                let freed = pool.evict_slot_page(0, evict_at);
+                assert!(freed.is_some(), "a real page was freed");
+            }
+        }
+        // Resident set stayed bounded near the budget despite a 50-page session.
+        assert!(
+            resident_high_water <= budget_pages + 1,
+            "resident pages {resident_high_water} stayed bounded near budget {budget_pages}"
+        );
+        // And the pool still has plenty of free pages — HBM did not grow with history.
+        let resident_now = pool
+            .page_indices(0)
+            .iter()
+            .filter(|&&p| p != EVICTED_PAGE)
+            .count();
+        assert!(resident_now <= budget_pages + 1);
+        assert!(
+            pool.free_pages() >= total_pages - budget_pages - 1,
+            "freed pages returned to the pool (flat VRAM)"
+        );
     }
 }

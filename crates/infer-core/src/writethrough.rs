@@ -290,6 +290,63 @@ mod tests {
     }
 
     #[test]
+    fn evict_drop_keeps_resident_page_set_bounded_as_session_grows() {
+        // The flat-VRAM invariant expressed at the policy level: simulate a slot
+        // whose physical page set is the working set, growing the logical length
+        // one page at a time and RELEASING (not just un-attending) the coldest
+        // unpinned page whenever the resident set exceeds the page budget. The
+        // number of physically-resident pages must stay bounded, even as the
+        // session grows to hundreds of pages.
+        let page_size = 16usize;
+        let c = cfg(16, 64, 16, 4); // sink 1 page, local 4 pages, k=4 -> budget ~9 pages
+        let budget_pages = c.working_set_tokens().div_ceil(page_size); // 9
+        // The slot's physically-resident pages, in temporal order. Each entry is a
+        // physical page id; we model a release by removing the entry entirely
+        // (the page went back to the pool) — NOT by leaving it resident.
+        let mut resident: Vec<u32> = Vec::new();
+        let mut access: Vec<u64> = Vec::new();
+        let mut high_water = 0usize;
+        for step in 0..400usize {
+            // A new page rolls every `page_size` tokens; here one per step. The
+            // physical page id is the step number (each step mints a fresh page).
+            resident.push(step as u32);
+            access.push(step as u64);
+            let cache_len = (step + 1) * page_size;
+            high_water = high_water.max(resident.len());
+            let drop = evict_drop_pages(&resident, &access, page_size, cache_len, budget_pages, &c);
+            // Actually RELEASE the dropped pages from the resident set (the win):
+            // remove them so the resident vector shrinks, proving they are freed,
+            // not merely excluded from attention.
+            if !drop.is_empty() {
+                let drop_set: std::collections::HashSet<u32> = drop.iter().copied().collect();
+                let kept: Vec<(u32, u64)> = resident
+                    .iter()
+                    .copied()
+                    .zip(access.iter().copied())
+                    .filter(|(p, _)| !drop_set.contains(p))
+                    .collect();
+                resident = kept.iter().map(|&(p, _)| p).collect();
+                access = kept.iter().map(|&(_, a)| a).collect();
+            }
+            assert!(
+                resident.len() <= budget_pages,
+                "step {step}: resident {} exceeded budget {budget_pages} (page not freed)",
+                resident.len()
+            );
+        }
+        // Over 400 pages of history the resident set never grew past the budget.
+        assert_eq!(
+            resident.len(),
+            budget_pages,
+            "resident set converged to exactly the page budget"
+        );
+        assert!(
+            high_water <= budget_pages + 1,
+            "resident high-water {high_water} stayed at the budget (+1 transient) despite a 400-page session"
+        );
+    }
+
+    #[test]
     fn plan_working_set_is_budget_bounded() {
         // Bridge stays consistent with plan_recall: the working set stays constant
         // vs history (the whole point). The exact token_count can exceed

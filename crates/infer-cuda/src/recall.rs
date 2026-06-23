@@ -11,21 +11,28 @@
 //! kernel then attends exactly the working set, and RoPE is already baked into
 //! the cached K, so the non-contiguous page subset is correct.
 //!
-//! This is the **resident variant** (mirroring the Metal landing): the full KV
-//! stays in the device pool and recall restricts *attention* to the selected
-//! pages (a decode-compute saving). Under the write-through model
+//! Under the write-through model
 //! (`docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`, supersedes the swap
-//! plan), this module is the **decode attend-resident** verb (the restricted page
-//! table) and the **R6 reps** (mean-pooled K kept resident, computed once a block
-//! freezes — exactly the write-through-time rep). The other write-through verbs
-//! (mirror at page-fill / prefetch at prefill) live on the executor as the
-//! `infer_seam::KvTier` impl. The remaining gap — freeing the non-selected middle
-//! pages out of HBM for the flat-VRAM win — is the same single-allocator blocker:
-//! the host `CudaKvPool` owns the page free and the executor re-publishes the
-//! slot's full page table every step via `mirror_slot`, so a live slot's middle
-//! page cannot be freed without breaking the `SlotProgress` continuity guard. The
-//! reps + scoring + restricted page table are fully live, so the budget-bounded
-//! decode-attention working set works now; the VRAM flattening is deferred.
+//! plan), this module owns the **decode attend-resident** verb (the restricted
+//! page table), the **R6 reps** (mean-pooled K kept resident, computed once a
+//! block freezes — exactly the write-through-time rep), AND the **evict-drop
+//! selection** ([`CudaRecallState::take_evict_pages`]): the cold middle pages
+//! outside the working set whose HBM page is returned to the pool. The other
+//! write-through verbs (mirror at page-fill / prefetch at prefill) live on the
+//! executor as the `infer_seam::KvTier` impl.
+//!
+//! **The page actually frees now (flat VRAM).** The deferred blocker — that the
+//! host single-allocator re-publishes a contiguous page table every step via
+//! `mirror_slot`, so a live slot's middle page could not be freed without
+//! breaking the `SlotProgress` continuity guard — is resolved by decoupling
+//! *physical residency* from the *logical* page table: an evicted middle page
+//! leaves a sentinel ([`cuda_kernels::prelude::EVICTED_PAGE`]) in its logical
+//! slot while its physical page returns to both pools' free lists. The logical
+//! page count (and `seq_len`) is unchanged, so `mirror_slot`'s
+//! `pages.len() == ceil(seq_len/page_size)` and the `SlotProgress` contiguity
+//! guard both still hold — the slot is sparse without violating either contract.
+//! The executor drives the free against the host (`KvAllocator::evict_slot_page`)
+//! and device (`PagedKVPool::evict_slot_page`) pools.
 //!
 //! Everything here is `#[cfg(feature = "cuda")]`: the planner
 //! ([`infer_core::plan_recall`]) is device-neutral, but the rep/score machinery
@@ -54,7 +61,7 @@ pub(crate) use cuda_impl::CudaRecallState;
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use anyhow::Result;
-    use cuda_kernels::prelude::{DeviceContext, PagedKVPool};
+    use cuda_kernels::prelude::{DeviceContext, EVICTED_PAGE, PagedKVPool};
 
     /// Per-slot session KV-recall state for the dense-Qwen3 paged decode path.
     ///
@@ -76,6 +83,11 @@ mod cuda_impl {
         /// `None` = the session still fits the budget → today's full contiguous
         /// page table (byte-identical default).
         recall_pages: Option<Vec<u32>>,
+        /// Logical page indices the executor should evict-drop (free out of HBM)
+        /// after this step — the cold middle pages outside the recall working set.
+        /// Drained each step via [`Self::take_evict_pages`]; the actual page free
+        /// happens in the executor against both the host and device pools.
+        evict_pages: Vec<usize>,
     }
 
     impl CudaRecallState {
@@ -90,6 +102,7 @@ mod cuda_impl {
         pub(crate) fn reset(&mut self) {
             self.block_reps.clear();
             self.recall_pages = None;
+            self.evict_pages.clear();
         }
 
         /// Grow the resident mean-key reps for any newly-frozen middle blocks (#2).
@@ -129,6 +142,17 @@ mod cuda_impl {
 
             for block in self.block_reps.len()..frozen_blocks {
                 let base = cfg.n_init + block * cfg.l_bs;
+                // A just-frozen block is still resident this step (it only left the
+                // local window now), so its rep is computed before any evict-drop.
+                // Guard defensively: if a span page is already an evict sentinel,
+                // stop growing reps here (we cannot reconstruct a freed block's
+                // mean key; it stays prefix-only-recallable per R1). Never advance
+                // `block_reps` past a sentinel block — that would misalign scoring.
+                let span_resident =
+                    (base..base + cfg.l_bs).all(|pos| pages[pos / page_size] != EVICTED_PAGE);
+                if !span_resident {
+                    break;
+                }
                 let mut rep = vec![0.0_f32; num_kv_heads * head_dim];
                 // Walk this block's `l_bs` tokens; each token lives at page
                 // `pages[pos / page_size]`, intra-page row `pos % page_size`.
@@ -209,42 +233,102 @@ mod cuda_impl {
             }
 
             let nb = self.block_reps.len();
+            let page_size = pool.page_size;
+            let table = pool.page_indices(slot);
             let mut scores = vec![0.0_f32; nb];
             for (i, rep) in self.block_reps.iter().enumerate() {
-                let n = rep.len().min(q.len());
-                let mut acc = 0.0_f32;
-                for k in 0..n {
-                    acc += q[k] * rep[k];
-                }
-                scores[i] = acc;
+                // Decode is tier-free: a block whose pages were already evicted out
+                // of HBM cannot be re-attended mid-decode (re-recall needs a prefill
+                // prefetch — the accepted boundary of the write-through model). Mask
+                // its score to -inf so `plan_recall` never selects a non-resident
+                // block; only currently-resident blocks compete for the top-k.
+                let base = cfg.n_init + i * cfg.l_bs;
+                let resident = (base..base + cfg.l_bs)
+                    .all(|pos| table.get(pos / page_size).copied() != Some(EVICTED_PAGE));
+                scores[i] = if resident {
+                    let n = rep.len().min(q.len());
+                    let mut acc = 0.0_f32;
+                    for k in 0..n {
+                        acc += q[k] * rep[k];
+                    }
+                    acc
+                } else {
+                    f32::NEG_INFINITY
+                };
             }
 
             let plan = infer_core::plan_recall(cache_len, &scores, cfg);
             // A single contiguous full range == today's default read; keep `None`
             // so the decode hot path stays byte-identical when the session fits.
             let is_full = plan.ranges.len() == 1 && plan.ranges[0] == (0, cache_len);
-            self.recall_pages = if is_full {
-                None
+            if is_full {
+                self.recall_pages = None;
+                self.evict_pages.clear();
             } else {
-                Some(token_ranges_to_pages(
+                self.recall_pages = Some(token_ranges_to_pages(
                     &plan.ranges,
                     pool.page_indices(slot),
-                    pool.page_size,
-                ))
-            };
-            // TODO(write-through evict-drop): this is the RESIDENT variant — full
-            // KV stays in the device pool and recall restricts *attention* to the
-            // selected pages (the restricted page table), saving decode compute.
-            // The write-through verbs (`infer_seam::KvTier` on the executor)
-            // already mirror pages to the tier (`write_through`) and can prefetch
-            // them back (`prefetch`); the missing step for the flat-VRAM-vs-history
-            // win is freeing the non-selected middle pages OUT of HBM, which needs
-            // the executor to own mid-decode device-page lifecycle (currently the
-            // host CudaKvPool is the single allocator and re-publishes the full
-            // page table via `mirror_slot` every step). Reps + scoring + restricted
-            // page table are fully live.
+                    page_size,
+                ));
+                // Write-through evict-drop (the flat-VRAM win): the logical pages
+                // the plan does NOT attend, restricted to the still-resident middle
+                // (outside the pinned sink + local windows). The executor frees
+                // these physical pages from BOTH pools after this step; their KV is
+                // already mirrored to the tier (write_through), so the drop is free.
+                self.evict_pages =
+                    evict_logical_pages(&plan.ranges, pool.page_indices(slot), page_size, cfg);
+            }
             Ok(())
         }
+
+        /// Logical page indices the executor should evict-drop after this step
+        /// (the complement of the recall plan's working set within the resident
+        /// middle). Drained by the executor; empty when nothing new to free.
+        pub(crate) fn take_evict_pages(&mut self) -> Vec<usize> {
+            std::mem::take(&mut self.evict_pages)
+        }
+    }
+
+    /// Compute the *logical* page indices to evict-drop: pages NOT covered by any
+    /// working-set range, excluding the pinned sink (first `n_init` tokens) and
+    /// local (last `n_local` tokens) regions, and skipping pages already evicted
+    /// (sentinel). These are the cold middle pages whose KV is tier-resident and
+    /// whose HBM page can be returned to the pool.
+    fn evict_logical_pages(
+        ranges: &[(usize, usize)],
+        pages: &[u32],
+        page_size: usize,
+        cfg: &infer_core::RecallConfig,
+    ) -> Vec<usize> {
+        if page_size == 0 || pages.is_empty() {
+            return Vec::new();
+        }
+        // Pages covered by the working set (these stay resident).
+        let mut keep = vec![false; pages.len()];
+        for &(s, e) in ranges {
+            if s >= e {
+                continue;
+            }
+            let first = s / page_size;
+            let last = ((e - 1) / page_size).min(pages.len() - 1);
+            if first <= last {
+                for slot in &mut keep[first..=last] {
+                    *slot = true;
+                }
+            }
+        }
+        // Pin regions: leading sink pages and trailing local pages never evict.
+        let sink_pages = cfg.n_init.div_ceil(page_size);
+        // The local window is the last `n_local` tokens; pin every page from the
+        // local window's first page to the end (the current partial page included).
+        let total_tokens = ranges.iter().map(|&(_, e)| e).max().unwrap_or(0);
+        let local_start = total_tokens.saturating_sub(cfg.n_local);
+        let first_local_page = local_start / page_size;
+        (0..pages.len())
+            .filter(|&p| {
+                p >= sink_pages && p < first_local_page && !keep[p] && pages[p] != EVICTED_PAGE
+            })
+            .collect()
     }
 
     /// Convert ascending, merged token ranges (from `plan_recall`) to the
@@ -267,6 +351,16 @@ mod cuda_impl {
             let last_page = (e - 1) / page_size;
             for p in first_page..=last_page {
                 if let Some(&page) = pages.get(p) {
+                    // The working set is built only from resident blocks (scoring
+                    // masks evicted ones to -inf), so a sentinel must never reach
+                    // the kernel page table. Guard the invariant and skip if hit.
+                    debug_assert_ne!(
+                        page, EVICTED_PAGE,
+                        "recall working set referenced an evicted page (logical {p})"
+                    );
+                    if page == EVICTED_PAGE {
+                        continue;
+                    }
                     // Ranges are ascending and page-aligned at the block grain,
                     // but the sink end and a recalled-block start can land in the
                     // same page; dedup the boundary so a page is never doubled.

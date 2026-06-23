@@ -927,8 +927,10 @@ impl QwenCudaExecutor {
             let position = row.kv_seq_len.saturating_add(1) as u64;
             // Session KV-recall (eager-only, BF16-only): when on and this slot has
             // an active recall plan, attend the restricted page table + rescore
-            // for the next step. Off / no plan → the byte-identical default below.
-            if let Some(token) = self.try_recall_decode(row, position)? {
+            // for the next step, then evict-drop the non-working-set middle pages
+            // out of HBM (write-through tiered KV — the flat-VRAM win). Off / no
+            // plan → the byte-identical default below.
+            if let Some(token) = self.try_recall_decode(row, position, host_kv)? {
                 token
             } else {
                 // Try the captured graph; on any miss fall back to the eager path.
@@ -1060,7 +1062,12 @@ impl QwenCudaExecutor {
     /// the session has exceeded the working-set budget — below the budget recall
     /// is a strict no-op, so the default path stays byte-identical. Non-BF16 KV
     /// falls back (logged once); recall is BF16-gated.
-    fn try_recall_decode(&mut self, row: &DecodeRow, position: u64) -> Result<Option<u32>> {
+    fn try_recall_decode(
+        &mut self,
+        row: &DecodeRow,
+        position: u64,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Option<u32>> {
         if !self.kv_recall {
             return Ok(None);
         }
@@ -1131,7 +1138,7 @@ impl QwenCudaExecutor {
         let num_q_heads = self.model.local_q_heads;
         let num_kv_heads = self.model.local_kv_heads;
         let head_dim = self.model.config.head_dim;
-        if let Some(state) = self.recall.get_mut(row.slot) {
+        let evict_pages = if let Some(state) = self.recall.get_mut(row.slot) {
             state.recompute_recall_plan(
                 &self.model.ctx,
                 &self.kv,
@@ -1143,8 +1150,63 @@ impl QwenCudaExecutor {
                 head_dim,
                 &layer0_query,
             )?;
-        }
+            state.take_evict_pages()
+        } else {
+            Vec::new()
+        };
+
+        // Write-through evict-drop (THE flat-VRAM win): free the cold middle pages
+        // outside the working set out of HBM. For each, mirror it to the tier
+        // (write_through, async D2H — the page already has a durable copy after
+        // this) and only then return the physical page to BOTH the device pool and
+        // the host single-allocator. The logical page table keeps its length (an
+        // evict sentinel marks the slot), so `mirror_slot`/`SlotProgress` stay
+        // valid. If the tier is full we skip that page (never lose KV).
+        self.evict_drop_recall_pages(row.slot, &evict_pages, host_kv)?;
+
         Ok(Some(token))
+    }
+
+    /// Free the given logical pages of `slot` out of HBM (write-through tiered KV).
+    ///
+    /// Reused by [`Self::try_recall_decode`]. For each logical page: read its
+    /// physical id, mirror it to the tier (so the drop is free), then evict-drop it
+    /// from the device pool (`PagedKVPool::evict_slot_page` → recycles the HBM page)
+    /// and the host single-allocator (`KvAllocator::evict_slot_page` → returns it to
+    /// the free stack). Both pools' logical page tables stay the same length (an
+    /// `EVICTED_PAGE` sentinel marks the freed slot), keeping the slot sparse
+    /// without breaking the `mirror_slot` page-count or `SlotProgress` contiguity
+    /// contracts. A tier-full `write_through` skips that page (KV must not be lost).
+    fn evict_drop_recall_pages(
+        &mut self,
+        slot: usize,
+        evict_pages: &[usize],
+        host_kv: &mut dyn KvPool,
+    ) -> Result<()> {
+        for &logical in evict_pages {
+            let table = self.kv.page_indices(slot);
+            let Some(&physical) = table.get(logical) else {
+                continue;
+            };
+            if physical == cuda_kernels::prelude::EVICTED_PAGE {
+                continue; // already freed
+            }
+            // Mirror to the tier first; only drop if it took a durable copy.
+            let key = tier_block_u64(slot as u64, logical as u64);
+            if !self.write_through(key, physical)? {
+                continue; // tier full → keep the page resident (no KV loss)
+            }
+            // Free the physical page from BOTH pools (the real free). Host first so
+            // the device pool's `page_indices` (read above) is still valid for the
+            // device call; both replace the logical slot with the evict sentinel.
+            let host_freed = host_kv.evict_slot_page(slot, logical);
+            let dev_freed = self.kv.evict_slot_page(slot, logical);
+            debug_assert_eq!(
+                host_freed, dev_freed,
+                "host/device pools disagreed on evicted page for slot {slot} logical {logical}"
+            );
+        }
+        Ok(())
     }
 
     /// Write Stage-1 metadata and replay (or lazily capture) the decode graph for
@@ -1263,17 +1325,21 @@ impl QwenCudaExecutor {
 /// namespace via [`tier_block_u64`] so write-through keys never alias prefix-tier
 /// keys.
 ///
-/// Status (honest, per `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`):
+/// Status (per `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`):
 /// - `write_through` / `prefetch` — **real** (D2H/H2D over the existing store).
-/// - `evict_drop` — the backend has no per-page device mirror to drop, and the
-///   ACTUAL device-page free is owned by the host single-allocator `CudaKvPool`
-///   (the executor re-publishes the slot's full contiguous page table every step
-///   via `mirror_slot`, so freeing a live slot's middle page collides with the
-///   `SlotProgress` continuity guard). So this hook is a no-op and the flat-VRAM
-///   win — freeing non-resident middle pages out of HBM — is the documented
-///   remaining blocker (same wall the prior per-step recall landing hit). The
-///   resident-variant restricted page table (`try_recall_decode`) is live and
-///   gives the budget-bounded decode-attention working set today.
+/// - `evict_drop` — the **real page free now happens** in the decode path
+///   ([`QwenCudaExecutor::evict_drop_recall_pages`]), which holds the slot + the
+///   host `&mut dyn KvPool` and frees the physical page from BOTH the device pool
+///   ([`PagedKVPool::evict_slot_page`]) and the host single-allocator
+///   ([`infer_seam::KvAllocator::evict_slot_page`]). The deferred blocker — that
+///   `mirror_slot` re-publishes a contiguous page table every step, so freeing a
+///   live slot's middle page would break the `SlotProgress` contiguity guard — is
+///   resolved by decoupling physical residency from the logical page table: an
+///   evicted page leaves an `EVICTED_PAGE` sentinel in its logical slot, so the
+///   logical page count (and `seq_len`) is unchanged and both contracts hold. This
+///   seam `evict_drop(page)` verb (no slot/host context) is the device-side
+///   mirror-drop hook; with no per-page device sidecar to release it is a no-op,
+///   and the host allocator performs the page free via the decode-path call above.
 impl infer_seam::KvTier for QwenCudaExecutor {
     fn tier_capacity_pages(&self) -> usize {
         self.tier.capacity_pages()
