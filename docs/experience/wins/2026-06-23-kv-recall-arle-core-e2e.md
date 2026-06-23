@@ -36,6 +36,21 @@ The harness's recall policy is identical to `plan_recall`, and its `kv=544` equa
 `RecallConfig::working_set_tokens()` (32 + 8×32 + 256) — mechanism and Rust impl both
 validated on the same number.
 
+## Per-slot vs per-layer (license-or-kill)
+
+The harness recall is **per-layer** (each full-attn layer scores `query·mean-key`
+with its own Q/K and picks its own top-k). The Rust `plan_recall` is **per-slot**
+(one selection reused by all layers) — simpler + shares the gather, but unvalidated.
+`--shared` mode (one selection, first full-attn layer decides) tested it:
+
+| depth | full | stream | recall (per-slot) |
+|---|---|---|---|
+| 0.25 / 0.5 / 0.75 | OK | MISS | **OK** (544 = 9.6% KV) |
+
+Per-slot **LICENSED** for passkey retrieval — per-layer complexity not needed. Caveat:
+validated for retrieval/uniform; harder tasks (aggregation, diverse, multi-hop) would
+need their own per-slot re-check before claiming parity there.
+
 ## Rule
 
 The recall *planner* and *gather* are validated; the served ARLE-native e2e still
