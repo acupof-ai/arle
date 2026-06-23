@@ -13,3 +13,13 @@ export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-/host/arle-build/crates/c
 export all_proxy="${all_proxy:-socks5h://127.0.0.1:1080}"
 export https_proxy="${https_proxy:-$all_proxy}"
 export http_proxy="${http_proxy:-$all_proxy}"
+# Shared compile cache: sccache caches each rustc compilation keyed by content, so a
+# FRESH tree (or a toolchain-switch rebuild) reuses unchanged crates instead of
+# recompiling — the cross-POD_TREE / cross-restart reuse the per-tree target/ can't give.
+# Cache lives on /host (persistent). GRACEFUL: only wraps rustc if sccache is installed,
+# so a missing binary never breaks the build (install: scripts/pod.sh setup-sccache).
+if command -v sccache >/dev/null 2>&1; then
+  export SCCACHE_DIR="${SCCACHE_DIR:-/host/sccache}"
+  export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-50G}"
+  export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
+fi
