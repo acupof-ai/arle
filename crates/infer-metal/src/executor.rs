@@ -2385,6 +2385,51 @@ impl MetalSlotState {
         Ok((k_full, v_full))
     }
 
+    /// Page-gather read for session KV-recall (Phase-1 #4 primitive). Builds the
+    /// decode K/V from a SELECTED set of contiguous token ranges
+    /// (sink ∪ recalled blocks ∪ local window) instead of the full `[0..cache_len]`,
+    /// by slicing each range and concatenating along the token axis — reuses
+    /// `slice_kv_tokens` + `concatenate_or_single`, no new MLX op. Which ranges to
+    /// recall is the device-neutral policy (infer-core SessionMemory); this is only
+    /// the executor primitive that attends them. `ranges` must be within `cache_len`.
+    #[allow(dead_code)] // unused until SessionMemory recall wires this (#5)
+    fn bf16_recall_read_inputs(
+        &self,
+        ranges: &[(usize, usize)],
+    ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
+        anyhow::ensure!(
+            !ranges.is_empty(),
+            "recall KV read requires at least one token range"
+        );
+        for &(s, e) in ranges {
+            anyhow::ensure!(
+                s <= e && e <= self.cache_len,
+                "recall token range [{s}, {e}) exceeds slot cache_len {}",
+                self.cache_len
+            );
+        }
+        anyhow::ensure!(
+            self.kv_flat.len().is_multiple_of(2),
+            "bf16 slot cache must contain K/V pairs, got {} arrays",
+            self.kv_flat.len()
+        );
+
+        let mut k_full = Vec::with_capacity(self.kv_flat.len() / 2);
+        let mut v_full = Vec::with_capacity(self.kv_flat.len() / 2);
+        for (layer_idx, pair) in self.kv_flat.chunks_exact(2).enumerate() {
+            for (axis, array) in pair.iter().enumerate() {
+                anyhow::ensure!(
+                    array.dtype() == mlx::Dtype::Bfloat16,
+                    "recall KV read expected bf16 layer {layer_idx} axis {axis}, got {:?}",
+                    array.dtype()
+                );
+            }
+            k_full.push(gather_kv_ranges(&pair[0], ranges)?);
+            v_full.push(gather_kv_ranges(&pair[1], ranges)?);
+        }
+        Ok((k_full, v_full))
+    }
+
     fn int8_prefix_read_inputs(
         &self,
         cache_len: usize,
@@ -2555,6 +2600,22 @@ fn concatenate_or_single(mut arrays: Vec<mlx::MlxArray>) -> mlx::MlxArray {
     } else {
         mlx::concatenate_axis(&arrays, 2)
     }
+}
+
+/// Gather a token-axis subset of a rank-4 KV array by slicing each contiguous
+/// token range and concatenating along the token axis (axis 2). The building
+/// block of session KV-recall reads (sink ∪ recalled blocks ∪ local). Dtype-
+/// agnostic — reuses `slice_kv_tokens` + `concatenate_or_single`.
+#[cfg(feature = "metal")]
+fn gather_kv_ranges(
+    array: &mlx::MlxArray,
+    ranges: &[(usize, usize)],
+) -> anyhow::Result<mlx::MlxArray> {
+    let parts: anyhow::Result<Vec<_>> = ranges
+        .iter()
+        .map(|&(s, e)| slice_kv_tokens(array, s, e))
+        .collect();
+    Ok(concatenate_or_single(parts?))
 }
 
 #[cfg(feature = "metal")]
@@ -2798,6 +2859,27 @@ mod tests {
         );
         assert!(MetalKvCacheDtype::resolve(KvCacheDtype::Fp8).is_err());
         assert!(MetalKvCacheDtype::resolve(KvCacheDtype::Tq4).is_err());
+    }
+
+    // Session KV-recall page-gather (#4): slicing selected contiguous token ranges
+    // (sink ∪ recalled blocks ∪ local) and concatenating along the token axis must
+    // produce a working set whose token count is the sum of the range sizes, in
+    // order — and reject out-of-range ends. Dtype-agnostic, so an i32 array suffices.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn gather_kv_ranges_concats_selected_token_ranges() {
+        // rank-4 [1, 1, 6, 2] (batch, kv-heads, tokens=6, head_dim=2).
+        let data: Vec<i32> = (0..12).collect();
+        let arr = mlx::MlxArray::from_slice_i32(&data, &[1, 1, 6, 2]);
+        // sink [0,2) + local [4,6) -> 4 tokens kept (the recall working-set shape).
+        let g = gather_kv_ranges(&arr, &[(0, 2), (4, 6)]).unwrap();
+        mlx::eval(&[&g]);
+        assert_eq!(g.shape()[2], 4, "gathered token count = sum of range sizes");
+        // a single full range round-trips the token count.
+        let full = gather_kv_ranges(&arr, &[(0, 6)]).unwrap();
+        assert_eq!(full.shape()[2], 6);
+        // an end past the token axis is rejected, not silently clamped.
+        assert!(gather_kv_ranges(&arr, &[(0, 7)]).is_err());
     }
 
     // Qwen3.6-27B-family auto-enable detection must fire for OptiQ + MTP variants
