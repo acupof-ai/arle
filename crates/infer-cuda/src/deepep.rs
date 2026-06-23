@@ -208,7 +208,12 @@ impl DeepEpTransport {
         );
         let rank = u32::try_from(cfg.rank)?;
         let world_size = u32::try_from(cfg.world_size)?;
-        let mut buffer = deepep_sys::Buffer::new(rank, world_size)
+        // Pin the REAL device ordinal this rank runs on (INFER_CUDA_DEVICES via
+        // ctx.ordinal), NOT the TP rank. On a non-0-based GPU set (e.g. 4,5,6,7)
+        // rank != ordinal; passing rank would create the DeepEP buffers on the
+        // wrong physical GPU and the intranode barrier would fail. For 0-based
+        // contiguous layouts ctx.ordinal == rank, so this is byte-identical.
+        let mut buffer = deepep_sys::Buffer::new(rank, world_size, ctx.ordinal)
             .map_err(|e| anyhow!("DeepEP Buffer::new failed: {e}"))?;
         let (local_handle, local_device_id) = buffer
             .local_ipc_handle()
@@ -279,6 +284,7 @@ impl DeepEpTransport {
             let ll_buffer = deepep_sys::Buffer::new_low_latency(
                 rank,
                 world_size,
+                ctx.ordinal,
                 num_max_dispatch_tokens_per_rank,
                 hidden_u32,
                 num_experts_u32,

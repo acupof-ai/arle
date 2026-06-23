@@ -183,7 +183,7 @@ pub struct Buffer {
 
 #[cfg(deepep_stub)]
 impl Buffer {
-    pub fn new(_rank: u32, _world_size: u32) -> Result<Self> {
+    pub fn new(_rank: u32, _world_size: u32, _device_ordinal: u32) -> Result<Self> {
         bail!(DeepEpError::NotBuilt)
     }
     pub fn local_ipc_handle(&self) -> Result<([u8; IPC_HANDLE_BYTES], u32)> {
@@ -201,6 +201,7 @@ impl Buffer {
     pub fn new_low_latency(
         _rank: u32,
         _world_size: u32,
+        _device_ordinal: u32,
         _num_max_dispatch_tokens_per_rank: u32,
         _hidden: u32,
         _num_experts: u32,
@@ -320,6 +321,7 @@ mod native {
         pub(super) fn arle_deepep_buffer_create(
             rank: u32,
             world_size: u32,
+            device_id: u32,
             out_handle: *mut *mut ArleDeepEpBuffer,
         ) -> c_int;
         pub(super) fn arle_deepep_buffer_local_ipc_handle(
@@ -351,6 +353,7 @@ mod native {
         pub(super) fn arle_deepep_buffer_ll_create(
             rank: u32,
             world_size: u32,
+            device_id: u32,
             num_max_dispatch_tokens_per_rank: u32,
             hidden: u32,
             num_experts: u32,
@@ -393,9 +396,11 @@ unsafe impl Send for Buffer {}
 
 #[cfg(not(deepep_stub))]
 impl Buffer {
-    pub fn new(rank: u32, world_size: u32) -> Result<Self> {
+    pub fn new(rank: u32, world_size: u32, device_ordinal: u32) -> Result<Self> {
         let mut handle: *mut native::ArleDeepEpBuffer = std::ptr::null_mut();
-        let status = unsafe { native::arle_deepep_buffer_create(rank, world_size, &mut handle) };
+        let status = unsafe {
+            native::arle_deepep_buffer_create(rank, world_size, device_ordinal, &mut handle)
+        };
         if status != 0 {
             bail!(DeepEpError::Status {
                 code: status,
@@ -532,6 +537,7 @@ impl Buffer {
     pub fn new_low_latency(
         rank: u32,
         world_size: u32,
+        device_ordinal: u32,
         num_max_dispatch_tokens_per_rank: u32,
         hidden: u32,
         num_experts: u32,
@@ -547,6 +553,7 @@ impl Buffer {
             native::arle_deepep_buffer_ll_create(
                 rank,
                 world_size,
+                device_ordinal,
                 num_max_dispatch_tokens_per_rank,
                 hidden,
                 num_experts,

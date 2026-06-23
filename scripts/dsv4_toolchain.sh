@@ -306,8 +306,15 @@ build_infer() {
     need_cmd cargo
     cd "$ROOT"
     export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
+    # A native-DeepEP MoE backend needs the `deepep` cargo feature compiled in
+    # (it transitively pulls nccl+cuda); cuda,nccl alone yields a stub DeepEP.
+    local features="cuda,nccl"
+    case "$MOE_BACKEND" in
+        native-deepep|deepep|deepep_ll|deepep-ll|native_deepep_ll)
+            features="deepep" ;;
+    esac
     ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
-        cargo build --release --features cuda,nccl --bin arle
+        cargo build --release --features "$features" --bin arle
 }
 
 wait_ready() {
