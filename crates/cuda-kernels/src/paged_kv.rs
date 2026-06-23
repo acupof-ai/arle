@@ -23,6 +23,19 @@ use crate::kv_turboquant::turboquant_quantize_paged_single;
 use crate::kv_types::{KVCacheDtype, KVFormat};
 use crate::turboquant_state::TurboQuantLayerState;
 
+/// Logical-page marker for a page that has been **evict-dropped** out of HBM
+/// under the write-through tiered KV model ([`TokenKVPool::evict_slot_page`]).
+///
+/// A recall slot keeps its `page_indices[slot]` vector at full logical length so
+/// a logical page index still maps to the right entry; an evicted middle page
+/// leaves this sentinel in its logical slot while the physical HBM page returns
+/// to `free_pages`. The sentinel never names a real page (`max_total_pages` is
+/// far below `u32::MAX`) and only appears on the opt-in recall path — the
+/// default decode path keeps a contiguous, sentinel-free page table. This value
+/// MUST match `infer_seam::host_paged_kv_pool::EVICTED_PAGE` so a host-mirrored
+/// sentinel survives the round-trip through `mirror_slot`.
+pub const EVICTED_PAGE: u32 = u32::MAX;
+
 /// Paged KV cache pool — shared across all request slots.
 ///
 /// Storage is format-aware via `KVFormat`:
@@ -768,8 +781,13 @@ impl TokenKVPool {
             self.page_size
         );
         for &page in pages {
+            // The evict sentinel marks a logical page whose physical HBM page was
+            // returned to the pool under the write-through tiered KV model
+            // (`evict_slot_page`); it is not a real page id, so it bypasses the
+            // bounds check. It only appears on the opt-in recall path — the
+            // default decode path mirrors a fully contiguous, sentinel-free table.
             ensure!(
-                (page as usize) < self.max_total_pages,
+                page == EVICTED_PAGE || (page as usize) < self.max_total_pages,
                 "TokenKVPool::mirror_slot page {page} out of range {} \
                  (host pool total_pages exceeds device pool budget?)",
                 self.max_total_pages
@@ -1387,6 +1405,44 @@ impl TokenKVPool {
         }
         self.seq_lens[slot] = new_len;
         Ok(recycled)
+    }
+
+    /// **Write-through evict-drop**: release one *middle* physical page of a live
+    /// slot back to the pool while the slot keeps decoding, leaving its logical
+    /// length (`seq_lens[slot]`) and logical page-table length unchanged.
+    ///
+    /// The page is named by its *logical* page index within the slot. Its
+    /// physical HBM page is recycled to `free_pages` (the real free — this is the
+    /// flat-VRAM win), and the logical slot is overwritten with [`EVICTED_PAGE`]
+    /// so the surviving pages stay logically addressable. Returns the freed
+    /// physical page id, or `None` if that logical page was already evicted,
+    /// pinned by a radix/detached refcount, or out of range.
+    ///
+    /// The dropped page's KV is the tier's responsibility (it was mirrored by the
+    /// write-through verb before this call), so nothing is written back. This is
+    /// NEVER called on the default decode path — only the opt-in `--kv-recall`
+    /// executor calls it for non-pinned middle pages.
+    pub fn evict_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+        let page = *self.page_indices.get(slot)?.get(logical_page)?;
+        if page == EVICTED_PAGE {
+            return None; // already evicted
+        }
+        let page_idx = page as usize;
+        // A page pinned by the radix/detached store (ref > 0) or shared by more
+        // than this slot must not be freed out from under the other owner.
+        if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
+            return None;
+        }
+        // Drop this slot's attachment and recycle the physical page.
+        self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
+        let freed = self.recycle_page_if_unreferenced(page);
+        debug_assert!(
+            freed,
+            "evict_slot_page: unpinned single-owner page must recycle"
+        );
+        // Keep logical length intact: replace with the sentinel, never shrink.
+        self.page_indices[slot][logical_page] = EVICTED_PAGE;
+        Some(page)
     }
 
     /// Bump the external reference count on each of the given pages by one.
@@ -2173,7 +2229,9 @@ pub const DEFAULT_PAGE_SIZE: usize = 16;
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetBreakdown, TokenKVPool, compute_budget_breakdown, validate_format_shape};
+    use super::{
+        BudgetBreakdown, EVICTED_PAGE, TokenKVPool, compute_budget_breakdown, validate_format_shape,
+    };
     use crate::KVFormat;
 
     #[test]
@@ -2536,6 +2594,25 @@ mod tests {
             recycled
         }
 
+        /// Mirrors `TokenKVPool::evict_slot_page`: recycle one middle physical
+        /// page back to the pool, leaving the logical slot at full length with an
+        /// `EVICTED_PAGE` sentinel.
+        fn evict_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+            let page = *self.page_indices.get(slot)?.get(logical_page)?;
+            if page == EVICTED_PAGE {
+                return None;
+            }
+            let page_idx = page as usize;
+            if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
+                return None;
+            }
+            self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
+            let freed = self.recycle_page_if_unreferenced(page);
+            debug_assert!(freed);
+            self.page_indices[slot][logical_page] = EVICTED_PAGE;
+            Some(page)
+        }
+
         fn detach_shared_hot_tail_page_for_append(&mut self, slot: usize, shared_tail_page: u32) {
             debug_assert_eq!(
                 self.slot_shared_hot_tail_page(slot),
@@ -2801,6 +2878,40 @@ mod tests {
         );
         assert_eq!(pool.page_indices[0], vec![0, 1]);
         assert_eq!(pool.seq_lens[0], 17);
+    }
+
+    #[test]
+    fn evict_slot_page_recycles_middle_page_and_mirror_round_trips_sentinel() {
+        // The flat-VRAM win at the device-pool level: evict a middle page, it
+        // returns to free_pages, the logical table keeps its length with a
+        // sentinel, and a subsequent host->device mirror of the now-sparse table
+        // (same length) round-trips the sentinel without tripping the page-count
+        // assertion.
+        let mut pool = MockPool::new(8, 1, 16);
+        pool.alloc_tokens(0, 64); // 4 pages
+        let pages = pool.page_indices[0].clone();
+        assert_eq!(pages.len(), 4);
+        let free_before = pool.free_pages.len();
+
+        let freed = pool.evict_slot_page(0, 1).expect("middle page evicts");
+        assert_eq!(freed, pages[1]);
+        assert_eq!(
+            pool.free_pages.len(),
+            free_before + 1,
+            "physical page recycled to the pool"
+        );
+        assert_eq!(pool.page_indices[0].len(), 4, "logical length intact");
+        assert_eq!(pool.page_indices[0][1], EVICTED_PAGE);
+        // Already-evicted / out-of-range are no-ops.
+        assert_eq!(pool.evict_slot_page(0, 1), None);
+        assert_eq!(pool.evict_slot_page(0, 99), None);
+
+        // Mirror the sparse host-side table (with the sentinel) back: same length
+        // (4) so the page-count assertion holds; the sentinel survives the copy.
+        let sparse = pool.page_indices[0].clone();
+        pool.mirror_slot(0, &sparse, 64);
+        assert_eq!(pool.page_indices[0], sparse);
+        assert_eq!(pool.page_indices[0][1], EVICTED_PAGE);
     }
 
     #[test]

@@ -22,6 +22,24 @@ pub trait KvAllocator {
     /// Free all pages currently attached to `slot`.
     fn free_slot(&mut self, slot: usize);
 
+    /// **Write-through evict-drop** — release one *middle* physical page of a
+    /// live slot back to the free pool while the slot keeps decoding, leaving its
+    /// logical length unchanged (the dropped page's KV is already mirrored to the
+    /// tier by `KvTier::write_through`). The page is identified by its *logical*
+    /// page index within the slot (`token_pos / page_size`); the implementation
+    /// replaces that logical slot with an evicted sentinel so the remaining pages
+    /// stay logically addressable, and returns the freed physical page id (or
+    /// `None` if that logical page was already evicted / pinned / out of range).
+    ///
+    /// This is the one allocator-level operation that makes HBM bounded as a
+    /// session grows: it is the *real* page free behind the write-through tiered
+    /// KV model. It is NEVER called on the default decode path — only the opt-in
+    /// `--kv-recall` executor calls it for non-pinned middle pages — so the
+    /// default impl is a no-op and the baseline stays byte-identical.
+    fn evict_slot_page(&mut self, _slot: usize, _logical_page: usize) -> Option<u32> {
+        None
+    }
+
     /// Truncate a slot to `new_len` logical tokens.
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()>;
 
