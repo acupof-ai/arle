@@ -30,6 +30,22 @@ turn-boundary history blocks straight to **L3** (`kv-native-sys` SSD / remote), 
 intra-prompt overflow to L2; #5 promotes the top-k back. The recall *planner* (#3,
 `recall.rs`) is tier-agnostic — it only emits token ranges; the fetch tier is #2/#5.
 
+## Scoring: resident reps (load-bearing — do not skip)
+
+To recall you must score **all** middle blocks every step. If offloaded blocks were
+gone you could never rediscover them → recall collapses to a fixed subset. So each
+block keeps a tiny **mean-key rep resident** (one `[nkv, hd]` vector, mean-pooled at
+offload); only the full KV goes to L3. Scoring = `q · resident-reps` over all blocks
+(cheap). This keeps the live path **Rust-orchestrated**, reusing #4/#5:
+
+1. C++ `full_attn_step` (`mlx_qwen35_model.cpp:905`, layer 0) emits the decode
+   **query vector** (small). One-step stale → fine (`--stale` licensed).
+2. Rust: `score = q · reps` (resident) → `plan_recall` → `recall_ranges`.
+3. #4 gather over the resident working set + promote selected full KV from L3.
+
+`--shared --stale`'s `reps` (mean-pooled block K) **is** the resident rep — that's the
+validated math. The C++ change is small (emit the query), NOT an in-attention recall.
+
 ## Components (file:line)
 
 | # | Component | Status | Home |
