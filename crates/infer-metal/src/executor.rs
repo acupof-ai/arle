@@ -2264,6 +2264,11 @@ struct MetalSlotState {
     dflash_target_hidden: Option<mlx::MlxArray>,
     /// Per-slot draft-model KV cache. Separate from target K/V.
     dflash_draft_state: Option<dflash::DFlashDraftState>,
+    /// Session KV-recall plan for the next decode: when `Some`, the step attends
+    /// only these token ranges (sink ∪ recalled blocks ∪ local) via the page-gather
+    /// instead of the full `[0..cache_len]`. `None` = today's contiguous read.
+    /// Set by the Engine from `infer_core::plan_recall` (#5); default off.
+    recall_ranges: Option<Vec<(usize, usize)>>,
 }
 
 #[cfg(feature = "metal")]
@@ -2310,6 +2315,7 @@ impl MetalSlotState {
             last_sampled: None,
             dflash_target_hidden: None,
             dflash_draft_state: None,
+            recall_ranges: None,
         }
     }
 
@@ -2331,6 +2337,7 @@ impl MetalSlotState {
             last_sampled: None,
             dflash_target_hidden: None,
             dflash_draft_state: None,
+            recall_ranges: None,
         }
     }
 
@@ -2392,7 +2399,6 @@ impl MetalSlotState {
     /// `slice_kv_tokens` + `concatenate_or_single`, no new MLX op. Which ranges to
     /// recall is the device-neutral policy (infer-core SessionMemory); this is only
     /// the executor primitive that attends them. `ranges` must be within `cache_len`.
-    #[allow(dead_code)] // unused until SessionMemory recall wires this (#5)
     fn bf16_recall_read_inputs(
         &self,
         ranges: &[(usize, usize)],
@@ -2532,7 +2538,12 @@ fn step_session_decode(
         if slot.cache_len > 0 {
             let logits = match kv_cache_dtype {
                 MetalKvCacheDtype::Bf16 => {
-                    let (k_full, v_full) = slot.bf16_prefix_read_inputs(slot.cache_len)?;
+                    // Recall plan set → attend only sink ∪ recalled ∪ local (#5);
+                    // otherwise the full contiguous read (byte-identical default).
+                    let (k_full, v_full) = match &slot.recall_ranges {
+                        Some(ranges) => slot.bf16_recall_read_inputs(ranges)?,
+                        None => slot.bf16_prefix_read_inputs(slot.cache_len)?,
+                    };
                     model.step_session_paged_bf16(token, cache_pos, &k_full, &v_full)
                 }
                 MetalKvCacheDtype::Int8 => {
