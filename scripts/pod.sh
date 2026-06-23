@@ -21,16 +21,15 @@
 #   Typical fan-out: build the shared binary ONCE (`build`), then N agents each
 #   `run <label-i> <gpu-i> -- <args>` on a free GPU (`gpus` to pick).
 #
-# Usage:
-#   scripts/pod.sh push-scripts                       # push the 3 pod-side helpers
-#   scripts/pod.sh setup                              # warm/repair the shared toolchain (flock)
-#   scripts/pod.sh sync [paths...]                    # push files local->pod (default: git-changed)
-#   scripts/pod.sh build <label> <cargo-args...>      # detached build (per-tree-flocked)
-#   scripts/pod.sh run   <label> <gpu> [--] <args...> # detached arle run on ONE gpu
-#   scripts/pod.sh gpus                               # per-GPU memory/util (pick a free one)
-#   scripts/pod.sh status <label>                     # build- AND run-<label>: running? tail + marker
-#   scripts/pod.sh log    <label>                     # full build/run log
-#   scripts/pod.sh kill   <label>                     # kill build/run by recorded PGID
+# Usage (the common path is zero-param — defaults fill in label/GPU/cargo-args):
+#   scripts/pod.sh push-scripts            # push the pod-side helpers (once)
+#   scripts/pod.sh sync                    # push all git-changed files local->pod
+#   scripts/pod.sh build                   # = build arle --release --features cuda --bin arle
+#   scripts/pod.sh run -- train opd ...    # AUTO-pick a free GPU, label "g<gpu>", detached
+#   scripts/pod.sh status                  # label defaults to "arle" (or pass g3 / your label)
+#   scripts/pod.sh gpus                    # per-GPU memory/util
+#   Explicit when needed: build <label> <cargo-args> | run <label> <gpu> -- <args>
+#                         | status/log/kill <label> | setup (warm/repair toolchain)
 #
 # Env overrides: POD (exec wrapper, default ~/bin/pod), TN (default tn),
 #                NODE_TREE (tn push target), POD_TREE (container-view tree).
@@ -46,7 +45,7 @@ cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   push-scripts)
-    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh; do
+    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pick-gpu.sh; do
       "$TN" push "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
     done
     echo "pushed pod-side helpers -> $NODE_TREE/scripts/"
@@ -73,22 +72,30 @@ case "$cmd" in
     done
     ;;
   build)
-    label="${1:?usage: build <label> <cargo-args...>}"; shift
+    # No args => standard arle build (label "arle"). Else: first arg = label.
+    if [ $# -eq 0 ]; then label="arle"; set -- --release --features cuda --bin arle
+    else label="$1"; shift; fi
     "$POD" "setsid bash $TREE/scripts/pod-remote-build.sh $label $* </dev/null >/dev/null 2>&1 &"
     echo "build '$label' launched (detached). poll: scripts/pod.sh status $label"
     ;;
   run)
-    label="${1:?usage: run <label> <gpu> [--] <arle args...>}"; shift
-    gpu="${1:?usage: run <label> <gpu> [--] <arle args...>}"; shift
+    # Tokens before `--`: 0 => auto GPU + auto label; 1 => label; 2 => label gpu.
+    pre=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do pre+=("$1"); shift; done
     [ "${1:-}" = "--" ] && shift
+    label="${pre[0]:-}"; gpu="${pre[1]:-auto}"
+    if [ "$gpu" = "auto" ]; then
+      gpu="$("$POD" "bash $TREE/scripts/pick-gpu.sh" 2>/dev/null | tail -1 | tr -d '\r\n ')"
+      if ! [[ "$gpu" =~ ^[0-9]+$ ]]; then echo "no free GPU (all >2GB used or claimed)"; exit 1; fi
+    fi
+    [ -z "$label" ] && label="g$gpu"   # default label derived from the GPU => collision-free across agents
     "$POD" "setsid bash $TREE/scripts/pod-remote-run.sh $label $gpu $* </dev/null >/dev/null 2>&1 &"
-    echo "run '$label' launched on GPU $gpu (detached). poll: scripts/pod.sh status $label"
+    echo "run '$label' launched on GPU $gpu. poll: scripts/pod.sh status $label"
     ;;
   gpus)
     "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader"
     ;;
   status)
-    label="${1:?usage: status <label>}"
+    label="${1:-arle}"
     "$POD" "for k in build run; do f=/root/\$k-$label; [ -f \$f.log ] || continue; \
       p=\$(cat \$f.pid 2>/dev/null); \
       if [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; then echo \"[\$k] RUNNING pid=\$p\"; else echo \"[\$k] not running (done or never started)\"; fi; \
@@ -96,11 +103,11 @@ case "$cmd" in
       echo '--- marker ---'; grep -E 'BUILD_EXIT|RUN_EXIT|DONE' \$f.log 2>/dev/null | tail -2; done"
     ;;
   log)
-    label="${1:?usage: log <label>}"
+    label="${1:-arle}"
     "$POD" "for k in build run; do [ -f /root/\$k-$label.log ] && { echo \"==== \$k-$label.log ====\"; cat /root/\$k-$label.log; }; done"
     ;;
   kill)
-    label="${1:?usage: kill <label>}"
+    label="${1:-arle}"
     "$POD" "for k in build run; do p=\$(cat /root/\$k-$label.pid 2>/dev/null); \
       [ -n \"\$p\" ] && { kill -- -\$p 2>/dev/null; kill \$p 2>/dev/null; echo \"killed \$k pgid \$p\"; }; done"
     ;;
