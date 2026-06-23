@@ -30,7 +30,7 @@ pub trait ToolExecutor {
     /// real timings via `tools::execute_tool_call_with_metadata`.
     fn execute_with_metadata(&self, tool_call: &ToolCall) -> (String, ToolExecutionMetadata) {
         let result = self.execute(tool_call);
-        let truncated = result.ends_with(TOOL_RESULT_TRUNCATION_MARKER);
+        let truncated = result.contains(TOOL_RESULT_TRUNCATION_MARKER);
         (
             result,
             ToolExecutionMetadata {
@@ -1602,10 +1602,10 @@ mod tests {
             .eq("1")
     }
 
-    fn shell_tool() -> ToolDefinition {
+    fn bash_tool() -> ToolDefinition {
         ToolDefinition::new(
-            "shell",
-            "Run shell",
+            "bash",
+            "Run bash",
             json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
@@ -1628,11 +1628,11 @@ mod tests {
     #[test]
     fn parse_tool_calls_uses_shared_protocol_parser() {
         let parsed = super::parse_tool_calls(
-            "Let me check.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            "Let me check.\n<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
         );
 
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].name, "bash");
         assert_eq!(parsed.tool_calls[0].arguments["command"], "pwd");
         assert_eq!(parsed.content, "Let me check.");
     }
@@ -1644,18 +1644,14 @@ mod tests {
                 Message::system("You are helpful."),
                 Message::assistant(
                     "Checking.",
-                    vec![ToolCall::new("shell", json!({ "command": "pwd" }))],
+                    vec![ToolCall::new("bash", json!({ "command": "pwd" }))],
                 ),
             ],
-            &[ToolDefinition::new(
-                "shell",
-                "Run a shell command",
-                json!({}),
-            )],
+            &[ToolDefinition::new("bash", "Run a bash command", json!({}))],
         );
 
         assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains(r#""name":"shell""#));
+        assert!(prompt.contains(r#""name":"bash""#));
         assert!(prompt.contains(r#""command":"pwd""#));
     }
 
@@ -1895,7 +1891,7 @@ mod tests {
             .run_turn(
                 &mut engine,
                 "本地有哪些文件",
-                &[shell_tool()],
+                &[bash_tool()],
                 &tool_executor(),
                 &tool_policy(),
                 settings(),
@@ -1909,10 +1905,10 @@ mod tests {
     }
 
     #[test]
-    fn shell_tool_follow_up_text_comes_from_model_not_template() {
+    fn bash_tool_follow_up_text_comes_from_model_not_template() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
             "I listed the current directory contents above.",
         ]);
 
@@ -1920,7 +1916,7 @@ mod tests {
             .run_turn(
                 &mut engine,
                 "Check the workspace root.",
-                &[shell_tool()],
+                &[bash_tool()],
                 &tool_executor(),
                 &tool_policy(),
                 settings(),
@@ -1946,7 +1942,7 @@ mod tests {
             .run_turn(
                 &mut engine,
                 "Summarize the current workspace.",
-                &[shell_tool()],
+                &[bash_tool()],
                 &tool_executor(),
                 &tool_policy(),
                 AgentSettings {
@@ -1968,7 +1964,7 @@ mod tests {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "<tool_call>\n{\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
             "done",
         ]);
 
@@ -1976,7 +1972,7 @@ mod tests {
             .run_turn(
                 &mut engine,
                 "Check the workspace root.",
-                &[shell_tool()],
+                &[bash_tool()],
                 &tool_executor(),
                 &tool_policy(),
                 settings(),
@@ -1999,7 +1995,7 @@ mod tests {
             // 1. Main generation: malformed tool_call (missing "name")
             "<tool_call>\n{\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
             // 2. Repair generation: valid tool_call
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
             // 3. Final assistant turn after tool result
             "done",
         ]);
@@ -2008,7 +2004,7 @@ mod tests {
             .run_turn(
                 &mut engine,
                 "Check the workspace root.",
-                &[shell_tool()],
+                &[bash_tool()],
                 &tool_executor(),
                 &tool_policy(),
                 settings(),
@@ -2223,10 +2219,10 @@ mod tests {
         }
     }
 
-    fn shell_def() -> ToolDefinition {
+    fn bash_def() -> ToolDefinition {
         ToolDefinition::new(
-            "shell",
-            "shell",
+            "bash",
+            "bash",
             json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
@@ -2261,14 +2257,14 @@ mod tests {
         // run twice and then fall through to the max-turns return site.
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
         ]);
         let result = session
             .run_turn(
                 &mut engine,
                 "do thing",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("ok"),
                 &NoopToolPolicy,
                 shell_recorder_settings(),
@@ -2300,13 +2296,13 @@ mod tests {
     fn terminal_state_policy_short_circuit_when_policy_returns_text() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
         ]);
         let result = session
             .run_turn(
                 &mut engine,
                 "list",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("file-a\nfile-b"),
                 &AlwaysShortCircuit,
                 shell_recorder_settings(),
@@ -2320,14 +2316,14 @@ mod tests {
     fn sub_turns_capture_per_call_usage_and_finish_reason() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
             "done",
         ]);
         let result = session
             .run_turn(
                 &mut engine,
                 "go",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("ok"),
                 &NoopToolPolicy,
                 settings(),
@@ -2350,14 +2346,14 @@ mod tests {
     fn messages_preserve_tool_use_id_correlation() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
             "done",
         ]);
         let result = session
             .run_turn(
                 &mut engine,
                 "go",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("ok"),
                 &NoopToolPolicy,
                 settings(),
@@ -2397,14 +2393,14 @@ mod tests {
         for _ in 0..2 {
             let mut session = AgentSession::new();
             let mut engine = FakeEngine::new(vec![
-                "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+                "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
                 "done",
             ]);
             let result = session
                 .run_turn(
                     &mut engine,
                     "go",
-                    &[shell_def()],
+                    &[bash_def()],
                     &StubToolExecutor::new("ok"),
                     &NoopToolPolicy,
                     settings(),
@@ -2439,7 +2435,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "tu_0_0".to_string(),
-                    name: "shell".to_string(),
+                    name: "bash".to_string(),
                     input: json!({ "command": "ls" }),
                 },
             ]),
@@ -2525,14 +2521,14 @@ mod tests {
         // scope for ARLE's current re-render-per-sub-turn loop.
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
             "done",
         ]);
         let result = session
             .run_turn(
                 &mut engine,
                 "list files",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("file-a\nfile-b"),
                 &NoopToolPolicy,
                 settings(),
@@ -2591,14 +2587,14 @@ mod tests {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "<tool_call>\n{\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
             "done",
         ]);
         let result = session
             .run_turn(
                 &mut engine,
                 "Check the workspace root.",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("ok"),
                 &NoopToolPolicy,
                 settings(),
@@ -2655,7 +2651,7 @@ mod tests {
         // ship a corrupted reconstruction.
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
-            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
             "done",
         ])
         .with_broken_prompt_extension();
@@ -2663,7 +2659,7 @@ mod tests {
             .run_turn(
                 &mut engine,
                 "list",
-                &[shell_def()],
+                &[bash_def()],
                 &StubToolExecutor::new("ok"),
                 &NoopToolPolicy,
                 settings(),
