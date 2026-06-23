@@ -1027,6 +1027,130 @@ impl SafetensorLoader {
         )
     }
 
+    /// Quant-aware twin of the BF16 fused-qkv head shard
+    /// ([`crate::shard_slice::shard_head_blocks_column_parallel`] over the
+    /// `[q; k; v]` blocks): if the checkpoint exposes a `Fp8BlockScaled` view
+    /// for `name`, shard the F8_E4M3 weight AND its block-scale sidecar with the
+    /// SAME head-block helper and build an `Fp8BlockScaled` [`DeviceMatrix`];
+    /// otherwise the caller keeps its byte-for-byte BF16 path.
+    ///
+    /// The scale rows map 1:1 to head-block rows because (and only because)
+    /// `head_rows` is a whole multiple of `block_m` — the per-head row group is
+    /// one (or more) complete scale block(s), so re-stacking the three blocks in
+    /// scale-row units mirrors the weight shard exactly. The blocks are
+    /// re-expressed in scale units (`head_rows / block_m` scale rows per head,
+    /// `cols / block_k` scale cols) and fed through the identical helper.
+    pub(crate) fn load_linear_qkv_fp8_head_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        blocks: &[crate::shard_slice::HeadBlock],
+        tp: &TpConfig,
+    ) -> Result<Option<DeviceMatrix>> {
+        let Some(view) = self.quant_view_for(name)? else {
+            return Ok(None);
+        };
+        let QuantFormat::Fp8BlockScaled {
+            block_m,
+            block_k,
+            scale_apply,
+        } = view.format
+        else {
+            // A non-FP8 quant sidecar (per-shard FP8 / FP4 / dense-F32) on the
+            // fused qkv is unsupported here; fall back to the caller's existing
+            // path rather than silently mis-sharding.
+            return Ok(None);
+        };
+        ensure!(
+            view.logical_shape.len() == 2,
+            "{name}: expected 2D fused qkv FP8 matrix, got {:?}",
+            view.logical_shape
+        );
+        let rows = view.logical_shape[0];
+        let cols = view.logical_shape[1];
+
+        // (a) borrow the raw F8_E4M3 weight + the BF16/F32 block-scale sidecar.
+        let weight = self.borrow_raw_tensor(&view.name)?;
+        ensure!(
+            weight.dtype == Dtype::F8_E4M3 && weight.shape == view.logical_shape,
+            "{name}: expected F8_E4M3 {:?}, got {:?} {:?}",
+            view.logical_shape,
+            weight.dtype,
+            weight.shape
+        );
+        let scale = self.borrow_raw_tensor(&view.scale_names[0])?;
+        let scale_elem = float_elem_size(&view.scale_names[0], scale.dtype)?;
+        let scale_rows = rows.div_ceil(block_m);
+        let scale_cols = cols.div_ceil(block_k);
+        ensure!(
+            scale.shape == [scale_rows, scale_cols],
+            "{}: scale shape {:?} != [{scale_rows}, {scale_cols}]",
+            view.scale_names[0],
+            scale.shape
+        );
+
+        // Each head block's row count must tile the scale-block grid exactly, or
+        // a scale row would straddle two head blocks and the 1:1 re-stack breaks.
+        let scale_blocks = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                ensure!(
+                    b.head_rows.is_multiple_of(block_m),
+                    "{name}: fused block {i} head_rows {} not a multiple of block_m {block_m} \
+                     (FP8 head shard requires head rows to tile the scale grid)",
+                    b.head_rows
+                );
+                Ok(crate::shard_slice::HeadBlock {
+                    heads: b.heads,
+                    head_rows: b.head_rows / block_m,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            cols.is_multiple_of(block_k),
+            "{name}: cols {cols} not a multiple of block_k {block_k}"
+        );
+
+        // (b) shard the FP8 weight with the SAME head-block helper as BF16.
+        let weight_shard = crate::shard_slice::shard_head_blocks_column_parallel(
+            weight.bytes(),
+            cols,
+            1,
+            blocks,
+            tp,
+        )?;
+        // (c) shard the scale bytes in scale-row units (head_rows/block_m rows
+        // per head, cols/block_k scale cols).
+        let scale_shard = crate::shard_slice::shard_head_blocks_column_parallel(
+            scale.bytes(),
+            scale_cols,
+            scale_elem,
+            &scale_blocks,
+            tp,
+        )?;
+        // (d) decode the scale bytes to f32 using the view's own scale_apply
+        // (Multiply/Divide) — never hardcoded.
+        let scales = tensor_bytes_to_f32(
+            &view.scale_names[0],
+            scale.dtype,
+            &scale_shard.bytes,
+            scale_apply,
+        )?;
+        // (e) build the resident FP8 block-scaled matrix for this rank's slice.
+        let matrix = DeviceMatrix::from_fp8_block_scaled(
+            ctx,
+            &weight_shard.bytes,
+            &scales,
+            weight_shard.rows,
+            weight_shard.cols,
+            block_m,
+            block_k,
+        )
+        .with_context(|| format!("upload sharded FP8 fused qkv {name}"))?;
+        Ok(Some(matrix))
+    }
+
     /// Load this EP rank's MoE weights for one layer (routed gate/up/down +
     /// router gate + shared expert) and build the per-expert weight-pointer
     /// tables. Only the experts in

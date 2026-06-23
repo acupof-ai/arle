@@ -5656,6 +5656,15 @@ fn load_linear_qkv_sharded(
     m: &Qwen35Config,
     tp: &TpConfig,
 ) -> Result<DeviceMatrix> {
+    let head_blocks = linear_qkv_head_blocks(m);
+    // FP8 block-scaled checkpoints (e.g. Qwen3.6-27B-FP8) carry the fused qkv as
+    // F8_E4M3 + a `weight_scale_inv` sidecar; shard both with the same head-block
+    // helper as the BF16 path. `None` → no quant view, keep the BF16 path below
+    // byte-for-byte. head_dim == block_m makes head-block boundaries land on
+    // scale-row boundaries, so the 3-block re-stack mirrors 1:1 in scale units.
+    if let Some(matrix) = loader.load_linear_qkv_fp8_head_sharded(ctx, name, &head_blocks, tp)? {
+        return Ok(matrix);
+    }
     let tensor = loader.load_raw_tensor(name)?;
     ensure!(
         tensor.dtype == Dtype::BF16,
@@ -5672,7 +5681,7 @@ fn load_linear_qkv_sharded(
         &tensor.bytes,
         tensor.shape[1],
         2,
-        &linear_qkv_head_blocks(m),
+        &head_blocks,
         tp,
     )?;
     DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
