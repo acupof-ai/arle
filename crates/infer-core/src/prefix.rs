@@ -269,6 +269,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .page_indices_for_token_range(slot, 0, sealed_tokens)
             .to_vec();
         let mut publish_blocks = sealed_blocks.min(pages.len());
+        // A recall-evicted prompt page leaves an EVICTED_PAGE sentinel; a cached
+        // prefix must be contiguous-resident, so truncate at the first hole — never
+        // publish a sentinel as a ResidentPage (it would later mirror u32::MAX →
+        // -1 in kv_indices and corrupt attention).
+        if let Some(hole) = pages
+            .iter()
+            .take(publish_blocks)
+            .position(|&p| p == infer_seam::EVICTED_PAGE)
+        {
+            publish_blocks = hole;
+        }
+        if publish_blocks == 0 {
+            return Vec::new();
+        }
         let blocks: Vec<_> = pages
             .iter()
             .take(publish_blocks)

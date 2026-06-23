@@ -34,7 +34,7 @@ mod resource;
 
 pub use allocator::KvAllocator;
 pub use diffusion_executor::BufferedDiffusionExecutor;
-pub use host_paged_kv_pool::HostPagedKvPool;
+pub use host_paged_kv_pool::{EVICTED_PAGE, HostPagedKvPool};
 pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};
 pub use kv_dtype::KvCacheDtype;
