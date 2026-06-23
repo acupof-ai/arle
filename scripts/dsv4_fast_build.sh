@@ -87,7 +87,7 @@ abs_path() {
 }
 
 resolve_deepgemm_env() {
-    local native="${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-${ARLE_CUDA_ENABLE_DEEPGEMM_TORCH:-}}"
+    local native="${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}"
     if [[ "$native" != "1" && "$native" != "true" && "$native" != "TRUE" && "$native" != "yes" && "$native" != "YES" ]]; then
         return 0
     fi
