@@ -63,6 +63,11 @@ pub struct EngineLoadConfig {
     /// this is set; server-style defaults leave it off.
     #[serde(default)]
     pub low_impact: bool,
+    /// Opt into session KV-recall ("infinite memory"). Metal-only, bf16-KV only;
+    /// default off → baseline byte-identical. The Metal builder turns it on via
+    /// `MetalExecutor::set_kv_recall`; other backends ignore it.
+    #[serde(default)]
+    pub kv_recall: bool,
 }
 
 impl Default for EngineLoadConfig {
@@ -83,6 +88,7 @@ impl Default for EngineLoadConfig {
             system_reserve_bytes: None,
             allow_swap: false,
             low_impact: false,
+            kv_recall: false,
         }
     }
 }
@@ -888,6 +894,7 @@ mod backend {
         let num_slots = config.num_slots;
         let page_size = config.page_size;
         let low_impact = config.low_impact;
+        let kv_recall = config.kv_recall;
         let resource_plan = infer_metal::plan_resource_budget(
             &resolved,
             infer_metal::MetalResourceRequest {
@@ -921,12 +928,13 @@ mod backend {
         }
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
-                let executor =
+                let mut executor =
                     MetalExecutor::from_model_path_with_kv_cache_dtype_and_resource_plan(
                         &model_source,
                         metal_kv_dtype,
                         resource_plan,
                     )?;
+                executor.set_kv_recall(kv_recall);
                 let kv = MetalKvPool::new(num_slots, total_pages, page_size);
                 if low_impact {
                     let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {

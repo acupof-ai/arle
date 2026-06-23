@@ -420,6 +420,8 @@ fn resolve_engine_config(
         config.chunked_prefill_size = config.chunked_prefill_size.min(32);
     }
 
+    config.kv_recall = serve_args.kv_recall;
+
     if let Some(value) = serve_args.num_slots {
         config.num_slots = value;
     }

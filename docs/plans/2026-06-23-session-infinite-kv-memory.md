@@ -51,10 +51,25 @@ validated math. The C++ change is small (emit the query), NOT an in-attention re
 | # | Component | Status | Home |
 |---|-----------|--------|------|
 | 1 | `session_id` on the request | ✅ exists (`infer-api/types.rs:104`, "advisory") | honor it |
-| 2 | `SessionMemory` store: `SessionId → {offloaded tier-keys, per-block mean-key rep}` | 🔨 new | `infer-core` (device-neutral), keyed by session → multi-tenant isolation (doc §5) |
-| 3 | Recall orchestration: when resident > working-set, keep sink+local, recall top-k by `query·rep` | 🔨 reuse | `infer-core/prefix.rs` demote/promote + `kv-native-sys` tier |
-| 4 | **Executor page-gather**: decode attends a *selected* page list (sink∪local∪recalled), not `[0..cache_len]` | 🔨 **only hard piece** | `infer-metal/executor.rs:2357-2430`; CUDA mirror |
-| 5 | Wire `session_id` → SessionMemory → assemble → page-gather | 🔨 | gated, default off |
+| 2 | Resident mean-key reps + `q·rep` scoring (per-block, layer-0) | ✅ live (Metal) `infer-metal/executor.rs` `block_reps` + `recompute_recall_plan` | device-side reps, host scoring |
+| 3 | Recall orchestration: when resident > working-set, keep sink+local, recall top-k by `query·rep` | ✅ live (Metal, **resident variant**); ⏳ L3 tier offload TODO | `infer-core::plan_recall` + `recall_ranges`; L3 demote/promote (`radix.rs`/`kv-native-sys`) deferred |
+| 4 | **Executor page-gather**: decode attends a *selected* page list (sink∪local∪recalled), not `[0..cache_len]` | ✅ done+tested `gather_kv_ranges`/`bf16_recall_read_inputs` | `infer-metal/executor.rs`; CUDA mirror TODO |
+| 5 | Wire `session_id` → recall → assemble → page-gather | ✅ live: C++ layer-0 query emit + Rust scoring + `recall_ranges`, gated `--kv-recall` (bf16-only), default off | `mlx_qwen35_model.cpp` emit + `executor.rs` `maybe_recompute_recall` |
+
+**Implementation status (2026-06-23):** Pieces 1–5 of the live recall path land
+in this pass — C++ emits the layer-0 decode query each step
+(`qwen35_compiled_take_recall_query`), Rust mean-pools resident per-block
+mean-key reps (`block_reps`), scores `q·rep`, runs `plan_recall`, and sets
+`recall_ranges` for the next step (stale-Q, licensed). Recall is **bf16-only**
+(int8 KV falls back to full attention, logged once) and gated behind
+`--kv-recall` (default off → baseline byte-identical). What's deferred:
+component #3's **L3 tier offload** — the current implementation is the
+**resident variant** (full KV stays in HBM `slot.kv_flat`; recall restricts
+*attention* to the selected ranges, saving decode compute). Freeing the
+offloaded blocks' full KV to L3 while keeping only the resident rep (the
+flat-VRAM-vs-history win) needs the per-block Metal-slot KV ↔ tier wiring and is
+marked `// TODO(kv-recall L3)` in `recompute_recall_plan`. The CUDA #4 mirror is
+also deferred (recall is Metal-only, cfg-gated).
 
 ## Critical path / DAG
 
