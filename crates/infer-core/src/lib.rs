@@ -8,8 +8,10 @@ use std::collections::{BTreeMap, VecDeque};
 mod planner;
 mod prefix;
 mod radix;
+mod recall;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
+pub use recall::{RecallConfig, RecallPlan, plan_recall};
 
 use anyhow::{Result, bail};
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
