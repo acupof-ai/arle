@@ -25,6 +25,8 @@ mod kv_batch;
 mod kv_dtype;
 #[path = "kv_query.rs"]
 mod kv_query;
+#[path = "kv_tier.rs"]
+mod kv_tier;
 #[path = "prefix_store.rs"]
 mod prefix_store;
 #[path = "resource.rs"]
@@ -37,6 +39,7 @@ pub use kv::KvPool;
 pub use kv_batch::{KvBatchDescriptor, KvBatchRow, KvBatchRowKind};
 pub use kv_dtype::KvCacheDtype;
 pub use kv_query::KvQuery;
+pub use kv_tier::{KvTier, TierBlockKey};
 pub use prefix_store::KvPrefixStore;
 pub use resource::{
     HostTierBudget, HostTierPolicy, SlotBudget, clamp_to_affordable, split_host_tiers,

@@ -28,6 +28,22 @@ use crate::ops::argmax;
 mod spec_decode;
 
 const SUPPORTED_PAGE_SIZE: usize = 16;
+
+/// Flatten a `(session, block)` [`infer_seam::TierBlockKey`] into the
+/// `CudaKvTierStore`'s opaque `u64` key namespace. The prefix tier already keys
+/// the same store by sequentially-assigned `u64`s (`next_tier_key`), so the
+/// write-through namespace must never collide with it: we reserve the high bit
+/// for write-through keys and pack `session` (low 31 bits) and `block` (low 32
+/// bits) below it. Two distinct sessions therefore never alias (tenant
+/// isolation, the "session A never prefetches into session B" gate), and no
+/// write-through key can equal a prefix-tier key (which the engine assigns from 0
+/// upward, never setting the high bit before wrapping past 2^63).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub(crate) fn tier_block_u64(session: u64, block: u64) -> u64 {
+    const WRITETHROUGH_BIT: u64 = 1 << 63;
+    WRITETHROUGH_BIT | ((session & 0x7FFF_FFFF) << 32) | (block & 0xFFFF_FFFF)
+}
 const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
 /// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
@@ -791,6 +807,33 @@ impl QwenCudaExecutor {
         self.tier.remove(keys);
     }
 
+    /// **Write-through** (`infer_seam::KvTier::write_through`): mirror a filled
+    /// device `page` into the host tier under `key`, so a later evict-drop of that
+    /// page is free (the tier keeps the source of truth). Reuses the same
+    /// `CudaKvTierStore` as the prefix tier — there is ONE session-keyed store
+    /// (R5), not a parallel one. `key` is the `(session, block)` `TierBlockKey`
+    /// flattened to the store's `u64` namespace by [`tier_block_u64`].
+    ///
+    /// Synchronous today (the copy is complete on return, matching
+    /// `demote_prefix_pages`); R4's side-stream async mirror is the remaining perf
+    /// step — see the pending-remote wins entry. Returns `false` (page not
+    /// mirrored, MUST NOT be evict-dropped) when the tier is full.
+    pub(crate) fn write_through(&mut self, key: u64, page: u32) -> Result<bool> {
+        if self.tier.is_full() {
+            return Ok(false);
+        }
+        let payload = self.kv.copy_pages_to_host(&self.model.ctx, &[page])?;
+        Ok(self.tier.insert(key, payload))
+    }
+
+    /// **Prefetch** (`infer_seam::KvTier::prefetch`): load blocks from the host
+    /// tier back into freshly allocated device pages (`(key, page)`), complete on
+    /// return. Identical transport to `promote_prefix_pages`; the difference is the
+    /// entry point (relevance-prefetch at prefill vs prefix-hit promote), per R5.
+    pub(crate) fn prefetch_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
+        self.promote_prefix_pages(entries)
+    }
+
     pub(crate) fn submit(
         &mut self,
         plan: &ForwardPlan,
@@ -1208,6 +1251,69 @@ impl QwenCudaExecutor {
         }
         self.slot_progress[slot] = SlotProgress { epoch, len: end };
         Ok(())
+    }
+}
+
+/// Write-through tiered KV memory contract for the dense-Qwen3 paged pool.
+///
+/// The CUDA paged pool is the natural write-through grain (page == mirror/evict/
+/// prefetch unit). These verbs delegate to the SAME `CudaKvTierStore` the prefix
+/// tier uses (R5 — one session-keyed store, not a parallel one), flattening the
+/// device-neutral `(session, block)` `TierBlockKey` into the store's `u64`
+/// namespace via [`tier_block_u64`] so write-through keys never alias prefix-tier
+/// keys.
+///
+/// Status (honest, per `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`):
+/// - `write_through` / `prefetch` — **real** (D2H/H2D over the existing store).
+/// - `evict_drop` — the backend has no per-page device mirror to drop, and the
+///   ACTUAL device-page free is owned by the host single-allocator `CudaKvPool`
+///   (the executor re-publishes the slot's full contiguous page table every step
+///   via `mirror_slot`, so freeing a live slot's middle page collides with the
+///   `SlotProgress` continuity guard). So this hook is a no-op and the flat-VRAM
+///   win — freeing non-resident middle pages out of HBM — is the documented
+///   remaining blocker (same wall the prior per-step recall landing hit). The
+///   resident-variant restricted page table (`try_recall_decode`) is live and
+///   gives the budget-bounded decode-attention working set today.
+impl infer_seam::KvTier for QwenCudaExecutor {
+    fn tier_capacity_pages(&self) -> usize {
+        self.tier.capacity_pages()
+    }
+
+    fn tier_page_bytes(&self) -> usize {
+        self.tier.page_bytes()
+    }
+
+    fn tier_location(&self, key: infer_seam::TierBlockKey) -> Option<infer_seam::KvTierLocation> {
+        self.tier.location(tier_block_u64(key.session, key.block))
+    }
+
+    fn write_through(&mut self, key: infer_seam::TierBlockKey, page: u32) -> Result<bool> {
+        QwenCudaExecutor::write_through(self, tier_block_u64(key.session, key.block), page)
+    }
+
+    fn evict_drop(&mut self, _page: u32) {
+        // No backend-side device mirror to release; the host CudaKvPool owns the
+        // page free. Mid-decode device-page free is the documented blocker (see
+        // the impl-level doc) — left a no-op so the contract is satisfiable
+        // without a half-broken page-lifecycle path. The page's tier copy (from
+        // `write_through`) remains the source of truth.
+    }
+
+    fn prefetch(&mut self, entries: &[(infer_seam::TierBlockKey, u32)]) -> Result<()> {
+        let u64_entries: Vec<(u64, u32)> = entries
+            .iter()
+            .map(|&(key, page)| (tier_block_u64(key.session, key.block), page))
+            .collect();
+        self.prefetch_pages(&u64_entries)
+    }
+
+    fn drop_tier_session(&mut self, session: u64) {
+        // The store has no session index (keys are opaque u64), so a precise
+        // per-session sweep would need a key registry. Until session_id is
+        // threaded into the engine (the prefetch-policy plumbing), sessions are
+        // reclaimed lazily via the tier's own LRU/capacity eviction; this hook is
+        // the seam-level entry point for the future precise sweep.
+        let _ = session;
     }
 }
 

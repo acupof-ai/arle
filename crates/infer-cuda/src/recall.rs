@@ -13,12 +13,19 @@
 //!
 //! This is the **resident variant** (mirroring the Metal landing): the full KV
 //! stays in the device pool and recall restricts *attention* to the selected
-//! pages (a decode-compute saving). The plan-doc L3 tier offload — demoting the
-//! non-selected middle pages out of HBM while keeping only the resident rep — is
-//! `TODO(kv-recall L3)`: it needs the executor to own mid-decode device-page
-//! lifecycle, which conflicts with the host-`CudaKvPool`-is-single-allocator
-//! contract (the `SlotProgress` continuity guard). The reps + scoring +
-//! restricted page table are fully live, so recall itself works now.
+//! pages (a decode-compute saving). Under the write-through model
+//! (`docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`, supersedes the swap
+//! plan), this module is the **decode attend-resident** verb (the restricted page
+//! table) and the **R6 reps** (mean-pooled K kept resident, computed once a block
+//! freezes — exactly the write-through-time rep). The other write-through verbs
+//! (mirror at page-fill / prefetch at prefill) live on the executor as the
+//! `infer_seam::KvTier` impl. The remaining gap — freeing the non-selected middle
+//! pages out of HBM for the flat-VRAM win — is the same single-allocator blocker:
+//! the host `CudaKvPool` owns the page free and the executor re-publishes the
+//! slot's full page table every step via `mirror_slot`, so a live slot's middle
+//! page cannot be freed without breaking the `SlotProgress` continuity guard. The
+//! reps + scoring + restricted page table are fully live, so the budget-bounded
+//! decode-attention working set works now; the VRAM flattening is deferred.
 //!
 //! Everything here is `#[cfg(feature = "cuda")]`: the planner
 //! ([`infer_core::plan_recall`]) is device-neutral, but the rep/score machinery
@@ -225,14 +232,17 @@ mod cuda_impl {
                     pool.page_size,
                 ))
             };
-            // TODO(kv-recall L3): this is the RESIDENT variant — full KV stays in
-            // the device pool and recall restricts *attention* to the selected
-            // pages (the restricted page table), saving decode compute. Freeing
-            // the non-selected middle pages to the L3 tier (`demote_prefix_pages`
-            // / kv-native-sys) while keeping only the resident rep — the
-            // flat-VRAM-vs-history win — needs the executor to own mid-decode
-            // device-page lifecycle (currently the host CudaKvPool is the single
-            // allocator). Reps + scoring + restricted page table are fully live.
+            // TODO(write-through evict-drop): this is the RESIDENT variant — full
+            // KV stays in the device pool and recall restricts *attention* to the
+            // selected pages (the restricted page table), saving decode compute.
+            // The write-through verbs (`infer_seam::KvTier` on the executor)
+            // already mirror pages to the tier (`write_through`) and can prefetch
+            // them back (`prefetch`); the missing step for the flat-VRAM-vs-history
+            // win is freeing the non-selected middle pages OUT of HBM, which needs
+            // the executor to own mid-decode device-page lifecycle (currently the
+            // host CudaKvPool is the single allocator and re-publishes the full
+            // page table via `mirror_slot` every step). Reps + scoring + restricted
+            // page table are fully live.
             Ok(())
         }
     }

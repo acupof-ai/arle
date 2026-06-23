@@ -9,9 +9,13 @@ mod planner;
 mod prefix;
 mod radix;
 mod recall;
+mod writethrough;
 
 pub use radix::{BlockId, PrefixMatch, RadixCache};
 pub use recall::{RecallConfig, RecallPlan, plan_recall};
+pub use writethrough::{
+    cap_rep_pool, evict_drop_pages, plan_working_set, prefetch_blocks, prefetch_query,
+};
 
 use anyhow::{Result, bail};
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
