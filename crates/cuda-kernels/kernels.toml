@@ -1,0 +1,806 @@
+# crates/cuda-kernels/kernels.toml
+#
+# SINGLE SOURCE OF TRUTH for the TileLang AOT kernel matrix.
+# Tranche 1 (registry + generated FFI): build.rs parses this; build/codegen
+# emits OUT_DIR/ffi_tilelang_generated.rs (extern block + resolve()).
+#
+# Behavior-identical to the pre-redesign hardcoded specs:
+#   - same set of C symbols (public_name = "{kernel_name}_cuda")
+#   - same per-SM dispatch wrapper, same generator invocation args
+#   - the consumer dispatch (decode,q_heads -> fn) is reproduced by resolve().
+#
+# Each [[kernel]] row is one TileLangKernelSpec. Fields map 1:1 to the old
+# inline struct construction in compile_tilelang_aot_kernels():
+#   family       -> grouping + drives generated_dir/symbol prefixes
+#   head_dim     -> documentation/resolve key (baked into the cubin, not a py arg)
+#   q_heads/kv_heads -> --num-q-heads/--num-kv-heads (omit for non-attn rows)
+#   kv_dtype     -> bf16 | fp8 (selects the abi; resolve() key)
+#   phase        -> prefill | decode | split_partial | split_merge | <gdr phase> | <fq phase>
+#   abi          -> names a [abi.*] shared C signature block (below)
+#   py_module    -> --kernel-path
+#   kernel_name  -> generator --kernel-name stem (==> symbol "{kernel_name}_cuda")
+#   out_name     -> generator --out-name (artifact basename)
+#   artifact_dir -> generated/<dir> base (per-SM gets _sm{N}, dispatch gets _dispatch)
+#   kernel_family-> generator --kernel-family (NOT the registry `family`; the py
+#                   codegen tag: attention | attention_bf16_split_partial |
+#                   attention_bf16_split_merge | attention_fp8 | gdr | flashqla)
+#   kernel_key   -> generator --kernel-key (optional; split_partial/merge/gdr/fq)
+#   allow_sm70   -> include sm_70 in the per-SM loop (Qwen3.5 dense subset + GDR)
+#   ffi          -> true: emit a Rust extern in ffi_tilelang_generated.rs.
+#                   false/omitted: build-only (FFI extern stays hand-written in
+#                   ffi/recurrent.rs for GDR/FlashQLA — see open_questions).
+#   gate         -> default | flashqla (build-time inclusion gate; flashqla rows
+#                   are sm_90-only + ARLE_CUDA_ENABLE_FLASHQLA_GDR; else stubbed)
+#
+# Head-config derivation for the python SUPPORTED_HEADS lists is deferred to a
+# later tranche (the py modules still validate against their own tuples); tranche
+# 1 keeps the generator interface byte-identical.
+
+schema_version = 1
+
+# ---------------------------------------------------------------------------
+# Shared C ABI signatures. Field order is load-bearing (matches the dispatch
+# wrapper extern/call args AND the Rust extern block). `c` is the C decl used by
+# the dispatch wrapper (format_dispatch_wrapper); `rust` is the Rust extern arg
+# list emitted into ffi_tilelang_generated.rs. `fn_ty` is the resolve() pointer
+# type alias name.
+# ---------------------------------------------------------------------------
+
+[abi.paged_attn_v1]
+fn_ty = "PagedAttnV1Fn"
+# 18-arg base BF16 paged signature (prefill + decode, all head dims).
+c = """uint16_t *q, const int32_t *q_indptr, uint16_t *k_pool, uint16_t *v_pool, \
+const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
+uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
+int32_t num_pages, int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, \
+int32_t page_size, float sm_scale, CUstream stream"""
+call = """q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, o, \
+batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
+num_kv_heads, page_size, sm_scale, stream"""
+rust = [
+  ["q", "*mut Half"],
+  ["q_indptr", "*const i32"],
+  ["k_pool", "*mut Half"],
+  ["v_pool", "*mut Half"],
+  ["kv_indptr", "*const i32"],
+  ["kv_indices", "*const i32"],
+  ["kv_last_page_len", "*const i32"],
+  ["o", "*mut Half"],
+  ["batch_size", "i32"],
+  ["total_q_tokens", "i32"],
+  ["max_qlen", "i32"],
+  ["num_pages", "i32"],
+  ["total_pages", "i32"],
+  ["num_q_heads", "i32"],
+  ["num_kv_heads", "i32"],
+  ["page_size", "i32"],
+  ["sm_scale", "f32"],
+  ["stream", "CUstream"],
+]
+
+[abi.paged_attn_split_partial_v1]
+fn_ty = "PagedAttnSplitPartialV1Fn"
+# 21-arg: adds partial_out/m/l + num_splits.
+c = """uint16_t *q, const int32_t *q_indptr, uint16_t *k_pool, uint16_t *v_pool, \
+const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
+float *partial_out, float *partial_m, float *partial_l, int32_t batch_size, \
+int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, int32_t total_pages, \
+int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, float sm_scale, \
+int32_t num_splits, CUstream stream"""
+call = """q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, \
+partial_out, partial_m, partial_l, batch_size, total_q_tokens, max_qlen, num_pages, \
+total_pages, num_q_heads, num_kv_heads, page_size, sm_scale, num_splits, stream"""
+rust = [
+  ["q", "*mut Half"],
+  ["q_indptr", "*const i32"],
+  ["k_pool", "*mut Half"],
+  ["v_pool", "*mut Half"],
+  ["kv_indptr", "*const i32"],
+  ["kv_indices", "*const i32"],
+  ["kv_last_page_len", "*const i32"],
+  ["partial_out", "*mut f32"],
+  ["partial_m", "*mut f32"],
+  ["partial_l", "*mut f32"],
+  ["batch_size", "i32"],
+  ["total_q_tokens", "i32"],
+  ["max_qlen", "i32"],
+  ["num_pages", "i32"],
+  ["total_pages", "i32"],
+  ["num_q_heads", "i32"],
+  ["num_kv_heads", "i32"],
+  ["page_size", "i32"],
+  ["sm_scale", "f32"],
+  ["num_splits", "i32"],
+  ["stream", "CUstream"],
+]
+
+[abi.paged_attn_split_merge_v1]
+fn_ty = "PagedAttnSplitMergeV1Fn"
+# 15-arg: consumes the partials, writes o.
+c = """const float *partial_out, const float *partial_m, const float *partial_l, \
+uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
+int32_t num_pages, int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, \
+int32_t page_size, float sm_scale, int32_t num_splits, CUstream stream"""
+call = """partial_out, partial_m, partial_l, o, batch_size, total_q_tokens, max_qlen, \
+num_pages, total_pages, num_q_heads, num_kv_heads, page_size, sm_scale, num_splits, stream"""
+rust = [
+  ["partial_out", "*const f32"],
+  ["partial_m", "*const f32"],
+  ["partial_l", "*const f32"],
+  ["o", "*mut Half"],
+  ["batch_size", "i32"],
+  ["total_q_tokens", "i32"],
+  ["max_qlen", "i32"],
+  ["num_pages", "i32"],
+  ["total_pages", "i32"],
+  ["num_q_heads", "i32"],
+  ["num_kv_heads", "i32"],
+  ["page_size", "i32"],
+  ["sm_scale", "f32"],
+  ["num_splits", "i32"],
+  ["stream", "CUstream"],
+]
+
+[abi.paged_attn_fp8_v1]
+fn_ty = "PagedAttnFp8V1Fn"
+# 20-arg: k/v pools as const u8 (FP8 E4M3) + k_scales/v_scales.
+c = """uint16_t *q, const int32_t *q_indptr, const uint8_t *k_pool, const uint8_t *v_pool, \
+const float *k_scales, const float *v_scales, const int32_t *kv_indptr, \
+const int32_t *kv_indices, const int32_t *kv_last_page_len, uint16_t *o, \
+int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, \
+int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, \
+float sm_scale, CUstream stream"""
+call = """q, q_indptr, k_pool, v_pool, k_scales, v_scales, kv_indptr, kv_indices, \
+kv_last_page_len, o, batch_size, total_q_tokens, max_qlen, num_pages, total_pages, \
+num_q_heads, num_kv_heads, page_size, sm_scale, stream"""
+rust = [
+  ["q", "*mut Half"],
+  ["q_indptr", "*const i32"],
+  ["k_pool", "*const u8"],
+  ["v_pool", "*const u8"],
+  ["k_scales", "*const f32"],
+  ["v_scales", "*const f32"],
+  ["kv_indptr", "*const i32"],
+  ["kv_indices", "*const i32"],
+  ["kv_last_page_len", "*const i32"],
+  ["o", "*mut Half"],
+  ["batch_size", "i32"],
+  ["total_q_tokens", "i32"],
+  ["max_qlen", "i32"],
+  ["num_pages", "i32"],
+  ["total_pages", "i32"],
+  ["num_q_heads", "i32"],
+  ["num_kv_heads", "i32"],
+  ["page_size", "i32"],
+  ["sm_scale", "f32"],
+  ["stream", "CUstream"],
+]
+
+# GDR + FlashQLA ABIs: build-only in tranche 1 (ffi = false). Their Rust externs
+# stay hand-written in ffi/recurrent.rs (they are individual pub fn decls, not
+# macro lockstep — outside the FFI-collapse scope). C signature is still required
+# here so build.rs emits the matching dispatch wrapper.
+
+[abi.gdr_prepare_v1]
+fn_ty = "GdrPrepareV1Fn"
+c = """const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, \
+const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, \
+uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, \
+int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream"""
+call = """qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, g_out, beta_out, \
+num_key_heads, num_value_heads, qkv_dim, seq_len, stream"""
+rust = []  # build-only
+
+[abi.gdr_cumsum_v1]
+fn_ty = "GdrCumsumV1Fn"
+c = "const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream"
+call = "g_in, g_out, seq_len, num_value_heads, stream"
+rust = []
+
+[abi.gdr_a_v1]
+fn_ty = "GdrAV1Fn"
+c = """const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, \
+int32_t seq_len, int32_t num_value_heads, CUstream stream"""
+call = "k, g_cumsum, beta, a_tril, seq_len, num_value_heads, stream"
+rust = []
+
+[abi.gdr_recompute_v1]
+fn_ty = "GdrRecomputeV1Fn"
+c = """const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, \
+const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream"""
+call = "k, v, beta, w, u, a_inv, g_cumsum, seq_len, num_value_heads, stream"
+rust = []
+
+[abi.gdr_state_v1]
+fn_ty = "GdrStateV1Fn"
+c = """const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, \
+const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, \
+int32_t seq_len, int32_t num_value_heads, CUstream stream"""
+call = "k, w, u, g_cumsum, initial_state, chunk_state, v_new, final_state, seq_len, num_value_heads, stream"
+rust = []
+
+[abi.gdr_o_v1]
+fn_ty = "GdrOV1Fn"
+c = """const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, \
+const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, \
+float scale, CUstream stream"""
+call = "q, k, v_new, chunk_state, g_cumsum, output, seq_len, num_value_heads, scale, stream"
+rust = []
+
+[abi.fq_cumsum_v1]
+fn_ty = "FqCumsumV1Fn"
+c = "const float* g_in, float* g_out, int32_t seq_len, CUstream stream"
+call = "g_in, g_out, seq_len, stream"
+rust = []
+
+[abi.fq_kkt_v1]
+fn_ty = "FqKktV1Fn"
+c = "const uint16_t* k, const float* beta, uint16_t* a_inv, int32_t seq_len, CUstream stream"
+call = "k, beta, a_inv, seq_len, stream"
+rust = []
+
+[abi.fq_fwd_v1]
+fn_ty = "FqFwdV1Fn"
+c = """const uint16_t* q, const uint16_t* k, const uint16_t* v, const uint16_t* a_inv, \
+const float* g_cumsum, const float* beta, const float* h0, uint16_t* o, float* ht, \
+int32_t seq_len, CUstream stream"""
+call = "q, k, v, a_inv, g_cumsum, beta, h0, o, ht, seq_len, stream"
+rust = []
+
+# ===========================================================================
+# BF16 prefill (paged_attn_v1) — kernel_family "attention".
+# allow_sm70: HD128 q32/q40 + HD256 q16_kv4 (Qwen3.5 dense subset).
+# ===========================================================================
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 128
+q_heads = 16
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd128.py"
+artifact_dir = "batch_prefill_paged_hd128_q16_kv8"
+kernel_name = "tilelang_batch_prefill_paged_hd128_q16_kv8_run"
+out_name = "tilelang_batch_prefill_paged_hd128_q16_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 128
+q_heads = 32
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd128.py"
+artifact_dir = "batch_prefill_paged_hd128_q32_kv8"
+kernel_name = "tilelang_batch_prefill_paged_hd128_q32_kv8_run"
+out_name = "tilelang_batch_prefill_paged_hd128_q32_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 128
+q_heads = 40
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd128.py"
+artifact_dir = "batch_prefill_paged_hd128_q40_kv8"
+kernel_name = "tilelang_batch_prefill_paged_hd128_q40_kv8_run"
+out_name = "tilelang_batch_prefill_paged_hd128_q40_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 128
+q_heads = 64
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd128.py"
+artifact_dir = "batch_prefill_paged_hd128_q64_kv8"
+kernel_name = "tilelang_batch_prefill_paged_hd128_q64_kv8_run"
+out_name = "tilelang_batch_prefill_paged_hd128_q64_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 256
+q_heads = 8
+kv_heads = 2
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
+artifact_dir = "batch_prefill_paged_hd256_q8_kv2"
+kernel_name = "tilelang_batch_prefill_paged_hd256_q8_kv2_run"
+out_name = "tilelang_batch_prefill_paged_hd256_q8_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 256
+q_heads = 16
+kv_heads = 2
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
+artifact_dir = "batch_prefill_paged_hd256_q16_kv2"
+kernel_name = "tilelang_batch_prefill_paged_hd256_q16_kv2_run"
+out_name = "tilelang_batch_prefill_paged_hd256_q16_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 256
+q_heads = 16
+kv_heads = 4
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
+artifact_dir = "batch_prefill_paged_hd256_q16_kv4"
+kernel_name = "tilelang_batch_prefill_paged_hd256_q16_kv4_run"
+out_name = "tilelang_batch_prefill_paged_hd256_q16_kv4"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 64
+q_heads = 16
+kv_heads = 1
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd64.py"
+artifact_dir = "batch_prefill_paged_hd64_q16_kv1"
+kernel_name = "tilelang_batch_prefill_paged_hd64_q16_kv1_run"
+out_name = "tilelang_batch_prefill_paged_hd64_q16_kv1"
+allow_sm70 = false
+ffi = true
+
+# ===========================================================================
+# BF16 decode (paged_attn_v1) — kernel_family "attention".
+# ===========================================================================
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 256
+q_heads = 8
+kv_heads = 2
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd256.py"
+artifact_dir = "batch_decode_paged_hd256_q8_kv2"
+kernel_name = "tilelang_batch_decode_paged_hd256_q8_kv2_run"
+out_name = "tilelang_batch_decode_paged_hd256_q8_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 256
+q_heads = 16
+kv_heads = 2
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd256.py"
+artifact_dir = "batch_decode_paged_hd256_q16_kv2"
+kernel_name = "tilelang_batch_decode_paged_hd256_q16_kv2_run"
+out_name = "tilelang_batch_decode_paged_hd256_q16_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 256
+q_heads = 16
+kv_heads = 4
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd256.py"
+artifact_dir = "batch_decode_paged_hd256_q16_kv4"
+kernel_name = "tilelang_batch_decode_paged_hd256_q16_kv4_run"
+out_name = "tilelang_batch_decode_paged_hd256_q16_kv4"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 16
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_q16_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_q16_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_q16_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 32
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_q32_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_q32_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_q32_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 40
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_q40_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_q40_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_q40_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 64
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_q64_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_q64_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_q64_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 64
+q_heads = 16
+kv_heads = 1
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd64.py"
+artifact_dir = "batch_decode_paged_hd64_q16_kv1"
+kernel_name = "tilelang_batch_decode_paged_hd64_q16_kv1_run"
+out_name = "tilelang_batch_decode_paged_hd64_q16_kv1"
+allow_sm70 = false
+ffi = true
+
+# ===========================================================================
+# BF16 split-KV decode (M_b.1). partial + merge per HD128 head config.
+# kernel_family = attention_bf16_split_partial / attention_bf16_split_merge.
+# allow_sm70 mirrors the base HD128 decode (q32/q40 true).
+# ===========================================================================
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 16
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_partial"
+abi = "paged_attn_split_partial_v1"
+kernel_family = "attention_bf16_split_partial"
+kernel_key = "split_partial"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_partial_q16_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_partial_q16_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_partial_q16_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 32
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_partial"
+abi = "paged_attn_split_partial_v1"
+kernel_family = "attention_bf16_split_partial"
+kernel_key = "split_partial"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_partial_q32_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_partial_q32_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_partial_q32_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 40
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_partial"
+abi = "paged_attn_split_partial_v1"
+kernel_family = "attention_bf16_split_partial"
+kernel_key = "split_partial"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_partial_q40_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_partial_q40_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_partial_q40_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 64
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_partial"
+abi = "paged_attn_split_partial_v1"
+kernel_family = "attention_bf16_split_partial"
+kernel_key = "split_partial"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_partial_q64_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_partial_q64_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_partial_q64_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 16
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_merge"
+abi = "paged_attn_split_merge_v1"
+kernel_family = "attention_bf16_split_merge"
+kernel_key = "split_merge"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_merge_q16_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q16_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_merge_q16_kv8"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 32
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_merge"
+abi = "paged_attn_split_merge_v1"
+kernel_family = "attention_bf16_split_merge"
+kernel_key = "split_merge"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_merge_q32_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q32_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_merge_q32_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 40
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_merge"
+abi = "paged_attn_split_merge_v1"
+kernel_family = "attention_bf16_split_merge"
+kernel_key = "split_merge"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_merge_q40_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q40_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_merge_q40_kv8"
+allow_sm70 = true
+ffi = true
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 64
+kv_heads = 8
+kv_dtype = "bf16"
+phase = "split_merge"
+abi = "paged_attn_split_merge_v1"
+kernel_family = "attention_bf16_split_merge"
+kernel_key = "split_merge"
+py_module = "tools/tilelang/batch_decode_paged_hd128.py"
+artifact_dir = "batch_decode_paged_hd128_split_merge_q64_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q64_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_split_merge_q64_kv8"
+allow_sm70 = false
+ffi = true
+
+# ===========================================================================
+# FP8 KV decode (M_b.2 A0) — single config (32,8). kernel_family attention_fp8.
+# ===========================================================================
+
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 128
+q_heads = 32
+kv_heads = 8
+kv_dtype = "fp8"
+phase = "decode"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_decode_paged_hd128_fp8.py"
+artifact_dir = "batch_decode_paged_hd128_fp8_q32_kv8"
+kernel_name = "tilelang_batch_decode_paged_hd128_fp8_q32_kv8_run"
+out_name = "tilelang_batch_decode_paged_hd128_fp8_q32_kv8"
+allow_sm70 = false
+ffi = true
+
+# ===========================================================================
+# Gated Delta Rule (Qwen3.5 fixed shape). build-only (ffi=false); 6 phases.
+# kernel_family "gdr"; allow_sm70=true (all phases).
+# ===========================================================================
+
+[[kernel]]
+family = "gated_delta_rule"
+phase = "prepare"
+abi = "gdr_prepare_v1"
+kernel_family = "gdr"
+kernel_key = "gdr_chunk_prepare"
+py_module = "tools/tilelang/gated_delta_rule.py"
+artifact_dir = "gated_delta_rule_chunk_prepare"
+kernel_name = "gated_delta_rule_prefill_chunk_prepare"
+out_name = "tilelang_gated_delta_rule_chunk_prepare"
+allow_sm70 = true
+ffi = false
+
+[[kernel]]
+family = "gated_delta_rule"
+phase = "cumsum"
+abi = "gdr_cumsum_v1"
+kernel_family = "gdr"
+kernel_key = "gdr_chunk_cumsum"
+py_module = "tools/tilelang/gated_delta_rule.py"
+artifact_dir = "gated_delta_rule_chunk_cumsum"
+kernel_name = "gated_delta_rule_prefill_chunk_cumsum"
+out_name = "tilelang_gated_delta_rule_chunk_cumsum"
+allow_sm70 = true
+ffi = false
+
+[[kernel]]
+family = "gated_delta_rule"
+phase = "a"
+abi = "gdr_a_v1"
+kernel_family = "gdr"
+kernel_key = "gdr_chunk_a"
+py_module = "tools/tilelang/gated_delta_rule.py"
+artifact_dir = "gated_delta_rule_chunk_a"
+kernel_name = "gated_delta_rule_prefill_chunk_a"
+out_name = "tilelang_gated_delta_rule_chunk_a"
+allow_sm70 = true
+ffi = false
+
+[[kernel]]
+family = "gated_delta_rule"
+phase = "recompute"
+abi = "gdr_recompute_v1"
+kernel_family = "gdr"
+kernel_key = "gdr_chunk_recompute"
+py_module = "tools/tilelang/gated_delta_rule.py"
+artifact_dir = "gated_delta_rule_chunk_recompute"
+kernel_name = "gated_delta_rule_prefill_chunk_recompute"
+out_name = "tilelang_gated_delta_rule_chunk_recompute"
+allow_sm70 = true
+ffi = false
+
+[[kernel]]
+family = "gated_delta_rule"
+phase = "state"
+abi = "gdr_state_v1"
+kernel_family = "gdr"
+kernel_key = "gdr_chunk_state"
+py_module = "tools/tilelang/gated_delta_rule.py"
+artifact_dir = "gated_delta_rule_chunk_state"
+kernel_name = "gated_delta_rule_prefill_chunk_state"
+out_name = "tilelang_gated_delta_rule_chunk_state"
+allow_sm70 = true
+ffi = false
+
+[[kernel]]
+family = "gated_delta_rule"
+phase = "o"
+abi = "gdr_o_v1"
+kernel_family = "gdr"
+kernel_key = "gdr_chunk_o"
+py_module = "tools/tilelang/gated_delta_rule.py"
+artifact_dir = "gated_delta_rule_chunk_o"
+kernel_name = "gated_delta_rule_prefill_chunk_o"
+out_name = "tilelang_gated_delta_rule_chunk_o"
+allow_sm70 = true
+ffi = false
+
+# ===========================================================================
+# FlashQLA chunked GDR fwd — sm_90 only + ARLE_CUDA_ENABLE_FLASHQLA_GDR.
+# gate="flashqla": build.rs stubs (NOT_SUPPORTED) unless flag set AND sm_90 in
+# targets. build-only (ffi=false). 3 phases.
+# ===========================================================================
+
+[[kernel]]
+family = "flashqla"
+phase = "fq_cumsum"
+abi = "fq_cumsum_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_cumsum"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_cumsum"
+kernel_name = "gdr_fq_cumsum"
+out_name = "tilelang_flashqla_gdr_cumsum"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+family = "flashqla"
+phase = "fq_kkt"
+abi = "fq_kkt_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_kkt"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_kkt"
+kernel_name = "gdr_fq_kkt"
+out_name = "tilelang_flashqla_gdr_kkt"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+family = "flashqla"
+phase = "fq_fwd"
+abi = "fq_fwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_fwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_fwd"
+kernel_name = "gdr_fq_fwd"
+out_name = "tilelang_flashqla_gdr_fwd"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
