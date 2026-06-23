@@ -318,85 +318,345 @@ fn format_dispatch_wrapper(
     )
 }
 
-/// One AOT-specialized prefill HD128 kernel per (num_q_heads, num_kv_heads).
-/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd128.py`
-/// — when adding a new HD128 head config, extend both lists in lockstep
-/// AND add the matching FFI extern + dispatch arm in
-/// `crates/cuda-kernels/src/ffi/attention.rs` and
-/// `infer/src/ops/attention.rs`.
-const TILELANG_PREFILL_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
-
-/// One AOT-specialized prefill HD256 kernel per (num_q_heads, num_kv_heads).
-/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd256.py`
-/// — when adding a new Qwen3.5 full-attn head config, extend both lists in
-/// lockstep AND add the matching FFI extern + dispatch arm in
-/// `crates/cuda-kernels/src/ffi/attention.rs` and
-/// `infer/src/ops/attention.rs`.
-const TILELANG_PREFILL_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16, 4)];
-
-/// One AOT-specialized decode HD256 kernel per (num_q_heads, num_kv_heads).
-/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd256.py`
-/// — when adding a new Qwen3.5 full-attn head config, extend both lists in
-/// lockstep AND add the matching FFI extern + dispatch arm in
-/// `crates/cuda-kernels/src/ffi/attention.rs` and
-/// `infer/src/ops/attention.rs`.
-const TILELANG_DECODE_HD256_HEAD_CONFIGS: &[(u32, u32)] = &[(8, 2), (16, 2), (16, 4)];
-
-/// One AOT-specialized decode HD128 kernel per (num_q_heads, num_kv_heads).
-/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128.py`
-/// — when adding a new HD128 full-attn head config, extend both lists in
-/// lockstep AND add the matching FFI extern + dispatch arm in
-/// `crates/cuda-kernels/src/ffi/attention.rs` and
-/// `infer/src/ops/attention.rs`.
-const TILELANG_DECODE_HD128_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 8), (32, 8), (40, 8), (64, 8)];
-
-/// One AOT-specialized prefill HD64 kernel per (num_q_heads, num_kv_heads).
-/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_prefill_paged_hd64.py`
-/// — substrate for the DSV4-mini family (head_dim=64, single KV head;
-/// master §8.2 P1.0). When adding a new HD64 head config, extend both
-/// lists in lockstep AND add the matching FFI extern decl in
-/// `crates/cuda-kernels/src/ffi/attention.rs`.
-const TILELANG_PREFILL_HD64_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 1)];
-
-/// One AOT-specialized decode HD64 kernel per (num_q_heads, num_kv_heads).
-/// Mirrors `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd64.py`
-/// — substrate for the DSV4-mini family. When adding a new HD64 head
-/// config, extend both lists in lockstep AND add the matching FFI extern
-/// decl in `crates/cuda-kernels/src/ffi/attention.rs`.
-const TILELANG_DECODE_HD64_HEAD_CONFIGS: &[(u32, u32)] = &[(16, 1)];
-
-/// M_b.1 — BF16 split-KV decode phase kernels. Mirrors
-/// `TILELANG_DECODE_HD128_HEAD_CONFIGS`; each config emits a partial kernel and
-/// a merge kernel.
-const TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS: &[(u32, u32)] = TILELANG_DECODE_HD128_HEAD_CONFIGS;
-
-/// M_b.2 Phase A0 — FP8 KV variant of HD128 paged decode. A0 scope is
-/// single-config (32, 8) = Qwen3.5-4B; A1 will extend to all four head
-/// shapes once codegen + numerical correctness are proven. Mirrors
-/// `SUPPORTED_HEADS` in `tools/tilelang/batch_decode_paged_hd128_fp8.py`.
-const TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS: &[(u32, u32)] = &[(32, 8)];
-
-fn sm70_qwen35_dense_head_config(q: u32, kv: u32) -> bool {
-    matches!((q, kv), (32, 8) | (40, 8))
-}
-
-fn sm70_qwen35_dense_hd256_head_config(q: u32, kv: u32) -> bool {
-    matches!((q, kv), (16, 4))
-}
+// The TileLang AOT kernel matrix (head configs, ABIs, allow_sm70, gates) is the
+// single source of truth in `crates/cuda-kernels/kernels.toml`, parsed at build
+// time by `load_registry()` (see the registry model + emitters below). The old
+// hand-duplicated `TILELANG_*_HEAD_CONFIGS` consts + the `*_PUBLIC_DECL` /
+// `*_EXTERN_DECL` / `*_CALL_ARGS` C-signature consts were deleted in favor of
+// the registry rows + `[abi.*]` blocks.
 
 struct TileLangKernelSpec {
     artifact_dir: String,
-    kernel_path: &'static str,
+    kernel_path: String,
     kernel_name: String,
     out_name: String,
-    kernel_family: &'static str,
-    kernel_key: Option<&'static str>,
+    kernel_family: String,
+    kernel_key: Option<String>,
     num_q_heads: Option<u32>,
     num_kv_heads: Option<u32>,
-    public_decl: &'static str,
-    extern_decl: &'static str,
-    call_args: &'static str,
+    public_decl: String,
+    extern_decl: String,
+    call_args: String,
     allow_sm70: bool,
+}
+
+// ---- registry data model (kernels.toml) -----------------------------------
+
+#[derive(Clone)]
+struct AbiSig {
+    fn_ty: String,                    // resolve() fn-ptr alias name
+    c_decl: String,                   // C param list for the dispatch wrapper
+    call_args: String,                // C call args
+    rust_args: Vec<(String, String)>, // (name, rust_ty); empty => build-only
+}
+
+#[derive(Clone)]
+struct RegKernel {
+    head_dim: Option<u32>,
+    q_heads: Option<u32>,
+    kv_heads: Option<u32>,
+    phase: String,
+    abi: String,
+    kernel_family: String, // python --kernel-family tag
+    kernel_key: Option<String>,
+    py_module: String, // --kernel-path (manifest-relative)
+    artifact_dir: String,
+    kernel_name: String,
+    out_name: String,
+    allow_sm70: bool,
+    gate: String, // "default" | "flashqla"
+    ffi: bool,
+}
+
+struct Registry {
+    abis: std::collections::BTreeMap<String, AbiSig>,
+    kernels: Vec<RegKernel>,
+}
+
+/// Parse `crates/cuda-kernels/kernels.toml` (manifest-relative). Re-runs the
+/// build on edit via `rerun-if-changed`.
+fn load_registry() -> Registry {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let path = manifest.join("kernels.toml");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read kernels.toml ({}): {e}", path.display()));
+    parse_registry(&text)
+}
+
+/// Parse kernels.toml into the registry model using the `toml` crate. Walks
+/// `doc["abi"]` (table of ABI signatures) + `doc["kernel"]` (array of tables).
+fn parse_registry(text: &str) -> Registry {
+    let doc: toml::Value =
+        toml::from_str(text).unwrap_or_else(|e| panic!("parse kernels.toml: {e}"));
+
+    let mut abis = std::collections::BTreeMap::new();
+    if let Some(abi_tbl) = doc.get("abi").and_then(|v| v.as_table()) {
+        for (name, body) in abi_tbl {
+            let body = body
+                .as_table()
+                .unwrap_or_else(|| panic!("abi.{name} must be a table"));
+            let fn_ty = body
+                .get("fn_ty")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("abi.{name} missing fn_ty"))
+                .to_string();
+            let c_decl = normalize_ws(
+                body.get("c")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("abi.{name} missing c")),
+            );
+            let call_args = normalize_ws(
+                body.get("call")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("abi.{name} missing call")),
+            );
+            let mut rust_args = Vec::new();
+            if let Some(rows) = body.get("rust").and_then(|v| v.as_array()) {
+                for row in rows {
+                    let pair = row.as_array().unwrap_or_else(|| {
+                        panic!("abi.{name}.rust rows must be [name, ty] arrays")
+                    });
+                    let arg_name = pair[0]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("abi.{name}.rust arg name must be a string"))
+                        .to_string();
+                    let arg_ty = pair[1]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("abi.{name}.rust arg ty must be a string"))
+                        .to_string();
+                    rust_args.push((arg_name, arg_ty));
+                }
+            }
+            abis.insert(
+                name.clone(),
+                AbiSig {
+                    fn_ty,
+                    c_decl,
+                    call_args,
+                    rust_args,
+                },
+            );
+        }
+    }
+
+    let mut kernels = Vec::new();
+    if let Some(rows) = doc.get("kernel").and_then(|v| v.as_array()) {
+        for row in rows {
+            let t = row.as_table().expect("[[kernel]] must be a table");
+            let getstr = |key: &str| t.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let getu32 = |key: &str| t.get(key).and_then(|v| v.as_integer()).map(|n| n as u32);
+            let kernel_name = getstr("kernel_name").expect("[[kernel]] missing kernel_name");
+            kernels.push(RegKernel {
+                head_dim: getu32("head_dim"),
+                q_heads: getu32("q_heads"),
+                kv_heads: getu32("kv_heads"),
+                phase: getstr("phase").unwrap_or_default(),
+                abi: getstr("abi").unwrap_or_else(|| panic!("kernel {kernel_name} missing abi")),
+                kernel_family: getstr("kernel_family")
+                    .unwrap_or_else(|| panic!("kernel {kernel_name} missing kernel_family")),
+                kernel_key: getstr("kernel_key"),
+                py_module: getstr("py_module")
+                    .unwrap_or_else(|| panic!("kernel {kernel_name} missing py_module")),
+                artifact_dir: getstr("artifact_dir")
+                    .unwrap_or_else(|| panic!("kernel {kernel_name} missing artifact_dir")),
+                out_name: getstr("out_name")
+                    .unwrap_or_else(|| panic!("kernel {kernel_name} missing out_name")),
+                kernel_name,
+                allow_sm70: t
+                    .get("allow_sm70")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                gate: getstr("gate").unwrap_or_else(|| "default".to_string()),
+                ffi: t.get("ffi").and_then(|v| v.as_bool()).unwrap_or(false),
+            });
+        }
+    }
+
+    Registry { abis, kernels }
+}
+
+/// Collapse runs of whitespace (incl. the `\`-continuation newlines TOML keeps
+/// in multi-line basic strings) into single spaces, matching the old
+/// `&str` consts after rustfmt joined their `\`-wrapped literals.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Build the `TileLangKernelSpec` list from the registry, reproducing the old
+/// inline construction. `gdr_only` (OpdGdr) drops the BF16/FP8 paged-attention
+/// families (those are stubbed by `write_tilelang_attention_stub_sources`) but
+/// keeps `gdr` AND `flashqla` rows — exactly as the old `gdr_specs` +
+/// `flashqla_specs` loops ran unconditionally regardless of `gdr_only`. The
+/// flashqla gate (sm90 + env flag) is applied by the caller.
+fn registry_to_specs(reg: &Registry, gdr_only: bool) -> Vec<(TileLangKernelSpec, &RegKernel)> {
+    let mut out = Vec::new();
+    for k in &reg.kernels {
+        let is_gdr = k.kernel_family == "gdr";
+        let is_flashqla = k.kernel_family == "flashqla";
+        if gdr_only && !is_gdr && !is_flashqla {
+            continue; // attention/fp8 stubbed by write_tilelang_attention_stub_sources
+        }
+        let abi = reg
+            .abis
+            .get(&k.abi)
+            .unwrap_or_else(|| panic!("kernel {} references unknown abi {}", k.kernel_name, k.abi));
+        let spec = TileLangKernelSpec {
+            artifact_dir: k.artifact_dir.clone(),
+            kernel_path: k.py_module.clone(),
+            kernel_name: k.kernel_name.clone(),
+            out_name: k.out_name.clone(),
+            kernel_family: k.kernel_family.clone(),
+            kernel_key: k.kernel_key.clone(),
+            num_q_heads: k.q_heads,
+            num_kv_heads: k.kv_heads,
+            public_decl: abi.c_decl.clone(),
+            extern_decl: abi.c_decl.clone(),
+            call_args: abi.call_args.clone(),
+            allow_sm70: k.allow_sm70,
+        };
+        out.push((spec, k));
+    }
+    out
+}
+
+// ---- FFI emitter: registry -> OUT_DIR/ffi_tilelang_generated.rs ------------
+
+/// Emit the extern blocks (one per ffi=true ABI) + fn-ptr aliases + the
+/// `AttnPhase` enum + `resolve_*()`. The head-config matrix lives entirely in
+/// kernels.toml; this is pure Rust codegen and runs even on a no-cuda Mac check.
+fn emit_ffi_generated(reg: &Registry, out_dir: &Path) {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    s.push_str("// @generated by build.rs from kernels.toml — DO NOT EDIT.\n\n");
+
+    // (A) extern blocks, grouped by ABI, only for ffi=true rows.
+    for (abi_name, abi) in &reg.abis {
+        if abi.rust_args.is_empty() {
+            continue; // build-only ABI -> no extern
+        }
+        let syms: Vec<&RegKernel> = reg
+            .kernels
+            .iter()
+            .filter(|k| k.ffi && &k.abi == abi_name)
+            .collect();
+        if syms.is_empty() {
+            continue;
+        }
+        writeln!(s, "// abi {abi_name} — {} symbol(s)", syms.len()).unwrap();
+        s.push_str("unsafe extern \"C\" {\n");
+        for k in &syms {
+            s.push_str("    #[allow(dead_code)]\n");
+            writeln!(s, "    pub fn {}_cuda(", k.kernel_name).unwrap();
+            for (name, ty) in &abi.rust_args {
+                writeln!(s, "        {name}: {ty},").unwrap();
+            }
+            s.push_str("    ) -> CUresult;\n");
+        }
+        s.push_str("}\n\n");
+    }
+
+    // (B) fn-ptr type aliases (one per ffi=true ABI).
+    for (abi_name, abi) in &reg.abis {
+        if abi.rust_args.is_empty() {
+            continue;
+        }
+        if !reg.kernels.iter().any(|k| k.ffi && &k.abi == abi_name) {
+            continue;
+        }
+        let tys: Vec<&str> = abi.rust_args.iter().map(|(_, t)| t.as_str()).collect();
+        writeln!(s, "#[allow(dead_code)]").unwrap();
+        writeln!(
+            s,
+            "pub type {} = unsafe extern \"C\" fn(\n    {},\n) -> CUresult;\n",
+            abi.fn_ty,
+            tys.join(", ")
+        )
+        .unwrap();
+    }
+
+    // AttnPhase enum (the distinct ffi=true attention phases).
+    s.push_str(
+        "#[allow(dead_code)]\n#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n\
+         pub enum AttnPhase { Prefill, Decode, SplitPartial, SplitMerge }\n\n",
+    );
+
+    // (C) resolve_* per ffi=true ABI. paged_attn_v1 keys on (hd,q,kv,phase);
+    // the split/fp8 ABIs are phase-mono so they key on (hd,q,kv).
+    emit_resolve_paged_attn_v1(&mut s, reg);
+    emit_resolve_mono(
+        &mut s,
+        reg,
+        "paged_attn_split_partial_v1",
+        "resolve_paged_attn_split_partial_v1",
+        "PagedAttnSplitPartialV1Fn",
+    );
+    emit_resolve_mono(
+        &mut s,
+        reg,
+        "paged_attn_split_merge_v1",
+        "resolve_paged_attn_split_merge_v1",
+        "PagedAttnSplitMergeV1Fn",
+    );
+    emit_resolve_mono(
+        &mut s,
+        reg,
+        "paged_attn_fp8_v1",
+        "resolve_paged_attn_fp8_v1",
+        "PagedAttnFp8V1Fn",
+    );
+
+    let out = out_dir.join("ffi_tilelang_generated.rs");
+    std::fs::write(&out, s).expect("write ffi_tilelang_generated.rs");
+}
+
+fn phase_variant(phase: &str) -> &str {
+    match phase {
+        "prefill" => "AttnPhase::Prefill",
+        "decode" => "AttnPhase::Decode",
+        other => panic!("paged_attn_v1 row has unexpected phase {other:?}"),
+    }
+}
+
+fn emit_resolve_paged_attn_v1(s: &mut String, reg: &Registry) {
+    use std::fmt::Write as _;
+    s.push_str(
+        "#[allow(dead_code)]\n\
+         pub fn resolve_paged_attn_v1(head_dim: u32, q_heads: u32, kv_heads: u32, \
+         phase: AttnPhase) -> Option<PagedAttnV1Fn> {\n\
+         \x20   Some(match (head_dim, q_heads, kv_heads, phase) {\n",
+    );
+    for k in reg
+        .kernels
+        .iter()
+        .filter(|k| k.ffi && k.abi == "paged_attn_v1")
+    {
+        let (hd, q, kv) = (k.head_dim.unwrap(), k.q_heads.unwrap(), k.kv_heads.unwrap());
+        writeln!(
+            s,
+            "        ({hd}, {q}, {kv}, {}) => {}_cuda,",
+            phase_variant(&k.phase),
+            k.kernel_name
+        )
+        .unwrap();
+    }
+    s.push_str("        _ => return None,\n    })\n}\n\n");
+}
+
+fn emit_resolve_mono(s: &mut String, reg: &Registry, abi: &str, fn_name: &str, fn_ty: &str) {
+    use std::fmt::Write as _;
+    writeln!(
+        s,
+        "#[allow(dead_code)]\n\
+        pub fn {fn_name}(head_dim: u32, q_heads: u32, kv_heads: u32) -> Option<{fn_ty}> {{\n\
+        \x20   Some(match (head_dim, q_heads, kv_heads) {{"
+    )
+    .unwrap();
+    for k in reg.kernels.iter().filter(|k| k.ffi && k.abi == abi) {
+        let (hd, q, kv) = (k.head_dim.unwrap(), k.q_heads.unwrap(), k.kv_heads.unwrap());
+        writeln!(s, "        ({hd}, {q}, {kv}) => {}_cuda,", k.kernel_name).unwrap();
+    }
+    s.push_str("        _ => return None,\n    })\n}\n\n");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -539,7 +799,7 @@ fn fnv1a_update(h: &mut u64, bytes: &[u8]) {
 fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for path in [
-        base_spec.kernel_path,
+        base_spec.kernel_path.as_str(),
         "tools/tilelang/gen_tilelang_aot.py",
     ] {
         let bytes = std::fs::read(path).unwrap_or_else(|_| b"<missing-source>".to_vec());
@@ -548,7 +808,10 @@ fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> S
     fnv1a_update(&mut h, base_spec.kernel_name.as_bytes());
     fnv1a_update(&mut h, base_spec.out_name.as_bytes());
     fnv1a_update(&mut h, base_spec.kernel_family.as_bytes());
-    fnv1a_update(&mut h, base_spec.kernel_key.unwrap_or("").as_bytes());
+    fnv1a_update(
+        &mut h,
+        base_spec.kernel_key.as_deref().unwrap_or("").as_bytes(),
+    );
     fnv1a_update(
         &mut h,
         base_spec
@@ -572,105 +835,10 @@ fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> S
 /// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
 type TileLangPerSmArtifact = (String, String, PathBuf);
 
-/// 18-arg public C signature shared by the BF16 TileLang families
-/// (HD128 prefill / HD256 prefill / HD128 decode / HD256 decode). Matches
-/// the FFI macros in `crates/cuda-kernels/src/ffi/attention.rs`.
-const TILELANG_DISPATCH_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, uint16_t *k_pool, uint16_t *v_pool, \
-     const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
-     uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
-     int32_t num_pages, int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, \
-     int32_t page_size, float sm_scale, CUstream stream";
-const TILELANG_DISPATCH_EXTERN_DECL: &str = TILELANG_DISPATCH_PUBLIC_DECL;
-const TILELANG_DISPATCH_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, kv_indptr, kv_indices, kv_last_page_len, o, \
-     batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
-     num_kv_heads, page_size, sm_scale, stream";
-
-/// 21-arg public C signature for the BF16 HD128 split-KV partial phase.
-const TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, \
-     uint16_t *k_pool, uint16_t *v_pool, const int32_t *kv_indptr, const int32_t *kv_indices, \
-     const int32_t *kv_last_page_len, float *partial_out, float *partial_m, float *partial_l, \
-     int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, \
-     int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, \
-     float sm_scale, int32_t num_splits, CUstream stream";
-const TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL: &str =
-    TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL;
-const TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, \
-     kv_indptr, kv_indices, kv_last_page_len, partial_out, partial_m, partial_l, \
-     batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
-     num_kv_heads, page_size, sm_scale, num_splits, stream";
-
-/// 15-arg public C signature for the BF16 HD128 split-KV merge phase.
-const TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL: &str = "const float *partial_out, \
-     const float *partial_m, const float *partial_l, uint16_t *o, int32_t batch_size, \
-     int32_t total_q_tokens, int32_t max_qlen, int32_t num_pages, int32_t total_pages, \
-     int32_t num_q_heads, int32_t num_kv_heads, int32_t page_size, float sm_scale, \
-     int32_t num_splits, CUstream stream";
-const TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL: &str =
-    TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL;
-const TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS: &str = "partial_out, partial_m, partial_l, o, \
-     batch_size, total_q_tokens, max_qlen, num_pages, total_pages, num_q_heads, \
-     num_kv_heads, page_size, sm_scale, num_splits, stream";
-
-/// 20-arg public C signature for the FP8 KV TileLang family (M_b.2 —
-/// HD128 FP8 paged decode). Adds `k_scales` / `v_scales` and switches
-/// `k_pool` / `v_pool` from `uint16_t*` (BF16) to `const uint8_t*`
-/// (FP8 E4M3 bytes). Matches `tilelang_decode_hd128_fp8_decl!` in
-/// `crates/cuda-kernels/src/ffi/attention.rs`.
-const TILELANG_DISPATCH_FP8_PUBLIC_DECL: &str = "uint16_t *q, const int32_t *q_indptr, \
-     const uint8_t *k_pool, const uint8_t *v_pool, const float *k_scales, const float *v_scales, \
-     const int32_t *kv_indptr, const int32_t *kv_indices, const int32_t *kv_last_page_len, \
-     uint16_t *o, int32_t batch_size, int32_t total_q_tokens, int32_t max_qlen, \
-     int32_t num_pages, int32_t total_pages, int32_t num_q_heads, int32_t num_kv_heads, \
-     int32_t page_size, float sm_scale, CUstream stream";
-const TILELANG_DISPATCH_FP8_EXTERN_DECL: &str = TILELANG_DISPATCH_FP8_PUBLIC_DECL;
-const TILELANG_DISPATCH_FP8_CALL_ARGS: &str = "q, q_indptr, k_pool, v_pool, k_scales, v_scales, \
-     kv_indptr, kv_indices, kv_last_page_len, o, batch_size, total_q_tokens, max_qlen, \
-     num_pages, total_pages, num_q_heads, num_kv_heads, page_size, sm_scale, stream";
-
-const GDR_PREPARE_PUBLIC_DECL: &str = "const uint16_t* qkv, const uint16_t* b_proj, const uint16_t* a_proj, const uint16_t* dt_bias, const float* a_log, uint16_t* q_out, uint16_t* k_out, uint16_t* v_out, float* g_out, float* beta_out, int32_t num_key_heads, int32_t num_value_heads, int32_t qkv_dim, int32_t seq_len, CUstream stream";
-const GDR_PREPARE_EXTERN_DECL: &str = GDR_PREPARE_PUBLIC_DECL;
-const GDR_PREPARE_CALL_ARGS: &str = "qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, g_out, beta_out, num_key_heads, num_value_heads, qkv_dim, seq_len, stream";
-
-const GDR_CUMSUM_PUBLIC_DECL: &str =
-    "const float* g_in, float* g_out, int32_t seq_len, int32_t num_value_heads, CUstream stream";
-const GDR_CUMSUM_EXTERN_DECL: &str = GDR_CUMSUM_PUBLIC_DECL;
-const GDR_CUMSUM_CALL_ARGS: &str = "g_in, g_out, seq_len, num_value_heads, stream";
-
-const GDR_A_PUBLIC_DECL: &str = "const uint16_t* k, const float* g_cumsum, const float* beta, float* a_tril, int32_t seq_len, int32_t num_value_heads, CUstream stream";
-const GDR_A_EXTERN_DECL: &str = GDR_A_PUBLIC_DECL;
-const GDR_A_CALL_ARGS: &str = "k, g_cumsum, beta, a_tril, seq_len, num_value_heads, stream";
-
-const GDR_RECOMPUTE_PUBLIC_DECL: &str = "const uint16_t* k, const uint16_t* v, const float* beta, uint16_t* w, uint16_t* u, const uint16_t* a_inv, const float* g_cumsum, int32_t seq_len, int32_t num_value_heads, CUstream stream";
-const GDR_RECOMPUTE_EXTERN_DECL: &str = GDR_RECOMPUTE_PUBLIC_DECL;
-const GDR_RECOMPUTE_CALL_ARGS: &str =
-    "k, v, beta, w, u, a_inv, g_cumsum, seq_len, num_value_heads, stream";
-
-const GDR_STATE_PUBLIC_DECL: &str = "const uint16_t* k, const uint16_t* w, const uint16_t* u, const float* g_cumsum, const float* initial_state, float* chunk_state, uint16_t* v_new, float* final_state, int32_t seq_len, int32_t num_value_heads, CUstream stream";
-const GDR_STATE_EXTERN_DECL: &str = GDR_STATE_PUBLIC_DECL;
-const GDR_STATE_CALL_ARGS: &str = "k, w, u, g_cumsum, initial_state, chunk_state, v_new, final_state, seq_len, num_value_heads, stream";
-
-const GDR_O_PUBLIC_DECL: &str = "const uint16_t* q, const uint16_t* k, const uint16_t* v_new, const float* chunk_state, const float* g_cumsum, uint16_t* output, int32_t seq_len, int32_t num_value_heads, float scale, CUstream stream";
-const GDR_O_EXTERN_DECL: &str = GDR_O_PUBLIC_DECL;
-const GDR_O_CALL_ARGS: &str =
-    "q, k, v_new, chunk_state, g_cumsum, output, seq_len, num_value_heads, scale, stream";
-
-// FlashQLA chunked GDR fwd (tools/tilelang/flashqla_gdr.py) — Hopper-only
-// (sm_90a warp-spec + barriers), fixed Qwen3.6 shard H=32/Hg=16/DK=DV=128.
-// Non-sm90 targets get CUDA_ERROR_NOT_SUPPORTED stubs; the runtime gate in
-// infer-cuda keeps those builds on the recurrent kernel.
-const FQ_CUMSUM_PUBLIC_DECL: &str =
-    "const float* g_in, float* g_out, int32_t seq_len, CUstream stream";
-const FQ_CUMSUM_EXTERN_DECL: &str = FQ_CUMSUM_PUBLIC_DECL;
-const FQ_CUMSUM_CALL_ARGS: &str = "g_in, g_out, seq_len, stream";
-
-const FQ_KKT_PUBLIC_DECL: &str =
-    "const uint16_t* k, const float* beta, uint16_t* a_inv, int32_t seq_len, CUstream stream";
-const FQ_KKT_EXTERN_DECL: &str = FQ_KKT_PUBLIC_DECL;
-const FQ_KKT_CALL_ARGS: &str = "k, beta, a_inv, seq_len, stream";
-
-const FQ_FWD_PUBLIC_DECL: &str = "const uint16_t* q, const uint16_t* k, const uint16_t* v, const uint16_t* a_inv, const float* g_cumsum, const float* beta, const float* h0, uint16_t* o, float* ht, int32_t seq_len, CUstream stream";
-const FQ_FWD_EXTERN_DECL: &str = FQ_FWD_PUBLIC_DECL;
-const FQ_FWD_CALL_ARGS: &str = "q, k, v, a_inv, g_cumsum, beta, h0, o, ht, seq_len, stream";
+// The shared C ABI signatures (the old TILELANG_DISPATCH_* / GDR_* / FQ_*
+// *_PUBLIC_DECL / *_EXTERN_DECL / *_CALL_ARGS consts) now live in the
+// `[abi.*]` blocks of kernels.toml and reach build code via the parsed
+// `TileLangKernelSpec.public_decl/extern_decl/call_args` fields.
 
 /// Locate the directories the TileLang AOT generator needs for nvcc to
 /// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
@@ -796,7 +964,8 @@ fn generate_tilelang_artifacts_per_sm(
                 .as_deref()
                 .and_then(|m| {
                     m.lines().find_map(|line| {
-                        line.strip_prefix("FUNC_NAME=").map(|f| f.trim().to_string())
+                        line.strip_prefix("FUNC_NAME=")
+                            .map(|f| f.trim().to_string())
                     })
                 })
                 .unwrap_or_else(|| func_name.clone());
@@ -815,7 +984,7 @@ fn generate_tilelang_artifacts_per_sm(
         let output = Command::new(python)
             .arg(&generator_path)
             .arg("--kernel-path")
-            .arg(base_spec.kernel_path)
+            .arg(&base_spec.kernel_path)
             .arg("--kernel-name")
             .arg(&per_sm_kernel_name)
             .arg("--out-name")
@@ -825,7 +994,7 @@ fn generate_tilelang_artifacts_per_sm(
             .arg("--target")
             .arg(&target)
             .arg("--kernel-family")
-            .arg(base_spec.kernel_family)
+            .arg(&base_spec.kernel_family)
             .arg("--cuda-arch")
             .arg(cuda_arch.to_string())
             .arg("--tilelang-src")
@@ -837,6 +1006,7 @@ fn generate_tilelang_artifacts_per_sm(
             .args(
                 base_spec
                     .kernel_key
+                    .as_deref()
                     .into_iter()
                     .flat_map(|key| ["--kernel-key".to_string(), key.to_string()]),
             )
@@ -895,8 +1065,7 @@ fn generate_tilelang_artifacts_per_sm(
                 c_path = Some(PathBuf::from(value.trim()));
             }
         }
-        let gen_func_name =
-            gen_func_name.expect("TileLang generator did not print FUNC_NAME");
+        let gen_func_name = gen_func_name.expect("TileLang generator did not print FUNC_NAME");
         let c_path = c_path.expect("TileLang generator did not print C_PATH");
 
         // Record the generator's authoritative FUNC_NAME + the source hash so the
@@ -905,12 +1074,7 @@ fn generate_tilelang_artifacts_per_sm(
             out_artifact_dir.join("meta.txt"),
             format!("FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\n"),
         )
-        .unwrap_or_else(|err| {
-            panic!(
-                "write meta.txt for {}: {err}",
-                out_artifact_dir.display()
-            )
-        });
+        .unwrap_or_else(|err| panic!("write meta.txt for {}: {err}", out_artifact_dir.display()));
 
         results.push((sm_token.clone(), gen_func_name, c_path));
     }
@@ -935,13 +1099,8 @@ fn build_tilelang_kernel(
         .filter(|sm| base_spec.allow_sm70 || !is_legacy_volta_sm(&sm.sm))
         .cloned()
         .collect();
-    let per_sm = generate_tilelang_artifacts_per_sm(
-        tl,
-        out_dir,
-        &eligible_targets,
-        cuda_path,
-        base_spec,
-    );
+    let per_sm =
+        generate_tilelang_artifacts_per_sm(tl, out_dir, &eligible_targets, cuda_path, base_spec);
     let pairs: Vec<(String, String)> = per_sm
         .iter()
         .map(|(sm, func, _)| (sm.clone(), func.clone()))
@@ -951,8 +1110,8 @@ fn build_tilelang_kernel(
     let public_decl = format!("{public_name}({})", base_spec.public_decl);
     let wrapper_src = format_dispatch_wrapper(
         &public_decl,
-        base_spec.extern_decl,
-        base_spec.call_args,
+        &base_spec.extern_decl,
+        &base_spec.call_args,
         &pairs,
     );
 
@@ -994,269 +1153,53 @@ fn write_tilelang_unsupported_stub(
     generated_sources.push(stub_path);
 }
 
-fn write_tilelang_attention_stub_sources(out_dir: &Path, generated_sources: &mut Vec<PathBuf>) {
-    for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_prefill_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_prefill_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_prefill_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_split_partial_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"),
-            TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
-            generated_sources,
-        );
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_split_merge_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
-            TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
-            generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_fp8_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
-            TILELANG_DISPATCH_FP8_PUBLIC_DECL,
-            generated_sources,
-        );
+/// Write a CUDA_ERROR_NOT_SUPPORTED stub for one registry kernel, looking its
+/// public C signature up from the named `[abi.*]` block.
+fn write_tilelang_stub_for_kernel(
+    reg: &Registry,
+    k: &RegKernel,
+    out_dir: &Path,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let abi = reg
+        .abis
+        .get(&k.abi)
+        .unwrap_or_else(|| panic!("kernel {} references unknown abi {}", k.kernel_name, k.abi));
+    write_tilelang_unsupported_stub(
+        out_dir,
+        &k.artifact_dir,
+        &k.out_name,
+        &k.kernel_name,
+        &abi.c_decl,
+        generated_sources,
+    );
+}
+
+/// Stub every non-GDR attention symbol (OpdGdr path builds only the GDR family
+/// via AOT and stubs the rest). Registry-driven: covers the same prefill/decode
+/// HD64/HD128/HD256 + split + fp8 rows as the old hardcoded list.
+fn write_tilelang_attention_stub_sources(
+    reg: &Registry,
+    out_dir: &Path,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    for k in reg
+        .kernels
+        .iter()
+        .filter(|k| k.kernel_family != "gdr" && k.kernel_family != "flashqla")
+    {
+        write_tilelang_stub_for_kernel(reg, k, out_dir, generated_sources);
     }
 }
 
-fn compile_tilelang_stub_kernels(cuda_path: &str, out_dir: &Path) {
+fn compile_tilelang_stub_kernels(reg: &Registry, cuda_path: &str, out_dir: &Path) {
     let mut generated_sources = Vec::new();
 
-    for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_prefill_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_prefill_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd256_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_prefill_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd64_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
-            TILELANG_DISPATCH_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_split_partial_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"),
-            TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_split_merge_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
-            TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-    for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
-        let suffix = format!("q{q}_kv{kv}");
-        write_tilelang_unsupported_stub(
-            out_dir,
-            &format!("batch_decode_paged_hd128_fp8_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
-            &format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
-            TILELANG_DISPATCH_FP8_PUBLIC_DECL,
-            &mut generated_sources,
-        );
-    }
-
-    for (artifact_dir, out_name, kernel_name, public_decl) in [
-        (
-            "gated_delta_rule_chunk_prepare",
-            "tilelang_gated_delta_rule_chunk_prepare",
-            "gated_delta_rule_prefill_chunk_prepare",
-            GDR_PREPARE_PUBLIC_DECL,
-        ),
-        (
-            "gated_delta_rule_chunk_cumsum",
-            "tilelang_gated_delta_rule_chunk_cumsum",
-            "gated_delta_rule_prefill_chunk_cumsum",
-            GDR_CUMSUM_PUBLIC_DECL,
-        ),
-        (
-            "gated_delta_rule_chunk_a",
-            "tilelang_gated_delta_rule_chunk_a",
-            "gated_delta_rule_prefill_chunk_a",
-            GDR_A_PUBLIC_DECL,
-        ),
-        (
-            "gated_delta_rule_chunk_recompute",
-            "tilelang_gated_delta_rule_chunk_recompute",
-            "gated_delta_rule_prefill_chunk_recompute",
-            GDR_RECOMPUTE_PUBLIC_DECL,
-        ),
-        (
-            "gated_delta_rule_chunk_state",
-            "tilelang_gated_delta_rule_chunk_state",
-            "gated_delta_rule_prefill_chunk_state",
-            GDR_STATE_PUBLIC_DECL,
-        ),
-        (
-            "gated_delta_rule_chunk_o",
-            "tilelang_gated_delta_rule_chunk_o",
-            "gated_delta_rule_prefill_chunk_o",
-            GDR_O_PUBLIC_DECL,
-        ),
-        (
-            "flashqla_gdr_cumsum",
-            "tilelang_flashqla_gdr_cumsum",
-            "gdr_fq_cumsum",
-            FQ_CUMSUM_PUBLIC_DECL,
-        ),
-        (
-            "flashqla_gdr_kkt",
-            "tilelang_flashqla_gdr_kkt",
-            "gdr_fq_kkt",
-            FQ_KKT_PUBLIC_DECL,
-        ),
-        (
-            "flashqla_gdr_fwd",
-            "tilelang_flashqla_gdr_fwd",
-            "gdr_fq_fwd",
-            FQ_FWD_PUBLIC_DECL,
-        ),
-    ] {
-        write_tilelang_unsupported_stub(
-            out_dir,
-            artifact_dir,
-            out_name,
-            kernel_name,
-            public_decl,
-            &mut generated_sources,
-        );
+    // dsv4_flash links CUDA_ERROR_NOT_SUPPORTED stubs for EVERY TileLang FFI
+    // symbol (attention + GDR + FlashQLA) so the build can link without paying
+    // the TileLang AOT tax. Registry-driven so the stub set tracks kernels.toml.
+    for k in &reg.kernels {
+        write_tilelang_stub_for_kernel(reg, k, out_dir, &mut generated_sources);
     }
 
     let mut build = cc::Build::new();
@@ -1276,6 +1219,7 @@ fn compile_tilelang_stub_kernels(cuda_path: &str, out_dir: &Path) {
 }
 
 fn compile_tilelang_aot_kernels(
+    reg: &Registry,
     cuda_path: &str,
     out_dir: &Path,
     sm_targets: &[SmSpec],
@@ -1285,399 +1229,15 @@ fn compile_tilelang_aot_kernels(
     let mut generated_sources = Vec::new();
 
     if gdr_only {
-        write_tilelang_attention_stub_sources(out_dir, &mut generated_sources);
+        write_tilelang_attention_stub_sources(reg, out_dir, &mut generated_sources);
         println!(
             "cargo:warning=ARLE_CUDA_KERNEL_SET=opd_gdr: stubbing non-GDR TileLang attention kernels."
         );
-    } else {
-        for &(q, kv) in TILELANG_PREFILL_HD128_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_prefill_paged_hd128_{suffix}"),
-                kernel_path: "tools/tilelang/batch_prefill_paged_hd128.py",
-                kernel_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}_run"),
-                out_name: format!("tilelang_batch_prefill_paged_hd128_{suffix}"),
-                kernel_family: "attention",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_CALL_ARGS,
-                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
-
-        for &(q, kv) in TILELANG_PREFILL_HD256_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_prefill_paged_hd256_{suffix}"),
-                kernel_path: "tools/tilelang/batch_prefill_paged_hd256.py",
-                kernel_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}_run"),
-                out_name: format!("tilelang_batch_prefill_paged_hd256_{suffix}"),
-                kernel_family: "attention",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_CALL_ARGS,
-                allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
-
-        for &(q, kv) in TILELANG_DECODE_HD256_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd256_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd256.py",
-                kernel_name: format!("tilelang_batch_decode_paged_hd256_{suffix}_run"),
-                out_name: format!("tilelang_batch_decode_paged_hd256_{suffix}"),
-                kernel_family: "attention",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_CALL_ARGS,
-                allow_sm70: sm70_qwen35_dense_hd256_head_config(q, kv),
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
-
-        for &(q, kv) in TILELANG_DECODE_HD128_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd128_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
-                kernel_name: format!("tilelang_batch_decode_paged_hd128_{suffix}_run"),
-                out_name: format!("tilelang_batch_decode_paged_hd128_{suffix}"),
-                kernel_family: "attention",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_CALL_ARGS,
-                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
-
-        // DSV4-mini HD64 substrate (master §8.2 P1.0). Same FFI shape as the
-        // HD128/HD256 BF16 prefill+decode families; only the cubin's baked
-        // `head_dim` differs.
-        for &(q, kv) in TILELANG_PREFILL_HD64_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_prefill_paged_hd64_{suffix}"),
-                kernel_path: "tools/tilelang/batch_prefill_paged_hd64.py",
-                kernel_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}_run"),
-                out_name: format!("tilelang_batch_prefill_paged_hd64_{suffix}"),
-                kernel_family: "attention",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_CALL_ARGS,
-                allow_sm70: false,
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
-
-        for &(q, kv) in TILELANG_DECODE_HD64_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd64_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd64.py",
-                kernel_name: format!("tilelang_batch_decode_paged_hd64_{suffix}_run"),
-                out_name: format!("tilelang_batch_decode_paged_hd64_{suffix}"),
-                kernel_family: "attention",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_CALL_ARGS,
-                allow_sm70: false,
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
-
-        for &(q, kv) in TILELANG_DECODE_HD128_SPLIT_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let partial_spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd128_split_partial_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
-                kernel_name: format!(
-                    "tilelang_batch_decode_paged_hd128_split_partial_{suffix}_run"
-                ),
-                out_name: format!("tilelang_batch_decode_paged_hd128_split_partial_{suffix}"),
-                kernel_family: "attention_bf16_split_partial",
-                kernel_key: Some("split_partial"),
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_BF16_SPLIT_PARTIAL_CALL_ARGS,
-                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &partial_spec,
-                &mut generated_sources,
-            );
-
-            let merge_spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd128_split_merge_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd128.py",
-                kernel_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}_run"),
-                out_name: format!("tilelang_batch_decode_paged_hd128_split_merge_{suffix}"),
-                kernel_family: "attention_bf16_split_merge",
-                kernel_key: Some("split_merge"),
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_BF16_SPLIT_MERGE_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_BF16_SPLIT_MERGE_CALL_ARGS,
-                allow_sm70: sm70_qwen35_dense_head_config(q, kv),
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &merge_spec,
-                &mut generated_sources,
-            );
-        }
-
-        // M_b.2 Phase A0 — FP8 KV decode (single config (32,8) = Qwen3.5-4B).
-        for &(q, kv) in TILELANG_DECODE_HD128_FP8_HEAD_CONFIGS {
-            let suffix = format!("q{q}_kv{kv}");
-            let spec = TileLangKernelSpec {
-                artifact_dir: format!("batch_decode_paged_hd128_fp8_{suffix}"),
-                kernel_path: "tools/tilelang/batch_decode_paged_hd128_fp8.py",
-                kernel_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}_run"),
-                out_name: format!("tilelang_batch_decode_paged_hd128_fp8_{suffix}"),
-                kernel_family: "attention_fp8",
-                kernel_key: None,
-                num_q_heads: Some(q),
-                num_kv_heads: Some(kv),
-                public_decl: TILELANG_DISPATCH_FP8_PUBLIC_DECL,
-                extern_decl: TILELANG_DISPATCH_FP8_EXTERN_DECL,
-                call_args: TILELANG_DISPATCH_FP8_CALL_ARGS,
-                allow_sm70: false,
-            };
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
-        }
     }
 
-    let gdr_specs = [
-        TileLangKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_prepare".to_string(),
-            kernel_path: "tools/tilelang/gated_delta_rule.py",
-            kernel_name: "gated_delta_rule_prefill_chunk_prepare".to_string(),
-            out_name: "tilelang_gated_delta_rule_chunk_prepare".to_string(),
-            kernel_family: "gdr",
-            kernel_key: Some("gdr_chunk_prepare"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: GDR_PREPARE_PUBLIC_DECL,
-            extern_decl: GDR_PREPARE_EXTERN_DECL,
-            call_args: GDR_PREPARE_CALL_ARGS,
-            allow_sm70: true,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_cumsum".to_string(),
-            kernel_path: "tools/tilelang/gated_delta_rule.py",
-            kernel_name: "gated_delta_rule_prefill_chunk_cumsum".to_string(),
-            out_name: "tilelang_gated_delta_rule_chunk_cumsum".to_string(),
-            kernel_family: "gdr",
-            kernel_key: Some("gdr_chunk_cumsum"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: GDR_CUMSUM_PUBLIC_DECL,
-            extern_decl: GDR_CUMSUM_EXTERN_DECL,
-            call_args: GDR_CUMSUM_CALL_ARGS,
-            allow_sm70: true,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_a".to_string(),
-            kernel_path: "tools/tilelang/gated_delta_rule.py",
-            kernel_name: "gated_delta_rule_prefill_chunk_a".to_string(),
-            out_name: "tilelang_gated_delta_rule_chunk_a".to_string(),
-            kernel_family: "gdr",
-            kernel_key: Some("gdr_chunk_a"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: GDR_A_PUBLIC_DECL,
-            extern_decl: GDR_A_EXTERN_DECL,
-            call_args: GDR_A_CALL_ARGS,
-            allow_sm70: true,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_recompute".to_string(),
-            kernel_path: "tools/tilelang/gated_delta_rule.py",
-            kernel_name: "gated_delta_rule_prefill_chunk_recompute".to_string(),
-            out_name: "tilelang_gated_delta_rule_chunk_recompute".to_string(),
-            kernel_family: "gdr",
-            kernel_key: Some("gdr_chunk_recompute"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: GDR_RECOMPUTE_PUBLIC_DECL,
-            extern_decl: GDR_RECOMPUTE_EXTERN_DECL,
-            call_args: GDR_RECOMPUTE_CALL_ARGS,
-            allow_sm70: true,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_state".to_string(),
-            kernel_path: "tools/tilelang/gated_delta_rule.py",
-            kernel_name: "gated_delta_rule_prefill_chunk_state".to_string(),
-            out_name: "tilelang_gated_delta_rule_chunk_state".to_string(),
-            kernel_family: "gdr",
-            kernel_key: Some("gdr_chunk_state"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: GDR_STATE_PUBLIC_DECL,
-            extern_decl: GDR_STATE_EXTERN_DECL,
-            call_args: GDR_STATE_CALL_ARGS,
-            allow_sm70: true,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "gated_delta_rule_chunk_o".to_string(),
-            kernel_path: "tools/tilelang/gated_delta_rule.py",
-            kernel_name: "gated_delta_rule_prefill_chunk_o".to_string(),
-            out_name: "tilelang_gated_delta_rule_chunk_o".to_string(),
-            kernel_family: "gdr",
-            kernel_key: Some("gdr_chunk_o"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: GDR_O_PUBLIC_DECL,
-            extern_decl: GDR_O_EXTERN_DECL,
-            call_args: GDR_O_CALL_ARGS,
-            allow_sm70: true,
-        },
-    ];
-    for spec in &gdr_specs {
-        build_tilelang_kernel(
-            &tl,
-            out_dir,
-            sm_targets,
-            cuda_path,
-            spec,
-            &mut generated_sources,
-        );
-    }
-
-    // FlashQLA chunked GDR fwd — OPT-IN (ARLE_CUDA_ENABLE_FLASHQLA_GDR=1) and
-    // sm_90 ONLY (TileLang lowering uses Hopper barriers/warp-spec/TMA that fail
-    // on every other SM). The runtime path is itself env-gated OFF by default
-    // (ARLE_QWEN35_GDR_CHUNKED → use_fq_chunked in infer-cuda/src/qwen35.rs), so
-    // its AOT is not a hard build dependency — same opt-in discipline as
-    // ARLE_CUDA_ENABLE_FA3. When the flag is unset (or building off-sm90) every
-    // build flavor links the NOT_SUPPORTED stubs, keeping the FFI surface
-    // complete so the rest of the tree builds while these fwd kernels (TileLang
-    // T.gemm TMA-descriptor wrapper gen) are still being iterated on.
-    let flashqla_specs = [
-        TileLangKernelSpec {
-            artifact_dir: "flashqla_gdr_cumsum".to_string(),
-            kernel_path: "tools/tilelang/flashqla_gdr.py",
-            kernel_name: "gdr_fq_cumsum".to_string(),
-            out_name: "tilelang_flashqla_gdr_cumsum".to_string(),
-            kernel_family: "flashqla",
-            kernel_key: Some("fq_cumsum"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: FQ_CUMSUM_PUBLIC_DECL,
-            extern_decl: FQ_CUMSUM_EXTERN_DECL,
-            call_args: FQ_CUMSUM_CALL_ARGS,
-            allow_sm70: false,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "flashqla_gdr_kkt".to_string(),
-            kernel_path: "tools/tilelang/flashqla_gdr.py",
-            kernel_name: "gdr_fq_kkt".to_string(),
-            out_name: "tilelang_flashqla_gdr_kkt".to_string(),
-            kernel_family: "flashqla",
-            kernel_key: Some("fq_kkt"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: FQ_KKT_PUBLIC_DECL,
-            extern_decl: FQ_KKT_EXTERN_DECL,
-            call_args: FQ_KKT_CALL_ARGS,
-            allow_sm70: false,
-        },
-        TileLangKernelSpec {
-            artifact_dir: "flashqla_gdr_fwd".to_string(),
-            kernel_path: "tools/tilelang/flashqla_gdr.py",
-            kernel_name: "gdr_fq_fwd".to_string(),
-            out_name: "tilelang_flashqla_gdr_fwd".to_string(),
-            kernel_family: "flashqla",
-            kernel_key: Some("fq_fwd"),
-            num_q_heads: None,
-            num_kv_heads: None,
-            public_decl: FQ_FWD_PUBLIC_DECL,
-            extern_decl: FQ_FWD_EXTERN_DECL,
-            call_args: FQ_FWD_CALL_ARGS,
-            allow_sm70: false,
-        },
-    ];
+    // Registry-driven: one TileLangKernelSpec per kernels.toml row. gdr_only
+    // keeps only the GDR family (attention stubbed above). The flashqla gate
+    // (sm90-only + ARLE_CUDA_ENABLE_FLASHQLA_GDR) is reproduced per-row below.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHQLA_GDR");
     let enable_flashqla_gdr = env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR");
     let sm90_targets: Vec<SmSpec> = sm_targets
@@ -1685,23 +1245,34 @@ fn compile_tilelang_aot_kernels(
         .filter(|sm| sm.sm == "90")
         .cloned()
         .collect();
-    for spec in &flashqla_specs {
-        if !enable_flashqla_gdr || sm90_targets.is_empty() {
-            write_tilelang_unsupported_stub(
-                out_dir,
-                &spec.artifact_dir,
-                &spec.out_name,
-                &spec.kernel_name,
-                spec.public_decl,
-                &mut generated_sources,
-            );
+    for (spec, k) in registry_to_specs(reg, gdr_only) {
+        if k.gate == "flashqla" {
+            if !enable_flashqla_gdr || sm90_targets.is_empty() {
+                write_tilelang_unsupported_stub(
+                    out_dir,
+                    &spec.artifact_dir,
+                    &spec.out_name,
+                    &spec.kernel_name,
+                    &spec.public_decl,
+                    &mut generated_sources,
+                );
+            } else {
+                build_tilelang_kernel(
+                    &tl,
+                    out_dir,
+                    &sm90_targets,
+                    cuda_path,
+                    &spec,
+                    &mut generated_sources,
+                );
+            }
         } else {
             build_tilelang_kernel(
                 &tl,
                 out_dir,
-                &sm90_targets,
+                sm_targets,
                 cuda_path,
-                spec,
+                &spec,
                 &mut generated_sources,
             );
         }
@@ -2164,6 +1735,15 @@ fn main() {
         println!("cargo:warning=metal feature active: relying on mlx-sys bridge only.");
     }
 
+    // Emit the generated Rust FFI glue (extern block + resolve_* + AttnPhase)
+    // UNCONDITIONALLY and EARLY: `src/ffi/attention.rs` `include!`s it from
+    // OUT_DIR, so the file must exist before any cuda/metal/no-cuda branch
+    // returns (the Mac `cuda,no-cuda` typecheck hits the no-cuda return below).
+    // This is pure Rust codegen from kernels.toml — it needs no CUDA toolchain.
+    let registry = load_registry();
+    let early_out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    emit_ffi_generated(&registry, &early_out_dir);
+
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
         println!("cargo:warning=cuda feature inactive: skipping CUDA/TileLang kernel compilation.");
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
@@ -2617,13 +2197,14 @@ fn main() {
 
     if kernel_set.tilelang_aot_enabled() {
         compile_tilelang_aot_kernels(
+            &registry,
             &cuda_path,
             &out_dir,
             &sm_targets,
             kernel_set.tilelang_gdr_only(),
         );
     } else {
-        compile_tilelang_stub_kernels(&cuda_path, &out_dir);
+        compile_tilelang_stub_kernels(&registry, &cuda_path, &out_dir);
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
