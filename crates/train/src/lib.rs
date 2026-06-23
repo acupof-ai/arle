@@ -1,3 +1,5 @@
+#[path = "agent_opd.rs"]
+pub mod agent_opd;
 #[path = "causal_lm.rs"]
 pub mod causal_lm;
 #[path = "checkpoint.rs"]
@@ -36,8 +38,12 @@ pub mod qwen35_loader;
 pub mod rubric;
 #[path = "rubric_opd.rs"]
 pub mod rubric_opd;
+#[path = "sandbox.rs"]
+pub mod sandbox;
 #[path = "server.rs"]
 pub mod server;
+#[path = "swe_dataset.rs"]
+pub mod swe_dataset;
 #[path = "teacher_infer.rs"]
 pub mod teacher_infer;
 #[path = "tokenizer.rs"]

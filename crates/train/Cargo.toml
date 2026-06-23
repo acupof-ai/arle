@@ -43,6 +43,8 @@ qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
 deepseek-spec = { path = "../deepseek-spec" }
 chat = { path = "../chat" }
+agent = { path = "../agent" }
+tools = { path = "../tools" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
 cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
