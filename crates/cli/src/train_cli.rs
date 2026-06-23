@@ -22,9 +22,9 @@ use crate::args::{ModelArgs, ModelCommand, ModelDownloadArgs, ModelSourceArg};
 use crate::{
     args::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
-        OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainArgs,
-        TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs, TrainRubricOpdArgs,
-        TrainSelfOpdArgs,
+        OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainAgentOpdArgs,
+        TrainArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
+        TrainRubricOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -83,6 +83,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::Opd(args) => run_opd(args),
         TrainCommand::SelfOpd(args) => run_self_opd(args),
         TrainCommand::RubricOpd(args) => run_rubric_opd(args),
+        TrainCommand::AgentOpd(args) => run_agent_opd(args),
     }
 }
 
@@ -1302,6 +1303,18 @@ fn run_rubric_opd_impl(_args: TrainRubricOpdArgs) -> Result<()> {
     )
 }
 
+fn run_agent_opd(args: TrainAgentOpdArgs) -> ExitCode {
+    exit_from_result(run_agent_opd_impl(args))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_agent_opd_impl(_args: TrainAgentOpdArgs) -> Result<()> {
+    bail!(
+        "agent-opd requires the cuda feature (the in-process rollout engine + CE \
+         writeback are CUDA-only). Build with --features cuda,nccl."
+    )
+}
+
 /// Load the in-process eval set (jsonl `{problem, answer}`), head-`n`, rendered with
 /// the same math prompt prefix the training corpus uses, tokenized. Returns
 /// `(prompt_ids, problem_text, gold_answer)`.
@@ -1817,6 +1830,292 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     }
 
     eprintln!("[arle train rubric-opd] done ({} rounds)", args.rounds);
+    Ok(())
+}
+
+/// Agent-OPD RFT loop: the student drives the read/write/replace/bash tool loop
+/// against a per-task repo sandbox (SWE-bench-Pro); the reward is EXECUTION (the
+/// hidden tests are run on `git diff`), no text judge is loaded; passing
+/// trajectories are written back as CE targets via the same path as rubric-OPD.
+#[cfg(feature = "cuda")]
+fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    use autograd::optim::AdamW;
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+    use train::{
+        infer_student::{InferStudent, save_lora_adapters},
+        lora::LoraConfig,
+        opd::rubric_writeback_ce_step_batched,
+        qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
+        swe_dataset::SweTask,
+    };
+
+    let student_dir = args.student_model.as_path();
+    let target_set = parse_lora_target_set(&args.lora_target_set)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
+
+    let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
+
+    // Vocab from the checkpoint config (not the autograd student) so the rollout
+    // engine can load BEFORE the autograd student when `--share-frozen-base` is
+    // set. Same value `Qwen35Model::config()` exposes — default path unchanged.
+    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
+        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
+    let vocab = hf_config.vocab_size;
+
+    // SWE-bench-Pro tasks; each task's staged tree is `<staged_root>/<instance_id>/`.
+    let mut tasks_raw = train::swe_dataset::load_swe_tasks(&args.dataset)?;
+    if let Some(n) = args.task_limit {
+        tasks_raw.truncate(n);
+    }
+    let tasks: Vec<(SweTask, PathBuf)> = tasks_raw
+        .into_iter()
+        .map(|t| {
+            let tree = args.staged_root.join(&t.instance_id);
+            (t, tree)
+        })
+        .collect();
+    if tasks.is_empty() {
+        bail!("no usable tasks in {}", args.dataset.display());
+    }
+    eprintln!(
+        "[arle train agent-opd] loaded {} tasks from {}",
+        tasks.len(),
+        args.dataset.display()
+    );
+
+    // Rollout engine (student) — own KV/scheduler path for the multi-turn agent
+    // tool loop. Size for the full accumulated agent conversation: up to
+    // `max_turns` sub-turns, each generating up to `max_tokens`, plus tool
+    // outputs / context. Generous budget, floored, bounds total KV pages.
+    let student_seq = (args.max_turns * args.max_tokens + 8192).max(16384);
+
+    // Load order: default loads the autograd student FIRST (engine then sees
+    // post-student free VRAM — byte-identical). --share-frozen-base loads the
+    // engine FIRST so the student can import (zero-copy) its resident FP8 base.
+    let prebuilt_student = if args.share_frozen_base {
+        None
+    } else {
+        eprintln!(
+            "[arle train agent-opd] loading student from {}",
+            student_dir.display()
+        );
+        Some(
+            load_qwen35_lora_from_hf_dir_with_shared_base(
+                student_dir,
+                lora,
+                target_set,
+                args.lora_layer_start,
+                None,
+                &mut store,
+            )
+            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?,
+        )
+    };
+
+    eprintln!(
+        "[arle train agent-opd] loading rollout engine from {} (max_seq_len={student_seq})",
+        student_dir.display()
+    );
+    let student_engine = LoadedInferenceEngine::load_with_config(
+        student_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
+        true,
+        EngineLoadConfig {
+            num_slots: args.rollout_num_slots,
+            page_size: 16,
+            total_pages: args.rollout_num_slots.max(1) * student_seq.div_ceil(16),
+            max_prompt_tokens: student_seq,
+            max_total_tokens: student_seq,
+            chunked_prefill_size: student_seq,
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
+
+    // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
+    // engine's resident FP8 base pointers and pass them into the autograd student
+    // load so its frozen FP8 base projections import a NON-OWNING view.
+    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if args.share_frozen_base {
+        let table = student_engine
+            .frozen_base_fp8_pointers()
+            .context("borrow rollout-engine FP8 base pointers for --share-frozen-base")?;
+        eprintln!(
+            "[arle train agent-opd] --share-frozen-base: borrowing {} resident FP8 base projections from the rollout engine (zero-copy)",
+            table.len()
+        );
+        table
+            .into_iter()
+            .map(|p| SharedFrozenBaseEntry {
+                layer_idx: p.layer_idx,
+                proj_suffix: p.proj_suffix,
+                weight_ptr: p.weight_ptr,
+                scale_ptr: p.scale_ptr,
+                rows: p.rows,
+                cols: p.cols,
+                block_m: p.block_m,
+                block_k: p.block_k,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let shared_base = if args.share_frozen_base {
+        Some(shared_base_entries.as_slice())
+    } else {
+        None
+    };
+
+    let mut student = match prebuilt_student {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "[arle train agent-opd] loading student from {}",
+                student_dir.display()
+            );
+            load_qwen35_lora_from_hf_dir_with_shared_base(
+                student_dir,
+                lora,
+                target_set,
+                args.lora_layer_start,
+                shared_base,
+                &mut store,
+            )
+            .with_context(|| format!("load LoRA student from {}", student_dir.display()))?
+        }
+    };
+
+    // Shared-base bytes alias the engine's resident FP8 — drain in-flight device
+    // work before the first autograd forward (cross-stream handoff fence).
+    if args.share_frozen_base {
+        train_backend
+            .device_synchronize()
+            .context("device sync before first shared-base autograd forward")?;
+    }
+
+    // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
+    // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
+    if args.grad_checkpointing {
+        student.set_gradient_checkpointing(true);
+    }
+    let all_params: Vec<TensorId> = student.all_parameter_ids();
+    let trainable: Vec<TensorId> = all_params
+        .iter()
+        .copied()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    if trainable.is_empty() {
+        bail!("agent-opd student has no trainable (LoRA) parameters; check --lora-target-set");
+    }
+
+    let infer_student = InferStudent::new(
+        Arc::new(Mutex::new(student_engine)),
+        train_backend.clone(),
+        vocab,
+    );
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+
+    // rounds:1 — the round loop is external (mirroring rubric-OPD); each call runs
+    // one round, then the caller syncs the trained LoRA into the rollout engine.
+    let cfg = train::agent_opd::AgentOpdConfig {
+        rounds: 1,
+        samples_per_prompt: args.samples_per_prompt,
+        max_turns: args.max_turns,
+        max_tokens: args.max_tokens,
+        temperature: args.rollout_temperature,
+        writeback_batch: args.writeback_batch,
+        writeback_cap: args.writeback_cap,
+        work_root: args.work_root.clone(),
+        pythonpath: args.pythonpath.clone(),
+        bash_timeout_secs: args.bash_timeout_secs,
+        test_timeout_secs: args.test_timeout_secs,
+    };
+
+    for round in 0..args.rounds {
+        // Fresh closures each round so the &mut store / &mut optimizer borrows
+        // are released before the per-round checkpoint reuses the store.
+        let report = {
+            let student_ref = &student;
+            let all_ref = all_params.as_slice();
+            let trainable_ref = trainable.as_slice();
+            let store_ref = &mut store;
+            let opt_ref = &mut optimizer;
+            train::agent_opd::run_agentic_opd_round(
+                &infer_student,
+                &tasks,
+                &cfg,
+                round,
+                |chunk: &[(Vec<u32>, Vec<u32>)]| {
+                    rubric_writeback_ce_step_batched(
+                        student_ref,
+                        all_ref,
+                        trainable_ref,
+                        opt_ref,
+                        chunk,
+                        vocab,
+                        store_ref,
+                    )
+                    .map_err(anyhow::Error::from)
+                },
+            )?
+        };
+        eprintln!(
+            "[arle train agent-opd] round {round}: tasks={} rollouts={} passed={} distinct={} no_token_record={} trained_pairs={} mean_loss={:.4}",
+            report.tasks,
+            report.rollouts,
+            report.passed,
+            report.distinct_passed,
+            report.no_token_record,
+            report.trained_pairs,
+            report.mean_train_loss
+        );
+
+        // Sync the trained LoRA into the rollout engine (always): the next round
+        // needs this round's improved student. Round 0 sampled from base.
+        infer_student
+            .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
+            .context("sync trained LoRA into rollout engine")?;
+
+        // Fast adapter-only (LoRA) save — avoids the full-materialize host-loop hang.
+        if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
+            if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
+                fs::create_dir_all(adapter_dir).with_context(|| {
+                    format!("create LoRA adapter dir {}", adapter_dir.display())
+                })?;
+                let out = adapter_dir.join(format!("adapters_round{}.safetensors", round + 1));
+                let started = Instant::now();
+                save_lora_adapters(&mut store, &student.adapter_name_map(), &out)
+                    .with_context(|| format!("save LoRA adapters at round {}", round + 1))?;
+                println!(
+                    "checkpoint_saved kind=lora_adapters mode=agent-opd step={} dir={} seconds={:.6}",
+                    round + 1,
+                    out.display(),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
+
+        let mut ckpt_tape = Tape::new();
+        maybe_save_full_student_checkpoint(
+            "agent-opd",
+            args.save_checkpoint.as_deref(),
+            args.save_every,
+            round + 1,
+            args.rounds,
+            student_dir,
+            &student,
+            &mut store,
+            &mut ckpt_tape,
+        )?;
+    }
+
+    eprintln!("[arle train agent-opd] done ({} rounds)", args.rounds);
     Ok(())
 }
 
