@@ -34,6 +34,42 @@ extern "C" __global__ void sum_squares_partial_f32(
     }
 }
 
+// Block-reduce sum of an f32 array into one f32 partial per block.
+//   partial[blockIdx.x] = sum(x[blockIdx.x*blockDim.x .. +blockDim.x])
+// Grid=(ceil(n / block), 1, 1), block=(256, 1, 1), shared=block * f32.
+// Sibling of `sum_squares_partial_f32` but accumulates the raw value (not the
+// square) so a multi-pass launch can reduce a [B*S*V] tensor to a single
+// scalar entirely on-device — no full-tensor DtoH. Accumulation is in f32 to
+// match the host `Vec<f32>::iter().sum()` reduction order tolerance the
+// device-resident `sum_all` replaces; the loss/grad correctness gate is the
+// `kl_distill_loss` fp tolerance, not byte-identity.
+extern "C" __global__ void sum_partial_f32(
+    float* __restrict__ partial,
+    const float* __restrict__ x,
+    int n
+) {
+    extern __shared__ float smem32[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    float local = 0.0f;
+    if (idx < n) {
+        local = x[idx];
+    }
+    smem32[tid] = local;
+    __syncthreads();
+
+    for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            smem32[tid] += smem32[tid + step];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = smem32[0];
+    }
+}
+
 extern "C" __global__ void grad_clip_sumsq_f32(
     double* __restrict__ partial,
     const unsigned long long* __restrict__ grad_ptrs,

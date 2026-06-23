@@ -1526,13 +1526,20 @@ impl Backend for CudaBackend {
             todo!("GPU required: cuda sum_all is unavailable under feature no-cuda")
         }
 
-        // CUDA stays eager for M5.3b.1 — no device-resident lazy graph here.
-        // We still keep the result on-device so the returned handle composes
-        // with future device-resident consumers (e.g. tape.backward()'s
-        // ensure_host of the loss). Strategy: download → reduce on host →
-        // upload the scalar back. This is one HtoD round-trip and a tiny
-        // sum, dwarfed by the matmul that produced `x`. PENDING REMOTE CUDA
-        // VERIFICATION.
+        // Device-resident reduction. Previously this downloaded the whole
+        // `x` (e.g. the `[seq, vocab]` KL-loss intermediate, ~32 MB/chunk at
+        // vocab=248320) to host, summed single-threaded, and re-uploaded the
+        // scalar — a full-tensor DtoH + blocking `synchronize()` per `mean`
+        // in the OPD CE/KL head (`log_softmax → mul → mean`, see
+        // `ops::reduce::mean_device_lazy`). That serialized the GPU behind a
+        // CPU reduce every chunk and was the host-bound bottleneck.
+        //
+        // Now: a `sum_partial_f32` block reduce produces one f32 per block,
+        // then the partials are recursively reduced on-device until a single
+        // scalar remains. The result handle never leaves the GPU; the only
+        // host transfer is the final 4-byte loss scalar in `tape.backward`'s
+        // `ensure_host`. No `synchronize()` — the caller's terminal eval owns
+        // it, so this composes into the existing device-resident chain.
         #[cfg(not(feature = "no-cuda"))]
         {
             let slice = self.cuda_slice(x, "sum_all")?;
@@ -1544,19 +1551,7 @@ impl Backend for CudaBackend {
                     size,
                 });
             }
-            let mut host = vec![0.0_f32; size];
-            self.stream
-                .memcpy_dtoh(slice, &mut host)
-                .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
-            self.stream
-                .synchronize()
-                .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
-            let total: f32 = host.iter().sum();
-            let scalar = self
-                .stream
-                .clone_htod(&[total])
-                .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-            Ok(DeviceHandle::Cuda(CudaStorage::new(scalar)))
+            cuda_sum_all_device(self, x, size)
         }
     }
 
@@ -5992,6 +5987,84 @@ fn cuda_write_scalar_at(
         },
     )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+// Device-resident full reduction `out[0] = sum(x[0..size])`. Multi-pass
+// block reduce via `sum_partial_f32`: pass 1 reduces `size` elements into
+// `ceil(size/BLOCK)` partials; each subsequent pass reduces the partials the
+// same way until one element remains. Returns a 1-element device handle with
+// NO host transfer and NO `synchronize()` — the launches are enqueued on the
+// backend stream and the caller's terminal eval forces them. This is the
+// device-resident sibling of the host-reduce path `sum_all` used to take.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_sum_all_device(
+    backend: &CudaBackend,
+    x: &DeviceHandle,
+    size: usize,
+) -> Result<DeviceHandle> {
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+
+    // size == 0 → empty sum is 0.0; size == 1 → already a scalar, copy as-is
+    // through one trivial reduce so the returned buffer is freshly owned.
+    if size == 0 {
+        let d_out = backend
+            .stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_all empty)"))?;
+        return Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)));
+    }
+
+    // First pass reads the borrowed input slice; later passes read the
+    // previous pass's owned partial buffer. `function()` is re-fetched inline
+    // per launch (a cheap HashMap lookup) so each `&CudaFunction` borrow is
+    // scoped to a single `launch_rows` call — mirrors `cuda_sum_squares`.
+    let in_slice = backend.cuda_slice(x, "sum_all")?;
+    let mut n = size;
+    let mut blocks = n.div_ceil(BLOCK as usize);
+    let n_i32 = i32::try_from(n)
+        .map_err(|_| AutogradError::TapeInvariant("cuda sum_all size exceeds i32"))?;
+    let mut current = backend
+        .stream
+        .alloc_zeros::<f32>(blocks)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_all)"))?;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("sum_partial_f32")?,
+        blocks,
+        BLOCK,
+        SHARED,
+        |mut builder| {
+            builder.arg(&mut current).arg(in_slice).arg(&n_i32);
+            builder
+        },
+    )?;
+
+    // Recursively reduce the partials until a single scalar remains.
+    while blocks > 1 {
+        n = blocks;
+        blocks = n.div_ceil(BLOCK as usize);
+        let pass_n = i32::try_from(n)
+            .map_err(|_| AutogradError::TapeInvariant("cuda sum_all partials exceed i32"))?;
+        let mut next = backend
+            .stream
+            .alloc_zeros::<f32>(blocks)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sum_all pass)"))?;
+        launch_rows(
+            &backend.stream,
+            backend.kernels.function("sum_partial_f32")?,
+            blocks,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder.arg(&mut next).arg(&current).arg(&pass_n);
+                builder
+            },
+        )?;
+        current = next;
+    }
+
+    Ok(DeviceHandle::Cuda(CudaStorage::new(current)))
 }
 
 #[cfg(not(feature = "no-cuda"))]

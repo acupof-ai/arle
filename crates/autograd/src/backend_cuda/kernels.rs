@@ -83,6 +83,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "embedding_f32",
     "embedding_bf16_to_f32",
     "sum_squares_partial_f32",
+    "sum_partial_f32",
     "grad_clip_sumsq_f32",
     "grad_clip_scale_f32",
     "sum_last_axis_f32",
