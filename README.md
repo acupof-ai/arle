@@ -3,7 +3,11 @@
 </p>
 
 <p align="center">
-  <em>Pure-Rust runtime for serving, local agents, On-Policy Distillation, and evaluation. <code>arle serve</code> is the OpenAI-compatible serving path; <code>arle</code> is the unified front door.</em>
+  <b>One pure-Rust binary that serves LLMs (OpenAI-compatible), runs local agents, and distills them on their own rollouts — on Apple Silicon <em>and</em> NVIDIA. No Python on the hot path.</b>
+</p>
+
+<p align="center">
+  <sub>35B-A3B MoE at <b>85 tok/s</b> on a MacBook · <b>bit-identical</b> speculative decode · OPD lifts a 4B student <b>+27pp</b> on MATH-500</sub>
 </p>
 
 <p align="center">
