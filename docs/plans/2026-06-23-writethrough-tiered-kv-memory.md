@@ -226,25 +226,32 @@ The four axes are **one interlocked system**, not four features:
 
 Each below: **target** · *grounded current state (file:line)* · **the change**.
 
-### ① Budget — one ledger, per tier, sized to the working set (NOT max_seq_len)
-*Now: `recall_kv` token budget = `num_slots × max_seq_len` (`executor.rs:3065`) = the
-34.4 GB over-alloc; no ledger; rollout sets `total_pages = num_slots × max_seq_len/16`
-(`train_cli.rs:1547`) with no free-VRAM clamp → build OOM. Tiers (HBM/T1/T2) are
-independent capacities, not a ledger.*
+### ① Budget — ONE unified L1+L2 ledger; L3 is recall-only (ckl 2026-06-23)
+The live KV budget spans **L1(HBM) + L2(DRAM) together** — one capacity, one
+eviction/admission decision; a block moves L1↔L2 *within* this budget (cheap write-back /
+promote). **L3(NVMe) is NOT in the live budget** — it is the **recall archive**, touched
+only when `--kv-recall` is on (write-through on evict-out-of-live; prefetch at prefill).
+Base serving (no recall) uses L1+L2 only and never touches L3.
+*Now: `recall_kv` = `num_slots × max_seq_len` (`executor.rs:3065`) = the 34.4 GB over-alloc;
+no ledger; rollout sets `total_pages = num_slots × max_seq_len/16` (`train_cli.rs:1547`),
+no free-VRAM clamp → build OOM. The three tiers are independent capacities, not one ledger.*
 
 ```
-HBM_ledger = working_set + staging + reps        (all bounded; none scales with max_seq_len)
-  working_set = num_slots × (n_init + n_local + top_k·l_bs + headroom) pages   ← the bound (~544 tok/slot)
-  staging     = num_slots × ceil(1 KV-block)                                    ← ②
-  reps        = num_slots × max_blocks × rep_bytes   (f32[kv_heads·head_dim]/l_bs-block; rep-pool capped)
-L2(DRAM) budget = the session-history cap (the real "256K→millions")            (default_t1, kv_tier.rs:71)
-L3(NVMe) budget = durable overflow                                              (default_t2)
+LIVE budget = L1 + L2 (unified) — sized to the working set, NOT max_seq_len:
+  L1 (HBM)  = working_set(sink+local+recalled) + staging + reps      ← bounded ~544 tok/slot, attended directly
+              working_set = num_slots × (n_init + n_local + top_k·l_bs + headroom) pages
+              staging     = num_slots × ceil(1 KV-block)              ← ②
+              reps        = num_slots × max_blocks × rep_bytes (rep-pool capped)
+  L2 (DRAM) = warm overflow demoted-from-L1 (fast to promote) + DRAM staging   (default_t1, kv_tier.rs:71)
+  cap = HBM_cap + DRAM_cap ; L1→L2 write-back stays WITHIN this budget ; admission gates on it
+L3 (NVMe) = recall-only archive — write-through L2→L3 when live is full ; prefetch L3→L1 at prefill
+            durable/effectively-unbounded ; NOT counted in the live arithmetic   (default_t2)
 ```
 - Change `executor.rs:3065` token budget `num_slots×max_seq_len` → `working_set_tokens`.
 - Change `train_cli.rs:1547` to the same bounded sizing + the `kv_budget_num_slots`
   clamp (`qwen35.rs:1636`) → **kills the build OOM**.
-- `cuda_admission_total_pages` (`loaded.rs:1266`) reserves working_set+staging up front
-  (recall pool no longer a lazy after-the-fact alloc that competes with slots).
+- `cuda_admission_total_pages` (`loaded.rs:1266`) reserves working_set+staging up front.
+- L3 stays opt-in (recall): no L3 plumbing on the base serving path.
 
 ### ② Eviction — proactive + graceful, cascading L1→L2→L3
 *Now: preemption (`planner.rs:94-182`) IS graceful-demote when a tier is wired
@@ -254,9 +261,11 @@ L3(NVMe) budget = durable overflow                                              
 - **Proactive**: evict to hold `working_set ≤ budget − staging − reps` at a low-watermark
   each tick (BEFORE the wall) → append/prefetch always has room. New headroom check in
   the scheduler tick / `decode_row_recall`, not only `retract_decode_to_fit`'s at-wall trigger.
-- **Cascade**: L1→L2 **write-back** on evict (cold block → DRAM); L2→L3 **write-through**
-  (every L2 block durably to NVMe, async). Reuse the coldest-unpinned + sink/local-pin
-  policy (`writethrough.rs:114`), extend to the cascade.
+- **Cascade (within the unified L1+L2 budget, then L3 only for recall)**: L1→L2
+  **write-back** on evict (cold block → DRAM, stays in the live budget). When L1+L2 is
+  full: **base serving drops** the coldest (bounded KV, no long memory); **recall on** →
+  L2→L3 **write-through** to the recall archive instead of dropping. Reuse the
+  coldest-unpinned + sink/local-pin policy (`writethrough.rs:114`).
 - **Graceful in rollout**: wire the tier so `requeue_preempted_decode` takes the demote
   path, not the recompute fallback → zero token loss.
 
