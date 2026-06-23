@@ -498,6 +498,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) max_total_tokens: Option<usize>,
 
+    /// Bound on generated tokens for chat requests that enable thinking
+    /// (`chat_template_kwargs.enable_thinking=true`). `0` (the default) leaves
+    /// thinking unbounded — byte-identical to before this flag. A positive
+    /// value caps such requests so a slow think can't run away / time out.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) max_thinking_tokens: usize,
+
     /// Per-request prefill chunk size.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) chunked_prefill_size: Option<usize>,

@@ -68,6 +68,12 @@ pub struct EngineLoadConfig {
     /// `MetalExecutor::set_kv_recall`; other backends ignore it.
     #[serde(default)]
     pub kv_recall: bool,
+    /// Generation-token bound for chat requests that enable thinking
+    /// (`chat_template_kwargs.enable_thinking=true`). `0` = off (unbounded),
+    /// keeping the chat path byte-identical to before this knob. The OpenAI
+    /// facade clamps `max_tokens` to this when thinking is on.
+    #[serde(default)]
+    pub max_thinking_tokens: usize,
 }
 
 impl Default for EngineLoadConfig {
@@ -89,6 +95,7 @@ impl Default for EngineLoadConfig {
             allow_swap: false,
             low_impact: false,
             kv_recall: false,
+            max_thinking_tokens: 0,
         }
     }
 }
@@ -987,16 +994,31 @@ mod backend {
             let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
                 model_path, &resolved, config, kv_ssd, shutdown,
             )?;
-            return Ok(infer_server::openai_router(serve, tokenizer, model_id));
+            return Ok(infer_server::openai_router(
+                serve,
+                tokenizer,
+                model_id,
+                config.max_thinking_tokens,
+            ));
         }
         if infer_metal::model_dir_is_gemma4(&resolved) {
             let (serve, tokenizer, model_id) =
                 metal_gemma4_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
-            return Ok(infer_server::openai_router(serve, tokenizer, model_id));
+            return Ok(infer_server::openai_router(
+                serve,
+                tokenizer,
+                model_id,
+                config.max_thinking_tokens,
+            ));
         }
         let (serve, tokenizer, model_id) =
             metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
-        Ok(infer_server::openai_router(serve, tokenizer, model_id))
+        Ok(infer_server::openai_router(
+            serve,
+            tokenizer,
+            model_id,
+            config.max_thinking_tokens,
+        ))
     }
 
     #[cfg(feature = "metal")]
@@ -1494,7 +1516,12 @@ mod backend {
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) =
             cuda_serve_handle(model_path, enable_cuda_graph, config, kv_ssd, shutdown)?;
-        Ok(infer_server::openai_router(serve, tokenizer, model_id))
+        Ok(infer_server::openai_router(
+            serve,
+            tokenizer,
+            model_id,
+            config.max_thinking_tokens,
+        ))
     }
 
     /// Resolve `model_path` to a `.gguf` checkpoint: either the file itself or a
@@ -1641,7 +1668,12 @@ mod backend {
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::openai_router(serve, tokenizer, model_id))
+        Ok(infer_server::openai_router(
+            serve,
+            tokenizer,
+            model_id,
+            config.max_thinking_tokens,
+        ))
     }
 
     /// Vulkan serve router. Builds the same `ServeHandle` as
@@ -1654,7 +1686,12 @@ mod backend {
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::openai_router(serve, tokenizer, model_id))
+        Ok(infer_server::openai_router(
+            serve,
+            tokenizer,
+            model_id,
+            config.max_thinking_tokens,
+        ))
     }
 
     /// Portable CPU serve router: the placeholder `MetalExecutor` over the real
@@ -1684,7 +1721,12 @@ mod backend {
         let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
         let serve =
             ServeHandle::spawn_with_shutdown(executor, kv, config.scheduler_config(), shutdown);
-        Ok(openai_router(serve, tokenizer, model_id))
+        Ok(openai_router(
+            serve,
+            tokenizer,
+            model_id,
+            config.max_thinking_tokens,
+        ))
     }
 
     impl InferenceEngine for LoadedInferenceEngine {
