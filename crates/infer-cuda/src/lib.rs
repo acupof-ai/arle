@@ -247,10 +247,11 @@ impl CudaExecutor {
     /// a paged page table + page-granular tier); other arms log + ignore. Off →
     /// the decode hot path is byte-identical (CUDA is the Stable backend). Must
     /// be called pre-serve, like the tier setters above.
-    pub fn set_kv_recall(&mut self, enabled: bool) {
+    pub fn set_kv_recall(&mut self, enabled: bool) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
                 let _ = enabled;
+                Ok(())
             }
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.set_kv_recall(enabled),

@@ -1476,7 +1476,7 @@ mod backend {
         // for the dense-Qwen3 paged decode arm; other arms log + ignore. Off → the
         // decode hot path is byte-identical (CUDA is the Stable backend). Set here
         // (the ONE engine constructor every rank uses) so single-GPU + TP agree.
-        executor.set_kv_recall(config.kv_recall);
+        executor.set_kv_recall(config.kv_recall)?;
         // The DSv4 constructor may clamp slots below the request (dynamic KV
         // mem budget, NCCL min-reduced ⇒ identical on every rank). Scheduler +
         // admission pool MUST follow the effective count: admitting to a slot

@@ -15,17 +15,46 @@ only at prefill, no tier interaction during decode.**
 HBM is a **write-through cache** of the session's KV; the tier (host DRAM → NVMe) is
 the **source of truth** holding everything. The only rules:
 
-| when | action | why it's free |
-|---|---|---|
-| **write** (prefill/decode produces a KV page) | mirror HBM→tier **async**, off the critical path | tier always has a copy |
-| **HBM full** | **drop** the coldest unpinned page (淘汰) — no write-back | already write-through'd |
-| **prefill** | **prefetch** relevant history tier→HBM (the recall) | the one known sync point |
-| **decode** | append + attend resident; evict-drop if over budget; **no synchronous tier read** | no latency, no allocator contention |
+| when | action |
+|---|---|
+| **write** (page completes) | keep the block's mean-key rep resident; KV stays in HBM — **L2 is write-back**, populated on eviction (NOT continuously mirrored → cheap hot path) |
+| **HBM full / evict** | **write-back** the cold block HBM→**L2** (host DRAM, fast); free the HBM page (event-ordered — never while a kernel still reads it) |
+| **L2 → L3** (async, off the decode path) | **write-through** to **L3** (NVMe): every L2 block is durably in L3 → no block is ever lost |
+| **prefill** | **prefetch** relevant history L2/L3→HBM (the recall): L2 hit = fast, L3 = slow |
+| **decode** | append + attend resident; write-back-evict if over budget; **no synchronous tier read** |
 
-Why this beats swap: eviction costs nothing (no write-back), prefetch happens at a
-single batched point (prefill, not per-step), and decode never blocks on tier I/O or
-fights the page allocator. This is the HiCache pattern (write-through L1 + prefetch),
-and it dissolves the blocker rather than working around it.
+**Per-tier write policy (ckl 2026-06-23): HBM→L2 write-back** (lazy, on eviction — the hot
+path never continuously mirrors) **+ L2→L3 write-through** (every evicted block lands
+durably in L3). `L3 write-through` = **full recall coverage** — a block is never
+dropped/lost (unlike the resident-only arm that drops on evict), so recall can always
+re-fetch. `L2 write-back` = cheap eviction into fast DRAM. Decode never blocks on tier
+I/O; prefetch is the one batched sync point (prefill). This beats swap: no mid-decode
+tier read, no per-step allocator fight.
+
+## Global budget ledger + swap/staging area (ckl 2026-06-23)
+
+One HBM ledger, **fully pre-reserved** — no on-the-fly alloc (on-the-fly was the
+34.4 GB / 524288-token over-alloc seen on the pod). **Timely (proactive)** eviction
+holds the invariant.
+
+```
+HBM KV budget (resource.rs kv_capacity) =
+    working_set   sink + local + recalled      (bounded to working_set_tokens)
+  + staging       >= 1 KV-block upper-bound     (prefetch-in landing + write-back-out source)
+  + reps          resident mean-key reps        (rep-pool capped)
+```
+
+- **HBM 交换区 (staging)**: reserve >= one KV-block so a prefetch (L2/L3->HBM) lands and
+  a write-back (HBM->L2) stages **without first evicting** and **without a surprise
+  malloc** (malloc implicit-syncs + can OOM). Decouples prefetch from evict timing.
+- **DRAM (L2) staging**: same — reserved landing for HBM write-backs + source buffer for
+  the L2->L3 write-through.
+- **Timely eviction**: proactively write-back-evict to keep
+  `working_set <= budget - staging - reps` — always >= 1 free block for append/prefetch.
+  Never lazy-too-late (that blocks or OOMs).
+- **Why global**: eviction timing × staging reuse × transfer event-order (write-back
+  done before staging is reused; prefetch landed before attend) must be **one ledger +
+  one policy**, not per-call. This is the hard part.
 
 ## What the model gives
 
