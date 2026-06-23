@@ -4696,178 +4696,51 @@ fn run_tilelang_paged(
     // (`pool.max_total_pages`, the k_pool/v_pool first-dim extent); `total_pages`
     // (arg 13) = page-table length (`meta.num_pages`). Swapping them gives wrong
     // pool strides + an OOB kv_indices walk that hangs the kernel (Xid 43).
+    // Generated dispatch table (kernels.toml -> resolve_paged_attn_v1). The
+    // ensure!() above pins head_dim==128 / kv==8; only the same 8 configs
+    // (prefill/decode x q16/32/40/64) resolve. The (1,1,1) vs (1,seq,seq)
+    // scalar choice reproduces the old per-arm literals exactly.
+    let phase = if decode {
+        ffi::AttnPhase::Decode
+    } else {
+        ffi::AttnPhase::Prefill
+    };
+    let kernel = ffi::resolve_paged_attn_v1(
+        head_dim as u32,
+        num_q_heads as u32,
+        num_kv_heads as u32,
+        phase,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!("unsupported HD128 q/kv head config q{num_q_heads}_kv{num_kv_heads}")
+    })?;
+    let (bsz, total_q, max_q) = if decode {
+        (1, 1, 1)
+    } else {
+        (1, meta.seq_len as i32, meta.seq_len as i32)
+    };
     unsafe {
-        match (decode, num_q_heads) {
-            (false, 16) => ffi::tilelang_batch_prefill_paged_hd128_q16_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                meta.seq_len as i32,
-                meta.seq_len as i32,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (false, 32) => ffi::tilelang_batch_prefill_paged_hd128_q32_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                meta.seq_len as i32,
-                meta.seq_len as i32,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (false, 40) => ffi::tilelang_batch_prefill_paged_hd128_q40_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                meta.seq_len as i32,
-                meta.seq_len as i32,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (false, 64) => ffi::tilelang_batch_prefill_paged_hd128_q64_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                meta.seq_len as i32,
-                meta.seq_len as i32,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (true, 16) => ffi::tilelang_batch_decode_paged_hd128_q16_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                1,
-                1,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (true, 32) => ffi::tilelang_batch_decode_paged_hd128_q32_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                1,
-                1,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (true, 40) => ffi::tilelang_batch_decode_paged_hd128_q40_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                1,
-                1,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            (true, 64) => ffi::tilelang_batch_decode_paged_hd128_q64_kv8_run_cuda(
-                q_ptr as *mut ffi::Half,
-                qo_ptr as *const i32,
-                k_pool_ptr as *mut ffi::Half,
-                v_pool_ptr as *mut ffi::Half,
-                kv_indptr_ptr as *const i32,
-                kv_indices_ptr as *const i32,
-                last_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                1,
-                1,
-                1,
-                pool.max_total_pages as i32,
-                meta.num_pages as i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                pool.page_size as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-            .result()?,
-            _ => bail!("unsupported HD128 q/kv head config q{num_q_heads}_kv{num_kv_heads}"),
-        }
+        kernel(
+            q_ptr as *mut ffi::Half,
+            qo_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            kv_indptr_ptr as *const i32,
+            kv_indices_ptr as *const i32,
+            last_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            bsz,
+            total_q,
+            max_q,
+            pool.max_total_pages as i32,
+            meta.num_pages as i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            pool.page_size as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
     }
     Ok(())
 }
