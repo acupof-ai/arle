@@ -226,12 +226,14 @@ The four axes are **one interlocked system**, not four features:
 
 Each below: **target** · *grounded current state (file:line)* · **the change**.
 
-### ① Budget — ONE unified L1+L2 ledger; L3 is recall-only (ckl 2026-06-23)
+### ① Budget — ONE unified L1+L2 live ledger; L3 is a general deep tier (NOT recall-coupled) (ckl 2026-06-23)
 The live KV budget spans **L1(HBM) + L2(DRAM) together** — one capacity, one
 eviction/admission decision; a block moves L1↔L2 *within* this budget (cheap write-back /
-promote). **L3(NVMe) is NOT in the live budget** — it is the **recall archive**, touched
-only when `--kv-recall` is on (write-through on evict-out-of-live; prefetch at prefill).
-Base serving (no recall) uses L1+L2 only and never touches L3.
+promote). **L3(NVMe) is NOT in the live budget**, but it is **NOT recall-only** — it is a
+**general deep tier** shared by two independent consumers: serve's **prefix-cache** (demote-
+to-L3, already wired via `set_disk`) AND **recall** (the deep archive). Same `CudaKvTierStore`,
+separate key namespaces, no conflict — normal serve can enable L3 on its own; recall is just
+another consumer. Decoupled by design.
 *Now: `recall_kv` = `num_slots × max_seq_len` (`executor.rs:3065`) = the 34.4 GB over-alloc;
 no ledger; rollout sets `total_pages = num_slots × max_seq_len/16` (`train_cli.rs:1547`),
 no free-VRAM clamp → build OOM. The three tiers are independent capacities, not one ledger.*
@@ -244,14 +246,16 @@ LIVE budget = L1 + L2 (unified) — sized to the working set, NOT max_seq_len:
               reps        = num_slots × max_blocks × rep_bytes (rep-pool capped)
   L2 (DRAM) = warm overflow demoted-from-L1 (fast to promote) + DRAM staging   (default_t1, kv_tier.rs:71)
   cap = HBM_cap + DRAM_cap ; L1→L2 write-back stays WITHIN this budget ; admission gates on it
-L3 (NVMe) = recall-only archive — write-through L2→L3 when live is full ; prefetch L3→L1 at prefill
-            durable/effectively-unbounded ; NOT counted in the live arithmetic   (default_t2)
+L3 (NVMe) = general deep tier (shared) — prefix-cache demote (serve) + recall archive,
+            decoupled consumers ; write-through when live full ; promote on prefix-hit /
+            prefetch at prefill (recall) ; durable ; NOT in the live arithmetic   (default_t2)
 ```
 - Change `executor.rs:3065` token budget `num_slots×max_seq_len` → `working_set_tokens`.
 - Change `train_cli.rs:1547` to the same bounded sizing + the `kv_budget_num_slots`
   clamp (`qwen35.rs:1636`) → **kills the build OOM**.
 - `cuda_admission_total_pages` (`loaded.rs:1266`) reserves working_set+staging up front.
-- L3 stays opt-in (recall): no L3 plumbing on the base serving path.
+- L3 is opt-in per-consumer: serve enables it via `set_disk` (prefix-cache), recall via the
+  recall tier — independently. No coupling.
 
 ### ② Eviction — proactive + graceful, cascading L1→L2→L3
 *Now: preemption (`planner.rs:94-182`) IS graceful-demote when a tier is wired
