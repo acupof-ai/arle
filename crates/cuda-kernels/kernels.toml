@@ -36,7 +36,6 @@
 # later tranche (the py modules still validate against their own tuples); tranche
 # 1 keeps the generator interface byte-identical.
 
-schema_version = 1
 
 # ---------------------------------------------------------------------------
 # Shared C ABI signatures. Field order is load-bearing (matches the dispatch
@@ -253,11 +252,9 @@ rust = []
 # ===========================================================================
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 128
 q_heads = 16
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -269,11 +266,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 128
 q_heads = 32
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -285,11 +280,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 128
 q_heads = 40
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -301,11 +294,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 128
 q_heads = 64
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -317,11 +308,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 256
 q_heads = 8
 kv_heads = 2
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -333,11 +322,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 256
 q_heads = 16
 kv_heads = 2
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -349,11 +336,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 256
 q_heads = 16
 kv_heads = 4
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -365,11 +350,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_prefill_paged"
 head_dim = 64
 q_heads = 16
 kv_heads = 1
-kv_dtype = "bf16"
 phase = "prefill"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -385,11 +368,9 @@ ffi = true
 # ===========================================================================
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 256
 q_heads = 8
 kv_heads = 2
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -401,11 +382,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 256
 q_heads = 16
 kv_heads = 2
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -417,11 +396,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 256
 q_heads = 16
 kv_heads = 4
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -433,11 +410,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 16
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -449,11 +424,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 32
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -465,11 +438,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 40
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -481,11 +452,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 64
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -497,11 +466,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 64
 q_heads = 16
 kv_heads = 1
-kv_dtype = "bf16"
 phase = "decode"
 abi = "paged_attn_v1"
 kernel_family = "attention"
@@ -519,11 +486,9 @@ ffi = true
 # ===========================================================================
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 16
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_partial"
 abi = "paged_attn_split_partial_v1"
 kernel_family = "attention_bf16_split_partial"
@@ -536,11 +501,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 32
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_partial"
 abi = "paged_attn_split_partial_v1"
 kernel_family = "attention_bf16_split_partial"
@@ -553,11 +516,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 40
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_partial"
 abi = "paged_attn_split_partial_v1"
 kernel_family = "attention_bf16_split_partial"
@@ -570,11 +531,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 64
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_partial"
 abi = "paged_attn_split_partial_v1"
 kernel_family = "attention_bf16_split_partial"
@@ -587,11 +546,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 16
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_merge"
 abi = "paged_attn_split_merge_v1"
 kernel_family = "attention_bf16_split_merge"
@@ -604,11 +561,9 @@ allow_sm70 = false
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 32
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_merge"
 abi = "paged_attn_split_merge_v1"
 kernel_family = "attention_bf16_split_merge"
@@ -621,11 +576,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 40
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_merge"
 abi = "paged_attn_split_merge_v1"
 kernel_family = "attention_bf16_split_merge"
@@ -638,11 +591,9 @@ allow_sm70 = true
 ffi = true
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 64
 kv_heads = 8
-kv_dtype = "bf16"
 phase = "split_merge"
 abi = "paged_attn_split_merge_v1"
 kernel_family = "attention_bf16_split_merge"
@@ -659,11 +610,9 @@ ffi = true
 # ===========================================================================
 
 [[kernel]]
-family = "batch_decode_paged"
 head_dim = 128
 q_heads = 32
 kv_heads = 8
-kv_dtype = "fp8"
 phase = "decode"
 abi = "paged_attn_fp8_v1"
 kernel_family = "attention_fp8"
@@ -680,7 +629,6 @@ ffi = true
 # ===========================================================================
 
 [[kernel]]
-family = "gated_delta_rule"
 phase = "prepare"
 abi = "gdr_prepare_v1"
 kernel_family = "gdr"
@@ -693,7 +641,6 @@ allow_sm70 = true
 ffi = false
 
 [[kernel]]
-family = "gated_delta_rule"
 phase = "cumsum"
 abi = "gdr_cumsum_v1"
 kernel_family = "gdr"
@@ -706,7 +653,6 @@ allow_sm70 = true
 ffi = false
 
 [[kernel]]
-family = "gated_delta_rule"
 phase = "a"
 abi = "gdr_a_v1"
 kernel_family = "gdr"
@@ -719,7 +665,6 @@ allow_sm70 = true
 ffi = false
 
 [[kernel]]
-family = "gated_delta_rule"
 phase = "recompute"
 abi = "gdr_recompute_v1"
 kernel_family = "gdr"
@@ -732,7 +677,6 @@ allow_sm70 = true
 ffi = false
 
 [[kernel]]
-family = "gated_delta_rule"
 phase = "state"
 abi = "gdr_state_v1"
 kernel_family = "gdr"
@@ -745,7 +689,6 @@ allow_sm70 = true
 ffi = false
 
 [[kernel]]
-family = "gated_delta_rule"
 phase = "o"
 abi = "gdr_o_v1"
 kernel_family = "gdr"
@@ -764,7 +707,6 @@ ffi = false
 # ===========================================================================
 
 [[kernel]]
-family = "flashqla"
 phase = "fq_cumsum"
 abi = "fq_cumsum_v1"
 kernel_family = "flashqla"
@@ -778,7 +720,6 @@ gate = "flashqla"
 ffi = false
 
 [[kernel]]
-family = "flashqla"
 phase = "fq_kkt"
 abi = "fq_kkt_v1"
 kernel_family = "flashqla"
@@ -792,7 +733,6 @@ gate = "flashqla"
 ffi = false
 
 [[kernel]]
-family = "flashqla"
 phase = "fq_fwd"
 abi = "fq_fwd_v1"
 kernel_family = "flashqla"
