@@ -39,6 +39,7 @@ from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models import qwen3_next as qn
 
 CFG = {"mode": "full", "n_init": 32, "n_local": 256, "l_bs": 32, "top_k": 8}
+_SHARED_SEL = {}  # per-slot recall (--shared): S -> sel, first full-attn layer decides
 KV_ATTENDED = {}  # mode -> tokens attended per full-attn layer at the last decode step
 KEYS = ["739154", "281607", "930472", "615838", "472916", "108253", "664019", "357284",
         "850291", "317864", "629053", "194738", "573916", "482067", "916354", "205879"]
@@ -85,23 +86,33 @@ def _patched_attn_call(self, x, mask=None, cache=None):
     S = keys.shape[2]
     n_init, n_local, l_bs, top_k = CFG["n_init"], CFG["n_local"], CFG["l_bs"], CFG["top_k"]
     if mode != "full" and L == 1 and S > n_init + n_local + l_bs:
-        mid_lo, mid_hi = n_init, S - n_local
-        sel = list(range(0, n_init))
-        if mode == "recall":
-            nb = (mid_hi - mid_lo) // l_bs
-            if nb > 0:
-                kh = keys[:, :, mid_lo:mid_lo + nb * l_bs, :]
-                nkv, hd = kh.shape[1], kh.shape[3]
-                reps = kh.reshape(B, nkv, nb, l_bs, hd).mean(axis=3)
-                g = self.num_attention_heads // self.num_key_value_heads
-                qk = queries.reshape(B, nkv, g, hd).mean(axis=2)
-                score = (reps * qk[:, :, None, :]).sum(axis=(1, 3))
-                k = min(top_k, nb)
-                idx = mx.argpartition(-score[0], k - 1)[:k]
-                idx = sorted(int(i) for i in idx.tolist())
-                for bi in idx:
-                    sel.extend(range(mid_lo + bi * l_bs, mid_lo + (bi + 1) * l_bs))
-        sel.extend(range(S - n_local, S))
+        # --shared: per-SLOT recall (one block selection reused by every layer at
+        # this S — the first full-attn layer decides). This is the ARLE Rust design
+        # (`plan_recall` emits one set of ranges per slot). Without it, recall is
+        # per-LAYER (each layer picks its own top_k). Comparing the two licenses or
+        # kills the per-slot simplification.
+        if mode == "recall" and CFG.get("shared") and S in _SHARED_SEL:
+            sel = _SHARED_SEL[S]
+        else:
+            mid_lo, mid_hi = n_init, S - n_local
+            sel = list(range(0, n_init))
+            if mode == "recall":
+                nb = (mid_hi - mid_lo) // l_bs
+                if nb > 0:
+                    kh = keys[:, :, mid_lo:mid_lo + nb * l_bs, :]
+                    nkv, hd = kh.shape[1], kh.shape[3]
+                    reps = kh.reshape(B, nkv, nb, l_bs, hd).mean(axis=3)
+                    g = self.num_attention_heads // self.num_key_value_heads
+                    qk = queries.reshape(B, nkv, g, hd).mean(axis=2)
+                    score = (reps * qk[:, :, None, :]).sum(axis=(1, 3))
+                    k = min(top_k, nb)
+                    idx = mx.argpartition(-score[0], k - 1)[:k]
+                    idx = sorted(int(i) for i in idx.tolist())
+                    for bi in idx:
+                        sel.extend(range(mid_lo + bi * l_bs, mid_lo + (bi + 1) * l_bs))
+            sel.extend(range(S - n_local, S))
+            if mode == "recall" and CFG.get("shared"):
+                _SHARED_SEL[S] = sel
         KV_ATTENDED[mode] = len(sel)
         sel_idx = mx.array(sel, dtype=mx.int32)
         keys = mx.take(keys, sel_idx, axis=2)
@@ -147,6 +158,7 @@ def build_prompt(tok, ctx_tokens, placements, multi, diverse):
 
 
 def run(model, tok, prompt, max_tokens):
+    _SHARED_SEL.clear()  # fresh per-slot selection cache per generation
     return generate(model, tok, prompt=prompt, max_tokens=max_tokens,
                     sampler=make_sampler(temp=0.0), verbose=False)
 
@@ -166,8 +178,9 @@ def main():
     ap.add_argument("--doc", default=None, help="real-content mode: file used as the context")
     ap.add_argument("--question", action="append", default=[], help="question(s) for --doc mode")
     ap.add_argument("--agentic", action="store_true", help="multi-hop next-step decision over scattered rules")
+    ap.add_argument("--shared", action="store_true", help="per-slot recall: one block selection reused by all layers (the ARLE Rust design)")
     args = ap.parse_args()
-    CFG.update(n_init=args.ninit, n_local=args.nlocal, l_bs=args.lbs, top_k=args.topk)
+    CFG.update(n_init=args.ninit, n_local=args.nlocal, l_bs=args.lbs, top_k=args.topk, shared=args.shared)
     diverse = args.distractor == "diverse"
 
     print(f"loading {args.model} ... (distractor={args.distractor})", flush=True)
