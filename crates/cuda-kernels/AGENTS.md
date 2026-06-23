@@ -185,8 +185,9 @@ With `--features cuda,no-cuda`:
   multi-GPU primitive surface. F2 production NCCL forward collectives
   block both P0' (TP=2 throughput bench) and P0'' (DeepSeek V4 DS5
   collectives in forward).
-- **P0'' DeepSeek V4.** `ffi/mla.rs` carries the legacy `mla_decode_paged_bf16`
-  ABI scaffold. New MLA attention should use TileLang AOT, cute-DSL, or a
+- **P0'' DeepSeek V4.** The legacy `mla_decode_paged_bf16` ABI scaffold
+  (`ffi/mla.rs` + `csrc/attention/mla_decode.cu`) was removed as dead code.
+  New MLA attention should use TileLang AOT, cute-DSL, or a
   hand CUDA kernel; do not reintroduce external attention wrappers. The DSV4
   small-substrate SKUs in
   [`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](../../docs/plans/2026-05-05-deepseek-v4-small-substrate.md)
