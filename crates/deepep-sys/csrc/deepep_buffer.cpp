@@ -114,7 +114,8 @@ struct ArleDeepEpBuffer {
     } while (0)
 
 extern "C" ArleDeepEpStatus arle_deepep_buffer_create(
-    uint32_t rank, uint32_t world_size, ArleDeepEpBuffer **out_handle) {
+    uint32_t rank, uint32_t world_size, uint32_t device_id,
+    ArleDeepEpBuffer **out_handle) {
     if (!out_handle) {
         record_error("out_handle is null");
         return -1;
@@ -131,13 +132,22 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_create(
         record_error("not enough CUDA devices");
         return -1;
     }
+    if (static_cast<int>(device_id) >= device_count) {
+        record_error("device_id out of range");
+        return -1;
+    }
 
     auto *self = new ArleDeepEpBuffer();
     self->rank = static_cast<int>(rank);
     self->world_size = static_cast<int>(world_size);
 
     cudaError_t err;
-    err = cudaSetDevice(self->rank);
+    // Pin the REAL device ordinal this rank runs on (INFER_CUDA_DEVICES),
+    // NOT the TP rank. On a non-0-based GPU set (e.g. 4,5,6,7) rank != ordinal;
+    // setting the device by rank selected the wrong physical GPU, so the
+    // buffers/streams created here mismatched the executor's context and the
+    // intranode barrier launch failed with cudaErrorInvalidResourceHandle.
+    err = cudaSetDevice(static_cast<int>(device_id));
     if (err != cudaSuccess) {
         record_cuda_error("cudaSetDevice", err);
         delete self;
@@ -273,6 +283,11 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_sync(
         record_error("world_size mismatch with handle ctor");
         return -1;
     }
+    // Belt-and-suspenders: every barrier/kernel launch on self->stream must
+    // run under the context of the device the buffers were created on. Pin it
+    // here (idempotent) so a caller thread on a different current device can't
+    // launch the intranode barrier into the wrong context.
+    CK(cudaSetDevice(self->device_id), "cudaSetDevice (sync)");
 
     for (int i = 0; i < self->world_size; ++i) {
         if (i == self->rank) {
@@ -332,6 +347,9 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_dispatch(
         record_error("dispatch before sync");
         return -4;
     }
+    // Pin the buffer's real device so every launch on self->stream runs under
+    // the matching context (idempotent; see arle_deepep_buffer_sync).
+    CK(cudaSetDevice(self->device_id), "cudaSetDevice (dispatch)");
     if (p->num_sms % 2 != 0 || p->num_sms == 0) {
         record_error("num_sms must be positive and even");
         return -1;
@@ -428,6 +446,9 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_combine(
         record_error("combine before sync");
         return -4;
     }
+    // Pin the buffer's real device so every launch on self->stream runs under
+    // the matching context (idempotent; see arle_deepep_buffer_sync).
+    CK(cudaSetDevice(self->device_id), "cudaSetDevice (combine)");
     if (p->num_sms % 2 != 0 || p->num_sms == 0) {
         record_error("num_sms must be positive and even");
         return -1;
@@ -628,6 +649,7 @@ extern "C" ArleDeepEpStatus arle_deepep_ll_get_uniqueid(
 extern "C" ArleDeepEpStatus arle_deepep_buffer_ll_create(
     uint32_t rank,
     uint32_t world_size,
+    uint32_t device_id,
     uint32_t num_max_dispatch_tokens_per_rank,
     uint32_t hidden,
     uint32_t num_experts,
@@ -664,9 +686,10 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_ll_create(
     self->ll_num_experts = static_cast<int>(num_experts);
 
     cudaError_t err;
-    // LL uses one device per rank (the rank's own GPU). Mirror the smoke +
-    // the multi-proc serve model: each process pins device `rank`.
-    if ((err = cudaSetDevice(self->rank)) != cudaSuccess) {
+    // LL uses one device per rank (the rank's own GPU). Pin the REAL device
+    // ordinal this rank runs on (INFER_CUDA_DEVICES), NOT the TP rank — on a
+    // non-0-based GPU set rank != ordinal (see arle_deepep_buffer_create).
+    if ((err = cudaSetDevice(static_cast<int>(device_id))) != cudaSuccess) {
         record_cuda_error("cudaSetDevice", err);
         delete self;
         return -2;
@@ -782,6 +805,9 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_low_latency_dispatch(
         record_error("low_latency_dispatch on a non-LL buffer");
         return -4;
     }
+    // Pin the buffer's real device so every launch on self->stream runs under
+    // the matching context (idempotent; see arle_deepep_buffer_create).
+    CK(cudaSetDevice(self->device_id), "cudaSetDevice (ll dispatch)");
     if (static_cast<int>(p->hidden) != self->ll_hidden ||
         static_cast<int>(p->num_experts) != self->ll_num_experts ||
         static_cast<int>(p->num_max_dispatch_tokens_per_rank) !=
@@ -905,6 +931,9 @@ extern "C" ArleDeepEpStatus arle_deepep_buffer_low_latency_combine(
         record_error("low_latency_combine on a non-LL buffer");
         return -4;
     }
+    // Pin the buffer's real device so every launch on self->stream runs under
+    // the matching context (idempotent; see arle_deepep_buffer_create).
+    CK(cudaSetDevice(self->device_id), "cudaSetDevice (ll combine)");
     if (static_cast<int>(p->hidden) != self->ll_hidden ||
         static_cast<int>(p->num_experts) != self->ll_num_experts ||
         static_cast<int>(p->num_max_dispatch_tokens_per_rank) !=
@@ -1018,12 +1047,13 @@ extern "C" ArleDeepEpStatus arle_deepep_ll_get_uniqueid(
     return -1;
 }
 extern "C" ArleDeepEpStatus arle_deepep_buffer_ll_create(
-    uint32_t rank, uint32_t world_size,
+    uint32_t rank, uint32_t world_size, uint32_t device_id,
     uint32_t num_max_dispatch_tokens_per_rank, uint32_t hidden,
     uint32_t num_experts,
     const uint8_t root_uniqueid[ARLE_DEEPEP_LL_UNIQUEID_BYTES],
     ArleDeepEpBuffer **out_handle) {
-    (void)rank; (void)world_size; (void)num_max_dispatch_tokens_per_rank;
+    (void)rank; (void)world_size; (void)device_id;
+    (void)num_max_dispatch_tokens_per_rank;
     (void)hidden; (void)num_experts; (void)root_uniqueid;
     if (out_handle) *out_handle = nullptr;
     record_error("deepep built without NVSHMEM — LL path unavailable");

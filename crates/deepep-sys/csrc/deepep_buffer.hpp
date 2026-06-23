@@ -51,8 +51,14 @@ typedef int ArleDeepEpStatus;
 // IPC handle size is the same 64-byte opaque as cudaIpcMemHandle_t.reserved.
 #define ARLE_DEEPEP_IPC_HANDLE_BYTES 64
 
+// `device_id` is the REAL CUDA device ordinal this rank runs on (from
+// INFER_CUDA_DEVICES, e.g. 4 for rank 0 on a 4,5,6,7 set). It is NOT the
+// TP rank — on a non-0-based GPU set rank != ordinal, and pinning by rank
+// would select the wrong physical GPU (cudaErrorInvalidResourceHandle at
+// barrier launch). All buffers/streams are created on this device.
 ArleDeepEpStatus arle_deepep_buffer_create(
-    uint32_t rank, uint32_t world_size, ArleDeepEpBuffer **out_handle);
+    uint32_t rank, uint32_t world_size, uint32_t device_id,
+    ArleDeepEpBuffer **out_handle);
 
 // Writes the local CUDA IPC handle into `out_ipc_handle[0..64]` and the
 // local device_id into `out_device_id`.
@@ -174,9 +180,12 @@ ArleDeepEpStatus arle_deepep_ll_get_uniqueid(
 // arle_deepep_ll_get_uniqueid on rank 0 and broadcast to all ranks. The
 // rdma buffer is sized from (num_max_dispatch_tokens_per_rank, hidden,
 // world_size, num_experts) per DeepEP's LowLatencyLayout.
+// `device_id` is the REAL CUDA device ordinal this rank runs on (see
+// arle_deepep_buffer_create); NOT the TP rank.
 ArleDeepEpStatus arle_deepep_buffer_ll_create(
     uint32_t rank,
     uint32_t world_size,
+    uint32_t device_id,
     uint32_t num_max_dispatch_tokens_per_rank,
     uint32_t hidden,
     uint32_t num_experts,
