@@ -185,3 +185,107 @@ no synchronous tier read.
 - **Baseline**: default-off → byte-identical (CUDA is Stable). The opt-in is the same
   `--kv-recall` flag, now meaning write-through-tier + prefetch.
 - **Multi-tenant**: session A's tier never prefetches into session B.
+
+## Where it must land: the rollout engine (train agent-opd) — 4 gaps (ckl 2026-06-23, grounded)
+
+The real "infinite memory" target is the **OPD agent rollout**, not just serve
+`--kv-recall`. The rollout engine today (grounded read):
+
+1. **Cap = hard, build-time, HBM-preallocated**: `total_pages = num_slots ×
+   (max_turns×max_tokens + 8192) / 16`, claimed once at engine build. max_seq_len
+   too big → **build OOM** (the one I hit). No dynamic growth.
+2. **Eviction = decode preemption only** (`retract_decode_to_fit`, per scheduler
+   tick): pool full → retract the shortest-generation decode row to the queue =
+   its generated tokens **dropped + recomputed** (token loss). Prefill never preempted.
+3. **No tier/swap wired for rollout**: T1(host-RAM)/T2(SSD) infra exists but only in
+   serve mode; the train agent-opd engine build doesn't wire it — not even
+   `--kv-ssd-path`. Pool full → no overflow path, only preempt-recompute.
+4. **RadixCache LRU is decoupled from engine pages**: evicts prefix-cache blocks,
+   doesn't free engine pages — not a pool-pressure lever.
+
+| want | rollout now | how the tier closes it |
+|---|---|---|
+| bounded cap | ✅ but dead/HBM-prealloc → OOM when grown | HBM = bounded working set (sink+local+recalled+staging); build sizes to that, not max_turns×max_tokens → no build OOM |
+| timely eviction | ⚠️ reactive preempt = drop+recompute | evict = graceful **write-back-demote** to L2/L3 (keepalive + write-through, verified on serve) → zero token loss |
+| reserved swap | ❌ rollout has none | **wire the tier into the rollout engine build** + the reserved staging |
+| admission / per-req cap | ❌ none — hits the wall then preempts | add **admission control / per-request KV cap** at the scheduler (block at entry) |
+
+**Order**: ✅ mechanism (serve recall + L3 tier — GPU-verifying on GPU 0) → wire tier
+into the rollout build → graceful-demote replaces preempt-recompute → bounded-working-set
+cap (kills build OOM) → admission control. The mechanism is the same code; the work is
+**wiring it into train agent-opd's engine build + the scheduler**, which serve already has.
+
+## Systematic design: budget · eviction · staging · prefetch (grounded 2026-06-23)
+
+The four axes are **one interlocked system**, not four features:
+
+> a **global per-tier budget ledger** fixes HBM headroom → **proactive timely eviction**
+> cascades L1→L2→L3 to hold that headroom → a **reserved staging area** makes every
+> transfer bounded + async (no surprise malloc, no evict-before-prefetch ordering) →
+> **prefetch at the prefill sync point** refills the working set by rep-relevance.
+
+Each below: **target** · *grounded current state (file:line)* · **the change**.
+
+### ① Budget — one ledger, per tier, sized to the working set (NOT max_seq_len)
+*Now: `recall_kv` token budget = `num_slots × max_seq_len` (`executor.rs:3065`) = the
+34.4 GB over-alloc; no ledger; rollout sets `total_pages = num_slots × max_seq_len/16`
+(`train_cli.rs:1547`) with no free-VRAM clamp → build OOM. Tiers (HBM/T1/T2) are
+independent capacities, not a ledger.*
+
+```
+HBM_ledger = working_set + staging + reps        (all bounded; none scales with max_seq_len)
+  working_set = num_slots × (n_init + n_local + top_k·l_bs + headroom) pages   ← the bound (~544 tok/slot)
+  staging     = num_slots × ceil(1 KV-block)                                    ← ②
+  reps        = num_slots × max_blocks × rep_bytes   (f32[kv_heads·head_dim]/l_bs-block; rep-pool capped)
+L2(DRAM) budget = the session-history cap (the real "256K→millions")            (default_t1, kv_tier.rs:71)
+L3(NVMe) budget = durable overflow                                              (default_t2)
+```
+- Change `executor.rs:3065` token budget `num_slots×max_seq_len` → `working_set_tokens`.
+- Change `train_cli.rs:1547` to the same bounded sizing + the `kv_budget_num_slots`
+  clamp (`qwen35.rs:1636`) → **kills the build OOM**.
+- `cuda_admission_total_pages` (`loaded.rs:1266`) reserves working_set+staging up front
+  (recall pool no longer a lazy after-the-fact alloc that competes with slots).
+
+### ② Eviction — proactive + graceful, cascading L1→L2→L3
+*Now: preemption (`planner.rs:94-182`) IS graceful-demote when a tier is wired
+(publish→demote→free), else recompute; recall evict-drop (`decode_row_recall`,
+`executor.rs:3319`) write-throughs then keepalive-frees, coldest-unpinned
+(`writethrough.rs:114-148`). Both **reactive (at-the-wall)**; rollout has no tier → recompute.*
+- **Proactive**: evict to hold `working_set ≤ budget − staging − reps` at a low-watermark
+  each tick (BEFORE the wall) → append/prefetch always has room. New headroom check in
+  the scheduler tick / `decode_row_recall`, not only `retract_decode_to_fit`'s at-wall trigger.
+- **Cascade**: L1→L2 **write-back** on evict (cold block → DRAM); L2→L3 **write-through**
+  (every L2 block durably to NVMe, async). Reuse the coldest-unpinned + sink/local-pin
+  policy (`writethrough.rs:114`), extend to the cascade.
+- **Graceful in rollout**: wire the tier so `requeue_preempted_decode` takes the demote
+  path, not the recompute fallback → zero token loss.
+
+### ③ Staging — reserved swap area, pinned, async (decouples transfer from evict)
+*Now: NO reserved staging. D2H allocs a `Vec` on-the-fly (`copy_pages_to_host`,
+`paged_kv.rs:869`); H2D borrows; copies are synchronous; no pinned-host ring (R4 pending).*
+- Reserve in the ledger: **HBM staging** ≥1 block/slot (prefetch-in landing + write-back-out
+  source-pin); **DRAM staging** = a pinned-host ring (`cudaHostAlloc`) — the D2H landing +
+  H2D source.
+- D2H/H2D (`paged_kv.rs:869/953`) read/write the ring on a **side-stream**, not the decode
+  stream (the R4 async mirror) → no per-copy `Vec`, no decode stall.
+- **Decouples** prefetch from evict: prefetch lands in the reserved staging page (no
+  "evict first to make room") → no ordering deadlock. Keepalive handles the evict race;
+  staging handles the prefetch landing. Both fixed-size → no surprise malloc/OOM.
+
+### ④ Prefetch — at the prefill sync point, batched, reps-scored
+*Now: per-**decode-step** (`executor.rs:3291`, mid-decode H2D), contradicting the plan;
+violates "no mid-decode tier read"; rollout doesn't wire the tier so the path is dead there.*
+- Move to the **prefill / per-turn** sync point: at each turn's prefill, score the whole
+  history (reps · prefill query, `recall.rs:280`) → top-k → **one batched H2D** into the
+  working set via the staging ring; decode then attends the resident set (no mid-decode read).
+- Fits the rollout (multi-turn agent: each turn re-prefills = the natural batched point).
+  Keep the per-step arm only for a single ultra-long generation with no re-prefill.
+
+### Implementation order (each lands + verifies independently)
+1. **Budget ledger** (`executor.rs:3065`, `train_cli.rs:1547`, `cuda_admission_total_pages`)
+   — kills the 34.4 GB over-alloc + the build OOM. Foundation.
+2. **Reserved staging** (HBM page + pinned-host ring; `paged_kv.rs:869/953`) — bounded async transfer.
+3. **Wire tier into rollout** (`train_cli.rs` build + `set_disk`) — makes preemption graceful (gap ③).
+4. **Proactive eviction** (headroom watermark; scheduler tick / `writethrough.rs`) — gap ② fully.
+5. **Per-prefill prefetch** (move off `decode_row_recall:3291` to the prefill path) — the plan intent.
+6. **Admission control** (scheduler entry-gate / per-request KV cap) — gap ④.
