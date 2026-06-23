@@ -903,6 +903,26 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// Session KV-recall: toggle the layer-0 decode query emit on the C++ model.
+    /// Off by default; only the recall-enabled executor turns it on.
+    pub(crate) fn set_recall_emit_query(&self, enabled: bool) {
+        unsafe {
+            mlx_sys::qwen35_compiled_set_recall_emit_query(self.raw, i32::from(enabled));
+        }
+    }
+
+    /// Session KV-recall: take the most recent layer-0 decode query as a fresh
+    /// float32 `[n_kv_heads, head_dim]` array. `Ok(None)` when no query has been
+    /// stashed since the last enable (e.g. the first decode step).
+    pub(crate) fn take_recall_query(&self) -> Result<Option<MlxArray>> {
+        let mut out: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let rc = unsafe { mlx_sys::qwen35_compiled_take_recall_query(self.raw, &raw mut out) };
+        if rc != 0 || out.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(unsafe { MlxArray::from_raw(out) }))
+    }
+
     pub(crate) fn step_session_paged_bf16(
         &self,
         token: &MlxArray,

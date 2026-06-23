@@ -418,8 +418,21 @@ impl MetalExecutor {
                 active_session_slot: None,
                 pending: None,
                 dflash,
+                kv_recall: false,
+                recall_cfg: default_recall_config(),
+                recall_int8_warned: false,
             }),
         })
+    }
+
+    /// Opt into session KV-recall (the `--kv-recall` flag, default off). Mirrors
+    /// `set_kv_tier_disk`: a post-construction setter so the executor builder
+    /// signatures stay stable. With recall off the decode hot path is unchanged.
+    #[cfg(feature = "metal")]
+    pub fn set_kv_recall(&mut self, enabled: bool) {
+        if let Some(real) = self.real.as_mut() {
+            real.kv_recall = enabled;
+        }
     }
 
     #[cfg(feature = "metal")]
@@ -629,6 +642,21 @@ struct PendingStep {
     sampled: mlx::MlxArray,
 }
 
+/// Validated session KV-recall budget (per the offline Qwen3.6 quality gate +
+/// `wins/2026-06-23-kv-recall-arle-core-e2e.md`): sink 32, local 256, block 32,
+/// top-k 8 → working set 32 + 256 + 8·32 = 544 tokens (9.6% KV in the e2e).
+/// Recall only restricts attention once `cache_len` exceeds this budget; below
+/// it `plan_recall` returns the full contiguous range (no-op).
+#[cfg(feature = "metal")]
+fn default_recall_config() -> infer_core::RecallConfig {
+    infer_core::RecallConfig {
+        n_init: 32,
+        n_local: 256,
+        l_bs: 32,
+        top_k: 8,
+    }
+}
+
 #[cfg(feature = "metal")]
 struct RealMetalExecutor {
     config: config::MetalModelConfig,
@@ -642,6 +670,16 @@ struct RealMetalExecutor {
     /// Opt-in single-request DFlash side path. When present, decode must route
     /// through DFlash or fail; it must never silently fall back to target-only.
     dflash: Option<dflash::MetalDflashRuntime>,
+    /// Session KV-recall opt-in (`--kv-recall`). When off (default) the decode
+    /// hot path does no scoring and `recall_ranges` stays `None` → baseline
+    /// byte-identical. Recall is bf16-only; int8 KV falls back to full attention
+    /// (logged once). See `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
+    kv_recall: bool,
+    /// Recall budget regions (validated defaults). Carved into sink + recalled
+    /// top-k + local; the working set is bounded regardless of history length.
+    recall_cfg: infer_core::RecallConfig,
+    /// One-time int8-KV-with-recall fallback log latch.
+    recall_int8_warned: bool,
 }
 
 #[cfg(feature = "metal")]
@@ -1183,6 +1221,13 @@ impl RealMetalExecutor {
         // must keep pace or `slice_update` silently drops the write.
         slot.ensure_kv_capacity(model, 1)?;
         slot.ensure_session_active(model)?;
+        // Session KV-recall: emit the layer-0 query from this step's forward so
+        // the post-drain scoring (`maybe_recompute_recall`) can plan the next
+        // step's ranges. Touched only when recall is opted in on a bf16 cache —
+        // the default path makes no recall FFI call and stays byte-identical.
+        if self.kv_recall && kv_cache_dtype == MetalKvCacheDtype::Bf16 {
+            model.set_recall_emit_query(true);
+        }
         self.active_session_slot = Some(row.slot);
         let token_arr = mlx::MlxArray::from_slice_i32(&[row.last_token as i32], &[1]);
         let logits = step_session_decode(model, slot, kv_cache_dtype, &token_arr)?;
@@ -1192,6 +1237,7 @@ impl RealMetalExecutor {
         let position = slot.cache_len as u64;
         slot.drain_session(model)?;
         self.active_session_slot = None;
+        self.maybe_recompute_recall(row.slot)?;
 
         let inflight = sample_inflight(row.slot, &logits, &row.params, position);
 
@@ -1259,7 +1305,35 @@ impl RealMetalExecutor {
             slot.drain_session(model)?;
             self.active_session_slot = None;
         }
+        self.maybe_recompute_recall(row.slot)?;
         self.prequeue_decode(row.slot, kv)
+    }
+
+    /// Session KV-recall (#2/#3/#5): after a step drains (so `slot.kv_flat` holds
+    /// the up-to-date K cache) score the resident block reps against this step's
+    /// layer-0 query and set `recall_ranges` for the next step. No-op unless
+    /// `--kv-recall` is on; recall is bf16-only (int8 falls back to full
+    /// attention, logged once). Off → the decode hot path is byte-identical.
+    fn maybe_recompute_recall(&mut self, slot_idx: usize) -> anyhow::Result<()> {
+        if !self.kv_recall {
+            return Ok(());
+        }
+        if self.kv_cache_dtype != MetalKvCacheDtype::Bf16 {
+            if !self.recall_int8_warned {
+                log::warn!(
+                    "--kv-recall requested with int8 KV cache; recall is bf16-only — \
+                     falling back to full attention (use --kv-cache-dtype bf16 to enable recall)"
+                );
+                self.recall_int8_warned = true;
+            }
+            return Ok(());
+        }
+        let model = self.weights.cpp_model()?;
+        let cfg = self.recall_cfg;
+        if let Some(slot) = self.slots.get_mut(&slot_idx) {
+            slot.recompute_recall_plan(model, &cfg)?;
+        }
+        Ok(())
     }
 
     /// Issue (async) the next greedy step on `slot`'s session, feeding the slot's
@@ -1294,6 +1368,12 @@ impl RealMetalExecutor {
             return Ok(());
         }
         slot.ensure_session_active(model)?;
+        // Session KV-recall: keep the layer-0 query emit on for the prequeued
+        // step; this step's drain (in `commit_pending_then_prequeue`) scores it.
+        // Untouched on the default path → byte-identical.
+        if self.kv_recall && kv_cache_dtype == MetalKvCacheDtype::Bf16 {
+            model.set_recall_emit_query(true);
+        }
         self.active_session_slot = Some(slot_idx);
         let logits = step_session_decode(model, slot, kv_cache_dtype, &token_arr)?;
         mlx::async_eval(&[&logits]);
@@ -2269,6 +2349,13 @@ struct MetalSlotState {
     /// instead of the full `[0..cache_len]`. `None` = today's contiguous read.
     /// Set by the Engine from `infer_core::plan_recall` (#5); default off.
     recall_ranges: Option<Vec<(usize, usize)>>,
+    /// Resident per-middle-block mean-key reps for KV-recall scoring (#2). Each
+    /// entry is the layer-0 K mean-pooled over its `l_bs` tokens, flattened to
+    /// `nkv * hd` f32 — the resident representative that keeps an offloaded block
+    /// scorable (`q · rep`). Index = middle block index (token base
+    /// `n_init + i * l_bs`). Grown incrementally as whole blocks complete; empty
+    /// unless recall is enabled for this slot.
+    block_reps: Vec<Vec<f32>>,
 }
 
 #[cfg(feature = "metal")]
@@ -2316,6 +2403,7 @@ impl MetalSlotState {
             dflash_target_hidden: None,
             dflash_draft_state: None,
             recall_ranges: None,
+            block_reps: Vec::new(),
         }
     }
 
@@ -2338,6 +2426,7 @@ impl MetalSlotState {
             dflash_target_hidden: None,
             dflash_draft_state: None,
             recall_ranges: None,
+            block_reps: Vec::new(),
         }
     }
 
@@ -2434,6 +2523,106 @@ impl MetalSlotState {
             v_full.push(gather_kv_ranges(&pair[1], ranges)?);
         }
         Ok((k_full, v_full))
+    }
+
+    /// Session KV-recall reps (#2): mean-pool layer-0 K over each frozen middle
+    /// block into a resident `[nkv, hd]` representative (flattened `nkv*hd` f32).
+    /// A block is "frozen" once it has left the local window
+    /// (`base + l_bs <= cache_len - n_local`), so its K is final and the rep is
+    /// computed exactly once. This is the resident scoring substrate: even after
+    /// a block's full KV is offloaded its rep stays here, keeping `q · rep`
+    /// scorable. Cheap — only newly-completed blocks are recomputed each step.
+    /// The mean is taken on the host from the (tiny) block K slice.
+    fn update_block_reps(&mut self, cfg: &infer_core::RecallConfig) -> anyhow::Result<()> {
+        if cfg.l_bs == 0 || self.cache_len <= cfg.n_init + cfg.n_local {
+            return Ok(());
+        }
+        let mid_span = self.cache_len - cfg.n_init - cfg.n_local;
+        let frozen_blocks = mid_span / cfg.l_bs;
+        if frozen_blocks <= self.block_reps.len() {
+            return Ok(());
+        }
+        let Some(k0) = self.kv_flat.first() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            k0.dtype() == mlx::Dtype::Bfloat16,
+            "recall reps expect bf16 layer-0 K, got {:?}",
+            k0.dtype()
+        );
+        let shape = k0.shape();
+        anyhow::ensure!(shape.len() == 4, "recall reps expect rank-4 K");
+        let nkv = shape[1] as usize;
+        let hd = shape[3] as usize;
+        let l_bs_f = cfg.l_bs as f32;
+        for block in self.block_reps.len()..frozen_blocks {
+            let base = cfg.n_init + block * cfg.l_bs;
+            let slice = slice_kv_tokens(k0, base, base + cfg.l_bs)?; // [1, nkv, l_bs, hd]
+            let f32_slice = mlx::as_dtype(&slice, mlx::Dtype::Float32);
+            mlx::eval(&[&f32_slice]);
+            let data = f32_slice.as_slice_f32(); // row-major [1, nkv, l_bs, hd]
+            let mut rep = vec![0.0_f32; nkv * hd];
+            for h in 0..nkv {
+                for t in 0..cfg.l_bs {
+                    let row = (h * cfg.l_bs + t) * hd;
+                    let out = h * hd;
+                    for d in 0..hd {
+                        rep[out + d] += data[row + d];
+                    }
+                }
+            }
+            for v in &mut rep {
+                *v /= l_bs_f;
+            }
+            self.block_reps.push(rep);
+        }
+        Ok(())
+    }
+
+    /// Session KV-recall plan (#2/#3): score the resident block reps against the
+    /// just-emitted layer-0 decode query (`q · rep`, one step stale — licensed),
+    /// run `infer_core::plan_recall`, and stash the result for the NEXT step.
+    /// `recall_ranges` is set to `None` when the plan is the single contiguous
+    /// range (session still fits the budget) so the default page-read stays
+    /// byte-identical. Requires bf16 KV (the only recall-built path); the query
+    /// is the C++ emit (`take_recall_query`).
+    fn recompute_recall_plan(
+        &mut self,
+        model: &qwen35::CppQwen35Model,
+        cfg: &infer_core::RecallConfig,
+    ) -> anyhow::Result<()> {
+        self.update_block_reps(cfg)?;
+        let Some(query) = model.take_recall_query()? else {
+            // No query stashed yet (first step on the session) → leave ranges.
+            return Ok(());
+        };
+        mlx::eval(&[&query]);
+        let q = query.as_slice_f32(); // [nkv, hd] row-major
+        let nb = self.block_reps.len();
+        let mut scores = vec![0.0_f32; nb];
+        for (i, rep) in self.block_reps.iter().enumerate() {
+            // q · rep over the full [nkv, hd] vector (GQA-grouped query mean).
+            let n = rep.len().min(q.len());
+            let mut acc = 0.0_f32;
+            for k in 0..n {
+                acc += q[k] * rep[k];
+            }
+            scores[i] = acc;
+        }
+        let plan = infer_core::plan_recall(self.cache_len, &scores, cfg);
+        // A single contiguous full range == today's default read; keep `None` so
+        // the decode hot path stays byte-identical when the session fits.
+        let is_full = plan.ranges.len() == 1 && plan.ranges[0] == (0, self.cache_len);
+        self.recall_ranges = if is_full { None } else { Some(plan.ranges) };
+        // TODO(kv-recall L3): this is the RESIDENT variant — full KV stays in
+        // `slot.kv_flat` (HBM) and recall restricts *attention* to the selected
+        // ranges (the page-gather), saving decode compute. The plan-doc L3 tier
+        // offload (demote the non-selected middle blocks' full KV to
+        // kv-native-sys / `radix::demote_block`, keeping only the resident rep;
+        // promote the selected blocks back) is not wired into the Metal slot KV
+        // yet — that frees the HBM working set for unbounded history. Reps +
+        // scoring + recall_ranges are fully live, so recall itself works now.
+        Ok(())
     }
 
     fn int8_prefix_read_inputs(
@@ -2891,6 +3080,38 @@ mod tests {
         assert_eq!(full.shape()[2], 6);
         // an end past the token axis is rejected, not silently clamped.
         assert!(gather_kv_ranges(&arr, &[(0, 7)]).is_err());
+    }
+
+    // Session KV-recall reps (#2): `update_block_reps` mean-pools layer-0 K over
+    // each frozen middle block into a resident `[nkv, hd]` rep. With n_init=0,
+    // n_local=2, l_bs=2 over a 6-token cache, the middle is [0,4) = 2 frozen
+    // blocks; their reps are the per-block token means. Per-token-constant values
+    // (bf16-exact) make the expected mean exact.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn update_block_reps_mean_pools_frozen_middle_blocks() {
+        let _guard = mlx_sys::mlx_guard();
+        // [B=1, nkv=1, seq=6, hd=2]; token t holds (t, t) so block [0,2) mean is
+        // (0.5,0.5) and block [2,4) mean is (2.5,2.5).
+        let k: Vec<i32> = vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5];
+        let k = mlx::MlxArray::from_slice_i32(&k, &[1, 1, 6, 2]);
+        let k = mlx::as_dtype(&k, mlx::Dtype::Bfloat16);
+        // V is unused by reps; share the K shape.
+        let v = mlx::zeros(&[1, 1, 6, 2], mlx::Dtype::Bfloat16);
+        let mut slot = MetalSlotState::from_arrays(0, 0, 6, vec![k, v], Vec::new());
+        let cfg = infer_core::RecallConfig {
+            n_init: 0,
+            n_local: 2,
+            l_bs: 2,
+            top_k: 1,
+        };
+        slot.update_block_reps(&cfg).unwrap();
+        assert_eq!(slot.block_reps.len(), 2, "two frozen middle blocks");
+        assert_eq!(slot.block_reps[0], vec![0.5, 0.5], "block [0,2) token mean");
+        assert_eq!(slot.block_reps[1], vec![2.5, 2.5], "block [2,4) token mean");
+        // Idempotent: re-running adds no blocks (only newly-completed recomputed).
+        slot.update_block_reps(&cfg).unwrap();
+        assert_eq!(slot.block_reps.len(), 2);
     }
 
     // Qwen3.6-27B-family auto-enable detection must fire for OptiQ + MTP variants

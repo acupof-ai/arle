@@ -954,6 +954,17 @@ unsafe extern "C" {
         cache_pos: i32,
         out_logits: *mut *mut mlx_array,
     ) -> i32;
+    /// Session KV-recall: toggle the layer-0 decode query emit. Off by default →
+    /// the forward path is byte-identical to the non-recall baseline.
+    pub fn qwen35_compiled_set_recall_emit_query(model: *mut std::ffi::c_void, enabled: i32);
+    /// Session KV-recall: take the most recent layer-0 decode query as a fresh
+    /// float32 `[n_kv_heads, head_dim]` array (B=1). Returns -1 (with `*out_query`
+    /// null) when no query has been stashed since the last enable. The caller owns
+    /// and frees the returned array.
+    pub fn qwen35_compiled_take_recall_query(
+        model: *mut std::ffi::c_void,
+        out_query: *mut *mut mlx_array,
+    ) -> i32;
     /// M_e.1 P2.1 — clone a layer's session-owned K or V cache out of the
     /// C++ session for the Rust side. `kv_axis` 0 = K, 1 = V. Returns
     /// the full cache shape `[1, n_kv_heads, kv_capacity, head_dim]`;

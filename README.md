@@ -118,6 +118,7 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 
 - **KV stays hot across turns.** Prior-turn KV stays on GPU so only new tokens prefill; prefix pages are shared across requests via the host radix cache, demote to a host-RAM tier under pressure (opt-in disk spill), and promote back on the next hit instead of re-prefilling. ([support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix))
 - **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV kernels behind a `--kv-cache-dtype` serve flag — correctness-gated, opt-in (default stays BF16).
+- **KV-recall = long-context memory (Metal, opt-in).** When a session outgrows the window, decode attends only `sink + recent + top-k recalled` older blocks (scored by mean-key relevance to the current query) instead of the whole history. On Qwen3.6-35B a mid-context passkey resolves at **9.6% of the KV, identical to full attention** — where plain sliding-window truncation forgets it ([note](docs/notes/2026-06-23-kv-as-infinite-memory.md)). Behind `--kv-recall` (bf16, default off); the recall mechanism is live (compute-saving), L3 tier offload for the flat-VRAM-vs-history win is in progress.
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code — the OPD teacher *is* the production server.
 
 ```mermaid

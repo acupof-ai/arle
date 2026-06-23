@@ -1625,6 +1625,7 @@ dependencies = [
  "anyhow",
  "gemma-spec",
  "hf-hub",
+ "infer-core",
  "infer-plan",
  "infer-seam",
  "kv-native-sys",

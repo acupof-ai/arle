@@ -446,6 +446,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
     pub(crate) kv_cache_dtype: ServeKvCacheDtypeArg,
 
+    /// Opt into session KV-recall ("infinite memory"): when a session exceeds the
+    /// GPU working set, attend a recalled subset (sink + top-k mean-key + local)
+    /// instead of the full cache. Metal + `--kv-cache-dtype bf16` only; default
+    /// off → baseline byte-identical. See
+    /// `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
+    #[arg(long, default_value_t = false)]
+    pub(crate) kv_recall: bool,
+
     /// Maximum bytes this serve process may use under the SSD KV tier root.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) kv_ssd_max_bytes: Option<usize>,
