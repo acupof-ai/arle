@@ -4758,15 +4758,35 @@ impl Qwen35Model {
             )?;
         }
 
-        // Layer-0 decode: read back the post-RoPE prepped Q for the next-step
-        // recall score (head-major `[num_q_heads * head_dim]`).
-        if full_idx == 0 && decode {
+        // Layer-0 PREFILL: read back the post-RoPE prepped Q for the recall score
+        // (head-major `[num_q_heads * head_dim]`). Under the write-through model the
+        // whole recall cycle (score → evict → prefetch) runs ONCE per prefill, not
+        // per decode step, so ONLY the multi-token prefill needs this signal — the
+        // decode path (`seq_len == 1`) ignores `rc.layer0_query` entirely, so we
+        // skip the D2H there to keep the decode hot path lean (zero extra readback).
+        // `q_prepped` is token-major `[seq_len, q_dim]`; the recall query is the
+        // mean of the last `m` prompt tokens' queries (R3 — "what am I about to
+        // generate"), matching the `[num_q_heads * head_dim]` rep shape.
+        if full_idx == 0 && seq_len > 1 {
             let host: Vec<bf16> = self
                 .ctx
                 .stream
                 .clone_dtoh(&q_prepped.data)
                 .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
-            rc.layer0_query = host.iter().map(|v| v.to_f32()).collect();
+            const RECALL_PREFILL_Q_TOKENS: usize = 16; // R3 default `m`.
+            let m = RECALL_PREFILL_Q_TOKENS.min(seq_len);
+            let mut q = vec![0.0_f32; q_dim];
+            for t in (seq_len - m)..seq_len {
+                let base = t * q_dim;
+                for (d, slot) in q.iter_mut().enumerate() {
+                    *slot += host[base + d].to_f32();
+                }
+            }
+            let inv = 1.0_f32 / m as f32;
+            for v in &mut q {
+                *v *= inv;
+            }
+            rc.layer0_query = q;
         }
 
         qwen35_profile(

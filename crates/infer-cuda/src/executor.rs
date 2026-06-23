@@ -3106,12 +3106,32 @@ impl Qwen35CudaExecutor {
         self.kv_recall && self.recall_kv.is_some()
     }
 
-    /// One prefill row over the paged recall pool (`--kv-recall`): self-allocate
-    /// the new tokens into the pool, build the (full resident) page table, and
-    /// run the paged forward. The pool owns the full-attn KV; linear-attn state
-    /// stays in the slot.
+    /// One prefill row over the paged recall pool (`--kv-recall`), and the ONE
+    /// place the whole recall cycle runs (the write-through model's non-negotiable
+    /// rule: "decode 不召回; prefetch 只在 prefill; 其他时机不交互").
+    ///
+    /// 1. Self-allocate the prompt tokens, build the full-resident page table, run
+    ///    the paged forward — this writes the new KV and reads back the layer-0
+    ///    prefill query (`rc.layer0_query`, the mean of the last `m` prompt tokens'
+    ///    post-RoPE queries; see `full_attention_paged`).
+    /// 2. Score the whole history against that query (`recompute_recall_plan`,
+    ///    `allow_prefetch=true`): pick the working set (sink + local + top-k
+    ///    relevant blocks), choosing `evict_pages` (cold middle to drop) and
+    ///    `prefetch_pages` (chosen blocks that are tier-resident sentinels).
+    /// 3. Batched-H2D prefetch the chosen tier-resident blocks back into HBM
+    ///    (`reinstate_slot_page` + `copy_pages_from_host`), then resolve the FIXED
+    ///    `recall_pages` working set the decode steps will attend.
+    /// 4. Write-back-evict the cold middle (`copy_pages_to_host` → `tier.insert`)
+    ///    and free its physical pages IMMEDIATELY (`evict_slot_page`): prefill's
+    ///    forward + sampling already drained the compute stream, so there is no
+    ///    in-flight attention to race — no decode-step keepalive needed.
+    ///
+    /// After this returns, `self.recall[slot].recall_pages()` holds the immutable
+    /// working set; decode does nothing but append + attend it (see
+    /// [`Self::decode_row_recall`]).
     fn prefill_row_recall(&mut self, row: &infer_plan::PrefillRow, position: u64) -> Result<u32> {
         let slot = row.slot;
+        let cfg = self.recall_cfg;
         // Self-allocate the new tokens (extends the page table + pool seq_len).
         {
             let pool = self
@@ -3130,74 +3150,36 @@ impl Qwen35CudaExecutor {
                 row.tokens.len(),
             )?
         };
-        // Borrow split: forward needs &model + &mut slots[slot] + &mut workspace
-        // + &mut pool (through rc).
-        let Self {
-            model,
-            slots,
-            workspace,
-            recall_kv,
-            ..
-        } = self;
-        let pool = recall_kv.as_mut().expect("recall_kv present");
-        let mut rc = crate::qwen35::Qwen35RecallForward {
-            pool,
-            meta: &meta,
-            layer0_query: Vec::new(),
+        // (1) Forward (paged prefill). Borrow split: forward needs &model +
+        // &mut slots[slot] + &mut workspace + &mut pool (through rc). `rc` carries
+        // back the layer-0 prefill query for the recall score below.
+        let (token, layer0_query) = {
+            let Self {
+                model,
+                slots,
+                workspace,
+                recall_kv,
+                ..
+            } = self;
+            let pool = recall_kv.as_mut().expect("recall_kv present");
+            let mut rc = crate::qwen35::Qwen35RecallForward {
+                pool,
+                meta: &meta,
+                layer0_query: Vec::new(),
+            };
+            let token = model.forward_tokens_recall(
+                &mut slots[slot],
+                workspace,
+                &row.tokens,
+                row.start_pos,
+                &row.params,
+                position,
+                &mut rc,
+            )?;
+            (token, rc.layer0_query)
         };
-        model.forward_tokens_recall(
-            &mut slots[slot],
-            workspace,
-            &row.tokens,
-            row.start_pos,
-            &row.params,
-            position,
-            &mut rc,
-        )
-    }
 
-    /// One decode row over the paged recall pool (`--kv-recall`) with the L3
-    /// write-through tier (the "盖好" coverage path). Per step:
-    ///
-    /// 1. **Release the previous step's eviction keepalive** (the use-after-free
-    ///    race fix): pages evict-dropped at step N-1 were parked OUT of the pool's
-    ///    free list; now that step N-1's attention has fully completed (its argmax
-    ///    `ctx.sync()` drained the compute stream at the step boundary), return them
-    ///    to `free_pages` so `alloc_tokens` may reuse them — never the page an
-    ///    in-flight attention is still reading. NO full per-step `stream.synchronize`.
-    /// 2. Alloc this step's token; forward over the recall-restricted page table.
-    /// 3. Score this step's stale-Q, plan the NEXT step's working set
-    ///    (`recompute_recall_plan`, `allow_prefetch=true`): evicted middle blocks
-    ///    are scorable via their resident reps, so a hot one is re-recalled.
-    /// 4. **Prefetch** any re-recalled (L3-resident) block back into HBM (alloc a
-    ///    fresh page, H2D from the tier, patch the sentinel), then re-resolve the
-    ///    next-step page list. **Write-through evict-drop** the cold middle: mirror
-    ///    each to the tier (so the drop is free), then deferred-evict it into THIS
-    ///    step's keepalive (released at the top of the next step, per #1).
-    fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
-        let slot = row.slot;
-        let cfg = self.recall_cfg;
-        // (1) Race fix: release the prior step's parked eviction pages now that the
-        // prior step's attention has completed (no full per-step device sync).
-        {
-            let parked = std::mem::take(&mut self.recall_keepalive[slot]);
-            if !parked.is_empty() {
-                if let Some(pool) = self.recall_kv.as_mut() {
-                    for (_logical, physical) in parked {
-                        pool.release_evicted_page(physical);
-                    }
-                }
-            }
-        }
-        // Alloc this step's token FIRST so the tail page exists.
-        {
-            let pool = self
-                .recall_kv
-                .as_mut()
-                .expect("recall_kv present (recall_active)");
-            pool.alloc_tokens(slot, 1)?;
-        }
-        let cache_len = row.kv_seq_len + 1; // incl. this step's token
+        let cache_len = row.start_pos + row.tokens.len();
         let ps = self.recall_kv.as_ref().expect("recall_kv").page_size;
         ensure!(
             cfg.n_init.is_multiple_of(ps)
@@ -3209,55 +3191,11 @@ impl Qwen35CudaExecutor {
             cfg.l_bs,
             ps
         );
-        // Page list for this step: the prev step's plan (stale-Q), else the full
-        // resident list (first recall step / under budget).
-        let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
-            Some(p) => p.to_vec(),
-            None => {
-                let pool = self.recall_kv.as_ref().expect("recall_kv");
-                let num_pages = cache_len.div_ceil(pool.page_size);
-                pool.page_indices(slot)[..num_pages].to_vec()
-            }
-        };
-        let meta = {
-            let pool = self.recall_kv.as_ref().expect("recall_kv");
-            crate::loader::PageMeta::for_recall_decode(
-                &self.model.ctx,
-                pool,
-                cache_len,
-                &recall_pages,
-            )?
-        };
-        // Forward (paged decode). Borrow split.
-        let (token, layer0_query) = {
-            let Self {
-                model,
-                slots,
-                workspace,
-                recall_kv,
-                ..
-            } = self;
-            let pool = recall_kv.as_mut().expect("recall_kv");
-            let mut rc = crate::qwen35::Qwen35RecallForward {
-                pool,
-                meta: &meta,
-                layer0_query: Vec::new(),
-            };
-            let token = model.forward_tokens_recall(
-                &mut slots[slot],
-                workspace,
-                &[row.last_token],
-                row.kv_seq_len,
-                &row.params,
-                position,
-                &mut rc,
-            )?;
-            (token, rc.layer0_query)
-        };
-        // Score this step's query and plan NEXT step's recall (stale-Q). With the
-        // L3 tier, evicted blocks are scorable (allow_prefetch=true) and page-list
-        // resolution is deferred until after this step's prefetch/evict patch the
-        // table (see `resolve_recall_pages`).
+
+        // (2) Score the whole history against the prefill query and plan the FIXED
+        // working set (sink + local + top-k relevant). `allow_prefetch=true` lets a
+        // tier-resident (previously evicted) block re-enter the set; page-list
+        // resolution is deferred until after the prefetch patches the table.
         let num_q_heads = self.model.local_q_heads();
         let num_kv_heads = self.model.local_kv_heads();
         let head_dim = self.model.config.head_dim;
@@ -3288,15 +3226,13 @@ impl Qwen35CudaExecutor {
             }
         };
 
-        // (4a) Re-recall PREFETCH (the coverage win): pull each re-recalled block
-        // back from the L3 tier into a fresh HBM page (alloc + H2D), patching its
-        // sentinel. Per-step H2D — it only fires when a hot block re-enters the
-        // working set, and decode is serial so it cannot race the forward. If the
-        // pool is out of free pages or the tier lost the entry, the page stays
-        // evicted (no crash; that block simply won't be attended next step).
+        // (3) Prefetch the chosen tier-resident blocks back into HBM (alloc a fresh
+        // page, H2D from the tier, patch the sentinel). Decode never does this; it
+        // is the one batched prefill sync point. If the pool is out of free pages or
+        // the tier lost the entry, the block stays evicted (no crash; it simply
+        // won't be in the working set).
         for logical in prefetch_pages {
             let key = tier_block_u64(slot as u64, logical as u64);
-            // Read the tier payload first; only reinstate a page if the tier has it.
             let Some(tier) = self.recall_tier.as_mut() else {
                 break;
             };
@@ -3311,23 +3247,21 @@ impl Qwen35CudaExecutor {
             }
         }
 
-        // (4b) Re-resolve the next step's page list now that prefetch has patched
-        // any reinstated sentinels back to real ids.
+        // (3b) Resolve the FIXED working-set page list now that prefetch has patched
+        // any reinstated sentinels to real ids. Decode reads this and never mutates it.
         if let Some(state) = self.recall.get_mut(slot) {
             if let Some(pool) = self.recall_kv.as_ref() {
                 state.resolve_recall_pages(pool, slot);
             }
         }
 
-        // (4c) Write-through evict-drop the cold middle pages. For each: mirror its
-        // KV to the L3 tier (so the drop is free), then DEFERRED-evict it — the
-        // physical page is parked in this slot's keepalive and returned to the pool
-        // at the TOP of the next step (#1), never freed while this step's attention
-        // could still read it. A tier-full write_through keeps the page resident
-        // (no KV loss). The tier read above happens before any device free, so the
-        // page table is consistent throughout.
+        // (4) Write-back-evict the cold middle pages: mirror each to the L3 tier,
+        // then free its physical page IMMEDIATELY (`evict_slot_page`). Prefill's
+        // forward + sampling already drained the compute stream, so no in-flight
+        // attention can be reading these pages — the deferred-keepalive dance that
+        // the per-decode-step path needed is unnecessary here. A tier-full
+        // write_through keeps the page resident (no KV loss).
         for logical in evict_pages {
-            // Mirror the physical page to the tier under (slot, logical).
             let physical = {
                 let pool = self.recall_kv.as_ref().expect("recall_kv");
                 pool.page_indices(slot)
@@ -3352,15 +3286,86 @@ impl Qwen35CudaExecutor {
             if !mirrored {
                 continue; // tier full → keep the page resident (no KV loss)
             }
-            // Deferred evict: detach + sentinel now, park the physical page for a
-            // one-step keepalive (released at the top of the next step).
             if let Some(pool) = self.recall_kv.as_mut() {
-                if let Some(parked) = pool.evict_slot_page_deferred(slot, logical) {
-                    self.recall_keepalive[slot].push((logical, parked));
-                }
+                pool.evict_slot_page(slot, logical);
             }
         }
         Ok(token)
+    }
+
+    /// One decode row over the paged recall pool (`--kv-recall`): **append +
+    /// attend, ZERO tier I/O** (the write-through model's non-negotiable rule —
+    /// "decode 不召回; prefetch 只在 prefill; 其他时机不交互"). The whole recall
+    /// cycle (score → evict → H2D prefetch) ran ONCE at prefill
+    /// ([`Self::prefill_row_recall`]) and fixed the working set; decode only:
+    ///
+    /// 1. Alloc this step's token (extends the tail page).
+    /// 2. Read the FIXED `recall_pages` working set (immutable for this decode
+    ///    run; never mutated here) — or the full contiguous list if the session
+    ///    still fits the budget (prefill chose no restriction).
+    /// 3. Forward over that page table (paged decode) + sample.
+    ///
+    /// There is NO `recompute_recall_plan`, NO `copy_pages_to_host`/`_from_host`,
+    /// NO `write_through`, NO `reinstate_slot_page`, NO keepalive release — none of
+    /// the tier machinery is reachable from here (that is the whole point: a
+    /// 6000-token recall request must not pay the per-step cycle that took >10 min).
+    /// A single ultra-long generation with no re-prefill keeps whatever working set
+    /// prefill chose (accepted boundary, ckl's design).
+    fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
+        let slot = row.slot;
+        // (1) Alloc this step's token so the tail page exists.
+        {
+            let pool = self
+                .recall_kv
+                .as_mut()
+                .expect("recall_kv present (recall_active)");
+            pool.alloc_tokens(slot, 1)?;
+        }
+        let cache_len = row.kv_seq_len + 1; // incl. this step's token
+        // (2) The FIXED working set chosen at prefill; else the full resident list
+        // (session under budget → prefill left no restriction). Read-only here.
+        let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
+            Some(p) => p.to_vec(),
+            None => {
+                let pool = self.recall_kv.as_ref().expect("recall_kv");
+                let num_pages = cache_len.div_ceil(pool.page_size);
+                pool.page_indices(slot)[..num_pages].to_vec()
+            }
+        };
+        let meta = {
+            let pool = self.recall_kv.as_ref().expect("recall_kv");
+            crate::loader::PageMeta::for_recall_decode(
+                &self.model.ctx,
+                pool,
+                cache_len,
+                &recall_pages,
+            )?
+        };
+        // (3) Forward (paged decode) + sample. Borrow split. `rc.layer0_query` is
+        // collected by the forward but UNUSED on decode — no recall re-scoring,
+        // no eviction, no prefetch happens here.
+        let Self {
+            model,
+            slots,
+            workspace,
+            recall_kv,
+            ..
+        } = self;
+        let pool = recall_kv.as_mut().expect("recall_kv");
+        let mut rc = crate::qwen35::Qwen35RecallForward {
+            pool,
+            meta: &meta,
+            layer0_query: Vec::new(),
+        };
+        model.forward_tokens_recall(
+            &mut slots[slot],
+            workspace,
+            &[row.last_token],
+            row.kv_seq_len,
+            &row.params,
+            position,
+            &mut rc,
+        )
     }
 
     /// Run one decode step through the captured whole-step graph. Returns
