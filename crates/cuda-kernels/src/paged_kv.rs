@@ -1359,6 +1359,9 @@ impl TokenKVPool {
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
         }
         for idx in slot_pages {
+            if idx == EVICTED_PAGE {
+                continue; // mid-decode recall already freed this page; no slot ref to drop
+            }
             let usize_idx = idx as usize;
             debug_assert!(
                 self.page_attach_count[usize_idx] > 0,
@@ -1391,6 +1394,9 @@ impl TokenKVPool {
         }
         let mut recycled = Vec::new();
         for idx in removed {
+            if idx == EVICTED_PAGE {
+                continue; // mid-decode recall already freed this page; no slot ref to drop
+            }
             let usize_idx = idx as usize;
             debug_assert!(
                 self.page_attach_count[usize_idx] > 0,
