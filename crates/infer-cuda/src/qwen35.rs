@@ -34,7 +34,7 @@ use std::time::Instant;
 use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::ffi;
 use cuda_kernels::moe as cuda_moe;
-use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
 use cuda_kernels::tensor::{
     HostMatrixSnapshot, WeightFormat, cache_ptr, offload_raw_slice, reload_raw_slice,
 };
@@ -690,6 +690,17 @@ pub(crate) struct FullAttnScratch {
     /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS]`.
     batch_partial_m: SliceSlot<f32>,
     batch_partial_l: SliceSlot<f32>,
+}
+
+/// Opt-in paged full-attn forwarding context for Qwen3.6 KV-recall. When
+/// threaded `Some`, each full-attn layer reads/writes the paged `PagedKVPool`
+/// over `meta` instead of the contiguous slot cache. `None` → contiguous
+/// (byte-identical default). `layer0_query` collects the post-RoPE layer-0
+/// full-attn query for the next-step recall score.
+pub(crate) struct Qwen35RecallForward<'a> {
+    pub(crate) pool: &'a mut PagedKVPool,
+    pub(crate) meta: &'a crate::loader::PageMeta,
+    pub(crate) layer0_query: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -2380,7 +2391,7 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<()> {
-        self.forward_hidden_capture(slot, ws, tokens, start_pos, None)
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, None)
     }
 
     /// [`Self::forward_hidden`] with an optional per-linear-layer gated-delta
@@ -2396,6 +2407,7 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
+        recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<()> {
         ensure!(
             !tokens.is_empty(),
@@ -2415,7 +2427,7 @@ impl Qwen35Model {
             self.max_seq_len
         );
         self.stage_step_inputs(ws, tokens, start_pos)?;
-        self.forward_hidden_staged(slot, ws, seq_len, start_pos, capture)?;
+        self.forward_hidden_staged(slot, ws, seq_len, start_pos, capture, recall)?;
         slot.seq_len += seq_len;
         Ok(())
     }
@@ -2459,6 +2471,7 @@ impl Qwen35Model {
         seq_len: usize,
         start_pos: usize,
         mut capture: Option<&mut Qwen35LinearCapture>,
+        mut recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<()> {
         let c = &self.config;
         let eps = c.rms_norm_eps;
@@ -2516,16 +2529,28 @@ impl Qwen35Model {
                         Some(layer_idx),
                         seq_len,
                         || {
-                            self.full_attention(
-                                full_attn,
-                                normed,
-                                slot,
-                                full_idx,
-                                start_pos,
-                                start_pos_dev,
-                                full,
-                                attn_out,
-                            )
+                            if let Some(rc) = recall.as_deref_mut() {
+                                self.full_attention_paged(
+                                    full_attn,
+                                    normed,
+                                    full_idx,
+                                    full,
+                                    attn_out,
+                                    rc,
+                                    seq_len == 1,
+                                )
+                            } else {
+                                self.full_attention(
+                                    full_attn,
+                                    normed,
+                                    slot,
+                                    full_idx,
+                                    start_pos,
+                                    start_pos_dev,
+                                    full,
+                                    attn_out,
+                                )
+                            }
                         },
                     )?;
                     full_idx += 1;
@@ -2648,6 +2673,33 @@ impl Qwen35Model {
         })
     }
 
+    /// [`Self::forward_tokens`] over the opt-in paged recall KV pool
+    /// (`--kv-recall`): the full-attn layers read/write `recall.pool` over
+    /// `recall.meta` instead of the contiguous slot cache. `slot.seq_len` is
+    /// still advanced in lockstep (the executor's decode invariant reads it);
+    /// the pool's own `seq_len` is advanced separately via `alloc_tokens`.
+    pub(crate) fn forward_tokens_recall(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+        recall: &mut Qwen35RecallForward,
+    ) -> Result<u32> {
+        ensure!(
+            !tokens.is_empty(),
+            "Qwen3.5 recall forward requires at least one token"
+        );
+        let seq_len = tokens.len();
+        self.stage_step_inputs(ws, tokens, start_pos)?;
+        self.forward_hidden_staged(slot, ws, seq_len, start_pos, None, Some(recall))?;
+        slot.seq_len += seq_len;
+        self.lm_head_logits(ws, seq_len)?;
+        self.sample_workspace_logits(ws, params, position)
+    }
+
     /// Final norm (offset) + LM head on the last token only, into `ws.logits`.
     /// Last stage of the captured decode graph (the capture ends at the logits
     /// buffer, dense-style); sampling stays outside.
@@ -2708,6 +2760,18 @@ impl Qwen35Model {
         self.max_seq_len
     }
 
+    /// This rank's local full-attention KV head count (= global config on a
+    /// single GPU). Used by the opt-in KV-recall pool sizing + paged kernels.
+    pub(crate) fn local_kv_heads(&self) -> usize {
+        self.local_kv_heads
+    }
+
+    /// This rank's local full-attention query head count (= global config on a
+    /// single GPU). Used by the opt-in KV-recall scoring + paged kernels.
+    pub(crate) fn local_q_heads(&self) -> usize {
+        self.local_q_heads
+    }
+
     /// Whole-step captured decode body: embedding → every layer (norms,
     /// full/linear attention, dense/MoE FFN) → final norm → lm_head GEMV,
     /// ending at `ws.logits`. One `seq_len == 1` pass over already-staged
@@ -2766,7 +2830,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         start_pos: usize,
     ) -> Result<()> {
-        self.forward_hidden_staged(slot, ws, 1, start_pos, None)?;
+        self.forward_hidden_staged(slot, ws, 1, start_pos, None, None)?;
         self.lm_head_logits(ws, 1)
     }
 
@@ -2902,7 +2966,7 @@ impl Qwen35Model {
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
-        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture)?;
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, None)?;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
@@ -4451,6 +4515,271 @@ impl Qwen35Model {
         qwen35_profile(
             &self.ctx,
             "qwen/full/allreduce",
+            Some(full_idx),
+            seq_len,
+            || self.tp.all_reduce_sum(&self.ctx, out),
+        )?;
+        Ok(())
+    }
+
+    /// Opt-in paged full attention over the recall [`PagedKVPool`] (`--kv-recall`).
+    ///
+    /// Mirrors [`Self::full_attention_into`]'s q/k/v GEMM → prep → attention →
+    /// gate → o_proj → all-reduce shape, but the prep writes this step's K/V into
+    /// the pool's tail page and the attention reads the page table in `rc.meta`
+    /// (a recall-restricted page subset on decode, the full resident list on
+    /// prefill). RoPE is baked into the cached K at write time, so a
+    /// non-contiguous page subset attends exactly those pages (the dense-Qwen3
+    /// recall correctness argument). HD256 paged kernels (BF16 pool only).
+    ///
+    /// `decode` is `seq_len == 1`. On the layer-0 decode step the post-RoPE
+    /// prepped Q is read back into `rc.layer0_query` for the next-step recall
+    /// score (head-major `[num_q_heads * head_dim]`, matching
+    /// `recompute_recall_plan`).
+    #[allow(clippy::too_many_arguments)]
+    fn full_attention_paged(
+        &self,
+        attn: &FullAttn,
+        normed: &HiddenStates,
+        full_idx: usize,
+        fw: &mut FullAttnScratch,
+        out: &mut HiddenStates,
+        rc: &mut Qwen35RecallForward,
+        decode: bool,
+    ) -> Result<()> {
+        let c = &self.config;
+        let seq_len = normed.seq_len;
+        let q_dim = self.local_full_attn_q_dim();
+        let kv_dim = self.local_full_attn_kv_dim();
+        let q_proj_dim = self.local_full_attn_q_proj_dim();
+        let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
+        let stride_page = rc.pool.kv_dim * rc.pool.page_size;
+
+        let FullAttnScratch {
+            q_full,
+            k_batch,
+            v_batch,
+            q_prepped,
+            attn_heads,
+            ..
+        } = fw;
+        let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
+        let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
+        let v_batch = v_batch.get(&self.ctx, kv_dim, seq_len)?;
+        qwen35_profile(
+            &self.ctx,
+            "qwen/full_paged/qkv_gemm",
+            Some(full_idx),
+            seq_len,
+            || {
+                gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
+                gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
+                gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+                Ok(())
+            },
+        )?;
+
+        let q_prepped = q_prepped.get(&self.ctx, q_dim, seq_len)?;
+        let attn_out = attn_heads.get(&self.ctx, q_dim, seq_len)?;
+
+        let k_pool_ptr = rc.pool.k_ptr(full_idx, &self.ctx.stream);
+        let v_pool_ptr = rc.pool.v_ptr(full_idx, &self.ctx.stream);
+
+        // ── 1. Prep: q/k RMSNorm + RoPE; write K/V into the pool's tail page. ──
+        {
+            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (positions_ptr, _gp) = rc.meta.positions.device_ptr(&self.ctx.stream);
+            let (kv_indices_ptr, _gi) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
+            let (kv_indptr_ptr, _gpi) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
+            let (last_page_len_ptr, _gl) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let (start_pos_ptr, _gs) = rc.meta.start_positions.device_ptr(&self.ctx.stream);
+            // SAFETY: all buffers valid on ctx.stream; pool tail page allocated.
+            qwen35_profile(
+                &self.ctx,
+                "qwen/full_paged/prep",
+                Some(full_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        if decode {
+                            ffi::decode_prep_paged_hd256_cuda(
+                                qf_ptr as *const ffi::Half,
+                                qp_ptr as *mut ffi::Half,
+                                k_ptr as *const ffi::Half,
+                                v_ptr as *const ffi::Half,
+                                qn_ptr as *const ffi::Half,
+                                kn_ptr as *const ffi::Half,
+                                cos_ptr as *const ffi::Half,
+                                sin_ptr as *const ffi::Half,
+                                positions_ptr as *const i32,
+                                k_pool_ptr as *mut ffi::Half,
+                                v_pool_ptr as *mut ffi::Half,
+                                kv_indices_ptr as *const i32,
+                                kv_indptr_ptr as *const i32,
+                                last_page_len_ptr as *const i32,
+                                self.local_q_heads as i32,
+                                self.local_kv_heads as i32,
+                                rc.pool.page_size as i32,
+                                stride_page as i32,
+                                1,
+                                c.rotary_dim as i32,
+                                c.rms_norm_eps,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        } else {
+                            ffi::prefill_attention_paged_prep_hd256_cuda(
+                                qf_ptr as *const ffi::Half,
+                                qp_ptr as *mut ffi::Half,
+                                k_ptr as *const ffi::Half,
+                                v_ptr as *const ffi::Half,
+                                qn_ptr as *const ffi::Half,
+                                kn_ptr as *const ffi::Half,
+                                cos_ptr as *const ffi::Half,
+                                sin_ptr as *const ffi::Half,
+                                kv_indices_ptr as *const i32,
+                                rc.pool.page_size as i32,
+                                k_pool_ptr as *mut ffi::Half,
+                                v_pool_ptr as *mut ffi::Half,
+                                self.local_q_heads as i32,
+                                self.local_kv_heads as i32,
+                                seq_len as i32,
+                                start_pos_ptr as *const i32,
+                                c.rotary_dim as i32,
+                                c.rms_norm_eps,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ── 2. Paged attention over the recall page table (RoPE pre-baked). ──
+        {
+            let kernel = ffi::resolve_paged_attn_v1(
+                c.head_dim as u32,
+                self.local_q_heads as u32,
+                self.local_kv_heads as u32,
+                if decode {
+                    ffi::AttnPhase::Decode
+                } else {
+                    ffi::AttnPhase::Prefill
+                },
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "no HD256 paged {} kernel for q{}_kv{}",
+                    if decode { "decode" } else { "prefill" },
+                    self.local_q_heads,
+                    self.local_kv_heads
+                )
+            })?;
+            let (bsz, total_q, max_q) = if decode {
+                (1, 1, 1)
+            } else {
+                (1, seq_len as i32, seq_len as i32)
+            };
+            let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (q_indptr_ptr, _g1) = rc.meta.q_indptr.device_ptr(&self.ctx.stream);
+            let (kv_indptr_ptr, _g2) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
+            let (kv_indices_ptr, _g3) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
+            let (last_page_len_ptr, _g4) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: q/page-table/out buffers valid on ctx.stream; kernel
+            // signature from the paged_attn_v1 ABI (18-arg base BF16).
+            qwen35_profile(
+                &self.ctx,
+                "qwen/full_paged/attention",
+                Some(full_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        kernel(
+                            qp_ptr as *mut ffi::Half,
+                            q_indptr_ptr as *const i32,
+                            k_pool_ptr as *mut ffi::Half,
+                            v_pool_ptr as *mut ffi::Half,
+                            kv_indptr_ptr as *const i32,
+                            kv_indices_ptr as *const i32,
+                            last_page_len_ptr as *const i32,
+                            ao_ptr as *mut ffi::Half,
+                            bsz,
+                            total_q,
+                            max_q,
+                            rc.pool.max_total_pages as i32,
+                            rc.meta.num_pages as i32,
+                            self.local_q_heads as i32,
+                            self.local_kv_heads as i32,
+                            rc.pool.page_size as i32,
+                            sm_scale,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ── 3. Per-head sigmoid gate from q_full's gate half. ──
+        {
+            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: q_full/attn_out valid on ctx.stream; gate iterates
+            // batch_size * num_q_heads (batch_size = seq_len; decode = 1).
+            qwen35_profile(
+                &self.ctx,
+                "qwen/full_paged/gate",
+                Some(full_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        ffi::attention_gate_paged_hd256_cuda(
+                            qf_ptr as *const ffi::Half,
+                            o_ptr as *mut ffi::Half,
+                            self.local_q_heads as i32,
+                            seq_len as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // Layer-0 decode: read back the post-RoPE prepped Q for the next-step
+        // recall score (head-major `[num_q_heads * head_dim]`).
+        if full_idx == 0 && decode {
+            let host: Vec<bf16> = self
+                .ctx
+                .stream
+                .clone_dtoh(&q_prepped.data)
+                .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
+            rc.layer0_query = host.iter().map(|v| v.to_f32()).collect();
+        }
+
+        qwen35_profile(
+            &self.ctx,
+            "qwen/full_paged/o_proj",
+            Some(full_idx),
+            seq_len,
+            || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
+        )?;
+        // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
+        qwen35_profile(
+            &self.ctx,
+            "qwen/full_paged/allreduce",
             Some(full_idx),
             seq_len,
             || self.tp.all_reduce_sum(&self.ctx, out),

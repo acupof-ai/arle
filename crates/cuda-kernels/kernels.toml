@@ -349,6 +349,23 @@ out_name = "tilelang_batch_prefill_paged_hd256_q16_kv4"
 allow_sm70 = true
 ffi = true
 
+# Qwen3.6-27B full-attn: 24 q heads / 4 kv heads, HD256 (KV-recall paged path).
+[[kernel]]
+family = "batch_prefill_paged"
+head_dim = 256
+q_heads = 24
+kv_heads = 4
+kv_dtype = "bf16"
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
+artifact_dir = "batch_prefill_paged_hd256_q24_kv4"
+kernel_name = "tilelang_batch_prefill_paged_hd256_q24_kv4_run"
+out_name = "tilelang_batch_prefill_paged_hd256_q24_kv4"
+allow_sm70 = false
+ffi = true
+
 [[kernel]]
 head_dim = 64
 q_heads = 16
@@ -407,6 +424,23 @@ artifact_dir = "batch_decode_paged_hd256_q16_kv4"
 kernel_name = "tilelang_batch_decode_paged_hd256_q16_kv4_run"
 out_name = "tilelang_batch_decode_paged_hd256_q16_kv4"
 allow_sm70 = true
+ffi = true
+
+# Qwen3.6-27B full-attn: 24 q heads / 4 kv heads, HD256 (KV-recall paged decode).
+[[kernel]]
+family = "batch_decode_paged"
+head_dim = 256
+q_heads = 24
+kv_heads = 4
+kv_dtype = "bf16"
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd256.py"
+artifact_dir = "batch_decode_paged_hd256_q24_kv4"
+kernel_name = "tilelang_batch_decode_paged_hd256_q24_kv4_run"
+out_name = "tilelang_batch_decode_paged_hd256_q24_kv4"
+allow_sm70 = false
 ffi = true
 
 [[kernel]]
