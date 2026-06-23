@@ -634,6 +634,11 @@ pub(crate) enum TrainCommand {
     /// (DeepSeek-V4-Flash) judges each against a text-level rubric, and the
     /// accepted rollouts are written back as CE targets (RFT). Cross-vocab-free.
     RubricOpd(TrainRubricOpdArgs),
+    /// Agent-OPD: the student drives the read/write/replace/bash tool loop
+    /// against a per-task repo sandbox (SWE-bench-Pro). The reward is execution
+    /// (run the hidden tests), no text judge — passing trajectories are written
+    /// back as CE targets.
+    AgentOpd(TrainAgentOpdArgs),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -1213,6 +1218,148 @@ pub(crate) struct TrainRubricOpdArgs {
     /// answer; too small truncates mid-reasoning and scores a fake 0.
     #[arg(long, default_value_t = 4096)]
     pub(crate) eval_max_new_tokens: usize,
+
+    /// Compute backend for autograd (auto picks CUDA when built with cuda).
+    #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
+    pub(crate) backend: OpdBackendArg,
+
+    /// Render output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Agent-OPD: the student drives the read/write/replace/bash tool loop against a\nper-task repo sandbox (SWE-bench-Pro). The reward is EXECUTION — `git diff` is the\ncandidate patch, the hidden test_patch + fail_to_pass tests are run, exit-0 = pass.\nNo text judge/teacher is loaded; passing trajectories are written back as CE targets\n(verl-style response_mask keeps tool/environment tokens out of the loss).\n\n  arle train agent-opd --student-model <qwen3.6-27b-dir> \\\n    --dataset <swe-bench-pro.jsonl> --staged-root <repos-checked-out-at-base_commit> \\\n    --rounds 3 --samples-per-prompt 4"
+)]
+pub(crate) struct TrainAgentOpdArgs {
+    /// Student model directory (HF safetensors layout). The trained LoRA student.
+    #[arg(long, alias = "student")]
+    pub(crate) student_model: PathBuf,
+
+    /// SWE-bench-Pro dataset JSONL (one task object per line: instance_id,
+    /// problem_statement, repo, base_commit, test_patch, fail_to_pass, ...).
+    #[arg(long, value_name = "FILE")]
+    pub(crate) dataset: PathBuf,
+
+    /// Directory holding each task's repo already checked out at its
+    /// `base_commit`, addressed as `<staged-root>/<instance_id>/`.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) staged_root: PathBuf,
+
+    /// Root dir under which each task's per-rollout sandbox is built (copied from
+    /// the staged tree, reset between samples).
+    #[arg(long, value_name = "DIR", default_value = "/tmp/agent-opd")]
+    pub(crate) work_root: PathBuf,
+
+    /// Optional cap on the number of tasks (from the head of --dataset) for a
+    /// smoke run.
+    #[arg(long, value_name = "N")]
+    pub(crate) task_limit: Option<usize>,
+
+    /// Agent rollouts generated per task each round (best-of-N).
+    #[arg(long, default_value_t = 4)]
+    pub(crate) samples_per_prompt: usize,
+
+    /// Max agent turns (tool sub-turns) per rollout.
+    #[arg(long, default_value_t = 30)]
+    pub(crate) max_turns: usize,
+
+    /// Max tokens the engine generates per agent sub-turn.
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) max_tokens: usize,
+
+    /// `PYTHONPATH` (sandbox-relative) for the bash tool + test runs, e.g.
+    /// `lib:test`. Optional.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) pythonpath: Option<String>,
+
+    /// Bash tool timeout (seconds).
+    #[arg(long, default_value_t = 150)]
+    pub(crate) bash_timeout_secs: u64,
+
+    /// Test-run (scoring) timeout (seconds).
+    #[arg(long, default_value_t = 300)]
+    pub(crate) test_timeout_secs: u64,
+
+    /// RFT rounds (rollout → execute → score → writeback-CE).
+    #[arg(long, default_value_t = 3)]
+    pub(crate) rounds: usize,
+
+    /// Cap on CE writeback pairs trained per round (unset = all accepted).
+    #[arg(long, value_name = "N")]
+    pub(crate) writeback_cap: Option<usize>,
+
+    /// CE writeback micro-batch size (amortizes host op-dispatch; bounds logit VRAM).
+    #[arg(long, default_value_t = 4)]
+    pub(crate) writeback_batch: usize,
+
+    /// KV slots for the rollout engine (>1 batches sampling/eval; VRAM-gated).
+    #[arg(long, default_value_t = 2)]
+    pub(crate) rollout_num_slots: usize,
+
+    /// Train-infer FP8 weight sharing (训推一体). When set, the autograd LoRA
+    /// student's FROZEN FP8 base projections point (zero-copy) at the resident
+    /// FP8 base of the co-resident rollout engine. Off by default — the default
+    /// load path is byte-identical.
+    #[arg(long, default_value_t = false)]
+    pub(crate) share_frozen_base: bool,
+
+    /// Rollout sampling temperature (>0 for rejection-sampling diversity).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
+    pub(crate) rollout_temperature: f32,
+
+    /// Rollout nucleus sampling threshold (1.0 disables top-p).
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) rollout_top_p: f32,
+
+    /// Rollout top-k filter (0 disables top-k).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) rollout_top_k: i32,
+
+    /// Optional deterministic base rollout seed (per-sample = base + i).
+    #[arg(long)]
+    pub(crate) rollout_seed: Option<u64>,
+
+    /// AdamW learning rate.
+    #[arg(long, default_value_t = 1.0e-5)]
+    pub(crate) lr: f32,
+
+    /// LoRA rank for the student adapter.
+    #[arg(long, default_value_t = 32)]
+    pub(crate) lora_rank: usize,
+
+    /// LoRA alpha for the student adapter.
+    #[arg(long, default_value_t = 64.0)]
+    pub(crate) lora_alpha: f32,
+
+    /// LoRA target set: `attention-qv` or `all-linear`.
+    #[arg(long, default_value = "all-linear")]
+    pub(crate) lora_target_set: String,
+
+    /// Suffix-detach: train LoRA only on layers >= N and detach the autograd
+    /// backward before layer N (cuts the backward to the top suffix). Needed to
+    /// fit a 27B dense student CE backward; unset = all layers.
+    #[arg(long, value_name = "N")]
+    pub(crate) lora_layer_start: Option<usize>,
+
+    /// Gradient checkpointing for the CE backward (recompute activations). On by
+    /// default; `--grad-checkpointing false` to disable.
+    #[arg(long, default_value_t = true)]
+    pub(crate) grad_checkpointing: bool,
+
+    /// Directory where servable full-materialized checkpoints are written.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_checkpoint: Option<PathBuf>,
+
+    /// Save a checkpoint every N rounds (0 = final round only).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) save_every: usize,
+
+    /// Directory for fast adapter-only (LoRA) safetensors saves
+    /// (adapters_round{N}.safetensors).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) save_lora_adapters: Option<PathBuf>,
 
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
