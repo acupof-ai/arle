@@ -1581,6 +1581,7 @@ dependencies = [
  "deepep-sys",
  "deepseek-spec",
  "half",
+ "infer-core",
  "infer-moe",
  "infer-plan",
  "infer-seam",
