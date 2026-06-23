@@ -272,14 +272,25 @@ L3(NVMe) budget = durable overflow                                              
   "evict first to make room") → no ordering deadlock. Keepalive handles the evict race;
   staging handles the prefetch landing. Both fixed-size → no surprise malloc/OOM.
 
-### ④ Prefetch — at the prefill sync point, batched, reps-scored
-*Now: per-**decode-step** (`executor.rs:3291`, mid-decode H2D), contradicting the plan;
-violates "no mid-decode tier read"; rollout doesn't wire the tier so the path is dead there.*
-- Move to the **prefill / per-turn** sync point: at each turn's prefill, score the whole
-  history (reps · prefill query, `recall.rs:280`) → top-k → **one batched H2D** into the
-  working set via the staging ring; decode then attends the resident set (no mid-decode read).
-- Fits the rollout (multi-turn agent: each turn re-prefills = the natural batched point).
-  Keep the per-step arm only for a single ultra-long generation with no re-prefill.
+### ④ The whole recall cycle is per-prefill ONLY — decode does ZERO tier I/O (ckl, non-negotiable)
+*Now (the violation): the entire cycle — score → evict → **H2D prefetch** — runs EVERY
+decode step (`executor.rs:3291`, `decode_row_recall`). This directly breaks ckl's rule
+("decode 不召回; prefetch 只在 prefill; 其他时机不交互") and is exactly why `6000/0.75` took
+>10 min. Cause: the L3 work was layered on the pre-existing per-step dynamic-recall arm; the
+brief never enforced the per-prefill constraint.*
+- **Decode = append the new token + attend the FIXED resident working set. Nothing else.**
+  No re-scoring, no eviction, no prefetch, no tier touch mid-decode. The working set is
+  immutable for the duration of a decode run.
+- **The entire recall cycle happens ONCE per prefill / turn**: score the whole history
+  (reps · prefill query, `recall.rs:280`) → choose the working set (sink + local + top-k
+  relevant) → write-back-evict what falls out → **one batched H2D** prefetch into HBM via
+  the staging ring. Then decode runs free against it.
+- Fits the rollout exactly: each agent turn re-prefills = the one recall point. A single
+  ultra-long generation keeps the working set fixed for that generation (accepted boundary —
+  not a regression; it is ckl's design).
+- **Implementation**: gut the per-step `recompute_recall_plan`/evict/prefetch from
+  `decode_row_recall` (`executor.rs:3177-3364`); move the cycle to the prefill path
+  (`forward_tokens` prefill branch). `decode_row_recall` shrinks to append + attend.
 
 ### Implementation order (each lands + verifies independently)
 1. **Budget ledger** (`executor.rs:3065`, `train_cli.rs:1547`, `cuda_admission_total_pages`)
