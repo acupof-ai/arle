@@ -4,9 +4,14 @@
 > Evaluation section gives the protocol + table skeletons — **results are TODO,
 > pending the pod benchmark runs** (no numbers are fabricated). Design source:
 > [`docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`](../plans/2026-06-23-writethrough-tiered-kv-memory.md).
-> Early GPU evidence already in hand (Qwen3.6-27B, H20): coherent generation +
-> 6K-context needle retrieval past the working-set budget; per-step→per-prefill
-> recall removed a >10 min long-context stall (the load-bearing RQ3 ablation).
+> Early GPU evidence (Qwen3.6-27B, H20 GPU0): per-step→per-prefill recall **fixed a
+> crash** and removed the **>10 min per-step decode stall** (the load-bearing RQ3
+> ablation); `6000/0.75` needle now **retrieved** via prefill prefetch (119 s,
+> gated by a *synchronous* prefill write-back of ~340 cold blocks → §3.3 staging
+> makes it async). Decode itself is fast (quick gen 0 s, no per-step tier I/O).
+> Recall *quality* is partial on a 2-case probe (`2000/0.75` missed) — the
+> mean-key scoring didn't rank that block top-k; RQ1 grid + top-k/query-window
+> tuning pending. Not over-claiming "great recall" until the grid is run.
 
 ## Abstract
 
