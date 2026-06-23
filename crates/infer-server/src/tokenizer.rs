@@ -131,6 +131,18 @@ impl OpenAiTokenizer {
 
     /// Render OpenAI chat messages into the model's prompt form.
     pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.render_chat_with_kwargs(messages, None)
+    }
+
+    /// Render chat messages, passing optional `chat_template_kwargs` (e.g.
+    /// `enable_thinking`) into the Jinja template context. `None` kwargs render
+    /// byte-identically to [`Self::render_chat`]. Builtin (non-Jinja) renderers
+    /// have no template variables and ignore the kwargs.
+    pub fn render_chat_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String> {
         ensure!(
             !messages.is_empty(),
             "messages must contain at least one message"
@@ -152,7 +164,7 @@ impl OpenAiTokenizer {
                 source,
                 bos_token,
                 eos_token,
-            } => render_jinja(source, bos_token, eos_token, messages),
+            } => render_jinja(source, bos_token, eos_token, messages, chat_template_kwargs),
             ChatTemplate::BuiltinDeepseekV4 => render_deepseek_v4(messages),
             ChatTemplate::BuiltinChatMl => render_chatml(messages),
             ChatTemplate::UnsupportedChat { reason } => {
@@ -196,6 +208,7 @@ fn render_jinja(
     bos_token: &str,
     eos_token: &str,
     messages: &[ChatMessage],
+    chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<String> {
     use minijinja::{Environment, UndefinedBehavior, context};
 
@@ -229,14 +242,29 @@ fn render_jinja(
             }
         })
         .collect();
+    let base = context! {
+        messages => rows,
+        add_generation_prompt => true,
+        bos_token => bos_token,
+        eos_token => eos_token,
+    };
+    // Pass-through `chat_template_kwargs` (e.g. `enable_thinking`) as top-level
+    // template variables, merged ON TOP of the standard HF context. When absent
+    // the render is byte-identical to before — only the `Some` arm changes the
+    // context. Spread-merge keeps the base keys; the kwargs cannot shadow them
+    // because the standard keys are reserved by HF templates anyway.
+    let render_context = match chat_template_kwargs {
+        Some(kwargs) if !kwargs.is_empty() => {
+            let extra = minijinja::Value::from_serialize(kwargs);
+            // base spread LAST so the reserved HF keys (messages,
+            // add_generation_prompt, bos/eos) always win over any kwargs.
+            context! { ..extra, ..base }
+        }
+        _ => base,
+    };
     env.get_template("chat")
         .expect("template registered above")
-        .render(context! {
-            messages => rows,
-            add_generation_prompt => true,
-            bos_token => bos_token,
-            eos_token => eos_token,
-        })
+        .render(render_context)
         .map_err(|err| anyhow!("render checkpoint chat_template failed: {err}"))
 }
 
@@ -444,6 +472,7 @@ mod tests {
             "",
             "<|im_end|>",
             &[msg("system", "be brief"), msg("user", "hi")],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -460,9 +489,54 @@ mod tests {
             "",
             "",
             &[msg("user", "x")],
+            None,
         )
         .unwrap();
         assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn jinja_enable_thinking_kwarg_toggles_branch() {
+        // A Qwen-style `{% if enable_thinking %}` probe: the kwarg must reach
+        // the template context and flip the branch.
+        const THINK_TEMPLATE: &str = "{{ messages[0].content }}{%- if enable_thinking %}<think>{%- else %}</think>{%- endif %}";
+
+        let kwargs_on = serde_json::Map::from_iter([(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(true),
+        )]);
+        let kwargs_off = serde_json::Map::from_iter([(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        )]);
+
+        let on = render_jinja(
+            THINK_TEMPLATE,
+            "",
+            "",
+            &[msg("user", "hi")],
+            Some(&kwargs_on),
+        )
+        .unwrap();
+        let off = render_jinja(
+            THINK_TEMPLATE,
+            "",
+            "",
+            &[msg("user", "hi")],
+            Some(&kwargs_off),
+        )
+        .unwrap();
+        // absent kwargs must render byte-identically to the explicit `false`
+        // case (lenient-undefined makes the probe falsy) — backward compat.
+        let absent = render_jinja(THINK_TEMPLATE, "", "", &[msg("user", "hi")], None).unwrap();
+
+        assert_eq!(on, "hi<think>");
+        assert_eq!(off, "hi</think>");
+        assert_ne!(on, off, "enable_thinking must toggle the thinking branch");
+        assert_eq!(
+            absent, off,
+            "absent kwargs must match explicit enable_thinking=false"
+        );
     }
 
     #[test]
@@ -480,6 +554,7 @@ mod tests {
             "",
             "",
             &[message],
+            None,
         )
         .unwrap();
         assert_eq!(out, "look<|image|>");
@@ -492,6 +567,7 @@ mod tests {
             "",
             "",
             &[msg("user", "x")],
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("render checkpoint chat_template"));
@@ -650,6 +726,7 @@ mod real_checkpoint_tests {
                     content: Some(ChatContent::Text("hi".into())),
                 },
             ],
+            None,
         )
         .unwrap();
         assert!(out.contains("<|im_start|>user\nhi<|im_end|>"), "got: {out}");
@@ -695,6 +772,7 @@ mod real_checkpoint_tests {
                 role: "user".into(),
                 content: Some(ChatContent::Text("hi".into())),
             }],
+            None,
         )
         .unwrap();
         assert!(out.contains("<|turn>user"), "got: {out}");

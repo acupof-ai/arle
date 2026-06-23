@@ -437,6 +437,7 @@ fn resolve_engine_config(
     if let Some(value) = serve_args.max_total_tokens {
         config.max_total_tokens = value;
     }
+    config.max_thinking_tokens = serve_args.max_thinking_tokens;
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = value;
     }
