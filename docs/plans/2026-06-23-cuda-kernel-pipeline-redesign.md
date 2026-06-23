@@ -115,10 +115,13 @@ CUDA-only → cannot build on this Mac. Every tranche verifies on the **H20 pod*
 
 ## Tranches (each: small commit + pod-verify)
 
-0. ✅ `vendor/tilekernels` removed (vendored, 0 refs) + README ref cleaned.
-1. **Registry + generated FFI.** Add `kernels.toml`; emit `ffi_tilelang_generated.rs`;
-   replace the macros + invocations + dispatch arm. Behavior-identical (same
-   symbols, same dispatch) → pod needle gate must match the bf16 envelope.
+0. ✅ `vendor/tilekernels` removed (vendored, 0 refs) + README ref cleaned (`d638c134`).
+1. ✅ **Registry + generated FFI** (`64dc0b13`). `kernels.toml` (34 rows, 25 ffi)
+   drives `build.rs`-emitted `ffi_tilelang_generated.rs`; 9 macros + invocations +
+   the consumer match → `include!` + `resolve_*()`. Mac-green; FFI parity proven
+   byte-equal (25==25, all 4 ABI sigs); net −905 build.rs lines. **Pod-pending**:
+   nvcc/cc + link all 3 KernelSet branches + needle gate ×3 vs bf16 envelope + bench
+   (see [wins stub](../experience/wins/2026-06-23-cuda-registry-ffi-codegen-pending-remote.md)).
 2. **Prebuilt-release first-class.** Conventional-path auto-detect; a
    `scripts/build_kernel_release.sh` on a GPU box produces the two archives + sidecar.
 3. **Drop committed `generated/`** once prebuilt is the fed default; regen-on-demand
