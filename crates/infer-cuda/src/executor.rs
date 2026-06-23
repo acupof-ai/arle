@@ -44,7 +44,12 @@ pub(crate) fn tier_block_u64(session: u64, block: u64) -> u64 {
     const WRITETHROUGH_BIT: u64 = 1 << 63;
     WRITETHROUGH_BIT | ((session & 0x7FFF_FFFF) << 32) | (block & 0xFFFF_FFFF)
 }
-const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 4096;
+// Default DSv4 per-slot max KV sequence length when `INFER_DSV4_MAX_SEQ_LEN` is
+// unset. 32768 admits realistic agentic prompts out of the box. NOT 262144: the
+// O(N^2) DSA-indexer logits scratch OOMs above ~200K (16384 is a known-good
+// floor). The executor clamps `num_slots` to HBM (`kv_budget_num_slots`), so a
+// larger default degrades to fewer slots, never OOM.
+const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 32768;
 
 /// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
 /// pages beyond it fall back to eager rather than replay a stale graph.
