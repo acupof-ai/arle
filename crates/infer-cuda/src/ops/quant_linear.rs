@@ -134,48 +134,6 @@ fn qwen_fp8_dense_sm_supports_deepgemm(ctx: &DeviceContext) -> bool {
     })
 }
 
-/// Opt INTO the tensor-core MMA decode GEMV (default = the coalesced scalar
-/// kernel). Measured on Qwen3.6-27B-FP8 / H20: the MMA tile is built for DSv4
-/// batched decode (B<=16) and is occupancy-starved + uncoalesced at B=1 (only
-/// N/32 blocks, ~3-9% HBM BW), while the scalar warp-per-row kernel has
-/// N/GEMV_ROWS blocks (~16x) + coalesced byte loads → 3.6x single-stream
-/// (7.5→27.2 tok/s), 2.8x at conc=8 (17.6→50). So scalar is the DEFAULT; this
-/// flag is an A/B escape hatch (e.g. for shapes where MMA might still win).
-fn qwen_fp8_gemv_use_mma() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_QWEN35_FP8_GEMV_MMA").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    })
-}
-
-/// Log exactly once which path the *decode* GEMV (seq_len <= 16) takes — MMA vs
-/// scalar fallback. Prefill (seq_len > 16) always uses the scalar kernel by
-/// design and is NOT logged here: logging the prefill call first would consume
-/// the OnceLock with a "scalar fallback" line and mask the decode path, which
-/// reads (wrongly) as "MMA never engages".
-fn log_qwen_fp8_gemv_path(attempted_mma: bool, mma_ok: bool) {
-    if !attempted_mma {
-        return;
-    }
-    static LOGGED: OnceLock<()> = OnceLock::new();
-    LOGGED.get_or_init(|| {
-        if mma_ok {
-            log::info!(
-                "Qwen FP8 dense decode GEMV: tensor-core MMA path (default; \
-                 gemv_fp8_block_scaled_batch_mma_launch)"
-            );
-        } else {
-            log::info!(
-                "Qwen FP8 dense decode GEMV: scalar fallback \
-                 (gemv_fp8_block_scaled_batch_cuda; MMA launch rejected this decode shape)"
-            );
-        }
-    });
-}
-
 fn qwen_quant_profile<T>(
     ctx: &DeviceContext,
     label: &'static str,
@@ -579,81 +537,35 @@ pub(super) fn gemm_batch(
                 let (scale_rows, scale_cols, block_m, block_k) = fp8_f32_scale_shape(weight)?;
                 let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
                 let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                // DEFAULT = the coalesced scalar warp-per-row GEMV below; it is
-                // 3.6x faster than the MMA tile at B=1 decode on H20 (the MMA is
-                // occupancy-starved + uncoalesced off its batched B<=16 design
-                // point — see qwen_fp8_gemv_use_mma). MMA is opt-in via
-                // ARLE_QWEN35_FP8_GEMV_MMA=1. Parity: cosine 1.0 / max_abs 0 (the
-                // MMA was built to match this scalar kernel). When MMA is opted in
-                // it self-gates on N%8 / K%16 / block_k%128 and returns a
-                // non-success CUresult for shapes it can't tile; on that signal we
-                // reset the sticky error and fall through to the scalar kernel.
-                let mma = x.seq_len <= 16 && qwen_fp8_gemv_use_mma();
-                let mma_ok = if mma {
-                    let res = qwen_quant_profile(
-                        ctx,
-                        "qwen/fp8/gemv_batch_mma",
-                        x.seq_len,
-                        weight.rows,
-                        weight.cols,
-                        || {
-                            Ok(ffi::gemv_fp8_block_scaled_batch_mma_launch(
-                                qw_ptr as *const u8,
-                                scales_ptr as *const f32,
-                                x_ptr as *const ffi::Half,
-                                out_ptr as *mut ffi::Half,
-                                x.seq_len as i32,
-                                weight.rows as i32,
-                                weight.cols as i32,
-                                scale_rows,
-                                scale_cols,
-                                block_m,
-                                block_k,
-                                stream,
-                            ))
-                        },
-                    )?;
-                    // CUresult::InvalidValue (1) is the kernel's "can't tile
-                    // this shape" fall-through signal; any other error is real.
-                    match res.result() {
-                        Ok(()) => true,
-                        Err(_)
-                            if res == cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE =>
-                        {
-                            false
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                } else {
-                    false
-                };
-                log_qwen_fp8_gemv_path(mma, mma_ok);
-                if !mma_ok {
-                    qwen_quant_profile(
-                        ctx,
-                        "qwen/fp8/gemv_batch",
-                        x.seq_len,
-                        weight.rows,
-                        weight.cols,
-                        || {
-                            Ok(ffi::gemv_fp8_block_scaled_batch_cuda(
-                                qw_ptr as *const u8,
-                                scales_ptr as *const f32,
-                                x_ptr as *const ffi::Half,
-                                out_ptr as *mut ffi::Half,
-                                x.seq_len as i32,
-                                weight.rows as i32,
-                                weight.cols as i32,
-                                scale_rows,
-                                scale_cols,
-                                block_m,
-                                block_k,
-                                stream,
-                            )
-                            .result()?)
-                        },
-                    )?;
-                }
+                // The coalesced scalar warp-per-row GEMV is the production path:
+                // 3.6x faster than the tensor-core MMA tile at B=1 decode on H20
+                // (the MMA was occupancy-starved + uncoalesced off its batched
+                // B<=16 design point — KILLED, see
+                // docs/experience/wins/2026-06-22-qwen-fp8-decode-gemv-scalar.md).
+                qwen_quant_profile(
+                    ctx,
+                    "qwen/fp8/gemv_batch",
+                    x.seq_len,
+                    weight.rows,
+                    weight.cols,
+                    || {
+                        Ok(ffi::gemv_fp8_block_scaled_batch_cuda(
+                            qw_ptr as *const u8,
+                            scales_ptr as *const f32,
+                            x_ptr as *const ffi::Half,
+                            out_ptr as *mut ffi::Half,
+                            x.seq_len as i32,
+                            weight.rows as i32,
+                            weight.cols as i32,
+                            scale_rows,
+                            scale_cols,
+                            block_m,
+                            block_k,
+                            stream,
+                        )
+                        .result()?)
+                    },
+                )?;
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(

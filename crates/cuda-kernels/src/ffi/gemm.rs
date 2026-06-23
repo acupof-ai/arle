@@ -333,28 +333,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // CUTLASS-MMA port of the Qwen f32-block-scale FP8 batched GEMV (decode
-    // shape B <= 16). Clone of `dsv4_fp8_gemv_batch_mma_launch` with the scale
-    // decode swapped from E8M0 (`*const u8`) to the Qwen f32 block-scale
-    // (`*const f32`, explicit block_m/block_k). Self-gates on N%8 / K%16 and
-    // block_k % 128 == 0, returning a non-success CUresult for shapes it can't
-    // tile so the caller falls back to `gemv_fp8_block_scaled_batch_cuda`.
-    // Routed from `quant_linear.rs` the DEFAULT decode FP8 dense path (scalar fallback for uncovered shapes).
-    pub fn gemv_fp8_block_scaled_batch_mma_launch(
-        weight: *const u8,
-        scales: *const f32,
-        input: *const Half,
-        output: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        block_m: i32,
-        block_k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn gemv_fp4_e2m1_group_cuda(
         weight: *const u8,
         scales: *const u8,
