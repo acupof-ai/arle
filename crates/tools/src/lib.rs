@@ -1087,23 +1087,20 @@ fn execute_python(code: &str) -> String {
     }
 }
 
-/// Read a file and return its lines numbered as `{n}\t{line}` (1-based `n`).
+/// Pure formatting half of [`execute_read`]: given in-memory file `contents`,
+/// produce the numbered-line view (1-based `{n}\t{line}`) with the same
+/// windowing, footer, per-line clip and `clip_middle` backstop. Does NO
+/// filesystem IO — `path` is used only for the empty-file note. Shared by the
+/// local-fs reader and the container-sandbox executor so both hardened views
+/// stay byte-for-byte identical.
+///
 /// `start`/`end` are inclusive 1-based bounds; either may be omitted. Without
-/// `end`, at most [`READ_WINDOW`] lines from `start` are returned and a
+/// `end`, at most `READ_WINDOW` lines from `start` are returned and a
 /// `[lines s-e of total]` footer tells the agent more remains. Over-long lines
 /// are clipped so a minified file can't blow the context.
-fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
+pub fn format_read(contents: &str, path: &str, start: Option<i64>, end: Option<i64>) -> String {
     const READ_WINDOW: i64 = 400;
     const MAX_LINE_CHARS: usize = 2000;
-
-    let resolved = resolve_sandbox_path(path);
-    if resolved.is_dir() {
-        return format!("ERROR: {path} is a directory (use bash `ls` to list it)");
-    }
-    let contents = match std::fs::read_to_string(&resolved) {
-        Ok(c) => c,
-        Err(_) => return format!("ERROR: no such file: {path}"),
-    };
 
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len() as i64;
@@ -1134,6 +1131,22 @@ fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
     out
 }
 
+/// Read a file and return its lines numbered as `{n}\t{line}` (1-based `n`).
+/// Resolves the path, handles the is-a-directory / no-such-file cases, reads
+/// the file, then delegates ALL formatting to [`format_read`].
+fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
+    let resolved = resolve_sandbox_path(path);
+    if resolved.is_dir() {
+        return format!("ERROR: {path} is a directory (use bash `ls` to list it)");
+    }
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(_) => return format!("ERROR: no such file: {path}"),
+    };
+
+    format_read(&contents, path, start, end)
+}
+
 /// Create parent directories and (over)write `content` to `path`.
 fn execute_write(path: &str, content: &str) -> String {
     let resolved = resolve_sandbox_path(path);
@@ -1148,7 +1161,36 @@ fn execute_write(path: &str, content: &str) -> String {
     }
 }
 
+/// Pure match-counting + guard half of [`execute_replace`]: given in-memory
+/// `contents`, validate the `old`/`new` pair and produce the post-replace
+/// string. Does NO filesystem IO. On any guard failure (empty `old`,
+/// `old == new`, 0 matches, >1 matches) returns `Err(message)` with the exact
+/// same error strings the tool surfaces; on a unique match returns
+/// `Ok(new_file_contents)`. `path` is used only in the error messages. Shared
+/// by the local-fs replacer and the container-sandbox executor.
+pub fn apply_replace(contents: &str, path: &str, old: &str, new: &str) -> Result<String, String> {
+    if old.is_empty() {
+        return Err("ERROR: 'old' is empty; provide the exact text to replace".to_string());
+    }
+    if old == new {
+        return Err("ERROR: 'old' and 'new' are identical; nothing to change".to_string());
+    }
+
+    let count = contents.matches(old).count();
+    match count {
+        0 => Err(format!(
+            "ERROR: 'old' not found in {path}; copy it EXACTLY incl. whitespace/indentation (read the file to check)"
+        )),
+        1 => Ok(contents.replacen(old, new, 1)),
+        n => Err(format!(
+            "ERROR: 'old' occurs {n} times in {path}; add surrounding lines to make the match unique"
+        )),
+    }
+}
+
 /// Replace exactly one unique occurrence of `old` with `new` in `path`.
+/// Resolves the path and reads the file, delegates the match-counting + guard
+/// logic to [`apply_replace`], then writes the result back.
 fn execute_replace(path: &str, old: &str, new: &str) -> String {
     let resolved = resolve_sandbox_path(path);
     let contents = match std::fs::read_to_string(&resolved) {
@@ -1156,28 +1198,12 @@ fn execute_replace(path: &str, old: &str, new: &str) -> String {
         Err(_) => return format!("ERROR: no such file: {path}"),
     };
 
-    if old.is_empty() {
-        return "ERROR: 'old' is empty; provide the exact text to replace".to_string();
-    }
-    if old == new {
-        return "ERROR: 'old' and 'new' are identical; nothing to change".to_string();
-    }
-
-    let count = contents.matches(old).count();
-    match count {
-        0 => format!(
-            "ERROR: 'old' not found in {path}; copy it EXACTLY incl. whitespace/indentation (read the file to check)"
-        ),
-        1 => {
-            let replaced = contents.replacen(old, new, 1);
-            match std::fs::write(&resolved, replaced) {
-                Ok(()) => format!("OK: replaced 1 occurrence in {path}"),
-                Err(e) => format!("ERROR: failed to write {path}: {e}"),
-            }
-        }
-        n => format!(
-            "ERROR: 'old' occurs {n} times in {path}; add surrounding lines to make the match unique"
-        ),
+    match apply_replace(&contents, path, old, new) {
+        Err(msg) => msg,
+        Ok(replaced) => match std::fs::write(&resolved, replaced) {
+            Ok(()) => format!("OK: replaced 1 occurrence in {path}"),
+            Err(e) => format!("ERROR: failed to write {path}: {e}"),
+        },
     }
 }
 
@@ -1463,5 +1489,50 @@ mod tests {
         assert!(super::execute_replace(path, "foo", "x").contains("occurs 2 times"));
         assert!(super::execute_replace(path, "bar", "baz").starts_with("OK"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "foo baz foo\n");
+    }
+
+    #[test]
+    fn format_read_on_string_matches_window() {
+        let body: String = (1..=900).map(|i| format!("L{i}\n")).collect();
+        let out = super::format_read(&body, "synthetic.txt", None, None);
+        assert!(out.contains("1\tL1"), "shows first line: {out:.80}");
+        assert!(out.contains("400\tL400"), "shows last shown line of window");
+        assert!(!out.contains("401\tL401"), "stops at window");
+        assert!(out.ends_with("[lines 1-400 of 900]"), "footer: {out:?}");
+    }
+
+    #[test]
+    fn apply_replace_pure_unique() {
+        let contents = "foo bar foo\n";
+        let path = "synthetic.txt";
+        // Unique match returns the replaced string.
+        assert_eq!(
+            super::apply_replace(contents, path, "bar", "baz"),
+            Ok("foo baz foo\n".to_string())
+        );
+        // 0 matches.
+        assert!(
+            super::apply_replace(contents, path, "zzz", "x")
+                .unwrap_err()
+                .contains("not found")
+        );
+        // >1 matches.
+        assert!(
+            super::apply_replace(contents, path, "foo", "x")
+                .unwrap_err()
+                .contains("occurs 2 times")
+        );
+        // old == new.
+        assert!(
+            super::apply_replace(contents, path, "foo", "foo")
+                .unwrap_err()
+                .contains("identical")
+        );
+        // empty old.
+        assert!(
+            super::apply_replace(contents, path, "", "x")
+                .unwrap_err()
+                .contains("empty")
+        );
     }
 }
