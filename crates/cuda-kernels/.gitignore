@@ -1,0 +1,3 @@
+# generated TileLang AOT artifacts — the per-SM *.c (cubin-as-text) is the consumed build input and STAYS tracked;
+generated/**/*.cubin
+generated/**/*_device_kernel.cu
