@@ -112,6 +112,13 @@ pub(crate) enum CudaModelKind {
     Dsv4,
     /// DiffusionGemma/Gemma4 block-diffusion checkpoint. Not a CUDA AR path.
     DiffusionGemma,
+    /// Vanilla public Qwen3-MoE (`model_type=qwen3_moe`,
+    /// `Qwen3MoeForCausalLM`) — NOT ARLE's Qwen3.5/3.6 (`qwen3_5*`). The
+    /// qwen35 CUDA loader is hardwired for gated-attn + `model.language_model`
+    /// prefix + shared-expert, none of which vanilla Qwen3-MoE has, so it can
+    /// never load on CUDA today. Classified distinctly so the load path
+    /// fails fast with an actionable message instead of an opaque serde error.
+    Qwen3MoeUnsupported,
 }
 
 /// Pure classification of a parsed `config.json`: DeepSeek-V4 by
@@ -144,6 +151,17 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     {
         return CudaModelKind::DiffusionGemma;
     }
+    // Vanilla public Qwen3-MoE (`model_type=qwen3_moe`) is a different schema
+    // and a different forward from ARLE's Qwen3.5/3.6 (`qwen3_5*`): no gated
+    // attn, no `model.language_model` prefix, no shared expert. The qwen35
+    // CUDA loader cannot load it, so fail fast here rather than fall through to
+    // the MoE→Qwen35 branch (which then errors with an opaque serde mismatch).
+    // Key on `model_type`, NOT the architecture string: Qwen3.6 ships
+    // `model_type=qwen3_5` but a bare `Qwen3MoeForCausalLM` architecture, so
+    // an arch-based guard would misroute it.
+    if model_type == "qwen3_moe" {
+        return CudaModelKind::Qwen3MoeUnsupported;
+    }
     let expert_count = |key: &str| v.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
     let is_qwen35 = matches!(model_type, "qwen3_5" | "qwen3_5_moe") || arch_contains("Qwen3_5");
     let is_moe = arch_contains("Moe")
@@ -169,9 +187,22 @@ mod classify_tests {
             ),
             CudaModelKind::Qwen3Dense
         );
+        // Bare `Qwen3MoeForCausalLM` architecture with NO `model_type` is how
+        // Qwen3.6 ships its arch field; the qwen35 loader handles it, so it must
+        // stay Qwen35. The vanilla-Qwen3-MoE guard keys on `model_type`, not the
+        // architecture string, precisely so this case is unaffected.
         assert_eq!(
             classify_cuda_model(&json!({"architectures": ["Qwen3MoeForCausalLM"]})),
             CudaModelKind::Qwen35
+        );
+        // Vanilla public Qwen3-MoE: same architecture string BUT
+        // `model_type=qwen3_moe`. Must classify as the unsupported kind (the
+        // load path turns this into a clear `--backend metal` bail), NOT Qwen35.
+        assert_eq!(
+            classify_cuda_model(
+                &json!({"architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe", "num_experts": 128})
+            ),
+            CudaModelKind::Qwen3MoeUnsupported
         );
         assert_eq!(
             classify_cuda_model(
@@ -1248,7 +1279,9 @@ mod backend {
             CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len()
                 .saturating_add(4096)
                 .saturating_mul(num_slots.max(1)),
-            CudaModelKind::DiffusionGemma => config.total_pages.saturating_mul(ps),
+            CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
+                config.total_pages.saturating_mul(ps)
+            }
         };
         capacity_tokens.div_ceil(ps).max(config.total_pages)
     }
@@ -1327,6 +1360,12 @@ mod backend {
                  DiffusionGemma forward path or weight mapping"
             );
         }
+        if matches!(kind, CudaModelKind::Qwen3MoeUnsupported) {
+            anyhow::bail!(
+                "vanilla Qwen3-MoE (Qwen3MoeForCausalLM) is not supported on the \
+                 CUDA backend; use --backend metal"
+            );
+        }
         // Resolve the requested KV dtype against the CUDA support matrix at the
         // engine boundary, mirroring the Metal path's `MetalKvCacheDtype::resolve`
         // (#68 T2). Admits BF16/INT8/FP8 (tq4 fails loud — see resolve); the
@@ -1363,14 +1402,21 @@ mod backend {
         // CUDA arms fail closed without an API-layer model branch.
         if matches!(kind, CudaModelKind::Dsv4) {
             scheduler.chunked_prefill_size = 4096;
-            // Long-context: lift the prompt/total token caps to the model's
-            // configured max_seq_len so a 900K-token needle isn't rejected with an
-            // empty completion. The 32768/65536 defaults are a short-context DoS
-            // guard, not a model limit; DSv4's KV budget (dsv4.rs) separately
-            // clamps slot count to what HBM affords at this length.
+            // Bind the ingress prompt/total caps DOWN to the executor's real slot
+            // capacity (`dsv4_max_seq_len()`). The DSv4 forward asserts
+            // `start_pos + tokens.len() <= slot.max_seq_len` (dsv4.rs); an over-
+            // length prompt that clears ingress reaches that assert, returns Err
+            // from engine.step(), and the multiproc worker propagates the Err →
+            // EVERY TP worker process exits. Reject such prompts gracefully at
+            // ingress instead (FinishReason::Abort → empty/finished completion).
+            // Use `.min()`, not assign: scheduler_config() already copied the
+            // user's `--max-prompt-tokens` in, and a stricter user cap must be
+            // RESPECTED — assigning would clobber the flag in both directions.
+            // `max_seq` is identical on every rank (env or const), so the
+            // lockstep-determinism invariant holds.
             let max_seq = infer_cuda::dsv4_max_seq_len();
-            scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.max(max_seq);
-            scheduler.max_total_tokens = scheduler.max_total_tokens.max(max_seq + 4096);
+            scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(max_seq);
+            scheduler.max_total_tokens = scheduler.max_total_tokens.min(max_seq + 4096);
         }
         let num_slots = config.num_slots;
         let page_size = config.page_size;
@@ -1416,7 +1462,9 @@ mod backend {
                 config.mtp_draft_tokens,
                 config.mtp_draft_topk,
             )?,
-            CudaModelKind::DiffusionGemma => unreachable!("checked before CUDA executor build"),
+            CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
+                unreachable!("checked before CUDA executor build")
+            }
         };
         let mut executor = executor;
         if let Some(bytes) = config.kv_t1_budget_bytes {
