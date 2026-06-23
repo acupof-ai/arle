@@ -48,21 +48,6 @@ static bool dsv4_fp8_gemv_mma_enabled() {
 #define DSV4_BATCH_TILE 32
 #define QWEN_GEMV_BATCH_TILE 8
 
-// Opt-in (ARLE_QWEN_GEMV_TILED=1): route the Qwen FP8 block-scaled B>1 decode
-// GEMV through the weight-amortizing tiled kernel — one weight-row HBM read per
-// tile of QWEN_GEMV_BATCH_TILE columns, vs the per-batch-element kernel (grid.y
-// = B, one weight-row read per column). REDUCES the spec-decode verify cost at
-// B>1; B==1 keeps the proven B=1-tuned path byte-for-byte (no added cost to the
-// no-spec hot path). Latched once (decode is hot).
-static bool qwen_gemv_tiled_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = getenv("ARLE_QWEN_GEMV_TILED");
-        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
-    }
-    return cached != 0;
-}
-
 __device__ __constant__ float DSV4_FP4_E2M1_LUT[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
@@ -948,7 +933,7 @@ __global__ void fp8_f32_block_gemv_batch_kernel(
 }
 
 // Weight-amortizing batch GEMV for the Qwen FP8 block-scaled decode path
-// (opt-in via qwen_gemv_tiled_enabled). grid.y maps to a tile of
+// (default for B>1). grid.y maps to a tile of
 // QWEN_GEMV_BATCH_TILE columns: each 16-byte weight chunk is read once
 // (L1-resident across the inner batch loop) and MAC'd against every column in
 // the tile, vs fp8_f32_block_gemv_batch_kernel which re-streams the weight row
@@ -3356,10 +3341,12 @@ cudaError_t gemv_fp8_block_scaled_batch_cuda(
         block_m <= 0 || block_k <= 0) {
         return cudaErrorInvalidValue;
     }
-    // B>1 (the spec-decode verify, B=2..) + opt-in: tile the batch so each weight
-    // row streams from HBM once per tile instead of once per column. B==1 keeps
-    // the optimized single-column decode kernel byte-for-byte.
-    if (B > 1 && qwen_gemv_tiled_enabled()) {
+    // B>1 (spec-decode verify / batched decode): always tile the batch so each
+    // weight row streams from HBM ONCE per tile (TILE==B) instead of once per
+    // column — measured strictly faster than the per-column grid.y=B kernel for
+    // B>1 (H20: verify 82.7→60.7ms; the lever that makes MTP spec-decode a net
+    // win). B==1 keeps the proven single-column kernel byte-for-byte unchanged.
+    if (B > 1) {
         dim3 block(GEMV_THREADS);
         // Instantiate TILE == B for the small spec-verify depths (grid.y=1 →
         // weight read ONCE, register pressure == B). B>8 falls back to the
