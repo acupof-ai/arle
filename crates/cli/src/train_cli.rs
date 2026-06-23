@@ -1506,7 +1506,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // pre-weight-share order. --share-frozen-base: the engine must load FIRST so
     // the student can import (zero-copy) its resident FP8 base, so the student
     // load is deferred to the `match` below.
-    let prebuilt_student = if args.share_frozen_base {
+    let prebuilt_student = if !args.no_share_frozen_base {
         None
     } else {
         eprintln!(
@@ -1557,7 +1557,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // engine's resident FP8 base pointers, map to the loader's backend-agnostic
     // table, and pass it into the autograd student load so its frozen FP8 base
     // projections import a NON-OWNING view instead of allocating ~27 GB.
-    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if args.share_frozen_base {
+    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if !args.no_share_frozen_base {
         let table = student_engine
             .frozen_base_fp8_pointers()
             .context("borrow rollout-engine FP8 base pointers for --share-frozen-base")?;
@@ -1581,7 +1581,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let shared_base = if args.share_frozen_base {
+    let shared_base = if !args.no_share_frozen_base {
         Some(shared_base_entries.as_slice())
     } else {
         None
@@ -1614,7 +1614,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     // student's own trainable-suffix uploads) before the first autograd forward so
     // the shared bytes are guaranteed valid across the (separate) train/infer
     // streams on the shared primary context (cross-stream handoff fence).
-    if args.share_frozen_base {
+    if !args.no_share_frozen_base {
         train_backend
             .device_synchronize()
             .context("device sync before first shared-base autograd forward")?;
@@ -1700,7 +1700,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         writeback_batch: args.writeback_batch,
         correction_cap: args.correction_cap,
         correction_max_tokens: args.correction_max_tokens,
-        share_frozen_base: args.share_frozen_base,
+        share_frozen_base: !args.no_share_frozen_base,
         distill_shortest: args.distill_shortest,
     };
 
@@ -1844,9 +1844,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use autograd::optim::AdamW;
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
-        infer_student::{InferStudent, save_lora_adapters},
-        lora::LoraConfig,
+        infer_student::InferStudent,
+        lora::{LoraAdapterConfig, LoraConfig, LoraTargetSet},
         opd::rubric_writeback_ce_step_batched,
+        qwen35_checkpoint::{
+            ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StudentWeights,
+            save_named_qwen35_student_checkpoint,
+        },
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         swe_dataset::SweTask,
     };
@@ -1897,7 +1901,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // Load order: default loads the autograd student FIRST (engine then sees
     // post-student free VRAM — byte-identical). --share-frozen-base loads the
     // engine FIRST so the student can import (zero-copy) its resident FP8 base.
-    let prebuilt_student = if args.share_frozen_base {
+    let prebuilt_student = if !args.no_share_frozen_base {
         None
     } else {
         eprintln!(
@@ -1941,7 +1945,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
     // engine's resident FP8 base pointers and pass them into the autograd student
     // load so its frozen FP8 base projections import a NON-OWNING view.
-    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if args.share_frozen_base {
+    let shared_base_entries: Vec<SharedFrozenBaseEntry> = if !args.no_share_frozen_base {
         let table = student_engine
             .frozen_base_fp8_pointers()
             .context("borrow rollout-engine FP8 base pointers for --share-frozen-base")?;
@@ -1965,7 +1969,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let shared_base = if args.share_frozen_base {
+    let shared_base = if !args.no_share_frozen_base {
         Some(shared_base_entries.as_slice())
     } else {
         None
@@ -1992,7 +1996,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     // Shared-base bytes alias the engine's resident FP8 — drain in-flight device
     // work before the first autograd forward (cross-stream handoff fence).
-    if args.share_frozen_base {
+    if !args.no_share_frozen_base {
         train_backend
             .device_synchronize()
             .context("device sync before first shared-base autograd forward")?;
@@ -2035,6 +2039,18 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         pythonpath: args.pythonpath.clone(),
         bash_timeout_secs: args.bash_timeout_secs,
         test_timeout_secs: args.test_timeout_secs,
+    };
+
+    // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
+    // adapter_config.json + adapter_model.safetensors). Built once; borrowed by
+    // every per-round adapter save.
+    let lora_adapter_config = {
+        let mut config = LoraAdapterConfig::new(student_dir.display().to_string(), "qwen35", lora);
+        config.target_modules = match target_set {
+            LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
+            LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
+        };
+        config
     };
 
     for round in 0..args.rounds {
@@ -2082,20 +2098,42 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
             .context("sync trained LoRA into rollout engine")?;
 
-        // Fast adapter-only (LoRA) save — avoids the full-materialize host-loop hang.
+        // Fast adapter-only (LoRA) save as a mainstream HF PEFT adapter dir
+        // (adapter_config.json + adapter_model.safetensors) — loadable by HF PEFT
+        // / vLLM / SGLang. Avoids the full-materialize host-loop hang.
         if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
             if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
                 fs::create_dir_all(adapter_dir).with_context(|| {
                     format!("create LoRA adapter dir {}", adapter_dir.display())
                 })?;
-                let out = adapter_dir.join(format!("adapters_round{}.safetensors", round + 1));
+                let sources = checkpoint_sources(student_dir)?;
+                let dirname = format!("adapters_round{}", round + 1);
                 let started = Instant::now();
-                save_lora_adapters(&mut store, &student.adapter_name_map(), &out)
-                    .with_context(|| format!("save LoRA adapters at round {}", round + 1))?;
+                let mut adapter_tape = Tape::new();
+                let saved_dir = save_named_qwen35_student_checkpoint(
+                    Qwen35NamedCheckpoint {
+                        out_dir: adapter_dir,
+                        dirname: &dirname,
+                        tokenizer_path: Some(&sources.tokenizer_path),
+                        config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
+                        generation_config: GenerationConfigSource::CopyOrSynthesize {
+                            source_path: &sources.generation_config_path,
+                            fallback_config_path: &sources.config_path,
+                        },
+                    },
+                    &student,
+                    &mut store,
+                    &mut adapter_tape,
+                    Qwen35StudentWeights::AdapterOnly {
+                        bf16: true,
+                        adapter_config: &lora_adapter_config,
+                    },
+                )
+                .with_context(|| format!("save LoRA PEFT adapter dir at round {}", round + 1))?;
                 println!(
-                    "checkpoint_saved kind=lora_adapters mode=agent-opd step={} dir={} seconds={:.6}",
+                    "checkpoint_saved kind=peft_adapter mode=agent-opd step={} dir={} seconds={:.6}",
                     round + 1,
-                    out.display(),
+                    saved_dir.display(),
                     started.elapsed().as_secs_f64()
                 );
             }
