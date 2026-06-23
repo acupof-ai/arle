@@ -518,10 +518,47 @@ pub(crate) struct Qwen35SpecSlotState {
     gdr_snap: Vec<CudaSlice<f32>>,
     /// Pre-verify snapshot of the trunk linear-attn conv rings (bf16).
     conv_snap: Vec<DeviceVec>,
+    /// Per-linear-layer capture of the verify forward's gated-delta inputs, for
+    /// the cheap partial-accept linear-only replay (see [`Qwen35LinearCapture`]).
+    capture: Qwen35LinearCapture,
     /// Persistent 1-element argmax scratch shared by the draft + the two verify
     /// rows, so a spec step performs ZERO per-token argmax allocations and the
     /// verify argmax stays on-device (no full `[seq, vocab]` D2H).
     argmax_scratch: CudaSlice<i32>,
+}
+
+/// Per-linear-layer capture of the gated-delta-rule inputs from the spec verify
+/// forward, sized for the full `depth+1`-row chain — the substrate for the
+/// cheap partial-accept replay.
+///
+/// On a partial accept (`k < depth`) the trunk linear state must be left at the
+/// post-`[pending, d1..dk]` position. The old path re-ran a FULL `depth+1`-wide
+/// trunk forward (`forward_hidden`) over the accepted prefix purely for that
+/// recurrent side-effect (21-47 ms per macro-step on H20 real-fp8). The state
+/// the GDR + conv1d kernels advance is a pure function of their per-layer inputs
+/// (the post-in_proj `qkv` PRE-conv1d, plus the `b`/`a` gate projections); those
+/// inputs already encode the full-stack residual because the verify produced
+/// them with the real trunk. So instead of recomputing them we **cache them
+/// during verify** and re-run ONLY conv1d + the recurrent GDR over rows
+/// `[0..=k]` on a partial accept — bit-identical to the verify's first `k+1`
+/// recurrent steps (same kernels, same inputs, same in-place math), skipping
+/// every full-attn block, every MLP/MoE, the final norm, and the lm_head.
+///
+/// All three caches are token-major `[(depth+1), width]` bf16 (token `t` at
+/// offset `t*width`), so rows `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
+/// Allocated only with the spec state, so the baseline decode path never pays.
+#[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
+pub(crate) struct Qwen35LinearCapture {
+    /// Number of layers (== `num_linear`); the per-row stride is each buffer's
+    /// `len / (depth+1)`.
+    rows: usize,
+    /// Post-in_proj fused `[q|k|v]` (PRE-conv1d) for all `depth+1` rows, one per
+    /// linear layer; feeds `conv1d_prefill_cuda` on replay.
+    qkv: Vec<DeviceVec>,
+    /// `in_proj_b` projection (one scalar per local v-head) for all rows.
+    b_proj: Vec<DeviceVec>,
+    /// `in_proj_a` projection (one scalar per local v-head) for all rows.
+    a_proj: Vec<DeviceVec>,
 }
 
 #[allow(dead_code)] // consumed by mtp_forward_level + spec_step (next increments)
@@ -1318,8 +1355,17 @@ impl Qwen35Model {
         let gdr_state_len =
             self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
         let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        let qkv_dim = self.local_linear_qkv_dim();
+        // b/a are one scalar per LOCAL value head, sharded identically on every
+        // linear layer (`in_proj_b`/`in_proj_a` rows == local_linear_v_heads),
+        // so the capture stride is uniform across layers.
+        let ba_dim = self.local_linear_v_heads;
+        let cap_rows = depth + 1;
         let mut gdr_snap = Vec::with_capacity(num_linear);
         let mut conv_snap = Vec::with_capacity(num_linear);
+        let mut cap_qkv = Vec::with_capacity(num_linear);
+        let mut cap_b = Vec::with_capacity(num_linear);
+        let mut cap_a = Vec::with_capacity(num_linear);
         for _ in 0..num_linear {
             gdr_snap.push(
                 self.ctx
@@ -1328,12 +1374,21 @@ impl Qwen35Model {
                     .map_err(|e| anyhow!("alloc spec gated-delta snapshot failed: {e}"))?,
             );
             conv_snap.push(DeviceVec::zeros(&self.ctx, conv_len)?);
+            cap_qkv.push(DeviceVec::zeros(&self.ctx, cap_rows * qkv_dim)?);
+            cap_b.push(DeviceVec::zeros(&self.ctx, cap_rows * ba_dim)?);
+            cap_a.push(DeviceVec::zeros(&self.ctx, cap_rows * ba_dim)?);
         }
         Ok(Qwen35SpecSlotState {
             head_k: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
             head_v: DeviceVec::zeros(&self.ctx, (depth + 1) * kv_dim)?,
             gdr_snap,
             conv_snap,
+            capture: Qwen35LinearCapture {
+                rows: cap_rows,
+                qkv: cap_qkv,
+                b_proj: cap_b,
+                a_proj: cap_a,
+            },
             argmax_scratch: self
                 .ctx
                 .stream
@@ -2325,6 +2380,23 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<()> {
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None)
+    }
+
+    /// [`Self::forward_hidden`] with an optional per-linear-layer gated-delta
+    /// input capture (spec verify only). When `capture` is `Some`, each linear
+    /// layer copies its post-in_proj `qkv` (PRE-conv1d) + `b`/`a` projections
+    /// for all rows into the capture so a partial-accept replay can re-run only
+    /// conv1d + GDR (see [`Qwen35LinearCapture`]). `None` is byte-for-byte the
+    /// old `forward_hidden` (the capture branch is fully elided).
+    fn forward_hidden_capture(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        capture: Option<&mut Qwen35LinearCapture>,
+    ) -> Result<()> {
         ensure!(
             !tokens.is_empty(),
             "Qwen3.5 hybrid forward requires at least one token"
@@ -2343,7 +2415,7 @@ impl Qwen35Model {
             self.max_seq_len
         );
         self.stage_step_inputs(ws, tokens, start_pos)?;
-        self.forward_hidden_staged(slot, ws, seq_len, start_pos)?;
+        self.forward_hidden_staged(slot, ws, seq_len, start_pos, capture)?;
         slot.seq_len += seq_len;
         Ok(())
     }
@@ -2386,6 +2458,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         seq_len: usize,
         start_pos: usize,
+        mut capture: Option<&mut Qwen35LinearCapture>,
     ) -> Result<()> {
         let c = &self.config;
         let eps = c.rms_norm_eps;
@@ -2458,12 +2531,17 @@ impl Qwen35Model {
                     full_idx += 1;
                 }
                 Qwen35Attn::Linear(lin) => {
+                    let cap = capture.as_deref_mut();
                     qwen35_profile(
                         &self.ctx,
                         "qwen/linear_attention",
                         Some(layer_idx),
                         seq_len,
-                        || self.linear_attention(lin, normed, slot, linear_idx, linear, attn_out),
+                        || {
+                            self.linear_attention(
+                                lin, normed, slot, linear_idx, linear, attn_out, cap,
+                            )
+                        },
                     )?;
                     linear_idx += 1;
                 }
@@ -2688,7 +2766,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         start_pos: usize,
     ) -> Result<()> {
-        self.forward_hidden_staged(slot, ws, 1, start_pos)?;
+        self.forward_hidden_staged(slot, ws, 1, start_pos, None)?;
         self.lm_head_logits(ws, 1)
     }
 
@@ -2822,8 +2900,9 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
+        capture: Option<&mut Qwen35LinearCapture>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
-        self.forward_hidden(slot, ws, tokens, start_pos)?;
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture)?;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
@@ -3064,8 +3143,11 @@ impl Qwen35Model {
         let snap_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         // 3. Verify the whole chain in ONE trunk forward → per-row logits + hiddens.
-        //    Advances the full-attn KV + 48 linear states by depth+1 tokens.
-        let (logits, dims, hiddens) = self.forward_tokens_verify(slot, ws, &chain, start_pos)?;
+        //    Advances the full-attn KV + 48 linear states by depth+1 tokens, and
+        //    captures each linear layer's gated-delta inputs for ALL depth+1 rows
+        //    (the cheap partial-accept replay reads them; see step 5).
+        let (logits, dims, hiddens) =
+            self.forward_tokens_verify(slot, ws, &chain, start_pos, Some(&mut spec.capture))?;
         ensure!(
             dims == [depth + 1, vocab],
             "spec verify dims {dims:?} != [{}, {vocab}]",
@@ -3104,11 +3186,15 @@ impl Qwen35Model {
         emitted.push(bonus);
         if k < depth {
             spec.restore_trunk(&self.ctx, slot)?;
-            slot.set_seq_len(start_pos);
-            // Replay [pending, d1..dk] (k+1 tokens) — forward_hidden re-advances the
-            // linear state + full-attn KV + seq_len to start_pos+k+1, identical to
-            // the verify's first k+1 recurrent steps.
-            self.forward_hidden(slot, ws, &chain[0..=k], start_pos)?;
+            // LINEAR-ONLY replay: restore_trunk just rewound the 48 gated-delta
+            // recurrent + conv rings to S_{start_pos}; re-advance ONLY them over
+            // the accepted prefix `[pending, d1..dk]` (k+1 rows) from the verify
+            // capture, skipping the full-attn blocks, MLP/MoE, final norm, and
+            // lm_head — the dominant avoidable cost of the old full replay. The
+            // 16 full-attn KV caches self-heal via position-indexing under the
+            // explicit seq_len rewind below; MLP/MoE/lm_head leave no state.
+            self.replay_linear_only(slot, ws, &spec.capture, k)?;
+            slot.set_seq_len(start_pos + k + 1);
         }
         // else k==depth: verify already left seq_len=start_pos+depth+1, state correct.
         let replay_ms = mtp_phase_lap(&self.ctx, &mut pt);
@@ -4384,6 +4470,7 @@ impl Qwen35Model {
         linear_idx: usize,
         lw: &mut LinearAttnScratch,
         out: &mut HiddenStates,
+        capture: Option<&mut Qwen35LinearCapture>,
     ) -> Result<()> {
         let c = &self.config;
         let seq_len = normed.seq_len;
@@ -4430,8 +4517,170 @@ impl Qwen35Model {
             },
         )?;
 
-        // ── conv1d (advances the per-slot conv ring). ──
+        // ── Spec-verify capture: stash this layer's gated-delta inputs (the
+        //    post-in_proj fused `qkv` PRE-conv1d + the `b`/`a` gates) for ALL
+        //    rows, so a partial-accept replay can re-run only conv1d + GDR over
+        //    the accepted prefix (see [`Qwen35LinearCapture`]). conv1d below
+        //    reads `qkv` and writes a SEPARATE `qkv_conv`, so `qkv` is still the
+        //    pristine in_proj output here. No-op (and zero cost) off the spec
+        //    verify path. ──
+        if let Some(cap) = capture {
+            ensure!(
+                linear_idx < cap.qkv.len(),
+                "spec capture has {} linear slots, layer idx {linear_idx} out of range",
+                cap.qkv.len()
+            );
+            ensure!(
+                seq_len <= cap.rows,
+                "spec capture sized for {} rows, verify seq_len {seq_len} exceeds it",
+                cap.rows
+            );
+            // Token-major contiguous: rows `[0..seq_len)` occupy `[0..seq_len*w)`.
+            let dst_qkv = &mut cap.qkv[linear_idx];
+            let mut dq = dst_qkv.data.slice_mut(0..seq_len * qkv_dim);
+            self.ctx
+                .stream
+                .memcpy_dtod(&qkv.data, &mut dq)
+                .map_err(|e| anyhow!("spec linear qkv capture failed: {e}"))?;
+            let dst_b = &mut cap.b_proj[linear_idx];
+            let mut db = dst_b.data.slice_mut(0..seq_len * b_dim);
+            self.ctx
+                .stream
+                .memcpy_dtod(&b_proj.data, &mut db)
+                .map_err(|e| anyhow!("spec linear b capture failed: {e}"))?;
+            let dst_a = &mut cap.a_proj[linear_idx];
+            let mut da = dst_a.data.slice_mut(0..seq_len * a_dim);
+            self.ctx
+                .stream
+                .memcpy_dtod(&a_proj.data, &mut da)
+                .map_err(|e| anyhow!("spec linear a capture failed: {e}"))?;
+        }
+
+        // ── conv1d (advances the per-slot conv ring) + gated-delta rule
+        //    (advances the per-slot recurrent state). Factored into
+        //    [`Self::advance_linear_conv_gdr`] so the partial-accept linear-only
+        //    replay re-runs the IDENTICAL kernel dispatch over the accepted
+        //    prefix from the verify capture (byte-identical state advance). ──
         let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, seq_len)?;
+        let gdr_out = gdr_out.get(&self.ctx, z_dim, seq_len)?;
+        self.advance_linear_conv_gdr(
+            attn,
+            &qkv.data,
+            &b_proj.data,
+            &a_proj.data,
+            slot,
+            linear_idx,
+            seq_len,
+            qkv_conv,
+            gdr_out,
+            fq_q,
+            fq_k,
+            fq_v,
+            fq_a,
+            fq_g,
+            fq_g_cumsum,
+            fq_beta,
+        )?;
+
+        // ── gated output RMSNorm (per value head; gate = z). ──
+        let normed_out = normed_out.get(&self.ctx, z_dim, seq_len)?;
+        {
+            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
+            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
+            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from config.
+            // The kernel launches exactly `num_heads` blocks, each normalizing one
+            // flat `[val_dim]` slice at `blockIdx.x * val_dim` — gdr_out/z are
+            // `[seq_len, Vh*Vd]` row-major, so the grid must cover all
+            // seq_len*Vh (token, head) slices, not just token 0. `weight[tid]`
+            // is a per-[Vd] broadcast (no blockIdx dependence), so the
+            // extension is exact (the monolith's `rms_norm_gated_batch_into`
+            // passed `seq_len * num_heads` identically).
+            qwen35_profile(
+                &self.ctx,
+                "qwen/linear/norm",
+                Some(linear_idx),
+                seq_len,
+                || {
+                    unsafe {
+                        ffi::rms_norm_gated_cuda(
+                            x_ptr as *const ffi::Half,
+                            w_ptr as *const f32,
+                            gate_ptr as *const ffi::Half,
+                            o_ptr as *mut ffi::Half,
+                            (self.local_linear_v_heads * seq_len) as i32,
+                            c.linear_value_head_dim as i32,
+                            c.rms_norm_eps,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        qwen35_profile(
+            &self.ctx,
+            "qwen/linear/out_proj",
+            Some(linear_idx),
+            seq_len,
+            || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
+        )?;
+        // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
+        qwen35_profile(
+            &self.ctx,
+            "qwen/linear/allreduce",
+            Some(linear_idx),
+            seq_len,
+            || self.tp.all_reduce_sum(&self.ctx, out),
+        )?;
+        Ok(())
+    }
+
+    /// Conv1d (advances `slot.conv_states[linear_idx]`) + gated-delta rule
+    /// (advances `slot.gdr_states[linear_idx]`) for one linear layer over
+    /// `seq_len` rows. The ONLY persistent-state-mutating core of
+    /// [`Self::linear_attention`], factored out so the partial-accept replay
+    /// re-runs the IDENTICAL kernel dispatch (same conv1d + same
+    /// recurrent/chunked GDR branch, same inputs) — guaranteeing the conv and
+    /// recurrent state advance is byte-identical between the trunk forward and
+    /// the replay.
+    ///
+    /// `qkv_in` is the post-in_proj fused `[q|k|v]` PRE-conv1d (`qkv_dim` wide,
+    /// token-major); conv1d reads it and writes the SEPARATE `qkv_conv`, which
+    /// the GDR then consumes. `b_in`/`a_in` are the `in_proj_b`/`in_proj_a`
+    /// gate projections. The caller passes buffers that hold AT LEAST `seq_len`
+    /// rows from offset 0 (the kernels read only the first `seq_len`); on the
+    /// replay path the capture buffers hold `depth+1` rows and `seq_len = k+1`.
+    /// `gdr_out` is written but discarded by the replay (only the state
+    /// side-effect matters); the trunk path norms it.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_linear_conv_gdr(
+        &self,
+        attn: &LinearAttn,
+        qkv_in: &CudaSlice<bf16>,
+        b_in: &CudaSlice<bf16>,
+        a_in: &CudaSlice<bf16>,
+        slot: &mut Qwen35SlotState,
+        linear_idx: usize,
+        seq_len: usize,
+        qkv_conv: &mut HiddenStates,
+        gdr_out: &mut HiddenStates,
+        fq_q: &mut HiddenSlot,
+        fq_k: &mut HiddenSlot,
+        fq_v: &mut HiddenSlot,
+        fq_a: &mut HiddenSlot,
+        fq_g: &mut SliceSlot<f32>,
+        fq_g_cumsum: &mut SliceSlot<f32>,
+        fq_beta: &mut SliceSlot<f32>,
+    ) -> Result<()> {
+        let c = &self.config;
+        let qkv_dim = self.local_linear_qkv_dim();
+        let z_dim = self.local_linear_z_dim();
+
+        // ── conv1d (advances the per-slot conv ring). ──
         let conv_state = &mut slot.conv_states[linear_idx];
         ensure!(
             conv_state.len == qkv_dim * (c.linear_conv_kernel_dim - 1),
@@ -4440,7 +4689,7 @@ impl Qwen35Model {
             qkv_dim * (c.linear_conv_kernel_dim - 1)
         );
         {
-            let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
+            let (x_ptr, _g0) = qkv_in.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
             let (s_ptr, _g2) = conv_state.data.device_ptr_mut(&self.ctx.stream);
             let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
@@ -4476,7 +4725,6 @@ impl Qwen35Model {
         //    serial token scan with chunk-parallel TileLang kernels on the
         //    baked Qwen3.6 single-GPU shard. The legacy in-tree chunkwise
         //    TileLang path stays dead (sm_90 hang was in ITS kernels). ──
-        let gdr_out = gdr_out.get(&self.ctx, z_dim, seq_len)?;
         let use_fq_chunked = seq_len > 1
             && qwen35_gdr_chunked_enabled()
             && self.local_linear_k_heads == 16
@@ -4496,8 +4744,8 @@ impl Qwen35Model {
             let gdr_state = &mut slot.gdr_states[linear_idx];
 
             let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
-            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
-            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
+            let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
+            let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
             let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
             let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
             let (q_ptr, _g5) = fq_q.data.device_ptr_mut(&self.ctx.stream);
@@ -4576,8 +4824,8 @@ impl Qwen35Model {
         if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
             let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
-            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
-            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
+            let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
+            let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
             let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
             let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
             let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
@@ -4629,61 +4877,107 @@ impl Qwen35Model {
                 },
             )?;
         }
+        Ok(())
+    }
 
-        // ── gated output RMSNorm (per value head; gate = z). ──
-        let normed_out = normed_out.get(&self.ctx, z_dim, seq_len)?;
-        {
-            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
-            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
-            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
-            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from config.
-            // The kernel launches exactly `num_heads` blocks, each normalizing one
-            // flat `[val_dim]` slice at `blockIdx.x * val_dim` — gdr_out/z are
-            // `[seq_len, Vh*Vd]` row-major, so the grid must cover all
-            // seq_len*Vh (token, head) slices, not just token 0. `weight[tid]`
-            // is a per-[Vd] broadcast (no blockIdx dependence), so the
-            // extension is exact (the monolith's `rms_norm_gated_batch_into`
-            // passed `seq_len * num_heads` identically).
-            qwen35_profile(
-                &self.ctx,
-                "qwen/linear/norm",
-                Some(linear_idx),
-                seq_len,
-                || {
-                    unsafe {
-                        ffi::rms_norm_gated_cuda(
-                            x_ptr as *const ffi::Half,
-                            w_ptr as *const f32,
-                            gate_ptr as *const ffi::Half,
-                            o_ptr as *mut ffi::Half,
-                            (self.local_linear_v_heads * seq_len) as i32,
-                            c.linear_value_head_dim as i32,
-                            c.rms_norm_eps,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                    Ok(())
-                },
-            )?;
+    /// Partial-accept linear-only replay: advance ONLY the 48 gated-delta
+    /// recurrent + conv states over the accepted prefix `[pending, d1..dk]`
+    /// (`k+1` rows) from the verify capture, leaving them byte-identical to the
+    /// old full-trunk `forward_hidden` replay at a tiny fraction of its cost.
+    ///
+    /// Precondition: the caller has just `restore_trunk`-ed the conv + gdr
+    /// states to `S_{start_pos}` (the pre-verify snapshot), so re-running the
+    /// first `k+1` recurrent steps reproduces the verify's `S_{start_pos+k+1}`.
+    /// This re-uses the SAME [`Self::advance_linear_conv_gdr`] dispatch the
+    /// verify forward used, fed the captured per-layer inputs — same conv1d +
+    /// same recurrent/chunked GDR branch + same in-place accumulation, so the
+    /// result is bit-for-bit the verify's first `k+1` steps. The
+    /// recurrent-vs-chunked branch is re-selected from `seq_len = k+1`
+    /// IDENTICALLY to how the old `forward_hidden` replay's `linear_attention`
+    /// selected it (preserving any k==0 decode-vs-chunked path choice).
+    ///
+    /// Mutated device buffers (full enumeration):
+    ///   - `slot.conv_states[li]` for every linear layer `li` — advanced k+1
+    ///     steps from the restored S_start (conv1d ring shift, content-based).
+    ///   - `slot.gdr_states[li]` for every linear layer `li` — advanced k+1
+    ///     steps from the restored S_start (recurrent in-place).
+    ///   - `ws.linear` scratch (`qkv_conv`/`gdr_out`/`fq_*`) — fully overwritten
+    ///     per layer before read; transient, no persistent meaning.
+    ///
+    /// Explicitly NOT touched: the 16 full-attn KV caches (self-heal via the
+    /// caller's `set_seq_len` position rewind), `slot.seq_len` (caller sets it),
+    /// MLP/MoE/lm_head (no persistent state). Numerics-only; no H2D/D2H/sync.
+    fn replay_linear_only(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        capture: &Qwen35LinearCapture,
+        k: usize,
+    ) -> Result<()> {
+        let num_linear = slot.conv_states.len();
+        ensure!(
+            capture.qkv.len() == num_linear
+                && capture.b_proj.len() == num_linear
+                && capture.a_proj.len() == num_linear,
+            "spec capture linear count {}/{}/{} != slot linear layers {num_linear}",
+            capture.qkv.len(),
+            capture.b_proj.len(),
+            capture.a_proj.len()
+        );
+        let rows = k + 1;
+        ensure!(
+            rows <= capture.rows,
+            "spec replay needs {rows} rows but capture holds {}",
+            capture.rows
+        );
+        // The capture buffers hold rows `[0..depth+1)` token-major from offset 0;
+        // `advance_linear_conv_gdr` reads only the first `rows = k+1` from the
+        // base pointer, so the full `.data` slices are passed as-is (no slicing).
+        let qkv_dim = self.local_linear_qkv_dim();
+        let z_dim = self.local_linear_z_dim();
+        let Qwen35Workspace { linear, .. } = ws;
+        let LinearAttnScratch {
+            qkv_conv,
+            gdr_out,
+            fq_q,
+            fq_k,
+            fq_v,
+            fq_a,
+            fq_g,
+            fq_g_cumsum,
+            fq_beta,
+            ..
+        } = linear;
+        let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, rows)?;
+        let gdr_out = gdr_out.get(&self.ctx, z_dim, rows)?;
+        let mut li = 0usize;
+        for layer in &self.layers {
+            if let Qwen35Attn::Linear(attn) = &layer.attn {
+                self.advance_linear_conv_gdr(
+                    attn,
+                    &capture.qkv[li].data,
+                    &capture.b_proj[li].data,
+                    &capture.a_proj[li].data,
+                    slot,
+                    li,
+                    rows,
+                    qkv_conv,
+                    gdr_out,
+                    fq_q,
+                    fq_k,
+                    fq_v,
+                    fq_a,
+                    fq_g,
+                    fq_g_cumsum,
+                    fq_beta,
+                )?;
+                li += 1;
+            }
         }
-
-        qwen35_profile(
-            &self.ctx,
-            "qwen/linear/out_proj",
-            Some(linear_idx),
-            seq_len,
-            || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
-        )?;
-        // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
-        qwen35_profile(
-            &self.ctx,
-            "qwen/linear/allreduce",
-            Some(linear_idx),
-            seq_len,
-            || self.tp.all_reduce_sum(&self.ctx, out),
-        )?;
+        ensure!(
+            li == num_linear,
+            "spec replay advanced {li} linear layers != slot count {num_linear}"
+        );
         Ok(())
     }
 
