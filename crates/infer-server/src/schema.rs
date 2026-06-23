@@ -85,6 +85,13 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
     pub stream: Option<bool>,
     pub stop: Option<Vec<String>>,
+    /// Pass-through extra arguments for the checkpoint's Jinja chat template
+    /// (vLLM / SGLang field name). The HF chat-template render receives these
+    /// as top-level context variables — most notably `enable_thinking: bool`,
+    /// which toggles the Qwen `{% if enable_thinking %}` reasoning branch.
+    /// Absent (the default) renders byte-identically to before this field.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ChatCompletionRequest {
@@ -118,6 +125,18 @@ impl ChatCompletionRequest {
             self.stop_token_ids.clone(),
             self.seed,
         )
+    }
+
+    /// Whether `chat_template_kwargs.enable_thinking` is set truthy. Used only
+    /// to decide if the max-thinking-token budget applies; absent or
+    /// non-boolean → `false` (no budget clamp, today's behavior).
+    #[must_use]
+    pub(crate) fn enable_thinking(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.get("enable_thinking"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 

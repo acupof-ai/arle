@@ -37,13 +37,21 @@ struct HttpState<E: BackendExecutor, K: KvPool> {
     model: String,
     tokenizer: Mutex<OpenAiTokenizer>,
     serve: ServeHandle<E, K>,
+    /// Bound on generated tokens for chat requests that enable thinking
+    /// (`chat_template_kwargs.enable_thinking=true`). `0` = off (unbounded),
+    /// which keeps the chat path byte-identical to before this knob.
+    max_thinking_tokens: usize,
 }
 
 /// Build an axum router exposing non-streaming OpenAI v1 completions.
+///
+/// `max_thinking_tokens` bounds the generation budget for chat requests that
+/// turn thinking on; `0` disables the bound (today's behavior).
 pub fn openai_router<E, K>(
     serve: ServeHandle<E, K>,
     tokenizer: OpenAiTokenizer,
     model: impl Into<String>,
+    max_thinking_tokens: usize,
 ) -> Router
 where
     E: BackendExecutor + 'static,
@@ -53,6 +61,7 @@ where
         model: model.into(),
         tokenizer: Mutex::new(tokenizer),
         serve,
+        max_thinking_tokens,
     });
     Router::new()
         .route("/v1/completions", post(completions::<E, K>))
@@ -143,14 +152,22 @@ where
 {
     request.validate()?;
     let sampling = request.sampling_params();
-    let max_tokens = sampling.max_new_tokens.unwrap_or(16);
+    let mut max_tokens = sampling.max_new_tokens.unwrap_or(16);
+    // Bound runaway thinking: when the request turns thinking on and the server
+    // has a budget configured, clamp the generation budget so a slow think can't
+    // run away / time out. `0` budget (default) leaves max_tokens untouched, so
+    // the non-thinking and unconfigured paths stay byte-identical.
+    if state.max_thinking_tokens > 0 && request.enable_thinking() {
+        max_tokens = max_tokens.min(state.max_thinking_tokens);
+    }
     let images = extract_gemma4_images(&request.messages)?;
     let prompt = {
         let tokenizer = state
             .tokenizer
             .lock()
             .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
-        tokenizer.render_chat(&request.messages)?
+        tokenizer
+            .render_chat_with_kwargs(&request.messages, request.chat_template_kwargs.as_ref())?
     };
     if !images.is_empty() {
         let prompt = expand_gemma4_image_markers(&prompt, &images)?;
