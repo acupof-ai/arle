@@ -30,6 +30,8 @@
 #   scripts/pod.sh gpus                    # per-GPU memory/util
 #   Explicit when needed: build <label> <cargo-args> | run <label> <gpu> -- <args>
 #                         | status/log/kill <label> | setup (warm/repair toolchain)
+#   Compile cache: setup-sccache (install binary; cache on /host persists) | sccache-stats
+#   (RUSTC_WRAPPER=sccache auto-engages once installed — gives fresh-tree/cross-restart reuse)
 #
 # Env overrides: POD (exec wrapper, default ~/bin/pod), TN (default tn),
 #                NODE_TREE (tn push target), POD_TREE (container-view tree).
@@ -59,6 +61,20 @@ case "$cmd" in
       else
         echo installing 1.95.0 via proxy; rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy
       fi'"
+    ;;
+  setup-sccache)
+    # Install the sccache binary (ephemeral /root/.cargo/bin — re-run after a pod
+    # restart; the cache itself lives on persistent /host/sccache). Idempotent.
+    "$POD" "if command -v sccache >/dev/null 2>&1; then sccache --version; else \
+      V=v0.8.2; export all_proxy=socks5h://127.0.0.1:1080; \
+      curl -fsSL --proxy socks5h://127.0.0.1:1080 -o /tmp/sccache.tgz \
+        https://github.com/mozilla/sccache/releases/download/\$V/sccache-\$V-x86_64-unknown-linux-musl.tar.gz && \
+      tar -C /tmp -xzf /tmp/sccache.tgz && \
+      install -m755 /tmp/sccache-\$V-x86_64-unknown-linux-musl/sccache /root/.cargo/bin/sccache && \
+      sccache --version; fi"
+    ;;
+  sccache-stats)
+    "$POD" "sccache --show-stats 2>/dev/null | grep -iE 'compile requests|cache hits|cache misses|cache hit rate|stored|errors' | head"
     ;;
   sync)
     paths=("$@")
