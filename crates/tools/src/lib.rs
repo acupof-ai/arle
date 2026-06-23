@@ -12,38 +12,60 @@ static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuiltinToolKind {
-    Shell,
+    Bash,
     Python,
+    Read,
+    Write,
+    Replace,
 }
 
 impl BuiltinToolKind {
-    const ALL: [Self; 2] = [Self::Shell, Self::Python];
+    const ALL: [Self; 5] = [
+        Self::Bash,
+        Self::Python,
+        Self::Read,
+        Self::Write,
+        Self::Replace,
+    ];
 
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "shell" => Some(Self::Shell),
+            "bash" => Some(Self::Bash),
             "python" => Some(Self::Python),
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "replace" => Some(Self::Replace),
             _ => None,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
-            Self::Shell => "shell",
+            Self::Bash => "bash",
             Self::Python => "python",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Replace => "replace",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            Self::Shell => "Run a shell command.",
+            Self::Bash => "Run a bash command.",
             Self::Python => "Run Python 3 code.",
+            Self::Read => {
+                "Read a file and return numbered lines, optionally sliced to a 1-based line range."
+            }
+            Self::Write => {
+                "Write content to a file, creating parent directories and overwriting any existing file."
+            }
+            Self::Replace => "Replace a single unique occurrence of a string in a file.",
         }
     }
 
     fn parameters(self) -> Value {
         match self {
-            Self::Shell => json!({
+            Self::Bash => json!({
                 "type": "object",
                 "properties": {
                     "command": {
@@ -61,6 +83,48 @@ impl BuiltinToolKind {
                 },
                 "required": ["code"]
             }),
+            Self::Read => json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string"
+                    },
+                    "start": {
+                        "type": "integer"
+                    },
+                    "end": {
+                        "type": "integer"
+                    }
+                },
+                "required": ["path"]
+            }),
+            Self::Write => json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string"
+                    },
+                    "content": {
+                        "type": "string"
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+            Self::Replace => json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string"
+                    },
+                    "old": {
+                        "type": "string"
+                    },
+                    "new": {
+                        "type": "string"
+                    }
+                },
+                "required": ["path", "old", "new"]
+            }),
         }
     }
 
@@ -74,8 +138,22 @@ impl BuiltinToolKind {
 
     fn execute(self, arguments: &Value) -> String {
         match self {
-            Self::Shell => execute_shell(argument_as_str(arguments, "command")),
+            Self::Bash => execute_bash(argument_as_str(arguments, "command")),
             Self::Python => execute_python(argument_as_str(arguments, "code")),
+            Self::Read => execute_read(
+                argument_as_str(arguments, "path"),
+                argument_as_i64(arguments, "start"),
+                argument_as_i64(arguments, "end"),
+            ),
+            Self::Write => execute_write(
+                argument_as_str(arguments, "path"),
+                argument_as_str(arguments, "content"),
+            ),
+            Self::Replace => execute_replace(
+                argument_as_str(arguments, "path"),
+                argument_as_str(arguments, "old"),
+                argument_as_str(arguments, "new"),
+            ),
         }
     }
 }
@@ -456,23 +534,23 @@ impl BuiltinToolPolicyHooks {
             }
         }
 
-        if tool_available(tools, "shell")
+        if tool_available(tools, "bash")
             && mentions_shell_tool(user_input)
             && let Some(command) = extract_shell_command(user_input)
         {
-            return Some(single_tool_response("shell", json!({ "command": command })));
+            return Some(single_tool_response("bash", json!({ "command": command })));
         }
 
-        if tool_available(tools, "shell") && asks_for_file_listing(user_input) {
+        if tool_available(tools, "bash") && asks_for_file_listing(user_input) {
             return Some(single_tool_response(
-                "shell",
+                "bash",
                 json!({ "command": default_directory_listing_command() }),
             ));
         }
 
-        if tool_available(tools, "shell") && asks_for_repository_overview(user_input) {
+        if tool_available(tools, "bash") && asks_for_repository_overview(user_input) {
             return Some(single_tool_response(
-                "shell",
+                "bash",
                 json!({ "command": default_repository_overview_command() }),
             ));
         }
@@ -495,11 +573,11 @@ impl BuiltinToolPolicyHooks {
             return Some(single_tool_response("python", json!({ "code": code })));
         }
 
-        if tool_available(tools, "shell")
+        if tool_available(tools, "bash")
             && mentions_shell_tool(draft)
             && let Some(command) = extract_shell_command(draft)
         {
-            return Some(single_tool_response("shell", json!({ "command": command })));
+            return Some(single_tool_response("bash", json!({ "command": command })));
         }
 
         None
@@ -551,7 +629,7 @@ impl BuiltinToolPolicyHooks {
         last_tool_result: Option<&str>,
         last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
-        if last_tool_name == Some("shell") && should_return_shell_result_directly(user_input) {
+        if last_tool_name == Some("bash") && should_return_shell_result_directly(user_input) {
             return last_tool_result.map(str::to_string);
         }
 
@@ -804,6 +882,23 @@ fn argument_as_str<'a>(arguments: &'a Value, key: &str) -> &'a str {
     arguments.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// Optional integer argument (absent / non-integer -> `None`).
+fn argument_as_i64(arguments: &Value, key: &str) -> Option<i64> {
+    arguments.get(key).and_then(Value::as_i64)
+}
+
+/// Resolve a tool-supplied path against the sandbox workdir, mirroring how
+/// [`execute_bash`] / [`execute_python`] run with `cwd = SandboxConfig.workdir`.
+/// Absolute paths are used as-is.
+fn resolve_sandbox_path(path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        PathBuf::from(SandboxConfig::default().workdir).join(p)
+    }
+}
+
 /// Execute a tool by name with the given JSON arguments.
 pub fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
     BuiltinToolKind::from_name(name).map_or_else(
@@ -915,10 +1010,10 @@ fn run_command_with_timeout(
     }
 }
 
-fn execute_shell(command: &str) -> String {
+fn execute_bash(command: &str) -> String {
     let sandbox = SandboxConfig::default();
     log::info!(
-        "Executing shell ({}, timeout={}s): {}",
+        "Executing bash ({}, timeout={}s): {}",
         active_sandbox_backend().label(),
         sandbox.timeout_secs,
         command
@@ -970,6 +1065,68 @@ fn execute_python(code: &str) -> String {
             }
         }
         Err(e) => format!("Error executing python: {e}"),
+    }
+}
+
+/// Read a file and return its lines numbered as `{n}\t{line}` (1-based `n`).
+/// `start`/`end` are inclusive 1-based bounds; either may be omitted.
+fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
+    let resolved = resolve_sandbox_path(path);
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(_) => return format!("ERROR: no such file: {path}"),
+    };
+
+    let start = start.unwrap_or(1).max(1);
+    let end = end.unwrap_or(i64::MAX);
+
+    let mut out = String::new();
+    for (idx, line) in contents.lines().enumerate() {
+        let n = idx as i64 + 1;
+        if n < start || n > end {
+            continue;
+        }
+        out.push_str(&format!("{n}\t{line}\n"));
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Create parent directories and (over)write `content` to `path`.
+fn execute_write(path: &str, content: &str) -> String {
+    let resolved = resolve_sandbox_path(path);
+    if let Some(parent) = resolved.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("ERROR: failed to create parent dirs for {path}: {e}");
+        }
+    }
+    match std::fs::write(&resolved, content) {
+        Ok(()) => format!("wrote {} bytes to {path}", content.len()),
+        Err(e) => format!("ERROR: failed to write {path}: {e}"),
+    }
+}
+
+/// Replace exactly one unique occurrence of `old` with `new` in `path`.
+fn execute_replace(path: &str, old: &str, new: &str) -> String {
+    let resolved = resolve_sandbox_path(path);
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(_) => return format!("ERROR: no such file: {path}"),
+    };
+
+    let count = contents.matches(old).count();
+    match count {
+        0 => format!("ERROR: 'old' not found in {path}"),
+        1 => {
+            let replaced = contents.replacen(old, new, 1);
+            match std::fs::write(&resolved, replaced) {
+                Ok(()) => format!("OK: replaced 1 occurrence in {path}"),
+                Err(e) => format!("ERROR: failed to write {path}: {e}"),
+            }
+        }
+        n => format!("ERROR: 'old' occurs {n} times; add more context to make it unique"),
     }
 }
 
@@ -1104,7 +1261,7 @@ mod tests {
 
         let shell_result = BuiltinToolPolicyHooks.finalize_after_tool_execution(
             "本地有哪些文件",
-            Some("shell"),
+            Some("bash"),
             Some("file-a\nfile-b"),
             Some("ignored"),
         );
@@ -1112,7 +1269,7 @@ mod tests {
 
         let repo_result = BuiltinToolPolicyHooks.finalize_after_tool_execution(
             "你看看本地仓库",
-            Some("shell"),
+            Some("bash"),
             Some("repo: /tmp/demo\n\n== top-level ==\nsrc\nCargo.toml"),
             Some("ignored"),
         );
@@ -1163,11 +1320,11 @@ mod tests {
             .expect("recover repo overview tool call");
 
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].name, "bash");
         assert!(
             parsed.tool_calls[0].arguments["command"]
                 .as_str()
-                .expect("shell command")
+                .expect("bash command")
                 .contains("git rev-parse")
         );
     }
