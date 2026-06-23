@@ -1940,13 +1940,9 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE");
-    // Backward-compatible alias for old remote scripts. It no longer enables a
-    // PyTorch bridge; it selects the native raw-pointer DeepGEMM bridge.
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
-    let enable_deepgemm_native =
-        env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE") || env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_TORCH");
+    let enable_deepgemm_native = env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE");
     // DeepGEMM availability is a RUNTIME preflight probe (`cuda_kernels::
     // has_deepgemm_native`), not a cfg — the non-native stub exports the same
     // bridge symbols, so it can't be build-determined. No cfg emitted here.
