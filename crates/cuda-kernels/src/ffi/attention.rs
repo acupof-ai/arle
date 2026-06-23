@@ -167,6 +167,64 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // Paged HD256 prep/gate helpers for the Qwen3.6 KV-recall read-swap. Removed
+    // as "dead" in c7eb88cd (no callers in main at the time); restored here because
+    // the read-swap (qwen35.rs full_attention_paged) reintroduces the usage.
+    pub fn prefill_attention_paged_prep_hd256_cuda(
+        q_full_batch: *const Half,
+        q_out_batch: *mut Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        page_table: *const i32,
+        page_size: i32,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos_ptr: *const i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn decode_prep_paged_hd256_cuda(
+        q_full_batch: *const Half,
+        q_out_batch: *mut Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        page_table: *const i32,
+        page_indptr: *const i32,
+        last_page_len: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        stride_page: i32,
+        batch_size: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn attention_gate_paged_hd256_cuda(
+        q_full_batch: *const Half,
+        attn_out: *mut Half,
+        num_q_heads: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn decode_attention_int8_workspace_bytes(
         batch_size: i32,
         num_qo_heads: i32,

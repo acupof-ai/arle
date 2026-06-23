@@ -1451,6 +1451,75 @@ impl TokenKVPool {
         Some(page)
     }
 
+    /// **Deferred evict-drop** (the use-after-free race fix): same as
+    /// [`Self::evict_slot_page`] — drop this slot's attachment and replace the
+    /// logical page with the [`EVICTED_PAGE`] sentinel — but DO NOT return the
+    /// physical page to `free_pages`. The caller parks the returned physical id in
+    /// a one-step keepalive and hands it to [`Self::release_evicted_page`] one
+    /// decode step later, so the just-launched attention that may still be reading
+    /// this page has completed before `alloc_tokens` can reuse it.
+    ///
+    /// Returns the detached physical page id, or `None` (page already evicted,
+    /// shared/pinned, or out of range) on the same conditions as `evict_slot_page`.
+    /// A `None` means nothing was detached, so the caller must NOT later release it.
+    pub fn evict_slot_page_deferred(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+        let page = *self.page_indices.get(slot)?.get(logical_page)?;
+        if page == EVICTED_PAGE {
+            return None; // already evicted
+        }
+        let page_idx = page as usize;
+        if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
+            return None; // shared / radix-pinned: not ours to free
+        }
+        self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
+        debug_assert_eq!(
+            self.page_attach_count[page_idx], 0,
+            "evict_slot_page_deferred: single-owner page must reach zero attach"
+        );
+        // Keep logical length intact: sentinel now, physical page parked by caller.
+        self.page_indices[slot][logical_page] = EVICTED_PAGE;
+        Some(page)
+    }
+
+    /// Return a page previously detached by [`Self::evict_slot_page_deferred`] to
+    /// the free list (the keepalive's one-step-later free). The page was parked OUT
+    /// of `free_pages` for the whole keepalive step, so no `alloc_tokens` /
+    /// `reinstate_slot_page` could have re-popped it; at release it is single-owner
+    /// detached (attach 0, ref 0) and recycles cleanly.
+    pub fn release_evicted_page(&mut self, page: u32) {
+        if page == EVICTED_PAGE {
+            return;
+        }
+        debug_assert_eq!(
+            self.page_attach_count[page as usize], 0,
+            "release_evicted_page: parked page {page} should have zero slot refs"
+        );
+        self.recycle_page_if_unreferenced(page);
+    }
+
+    /// **Re-recall prefetch reinstate**: the inverse of [`Self::evict_slot_page`].
+    /// Allocate one fresh physical page from `free_pages` and bind it to the given
+    /// *logical* page index of `slot`, which MUST currently hold an [`EVICTED_PAGE`]
+    /// sentinel (its KV was evict-dropped and mirrored to the tier). Returns the
+    /// fresh physical page id so the caller can H2D-copy the tier payload into it.
+    ///
+    /// Restores the dual-residency invariant exactly: `page_attach_count` for the
+    /// new page starts at 1 (single owner, this slot), logical length is unchanged
+    /// (a sentinel is swapped for a real id, never grown). `None` if the logical
+    /// index is out of range, was not a sentinel (already resident — nothing to
+    /// do), or the pool is out of free pages (caller keeps it evicted; no KV loss
+    /// because the tier copy persists). NEVER called on the default decode path.
+    pub fn reinstate_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+        let cur = *self.page_indices.get(slot)?.get(logical_page)?;
+        if cur != EVICTED_PAGE {
+            return None; // already resident
+        }
+        let new_page = self.free_pages.pop()?;
+        self.page_attach_count[new_page as usize] = 1;
+        self.page_indices[slot][logical_page] = new_page;
+        Some(new_page)
+    }
+
     /// Bump the external reference count on each of the given pages by one.
     ///
     /// Used by the scheduler's `publish_to_prefix_cache` path: when a
@@ -2619,6 +2688,43 @@ mod tests {
             Some(page)
         }
 
+        /// Mirrors `TokenKVPool::evict_slot_page_deferred`: detach + sentinel but
+        /// do NOT recycle (the page is parked by the caller for a one-step keepalive).
+        fn evict_slot_page_deferred(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+            let page = *self.page_indices.get(slot)?.get(logical_page)?;
+            if page == EVICTED_PAGE {
+                return None;
+            }
+            let page_idx = page as usize;
+            if self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1 {
+                return None;
+            }
+            self.page_attach_count[page_idx] = self.page_attach_count[page_idx].saturating_sub(1);
+            self.page_indices[slot][logical_page] = EVICTED_PAGE;
+            Some(page)
+        }
+
+        /// Mirrors `TokenKVPool::release_evicted_page`: recycle a parked page.
+        fn release_evicted_page(&mut self, page: u32) {
+            if page == EVICTED_PAGE {
+                return;
+            }
+            self.recycle_page_if_unreferenced(page);
+        }
+
+        /// Mirrors `TokenKVPool::reinstate_slot_page`: alloc a fresh page and bind
+        /// it to a sentinel logical slot (re-recall prefetch).
+        fn reinstate_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+            let cur = *self.page_indices.get(slot)?.get(logical_page)?;
+            if cur != EVICTED_PAGE {
+                return None;
+            }
+            let new_page = self.free_pages.pop()?;
+            self.page_attach_count[new_page as usize] = 1;
+            self.page_indices[slot][logical_page] = new_page;
+            Some(new_page)
+        }
+
         fn detach_shared_hot_tail_page_for_append(&mut self, slot: usize, shared_tail_page: u32) {
             debug_assert_eq!(
                 self.slot_shared_hot_tail_page(slot),
@@ -2918,6 +3024,69 @@ mod tests {
         pool.mirror_slot(0, &sparse, 64);
         assert_eq!(pool.page_indices[0], sparse);
         assert_eq!(pool.page_indices[0][1], EVICTED_PAGE);
+    }
+
+    #[test]
+    fn deferred_evict_keepalive_holds_page_out_of_free_list_for_one_step() {
+        // The use-after-free race fix at the pool level: a deferred-evict detaches
+        // the page (sentinel in the table) but does NOT return it to free_pages, so
+        // an intervening alloc_tokens can NEVER hand the still-in-flight attention's
+        // page to the new token. Only the explicit one-step-later release recycles it.
+        let mut pool = MockPool::new(8, 1, 16);
+        pool.alloc_tokens(0, 64); // 4 pages
+        let pages = pool.page_indices[0].clone();
+        let free_before = pool.free_pages.len();
+
+        let parked = pool
+            .evict_slot_page_deferred(0, 1)
+            .expect("middle page deferred-evicts");
+        assert_eq!(parked, pages[1]);
+        assert_eq!(
+            pool.free_pages.len(),
+            free_before,
+            "deferred evict must NOT return the page to the free list yet"
+        );
+        assert_eq!(
+            pool.page_indices[0][1], EVICTED_PAGE,
+            "sentinel in the table"
+        );
+        assert!(
+            !pool.free_pages.contains(&parked),
+            "the in-flight page must not be reusable during its keepalive step"
+        );
+        // Already-evicted is a no-op (returns None → caller won't double-park).
+        assert_eq!(pool.evict_slot_page_deferred(0, 1), None);
+
+        // The one-step-later release returns it to the pool.
+        pool.release_evicted_page(parked);
+        assert_eq!(
+            pool.free_pages.len(),
+            free_before + 1,
+            "release recycles the parked page"
+        );
+        assert!(pool.free_pages.contains(&parked));
+    }
+
+    #[test]
+    fn reinstate_slot_page_re_recall_round_trips_a_sentinel() {
+        // Re-recall prefetch: an evicted (sentinel) middle page is reinstated to a
+        // fresh physical page, logical length unchanged, attach count restored.
+        let mut pool = MockPool::new(8, 1, 16);
+        pool.alloc_tokens(0, 64);
+        let evicted = pool.evict_slot_page(0, 2).expect("middle evicts");
+        assert_eq!(pool.page_indices[0][2], EVICTED_PAGE);
+
+        let reinstated = pool
+            .reinstate_slot_page(0, 2)
+            .expect("sentinel reinstates to a fresh page");
+        assert_ne!(reinstated, EVICTED_PAGE);
+        assert_eq!(pool.page_indices[0][2], reinstated, "table patched");
+        assert_eq!(pool.page_attach_count[reinstated as usize], 1);
+        assert_eq!(pool.page_indices[0].len(), 4, "logical length intact");
+        // Reinstating a non-sentinel (already resident) is a no-op.
+        assert_eq!(pool.reinstate_slot_page(0, 0), None);
+        // LIFO free list: the evicted page is reused first.
+        assert_eq!(reinstated, evicted, "freed page reused first (LIFO)");
     }
 
     #[test]

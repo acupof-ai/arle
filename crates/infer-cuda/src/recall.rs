@@ -83,11 +83,26 @@ mod cuda_impl {
         /// `None` = the session still fits the budget → today's full contiguous
         /// page table (byte-identical default).
         recall_pages: Option<Vec<u32>>,
+        /// The working-set token ranges of the NEXT decode step's plan (the
+        /// `plan_recall` output). Kept alongside `recall_pages` so the executor
+        /// can RE-RESOLVE the page list after it prefetches an L3-resident block
+        /// back into HBM (the sentinels in the working set get patched to fresh
+        /// page ids, then [`Self::resolve_recall_pages`] rebuilds `recall_pages`).
+        /// Empty when the plan is the full contiguous range (default path).
+        recall_ranges: Vec<(usize, usize)>,
         /// Logical page indices the executor should evict-drop (free out of HBM)
         /// after this step — the cold middle pages outside the recall working set.
         /// Drained each step via [`Self::take_evict_pages`]; the actual page free
         /// happens in the executor against both the host and device pools.
         evict_pages: Vec<usize>,
+        /// Logical page indices the executor should PREFETCH back into HBM before
+        /// the next step (the re-recall coverage win): pages inside the new
+        /// working set whose physical HBM page was previously evict-dropped (now an
+        /// `EVICTED_PAGE` sentinel) but whose KV lives in the L3 tier. Drained each
+        /// step via [`Self::take_prefetch_pages`]; the executor allocs a fresh page,
+        /// H2D-copies the tier payload, patches the sentinel, then re-resolves
+        /// `recall_pages`. Empty unless re-recall is enabled (`allow_prefetch`).
+        prefetch_pages: Vec<usize>,
     }
 
     impl CudaRecallState {
@@ -102,7 +117,9 @@ mod cuda_impl {
         pub(crate) fn reset(&mut self) {
             self.block_reps.clear();
             self.recall_pages = None;
+            self.recall_ranges.clear();
             self.evict_pages.clear();
+            self.prefetch_pages.clear();
         }
 
         /// Grow the resident mean-key reps for any newly-frozen middle blocks (#2).
@@ -199,6 +216,19 @@ mod cuda_impl {
         /// `q_batch` as `[num_q_heads, head_dim]` row-major f32. It is GQA-mean
         /// pooled here (query-heads-per-KV-group → `[num_kv_heads, head_dim]`) to
         /// match the rep shape — the validated `--shared` per-slot scoring.
+        ///
+        /// `allow_prefetch` selects the tier policy:
+        /// - `false` (the dense-Qwen3 arm, no Qwen3.6-style L3 recall tier): a
+        ///   block whose HBM pages were already evict-dropped is masked to `-inf`
+        ///   so `plan_recall` never re-selects it (it cannot be re-attended). The
+        ///   page list is resolved eagerly here — byte-identical to the prior
+        ///   behavior, so the dense path is untouched.
+        /// - `true` (the Qwen3.6 recall tier): ALL blocks compete on their
+        ///   resident reps; an evicted block that ranks top-k is recorded in
+        ///   `prefetch_pages` for the executor to pull back H2D, and page-list
+        ///   resolution is DEFERRED ([`Self::recall_pages`] stays at its previous
+        ///   value until [`Self::resolve_recall_pages`] runs after the prefetch
+        ///   patches the sentinels). The ranges are stashed in `recall_ranges`.
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn recompute_recall_plan(
             &mut self,
@@ -211,6 +241,7 @@ mod cuda_impl {
             num_kv_heads: usize,
             head_dim: usize,
             query_layer0: &[f32],
+            allow_prefetch: bool,
         ) -> Result<()> {
             self.update_block_reps(ctx, pool, slot, cache_len, cfg, num_kv_heads, head_dim)?;
 
@@ -237,15 +268,16 @@ mod cuda_impl {
             let table = pool.page_indices(slot);
             let mut scores = vec![0.0_f32; nb];
             for (i, rep) in self.block_reps.iter().enumerate() {
-                // Decode is tier-free: a block whose pages were already evicted out
-                // of HBM cannot be re-attended mid-decode (re-recall needs a prefill
-                // prefetch — the accepted boundary of the write-through model). Mask
-                // its score to -inf so `plan_recall` never selects a non-resident
-                // block; only currently-resident blocks compete for the top-k.
                 let base = cfg.n_init + i * cfg.l_bs;
                 let resident = (base..base + cfg.l_bs)
                     .all(|pos| table.get(pos / page_size).copied() != Some(EVICTED_PAGE));
-                scores[i] = if resident {
+                // Without an L3 tier (dense arm, `allow_prefetch=false`) a block
+                // whose pages were evict-dropped cannot be re-attended mid-decode,
+                // so mask it to `-inf` (only resident blocks compete). With the L3
+                // recall tier (`allow_prefetch=true`) an evicted block IS scorable
+                // via its resident rep and will be prefetched back if it ranks
+                // top-k — the re-recall coverage win.
+                scores[i] = if resident || allow_prefetch {
                     let n = rep.len().min(q.len());
                     let mut acc = 0.0_f32;
                     for k in 0..n {
@@ -263,13 +295,10 @@ mod cuda_impl {
             let is_full = plan.ranges.len() == 1 && plan.ranges[0] == (0, cache_len);
             if is_full {
                 self.recall_pages = None;
+                self.recall_ranges.clear();
                 self.evict_pages.clear();
+                self.prefetch_pages.clear();
             } else {
-                self.recall_pages = Some(token_ranges_to_pages(
-                    &plan.ranges,
-                    pool.page_indices(slot),
-                    page_size,
-                ));
                 // Write-through evict-drop (the flat-VRAM win): the logical pages
                 // the plan does NOT attend, restricted to the still-resident middle
                 // (outside the pinned sink + local windows). The executor frees
@@ -277,6 +306,27 @@ mod cuda_impl {
                 // already mirrored to the tier (write_through), so the drop is free.
                 self.evict_pages =
                     evict_logical_pages(&plan.ranges, pool.page_indices(slot), page_size, cfg);
+                if allow_prefetch {
+                    // Re-recall: logical pages in the working set that are currently
+                    // evicted sentinels. The executor pulls them back H2D from the
+                    // tier (reinstating real page ids) BEFORE the next step, then
+                    // calls `resolve_recall_pages`. Defer page resolution until
+                    // then so a sentinel never reaches the kernel page table.
+                    self.prefetch_pages =
+                        prefetch_logical_pages(&plan.ranges, pool.page_indices(slot), page_size);
+                    self.recall_ranges = plan.ranges;
+                    // `recall_pages` is intentionally left at its previous value;
+                    // `resolve_recall_pages` rebuilds it after the executor's
+                    // prefetch + evict patch the table for the next step.
+                } else {
+                    self.recall_pages = Some(token_ranges_to_pages(
+                        &plan.ranges,
+                        pool.page_indices(slot),
+                        page_size,
+                    ));
+                    self.recall_ranges.clear();
+                    self.prefetch_pages.clear();
+                }
             }
             Ok(())
         }
@@ -287,6 +337,61 @@ mod cuda_impl {
         pub(crate) fn take_evict_pages(&mut self) -> Vec<usize> {
             std::mem::take(&mut self.evict_pages)
         }
+
+        /// Logical page indices the executor should PREFETCH back into HBM from the
+        /// L3 tier before the next step (re-recall). Drained by the executor; empty
+        /// unless `allow_prefetch` and an evicted block re-entered the working set.
+        pub(crate) fn take_prefetch_pages(&mut self) -> Vec<usize> {
+            std::mem::take(&mut self.prefetch_pages)
+        }
+
+        /// Re-resolve `recall_pages` from the stored plan ranges against the pool's
+        /// CURRENT page table — called by the executor AFTER it has prefetched the
+        /// evicted blocks back (patching their sentinels to fresh page ids) and
+        /// evict-dropped the cold ones. Only used on the prefetch-enabled
+        /// (Qwen3.6) arm, where `recompute_recall_plan` deferred page resolution.
+        ///
+        /// Every working-set page must now be resident (the executor prefetched all
+        /// `take_prefetch_pages`), so a surviving sentinel is a bug — `errors`-loud
+        /// in debug, skipped in release rather than feeding the kernel a sentinel.
+        pub(crate) fn resolve_recall_pages(&mut self, pool: &PagedKVPool, slot: usize) {
+            if self.recall_ranges.is_empty() {
+                return;
+            }
+            self.recall_pages = Some(token_ranges_to_pages(
+                &self.recall_ranges,
+                pool.page_indices(slot),
+                pool.page_size,
+            ));
+        }
+    }
+
+    /// Compute the *logical* page indices to PREFETCH back into HBM: pages covered
+    /// by a working-set range that are currently `EVICTED_PAGE` sentinels (their KV
+    /// lives only in the L3 tier). These are exactly the re-recalled-block pages
+    /// the executor must reinstate before the next step attends them.
+    fn prefetch_logical_pages(
+        ranges: &[(usize, usize)],
+        pages: &[u32],
+        page_size: usize,
+    ) -> Vec<usize> {
+        if page_size == 0 || pages.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<usize> = Vec::new();
+        for &(s, e) in ranges {
+            if s >= e {
+                continue;
+            }
+            let first = s / page_size;
+            let last = ((e - 1) / page_size).min(pages.len() - 1);
+            for (p, &page) in pages.iter().enumerate().take(last + 1).skip(first) {
+                if page == EVICTED_PAGE && out.last() != Some(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     /// Compute the *logical* page indices to evict-drop: pages NOT covered by any
