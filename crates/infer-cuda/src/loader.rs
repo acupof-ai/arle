@@ -2751,6 +2751,42 @@ impl SafetensorLoader {
     /// tensor is loaded (EP rank selection happens by expert index in the caller;
     /// TP weight sharding is Piece 4). Returns the block-scaled `DeviceMatrix` the
     /// shared `Dsv4Fp8DeepGemmWeightCache` consumes.
+    /// DSv4 block-scales feed a 1-byte E8M0 decode (`bits << 23`) downstream. Accept
+    /// either native `F8_E8M0`, or the common `F32` power-of-two serialization
+    /// (vLLM / DeepSeek-V3 `weight_block_size` FP8): a power-of-two f32's biased
+    /// exponent byte IS its E8M0 code, so `(bits >> 23) & 0xff` is the lossless encode.
+    /// Returns owned E8M0 bytes (scale tensors are tiny). Errors on a non-power-of-two
+    /// F32 scale (would need the dequant route) or any other dtype.
+    fn dsv4_block_scale_e8m0(scale_name: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<u8>> {
+        match dtype {
+            Dtype::F8_E8M0 => Ok(bytes.to_vec()),
+            Dtype::F32 => {
+                ensure!(
+                    bytes.len() % 4 == 0,
+                    "{scale_name}: F32 scale byte length {} not a multiple of 4",
+                    bytes.len()
+                );
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| {
+                        let bits = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        ensure!(
+                            bits & 0x007f_ffff == 0,
+                            "{scale_name}: F32 block scale {} is not a power of two; cannot map losslessly to E8M0",
+                            f32::from_bits(bits)
+                        );
+                        Ok(((bits >> 23) & 0xff) as u8)
+                    })
+                    .collect()
+            }
+            other => {
+                bail!(
+                    "{scale_name}: expected F8_E8M0 or F32 power-of-two block scale, got {other:?}"
+                )
+            }
+        }
+    }
+
     pub(crate) fn load_dsv4_block_scaled(
         &self,
         ctx: &DeviceContext,
@@ -2768,15 +2804,11 @@ impl SafetensorLoader {
             .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
         let scale = self.borrow_raw_tensor(&scale_name)?;
         ensure!(
-            scale.dtype == Dtype::F8_E8M0,
-            "{scale_name}: expected F8_E8M0 block scale, got {:?}",
-            scale.dtype
-        );
-        ensure!(
             scale.shape.len() == 2,
             "{scale_name}: expected 2D scale, got shape {:?}",
             scale.shape
         );
+        let scale_e8m0 = Self::dsv4_block_scale_e8m0(&scale_name, scale.dtype, scale.bytes())?;
         let (scale_rows, scale_cols) = (scale.shape[0], scale.shape[1]);
 
         match tensor.dtype {
@@ -2785,7 +2817,7 @@ impl SafetensorLoader {
                 DeviceMatrix::from_dsv4_fp8_block_scaled(
                     ctx,
                     tensor.bytes(),
-                    scale.bytes(),
+                    &scale_e8m0,
                     rows,
                     cols,
                     scale_rows,
@@ -2800,7 +2832,7 @@ impl SafetensorLoader {
                 DeviceMatrix::from_dsv4_fp4_block_scaled(
                     ctx,
                     tensor.bytes(),
-                    scale.bytes(),
+                    &scale_e8m0,
                     rows,
                     logical_cols,
                     scale_rows,
@@ -2862,15 +2894,11 @@ impl SafetensorLoader {
             .ok_or_else(|| anyhow!("{name}: quantized DSv4 tensor must end with .weight"))?;
         let scale = self.borrow_raw_tensor(&scale_name)?;
         ensure!(
-            scale.dtype == Dtype::F8_E8M0,
-            "{scale_name}: expected F8_E8M0 block scale, got {:?}",
-            scale.dtype
-        );
-        ensure!(
             scale.shape.len() == 2,
             "{scale_name}: expected 2D scale, got shape {:?}",
             scale.shape
         );
+        let scale_e8m0 = Self::dsv4_block_scale_e8m0(&scale_name, scale.dtype, scale.bytes())?;
 
         match tensor.dtype {
             Dtype::F8_E4M3 => {
@@ -2889,7 +2917,7 @@ impl SafetensorLoader {
                         let scale_spec =
                             Self::dsv4_scale_shard_for_value_shard(name, &spec, scale_rows, 128)?;
                         let scales = crate::shard_slice::shard_column_parallel(
-                            scale.bytes(),
+                            &scale_e8m0,
                             scale_rows,
                             scale_cols,
                             1,
@@ -2909,7 +2937,7 @@ impl SafetensorLoader {
                         let scale_spec =
                             Self::dsv4_scale_shard_for_value_shard(name, &spec, scale_cols, 128)?;
                         let scales = crate::shard_slice::shard_row_parallel(
-                            scale.bytes(),
+                            &scale_e8m0,
                             scale_rows,
                             scale_cols,
                             1,
