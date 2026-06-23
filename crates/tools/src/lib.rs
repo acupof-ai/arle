@@ -935,7 +935,7 @@ pub fn execute_tool_call_with_metadata(call: &ToolCall) -> (String, ToolExecutio
     let start = Instant::now();
     let result = execute_tool_call(call);
     let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let truncated = result.ends_with(TOOL_RESULT_TRUNCATION_MARKER);
+    let truncated = result.contains(TOOL_RESULT_TRUNCATION_MARKER);
     (
         result,
         ToolExecutionMetadata {
@@ -945,8 +945,27 @@ pub fn execute_tool_call_with_metadata(call: &ToolCall) -> (String, ToolExecutio
     )
 }
 
+/// Truncate `s` to ~`max_chars`, keeping the head AND tail with the middle
+/// elided. Command/test output puts the important summary (pytest failures,
+/// tracebacks) at the END, so a head-only cut drops exactly what the agent
+/// needs. The elision embeds [`TOOL_RESULT_TRUNCATION_MARKER`] so callers
+/// detect truncation via `contains`.
+fn clip_middle(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let head_n = max_chars / 2;
+    let tail_n = max_chars - head_n;
+    let head: String = s.chars().take(head_n).collect();
+    let tail: String = s.chars().skip(total - tail_n).collect();
+    let omitted = total - head_n - tail_n;
+    format!("{head}{TOOL_RESULT_TRUNCATION_MARKER}: {omitted} chars omitted ...\n{tail}")
+}
+
 /// Collect stdout + stderr from a process Output into a truncated string.
-/// Filters out nsjail's own warning/info lines from stderr.
+/// Filters out nsjail's own warning/info lines from stderr. Appends the
+/// process exit code so the agent can tell success from failure.
 fn collect_output(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw_stderr = String::from_utf8_lossy(&output.stderr);
@@ -974,9 +993,9 @@ fn collect_output(output: &std::process::Output) -> String {
     if result.is_empty() {
         result.push_str("(no output)");
     }
-    if result.len() > 8000 {
-        result.truncate(8000);
-        result.push_str(TOOL_RESULT_TRUNCATION_MARKER);
+    let mut result = clip_middle(&result, 8000);
+    if let Some(code) = output.status.code() {
+        result.push_str(&format!("\n[exit {code}]"));
     }
     result
 }
@@ -1069,27 +1088,48 @@ fn execute_python(code: &str) -> String {
 }
 
 /// Read a file and return its lines numbered as `{n}\t{line}` (1-based `n`).
-/// `start`/`end` are inclusive 1-based bounds; either may be omitted.
+/// `start`/`end` are inclusive 1-based bounds; either may be omitted. Without
+/// `end`, at most [`READ_WINDOW`] lines from `start` are returned and a
+/// `[lines s-e of total]` footer tells the agent more remains. Over-long lines
+/// are clipped so a minified file can't blow the context.
 fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
+    const READ_WINDOW: i64 = 400;
+    const MAX_LINE_CHARS: usize = 2000;
+
     let resolved = resolve_sandbox_path(path);
+    if resolved.is_dir() {
+        return format!("ERROR: {path} is a directory (use bash `ls` to list it)");
+    }
     let contents = match std::fs::read_to_string(&resolved) {
         Ok(c) => c,
         Err(_) => return format!("ERROR: no such file: {path}"),
     };
 
-    let start = start.unwrap_or(1).max(1);
-    let end = end.unwrap_or(i64::MAX);
+    let lines: Vec<&str> = contents.lines().collect();
+    let total = lines.len() as i64;
+    if total == 0 {
+        return format!("(file {path} is empty)");
+    }
+
+    let start = start.unwrap_or(1).clamp(1, total);
+    let end = end.unwrap_or(start + READ_WINDOW - 1).clamp(start, total);
 
     let mut out = String::new();
-    for (idx, line) in contents.lines().enumerate() {
-        let n = idx as i64 + 1;
-        if n < start || n > end {
-            continue;
+    for n in start..=end {
+        let line = lines[(n - 1) as usize];
+        if line.chars().count() > MAX_LINE_CHARS {
+            let clipped: String = line.chars().take(MAX_LINE_CHARS).collect();
+            out.push_str(&format!("{n}\t{clipped}… (line truncated)\n"));
+        } else {
+            out.push_str(&format!("{n}\t{line}\n"));
         }
-        out.push_str(&format!("{n}\t{line}\n"));
     }
     if out.ends_with('\n') {
         out.pop();
+    }
+    let mut out = clip_middle(&out, 20_000);
+    if start > 1 || end < total {
+        out.push_str(&format!("\n[lines {start}-{end} of {total}]"));
     }
     out
 }
@@ -1116,9 +1156,18 @@ fn execute_replace(path: &str, old: &str, new: &str) -> String {
         Err(_) => return format!("ERROR: no such file: {path}"),
     };
 
+    if old.is_empty() {
+        return "ERROR: 'old' is empty; provide the exact text to replace".to_string();
+    }
+    if old == new {
+        return "ERROR: 'old' and 'new' are identical; nothing to change".to_string();
+    }
+
     let count = contents.matches(old).count();
     match count {
-        0 => format!("ERROR: 'old' not found in {path}"),
+        0 => format!(
+            "ERROR: 'old' not found in {path}; copy it EXACTLY incl. whitespace/indentation (read the file to check)"
+        ),
         1 => {
             let replaced = contents.replacen(old, new, 1);
             match std::fs::write(&resolved, replaced) {
@@ -1126,7 +1175,9 @@ fn execute_replace(path: &str, old: &str, new: &str) -> String {
                 Err(e) => format!("ERROR: failed to write {path}: {e}"),
             }
         }
-        n => format!("ERROR: 'old' occurs {n} times; add more context to make it unique"),
+        n => format!(
+            "ERROR: 'old' occurs {n} times in {path}; add surrounding lines to make the match unique"
+        ),
     }
 }
 
@@ -1347,14 +1398,70 @@ mod tests {
         // The point is we got a defined value.
         let _ = metadata.latency_ms;
 
-        // Synthetic truncated string: the executor uses the same marker
-        // to signal truncation. Verify the detection logic round-trips.
-        let truncated_text = format!("first line\nsecond line{TOOL_RESULT_TRUNCATION_MARKER}");
-        assert!(truncated_text.ends_with(TOOL_RESULT_TRUNCATION_MARKER));
+        // Synthetic truncated string: the executor detects the marker
+        // anywhere (head+tail clips put it in the middle). Verify round-trip.
+        let truncated_text =
+            format!("head{TOOL_RESULT_TRUNCATION_MARKER}: 99 chars omitted ...\ntail");
+        assert!(truncated_text.contains(TOOL_RESULT_TRUNCATION_MARKER));
         let synthetic = ToolExecutionMetadata {
             latency_ms: 0,
-            truncated: truncated_text.ends_with(TOOL_RESULT_TRUNCATION_MARKER),
+            truncated: truncated_text.contains(TOOL_RESULT_TRUNCATION_MARKER),
         };
         assert!(synthetic.truncated);
+    }
+
+    #[test]
+    fn clip_middle_keeps_head_and_tail() {
+        let s: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let clipped = super::clip_middle(&s, 80);
+        assert!(clipped.contains(super::TOOL_RESULT_TRUNCATION_MARKER));
+        assert!(clipped.starts_with("line0"));
+        assert!(clipped.trim_end().ends_with("line99"));
+        assert!(clipped.chars().count() < s.chars().count());
+    }
+
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arle-tools-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join(name)
+    }
+
+    #[test]
+    fn read_windows_long_files_with_footer() {
+        let p = scratch_path("read_window.txt");
+        let body: String = (1..=900).map(|i| format!("L{i}\n")).collect();
+        std::fs::write(&p, body).expect("write");
+        let out = super::execute_read(p.to_str().unwrap(), None, None);
+        assert!(out.contains("1\tL1"), "shows first line: {out:.80}");
+        assert!(out.contains("400\tL400"), "shows window end");
+        assert!(!out.contains("401\tL401"), "stops at window");
+        assert!(out.ends_with("[lines 1-400 of 900]"), "footer: {out:?}");
+    }
+
+    #[test]
+    fn read_empty_and_explicit_range() {
+        let empty = scratch_path("read_empty.txt");
+        std::fs::write(&empty, "").expect("write");
+        assert!(super::execute_read(empty.to_str().unwrap(), None, None).contains("is empty"));
+
+        let p = scratch_path("read_range.txt");
+        std::fs::write(&p, "a\nb\nc\nd\ne\n").expect("write");
+        let out = super::execute_read(p.to_str().unwrap(), Some(2), Some(4));
+        assert!(out.contains("2\tb") && out.contains("4\td"));
+        assert!(!out.contains("1\ta") && !out.contains("5\te"));
+        assert!(out.ends_with("[lines 2-4 of 5]"));
+    }
+
+    #[test]
+    fn replace_guards_and_uniqueness() {
+        let p = scratch_path("replace.txt");
+        std::fs::write(&p, "foo bar foo\n").expect("write");
+        let path = p.to_str().unwrap();
+        assert!(super::execute_replace(path, "foo", "foo").contains("identical"));
+        assert!(super::execute_replace(path, "", "x").contains("empty"));
+        assert!(super::execute_replace(path, "zzz", "x").contains("not found"));
+        assert!(super::execute_replace(path, "foo", "x").contains("occurs 2 times"));
+        assert!(super::execute_replace(path, "bar", "baz").starts_with("OK"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "foo baz foo\n");
     }
 }
