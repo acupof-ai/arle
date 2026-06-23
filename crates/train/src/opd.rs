@@ -239,7 +239,11 @@ impl Default for GkdLossConfig<'_> {
             kl_temperature: 1.0,
             kl_beta: None,
             teacher_topk: None,
-            fused_distill: true,
+            // Dense logits+KL by default: the fused lm_head+loss path ran the
+            // lm_head on the HOST (~205 s/step for the 27B, GPU idle) vs ~3.9 s
+            // GPU-bound dense. Opt into fused only for windows too large to
+            // materialize [window, vocab]. errors/2026-06-23-opd-fused-distill-default-host-bound.
+            fused_distill: false,
             logits_window_size: None,
             kl_mask: OpdKlMask::CompletionOnly,
         }
@@ -2239,7 +2243,10 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
                     student.lm_head_weight_id()
                 ),
             );
-            // Default fused path is not bit-identical to dense logits+KL; local tests gate ~2e-5 equivalence. --no-fused-distill is the revert lever; H20 needle + same-binary A/B + wins are pending.
+            // Opt-in fused path (--fused-distill). NOT default: H20 A/B measured it
+            // ~205 s/step (lm_head on HOST, GPU 0%) vs ~3.9 s dense (GPU 98%) on the
+            // 27B; loss matches dense to ~5e-4. Only worth it for windows too large to
+            // materialize [window, vocab]. errors/2026-06-23-opd-fused-distill-default-host-bound.
             let loss = fused_linear_distill_loss(
                 student_hidden,
                 student.lm_head_weight_id(),
