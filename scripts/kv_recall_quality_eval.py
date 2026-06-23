@@ -40,6 +40,7 @@ from mlx_lm.models import qwen3_next as qn
 
 CFG = {"mode": "full", "n_init": 32, "n_local": 256, "l_bs": 32, "top_k": 8}
 _SHARED_SEL = {}  # per-slot recall (--shared): S -> sel, first full-attn layer decides
+_PREV_QK = {}  # stale-Q scoring (--stale): id(layer) -> previous step's query
 KV_ATTENDED = {}  # mode -> tokens attended per full-attn layer at the last decode step
 KEYS = ["739154", "281607", "930472", "615838", "472916", "108253", "664019", "357284",
         "850291", "317864", "629053", "194738", "573916", "482067", "916354", "205879"]
@@ -104,6 +105,15 @@ def _patched_attn_call(self, x, mask=None, cache=None):
                     reps = kh.reshape(B, nkv, nb, l_bs, hd).mean(axis=3)
                     g = self.num_attention_heads // self.num_key_value_heads
                     qk = queries.reshape(B, nkv, g, hd).mean(axis=2)
+                    if CFG.get("stale"):
+                        # Score the current token's blocks with the PREVIOUS step's
+                        # query (the ARLE Rust-orchestrated design: C++ returns this
+                        # step's layer-3 scores, recall applies on the NEXT step). The
+                        # first step has no prior → use current.
+                        prev = _PREV_QK.get(id(self))
+                        _PREV_QK[id(self)] = qk
+                        if prev is not None:
+                            qk = prev
                     score = (reps * qk[:, :, None, :]).sum(axis=(1, 3))
                     k = min(top_k, nb)
                     idx = mx.argpartition(-score[0], k - 1)[:k]
@@ -159,6 +169,7 @@ def build_prompt(tok, ctx_tokens, placements, multi, diverse):
 
 def run(model, tok, prompt, max_tokens):
     _SHARED_SEL.clear()  # fresh per-slot selection cache per generation
+    _PREV_QK.clear()
     return generate(model, tok, prompt=prompt, max_tokens=max_tokens,
                     sampler=make_sampler(temp=0.0), verbose=False)
 
@@ -179,8 +190,9 @@ def main():
     ap.add_argument("--question", action="append", default=[], help="question(s) for --doc mode")
     ap.add_argument("--agentic", action="store_true", help="multi-hop next-step decision over scattered rules")
     ap.add_argument("--shared", action="store_true", help="per-slot recall: one block selection reused by all layers (the ARLE Rust design)")
+    ap.add_argument("--stale", action="store_true", help="score blocks with the previous step's query (Rust-orchestrated recall: scores lag one step)")
     args = ap.parse_args()
-    CFG.update(n_init=args.ninit, n_local=args.nlocal, l_bs=args.lbs, top_k=args.topk, shared=args.shared)
+    CFG.update(n_init=args.ninit, n_local=args.nlocal, l_bs=args.lbs, top_k=args.topk, shared=args.shared, stale=args.stale)
     diverse = args.distractor == "diverse"
 
     print(f"loading {args.model} ... (distractor={args.distractor})", flush=True)

@@ -51,6 +51,14 @@ Per-slot **LICENSED** for passkey retrieval — per-layer complexity not needed.
 validated for retrieval/uniform; harder tasks (aggregation, diverse, multi-hop) would
 need their own per-slot re-check before claiming parity there.
 
+**Stale-Q** (`--stale`, score the current token's blocks with the *previous* step's
+query) also LICENSED — per-slot + stale-Q retrieves at 0.25/0.5/0.75, acc=1.00, 544 KV.
+This settles the architecture: the live recall is **Rust-orchestrated** — the C++ step
+outputs layer-3 block scores, Rust runs `plan_recall` → sets `recall_ranges` for the
+*next* step → the #4 gather + #5 dispatch. No mid-step interception, no C++-internal
+recall, and the committed Rust path is the live path. The C++ only adds a per-block
+score output at the first full-attn layer.
+
 ## Rule
 
 The recall *planner* and *gather* are validated; the served ARLE-native e2e still
