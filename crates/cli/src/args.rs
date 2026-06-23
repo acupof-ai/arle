@@ -806,7 +806,16 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) teacher_topk: Option<usize>,
 
-    /// Revert windowed Route-B KL to dense logits+KL instead of fused lm_head+loss.
+    /// Opt in to the fused lm_head+loss path (computes full-vocab logits + KD loss
+    /// in one op to save the [window, vocab] tensor). DEFAULT IS DENSE: on H20 the
+    /// fused path ran the lm_head on the HOST (~205 s/step for the 27B, GPU idle)
+    /// vs ~3.9 s GPU-bound for dense — only enable for windows too large to
+    /// materialize [window, vocab]. See errors/2026-06-23-opd-fused-distill-default-host-bound.
+    #[arg(long, default_value_t = false)]
+    pub(crate) fused_distill: bool,
+
+    /// Deprecated no-op: dense logits+KL is now the default. Kept so existing
+    /// `--no-fused-distill` invocations still run (it forces the now-default dense path).
     #[arg(long, default_value_t = false)]
     pub(crate) no_fused_distill: bool,
 
@@ -1861,6 +1870,27 @@ mod tests {
             panic!("expected train opd command");
         };
         assert!(opd.no_fused_distill);
+    }
+
+    #[test]
+    fn train_opd_defaults_to_dense_fused_distill_opt_in() {
+        // Default (no flag) must be dense: --fused-distill is opt-in, off by default.
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["arle", "train", "opd", "--student-model", "models/qwen"];
+            argv.extend_from_slice(extra);
+            let args = Args::try_parse_from(argv).expect("train opd should parse");
+            let Some(CliCommand::Train(train)) = args.command else {
+                panic!("expected train command");
+            };
+            let TrainCommand::Opd(opd) = train.command else {
+                panic!("expected train opd command");
+            };
+            opd
+        };
+        // Absent => dense (fused_distill stays false).
+        assert!(!parse(&[]).fused_distill);
+        // Opt-in flag flips it on.
+        assert!(parse(&["--fused-distill"]).fused_distill);
     }
 
     #[test]
