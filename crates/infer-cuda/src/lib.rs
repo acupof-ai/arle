@@ -70,6 +70,10 @@ mod numa_pin;
 mod nvtx;
 #[cfg(feature = "cuda")]
 mod ops;
+// Session KV-recall (infinite memory): resident mean-key reps + restricted page
+// table on the dense-Qwen3 paged decode path. The `default_recall_config`
+// budget is device-neutral; the rep/score machinery is cuda-gated inside.
+mod recall;
 #[cfg(feature = "cuda")]
 mod stage_profile;
 // Qwen3.5 / Qwen3.6 HYBRID model (gated-delta linear attention + periodic full
@@ -235,6 +239,21 @@ impl CudaExecutor {
             }
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.set_kv_tier_disk(root, budget_bytes),
+        }
+    }
+
+    /// Opt into session KV-recall ("infinite memory", `--kv-recall`, default
+    /// off). Wired for the dense-Qwen3 paged decode arm (the only CUDA arm with
+    /// a paged page table + page-granular tier); other arms log + ignore. Off →
+    /// the decode hot path is byte-identical (CUDA is the Stable backend). Must
+    /// be called pre-serve, like the tier setters above.
+    pub fn set_kv_recall(&mut self, enabled: bool) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = enabled;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.set_kv_recall(enabled),
         }
     }
 

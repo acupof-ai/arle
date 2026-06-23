@@ -392,6 +392,58 @@ impl PageMeta {
             quant_decode_meta,
         })
     }
+
+    /// Session KV-recall decode page table (BF16 only): build the metadata over a
+    /// SELECTED page subset (`recall_pages`, in ascending temporal order ending
+    /// with the current local page) instead of the slot's full page list.
+    ///
+    /// The decode TileLang kernel derives the KV length entirely from the page
+    /// table (`num_pages * page_size`, last page filled to `kv_last_page_len`) and
+    /// carries NO per-KV-token position array, so a non-contiguous page subset
+    /// attends exactly those pages — correct because RoPE is baked into the cached
+    /// K at write time and the query's RoPE position (`positions = total_len - 1`)
+    /// is independent of which KV pages are attended. The last selected page IS the
+    /// current page, so `kv_last_page_len` matches the true tail fill. Decode-only
+    /// (`seq_len == 1`); BF16 only (no quant row lists — recall is BF16-gated).
+    pub(crate) fn for_recall_decode(
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        total_len: usize,
+        recall_pages: &[u32],
+    ) -> Result<Self> {
+        ensure!(
+            pool.format == KVFormat::BF16,
+            "session KV-recall decode page table is BF16-only, got {:?}",
+            pool.format
+        );
+        ensure!(
+            !recall_pages.is_empty(),
+            "recall decode page table needs at least one selected page"
+        );
+        let num_pages = recall_pages.len();
+        let last_page_len = total_len % pool.page_size;
+        let last_page_len = if last_page_len == 0 {
+            pool.page_size
+        } else {
+            last_page_len
+        };
+        let page_ids = recall_pages.iter().map(|&p| p as i32).collect::<Vec<_>>();
+        Ok(Self {
+            q_indptr: upload_i32(ctx, &[0, 1])?,
+            kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
+            kv_indices: upload_i32(ctx, &page_ids)?,
+            kv_last_page_len: upload_i32(ctx, &[last_page_len as i32])?,
+            page_table_offsets: upload_i32(ctx, &[0])?,
+            start_positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
+            positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
+            seq_len: 1,
+            num_pages,
+            start_pos: total_len - 1,
+            new_token_rows: None,
+            prefix_token_rows: None,
+            quant_decode_meta: None,
+        })
+    }
 }
 
 pub(crate) struct SafetensorLoader {

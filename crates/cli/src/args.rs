@@ -448,9 +448,9 @@ pub(crate) struct ServeArgs {
 
     /// Opt into session KV-recall ("infinite memory"): when a session exceeds the
     /// GPU working set, attend a recalled subset (sink + top-k mean-key + local)
-    /// instead of the full cache. Metal + `--kv-cache-dtype bf16` only; default
-    /// off → baseline byte-identical. See
-    /// `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
+    /// instead of the full cache. Metal, and CUDA dense-Qwen3 (eager decode),
+    /// with `--kv-cache-dtype bf16` only; default off → baseline byte-identical.
+    /// See `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
     #[arg(long, default_value_t = false)]
     pub(crate) kv_recall: bool,
 

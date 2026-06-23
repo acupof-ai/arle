@@ -20,6 +20,7 @@ use crate::attention::ModelKvAdapter;
 use crate::decode_graph::DecodeGraphContext;
 use crate::decode_graph_key::{DECODE_GRAPH_BATCH, DecodeGraphKey};
 use crate::graph::GraphBucket;
+use crate::loader::PageMeta;
 use crate::model::CudaModel;
 use crate::ops::argmax;
 
@@ -396,6 +397,26 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Opt into session KV-recall (`--kv-recall`, default off). Wired for the
+    /// dense-Qwen3 paged decode arm (the only CUDA arm with a paged page table +
+    /// page-granular tier); the Qwen3.5/3.6 hybrid and DSv4 arms own per-slot KV
+    /// state internally and ignore the request (logged at the call site). Off →
+    /// the decode hot path is byte-identical.
+    pub(crate) fn set_kv_recall(&mut self, enabled: bool) {
+        match self {
+            Self::Qwen(q) => q.set_kv_recall(enabled),
+            Self::Qwen35(_) | Self::Dsv4(_) => {
+                if enabled {
+                    warn!(
+                        "--kv-recall requested but the loaded CUDA model is not the dense-Qwen3 \
+                         paged-KV path; session KV-recall is wired only for dense Qwen3 today — \
+                         decode runs full attention (ignored)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Attach the opt-in disk spill level (pre-serve only). Returns whether
     /// any arm consumed it, so callers can fail closed instead of silently
     /// dropping an explicit `--kv-ssd-path` request.
@@ -567,6 +588,22 @@ pub(crate) struct QwenCudaExecutor {
     /// fixed at [`DECODE_GRAPH_BATCH`], so `num_pages` is the only varying capture
     /// scalar. A new page count recaptures.
     graphs: Option<GraphBucket>,
+    /// Session KV-recall opt-in (`--kv-recall`, default off). When off the decode
+    /// hot path does no scoring and the page table is the full contiguous cache →
+    /// baseline byte-identical (CUDA is the Stable backend). When on, recall is
+    /// BF16-only and **eager-only** (the captured decode graph bakes `num_pages`,
+    /// and recall needs a host query read-back + restricted page table between
+    /// steps), so a recall-active slot skips the graph. See
+    /// `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
+    kv_recall: bool,
+    /// Recall budget regions (validated defaults): sink 32 + local 256 + top-k 8
+    /// blocks of 32. The working set is bounded regardless of history length.
+    recall_cfg: infer_core::RecallConfig,
+    /// Per-slot resident mean-key reps + next-step recall page plan. Indexed by
+    /// slot; only mutated when `kv_recall` is on.
+    recall: Vec<crate::recall::CudaRecallState>,
+    /// One-time non-BF16-KV-with-recall fallback log latch.
+    recall_quant_warned: bool,
 }
 
 /// One slot's executor-side materialization watermark (see
@@ -648,6 +685,9 @@ impl QwenCudaExecutor {
         let slot_progress = vec![SlotProgress::default(); num_slots];
         let tier =
             CudaKvTierStore::with_budget(default_t1_budget_bytes(), kv.storage_bytes_per_page());
+        let recall = (0..num_slots)
+            .map(|_| crate::recall::CudaRecallState::default())
+            .collect();
         Ok(Self {
             model,
             kv,
@@ -656,6 +696,10 @@ impl QwenCudaExecutor {
             slot_progress,
             decode_ctx: None,
             graphs: None,
+            kv_recall: false,
+            recall_cfg: crate::recall::default_recall_config(),
+            recall,
+            recall_quant_warned: false,
         })
     }
 
@@ -688,6 +732,14 @@ impl QwenCudaExecutor {
     /// construction, before the engine demotes anything.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.tier = CudaKvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
+    }
+
+    /// Opt into session KV-recall (`--kv-recall`, default off). Mirrors the Metal
+    /// `set_kv_recall`: a post-construction setter so the constructor signature
+    /// stays stable. With recall off the decode hot path is unchanged
+    /// (byte-identical baseline — CUDA is the Stable backend).
+    pub(crate) fn set_kv_recall(&mut self, enabled: bool) {
+        self.kv_recall = enabled;
     }
 
     /// Attach the opt-in disk spill level (`--kv-ssd-path`). Pre-serve only.
@@ -830,17 +882,24 @@ impl QwenCudaExecutor {
             )?;
             self.kv.mirror_slot(row.slot, pages, row.kv_seq_len + 1)?;
             let position = row.kv_seq_len.saturating_add(1) as u64;
-            // Try the captured graph; on any miss fall back to the eager path.
-            match self.try_captured_decode(row.slot, row.last_token, row.kv_seq_len)? {
-                Some(()) => self.sample_decode_logits(&row.params, position)?,
-                None => self.model.forward_tokens(
-                    row.slot,
-                    &[row.last_token],
-                    row.kv_seq_len,
-                    &mut self.kv,
-                    &row.params,
-                    position,
-                )?,
+            // Session KV-recall (eager-only, BF16-only): when on and this slot has
+            // an active recall plan, attend the restricted page table + rescore
+            // for the next step. Off / no plan → the byte-identical default below.
+            if let Some(token) = self.try_recall_decode(row, position)? {
+                token
+            } else {
+                // Try the captured graph; on any miss fall back to the eager path.
+                match self.try_captured_decode(row.slot, row.last_token, row.kv_seq_len)? {
+                    Some(()) => self.sample_decode_logits(&row.params, position)?,
+                    None => self.model.forward_tokens(
+                        row.slot,
+                        &[row.last_token],
+                        row.kv_seq_len,
+                        &mut self.kv,
+                        &row.params,
+                        position,
+                    )?,
+                }
             }
         };
 
@@ -950,6 +1009,101 @@ impl QwenCudaExecutor {
         Ok(())
     }
 
+    /// Session KV-recall decode step (#3/#4/#5), eager-only and BF16-only.
+    ///
+    /// Returns `Ok(Some(token))` when recall handled the step (restricted page
+    /// table + rescore for the next step), `Ok(None)` to fall through to the
+    /// default graph/eager decode. No-op (`None`) unless `--kv-recall` is on AND
+    /// the session has exceeded the working-set budget — below the budget recall
+    /// is a strict no-op, so the default path stays byte-identical. Non-BF16 KV
+    /// falls back (logged once); recall is BF16-gated.
+    fn try_recall_decode(&mut self, row: &DecodeRow, position: u64) -> Result<Option<u32>> {
+        if !self.kv_recall {
+            return Ok(None);
+        }
+        if self.kv.format != KVFormat::BF16 {
+            if !self.recall_quant_warned {
+                warn!(
+                    "--kv-recall requested with a {:?} KV pool; recall is BF16-only — \
+                     falling back to full attention (use --kv-cache-dtype bf16 to enable recall)",
+                    self.kv.format
+                );
+                self.recall_quant_warned = true;
+            }
+            return Ok(None);
+        }
+        let cfg = self.recall_cfg;
+        let cache_len = row.kv_seq_len + 1; // includes this step's appended token
+        // Below the working-set budget recall is a strict no-op (mirrors
+        // `plan_recall` returning the full contiguous range) → default path.
+        if cache_len <= cfg.working_set_tokens() {
+            return Ok(None);
+        }
+
+        // Correctness invariant for the restricted page table: the decode kernel
+        // treats every page EXCEPT the last in `kv_indices` as FULL (`page_size`
+        // tokens) and only the last as partial (`kv_last_page_len`). With all the
+        // recall region boundaries (`n_init`, `l_bs`, `n_local`) multiples of
+        // `page_size`, every range start/end is page-aligned except the final
+        // local-window end (= `cache_len`), whose last page IS the current partial
+        // page — so the only partial page is the last selected one, matching the
+        // kernel. A future config that breaks this alignment would silently
+        // mis-attend, so fail loud here.
+        let ps = self.kv.page_size;
+        ensure!(
+            cfg.n_init.is_multiple_of(ps)
+                && cfg.n_local.is_multiple_of(ps)
+                && cfg.l_bs.is_multiple_of(ps),
+            "KV-recall config (n_init {}, n_local {}, l_bs {}) must be multiples of \
+             the KV page_size {} so the restricted page table has only its LAST page partial",
+            cfg.n_init,
+            cfg.n_local,
+            cfg.l_bs,
+            ps
+        );
+
+        // Page list for this step's attention: the slot's recall plan from the
+        // previous step (stale-Q), or the full page list on the first recall step
+        // (no plan yet) so the forward is still correct while we seed scoring.
+        let recall_pages: Vec<u32> = match self.recall.get(row.slot).and_then(|s| s.recall_pages())
+        {
+            Some(p) => p.to_vec(),
+            None => {
+                let num_pages = cache_len.div_ceil(self.kv.page_size);
+                self.kv.page_indices(row.slot)[..num_pages].to_vec()
+            }
+        };
+        let recall_meta =
+            PageMeta::for_recall_decode(&self.model.ctx, &self.kv, cache_len, &recall_pages)?;
+        let (token, layer0_query) = self.model.forward_decode_recall(
+            row.last_token,
+            &mut self.kv,
+            &recall_meta,
+            &row.params,
+            position,
+        )?;
+
+        // Score this step's query against the resident reps and plan the NEXT
+        // step's recall (stale-Q, licensed).
+        let num_q_heads = self.model.local_q_heads;
+        let num_kv_heads = self.model.local_kv_heads;
+        let head_dim = self.model.config.head_dim;
+        if let Some(state) = self.recall.get_mut(row.slot) {
+            state.recompute_recall_plan(
+                &self.model.ctx,
+                &self.kv,
+                row.slot,
+                cache_len,
+                &cfg,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &layer0_query,
+            )?;
+        }
+        Ok(Some(token))
+    }
+
     /// Write Stage-1 metadata and replay (or lazily capture) the decode graph for
     /// this step's page count. Returns `Ok(Some(()))` when the graph wrote
     /// `decode_ctx.logits` (sample from there), `Ok(None)` for eager fallback
@@ -1045,8 +1199,14 @@ impl QwenCudaExecutor {
                 "CUDA slot {slot} epoch {epoch} materialized {} tokens but the plan resumes at {append_pos} (non-contiguous append)",
                 progress.len
             );
+        } else if self.kv_recall {
+            // New occupant: drop the prior session's recall reps + plan so the
+            // fresh request starts from the byte-identical default page table.
+            if let Some(state) = self.recall.get_mut(slot) {
+                state.reset();
+            }
         }
-        *progress = SlotProgress { epoch, len: end };
+        self.slot_progress[slot] = SlotProgress { epoch, len: end };
         Ok(())
     }
 }
