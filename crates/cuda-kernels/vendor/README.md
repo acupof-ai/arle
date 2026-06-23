@@ -2,8 +2,6 @@ Vendored upstream kernels (adopt-official-first; see each entry's pin).
 
 - `deepgemm/`: copied from `deepseek-ai/DeepGEMM` at
   `714dd1a4a980f7937a74343d19a8eba4fe321480`.
-- `tilekernels/`: copied from `deepseek-ai/TileKernels` at
-  `36d9e45d38e204ebb87e6f6e833821eee0482fe5`.
 - `flashmla/`: `deepseek-ai/FlashMLA` csrc (cutlass submodule snapshot at
   NVIDIA tag `147f5673`). Linked via `arle_flashmla_shim.cu` behind
   `ARLE_CUDA_ENABLE_FLASHMLA`.
@@ -17,7 +15,7 @@ Vendored upstream kernels (adopt-official-first; see each entry's pin).
   (num_splits, pagedkv_tma) and is never compiled. Consumer plan:
   `docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md`.
 
-DeepGEMM/TileKernels are not linked into the default CUDA build; the ARLE
-path ports raw kernels behind C ABI entry points first, then can replace
-selected kernels with direct integrations. FlashMLA and flash-attention link
-through ARLE shims, env-gated, sm_90a only.
+DeepGEMM is not linked into the default CUDA build; the ARLE path ports raw
+kernels behind C ABI entry points first, then can replace selected kernels
+with direct integrations. FlashMLA and flash-attention link through ARLE
+shims, env-gated, sm_90a only.
