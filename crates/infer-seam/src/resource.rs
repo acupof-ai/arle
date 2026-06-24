@@ -239,6 +239,150 @@ pub fn split_host_tiers(
     }
 }
 
+/// Inputs/policy for the unified L2 (host DRAM) tier budget ([`dram_l2_budget`]).
+///
+/// The L2 store is *pageable* host memory holding demoted KV pages; the box is
+/// shared, so being greedy swaps or OOM-kills co-tenants. The budget is
+/// `clamp(fraction × MemAvailable, [floor, MemAvailable − reserve])` with a
+/// reserve that scales with total RAM (the OS + service host: weight staging,
+/// pinned ring, page cache).
+#[derive(Debug, Clone, Copy)]
+pub struct DramTierPolicy {
+    /// Fraction of *available* DRAM the L2 tier may claim. Default 0.5 (NOT 0.8):
+    /// the store is pageable host memory on a shared box.
+    pub fraction: f64,
+    /// Floor on the L2 budget when DRAM is ample (so a tiny `MemAvailable`
+    /// reading never collapses the tier, but the reserve still wins when DRAM
+    /// is genuinely scarce — see [`dram_l2_budget`]).
+    pub floor_bytes: usize,
+    /// Absolute reserve floor: never claim DRAM that would leave less than this
+    /// for the OS + co-tenants.
+    pub reserve_floor_bytes: usize,
+    /// Fractional reserve: `reserve = max(reserve_floor_bytes, reserve_fraction
+    /// × total_ram)`. Scales the headroom up on a big box.
+    pub reserve_fraction: f64,
+}
+
+impl Default for DramTierPolicy {
+    fn default() -> Self {
+        Self {
+            fraction: 0.5,
+            floor_bytes: 4 * GIB,
+            reserve_floor_bytes: 64 * GIB,
+            reserve_fraction: 0.15,
+        }
+    }
+}
+
+/// Inputs/policy for the unified L3 (NVMe) tier budget ([`nvme_l3_budget`]).
+///
+/// `clamp(fraction × free_disk, [floor, free_disk − reserve])` with a reserve
+/// that scales with total disk (the FS itself + other tenants).
+#[derive(Debug, Clone, Copy)]
+pub struct NvmeTierPolicy {
+    /// Fraction of *free* disk the L3 tier may claim. Default 0.5.
+    pub fraction: f64,
+    /// Floor on the L3 budget when free disk is ample.
+    pub floor_bytes: usize,
+    /// Absolute reserve floor for the FS + other tenants.
+    pub reserve_floor_bytes: usize,
+    /// Fractional reserve: `reserve = max(reserve_floor_bytes, reserve_fraction
+    /// × total_disk)`.
+    pub reserve_fraction: f64,
+}
+
+impl Default for NvmeTierPolicy {
+    fn default() -> Self {
+        Self {
+            fraction: 0.5,
+            floor_bytes: 8 * GIB,
+            reserve_floor_bytes: 50 * GIB,
+            reserve_fraction: 0.1,
+        }
+    }
+}
+
+/// Clamp `fraction × resource` into `[floor, resource − reserve]`, where
+/// `reserve = max(reserve_floor, reserve_fraction × total)`.
+///
+/// The clamp order is deliberate: the upper bound (`resource − reserve`,
+/// saturating) is applied LAST so the reserve always wins on a scarce box — a
+/// `floor` larger than `resource − reserve` collapses to `resource − reserve`
+/// (which may be 0), never claiming into the reserve. `total >= resource` is
+/// the expected relationship (free/available ≤ total) but is not required.
+fn tier_budget_with_reserve(
+    resource_bytes: usize,
+    total_bytes: usize,
+    fraction: f64,
+    floor_bytes: usize,
+    reserve_floor_bytes: usize,
+    reserve_fraction: f64,
+) -> usize {
+    let reserve = reserve_floor_bytes.max((total_bytes as f64 * reserve_fraction) as usize);
+    let ceiling = resource_bytes.saturating_sub(reserve);
+    let scaled = (resource_bytes as f64 * fraction) as usize;
+    // Lower-bound by the floor, then upper-bound by the reserve ceiling (the
+    // reserve must win — `.min` last so a floor above the ceiling cannot claim
+    // into the reserve).
+    scaled.max(floor_bytes).min(ceiling)
+}
+
+/// Unified **L2 (host DRAM)** KV-tier budget — measured-hardware, leave-a-reserve
+/// (the box is shared; the store is pageable host memory).
+///
+/// `budget = clamp(fraction × available_ram, [floor, available_ram − reserve])`,
+/// `reserve = max(reserve_floor, reserve_fraction × total_ram)`.
+///
+/// `available_ram_bytes`/`total_ram_bytes` of `None` (a probe miss off Linux)
+/// fall back to `floor_bytes` so a `/proc`-less typecheck build never
+/// over-claims. When both are present but `available ≤ reserve`, the budget
+/// floors at `0` — the box has no spare DRAM for an L2 tier.
+#[must_use]
+pub fn dram_l2_budget(
+    available_ram_bytes: Option<usize>,
+    total_ram_bytes: Option<usize>,
+    policy: DramTierPolicy,
+) -> usize {
+    let (Some(avail), Some(total)) = (available_ram_bytes, total_ram_bytes) else {
+        return policy.floor_bytes;
+    };
+    tier_budget_with_reserve(
+        avail,
+        total,
+        policy.fraction,
+        policy.floor_bytes,
+        policy.reserve_floor_bytes,
+        policy.reserve_fraction,
+    )
+}
+
+/// Unified **L3 (NVMe)** KV-tier budget — measured free disk, leave a reserve for
+/// the FS + other tenants.
+///
+/// `budget = clamp(fraction × free_disk, [floor, free_disk − reserve])`,
+/// `reserve = max(reserve_floor, reserve_fraction × total_disk)`.
+///
+/// `free_disk_bytes`/`total_disk_bytes` of `None` (a probe miss) fall back to
+/// `floor_bytes`. When `free ≤ reserve` the budget floors at `0`.
+#[must_use]
+pub fn nvme_l3_budget(
+    free_disk_bytes: Option<usize>,
+    total_disk_bytes: Option<usize>,
+    policy: NvmeTierPolicy,
+) -> usize {
+    let (Some(free), Some(total)) = (free_disk_bytes, total_disk_bytes) else {
+        return policy.floor_bytes;
+    };
+    tier_budget_with_reserve(
+        free,
+        total,
+        policy.fraction,
+        policy.floor_bytes,
+        policy.reserve_floor_bytes,
+        policy.reserve_fraction,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +567,91 @@ mod tests {
         assert_eq!(clamp_mem_fraction_static(0.1), 0.5);
         assert_eq!(clamp_mem_fraction_static(1.5), 0.97);
         assert_eq!(clamp_mem_fraction_static(f64::NAN), 0.97);
+    }
+
+    // The 8×H20 box from the plan §3.6 example: ~1.9 TB DRAM. We take a round
+    // 1800 GiB total / 1700 GiB available reading.
+    const DRAM_TOTAL: usize = 1800 * GIB;
+    const DRAM_AVAIL: usize = 1700 * GIB;
+    // ~766 GB free / 1 TiB total disk.
+    const DISK_TOTAL: usize = 1024 * GIB;
+    const DISK_FREE: usize = 766 * GIB;
+
+    #[test]
+    fn dram_l2_budget_big_box_claims_half_avail_above_reserve() {
+        let p = DramTierPolicy::default();
+        // reserve = max(64 GiB, 0.15 × 1800 GiB = 270 GiB) = 270 GiB.
+        // ceiling = 1700 − 270 = 1430 GiB; 0.5 × 1700 = 850 GiB < ceiling → 850.
+        let b = dram_l2_budget(Some(DRAM_AVAIL), Some(DRAM_TOTAL), p);
+        assert_eq!(b, 850 * GIB, "0.5 × avail wins under the reserve ceiling");
+        // Far above the old [1,4] GiB cap — the whole point.
+        assert!(b > 100 * GIB);
+    }
+
+    #[test]
+    fn dram_l2_budget_reserve_ceiling_wins_when_fraction_too_greedy() {
+        // A higher fraction would claim past the reserve ceiling → clamped down.
+        let p = DramTierPolicy {
+            fraction: 0.95,
+            ..DramTierPolicy::default()
+        };
+        // ceiling = 1700 − 270 = 1430 GiB; 0.95 × 1700 = 1615 GiB > ceiling → 1430.
+        let b = dram_l2_budget(Some(DRAM_AVAIL), Some(DRAM_TOTAL), p);
+        assert_eq!(b, 1430 * GIB, "reserve ceiling clamps a greedy fraction");
+    }
+
+    #[test]
+    fn dram_l2_budget_floor_protects_small_avail_but_reserve_still_wins() {
+        let p = DramTierPolicy::default();
+        // 5 GiB available, 128 GiB total → reserve = max(64, 19.2) = 64 GiB.
+        // ceiling = 5 − 64 saturates to 0; floor 4 GiB clamped down to ceiling 0.
+        let b = dram_l2_budget(Some(5 * GIB), Some(128 * GIB), p);
+        assert_eq!(
+            b, 0,
+            "no spare DRAM above the reserve → 0, floor can't override"
+        );
+        // 80 GiB available, 128 GiB total → reserve = max(64, 19.2) = 64 GiB.
+        // ceiling = 80 − 64 = 16 GiB; 0.5 × 80 = 40 > ceiling, floor 4 < ceiling → 16.
+        let b2 = dram_l2_budget(Some(80 * GIB), Some(128 * GIB), p);
+        assert_eq!(b2, 16 * GIB, "reserve ceiling caps the mid-size box");
+    }
+
+    #[test]
+    fn dram_l2_budget_probe_miss_falls_back_to_floor() {
+        let p = DramTierPolicy::default();
+        assert_eq!(dram_l2_budget(None, Some(DRAM_TOTAL), p), p.floor_bytes);
+        assert_eq!(dram_l2_budget(Some(DRAM_AVAIL), None, p), p.floor_bytes);
+        assert_eq!(dram_l2_budget(None, None, p), 4 * GIB);
+    }
+
+    #[test]
+    fn nvme_l3_budget_big_box_claims_half_free_above_reserve() {
+        let p = NvmeTierPolicy::default();
+        // reserve = max(50 GiB, 0.1 × 1024 GiB = 102.4 GiB) = 102.4 GiB.
+        // ceiling = 766 − 102.4 ≈ 663.6 GiB; 0.5 × 766 = 383 GiB < ceiling → 383.
+        let b = nvme_l3_budget(Some(DISK_FREE), Some(DISK_TOTAL), p);
+        assert_eq!(b, 383 * GIB, "0.5 × free wins under the reserve ceiling");
+        // Far above the old 20 GiB cap.
+        assert!(b > 100 * GIB);
+    }
+
+    #[test]
+    fn nvme_l3_budget_reserve_floor_dominates_small_total() {
+        let p = NvmeTierPolicy::default();
+        // 100 GiB free, 200 GiB total → reserve = max(50, 0.1×200=20) = 50 GiB.
+        // ceiling = 100 − 50 = 50 GiB; 0.5 × 100 = 50 GiB == ceiling → 50.
+        let b = nvme_l3_budget(Some(100 * GIB), Some(200 * GIB), p);
+        assert_eq!(b, 50 * GIB);
+    }
+
+    #[test]
+    fn nvme_l3_budget_floor_and_probe_miss() {
+        let p = NvmeTierPolicy::default();
+        // 12 GiB free, 64 GiB total → reserve = max(50, 6.4) = 50; ceiling = 12 − 50
+        // saturates to 0 → budget 0 (floor 8 can't claim into the reserve).
+        assert_eq!(nvme_l3_budget(Some(12 * GIB), Some(64 * GIB), p), 0);
+        // Probe miss → floor.
+        assert_eq!(nvme_l3_budget(None, Some(DISK_TOTAL), p), p.floor_bytes);
+        assert_eq!(nvme_l3_budget(Some(DISK_FREE), None, p), 8 * GIB);
     }
 }

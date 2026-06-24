@@ -26,7 +26,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use infer_seam::{HostTierPolicy, split_host_tiers};
+use infer_seam::{DramTierPolicy, NvmeTierPolicy, dram_l2_budget, nvme_l3_budget};
 
 /// Manifest filename under a durable disk namespace. Records the epoch tag plus
 /// one `key byte_len` line per disk-resident block so a restart can rebuild the
@@ -40,16 +40,16 @@ const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V1";
 static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
-/// Bytes of *available* system RAM (Linux `/proc/meminfo` `MemAvailable`).
+/// Read a `/proc/meminfo` field (e.g. `MemAvailable`, `MemTotal`) in bytes.
 ///
-/// `None` off Linux or when the field is unreadable — [`split_host_tiers`]
-/// then falls back to the proven cap, so a probe miss never over-shrinks the
-/// tier (a Mac CUDA-typecheck build, having no `/proc`, lands on the cap).
-fn available_ram_bytes() -> Option<usize> {
+/// `None` off Linux or when the field is unreadable, so a `/proc`-less build
+/// (a Mac CUDA-typecheck) makes [`dram_l2_budget`] fall back to its floor.
+fn meminfo_field_bytes(field: &str) -> Option<usize> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let prefix = format!("{field}:");
     for line in meminfo.lines() {
         // "MemAvailable:   12345678 kB"
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+        if let Some(rest) = line.strip_prefix(&prefix) {
             let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb.saturating_mul(1024));
         }
@@ -57,11 +57,25 @@ fn available_ram_bytes() -> Option<usize> {
     None
 }
 
-/// Bytes free on the filesystem holding `path` (POSIX `statvfs`,
-/// unprivileged-available blocks). `None` on non-unix or probe failure →
-/// [`split_host_tiers`] falls back to the proven cap.
+/// Bytes of *available* system RAM (Linux `/proc/meminfo` `MemAvailable`).
+fn available_ram_bytes() -> Option<usize> {
+    meminfo_field_bytes("MemAvailable")
+}
+
+/// Bytes of *total* system RAM (Linux `/proc/meminfo` `MemTotal`) — the base
+/// for the L2 reserve (`reserve = max(64 GiB, 0.15 × total_ram)`).
+fn total_ram_bytes() -> Option<usize> {
+    meminfo_field_bytes("MemTotal")
+}
+
+/// One `statvfs` of `path`, returning `(free_bytes, total_bytes)` for the
+/// filesystem holding it. `None` on non-unix or probe failure → the L3 budget
+/// falls back to its floor.
+///
+/// - free  = `f_bavail × f_frsize` (blocks available to unprivileged users)
+/// - total = `f_blocks × f_frsize` (all data blocks — the base for the reserve)
 #[cfg(unix)]
-fn free_disk_bytes(path: &Path) -> Option<usize> {
+fn disk_free_total_bytes(path: &Path) -> Option<(usize, usize)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -74,40 +88,71 @@ fn free_disk_bytes(path: &Path) -> Option<usize> {
         }
         stat
     };
-    // f_bavail = blocks available to unprivileged users; f_frsize = fragment size.
-    let bytes = u128::from(stat.f_frsize).saturating_mul(u128::from(stat.f_bavail));
-    usize::try_from(bytes).ok()
+    let frsize = u128::from(stat.f_frsize);
+    let free = usize::try_from(frsize.saturating_mul(u128::from(stat.f_bavail))).ok()?;
+    let total = usize::try_from(frsize.saturating_mul(u128::from(stat.f_blocks))).ok()?;
+    Some((free, total))
 }
 
 #[cfg(not(unix))]
-fn free_disk_bytes(_path: &Path) -> Option<usize> {
+fn disk_free_total_bytes(_path: &Path) -> Option<(usize, usize)> {
     None
 }
 
-/// Machine-derived host-RAM budget for demoted prefix pages — replaces the
-/// hardcoded 4 GiB constant. Default-on (ckl 2026-06-11): evicted prefix pages
-/// demote into host RAM and promote back on the next prefix hit instead of
-/// re-prefilling (`--kv-t1-budget-bytes 0` opts out). Probes `MemAvailable`;
-/// the neutral [`split_host_tiers`] policy caps it at the proven 4 GiB (so an
-/// ample host is byte-identical to the old default) and scales it down on a
-/// constrained one, with a 1 GiB floor.
-pub(crate) fn default_t1_budget_bytes() -> usize {
-    split_host_tiers(
+/// Machine-derived **L2 (host DRAM)** budget for demoted prefix/recall pages —
+/// replaces the hardcoded [1,4] GiB cap. Default-on (ckl 2026-06-11): evicted
+/// pages demote into host RAM and promote back on the next hit instead of
+/// re-prefilling (`--kv-t1-budget-bytes 0` opts out). Profiled from measured
+/// hardware with a reserve so the **shared, pageable** host store never swaps or
+/// OOM-kills co-tenants: `budget = clamp(dram_fraction × MemAvailable, [4 GiB,
+/// MemAvailable − reserve])`, `reserve = max(64 GiB, 0.15 × MemTotal)`. A probe
+/// miss (off Linux) falls back to the 4 GiB floor.
+pub(crate) fn default_t1_budget_bytes(dram_fraction: f64) -> usize {
+    let budget = dram_l2_budget(
         available_ram_bytes(),
-        None,
-        false,
-        HostTierPolicy::default(),
-    )
-    .ram_bytes
+        total_ram_bytes(),
+        DramTierPolicy {
+            fraction: dram_fraction,
+            ..DramTierPolicy::default()
+        },
+    );
+    log::info!(
+        "L2 (host DRAM) KV tier budget {} MiB (dram_fraction {dram_fraction}, MemAvailable {} MiB, \
+         MemTotal {} MiB)",
+        budget / (1 << 20),
+        available_ram_bytes().map_or(0, |b| b / (1 << 20)),
+        total_ram_bytes().map_or(0, |b| b / (1 << 20)),
+    );
+    budget
 }
 
-/// Machine-derived SSD spill budget for the disk tier rooted at `root` —
-/// replaces the hardcoded 20 GiB constant. Applies when `--kv-ssd-path` is set
-/// without `--kv-ssd-max-bytes`. Probes free disk at the spill path; the
-/// neutral [`split_host_tiers`] policy caps it at the proven 20 GiB and scales
-/// it down when free disk is scarce.
-pub fn default_t2_budget_bytes(root: &Path) -> usize {
-    split_host_tiers(None, free_disk_bytes(root), true, HostTierPolicy::default()).ssd_bytes
+/// Machine-derived **L3 (NVMe)** spill budget for the disk tier rooted at `root`
+/// — replaces the hardcoded 20 GiB cap. Applies when `--kv-ssd-path` is set
+/// without `--kv-ssd-max-bytes`: `budget = clamp(ssd_fraction × free_disk,
+/// [8 GiB, free_disk − reserve])`, `reserve = max(50 GiB, 0.1 × total_disk)`.
+/// A probe miss falls back to the 8 GiB floor.
+pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
+    let (free, total) = match disk_free_total_bytes(root) {
+        Some((free, total)) => (Some(free), Some(total)),
+        None => (None, None),
+    };
+    let budget = nvme_l3_budget(
+        free,
+        total,
+        NvmeTierPolicy {
+            fraction: ssd_fraction,
+            ..NvmeTierPolicy::default()
+        },
+    );
+    log::info!(
+        "L3 (NVMe) KV tier budget {} MiB at {} (ssd_fraction {ssd_fraction}, free_disk {} MiB, \
+         total_disk {} MiB)",
+        budget / (1 << 20),
+        root.display(),
+        free.map_or(0, |b| b / (1 << 20)),
+        total.map_or(0, |b| b / (1 << 20)),
+    );
+    budget
 }
 
 pub(crate) struct CudaKvTierStore {
@@ -845,36 +890,48 @@ mod tests {
     const GIB: usize = 1 << 30;
 
     #[test]
-    fn host_default_budget_within_policy_envelope() {
-        // Probe miss (Mac) → 4 GiB cap; Linux MemAvailable → clamp(avail×0.25,
-        // 1 GiB floor, 4 GiB cap). Either way: floored at 1 GiB, capped at 4 GiB.
-        let b = default_t1_budget_bytes();
+    fn host_default_budget_at_least_floor() {
+        // Probe miss (Mac, no /proc) → 4 GiB floor; Linux MemAvailable →
+        // clamp(avail×0.5, [4 GiB, avail − reserve]). Either way ≥ 0 and, when
+        // DRAM is present, never below the 4 GiB floor unless the reserve eats
+        // the whole box (a constrained machine, where 0 is correct). On the CI
+        // hosts (ample RAM) we expect the 4 GiB floor or higher.
+        let b = default_t1_budget_bytes(0.5);
+        // No upper cap any more — the L2 tier grows into the box. Just prove the
+        // probe path runs and the result is sane (≥ floor on a real machine, or
+        // 0 only if available ≤ reserve).
         assert!(
-            (GIB..=4 * GIB).contains(&b),
-            "host-demoted budget {b} outside [1 GiB, 4 GiB]"
+            b == 0 || b >= 4 * GIB,
+            "L2 DRAM budget {b} is neither 0 nor ≥ floor"
         );
     }
 
     #[test]
-    fn disk_default_budget_capped_at_proven_constant() {
-        // statvfs on a real temp dir (or probe-miss fallback) → never exceeds
-        // the proven 20 GiB cap.
+    fn disk_default_budget_runs_and_is_bounded_by_free() {
+        // statvfs on a real temp dir (or probe-miss fallback). No proven cap any
+        // more: the budget grows into free disk, bounded by free − reserve.
         let root = temp_root("disk_probe");
-        let b = default_t2_budget_bytes(&root);
-        assert!(b <= 20 * GIB, "disk budget {b} exceeds 20 GiB cap");
+        let b = default_t2_budget_bytes(&root, 0.5);
+        if let Some((free, _total)) = disk_free_total_bytes(&root) {
+            assert!(b <= free, "L3 budget {b} exceeds free disk {free}");
+        }
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[cfg(unix)]
     #[test]
-    fn free_disk_probe_reports_some_on_real_dir() {
+    fn disk_free_total_probe_reports_some_on_real_dir() {
         let root = temp_root("statvfs");
+        let probe = disk_free_total_bytes(&root);
         assert!(
-            free_disk_bytes(&root).is_some(),
-            "statvfs on an existing dir should report free bytes"
+            probe.is_some(),
+            "statvfs on an existing dir should report free+total bytes"
         );
-        // A nonexistent path fails the syscall → None (caller falls back to cap).
-        assert!(free_disk_bytes(&root.join("does-not-exist/x")).is_none());
+        if let Some((free, total)) = probe {
+            assert!(total >= free, "total disk {total} < free {free}");
+        }
+        // A nonexistent path fails the syscall → None (caller falls back to floor).
+        assert!(disk_free_total_bytes(&root.join("does-not-exist/x")).is_none());
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 

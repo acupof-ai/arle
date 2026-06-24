@@ -82,6 +82,19 @@ pub struct EngineLoadConfig {
     /// Qwen3.5/3.6 and DSv4 keep their per-slot sizing this phase.
     #[serde(default = "default_mem_fraction_static")]
     pub mem_fraction_static: f64,
+    /// Fraction of *available* host DRAM the L2 (host-DRAM) KV tier may claim
+    /// (`--dram-fraction`, default 0.5 — the store is pageable host memory on a
+    /// shared box). Budget = `clamp(frac × MemAvailable, [4 GiB, MemAvailable −
+    /// max(64 GiB, 0.15 × MemTotal)])`. CUDA only; `--kv-t1-budget-bytes` is an
+    /// explicit override that wins over this fraction.
+    #[serde(default = "default_dram_fraction")]
+    pub dram_fraction: f64,
+    /// Fraction of *free* disk the L3 (NVMe) KV tier may claim (`--ssd-fraction`,
+    /// default 0.5). Budget = `clamp(frac × free_disk, [8 GiB, free_disk −
+    /// max(50 GiB, 0.1 × total_disk)])`. Applies when `--kv-ssd-path` is set
+    /// without `--kv-ssd-max-bytes`.
+    #[serde(default = "default_ssd_fraction")]
+    pub ssd_fraction: f64,
 }
 
 /// SGLang's default static-memory fraction (0.9): 90% of VRAM for weights+KV,
@@ -89,6 +102,18 @@ pub struct EngineLoadConfig {
 /// inline literal) so `#[serde(default = ...)]` can name it.
 fn default_mem_fraction_static() -> f64 {
     0.9
+}
+
+/// Default L2 host-DRAM tier fraction (0.5): the store is pageable host memory
+/// on a shared box, so half of available DRAM (under a reserve) — never greedy.
+fn default_dram_fraction() -> f64 {
+    0.5
+}
+
+/// Default L3 NVMe tier fraction (0.5): half of free disk under a reserve for
+/// the FS + co-tenants.
+fn default_ssd_fraction() -> f64 {
+    0.5
 }
 
 impl Default for EngineLoadConfig {
@@ -112,6 +137,8 @@ impl Default for EngineLoadConfig {
             kv_recall: false,
             max_thinking_tokens: 0,
             mem_fraction_static: default_mem_fraction_static(),
+            dram_fraction: default_dram_fraction(),
+            ssd_fraction: default_ssd_fraction(),
         }
     }
 }
@@ -1013,9 +1040,10 @@ mod backend {
                 .root
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
+            let ssd_fraction = config.ssd_fraction;
             let budget = kv_ssd
                 .max_bytes
-                .unwrap_or_else(|| infer_metal::default_t2_budget_bytes(&root));
+                .unwrap_or_else(|| infer_metal::default_t2_budget_bytes(&root, ssd_fraction));
             let consumed =
                 serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget, page_size))?;
             anyhow::ensure!(
@@ -1357,11 +1385,13 @@ mod backend {
                 .root
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
-            // Machine-derived T2 budget when `--kv-ssd-max-bytes` is unset:
-            // probe free disk at the spill root (borrow ends before the move).
+            // Machine-derived L3 (NVMe) budget when `--kv-ssd-max-bytes` is
+            // unset: probe free disk at the spill root and claim
+            // `--ssd-fraction` of it (under a reserve). Borrow ends before move.
+            let ssd_fraction = config.ssd_fraction;
             let budget = kv_ssd
                 .max_bytes
-                .unwrap_or_else(|| infer_cuda::default_t2_budget_bytes(&root));
+                .unwrap_or_else(|| infer_cuda::default_t2_budget_bytes(&root, ssd_fraction));
             let consumed = serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget))?;
             anyhow::ensure!(
                 consumed,
@@ -1503,9 +1533,14 @@ mod backend {
             }
         };
         let mut executor = executor;
+        // L2 (host DRAM) tier sizing: `--dram-fraction` (default 0.5) re-budgets
+        // the prefix/recall tier from MEASURED available DRAM with a reserve so
+        // the shared box never swaps. Run FIRST so an explicit
+        // `--kv-t1-budget-bytes` cap below still wins.
+        executor.set_dram_fraction(config.dram_fraction);
         if let Some(bytes) = config.kv_t1_budget_bytes {
             // Pre-serve re-budget of the T1 prefix tier (0 disables); None
-            // keeps the executor's default-on budget.
+            // keeps the executor's --dram-fraction-derived budget.
             executor.set_kv_tier_budget_bytes(bytes);
         }
         // Session KV-recall ("infinite memory", `--kv-recall`, default off). Wired
