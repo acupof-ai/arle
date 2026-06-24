@@ -835,6 +835,46 @@ fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> S
 /// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
 type TileLangPerSmArtifact = (String, String, PathBuf);
 
+/// Persistent kernel-artifact cache root, OUTSIDE `target/` so `cargo clean` and
+/// fresh clones reuse it. `generated/` is gitignored now, so a clean/CI build
+/// regenerates every kernel (TileLang + nvcc, ~60s); this cache restores a prior
+/// build's identical `(kernel source × SM × nvcc)` artifact instead of regenning.
+/// Disable with `ARLE_CUDA_KERNEL_CACHE=0`; relocate with `ARLE_CUDA_KERNEL_CACHE_DIR`.
+fn kernel_cache_root() -> Option<PathBuf> {
+    if std::env::var("ARLE_CUDA_KERNEL_CACHE").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let root = std::env::var("ARLE_CUDA_KERNEL_CACHE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".cache/arle-cuda-kernels"))
+        })?;
+    std::fs::create_dir_all(&root).ok()?;
+    Some(root)
+}
+
+/// nvcc-version fingerprint for the cache key — the cubin-as-text depends on the
+/// compiler, while `tilelang_kernel_src_hash` covers only the kernel source.
+fn nvcc_cache_tag(cuda_path: &str) -> String {
+    let out = Command::new(format!("{cuda_path}/bin/nvcc"))
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let rel = out
+        .lines()
+        .find(|l| l.contains("release"))
+        .unwrap_or("")
+        .trim();
+    let mut h: u64 = 0xcbf29ce484222325;
+    fnv1a_update(&mut h, rel.as_bytes());
+    format!("{h:08x}")
+}
+
 // The shared C ABI signatures (the old TILELANG_DISPATCH_* / GDR_* / FQ_*
 // *_PUBLIC_DECL / *_EXTERN_DECL / *_CALL_ARGS consts) now live in the
 // `[abi.*]` blocks of kernels.toml and reach build code via the parsed
@@ -915,6 +955,8 @@ fn generate_tilelang_artifacts_per_sm(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
     );
     let force_regen = env_truthy("ARLE_TILELANG_REGEN");
+    let cache_root = kernel_cache_root();
+    let nvcc_tag = nvcc_cache_tag(cuda_path);
     let mut results = Vec::new();
 
     for sm in sm_targets {
@@ -975,6 +1017,41 @@ fn generate_tilelang_artifacts_per_sm(
             println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
             results.push((sm_token.clone(), func, consumed_c));
             continue;
+        }
+
+        // Cache tier: restore a prior build's identical regen — keyed on the
+        // source hash + nvcc — from the persistent cache, skipping TileLang+nvcc.
+        let cache_entry = cache_root.as_ref().map(|r| {
+            r.join(format!("{src_hash}-{nvcc_tag}"))
+                .join(&per_sm_artifact_dir)
+        });
+        if let Some(entry) = &cache_entry {
+            let cached_c = entry.join(format!("{per_sm_out_name}.c"));
+            if !force_regen && cached_c.is_file() {
+                copy_dir_recursive(entry, &out_artifact_dir).unwrap_or_else(|err| {
+                    panic!(
+                        "restore cached TileLang artifact {} -> {}: {err}",
+                        entry.display(),
+                        out_artifact_dir.display()
+                    )
+                });
+                let func = std::fs::read_to_string(entry.join("meta.txt"))
+                    .ok()
+                    .and_then(|m| {
+                        m.lines().find_map(|line| {
+                            line.strip_prefix("FUNC_NAME=")
+                                .map(|f| f.trim().to_string())
+                        })
+                    })
+                    .unwrap_or_else(|| func_name.clone());
+                println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
+                results.push((
+                    sm_token.clone(),
+                    func,
+                    out_artifact_dir.join(format!("{per_sm_out_name}.c")),
+                ));
+                continue;
+            }
         }
 
         // Regen: resolve tilelang lazily (panics if unavailable) and run the
@@ -1075,6 +1152,16 @@ fn generate_tilelang_artifacts_per_sm(
             format!("FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\n"),
         )
         .unwrap_or_else(|err| panic!("write meta.txt for {}: {err}", out_artifact_dir.display()));
+
+        // Populate the persistent cache so future clean/CI builds skip this regen.
+        // Best-effort: a cache write failure must never fail the build.
+        if let Some(entry) = &cache_entry {
+            if let Some(parent) = entry.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_dir_all(entry);
+            let _ = copy_dir_recursive(&out_artifact_dir, entry);
+        }
 
         results.push((sm_token.clone(), gen_func_name, c_path));
     }
