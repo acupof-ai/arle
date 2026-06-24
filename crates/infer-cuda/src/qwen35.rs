@@ -370,56 +370,89 @@ pub(crate) struct Qwen35SlotState {
     seq_len: usize,
 }
 
+/// A detached, reusable recurrent state block (`(gdr_states, conv_states)`) on
+/// the executor's free-list. Released back by a finished request and popped by
+/// the next one — same dims for every slot, so any block fits any slot.
+pub(crate) type RecurrentBlock = (Vec<CudaSlice<f32>>, Vec<DeviceVec>);
+
 impl Qwen35SlotState {
-    /// Allocate a slot's recurrent state ONLY (the default paged build): the
-    /// full-attn K/V lives in the shared [`PagedKVPool`], so `k_caches`/
-    /// `v_caches` start empty — zero per-slot full-attn bytes (the 4× capacity
-    /// win). `gdr_states`/`conv_states` are the small per-slot recurrent state
-    /// (MB-scale, not pageable).
-    pub(crate) fn new_linear_only(
+    /// A fresh idle slot: allocate NOTHING. The recurrent state (~147 MiB) is a
+    /// fixed-size per-request state — not token-addressable like the paged
+    /// full-attn KV — so it draws from a request-grained free-list pool
+    /// ([`RecurrentBlock`]) lazily on activation ([`Self::acquire_recurrent`]),
+    /// not upfront per `num_slots`. Idle slots cost zero recurrent HBM; the win
+    /// is partial-load footprint + the foundation for future L2 spill. At full
+    /// concurrency the pool grows to `num_slots`, identical to the old upfront
+    /// reservation. `k_caches`/`v_caches` stay empty (full-attn KV is paged).
+    pub(crate) fn new_linear_only() -> Self {
+        Self {
+            k_caches: Vec::new(),
+            v_caches: Vec::new(),
+            gdr_states: Vec::new(),
+            conv_states: Vec::new(),
+            seq_len: 0,
+        }
+    }
+
+    /// Activate this slot's recurrent state for a fresh request (the
+    /// `start_pos == 0` prefill): pop a reusable block from `pool` (free-list
+    /// reuse, no alloc churn) or allocate fresh, then ZERO it. Idempotent —
+    /// no-op if already allocated, so a chunked-prefill's later chunks
+    /// (`start_pos > 0`) never re-zero and wipe the prefix's recurrent state;
+    /// the zero happens ONLY on fresh acquisition. MUST run before any forward
+    /// reads `gdr_states`.
+    pub(crate) fn acquire_recurrent(
+        &mut self,
         ctx: &DeviceContext,
         num_linear: usize,
         gdr_state_len: usize,
         conv_len: usize,
-    ) -> Result<Self> {
-        let mut gdr_states = Vec::with_capacity(num_linear);
-        let mut conv_states = Vec::with_capacity(num_linear);
-        for _ in 0..num_linear {
-            gdr_states.push(
-                ctx.stream
-                    .alloc_zeros::<f32>(gdr_state_len)
-                    .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?,
-            );
-            conv_states.push(DeviceVec::zeros(ctx, conv_len)?);
+        pool: &mut Vec<RecurrentBlock>,
+    ) -> Result<()> {
+        if !self.gdr_states.is_empty() {
+            return Ok(()); // already active (a chunked-prefill continuation)
         }
-        Ok(Self {
-            k_caches: Vec::new(),
-            v_caches: Vec::new(),
-            gdr_states,
-            conv_states,
-            seq_len: 0,
-        })
-    }
-
-    pub(crate) fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-
-    /// Advance the materialized length by `n` tokens. The captured decode
-    /// graph's caller uses this: the graph body
-    /// ([`Qwen35Model::forward_decode_step_captured`]) is host-state-free —
-    /// replay re-launches only GPU work — so the host-side length advance
-    /// happens exactly once per step at the call site, never inside the
-    /// captured closure.
-    pub(crate) fn advance_seq_len(&mut self, n: usize) {
-        self.seq_len += n;
-    }
-
-    /// Reset for a fresh generation in this slot (zeros recurrent + conv state,
-    /// rewinds the full-attn cache cursor; stale cache rows are overwritten on
-    /// the next prefill).
-    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        let (gdr, conv) = match pool.pop() {
+            Some(block) => block,
+            None => {
+                let mut gdr = Vec::with_capacity(num_linear);
+                let mut conv = Vec::with_capacity(num_linear);
+                for _ in 0..num_linear {
+                    gdr.push(
+                        ctx.stream
+                            .alloc_zeros::<f32>(gdr_state_len)
+                            .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?,
+                    );
+                    conv.push(DeviceVec::zeros(ctx, conv_len)?);
+                }
+                (gdr, conv)
+            }
+        };
+        self.gdr_states = gdr;
+        self.conv_states = conv;
         self.seq_len = 0;
+        // Zero on acquisition (a pooled block carries the prior occupant's
+        // state; a fresh alloc is already zero but re-zeroing is cheap/uniform).
+        self.zero_recurrent(ctx)
+    }
+
+    /// Return this slot's recurrent block to the free-list, leaving the slot's
+    /// fields empty. Called ONLY at request finish (the slot's prior occupant is
+    /// fully done — no in-flight forward references it), so the block is safe to
+    /// hand to the next request.
+    pub(crate) fn release_recurrent(&mut self, pool: &mut Vec<RecurrentBlock>) {
+        if self.gdr_states.is_empty() {
+            return;
+        }
+        let gdr = std::mem::take(&mut self.gdr_states);
+        let conv = std::mem::take(&mut self.conv_states);
+        pool.push((gdr, conv));
+        self.seq_len = 0;
+    }
+
+    /// Zero the recurrent + conv-ring state in place (the per-request fresh
+    /// start). Does not touch the full-attn cursor. No-op when unallocated.
+    fn zero_recurrent(&mut self, ctx: &DeviceContext) -> Result<()> {
         for s in &mut self.gdr_states {
             ctx.stream
                 .memset_zeros(s)
@@ -431,6 +464,27 @@ impl Qwen35SlotState {
                 .map_err(|e| anyhow!("memset conv state failed: {e}"))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Whether this slot's recurrent state is resident (acquired). A forward
+    /// that reads `gdr_states` MUST see this true — a false here means an
+    /// `acquire_recurrent` hook was missed at the request's `start_pos == 0`.
+    pub(crate) fn has_recurrent(&self) -> bool {
+        !self.gdr_states.is_empty()
+    }
+
+    /// Advance the materialized length by `n` tokens. The captured decode
+    /// graph's caller uses this: the graph body
+    /// ([`Qwen35Model::forward_decode_step_captured`]) is host-state-free —
+    /// replay re-launches only GPU work — so the host-side length advance
+    /// happens exactly once per step at the call site, never inside the
+    /// captured closure.
+    pub(crate) fn advance_seq_len(&mut self, n: usize) {
+        self.seq_len += n;
     }
 
     /// Snapshot the linear-attention recurrent + conv-ring state into caller
@@ -1005,6 +1059,17 @@ impl Qwen35BatchDecodeState {
         Ok(())
     }
 
+    /// Invalidate the staged pointer-table cache so the next decode batch
+    /// restages from the slots' CURRENT recurrent-block addresses. Required at a
+    /// request boundary: with the free-list pool a slot's `gdr_states`/
+    /// `conv_states` `CudaSlice`s change identity when a new request acquires a
+    /// different block (vs the old upfront alloc, where they were fixed for the
+    /// executor's lifetime). The cache keys on `slot_indices` alone, so without
+    /// this a same-mapping batch would dereference the prior occupant's block.
+    pub(crate) fn invalidate_staged_pointers(&mut self) {
+        self.staged_slot_indices.clear();
+    }
+
     /// Drop the workspace VRAM (OPD weight time-share hook). The pointer
     /// TABLES and the staged mapping stay: the per-slot state addresses they
     /// hold are executor-owned and untouched by the weight offload, so they
@@ -1356,22 +1421,24 @@ impl Qwen35Model {
         self.local_linear_v_heads * self.config.linear_value_head_dim
     }
 
-    pub(crate) fn new_slot_state(&self) -> Result<Qwen35SlotState> {
+    /// `(num_linear, gdr_state_len, conv_len)` for this rank's recurrent state,
+    /// sized from LOCAL shard widths (each rank carries only its own v-head
+    /// recurrent slabs / qkv conv channels). Single source for both
+    /// [`Qwen35SlotState::acquire_recurrent`] and the spec snapshot scratch.
+    pub(crate) fn recurrent_dims(&self) -> (usize, usize, usize) {
         let c = &self.config;
-        let num_full = c.num_full_attention_layers();
-        let num_linear = c.num_hidden_layers - num_full;
-        let _ = num_full; // full-attn KV is paged (shared pool), not per-slot here.
-        // Default build: recurrent state ONLY — the full-attn K/V lives in the
-        // executor's shared `PagedKVPool`, so the slot allocates zero full-attn
-        // bytes (the 4× capacity win). Sized from this rank's LOCAL shard
-        // widths: each rank carries only its own v-head recurrent slabs / qkv
-        // conv channels.
-        Qwen35SlotState::new_linear_only(
-            &self.ctx,
-            num_linear,
-            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim,
-            self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1),
-        )
+        let num_linear = c.num_hidden_layers - c.num_full_attention_layers();
+        let gdr_state_len =
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
+        let conv_len = self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1);
+        (num_linear, gdr_state_len, conv_len)
+    }
+
+    /// A fresh idle slot — allocates nothing. The recurrent state is drawn from
+    /// the executor's free-list on activation ([`Qwen35SlotState::acquire_recurrent`]);
+    /// the full-attn K/V lives in the shared `PagedKVPool`.
+    pub(crate) fn new_slot_state(&self) -> Qwen35SlotState {
+        Qwen35SlotState::new_linear_only()
     }
 
     /// Allocate per-slot speculative-decode state (draft head KV + trunk linear
@@ -1625,8 +1692,10 @@ impl Qwen35Model {
     }
 
     /// Per-slot device-memory cost (bytes) at this rank's local shard widths:
-    /// the gated-delta recurrent state + conv rings ONLY. Mirrors exactly what
-    /// [`Self::new_slot_state`] allocates per slot.
+    /// the gated-delta recurrent state + conv rings ONLY. This is the recurrent
+    /// block each ACTIVE slot draws from the executor's free-list on activation
+    /// (the pool grows to `num_slots` at full concurrency); the budget reserves
+    /// for the worst case even though idle slots hold no block.
     ///
     /// Full-attn K/V is NO LONGER per-slot since the shared-paged migration: it
     /// lives in the executor's one shared profile-sized [`PagedKVPool`], so the
@@ -2506,6 +2575,15 @@ impl Qwen35Model {
         mut capture: Option<&mut Qwen35LinearCapture>,
         mut recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<()> {
+        // Single chokepoint for every recurrent-reading forward (prefill /
+        // decode / spec-capture / OPD): the slot's recurrent block MUST be
+        // resident — a missed `acquire_recurrent` hook would otherwise read an
+        // empty `gdr_states` as a silent no-op.
+        ensure!(
+            slot.has_recurrent(),
+            "Qwen3.6 forward: slot recurrent state not acquired (missing \
+             acquire_recurrent at the start_pos==0 prefill)"
+        );
         let c = &self.config;
         let eps = c.rms_norm_eps;
         let hidden_size = c.hidden_size;
@@ -5445,6 +5523,13 @@ impl Qwen35Model {
                 slots[si].seq_len(),
                 kv_seq_lens[r]
             );
+            // A decode-batch row's slot was activated at its start_pos==0 prefill;
+            // its recurrent block MUST still be resident (the pointer tables below
+            // dereference `gdr_states`).
+            ensure!(
+                slots[si].has_recurrent(),
+                "Qwen3.6 batched decode: slot {si} recurrent state not acquired"
+            );
             ensure!(
                 kv_seq_lens[r] < self.max_seq_len,
                 "Qwen3.5 batched decode sequence {} exceeds KV cache budget {}",
@@ -7099,8 +7184,12 @@ mod tests {
             .expect("load Qwen3.6-27B-FP8 with MTP head");
 
         // Greedy no-spec: prefill the prompt, then decode `n_decode` tokens.
+        let (num_linear, gdr_len, conv_len) = model.recurrent_dims();
         let run_nospec = || -> (Vec<u32>, f64) {
-            let mut slot = model.new_slot_state().unwrap();
+            let mut slot = model.new_slot_state();
+            let mut acq_pool = Vec::new();
+            slot.acquire_recurrent(&model.ctx, num_linear, gdr_len, conv_len, &mut acq_pool)
+                .unwrap();
             let mut ws = Qwen35Workspace::new();
             let mut out = Vec::with_capacity(n_decode);
             let mut tok = model
@@ -7122,7 +7211,10 @@ mod tests {
 
         // Spec: prefill seeds (pending, hidden), then loop spec_step(depth).
         let run_spec = || -> (Vec<u32>, f64, usize, usize) {
-            let mut slot = model.new_slot_state().unwrap();
+            let mut slot = model.new_slot_state();
+            let mut acq_pool = Vec::new();
+            slot.acquire_recurrent(&model.ctx, num_linear, gdr_len, conv_len, &mut acq_pool)
+                .unwrap();
             let mut spec = model.new_spec_slot_state().unwrap();
             let mut ws = Qwen35Workspace::new();
             // Prefill returns the next token's logits + the producing hidden.
