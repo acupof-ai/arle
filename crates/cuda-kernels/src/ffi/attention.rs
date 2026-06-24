@@ -505,6 +505,10 @@ unsafe extern "C" {
     /// - `compress_ratio`: causality-gate ratio for compressed selections.
     /// - `mode_int`: 1 = CSA, 2 = HCA.
     /// - `page_block_size`: 64 for DSv4-Flash MODEL1.
+    /// - `page_table`/`num_logical_pages`: OPTIONAL Stage-B logical→physical page
+    ///   table (`null`/0 = Stage-A slot-relative path, unchanged). When set, each
+    ///   emitted index's logical page is routed to physical, yielding POOL-absolute
+    ///   indices (an identity table reproduces the Stage-A index for-for-index).
     pub fn arle_dsv4_flashmla_decode_build_indices_cuda(
         indices: *mut i32,
         selected: *const i32,
@@ -515,6 +519,8 @@ unsafe extern "C" {
         compress_ratio: i32,
         mode_int: i32,
         page_block_size: i32,
+        page_table: *const i32,
+        num_logical_pages: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -532,6 +538,8 @@ unsafe extern "C" {
         compress_ratio: i32,
         mode_int: i32,
         page_block_size: i32,
+        page_table: *const i32,
+        num_logical_pages: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -541,6 +549,12 @@ unsafe extern "C" {
     /// `slot_layer_block_offsets` is `[b]` in blocks from the shared KV arena
     /// base, `selected` is `[b, max_compressed_keys]` for CSA or null for HCA,
     /// and `topk_length` is `[b]`.
+    ///
+    /// `page_table`/`num_logical_pages`: OPTIONAL Stage-B per-row logical→physical
+    /// page table (`[b, num_logical_pages]`; `null`/0 = Stage-A band path,
+    /// unchanged). When set the routed indices are POOL-absolute, so the
+    /// `slot_layer_block_offsets` band shift is SKIPPED (an identity per-row table
+    /// = the Stage-A index after the band shift).
     pub fn arle_dsv4_flashmla_decode_build_indices_batched_cuda(
         indices: *mut i32,
         start_pos: *const i32,
@@ -555,6 +569,8 @@ unsafe extern "C" {
         mode_int: i32,
         page_block_size: i32,
         total_blocks: i32,
+        page_table: *const i32,
+        num_logical_pages: i32,
         stream: CUstream,
     ) -> CUresult;
 }

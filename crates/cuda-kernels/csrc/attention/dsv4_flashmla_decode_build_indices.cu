@@ -56,6 +56,22 @@
 
 namespace {
 
+// Stage-B page-table lookup (gated): when `page_table != nullptr`, the
+// slot-relative index `out` carries a slot-LOGICAL page (`out / page_block_size`)
+// routed to physical via `page_table[logical]`, emitting `physical *
+// page_block_size + (out % page_block_size)` — already POOL-absolute, so the
+// batched kernel SKIPS its `block_offset` add. `page_table == nullptr`
+// (Stage-A default) keeps `out` slot-relative verbatim; an identity table
+// (`page_table[i] = first + i`) reproduces the band path index-for-index.
+__device__ __forceinline__ int32_t arle_dsv4_decode_route_index(
+        int32_t out, const int32_t* __restrict__ page_table,
+        int num_logical_pages, int page_block_size) {
+    if (out < 0 || page_table == nullptr) return out;
+    const int logical = out / page_block_size;
+    if (logical < 0 || logical >= num_logical_pages) return -1;
+    return page_table[logical] * page_block_size + (out % page_block_size);
+}
+
 __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
         int tid,
         const int32_t* __restrict__ selected,   // [max_compressed_keys] int32 (CSA) or nullptr (HCA)
@@ -65,7 +81,9 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
         int max_compressed_keys,                // index_topk (CSA) or padded compressed_count (HCA)
         int compress_ratio,
         int mode_int,
-        int page_block_size) {
+        int page_block_size,
+        const int32_t* __restrict__ page_table, // Stage-B nullable logical→physical page table
+        int num_logical_pages) {
     if (start_pos < 0) return -1;
     // SW slot count for this decode token. Decode is single-token (s_q=1)
     // so the SW window covers positions [max(0, start_pos - sw + 1), start_pos].
@@ -83,7 +101,7 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
         int32_t out = block_id * page_block_size + row_in_block;
         // Defensive: if a position would map past sw_blocks (config drift), mask.
         if (block_id >= sw_blocks) out = -1;
-        return out;
+        return arle_dsv4_decode_route_index(out, page_table, num_logical_pages, page_block_size);
     } else if (tid < sw_count + max_compressed_keys) {
         const int k = tid - sw_count;
         if (mode_int == 1) {
@@ -99,7 +117,9 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
             if (valid) {
                 const int abs_block = sw_blocks + c / page_block_size;
                 const int row_in_block = c % page_block_size;
-                return abs_block * page_block_size + row_in_block;
+                return arle_dsv4_decode_route_index(
+                    abs_block * page_block_size + row_in_block, page_table,
+                    num_logical_pages, page_block_size);
             } else {
                 return -1;
             }
@@ -120,7 +140,9 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
                 const int r = k;
                 const int abs_block = sw_blocks + r / page_block_size;
                 const int row_in_block = r % page_block_size;
-                return abs_block * page_block_size + row_in_block;
+                return arle_dsv4_decode_route_index(
+                    abs_block * page_block_size + row_in_block, page_table,
+                    num_logical_pages, page_block_size);
             } else {
                 return -1;
             }
@@ -143,12 +165,15 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
         int compress_ratio,
         int mode_int,
         int page_block_size,
+        const int32_t* __restrict__ page_table,
+        int num_logical_pages,
         int topk_unified) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= topk_unified) return;
     indices[tid] = arle_dsv4_flashmla_decode_index_at(
         tid, selected, sw_blocks, sliding_window, start_pos,
-        max_compressed_keys, compress_ratio, mode_int, page_block_size);
+        max_compressed_keys, compress_ratio, mode_int, page_block_size,
+        page_table, num_logical_pages);
 }
 
 __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
@@ -161,13 +186,16 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
         int compress_ratio,
         int mode_int,
         int page_block_size,
+        const int32_t* __restrict__ page_table,
+        int num_logical_pages,
         int topk_unified) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= topk_unified) return;
     const int start_pos = *start_pos_ptr;
     indices[tid] = arle_dsv4_flashmla_decode_index_at(
         tid, selected, sw_blocks, sliding_window, start_pos,
-        max_compressed_keys, compress_ratio, mode_int, page_block_size);
+        max_compressed_keys, compress_ratio, mode_int, page_block_size,
+        page_table, num_logical_pages);
 }
 
 __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
@@ -184,6 +212,8 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
         int mode_int,
         int page_block_size,
         int total_blocks,
+        const int32_t* __restrict__ page_table,
+        int num_logical_pages,
         int topk_unified) {
     const int row = blockIdx.y;
     if (row >= b) return;
@@ -196,10 +226,15 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
 
     const int32_t* selected_row =
         selected != nullptr ? selected + static_cast<int64_t>(row) * max_compressed_keys : nullptr;
+    // Stage-B: a non-null page table yields POOL-absolute indices already, so the
+    // band block_offset add is skipped; Stage-A (null) keeps the band shift.
+    const int32_t* page_table_row =
+        page_table != nullptr ? page_table + static_cast<int64_t>(row) * num_logical_pages : nullptr;
     int32_t out = arle_dsv4_flashmla_decode_index_at(
         tid, selected_row, sw_blocks, sliding_window, start_pos[row],
-        max_compressed_keys, compress_ratio, mode_int, page_block_size);
-    if (out >= 0) {
+        max_compressed_keys, compress_ratio, mode_int, page_block_size,
+        page_table_row, num_logical_pages);
+    if (out >= 0 && page_table == nullptr) {
         const int block_offset = slot_layer_block_offsets[row];
         if (block_offset < 0 || block_offset >= total_blocks) {
             out = -1;
@@ -243,6 +278,8 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
         int compress_ratio,
         int mode_int,
         int page_block_size,
+        const int32_t* page_table,
+        int num_logical_pages,
         cudaStream_t stream) {
     if (indices == nullptr) return cudaErrorInvalidValue;
     if (sliding_window <= 0 || start_pos < 0) return cudaErrorInvalidValue;
@@ -250,6 +287,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
     if (mode_int != 1 && mode_int != 2) return cudaErrorInvalidValue;
     if (mode_int == 1 && selected == nullptr) return cudaErrorInvalidValue;
     if (sw_blocks < 0) return cudaErrorInvalidValue;
+    if (page_table != nullptr && num_logical_pages <= 0) return cudaErrorInvalidValue;
 
     const int topk_unified = sliding_window + max_compressed_keys;
     if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;  // 2 * B_TOPK = 128
@@ -259,7 +297,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
     arle_dsv4_flashmla_decode_build_indices_kernel<<<grid, kBlock, 0, stream>>>(
         indices, selected, sw_blocks, sliding_window, start_pos,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        topk_unified);
+        page_table, num_logical_pages, topk_unified);
     return cudaGetLastError();
 }
 
@@ -273,6 +311,8 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
         int compress_ratio,
         int mode_int,
         int page_block_size,
+        const int32_t* page_table,
+        int num_logical_pages,
         cudaStream_t stream) {
     if (indices == nullptr || start_pos_ptr == nullptr) return cudaErrorInvalidValue;
     if (sliding_window <= 0) return cudaErrorInvalidValue;
@@ -280,6 +320,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
     if (mode_int != 1 && mode_int != 2) return cudaErrorInvalidValue;
     if (mode_int == 1 && selected == nullptr) return cudaErrorInvalidValue;
     if (sw_blocks < 0) return cudaErrorInvalidValue;
+    if (page_table != nullptr && num_logical_pages <= 0) return cudaErrorInvalidValue;
 
     const int topk_unified = sliding_window + max_compressed_keys;
     if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;  // 2 * B_TOPK = 128
@@ -289,7 +330,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
     arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel<<<grid, kBlock, 0, stream>>>(
         indices, selected, sw_blocks, sliding_window, start_pos_ptr,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        topk_unified);
+        page_table, num_logical_pages, topk_unified);
     return cudaGetLastError();
 }
 
@@ -307,6 +348,8 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
         int mode_int,
         int page_block_size,
         int total_blocks,
+        const int32_t* page_table,
+        int num_logical_pages,
         cudaStream_t stream) {
     if (indices == nullptr || start_pos == nullptr || slot_layer_block_offsets == nullptr ||
         topk_length == nullptr) {
@@ -319,6 +362,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
     if (sw_blocks < 0 || total_blocks <= 0 || sw_blocks > total_blocks) {
         return cudaErrorInvalidValue;
     }
+    if (page_table != nullptr && num_logical_pages <= 0) return cudaErrorInvalidValue;
 
     const int topk_unified = sliding_window + max_compressed_keys;
     if ((topk_unified & 127) != 0) return cudaErrorInvalidValue;  // 2 * B_TOPK = 128
@@ -328,7 +372,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_batched_cuda(
     arle_dsv4_flashmla_decode_build_indices_batched_kernel<<<grid, kBlock, 0, stream>>>(
         indices, start_pos, slot_layer_block_offsets, selected, topk_length, b, sw_blocks,
         sliding_window, max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        total_blocks, topk_unified);
+        total_blocks, page_table, num_logical_pages, topk_unified);
     return cudaGetLastError();
 }
 

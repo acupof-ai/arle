@@ -728,9 +728,16 @@ impl Dsv4LayerKvLayout {
             .checked_mul(kv_arena.bytes_per_token)
             .ok_or_else(|| anyhow!("DSv4 shared FlashMLA page byte size overflow"))?;
         let flashmla_kv_pool = if flashmla_slot_pages > 0 {
-            // #85 P2 Stage A: the raw band arena is replaced by a shared
-            // `TokenKVPool` of packed MLA latent records, sized to the SAME
-            // total token budget (`total_blocks × 64 × num_slots` records).
+            // #85 P2 Stage B: a shared `TokenKVPool` of packed MLA latent records,
+            // sized from the PROFILED FREE-VRAM token budget (not `× num_slots`,
+            // not capped at max_seq) — the dominant per-slot KV term becomes one
+            // dynamic shared pool. Slots start EMPTY and draw a contiguous band
+            // (`alloc_tokens(slot, tokens_per_slot)`) on admission via
+            // `reset_flashmla_slot`; `free_slot` returns it on release. The band
+            // stays contiguous (one alloc per freed slot), so the read/batched/
+            // graph paths keep their band-base addressing until the Stage-B
+            // read-kernel rework lands; the pack write side already routes the
+            // device page table (step 3).
             let format = KVFormat::PackedBytes {
                 bytes_per_token: kv_arena.bytes_per_token,
             };
@@ -743,17 +750,23 @@ impl Dsv4LayerKvLayout {
             let tokens_per_slot = flashmla_slot_pages
                 .checked_mul(kv_arena.page_block_size)
                 .ok_or_else(|| anyhow!("DSv4 shared FlashMLA slot token overflow"))?;
-            let total_tokens = tokens_per_slot
-                .checked_mul(num_slots)
-                .ok_or_else(|| anyhow!("DSv4 shared FlashMLA pool total overflow"))?;
+            // Pool capacity = the free-VRAM-derived slot budget (`num_slots`, the
+            // count `kv_budget_num_slots` already proved fits `MEM_FRACTION × free`)
+            // worth of bands. This keeps the Phase-2 VRAM footprint byte-equal to
+            // Stage-A (no double-count vs the KV budget's per-slot arena term, no
+            // OOM at the licensed num_slots), while the ALLOCATION is now dynamic:
+            // slots draw a band on admission and free it on release. Lifting the
+            // ceiling beyond num_slots bands (true free-VRAM sizing) is Phase 4,
+            // coupled with dropping the budget's MLA arena per-slot term.
+            let pool_tokens = tokens_per_slot.saturating_mul(num_slots);
             let budget_bytes = TokenKVPool::budget_bytes_for_tokens(
                 1, // single "layer": one pool per Dsv4LayerKvLayout
                 1, // MLA latent is head-less (kv_heads = 1)
                 config.head_dim,
-                total_tokens,
+                pool_tokens,
                 format,
             );
-            let mut pool = TokenKVPool::with_format(
+            let pool = TokenKVPool::with_format(
                 ctx,
                 1,
                 1,
@@ -765,36 +778,13 @@ impl Dsv4LayerKvLayout {
             .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?;
             ensure!(
                 pool.page_size == kv_arena.page_block_size
-                    && pool.max_total_pages == flashmla_slot_pages * num_slots,
-                "DSv4 FlashMLA pool sizing mismatch: page_size={} pages={} expected page_size={} pages={}",
+                    && pool.max_total_pages >= flashmla_slot_pages * num_slots,
+                "DSv4 FlashMLA pool sizing mismatch: page_size={} pages={} need page_size={} pages>={}",
                 pool.page_size,
                 pool.max_total_pages,
                 kv_arena.page_block_size,
                 flashmla_slot_pages * num_slots
             );
-            // Stage A identity tables: every slot's pages are allocated
-            // up-front in slot order, so slot `i` owns the contiguous run
-            // `[i × total_blocks, (i+1) × total_blocks)` — byte-identical to
-            // the pre-paging band arena. TP lockstep invariant: the tables
-            // derive only from construction constants (num_slots + the
-            // plan-pinned decode shape), so they are identical on every rank;
-            // the NCCL min-reduced slot budget (`kv_budget_num_slots`) stays
-            // the cross-rank capacity gate. Stage B replaces this loop with
-            // host-pool mirroring (Qwen `mirror_slot` pattern).
-            for slot in 0..num_slots {
-                let pages = pool
-                    .alloc_tokens(slot, tokens_per_slot)
-                    .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot} page alloc failed: {e}"))?;
-                let first = (slot * flashmla_slot_pages) as u32;
-                ensure!(
-                    pages.len() == flashmla_slot_pages
-                        && pages
-                            .iter()
-                            .enumerate()
-                            .all(|(i, &p)| p == first + i as u32),
-                    "DSv4 FlashMLA Stage A identity layout violated for slot {slot}"
-                );
-            }
             Some(pool)
         } else {
             None
@@ -904,6 +894,27 @@ impl Dsv4LayerKvLayout {
         Ok(self.flashmla_pool()?.page_indices(slot_idx))
     }
 
+    /// Publish one slot's page table (slot-logical → physical pool block) to a
+    /// device `i32` buffer for the Stage-B pack kernel: the kernel reads
+    /// `block_id = page_table[token_block_id[t]]`, so the host hands it logical
+    /// pages and this device table routes them to the (dynamically-drawn)
+    /// physical blocks. Identity-table == band (Phase 1 gate), so this is
+    /// correct under the contiguous-band invariant and ready for fragmentation.
+    fn flashmla_device_page_table(
+        &self,
+        ctx: &DeviceContext,
+        slot_idx: usize,
+    ) -> Result<CudaSlice<i32>> {
+        let table_i32: Vec<i32> = self
+            .flashmla_page_table(slot_idx)?
+            .iter()
+            .map(|&p| p as i32)
+            .collect();
+        ctx.stream
+            .clone_htod(&table_i32)
+            .map_err(|e| anyhow!("DSv4 FlashMLA device page table H2D failed: {e}"))
+    }
+
     /// Table-routed byte range of one slot's FlashMLA band.
     ///
     /// Invariant (#85 P2 Stage A): the range derives from the slot's PAGE
@@ -954,10 +965,36 @@ impl Dsv4LayerKvLayout {
         ctx: &DeviceContext,
         flash: &Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
-        // Table-routed (#85 P2): the zeroed range derives from the slot's
-        // page table. Stage A contiguity makes it one span (a single memset,
-        // same launch count as the pre-paging band reset); Stage B zeroes —
-        // or frees — per page once tables may fragment.
+        // #85 P2 Stage B admission hook: LAZILY draw the slot's CONTIGUOUS band
+        // on first use (`alloc_tokens` in slot order → ascending pages 0,1,2,…,
+        // byte-identical to the Stage-A identity layout), then KEEP it across
+        // re-admissions (just zero below). One alloc per slot preserves the
+        // ascending-contiguous invariant the band-base read/batched/graph paths
+        // and the `contiguous_page_table_byte_range` guard require — a
+        // free+realloc churn would reverse the LIFO page order and break that
+        // guard. Returning bands to the free-stack (the ceiling-lift) is Phase 4
+        // once the read kernels route the device table.
+        let slot_pages = self.flashmla_slot_pages;
+        let pool = self.flashmla_pool_mut()?;
+        if pool.page_indices(flash.slot_idx).is_empty() {
+            let want_tokens = slot_pages
+                .checked_mul(pool.page_size)
+                .ok_or_else(|| anyhow!("DSv4 FlashMLA slot token count overflow"))?;
+            let pages = pool
+                .alloc_tokens(flash.slot_idx, want_tokens)
+                .map_err(|e| {
+                    anyhow!(
+                        "DSv4 FlashMLA slot {} band alloc failed: {e}",
+                        flash.slot_idx
+                    )
+                })?;
+            ensure!(
+                pages.len() == slot_pages,
+                "DSv4 FlashMLA slot {} drew {} pages, expected {slot_pages}",
+                flash.slot_idx,
+                pages.len(),
+            );
+        }
         let range = self.flashmla_pages_byte_range(flash.slot_idx)?;
         ensure!(
             range.len() == flash.fp8_kv_pool_len,
@@ -1128,17 +1165,21 @@ impl Dsv4FlashMlaDecodeState {
             local_heads,
             tp_world,
         )?;
-        // Table-routed (#85 P2): the slot band length comes from the slot's
-        // block table; the decode shape must agree with the layout's table
-        // length (both derive from the same plan-pinned construction params).
-        let range = pool.flashmla_pages_byte_range(slot_idx)?;
+        // #85 P2 Stage B: slots start EMPTY (the band is drawn on admission), so
+        // the band length is derived from the SHAPE, not the table. The decode
+        // shape must agree with the layout's per-slot block count (both derive
+        // from the same plan-pinned construction params).
         ensure!(
-            shape.total_blocks == pool.flashmla_slot_pages && !range.is_empty(),
-            "DSv4 FlashMLA shared slot band missing/invalid for slot {slot_idx} \
-             (shape blocks {} vs table blocks {})",
+            shape.total_blocks == pool.flashmla_slot_pages && shape.total_blocks > 0,
+            "DSv4 FlashMLA shared slot band shape mismatch for slot {slot_idx} \
+             (shape blocks {} vs layout blocks {})",
             shape.total_blocks,
             pool.flashmla_slot_pages
         );
+        let fp8_kv_pool_len = shape
+            .total_blocks
+            .checked_mul(pool.flashmla_page_bytes)
+            .ok_or_else(|| anyhow!("DSv4 FlashMLA slot band byte length overflow"))?;
 
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
@@ -1163,7 +1204,7 @@ impl Dsv4FlashMlaDecodeState {
         // CONSTANT-after-init scheduler metadata remain per (slot, layer).
         let mut state = Self {
             slot_idx,
-            fp8_kv_pool_len: range.len(),
+            fp8_kv_pool_len,
             sw_blocks: shape.sw_blocks,
             comp_blocks: shape.comp_blocks,
             max_compressed_keys: shape.max_compressed_keys,
@@ -1816,6 +1857,9 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             // every row r≥1 to -1 (offset r*tb >= tb), yielding garbled decode (KILL
             // errors/2026-06-14-dsv4-batched-flashmla-decode-phaseB-correctness-kill.md).
             shape.total_blocks * self.max_batch,
+            // Stage-A: null page table = band path (byte-unchanged). Stage-B
+            // dynamic dispatch (Some(table)) is the next phase.
+            None,
         )?;
         drop(indices_guard);
         drop(start_guard);
@@ -4079,20 +4123,16 @@ pub(crate) fn commit_layer_fold(
             anyhow!("DSv4 commit fold: FlashMLA arena present but shared decode scratch missing")
         })?;
         let page_block_size = 64;
+        // Stage-B: hand the kernel slot-LOGICAL pages + the device page table;
+        // it resolves `block_id = table[logical]` into the dynamic pool.
         let mut block_ids = Vec::with_capacity(m);
         let mut rows = Vec::with_capacity(m);
-        {
-            let table = pool.flashmla_page_table(flash.slot_idx)?;
-            for i in 0..m {
-                let slot_idx = (start_pos + i) % config.sliding_window;
-                let page = physical_page(table, slot_idx / page_block_size)?;
-                block_ids.push(
-                    i32::try_from(page)
-                        .map_err(|_| anyhow!("DSv4 commit fold FP8 page overflows i32"))?,
-                );
-                rows.push((slot_idx % page_block_size) as i32);
-            }
+        for i in 0..m {
+            let slot_idx = (start_pos + i) % config.sliding_window;
+            block_ids.push((slot_idx / page_block_size) as i32);
+            rows.push((slot_idx % page_block_size) as i32);
         }
+        let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
         ctx.stream
             .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
             .map_err(|e| anyhow!("DSv4 commit fold FP8 block_ids H2D failed: {e}"))?;
@@ -4115,7 +4155,7 @@ pub(crate) fn commit_layer_fold(
             page_block_size,
             config.head_dim,
             config.head_dim,
-            None, // Stage-A: host-physical block ids, no device page table.
+            Some(&page_table),
         )?;
     }
     Ok(())
@@ -5494,23 +5534,15 @@ fn flashmla_pack_sw_ring(
     }
     let sliding_window = config.sliding_window;
     let page_block_size = 64;
+    // Stage-B: slot-LOGICAL pages + device page table; the kernel resolves
+    // `block_id = table[logical]` into the dynamic pool (pool BASE pointer).
     let mut block_ids = Vec::with_capacity(sliding_window);
     let mut rows = Vec::with_capacity(sliding_window);
-    {
-        // Table-routed (#85 P2): this host-built bulk pack hands the kernel
-        // PHYSICAL pool pages (page-table lookup) and the pool BASE pointer,
-        // so it stays valid when Stage B fragments the table. Token/block
-        // counts come from the slot's table, never re-derived.
-        let table = pool.flashmla_page_table(flash.slot_idx)?;
-        for slot in 0..sliding_window {
-            let page = physical_page(table, slot / page_block_size)?;
-            block_ids.push(
-                i32::try_from(page)
-                    .map_err(|_| anyhow!("DSv4 FlashMLA SW page {page} overflows i32"))?,
-            );
-            rows.push((slot % page_block_size) as i32);
-        }
+    for slot in 0..sliding_window {
+        block_ids.push((slot / page_block_size) as i32);
+        rows.push((slot % page_block_size) as i32);
     }
+    let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
     ctx.stream
         .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
         .map_err(|e| anyhow!("DSv4 FlashMLA SW block_ids H2D failed: {e}"))?;
@@ -5533,7 +5565,7 @@ fn flashmla_pack_sw_ring(
         page_block_size,
         config.head_dim,
         config.head_dim,
-        None, // Stage-A: host-physical block ids, no device page table.
+        Some(&page_table),
     )?;
     flash.fp8_kv_sw_bootstrapped = true;
     Ok(())
@@ -5563,17 +5595,6 @@ fn flashmla_pack_one_sw_token(
     drop(row_guard);
 
     let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
-    let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
-    let pool_buf = pool.flashmla_pool_data_mut()?;
-    ensure!(
-        range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared one-token table range {:?} invalid pool_len={} slot_len={}",
-        range,
-        pool_buf.len(),
-        flash.fp8_kv_pool_len
-    );
-    let mut pool_view = pool_buf.slice_mut(range);
-    let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
     let nope_ptr = k_ptr;
     // rope offset = head_dim - rope_dim: MODEL1 512-64=448, V32 576-64=512.
     // stride = head_dim: MODEL1 512, V32 576. The config formula yields the
@@ -5583,6 +5604,19 @@ fn flashmla_pack_one_sw_token(
     // ponytail: pod-verify V32 pack offsets (nope@0 stride576, rope@512 stride576) + 656 B/tok pool addressing
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
     if config.head_dim == 576 {
+        // V32/GLM has no device-page-table pack kernel; it keeps band-base
+        // addressing (the band stays contiguous), slicing the slot's range.
+        let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+        let pool_buf = pool.flashmla_pool_data_mut()?;
+        ensure!(
+            range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
+            "DSv4 FlashMLA shared one-token table range {:?} invalid pool_len={} slot_len={}",
+            range,
+            pool_buf.len(),
+            flash.fp8_kv_pool_len
+        );
+        let mut pool_view = pool_buf.slice_mut(range);
+        let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
         flash_kv::dsv4_v32_fp8_kv_pack_strided_raw(
             ctx,
             nope_ptr,
@@ -5596,6 +5630,12 @@ fn flashmla_pack_one_sw_token(
             config.head_dim,
         )
     } else {
+        // MODEL1 Stage-B: the device fill kernel produced a slot-LOGICAL block
+        // id; hand the POOL base + device page table so it routes to the dynamic
+        // physical block (`block_id = table[logical]`).
+        let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
+        let pool_buf = pool.flashmla_pool_data_mut()?;
+        let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
         flash_kv::dsv4_fp8_kv_pack_strided_raw(
             ctx,
             nope_ptr,
@@ -5607,7 +5647,7 @@ fn flashmla_pack_one_sw_token(
             64,
             config.head_dim,
             config.head_dim,
-            None, // Stage-A: host-physical block ids, no device page table.
+            Some(&page_table),
         )
     }
 }
@@ -5685,18 +5725,13 @@ fn flashmla_pack_compressed_delta(
         .memcpy_htod(&rows, &mut scratch.comp_rows)
         .map_err(|e| anyhow!("DSv4 FlashMLA compressed rows H2D failed: {e}"))?;
 
+    // Stage-B: `block_ids` carries slot-LOGICAL pages (`sw_blocks + row/64`);
+    // hand the POOL base + device page table so the kernel routes each to its
+    // dynamic physical block (`block_id = table[logical]`).
     let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
-    let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+    let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
     let pool_buf = pool.flashmla_pool_data_mut()?;
-    ensure!(
-        range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared compressed table range {:?} invalid pool_len={} slot_len={}",
-        range,
-        pool_buf.len(),
-        flash.fp8_kv_pool_len
-    );
-    let mut pool_view = pool_buf.slice_mut(range);
-    let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
+    let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
     let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
     let nope_ptr = compressed_ptr + row_offset_bytes;
     let rope_ptr = nope_ptr + (config.head_dim - config.qk_rope_head_dim) as u64 * 2;
@@ -5711,7 +5746,7 @@ fn flashmla_pack_compressed_delta(
         64,
         config.head_dim,
         config.head_dim,
-        None, // Stage-A: host-physical block ids, no device page table.
+        Some(&page_table),
     )?;
     flash.fp8_kv_comp_packed_rows = end_row;
     Ok(())
@@ -6457,6 +6492,8 @@ fn try_flashmla_decode_attention(
             },
             mode_int,
             64,
+            // Stage-A: null page table = slot-relative path (byte-unchanged).
+            None,
         )?;
     }
     drop(indices_guard);

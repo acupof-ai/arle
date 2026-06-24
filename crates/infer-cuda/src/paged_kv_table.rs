@@ -147,11 +147,40 @@ pub(crate) fn dsv4_pack_token_byte_base(
         .ok_or_else(|| anyhow!("DSv4 pack token base overflow"))
 }
 
+/// DSv4 FlashMLA decode build-indices Stage-B route: the host mirror of
+/// `dsv4_flashmla_decode_build_indices.cu`'s `arle_dsv4_decode_route_index`.
+/// A slot-relative `out` (`block_id * page_block_size + row`) becomes
+/// POOL-absolute by routing its LOGICAL page (`out / page_block_size`) to
+/// physical via the table: `table[logical] * page_block_size + (out % page_block_size)`.
+/// Negative `out` (mask) passes through. This is the gate for proving the
+/// table-lookup path reproduces the Stage-A band shift on an identity table.
+#[allow(dead_code)]
+pub(crate) fn dsv4_decode_route_index(
+    table: &[u32],
+    out: i32,
+    page_block_size: usize,
+) -> Result<i32> {
+    ensure!(
+        page_block_size > 0,
+        "paged-KV page_block_size must be non-zero"
+    );
+    if out < 0 {
+        return Ok(out);
+    }
+    let out = out as usize;
+    let physical = physical_page(table, out / page_block_size)? as usize;
+    let routed = physical
+        .checked_mul(page_block_size)
+        .and_then(|base| base.checked_add(out % page_block_size))
+        .ok_or_else(|| anyhow!("DSv4 decode routed index overflow"))?;
+    i32::try_from(routed).map_err(|_| anyhow!("DSv4 decode routed index {routed} exceeds i32"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        contiguous_page_table_byte_range, dsv4_pack_token_byte_base, physical_page,
-        physical_token_rows,
+        contiguous_page_table_byte_range, dsv4_decode_route_index, dsv4_pack_token_byte_base,
+        physical_page, physical_token_rows,
     };
 
     /// Synthetic Stage A config: 3 slots x 5 pages of 64 x 584 B each.
@@ -368,6 +397,76 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+        assert!(err.contains("outside slot page table"), "got: {err}");
+    }
+
+    // DSv4 FlashMLA decode build-indices Stage-B: page_block_size=64 (MODEL1),
+    // 5 logical pages per slot (SW + compressed sub-pools mapped flat here).
+    const DEC_PBS: usize = 64;
+    const DEC_PAGES: usize = 5;
+
+    /// Stage-A band path: the kernel emits a slot-relative `out` and adds
+    /// `block_offset * page_block_size` to reach POOL-absolute. Host mirror of
+    /// the pre-table addressing the batched build-indices kernel did at line 207.
+    fn band_decode_index(block_offset: usize, out: i32) -> i32 {
+        out + (block_offset * DEC_PBS) as i32
+    }
+
+    /// GATE: an IDENTITY page table (`table[i] = block_offset + i`) routed
+    /// through the device-lookup addressing produces byte-identical POOL-absolute
+    /// indices to the Stage-A band shift, for every slot-relative `out` across
+    /// the slot's logical pages. Mirrors `dsv4_pack_identity_table_byte_identical_to_band`.
+    #[test]
+    fn dsv4_decode_identity_table_byte_identical_to_band() {
+        for block_offset in [0usize, 5, 17] {
+            let table: Vec<u32> =
+                (block_offset as u32..(block_offset + DEC_PAGES) as u32).collect();
+            for out in 0..(DEC_PAGES * DEC_PBS) as i32 {
+                assert_eq!(
+                    dsv4_decode_route_index(&table, out, DEC_PBS).expect("routed"),
+                    band_decode_index(block_offset, out),
+                    "offset {block_offset} out {out} routed != band"
+                );
+            }
+        }
+    }
+
+    /// Mask (-1) passes through both paths unchanged.
+    #[test]
+    fn dsv4_decode_mask_passes_through() {
+        let table: Vec<u32> = (0..DEC_PAGES as u32).collect();
+        assert_eq!(dsv4_decode_route_index(&table, -1, DEC_PBS).unwrap(), -1);
+    }
+
+    /// A FRAGMENTED (gapped) table lands each index in its physical page — the
+    /// whole point of the lookup; band addressing could not serve this.
+    #[test]
+    fn dsv4_decode_fragmented_table_follows_physical_pages() {
+        // Logical pages 0,1,2 → physical pages 7,3,9 (non-contiguous).
+        let table = vec![7u32, 3, 9];
+        // out=0 (logical page 0 → phys 7, row 0).
+        assert_eq!(
+            dsv4_decode_route_index(&table, 0, DEC_PBS).unwrap(),
+            (7 * DEC_PBS) as i32
+        );
+        // out=65 (logical page 1 → phys 3, row 1).
+        assert_eq!(
+            dsv4_decode_route_index(&table, DEC_PBS as i32 + 1, DEC_PBS).unwrap(),
+            (3 * DEC_PBS + 1) as i32
+        );
+        // out=130 (logical page 2 → phys 9, row 2).
+        assert_eq!(
+            dsv4_decode_route_index(&table, 2 * DEC_PBS as i32 + 2, DEC_PBS).unwrap(),
+            (9 * DEC_PBS + 2) as i32
+        );
+    }
+
+    #[test]
+    fn dsv4_decode_rejects_index_past_table() {
+        let table = vec![0u32, 1]; // 2 logical pages → indices 0..128.
+        let err = dsv4_decode_route_index(&table, 200, DEC_PBS)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("outside slot page table"), "got: {err}");
     }
 }
