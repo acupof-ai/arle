@@ -1846,7 +1846,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use train::{
         infer_student::InferStudent,
         lora::{LoraAdapterConfig, LoraConfig, LoraTargetSet},
-        opd::rubric_writeback_ce_step_batched,
+        opd::masked_writeback_ce_step,
         qwen35_checkpoint::{
             ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StudentWeights,
             save_named_qwen35_student_checkpoint,
@@ -2062,19 +2062,23 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             let trainable_ref = trainable.as_slice();
             let store_ref = &mut store;
             let opt_ref = &mut optimizer;
+            let writeback_window = args.writeback_window;
             train::agent_opd::run_agentic_opd_round(
                 &infer_student,
                 &tasks,
                 &cfg,
                 round,
-                |chunk: &[(Vec<u32>, Vec<u32>)]| {
-                    rubric_writeback_ce_step_batched(
+                |prompt_ids: &[u32], response_ids: &[u32], response_mask: &[u8]| {
+                    masked_writeback_ce_step(
                         student_ref,
                         all_ref,
                         trainable_ref,
                         opt_ref,
-                        chunk,
+                        prompt_ids,
+                        response_ids,
+                        response_mask,
                         vocab,
+                        writeback_window,
                         store_ref,
                     )
                     .map_err(anyhow::Error::from)

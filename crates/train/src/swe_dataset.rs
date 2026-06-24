@@ -155,17 +155,23 @@ the smallest correct change.
 - `bash`: run a shell command (use it to explore the tree, e.g. `ls`, `grep`, \
 `find`).
 
+All paths are RELATIVE to the repo root (cwd). Use `lib/ansible/...`, \
+`test/...` — never absolute paths like `/repo` or `/work`.
+
 Workflow:
 1. Explore briefly with `bash` and `read` (a few steps — locate the relevant \
 files and understand the failure).
-2. Make the fix: use `replace` (or `write`) to apply the SMALLEST correct \
-change that resolves the issue. Do not refactor unrelated code.
+2. Make the fix: you MUST apply at least one edit with `replace` (or `write`) \
+— the SMALLEST correct change that resolves the issue. Do not finish without \
+editing a file; do not refactor unrelated code.
 3. Do NOT run the hidden tests — they are not present and will be applied at \
 scoring time. Do not try to write or guess the tests.
-4. When the edit is complete, reply with a short final message stating what you \
-changed and why.
+4. Only after you have edited a file, reply with a short final message stating \
+what you changed and why.
 
-Keep the change minimal and correct.",
+Keep the change minimal and correct.
+
+Respond directly with a tool call — do not deliberate at length. /no_think",
         repo = task.repo,
     )
 }
@@ -185,6 +191,11 @@ pub fn agent_user_prompt(task: &SweTask) -> String {
         }
     }
 
+    // Qwen3.x soft-switch: disable thinking-mode for the rollout so the student
+    // emits tool calls directly instead of an empty <think> block that strips to
+    // nothing (decoded EmptyNoProgress root cause). Scoped to agent-OPD, not the
+    // chat renderer, so the local `arle run` agent keeps thinking available.
+    prompt.push_str("\n\n/no_think");
     prompt
 }
 

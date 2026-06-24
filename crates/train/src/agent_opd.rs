@@ -6,14 +6,24 @@
 //! execution: `git diff` is the candidate patch, the hidden `test_patch` +
 //! `fail_to_pass` tests are run, exit-0 = pass.
 //!
-//! Passing trajectories are written back as cross-entropy targets through the
-//! SAME path as rubric-OPD ([`crate::opd::rubric_writeback_ce_step_batched`]):
-//! each accepted trajectory's verl-style `TokensRecord` (LLM tokens masked from
-//! tool/environment tokens via `response_mask`) is exploded into per-assistant
-//! `(context_prefix, llm_span)` token pairs. Tool-result tokens always land in
-//! a later pair's prefix, so they never receive loss — the student never learns
-//! to hallucinate tool output. Only the rollout front-end + the reward differ
-//! from rubric-OPD; the writeback / CE / optimizer path is reused unchanged.
+//! Passing trajectories are written back as cross-entropy targets via
+//! [`crate::opd::masked_writeback_ce_step`]: ONE masked next-token CE over the
+//! whole `prompt ++ response` trajectory, windowed over the sequence so only a
+//! `[window, vocab]` logits tile is ever live. The verl-style `response_mask`
+//! (`1` = LLM-generated, `0` = tool/environment) selects which next-token
+//! targets receive loss — tool-result tokens are context the LLM predictions
+//! condition on but never a loss target, so the student never learns to
+//! hallucinate tool output.
+//!
+//! This replaces the prior per-assistant `(context_prefix, llm_span)` pair
+//! explosion (`tokens_record_to_pairs` → `rubric_writeback_ce_step_batched`),
+//! which re-forwarded the growing ~30K-token prefix once per turn and
+//! materialized a dense `[seq, vocab]` logits tensor → O(N²) work and
+//! `cuda alloc_zeros failed` OOM on long agentic trajectories. The masked
+//! single-trajectory CE forwards the trajectory once per window instead.
+//! Only the rollout front-end + the reward differ from rubric-OPD; the CE /
+//! optimizer machinery is shared. `tokens_record_to_pairs` is retained (still
+//! unit-tested) but is no longer the writeback path.
 //!
 //! The rollout machinery needs the CUDA in-process student, so it is gated
 //! behind `feature = "cuda"` (mirroring [`crate::infer_student`]). The pure
@@ -101,7 +111,6 @@ mod cuda_rollout {
     use chat::{ToolCall, ToolDefinition};
     use serde_json::json;
 
-    use super::tokens_record_to_pairs;
     use crate::infer_student::InferStudent;
     use crate::sandbox::{
         SandboxToolExecutor, boot_workdir, diff_workdir, reset_workdir, score_workdir,
@@ -135,9 +144,10 @@ mod cuda_rollout {
         pub max_tokens: usize,
         /// Sampling temperature for rollout diversity.
         pub temperature: f32,
-        /// CE micro-batch size for writeback.
+        /// Legacy CE micro-batch size (inert under masked single-trajectory CE,
+        /// which forwards one trajectory per window; retained for CLI back-compat).
         pub writeback_batch: usize,
-        /// Optional cap on accepted `(prompt, completion)` pairs trained per round.
+        /// Optional cap on accepted trajectories trained per round.
         pub writeback_cap: Option<usize>,
         /// Root dir under which per-task sandboxes are staged.
         pub work_root: PathBuf,
@@ -164,9 +174,10 @@ mod cuda_rollout {
 
     /// Run the agent-OPD loop. `tasks` pairs each [`SweTask`] with the directory
     /// holding its repo already checked out at `base_commit` (the staged tree).
-    /// `train_on_accepted` performs one CE micro-batch step on `(prompt,
-    /// completion)` pairs and returns the mean loss — the caller wires
-    /// [`crate::opd::rubric_writeback_ce_step_batched`].
+    /// `train_on_accepted` performs ONE masked-CE writeback step on a single
+    /// accepted trajectory `(prompt_ids, response_ids, response_mask)` and
+    /// returns the mean CE per masked token — the caller wires
+    /// [`crate::opd::masked_writeback_ce_step`].
     ///
     /// Runs ONE round (mirroring `run_rubric_rounds` called with `rounds=1`):
     /// the caller loops over rounds and performs the LoRA→rollout-engine sync
@@ -180,7 +191,7 @@ mod cuda_rollout {
         mut train_on_accepted: T,
     ) -> Result<AgentRoundReport>
     where
-        T: FnMut(&[(Vec<u32>, Vec<u32>)]) -> Result<f32>,
+        T: FnMut(&[u32], &[u32], &[u8]) -> Result<f32>,
     {
         let tool_defs = coding_tools();
         let policy = NoPolicy;
@@ -192,7 +203,11 @@ mod cuda_rollout {
 
         {
             let mut report = AgentRoundReport::default();
-            let mut accepted_pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+            // One masked-CE writeback per accepted trajectory: collect the
+            // verl-style record `(prompt_ids, response_ids, response_mask)` and
+            // train each whole trajectory once (windowed), instead of exploding
+            // into O(N²) per-turn `(prefix, completion)` pairs.
+            let mut accepted_trajectories: Vec<(Vec<u32>, Vec<u32>, Vec<u8>)> = Vec::new();
             let mut loss_sum = 0.0f32;
             let mut loss_steps = 0usize;
 
@@ -256,6 +271,37 @@ mod cuda_rollout {
                         }
                     };
 
+                    // DEBUG (temporary): decode the FULL trajectory of sample 0 — every
+                    // sub-turn's action — to see whether the student locates the bug and
+                    // attempts an edit, or just explores. Case-as-fact, not a guess.
+                    if sample == 0 {
+                        eprintln!(
+                            "[agent-opd-debug] {} terminal={:?} turns={} sub_turns={} final={:?}",
+                            task.instance_id,
+                            result.terminal_state,
+                            result.tool_calls_executed,
+                            result.sub_turns.len(),
+                            result
+                                .text
+                                .replace('\n', " ")
+                                .chars()
+                                .take(220)
+                                .collect::<String>(),
+                        );
+                        for st in &result.sub_turns {
+                            eprintln!(
+                                "[agent-opd-debug]  turn{} fin={} :: {}",
+                                st.index,
+                                st.finish_reason,
+                                st.completion_text
+                                    .replace('\n', " ")
+                                    .chars()
+                                    .take(300)
+                                    .collect::<String>(),
+                            );
+                        }
+                    }
+
                     let diff = diff_workdir(&workdir).unwrap_or_default();
                     if diff.trim().is_empty() {
                         eprintln!(
@@ -297,12 +343,11 @@ mod cuda_rollout {
 
                     match &result.tokens {
                         Some(tok) => {
-                            let pairs = tokens_record_to_pairs(
-                                &tok.prompt_ids,
-                                &tok.response_ids,
-                                &tok.response_mask,
-                            );
-                            accepted_pairs.extend(pairs);
+                            accepted_trajectories.push((
+                                tok.prompt_ids.clone(),
+                                tok.response_ids.clone(),
+                                tok.response_mask.clone(),
+                            ));
                         }
                         None => {
                             report.no_token_record += 1;
@@ -319,15 +364,15 @@ mod cuda_rollout {
                 }
             }
 
-            // Optional cap on pairs trained this round.
+            // Optional cap on accepted trajectories trained this round.
             if let Some(cap) = cfg.writeback_cap {
-                accepted_pairs.truncate(cap);
+                accepted_trajectories.truncate(cap);
             }
-            report.trained_pairs = accepted_pairs.len();
+            report.trained_pairs = accepted_trajectories.len();
 
-            for chunk in accepted_pairs.chunks(cfg.writeback_batch.max(1)) {
-                let loss = train_on_accepted(chunk)
-                    .with_context(|| format!("CE writeback (round {round})"))?;
+            for (prompt_ids, response_ids, response_mask) in &accepted_trajectories {
+                let loss = train_on_accepted(prompt_ids, response_ids, response_mask)
+                    .with_context(|| format!("masked CE writeback (round {round})"))?;
                 loss_sum += loss;
                 loss_steps += 1;
             }

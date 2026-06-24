@@ -1329,6 +1329,12 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 4)]
     pub(crate) writeback_batch: usize,
 
+    /// Sequence-window size for the masked single-trajectory CE writeback. Each
+    /// window re-forwards the prefix up to its end and materializes only a
+    /// `[window, vocab]` logits tile, bounding VRAM on long agentic trajectories.
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) writeback_window: usize,
+
     /// KV slots for the rollout engine (>1 batches sampling/eval; VRAM-gated).
     #[arg(long, default_value_t = 2)]
     pub(crate) rollout_num_slots: usize,
