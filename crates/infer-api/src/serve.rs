@@ -259,6 +259,44 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
     })
 }
 
+/// Serve the multiproc SPMD coordinator HTTP front door (parent process, no TP
+/// rank). Serves OpenAI v1 via [`infer_server::coordinator_router`] over the
+/// already-accepted `relay`; blocks on an owned tokio runtime until Ctrl-C, like
+/// [`serve_http`]. CUDA-only; TP=1 never reaches here.
+#[cfg(feature = "cuda")]
+pub fn serve_coordinator_http(
+    model_path: &str,
+    bind: &str,
+    port: u16,
+    max_thinking_tokens: usize,
+    relay: infer_server::RelayCoordinator,
+) -> Result<()> {
+    let tokenizer = infer_server::OpenAiTokenizer::from_model_dir(model_path)
+        .with_context(|| format!("coordinator tokenizer load for {model_path}"))?;
+    let model_id = crate::serve_engine::model_id_from_path(model_path);
+    let shutdown = infer_server::ServeShutdown::new();
+    let router = infer_server::coordinator_router(relay, tokenizer, model_id, max_thinking_tokens);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build coordinator serve tokio runtime")?;
+
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind((bind, port))
+            .await
+            .with_context(|| format!("failed to bind {bind}:{port}"))?;
+        let addr = listener
+            .local_addr()
+            .context("failed to read listener local address")?;
+        log::info!("serving OpenAI v1 (multiproc coordinator) on http://{addr} ({model_path})");
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal(shutdown))
+            .await
+            .context("coordinator serve loop error")
+    })
+}
+
 fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
     if !opts.requested() {
         return Ok(());

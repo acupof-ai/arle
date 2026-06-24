@@ -49,6 +49,8 @@ pub use loaded::LoadedInferenceEngine;
 #[cfg(feature = "cuda")]
 pub use loaded::cuda_model_takes_multiproc_serve;
 pub use loaded::{EngineLoadConfig, KvCacheDtype};
+#[cfg(feature = "cuda")]
+pub use serve::serve_coordinator_http;
 pub use serve::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeKvSsdOptions,
     ServeSpecOptions, ServeSpecType, serve_http,
@@ -59,8 +61,8 @@ pub use serve_engine::ServeInferenceEngine;
 // the `infer-api` surface without depending on `infer-server` directly (mirrors
 // the `infer-cuda` re-export pattern above).
 pub use infer_server::{
-    PendingRelayCoordinator, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker,
-    WireRequest, set_tick_broadcaster,
+    PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
+    RelayWorker, TcpChannel, WireRequest, set_tick_broadcaster,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy

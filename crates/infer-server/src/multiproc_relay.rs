@@ -34,7 +34,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,55 @@ pub fn broadcast_tick(seq: u64, requests: Vec<WireRequest>) -> Result<()> {
     Ok(())
 }
 
+/// Transport seam for length-prefixed JSON [`RelayEnvelope`]s between coordinator
+/// and worker ranks. Only impl today is [`TcpChannel`]; the trait exists so a
+/// shm ring can plug in later without touching the loops.
+pub trait RelayChannel: Send {
+    /// Write one envelope to the peer.
+    fn send(&mut self, envelope: &RelayEnvelope) -> Result<()>;
+    /// Read one envelope; `Ok(None)` on clean peer EOF.
+    fn recv(&mut self) -> Result<Option<RelayEnvelope>>;
+    /// Clone an independent handle over the same underlying connection.
+    fn try_clone_channel(&self) -> Result<Box<dyn RelayChannel>>;
+    /// Set a read timeout (used by the completion reader to poll for shutdown);
+    /// `None` blocks indefinitely. Default is a no-op for transports without one.
+    fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Localhost-TCP [`RelayChannel`] — the only transport; a thin newtype over
+/// [`TcpStream`].
+pub struct TcpChannel(TcpStream);
+
+impl TcpChannel {
+    #[must_use]
+    pub fn new(stream: TcpStream) -> Self {
+        Self(stream)
+    }
+}
+
+impl RelayChannel for TcpChannel {
+    fn send(&mut self, envelope: &RelayEnvelope) -> Result<()> {
+        write_envelope(&mut self.0, envelope)
+    }
+
+    fn recv(&mut self) -> Result<Option<RelayEnvelope>> {
+        read_envelope(&mut self.0)
+    }
+
+    fn try_clone_channel(&self) -> Result<Box<dyn RelayChannel>> {
+        let stream = self.0.try_clone().context("TcpChannel clone stream")?;
+        Ok(Box::new(TcpChannel(stream)))
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+        self.0
+            .set_read_timeout(timeout)
+            .context("TcpChannel set_read_timeout")
+    }
+}
+
 /// Free-port picker. Binds 127.0.0.1:0, reads the assigned port, drops the
 /// listener. Caller races to use the port (negligible window on single host).
 pub fn pick_free_port() -> Result<u16> {
@@ -120,6 +169,9 @@ pub struct RelayCompletionDelta {
     pub token_ids: Vec<u32>,
     /// Whether this is the terminal delta for the request.
     pub finish: bool,
+    /// Finish reason on the terminal delta, so the coordinator reports the real
+    /// OpenAI `finish_reason` rather than always "stop".
+    pub finish_reason: Option<infer_plan::FinishReason>,
     /// Terminal failure message, if the request failed before a normal finish.
     pub error: Option<String>,
 }
@@ -162,6 +214,10 @@ pub enum RelayEnvelope {
         seq: u64,
         requests: Vec<WireRequest>,
     },
+    /// Worker readiness ack, sent once a rank's engine (incl. NCCL rendezvous) is
+    /// built. The coordinator blocks HTTP bind until all `world_size` readies
+    /// arrive, so no request is broadcast before the collective has formed.
+    EngineReady { rank: usize },
     /// Worker-to-coordinator output for a remote visible-output owner rank.
     /// `// STAGE 2:` the visible-output owner routing is not wired yet; today
     /// every worker is a replicated-token follower with no visible output.
@@ -208,10 +264,13 @@ impl WireRequest {
 /// boot, then provides `broadcast()` to send envelopes to every worker stream.
 pub struct RelayCoordinator {
     port: u16,
-    workers: BTreeMap<usize, TcpStream>,
+    workers: BTreeMap<usize, Box<dyn RelayChannel>>,
     completion_sinks:
         Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>>,
     completion_shutdown: Arc<AtomicBool>,
+    /// Count of ranks that sent [`RelayEnvelope::EngineReady`]; the coordinator
+    /// polls it via [`Self::ready_count`] before opening HTTP.
+    ready_count: Arc<AtomicUsize>,
 }
 
 /// Pending coordinator state — listener is bound and port is known but workers
@@ -229,11 +288,24 @@ impl PendingRelayCoordinator {
         self.port
     }
 
+    /// Legacy accept: wait for ranks 1..N-1 (rank 0 is the in-process engine).
+    /// Kept for the relay tests; the SPMD coordinator uses [`Self::accept_symmetric`].
     pub fn accept(self, world_size: usize, accept_timeout: Duration) -> Result<RelayCoordinator> {
         if world_size < 2 {
             bail!("RelayCoordinator needs world_size >= 2 (got {world_size})");
         }
-        let expected = world_size - 1;
+        self.accept_n(world_size, world_size - 1, accept_timeout)
+    }
+
+    fn accept_n(
+        self,
+        world_size: usize,
+        expected: usize,
+        accept_timeout: Duration,
+    ) -> Result<RelayCoordinator> {
+        if world_size < 2 {
+            bail!("RelayCoordinator needs world_size >= 2 (got {world_size})");
+        }
         let mut workers = BTreeMap::new();
         let deadline = Instant::now() + accept_timeout;
 
@@ -257,10 +329,11 @@ impl PendingRelayCoordinator {
                             "RelayCoordinator worker rank {rank} reported world_size={worker_world_size}, expected {world_size}"
                         );
                     }
-                    if rank == 0 || rank >= world_size {
-                        bail!("RelayCoordinator worker rank {rank} out of range [1, {world_size})");
+                    if rank >= world_size {
+                        bail!("RelayCoordinator worker rank {rank} out of range [0, {world_size})");
                     }
-                    if workers.insert(rank, stream).is_some() {
+                    let channel: Box<dyn RelayChannel> = Box::new(TcpChannel::new(stream));
+                    if workers.insert(rank, channel).is_some() {
                         bail!("RelayCoordinator duplicate worker rank {rank}");
                     }
                     log::info!(
@@ -286,15 +359,17 @@ impl PendingRelayCoordinator {
         }
         let completion_sinks = Arc::new(Mutex::new(HashMap::new()));
         let completion_shutdown = Arc::new(AtomicBool::new(false));
-        for (&rank, stream) in &workers {
-            let stream = stream
-                .try_clone()
-                .with_context(|| format!("RelayCoordinator clone worker rank {rank} stream"))?;
+        let ready_count = Arc::new(AtomicUsize::new(0));
+        for (&rank, channel) in &workers {
+            let reader = channel
+                .try_clone_channel()
+                .with_context(|| format!("RelayCoordinator clone worker rank {rank} channel"))?;
             spawn_completion_reader(
                 rank,
-                stream,
+                reader,
                 Arc::clone(&completion_sinks),
                 Arc::clone(&completion_shutdown),
+                Arc::clone(&ready_count),
             );
         }
         Ok(RelayCoordinator {
@@ -302,7 +377,19 @@ impl PendingRelayCoordinator {
             workers,
             completion_sinks,
             completion_shutdown,
+            ready_count,
         })
+    }
+
+    /// SPMD (B) accept: wait for ALL `world_size` ranks (0..N-1), including rank 0
+    /// (a child worker / the visible-output owner). Like [`Self::accept`] but
+    /// admits rank 0 into the worker map for tick broadcast + completion routing.
+    pub fn accept_symmetric(
+        self,
+        world_size: usize,
+        accept_timeout: Duration,
+    ) -> Result<RelayCoordinator> {
+        self.accept_n(world_size, world_size, accept_timeout)
     }
 }
 
@@ -352,6 +439,23 @@ impl RelayCoordinator {
         self.workers.keys().copied().collect()
     }
 
+    /// Ranks that have sent [`RelayEnvelope::EngineReady`] so far; polled to block
+    /// HTTP bind until the whole collective has rendezvoused.
+    #[must_use]
+    pub fn ready_count(&self) -> usize {
+        self.ready_count.load(Ordering::Acquire)
+    }
+
+    /// Clone the shared completion-sink registry so the async HTTP path can
+    /// (un)register sinks directly, without contending for the `RelayCoordinator`
+    /// mutex the lockstep loop holds across its blocking broadcast.
+    #[must_use]
+    pub fn completion_sinks(&self) -> CompletionSinks {
+        CompletionSinks {
+            inner: Arc::clone(&self.completion_sinks),
+        }
+    }
+
     pub fn register_completion_sink(
         &mut self,
         request_id: u64,
@@ -379,26 +483,26 @@ impl RelayCoordinator {
     /// error, returns immediately — caller decides whether to drop the
     /// coordinator (workers exit) or retry.
     pub fn broadcast(&mut self, envelope: &RelayEnvelope) -> Result<()> {
-        for (&rank, stream) in self.workers.iter_mut() {
-            write_envelope(stream, envelope).with_context(|| {
+        for (&rank, channel) in self.workers.iter_mut() {
+            channel.send(envelope).with_context(|| {
                 format!("RelayCoordinator write envelope to worker rank {rank}")
             })?;
         }
         Ok(())
     }
 
-    /// Send an envelope to a selected global-rank set. Rank 0 is local to the
-    /// coordinator process and is intentionally skipped.
+    /// Send an envelope to a selected global-rank set. A rank absent from the
+    /// worker map (e.g. rank 0 in the legacy in-process layout) is skipped.
     pub fn send_to_ranks(&mut self, ranks: &[usize], envelope: &RelayEnvelope) -> Result<()> {
         for &rank in ranks {
-            if rank == 0 {
-                continue;
-            }
-            let stream = self
-                .workers
-                .get_mut(&rank)
-                .with_context(|| format!("RelayCoordinator missing worker rank {rank}"))?;
-            write_envelope(stream, envelope).with_context(|| {
+            let Some(channel) = self.workers.get_mut(&rank) else {
+                // Legacy layout: rank 0 is the in-process engine, not a relay peer.
+                if rank == 0 {
+                    continue;
+                }
+                bail!("RelayCoordinator missing worker rank {rank}");
+            };
+            channel.send(envelope).with_context(|| {
                 format!("RelayCoordinator write envelope to worker rank {rank}")
             })?;
         }
@@ -406,10 +510,63 @@ impl RelayCoordinator {
     }
 }
 
-/// Worker-side TCP relay. Connects to the coordinator at boot, then provides
-/// `recv()` to read one envelope at a time.
+/// Shared handle to the per-request completion-sink registry, cloned so the async
+/// HTTP path can (un)register without taking the `RelayCoordinator` mutex the
+/// lockstep loop holds across its blocking broadcast. Reader threads use the same `Arc`.
+#[derive(Clone)]
+pub struct CompletionSinks {
+    inner: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>>,
+}
+
+impl CompletionSinks {
+    /// Register a per-request sink. Errors on a duplicate id (a coordinator
+    /// request-id allocation bug).
+    pub fn register(
+        &self,
+        request_id: u64,
+        sink: tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>,
+    ) -> Result<()> {
+        let mut sinks = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sinks.insert(request_id, sink).is_some() {
+            bail!("duplicate completion sink for request_id={request_id}");
+        }
+        Ok(())
+    }
+
+    /// Remove a per-request sink (idempotent). Called from the HTTP path's RAII
+    /// guard on completion OR cancellation.
+    pub fn unregister(&self, request_id: u64) {
+        let mut sinks = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sinks.remove(&request_id);
+    }
+
+    /// Fail every registered sink with a terminal error delta and clear the
+    /// registry, so awaiting handlers return an error when the worker group dies.
+    pub fn fail_all(&self, message: &str) {
+        let mut sinks = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_request_id, sink) in sinks.drain() {
+            let _ = sink.send(RelayCompletionDelta {
+                finish: true,
+                error: Some(message.to_string()),
+                ..RelayCompletionDelta::default()
+            });
+        }
+    }
+}
+
+/// Worker-side relay: connects at boot, then `recv()`s one envelope at a time
+/// over a [`RelayChannel`] trait object (transport-agnostic, TCP today).
 pub struct RelayWorker {
-    stream: TcpStream,
+    channel: Box<dyn RelayChannel>,
 }
 
 impl RelayWorker {
@@ -441,7 +598,9 @@ impl RelayWorker {
                     log::info!(
                         "[relay-worker] rank {rank}/{world_size} connected to coordinator at {coordinator}"
                     );
-                    return Ok(Self { stream });
+                    return Ok(Self {
+                        channel: Box::new(TcpChannel::new(stream)),
+                    });
                 }
                 Err(err) => {
                     last_err = Some(err);
@@ -457,36 +616,35 @@ impl RelayWorker {
     /// Read one envelope. Returns `Ok(None)` on coordinator EOF (clean
     /// shutdown); `Err` on protocol violation or transport failure.
     pub fn recv(&mut self) -> Result<Option<RelayEnvelope>> {
-        read_envelope(&mut self.stream)
+        self.channel.recv()
     }
 
     pub fn send(&mut self, envelope: &RelayEnvelope) -> Result<()> {
-        write_envelope(&mut self.stream, envelope)
+        self.channel.send(envelope)
     }
 
     pub fn try_clone(&self) -> Result<Self> {
-        let stream = self
-            .stream
-            .try_clone()
-            .context("RelayWorker clone stream")?;
-        Ok(Self { stream })
+        Ok(Self {
+            channel: self.channel.try_clone_channel()?,
+        })
     }
 }
 
 fn spawn_completion_reader(
     rank: usize,
-    mut stream: TcpStream,
+    mut channel: Box<dyn RelayChannel>,
     completion_sinks: Arc<
         Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>,
     >,
     shutdown: Arc<AtomicBool>,
+    ready_count: Arc<AtomicUsize>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = channel.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = std::thread::Builder::new()
         .name(format!("arle-relay-rank{rank}-completion-reader"))
         .spawn(move || {
             loop {
-                match read_envelope(&mut stream) {
+                match channel.recv() {
                     Ok(Some(RelayEnvelope::Completion { request_id, delta })) => {
                         let done = delta.is_done();
                         let sink = {
@@ -510,6 +668,12 @@ fn spawn_completion_reader(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             sinks.remove(&request_id);
                         }
+                    }
+                    Ok(Some(RelayEnvelope::EngineReady { rank: ready_rank })) => {
+                        ready_count.fetch_add(1, Ordering::AcqRel);
+                        log::info!(
+                            "[relay-coordinator] worker rank {ready_rank} engine ready (via rank {rank} reader)"
+                        );
                     }
                     Ok(Some(other)) => {
                         log::warn!(
