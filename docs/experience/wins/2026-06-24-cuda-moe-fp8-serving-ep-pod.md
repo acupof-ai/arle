@@ -67,7 +67,12 @@ already reaches the ceiling at c=8 (continuous batching pipelines the queue);
 ceiling is the MoE expert grouped-GEMM at small batch + TP=4 per-layer allreduce,
 not the slot cap. The lever is an MoE-decode batching kernel (or EP), not slots.
 
-## DSv4 EP (DeepEP) — 2 device bugs fixed (`5a2b8273`); deepep_ll boot DEADLOCKS (root-caused, fix scoped)
+## DSv4 EP (DeepEP) — 2 device bugs fixed (`5a2b8273`); deepep_ll boot DEADLOCKS (root-caused)
+
+> **UPDATE: FIXED by the SPMD redesign (`f72d94f3`).** EP=4 now boots ready + needle
+> exact DET + c跑 ok=N/N. The "concurrency non-functional / hard memory blocker"
+> conclusion below was the boot deadlock + a needle-residue confound, both gone — see
+> [2026-06-24-spmd-multiproc-ep-fixed.md](2026-06-24-spmd-multiproc-ep-fixed.md).
 
 "Use GPUs 4-7" surfaced a latent device-binding bug:
 - **Toolchain**: `dsv4_toolchain.sh build_infer` hardcoded `--features cuda,nccl`,
