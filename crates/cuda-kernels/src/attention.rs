@@ -316,6 +316,11 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
 ///
 /// `topk_unified = sliding_window + max_compressed_keys` must be %128==0
 /// (FlashMLA invariant); the kernel returns `cudaErrorInvalidValue` otherwise.
+///
+/// `page_table` is the OPTIONAL Stage-B logical→physical page table: `None` (the
+/// default for every current caller) keeps the Stage-A slot-relative path
+/// byte-for-byte; `Some(table)` routes each emitted index's logical page through
+/// the table (identity table = the Stage-A index, index-for-index).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_flashmla_decode_build_indices_raw(
     ctx: &DeviceContext,
@@ -328,7 +333,15 @@ pub fn dsv4_flashmla_decode_build_indices_raw(
     compress_ratio: usize,
     mode_int: i32,
     page_block_size: usize,
+    page_table: Option<&CudaSlice<i32>>,
 ) -> Result<()> {
+    let (pt_ptr, num_logical_pages, _gp) = match page_table {
+        Some(table) => {
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const i32, table.len() as i32, Some(guard))
+        }
+        None => (std::ptr::null(), 0, None),
+    };
     unsafe {
         ffi::arle_dsv4_flashmla_decode_build_indices_cuda(
             indices_ptr as *mut i32,
@@ -340,6 +353,8 @@ pub fn dsv4_flashmla_decode_build_indices_raw(
             compress_ratio as i32,
             mode_int,
             page_block_size as i32,
+            pt_ptr,
+            num_logical_pages,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -362,7 +377,15 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
     compress_ratio: usize,
     mode_int: i32,
     page_block_size: usize,
+    page_table: Option<&CudaSlice<i32>>,
 ) -> Result<()> {
+    let (pt_ptr, num_logical_pages, _gp) = match page_table {
+        Some(table) => {
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const i32, table.len() as i32, Some(guard))
+        }
+        None => (std::ptr::null(), 0, None),
+    };
     unsafe {
         ffi::arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
             indices_ptr as *mut i32,
@@ -374,6 +397,8 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
             compress_ratio as i32,
             mode_int,
             page_block_size as i32,
+            pt_ptr,
+            num_logical_pages,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -388,6 +413,13 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
 /// shifted by `slot_layer_block_offsets[row] * page_block_size`, matching
 /// FlashMLA's absolute slot addressing over one contiguous shared FP8 KV base.
 /// Active scheduler slots are not required to be row-contiguous.
+#[allow(clippy::too_many_arguments)]
+/// `page_table` is the OPTIONAL Stage-B per-row logical→physical page table
+/// (`[b, num_logical_pages]`): `None` (every current caller) keeps the Stage-A
+/// band path byte-for-byte; `Some(table)` routes each row's indices to
+/// POOL-absolute and SKIPS the `slot_layer_block_offsets` band shift (identity
+/// per-row table = the Stage-A index after the band shift). `table.len()` must
+/// be a multiple of `b`.
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     ctx: &DeviceContext,
@@ -404,7 +436,20 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     mode_int: i32,
     page_block_size: usize,
     total_blocks: usize,
+    page_table: Option<&CudaSlice<i32>>,
 ) -> Result<()> {
+    let (pt_ptr, num_logical_pages, _gp) = match page_table {
+        Some(table) => {
+            anyhow::ensure!(
+                b > 0 && table.len() % b == 0,
+                "batched page table len {} not a multiple of b {b}",
+                table.len()
+            );
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const i32, (table.len() / b) as i32, Some(guard))
+        }
+        None => (std::ptr::null(), 0, None),
+    };
     unsafe {
         ffi::arle_dsv4_flashmla_decode_build_indices_batched_cuda(
             indices_ptr as *mut i32,
@@ -420,6 +465,8 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
             mode_int,
             page_block_size as i32,
             total_blocks as i32,
+            pt_ptr,
+            num_logical_pages,
             ctx.stream.cu_stream(),
         )
         .result()?;
