@@ -2947,7 +2947,13 @@ impl Qwen35DecodeGraph {
 pub(crate) struct Qwen35CudaExecutor {
     model: crate::qwen35::Qwen35Model,
     /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
+    /// A slot's recurrent state is EMPTY until its first request activates it.
     slots: Vec<crate::qwen35::Qwen35SlotState>,
+    /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
+    /// finished request, popped by the next — so only ACTIVE slots hold a block,
+    /// not all `num_slots`. Grows to `num_slots` at full concurrency (then HBM ==
+    /// the old upfront reservation); idle/partial load costs proportionally less.
+    recurrent_pool: Vec<crate::qwen35::RecurrentBlock>,
     /// Persistent forward workspace (exact-shape buffer reuse): forwards are
     /// strictly serial on this executor, so ONE workspace serves every slot.
     /// Mirrors the DSv4 persistent decode scratch (passed `&mut` per forward).
@@ -3098,9 +3104,13 @@ impl Qwen35CudaExecutor {
             format_args!("effective_slots={num_slots}"),
         );
         let slots_t0 = Instant::now();
+        // Empty slots — zero recurrent HBM upfront. Each slot's ~147 MiB
+        // recurrent block is drawn from `recurrent_pool` on its first request
+        // (`acquire_recurrent` at the `start_pos == 0` prefill) and returned on
+        // request finish. The pool starts empty and grows on demand.
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
-            slots.push(model.new_slot_state()?);
+            slots.push(model.new_slot_state());
         }
         cuda_startup_log(
             "qwen35_slot_alloc",
@@ -3196,6 +3206,7 @@ impl Qwen35CudaExecutor {
         let executor = Self {
             model,
             slots,
+            recurrent_pool: Vec::new(),
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
             decode_graph_armed,
@@ -4016,9 +4027,36 @@ impl Qwen35CudaExecutor {
         // dropping the capture — capture cost stays once per slot, not
         // once per request.
         if row.start_pos == 0 {
-            self.slots[row.slot].reset(&self.model.ctx)?;
+            // Request boundary: the prior occupant is finished (the scheduler
+            // only reassigns a slot after its request completes — no in-flight
+            // forward references the slot), so return its recurrent block to the
+            // free-list, then acquire (pop the same block back, or alloc) and
+            // zero it for the new occupant. This replaces the old in-place
+            // `reset()` zeroing; the block MUST be resident before the forward.
+            self.slots[row.slot].release_recurrent(&mut self.recurrent_pool);
+            let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+            self.slots[row.slot].acquire_recurrent(
+                &self.model.ctx,
+                num_linear,
+                gdr_len,
+                conv_len,
+                &mut self.recurrent_pool,
+            )?;
+            // The new block's `gdr_states`/`conv_states` addresses differ from the
+            // prior occupant's, so the batched-decode pointer-table cache (keyed
+            // on slot_indices only) must restage on the next decode batch.
+            if let Some(bd) = self.batch_decode.as_mut() {
+                bd.invalidate_staged_pointers();
+            }
+            // The captured decode graph (legacy contiguous lane) bakes this slot's
+            // recurrent-block addresses; a different block invalidates it. Drop the
+            // slot's capture (the `baked` staleness check only tracks workspace
+            // ptrs, not recurrent ptrs) so it re-captures against the new block —
+            // `rearm_warm` alone keeps the stale capture and would replay freed mem.
             if let Some(dg) = self.decode_graph.as_mut() {
-                dg.graphs[row.slot].rearm_warm(1);
+                dg.graphs[row.slot] =
+                    crate::graph::CudaGraphState::new(self.model.ctx.stream.clone());
+                dg.baked[row.slot] = None;
             }
             // Default paged path: free the prior occupant's pages back to the
             // shared pool so a fresh prefill starts at logical page 0. (Under
@@ -4261,7 +4299,18 @@ impl Qwen35CudaExecutor {
         // forward, so it never shares the serving slots' KV/recurrent state.
         // The shared workspace IS reused (serial forwards; its buffers reshape
         // to the teacher's seq_len and back on the next serving call).
-        let mut slot = self.model.new_slot_state()?;
+        // Recurrent state is acquired into a throwaway local pool (the block is
+        // dropped with the slot, never pooled — this path is rare and transient).
+        let mut slot = self.model.new_slot_state();
+        let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+        let mut scratch_pool = Vec::new();
+        slot.acquire_recurrent(
+            &self.model.ctx,
+            num_linear,
+            gdr_len,
+            conv_len,
+            &mut scratch_pool,
+        )?;
         self.model
             .forward_token_logits_full(&mut slot, &mut self.workspace, input_ids, start_pos)
     }
