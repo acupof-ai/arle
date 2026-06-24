@@ -67,7 +67,7 @@ already reaches the ceiling at c=8 (continuous batching pipelines the queue);
 ceiling is the MoE expert grouped-GEMM at small batch + TP=4 per-layer allreduce,
 not the slot cap. The lever is an MoE-decode batching kernel (or EP), not slots.
 
-## DSv4 EP (DeepEP) — 2 latent bugs fixed, correctness proven (commit `5a2b8273`)
+## DSv4 EP (DeepEP) — 2 latent bugs fixed; c=1 correct, concurrency NON-FUNCTIONAL (commit `5a2b8273`)
 
 "Use GPUs 4-7" surfaced a latent device-binding bug:
 - **Toolchain**: `dsv4_toolchain.sh build_infer` hardcoded `--features cuda,nccl`,
@@ -86,12 +86,18 @@ not the slot cap. The lever is an MoE-decode batching kernel (or EP), not slots.
   (`ARLE_DEEPEP_NVSHMEM_DIR` = the pip `nvidia-nvshmem` pkg, `nvshmem=true`);
   DeepEP @ `d4f41e4` cloned via the proxy (the sglang `/sgl-workspace/DeepEP` is a
   newer non-`legacy/` layout deepep-sys rejects).
-- **`deepep_ll` (NVSHMEM EP) on 4,5,6,7: needle exact ×3 DET all lengths** — EP
-  produces correct inference end-to-end. Concurrent `c跑` blocked by an
-  **LL-buffer-vs-HBM tension**: `num_max_dispatch_tokens_per_rank` must be ≥ the
-  concurrent batch (≥512/rank), but that OOMs alongside DSv4's ~40 GB/rank weights
-  on 96 GB cards (256 overflows under concurrency; ≥512 OOMs/hangs). Throughput
-  A/B is a memory-budget follow-up (smaller KV arena / lower `INFER_DSV4_MAX_SEQ_LEN`).
+- **`deepep_ll` (NVSHMEM EP) on 4,5,6,7 — c=1 single-stream ONLY**: needle exact
+  ×3 DET at the lengths run (115→1000, `num_max_dispatch_tokens_per_rank=256`), so
+  the EP forward path is numerically correct at batch 1 (transcript only — not
+  re-captured in a commit/log artifact; treat as evidence-grade c=1, not archived).
+  **Concurrency is NON-FUNCTIONAL, not "tuned later": every concurrent `c跑` (c=1/4/8/16)
+  returned 0 successful requests (0 tok/s, ok=0/N), and `=512` made even the needle
+  NONDET exact=0.** Root tension: `num_max_dispatch_tokens_per_rank` must be ≥ the
+  concurrent batch (≥512/rank) but that OOMs alongside DSv4's ~40 GB/rank weights on
+  96 GB cards; 256 overflows under any concurrency. **EP's entire point is throughput,
+  so EP throughput is UNVERIFIED — a hard blocker (no batch size fits on 96 GB),
+  not a perf follow-up.** Next: shrink the KV arena / lower `INFER_DSV4_MAX_SEQ_LEN`
+  to fit ≥512 LL buffer, then re-run the c-sweep and capture the log.
 
 ## Rule
 
