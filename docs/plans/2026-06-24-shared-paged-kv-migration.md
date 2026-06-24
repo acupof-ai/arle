@@ -51,7 +51,40 @@ total_pages = max_total_tokens / page_size
 Lands in a new `infer-seam` helper `profile_kv_pool_tokens(free, total, cell_bytes, mem_frac)`
 used by every backend's executor build (replaces the per-kind branches in
 `loaded.rs:1266-1287`). A `--mem-fraction-static` CLI flag (default 0.9). One shared pool,
-not `× num_slots`.
+not `× num_slots`. **Phase 1 (committed `912547ec`) ships this config-cell + 0.9-guess version.**
+
+### 3.5 Auto-warmup budget — measure the footprint, don't guess (ckl 2026-06-24)
+The config `cell_bytes` is theoretical and the `mem_fraction_static 0.9` is a guess. Refine to a
+**warmup profile-run** (SGLang's actual method) so the budget rests on measured hardware:
+1. After weights load, measure free VRAM `V0`.
+2. Alloc a **minimal** KV pool (one warmup batch), run a **warmup forward** (max prefill chunk +
+   a decode step) — this allocates the real activation/attention-scratch/graph buffers.
+3. Measure free VRAM low-point `V1` during the warmup → **activation_peak = V0 − V1 −
+   minimal_pool_bytes** (the measured dynamic footprint, replacing the 0.9 guess).
+4. `per_token_bytes` = the pool's **exact** `budget_bytes_for_tokens(1)` (the real per-token KV
+   cost incl. scales/alignment, not the config estimate) — cross-check it against the warmup's
+   measured KV delta and warn on mismatch.
+5. **KV budget = V0 − activation_peak − safety_margin**; `max_total_tokens = budget /
+   per_token_bytes`. Free the minimal pool, allocate the real pool at that size.
+This makes the budget **model-agnostic + quant-agnostic** (no per-config formula trusted blindly)
+and tighter (measured activation may be < or > 10%). `--mem-fraction-static` becomes the safety
+margin knob; warmup overrides the guess. Log `measured activation X GB, per_token Y B, budget Z`.
+
+### 3.6 Unified L1/L2/L3 budget policy — profiled + reserve + flags (shared box: never greedy)
+Same "measure + leave a reserve + flag" discipline for ALL tiers; L2/L3 are NOT pre-allocated —
+a capacity cap they grow into on-demand, LRU-evicting down a tier when full.
+- **L1 (HBM)** — §3.5 warmup budget.
+- **L2 (host DRAM)** — `budget = clamp(dram_fraction × MemAvailable, [floor, MemAvailable −
+  reserve])`. Measure `MemAvailable` (/proc/meminfo). `dram_fraction` default **0.5 (NOT 0.8)** —
+  the box is shared and the T1 store is **pageable** host memory (OS can swap/OOM-kill if greedy);
+  `reserve ≥ max(64 GB, OS + service host: weight staging, pinned ring, page cache)`. Flag
+  `--kv-t1-budget-bytes` / `--dram-fraction`. Replaces `default_t1` [1,4] GB cap.
+- **L3 (NVMe)** — `budget = clamp(ssd_fraction × free_disk, [floor, free_disk − reserve])`.
+  Measure free disk (statvfs of the ssd root). `ssd_fraction` default ~0.5; reserve for the FS +
+  other tenants. Flag `--kv-ssd-path` + budget. Replaces `default_t2` 20 GB cap.
+- **Example (this 8×H20 box, 1.9 TB DRAM / 766 GB free disk)**: L1 ≈ 61 GB/935 K tok (measured),
+  L2 ≈ 0.5×1.8 TB ≈ 900 GB/~14 M tok, L3 ≈ 0.5×766 GB ≈ 380 GB/~6 M tok → **~20 M+ tok** tiered,
+  leaving ~950 GB DRAM + ~380 GB disk for the box. (Greedy 80% would starve co-tenants.)
 
 ## 4. Per-model migration
 
