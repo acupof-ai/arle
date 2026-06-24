@@ -195,12 +195,15 @@ deepep_layout_label() {
     fi
 }
 
-# Validate ARLE_DEEPEP_DIR when MOE_BACKEND=native-deepep. Other backends
-# don't require it — deepep-sys falls back to stub mode without it.
+# Validate ARLE_DEEPEP_DIR for any DeepEP MoE backend (intranode native-deepep OR
+# the NVSHMEM low-latency deepep_ll). Other backends (allreduce/deepgemm) don't
+# need it — deepep-sys falls back to stub mode without it. The _ll variants also
+# need NVSHMEM (auto-detected below).
 detect_deepep_dir() {
-    if [[ "$MOE_BACKEND" != "native-deepep" ]]; then
-        return 0
-    fi
+    case "$MOE_BACKEND" in
+        native-deepep | deepep | deepep_ll | deepep-ll | native_deepep_ll) ;;
+        *) return 0 ;;
+    esac
 
     if [[ -n "$DEEPEP_DIR" ]]; then
         DEEPEP_DIR="$(abs_path "$DEEPEP_DIR")"
@@ -223,8 +226,27 @@ detect_deepep_dir() {
     fi
 
     [[ -n "$DEEPEP_DIR" ]] ||
-        die "ARLE_DSV4_MOE_BACKEND=native-deepep requires --deepep-dir DIR or ARLE_DEEPEP_DIR"
+        die "ARLE_DSV4_MOE_BACKEND=$MOE_BACKEND requires --deepep-dir DIR or ARLE_DEEPEP_DIR"
     export ARLE_DEEPEP_DIR="$DEEPEP_DIR"
+
+    # deepep_ll (low-latency) needs NVSHMEM. Auto-detect the pip nvidia-nvshmem
+    # package (ships alongside deep_ep) unless overridden; deepep-sys build.rs
+    # compiles internode_ll against ARLE_DEEPEP_NVSHMEM_DIR, and libnvshmem_host.so
+    # must be on LD_LIBRARY_PATH at runtime.
+    case "$MOE_BACKEND" in
+    deepep_ll | deepep-ll | native_deepep_ll)
+        if [[ -z "${ARLE_DEEPEP_NVSHMEM_DIR:-}" ]]; then
+            local nv
+            nv="$(python3 -c 'import os,nvidia.nvshmem as n; print(os.path.dirname(n.__file__))' 2>/dev/null || true)"
+            [[ -n "$nv" && -f "$nv/include/nvshmem.h" ]] && ARLE_DEEPEP_NVSHMEM_DIR="$nv"
+        fi
+        [[ -n "${ARLE_DEEPEP_NVSHMEM_DIR:-}" && -f "$ARLE_DEEPEP_NVSHMEM_DIR/include/nvshmem.h" ]] ||
+            die "deepep_ll needs NVSHMEM; set ARLE_DEEPEP_NVSHMEM_DIR (pip nvidia-nvshmem: <site-packages>/nvidia/nvshmem)"
+        export ARLE_DEEPEP_NVSHMEM_DIR
+        export LD_LIBRARY_PATH="$ARLE_DEEPEP_NVSHMEM_DIR/lib:${LD_LIBRARY_PATH:-}"
+        echo "using NVSHMEM from $ARLE_DEEPEP_NVSHMEM_DIR (deepep_ll)"
+        ;;
+    esac
 }
 
 export_runtime_env() {
