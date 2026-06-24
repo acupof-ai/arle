@@ -148,6 +148,11 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // `k_prepared + 448` (RoPE).
 //
 // MODEL1 only (NoPE=448). V32 is handled by `dsv4_v32_fp8_kv_pack_kernel`.
+//
+// Stage-B page-table lookup (gated): when `page_table != nullptr`, `token_block_id[t]`
+// carries a slot-LOGICAL page and the physical block is `page_table[token_block_id[t]]`.
+// `page_table == nullptr` (Stage-A default) keeps `block_id = token_block_id[t]` verbatim
+// — identity table (`page_table[i] = first + i`) reproduces the band path byte-for-byte.
 template <int HEAD_DIM_NOPE>
 __global__ void dsv4_fp8_kv_pack_kernel(
     const __nv_bfloat16* __restrict__ nope,   // [n_tokens, stride_nope_elems]
@@ -158,7 +163,9 @@ __global__ void dsv4_fp8_kv_pack_kernel(
     int n_tokens,
     int page_block_size,
     int stride_nope_elems,
-    int stride_rope_elems)
+    int stride_rope_elems,
+    const int* __restrict__ page_table,
+    int num_logical_pages)
 {
     // MODEL1-only NoPE-dim-dependent constants (NoPE=448 → NUM_TILES=7,
     // NUM_SCALES=8, TOKEN_BYTES=584). The trailing e8m0 scale region at 64-elem
@@ -174,8 +181,13 @@ __global__ void dsv4_fp8_kv_pack_kernel(
     if (t >= n_tokens) return;
 
     const int tid = threadIdx.x;
-    const int block_id = token_block_id[t];
     const int row = token_in_block_row[t];
+    // Stage-B: route the logical page through the device table; Stage-A: identity.
+    int block_id = token_block_id[t];
+    if (page_table != nullptr) {
+        if (block_id < 0 || block_id >= num_logical_pages) return;
+        block_id = page_table[block_id];
+    }
 
     // Block-paged base (in bytes).
     const int64_t block_stride = (int64_t)page_block_size * TOKEN_BYTES;
@@ -576,11 +588,13 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_cuda(
     dim3 grid((unsigned)n_tokens, 1, 1);
     dim3 block(THREADS_PER_BLOCK, 1, 1);
     // MODEL1 contiguous pack: NoPE=448. Strides equal the dims (tight packing).
+    // Stage-A only (no page table) — band addressing via host-physical block ids.
     dsv4_fp8_kv_pack_kernel<448><<<grid, block, 0, stream>>>(
         nope, rope, packed_kv,
         token_block_id, token_in_block_row,
         n_tokens, page_block_size,
-        448, HEAD_DIM_ROPE);
+        448, HEAD_DIM_ROPE,
+        nullptr, 0);
     return cudaGetLastError();
 }
 
@@ -591,6 +605,9 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_cuda(
 // survey Finding 1 in docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md.
 //
 // Both strides must be ≥ HEAD_DIM_NOPE (448) / HEAD_DIM_ROPE (64) respectively.
+// `page_table`/`num_logical_pages` are the OPTIONAL Stage-B lookup (pass
+// nullptr/0 for the Stage-A band path). When set, `token_block_id[t]` is a
+// slot-LOGICAL page indexed through `page_table`; identity table = byte-identical.
 extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
     const __nv_bfloat16* nope,
     const __nv_bfloat16* rope,
@@ -601,6 +618,8 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
     int page_block_size,
     int stride_nope_elems,
     int stride_rope_elems,
+    const int* page_table,
+    int num_logical_pages,
     cudaStream_t stream)
 {
     if (n_tokens == 0) return cudaSuccess;
@@ -612,6 +631,9 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
         || token_block_id == nullptr || token_in_block_row == nullptr) {
         return cudaErrorInvalidValue;
     }
+    if (page_table != nullptr && num_logical_pages <= 0) {
+        return cudaErrorInvalidValue;
+    }
 
     dim3 grid((unsigned)n_tokens, 1, 1);
     dim3 block(THREADS_PER_BLOCK, 1, 1);
@@ -620,7 +642,8 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_cuda(
         nope, rope, packed_kv,
         token_block_id, token_in_block_row,
         n_tokens, page_block_size,
-        stride_nope_elems, stride_rope_elems);
+        stride_nope_elems, stride_rope_elems,
+        page_table, num_logical_pages);
     return cudaGetLastError();
 }
 

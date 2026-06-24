@@ -116,6 +116,11 @@ pub fn dsv4_fp8_kv_pack_raw(
 /// strides. Must be ≥ 448 / 64 respectively. For `k_prepared`-shaped
 /// input pass `(nope_ptr = k_prepared, rope_ptr = k_prepared + 448*2 B,
 /// stride_*_elems = 512)`.
+///
+/// `page_table` is the OPTIONAL Stage-B device page-table lookup: `None` (the
+/// default for every current caller) keeps the Stage-A band path byte-for-byte;
+/// `Some(table)` reinterprets `token_block_id[t]` as a slot-LOGICAL page routed
+/// through `table[logical]` (identity table = byte-identical to band).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_fp8_kv_pack_strided_raw(
     ctx: &DeviceContext,
@@ -128,6 +133,7 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
     page_block_size: usize,
     stride_nope_elems: usize,
     stride_rope_elems: usize,
+    page_table: Option<&CudaSlice<i32>>,
 ) -> Result<()> {
     if n_tokens == 0 {
         return Ok(());
@@ -135,6 +141,13 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
 
     let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
     let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
+    let (pt_ptr, num_logical_pages, _gp) = match page_table {
+        Some(table) => {
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const i32, table.len() as i32, Some(guard))
+        }
+        None => (std::ptr::null(), 0, None),
+    };
 
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
@@ -147,6 +160,8 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
             page_block_size as i32,
             stride_nope_elems as i32,
             stride_rope_elems as i32,
+            pt_ptr,
+            num_logical_pages,
             ctx.stream.cu_stream(),
         )
         .result()?;

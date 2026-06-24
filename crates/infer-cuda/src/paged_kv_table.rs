@@ -116,9 +116,43 @@ pub(crate) fn contiguous_page_table_byte_range(
     Ok(start..end)
 }
 
+/// DSv4 FP8 pack kernel's block-paged byte base for a token at slot-logical
+/// `token_idx`, computed via the device page-table lookup (Stage-B):
+/// `block_id = table[token_idx / page_block_size]`,
+/// `base = block_id * page_block_size * token_bytes + (token_idx % page_block_size) * token_data_bytes`.
+/// Host mirror of `dsv4_fp8_kv_pack.cu`'s addressing — the gate for proving the
+/// table-lookup path is byte-identical to band addressing on an identity table.
+#[allow(dead_code)]
+pub(crate) fn dsv4_pack_token_byte_base(
+    table: &[u32],
+    token_idx: usize,
+    page_block_size: usize,
+    token_bytes: usize,
+    token_data_bytes: usize,
+) -> Result<usize> {
+    ensure!(
+        page_block_size > 0,
+        "paged-KV page_block_size must be non-zero"
+    );
+    let block_id = physical_page(table, token_idx / page_block_size)? as usize;
+    let block_base = block_id
+        .checked_mul(page_block_size)
+        .and_then(|n| n.checked_mul(token_bytes))
+        .ok_or_else(|| anyhow!("DSv4 pack block base overflow"))?;
+    let row_off = (token_idx % page_block_size)
+        .checked_mul(token_data_bytes)
+        .ok_or_else(|| anyhow!("DSv4 pack row offset overflow"))?;
+    block_base
+        .checked_add(row_off)
+        .ok_or_else(|| anyhow!("DSv4 pack token base overflow"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{contiguous_page_table_byte_range, physical_page, physical_token_rows};
+    use super::{
+        contiguous_page_table_byte_range, dsv4_pack_token_byte_base, physical_page,
+        physical_token_rows,
+    };
 
     /// Synthetic Stage A config: 3 slots x 5 pages of 64 x 584 B each.
     const PAGE_BYTES: usize = 64 * 584;
@@ -237,5 +271,103 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("page_size must be non-zero"), "got: {err}");
+    }
+
+    // DSv4 FP8 pack MODEL1 byte layout: 64-token blocks, 584 B/token (576 data).
+    const PACK_BLOCK: usize = 64;
+    const PACK_TOKEN_BYTES: usize = 584;
+    const PACK_TOKEN_DATA_BYTES: usize = 576;
+
+    /// Band path: the Stage-A kernel reads a host-physical `block_id` directly
+    /// (`physical = slot_first + logical_page`). The host mirror of the pre-table
+    /// addressing the device pack kernel did before Phase 1.
+    fn band_token_byte_base(slot_first: usize, token_idx: usize) -> usize {
+        let block_id = slot_first + token_idx / PACK_BLOCK;
+        block_id * PACK_BLOCK * PACK_TOKEN_BYTES + (token_idx % PACK_BLOCK) * PACK_TOKEN_DATA_BYTES
+    }
+
+    /// GATE: an IDENTITY page table (`table[i] = slot_first + i`) routed through
+    /// the device-lookup addressing produces byte-identical token bases to the
+    /// Stage-A band path, for every token across the slot's pages.
+    #[test]
+    fn dsv4_pack_identity_table_byte_identical_to_band() {
+        for slot in 0..NUM_SLOTS {
+            let slot_first = slot * SLOT_PAGES;
+            let table: Vec<u32> = (slot_first as u32..(slot_first + SLOT_PAGES) as u32).collect();
+            for token_idx in 0..SLOT_PAGES * PACK_BLOCK {
+                let table_base = dsv4_pack_token_byte_base(
+                    &table,
+                    token_idx,
+                    PACK_BLOCK,
+                    PACK_TOKEN_BYTES,
+                    PACK_TOKEN_DATA_BYTES,
+                )
+                .expect("identity base");
+                assert_eq!(
+                    table_base,
+                    band_token_byte_base(slot_first, token_idx),
+                    "slot {slot} token {token_idx} table base != band base"
+                );
+            }
+        }
+    }
+
+    /// A FRAGMENTED (gapped) table lands each token in its physical page — the
+    /// whole point of the lookup; band addressing could not serve this.
+    #[test]
+    fn dsv4_pack_fragmented_table_follows_physical_pages() {
+        // Logical pages 0,1,2 → physical pages 7,3,9 (non-contiguous).
+        let table = vec![7u32, 3, 9];
+        // Token 0 (logical page 0 → phys 7, row 0).
+        assert_eq!(
+            dsv4_pack_token_byte_base(
+                &table,
+                0,
+                PACK_BLOCK,
+                PACK_TOKEN_BYTES,
+                PACK_TOKEN_DATA_BYTES
+            )
+            .unwrap(),
+            7 * PACK_BLOCK * PACK_TOKEN_BYTES
+        );
+        // Token 65 (logical page 1 → phys 3, row 1).
+        assert_eq!(
+            dsv4_pack_token_byte_base(
+                &table,
+                PACK_BLOCK + 1,
+                PACK_BLOCK,
+                PACK_TOKEN_BYTES,
+                PACK_TOKEN_DATA_BYTES
+            )
+            .unwrap(),
+            3 * PACK_BLOCK * PACK_TOKEN_BYTES + PACK_TOKEN_DATA_BYTES
+        );
+        // Token 130 (logical page 2 → phys 9, row 2).
+        assert_eq!(
+            dsv4_pack_token_byte_base(
+                &table,
+                2 * PACK_BLOCK + 2,
+                PACK_BLOCK,
+                PACK_TOKEN_BYTES,
+                PACK_TOKEN_DATA_BYTES
+            )
+            .unwrap(),
+            9 * PACK_BLOCK * PACK_TOKEN_BYTES + 2 * PACK_TOKEN_DATA_BYTES
+        );
+    }
+
+    #[test]
+    fn dsv4_pack_rejects_token_past_table() {
+        let table = vec![0u32, 1]; // 2 logical pages → 128 tokens.
+        let err = dsv4_pack_token_byte_base(
+            &table,
+            200,
+            PACK_BLOCK,
+            PACK_TOKEN_BYTES,
+            PACK_TOKEN_DATA_BYTES,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("outside slot page table"), "got: {err}");
     }
 }
