@@ -336,7 +336,15 @@ mod backend {
     impl EngineLoadConfig {
         pub(super) fn scheduler_config(&self) -> SchedulerConfig {
             let mut config = SchedulerConfig::for_slots(self.num_slots);
-            config.max_prompt_tokens = self.max_prompt_tokens;
+            // Prompt cap tracks the real per-request KV capacity
+            // (max_seq_len = total_pages × page_size), minus a generation
+            // reserve — NOT a hardcoded 32K that aborts moderate prompts even
+            // though the page table / model support far more.
+            let per_req_cap = self.total_pages.saturating_mul(self.page_size);
+            let gen_reserve = per_req_cap / 8;
+            config.max_prompt_tokens = self
+                .max_prompt_tokens
+                .max(per_req_cap.saturating_sub(gen_reserve));
             config.max_total_tokens = self.max_total_tokens;
             config.chunked_prefill_size = self.chunked_prefill_size;
             config
