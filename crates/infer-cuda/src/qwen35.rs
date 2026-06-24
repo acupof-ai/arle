@@ -342,15 +342,24 @@ pub struct SharedFp8BaseProjection {
     pub block_k: usize,
 }
 
-/// Per-slot full-attention K/V cache (one contiguous bf16 cache per full-attn
-/// layer) + per-slot gated-delta recurrent state (state + conv ring per
-/// linear-attn layer). Carried across prefill/decode for one request.
+/// Per-slot gated-delta recurrent state (state + conv ring per linear-attn
+/// layer). Carried across prefill/decode for one request.
+///
+/// Full-attention K/V is NOT here: since the shared-paged migration (Phase 2)
+/// Qwen3.6's full-attn KV lives in the executor's shared [`PagedKVPool`]
+/// (`full_attn_kv`), addressed per slot via a page table — never per-slot
+/// contiguous (the `max_seq_len × kv_dim × num_full × 2` waste). `k_caches`/
+/// `v_caches` stay as (normally-empty) `Vec`s only for the legacy contiguous
+/// batched-decode A/B lane, which the paged default bypasses; the default
+/// build leaves them empty (`new_slot_state` allocates zero full-attn bytes).
 ///
 /// All dims are this rank's LOCAL shard sizes (= the global config dims on a
-/// single GPU): each TP rank caches only its own kv heads, v-head recurrent
-/// slabs, and qkv conv channels.
+/// single GPU): each TP rank caches only its own v-head recurrent slabs and
+/// qkv conv channels.
 pub(crate) struct Qwen35SlotState {
     /// `[num_full_layers]` contiguous K caches, each `max_seq_len*kv_dim` bf16.
+    /// EMPTY by default (full-attn KV is paged); populated only by the legacy
+    /// contiguous lane when explicitly requested.
     k_caches: Vec<DeviceVec>,
     v_caches: Vec<DeviceVec>,
     /// `[num_linear_layers]` gated-delta recurrent states (`Vh*Kd*Vd` f32).
@@ -362,6 +371,37 @@ pub(crate) struct Qwen35SlotState {
 }
 
 impl Qwen35SlotState {
+    /// Allocate a slot's recurrent state ONLY (the default paged build): the
+    /// full-attn K/V lives in the shared [`PagedKVPool`], so `k_caches`/
+    /// `v_caches` start empty — zero per-slot full-attn bytes (the 4× capacity
+    /// win). `gdr_states`/`conv_states` are the small per-slot recurrent state
+    /// (MB-scale, not pageable).
+    pub(crate) fn new_linear_only(
+        ctx: &DeviceContext,
+        num_linear: usize,
+        gdr_state_len: usize,
+        conv_len: usize,
+    ) -> Result<Self> {
+        let mut gdr_states = Vec::with_capacity(num_linear);
+        let mut conv_states = Vec::with_capacity(num_linear);
+        for _ in 0..num_linear {
+            gdr_states.push(
+                ctx.stream
+                    .alloc_zeros::<f32>(gdr_state_len)
+                    .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?,
+            );
+            conv_states.push(DeviceVec::zeros(ctx, conv_len)?);
+        }
+        Ok(Self {
+            k_caches: Vec::new(),
+            v_caches: Vec::new(),
+            gdr_states,
+            conv_states,
+            seq_len: 0,
+        })
+    }
+
+    #[allow(dead_code)] // legacy contiguous-cache lane (A/B); the paged default uses new_linear_only.
     pub(crate) fn new(
         ctx: &DeviceContext,
         num_full: usize,
@@ -498,23 +538,13 @@ impl Qwen35SlotState {
         self.seq_len = len;
     }
 
-    /// Free the redundant per-slot full-attn contiguous K/V caches when session
-    /// KV-recall is enabled. Under `--kv-recall` the full-attn K/V lives in the
-    /// paged `recall_kv` pool (the read-swap routes every full-attn layer
-    /// through it via `full_attention_paged`), so these per-slot contiguous
-    /// caches — ~most of the per-slot bytes — are dead weight: nothing reads or
-    /// writes `k_caches`/`v_caches` while recall is active. The only consumers
-    /// are `full_attention` and the batched-decode pointer staging, both of
-    /// which the recall dispatch skips (the `forward_hidden` full-attn match
-    /// takes the `recall.is_some()` → `full_attention_paged` branch, and the
-    /// executor's batched-decode path bypasses on `recall_active()`). Dropping
-    /// the `DeviceVec`s frees their `CudaSlice` device memory immediately.
-    ///
-    /// The linear-attn recurrent + conv-ring state (`gdr_states`/`conv_states`)
-    /// is REQUIRED in both paths and is left untouched — Qwen3.6 is hybrid, the
-    /// recall pool carries only the full-attn layers. After this the slot holds
-    /// ONLY the linear-attn state; `seq_len` continues to track the full-attn
-    /// length via `advance_seq_len`/`set_seq_len` for the recall pool.
+    /// Free the per-slot full-attn contiguous K/V caches. Since the shared-paged
+    /// migration the DEFAULT build never allocates them (`new_linear_only` leaves
+    /// `k_caches`/`v_caches` empty), so this is a no-op there — kept for the
+    /// legacy contiguous lane (`Qwen35SlotState::new`) to drop the caches if a
+    /// caller switches that slot to the paged path. The linear-attn recurrent +
+    /// conv-ring state (`gdr_states`/`conv_states`) is untouched.
+    #[allow(dead_code)] // legacy contiguous-lane helper; the paged default never allocates these.
     pub(crate) fn free_full_attn_caches(&mut self) {
         self.k_caches = Vec::new();
         self.v_caches = Vec::new();
@@ -714,11 +744,14 @@ pub(crate) struct FullAttnScratch {
     batch_partial_l: SliceSlot<f32>,
 }
 
-/// Opt-in paged full-attn forwarding context for Qwen3.6 KV-recall. When
-/// threaded `Some`, each full-attn layer reads/writes the paged `PagedKVPool`
-/// over `meta` instead of the contiguous slot cache. `None` → contiguous
-/// (byte-identical default). `layer0_query` collects the post-RoPE layer-0
-/// full-attn query for the next-step recall score.
+/// Paged full-attn forwarding context for Qwen3.6 — the DEFAULT path since the
+/// shared-paged migration. Each full-attn layer reads/writes the shared
+/// `PagedKVPool` (`full_attn_kv`) over `meta` (the page table) instead of a
+/// per-slot contiguous cache. The default build hands a `for_slot` page table
+/// over the slot's FULL resident pages (full attention, no eviction); the
+/// `--kv-recall` cycle layers a working-set restriction on top of the SAME
+/// pool. `layer0_query` collects the post-RoPE layer-0 full-attn query for the
+/// recall score (unused on the default path; populated only on prefill).
 pub(crate) struct Qwen35RecallForward<'a> {
     pub(crate) pool: &'a mut PagedKVPool,
     pub(crate) meta: &'a crate::loader::PageMeta,
@@ -1364,14 +1397,15 @@ impl Qwen35Model {
         let c = &self.config;
         let num_full = c.num_full_attention_layers();
         let num_linear = c.num_hidden_layers - num_full;
-        // Slot state is sized from this rank's LOCAL shard widths: each rank
-        // caches only its own kv heads / v-head recurrent slabs / qkv channels.
-        Qwen35SlotState::new(
+        let _ = num_full; // full-attn KV is paged (shared pool), not per-slot here.
+        // Default build: recurrent state ONLY — the full-attn K/V lives in the
+        // executor's shared `PagedKVPool`, so the slot allocates zero full-attn
+        // bytes (the 4× capacity win). Sized from this rank's LOCAL shard
+        // widths: each rank carries only its own v-head recurrent slabs / qkv
+        // conv channels.
+        Qwen35SlotState::new_linear_only(
             &self.ctx,
-            num_full,
             num_linear,
-            self.max_seq_len,
-            self.local_full_attn_kv_dim(),
             self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim,
             self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1),
         )
@@ -1628,20 +1662,22 @@ impl Qwen35Model {
     }
 
     /// Per-slot device-memory cost (bytes) at this rank's local shard widths:
-    /// K+V contiguous full-attn caches + gated-delta recurrent state + conv
-    /// rings. Mirrors exactly what [`Self::new_slot_state`] allocates per slot.
+    /// the gated-delta recurrent state + conv rings ONLY. Mirrors exactly what
+    /// [`Self::new_slot_state`] allocates per slot.
+    ///
+    /// Full-attn K/V is NO LONGER per-slot since the shared-paged migration: it
+    /// lives in the executor's one shared profile-sized [`PagedKVPool`], so the
+    /// per-slot budget excludes it (the `kv_bytes` term is 0). The slot clamp
+    /// then reflects only the small recurrent state; the pool reserves the bulk
+    /// of free VRAM separately (profiled AFTER this clamp, dense-style).
     fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
         let c = &self.config;
         let num_full = c.num_full_attention_layers();
         let num_linear = c.num_hidden_layers - num_full;
         let bf16 = std::mem::size_of::<half::bf16>();
         let f32sz = std::mem::size_of::<f32>();
-        // K and V contiguous caches: num_full × (max_seq_len × kv_dim) bf16, ×2.
-        let kv_bytes = num_full
-            .saturating_mul(self.max_seq_len)
-            .saturating_mul(self.local_full_attn_kv_dim())
-            .saturating_mul(2)
-            .saturating_mul(bf16);
+        // Full-attn K/V is paged (shared pool), not per-slot → 0 here.
+        let kv_bytes = 0usize;
         // Gated-delta recurrent state: num_linear × (Vh × Kd × Vd) f32.
         let gdr_len = self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim;
         let gdr_bytes = num_linear.saturating_mul(gdr_len).saturating_mul(f32sz);
