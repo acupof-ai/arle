@@ -170,18 +170,17 @@ where
     // the prompt directly from the parts instead: each image part becomes one
     // `<image>` marker, text parts pass through, matching the processor's
     // `<image>\n<text>` SFT layout.
-    let prompt = if multimodal_kind == Some(infer_plan::MultimodalKind::DeepseekOcr)
-        && !images.is_empty()
-    {
-        build_deepseek_ocr_prompt(&request.messages)
-    } else {
-        let tokenizer = state
-            .tokenizer
-            .lock()
-            .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
-        tokenizer
-            .render_chat_with_kwargs(&request.messages, request.chat_template_kwargs.as_ref())?
-    };
+    let prompt =
+        if multimodal_kind == Some(infer_plan::MultimodalKind::DeepseekOcr) && !images.is_empty() {
+            build_deepseek_ocr_prompt(&request.messages)
+        } else {
+            let tokenizer = state
+                .tokenizer
+                .lock()
+                .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
+            tokenizer
+                .render_chat_with_kwargs(&request.messages, request.chat_template_kwargs.as_ref())?
+        };
     if !images.is_empty() {
         let prompt = expand_image_markers(&prompt, &images, multimodal_kind)?;
         let prompt_tokens = encode(&state, &prompt)?;
@@ -508,7 +507,9 @@ fn expand_image_markers(
 /// per image part and concatenating text parts (the model's `<image>\n<text>`
 /// SFT layout). The model's chat template is too trivial to render image parts.
 fn build_deepseek_ocr_prompt(messages: &[crate::schema::ChatMessage]) -> String {
-    let mut prompt = String::new();
+    // The reference processor always prepends BOS; the server's `encode` skips
+    // special tokens, so emit the BOS marker explicitly (it encodes to id 0).
+    let mut prompt = String::from(crate::multimodal::DEEPSEEK_OCR_BOS_MARKER);
     for message in messages {
         match &message.content {
             Some(ChatContent::Text(text)) => prompt.push_str(text),

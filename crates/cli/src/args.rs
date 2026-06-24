@@ -1409,6 +1409,10 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
 
+    /// Diagnostic: skip the rollout and run ONE masked-CE writeback on a synthetic trajectory of this token length (find writeback OOM fast). 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) synthetic_writeback_seq: usize,
+
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,

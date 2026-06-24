@@ -61,6 +61,18 @@ array array_from_f32(const float* data, const Shape& shape) {
     return array(std::move(buf), shape, float32);
 }
 
+// Env-gated L2-norm trace for numerically bisecting the vision tower.
+void vdbg(const char* tag, const array& a) {
+    if (std::getenv("INFER_DSOCR_VDEBUG") == nullptr) {
+        return;
+    }
+    auto n = sqrt(sum(astype(a, float32) * astype(a, float32)));
+    eval({n});
+    std::fprintf(stderr, "[vdbg] %-18s l2=%.4f shape=[", tag, n.item<float>());
+    for (int d : a.shape()) std::fprintf(stderr, "%d,", d);
+    std::fprintf(stderr, "]\n");
+}
+
 // GELU (exact erf form, matching nn.GELU default in the reference).
 array gelu(const array& x) {
     return x * (array(0.5f) * (array(1.0f) + erf(x * array(0.7071067811865476f))));
@@ -537,22 +549,34 @@ struct DeepseekOcrModel {
 
     // SAM encoder: image [1, H, W, 3] -> [1, h16, w16, 1024], flattened later.
     array sam_forward(const array& image) const {
+        vdbg("sam.image", image);
         // patch_embed conv (stride patch).
         auto x = conv_with_bias(image, vision.sam_patch_embed_w,
                                 std::optional<array>(vision.sam_patch_embed_b),
                                 vision.sam_patch, 0); // [1, gh, gw, width]
+        vdbg("sam.patch_embed", x);
         x = x + vision.sam_pos_embed;
+        vdbg("sam.+pos", x);
+        int bi = 0;
         for (const auto& blk : vision.sam_blocks) {
             x = sam_block_forward(x, blk);
+            if (bi == 0 || bi == 1 || bi == 2 || bi == 11) {
+                char tag[24];
+                std::snprintf(tag, sizeof(tag), "sam.block%d", bi);
+                vdbg(tag, x);
+            }
+            ++bi;
         }
         // neck: conv1x1 -> ln -> conv3x3(pad1) -> ln  (channel-last layernorm).
         x = conv_with_bias(x, vision.neck0_w, std::nullopt, 1, 0);
         x = ln(x, vision.neck1_w, vision.neck1_b, 1e-6f);
         x = conv_with_bias(x, vision.neck2_w, std::nullopt, 1, 1);
         x = ln(x, vision.neck3_w, vision.neck3_b, 1e-6f);
+        vdbg("sam.neck", x);
         // net_2 / net_3: stride-2 conv compressor 256->512->1024.
         x = conv_with_bias(x, vision.net2_w, std::nullopt, 2, 1);
         x = conv_with_bias(x, vision.net3_w, std::nullopt, 2, 1);
+        vdbg("sam_out", x);
         return x; // [1, h', w', 1024]
     }
 
@@ -603,6 +627,7 @@ struct DeepseekOcrModel {
         for (const auto& layer : vision.clip_layers_w) {
             x = clip_layer_forward(x, layer);
         }
+        vdbg("clip_out", x);
         return x;
     }
 
@@ -634,8 +659,10 @@ struct DeepseekOcrModel {
         const int sam_dim = sam_out.shape(3);
         auto sam_flat = reshape(sam_out, {1, gh * gw, sam_dim});
         auto feats = concatenate(std::vector<array>{clip_patches, sam_flat}, -1); // [1, gh*gw, 2048]
+        vdbg("feats", feats);
         // projector (linear) -> [1, gh*gw, n_embed]
         auto proj = vision.projector.apply(feats) + vision.projector_bias;
+        vdbg("proj", proj);
         proj = squeeze(proj, 0); // [gh*gw, n_embed]
 
         const int hw = proj.shape(0);
