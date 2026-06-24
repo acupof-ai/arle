@@ -87,7 +87,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: linux-x86-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-x86-cargo-${{ hashFiles('**/Cargo.lock', 'crates/cuda-kernels/kernels.toml') }}
           restore-keys: linux-x86-cargo-
 
       # `infer`/`bench_serving` were standalone bins removed in the rewrite; the
@@ -191,7 +191,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: linux-x86-sm70-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-x86-sm70-cargo-${{ hashFiles('**/Cargo.lock', 'crates/cuda-kernels/kernels.toml') }}
           restore-keys: linux-x86-sm70-cargo-
 
       - name: Build ARLE CLI (CUDA sm_70 pinned)
@@ -249,7 +249,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: linux-x86-blackwell-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-x86-blackwell-cargo-${{ hashFiles('**/Cargo.lock', 'crates/cuda-kernels/kernels.toml') }}
           restore-keys: linux-x86-blackwell-cargo-
 
       - name: Build ARLE CLI (CUDA Blackwell)
