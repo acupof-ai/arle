@@ -400,6 +400,24 @@ impl TensorStore {
         Ok(evicted_bytes)
     }
 
+    /// Inverse of [`Self::evict_host_mirror`]: ensure the host copy is current,
+    /// then drop the device handle to free VRAM. The tensor becomes host-only
+    /// (`Dirty::Host`); a later `ensure_device` (e.g. checkpoint backward replay)
+    /// re-uploads it. Used to offload grad-checkpoints to host RAM during a long
+    /// training forward so they don't pin ~30 GB of VRAM. Returns bytes freed.
+    pub fn offload_to_host(&mut self, id: TensorId) -> Result<usize> {
+        self.ensure_host(id)?;
+        let tensor = self.raw_tensor_mut(id)?;
+        let freed = if tensor.device_handle.is_some() {
+            tensor.size * std::mem::size_of::<f32>()
+        } else {
+            0
+        };
+        tensor.device_handle = None;
+        tensor.dirty = Dirty::Host;
+        Ok(freed)
+    }
+
     /// Flip a tensor's `requires_grad` flag in place (host-side metadata only;
     /// does not touch device residency). Used to freeze a parameter — e.g. the
     /// SOPD EMA adapter, which is a frozen teacher param updated host-side, not

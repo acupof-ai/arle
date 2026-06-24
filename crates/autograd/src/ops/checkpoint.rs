@@ -43,6 +43,15 @@ where
         .iter()
         .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
     if requires_grad {
+        // Offload the saved inputs to host RAM: each layer's input is the prior
+        // layer's output and is untouched until backward replay (which re-fetches
+        // via ensure_device), so this frees the ~30 GB of grad-checkpoints a long
+        // training forward would otherwise pin in VRAM.
+        if tape.offload_checkpoints {
+            for &id in &input_ids {
+                store.offload_to_host(id)?;
+            }
+        }
         let checkpoint_fn: CheckpointFn = Arc::new(replay);
         let function_id = tape.register_checkpoint_fn(checkpoint_fn);
         tape.record(TapeEntry {

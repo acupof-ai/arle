@@ -318,6 +318,7 @@ pub struct Tape {
     pub entries: Vec<TapeEntry>,
     pub enabled: bool,
     checkpoint_fns: Vec<CheckpointFn>,
+    pub(crate) offload_checkpoints: bool,
 }
 
 impl fmt::Debug for Tape {
@@ -336,6 +337,7 @@ impl Tape {
             entries: Vec::new(),
             enabled: true,
             checkpoint_fns: Vec::new(),
+            offload_checkpoints: false,
         }
     }
 
@@ -347,6 +349,13 @@ impl Tape {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// When enabled, `checkpoint()` offloads its saved input tensors to host RAM
+    /// after the forward (re-fetched on backward replay), trading PCIe traffic
+    /// for less VRAM on long training forwards.
+    pub fn set_offload_checkpoints(&mut self, on: bool) {
+        self.offload_checkpoints = on;
     }
 
     pub(crate) fn register_checkpoint_fn(&mut self, checkpoint_fn: CheckpointFn) -> usize {
@@ -1071,5 +1080,29 @@ mod tests {
         assert_eq!(checkpointed.3, plain.3);
         assert_eq!(checkpointed.0, vec![1.0, -24.0]);
         assert_eq!(checkpointed.1, vec![4.0, -36.0]);
+    }
+
+    #[test]
+    fn checkpoint_offload_is_transparent() {
+        // offload_checkpoints only moves saved inputs host<->device around the
+        // backward replay; gradients must be identical with it on vs off.
+        fn run(offload: bool) -> (Vec<f32>, Vec<f32>) {
+            let mut store = TensorStore::default();
+            let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("x"));
+            let w = store.alloc(Tensor::new(vec![0.5, -2.0], vec![2], true).expect("w"));
+            let mut tape = Tape::new();
+            tape.set_offload_checkpoints(offload);
+            let y = ops::checkpoint(vec![x, w], &mut store, &mut tape, |store, tape, inputs| {
+                let prod = ops::mul(inputs[0], inputs[1], store, tape)?;
+                ops::mul(prod, prod, store, tape)
+            })
+            .expect("checkpoint forward");
+            let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+            let grads = tape.backward(loss, &mut store).expect("backward");
+            let xg = store.to_host(*grads.get(&x).expect("x grad")).expect("xg");
+            let wg = store.to_host(*grads.get(&w).expect("w grad")).expect("wg");
+            (xg, wg)
+        }
+        assert_eq!(run(true), run(false));
     }
 }
