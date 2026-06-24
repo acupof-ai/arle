@@ -1,3 +1,5 @@
-# generated TileLang AOT artifacts — the per-SM *.c (cubin-as-text) is the consumed build input and STAYS tracked;
-generated/**/*.cubin
-generated/**/*_device_kernel.cu
+# Generated TileLang AOT artifacts — NOT committed. The build regenerates per-SM
+# cubins on demand via TileLang (nvcc cross-compiles every SM incl. Blackwell, no
+# matching GPU needed) into this dir + a hash-keyed cache. Distribution of a
+# prebuilt pack for TileLang-less builds is a separate (public) channel (TODO).
+generated/
