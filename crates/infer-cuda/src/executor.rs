@@ -947,12 +947,12 @@ impl QwenCudaExecutor {
         self.tier.remove(keys);
     }
 
-    /// **Write-through** (`infer_seam::KvTier::write_through`): mirror a filled
-    /// device `page` into the host tier under `key`, so a later evict-drop of that
-    /// page is free (the tier keeps the source of truth). Reuses the same
-    /// `CudaKvTierStore` as the prefix tier — there is ONE session-keyed store
-    /// (R5), not a parallel one. `key` is the `(session, block)` `TierBlockKey`
-    /// flattened to the store's `u64` namespace by [`tier_block_u64`].
+    /// **Write-through**: mirror a filled device `page` into the host tier under
+    /// `key`, so a later evict-drop of that page is free (the tier keeps the
+    /// source of truth). Reuses the same `CudaKvTierStore` as the prefix tier —
+    /// there is ONE session-keyed store (R5), not a parallel one. `key` is a
+    /// `(session, block)` pair flattened to the store's `u64` namespace by
+    /// [`tier_block_u64`].
     ///
     /// Synchronous today (the copy is complete on return, matching
     /// `demote_prefix_pages`); R4's side-stream async mirror is the remaining perf
@@ -966,10 +966,10 @@ impl QwenCudaExecutor {
         Ok(self.tier.insert(key, payload))
     }
 
-    /// **Prefetch** (`infer_seam::KvTier::prefetch`): load blocks from the host
-    /// tier back into freshly allocated device pages (`(key, page)`), complete on
-    /// return. Identical transport to `promote_prefix_pages`; the difference is the
-    /// entry point (relevance-prefetch at prefill vs prefix-hit promote), per R5.
+    /// **Prefetch**: load blocks from the host tier back into freshly allocated
+    /// device pages (`(key, page)`), complete on return. Identical transport to
+    /// `promote_prefix_pages`; the difference is the entry point
+    /// (relevance-prefetch at prefill vs prefix-hit promote), per R5.
     pub(crate) fn prefetch_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
         self.promote_prefix_pages(entries)
     }
@@ -1458,73 +1458,6 @@ impl QwenCudaExecutor {
         }
         self.slot_progress[slot] = SlotProgress { epoch, len: end };
         Ok(())
-    }
-}
-
-/// Write-through tiered KV memory contract for the dense-Qwen3 paged pool.
-///
-/// The CUDA paged pool is the natural write-through grain (page == mirror/evict/
-/// prefetch unit). These verbs delegate to the SAME `CudaKvTierStore` the prefix
-/// tier uses (R5 — one session-keyed store, not a parallel one), flattening the
-/// device-neutral `(session, block)` `TierBlockKey` into the store's `u64`
-/// namespace via [`tier_block_u64`] so write-through keys never alias prefix-tier
-/// keys.
-///
-/// Status (per `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`):
-/// - `write_through` / `prefetch` — **real** (D2H/H2D over the existing store).
-/// - `evict_drop` — the **real page free now happens** in the decode path
-///   ([`QwenCudaExecutor::evict_drop_recall_pages`]), which holds the slot + the
-///   host `&mut dyn KvPool` and frees the physical page from BOTH the device pool
-///   ([`PagedKVPool::evict_slot_page`]) and the host single-allocator
-///   ([`infer_seam::KvAllocator::evict_slot_page`]). The deferred blocker — that
-///   `mirror_slot` re-publishes a contiguous page table every step, so freeing a
-///   live slot's middle page would break the `SlotProgress` contiguity guard — is
-///   resolved by decoupling physical residency from the logical page table: an
-///   evicted page leaves an `EVICTED_PAGE` sentinel in its logical slot, so the
-///   logical page count (and `seq_len`) is unchanged and both contracts hold. This
-///   seam `evict_drop(page)` verb (no slot/host context) is the device-side
-///   mirror-drop hook; with no per-page device sidecar to release it is a no-op,
-///   and the host allocator performs the page free via the decode-path call above.
-impl infer_seam::KvTier for QwenCudaExecutor {
-    fn tier_capacity_pages(&self) -> usize {
-        self.tier.capacity_pages()
-    }
-
-    fn tier_page_bytes(&self) -> usize {
-        self.tier.page_bytes()
-    }
-
-    fn tier_location(&self, key: infer_seam::TierBlockKey) -> Option<infer_seam::KvTierLocation> {
-        self.tier.location(tier_block_u64(key.session, key.block))
-    }
-
-    fn write_through(&mut self, key: infer_seam::TierBlockKey, page: u32) -> Result<bool> {
-        QwenCudaExecutor::write_through(self, tier_block_u64(key.session, key.block), page)
-    }
-
-    fn evict_drop(&mut self, _page: u32) {
-        // No backend-side device mirror to release; the host CudaKvPool owns the
-        // page free. Mid-decode device-page free is the documented blocker (see
-        // the impl-level doc) — left a no-op so the contract is satisfiable
-        // without a half-broken page-lifecycle path. The page's tier copy (from
-        // `write_through`) remains the source of truth.
-    }
-
-    fn prefetch(&mut self, entries: &[(infer_seam::TierBlockKey, u32)]) -> Result<()> {
-        let u64_entries: Vec<(u64, u32)> = entries
-            .iter()
-            .map(|&(key, page)| (tier_block_u64(key.session, key.block), page))
-            .collect();
-        self.prefetch_pages(&u64_entries)
-    }
-
-    fn drop_tier_session(&mut self, session: u64) {
-        // The store has no session index (keys are opaque u64), so a precise
-        // per-session sweep would need a key registry. Until session_id is
-        // threaded into the engine (the prefetch-policy plumbing), sessions are
-        // reclaimed lazily via the tier's own LRU/capacity eviction; this hook is
-        // the seam-level entry point for the future precise sweep.
-        let _ = session;
     }
 }
 
