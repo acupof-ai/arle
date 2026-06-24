@@ -2025,6 +2025,43 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
 
+    // Diagnostic: skip the (slow, stochastic) agent rollout and drive ONE masked-CE
+    // writeback on a synthetic trajectory of length N, so the writeback's OOM
+    // instrumentation fires deterministically. Same call the rollout closure below
+    // makes (masked_writeback_ce_step with the trained student + optimizer + store).
+    if args.synthetic_writeback_seq > 0 {
+        let n = args.synthetic_writeback_seq;
+        let prompt_len = 256.min(n / 2);
+        let prompt_ids: Vec<u32> = (0..prompt_len as u32).map(|i| (i % 1000) + 1).collect();
+        // response = the rest; all masked (=1) so every position is a loss target (worst case).
+        let response_ids: Vec<u32> = (0..(n - prompt_len) as u32)
+            .map(|i| (i % 30000) + 1)
+            .collect();
+        let response_mask: Vec<u8> = vec![1u8; response_ids.len()];
+        eprintln!(
+            "[synthetic-writeback] seq={n} prompt_len={prompt_len} response_len={} (all masked)",
+            response_ids.len()
+        );
+        let started = std::time::Instant::now();
+        let loss = masked_writeback_ce_step(
+            &student,
+            all_params.as_slice(),
+            trainable.as_slice(),
+            &mut optimizer,
+            &prompt_ids,
+            &response_ids,
+            &response_mask,
+            vocab,
+            args.writeback_window,
+            &mut store,
+        )?;
+        eprintln!(
+            "[synthetic-writeback] DONE loss={loss:.6} elapsed={:?}",
+            started.elapsed()
+        );
+        return Ok(());
+    }
+
     // rounds:1 — the round loop is external (mirroring rubric-OPD); each call runs
     // one round, then the caller syncs the trained LoRA into the rollout engine.
     let cfg = train::agent_opd::AgentOpdConfig {
