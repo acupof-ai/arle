@@ -1171,6 +1171,23 @@ impl std::fmt::Debug for Dsv4Model {
 }
 
 impl Dsv4Model {
+    /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
+    /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
+    /// caps decode_rows + prefill chunk tokens to this so the LL dispatch buffer
+    /// is never overrun.
+    pub(crate) fn max_tokens_per_step(&self) -> Option<usize> {
+        #[cfg(feature = "deepep")]
+        {
+            self.deepep
+                .as_ref()
+                .and_then(|t| t.max_owned_tokens_per_forward())
+        }
+        #[cfg(not(feature = "deepep"))]
+        {
+            None
+        }
+    }
+
     /// Load a DSv4-Flash FP8 checkpoint for this TP/EP rank.
     ///
     /// EP mirrors TP (the plan's TP=8/EP=8 layout): `ep_size = world_size`,

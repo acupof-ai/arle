@@ -41,8 +41,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Chunked prefill under the per-tick token budget and concurrency cap.
         // A prompt longer than `prefill_chunk_size` is split across ticks so
         // decode rows keep interleaving (interactivity + mixed batching).
-        let mut budget = self.config.prefill_step_budget();
-        let chunk_cap = self.config.prefill_chunk_size();
+        // Cap total plan tokens (decode rows + prefill chunk tokens) to the
+        // executor's per-forward limit (deepep_ll LL dispatch buffer). With the
+        // default `usize::MAX` both `saturating_sub` and `min` are no-ops.
+        let cap = self.config.max_tokens_per_step;
+        let mut budget = self
+            .config
+            .prefill_step_budget()
+            .min(cap.saturating_sub(decode_rows.len()));
+        let chunk_cap = self.config.prefill_chunk_size().min(cap);
         let max_prefills = self.config.max_concurrent_prefill();
         for (&slot, request) in &self.active {
             if prefill_rows.len() >= max_prefills || budget == 0 {

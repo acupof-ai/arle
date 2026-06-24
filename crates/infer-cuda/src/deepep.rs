@@ -116,6 +116,15 @@ impl DeepEpTransport {
         self.ll.is_some()
     }
 
+    /// Per-forward owned-token cap for the LL dispatch buffer (`Some` only on the
+    /// deepep_ll path); core caps decode_rows + prefill chunk tokens to it so
+    /// `dispatch` never asserts `owned_n <= num_max_dispatch_tokens_per_rank`.
+    pub(crate) fn max_owned_tokens_per_forward(&self) -> Option<usize> {
+        self.ll
+            .as_ref()
+            .map(|ll| ll.num_max_dispatch_tokens_per_rank as usize)
+    }
+
     /// `num_max_dispatch_tokens_per_rank` knob — env-overridable, default 256,
     /// asserted `<= 1024` per DeepEP LL layout limits.
     fn num_max_dispatch_tokens_per_rank() -> Result<u32> {

@@ -288,6 +288,16 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Per-forward total-token cap. Only DSv4 on the deepep_ll transport has a
+    /// hard limit (the LL NVSHMEM dispatch buffer's
+    /// `num_max_dispatch_tokens_per_rank`); all other arms are unbounded.
+    pub(crate) fn max_tokens_per_step(&self) -> usize {
+        match self {
+            Self::Qwen(_) | Self::Qwen35(_) => usize::MAX,
+            Self::Dsv4(d) => d.model.max_tokens_per_step().unwrap_or(usize::MAX),
+        }
+    }
+
     /// Page-granular host-tier hooks. Dense Qwen3 is the only CUDA arm with a
     /// page-addressable device pool here; DSv4 whole-slot swap is a separate
     /// hook below.

@@ -73,6 +73,11 @@ pub struct SchedulerConfig {
     /// is a complete restore boundary, or when they can clamp matches to such
     /// boundaries via `BackendExecutor::reusable_prefix_blocks`.
     pub enable_prefix_cache: bool,
+    /// Maximum total plan tokens (decode rows + prefill chunk tokens) per
+    /// forward, from `BackendExecutor::max_tokens_per_step`. `usize::MAX` (the
+    /// default) means unbounded; the deepep_ll DSv4 arm reports its LL dispatch
+    /// cap so the planner never builds a forward the executor would reject.
+    pub max_tokens_per_step: usize,
 }
 
 impl SchedulerConfig {
@@ -110,6 +115,7 @@ impl Default for SchedulerConfig {
             prefix_cache_low_water_pages: 0,
             chunked_prefill_size: 2_048,
             enable_prefix_cache: true,
+            max_tokens_per_step: usize::MAX,
         }
     }
 }
@@ -395,6 +401,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             );
             config.num_slots = max_rows;
         }
+        // Per-forward token cap (deepep_ll LL dispatch buffer): clamp num_slots so
+        // a pure-decode forward (one token per slot) never exceeds it.
+        config.max_tokens_per_step = executor.max_tokens_per_step().max(1);
+        config.num_slots = config.num_slots.min(config.max_tokens_per_step);
         config.num_slots = config.num_slots.max(1);
         let radix = RadixCache::new(kv.page_size().max(1));
         let model_stop_token_ids = executor.model_stop_token_ids();

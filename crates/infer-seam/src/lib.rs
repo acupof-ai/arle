@@ -145,6 +145,14 @@ pub trait BackendExecutor {
         usize::MAX
     }
 
+    /// Maximum total plan tokens (decode rows + prefill chunk tokens) per
+    /// forward. Backends with a hard per-forward token limit (e.g. the
+    /// deepep_ll NVSHMEM dispatch buffer) report it so core never builds a
+    /// forward the executor must reject; default unbounded.
+    fn max_tokens_per_step(&self) -> usize {
+        usize::MAX
+    }
+
     /// Maximum number of live frontend requests this backend wants the serve
     /// layer to allow at once. Batched/server backends keep the unbounded
     /// default. Desktop scalar backends can return `1` so the frontend rejects a
