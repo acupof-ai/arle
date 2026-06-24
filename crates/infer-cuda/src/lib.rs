@@ -582,6 +582,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn max_tokens_per_step(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => usize::MAX,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.max_tokens_per_step(),
+        }
+    }
+
     fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
