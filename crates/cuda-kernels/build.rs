@@ -379,6 +379,12 @@ fn load_registry() -> Registry {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let path = manifest.join("kernels.toml");
     println!("cargo:rerun-if-changed={}", path.display());
+    // The tilelang pin folds into the kernel cache key (tilelang_kernel_src_hash);
+    // re-run the build when it changes so a tilelang bump busts the cache.
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("../../requirements-build.txt").display()
+    );
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read kernels.toml ({}): {e}", path.display()));
     parse_registry(&text)
@@ -755,9 +761,10 @@ fn find_tilelang_python() -> Result<String, String> {
 
 /// Lazy TileLang toolchain resolver. Resolves the Python interpreter and the
 /// TileLang/cutlass include dirs ONCE, on first actual (re)generation, and
-/// caches the result. A fully-vendored build (every per-(kernel, SM) artifact
-/// present and source-unchanged) consumes the checked-in `.c` directly and
-/// never calls `get()`, so it never needs `tilelang` installed at all.
+/// caches the result. `generated/` is gitignored now (no committed `.c`), so a
+/// from-source build regenerates and DOES need `tilelang` installed — `get()` is
+/// only skipped when every per-(kernel, SM) artifact is restored from the
+/// persistent kernel cache or an externally-provided `generated/`/prebuilt dir.
 struct LazyTilelang {
     cell: std::cell::OnceCell<(String, std::path::PathBuf, std::path::PathBuf)>, // (python, tilelang_src, cutlass_include)
 }
@@ -829,6 +836,17 @@ fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> S
             .as_bytes(),
     );
     fnv1a_update(&mut h, sm_token.as_bytes());
+    // ABI signature (kernels.toml [abi.*]): the SM-dispatch wrapper extern-declares
+    // each symbol from these; a cached .c carrying the OLD signature is silent UB.
+    fnv1a_update(&mut h, base_spec.public_decl.as_bytes());
+    fnv1a_update(&mut h, base_spec.extern_decl.as_bytes());
+    fnv1a_update(&mut h, base_spec.call_args.as_bytes());
+    // tilelang library pin — the package (not the hashed .py) emits the .cu/cubin, so
+    // a deliberate tilelang bump must bust the cache. Hash the pin file (load_registry
+    // emits rerun-if-changed on it so a pin edit alone re-triggers the build).
+    let reqs =
+        std::fs::read("../../requirements-build.txt").unwrap_or_else(|_| b"<no-reqs>".to_vec());
+    fnv1a_update(&mut h, &reqs);
     format!("{h:016x}")
 }
 
@@ -1026,8 +1044,9 @@ fn generate_tilelang_artifacts_per_sm(
                 .join(&per_sm_artifact_dir)
         });
         if let Some(entry) = &cache_entry {
-            let cached_c = entry.join(format!("{per_sm_out_name}.c"));
-            if !force_regen && cached_c.is_file() {
+            // Require the .complete marker (written last under an atomic rename), not
+            // just the .c — a torn/killed/concurrent store must read as a miss.
+            if !force_regen && entry.join(".complete").is_file() {
                 copy_dir_recursive(entry, &out_artifact_dir).unwrap_or_else(|err| {
                     panic!(
                         "restore cached TileLang artifact {} -> {}: {err}",
@@ -1154,13 +1173,27 @@ fn generate_tilelang_artifacts_per_sm(
         .unwrap_or_else(|err| panic!("write meta.txt for {}: {err}", out_artifact_dir.display()));
 
         // Populate the persistent cache so future clean/CI builds skip this regen.
-        // Best-effort: a cache write failure must never fail the build.
+        // Atomic + parallel-safe: stage in a per-pid temp dir, write the .complete
+        // marker LAST, then rename into place. A torn/killed/concurrent store reads as
+        // a miss (redundant regen), never a corrupt or partial kernel.
+        // ponytail: the remove-then-rename window degrades a racing restore to a
+        // redundant regen, not corruption — acceptable; per-key flock if it churns.
         if let Some(entry) = &cache_entry {
             if let Some(parent) = entry.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::remove_dir_all(entry);
-            let _ = copy_dir_recursive(&out_artifact_dir, entry);
+            let staging = entry.with_file_name(format!(
+                "{per_sm_artifact_dir}.staging.{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            if copy_dir_recursive(&out_artifact_dir, &staging).is_ok()
+                && std::fs::write(staging.join(".complete"), src_hash.as_bytes()).is_ok()
+            {
+                let _ = std::fs::remove_dir_all(entry);
+                let _ = std::fs::rename(&staging, entry);
+            }
+            let _ = std::fs::remove_dir_all(&staging);
         }
 
         results.push((sm_token.clone(), gen_func_name, c_path));
