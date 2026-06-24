@@ -1,0 +1,38 @@
+crates/infer-cuda/src/attention.rs
+  s_027d29a10c8f65::t_8556e5edb34776 731-740,753-761,766,769,781-782
+  s_027d29a10c8f65::t_26831d267793dd 1168-1171,1173-1175,1179-1182
+  s_027d29a10c8f65::t_81b323d82f9c54 968-996,1207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3020145bdc5afd89e06d4c07921b92b438cf5321",
+  "prompts": {},
+  "sessions": {
+    "s_027d29a10c8f65": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3b86b979cab8974aec67e6",
+        "model": "openrouter-3o__max"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {
+    "s_027d29a10c8f65": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_027d29a10c8f65::t_d032b8e96d3cf6": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
