@@ -1105,4 +1105,64 @@ mod tests {
         }
         assert_eq!(run(true), run(false));
     }
+
+    #[test]
+    fn checkpoint_sequential_matches_per_layer() {
+        use std::sync::Arc;
+        // A 4-layer stack where layer i is `h -> h * w_i` (w_i trainable).
+        // checkpoint_sequential with any group_size must match a plain
+        // (non-checkpointed) run, both for x and every w_i gradient.
+        fn run(group_size: Option<usize>) -> (Vec<f32>, Vec<Vec<f32>>) {
+            let mut store = TensorStore::default();
+            let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("x"));
+            let weights: Vec<TensorId> = (0..4)
+                .map(|i| {
+                    let v = i as f32 + 1.0;
+                    store.alloc(Tensor::new(vec![v, -v], vec![2], true).expect("w"))
+                })
+                .collect();
+            let mut tape = Tape::new();
+
+            let y = if let Some(g) = group_size {
+                let ws = Arc::new(weights.clone());
+                let layer_fn = {
+                    let ws = Arc::clone(&ws);
+                    move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
+                        ops::mul(h, ws[idx], s, t)
+                    }
+                };
+                let layer_params = |idx: usize| vec![weights[idx]];
+                ops::checkpoint_sequential(
+                    x,
+                    weights.len(),
+                    g,
+                    None,
+                    &mut store,
+                    &mut tape,
+                    layer_params,
+                    layer_fn,
+                )
+                .expect("checkpoint_sequential")
+            } else {
+                let mut h = x;
+                for &w in &weights {
+                    h = ops::mul(h, w, &mut store, &mut tape).expect("mul");
+                }
+                h
+            };
+            let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+            let grads = tape.backward(loss, &mut store).expect("backward");
+            let xg = store.to_host(*grads.get(&x).expect("x grad")).expect("xg");
+            let wg = weights
+                .iter()
+                .map(|w| store.to_host(*grads.get(w).expect("w grad")).expect("wg"))
+                .collect();
+            (xg, wg)
+        }
+
+        let plain = run(None);
+        for g in [1, 2, 4] {
+            assert_eq!(run(Some(g)), plain, "group_size {g} must match per-layer");
+        }
+    }
 }
