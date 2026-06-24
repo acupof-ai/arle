@@ -675,6 +675,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepseek-ocr-spec"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "deepseek-spec"
 version = "0.2.1"
 dependencies = [
@@ -1625,6 +1634,7 @@ name = "infer-metal"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "deepseek-ocr-spec",
  "gemma-spec",
  "hf-hub",
  "infer-core",

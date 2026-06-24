@@ -8,7 +8,8 @@
 use std::cell::Cell;
 
 use infer_plan::{
-    DiffusionGenerateOutput, ForwardPlan, MultimodalImage, SamplingParams, StepOutput,
+    DiffusionGenerateOutput, ForwardPlan, MultimodalImage, MultimodalKind, SamplingParams,
+    StepOutput,
 };
 
 #[path = "allocator.rs"]
@@ -134,6 +135,14 @@ pub trait BackendExecutor {
         _sampling: &SamplingParams,
     ) -> anyhow::Result<Option<DiffusionGenerateOutput>> {
         Ok(None)
+    }
+
+    /// Which VLM image-preprocessing/marker convention this backend expects.
+    /// The serving layer dispatches preprocessing on this so a second VLM
+    /// (DeepSeek-OCR) doesn't run Gemma4's resize/marker logic. Default `None`
+    /// = text-only backend.
+    fn multimodal_kind(&self) -> Option<MultimodalKind> {
+        None
     }
 
     /// Maximum number of plan rows the backend can execute in one scheduler

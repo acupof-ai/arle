@@ -321,7 +321,10 @@ mod backend {
     #[cfg(feature = "hip")]
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
-    use infer_metal::{MetalDiffusionGemmaModel, MetalExecutor, MetalGemma4Model, MetalKvPool};
+    use infer_metal::{
+        MetalDeepseekOcrModel, MetalDiffusionGemmaModel, MetalExecutor, MetalGemma4Model,
+        MetalKvPool,
+    };
     #[cfg(feature = "metal")]
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool};
     #[cfg(feature = "vulkan")]
@@ -370,6 +373,13 @@ mod backend {
         #[cfg(feature = "metal")]
         MetalGemma4(
             ServeInferenceEngine<BufferedDiffusionExecutor<MetalGemma4Model>, HostPagedKvPool>,
+        ),
+        /// Metal DeepSeek-OCR VLM backend. The DeepEncoder + DeepSeek-MoE MLX
+        /// bridge owns generation and is adapted to the shared autoregressive
+        /// engine by a buffered executor (single image, 1024x1024 base view).
+        #[cfg(feature = "metal")]
+        MetalDeepseekOcr(
+            ServeInferenceEngine<BufferedDiffusionExecutor<MetalDeepseekOcrModel>, HostPagedKvPool>,
         ),
         /// CUDA backend (Linux + NVIDIA). Structurally wired (typechecks); the
         /// real forward is lead-owned and not yet runnable.
@@ -456,6 +466,8 @@ mod backend {
                 Self::MetalDiffusionGemma(_) => "metal-diffusion-gemma",
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(_) => "metal-gemma4",
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => "metal-deepseek-ocr",
                 #[cfg(feature = "cuda")]
                 Self::Cuda(_) => "cuda",
                 #[cfg(feature = "hip")]
@@ -489,6 +501,10 @@ mod backend {
                 }
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(_) => {
+                    anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("forward_token_logits is CUDA-only (OPD teacher raw logits)")
                 }
                 #[cfg(feature = "hip")]
@@ -532,6 +548,10 @@ mod backend {
                 Self::MetalGemma4(_) => {
                     anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => {
                     anyhow::bail!("generate_token_ids is CUDA-only for OPD student rollout")
@@ -569,6 +589,10 @@ mod backend {
                 }
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(_) => {
+                    anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("generate_token_ids_batch is CUDA-only for OPD")
                 }
                 #[cfg(feature = "hip")]
@@ -609,6 +633,10 @@ mod backend {
                 Self::MetalGemma4(_) => {
                     anyhow::bail!("complete_batch is CUDA-only for OPD")
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("complete_batch is CUDA-only for OPD")
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => {
                     anyhow::bail!("complete_batch is CUDA-only for OPD")
@@ -643,6 +671,10 @@ mod backend {
                 Self::MetalGemma4(_) => {
                     anyhow::bail!("offload_engine_weights is only available on CUDA")
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("offload_engine_weights is only available on CUDA")
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => anyhow::bail!("offload_engine_weights is only available on CUDA"),
                 #[cfg(feature = "vulkan")]
@@ -668,6 +700,10 @@ mod backend {
                 }
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(_) => {
+                    anyhow::bail!("reload_engine_weights is only available on CUDA")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
                     anyhow::bail!("reload_engine_weights is only available on CUDA")
                 }
                 #[cfg(feature = "hip")]
@@ -719,6 +755,13 @@ mod backend {
                         "student LoRA re-merge is CUDA-only; active backend is Metal Gemma4"
                     )
                 }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
+                    let _ = update;
+                    anyhow::bail!(
+                        "student LoRA re-merge is CUDA-only; active backend is Metal DeepSeek-OCR"
+                    )
+                }
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => {
                     let _ = update;
@@ -758,6 +801,10 @@ mod backend {
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(_) => anyhow::bail!(
                     "frozen-base FP8 sharing is CUDA-only; active backend is Metal Gemma4"
+                ),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => anyhow::bail!(
+                    "frozen-base FP8 sharing is CUDA-only; active backend is Metal DeepSeek-OCR"
                 ),
                 #[cfg(feature = "hip")]
                 Self::Hip(_) => {
@@ -799,6 +846,18 @@ mod backend {
                     infer_server::ServeShutdown::new(),
                 )?;
                 return Ok(Self::MetalGemma4(ServeInferenceEngine::new(
+                    model_id, tokenizer, serve,
+                )));
+            }
+            if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
+                let (serve, tokenizer, model_id) = metal_deepseek_ocr_serve_handle(
+                    model_path,
+                    &resolved,
+                    config,
+                    &kv_ssd,
+                    infer_server::ServeShutdown::new(),
+                )?;
+                return Ok(Self::MetalDeepseekOcr(ServeInferenceEngine::new(
                     model_id, tokenizer, serve,
                 )));
             }
@@ -1094,6 +1153,16 @@ mod backend {
                 config.max_thinking_tokens,
             ));
         }
+        if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
+            let (serve, tokenizer, model_id) =
+                metal_deepseek_ocr_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
+            return Ok(infer_server::openai_router(
+                serve,
+                tokenizer,
+                model_id,
+                config.max_thinking_tokens,
+            ));
+        }
         let (serve, tokenizer, model_id) =
             metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
         Ok(infer_server::openai_router(
@@ -1261,6 +1330,85 @@ mod backend {
         Ok((serve, tokenizer, model_id))
     }
 
+    #[cfg(feature = "metal")]
+    fn metal_deepseek_ocr_serve_handle(
+        model_path: &str,
+        resolved: &std::path::Path,
+        config: &EngineLoadConfig,
+        kv_ssd: &crate::serve::ServeKvSsdOptions,
+        shutdown: infer_server::ServeShutdown,
+    ) -> Result<(
+        ServeHandle<BufferedDiffusionExecutor<MetalDeepseekOcrModel>, HostPagedKvPool>,
+        infer_server::OpenAiTokenizer,
+        String,
+    )> {
+        use infer_server::OpenAiTokenizer;
+
+        if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
+            anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
+        }
+        anyhow::ensure!(
+            !kv_ssd.requested(),
+            "--kv-ssd-path: DeepSeek-OCR Metal owns no page-addressable KV tier store"
+        );
+
+        let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
+        let model_id = crate::serve_engine::model_id_from_path(model_path);
+        let model_source = resolved.to_string_lossy().to_string();
+        let mut scheduler = config.scheduler_config();
+        scheduler.num_slots = 1;
+        scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
+        let page_size = config.page_size.max(1);
+        let total_pages = config.total_pages.max(1);
+        let low_impact = config.low_impact;
+        let resource_plan = infer_metal::plan_weight_only_resource_budget(
+            resolved,
+            infer_metal::MetalWeightOnlyResourceRequest {
+                low_impact,
+                memory_budget_bytes: config.memory_budget_bytes,
+                system_reserve_bytes: config.system_reserve_bytes,
+                allow_swap: config.allow_swap,
+            },
+        )?;
+        let cancel = shutdown.cancel_flag();
+
+        let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
+            move || {
+                let loaded = infer_metal::MetalDeepseekOcrModel::load_with_resource_plan(
+                    std::path::Path::new(&model_source),
+                    Some(resource_plan),
+                )?;
+                log::info!(
+                    "DeepSeek-OCR VLM loaded: image_token_id={}; Metal DeepEncoder soft-token bridge enabled",
+                    loaded.image_token_id
+                );
+                let executor = BufferedDiffusionExecutor::new_with_cancel(
+                    loaded.model,
+                    loaded.generation,
+                    cancel,
+                );
+                let kv = HostPagedKvPool::new(1, total_pages, page_size);
+                if low_impact {
+                    let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
+                        max_tokens: scheduler.chunked_prefill_size.max(1),
+                        max_micros: 20_000,
+                    })
+                    .with_yield_every_ticks(8);
+                    Ok(infer_core::Engine::with_config_and_governor(
+                        executor,
+                        kv,
+                        scheduler,
+                        Box::new(governor),
+                    ))
+                } else {
+                    Ok(infer_core::Engine::with_config(executor, kv, scheduler))
+                }
+            },
+            shutdown,
+        )?;
+        Ok((serve, tokenizer, model_id))
+    }
+
     /// Read a CUDA checkpoint's `config.json` and classify it for `load_cuda`.
     #[cfg(feature = "cuda")]
     fn detect_cuda_model_kind(model_path: &str) -> Result<super::CudaModelKind> {
@@ -1310,19 +1458,16 @@ mod backend {
     ///     `num_slots × total_pages`. The linear-attn recurrent state stays
     ///     per-slot but is not page-addressable, so it never touches the host
     ///     KV pool.
-    ///   - DSv4: SLOT ARENA (SW ring + compressed, each slot covers max context)
-    ///     with its own dynamic mem-budget slot clamp; admission is
-    ///     `num_slots × per-slot tokens`. Sizing a slot-arena model for a single
-    ///     max-context request under-admits at c>1 (a second long request waits
-    ///     for fictional pages while a real slot arena sits free).
+    ///   - DSv4: SHARED MLA latent pool — the executor profiles the pool TOTAL
+    ///     from measured free VRAM (`profile_kv_pool_tokens`) and derives per-slot
+    ///     length as total/num_slots, exactly like dense. Admission MUST equal the
+    ///     device pool's ACTUAL page count (`effective_total_pages()`), not the old
+    ///     `num_slots × 32768`.
     ///
     /// `CudaKvPool::new` allocates NO HBM (just a `Vec<u32>` of page ids).
     ///
-    /// `num_slots` must be the EFFECTIVE slot count (post KV-budget clamp), not
-    /// the requested one.
-    ///
     /// `paged_pool_pages` is the paged-pool executor's ACTUAL device pool page
-    /// count (profiled from free VRAM; dense + Qwen3.6). For those branches the
+    /// count (profiled from free VRAM; dense + Qwen3.6 + DSv4). For those branches the
     /// host pool mirrors it exactly — never floored back up to the requested
     /// `config.total_pages`, because a profiled pool may legitimately be SMALLER
     /// (big weights / small card) and a host pool larger than the device pool
@@ -1332,21 +1477,23 @@ mod backend {
         kind: CudaModelKind,
         config: &EngineLoadConfig,
         page_size: usize,
-        num_slots: usize,
         paged_pool_pages: usize,
     ) -> usize {
         let ps = page_size.max(1);
-        // Paged-pool models (dense Qwen3 + Qwen3.6): the host admission pool is
-        // exactly the device pool — the profiled page count, NOT a token-derived
-        // re-ceiling, and NOT floored at the requested config value.
-        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35) {
+        // Paged-pool models (dense Qwen3 + Qwen3.6 + DSv4 MLA latent pool): the
+        // host admission pool is exactly the device pool — the profiled page
+        // count, NOT a token-derived re-ceiling, and NOT floored at the requested
+        // config value. DSv4's MLA pool is now free-VRAM-sized like the others.
+        if matches!(
+            kind,
+            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35 | CudaModelKind::Dsv4
+        ) {
             return paged_pool_pages.max(1);
         }
         let capacity_tokens = match kind {
-            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35 => unreachable!("handled above"),
-            CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len()
-                .saturating_add(4096)
-                .saturating_mul(num_slots.max(1)),
+            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35 | CudaModelKind::Dsv4 => {
+                unreachable!("handled above")
+            }
             CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
                 config.total_pages.saturating_mul(ps)
             }
@@ -1535,6 +1682,7 @@ mod backend {
                 infer_cuda::dsv4_max_seq_len(),
                 config.mtp_draft_tokens,
                 config.mtp_draft_topk,
+                config.mem_fraction_static,
             )?,
             CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
                 unreachable!("checked before CUDA executor build")
@@ -1571,8 +1719,7 @@ mod backend {
         let paged_pool_pages = executor
             .effective_total_pages()
             .unwrap_or(config.total_pages);
-        let total_pages =
-            cuda_admission_total_pages(kind, config, page_size, num_slots, paged_pool_pages);
+        let total_pages = cuda_admission_total_pages(kind, config, page_size, paged_pool_pages);
         if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
             && paged_pool_pages != config.total_pages
         {
@@ -1583,6 +1730,12 @@ mod backend {
                 config.total_pages,
                 config.mem_fraction_static
             );
+        }
+        // DSv4 shared pool: per-slot length is profiled_total/num_slots, possibly
+        // below the ingress cap. Bind ingress DOWN so a long prompt is rejected,
+        // not crashed at the forward `start_pos+len <= slot.max_seq_len` assert.
+        if let Some(eff) = executor.effective_max_seq_len() {
+            scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(eff);
         }
         if num_slots != scheduler.num_slots {
             log::warn!(
@@ -1948,6 +2101,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.model_id(),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.model_id(),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.model_id(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.model_id(),
                 #[cfg(feature = "hip")]
@@ -1967,6 +2122,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.complete(req),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.complete(req),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.complete(req),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete(req),
                 #[cfg(feature = "hip")]
@@ -1989,6 +2146,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.complete_multimodal_chat(req),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete_multimodal_chat(req),
                 #[cfg(feature = "hip")]
@@ -2012,6 +2171,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.complete_stream(req, tx),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.complete_stream(req, tx),
                 #[cfg(feature = "hip")]
@@ -2031,6 +2192,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.tokenize(text),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.tokenize(text),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.tokenize(text),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.tokenize(text),
                 #[cfg(feature = "hip")]
@@ -2050,6 +2213,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.render_chat_prompt(messages),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.render_chat_prompt(messages),
                 #[cfg(feature = "hip")]
@@ -2069,6 +2234,8 @@ mod backend {
                 Self::MetalDiffusionGemma(engine) => engine.telemetry(),
                 #[cfg(feature = "metal")]
                 Self::MetalGemma4(engine) => engine.telemetry(),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.telemetry(),
                 #[cfg(feature = "cuda")]
                 Self::Cuda(engine) => engine.telemetry(),
                 #[cfg(feature = "hip")]

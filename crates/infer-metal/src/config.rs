@@ -141,6 +141,124 @@ pub(crate) struct MetalGemma4VisionConfig {
     pub(crate) use_clipped_linears: bool,
 }
 
+/// DeepSeek-OCR (`deepseekocr` / `UnlimitedOCRForCausalLM`) Metal config.
+///
+/// The text decoder + DeepEncoder + projector are parsed by `deepseek-ocr-spec`.
+/// `generation` flattens the diffusion plumbing to autoregressive
+/// (`canvas_length=1`, `max_denoising_steps=1`) the same way Gemma4 does, and
+/// `image_token_id` is the `<image>` placeholder id resolved from the tokenizer.
+#[derive(Debug, Clone)]
+pub(crate) struct MetalDeepseekOcrConfig {
+    pub(crate) spec: deepseek_ocr_spec::DeepseekOcrConfig,
+    pub(crate) generation: DiffusionGenerationConfig,
+    pub(crate) image_token_id: u32,
+}
+
+pub fn model_dir_is_deepseek_ocr(model_dir: &Path) -> bool {
+    let path = model_dir.join("config.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    is_deepseek_ocr_config(root)
+}
+
+fn is_deepseek_ocr_config(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    model_type_is(root, "deepseekocr") || architectures_contain(root, "UnlimitedOCR")
+}
+
+/// Resolve the `<image>` placeholder token id from `tokenizer_config.json`'s
+/// added-tokens table (the processor uses `image_token="<image>"`).
+fn resolve_image_token_id(model_dir: &Path) -> Result<u32> {
+    let path = model_dir.join("tokenizer_config.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).context("tokenizer_config.json parse")?;
+    if let Some(table) = value
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (id, entry) in table {
+            if entry.get("content").and_then(serde_json::Value::as_str) == Some("<image>") {
+                if let Ok(parsed) = id.parse::<u32>() {
+                    return Ok(parsed);
+                }
+            }
+        }
+    }
+    // Fallback: the DeepSeek-OCR mlx-vlm config pins image_token_index=128815.
+    Ok(128_815)
+}
+
+pub(crate) fn load_deepseek_ocr_config(model_dir: &Path) -> Result<MetalDeepseekOcrConfig> {
+    let path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
+    let root = value
+        .as_object()
+        .context("config.json root must be a JSON object")?;
+    anyhow::ensure!(
+        is_deepseek_ocr_config(root),
+        "config.json is not a DeepSeek-OCR (deepseekocr) checkpoint"
+    );
+    let spec = deepseek_ocr_spec::DeepseekOcrConfig::from_json_value(&value)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    anyhow::ensure!(
+        spec.is_mxfp8(),
+        "DeepSeek-OCR Metal path currently requires an MXFP8 checkpoint (quantization.mode=mxfp8)"
+    );
+    anyhow::ensure!(
+        spec.tile_tag == "2D",
+        "DeepSeek-OCR Metal path only supports tile_tag=2D"
+    );
+    let image_token_id = resolve_image_token_id(model_dir)?;
+    let generation = deepseek_ocr_generation_from_config(model_dir, root, &spec)?;
+    Ok(MetalDeepseekOcrConfig {
+        spec,
+        generation,
+        image_token_id,
+    })
+}
+
+fn deepseek_ocr_generation_from_config(
+    model_dir: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+    spec: &deepseek_ocr_spec::DeepseekOcrConfig,
+) -> Result<DiffusionGenerationConfig> {
+    let vocab_size = u32::try_from(spec.text.vocab_size)
+        .context("DeepSeek-OCR vocab_size does not fit in u32")?;
+    let generation_json = match std::fs::read_to_string(model_dir.join("generation_config.json")) {
+        Ok(content) => Some(
+            serde_json::from_str::<serde_json::Value>(&content)
+                .context("generation_config.json parse")?,
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let max_new_tokens = generation_json
+        .as_ref()
+        .and_then(|value| value.get("max_new_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(8192, |n| n as usize);
+    let mut generation = DiffusionGenerationConfig::diffusion_gemma(max_new_tokens, vocab_size);
+    generation.canvas_length = 1;
+    generation.max_denoising_steps = 1;
+    generation.pad_token_id = generation_json
+        .as_ref()
+        .and_then(|value| value.get("pad_token_id"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |n| n as u32);
+    generation.stop_token_ids = resolve_stop_token_ids(model_dir, root, root)?;
+    Ok(generation)
+}
+
 pub(crate) fn load_diffusion_gemma_config(model_dir: &Path) -> Result<MetalDiffusionGemmaConfig> {
     let path = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)
