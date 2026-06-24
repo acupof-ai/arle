@@ -262,14 +262,17 @@ impl CudaExecutor {
     /// names the WEIGHTS dtype; `kv_dtype` selects the paged KV-cache format —
     /// BF16 default or the INT8/FP8 quant pools, #68 T3).
     ///
-    /// `total_pages` must match the host [`CudaKvPool`] so device page
-    /// allocation mirrors host logical pages.
+    /// The shared paged pool is sized from MEASURED free VRAM after weights load
+    /// (`mem_fraction_static`, SGLang-style); `total_pages` is a minimum-capacity
+    /// floor. The ACTUAL page count the host [`CudaKvPool`] must mirror is
+    /// reported by [`Self::effective_total_pages`], not `total_pages`.
     #[cfg(feature = "cuda")]
     pub fn from_qwen3_bf16_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
         kv_dtype: CudaKvCacheDtype,
+        mem_fraction_static: f64,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -278,6 +281,7 @@ impl CudaExecutor {
                     num_slots,
                     total_pages,
                     kv_dtype,
+                    mem_fraction_static,
                 )?,
             )),
         })
@@ -353,6 +357,20 @@ impl CudaExecutor {
             CudaExecutorInner::Placeholder => None,
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => Some(real.effective_num_slots()),
+        }
+    }
+
+    /// Actual shared device-pool page count for the dense Qwen3 path (profiled
+    /// from measured free VRAM at construction). The host admission `CudaKvPool`
+    /// must mirror this 1:1 — not the requested `total_pages`. `None` for the
+    /// placeholder and for slot-arena models (Qwen3.5/3.6, DSv4), whose admission
+    /// stays per-slot this phase.
+    #[must_use]
+    pub fn effective_total_pages(&self) -> Option<usize> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => None,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.effective_total_pages(),
         }
     }
 
