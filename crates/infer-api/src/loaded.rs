@@ -1054,6 +1054,7 @@ mod backend {
                 memory_budget_bytes: config.memory_budget_bytes,
                 system_reserve_bytes: config.system_reserve_bytes,
                 allow_swap: config.allow_swap,
+                mem_fraction_static: config.mem_fraction_static,
             },
         )?;
         let total_pages = resource_plan.planned_total_pages;
@@ -1682,7 +1683,6 @@ mod backend {
                 infer_cuda::dsv4_max_seq_len(),
                 config.mtp_draft_tokens,
                 config.mtp_draft_topk,
-                config.mem_fraction_static,
             )?,
             CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
                 unreachable!("checked before CUDA executor build")
@@ -1730,12 +1730,6 @@ mod backend {
                 config.total_pages,
                 config.mem_fraction_static
             );
-        }
-        // DSv4 shared pool: per-slot length is profiled_total/num_slots, possibly
-        // below the ingress cap. Bind ingress DOWN so a long prompt is rejected,
-        // not crashed at the forward `start_pos+len <= slot.max_seq_len` assert.
-        if let Some(eff) = executor.effective_max_seq_len() {
-            scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(eff);
         }
         if num_slots != scheduler.num_slots {
             log::warn!(

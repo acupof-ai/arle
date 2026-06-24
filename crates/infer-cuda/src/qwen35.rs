@@ -401,41 +401,6 @@ impl Qwen35SlotState {
         })
     }
 
-    #[allow(dead_code)] // legacy contiguous-cache lane (A/B); the paged default uses new_linear_only.
-    pub(crate) fn new(
-        ctx: &DeviceContext,
-        num_full: usize,
-        num_linear: usize,
-        max_seq_len: usize,
-        kv_dim: usize,
-        gdr_state_len: usize,
-        conv_len: usize,
-    ) -> Result<Self> {
-        let mut k_caches = Vec::with_capacity(num_full);
-        let mut v_caches = Vec::with_capacity(num_full);
-        for _ in 0..num_full {
-            k_caches.push(DeviceVec::zeros(ctx, max_seq_len * kv_dim)?);
-            v_caches.push(DeviceVec::zeros(ctx, max_seq_len * kv_dim)?);
-        }
-        let mut gdr_states = Vec::with_capacity(num_linear);
-        let mut conv_states = Vec::with_capacity(num_linear);
-        for _ in 0..num_linear {
-            gdr_states.push(
-                ctx.stream
-                    .alloc_zeros::<f32>(gdr_state_len)
-                    .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?,
-            );
-            conv_states.push(DeviceVec::zeros(ctx, conv_len)?);
-        }
-        Ok(Self {
-            k_caches,
-            v_caches,
-            gdr_states,
-            conv_states,
-            seq_len: 0,
-        })
-    }
-
     pub(crate) fn seq_len(&self) -> usize {
         self.seq_len
     }
@@ -540,10 +505,8 @@ impl Qwen35SlotState {
 
     /// Free the per-slot full-attn contiguous K/V caches. Since the shared-paged
     /// migration the DEFAULT build never allocates them (`new_linear_only` leaves
-    /// `k_caches`/`v_caches` empty), so this is a no-op there — kept for the
-    /// legacy contiguous lane (`Qwen35SlotState::new`) to drop the caches if a
-    /// caller switches that slot to the paged path. The linear-attn recurrent +
-    /// conv-ring state (`gdr_states`/`conv_states`) is untouched.
+    /// `k_caches`/`v_caches` empty), so this is a no-op there. The linear-attn
+    /// recurrent + conv-ring state (`gdr_states`/`conv_states`) is untouched.
     #[allow(dead_code)] // legacy contiguous-lane helper; the paged default never allocates these.
     pub(crate) fn free_full_attn_caches(&mut self) {
         self.k_caches = Vec::new();

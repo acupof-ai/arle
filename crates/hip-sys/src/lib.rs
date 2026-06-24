@@ -64,6 +64,7 @@ mod ffi {
         pub fn hipSetDevice(device: i32) -> i32;
         pub fn hipDeviceGetName(name: *mut c_char, len: i32, device: i32) -> i32;
         pub fn hipDeviceTotalMem(bytes: *mut usize, device: i32) -> i32;
+        pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
         pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
         pub fn hipFree(ptr: *mut c_void) -> i32;
         pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
@@ -114,6 +115,13 @@ mod real {
         let mut bytes = 0usize;
         check(unsafe { ffi::hipDeviceTotalMem(&mut bytes, device) })?;
         Ok(bytes)
+    }
+
+    /// (free, total) device memory bytes — the ROCm analogue of `cudaMemGetInfo`.
+    pub fn mem_get_info() -> Result<(usize, usize)> {
+        let (mut free, mut total) = (0usize, 0usize);
+        check(unsafe { ffi::hipMemGetInfo(&mut free, &mut total) })?;
+        Ok((free, total))
     }
 
     pub fn device_synchronize() -> Result<()> {
@@ -206,7 +214,7 @@ mod real {
 #[cfg(hip_runtime_available)]
 pub use real::{
     DeviceBuffer, Stream, device_count, device_name, device_synchronize, device_total_mem, init,
-    set_device,
+    mem_get_info, set_device,
 };
 
 #[cfg(not(hip_runtime_available))]
@@ -231,6 +239,10 @@ mod stub {
     }
 
     pub fn device_total_mem(_device: i32) -> Result<usize> {
+        Err(HIP_NOT_COMPILED)
+    }
+
+    pub fn mem_get_info() -> Result<(usize, usize)> {
         Err(HIP_NOT_COMPILED)
     }
 
@@ -290,7 +302,7 @@ mod stub {
 #[cfg(not(hip_runtime_available))]
 pub use stub::{
     DeviceBuffer, Stream, device_count, device_name, device_synchronize, device_total_mem, init,
-    set_device,
+    mem_get_info, set_device,
 };
 
 #[cfg(test)]
