@@ -3029,8 +3029,29 @@ impl Qwen35CudaExecutor {
     /// infer-core radix cache). Resident pages only: Qwen3.6 has no prefix-tier
     /// demote/promote yet (`demote/promote_prefix_pages` no-op for Qwen35), so
     /// demoted keys are never restorable and the count stops at the first one.
+    ///
+    /// SOUNDNESS GATE — full-attention-only models. The radix cache keys on
+    /// full-attn KV *pages*, but Qwen3.6 is a HYBRID: its gated-delta linear
+    /// layers carry per-slot recurrent + conv state that is content-based,
+    /// position-free, and NOT page-addressable, so a reused prefix has no way to
+    /// restore those layers' state (they never processed the prefix). Reusing a
+    /// prefix would attend correct full-attn KV but feed the linear layers a
+    /// slot whose recurrent state never saw the prefix → silently wrong output,
+    /// and the page accounting itself diverges (`pool.seq_len` self-allocated for
+    /// the tail vs the engine's `start_pos`-credited `kv_seq_len`, the
+    /// `decode_graph.rs` ensure that surfaced this). Until a prefix-keyed
+    /// recurrent-state snapshot/restore exists, reuse is sound ONLY for a pure
+    /// full-attention checkpoint (no linear layers). Otherwise report 0 so the
+    /// scheduler never sets `start_pos > 0` and every prefill starts fresh at
+    /// position 0 (byte-identical to the no-reuse path).
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
-        pages_only_reusable_prefix_blocks(blocks, |_| false)
+        let cfg = &self.model.config;
+        let pure_full_attn = cfg.num_full_attention_layers() == cfg.num_hidden_layers;
+        if pure_full_attn {
+            pages_only_reusable_prefix_blocks(blocks, |_| false)
+        } else {
+            0
+        }
     }
 
     pub(crate) fn from_qwen35_safetensors(
@@ -3359,6 +3380,23 @@ impl Qwen35CudaExecutor {
                 .full_attn_kv
                 .as_mut()
                 .expect("full_attn_kv present (full_attn_paged)");
+            // This self-allocating path materializes the slot from a fresh start
+            // (`free_slot` ran at `start_pos == 0` in `submit_prefill_row`), so
+            // the pool must hold exactly `start_pos` tokens before appending the
+            // tail. A `start_pos > 0` here means radix reuse leaked through the
+            // `reusable_prefix_blocks` soundness gate — fail loudly rather than
+            // double-count (`pool.seq_len` would end at the tail length, not
+            // `start_pos + tail`, surfacing as a confusing `decode_graph` mismatch
+            // many steps later). The hybrid recurrent state is unrestorable for a
+            // reused prefix regardless (see `reusable_prefix_blocks`).
+            ensure!(
+                pool.seq_len(slot) == row.start_pos,
+                "Qwen3.6 default-paged prefill: pool seq_len {} != start_pos {} for slot {} \
+                 (radix prefix reuse is not supported for the hybrid recurrent state)",
+                pool.seq_len(slot),
+                row.start_pos,
+                slot
+            );
             pool.alloc_tokens(slot, row.tokens.len())?;
         }
         let meta = {
@@ -3406,6 +3444,18 @@ impl Qwen35CudaExecutor {
                 .full_attn_kv
                 .as_mut()
                 .expect("full_attn_kv present (full_attn_paged)");
+            // The pool must already hold exactly this step's cache length before
+            // appending the new token; a mismatch means an upstream prefill left
+            // the slot's `seq_len` inconsistent with the engine's `kv_seq_len`
+            // (e.g. a leaked radix-reuse prefill — see `prefill_row_paged_default`).
+            // Catch it at the append, not via `PageMeta::for_slot` math downstream.
+            ensure!(
+                pool.seq_len(slot) == row.kv_seq_len,
+                "Qwen3.6 default-paged decode: pool seq_len {} != kv_seq_len {} for slot {}",
+                pool.seq_len(slot),
+                row.kv_seq_len,
+                slot
+            );
             pool.alloc_tokens(slot, 1)?;
         }
         let meta = {
