@@ -339,7 +339,10 @@ impl RealCudaExecutor {
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         match self {
             Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
-            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+            Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
+            // DSv4 reuses prefixes via the position-0 whole-slot store, not page-radix
+            // (its MLA KV is per-slot, not yet paged — Phase 5).
+            Self::Dsv4(_) => 0,
         }
     }
 
@@ -3021,6 +3024,15 @@ impl std::fmt::Debug for Qwen35CudaExecutor {
 }
 
 impl Qwen35CudaExecutor {
+    /// Radix prefix reuse over the shared paged full-attn pool — same uniform
+    /// mechanism as dense Qwen3 (`pages_only_reusable_prefix_blocks` + the
+    /// infer-core radix cache). Resident pages only: Qwen3.6 has no prefix-tier
+    /// demote/promote yet (`demote/promote_prefix_pages` no-op for Qwen35), so
+    /// demoted keys are never restorable and the count stops at the first one.
+    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        pages_only_reusable_prefix_blocks(blocks, |_| false)
+    }
+
     pub(crate) fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
