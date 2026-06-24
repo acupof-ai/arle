@@ -120,16 +120,21 @@ CUDA-only → cannot build on this Mac. Every tranche verifies on the **H20 pod*
    sm_90 regen from `kernels.toml` + all externs linked on 8×H20; runtime needle
    exact ×3 DET (Qwen3-4B through `resolve_paged_attn_v1`). Byte-equal ABI proof
    ([wins](../experience/wins/2026-06-23-cuda-registry-ffi-codegen-pending-remote.md)).
-2. ⏳ **Prebuilt-release first-class** — NOT done; the last big bloat. Open
-   decision (ckl has auth): per-SM cubins as a **Rust crate via a cargo registry**
-   (ckl pref "更方便"; ship BINARY cubins ~4.4M — fits; the 22.6M `.c` text does
-   not) consumed via `links`/`DEP_*`, OR a Python wheel (pip in the TileLang venv),
-   OR GH-release + `ARLE_CUDA_KERNELS_PREBUILT_DIR` (existing
-   `export_prebuilt_cuda_kernels.sh`). Versioned by `kernels.toml` hash.
-3. ⏳ **Drop committed `generated/`** — PARTIAL: dropped 62 binary cubins
-   (`255ead11`) + 62 device-kernel `.cu` (`c936a826`), now `.gitignore`d. The **93
-   per-SM `.c` (sm100/sm120 cubin-as-text ~22.6M)** stay until tranche 2 — they ARE
-   the build-consumed source for Blackwell targets the dev/CI box can't compile.
+2. ⏳ **Prebuilt-release first-class** — speed need now met locally by the tranche-3
+   hash cache (regen 251s→53s warm); the remaining piece is a **public** distribution
+   pack for TileLang-less consumers. ckl ruled out internal TOS ("得发到公共外网的");
+   preference is a **Python wheel like sglang ships prebuilt kernels** (PyPI), binary
+   cubins (~4.4M, not the 22.6M `.c` text), versioned by `kernels.toml` hash, fed to
+   the existing `ARLE_CUDA_KERNELS_PREBUILT_DIR`. Not yet built.
+3. ✅ **Drop committed `generated/`** — DONE: dropped 62 binary cubins (`255ead11`)
+   + 62 device-kernel `.cu` (`c936a826`) + the **93 per-SM `.c` (~22.6M)**
+   (`e893c5de`); `generated/` fully `.gitignore`d. Verified the dev/CI box CAN
+   regenerate Blackwell after all — **nvcc 12.8+ cross-compiles sm_100/sm_120 with
+   no Blackwell GPU** (pod: sm_100 regen `Finished` 5m38s). A **persistent
+   hash-keyed kernel cache** (`4069acc7`, `<src_hash>-<nvcc_tag>`, lives outside
+   `target/`) recovers the regen cost: forced full regen 251s → warm-cache 53s
+   (−79%). CI caches key on `kernels.toml` (`e967225e`); release T0/T1/T2 install
+   TileLang via `requirements-build.txt` + CUDA 12.8 so all SMs regen on demand.
 4. ⏳ **Env collapse** — PARTIAL: dropped the `ARLE_CUDA_ENABLE_DEEPGEMM_TORCH`
    alias (`c34b2486`). Rest pending; audit found most remaining envs are genuine
    build-time overrides (TORCH_CUDA_ARCH_LIST, INFER_TILELANG_PYTHON, etc.).
