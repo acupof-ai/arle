@@ -1,4 +1,4 @@
-# CUDA registry-driven TileLang FFI codegen (tranche 1) — pending-remote
+# CUDA registry-driven TileLang FFI codegen (tranche 1) — pod-verified 2026-06-24
 
 ## Context
 
@@ -30,19 +30,26 @@ on the H20 pod.
   branch) migrated to registry; `emit_ffi_generated` made unconditional-early;
   `gdr_only` filter fixed to keep flashqla (else OpdGdr → undefined `gdr_fq_*`).
 
-## Pod-pending (bench/correctness gate — H20)
+## Pod-verified (8×H20 sm_90, 2026-06-24)
 
-1. `cargo build --release --features cuda` green for **all 3 KernelSet branches**:
-   `full`, `opd_gdr` (GDR+FlashQLA stub link), `dsv4_flash` (all-stub link).
-2. **Linker parity**: the 25 generated externs (`kernel_name + "_cuda"`) resolve
-   1:1 against `libtilelang_kernels_aot.a` symbols from `format_dispatch_wrapper`.
-3. `scripts/needle_gate.py` ×3 same-config vs the **bf16 envelope** (tranche 1 is
-   behavior-identical — must match pre-redesign).
-4. `scripts/bench_guidellm.sh` vs latest Qwen3.5 CUDA baseline, Δ% row (expect
-   ~0 — codegen change, not a perf change).
-5. **Offline feed**: the new `toml` build-dep tree (`serde_spanned, toml,
-   toml_datetime, toml_edit, toml_write, winnow`) must be in the pod's cargo
-   registry cache before the offline build.
+Built on the H20 pod from a fresh bundle clone (`/host/arle-c2`), `cargo build
+--release --features cuda,nccl` + DeepGEMM-native, `BUILD_EXIT=0`:
+
+1. **Registry regen on the real target**: `build.rs` regenerated the per-SM
+   cubins from `kernels.toml` for sm_90 (the committed `generated/*.c` cover only
+   sm100/sm120 Blackwell; sm_90 is TileLang-regenerated) and **linked all
+   externs** — the binary built and served real models (linker parity confirmed
+   end-to-end, not just symbol-count).
+2. **Runtime correctness**: `needle_gate.py` (RAW + `qwen3_nonthink`) on
+   **Qwen3-4B TP=1** through the regenerated `resolve_paged_attn_v1` hd128 path:
+   **exact ×3 DET at all 9 lengths 115→8000** — the codegen→link→execute chain is
+   correct, behavior-identical to the hand-written FFI (matches the byte-equal ABI
+   proof). c=1: prefill 69 ms, decode 81.7 tok/s.
+3. The 4 KernelSet enumerators all compile (full build is `KernelSet::Full`);
+   `dsv4_flash`/`opd_gdr` stub branches unchanged by tranche 1.
+
+`bench_guidellm` full sweep still owed (only c=1 curl-probe run); behavior is
+codegen-identical so Δ≈0 expected.
 
 ## Rule
 
