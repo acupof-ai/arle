@@ -357,14 +357,19 @@ fn try_fp8_deepgemm_dense_batch(
 /// (prefill) path: dequant is `rows*cols` work amortized over the `M` GEMM rows,
 /// far cheaper than the warp-per-row scalar GEMV at large M.
 ///
+/// Engages for large-M (prefill) on ANY arch whenever DeepGEMM did not handle the
+/// GEMM — we only reach this fn *after* `try_fp8_deepgemm_dense_batch` returned
+/// false (DeepGEMM disabled/unbuilt, or it declined the shape). Prefill must NEVER
+/// fall through to the scalar GEMV below — that is a memory-bound per-token path
+/// (~20× slower at M=2048): dequant once, cuBLAS GEMM over all M rows instead.
+///
 /// Only engages when:
-///  - the device is pre-Hopper (`!qwen_fp8_dense_sm_supports_deepgemm`),
 ///  - the weight is `Fp8BlockScaled` with the canonical 128x128 block shape,
 ///  - `M >= QWEN_FP8_DEEPGEMM_DENSE_MIN_M` (small-M decode keeps the scalar GEMV,
 ///    which is already coalesced + occupancy-friendly there).
 ///
-/// Returns `Ok(false)` when it does not apply, leaving `gemm_batch` to fall
-/// through to the scalar/MMA block-scaled GEMV (also sm_70+).
+/// Returns `Ok(false)` when it does not apply (small-M decode), leaving
+/// `gemm_batch` to fall through to the scalar/MMA block-scaled GEMV.
 fn try_fp8_dequant_bf16_gemm_batch(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -372,7 +377,6 @@ fn try_fp8_dequant_bf16_gemm_batch(
     out: &mut HiddenStates,
 ) -> Result<bool> {
     if weight.weight_format != WeightFormat::Fp8BlockScaled
-        || qwen_fp8_dense_sm_supports_deepgemm(ctx)
         || x.seq_len < QWEN_FP8_DEEPGEMM_DENSE_MIN_M
         || weight.quant_block_m != 128
         || weight.quant_block_k != 128
