@@ -1,51 +1,18 @@
-//! Multi-rank TP multiproc-serve coordinator + worker scaffold (DSv4 +
-//! Qwen3.5/3.6 MoE; Stage 1 re-wire).
-//!
-//! Ported from `git show e81b98fb^:infer/src/main.rs` (fn `main` worker-entry,
-//! `run_worker_mode`, `spawn_cuda_worker_processes`, and the coordinator-side
-//! relay bind/spawn/accept in `async_main`), adapted to the rewrite crate stack.
-//!
-//! Control flow this reproduces:
-//!   - `arle serve` on a multi-rank TP CUDA model (DSv4, Qwen3.5/3.6 MoE)
-//!     becomes the COORDINATOR (rank 0):
-//!     [`bind_relay_and_spawn_workers`] binds the relay listener
-//!     ([`RelayCoordinator::bind`]), publishes the port via
-//!     `ARLE_COORDINATOR_RELAY_PORT`, spawns N-1 worker processes via
-//!     `current_exe()` with `ARLE_WORKER_RANK=R` + `WORLD_SIZE` +
-//!     `INFER_CUDA_DEVICE` + a parent-fd pipe (`ARLE_WORKER_PARENT_FD`), accepts
-//!     the N-1 relay connects, boot-pings, then the caller proceeds to its
-//!     normal in-process serve. The returned [`CoordinatorGuard`] holds the
-//!     relay + worker pipes; dropping it EOFs the workers so they exit.
-//!   - On process start, BEFORE clap parsing, [`worker_entry`] detects
-//!     `ARLE_WORKER_RANK>0` and runs worker mode: pre-connect the relay
-//!     ([`RelayWorker::connect_with_rank`]), build the rank-R engine (which
-//!     bootstraps NCCL as rank R from env during construction), then run a
-//!     relay-receiver loop.
-//!
-//! Lockstep admission (this change): the coordinator installs a per-tick
-//! broadcaster (`infer_api::set_tick_broadcaster`); the rank-0 engine loop sends
-//! exactly one `RelayEnvelope::TickAdmissions { seq, requests }` before every
-//! engine step (empty `requests` on pure-decode ticks). Each worker drives its
-//! own rank-R engine SYNCHRONOUSLY — one `inject + step` per envelope
-//! ([`infer_api::CudaWorkerEngine`]) — so every rank admits the same requests at
-//! the same step index and the per-step NCCL collective sequences stay aligned.
-//! Free-running per-request relays desync (admission-vs-tick race, measured
-//! 2026-06-10: `errors/2026-06-10-dsv4-c2-layer2-lockstep-admission-deadlock.md`).
-//! Worker output is discarded — only rank 0 returns over HTTP.
-//!
-//! Config parity: the coordinator serializes its resolved
-//! [`EngineLoadConfig`] into `ARLE_WORKER_ENGINE_CONFIG` before spawning, so
-//! worker planners run the SAME scheduler knobs (a divergent knob = divergent
-//! plans = NCCL deadlock).
-//!
-//! `// STAGE 3:` owner-routed visible output (`RelayEnvelope::Completion` back to
-//! a non-rank-0 owner) remains a later stage.
+//! Multi-rank TP multiproc-serve: SPMD coordinator + symmetric workers (DSv4 +
+//! Qwen3.5/3.6 MoE). The engine-less parent ([`bind_relay_and_spawn_workers`])
+//! spawns all N workers and runs the coordinator HTTP loop; [`worker_entry`]
+//! detects `ARLE_WORKER_RANK` (set on every rank) and runs worker mode + the
+//! lockstep driver. Each worker steps SYNCHRONOUSLY, one `inject + step` per
+//! relayed tick, so the per-step NCCL collective sequences stay aligned —
+//! free-running per-request relays desync (`errors/2026-06-10-dsv4-c2-layer2-
+//! lockstep-admission-deadlock.md`). Worker planners must use the SAME config
+//! (serialized via `ARLE_WORKER_ENGINE_CONFIG`): a divergent knob = NCCL deadlock.
+//! See `docs/plans/2026-06-24-multiproc-control-data-plane-redesign.md`.
 
 #![cfg(all(unix, feature = "cuda"))]
 
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -92,39 +59,28 @@ fn cuda_ordinals(world_size: usize) -> Vec<usize> {
         .unwrap_or_else(|| (0..world_size).collect())
 }
 
-/// RAII guard for a running coordinator: holds the accepted relay plus the
-/// worker-process pipe write-ends. Dropping it closes the pipes (workers EOF on
-/// their parent-pipe read and exit) and lets the relay drop.
-///
-/// The relay is `Arc<Mutex<_>>` so it is shared between the process-global
-/// admission broadcaster (installed in [`bind_relay_and_spawn_workers`], invoked
-/// from the rank-0 engine thread per request) and this guard, which keeps it (and
-/// the worker pipes) alive for the serve loop. This mirrors the old coordinator
-/// wrapping its `RelayCoordinator` in `Arc<Mutex<_>>` to share it with
-/// `DistributedSchedulerGroup` (`e81b98fb^:infer/src/main.rs:1949`).
+/// RAII guard for the worker children: holds their pipe write-ends, so dropping
+/// it EOFs the workers. Must outlive the serve loop to keep the workers up.
 pub(crate) struct CoordinatorGuard {
-    _relay: Arc<Mutex<RelayCoordinator>>,
     _children: WorkerChildren,
 }
 
-/// COORDINATOR (rank 0): bind the relay, publish its port, spawn N-1 workers,
-/// accept their relay connects, boot-ping, then install the process-global
-/// admission broadcaster so each request the rank-0 engine admits is fanned out
-/// to workers in lockstep. Returns a guard the caller holds for the lifetime of
-/// the serve loop; on `world_size <= 1` returns `None` (single GPU — serve alone,
-/// no workers, no broadcaster — the default serve path is byte-identical).
-///
-/// Stage-2 wiring (the admission-broadcast hook) is ported from the old
-/// `DistributedSchedulerGroup::submit` path (`e81b98fb^:infer/src/request_handle.rs:909`):
-/// the coordinator's relay is shared (`Arc<Mutex<_>>`) between this guard and a
-/// closure installed via [`infer_api::set_admission_broadcaster`]; the rank-0
-/// engine thread invokes that closure (`infer_server::broadcast_admission`) at the
-/// single deterministic admission point, broadcasting a [`WireRequest`] to every
-/// worker before submitting the request locally.
+/// What [`bind_relay_and_spawn_workers`] hands back: the accepted relay (drives
+/// the coordinator HTTP loop) + the child guard (keeps workers alive).
+pub(crate) struct MultiprocCoordinator {
+    pub(crate) relay: RelayCoordinator,
+    pub(crate) guard: CoordinatorGuard,
+}
+
+/// COORDINATOR: bind the relay, publish its port, spawn ALL N workers (rank
+/// 0..N-1; rank 0 owns the visible output), accept their connects, and boot-ping.
+/// Returns the accepted relay + child guard for the coordinator HTTP loop; on
+/// `world_size <= 1` returns `None` (single GPU, byte-identical serve). The parent
+/// owns no TP rank and joins no collective, so it is never the missing rank.
 pub(crate) fn bind_relay_and_spawn_workers(
     model_path: &str,
     engine_config: &EngineLoadConfig,
-) -> Result<Option<CoordinatorGuard>> {
+) -> Result<Option<MultiprocCoordinator>> {
     let world_size = world_size_from_env();
     if world_size <= 1 {
         log::info!(
@@ -133,10 +89,9 @@ pub(crate) fn bind_relay_and_spawn_workers(
         return Ok(None);
     }
 
-    // Config parity: workers must build their engines from the SAME resolved
-    // config as rank 0 (any scheduler-knob divergence diverges the
-    // deterministic planner across ranks → NCCL deadlock). Published via env
-    // BEFORE spawn so children inherit it.
+    // Config parity (load-bearing): workers must build from the SAME config — any
+    // scheduler-knob divergence diverges the planner across ranks → NCCL deadlock.
+    // Published via env before spawn so children inherit it.
     let config_json =
         serde_json::to_string(engine_config).context("serialize ARLE_WORKER_ENGINE_CONFIG")?;
     // SAFETY: env write happens before child spawn, on the single CLI thread.
@@ -144,12 +99,9 @@ pub(crate) fn bind_relay_and_spawn_workers(
         std::env::set_var("ARLE_WORKER_ENGINE_CONFIG", &config_json);
     }
 
-    // 0. Mint the NCCL rendezvous id ONCE (rank 0) and publish it via env so every
-    //    spawned worker inherits the SAME handle. The TP executors read
-    //    `INFER_NCCL_UNIQUE_ID` during construction (loader::nccl_unique_id_from_env);
-    //    minting here is the multiproc analogue of the parity launcher's
-    //    file-rendezvous. Must happen BEFORE spawn_workers so children inherit it.
-    //    Skip if already set (an external launcher provided the rendezvous).
+    // 0. Mint the NCCL rendezvous id ONCE and publish via env before spawn so every
+    //    worker inherits the SAME handle (executors read `INFER_NCCL_UNIQUE_ID` at
+    //    construction). Skip if already set (an external launcher provided it).
     #[cfg(feature = "nccl")]
     if std::env::var("INFER_NCCL_UNIQUE_ID").is_err() {
         let hex = infer_api::mint_nccl_unique_id_hex().context("mint NCCL unique id")?;
@@ -181,12 +133,12 @@ pub(crate) fn bind_relay_and_spawn_workers(
         pending.port()
     );
 
-    // 2. Spawn N-1 worker processes (rank 1..world_size).
-    let children = spawn_workers(model_path, world_size)?;
+    // 2. Spawn ALL N worker processes (rank 0..world_size); rank 0 is a child too.
+    let mut children = spawn_workers(model_path, world_size)?;
 
-    // 3. Accept N-1 worker relay connects.
+    // 3. Accept ALL N worker relay connects (rank 0 included).
     let mut relay = pending
-        .accept(world_size, RELAY_TIMEOUT)
+        .accept_symmetric(world_size, RELAY_TIMEOUT)
         .context("multiproc relay accept")?;
     log::info!(
         "[multiproc-coord] relay accepted {} worker connects (ranks {:?})",
@@ -200,42 +152,57 @@ pub(crate) fn bind_relay_and_spawn_workers(
         .broadcast(&RelayEnvelope::BootPing { request_id: 0 })
         .context("multiproc relay boot-ping")?;
 
-    // 5. Install the per-tick admission broadcaster. Share the relay
-    //    (`Arc<Mutex<_>>`) between this guard and the closure the rank-0 engine
-    //    loop invokes exactly once before every engine step. A broadcast failure
-    //    is a BROKEN LOCKSTEP (a worker missing one tick deadlocks the NCCL
-    //    group), so it is logged at error level — the hang that follows is then
-    //    attributable in the log instead of silent.
-    let relay = Arc::new(Mutex::new(relay));
-    let broadcast_relay = Arc::clone(&relay);
-    infer_api::set_tick_broadcaster(Box::new(move |seq, requests| {
-        let mut coord = broadcast_relay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        coord
-            .broadcast(&RelayEnvelope::TickAdmissions { seq, requests })
-            .with_context(|| format!("[multiproc-coord] tick #{seq} admission broadcast failed"))
-    }))
-    .context("install multiproc tick broadcaster")?;
+    // 5. Engine-ready barrier: block until all N ranks report `EngineReady` before
+    //    binding HTTP, else requests broadcast into socket buffers while workers are
+    //    still in NCCL rendezvous. Fails fast if a child exits during the build.
+    wait_all_engines_ready(&relay, &mut children, world_size)?;
+    log::info!("[multiproc-coord] all {world_size} worker engines ready; opening HTTP");
 
-    Ok(Some(CoordinatorGuard {
-        _relay: relay,
-        _children: children,
+    Ok(Some(MultiprocCoordinator {
+        relay,
+        guard: CoordinatorGuard {
+            _children: children,
+        },
     }))
 }
 
-/// WORKER entry, hooked at the very top of `cli::run()` before clap parsing.
-///
-/// Returns `Some(ExitCode)` when this process is a worker (rank > 0) and ran
-/// worker mode to completion; `None` to fall through to the normal CLI path
-/// (rank 0 / not a worker).
+/// Block until all `world_size` ranks report [`RelayEnvelope::EngineReady`], or
+/// fail fast if a child exits first (a crashed rank never acks). Bounded by
+/// [`RELAY_TIMEOUT`].
+fn wait_all_engines_ready(
+    relay: &RelayCoordinator,
+    children: &mut WorkerChildren,
+    world_size: usize,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + RELAY_TIMEOUT;
+    loop {
+        let ready = relay.ready_count();
+        if ready >= world_size {
+            return Ok(());
+        }
+        // A child that exited during the build never acks → survivors would hang.
+        if let Some((rank, code)) = children.first_exited() {
+            anyhow::bail!(
+                "worker rank {rank} exited (code {code:?}) during engine build \
+                 ({ready}/{world_size} ready); aborting coordinator"
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out after {RELAY_TIMEOUT:?} waiting for worker engine-ready \
+                 ({ready}/{world_size} ready)"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// WORKER entry, hooked at the top of `cli::run()` before clap parsing. Returns
+/// `Some(ExitCode)` for a worker (any rank with `ARLE_WORKER_RANK` set, including
+/// rank 0); `None` for the parent coordinator (which never sets it on itself).
 #[must_use]
 pub(crate) fn worker_entry() -> Option<ExitCode> {
     let rank: usize = std::env::var("ARLE_WORKER_RANK").ok()?.parse().ok()?;
-    if rank == 0 {
-        // rank 0 is the coordinator; it falls through to the normal serve path.
-        return None;
-    }
     infer_util::logging::init_stderr("info");
     match run_worker_mode(rank) {
         Ok(()) => Some(ExitCode::SUCCESS),
@@ -246,7 +213,7 @@ pub(crate) fn worker_entry() -> Option<ExitCode> {
     }
 }
 
-/// Worker-mode body (rank R > 0). Pre-connects the relay, builds the rank-R
+/// Worker-mode body (rank R, 0..N-1). Pre-connects the relay, builds the rank-R
 /// engine (NCCL bootstrap as rank R happens inside construction from env), runs
 /// the relay-receiver loop, then blocks on the parent pipe until the coordinator
 /// dies.
@@ -263,12 +230,9 @@ fn run_worker_mode(rank: usize) -> Result<()> {
         std::process::id()
     );
 
-    // 1. Pre-connect the relay BEFORE building the engine. The coordinator's flow
-    //    binds the relay listener first, then spawns workers, then ACCEPTS relay
-    //    connects (blocking), and only after that proceeds. If workers built the
-    //    engine (NCCL rendezvous) first they could deadlock against the
-    //    coordinator still stuck in accept. Connect relay first so the
-    //    coordinator unblocks accept -> proceeds -> NCCL listener up.
+    // 1. Connect the relay BEFORE building the engine (load-bearing order): the
+    //    coordinator blocks in accept until all workers connect, so building NCCL
+    //    first would deadlock against an un-accepted coordinator.
     let mut relay = if let Ok(port_str) = std::env::var("ARLE_COORDINATOR_RELAY_PORT") {
         let port: u16 = port_str
             .parse()
@@ -288,14 +252,10 @@ fn run_worker_mode(rank: usize) -> Result<()> {
         None
     };
 
-    // 2. Build the rank-R engine from the coordinator's resolved config
-    //    (`ARLE_WORKER_ENGINE_CONFIG` — config parity is a lockstep invariant).
-    //    The executor resolves TP rank R / world-size + EP split + NCCL
-    //    communicator from the env the coordinator set (`INFER_TP_RANK`,
-    //    `INFER_TP_SIZE` / `INFER_CUDA_DEVICES`, `INFER_NCCL_UNIQUE_ID` /
-    //    `INFER_NCCL_ID_FILE`). Built directly on THIS thread (no background
-    //    engine loop): the lockstep driver below steps it exactly once per
-    //    relayed tick.
+    // 2. Build the rank-R engine from the coordinator's config
+    //    (`ARLE_WORKER_ENGINE_CONFIG` — config parity is a lockstep invariant);
+    //    TP rank / world / EP / NCCL come from env. Built on THIS thread (no
+    //    background loop); the driver below steps it once per relayed tick.
     let engine_config: EngineLoadConfig = match std::env::var("ARLE_WORKER_ENGINE_CONFIG") {
         Ok(json) => serde_json::from_str(&json)
             .with_context(|| format!("worker rank {rank} ARLE_WORKER_ENGINE_CONFIG parse"))?,
@@ -306,35 +266,40 @@ fn run_worker_mode(rank: usize) -> Result<()> {
             )
         }
     };
-    log::info!("[arle-worker rank={rank}] building rank-{rank} engine ({engine_config:?})");
-    let engine = CudaWorkerEngine::load(&model_path, &engine_config)
+    // Rank 0 owns the visible output (tracks + emits completions); followers discard.
+    let owns_output = rank == 0;
+    log::info!(
+        "[arle-worker rank={rank}] building rank-{rank} engine (owns_output={owns_output}) ({engine_config:?})"
+    );
+    let engine = CudaWorkerEngine::load(&model_path, &engine_config, owns_output)
         .with_context(|| format!("worker rank {rank} engine build"))?;
     log::info!("[arle-worker rank={rank}] engine built; entering lockstep driver");
+
+    // 2b. Ack readiness (engine + NCCL rendezvous built) before the driver, so the
+    //     coordinator unblocks its HTTP bind. A send failure means it is gone.
+    if let Some(relay) = relay.as_mut() {
+        relay
+            .send(&RelayEnvelope::EngineReady { rank })
+            .with_context(|| format!("worker rank {rank} engine-ready ack"))?;
+        log::info!("[arle-worker rank={rank}] engine-ready ack sent");
+    }
 
     // 3. Lockstep driver: one engine step per relayed `TickAdmissions`.
     if let Some(relay) = relay.as_mut() {
         run_lockstep_driver(rank, relay, engine)?;
     }
 
-    // 4. Block on the parent pipe — the coordinator closes the write end on
-    //    shutdown, the read() returns EOF, and the worker exits.
+    // 4. Block on the parent pipe; the coordinator closing it EOFs us into exit.
     block_on_parent_pipe(rank);
     Ok(())
 }
 
-/// Drive the worker engine in lockstep: exactly one engine step per relayed
-/// `TickAdmissions`, after injecting that tick's admissions.
-///
-/// This mirrors the rank-0 engine loop's pairing (one `TickAdmissions` is sent
-/// before every rank-0 step), so every rank admits the same requests at the
-/// same step index and the planner — a pure function of engine state — builds
-/// identical plans, keeping the per-step NCCL collective sequences aligned.
-/// Both sides evaluate the same post-injection `is_idle()` (e.g. a request
-/// completed at ingress steps NOBODY). A `seq` gap means the relay dropped a
-/// tick — fatal: a worker missing one tick deadlocks the NCCL group, so dying
-/// loudly (the coordinator's pipe then reaps the rank) beats spinning.
-///
-/// Worker output is discarded — only rank 0 returns over HTTP.
+/// Drive the worker engine in lockstep: inject one tick's admissions, then step
+/// once, so every rank admits the same requests at the same step index and the
+/// per-step NCCL collective sequences stay aligned. A `seq` gap means a dropped
+/// tick — fatal (a missing tick deadlocks NCCL), so die loudly rather than spin.
+/// After each step the rank-0 driver also ships terminal completions back to the
+/// coordinator (`drain_completions` is a no-op on followers).
 fn run_lockstep_driver(
     rank: usize,
     relay: &mut RelayWorker,
@@ -356,13 +321,25 @@ fn run_lockstep_driver(
                         wire.prompt_tokens.len(),
                         wire.max_tokens
                     );
+                    let request_id = wire.request_id;
                     let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
-                    engine.inject(prompt_tokens, max_tokens, sampling);
+                    engine.inject(request_id, prompt_tokens, max_tokens, sampling);
                 }
                 if !engine.is_idle() {
                     engine
                         .step()
                         .with_context(|| format!("worker rank {rank} step (tick #{seq})"))?;
+                }
+                // Emit terminal completions (rank 0 only); a send failure means the
+                // coordinator is gone, so stop and let the parent pipe reap us.
+                for (request_id, delta) in engine.drain_completions() {
+                    relay
+                        .send(&RelayEnvelope::Completion { request_id, delta })
+                        .with_context(|| {
+                            format!(
+                                "worker rank {rank} completion send (req#{request_id}, tick #{seq})"
+                            )
+                        })?;
                 }
             }
             Some(RelayEnvelope::BootPing { request_id }) => {
@@ -374,6 +351,11 @@ fn run_lockstep_driver(
             Some(RelayEnvelope::Completion { request_id, .. }) => {
                 log::warn!(
                     "[arle-worker rank={rank}] unexpected completion envelope request_id={request_id}"
+                );
+            }
+            Some(RelayEnvelope::EngineReady { rank: ready_rank }) => {
+                log::warn!(
+                    "[arle-worker rank={rank}] unexpected engine-ready envelope (rank {ready_rank})"
                 );
             }
             Some(RelayEnvelope::Shutdown) => {
@@ -428,6 +410,19 @@ struct WorkerChildren {
     children: Vec<(usize, std::process::Child, std::fs::File)>,
 }
 
+impl WorkerChildren {
+    /// `(rank, exit_code)` of the first already-exited child, else `None`. Lets the
+    /// engine-ready barrier fail fast on a worker that crashed during the build.
+    fn first_exited(&mut self) -> Option<(usize, Option<i32>)> {
+        for (rank, child, _) in &mut self.children {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Some((*rank, status.code()));
+            }
+        }
+        None
+    }
+}
+
 impl Drop for WorkerChildren {
     fn drop(&mut self) {
         // Close parent pipe write-ends -> children's read() returns EOF -> they
@@ -474,9 +469,11 @@ fn dummy_file() -> std::fs::File {
 fn spawn_workers(model_path: &str, world_size: usize) -> Result<WorkerChildren> {
     let exe = std::env::current_exe().context("current_exe")?;
     let ordinals = cuda_ordinals(world_size);
-    let mut children = Vec::with_capacity(world_size - 1);
+    let mut children = Vec::with_capacity(world_size);
 
-    for rank in 1..world_size {
+    // SPMD (B): spawn ALL ranks 0..world_size as identical child workers (rank 0 is
+    // the output owner); the engine-less parent never sets `ARLE_WORKER_RANK`.
+    for rank in 0..world_size {
         // Parent -> child pipe. Only the read end is inherited by the exec'd
         // worker; the parent write end stays close-on-exec so the worker cannot
         // keep its own writer alive and mask EOF after coordinator death.
