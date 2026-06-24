@@ -116,18 +116,29 @@ CUDA-only → cannot build on this Mac. Every tranche verifies on the **H20 pod*
 ## Tranches (each: small commit + pod-verify)
 
 0. ✅ `vendor/tilekernels` removed (vendored, 0 refs) + README ref cleaned (`d638c134`).
-1. ✅ **Registry + generated FFI** (`64dc0b13`). `kernels.toml` (34 rows, 25 ffi)
-   drives `build.rs`-emitted `ffi_tilelang_generated.rs`; 9 macros + invocations +
-   the consumer match → `include!` + `resolve_*()`. Mac-green; FFI parity proven
-   byte-equal (25==25, all 4 ABI sigs); net −905 build.rs lines. **Pod-pending**:
-   nvcc/cc + link all 3 KernelSet branches + needle gate ×3 vs bf16 envelope + bench
-   (see [wins stub](../experience/wins/2026-06-23-cuda-registry-ffi-codegen-pending-remote.md)).
-2. **Prebuilt-release first-class.** Conventional-path auto-detect; a
-   `scripts/build_kernel_release.sh` on a GPU box produces the two archives + sidecar.
-3. **Drop committed `generated/`** once prebuilt is the fed default; regen-on-demand
-   from source for GPU-box builds.
-4. **Env collapse** + `ARLE_CUDA_KERNEL_SET` → cargo feature.
+1. ✅ **Registry + generated FFI** (`64dc0b13`) — **pod-verified 2026-06-24**:
+   sm_90 regen from `kernels.toml` + all externs linked on 8×H20; runtime needle
+   exact ×3 DET (Qwen3-4B through `resolve_paged_attn_v1`). Byte-equal ABI proof
+   ([wins](../experience/wins/2026-06-23-cuda-registry-ffi-codegen-pending-remote.md)).
+2. ⏳ **Prebuilt-release first-class** — NOT done; the last big bloat. Open
+   decision (ckl has auth): per-SM cubins as a **Rust crate via a cargo registry**
+   (ckl pref "更方便"; ship BINARY cubins ~4.4M — fits; the 22.6M `.c` text does
+   not) consumed via `links`/`DEP_*`, OR a Python wheel (pip in the TileLang venv),
+   OR GH-release + `ARLE_CUDA_KERNELS_PREBUILT_DIR` (existing
+   `export_prebuilt_cuda_kernels.sh`). Versioned by `kernels.toml` hash.
+3. ⏳ **Drop committed `generated/`** — PARTIAL: dropped 62 binary cubins
+   (`255ead11`) + 62 device-kernel `.cu` (`c936a826`), now `.gitignore`d. The **93
+   per-SM `.c` (sm100/sm120 cubin-as-text ~22.6M)** stay until tranche 2 — they ARE
+   the build-consumed source for Blackwell targets the dev/CI box can't compile.
+4. ⏳ **Env collapse** — PARTIAL: dropped the `ARLE_CUDA_ENABLE_DEEPGEMM_TORCH`
+   alias (`c34b2486`). Rest pending; audit found most remaining envs are genuine
+   build-time overrides (TORCH_CUDA_ARCH_LIST, INFER_TILELANG_PYTHON, etc.).
 5. **build.rs modularization.**
+
+Adjacent (this arc, not in the original plan): registry cruft removed
+(`family`/`kv_dtype`/`schema_version`, dead flashinfer vendor, 9 dead FFI externs
++ `.cu`); CUDA serving fixes C1–C4 + DSv4 EP — see the
+[2026-06-24 wins](../experience/wins/2026-06-24-cuda-moe-fp8-serving-ep-pod.md).
 
 ## Decisions taken (defaults, correct if silent)
 
