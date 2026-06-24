@@ -403,6 +403,9 @@ changes.
   siblings; models follow `model/qwen3.rs` + `model/qwen3/`.
 - Weights `&self` (immutable, pool-shared); per-request mutable state in `State`
   associated types.
+- **Comments stay concise** — ≤1-2 lines on the non-obvious *why*, not what the
+  code does; no multi-line essay blocks in source. Load-bearing invariant/ordering
+  notes stay, but compressed.
 
 ### GPU kernel work
 
