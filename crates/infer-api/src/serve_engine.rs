@@ -209,11 +209,20 @@ where
         if req.messages.is_empty() {
             anyhow::bail!("messages must contain at least one message");
         }
+        let multimodal_kind = self
+            .serve
+            .run_on_executor(|executor| executor.multimodal_kind())
+            .unwrap_or(None);
         let mut images = Vec::new();
         for message in &req.messages {
             for image in &message.images {
-                let prepared = infer_server::multimodal::preprocess_gemma4_image(&image.data)
-                    .map_err(|err| anyhow!("preprocess image {} failed: {err}", image.source))?;
+                let prepared = match multimodal_kind {
+                    Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+                        infer_server::multimodal::preprocess_deepseek_ocr_image(&image.data)
+                    }
+                    _ => infer_server::multimodal::preprocess_gemma4_image(&image.data),
+                }
+                .map_err(|err| anyhow!("preprocess image {} failed: {err}", image.source))?;
                 images.push(prepared);
             }
         }
@@ -226,8 +235,13 @@ where
             .tokenizer
             .render_chat(&server_messages)
             .map_err(|err| anyhow!("render multimodal chat prompt failed: {err}"))?;
-        let prompt = infer_server::multimodal::expand_gemma4_image_markers(&prompt, &images)
-            .map_err(|err| anyhow!("expand image prompt markers failed: {err}"))?;
+        let prompt = match multimodal_kind {
+            Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+                infer_server::multimodal::expand_deepseek_ocr_image_markers(&prompt, &images)
+            }
+            _ => infer_server::multimodal::expand_gemma4_image_markers(&prompt, &images),
+        }
+        .map_err(|err| anyhow!("expand image prompt markers failed: {err}"))?;
         let prompt_token_ids = self
             .tokenizer
             .encode(&prompt)
