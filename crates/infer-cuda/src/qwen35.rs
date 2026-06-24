@@ -361,6 +361,123 @@ pub(crate) struct Qwen35SlotImage {
     seq_len: usize,
 }
 
+impl Qwen35SlotImage {
+    /// Approximate device-state byte size of a whole-slot image (the unit the G3
+    /// `CudaKvTierStore` budgets one entry against). Used only to size the tier's
+    /// count cap — exactness isn't required, but it must scale with the image.
+    pub(crate) fn dram_bytes(&self) -> usize {
+        self.full_attn_pages.len()
+            + self.gdr_host.iter().map(|v| v.len() * 4).sum::<usize>()
+            + self.conv_host.iter().map(|v| v.len() * 2).sum::<usize>()
+            + 8
+    }
+
+    /// Flatten the whole-slot image into ONE length-prefixed byte buffer for the
+    /// G3 [`crate::kv_tier::CudaKvTierStore`] (opaque-`u64`-keyed transport). The
+    /// exact byte-inverse of [`Self::from_bytes`] — proven field-for-field in the
+    /// `slot_image_byte_inverse` unit test. No serde: a small fixed header
+    /// (`seq_len`, `full_attn_page_count`, `full_attn_pages` byte length, the two
+    /// linear counts) followed by the full-attn bytes, then each gdr vec's
+    /// `[len:u64][f32 LE...]` and each conv vec's `[len:u64][bf16 LE...]`.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.dram_bytes() + 64);
+        buf.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.full_attn_page_count as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.full_attn_pages.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.gdr_host.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.conv_host.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&self.full_attn_pages);
+        for gdr in &self.gdr_host {
+            buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
+            for &x in gdr {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        for conv in &self.conv_host {
+            buf.extend_from_slice(&(conv.len() as u64).to_le_bytes());
+            for &x in conv {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Reconstruct a whole-slot image from [`Self::to_bytes`] — the exact
+    /// byte-inverse. A cursor walks the fixed header then the four sized regions;
+    /// any short/over-long buffer (a corrupt or foreign payload) errors rather
+    /// than restore garbage.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut pos = 0usize;
+        let mut take_u64 = |pos: &mut usize| -> Result<u64> {
+            let end = pos
+                .checked_add(8)
+                .ok_or_else(|| anyhow!("slot image header overflow"))?;
+            let slice = bytes
+                .get(*pos..end)
+                .ok_or_else(|| anyhow!("slot image truncated reading u64 at {pos}"))?;
+            *pos = end;
+            Ok(u64::from_le_bytes(slice.try_into().expect("8 bytes")))
+        };
+        let seq_len = take_u64(&mut pos)? as usize;
+        let full_attn_page_count = take_u64(&mut pos)? as usize;
+        let full_attn_len = take_u64(&mut pos)? as usize;
+        let num_gdr = take_u64(&mut pos)? as usize;
+        let num_conv = take_u64(&mut pos)? as usize;
+        let pages_end = pos
+            .checked_add(full_attn_len)
+            .ok_or_else(|| anyhow!("slot image full-attn length overflow"))?;
+        let full_attn_pages = bytes
+            .get(pos..pages_end)
+            .ok_or_else(|| anyhow!("slot image truncated reading full-attn pages"))?
+            .to_vec();
+        pos = pages_end;
+        let mut gdr_host = Vec::with_capacity(num_gdr);
+        for _ in 0..num_gdr {
+            let len = take_u64(&mut pos)? as usize;
+            let end = pos
+                .checked_add(len * 4)
+                .ok_or_else(|| anyhow!("slot image gdr length overflow"))?;
+            let raw = bytes
+                .get(pos..end)
+                .ok_or_else(|| anyhow!("slot image truncated reading gdr state"))?;
+            gdr_host.push(
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            );
+            pos = end;
+        }
+        let mut conv_host = Vec::with_capacity(num_conv);
+        for _ in 0..num_conv {
+            let len = take_u64(&mut pos)? as usize;
+            let end = pos
+                .checked_add(len * 2)
+                .ok_or_else(|| anyhow!("slot image conv length overflow"))?;
+            let raw = bytes
+                .get(pos..end)
+                .ok_or_else(|| anyhow!("slot image truncated reading conv state"))?;
+            conv_host.push(
+                raw.chunks_exact(2)
+                    .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            );
+            pos = end;
+        }
+        ensure!(
+            pos == bytes.len(),
+            "slot image has {} trailing bytes after deserialize",
+            bytes.len() - pos
+        );
+        Ok(Self {
+            full_attn_pages,
+            full_attn_page_count,
+            gdr_host,
+            conv_host,
+            seq_len,
+        })
+    }
+}
+
 /// Per-slot gated-delta recurrent state (state + conv ring per linear-attn
 /// layer). Carried across prefill/decode for one request.
 ///
@@ -7230,6 +7347,54 @@ fn rms_norm_offset_vec(
 mod tests {
     use super::*;
     use qwen35_spec::LayerType;
+
+    /// G3 whole-slot spill: `from_bytes(to_bytes(img))` must reproduce EVERY
+    /// field byte-for-byte (the new correctness surface — the device buffers and
+    /// the round-trip are independently proven). Ragged per-vec lengths +
+    /// non-trivial bytes exercise the length-prefixed layout and the f32/bf16
+    /// LE round-trips; a truncated buffer must error, never restore garbage.
+    #[test]
+    fn slot_image_byte_inverse() {
+        let img = Qwen35SlotImage {
+            full_attn_pages: (0u8..=233).cycle().take(777).collect(),
+            full_attn_page_count: 3,
+            gdr_host: vec![
+                vec![1.5_f32, -2.0, f32::from_bits(0x4048_f5c3)],
+                vec![],
+                vec![0.0, -0.0, 123.456],
+            ],
+            conv_host: vec![
+                vec![bf16::from_f32(1.0), bf16::from_f32(-3.5)],
+                vec![bf16::from_f32(0.25)],
+                vec![],
+            ],
+            seq_len: 1234,
+        };
+        let bytes = img.to_bytes();
+        let back = Qwen35SlotImage::from_bytes(&bytes).expect("round-trip");
+        assert_eq!(back.full_attn_pages, img.full_attn_pages);
+        assert_eq!(back.full_attn_page_count, img.full_attn_page_count);
+        assert_eq!(back.seq_len, img.seq_len);
+        // f32 / bf16 compared on bit patterns so a -0.0 or NaN can't false-pass.
+        assert_eq!(back.gdr_host.len(), img.gdr_host.len());
+        for (b, a) in back.gdr_host.iter().zip(&img.gdr_host) {
+            let bb: Vec<u32> = b.iter().map(|x| x.to_bits()).collect();
+            let ab: Vec<u32> = a.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(bb, ab);
+        }
+        assert_eq!(back.conv_host.len(), img.conv_host.len());
+        for (b, a) in back.conv_host.iter().zip(&img.conv_host) {
+            let bb: Vec<u16> = b.iter().map(|x| x.to_bits()).collect();
+            let ab: Vec<u16> = a.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(bb, ab);
+        }
+        // A truncated payload errors rather than restoring a partial image.
+        assert!(Qwen35SlotImage::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        // A foreign trailing byte is rejected (exact-length invariant).
+        let mut extra = bytes.clone();
+        extra.push(0xAB);
+        assert!(Qwen35SlotImage::from_bytes(&extra).is_err());
+    }
 
     fn qwen35_dense_4b_config() -> Qwen35Config {
         Qwen35Config {
