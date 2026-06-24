@@ -1267,11 +1267,13 @@ mod backend {
     ///     executor reports its effective page count via `effective_total_pages()`
     ///     and this passes it in as `dense_total_pages` (the hardcoded
     ///     `config.total_pages` is the request, not the truth).
-    ///   - Qwen3.5/3.6-MoE: SLOT ARENA — `Qwen35SlotState::new` eagerly allocates a
-    ///     contiguous full-attn K/V cache of `total_pages × page_size` tokens per
-    ///     layer PER SLOT at load (true VRAM = num_slots ×), so admission is
-    ///     `num_slots × per-slot tokens` — the page gate never binds before the
-    ///     slot gate.
+    ///   - Qwen3.6-MoE: SHARED paged pool (since the shared-paged migration) —
+    ///     the executor allocates ONE profile-sized full-attn `PagedKVPool` and
+    ///     host page ids mirror it 1:1, exactly like dense. Admission MUST equal
+    ///     the device pool's ACTUAL page count (`effective_total_pages()`), not
+    ///     `num_slots × total_pages`. The linear-attn recurrent state stays
+    ///     per-slot but is not page-addressable, so it never touches the host
+    ///     KV pool.
     ///   - DSv4: SLOT ARENA (SW ring + compressed, each slot covers max context)
     ///     with its own dynamic mem-budget slot clamp; admission is
     ///     `num_slots × per-slot tokens`. Sizing a slot-arena model for a single
@@ -1283,33 +1285,29 @@ mod backend {
     /// `num_slots` must be the EFFECTIVE slot count (post KV-budget clamp), not
     /// the requested one.
     ///
-    /// `dense_total_pages` is the dense executor's ACTUAL device pool page count
-    /// (profiled from free VRAM). For the dense branch the host pool mirrors it
-    /// exactly — never floored back up to the requested `config.total_pages`,
-    /// because a profiled pool may legitimately be SMALLER (big weights / small
-    /// card) and a host pool larger than the device pool hands out page ids the
-    /// device pool has no HBM for. Other kinds ignore it.
+    /// `paged_pool_pages` is the paged-pool executor's ACTUAL device pool page
+    /// count (profiled from free VRAM; dense + Qwen3.6). For those branches the
+    /// host pool mirrors it exactly — never floored back up to the requested
+    /// `config.total_pages`, because a profiled pool may legitimately be SMALLER
+    /// (big weights / small card) and a host pool larger than the device pool
+    /// hands out page ids the device pool has no HBM for. Other kinds ignore it.
     #[cfg(feature = "cuda")]
     fn cuda_admission_total_pages(
         kind: CudaModelKind,
         config: &EngineLoadConfig,
         page_size: usize,
         num_slots: usize,
-        dense_total_pages: usize,
+        paged_pool_pages: usize,
     ) -> usize {
         let ps = page_size.max(1);
-        // Dense: the host admission pool is exactly the device pool — the profiled
-        // page count, NOT a token-derived re-ceiling, and NOT floored at the
-        // requested config value.
-        if matches!(kind, CudaModelKind::Qwen3Dense) {
-            return dense_total_pages.max(1);
+        // Paged-pool models (dense Qwen3 + Qwen3.6): the host admission pool is
+        // exactly the device pool — the profiled page count, NOT a token-derived
+        // re-ceiling, and NOT floored at the requested config value.
+        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35) {
+            return paged_pool_pages.max(1);
         }
         let capacity_tokens = match kind {
-            CudaModelKind::Qwen3Dense => unreachable!("handled above"),
-            CudaModelKind::Qwen35 => config
-                .total_pages
-                .saturating_mul(ps)
-                .saturating_mul(num_slots.max(1)),
+            CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35 => unreachable!("handled above"),
             CudaModelKind::Dsv4 => infer_cuda::dsv4_max_seq_len()
                 .saturating_add(4096)
                 .saturating_mul(num_slots.max(1)),
@@ -1476,9 +1474,12 @@ mod backend {
             // Qwen35 clamps `num_slots` to free HBM inside the constructor
             // (`Qwen35Model::kv_budget_num_slots`, unified with DSv4 via the
             // infer-seam budget kernel) — no longer the #60 OOM risk.
-            CudaModelKind::Qwen35 => {
-                CudaExecutor::from_qwen35_safetensors(model_path, num_slots, config.total_pages)?
-            }
+            CudaModelKind::Qwen35 => CudaExecutor::from_qwen35_safetensors(
+                model_path,
+                num_slots,
+                config.total_pages,
+                config.mem_fraction_static,
+            )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the
             // environment during construction (`INFER_TP_RANK` /
@@ -1519,19 +1520,21 @@ mod backend {
         // scheduler-visible capacity that diverged from the executor's would
         // diverge the deterministic planner.
         let num_slots = executor.effective_num_slots().unwrap_or(num_slots);
-        // Dense Qwen3 profiles its device KV pool from measured free VRAM
-        // (`from_qwen3_bf16_safetensors` → `profile_kv_pool_tokens`), so the host
+        // Paged-pool models (dense Qwen3 + Qwen3.6) profile their device KV pool
+        // from measured free VRAM (`profile_kv_pool_tokens`), so the host
         // admission pool must mirror that ACTUAL page count, not the requested
-        // `config.total_pages`. Non-dense executors report `None` and the
-        // per-kind branch below ignores this argument.
-        let dense_total_pages = executor
+        // `config.total_pages`. DSv4 reports `None` and the per-kind branch below
+        // ignores this argument.
+        let paged_pool_pages = executor
             .effective_total_pages()
             .unwrap_or(config.total_pages);
         let total_pages =
-            cuda_admission_total_pages(kind, config, page_size, num_slots, dense_total_pages);
-        if matches!(kind, CudaModelKind::Qwen3Dense) && dense_total_pages != config.total_pages {
+            cuda_admission_total_pages(kind, config, page_size, num_slots, paged_pool_pages);
+        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
+            && paged_pool_pages != config.total_pages
+        {
             log::info!(
-                "CUDA dense Qwen3: profiled KV pool {dense_total_pages} pages from measured \
+                "CUDA {kind:?}: profiled full-attn KV pool {paged_pool_pages} pages from measured \
                  free VRAM (requested total_pages={}, mem_fraction_static={}); host admission \
                  follows the device pool",
                 config.total_pages,
