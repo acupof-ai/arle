@@ -1,0 +1,286 @@
+crates/infer-metal/src/gemma4.rs
+  s_027d29a10c8f65::t_5f7226ffe3d44a 139-142
+crates/mlx-sys/build.rs
+  s_027d29a10c8f65::t_99f3749730544f 138
+  s_027d29a10c8f65::t_704db8cfc28b98 194
+crates/mlx-sys/src/lib.rs
+  s_027d29a10c8f65::t_e369c37653ae2b 640-829
+crates/infer-metal/src/deepseek_ocr.rs
+  s_027d29a10c8f65::t_90172d8110d011 334
+  s_027d29a10c8f65::t_7137713543a72b 136-139
+  s_027d29a10c8f65::t_c003701c104655 1-20,22-135,140-333,335-677
+  s_027d29a10c8f65::t_79454bb73078c2 21
+crates/infer-metal/Cargo.toml
+  s_027d29a10c8f65::t_b3636baf41b298 10
+  s_027d29a10c8f65::t_e270f60a6c28e0 25
+crates/deepseek-ocr-spec/Cargo.toml
+  s_027d29a10c8f65::t_bb49fe6fbc5b8b 1-14 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3bbbe979cab8974aec7046","tool_type":"agent","tool_id":"Shell","line_ranges":[{"Range":[1,14]}]}]}
+crates/deepseek-ocr-spec/src/lib.rs
+  s_027d29a10c8f65::t_88f0d69cf726f4 1-267,273-312,316-464
+  s_027d29a10c8f65::t_6cb835833f4b39 268-272,313-315
+crates/infer-server/src/http.rs
+  s_027d29a10c8f65::t_21faa3ed0103ba 498
+  s_027d29a10c8f65::t_8c1b306785c00d 163-167,186
+  s_027d29a10c8f65::t_dd84fa59e5799d 452,454,466-477,483,493-497,499-504
+  s_027d29a10c8f65::t_55223a5f1087c0 168-177
+  s_027d29a10c8f65::t_4ba250c28c6bf1 507-533
+  s_027d29a10c8f65::t_bb49fe6fbc5b8b 505-506 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3bbbe979cab8974aec7046","tool_type":"agent","tool_id":"Shell","line_ranges":[{"Range":[505,506]}]}]}
+crates/infer-metal/src/lib.rs
+  s_027d29a10c8f65::t_7783ce9db672e9 40,44-45
+  s_027d29a10c8f65::t_0dc881b63f35c3 17-18
+crates/infer-api/src/serve_engine.rs
+  s_027d29a10c8f65::t_86520cd9f58bf9 212-215,219-225,238-244
+crates/infer-plan/src/diffusion.rs
+  s_027d29a10c8f65::t_b21e8178cbaab0 73-83
+  s_027d29a10c8f65::t_32525ced442a25 224-229
+crates/infer-plan/src/lib.rs
+  s_027d29a10c8f65::t_464f21ff733ec8 13-14
+crates/infer-metal/src/config.rs
+  s_027d29a10c8f65::t_404e17fc93f55d 144-261
+crates/infer-seam/src/diffusion_executor.rs
+  s_027d29a10c8f65::t_66b116589c4a80 272
+  s_027d29a10c8f65::t_23a432b2c049b6 273-275
+Cargo.toml
+  s_027d29a10c8f65::t_19d2334e1ab58f 11
+crates/infer-seam/src/lib.rs
+  s_027d29a10c8f65::t_3c3ed83478a7a5 140-147
+  s_027d29a10c8f65::t_dc1cb5086ee8d3 11-12
+crates/infer-api/src/loaded.rs
+  s_027d29a10c8f65::t_8cc3b657a1f74d 324-327
+  s_027d29a10c8f65::t_547e3a0638a068 1470,1722
+  s_027d29a10c8f65::t_ac5ade00697255 705-708
+  s_027d29a10c8f65::t_d145c70b8dcd9c 2216-2217
+  s_027d29a10c8f65::t_09ff1eb35c3b40 2104-2105
+  s_027d29a10c8f65::t_b9279025adb82d 805-808
+  s_027d29a10c8f65::t_199382454111bc 506-509
+  s_027d29a10c8f65::t_76650e5aa906c5 2195-2196
+  s_027d29a10c8f65::t_5ff57bf0f3ddc7 2237-2238
+  s_027d29a10c8f65::t_ee90ec9318bbdd 852-863
+  s_027d29a10c8f65::t_e202eec97bb570 2149-2150
+  s_027d29a10c8f65::t_00ff14461c6131 469-470
+  s_027d29a10c8f65::t_5c52c91df3c2f1 377-383
+  s_027d29a10c8f65::t_74e6ea67a335ea 636-639
+  s_027d29a10c8f65::t_13e454b759fc41 1156-1165
+  s_027d29a10c8f65::t_5f56aa3c077a99 1734-1739
+  s_027d29a10c8f65::t_db5de4c934e97a 674-677
+  s_027d29a10c8f65::t_968b2093c5a6f6 2125-2126
+  s_027d29a10c8f65::t_dbc693f7cc10e5 1333-1411
+  s_027d29a10c8f65::t_b046620d5e18ea 594-597
+  s_027d29a10c8f65::t_cbdbd232b9a1f5 2174-2175
+  s_027d29a10c8f65::t_3376f115694e8c 758-764
+  s_027d29a10c8f65::t_20cfe92848e359 1461-1465,1483-1490,1494-1496,1685
+  s_027d29a10c8f65::t_da7671af5f8930 551-554
+crates/infer-server/src/multimodal.rs
+  s_027d29a10c8f65::t_79a07c0c370cbb 103-194
+crates/mlx-sys/src/mlx_deepseek_ocr_model.cpp
+  s_027d29a10c8f65::t_46ab75e7f5ecf2 430
+  s_027d29a10c8f65::t_7d11e6716539d8 623-629 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3bb79679cab8974aec7003","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[623,629]}]}]}
+  s_027d29a10c8f65::t_53c68091b2e9f3 363-372 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3bb4fb79cab8974aec6fd3","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[363,372]}]}]}
+  s_027d29a10c8f65::t_6e6a030d74fc74 634-635
+  s_027d29a10c8f65::t_32fff63ef205fe 17-18
+  s_027d29a10c8f65::t_f45b3d66f8266f 384-388 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a3bb51f79cab8974aec6fd9","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[384,388]}]}]}
+  s_027d29a10c8f65::t_ce2fc95bdaac7d 893
+  s_027d29a10c8f65::t_d9d379a27afb5b 753-759
+  s_027d29a10c8f65::t_c28825cd732167 439-440,445,447-449,456,461-463,467
+  s_027d29a10c8f65::t_07cfbe46b8712b 974
+  s_027d29a10c8f65::t_06e9105a497bd7 1013
+  s_027d29a10c8f65::t_4092a19a381d1c 1-16,19-94,97-362,373-383,389-429,431-438,441-444,446,450-455,457-460,464-466,468-622,630-633,636-752,760-892,894-973,975-1012,1014-1096
+  s_027d29a10c8f65::t_d76e374055fb6e 95-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a8bad329d83c793dea6e84e04db5684306480fa9",
+  "prompts": {},
+  "sessions": {
+    "s_027d29a10c8f65": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3b86b979cab8974aec67e6",
+        "model": "openrouter-3o__max",
+        "display_model_name": "openrouter-3o"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {
+    "crates/deepseek-ocr-spec/Cargo.toml": [
+      {
+        "hash": "s_027d29a10c8f65::t_bb49fe6fbc5b8b",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              14
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3bbbe979cab8974aec7046",
+            "tool_type": "agent",
+            "tool_id": "Shell",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  14
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "crates/infer-server/src/http.rs": [
+      {
+        "hash": "s_027d29a10c8f65::t_bb49fe6fbc5b8b",
+        "line_ranges": [
+          {
+            "Range": [
+              505,
+              506
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3bbbe979cab8974aec7046",
+            "tool_type": "agent",
+            "tool_id": "Shell",
+            "line_ranges": [
+              {
+                "Range": [
+                  505,
+                  506
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "crates/mlx-sys/src/mlx_deepseek_ocr_model.cpp": [
+      {
+        "hash": "s_027d29a10c8f65::t_7d11e6716539d8",
+        "line_ranges": [
+          {
+            "Range": [
+              623,
+              629
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3bb79679cab8974aec7003",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  623,
+                  629
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_027d29a10c8f65::t_53c68091b2e9f3",
+        "line_ranges": [
+          {
+            "Range": [
+              363,
+              372
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3bb4fb79cab8974aec6fd3",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  363,
+                  372
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_027d29a10c8f65::t_f45b3d66f8266f",
+        "line_ranges": [
+          {
+            "Range": [
+              384,
+              388
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a3bb51f79cab8974aec6fd9",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  384,
+                  388
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_027d29a10c8f65": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_027d29a10c8f65::t_53c68091b2e9f3": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_027d29a10c8f65::t_7d11e6716539d8": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_027d29a10c8f65::t_bb49fe6fbc5b8b": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_027d29a10c8f65::t_f45b3d66f8266f": {
+      "tool": "trae",
+      "conversation_id": "6a3b86b979cab8974aec67e6",
+      "session_id": "6a3b86b979cab8974aec67e6",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
