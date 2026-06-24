@@ -445,6 +445,12 @@ impl RealCudaExecutor {
     /// Attach the opt-in disk spill level (pre-serve only). Returns whether
     /// any arm consumed it, so callers can fail closed instead of silently
     /// dropping an explicit `--kv-ssd-path` request.
+    ///
+    /// Dense Qwen3 wires its prefix/write-through tier's *ephemeral* spill.
+    /// Qwen3.5/3.6 has no prefix tier, but when `--kv-recall` is on its recall
+    /// tier consumes the path as a **durable** NVMe-backed store (manifest +
+    /// epoch); with recall off the Qwen3.5 arm has no tier and returns `false`
+    /// (the caller fails closed on the explicit flag).
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -452,7 +458,8 @@ impl RealCudaExecutor {
     ) -> bool {
         match self {
             Self::Qwen(q) => q.set_kv_tier_disk(root, budget_bytes),
-            Self::Qwen35(_) | Self::Dsv4(_) => false,
+            Self::Qwen35(q) => q.set_kv_recall_disk(root, budget_bytes),
+            Self::Dsv4(_) => false,
         }
     }
 
@@ -3087,18 +3094,63 @@ impl Qwen35CudaExecutor {
             // L3 write-through tier: source of truth for evict-dropped middle
             // blocks. One entry == one recall-pool page image (all `num_full`
             // layers, K+V). Host-DRAM budget is machine-derived (same policy as
-            // the prefix tier); NVMe spill is opt-in via the prefix-tier
-            // `--kv-ssd-path` wiring (a separate store today — see the report's
-            // NVMe gap note). Reuses the SAME `CudaKvTierStore` transport the
-            // dense arm's prefix/write-through tier uses (R5 — one store kind).
+            // the prefix tier). Durable NVMe spill is opt-in via
+            // [`Self::set_kv_recall_disk`] (the post-spawn `--kv-ssd-path`
+            // wiring) — the store starts host-DRAM-only here; the disk level +
+            // manifest replay attach pre-traffic. Reuses the SAME
+            // `CudaKvTierStore` transport the dense arm's prefix/write-through
+            // tier uses (R5 — one store kind).
             let tier = CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(),
                 pool.storage_bytes_per_page(),
             );
             self.recall_kv = Some(pool);
             self.recall_tier = Some(tier);
+            // Pool consolidation: the regular per-slot contiguous full-attn K/V
+            // (sized to max_seq_len, ~most of the per-slot bytes on Qwen3.6) is
+            // REDUNDANT under recall — the read-swap routes every full-attn
+            // layer through the paged `recall_kv` pool just allocated above
+            // (`full_attention_paged`), so nothing reads or writes those
+            // contiguous caches while recall is active. Free them now, once, on
+            // the first enable. Qwen3.6 is HYBRID: each slot ALSO holds the
+            // linear-attn recurrent + conv state, which `recall_kv` does NOT
+            // carry and which both paths still use — those are separately
+            // allocated `gdr_states`/`conv_states` Vecs and are left untouched
+            // (`free_full_attn_caches` drops only `k_caches`/`v_caches`).
+            // Default-off (`set_kv_recall(false)`) never reaches here, so the
+            // baseline per-slot allocation stays byte-identical.
+            for slot in &mut self.slots {
+                slot.free_full_attn_caches();
+            }
         }
         Ok(())
+    }
+
+    /// Attach a **durable, NVMe-backed** disk level to the session KV-recall
+    /// tier (`--kv-recall` + `--kv-ssd-path`). Pre-serve only, called once after
+    /// `set_kv_recall(true)` constructed the tier. Replays any prior session's
+    /// manifest under the per-process durable namespace (so its evicted KV is
+    /// addressable again) unless the weights epoch mismatches (stale memory
+    /// after an OPD weight update → start cold). Returns `false` when recall is
+    /// not active (no tier to back) so the caller can fail closed on an explicit
+    /// `--kv-ssd-path` that no arm consumed.
+    pub(crate) fn set_kv_recall_disk(
+        &mut self,
+        root: std::path::PathBuf,
+        budget_bytes: usize,
+    ) -> bool {
+        if self.recall_tier.is_none() {
+            return false;
+        }
+        let epoch = self.model.weights_epoch().to_string();
+        let tier = self.recall_tier.as_mut().expect("recall_tier present");
+        let page_bytes = tier.page_bytes();
+        let reloaded = tier.load(root, budget_bytes, page_bytes, epoch.clone());
+        info!(
+            "KV-recall durable NVMe tier attached (epoch={epoch}, reloaded_blocks={})",
+            if reloaded { ">0" } else { "0" }
+        );
+        true
     }
 
     /// Whether the full-attn KV path routes the paged recall pool this session.

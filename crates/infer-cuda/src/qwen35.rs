@@ -497,6 +497,28 @@ impl Qwen35SlotState {
     pub(crate) fn set_seq_len(&mut self, len: usize) {
         self.seq_len = len;
     }
+
+    /// Free the redundant per-slot full-attn contiguous K/V caches when session
+    /// KV-recall is enabled. Under `--kv-recall` the full-attn K/V lives in the
+    /// paged `recall_kv` pool (the read-swap routes every full-attn layer
+    /// through it via `full_attention_paged`), so these per-slot contiguous
+    /// caches — ~most of the per-slot bytes — are dead weight: nothing reads or
+    /// writes `k_caches`/`v_caches` while recall is active. The only consumers
+    /// are `full_attention` and the batched-decode pointer staging, both of
+    /// which the recall dispatch skips (the `forward_hidden` full-attn match
+    /// takes the `recall.is_some()` → `full_attention_paged` branch, and the
+    /// executor's batched-decode path bypasses on `recall_active()`). Dropping
+    /// the `DeviceVec`s frees their `CudaSlice` device memory immediately.
+    ///
+    /// The linear-attn recurrent + conv-ring state (`gdr_states`/`conv_states`)
+    /// is REQUIRED in both paths and is left untouched — Qwen3.6 is hybrid, the
+    /// recall pool carries only the full-attn layers. After this the slot holds
+    /// ONLY the linear-attn state; `seq_len` continues to track the full-attn
+    /// length via `advance_seq_len`/`set_seq_len` for the recall pool.
+    pub(crate) fn free_full_attn_caches(&mut self) {
+        self.k_caches = Vec::new();
+        self.v_caches = Vec::new();
+    }
 }
 
 /// Per-request speculative-decode state for the Qwen3.6 NextN-MTP draft head.
@@ -1133,6 +1155,11 @@ pub(crate) struct Qwen35Model {
     /// LoRA delta. Lets all-zero adapter steps skip weight uploads unless they
     /// need to restore a previously merged projection back to base.
     lora_dirty: HashSet<LoraBaseKey>,
+    /// Cheap model/weights-version tag (hash of the checkpoint's safetensors
+    /// file names + lengths + mtimes). Stamps the durable KV-recall manifest so
+    /// a restart after an OPD weight update (which rewrites the checkpoint, so
+    /// the mtimes/lengths shift) discards the now-stale recalled KV.
+    weights_epoch: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2123,7 +2150,14 @@ impl Qwen35Model {
             lora_base_dev: HashMap::new(),
             lora_delta_scratch: None,
             lora_dirty: HashSet::new(),
+            weights_epoch: crate::kv_tier::weights_epoch_tag(model_path),
         })
+    }
+
+    /// Cheap model/weights-version tag for the durable KV-recall manifest. See
+    /// the `weights_epoch` field.
+    pub(crate) fn weights_epoch(&self) -> &str {
+        &self.weights_epoch
     }
 
     /// Move every device weight buffer to host RAM and free the VRAM (OPD teacher
