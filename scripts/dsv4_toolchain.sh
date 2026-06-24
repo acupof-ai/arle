@@ -23,7 +23,11 @@ NSYS_DELAY_SECONDS="${NSYS_DELAY_SECONDS:-5}"
 NSYS_DURATION_SECONDS="${NSYS_DURATION_SECONDS:-10}"
 DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
-MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
+# Match the runtime's precedence: it reads ARLE_DSV4_MOE_TRANSPORT first, then
+# ARLE_DSV4_MOE_BACKEND (dsv4.rs dsv4_use_deepep_transport). Honoring only BACKEND
+# here lets `ARLE_DSV4_MOE_TRANSPORT=deepep_ll` (the documented canonical var) build
+# a stub binary the runtime then tries to run as LL -> boot fail.
+MOE_BACKEND="${ARLE_DSV4_MOE_TRANSPORT:-${ARLE_DSV4_MOE_BACKEND:-allreduce}}"
 EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
 NUM_SLOTS="${NUM_SLOTS:-}"
 SPEC_TYPE="${SPEC_TYPE:-none}"
@@ -200,8 +204,9 @@ deepep_layout_label() {
 # need it — deepep-sys falls back to stub mode without it. The _ll variants also
 # need NVSHMEM (auto-detected below).
 detect_deepep_dir() {
+    # Full DeepEP accept-set, matching dsv4.rs dsv4_use_deepep_transport.
     case "$MOE_BACKEND" in
-        native-deepep | deepep | deepep_ll | deepep-ll | native_deepep_ll) ;;
+        native-deepep | native_deepep | deepep | deepep_ll | deepep-ll | deepep_low_latency | native_deepep_ll) ;;
         *) return 0 ;;
     esac
 
@@ -234,7 +239,7 @@ detect_deepep_dir() {
     # compiles internode_ll against ARLE_DEEPEP_NVSHMEM_DIR, and libnvshmem_host.so
     # must be on LD_LIBRARY_PATH at runtime.
     case "$MOE_BACKEND" in
-    deepep_ll | deepep-ll | native_deepep_ll)
+    deepep_ll | deepep-ll | deepep_low_latency | native_deepep_ll)
         if [[ -z "${ARLE_DEEPEP_NVSHMEM_DIR:-}" ]]; then
             local nv
             nv="$(python3 -c 'import os,nvidia.nvshmem as n; print(os.path.dirname(n.__file__))' 2>/dev/null || true)"
@@ -312,11 +317,12 @@ env_check() {
     echo "SPEC_TYPE=$SPEC_TYPE"
     echo "MTP_DRAFT_TOKENS=${MTP_DRAFT_TOKENS:-unset}"
     echo "MTP_DRAFT_TOPK=${MTP_DRAFT_TOPK:-unset}"
-    if [[ "$MOE_BACKEND" == "native-deepep" ]]; then
+    if [[ -n "${ARLE_DEEPEP_DIR:-}" ]]; then
         echo "ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR"
         echo "ARLE_DEEPEP_LAYOUT=$(deepep_layout_label "$ARLE_DEEPEP_DIR")"
+        [[ -n "${ARLE_DEEPEP_NVSHMEM_DIR:-}" ]] && echo "ARLE_DEEPEP_NVSHMEM_DIR=$ARLE_DEEPEP_NVSHMEM_DIR"
     else
-        echo "ARLE_DEEPEP_DIR=(unset — not native-deepep)"
+        echo "ARLE_DEEPEP_DIR=(unset — non-DeepEP backend)"
     fi
 }
 
@@ -332,7 +338,7 @@ build_infer() {
     # (it transitively pulls nccl+cuda); cuda,nccl alone yields a stub DeepEP.
     local features="cuda,nccl"
     case "$MOE_BACKEND" in
-        native-deepep|deepep|deepep_ll|deepep-ll|native_deepep_ll)
+        native-deepep|native_deepep|deepep|deepep_ll|deepep-ll|deepep_low_latency|native_deepep_ll)
             features="deepep" ;;
     esac
     ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
