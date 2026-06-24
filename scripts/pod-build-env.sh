@@ -18,6 +18,12 @@ if [ -x "$_tl_venv" ]; then
 elif command -v python3 >/dev/null 2>&1 && python3 -c "import tilelang" >/dev/null 2>&1; then
   export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-$(command -v python3)}"
 fi
+# Persistent kernel-artifact cache (keyed on kernel source × SM × nvcc). build.rs
+# regenerates kernels on demand (generated/ gitignored); this cache restores a prior
+# build's identical artifacts instead of re-running TileLang+nvcc. MUST live on /host
+# (the container $HOME is ephemeral). Measured: a forced kernel regen 251s -> 53s on a
+# warm cache. Disable with ARLE_CUDA_KERNEL_CACHE=0.
+export ARLE_CUDA_KERNEL_CACHE_DIR="${ARLE_CUDA_KERNEL_CACHE_DIR:-/host/arle-kernel-cache}"
 # Fast network path: ckl's reverse SOCKS5 proxy (pod -> local network). The pod's
 # direct route to crates.io / static.rust-lang.org stalls; the proxy does not.
 export all_proxy="${all_proxy:-socks5h://127.0.0.1:1080}"
