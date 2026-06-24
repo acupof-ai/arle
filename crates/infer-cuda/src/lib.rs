@@ -227,6 +227,20 @@ impl CudaExecutor {
         }
     }
 
+    /// Apply the `--dram-fraction` knob (default 0.5): size the L2 host-DRAM KV
+    /// tier from MEASURED available DRAM at this fraction, leaving a reserve so
+    /// the shared box never swaps. Pre-serve only; run BEFORE any explicit
+    /// `--kv-t1-budget-bytes` override (the explicit cap wins).
+    pub fn set_dram_fraction(&mut self, fraction: f64) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = fraction;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.set_dram_fraction(fraction),
+        }
+    }
+
     /// Attach the opt-in disk spill level under `root` (pre-serve only).
     /// Returns whether the loaded model's arm consumed it; callers fail
     /// closed on `false` so an explicit `--kv-ssd-path` is never a silent

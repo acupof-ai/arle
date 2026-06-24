@@ -42,8 +42,9 @@ pub use kv_query::KvQuery;
 pub use kv_tier::{KvTier, TierBlockKey};
 pub use prefix_store::KvPrefixStore;
 pub use resource::{
-    HostTierBudget, HostTierPolicy, PROFILE_KV_TOKENS_FLOOR, SlotBudget, clamp_mem_fraction_static,
-    clamp_to_affordable, profile_kv_pool_tokens, split_host_tiers,
+    DramTierPolicy, HostTierBudget, HostTierPolicy, NvmeTierPolicy, PROFILE_KV_TOKENS_FLOOR,
+    SlotBudget, clamp_mem_fraction_static, clamp_to_affordable, dram_l2_budget, nvme_l3_budget,
+    profile_kv_pool_tokens, split_host_tiers,
 };
 
 /// Result of polling a submitted executor step.
