@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_backward};
-pub(crate) use attention::causal_sdpa_recompute_backward;
+pub(crate) use attention::{cat_heads_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::all_reduce_sum_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
@@ -144,6 +144,14 @@ pub fn causal_sdpa_with_q_start(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     attention::causal_sdpa_with_q_start(q, k, v, q_start, store, tape)
+}
+
+pub fn cat_heads(
+    inputs: &[TensorId],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    attention::cat_heads(inputs, store, tape)
 }
 
 pub fn causal_sdpa_decode_gqa(
