@@ -272,7 +272,12 @@ fn head_chunked_sdpa_recompute(
         .shape
         .clone();
     let (batch, heads, seq, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
-    if chunk == 0 || chunk >= heads {
+    // Adaptive: bound the [chunk, seq, seq] scores transient to ~6 GiB so long
+    // writeback sequences don't OOM (8 heads at 32K = 34 GB); short sequences
+    // keep the caller's chunk. `seq*seq*4` bytes per head.
+    let per_head = seq.saturating_mul(seq).saturating_mul(4).max(1);
+    let chunk = chunk.min((6usize << 30) / per_head).max(1);
+    if chunk >= heads {
         return Ok(causal_sdpa_recompute(q, k, v, store, tape)?);
     }
 
