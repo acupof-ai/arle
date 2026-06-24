@@ -482,9 +482,19 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) num_slots: Option<usize>,
 
-    /// Physical host KV pages for the unified scheduler.
+    /// Physical host KV pages for the unified scheduler. With the VRAM-profiled
+    /// KV pool (`--mem-fraction-static`, CUDA dense Qwen3) this is a minimum
+    /// floor: the pool is sized from measured free VRAM and only grows past this.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) total_pages: Option<usize>,
+
+    /// Fraction of total VRAM for the static KV pool, profiled from MEASURED
+    /// free VRAM after weights load (SGLang's `mem_fraction_static`). The KV
+    /// token pool gets `free − total × (1 − frac)`; the rest is headroom for
+    /// activations/scratch. Clamped to `[0.5, 0.97]`. Wired for CUDA dense Qwen3;
+    /// Qwen3.5/3.6 and DSv4 keep per-slot sizing for now. Default 0.9.
+    #[arg(long, default_value_t = 0.9)]
+    pub(crate) mem_fraction_static: f64,
 
     /// Tokens per host KV page.
     #[arg(long, value_parser = parse_positive_usize)]
