@@ -732,15 +732,26 @@ struct DeepseekOcrModel {
         return logits_from_hidden(hidden);
     }
 
-    int32_t greedy_next(const array& logits) const {
+    // Lazy greedy argmax of the last logits row -> int32 array [1]. No eval, so
+    // the result stays a graph node that the next step can build on.
+    array lazy_next_token(const array& logits) const {
         const int rows = logits.shape(0);
         if (rows <= 0) {
             throw std::runtime_error("DeepSeek-OCR logits empty");
         }
         auto last = slice(logits, {rows - 1, 0}, {rows, logits.shape(logits.ndim() - 1)});
-        auto token = contiguous(astype(argmax(last, -1, false), int32));
-        eval({token});
-        return token.data<int32_t>()[0];
+        return contiguous(astype(argmax(last, -1, false), int32)); // [1]
+    }
+
+    // Commit one lazy token id: embed it, run the decoder (lazy KV-cache update),
+    // and return next-position logits. All graph-building, no eval.
+    array commit_lazy_token(const array& token_id) {
+        auto embeds = token_embeddings(token_id); // [1, hidden]
+        auto next = layer_caches;
+        auto hidden = decode(token_id, embeds, next, context_len);
+        layer_caches = std::move(next);
+        context_len += 1;
+        return logits_from_hidden(hidden);
     }
 
     bool is_stop(uint32_t token, const uint32_t* stop_ids, int stop_ids_len) const {
@@ -752,28 +763,52 @@ struct DeepseekOcrModel {
         return false;
     }
 
+    // Software-pipelined greedy decode: build step N+1's graph and async_eval its
+    // token BEFORE eval-ing step N's token, so the CPU encodes the next step while
+    // the GPU finishes the current one (hides the per-step encode cost that caps
+    // the M-series Metal path well below the bandwidth ceiling).
     int generate(array logits, int max_new_tokens, const uint32_t* stop_ids, int stop_ids_len,
                  DeepseekCancelFn cancel_fn, const void* cancel_ctx,
                  uint32_t* out_tokens, int* out_finish) {
         std::vector<int32_t> output;
         output.reserve(static_cast<size_t>(std::max(max_new_tokens, 0)));
         *out_finish = 0;
-        while (static_cast<int>(output.size()) < max_new_tokens) {
+        if (max_new_tokens <= 0) {
+            return 0;
+        }
+
+        array y = lazy_next_token(logits); // token 0 (lazy)
+        async_eval(y);
+
+        int generated = 0;
+        while (generated < max_new_tokens) {
             if (cancelled(cancel_fn, cancel_ctx)) {
                 throw std::runtime_error("DeepSeek-OCR generation cancelled");
             }
-            const int32_t next = greedy_next(logits);
-            output.push_back(next);
-            const uint32_t next_u32 = static_cast<uint32_t>(next);
-            if (is_stop(next_u32, stop_ids, stop_ids_len)) {
+            const bool last_iter = (generated + 1 >= max_new_tokens);
+            // Build the next step's graph speculatively (one wasted step at most if
+            // the current token turns out to be a stop token — standard pipelining).
+            array next_y = y;
+            if (!last_iter) {
+                auto next_logits = commit_lazy_token(y);
+                next_y = lazy_next_token(next_logits);
+                async_eval(next_y);
+            }
+            // The GPU has been computing `y` while we built the next graph above.
+            eval(y);
+            const int32_t tok = y.item<int32_t>();
+            output.push_back(tok);
+            generated++;
+            if (is_stop(static_cast<uint32_t>(tok), stop_ids, stop_ids_len)) {
                 *out_finish = 1;
                 break;
             }
-            if (static_cast<int>(output.size()) >= max_new_tokens) {
+            if (last_iter) {
                 break;
             }
-            logits = commit_tokens_and_logits(&next, 1);
+            y = next_y;
         }
+
         for (size_t i = 0; i < output.size(); ++i) {
             out_tokens[i] = static_cast<uint32_t>(output[i]);
         }
