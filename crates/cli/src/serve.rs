@@ -439,6 +439,8 @@ fn resolve_engine_config(
     }
     config.max_thinking_tokens = serve_args.max_thinking_tokens;
     config.mem_fraction_static = serve_args.mem_fraction_static;
+    config.dram_fraction = serve_args.dram_fraction;
+    config.ssd_fraction = serve_args.ssd_fraction;
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = value;
     }

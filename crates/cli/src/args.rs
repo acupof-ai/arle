@@ -496,6 +496,22 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.9)]
     pub(crate) mem_fraction_static: f64,
 
+    /// Fraction of *available* host DRAM the L2 (host-DRAM) KV tier may claim.
+    /// The store is pageable host memory on a (shared) box, so the default 0.5
+    /// is deliberately conservative — the budget is
+    /// `clamp(frac × MemAvailable, [4 GiB, MemAvailable − max(64 GiB, 0.15 ×
+    /// MemTotal)])`, leaving a reserve so the OS never swaps/OOM-kills. CUDA
+    /// only; `--kv-t1-budget-bytes` is an explicit override that wins. Default 0.5.
+    #[arg(long, default_value_t = 0.5)]
+    pub(crate) dram_fraction: f64,
+
+    /// Fraction of *free* disk the L3 (NVMe) KV tier may claim when `--kv-ssd-path`
+    /// is set without `--kv-ssd-max-bytes`. Budget is `clamp(frac × free_disk,
+    /// [8 GiB, free_disk − max(50 GiB, 0.1 × total_disk)])`, reserving room for
+    /// the FS + co-tenants. Default 0.5.
+    #[arg(long, default_value_t = 0.5)]
+    pub(crate) ssd_fraction: f64,
+
     /// Tokens per host KV page.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) page_size: Option<usize>,
