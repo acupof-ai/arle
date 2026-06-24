@@ -342,6 +342,25 @@ pub struct SharedFp8BaseProjection {
     pub block_k: usize,
 }
 
+/// Host image of one whole slot for G3 capacity spill (mirror of
+/// [`crate::dsv4::Dsv4SlotImage`]): the slot's full-attn KV pages plus the
+/// per-linear-layer recurrent + conv state and the materialized length. Every
+/// device buffer the slot owns is captured here byte-for-byte — a missed buffer
+/// is a silently-wrong restore. `k_caches`/`v_caches` are NOT captured: the
+/// paged default leaves them empty (full-attn KV is paged), asserted at capture.
+pub(crate) struct Qwen35SlotImage {
+    /// Full-attn KV bytes in slot-logical page order (from `copy_pages_to_host`).
+    full_attn_pages: Vec<u8>,
+    /// Logical page count the bytes cover (drives swap-in page allocation).
+    full_attn_page_count: usize,
+    /// `[num_linear]` gated-delta recurrent states (f32), D2H verbatim.
+    gdr_host: Vec<Vec<f32>>,
+    /// `[num_linear]` conv1d rings (bf16), D2H verbatim.
+    conv_host: Vec<Vec<bf16>>,
+    /// Materialized full-attn length the image was captured at.
+    seq_len: usize,
+}
+
 /// Per-slot gated-delta recurrent state (state + conv ring per linear-attn
 /// layer). Carried across prefill/decode for one request.
 ///
@@ -565,6 +584,136 @@ impl Qwen35SlotState {
     pub(crate) fn free_full_attn_caches(&mut self) {
         self.k_caches = Vec::new();
         self.v_caches = Vec::new();
+    }
+
+    /// Serialize this slot's COMPLETE device state into a host image for G3
+    /// whole-slot spill, then FREE the device buffers (pages back to
+    /// `full_attn_kv`, recurrent block back to `pool`). Mirror of
+    /// [`crate::dsv4::Dsv4SlotState::swap_out_image`]. The engine frees the slot
+    /// right after `demote_slot`, so the trailing `ctx.sync()` (inside
+    /// `copy_pages_to_host` for pages, explicit here for the recurrent D2H) makes
+    /// the host image complete before any device buffer is reused.
+    ///
+    /// Captured buffers (every device buffer the slot owns, proven complete):
+    ///   (a) full-attn KV pages — `full_attn_kv.page_indices(slot)` →
+    ///       `copy_pages_to_host`, then `free_slot` returns them to the pool.
+    ///   (b) `gdr_states[0..num_linear]` (f32) — `clone_dtoh` each.
+    ///   (c) `conv_states[0..num_linear]` (bf16) — `clone_dtoh` each.
+    ///   (d) `seq_len`.
+    /// Then `release_recurrent` returns the recurrent block to the free-list.
+    /// `k_caches`/`v_caches` are asserted empty (paged default) — not captured.
+    pub(crate) fn swap_out_image(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        full_attn_kv: &mut PagedKVPool,
+        recurrent_pool: &mut Vec<RecurrentBlock>,
+    ) -> Result<Qwen35SlotImage> {
+        ensure!(
+            self.k_caches.is_empty() && self.v_caches.is_empty(),
+            "Qwen3.6 whole-slot swap requires the paged full-attn default; \
+             the legacy contiguous K/V caches are not captured (slot {slot})"
+        );
+        ensure!(
+            self.seq_len == full_attn_kv.seq_len(slot),
+            "Qwen3.6 swap-out slot {slot} seq_len {} != pool seq_len {}",
+            self.seq_len,
+            full_attn_kv.seq_len(slot)
+        );
+        // (a) Full-attn KV pages (slot-logical order). `copy_pages_to_host` ends
+        // in `ctx.sync()`, so the host bytes are complete here.
+        let pages = full_attn_kv.page_indices(slot).to_vec();
+        let full_attn_pages = full_attn_kv.copy_pages_to_host(ctx, &pages)?;
+        let full_attn_page_count = pages.len();
+        // (b) + (c) recurrent + conv D2H (stream-ordered; sync below covers them).
+        let mut gdr_host = Vec::with_capacity(self.gdr_states.len());
+        for s in &self.gdr_states {
+            gdr_host.push(
+                ctx.stream
+                    .clone_dtoh(s)
+                    .map_err(|e| anyhow!("Qwen3.6 swap gdr-state D2H failed: {e}"))?,
+            );
+        }
+        let mut conv_host = Vec::with_capacity(self.conv_states.len());
+        for c in &self.conv_states {
+            conv_host.push(
+                ctx.stream
+                    .clone_dtoh(&c.data)
+                    .map_err(|e| anyhow!("Qwen3.6 swap conv-state D2H failed: {e}"))?,
+            );
+        }
+        // The clone_dtoh copies above are stream-ordered; drain before the host
+        // image is stored/read (matches DSv4 swap_out_image's trailing sync).
+        ctx.sync()?;
+        let image = Qwen35SlotImage {
+            full_attn_pages,
+            full_attn_page_count,
+            gdr_host,
+            conv_host,
+            seq_len: self.seq_len,
+        };
+        // Free every device buffer now that the image owns the state.
+        full_attn_kv.free_slot(slot);
+        self.release_recurrent(recurrent_pool);
+        self.seq_len = 0;
+        Ok(image)
+    }
+
+    /// Restore a whole-slot image into this slot — the exact byte-inverse of
+    /// [`Self::swap_out_image`]. Allocate fresh pages + recurrent block, H2D the
+    /// captured bytes verbatim (the SAME session restores its OWN state, so this
+    /// is a byte-restore, not a reuse), and set `seq_len`. The engine resumes
+    /// decode immediately after `promote_slot`, so the trailing `ctx.sync()`
+    /// makes the device restore complete before the host image can be dropped.
+    pub(crate) fn swap_in_image(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        full_attn_kv: &mut PagedKVPool,
+        recurrent_pool: &mut Vec<RecurrentBlock>,
+        num_linear: usize,
+        gdr_state_len: usize,
+        conv_len: usize,
+        image: &Qwen35SlotImage,
+    ) -> Result<()> {
+        ensure!(
+            !self.has_recurrent() && full_attn_kv.seq_len(slot) == 0,
+            "Qwen3.6 swap-in requires an empty slot {slot} (recurrent={}, pool seq_len={})",
+            self.has_recurrent(),
+            full_attn_kv.seq_len(slot)
+        );
+        ensure!(
+            image.gdr_host.len() == num_linear && image.conv_host.len() == num_linear,
+            "Qwen3.6 swap image linear count {}/{} != num_linear {num_linear}",
+            image.gdr_host.len(),
+            image.conv_host.len()
+        );
+        // (a) Allocate exactly the captured pages and H2D the full-attn bytes.
+        let pages = full_attn_kv.alloc_tokens(slot, image.seq_len)?;
+        ensure!(
+            pages.len() == image.full_attn_page_count,
+            "Qwen3.6 swap-in allocated {} pages != captured {}",
+            pages.len(),
+            image.full_attn_page_count
+        );
+        full_attn_kv.copy_pages_from_host(ctx, &pages, &image.full_attn_pages)?;
+        // (b) + (c) acquire a fresh recurrent block (alloc+zero) then H2D-restore.
+        self.acquire_recurrent(ctx, num_linear, gdr_state_len, conv_len, recurrent_pool)?;
+        for (dst, src) in self.gdr_states.iter_mut().zip(&image.gdr_host) {
+            ctx.stream
+                .memcpy_htod(src, dst)
+                .map_err(|e| anyhow!("Qwen3.6 swap gdr-state H2D failed: {e}"))?;
+        }
+        for (dst, src) in self.conv_states.iter_mut().zip(&image.conv_host) {
+            ctx.stream
+                .memcpy_htod(src, &mut dst.data)
+                .map_err(|e| anyhow!("Qwen3.6 swap conv-state H2D failed: {e}"))?;
+        }
+        // (d) materialized length (both the slot and the pool's allocator agree).
+        self.seq_len = image.seq_len;
+        // H2D complete before the host image can be dropped (matches DSv4).
+        ctx.sync()?;
+        Ok(())
     }
 }
 

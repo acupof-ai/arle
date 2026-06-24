@@ -370,34 +370,40 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Whole-slot KV tier hooks. CUDA currently implements these only for the
-    /// DSv4 executor arm; other arms report no slot tier.
+    /// Whole-slot KV tier hooks. CUDA implements these for the DSv4 and Qwen3.6
+    /// (G3 capacity spill) executor arms; dense Qwen3 reports no slot tier (its
+    /// page-granular radix tier handles capacity).
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         match self {
             Self::Dsv4(d) => d.kv_slot_tier_enabled(),
-            Self::Qwen(_) | Self::Qwen35(_) => false,
+            Self::Qwen35(q) => q.kv_slot_tier_enabled(),
+            Self::Qwen(_) => false,
         }
     }
 
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         match self {
             Self::Dsv4(d) => d.demote_slot(slot, key),
-            Self::Qwen(_) | Self::Qwen35(_) => Ok(false),
+            Self::Qwen35(q) => q.demote_slot(slot, key),
+            Self::Qwen(_) => Ok(false),
         }
     }
 
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.promote_slot(key, slot),
-            Self::Qwen(_) | Self::Qwen35(_) => {
-                anyhow::bail!("whole-slot KV tier store is implemented only for DSv4 CUDA")
+            Self::Qwen35(q) => q.promote_slot(key, slot),
+            Self::Qwen(_) => {
+                anyhow::bail!("whole-slot KV tier store is not implemented for dense Qwen3 CUDA")
             }
         }
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        if let Self::Dsv4(d) = self {
-            d.drop_kv_slot_entries(keys);
+        match self {
+            Self::Dsv4(d) => d.drop_kv_slot_entries(keys),
+            Self::Qwen35(q) => q.drop_kv_slot_entries(keys),
+            Self::Qwen(_) => {}
         }
     }
 
@@ -2928,6 +2934,14 @@ impl Qwen35DecodeGraph {
     }
 }
 
+/// One demoted Qwen3.6 slot for G3 whole-slot capacity spill: the complete
+/// device-state image in host DRAM. Unlike DSv4 there is no executor-level MTP
+/// spec chain to carry (`Qwen35SpecSlotState` is test-only — the executor has
+/// no `spec_slots` field), so the entry is just the image.
+struct Qwen35SlotSwapEntry {
+    image: crate::qwen35::Qwen35SlotImage,
+}
+
 /// Qwen3.5 / Qwen3.6 HYBRID executor: drives
 /// [`crate::qwen35::Qwen35Model::forward_tokens`] per single-row sub-step and
 /// [`crate::qwen35::Qwen35Model::forward_decode_batch`] for rows>1 pure-decode
@@ -2949,6 +2963,11 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
     /// A slot's recurrent state is EMPTY until its first request activates it.
     slots: Vec<crate::qwen35::Qwen35SlotState>,
+    /// G3 whole-slot capacity spill (L2 = host DRAM). An inactive/retracted
+    /// request parks its whole slot image here instead of being dropped +
+    /// recomputed; restored on resume. The BTreeMap of host images IS the L2
+    /// (mirror of DSv4's `slot_swap_store`) — no separate tier abstraction.
+    slot_swap_store: std::collections::BTreeMap<u64, Qwen35SlotSwapEntry>,
     /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
     /// finished request, popped by the next — so only ACTIVE slots hold a block,
     /// not all `num_slots`. Grows to `num_slots` at full concurrency (then HBM ==
@@ -3057,6 +3076,103 @@ impl Qwen35CudaExecutor {
             pages_only_reusable_prefix_blocks(blocks, |_| false)
         } else {
             0
+        }
+    }
+
+    /// G3 whole-slot spill is single-rank today (mirror of DSv4's guard).
+    /// Multi-rank demote/promote must execute on EVERY rank in lockstep (the
+    /// seam hooks fire on the coordinator only) or the deterministic planner
+    /// diverges and NCCL deadlocks — out of scope.
+    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
+        let world_size = self.model.tp.config().world_size;
+        if world_size > 1 {
+            static MULTI_RANK_LOGGED: std::sync::Once = std::sync::Once::new();
+            MULTI_RANK_LOGGED.call_once(|| {
+                info!(
+                    "Qwen3.6 whole-slot KV tier disabled at world_size={world_size}: \
+                     multi-rank lockstep swap is not implemented"
+                );
+            });
+            return false;
+        }
+        true
+    }
+
+    /// Demote `slot`'s entire device state into the host store under `key`. The
+    /// copy is complete before returning (`swap_out_image` ends in `ctx.sync()`),
+    /// so the engine may free the slot immediately. Returns `Ok(false)` when the
+    /// store is at its v1 count cap (engine falls back to plain recompute).
+    pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
+        ensure!(
+            slot < self.num_slots,
+            "Qwen3.6 demote slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        // v1 count cap, mirror of DSv4. The budget-aware cap
+        // (`dram_l2_budget / image_bytes`, ~5500 images at 147 MiB) is the
+        // tunable upgrade — not implemented here.
+        if !self.slot_swap_store.contains_key(&key)
+            && self.slot_swap_store.len() >= self.num_slots.saturating_mul(2)
+        {
+            return Ok(false);
+        }
+        let Self {
+            model,
+            slots,
+            full_attn_kv,
+            recurrent_pool,
+            ..
+        } = self;
+        let pool = full_attn_kv
+            .as_mut()
+            .expect("full_attn_kv present (whole-slot demote)");
+        let image = slots[slot].swap_out_image(&model.ctx, slot, pool, recurrent_pool)?;
+        self.slot_swap_store
+            .insert(key, Qwen35SlotSwapEntry { image });
+        Ok(true)
+    }
+
+    /// Restore the whole-slot image stored under `key` into `slot`. The engine
+    /// resumes decode at the demoted position right after this returns, and drops
+    /// the entry via [`Self::drop_kv_slot_entries`] — the entry intentionally
+    /// stays in the store here. `swap_in_image` ends in `ctx.sync()`, so the
+    /// device restore is complete before the host image can be dropped.
+    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "Qwen3.6 promote slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+        let Self {
+            model,
+            slots,
+            full_attn_kv,
+            recurrent_pool,
+            slot_swap_store,
+            ..
+        } = self;
+        let entry = slot_swap_store.get(&key).ok_or_else(|| {
+            anyhow::anyhow!("Qwen3.6 whole-slot KV store has no image for key {key}")
+        })?;
+        let pool = full_attn_kv
+            .as_mut()
+            .expect("full_attn_kv present (whole-slot promote)");
+        slots[slot].swap_in_image(
+            &model.ctx,
+            slot,
+            pool,
+            recurrent_pool,
+            num_linear,
+            gdr_len,
+            conv_len,
+            &entry.image,
+        )
+    }
+
+    pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
+        for key in keys {
+            self.slot_swap_store.remove(key);
         }
     }
 
@@ -3206,6 +3322,7 @@ impl Qwen35CudaExecutor {
         let executor = Self {
             model,
             slots,
+            slot_swap_store: std::collections::BTreeMap::new(),
             recurrent_pool: Vec::new(),
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
