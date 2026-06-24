@@ -8,7 +8,7 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, all_reduce_sum, causal_sdpa_recompute,
+        MoeTopK, add, add_broadcast, all_reduce_sum, cat_heads, causal_sdpa_recompute,
         causal_sdpa_with_q_start, checkpoint, embedding, linear_attention_core,
         matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
         moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
@@ -244,6 +244,45 @@ impl Qwen35TensorParallelConfig {
     fn full_attn_kv_dim(self, cfg: &Qwen35Config) -> Result<usize> {
         Ok(self.local_key_value_heads(cfg)? * cfg.head_dim)
     }
+}
+
+/// Heads per chunk for `head_chunked_sdpa_recompute` — bounds the live
+/// `[chunk_heads, seq, seq]` scores to avoid OOM at long seq.
+const ATTN_HEAD_CHUNK: usize = 8;
+
+// Head-chunked causal SDPA: heads are independent so chunking is numerically exact;
+// bounds the live [chunk_heads, seq, seq] scores to avoid OOM at long seq.
+fn head_chunked_sdpa_recompute(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    chunk: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let q_shape = store
+        .get(q)
+        .ok_or(AutogradError::InvalidTensorId(q))?
+        .shape
+        .clone();
+    let (batch, heads, seq, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+    if chunk == 0 || chunk >= heads {
+        return Ok(causal_sdpa_recompute(q, k, v, store, tape)?);
+    }
+
+    let mut chunks: Vec<TensorId> = Vec::new();
+    let mut h0 = 0usize;
+    while h0 < heads {
+        let h1 = (h0 + chunk).min(heads);
+        let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+        let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+        let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+        chunks.push(causal_sdpa_recompute(
+            q_chunk, k_chunk, v_chunk, store, tape,
+        )?);
+        h0 = h1;
+    }
+    Ok(cat_heads(&chunks, store, tape)?)
 }
 
 fn divide_tp(value: usize, world_size: usize, message: &'static str) -> Result<usize> {
@@ -1453,7 +1492,7 @@ impl Qwen35Layer {
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
-        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
+        let attn_hidden = head_chunked_sdpa_recompute(q, k, v, ATTN_HEAD_CHUNK, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -1587,7 +1626,7 @@ impl Qwen35Layer {
         trace_attention_component(trace, layer_index, "repeat_kv", profile.repeat_kv);
 
         let started = Instant::now();
-        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
+        let attn_hidden = head_chunked_sdpa_recompute(q, k, v, ATTN_HEAD_CHUNK, store, tape)?;
         profile.sdpa += started.elapsed();
         trace_attention_component(trace, layer_index, "sdpa", profile.sdpa);
 
@@ -5792,6 +5831,71 @@ mod tests {
         let backend = Arc::new(CudaBackend::new(ordinal)?);
         let mut store = TensorStore::with_backend(backend);
         run_qwen35_checkpoint_lora_fd_gate(&mut store)?;
+        Ok(())
+    }
+
+    fn det_vec(len: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut state = seed;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = ((state >> 40) as f32) / ((1u64 << 24) as f32);
+            out.push((unit - 0.5) * scale);
+        }
+        out
+    }
+
+    #[test]
+    fn head_chunked_sdpa_matches_unchunked() -> TestResult {
+        use autograd::Tensor;
+
+        const BATCH: usize = 1;
+        const HEADS: usize = 4;
+        const SEQ: usize = 8;
+        const HEAD_DIM: usize = 16;
+        let shape = vec![BATCH, HEADS, SEQ, HEAD_DIM];
+        let size: usize = shape.iter().product();
+
+        let mut store = TensorStore::default();
+        let q = store.alloc(Tensor::new(
+            det_vec(size, 0x4d59_5df4, 0.1),
+            shape.clone(),
+            false,
+        )?);
+        let k = store.alloc(Tensor::new(
+            det_vec(size, 0x7a35_2b19, 0.1),
+            shape.clone(),
+            false,
+        )?);
+        let v = store.alloc(Tensor::new(
+            det_vec(size, 0x1f12_d9e7, 0.3),
+            shape.clone(),
+            false,
+        )?);
+
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let reference_id = super::causal_sdpa_recompute(q, k, v, &mut store, &mut tape)?;
+        let reference = store.to_host(reference_id)?;
+
+        for chunk in [4usize, 2, 1] {
+            let mut tape = Tape::new();
+            tape.set_enabled(false);
+            let out = super::head_chunked_sdpa_recompute(q, k, v, chunk, &mut store, &mut tape)?;
+            let got = store.to_host(out)?;
+            let max_abs = reference
+                .iter()
+                .zip(got.iter())
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            eprintln!("head_chunked_sdpa chunk={chunk} max_abs_diff={max_abs:.3e}");
+            assert!(
+                max_abs < 1e-4,
+                "chunk={chunk} diverged from unchunked: max_abs={max_abs:.3e}"
+            );
+        }
         Ok(())
     }
 }

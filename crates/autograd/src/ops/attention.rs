@@ -386,6 +386,137 @@ fn causal_sdpa_recompute_backward_device(
     Ok(grads)
 }
 
+/// Concatenate rank-4 `[batch, heads_i, seq, head_dim]` tensors along the
+/// head axis (axis 1). Host-only path — runs ~once per layer, not in the
+/// inner softmax loop, so correctness over speed (mirrors `slice_host_eager`).
+pub fn cat_heads(
+    inputs: &[TensorId],
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    if inputs.is_empty() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: 1,
+            got: 0,
+        });
+    }
+    if inputs.len() == 1 {
+        return Ok(inputs[0]);
+    }
+
+    // Validate ranks + matching batch/seq/head_dim; heads may differ.
+    let first_shape = store.tensor(inputs[0])?.shape.clone();
+    if first_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: first_shape.len(),
+        });
+    }
+    let (batch, seq, head_dim) = (first_shape[0], first_shape[2], first_shape[3]);
+    let mut head_counts = Vec::with_capacity(inputs.len());
+    let mut total_heads = 0usize;
+    let mut requires_grad = false;
+    for &id in inputs {
+        let t = store.tensor(id)?;
+        if t.shape.len() != 4 {
+            return Err(AutogradError::InvalidRank {
+                expected: "4",
+                got: t.shape.len(),
+            });
+        }
+        if t.shape[0] != batch || t.shape[2] != seq || t.shape[3] != head_dim {
+            return Err(AutogradError::ShapeMismatch {
+                expected: first_shape.clone(),
+                got: t.shape.clone(),
+            });
+        }
+        head_counts.push(t.shape[1]);
+        total_heads += t.shape[1];
+        requires_grad |= t.requires_grad;
+    }
+
+    let out_shape = vec![batch, total_heads, seq, head_dim];
+    let mut data = vec![0.0_f32; batch * total_heads * seq * head_dim];
+    let block = seq * head_dim;
+    for (i, &id) in inputs.iter().enumerate() {
+        let heads_i = head_counts[i];
+        let head_offset: usize = head_counts[..i].iter().sum();
+        let src = store.tensor_host(id)?;
+        for batch_idx in 0..batch {
+            let out_base = (batch_idx * total_heads + head_offset) * block;
+            let src_base = (batch_idx * heads_i) * block;
+            let len = heads_i * block;
+            data[out_base..out_base + len].copy_from_slice(&src.data[src_base..src_base + len]);
+        }
+    }
+
+    let output_id = store.alloc(Tensor::new(data, out_shape, requires_grad)?);
+
+    if tape.enabled && requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::CatHeads,
+            output_id,
+            input_ids: inputs.iter().copied().collect(),
+            saved: SavedContext::CatHeadsCtx { head_counts },
+        });
+    }
+
+    Ok(output_id)
+}
+
+pub(crate) fn cat_heads_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::CatHeadsCtx { head_counts } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "cat_heads backward missing saved context",
+        ));
+    };
+
+    let upstream = store.tensor_host(output_grad_id)?;
+    let upstream_shape = upstream.shape.clone();
+    if upstream_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: upstream_shape.len(),
+        });
+    }
+    let (batch, total_heads, seq, head_dim) = (
+        upstream_shape[0],
+        upstream_shape[1],
+        upstream_shape[2],
+        upstream_shape[3],
+    );
+    let block = seq * head_dim;
+
+    let mut grads = GradPairs::new();
+    for (i, &input_id) in entry.input_ids.iter().enumerate() {
+        if !store.tensor(input_id)?.requires_grad {
+            continue;
+        }
+        let heads_i = head_counts[i];
+        let head_offset: usize = head_counts[..i].iter().sum();
+        let mut grad = vec![0.0_f32; batch * heads_i * block];
+        for batch_idx in 0..batch {
+            let src_base = (batch_idx * total_heads + head_offset) * block;
+            let dst_base = (batch_idx * heads_i) * block;
+            let len = heads_i * block;
+            grad[dst_base..dst_base + len]
+                .copy_from_slice(&upstream.data[src_base..src_base + len]);
+        }
+        let grad_id = store.alloc(Tensor::new(
+            grad,
+            vec![batch, heads_i, seq, head_dim],
+            false,
+        )?);
+        grads.push((input_id, grad_id));
+    }
+
+    Ok(grads)
+}
+
 fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
     let mut data = vec![0.0; seq_len * seq_len];
     for row in 0..seq_len {
