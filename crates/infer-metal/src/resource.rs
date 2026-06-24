@@ -47,6 +47,9 @@ pub struct MetalResourceRequest {
     pub memory_budget_bytes: Option<usize>,
     pub system_reserve_bytes: Option<usize>,
     pub allow_swap: bool,
+    /// Fraction of the anti-swap-clamped `memory_limit` the KV pool may claim
+    /// (SGLang `mem_fraction_static`); the rest is non-KV headroom.
+    pub mem_fraction_static: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,7 +139,7 @@ pub struct MetalResourcePlan {
     pub runtime_headroom_bytes: usize,
     pub static_state_bytes: usize,
     pub kv_budget_bytes: usize,
-    pub kv_bytes_per_token_all_slots: usize,
+    pub kv_bytes_per_token: usize,
     pub requested_total_pages: usize,
     pub planned_total_pages: usize,
     pub capacity_tokens: usize,
@@ -267,20 +270,18 @@ pub fn plan_resource_budget(
         WIRED_HEADROOM_BYTES / GIB,
     );
 
-    let kv_bytes_per_token_all_slots =
-        kv_bytes_per_token_per_slot(&model_config, request.kv_cache_dtype)?
-            .checked_mul(request.num_slots.max(1))
-            .ok_or_else(|| anyhow::anyhow!("Metal KV byte estimate overflowed"))?;
-    anyhow::ensure!(
-        kv_bytes_per_token_all_slots > 0,
-        "Metal KV byte estimate was zero"
-    );
-    // Shared budget kernel: kv_budget = limit − fixed (saturating == plain here,
-    // guarded by the fits_fixed ensure above); max tokens = budget / per-token.
-    let token_budget = infer_seam::SlotBudget::from_limit(
+    // ONE shared num_slots-independent token pool (mirrors CUDA): per-token cost
+    // is NOT multiplied by num_slots — num_slots is a zero-HBM soft cap.
+    let kv_bytes_per_token = kv_bytes_per_token_per_slot(&model_config, request.kv_cache_dtype)?;
+    anyhow::ensure!(kv_bytes_per_token > 0, "Metal KV byte estimate was zero");
+    // Shared budget kernel with `mem_fraction_static`: kv_budget = floor(limit ×
+    // frac) − fixed, the anti-swap clamp already baked into `memory_limit`.
+    let mem_fraction = infer_seam::clamp_mem_fraction_static(request.mem_fraction_static);
+    let token_budget = infer_seam::SlotBudget::from_free(
         memory_limit_bytes,
+        mem_fraction,
         fixed_bytes,
-        kv_bytes_per_token_all_slots,
+        kv_bytes_per_token,
     );
     let kv_budget_bytes = token_budget.budget_bytes;
     let max_capacity_tokens = token_budget.affordable().unwrap_or(0);
@@ -292,11 +293,10 @@ pub fn plan_resource_budget(
     anyhow::ensure!(
         max_total_pages > 0,
         "Metal resource guard rejected startup: {system_status_line}; remaining KV budget {} MiB cannot hold one {}-token page \
-         ({} bytes/token across {} slot(s)).",
+         ({} bytes/token, shared pool).",
         kv_budget_bytes / MIB,
         request.page_size.max(1),
-        kv_bytes_per_token_all_slots,
-        request.num_slots.max(1),
+        kv_bytes_per_token,
     );
 
     // Shared clamp: planned = min(requested, max_total_pages); both ≥1 here, so
@@ -323,7 +323,7 @@ pub fn plan_resource_budget(
         runtime_headroom_bytes,
         static_state_bytes,
         kv_budget_bytes,
-        kv_bytes_per_token_all_slots,
+        kv_bytes_per_token,
         requested_total_pages,
         planned_total_pages,
         capacity_tokens: capacity_tokens.min(requested_capacity_tokens),
@@ -435,7 +435,7 @@ pub fn plan_weight_only_resource_budget(
         runtime_headroom_bytes,
         static_state_bytes: 0,
         kv_budget_bytes: memory_limit_bytes.saturating_sub(fixed_bytes),
-        kv_bytes_per_token_all_slots: 0,
+        kv_bytes_per_token: 0,
         requested_total_pages: 0,
         planned_total_pages: 0,
         capacity_tokens: usize::MAX,

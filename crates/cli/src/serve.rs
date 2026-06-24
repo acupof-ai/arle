@@ -434,7 +434,7 @@ fn resolve_engine_config(
 
     config.kv_recall = serve_args.kv_recall;
 
-    if let Some(value) = serve_args.num_slots {
+    if let Some(value) = serve_args.max_running_requests {
         config.num_slots = value;
     }
     if let Some(value) = serve_args.total_pages {
