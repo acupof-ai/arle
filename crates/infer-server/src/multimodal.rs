@@ -100,3 +100,95 @@ fn gemma4_resize_shape(width: usize, height: usize) -> Result<(usize, usize)> {
     }
     Ok((target_width, target_height))
 }
+
+// ── DeepSeek-OCR (deepseekocr) ─────────────────────────────────────────────
+//
+// Base-view-only preprocessing for the 1024x1024 global view (single image, no
+// dynamic crop tiling). The DeepEncoder compresses the 64x64 patch grid to
+// 16x16 = 256 soft tokens; the processor lays them out row-major with one
+// `image_newline` per row (16x17 = 272) plus a trailing `view_separator`, so the
+// chat prompt carries exactly (16+1)*16 + 1 = 273 `<image>` placeholders.
+
+/// The `<image>` placeholder the DeepSeek-OCR chat/template path emits.
+pub const DEEPSEEK_OCR_IMAGE_MARKER: &str = "<image>";
+const DEEPSEEK_OCR_BASE_SIZE: usize = 1024;
+const DEEPSEEK_OCR_PATCH_SIZE: usize = 16;
+const DEEPSEEK_OCR_DOWNSAMPLE: usize = 4;
+
+/// Soft-token count for the 1024x1024 base view: a 16x16 grid + one newline per
+/// row + one trailing separator = (q+1)*q + 1 where q = 1024/16/4 = 16.
+fn deepseek_ocr_soft_token_count() -> usize {
+    let q = DEEPSEEK_OCR_BASE_SIZE / DEEPSEEK_OCR_PATCH_SIZE / DEEPSEEK_OCR_DOWNSAMPLE; // 16
+    (q + 1) * q + 1
+}
+
+/// Preprocess one image into the DeepSeek-OCR base view: aspect-preserving pad
+/// to 1024x1024 (gray 0.5 fill, centered), normalized `(v/255 - 0.5)/0.5`,
+/// channel-first `[3,1024,1024]`. `soft_token_count` is the number of `<image>`
+/// placeholders the prompt must carry.
+pub fn preprocess_deepseek_ocr_image(bytes: &[u8]) -> Result<MultimodalImage> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|err| anyhow!("invalid image data: {err}"))?
+        .to_rgb8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        anyhow::bail!("image dimensions must be non-zero");
+    }
+    let target = DEEPSEEK_OCR_BASE_SIZE as u32;
+    // Aspect-preserving scale to fit inside target x target (ImageOps.pad).
+    let scale = (target as f64 / width as f64).min(target as f64 / height as f64);
+    let new_w = ((width as f64 * scale).round() as u32).clamp(1, target);
+    let new_h = ((height as f64 * scale).round() as u32).clamp(1, target);
+    let resized = image::imageops::resize(
+        &image,
+        new_w,
+        new_h,
+        image::imageops::FilterType::CatmullRom,
+    );
+    let off_x = ((target - new_w) / 2) as usize;
+    let off_y = ((target - new_h) / 2) as usize;
+    let side = target as usize;
+    let plane = side * side;
+    // Gray (0.5) fill in normalized space -> padded regions are 0.0 after
+    // (0.5 - 0.5)/0.5; initialize every channel to 0.0 (the normalized mean).
+    let mut pixels = vec![0.0f32; 3 * plane];
+    for y in 0..new_h as usize {
+        for x in 0..new_w as usize {
+            let pixel = resized.get_pixel(x as u32, y as u32).0;
+            let base = (off_y + y) * side + (off_x + x);
+            pixels[base] = (f32::from(pixel[0]) / 255.0 - 0.5) / 0.5;
+            pixels[plane + base] = (f32::from(pixel[1]) / 255.0 - 0.5) / 0.5;
+            pixels[2 * plane + base] = (f32::from(pixel[2]) / 255.0 - 0.5) / 0.5;
+        }
+    }
+    Ok(MultimodalImage {
+        pixels,
+        channels: 3,
+        height: side,
+        width: side,
+        soft_token_count: deepseek_ocr_soft_token_count(),
+    })
+}
+
+/// Expand each `<image>` marker the chat template emits into
+/// `soft_token_count` repeated `<image>` placeholders (the DeepEncoder splices
+/// vision embeddings onto exactly those token positions).
+pub fn expand_deepseek_ocr_image_markers(
+    prompt: &str,
+    images: &[MultimodalImage],
+) -> Result<String> {
+    let mut output = String::with_capacity(prompt.len() + images.len() * 4096);
+    let mut rest = prompt;
+    for image in images {
+        let Some(pos) = rest.find(DEEPSEEK_OCR_IMAGE_MARKER) else {
+            anyhow::bail!("chat template did not emit enough DeepSeek-OCR image markers");
+        };
+        output.push_str(&rest[..pos]);
+        for _ in 0..image.soft_token_count {
+            output.push_str(DEEPSEEK_OCR_IMAGE_MARKER);
+        }
+        rest = &rest[pos + DEEPSEEK_OCR_IMAGE_MARKER.len()..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}

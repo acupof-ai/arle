@@ -269,6 +269,10 @@ where
         1
     }
 
+    fn multimodal_kind(&self) -> Option<infer_plan::MultimodalKind> {
+        self.model.multimodal_kind()
+    }
+
     fn max_live_requests(&self) -> usize {
         1
     }

@@ -637,6 +637,199 @@ unsafe extern "C" {
         out_finish: *mut i32,
     ) -> i32;
 
+    // === DeepSeek-OCR (deepseekocr / UnlimitedOCRForCausalLM) ===
+    //
+    // VLM with a DeepEncoder (SAM-base + CLIP-large + 16x conv compressor +
+    // linear projector) and a DeepSeek-MoE decoder. Decoder weights are MXFP8
+    // (scales uint8, no biases); vision weights are dense BF16. Weight ids index
+    // into one registry; `add_*` returns the id, layer-push references them.
+
+    pub fn deepseek_ocr_new() -> *mut std::ffi::c_void;
+    pub fn deepseek_ocr_free(model: *mut std::ffi::c_void);
+    pub fn deepseek_ocr_add_dense_weight(model: *mut std::ffi::c_void, w: *mut mlx_array) -> i32;
+    /// Register an MXFP8 quantized weight (uint8 scales, no biases).
+    pub fn deepseek_ocr_add_mxfp8_weight(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+    ) -> i32;
+    pub fn deepseek_ocr_set_config(
+        model: *mut std::ffi::c_void,
+        hidden_size: i32,
+        vocab_size: i32,
+        num_attention_heads: i32,
+        num_key_value_heads: i32,
+        head_dim: i32,
+        v_head_dim: i32,
+        rms_norm_eps: f32,
+        rope_theta: f32,
+    );
+    pub fn deepseek_ocr_set_embed(
+        model: *mut std::ffi::c_void,
+        embed_id: i32,
+        embed_scales_id: i32,
+        lm_head_id: i32,
+        lm_head_scales_id: i32,
+        final_norm_id: i32,
+        quant_group_size: i32,
+        quant_bits: i32,
+    );
+    /// Push one decoder layer. Dense layer: pass `num_experts<=0` and use the
+    /// `dense_*` projection ids; MoE layer: pass `num_experts>0` with router +
+    /// stacked switch-expert + fused shared-expert ids.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek_ocr_push_layer(
+        model: *mut std::ffi::c_void,
+        input_ln_id: i32,
+        post_attn_ln_id: i32,
+        q_id: i32,
+        k_id: i32,
+        v_id: i32,
+        o_id: i32,
+        // dense MLP (used when num_experts <= 0)
+        dense_gate_id: i32,
+        dense_up_id: i32,
+        dense_down_id: i32,
+        // MoE (used when num_experts > 0)
+        router_id: i32,
+        switch_gate_id: i32,
+        switch_up_id: i32,
+        switch_down_id: i32,
+        shared_gate_id: i32,
+        shared_up_id: i32,
+        shared_down_id: i32,
+        num_experts: i32,
+        top_k: i32,
+        routed_scaling_factor: f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek_ocr_set_vision_config(
+        model: *mut std::ffi::c_void,
+        image_token_id: i32,
+        // CLIP
+        clip_hidden_size: i32,
+        clip_intermediate_size: i32,
+        clip_num_layers: i32,
+        clip_num_heads: i32,
+        clip_patch_size: i32,
+        clip_layer_norm_eps: f32,
+        // SAM
+        sam_width: i32,
+        sam_layers: i32,
+        sam_heads: i32,
+        sam_patch_size: i32,
+        sam_window_size: i32,
+        sam_image_size: i32,
+        // projector
+        projector_input_dim: i32,
+        projector_n_embed: i32,
+    ) -> i32;
+    /// SAM patch_embed (conv weight [out,kh,kw,in] + bias), absolute pos_embed,
+    /// neck convs (0/2 weights, 1/3 layernorm w+b), net_2/net_3 convs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek_ocr_set_sam_stem(
+        model: *mut std::ffi::c_void,
+        patch_embed_w_id: i32,
+        patch_embed_b_id: i32,
+        pos_embed_id: i32,
+        neck0_w_id: i32,
+        neck1_w_id: i32,
+        neck1_b_id: i32,
+        neck2_w_id: i32,
+        neck3_w_id: i32,
+        neck3_b_id: i32,
+        net2_w_id: i32,
+        net3_w_id: i32,
+    ) -> i32;
+    /// One SAM ViT block. `window_size=0` marks a global-attention block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek_ocr_push_sam_block(
+        model: *mut std::ffi::c_void,
+        window_size: i32,
+        norm1_w_id: i32,
+        norm1_b_id: i32,
+        qkv_w_id: i32,
+        qkv_b_id: i32,
+        proj_w_id: i32,
+        proj_b_id: i32,
+        rel_pos_h_id: i32,
+        rel_pos_w_id: i32,
+        norm2_w_id: i32,
+        norm2_b_id: i32,
+        lin1_w_id: i32,
+        lin1_b_id: i32,
+        lin2_w_id: i32,
+        lin2_b_id: i32,
+    ) -> i32;
+    /// CLIP embeddings + pre-layernorm stem.
+    pub fn deepseek_ocr_set_clip_stem(
+        model: *mut std::ffi::c_void,
+        class_embedding_id: i32,
+        position_embedding_id: i32,
+        pre_layernorm_w_id: i32,
+        pre_layernorm_b_id: i32,
+    ) -> i32;
+    /// One CLIP encoder layer (fused qkv, layernorm w+b, MLP fc1/fc2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek_ocr_push_clip_layer(
+        model: *mut std::ffi::c_void,
+        ln1_w_id: i32,
+        ln1_b_id: i32,
+        qkv_w_id: i32,
+        qkv_b_id: i32,
+        out_w_id: i32,
+        out_b_id: i32,
+        ln2_w_id: i32,
+        ln2_b_id: i32,
+        fc1_w_id: i32,
+        fc1_b_id: i32,
+        fc2_w_id: i32,
+        fc2_b_id: i32,
+    ) -> i32;
+    /// Projector (MXFP8 linear w+scales+bias) + image_newline + view_separator.
+    pub fn deepseek_ocr_set_projector(
+        model: *mut std::ffi::c_void,
+        projector_w_id: i32,
+        projector_bias_id: i32,
+        image_newline_id: i32,
+        view_separator_id: i32,
+    ) -> i32;
+    pub fn deepseek_ocr_finalize(model: *mut std::ffi::c_void) -> i32;
+    pub fn deepseek_ocr_generate_causal(
+        model: *mut std::ffi::c_void,
+        prompt: *const i32,
+        prompt_len: i32,
+        max_new_tokens: i32,
+        seed: u64,
+        stop_ids: *const u32,
+        stop_ids_len: i32,
+        cancel_fn: Option<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
+        cancel_ctx: *const std::ffi::c_void,
+        out_tokens: *mut u32,
+        out_len: *mut i32,
+        out_finish: *mut i32,
+    ) -> i32;
+    pub fn deepseek_ocr_generate_causal_image(
+        model: *mut std::ffi::c_void,
+        prompt: *const i32,
+        prompt_len: i32,
+        image_pixels: *const f32,
+        image_height: i32,
+        image_width: i32,
+        image_soft_tokens: i32,
+        max_new_tokens: i32,
+        seed: u64,
+        stop_ids: *const u32,
+        stop_ids_len: i32,
+        cancel_fn: Option<unsafe extern "C" fn(*const std::ffi::c_void) -> i32>,
+        cancel_ctx: *const std::ffi::c_void,
+        out_tokens: *mut u32,
+        out_len: *mut i32,
+        out_finish: *mut i32,
+    ) -> i32;
+
     // === Compiled Qwen3.5 model ===
 
     pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;

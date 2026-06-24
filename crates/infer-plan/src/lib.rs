@@ -10,8 +10,9 @@ mod sample;
 pub use diffusion::{
     DiffusionBlockModel, DiffusionCanvasPrediction, DiffusionGenerateError,
     DiffusionGenerateOutput, DiffusionGenerateStats, DiffusionGenerationConfig,
-    DiffusionModelError, DiffusionStepTrace, MultimodalImage, diffusion_prediction_from_logits,
-    entropy_bound_acceptance_mask, generate_diffusion, generate_diffusion_with_cancel,
+    DiffusionModelError, DiffusionStepTrace, MultimodalImage, MultimodalKind,
+    diffusion_prediction_from_logits, entropy_bound_acceptance_mask, generate_diffusion,
+    generate_diffusion_with_cancel,
 };
 pub use sample::{argmax_logit, sample_token};
 

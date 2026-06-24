@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+deepseek-ocr-spec = { path = "../deepseek-ocr-spec", optional = true }
 gemma-spec = { path = "../gemma-spec", optional = true }
 hf-hub = { version = "0.5", features = ["tokio"], optional = true }
 infer-core = { path = "../infer-core" }
@@ -21,7 +22,7 @@ serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
-metal = ["dep:gemma-spec", "dep:hf-hub", "dep:kv-native-sys", "dep:libc", "dep:mlx-sys", "dep:serde", "dep:serde_json"]
+metal = ["dep:deepseek-ocr-spec", "dep:gemma-spec", "dep:hf-hub", "dep:kv-native-sys", "dep:libc", "dep:mlx-sys", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true

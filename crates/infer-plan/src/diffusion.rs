@@ -70,6 +70,17 @@ pub struct MultimodalImage {
     pub soft_token_count: usize,
 }
 
+/// VLM image-preprocessing / marker convention a backend expects. The serving
+/// layer dispatches preprocessing on this so each VLM uses its own resize +
+/// marker logic without the server depending on backend types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultimodalKind {
+    /// Gemma4 SigLIP vision tower (`<|image|>` markers, pooled soft tokens).
+    Gemma4,
+    /// DeepSeek-OCR DeepEncoder (`<image>` markers, 1024x1024 base view).
+    DeepseekOcr,
+}
+
 impl DiffusionGenerationConfig {
     /// DiffusionGemma defaults from the public model config.
     #[must_use]
@@ -208,6 +219,12 @@ pub trait DiffusionBlockModel {
         _cancel: Option<&AtomicBool>,
     ) -> Result<Option<DiffusionGenerateOutput>, DiffusionModelError> {
         Ok(None)
+    }
+
+    /// VLM preprocessing/marker convention this model expects, when it is a VLM.
+    /// Default `None` = text-only / no multimodal preprocessing.
+    fn multimodal_kind(&self) -> Option<MultimodalKind> {
+        None
     }
 
     /// Start a request with the exact generation config selected by the engine.

@@ -136,6 +136,10 @@ impl DiffusionBlockModel for MetalGemma4Model {
             "Gemma4 uses the backend-owned causal generate fast path",
         ))
     }
+
+    fn multimodal_kind(&self) -> Option<infer_plan::MultimodalKind> {
+        Some(infer_plan::MultimodalKind::Gemma4)
+    }
 }
 
 fn i32_tokens(tokens: &[u32]) -> Result<Vec<i32>> {

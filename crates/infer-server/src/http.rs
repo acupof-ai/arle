@@ -160,8 +160,21 @@ where
     if state.max_thinking_tokens > 0 && request.enable_thinking() {
         max_tokens = max_tokens.min(state.max_thinking_tokens);
     }
-    let images = extract_gemma4_images(&request.messages)?;
-    let prompt = {
+    let multimodal_kind = state
+        .serve
+        .run_on_executor(|executor| executor.multimodal_kind())
+        .unwrap_or(None);
+    let images = extract_images(&request.messages, multimodal_kind)?;
+    // DeepSeek-OCR ships a trivial chat template (`{{message['content']}}`) that
+    // would stringify image parts (including the base64 data URL) as JSON. Build
+    // the prompt directly from the parts instead: each image part becomes one
+    // `<image>` marker, text parts pass through, matching the processor's
+    // `<image>\n<text>` SFT layout.
+    let prompt = if multimodal_kind == Some(infer_plan::MultimodalKind::DeepseekOcr)
+        && !images.is_empty()
+    {
+        build_deepseek_ocr_prompt(&request.messages)
+    } else {
         let tokenizer = state
             .tokenizer
             .lock()
@@ -170,7 +183,7 @@ where
             .render_chat_with_kwargs(&request.messages, request.chat_template_kwargs.as_ref())?
     };
     if !images.is_empty() {
-        let prompt = expand_gemma4_image_markers(&prompt, &images)?;
+        let prompt = expand_image_markers(&prompt, &images, multimodal_kind)?;
         let prompt_tokens = encode(&state, &prompt)?;
         let prompt_token_count = prompt_tokens.len();
         let output = generate_multimodal(&state, prompt_tokens, images, max_tokens, sampling)?;
@@ -436,8 +449,9 @@ where
     })
 }
 
-fn extract_gemma4_images(
+fn extract_images(
     messages: &[crate::schema::ChatMessage],
+    kind: Option<infer_plan::MultimodalKind>,
 ) -> Result<Vec<MultimodalImage>, ApiError> {
     let mut images = Vec::new();
     for message in messages {
@@ -449,13 +463,24 @@ fn extract_gemma4_images(
                 "image" => {
                     let url = image_data_url(part)?;
                     let bytes = decode_image_data_url(url)?;
-                    images.push(preprocess_gemma4_image(&bytes).map_err(|err| {
+                    let preprocessed = match kind {
+                        Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+                            crate::multimodal::preprocess_deepseek_ocr_image(&bytes)
+                        }
+                        Some(infer_plan::MultimodalKind::Gemma4) => preprocess_gemma4_image(&bytes),
+                        None => {
+                            return Err(ApiError::bad_request(
+                                "image content requires a VLM backend (Gemma4 or DeepSeek-OCR)",
+                            ));
+                        }
+                    };
+                    images.push(preprocessed.map_err(|err| {
                         ApiError::bad_request(format!("invalid image data: {err}"))
                     })?);
                 }
                 "audio" | "video" => {
                     return Err(ApiError::bad_request(
-                        "audio/video content parts are not supported by Gemma4 VLM",
+                        "audio/video content parts are not supported by this VLM",
                     ));
                 }
                 _ => {}
@@ -463,6 +488,47 @@ fn extract_gemma4_images(
         }
     }
     Ok(images)
+}
+
+fn expand_image_markers(
+    prompt: &str,
+    images: &[MultimodalImage],
+    kind: Option<infer_plan::MultimodalKind>,
+) -> Result<String, ApiError> {
+    let expanded = match kind {
+        Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+            crate::multimodal::expand_deepseek_ocr_image_markers(prompt, images)
+        }
+        _ => expand_gemma4_image_markers(prompt, images),
+    };
+    expanded.map_err(|err| ApiError::bad_request(format!("{err}")))
+}
+
+/// Build a DeepSeek-OCR prompt from chat messages, emitting one `<image>` marker
+/// per image part and concatenating text parts (the model's `<image>\n<text>`
+/// SFT layout). The model's chat template is too trivial to render image parts.
+fn build_deepseek_ocr_prompt(messages: &[crate::schema::ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        match &message.content {
+            Some(ChatContent::Text(text)) => prompt.push_str(text),
+            Some(ChatContent::Parts(parts)) => {
+                for part in parts {
+                    match part.normalized_kind() {
+                        "image" => prompt.push_str(crate::multimodal::DEEPSEEK_OCR_IMAGE_MARKER),
+                        "text" => {
+                            if let Some(text) = &part.text {
+                                prompt.push_str(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    prompt
 }
 
 fn image_data_url(part: &ChatContentPart) -> Result<&str, ApiError> {
