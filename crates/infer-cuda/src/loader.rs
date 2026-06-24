@@ -2746,6 +2746,44 @@ impl SafetensorLoader {
         .with_context(|| format!("upload DSv4 gate {name}"))
     }
 
+    /// Sharded dense BF16/F32 load — the dense-weight twin of
+    /// [`Self::load_dsv4_block_scaled_sharded`]. Used for `wo_a` when a checkpoint
+    /// leaves the tiny low-rank output down-projection unquantized (e.g.
+    /// `/host/DeepSeek-V4-Flash-FP8`). Converts to bf16, then slices rows for the
+    /// `Shard::Column { dim: 0 }` case `wo_a` takes when `o_groups % tp == 0`.
+    /// ponytail: only Column{0}/Replicated — the only shards `wo_a` uses; bail else.
+    pub(crate) fn load_dsv4_bf16_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        shard: Shard,
+        tp: &TpConfig,
+    ) -> Result<DeviceMatrix> {
+        if tp.is_single() || shard == Shard::Replicated {
+            return self.load_dsv4_bf16_matrix(ctx, name);
+        }
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D dense tensor, got shape {:?}",
+            tensor.shape
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        let bf16 = Self::tensor_bytes_to_bf16(name, tensor.dtype, tensor.bytes())?;
+        match shard {
+            Shard::Column { dim: 0 } => {
+                let spec = infer_topo::column_shard(rows, tp);
+                let sharded =
+                    crate::shard_slice::shard_column_parallel(bf16.as_ref(), rows, cols, 2, &spec)?;
+                DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+                    .with_context(|| format!("upload DSv4 dense shard {name}"))
+            }
+            other => bail!(
+                "{name}: DSv4 dense sharded load supports Column{{dim:0}}/Replicated, got {other:?}"
+            ),
+        }
+    }
+
     /// Load a DSv4 block-scaled FP8 (`F8_E4M3`) or packed FP4 (`I8`) `<name>` plus
     /// its sibling `<prefix>.scale` (`F8_E8M0`) into a [`DeviceMatrix`]. The whole
     /// tensor is loaded (EP rank selection happens by expert index in the caller;
@@ -2977,6 +3015,37 @@ impl SafetensorLoader {
         );
         let groups = weight.rows / rows_per_group;
         ensure!(groups > 0, "DSv4 wo_a grouped table has zero groups");
+        // Dense BF16 wo_a (unquantized re-serialization): the grouped route-GEMV
+        // kernel is FP8/FP4-only, so the per-group pointer/scale tables are consumed
+        // only when groups>1 — which `dsv4_wo_a_grouped_linear` rejects for dense. On
+        // the production groups==1 (TP=o_groups) path the forward reads only the shape
+        // fields and runs `dsv4_linear`→`gemm_batch`. Carry the shape; build trivial
+        // base-pointer tables so the struct stays well-formed.
+        if weight.weight_format == WeightFormat::DenseBf16 {
+            let (base, _bg) = weight.data.device_ptr(&ctx.stream);
+            let stride_bytes = rows_per_group
+                .checked_mul(weight.cols)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| anyhow!("DSv4 dense wo_a group stride overflow"))?;
+            let ptrs: Vec<u64> = (0..groups)
+                .map(|g| base + (g * stride_bytes) as u64)
+                .collect();
+            return Ok(crate::dsv4::Dsv4WoAGroupTables {
+                weight_ptrs: ctx
+                    .stream
+                    .clone_htod(&ptrs)
+                    .map_err(|e| anyhow!("DSv4 dense wo_a ptr table H2D failed: {e}"))?,
+                scale_ptrs: ctx
+                    .stream
+                    .clone_htod(&ptrs)
+                    .map_err(|e| anyhow!("DSv4 dense wo_a scale ptr table H2D failed: {e}"))?,
+                groups,
+                rows_per_group,
+                cols_per_group: weight.cols,
+                scale_rows_per_group: 0,
+                scale_cols: 0,
+            });
+        }
         ensure!(
             weight.dsv4_scale_rows > 0
                 && weight.dsv4_scale_cols > 0
@@ -3408,14 +3477,24 @@ impl SafetensorLoader {
                 Some(w_vc),
             )
         } else {
-            let wo_a = self.load_dsv4_block_scaled_sharded(
-                ctx,
-                &names.wo_a,
-                names
-                    .shard_for(config, &names.wo_a, tp.world_size)
-                    .unwrap_or(Shard::Replicated),
-                tp,
-            )?;
+            // `wo_a` is FP8/FP4 block-scaled in native DSv4 checkpoints, but some FP8
+            // re-serializations (e.g. /host/DeepSeek-V4-Flash-FP8) leave the tiny
+            // low-rank `wo_a` as dense BF16. Route by dtype: block-scaled keeps the
+            // grouped route-GEMV + DeepGEMM levers; dense BF16 rides `dsv4_linear`
+            // (gemm_batch) on the groups==1 (TP=o_groups) path. `wo_b` stays FP8.
+            let wo_a_shard = names
+                .shard_for(config, &names.wo_a, tp.world_size)
+                .unwrap_or(Shard::Replicated);
+            let wo_a = match self.borrow_raw_tensor(&names.wo_a)?.dtype {
+                Dtype::F8_E4M3 | Dtype::I8 => {
+                    self.load_dsv4_block_scaled_sharded(ctx, &names.wo_a, wo_a_shard, tp)?
+                }
+                _ => self.load_dsv4_bf16_sharded(ctx, &names.wo_a, wo_a_shard, tp)?,
+            };
+            let wo_a_is_block_scaled = matches!(
+                wo_a.weight_format,
+                WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled
+            );
             let wo_a_groups = Self::build_dsv4_wo_a_group_tables(ctx, &wo_a, config.o_lora_rank)?;
             let wo_b = self.load_dsv4_block_scaled_sharded(
                 ctx,
@@ -3425,43 +3504,45 @@ impl SafetensorLoader {
                     .unwrap_or(Shard::Replicated),
                 tp,
             )?;
-            // DeepGEMM caches for the decode output projection (lever #1b), same gate.
-            let (wo_a_deepgemm, wo_a_group_deepgemm, wo_b_deepgemm) =
-                if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
-                    let group_caches = if wo_a_groups.groups > 1 {
-                        let mut caches = Vec::with_capacity(wo_a_groups.groups);
-                        for group in 0..wo_a_groups.groups {
-                            caches.push(
-                                cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_row_range(
-                                    ctx,
-                                    &wo_a,
-                                    group * wo_a_groups.rows_per_group,
-                                    wo_a_groups.rows_per_group,
-                                )?,
-                            );
-                        }
-                        Some(caches)
-                    } else {
-                        None
-                    };
-                    (
-                        (wo_a_groups.groups == 1)
-                            .then(|| {
-                                cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
-                                    ctx, &wo_a,
-                                )
-                            })
-                            .transpose()?,
-                        group_caches,
-                        Some(
-                            cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
-                                ctx, &wo_b,
+            // DeepGEMM caches for the decode output projection (lever #1b). `wo_b` is
+            // always FP8 → cache under the alloc gate. `wo_a` caches only when `wo_a`
+            // is itself block-scaled (dense BF16 has no FP8 cache; it uses gemm_batch).
+            let decode_alloc = crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()?;
+            let (wo_a_deepgemm, wo_a_group_deepgemm) = if decode_alloc && wo_a_is_block_scaled {
+                let group_caches = if wo_a_groups.groups > 1 {
+                    let mut caches = Vec::with_capacity(wo_a_groups.groups);
+                    for group in 0..wo_a_groups.groups {
+                        caches.push(
+                            cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight_row_range(
+                                ctx,
+                                &wo_a,
+                                group * wo_a_groups.rows_per_group,
+                                wo_a_groups.rows_per_group,
                             )?,
-                        ),
-                    )
+                        );
+                    }
+                    Some(caches)
                 } else {
-                    (None, None, None)
+                    None
                 };
+                let flat = (wo_a_groups.groups == 1)
+                    .then(|| {
+                        cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(
+                            ctx, &wo_a,
+                        )
+                    })
+                    .transpose()?;
+                (flat, group_caches)
+            } else {
+                (None, None)
+            };
+            let wo_b_deepgemm = if decode_alloc {
+                Some(
+                    cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wo_b)?,
+                )
+            } else {
+                None
+            };
             (
                 Some(wo_a),
                 Some(wo_a_groups),
