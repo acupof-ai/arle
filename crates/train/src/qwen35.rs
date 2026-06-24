@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::TAU,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -9,7 +10,7 @@ use autograd::{
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
         MoeTopK, add, add_broadcast, all_reduce_sum, cat_heads, causal_sdpa_recompute,
-        causal_sdpa_with_q_start, checkpoint, embedding, linear_attention_core,
+        causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_core,
         matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
         moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
         slice, transpose,
@@ -249,6 +250,11 @@ impl Qwen35TensorParallelConfig {
 /// Heads per chunk for `head_chunked_sdpa_recompute` — bounds the live
 /// `[chunk_heads, seq, seq]` scores to avoid OOM at long seq.
 const ATTN_HEAD_CHUNK: usize = 8;
+
+/// Layers per gradient-checkpoint group: one checkpoint (one offload) per K
+/// layers instead of per layer, so K× fewer/larger host offloads (less PCIe
+/// traffic). The frozen/LoRA boundary still forces a group split.
+const CKPT_GROUP: usize = 4;
 
 // Head-chunked causal SDPA: heads are independent so chunking is numerically exact;
 // bounds the live [chunk_heads, seq, seq] scores to avoid OOM at long seq.
@@ -571,39 +577,39 @@ fn qwen35_parity_bf16_round(id: TensorId, store: &mut TensorStore) -> Result<Ten
 }
 
 impl Qwen35Layer {
-    fn checkpoint_input_ids(&self, hidden: TensorId, store: &TensorStore) -> Vec<TensorId> {
-        let mut ids = Vec::new();
-        ids.push(hidden);
-        ids.push(self.input_layernorm);
-        ids.push(self.post_attention_layernorm);
-        collect_mlp_ids(&self.mlp, &mut ids);
+    /// This layer's trainable param ids — fed to `checkpoint_sequential`'s
+    /// `layer_params` so each group's saved inputs carry every layer's params
+    /// (that's how `requires_grad` is true and param grads come back).
+    fn checkpoint_param_ids(&self, store: &TensorStore) -> Vec<TensorId> {
+        let mut params = Vec::new();
+        params.push(self.input_layernorm);
+        params.push(self.post_attention_layernorm);
+        collect_mlp_ids(&self.mlp, &mut params);
         match &self.self_attn {
             Qwen35Attention::Full(attn) => {
-                collect_linear_ids(&attn.q_proj, &mut ids);
-                collect_linear_ids(&attn.k_proj, &mut ids);
-                collect_linear_ids(&attn.v_proj, &mut ids);
-                collect_linear_ids(&attn.o_proj, &mut ids);
-                ids.push(attn.q_norm);
-                ids.push(attn.k_norm);
+                collect_linear_ids(&attn.q_proj, &mut params);
+                collect_linear_ids(&attn.k_proj, &mut params);
+                collect_linear_ids(&attn.v_proj, &mut params);
+                collect_linear_ids(&attn.o_proj, &mut params);
+                params.push(attn.q_norm);
+                params.push(attn.k_norm);
             }
             Qwen35Attention::Linear(attn) => {
-                collect_linear_ids(&attn.in_proj_qkv, &mut ids);
-                collect_linear_ids(&attn.in_proj_z, &mut ids);
-                collect_linear_ids(&attn.in_proj_b, &mut ids);
-                collect_linear_ids(&attn.in_proj_a, &mut ids);
-                collect_linear_ids(&attn.out_proj, &mut ids);
-                ids.push(attn.conv1d_weight);
-                ids.push(attn.dt_bias);
-                ids.push(attn.a_log);
-                ids.push(attn.norm);
+                collect_linear_ids(&attn.in_proj_qkv, &mut params);
+                collect_linear_ids(&attn.in_proj_z, &mut params);
+                collect_linear_ids(&attn.in_proj_b, &mut params);
+                collect_linear_ids(&attn.in_proj_a, &mut params);
+                collect_linear_ids(&attn.out_proj, &mut params);
+                params.push(attn.conv1d_weight);
+                params.push(attn.dt_bias);
+                params.push(attn.a_log);
+                params.push(attn.norm);
             }
         }
-        let mut params = ids.split_off(1);
         params.sort_unstable();
         params.dedup();
         params.retain(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
-        ids.extend(params);
-        ids
+        params
     }
 
     fn forward(
@@ -3350,27 +3356,49 @@ impl Qwen35Model {
         profile.embedding += started.elapsed();
         trace_model_component(trace, "embedding", profile.embedding);
 
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
-            let started = Instant::now();
-            let (next_hidden, layer_profile) = if self.gradient_checkpointing && tape.enabled {
-                let layer = layer.clone();
-                let cfg = self.config.clone();
-                let tp = self.tp;
-                let cos_id = cos;
-                let sin_id = sin;
-                let input_ids = layer.checkpoint_input_ids(hidden, store);
-                let hidden = checkpoint(input_ids, store, tape, move |store, tape, inputs| {
-                    let hidden = *inputs.first().ok_or(AutogradError::TapeInvariant(
-                        "qwen35 checkpoint missing hidden input",
-                    ))?;
-                    layer
-                        .forward(hidden, &cfg, tp, cos_id, sin_id, store, tape)
+        if self.gradient_checkpointing && tape.enabled {
+            // Checkpoint layers in groups of CKPT_GROUP (one host offload per
+            // group). Numerically exact vs per-layer: same layer order, same
+            // detach point (the LoRA boundary forces a group split), same params
+            // in each checkpoint's saved inputs.
+            let layers = Arc::new(self.layers.clone());
+            let cfg = self.config.clone();
+            let tp = self.tp;
+            let (cos_id, sin_id) = (cos, sin);
+            let layer_fn = {
+                let layers = Arc::clone(&layers);
+                move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
+                    layers[idx]
+                        .forward(h, &cfg, tp, cos_id, sin_id, s, t)
                         .map_err(qwen35_to_autograd)
-                })?;
-                (hidden, Qwen35LayerForwardProfile::default())
-            } else {
-                layer.forward_profiled(
+                }
+            };
+            // Param ids only read `requires_grad`; precompute so `layer_params`
+            // doesn't alias the mutable `store` borrow during the call.
+            let param_ids: Vec<Vec<TensorId>> = self
+                .layers
+                .iter()
+                .map(|l| l.checkpoint_param_ids(store))
+                .collect();
+            hidden = checkpoint_sequential(
+                hidden,
+                self.layers.len(),
+                CKPT_GROUP,
+                self.lora_layer_start,
+                store,
+                tape,
+                |idx| param_ids[idx].clone(),
+                layer_fn,
+            )?;
+            // Grouped path records no per-layer profile; keep profile.layers len.
+            profile
+                .layers
+                .resize_with(self.layers.len(), Qwen35LayerForwardProfile::default);
+        } else {
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
+                let started = Instant::now();
+                let (next_hidden, layer_profile) = layer.forward_profiled(
                     layer_index,
                     hidden,
                     &self.config,
@@ -3380,11 +3408,11 @@ impl Qwen35Model {
                     trace,
                     store,
                     tape,
-                )?
-            };
-            hidden = next_hidden;
-            trace_model_component(trace, "layer_total", started.elapsed());
-            profile.layers.push(layer_profile);
+                )?;
+                hidden = next_hidden;
+                trace_model_component(trace, "layer_total", started.elapsed());
+                profile.layers.push(layer_profile);
+            }
         }
 
         let started = Instant::now();
@@ -3432,26 +3460,43 @@ impl Qwen35Model {
             store,
             tape,
         )?;
-        for (layer_index, layer) in self.layers.iter().enumerate() {
-            hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
-            hidden = if self.gradient_checkpointing && tape.enabled {
-                let layer = layer.clone();
-                let cfg = self.config.clone();
-                let tp = self.tp;
-                let cos_id = cos;
-                let sin_id = sin;
-                let input_ids = layer.checkpoint_input_ids(hidden, store);
-                checkpoint(input_ids, store, tape, move |store, tape, inputs| {
-                    let hidden = *inputs.first().ok_or(AutogradError::TapeInvariant(
-                        "qwen35 checkpoint missing hidden input",
-                    ))?;
-                    layer
-                        .forward(hidden, &cfg, tp, cos_id, sin_id, store, tape)
+        if self.gradient_checkpointing && tape.enabled {
+            // Group-checkpoint (see forward_batch_indices_profiled) — exact vs
+            // per-layer.
+            let layers = Arc::new(self.layers.clone());
+            let cfg = self.config.clone();
+            let tp = self.tp;
+            let (cos_id, sin_id) = (cos, sin);
+            let layer_fn = {
+                let layers = Arc::clone(&layers);
+                move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
+                    layers[idx]
+                        .forward(h, &cfg, tp, cos_id, sin_id, s, t)
                         .map_err(qwen35_to_autograd)
-                })?
-            } else {
-                layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?
+                }
             };
+            // See forward_batch_indices_profiled: precompute param ids so the
+            // closure doesn't alias the mutable `store` borrow.
+            let param_ids: Vec<Vec<TensorId>> = self
+                .layers
+                .iter()
+                .map(|l| l.checkpoint_param_ids(store))
+                .collect();
+            hidden = checkpoint_sequential(
+                hidden,
+                self.layers.len(),
+                CKPT_GROUP,
+                self.lora_layer_start,
+                store,
+                tape,
+                |idx| param_ids[idx].clone(),
+                layer_fn,
+            )?;
+        } else {
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
+                hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
+            }
         }
         qwen35_rmsnorm(
             hidden,
@@ -5725,9 +5770,12 @@ mod tests {
             .iter()
             .filter(|entry| entry.op == BackwardOp::Checkpoint)
             .count();
+        // Layers are checkpointed in groups of CKPT_GROUP (no LoRA boundary
+        // here), so one entry per group, not per layer.
+        let expected_groups = cfg.num_hidden_layers.div_ceil(super::CKPT_GROUP);
         assert_eq!(
-            checkpoint_entries, cfg.num_hidden_layers,
-            "one checkpoint entry per transformer layer is required"
+            checkpoint_entries, expected_groups,
+            "one checkpoint entry per CKPT_GROUP-sized layer group is required"
         );
         let adapter_ids = model
             .adapter_name_map()
