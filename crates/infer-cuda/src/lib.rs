@@ -290,11 +290,18 @@ impl CudaExecutor {
     /// Build the real CUDA executor for a BF16 Qwen3.5/3.6 hybrid dense-or-MoE
     /// checkpoint. BF16 only; the W4/4-bit canonical needs the W4 grouped-GEMM
     /// follow-up.
+    ///
+    /// The full-attn KV is a SHARED paged pool sized from measured free VRAM
+    /// after weights load (`mem_fraction_static`, SGLang-style); `total_pages`
+    /// is the per-request ceiling + the host-admission floor. The ACTUAL device
+    /// pool page count the host [`CudaKvPool`] must mirror is reported by
+    /// [`Self::effective_total_pages`].
     #[cfg(feature = "cuda")]
     pub fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        mem_fraction_static: f64,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -302,6 +309,7 @@ impl CudaExecutor {
                     model_path,
                     num_slots,
                     total_pages,
+                    mem_fraction_static,
                 )?,
             )),
         })
@@ -360,11 +368,11 @@ impl CudaExecutor {
         }
     }
 
-    /// Actual shared device-pool page count for the dense Qwen3 path (profiled
-    /// from measured free VRAM at construction). The host admission `CudaKvPool`
-    /// must mirror this 1:1 — not the requested `total_pages`. `None` for the
-    /// placeholder and for slot-arena models (Qwen3.5/3.6, DSv4), whose admission
-    /// stays per-slot this phase.
+    /// Actual shared device-pool page count for the paged-pool models (dense
+    /// Qwen3 + Qwen3.6, profiled from measured free VRAM at construction). The
+    /// host admission `CudaKvPool` must mirror this 1:1 — not the requested
+    /// `total_pages`. `None` for the placeholder and for DSv4 (slot MLA arena),
+    /// whose admission stays per-slot this phase.
     #[must_use]
     pub fn effective_total_pages(&self) -> Option<usize> {
         match &self.inner {

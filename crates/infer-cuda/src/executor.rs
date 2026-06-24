@@ -205,9 +205,15 @@ impl RealCudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        mem_fraction_static: f64,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
-            Qwen35CudaExecutor::from_qwen35_safetensors(model_path, num_slots, total_pages)?,
+            Qwen35CudaExecutor::from_qwen35_safetensors(
+                model_path,
+                num_slots,
+                total_pages,
+                mem_fraction_static,
+            )?,
         )))
     }
 
@@ -479,16 +485,17 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Actual shared device-pool page count, for the dense Qwen3 path only. The
-    /// dense pool is profiled from measured free VRAM at construction
-    /// (`from_qwen3_bf16_safetensors` → `profile_kv_pool_tokens`), so this is the
-    /// page count the host admission pool MUST mirror 1:1 — not the requested
-    /// `total_pages`. `None` for Qwen3.5/3.6 + DSv4 (slot-arena KV, no shared
-    /// page pool); their admission stays per-slot this phase.
+    /// Actual shared device-pool page count, for the paged-pool models (dense
+    /// Qwen3 + Qwen3.6). Both profile their pool from measured free VRAM at
+    /// construction (`profile_kv_pool_tokens`), so this is the page count the
+    /// host admission pool MUST mirror 1:1 — not the requested `total_pages`.
+    /// `None` for DSv4 (slot MLA arena, no shared page pool); its admission stays
+    /// per-slot this phase.
     pub(crate) fn effective_total_pages(&self) -> Option<usize> {
         match self {
             Self::Qwen(q) => Some(q.kv.max_total_pages),
-            Self::Qwen35(_) | Self::Dsv4(_) => None,
+            Self::Qwen35(q) => q.full_attn_pool_pages(),
+            Self::Dsv4(_) => None,
         }
     }
 
@@ -2909,8 +2916,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// batched decode.
     batch_decode: Option<crate::qwen35::Qwen35BatchDecodeState>,
     /// Session KV-recall opt-in (`--kv-recall`, default off). When true the
-    /// full-attn KV lives in the paged `recall_kv` pool (evictable) and decode
-    /// reads a recall-restricted page table; off → contiguous byte-identical.
+    /// recall *cycle* (score → evict → prefetch) layers a working-set
+    /// restriction on the SAME paged `full_attn_kv` pool the default path uses;
+    /// off → the default attends the full resident page set (no eviction). The
+    /// full-attn KV is paged in BOTH cases since the shared-paged migration.
     kv_recall: bool,
     /// Recall budget (sink/local/block/top_k). Mirrors the dense arm.
     recall_cfg: infer_core::RecallConfig,
@@ -2919,14 +2928,18 @@ pub(crate) struct Qwen35CudaExecutor {
     /// One-shot warn latch when --kv-recall is requested with a non-BF16 pool.
     #[allow(dead_code)]
     recall_quant_warned: bool,
-    /// Opt-in paged full-attn KV pool (HD256, `num_full` layers), allocated
-    /// lazily on the first `set_kv_recall(true)`. Device-only, self-allocating.
-    recall_kv: Option<PagedKVPool>,
-    /// L3 write-through tier for the recall pool (host DRAM, optional NVMe spill):
-    /// the source of truth for evict-dropped middle blocks. Allocated lazily with
-    /// `recall_kv` and sized to ONE recall-pool page image. Keyed by
+    /// Shared paged full-attn KV pool (HD256, `num_full` layers), the DEFAULT
+    /// full-attn KV substrate since the shared-paged migration — built eagerly
+    /// in the constructor, profile-sized from measured free VRAM (not
+    /// `num_slots × max_seq_len`). Both the default forward and the `--kv-recall`
+    /// cycle read/write THIS one pool; `Option` only so the OPD-offload path can
+    /// drop it. Device-only, self-allocating.
+    full_attn_kv: Option<PagedKVPool>,
+    /// L3 write-through tier for the recall cycle (host DRAM, optional NVMe spill):
+    /// the source of truth for evict-dropped middle blocks. Allocated lazily on
+    /// the first `set_kv_recall(true)` and sized to ONE pool page image. Keyed by
     /// `tier_block_u64(slot, logical_page)` — a session-scoped namespace, so slot A
-    /// never prefetches slot B's KV. `None` until the first `set_kv_recall(true)`.
+    /// never prefetches slot B's KV. `None` until `--kv-recall` is enabled.
     recall_tier: Option<CudaKvTierStore>,
     /// Per-slot one-step eviction keepalive (the race fix). A page evict-dropped at
     /// decode step N is parked here, NOT returned to `free_pages`, until the START
@@ -2960,6 +2973,7 @@ impl Qwen35CudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        mem_fraction_static: f64,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
         ensure!(
@@ -2970,8 +2984,10 @@ impl Qwen35CudaExecutor {
             total_pages > 0,
             "Qwen35CudaExecutor requires at least one KV page"
         );
-        // The host CudaKvPool pages the logical seq budget; size each slot's
-        // contiguous full-attn cache to the same token budget.
+        // `max_seq_len` is the per-request token ceiling (the model's positional
+        // budget + the host CudaKvPool admission span). The full-attn KV is now a
+        // SHARED profile-sized paged pool (built below), not a per-slot
+        // contiguous cache, so this no longer scales VRAM by num_slots.
         let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
         let model_t0 = Instant::now();
         // `None`: MTP spec-decode flag wiring lands in a later increment; the
@@ -3006,6 +3022,87 @@ impl Qwen35CudaExecutor {
             slots_t0,
             format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
         );
+
+        // Shared paged full-attn KV pool — the DEFAULT substrate (Phase 2 of the
+        // shared-paged-KV migration). Built EAGERLY here, profile-sized from
+        // MEASURED free VRAM after weights load (SGLang's mem_fraction_static),
+        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). The
+        // per-token cell cost is the pool's own charge for one token across all
+        // full-attn layers (storage + work bytes), exactly the dense recipe.
+        let pool_t0 = Instant::now();
+        let num_full = model.config.num_full_attention_layers();
+        let local_kv_heads = model.local_kv_heads();
+        let head_dim = model.config.head_dim;
+        let cell_bytes_per_token = PagedKVPool::budget_bytes_for_tokens(
+            num_full,
+            local_kv_heads,
+            head_dim,
+            1,
+            KVFormat::BF16,
+        ) as u64;
+        // Host-admission span (the floor): every slot must be addressable up to
+        // `max_seq_len`, so the device pool is at least `num_slots × total_pages`
+        // pages — the same span the host CudaKvPool admits. The profiled budget
+        // raises this on an ample card for more concurrency / longer context.
+        let admission_pages = num_slots.saturating_mul(total_pages).max(1);
+        let total_pool_pages = match model.ctx.mem_info_bytes() {
+            Ok((free, total)) => {
+                let profiled_tokens = infer_seam::profile_kv_pool_tokens(
+                    free as u64,
+                    total as u64,
+                    cell_bytes_per_token,
+                    mem_fraction_static,
+                );
+                let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
+                let sized = profiled_pages.max(admission_pages).max(1);
+                log::info!(
+                    "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
+                     total {}MB, mem_fraction_static {mem_fraction_static}, cell \
+                     {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
+                     kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} \
+                     ({profiled_pages} pages); admission floor {admission_pages} pages \
+                     (num_slots {num_slots} × total_pages {total_pages}) -> sizing {sized} pages",
+                    free >> 20,
+                    total >> 20,
+                );
+                sized
+            }
+            Err(e) => {
+                log::warn!(
+                    "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed ({e}); falling back \
+                     to admission floor {admission_pages} pages"
+                );
+                admission_pages
+            }
+        };
+        let pool_token_budget = total_pool_pages * SUPPORTED_PAGE_SIZE;
+        let pool_budget_bytes = PagedKVPool::budget_bytes_for_tokens(
+            num_full,
+            local_kv_heads,
+            head_dim,
+            pool_token_budget,
+            KVFormat::BF16,
+        );
+        let full_attn_kv = PagedKVPool::with_format(
+            &model.ctx,
+            num_full,
+            local_kv_heads,
+            head_dim,
+            num_slots,
+            pool_budget_bytes,
+            KVFormat::BF16,
+        )?;
+        ensure!(
+            full_attn_kv.page_size == SUPPORTED_PAGE_SIZE,
+            "Qwen3.6 full-attn paged pool page_size={} != {SUPPORTED_PAGE_SIZE}",
+            full_attn_kv.page_size
+        );
+        cuda_startup_log(
+            "qwen35_paged_pool_alloc",
+            pool_t0,
+            format_args!("pages={total_pool_pages} tokens={pool_token_budget}"),
+        );
+
         // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
         // not graph-capturable on this stack — TP≥2 stays eager, same as
         // dense) ∧ every layer's decode step is a pure device-kernel sequence.
@@ -3026,7 +3123,7 @@ impl Qwen35CudaExecutor {
                 .map(|_| crate::recall::CudaRecallState::default())
                 .collect(),
             recall_quant_warned: false,
-            recall_kv: None,
+            full_attn_kv: Some(full_attn_kv),
             recall_tier: None,
             recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
         };
@@ -3119,58 +3216,149 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Opt into session KV-recall (`--kv-recall`, default off). Allocates the
-    /// paged BF16 full-attn recall pool lazily on the first enable. With recall
-    /// off the decode hot path is byte-identical (contiguous slot cache). The
-    /// recall pool carries ONLY the full-attn layers (linear-attn layers keep
-    /// their recurrent state in the slot, untouched).
+    /// Opt into session KV-recall (`--kv-recall`, default off). The paged
+    /// full-attn pool (`full_attn_kv`) is ALWAYS resident since the shared-paged
+    /// migration — the DEFAULT forward already attends it (full resident set, no
+    /// eviction). Enabling recall layers the eviction/scoring *cycle* on the
+    /// SAME pool (working-set restriction) and lazily builds its L3 tier on the
+    /// first enable. Default-off keeps the full resident attention.
     pub(crate) fn set_kv_recall(&mut self, enabled: bool) -> Result<()> {
         self.kv_recall = enabled;
-        if enabled && self.recall_kv.is_none() {
-            let c = &self.model.config;
-            let num_full = c.num_full_attention_layers();
-            let token_budget = self.num_slots * self.model.max_seq_len();
-            let budget_bytes = PagedKVPool::budget_bytes_for_tokens(
-                num_full,
-                self.model.local_kv_heads(),
-                c.head_dim,
-                token_budget,
-                KVFormat::BF16,
-            );
-            let pool = PagedKVPool::with_format(
-                &self.model.ctx,
-                num_full,
-                self.model.local_kv_heads(),
-                c.head_dim,
-                self.num_slots,
-                budget_bytes,
-                KVFormat::BF16,
-            )?;
-            ensure!(
-                pool.page_size == SUPPORTED_PAGE_SIZE,
-                "Qwen3.6 recall pool page_size={} != {SUPPORTED_PAGE_SIZE}",
-                pool.page_size
-            );
+        if enabled && self.recall_tier.is_none() {
             // L3 write-through tier: source of truth for evict-dropped middle
-            // blocks. One entry == one recall-pool page image (all `num_full`
-            // layers, K+V). Host-DRAM budget is machine-derived (same policy as
-            // the prefix tier); NVMe spill is opt-in via the prefix-tier
-            // `--kv-ssd-path` wiring (a separate store today — see the report's
-            // NVMe gap note). Reuses the SAME `CudaKvTierStore` transport the
-            // dense arm's prefix/write-through tier uses (R5 — one store kind).
-            let tier = CudaKvTierStore::with_budget(
-                default_t1_budget_bytes(),
-                pool.storage_bytes_per_page(),
-            );
-            self.recall_kv = Some(pool);
+            // blocks. One entry == one pool page image (all `num_full` layers,
+            // K+V). Host-DRAM budget is machine-derived (same policy as the
+            // prefix tier); NVMe spill is opt-in via the prefix-tier
+            // `--kv-ssd-path` wiring. Reuses the SAME `CudaKvTierStore` transport
+            // the dense arm's prefix/write-through tier uses (R5 — one store kind).
+            let page_bytes = self
+                .full_attn_kv
+                .as_ref()
+                .map(|p| p.storage_bytes_per_page())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--kv-recall: full-attn paged pool not allocated")
+                })?;
+            let tier = CudaKvTierStore::with_budget(default_t1_budget_bytes(), page_bytes);
             self.recall_tier = Some(tier);
         }
         Ok(())
     }
 
-    /// Whether the full-attn KV path routes the paged recall pool this session.
+    /// Whether the full-attn KV path is paged (the shared pool is resident).
+    /// TRUE by default since the shared-paged migration — the default forward
+    /// attends the full resident page set. (`Option` is `None` only after an
+    /// OPD weight offload dropped the pool.)
+    fn full_attn_paged(&self) -> bool {
+        self.full_attn_kv.is_some()
+    }
+
+    /// Actual shared full-attn paged-pool page count, so the host admission pool
+    /// mirrors the device pool 1:1 (like dense). `None` only if the pool was
+    /// dropped (OPD offload), in which case the caller falls back to the
+    /// requested config value.
+    pub(crate) fn full_attn_pool_pages(&self) -> Option<usize> {
+        self.full_attn_kv.as_ref().map(|p| p.max_total_pages)
+    }
+
+    /// Whether the recall eviction/scoring *cycle* runs this session
+    /// (`--kv-recall`). When false the default paged path still runs — it just
+    /// attends the full resident set (no working-set restriction, no tier I/O).
     fn recall_active(&self) -> bool {
-        self.kv_recall && self.recall_kv.is_some()
+        self.kv_recall && self.recall_tier.is_some() && self.full_attn_kv.is_some()
+    }
+
+    /// One DEFAULT paged prefill row (no recall cycle): self-allocate the prompt
+    /// tokens into the shared `full_attn_kv` pool, build the FULL-resident page
+    /// table (`PageMeta::for_slot`), and run the paged forward over it. This is
+    /// the dense-Qwen3 model applied to Qwen3.6 — full attention over every
+    /// resident page, no eviction/scoring/prefetch. Mirrors the prefill steps of
+    /// [`Self::prefill_row_recall`] but stops after the forward.
+    fn prefill_row_paged_default(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        position: u64,
+    ) -> Result<u32> {
+        let slot = row.slot;
+        {
+            let pool = self
+                .full_attn_kv
+                .as_mut()
+                .expect("full_attn_kv present (full_attn_paged)");
+            pool.alloc_tokens(slot, row.tokens.len())?;
+        }
+        let meta = {
+            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
+            crate::loader::PageMeta::for_slot(
+                &self.model.ctx,
+                pool,
+                slot,
+                row.start_pos,
+                row.tokens.len(),
+            )?
+        };
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            ..
+        } = self;
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        let mut rc = crate::qwen35::Qwen35RecallForward {
+            pool,
+            meta: &meta,
+            layer0_query: Vec::new(),
+        };
+        model.forward_tokens_recall(
+            &mut slots[slot],
+            workspace,
+            &row.tokens,
+            row.start_pos,
+            &row.params,
+            position,
+            &mut rc,
+        )
+    }
+
+    /// One DEFAULT paged decode row (no recall cycle): append this step's token
+    /// to the shared `full_attn_kv` pool and attend the FULL resident page set
+    /// (`PageMeta::for_slot`). Mirrors [`Self::decode_row_recall`] but without
+    /// the working-set restriction and without any tier I/O.
+    fn decode_row_paged_default(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
+        let slot = row.slot;
+        {
+            let pool = self
+                .full_attn_kv
+                .as_mut()
+                .expect("full_attn_kv present (full_attn_paged)");
+            pool.alloc_tokens(slot, 1)?;
+        }
+        let meta = {
+            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
+            crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
+        };
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            ..
+        } = self;
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        let mut rc = crate::qwen35::Qwen35RecallForward {
+            pool,
+            meta: &meta,
+            layer0_query: Vec::new(),
+        };
+        model.forward_tokens_recall(
+            &mut slots[slot],
+            workspace,
+            &[row.last_token],
+            row.kv_seq_len,
+            &row.params,
+            position,
+            &mut rc,
+        )
     }
 
     /// One prefill row over the paged recall pool (`--kv-recall`), and the ONE
@@ -3202,13 +3390,13 @@ impl Qwen35CudaExecutor {
         // Self-allocate the new tokens (extends the page table + pool seq_len).
         {
             let pool = self
-                .recall_kv
+                .full_attn_kv
                 .as_mut()
-                .expect("recall_kv present (recall_active)");
+                .expect("full_attn_kv present (recall_active)");
             pool.alloc_tokens(slot, row.tokens.len())?;
         }
         let meta = {
-            let pool = self.recall_kv.as_ref().expect("recall_kv present");
+            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
             crate::loader::PageMeta::for_slot(
                 &self.model.ctx,
                 pool,
@@ -3225,10 +3413,10 @@ impl Qwen35CudaExecutor {
                 model,
                 slots,
                 workspace,
-                recall_kv,
+                full_attn_kv,
                 ..
             } = self;
-            let pool = recall_kv.as_mut().expect("recall_kv present");
+            let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
             let mut rc = crate::qwen35::Qwen35RecallForward {
                 pool,
                 meta: &meta,
@@ -3247,7 +3435,7 @@ impl Qwen35CudaExecutor {
         };
 
         let cache_len = row.start_pos + row.tokens.len();
-        let ps = self.recall_kv.as_ref().expect("recall_kv").page_size;
+        let ps = self.full_attn_kv.as_ref().expect("full_attn_kv").page_size;
         ensure!(
             cfg.n_init.is_multiple_of(ps)
                 && cfg.n_local.is_multiple_of(ps)
@@ -3269,11 +3457,11 @@ impl Qwen35CudaExecutor {
         let (evict_pages, prefetch_pages) = {
             let Self {
                 recall,
-                recall_kv,
+                full_attn_kv,
                 model,
                 ..
             } = self;
-            let pool = recall_kv.as_ref().expect("recall_kv");
+            let pool = full_attn_kv.as_ref().expect("full_attn_kv");
             if let Some(state) = recall.get_mut(slot) {
                 state.recompute_recall_plan(
                     &model.ctx,
@@ -3307,7 +3495,7 @@ impl Qwen35CudaExecutor {
                 Ok(p) => p.into_owned(),
                 Err(_) => continue, // tier dropped it (LRU/capacity) → stays evicted
             };
-            if let Some(pool) = self.recall_kv.as_mut() {
+            if let Some(pool) = self.full_attn_kv.as_mut() {
                 if let Some(new_page) = pool.reinstate_slot_page(slot, logical) {
                     pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
                 }
@@ -3317,7 +3505,7 @@ impl Qwen35CudaExecutor {
         // (3b) Resolve the FIXED working-set page list now that prefetch has patched
         // any reinstated sentinels to real ids. Decode reads this and never mutates it.
         if let Some(state) = self.recall.get_mut(slot) {
-            if let Some(pool) = self.recall_kv.as_ref() {
+            if let Some(pool) = self.full_attn_kv.as_ref() {
                 state.resolve_recall_pages(pool, slot);
             }
         }
@@ -3330,7 +3518,7 @@ impl Qwen35CudaExecutor {
         // write_through keeps the page resident (no KV loss).
         for logical in evict_pages {
             let physical = {
-                let pool = self.recall_kv.as_ref().expect("recall_kv");
+                let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
                 pool.page_indices(slot)
                     .get(logical)
                     .copied()
@@ -3342,7 +3530,7 @@ impl Qwen35CudaExecutor {
             let key = tier_block_u64(slot as u64, logical as u64);
             let mirrored = {
                 let payload = {
-                    let pool = self.recall_kv.as_ref().expect("recall_kv");
+                    let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
                     pool.copy_pages_to_host(&self.model.ctx, &[physical])?
                 };
                 match self.recall_tier.as_mut() {
@@ -3353,7 +3541,7 @@ impl Qwen35CudaExecutor {
             if !mirrored {
                 continue; // tier full → keep the page resident (no KV loss)
             }
-            if let Some(pool) = self.recall_kv.as_mut() {
+            if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.evict_slot_page(slot, logical);
             }
         }
@@ -3383,9 +3571,9 @@ impl Qwen35CudaExecutor {
         // (1) Alloc this step's token so the tail page exists.
         {
             let pool = self
-                .recall_kv
+                .full_attn_kv
                 .as_mut()
-                .expect("recall_kv present (recall_active)");
+                .expect("full_attn_kv present (recall_active)");
             pool.alloc_tokens(slot, 1)?;
         }
         let cache_len = row.kv_seq_len + 1; // incl. this step's token
@@ -3394,13 +3582,13 @@ impl Qwen35CudaExecutor {
         let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
             Some(p) => p.to_vec(),
             None => {
-                let pool = self.recall_kv.as_ref().expect("recall_kv");
+                let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
                 let num_pages = cache_len.div_ceil(pool.page_size);
                 pool.page_indices(slot)[..num_pages].to_vec()
             }
         };
         let meta = {
-            let pool = self.recall_kv.as_ref().expect("recall_kv");
+            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
             crate::loader::PageMeta::for_recall_decode(
                 &self.model.ctx,
                 pool,
@@ -3415,10 +3603,10 @@ impl Qwen35CudaExecutor {
             model,
             slots,
             workspace,
-            recall_kv,
+            full_attn_kv,
             ..
         } = self;
-        let pool = recall_kv.as_mut().expect("recall_kv");
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv");
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
             meta: &meta,
@@ -3708,6 +3896,9 @@ impl Qwen35CudaExecutor {
             if let Some(dg) = self.decode_graph.as_mut() {
                 dg.graphs[row.slot].rearm_warm(1);
             }
+            // Default paged path: free the prior occupant's pages back to the
+            // shared pool so a fresh prefill starts at logical page 0. (Under
+            // recall the keepalive release below also runs.)
             if self.recall_active() {
                 self.recall[row.slot].reset();
                 // Release any pages still parked in the eviction keepalive from the
@@ -3717,7 +3908,7 @@ impl Qwen35CudaExecutor {
                 // them). The prior request finished, so its attention has long since
                 // completed — no race with the one-step deferral.
                 let parked = std::mem::take(&mut self.recall_keepalive[row.slot]);
-                if let Some(pool) = self.recall_kv.as_mut() {
+                if let Some(pool) = self.full_attn_kv.as_mut() {
                     for (_logical, physical) in parked {
                         pool.release_evicted_page(physical);
                     }
@@ -3730,20 +3921,18 @@ impl Qwen35CudaExecutor {
                 // occupant's tier block before overwriting that key — tenant-safe
                 // without a per-session key registry (the dense arm's
                 // `drop_tier_session` makes the same call, see its doc).
+            } else if let Some(pool) = self.full_attn_kv.as_mut() {
+                // Default paged (no recall): just recycle the slot's pages.
+                pool.free_slot(row.slot);
             }
         }
         let position = (row.start_pos + row.tokens.len()) as u64;
         if self.recall_active() {
             self.prefill_row_recall(row, position)
         } else {
-            self.model.forward_tokens(
-                &mut self.slots[row.slot],
-                &mut self.workspace,
-                &row.tokens,
-                row.start_pos,
-                &row.params,
-                position,
-            )
+            // Default paged prefill: full attention over all resident pages, no
+            // eviction (the dense model applied to Qwen3.6 — Phase 2).
+            self.prefill_row_paged_default(row, position)
         }
     }
 
@@ -3765,16 +3954,25 @@ impl Qwen35CudaExecutor {
             row.slot
         );
         let position = row.kv_seq_len.saturating_add(1) as u64;
-        // Session KV-recall (opt-in): the full-attn KV lives in the paged recall
-        // pool, so decode reads the recall-restricted page table instead of the
-        // contiguous slot cache (and the graph lane, which bakes contiguous-cache
-        // addresses, is bypassed). The seq_len invariant above still holds — the
-        // slot's seq_len is advanced in lockstep inside the recall forward.
+        // Session KV-recall (opt-in): decode reads the recall-restricted page
+        // table (the fixed working set chosen at prefill). The seq_len invariant
+        // above still holds — the slot's seq_len is advanced in lockstep inside
+        // the recall forward.
         if self.recall_active() {
             return self.decode_row_recall(row, position);
         }
-        // Whole-step graph lane first (opt-in); eager forward is the
-        // correctness floor and the fallback on any graph miss/failure.
+        // Default paged decode: append + attend the full resident page set. The
+        // whole-step decode-graph lane bakes per-step device addresses (the page
+        // table grows each step), so it is bypassed under the paged default —
+        // the paged forward IS the correctness floor; the graph lane (kept below
+        // for the legacy contiguous path) is a contiguous-cache optimization a
+        // later phase re-enables over a stable paged table.
+        if self.full_attn_paged() {
+            return self.decode_row_paged_default(row, position);
+        }
+        // Legacy contiguous path (no paged pool — e.g. OPD weight offload dropped
+        // it): the whole-step graph lane first (opt-in), with eager
+        // `forward_tokens` as the correctness floor / graph-miss fallback.
         let graph_token = if allow_graph {
             self.try_graph_decode(row, position)?
         } else {
@@ -3830,13 +4028,14 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        // Session KV-recall routes every decode row per-row (the recall path is
-        // inherently serial: per-slot stale-Q rescore + evict-drop between steps,
-        // and the full-attn KV lives in the paged recall pool, not the contiguous
-        // caches the batched kernel reads). `submit_decode_row` dispatches each
-        // row through `decode_row_recall`. With recall off this is unchanged.
-        if !qwen35_batched_decode_enabled() || self.recall_active() {
-            // Sequential per-row fallback (A/B arm / escape hatch / recall).
+        // The contiguous batched-decode kernel reads each slot's per-slot
+        // `k_caches`/`v_caches`, which the shared-paged default no longer
+        // allocates. Under the paged default (always-on) and under `--kv-recall`
+        // (serial per-slot rescore/evict), decode routes per-row through
+        // `submit_decode_row` (paged forward). The batched lane only runs in the
+        // legacy contiguous build (no paged pool) with the env gate on.
+        if !qwen35_batched_decode_enabled() || self.recall_active() || self.full_attn_paged() {
+            // Sequential per-row fallback (A/B arm / escape hatch / paged / recall).
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
