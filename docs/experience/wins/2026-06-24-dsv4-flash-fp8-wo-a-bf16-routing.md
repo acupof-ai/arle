@@ -1,6 +1,6 @@
 # DSv4-Flash-FP8 dense-BF16 `wo_a` routing (C2 follow-up)
 
-`pending-remote` — CUDA-only, pod needle-gate running on the 8×H20 box.
+**Pod-verified 2026-06-24** on 8×H20 TP=8/EP=8 (commit `91822235`).
 
 ## Context
 
@@ -35,12 +35,23 @@ regression.
 
 Local verify: `cargo check` + `cargo clippy` `cuda,no-cuda` clean.
 
-## Pod gate (pending)
+## Pod gate (passed)
 
-`/host/DeepSeek-V4-Flash-FP8` on TP=8/EP=8: (1) full load → engine-ready,
-(2) `needle_gate.py` same-config-twice within the non-determinism floor,
-(3) `strings target/release/arle | grep "DSv4 dense sharded"` symbol-check.
-Results fold in when the devops run reports.
+`/host/DeepSeek-V4-Flash-FP8` (274 GB FP8, 46 shards) on TP=8/EP=8, built in an
+isolated clean tree at HEAD `d965f093` (`--features deepep` +
+`ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`, BUILD_EXIT=0 in 6m15s):
+
+1. **Load → engine-ready ✓.** All 8 ranks pass the attention weights with **zero**
+   `wo_a.scale` / block-scale / missing-tensor errors (`grep -c` = 0); uniform
+   41577 MiB/GPU (predicted 41570). `GET /v1/models` → 200. This is the exact step
+   that hard-failed before the fix.
+2. **Needle DET ✓** (`needle_gate.py`, `RAW=1 TEMPLATE=dsv4`, needle `738291`):
+   len 115/446/2000 → exact=3 DET; len 8000 depth=0.5 → exact=2, the one NONDET a
+   benign markdown diff (`738291.` vs `**738291**.`, both correct — expected MoE
+   non-determinism, not a miss). Free-form output coherent + factual, no garbage.
+3. **Symbol-check ✓.** `strings arle | grep` hit all 4 fix markers
+   (`DSv4 dense sharded load supports Column{dim:0}/Replicated`, the three
+   `DSv4 dense wo_a …` messages) — the binary built the right tree.
 
 ## Rule
 
