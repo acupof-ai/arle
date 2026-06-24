@@ -188,6 +188,7 @@ impl RealCudaExecutor {
         num_slots: usize,
         total_pages: usize,
         kv_dtype: CudaKvCacheDtype,
+        mem_fraction_static: f64,
     ) -> Result<Self> {
         Ok(Self::Qwen(Box::new(
             QwenCudaExecutor::from_qwen3_bf16_safetensors(
@@ -195,6 +196,7 @@ impl RealCudaExecutor {
                 num_slots,
                 total_pages,
                 kv_dtype,
+                mem_fraction_static,
             )?,
         )))
     }
@@ -445,12 +447,6 @@ impl RealCudaExecutor {
     /// Attach the opt-in disk spill level (pre-serve only). Returns whether
     /// any arm consumed it, so callers can fail closed instead of silently
     /// dropping an explicit `--kv-ssd-path` request.
-    ///
-    /// Dense Qwen3 wires its prefix/write-through tier's *ephemeral* spill.
-    /// Qwen3.5/3.6 has no prefix tier, but when `--kv-recall` is on its recall
-    /// tier consumes the path as a **durable** NVMe-backed store (manifest +
-    /// epoch); with recall off the Qwen3.5 arm has no tier and returns `false`
-    /// (the caller fails closed on the explicit flag).
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -458,8 +454,7 @@ impl RealCudaExecutor {
     ) -> bool {
         match self {
             Self::Qwen(q) => q.set_kv_tier_disk(root, budget_bytes),
-            Self::Qwen35(q) => q.set_kv_recall_disk(root, budget_bytes),
-            Self::Dsv4(_) => false,
+            Self::Qwen35(_) | Self::Dsv4(_) => false,
         }
     }
 
@@ -481,6 +476,19 @@ impl RealCudaExecutor {
             Self::Qwen(q) => q.num_slots,
             Self::Qwen35(q) => q.num_slots,
             Self::Dsv4(d) => d.num_slots,
+        }
+    }
+
+    /// Actual shared device-pool page count, for the dense Qwen3 path only. The
+    /// dense pool is profiled from measured free VRAM at construction
+    /// (`from_qwen3_bf16_safetensors` → `profile_kv_pool_tokens`), so this is the
+    /// page count the host admission pool MUST mirror 1:1 — not the requested
+    /// `total_pages`. `None` for Qwen3.5/3.6 + DSv4 (slot-arena KV, no shared
+    /// page pool); their admission stays per-slot this phase.
+    pub(crate) fn effective_total_pages(&self) -> Option<usize> {
+        match self {
+            Self::Qwen(q) => Some(q.kv.max_total_pages),
+            Self::Qwen35(_) | Self::Dsv4(_) => None,
         }
     }
 
@@ -677,11 +685,18 @@ impl std::fmt::Debug for QwenCudaExecutor {
 }
 
 impl QwenCudaExecutor {
+    /// `mem_fraction_static` (default 0.9): the dense shared paged pool is sized
+    /// from MEASURED free VRAM after weights load (`infer_seam::profile_kv_pool_tokens`,
+    /// SGLang-style), NOT the requested `total_pages`. `total_pages` becomes a
+    /// minimum-capacity floor: the profiled pool is the larger of the two so an
+    /// explicit `--total-pages` never shrinks below the request, but a large card
+    /// gets the extra capacity for more concurrency.
     pub(crate) fn from_qwen3_bf16_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
         kv_dtype: CudaKvCacheDtype,
+        mem_fraction_static: f64,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "CudaExecutor requires at least one slot");
         ensure!(
@@ -691,6 +706,51 @@ impl QwenCudaExecutor {
 
         let model = CudaModel::from_safetensors(model_path.as_ref())?;
         let kv_format = kv_dtype.kv_format();
+
+        // Profile the shared paged pool from MEASURED free VRAM now that the
+        // weights are resident (SGLang's mem_fraction_static). Per-token cell cost
+        // = `budget_bytes_for_tokens(.., 1 token)` (storage + work bytes the pool
+        // actually charges). On a successful read, size the pool to the larger of
+        // the profiled token budget and the requested `total_pages` floor; if the
+        // VRAM probe fails (no active context / driver error), fall back to the
+        // requested `total_pages` exactly (byte-identical to before profiling).
+        let cell_bytes_per_token = PagedKVPool::budget_bytes_for_tokens(
+            model.config.num_hidden_layers,
+            model.config.num_key_value_heads,
+            model.config.head_dim,
+            1,
+            kv_format,
+        ) as u64;
+        let requested_pages = total_pages;
+        let total_pages = match model.ctx.mem_info_bytes() {
+            Ok((free, total)) => {
+                let profiled_tokens = infer_seam::profile_kv_pool_tokens(
+                    free as u64,
+                    total as u64,
+                    cell_bytes_per_token,
+                    mem_fraction_static,
+                );
+                let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
+                let sized = profiled_pages.max(requested_pages).max(1);
+                log::info!(
+                    "CUDA dense Qwen3 KV pool profiled from measured VRAM: free {}MB / total \
+                     {}MB, mem_fraction_static {mem_fraction_static}, cell {cell_bytes_per_token}B/tok \
+                     -> max_total_tokens {profiled_tokens} ({profiled_pages} pages); requested \
+                     floor {requested_pages} pages -> sizing {sized} pages",
+                    free >> 20,
+                    total >> 20,
+                );
+                sized
+            }
+            Err(e) => {
+                log::warn!(
+                    "CUDA dense Qwen3 KV pool: free-VRAM probe failed ({e}); falling back to \
+                     requested total_pages={requested_pages}"
+                );
+                requested_pages
+            }
+        };
+
         let token_budget = total_pages * SUPPORTED_PAGE_SIZE;
         let budget_bytes = PagedKVPool::budget_bytes_for_tokens(
             model.config.num_hidden_layers,
@@ -3094,63 +3154,18 @@ impl Qwen35CudaExecutor {
             // L3 write-through tier: source of truth for evict-dropped middle
             // blocks. One entry == one recall-pool page image (all `num_full`
             // layers, K+V). Host-DRAM budget is machine-derived (same policy as
-            // the prefix tier). Durable NVMe spill is opt-in via
-            // [`Self::set_kv_recall_disk`] (the post-spawn `--kv-ssd-path`
-            // wiring) — the store starts host-DRAM-only here; the disk level +
-            // manifest replay attach pre-traffic. Reuses the SAME
-            // `CudaKvTierStore` transport the dense arm's prefix/write-through
-            // tier uses (R5 — one store kind).
+            // the prefix tier); NVMe spill is opt-in via the prefix-tier
+            // `--kv-ssd-path` wiring (a separate store today — see the report's
+            // NVMe gap note). Reuses the SAME `CudaKvTierStore` transport the
+            // dense arm's prefix/write-through tier uses (R5 — one store kind).
             let tier = CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(),
                 pool.storage_bytes_per_page(),
             );
             self.recall_kv = Some(pool);
             self.recall_tier = Some(tier);
-            // Pool consolidation: the regular per-slot contiguous full-attn K/V
-            // (sized to max_seq_len, ~most of the per-slot bytes on Qwen3.6) is
-            // REDUNDANT under recall — the read-swap routes every full-attn
-            // layer through the paged `recall_kv` pool just allocated above
-            // (`full_attention_paged`), so nothing reads or writes those
-            // contiguous caches while recall is active. Free them now, once, on
-            // the first enable. Qwen3.6 is HYBRID: each slot ALSO holds the
-            // linear-attn recurrent + conv state, which `recall_kv` does NOT
-            // carry and which both paths still use — those are separately
-            // allocated `gdr_states`/`conv_states` Vecs and are left untouched
-            // (`free_full_attn_caches` drops only `k_caches`/`v_caches`).
-            // Default-off (`set_kv_recall(false)`) never reaches here, so the
-            // baseline per-slot allocation stays byte-identical.
-            for slot in &mut self.slots {
-                slot.free_full_attn_caches();
-            }
         }
         Ok(())
-    }
-
-    /// Attach a **durable, NVMe-backed** disk level to the session KV-recall
-    /// tier (`--kv-recall` + `--kv-ssd-path`). Pre-serve only, called once after
-    /// `set_kv_recall(true)` constructed the tier. Replays any prior session's
-    /// manifest under the per-process durable namespace (so its evicted KV is
-    /// addressable again) unless the weights epoch mismatches (stale memory
-    /// after an OPD weight update → start cold). Returns `false` when recall is
-    /// not active (no tier to back) so the caller can fail closed on an explicit
-    /// `--kv-ssd-path` that no arm consumed.
-    pub(crate) fn set_kv_recall_disk(
-        &mut self,
-        root: std::path::PathBuf,
-        budget_bytes: usize,
-    ) -> bool {
-        if self.recall_tier.is_none() {
-            return false;
-        }
-        let epoch = self.model.weights_epoch().to_string();
-        let tier = self.recall_tier.as_mut().expect("recall_tier present");
-        let page_bytes = tier.page_bytes();
-        let reloaded = tier.load(root, budget_bytes, page_bytes, epoch.clone());
-        info!(
-            "KV-recall durable NVMe tier attached (epoch={epoch}, reloaded_blocks={})",
-            if reloaded { ">0" } else { "0" }
-        );
-        true
     }
 
     /// Whether the full-attn KV path routes the paged recall pool this session.

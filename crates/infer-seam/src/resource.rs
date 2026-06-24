@@ -97,6 +97,69 @@ pub fn clamp_to_affordable(requested: usize, affordable: usize) -> (usize, bool)
     (planned, planned < requested)
 }
 
+/// Bounds for `mem_fraction_static`: a backend never claims less than half nor
+/// more than ~all of HBM for KV — leave room for activations/scratch even at the
+/// top, and don't collapse the pool to nothing at the bottom.
+const MEM_FRACTION_STATIC_MIN: f64 = 0.5;
+const MEM_FRACTION_STATIC_MAX: f64 = 0.97;
+
+/// Floor on the profiled token pool: a transient tiny free-VRAM reading (another
+/// process spiking, a fragmented allocator) must not size the KV pool to ~zero
+/// and wedge admission. 4096 tokens is far below any real serving budget yet
+/// keeps a short request alive; callers floor again at `page_size`.
+pub const PROFILE_KV_TOKENS_FLOOR: u64 = 4096;
+
+/// Clamp a requested static-memory fraction into the safe operating band
+/// `[0.5, 0.97]`. Exposed so callers can report the clamp; the profiler applies
+/// it internally regardless. A `NaN` fraction (a parse/compute bug) resolves to
+/// the conservative max rather than propagating `NaN` through the budget.
+#[must_use]
+pub fn clamp_mem_fraction_static(mem_fraction_static: f64) -> f64 {
+    if mem_fraction_static.is_nan() {
+        return MEM_FRACTION_STATIC_MAX;
+    }
+    mem_fraction_static.clamp(MEM_FRACTION_STATIC_MIN, MEM_FRACTION_STATIC_MAX)
+}
+
+/// SGLang-style KV pool sizing from a *measured* free/total VRAM reading taken
+/// AFTER weights are resident — the model-agnostic foundation. Knows nothing
+/// about any model: it takes bytes and a per-token cell cost and returns how
+/// many KV tokens fit.
+///
+/// ```text
+/// reserve = total_bytes × (1 − mem_fraction_static)   (headroom for activations/scratch/fragmentation)
+/// rest    = free_bytes − reserve                        (saturating)
+/// tokens  = rest / cell_bytes_per_token                 (floored at PROFILE_KV_TOKENS_FLOOR)
+/// ```
+///
+/// `cell_bytes_per_token = num_kv_heads · head_dim · num_layers · 2(K+V) ·
+/// sizeof(kv_dtype)` (plus any per-token scale/norm/work bytes the backend's
+/// pool charges) — computed backend-side and passed in, so this stays device-
+/// and model-neutral.
+///
+/// `mem_fraction_static` is clamped to `[0.5, 0.97]` ([`clamp_mem_fraction_static`]).
+/// A `cell_bytes_per_token` of 0 (a bug — an empty pool shape) returns the floor
+/// rather than dividing by zero. The result is floored at
+/// [`PROFILE_KV_TOKENS_FLOOR`] so a transient tiny `free_bytes` can't wedge
+/// admission at ~0 tokens.
+#[must_use]
+pub fn profile_kv_pool_tokens(
+    free_bytes: u64,
+    total_bytes: u64,
+    cell_bytes_per_token: u64,
+    mem_fraction_static: f64,
+) -> u64 {
+    if cell_bytes_per_token == 0 {
+        return PROFILE_KV_TOKENS_FLOOR;
+    }
+    let frac = clamp_mem_fraction_static(mem_fraction_static);
+    // reserve = total × (1 − frac); subtract from free, saturating to 0.
+    let reserve = (total_bytes as f64 * (1.0 - frac)) as u64;
+    let rest = free_bytes.saturating_sub(reserve);
+    let tokens = rest / cell_bytes_per_token;
+    tokens.max(PROFILE_KV_TOKENS_FLOOR)
+}
+
 /// Host-demoted RAM + disk budgets, derived from machine state instead of
 /// hardcoded constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,5 +353,75 @@ mod tests {
         let p = HostTierPolicy::default();
         let b = split_host_tiers(Some(64 * GIB), Some(512 * GIB), false, p);
         assert_eq!(b.ssd_bytes, 0);
+    }
+
+    const GIB_U64: u64 = 1 << 30;
+
+    #[test]
+    fn profile_kv_pool_tokens_matches_sglang_arithmetic() {
+        // A dense Qwen3-4B-shaped pool on an 80 GB card: ~30 GB weights resident,
+        // 50 GB free, 80 GB total, mem_fraction_static=0.9.
+        //   reserve = 80 GB × 0.1 = 8 GB; rest = 50 GB − 8 GB = 42 GB.
+        // cell = 8 kv_heads × 128 head_dim × 36 layers × 2 (K+V) × 2 (bf16)
+        //      = 147_456 bytes/token.
+        let free = 50 * GIB_U64;
+        let total = 80 * GIB_U64;
+        let cell: u64 = 8 * 128 * 36 * 2 * 2;
+        let mem_frac = 0.9;
+        let got = profile_kv_pool_tokens(free, total, cell, mem_frac);
+
+        let reserve = (total as f64 * (1.0 - mem_frac)) as u64;
+        let rest = free - reserve;
+        assert_eq!(got, rest / cell);
+        // Sanity: 42 GB / 144 KiB-ish/token is on the order of 300k tokens.
+        assert!(got > 250_000 && got < 350_000, "got {got}");
+    }
+
+    #[test]
+    fn profile_kv_pool_tokens_floors_on_tiny_free() {
+        // Free VRAM momentarily near zero (another process spiking): the pool must
+        // floor, never collapse to 0 tokens and wedge admission.
+        let cell: u64 = 147_456;
+        let got = profile_kv_pool_tokens(GIB_U64 / 1024, 80 * GIB_U64, cell, 0.9);
+        assert_eq!(got, PROFILE_KV_TOKENS_FLOOR);
+        // Reserve exceeding free → saturating rest=0 → floor.
+        let starved = profile_kv_pool_tokens(GIB_U64, 80 * GIB_U64, cell, 0.5);
+        assert_eq!(starved, PROFILE_KV_TOKENS_FLOOR);
+    }
+
+    #[test]
+    fn profile_kv_pool_tokens_clamps_fraction() {
+        let cell: u64 = 147_456;
+        let free = 50 * GIB_U64;
+        let total = 80 * GIB_U64;
+        // 0.99 clamps to 0.97 (reserve floor): smaller reserve than the request.
+        let high = profile_kv_pool_tokens(free, total, cell, 0.99);
+        let at_max = profile_kv_pool_tokens(free, total, cell, 0.97);
+        assert_eq!(high, at_max);
+        // 0.1 clamps to 0.5 (reserve cap): larger reserve than the request → fewer tokens.
+        let low = profile_kv_pool_tokens(free, total, cell, 0.1);
+        let at_min = profile_kv_pool_tokens(free, total, cell, 0.5);
+        assert_eq!(low, at_min);
+        assert!(low < high, "tighter fraction must size a smaller pool");
+        // NaN resolves to the conservative max, not a panic / NaN propagation.
+        let nan = profile_kv_pool_tokens(free, total, cell, f64::NAN);
+        assert_eq!(nan, at_max);
+    }
+
+    #[test]
+    fn profile_kv_pool_tokens_zero_cell_is_floor_not_panic() {
+        // A 0 cell cost would divide-by-zero; guard returns the floor instead.
+        assert_eq!(
+            profile_kv_pool_tokens(50 * GIB_U64, 80 * GIB_U64, 0, 0.9),
+            PROFILE_KV_TOKENS_FLOOR
+        );
+    }
+
+    #[test]
+    fn clamp_mem_fraction_static_band() {
+        assert_eq!(clamp_mem_fraction_static(0.9), 0.9);
+        assert_eq!(clamp_mem_fraction_static(0.1), 0.5);
+        assert_eq!(clamp_mem_fraction_static(1.5), 0.97);
+        assert_eq!(clamp_mem_fraction_static(f64::NAN), 0.97);
     }
 }

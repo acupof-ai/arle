@@ -607,16 +607,21 @@ pub fn metal_engine_from_model_path(
 pub fn cuda_engine_from_model_path(
     model_path: impl AsRef<std::path::Path>,
 ) -> Result<Engine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool>> {
-    let total_pages = 8192; // page_size 16 -> 131072 token capacity
+    let requested_pages = 8192; // page_size 16 -> 131072 token capacity (floor)
     let mut config = SchedulerConfig::for_slots(1);
     config.max_prompt_tokens = 32_768;
     config.max_total_tokens = 65_536;
+    // Dense Qwen3 profiles its shared paged pool from measured free VRAM
+    // (mem_fraction_static 0.9, the serve default); the host KV pool must mirror
+    // the ACTUAL device page count, not the requested floor.
     let executor = infer_cuda::CudaExecutor::from_qwen3_bf16_safetensors(
         model_path,
         1,
-        total_pages,
+        requested_pages,
         infer_cuda::CudaKvCacheDtype::default(),
+        0.9,
     )?;
+    let total_pages = executor.effective_total_pages().unwrap_or(requested_pages);
     let engine = Engine::with_config(
         executor,
         infer_cuda::CudaKvPool::new(1, total_pages, 16),
