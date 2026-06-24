@@ -67,7 +67,7 @@ already reaches the ceiling at c=8 (continuous batching pipelines the queue);
 ceiling is the MoE expert grouped-GEMM at small batch + TP=4 per-layer allreduce,
 not the slot cap. The lever is an MoE-decode batching kernel (or EP), not slots.
 
-## DSv4 EP (DeepEP) — 2 latent bugs fixed; c=1 correct, concurrency NON-FUNCTIONAL (commit `5a2b8273`)
+## DSv4 EP (DeepEP) — 2 device bugs fixed (`5a2b8273`); deepep_ll boot DEADLOCKS (root-caused, fix scoped)
 
 "Use GPUs 4-7" surfaced a latent device-binding bug:
 - **Toolchain**: `dsv4_toolchain.sh build_infer` hardcoded `--features cuda,nccl`,
@@ -86,18 +86,29 @@ not the slot cap. The lever is an MoE-decode batching kernel (or EP), not slots.
   (`ARLE_DEEPEP_NVSHMEM_DIR` = the pip `nvidia-nvshmem` pkg, `nvshmem=true`);
   DeepEP @ `d4f41e4` cloned via the proxy (the sglang `/sgl-workspace/DeepEP` is a
   newer non-`legacy/` layout deepep-sys rejects).
-- **`deepep_ll` (NVSHMEM EP) on 4,5,6,7 — c=1 single-stream ONLY**: needle exact
-  ×3 DET at the lengths run (115→1000, `num_max_dispatch_tokens_per_rank=256`), so
-  the EP forward path is numerically correct at batch 1 (transcript only — not
-  re-captured in a commit/log artifact; treat as evidence-grade c=1, not archived).
-  **Concurrency is NON-FUNCTIONAL, not "tuned later": every concurrent `c跑` (c=1/4/8/16)
-  returned 0 successful requests (0 tok/s, ok=0/N), and `=512` made even the needle
-  NONDET exact=0.** Root tension: `num_max_dispatch_tokens_per_rank` must be ≥ the
-  concurrent batch (≥512/rank) but that OOMs alongside DSv4's ~40 GB/rank weights on
-  96 GB cards; 256 overflows under any concurrency. **EP's entire point is throughput,
-  so EP throughput is UNVERIFIED — a hard blocker (no batch size fits on 96 GB),
-  not a perf follow-up.** Next: shrink the KV arena / lower `INFER_DSV4_MAX_SEQ_LEN`
-  to fit ≥512 LL buffer, then re-run the c-sweep and capture the log.
+- **`deepep_ll` (NVSHMEM EP) — clean re-test (2026-06-24, latest main `ed56d5ea`)
+  root-causes a BOOT DEADLOCK, correcting two earlier misdiagnoses.** Rebuilt with
+  the EP device-fix + ckl's `wo_a` fix present (the prior tree had been reset without
+  them — the earlier "needle exact" was unreproducible, audit H4). On GPUs 4-7,
+  `max_tok=512`, `INFER_DSV4_MAX_SEQ_LEN=4096`:
+  - **The model FITS — "no batch fits on 96 GB" was WRONG.** Ranks 1-3 loaded to
+    **83 GB / 96 GB** each (weights + 512 scratch). The prior "512 OOM" was the
+    `32768` arena (default I raised in C4), not the LL buffer.
+  - **It never reaches ready — deadlocks at BOOT, not concurrency.** `/proc/<pid>`
+    probe (the decisive evidence): ranks 1-3 = state **R**, spinning on GPU at the
+    NVSHMEM/NCCL boot barrier, **0 safetensors open**; rank 0 (in-process = relay
+    coordinator AND TP rank 0) = state **S**, stack `pipe_wait→pipe_read→vfs_read`,
+    **0 safetensors open** — stuck in the relay coordinator loop, never entering the
+    deepep_ll boot collectives (`Buffer::sync` + uid `all_gather` + `nvshmem_init`,
+    `deepep.rs:240-284`) that allreduce never runs. So the in-process rank-0's
+    coordinator role and TP-rank role aren't safely interleaved during the LL boot.
+    NOT SSD (no safetensors read — confound ruled out), NOT memory. allreduce-TP4
+    has no boot collectives → boots fine.
+  - **EP is blocked earlier than documented**: c=1 correctness is unverified-this-run
+    (couldn't boot) and concurrency was never reached. **Fix = multiproc boot-ordering
+    surgery** (interleave rank-0 coordinator vs TP-rank duties across the LL boot
+    collectives, or spawn rank 0 as a full worker), needs a quiet pod + rebuild cycles;
+    scoped, not yet done. EP=8 (production, 0-7) untested here — only 5 GPUs were free.
 
 ## Rule
 
