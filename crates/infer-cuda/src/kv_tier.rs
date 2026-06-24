@@ -6,13 +6,36 @@
 //! to a fingerprint-named block file, so the capacity the engine sees is
 //! host-demoted + disk pages. Payloads are full
 //! `PagedKVPool` page images; this module never touches the device.
+//!
+//! ## Durability (recall tier)
+//!
+//! The prefix tier uses a per-process *ephemeral* disk namespace that is wiped
+//! on drop (a crash-safe cache the engine can always rebuild). The session
+//! KV-recall tier instead opts into a **durable** disk namespace ([`set_disk`]
+//! with `durable = true`): the namespace is stable across restarts, survives
+//! drop, and carries a [`MANIFEST_FILE`] persisting each disk-resident block's
+//! `{key, byte_len}` plus an epoch tag. [`CudaKvTierStore::load`] replays the
+//! manifest so a prior session's evicted KV is addressable again; a stale epoch
+//! (e.g. after an OPD weight update) discards the prior memory.
+//!
+//! [`set_disk`]: CudaKvTierStore::set_disk
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use infer_seam::{HostTierPolicy, split_host_tiers};
+
+/// Manifest filename under a durable disk namespace. Records the epoch tag plus
+/// one `key byte_len` line per disk-resident block so a restart can rebuild the
+/// in-memory disk index and re-address the otherwise-orphaned sharded blobs.
+const MANIFEST_FILE: &str = "manifest.kvm";
+
+/// Manifest header magic + version. A mismatch — or a missing manifest — makes
+/// [`CudaKvTierStore::load`] start cold rather than trust a foreign layout.
+const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V1";
 
 static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -108,13 +131,74 @@ struct DiskTier {
     /// Process-owned namespace under the operator-provided root.
     root: PathBuf,
     capacity_pages: usize,
-    /// Keys whose payloads currently live on disk.
-    keys: BTreeSet<u64>,
+    /// Keys whose payloads currently live on disk, mapped to each blob's byte
+    /// length (the metadata the manifest persists alongside the key so a
+    /// restart can re-address + size-check the sharded blob).
+    keys: BTreeMap<u64, u64>,
+    /// Durable tier (the recall store): suppress the drop-time wipe, persist a
+    /// manifest under the namespace, and stamp it with `epoch`. Ephemeral
+    /// (prefix-tier) namespaces leave this `false` and are wiped on drop.
+    durable: bool,
+    /// Model/weights-version tag written into the manifest. A `load` whose
+    /// requested epoch differs ignores the prior manifest (stale-memory guard).
+    epoch: String,
 }
 
 impl Drop for DiskTier {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        // Durable namespaces (recall) MUST survive a restart — never wipe.
+        // Ephemeral prefix-tier namespaces are a rebuildable cache, so the
+        // process that owns them cleans up on drop.
+        if !self.durable {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+impl DiskTier {
+    fn manifest_path(&self) -> PathBuf {
+        self.root.join(MANIFEST_FILE)
+    }
+
+    /// Rewrite the manifest from the current key set (atomic temp+rename via
+    /// `kv-native-sys`). Cheap: one small text file, only the disk index — not
+    /// the blobs. Called on every disk insert/remove for a durable tier and on
+    /// the explicit `persist()`.
+    fn write_manifest(&self) -> Result<()> {
+        let mut buf = String::with_capacity(64 + self.keys.len() * 24);
+        buf.push_str(MANIFEST_MAGIC);
+        buf.push('\n');
+        buf.push_str(&self.epoch);
+        buf.push('\n');
+        for (key, byte_len) in &self.keys {
+            // One record per line: `<key> <byte_len>`.
+            writeln!(&mut buf, "{key} {byte_len}").expect("write to String never fails");
+        }
+        kv_native_sys::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
+            .with_context(|| format!("KV recall manifest write under {}", self.root.display()))
+    }
+
+    /// Parse a manifest file's bytes into `(epoch, [(key, byte_len)])`. Returns
+    /// `None` for a missing/empty/foreign-magic file (caller starts cold).
+    fn parse_manifest(bytes: &[u8]) -> Option<(String, Vec<(u64, u64)>)> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != MANIFEST_MAGIC {
+            return None;
+        }
+        let epoch = lines.next()?.to_string();
+        let mut records = Vec::new();
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let key: u64 = parts.next()?.parse().ok()?;
+            let byte_len: u64 = parts.next()?.parse().ok()?;
+            records.push((key, byte_len));
+        }
+        Some((epoch, records))
     }
 }
 
@@ -122,6 +206,69 @@ fn fingerprint(key: u64) -> [u8; 16] {
     let mut f = [0u8; 16];
     f[..8].copy_from_slice(&key.to_le_bytes());
     f
+}
+
+/// Cheap content-version tag for a model checkpoint directory, used to stamp the
+/// durable KV-recall manifest. Hashes each `*.safetensors` file's name, length,
+/// and mtime (FNV-1a, deterministic, no crypto needed). An OPD weight update
+/// rewrites the checkpoint so its lengths/mtimes shift, the tag changes, and a
+/// restart drops the now-stale recalled KV (per prefix-cache-stale-across-weight
+/// -epochs). A probe miss (unreadable dir) yields a stable fallback tag so recall
+/// still works; it just won't auto-invalidate on a silent weight swap.
+pub(crate) fn weights_epoch_tag(model_path: &Path) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    };
+    let mut any = false;
+    if let Ok(entries) = std::fs::read_dir(model_path) {
+        // Collect + sort so directory-order non-determinism never changes the
+        // tag for an unchanged checkpoint.
+        let mut files: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        files.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in files {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if !name_str.ends_with(".safetensors") {
+                continue;
+            }
+            any = true;
+            mix(name_str.as_bytes());
+            if let Ok(meta) = entry.metadata() {
+                mix(&meta.len().to_le_bytes());
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        mix(&dur.as_secs().to_le_bytes());
+                        mix(&dur.subsec_nanos().to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    if any {
+        format!("st-{hash:016x}")
+    } else {
+        // No safetensors enumerated (probe miss): a stable, path-derived tag so
+        // recall still functions across restarts of the same model dir.
+        mix(model_path.to_string_lossy().as_bytes());
+        format!("path-{hash:016x}")
+    }
+}
+
+impl Drop for CudaKvTierStore {
+    fn drop(&mut self) {
+        // Flush the durable manifest one last time on a clean shutdown
+        // (idempotent with the incremental writes on insert/remove). No-op for
+        // an ephemeral tier or when no disk level is attached.
+        self.persist();
+    }
 }
 
 impl CudaKvTierStore {
@@ -138,7 +285,8 @@ impl CudaKvTierStore {
         }
     }
 
-    /// Attach the disk spill level (opt-in). Pre-serve only.
+    /// Attach the **ephemeral** disk spill level (opt-in, the prefix tier).
+    /// Pre-serve only. The namespace is wiped on drop — a rebuildable cache.
     ///
     /// Each serve process gets its own namespace under the operator-provided
     /// root because tier keys are engine-local. Sharing a flat root across two
@@ -149,24 +297,130 @@ impl CudaKvTierStore {
         budget_bytes: usize,
         bytes_per_page: usize,
     ) -> bool {
+        let namespace = self.ephemeral_namespace(root);
+        self.attach_disk(
+            namespace,
+            budget_bytes,
+            bytes_per_page,
+            false,
+            String::new(),
+        )
+    }
+
+    /// Attach a **durable**, NVMe-backed disk spill level for the recall tier
+    /// (`--kv-recall` + `--kv-ssd-path`). Pre-serve only. The namespace is
+    /// *stable across restarts* (derived from the process id only, not a nanos
+    /// nonce) and is NOT wiped on drop, so a prior session's evicted KV blobs
+    /// survive. A manifest under the namespace records every disk-resident
+    /// block's `{key, byte_len}` plus `epoch`; [`Self::load`] replays it.
+    ///
+    /// Returns `false` only when the namespace directory cannot be created.
+    pub(crate) fn set_disk_durable(
+        &mut self,
+        root: PathBuf,
+        budget_bytes: usize,
+        bytes_per_page: usize,
+        epoch: String,
+    ) -> bool {
+        let namespace = Self::durable_namespace(root);
+        self.attach_disk(namespace, budget_bytes, bytes_per_page, true, epoch)
+    }
+
+    fn attach_disk(
+        &mut self,
+        namespace: PathBuf,
+        budget_bytes: usize,
+        bytes_per_page: usize,
+        durable: bool,
+        epoch: String,
+    ) -> bool {
         let capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
-        let root = self.disk_namespace(root);
-        if let Err(err) = std::fs::create_dir_all(&root) {
+        if let Err(err) = std::fs::create_dir_all(&namespace) {
             log::warn!(
                 "KV disk namespace creation failed under {}: {err}",
-                root.display()
+                namespace.display()
             );
             return false;
         }
         self.disk = Some(DiskTier {
-            root,
+            root: namespace,
             capacity_pages,
-            keys: BTreeSet::new(),
+            keys: BTreeMap::new(),
+            durable,
+            epoch,
         });
         true
     }
 
-    fn disk_namespace(&mut self, root: PathBuf) -> PathBuf {
+    /// Rebuild the in-memory disk index from a durable namespace's manifest so a
+    /// prior session's evicted KV is addressable again. Re-attaches the disk
+    /// level (durable) at `root` and replays the manifest's records into
+    /// `keys`. A missing manifest, or one whose epoch tag does not match
+    /// `epoch` (stale memory after an OPD weight update — see
+    /// prefix-cache-stale-across-weight-epochs), starts cold: the namespace is
+    /// re-created empty and any orphaned blobs are left for the OS/operator (a
+    /// new epoch never reads stale KV).
+    ///
+    /// Returns whether any block was reloaded.
+    pub(crate) fn load(
+        &mut self,
+        root: PathBuf,
+        budget_bytes: usize,
+        bytes_per_page: usize,
+        epoch: String,
+    ) -> bool {
+        let namespace = Self::durable_namespace(root.clone());
+        let manifest = namespace.join(MANIFEST_FILE);
+        let parsed = std::fs::read(&manifest)
+            .ok()
+            .and_then(|bytes| DiskTier::parse_manifest(&bytes));
+        // Always (re)attach the durable disk level first so the store is wired
+        // regardless of whether the manifest was usable. `set_disk_durable`
+        // re-derives the same per-process namespace from the operator root.
+        if !self.set_disk_durable(root, budget_bytes, bytes_per_page, epoch.clone()) {
+            return false;
+        }
+        let Some((manifest_epoch, records)) = parsed else {
+            return false;
+        };
+        if manifest_epoch != epoch {
+            log::warn!(
+                "KV recall manifest epoch mismatch under {} (manifest={manifest_epoch:?}, \
+                 requested={epoch:?}); discarding stale memory",
+                namespace.display()
+            );
+            return false;
+        }
+        let Some(disk) = self.disk.as_mut() else {
+            return false;
+        };
+        let capacity = disk.capacity_pages;
+        let mut reloaded = 0usize;
+        for (key, byte_len) in records {
+            if disk.keys.len() >= capacity {
+                break;
+            }
+            disk.keys.insert(key, byte_len);
+            reloaded += 1;
+        }
+        reloaded > 0
+    }
+
+    /// Explicitly flush the durable manifest. No-op for an ephemeral (prefix)
+    /// tier or when no disk level is attached. Best-effort: logs on failure.
+    pub(crate) fn persist(&self) {
+        if let Some(disk) = self.disk.as_ref() {
+            if disk.durable {
+                if let Err(err) = disk.write_manifest() {
+                    log::warn!("KV recall manifest persist failed: {err}");
+                }
+            }
+        }
+    }
+
+    /// Per-process *ephemeral* namespace: a nanos+counter nonce guarantees a
+    /// fresh dir each attach (wiped on drop). Prefix-tier path.
+    fn ephemeral_namespace(&mut self, root: PathBuf) -> PathBuf {
         let counter =
             DISK_TIER_NAMESPACE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -176,6 +430,13 @@ impl CudaKvTierStore {
             "arle-kv-tier-{}-{nanos}-{counter}",
             std::process::id()
         ))
+    }
+
+    /// Per-process *durable* namespace: stable across restarts (process id
+    /// only). The recall tier re-derives the same path on load to re-address
+    /// the prior session's blobs + manifest.
+    fn durable_namespace(root: PathBuf) -> PathBuf {
+        root.join(format!("arle-kv-recall-{}", std::process::id()))
     }
 
     /// Total pages the store can hold (host-demoted + disk) — what the engine budgets
@@ -203,7 +464,7 @@ impl CudaKvTierStore {
         }
         self.disk.as_ref().and_then(|disk| {
             disk.keys
-                .contains(&key)
+                .contains_key(&key)
                 .then_some(infer_seam::KvTierLocation::Disk)
         })
     }
@@ -222,7 +483,7 @@ impl CudaKvTierStore {
             || self
                 .disk
                 .as_ref()
-                .is_some_and(|disk| disk.keys.contains(&key))
+                .is_some_and(|disk| disk.keys.contains_key(&key))
     }
 
     /// Store a page payload. Host RAM takes it when it has room; a full (or
@@ -260,14 +521,23 @@ impl CudaKvTierStore {
         let Some(disk) = &mut self.disk else {
             return false;
         };
-        let already_present = disk.keys.contains(&key);
+        let already_present = disk.keys.contains_key(&key);
         if !already_present && disk.keys.len() >= disk.capacity_pages {
             return false;
         }
         match kv_native_sys::write_block_cache_sharded(&disk.root, fingerprint(key), payload) {
             Ok(()) => {
-                if !already_present {
-                    disk.keys.insert(key);
+                // Insert/refresh the key->byte_len index entry, then persist the
+                // manifest for a durable tier so a restart can re-address this
+                // blob (a fresh insert grows the index; a replace may change the
+                // recorded byte_len). Manifest write is best-effort: the blob is
+                // already durable, a missed manifest update just under-reports
+                // on the next load.
+                disk.keys.insert(key, payload.len() as u64);
+                if disk.durable {
+                    if let Err(err) = disk.write_manifest() {
+                        log::warn!("KV recall manifest update failed for key {key}: {err}");
+                    }
                 }
                 true
             }
@@ -312,7 +582,7 @@ impl CudaKvTierStore {
             return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
         let disk_root = self.disk.as_ref().and_then(|disk| {
-            if disk.keys.contains(&key) {
+            if disk.keys.contains_key(&key) {
                 Some(disk.root.clone())
             } else {
                 None
@@ -328,14 +598,27 @@ impl CudaKvTierStore {
 
     /// Drop entries from both levels (disk files unlinked best-effort).
     pub(crate) fn remove(&mut self, keys: &[u64]) {
+        let mut disk_index_changed = false;
         for key in keys {
             if let Some(entry) = self.host.remove(key) {
                 self.host_lru.remove(&(entry.stamp, *key));
             }
             if let Some(disk) = &mut self.disk {
-                if disk.keys.remove(key) {
+                if disk.keys.remove(key).is_some() {
                     let _ =
                         kv_native_sys::remove_block_sharded(&disk.root, fingerprint(*key), true);
+                    disk_index_changed = true;
+                }
+            }
+        }
+        // Re-persist the durable manifest once after the batch so the dropped
+        // keys are not re-addressed on the next load.
+        if disk_index_changed {
+            if let Some(disk) = self.disk.as_ref() {
+                if disk.durable {
+                    if let Err(err) = disk.write_manifest() {
+                        log::warn!("KV recall manifest update after remove failed: {err}");
+                    }
                 }
             }
         }
@@ -364,6 +647,16 @@ impl CudaKvTierStore {
     #[cfg(test)]
     fn read_scratch_capacity(&self) -> usize {
         self.read_scratch.capacity()
+    }
+
+    #[cfg(test)]
+    fn disk_is_durable(&self) -> bool {
+        self.disk.as_ref().is_some_and(|d| d.durable)
+    }
+
+    #[cfg(test)]
+    fn disk_byte_len(&self, key: u64) -> Option<u64> {
+        self.disk.as_ref().and_then(|d| d.keys.get(&key).copied())
     }
 }
 
@@ -582,6 +875,80 @@ mod tests {
         );
         // A nonexistent path fails the syscall → None (caller falls back to cap).
         assert!(free_disk_bytes(&root.join("does-not-exist/x")).is_none());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn weights_epoch_tag_is_stable_and_path_falls_back() {
+        // No safetensors in an empty dir → a stable path-derived tag (same dir
+        // → same tag across calls).
+        let root = temp_root("epoch");
+        let a = weights_epoch_tag(&root);
+        let b = weights_epoch_tag(&root);
+        assert_eq!(a, b, "epoch tag must be deterministic for an unchanged dir");
+        assert!(
+            a.starts_with("path-"),
+            "empty dir falls back to path tag: {a}"
+        );
+
+        // A safetensors file flips the tag to the content branch.
+        std::fs::write(root.join("model.safetensors"), b"weights-v1").expect("write st");
+        let c = weights_epoch_tag(&root);
+        assert!(
+            c.starts_with("st-"),
+            "safetensors present → content tag: {c}"
+        );
+        assert_ne!(a, c, "adding weights must change the tag");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_manifest_round_trips_disk_index_across_restart() {
+        // Disk-only durable tier (mirrors the recall store: host RAM may be 0,
+        // everything lands on NVMe). 8-byte pages, room for 4 blocks.
+        let root = temp_root("durable_manifest");
+        let epoch = "epoch-A".to_string();
+
+        // --- session 1: write three blocks, then drop (simulated restart) ---
+        let namespace;
+        {
+            let mut store = CudaKvTierStore::with_budget(0, 8);
+            assert!(store.set_disk_durable(root.clone(), 32, 8, epoch.clone()));
+            assert!(store.disk_is_durable());
+            namespace = store.disk_root().expect("durable namespace").to_path_buf();
+            assert!(namespace.starts_with(&root));
+
+            assert!(store.insert(1, vec![1; 8]));
+            assert!(store.insert(2, vec![2; 8]));
+            assert!(store.insert(3, vec![3; 8]));
+            assert_eq!(store.disk_len(), 3);
+            // The manifest was written incrementally on each insert.
+            assert!(namespace.join(MANIFEST_FILE).exists(), "manifest persisted");
+        }
+        // Durable namespace + blobs survive the drop (NOT wiped).
+        assert!(namespace.exists(), "durable namespace must survive drop");
+
+        // --- session 2: load() rebuilds the in-memory index from the manifest ---
+        {
+            let mut store = CudaKvTierStore::with_budget(0, 8);
+            let reloaded = store.load(root.clone(), 32, 8, epoch.clone());
+            assert!(reloaded, "load reports prior blocks reloaded");
+            assert_eq!(store.disk_len(), 3, "all three keys re-indexed");
+            assert_eq!(store.disk_byte_len(2), Some(8), "byte_len preserved");
+            // Blobs are addressable again, byte-identical.
+            assert_eq!(store.read(1).expect("reload read 1").as_ref(), &[1u8; 8]);
+            assert_eq!(store.read(3).expect("reload read 3").as_ref(), &[3u8; 8]);
+        }
+
+        // --- session 3: a mismatched epoch discards the stale memory ---
+        {
+            let mut store = CudaKvTierStore::with_budget(0, 8);
+            let reloaded = store.load(root.clone(), 32, 8, "epoch-B".to_string());
+            assert!(!reloaded, "stale epoch must not reload");
+            assert_eq!(store.disk_len(), 0, "stale-epoch index starts cold");
+            assert!(store.disk_is_durable(), "still a durable tier, just empty");
+        }
+
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
