@@ -45,22 +45,23 @@ Every other backend converges onto exactly this shape.
   ~61 MB/slot recurrent state (gdr+conv) is genuinely per-slot, seq-independent —
   keep. Delete the dead legacy contiguous `k_caches/v_caches` lane (`qwen35.rs:404-437`).
 
-- **Δ-B — CUDA DSv4 EP (the real work, TWO parts):**
-  1. **Shared token pool (Stage B) — KERNEL-BLOCKED.** The MLA latent `TokenKVPool`
-     is profiled but **pre-allocated per-slot up-front** (Stage A identity layout:
-     `total = tokens_per_slot × num_slots` + a construction `alloc_tokens(slot,…)`
-     loop, `attention.rs:750-808`), so num_slots still multiplies the pool. Going
-     dynamic (drop the per-slot loop + `×num_slots`, size purely from profiled tokens,
-     runtime `alloc/free/mirror`) is **blocked on the device pack/index kernels
-     consuming a device page table instead of band-base addressing** (the
-     `contiguous_page_table_byte_range` identity gate, `paged_kv_table.rs:90-117`) —
-     the load-bearing kernel work that let Stage A ship byte-identical. **This is the
-     piece that actually unlocks DSv4 high concurrency.**
-  2. **Per-slot DSA scratch → batch-bounded headroom (doable now).** `dsa_rotated_per_slot`
-     + `state_caches_per_slot` (selector/compressor/indexer caches, max_seq-scaled ×
-     num_slots, `dsv4.rs:1573-1644`) move to a model-wide b=max_running shared scratch
-     in the headroom — mirroring how FlashMLA/MoE decode scratch is already done
-     (`dsv4.rs:196-201`). This was the missing step in the earlier (killed) refactor.
+- **Δ-B — CUDA DSv4 EP (uniformly Stage-B kernel work; NO scratch shortcut).**
+  Correction over the original map: BOTH the MLA latent KV AND the DSA per-slot
+  caches are **persistent per-request state that grows with the sequence** — the MLA
+  `TokenKVPool` (Stage-A pre-alloc `total = tokens_per_slot × num_slots`,
+  `attention.rs:750-808`) and the **stateful** DSA `dsa_rotated_per_slot` +
+  `state_caches_per_slot` (rotated-keys + compressor/indexer **compressed caches**,
+  "All scale with max_seq/cr", `dsv4.rs:1574-1644`). The DSA caches are NOT transient
+  scratch (the transient logits/decode scratch is ALREADY model-wide shared,
+  `dsv4.rs:196-201`) — so they cannot be "batch-bounded scratch"; they belong in the
+  **same shared dynamic pool as the MLA KV**, paged + drawn per-request.
+  - The whole DSv4 fix = make the MLA KV + DSA persistent caches one shared
+    dynamic-draw pool sized from free-VRAM (drop the per-slot up-front alloc + the
+    `×num_slots` sizing). **KERNEL-BLOCKED**: the device pack/index kernels must
+    consume a device page table instead of band-base addressing (the
+    `contiguous_page_table_byte_range` identity gate, `paged_kv_table.rs:90-117`) —
+    the load-bearing work that let Stage A ship byte-identical. **This is the only
+    thing that unlocks DSv4 high concurrency; there is no contained shortcut.**
 
 - **Δ-C — Metal Qwen3.6 (small):** drop the `× num_slots` fold (`resource.rs:270-273`)
   → one num_slots-independent token budget; adopt `mem_fraction_static` (retire the
@@ -77,20 +78,19 @@ Every other backend converges onto exactly this shape.
 
 ## Honest scope split
 
-- **Contained (no kernel work):** Δ-A, Δ-C, Δ-D, naming, **Δ-B.2** — unifies the
-  SIZING + most workspace across Qwen3.6/Metal/HIP/DSv4. Good global hygiene; partial
-  DSv4 help.
-- **DSv4 high-concurrency unlock needs Δ-B.1 (Stage-B kernel work)** OR the orthogonal
-  **EP=8** (weights halve → headroom for more slots, no kernel work). The contained
-  deltas alone do NOT lift DSv4's slot ceiling — Stage A still multiplies by num_slots.
+- **Contained (no kernel work):** Δ-A, Δ-C, Δ-D, naming — unifies the SIZING across
+  Qwen3.6/Metal/HIP. Good global hygiene; does NOT touch DSv4's ceiling.
+- **DSv4 high-concurrency unlock = Δ-B (Stage-B kernel work), no shortcut.** Both the
+  MLA KV and the persistent DSA caches must move into one shared dynamic pool, which
+  needs the device-page-table pack/index kernels. (EP=8 only masks it with more cards —
+  it is NOT the architecture fix.)
 
 ## Implementation order + verification matrix
 
-1. Δ-B.2 (DSv4 DSA scratch → batch-bounded) — addresses the earlier OOM; pod-verify
-   DSv4 num_slots>4 fits.
-2. Δ-A (Qwen3.6 floor) — pod-verify Qwen3.6 num_slots scales.
-3. Δ-C (Metal), Δ-D (HIP), naming.
-4. Δ-B.1 (DSv4 Stage-B kernel) — the load-bearing remainder; separate effort.
+1. Δ-A (Qwen3.6 floor) — pod-verify Qwen3.6 num_slots scales.
+2. Δ-C (Metal), Δ-D (HIP), naming.
+3. Δ-B (DSv4 Stage-B kernel) — the load-bearing remainder: MLA KV + DSA persistent
+   caches → one shared dynamic pool + device-page-table kernels; needle-gated.
 
 Verify each: **Qwen3-dense, Qwen3.6-MoE-FP8, DSv4-EP4, Metal-Qwen3.6** — boot + needle
 exact + a num_slots-scaling c跑 (the per-backend throughput proof).
