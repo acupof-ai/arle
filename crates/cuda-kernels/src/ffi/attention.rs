@@ -398,6 +398,11 @@ unsafe extern "C" {
     ///   `rope = k_prepared + 448,     stride_rope_elems = 512`
     /// Strides must be ≥ HEAD_DIM_NOPE (448) / HEAD_DIM_ROPE (64) respectively.
     /// See Finding 1 in `docs/experience/wins/2026-05-28-dsv4-flashmla-decode-d4-plumbing.md`.
+    ///
+    /// `page_table`/`num_logical_pages` are the OPTIONAL Stage-B device page-table
+    /// lookup (`null`/0 = Stage-A band path, unchanged). When set, `token_block_id[t]`
+    /// is a slot-LOGICAL page routed through `page_table[logical]`; an identity table
+    /// is byte-identical to the band path.
     pub fn arle_dsv4_fp8_kv_pack_strided_cuda(
         nope: *const Half,
         rope: *const Half,
@@ -408,6 +413,8 @@ unsafe extern "C" {
         page_block_size: i32,
         stride_nope_elems: i32,
         stride_rope_elems: i32,
+        page_table: *const i32,
+        num_logical_pages: i32,
         stream: CUstream,
     ) -> CUresult;
 

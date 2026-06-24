@@ -4115,6 +4115,7 @@ pub(crate) fn commit_layer_fold(
             page_block_size,
             config.head_dim,
             config.head_dim,
+            None, // Stage-A: host-physical block ids, no device page table.
         )?;
     }
     Ok(())
@@ -5532,6 +5533,7 @@ fn flashmla_pack_sw_ring(
         page_block_size,
         config.head_dim,
         config.head_dim,
+        None, // Stage-A: host-physical block ids, no device page table.
     )?;
     flash.fp8_kv_sw_bootstrapped = true;
     Ok(())
@@ -5605,6 +5607,7 @@ fn flashmla_pack_one_sw_token(
             64,
             config.head_dim,
             config.head_dim,
+            None, // Stage-A: host-physical block ids, no device page table.
         )
     }
 }
@@ -5708,6 +5711,7 @@ fn flashmla_pack_compressed_delta(
         64,
         config.head_dim,
         config.head_dim,
+        None, // Stage-A: host-physical block ids, no device page table.
     )?;
     flash.fp8_kv_comp_packed_rows = end_row;
     Ok(())
