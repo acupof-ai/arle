@@ -32,6 +32,73 @@ const BASH_OUTPUT_CLIP: usize = 8000;
 /// stays tight, large enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Run `command` under a wall-clock `timeout`, isolating it in its own process
+/// group and capturing combined stdout+stderr to a temp file instead of a pipe.
+///
+/// This fixes a real hang: a tool command that backgrounds a process (`foo &`)
+/// or spawns a child that inherits and holds the stdout pipe makes
+/// `wait_with_output()` block reading that pipe until the grandchild closes it —
+/// i.e. forever for a daemon, leaving the parent stuck in `wait4()`. Capturing
+/// to a file removes the pipe entirely; running in a fresh process group and
+/// killing the whole group on exit/timeout reaps any lingering grandchildren so
+/// they can't linger or hold the parent.
+///
+/// Returns `(combined_output, exit_code, killed_by_timeout)`.
+fn run_captured(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
+    use std::os::unix::process::CommandExt;
+
+    let tmp = tempfile::NamedTempFile::new()?;
+    let stdout_handle = tmp.reopen()?;
+    let stderr_handle = stdout_handle.try_clone()?; // dup'd fd shares the offset → interleaved
+    command
+        .stdin(Stdio::null())
+        .stdout(stdout_handle)
+        .stderr(stderr_handle)
+        .process_group(0); // new group; pgid == child pid, so we can signal the whole tree
+
+    let mut child = command.spawn()?;
+    let pgid = child.id() as i32;
+
+    let deadline = Instant::now() + timeout;
+    let mut killed = false;
+    let code = loop {
+        match child.try_wait()? {
+            Some(status) => break status.code(),
+            None => {
+                if Instant::now() >= deadline {
+                    killed = true;
+                    kill_group(pgid);
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    };
+    // Reap grandchildren that outlived the leader (e.g. a backgrounded process),
+    // even on a clean exit — otherwise they linger and can block the parent.
+    kill_group(pgid);
+
+    let output = fs::read(tmp.path()).unwrap_or_default();
+    Ok((output, code, killed))
+}
+
+/// `kill -KILL -<pgid>` — signal the whole process group (negative pid). Uses the
+/// `kill` binary to avoid a libc dependency; failure is ignored (the group may be
+/// empty already, which is the common case).
+fn kill_group(pgid: i32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pgid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Runs the coding agent's read/write/replace/bash tools against a per-task
 /// repo directory on the local filesystem.
 ///
@@ -77,13 +144,7 @@ impl SandboxToolExecutor {
     /// collect stdout+stderr into a single tool result string.
     fn run_bash(&self, cmd: &str) -> String {
         let mut command = Command::new("bash");
-        command
-            .arg("-lc")
-            .arg(cmd)
-            .current_dir(&self.workdir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.arg("-lc").arg(cmd).current_dir(&self.workdir);
 
         if let Some(prefix) = &self.pythonpath {
             let combined = match std::env::var("PYTHONPATH") {
@@ -93,35 +154,10 @@ impl SandboxToolExecutor {
             command.env("PYTHONPATH", combined);
         }
 
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => return format!("ERROR: failed to spawn bash: {e}"),
-        };
-
-        let deadline = Instant::now() + Duration::from_secs(self.bash_timeout_secs);
-        let mut killed = false;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        killed = true;
-                        break;
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(e) => return format!("ERROR: failed to wait on bash: {e}"),
-            }
+        match run_captured(command, Duration::from_secs(self.bash_timeout_secs)) {
+            Ok((output, code, killed)) => format_bash_output(&output, &[], code, killed),
+            Err(e) => format!("ERROR: failed to run bash: {e}"),
         }
-
-        let output = match child.wait_with_output() {
-            Ok(output) => output,
-            Err(e) => return format!("ERROR: failed to collect bash output: {e}"),
-        };
-
-        format_bash_output(&output.stdout, &output.stderr, output.status.code(), killed)
     }
 }
 
@@ -403,13 +439,7 @@ pub fn score_workdir(
     );
 
     let mut command = Command::new("bash");
-    command
-        .arg("-lc")
-        .arg(&cmd)
-        .current_dir(workdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.arg("-lc").arg(&cmd).current_dir(workdir);
     if let Some(pythonpath) = pythonpath {
         let combined = match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.is_empty() => format!("{pythonpath}:{existing}"),
@@ -418,32 +448,10 @@ pub fn score_workdir(
         command.env("PYTHONPATH", combined);
     }
 
-    let mut child = command
-        .spawn()
-        .with_context(|| "failed to spawn pytest".to_string())?;
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut killed = false;
-    loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    killed = true;
-                    break;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| "failed to collect pytest output".to_string())?;
-    let passed = !killed && output.status.success();
-    let log_tail = format_bash_output(&output.stdout, &output.stderr, output.status.code(), killed);
+    let (output, code, killed) = run_captured(command, Duration::from_secs(timeout_secs))
+        .with_context(|| "failed to run pytest".to_string())?;
+    let passed = !killed && code == Some(0);
+    let log_tail = format_bash_output(&output, &[], code, killed);
     Ok((passed, log_tail))
 }
 
@@ -491,6 +499,26 @@ mod tests {
 
     fn call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall::new(name, args)
+    }
+
+    #[test]
+    fn bash_does_not_hang_on_backgrounded_child() {
+        // Regression: a tool command that backgrounds a process inheriting the
+        // stdout pipe used to block `wait_with_output()` until that grandchild
+        // exited (forever for a daemon), stranding the parent in `wait4()`.
+        // `run_captured` writes to a temp file (no pipe to hold) and kills the
+        // whole process group, so `execute` must return promptly.
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = SandboxToolExecutor::new(tmp.path().to_path_buf(), 30, None);
+        let start = std::time::Instant::now();
+        let out = exec.execute(&call("bash", json!({"command": "echo ready; sleep 30 &"})));
+        let elapsed = start.elapsed();
+        assert!(out.contains("ready"), "bash output: {out}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "run_bash blocked {}s on a backgrounded child — the pipe-hang regressed",
+            elapsed.as_secs()
+        );
     }
 
     #[test]
