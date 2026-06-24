@@ -591,7 +591,9 @@ mod tests {
             &[],
         );
 
-        assert!(prompt.contains(r#""arguments":"not-json""#));
+        // Qwen3.6-Coder native XML history render: a non-JSON `arguments` string
+        // is preserved verbatim under a synthetic `arguments` parameter.
+        assert!(prompt.contains("<function=shell>\n<parameter=arguments>\nnot-json\n</parameter>"));
     }
 
     #[test]
