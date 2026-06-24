@@ -2060,10 +2060,12 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE");
+    println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
-    let enable_deepgemm_native = env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE");
-    // DeepGEMM availability is a RUNTIME preflight probe (`cuda_kernels::
+    // `enable_deepgemm_native` is computed below (after the vendored paths +
+    // sm_targets resolve) so it can DEFAULT-ON via auto-detection.
+    // DeepGEMM availability is also a RUNTIME preflight probe (`cuda_kernels::
     // has_deepgemm_native`), not a cfg — the non-native stub exports the same
     // bridge symbols, so it can't be build-determined. No cfg emitted here.
     let deepgemm_root = std::env::var("ARLE_DEEPGEMM_ROOT")
@@ -2099,6 +2101,25 @@ fn main() {
             .expect("failed to resolve cuda-kernels build cwd")
             .join(deepgemm_cutlass_include)
     };
+    // DeepGEMM FP8-native dense/grouped GEMM: DEFAULT-ON when the build can support it
+    // — a Hopper sm_90 target AND the vendored source present — so FP8 prefill takes the
+    // fastest path with no manual flag (it was opt-in, leaving production on the ~20×
+    // slower dequant→GEMM fallback). Mirrors the FlashMLA auto-detect above. Opt out with
+    // ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1; ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 forces it on
+    // (e.g. a non-default arch). If unbuilt/unsupported, the runtime preflight falls back
+    // to dequant→GEMM (never GEMV for prefill — see infer-cuda quant_linear).
+    let deepgemm_buildable = sm_targets.iter().any(|s| s.sm.starts_with("90"))
+        && deepgemm_library_root.is_dir()
+        && deepgemm_cutlass_include
+            .join("cutlass/arch/barrier.h")
+            .is_file();
+    let enable_deepgemm_native = !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE")
+        && (env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE") || deepgemm_buildable);
+    if enable_deepgemm_native {
+        println!(
+            "cargo:warning=DeepGEMM native enabled (sm_90 + vendored source; set ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1 to opt out)"
+        );
+    }
     let ccbin = std::env::var("NVCC_CCBIN").ok();
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
     let legacy_volta_build = has_legacy_volta(&sm_targets);
