@@ -2987,6 +2987,9 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     let total_targets = loss_targets.len();
 
     let mut tape = Tape::new();
+    // Offload per-layer grad-checkpoints to host RAM during each window's forward
+    // (re-fetched on backward) so the long-trajectory forward doesn't pin ~30 GB.
+    tape.set_offload_checkpoints(true);
     let keep_extra: HashSet<TensorId> = HashSet::new();
     // Sum of per-position CE across all windows; divide by total_targets at the
     // end for the mean CE per masked token. (cross_entropy_loss means over the
