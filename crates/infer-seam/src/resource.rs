@@ -160,85 +160,6 @@ pub fn profile_kv_pool_tokens(
     tokens.max(PROFILE_KV_TOKENS_FLOOR)
 }
 
-/// Host-demoted RAM + disk budgets, derived from machine state instead of
-/// hardcoded constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostTierBudget {
-    /// Host-demoted RAM budget, bytes.
-    pub ram_bytes: usize,
-    /// Disk budget, bytes (0 when no disk path is configured).
-    pub ssd_bytes: usize,
-}
-
-/// Inputs/policy for [`split_host_tiers`].
-#[derive(Debug, Clone, Copy)]
-pub struct HostTierPolicy {
-    /// Fraction of *available* system RAM the host-demoted prefix tier may claim.
-    pub ram_fraction: f64,
-    /// Hard cap on the host-demoted RAM budget (the proven default, never exceeded so we
-    /// cannot regress an ample machine into over-claiming RAM).
-    pub ram_cap_bytes: usize,
-    /// Floor on the host-demoted RAM budget when *some* RAM is available, so tiny
-    /// available-RAM readings don't collapse the tier to nothing.
-    pub ram_floor_bytes: usize,
-    /// Fraction of *free* disk the spill tier may claim.
-    pub ssd_fraction: f64,
-    /// Hard cap on the disk budget (the proven default).
-    pub ssd_cap_bytes: usize,
-}
-
-impl Default for HostTierPolicy {
-    fn default() -> Self {
-        // Caps are the monolith-era proven constants (4 GiB RAM / 20 GiB SSD);
-        // the fractions shrink the budget on small machines without ever
-        // exceeding what historically shipped.
-        Self {
-            ram_fraction: 0.25,
-            ram_cap_bytes: 4 * GIB,
-            ram_floor_bytes: GIB,
-            ssd_fraction: 0.5,
-            ssd_cap_bytes: 20 * GIB,
-        }
-    }
-}
-
-/// Derive host-demoted RAM and disk budgets from system memory and free disk.
-///
-/// Replaces the hardcoded `DEFAULT_KV_TIER_BUDGET_BYTES` / `DEFAULT_KV_SSD_BUDGET_BYTES`:
-/// each tier is `clamp(resource × fraction, floor, cap)`, capped at the proven
-/// constant so an ample machine matches the old default and a constrained one
-/// scales down. `available_ram_bytes`/`free_disk_bytes` of `None` fall back to
-/// the cap (preserve the historical constant when the probe is unavailable).
-/// `disk_configured == false` zeroes the SSD tier (opt-in path unchanged).
-pub fn split_host_tiers(
-    available_ram_bytes: Option<usize>,
-    free_disk_bytes: Option<usize>,
-    disk_configured: bool,
-    policy: HostTierPolicy,
-) -> HostTierBudget {
-    let ram_bytes = match available_ram_bytes {
-        Some(avail) => {
-            let scaled = (avail as f64 * policy.ram_fraction) as usize;
-            scaled
-                .min(policy.ram_cap_bytes)
-                .max(policy.ram_floor_bytes.min(policy.ram_cap_bytes))
-        }
-        None => policy.ram_cap_bytes,
-    };
-    let ssd_bytes = if disk_configured {
-        match free_disk_bytes {
-            Some(free) => ((free as f64 * policy.ssd_fraction) as usize).min(policy.ssd_cap_bytes),
-            None => policy.ssd_cap_bytes,
-        }
-    } else {
-        0
-    };
-    HostTierBudget {
-        ram_bytes,
-        ssd_bytes,
-    }
-}
-
 /// Inputs/policy for the unified L2 (host DRAM) tier budget ([`dram_l2_budget`]).
 ///
 /// The L2 store is *pageable* host memory holding demoted KV pages; the box is
@@ -455,48 +376,6 @@ mod tests {
         assert_eq!(clamp_to_affordable(8, 32), (8, false));
         assert_eq!(clamp_to_affordable(32, 8), (8, true));
         assert_eq!(clamp_to_affordable(8, 8), (8, false));
-    }
-
-    #[test]
-    fn host_tiers_cap_at_proven_constants_when_ample() {
-        let p = HostTierPolicy::default();
-        // Ample RAM (256 GiB) and disk (1 TiB): each tier caps at the constant.
-        let b = split_host_tiers(Some(256 * GIB), Some(1024 * GIB), true, p);
-        assert_eq!(b.ram_bytes, 4 * GIB);
-        assert_eq!(b.ssd_bytes, 20 * GIB);
-    }
-
-    #[test]
-    fn host_tiers_scale_down_on_small_machine() {
-        let p = HostTierPolicy::default();
-        // 8 GiB available RAM × 0.25 = 2 GiB (< 4 GiB cap); 8 GiB free disk × 0.5 = 4 GiB.
-        let b = split_host_tiers(Some(8 * GIB), Some(8 * GIB), true, p);
-        assert_eq!(b.ram_bytes, 2 * GIB);
-        assert_eq!(b.ssd_bytes, 4 * GIB);
-    }
-
-    #[test]
-    fn host_tiers_floor_protects_tiny_available() {
-        let p = HostTierPolicy::default();
-        // 1 GiB available × 0.25 = 256 MiB < 1 GiB floor → floored to 1 GiB.
-        let b = split_host_tiers(Some(GIB), None, false, p);
-        assert_eq!(b.ram_bytes, GIB);
-        assert_eq!(b.ssd_bytes, 0); // disk not configured
-    }
-
-    #[test]
-    fn host_tiers_unknown_probe_falls_back_to_constants() {
-        let p = HostTierPolicy::default();
-        let b = split_host_tiers(None, None, true, p);
-        assert_eq!(b.ram_bytes, 4 * GIB); // cap = old constant
-        assert_eq!(b.ssd_bytes, 20 * GIB);
-    }
-
-    #[test]
-    fn host_tiers_disk_off_zeroes_ssd() {
-        let p = HostTierPolicy::default();
-        let b = split_host_tiers(Some(64 * GIB), Some(512 * GIB), false, p);
-        assert_eq!(b.ssd_bytes, 0);
     }
 
     const GIB_U64: u64 = 1 << 30;
