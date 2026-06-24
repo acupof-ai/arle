@@ -369,6 +369,7 @@ impl MetalExecutor {
                 memory_budget_bytes: None,
                 system_reserve_bytes: None,
                 allow_swap: false,
+                mem_fraction_static: 0.9,
             },
         )?;
         Self::from_resolved_model_path_with_plan(&resolved, kv_cache_dtype, Some(resource_plan))

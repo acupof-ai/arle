@@ -3125,11 +3125,10 @@ impl Qwen35CudaExecutor {
             1,
             KVFormat::BF16,
         ) as u64;
-        // Host-admission span (the floor): every slot must be addressable up to
-        // `max_seq_len`, so the device pool is at least `num_slots × total_pages`
-        // pages — the same span the host CudaKvPool admits. The profiled budget
-        // raises this on an ample card for more concurrency / longer context.
-        let admission_pages = num_slots.saturating_mul(total_pages).max(1);
+        // ONE shared dynamic-draw pool (mirrors dense at :788): floor at pure
+        // `total_pages` — num_slots is a zero-HBM soft cap, it never multiplies
+        // the pool. The profiled budget raises this on an ample card.
+        let requested_pages = total_pages.max(1);
         let total_pool_pages = match model.ctx.mem_info_bytes() {
             Ok((free, total)) => {
                 let profiled_tokens = infer_seam::profile_kv_pool_tokens(
@@ -3139,14 +3138,14 @@ impl Qwen35CudaExecutor {
                     mem_fraction_static,
                 );
                 let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                let sized = profiled_pages.max(admission_pages).max(1);
+                let sized = profiled_pages.max(requested_pages).max(1);
                 log::info!(
                     "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
                      total {}MB, mem_fraction_static {mem_fraction_static}, cell \
                      {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
                      kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} \
-                     ({profiled_pages} pages); admission floor {admission_pages} pages \
-                     (num_slots {num_slots} × total_pages {total_pages}) -> sizing {sized} pages",
+                     ({profiled_pages} pages); requested floor {requested_pages} pages \
+                     -> sizing {sized} pages",
                     free >> 20,
                     total >> 20,
                 );
@@ -3155,9 +3154,9 @@ impl Qwen35CudaExecutor {
             Err(e) => {
                 log::warn!(
                     "CUDA Qwen3.6 full-attn KV pool: free-VRAM probe failed ({e}); falling back \
-                     to admission floor {admission_pages} pages"
+                     to requested floor {requested_pages} pages"
                 );
-                admission_pages
+                requested_pages
             }
         };
         let pool_token_budget = total_pool_pages * SUPPORTED_PAGE_SIZE;

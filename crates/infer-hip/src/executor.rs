@@ -179,10 +179,28 @@ pub fn load_dsv4_gguf(
     )?;
     #[cfg(feature = "hip")]
     {
+        // ONE shared dynamic-draw page pool (mirrors CUDA dense): size from a ROCm
+        // free/total probe → `profile_kv_pool_tokens`, never `× num_slots`.
+        // TODO(#77, pending-remote): the GGUF DSv4 lane zeroes `kv_lora_rank`, so
+        // the latent cell is approximated as `head_dim × layers × 2 (bf16)`; refine
+        // once the GGUF MLA split is parsed and the device pool goes dynamic.
+        let cell = config
+            .head_dim
+            .saturating_mul(config.num_hidden_layers)
+            .saturating_mul(2) as u64;
+        let requested_pages = max_seq_len.div_ceil(DEFAULT_PAGE_SIZE).max(1);
+        let total_pages = match hip_sys::mem_get_info() {
+            Ok((free, total)) => {
+                let tokens =
+                    infer_seam::profile_kv_pool_tokens(free as u64, total as u64, cell, 0.9);
+                ((tokens as usize) / DEFAULT_PAGE_SIZE).max(requested_pages)
+            }
+            Err(_) => requested_pages, // probe miss → pure requested floor, no num_slots multiply
+        };
         let pool = HipKvPool::new(
             &config,
             num_slots,
-            num_slots * max_seq_len.div_ceil(DEFAULT_PAGE_SIZE),
+            total_pages,
             DEFAULT_PAGE_SIZE,
             max_seq_len,
         );
