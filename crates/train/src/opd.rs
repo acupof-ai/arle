@@ -2885,6 +2885,176 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     Ok(loss_value)
 }
 
+/// Build the `(predicting-position p, target token id)` list for masked
+/// next-token CE over `prompt_ids ++ response_ids`.
+///
+/// Logits at sequence position `p` predict token `p + 1` (the
+/// `next_token_sft_loss_from_logits` convention). A target counts iff:
+/// - it lies inside the response span: `p + 1 >= prompt_len`, AND
+/// - the response token at that index is LLM-generated:
+///   `response_mask[(p + 1) - prompt_len] == 1`.
+///
+/// Tool / environment tokens (`response_mask == 0`) are excluded as *targets*
+/// but still appear in the context that earlier predictions condition on, so
+/// the student never learns to hallucinate tool output. Pure (no device work)
+/// so it is unit-testable without a model.
+fn build_masked_loss_targets(
+    full: &[u32],
+    prompt_len: usize,
+    response_mask: &[u8],
+) -> Vec<(usize, usize)> {
+    let seq_len = full.len();
+    let mut targets = Vec::new();
+    if seq_len < 2 || prompt_len == 0 {
+        return targets;
+    }
+    // p ranges over predicting positions [prompt_len - 1 ..= seq_len - 2]; the
+    // target is full[p + 1]. Lower-bounding p at prompt_len - 1 starts loss at
+    // the first response token (predicted by the prompt's final token).
+    let p_start = prompt_len - 1;
+    for p in p_start..=(seq_len - 2) {
+        let target_pos = p + 1;
+        // target_pos >= prompt_len always holds here (p >= prompt_len - 1), so
+        // the response index never underflows.
+        let resp_idx = target_pos - prompt_len;
+        if resp_idx < response_mask.len() && response_mask[resp_idx] == 1 {
+            targets.push((p, full[target_pos] as usize));
+        }
+    }
+    targets
+}
+
+/// Masked single-trajectory CE writeback for agent-OPD: ONE masked next-token
+/// CE over the whole `prompt ++ response` trajectory, windowed over the
+/// SEQUENCE so only a `[window, vocab]` logits tile is ever live.
+///
+/// Replaces the O(N²) per-pair explosion (each pair re-forwarded the full
+/// ~30K-token prefix and materialized a dense `[seq, vocab]` logits tensor →
+/// `cuda alloc_zeros failed`). The windowed loop mirrors the windowed-KL
+/// distill path: per window `forward_logits_window` re-forwards the prefix up
+/// to `window.end` and applies the lm_head only to the window
+/// (`[1, window_len, vocab]`); gradients ACCUMULATE across windows into the
+/// param grads (cleanup keeps params+grads); `optimizer.step` runs ONCE after
+/// the loop. The returned scalar is the mean CE per masked (LLM-generated)
+/// token.
+#[allow(clippy::too_many_arguments)]
+pub fn masked_writeback_ce_step<O: Optimizer>(
+    student: &Qwen35Model,
+    all_model_params: &[TensorId],
+    trainable_params: &[TensorId],
+    optimizer: &mut O,
+    prompt_ids: &[u32],
+    response_ids: &[u32],
+    response_mask: &[u8],
+    vocab: usize,
+    window_size: usize,
+    store: &mut TensorStore,
+) -> Result<f32> {
+    if prompt_ids.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "masked writeback requires a non-empty prompt".to_owned(),
+        ));
+    }
+    if window_size == 0 {
+        return Err(OpdError::InvalidInput(
+            "masked writeback window_size must be > 0".to_owned(),
+        ));
+    }
+
+    let prompt_len = prompt_ids.len();
+    let mut full: Vec<u32> = Vec::with_capacity(prompt_len + response_ids.len());
+    full.extend_from_slice(prompt_ids);
+    full.extend_from_slice(response_ids);
+    let seq_len = full.len();
+    if seq_len > u32::MAX as usize {
+        return Err(OpdError::InvalidInput(format!(
+            "masked writeback trajectory length {seq_len} exceeds u32::MAX \
+             position ids."
+        )));
+    }
+    let positions: Vec<u32> = (0..seq_len as u32).collect();
+
+    let loss_targets = build_masked_loss_targets(&full, prompt_len, response_mask);
+    if loss_targets.is_empty() {
+        eprintln!(
+            "[masked-writeback] no LLM-generated targets (prompt_len={prompt_len}, \
+             response_len={}, mask_ones={}); skipping (nothing to train)",
+            response_ids.len(),
+            response_mask.iter().filter(|&&m| m == 1).count(),
+        );
+        return Ok(0.0);
+    }
+    let total_targets = loss_targets.len();
+
+    let mut tape = Tape::new();
+    let keep_extra: HashSet<TensorId> = HashSet::new();
+    // Sum of per-position CE across all windows; divide by total_targets at the
+    // end for the mean CE per masked token. (cross_entropy_loss means over the
+    // positions it is given, so a 1-position call returns that position's CE.)
+    let mut loss_sum = 0.0f32;
+    let mut ti = 0usize; // loss_targets is ascending in p; walk it per window.
+
+    for window in sequence_windows(seq_len, window_size)? {
+        // Collect the loss targets whose predicting position p lies in
+        // [window.start, window.end). loss_targets is sorted ascending in p.
+        let window_start_ti = ti;
+        while ti < total_targets && loss_targets[ti].0 < window.end {
+            ti += 1;
+        }
+        let window_targets = &loss_targets[window_start_ti..ti];
+        if window_targets.is_empty() {
+            continue;
+        }
+
+        tape.entries.clear();
+        tape.set_enabled(true);
+
+        // [1, window_len, vocab]; window_len = window.end - window.start.
+        let logits = student
+            .forward_logits_window(store, &mut tape, &full, &positions, window)
+            .map_err(|err| map_qwen35_forward_error("masked writeback student", err))?;
+
+        // Per-position slice + single-target CE, summed. Correctness-first;
+        // each slice is [1, 1, vocab] so only one position's softmax is live.
+        let mut window_loss: Option<TensorId> = None;
+        for &(p, target) in window_targets {
+            let local = p - window.start;
+            let row = slice(
+                logits,
+                &[0, local, 0],
+                &[1, local + 1, vocab],
+                store,
+                &mut tape,
+            )
+            .map_err(OpdError::from)?;
+            let ce =
+                cross_entropy_loss(row, &[target], store, &mut tape).map_err(OpdError::from)?;
+            window_loss = Some(match window_loss {
+                None => ce,
+                Some(prev) => add(prev, ce, store, &mut tape).map_err(OpdError::from)?,
+            });
+        }
+        let window_loss = window_loss.expect("window_targets is non-empty");
+
+        let lv = store.to_host(window_loss).map_err(OpdError::from)?[0];
+        loss_sum += lv;
+        // Scale by 1/total_targets BEFORE backward so the accumulated gradient
+        // is the mean CE per masked token — keeps the effective LR independent
+        // of trajectory length (raw-sum grad would scale the step with token
+        // count).
+        let inv = 1.0 / total_targets as f32;
+        let scaled = mul_scalar(window_loss, inv, store, &mut tape).map_err(OpdError::from)?;
+        backward_with_optional_profile(scaled, lv * inv, store, &mut tape)?;
+        cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
+    }
+
+    optimizer.step(store, trainable_params)?;
+    optimizer.zero_grad(store, trainable_params);
+
+    // Mean CE per masked token (matches the per-token-mean gradient applied above).
+    Ok(loss_sum / total_targets as f32)
+}
+
 pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
     student: &Qwen35Model,
     teacher: &T,
@@ -3469,9 +3639,9 @@ mod tests {
 
     use super::{
         GkdLossConfig, GkdSftAnchor, KlLogitRange, OpdError, OpdKlMask, OpdStepConfig,
-        greedy_next_token, kl_distill_loss_for_config, kl_logit_range, map_qwen35_forward_error,
-        mix_gkd_losses, next_token_sft_loss_from_logits, sequence_windows,
-        shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
+        build_masked_loss_targets, greedy_next_token, kl_distill_loss_for_config, kl_logit_range,
+        map_qwen35_forward_error, mix_gkd_losses, next_token_sft_loss_from_logits,
+        sequence_windows, shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
         validate_logits_shape, validate_loss_value, validate_rollout_shape, validate_step_config,
         validate_student_param_ownership, validate_student_params, validate_teacher_params,
     };
@@ -4136,5 +4306,53 @@ mod tests {
         };
         assert!(message.contains("vocab_size"));
         assert!(message.contains("u32 token ids"));
+    }
+
+    #[test]
+    fn masked_loss_targets_select_only_response_llm_positions() {
+        // prompt = [100, 101] (prompt_len = 2); response = [10, 11, 20, 21, 30]
+        // with mask [1, 1, 0, 0, 1] (two tool tokens at response idx 2,3).
+        // full = [100, 101, 10, 11, 20, 21, 30], seq_len = 7.
+        //
+        // Predicting position p targets full[p + 1]; it counts iff
+        // target_pos = p + 1 is a response position with mask == 1:
+        //   p=1 -> target full[2]=10  (resp idx 0, mask 1)  ✓
+        //   p=2 -> target full[3]=11  (resp idx 1, mask 1)  ✓
+        //   p=3 -> target full[4]=20  (resp idx 2, mask 0)  ✗ tool
+        //   p=4 -> target full[5]=21  (resp idx 3, mask 0)  ✗ tool
+        //   p=5 -> target full[6]=30  (resp idx 4, mask 1)  ✓
+        let full = [100u32, 101, 10, 11, 20, 21, 30];
+        let prompt_len = 2;
+        let mask = [1u8, 1, 0, 0, 1];
+        let targets = build_masked_loss_targets(&full, prompt_len, &mask);
+        assert_eq!(
+            targets,
+            vec![(1usize, 10usize), (2, 11), (5, 30)],
+            "loss targets must be the LLM-generated response positions only \
+             (tool tokens at p=3,4 excluded); position p predicts token p+1"
+        );
+    }
+
+    #[test]
+    fn masked_loss_targets_empty_when_no_llm_tokens() {
+        // All-tool response yields no targets (nothing to train).
+        let full = [1u32, 2, 5, 6];
+        assert!(build_masked_loss_targets(&full, 2, &[0u8, 0]).is_empty());
+        // Empty / single-token sequences yield no targets.
+        assert!(build_masked_loss_targets(&[1u32], 1, &[]).is_empty());
+        assert!(build_masked_loss_targets(&[], 0, &[]).is_empty());
+    }
+
+    #[test]
+    fn masked_loss_targets_clamp_ragged_mask() {
+        // mask shorter than the response: positions past the mask are excluded
+        // (resp_idx >= mask.len() -> skipped), never panicking.
+        // full = [1, 7, 8, 9], prompt_len = 1; mask = [1, 1] covers resp idx 0,1.
+        //   p=0 -> target full[1]=7 (resp idx 0, mask 1) ✓
+        //   p=1 -> target full[2]=8 (resp idx 1, mask 1) ✓
+        //   p=2 -> target full[3]=9 (resp idx 2, beyond mask) ✗
+        let full = [1u32, 7, 8, 9];
+        let targets = build_masked_loss_targets(&full, 1, &[1u8, 1]);
+        assert_eq!(targets, vec![(0usize, 7usize), (1, 8)]);
     }
 }
