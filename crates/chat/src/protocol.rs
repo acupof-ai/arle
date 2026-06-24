@@ -466,6 +466,12 @@ struct PromptRenderer<'a> {
     prompt: String,
     tool_block: &'a str,
     system_injected: bool,
+    /// Set when any message contains the Qwen `/no_think` soft-switch; the
+    /// generation prompt then gets a pre-closed `<think></think>` block so the
+    /// model skips reasoning and emits its action directly (mirrors the Qwen
+    /// `enable_thinking=False` chat template). Scoped: callers that never pass
+    /// `/no_think` (e.g. the interactive agent) keep thinking enabled.
+    no_think: bool,
 }
 
 /// Borrowed ChatML message used by callers that only need raw role/content
@@ -560,10 +566,14 @@ impl<'a> PromptRenderer<'a> {
             prompt: String::new(),
             tool_block,
             system_injected: false,
+            no_think: false,
         }
     }
 
     fn push_message(&mut self, message: &ChatMessage) {
+        if !self.no_think && message.content.contains("/no_think") {
+            self.no_think = true;
+        }
         match &message.role {
             ChatRole::System => self.push_system(&message.content),
             ChatRole::User => self.push_user(&message.content),
@@ -575,6 +585,9 @@ impl<'a> PromptRenderer<'a> {
 
     fn finish(mut self) -> String {
         self.prompt.push_str("<|im_start|>assistant\n");
+        if self.no_think {
+            self.prompt.push_str("<think>\n\n</think>\n\n");
+        }
         self.prompt
     }
 
@@ -727,13 +740,57 @@ impl ToolCall {
         }
     }
 
+    /// Render this call as the body that goes INSIDE a `<tool_call>...</tool_call>`
+    /// wrapper, in the Qwen3.6-Coder native XML format the chat template trains on:
+    ///
+    /// ```text
+    /// <function=NAME>
+    /// <parameter=ARG>
+    /// VALUE
+    /// </parameter>
+    /// </function>
+    /// ```
+    ///
+    /// VALUE rendering mirrors the template's `| tojson` rule: a JSON-string arg is
+    /// emitted as the raw string (no quotes/escaping — this is what fixes complex
+    /// commands that broke under JSON escaping); any non-string arg is emitted as
+    /// its compact JSON. This round-trips through [`parse_native_function_block`].
     fn prompt_payload(&self) -> String {
-        serde_json::to_string(&json!({
-            "name": self.name,
-            "arguments": self.arguments,
-        }))
-        .expect("tool call serialization")
+        let mut out = String::new();
+        out.push_str("<function=");
+        out.push_str(&self.name);
+        out.push_str(">\n");
+        match self.arguments.as_object() {
+            Some(args) => {
+                for (key, value) in args {
+                    push_parameter(&mut out, key, value);
+                }
+            }
+            // Non-object arguments (e.g. an OpenAI tool call whose `arguments`
+            // string wasn't valid JSON, stored as a bare `Value::String`) have no
+            // per-key shape. Preserve the whole value under a synthetic
+            // `arguments` parameter so nothing is lost and it stays round-trippable.
+            None if !self.arguments.is_null() => {
+                push_parameter(&mut out, "arguments", &self.arguments);
+            }
+            None => {}
+        }
+        out.push_str("</function>");
+        out
     }
+}
+
+/// Append one `<parameter=KEY>\nVALUE\n</parameter>` block. A JSON-string value
+/// is emitted raw (no quotes/escaping); any other value as its compact JSON.
+fn push_parameter(out: &mut String, key: &str, value: &Value) {
+    out.push_str("<parameter=");
+    out.push_str(key);
+    out.push_str(">\n");
+    match value {
+        Value::String(s) => out.push_str(s),
+        other => out.push_str(&serde_json::to_string(other).expect("tool arg serialization")),
+    }
+    out.push_str("\n</parameter>\n");
 }
 
 /// Role tags used by the shared ChatML formatter.
@@ -869,7 +926,14 @@ pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoic
         return String::new();
     }
 
-    let mut out = String::from("\n<tools>");
+    // Qwen3.6-Coder NATIVE tools block, verbatim from the model's
+    // `chat_template.jinja`. The `<tools>` payload keeps the project's compact
+    // OpenAI-function JSON (one tool per line); only the surrounding header +
+    // format instruction are the template's own XML-call contract — switching
+    // off the old Hermes `<tool_call>{json}` line the model botches on complex
+    // commands (JSON string escaping breaks) onto the format it was trained on.
+    let mut out =
+        String::from("\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
 
     for tool in tools {
         out.push('\n');
@@ -879,11 +943,27 @@ pub fn build_tool_block_with_choice(tools: &[ToolDefinition], choice: &ToolChoic
     }
 
     out.push_str(
-        "\n</tools>\nUse <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. \
-Call a tool only when you need information you don't already have, and never repeat a call \
-you already made. As soon as you have enough information, STOP calling tools and reply to the \
-user with a direct, complete final answer in plain language. \
-Never echo <tools>, <tool_call>, or <tool_response> in the final user-facing answer.",
+        "\n</tools>\n\n\
+If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+<tool_call>\n\
+<function=example_function_name>\n\
+<parameter=example_parameter_1>\n\
+value_1\n\
+</parameter>\n\
+<parameter=example_parameter_2>\n\
+This is the value for the second parameter\n\
+that can span\n\
+multiple lines\n\
+</parameter>\n\
+</function>\n\
+</tool_call>\n\n\
+<IMPORTANT>\n\
+Reminder:\n\
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n\
+- Required parameters MUST be specified\n\
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n\
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n\
+</IMPORTANT>",
     );
 
     match choice {
@@ -1018,9 +1098,6 @@ fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
             .and_then(|b| json_object_len(&after[b..]).map(|len| (b, len)))
         {
             Some((b, len)) => {
-                if let Some(call) = parse_tool_call_block(after[b..b + len].trim()) {
-                    calls.push(call);
-                }
                 let mut consumed = b + len;
                 // Swallow a trailing `</tool_call>` when present (only whitespace
                 // between the JSON and the close tag) so it doesn't leak.
@@ -1029,6 +1106,26 @@ fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                     && tail[..close_at].trim().is_empty()
                 {
                     consumed += close_at + TOOL_CALL_BLOCK.close.len();
+                }
+
+                if let Some(call) = parse_tool_call_block(after[b..b + len].trim()) {
+                    // Untrained-Qwen3.6 split-emission quirk: the block carried only
+                    // `{"name":...}` (no/empty `arguments`) and the actual argument
+                    // object was emitted as a bare `{...}` right AFTER the close tag
+                    // (sometimes with a second stray `</tool_call>`). Merge that object
+                    // in as the call's arguments and consume it so it doesn't leak.
+                    // Conservative: only when arguments are missing/empty AND the next
+                    // non-whitespace content (past one optional stray `</tool_call>`)
+                    // is a single balanced JSON object.
+                    if call_arguments_empty(&call)
+                        && let Some((args, follow_consumed)) =
+                            split_arguments_object(&after[consumed..])
+                    {
+                        calls.push(ToolCall::new(call.name, args));
+                        consumed += follow_consumed;
+                    } else {
+                        calls.push(call);
+                    }
                 }
                 rest = &after[consumed..];
             }
@@ -1079,6 +1176,70 @@ fn json_object_len(s: &str) -> Option<usize> {
     None
 }
 
+/// Whether a parsed [`ToolCall`] carries no usable arguments — either a missing
+/// `arguments` key (decoded to an empty object by [`parse_tool_call_block`]), an
+/// explicit empty object, or `null`. Used to gate the split-emission merge.
+fn call_arguments_empty(call: &ToolCall) -> bool {
+    match &call.arguments {
+        Value::Object(map) => map.is_empty(),
+        Value::Null => true,
+        _ => false,
+    }
+}
+
+/// Locate a bare arguments object emitted AFTER a name-only `<tool_call>` block
+/// (the untrained-Qwen3.6 split quirk). `s` is the text immediately following the
+/// already-consumed block + its (optional) close tag. Skips leading whitespace and
+/// at most one stray `</tool_call>`, then requires the next content to start with a
+/// single balanced JSON object. Returns the parsed object (used directly as the
+/// call's arguments) and the number of bytes of `s` to consume (through the object
+/// and an optional trailing stray `</tool_call>`), or `None` when the conservative
+/// shape doesn't hold — in which case the caller must NOT merge or consume.
+fn split_arguments_object(s: &str) -> Option<(Value, usize)> {
+    // Skip whitespace, then one optional stray `</tool_call>`, then whitespace.
+    let after_ws = s.trim_start();
+    let mut prefix = s.len() - after_ws.len();
+    let body = if let Some(rest) = after_ws.strip_prefix(TOOL_CALL_BLOCK.close) {
+        prefix += TOOL_CALL_BLOCK.close.len();
+        let rest_trimmed = rest.trim_start();
+        prefix += rest.len() - rest_trimmed.len();
+        rest_trimmed
+    } else {
+        after_ws
+    };
+
+    if !body.starts_with('{') {
+        return None;
+    }
+    let len = json_object_len(body)?;
+    let value = serde_json::from_str::<Value>(&body[..len]).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+
+    let mut consumed = prefix + len;
+    // Swallow a trailing stray `</tool_call>` after the arguments object too
+    // (only whitespace between the object and the close tag) so it doesn't leak.
+    let tail = &s[consumed..];
+    if let Some(close_at) = tail.find(TOOL_CALL_BLOCK.close)
+        && tail[..close_at].trim().is_empty()
+    {
+        consumed += close_at + TOOL_CALL_BLOCK.close.len();
+    }
+
+    Some((value, consumed))
+}
+
+/// Strip exactly ONE leading and ONE trailing newline (`\n`, tolerating a
+/// preceding `\r`), leaving everything else byte-for-byte. Used to undo the
+/// single newlines the emit format wraps each parameter value in, without the
+/// whitespace-eating behavior of `str::trim`.
+fn strip_one_surrounding_newline(s: &str) -> &str {
+    let s = s.strip_prefix('\n').unwrap_or(s);
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
 /// Parse Qwen3.6's native XML tool-call body
 /// `<function=NAME><parameter=KEY>\nVALUE\n</parameter>…</function>` into a
 /// [`ToolCall`]. Parameter values stay strings unless they parse as JSON
@@ -1101,14 +1262,24 @@ fn parse_native_function_block(inner: &str) -> Option<ToolCall> {
         };
         let key = after_p[..key_end].trim().to_string();
         let val_area = &after_p[key_end + 1..];
+        // FIRST `</parameter>` after the open is the terminator. Limitation: a
+        // value that literally contains `</parameter>` would truncate here —
+        // accepted, the model is trained never to emit that inside a value.
         let Some(pe) = val_area.find("</parameter>") else {
             break;
         };
-        let raw = val_area[..pe].trim();
-        let value = serde_json::from_str::<Value>(raw)
+        // Strip exactly ONE leading and ONE trailing newline added by the emit
+        // format (`<parameter=K>\nVALUE\n</parameter>`), keeping inner content
+        // verbatim (quotes, pipes, embedded newlines, code) — `.trim()` would
+        // eat significant leading/trailing spaces and collapse multi-line values.
+        let value_text = strip_one_surrounding_newline(&val_area[..pe]);
+        // Coercion mirrors the template's `| tojson` rule: a value that parses as
+        // a JSON number/bool/array/object is that typed Value; anything else
+        // (parse fails, or it is a bare/quoted string) stays a raw string.
+        let value = serde_json::from_str::<Value>(value_text.trim())
             .ok()
             .filter(|v| !v.is_string())
-            .unwrap_or_else(|| Value::String(raw.to_string()));
+            .unwrap_or_else(|| Value::String(value_text.to_string()));
         args.insert(key, value);
         rest = &val_area[pe + "</parameter>".len()..];
     }
@@ -1166,6 +1337,23 @@ mod tests {
         let prompt = messages_to_prompt(&[ChatMessage::user("hello")], &[]);
         assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn no_think_switch_pre_closes_think_block() {
+        // With `/no_think` anywhere in the conversation, the generation prompt
+        // gets a pre-closed think block so Qwen skips reasoning and acts.
+        let prompt = messages_to_prompt(
+            &[
+                ChatMessage::system("be an agent /no_think"),
+                ChatMessage::user("fix it"),
+            ],
+            &[],
+        );
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        // Without the switch, thinking stays enabled (no pre-closed block).
+        let normal = messages_to_prompt(&[ChatMessage::user("hello")], &[]);
+        assert!(normal.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
@@ -1263,9 +1451,9 @@ mod tests {
 
         assert!(prompt.contains("Checking."));
         assert!(prompt.contains("Checking.\n<tool_call>\n"));
-        assert!(prompt.contains("<tool_call>"));
-        assert!(prompt.contains(r#""name":"shell""#));
-        assert!(prompt.contains(r#""command":"pwd""#));
+        assert!(prompt.contains(
+            "<tool_call>\n<function=shell>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>"
+        ));
     }
 
     #[test]
@@ -1369,6 +1557,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_split_name_then_arguments_object() {
+        // Untrained-Qwen3.6 split-emission quirk: the `<tool_call>` block holds only
+        // `{"name":...}` and the arguments arrive as a bare object after the close
+        // tag (with a stray trailing `</tool_call>`). Merge them into one call.
+        let parsed = parse_tool_calls(
+            "<tool_call>{\"name\":\"bash\"}</tool_call>\n{\"command\":\"ls lib\"}\n</tool_call>",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "bash");
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            json!({ "command": "ls lib" })
+        );
+        // The bare arguments JSON must NOT leak into the visible content.
+        assert!(!parsed.content.contains("command"));
+        assert!(!parsed.content.contains('{'));
+    }
+
+    #[test]
+    fn name_only_tool_call_without_following_object_stays_empty() {
+        // No bare arguments object follows — must NOT false-merge; arguments stay
+        // empty and following prose is preserved as visible content.
+        let parsed = parse_tool_calls("<tool_call>{\"name\":\"bash\"}</tool_call>\nokay then.");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "bash");
+        assert_eq!(parsed.tool_calls[0].arguments, json!({}));
+        assert_eq!(parsed.content, "okay then.");
+    }
+
+    #[test]
+    fn correct_single_object_call_unchanged_by_split_merge() {
+        // Canonical single-object form with text after — the split-merge path must
+        // not disturb it (arguments already present, so no following-object peek).
+        let parsed = parse_tool_calls(
+            "<tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\n{\"command\":\"other\"}",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "bash");
+        assert_eq!(parsed.tool_calls[0].arguments, json!({ "command": "ls" }));
+        // The trailing bare object is NOT part of this call; it stays visible.
+        assert!(parsed.content.contains("other"));
+    }
+
+    #[test]
     fn parse_tool_call_text_after_close_preserved() {
         let parsed = parse_tool_calls(
             "<tool_call>{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}</tool_call> done now.",
@@ -1396,6 +1628,66 @@ mod tests {
         );
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].arguments["seconds"], 30);
+    }
+
+    #[test]
+    fn qwen3coder_roundtrip() {
+        // THE case that broke under Hermes JSON: a command full of quotes and
+        // pipes. Render to the native XML emit format, parse it back, and the
+        // command string must survive verbatim.
+        let call = ToolCall::new("bash", json!({ "command": "grep -rn \"foo|bar\" lib" }));
+        let rendered = messages_to_prompt(&[ChatMessage::assistant("", vec![call.clone()])], &[]);
+        let parsed = parse_tool_calls(&rendered);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "bash");
+        assert_eq!(parsed.tool_calls[0].arguments, call.arguments);
+        assert_eq!(
+            parsed.tool_calls[0].arguments["command"],
+            "grep -rn \"foo|bar\" lib"
+        );
+    }
+
+    #[test]
+    fn qwen3coder_parse_example() {
+        // The literal chat-template example: a string arg and a numeric arg.
+        let parsed = parse_tool_calls(
+            "<tool_call>\n<function=read>\n<parameter=path>\nlib/ansible/x.py\n</parameter>\n<parameter=start>\n520\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "read");
+        assert_eq!(parsed.tool_calls[0].arguments["path"], "lib/ansible/x.py");
+        // `start` coerces to a JSON NUMBER, not a string.
+        assert_eq!(parsed.tool_calls[0].arguments["start"], 520);
+        assert!(parsed.tool_calls[0].arguments["start"].is_number());
+        assert_eq!(parsed.content, "");
+    }
+
+    #[test]
+    fn qwen3coder_multiline_param() {
+        // A multi-line `write` content must round-trip byte-for-byte, including
+        // its inner blank lines, quotes, and braces.
+        let content = "def main():\n    x = {\"a\": 1}\n\n    return x\n";
+        let call = ToolCall::new("write", json!({ "path": "out.py", "content": content }));
+        let rendered = messages_to_prompt(&[ChatMessage::assistant("", vec![call.clone()])], &[]);
+        let parsed = parse_tool_calls(&rendered);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments["content"], content);
+        assert_eq!(parsed.tool_calls[0].arguments["path"], "out.py");
+    }
+
+    #[test]
+    fn malformed_xml_tool_call_not_leaked() {
+        // Truncated emission: an open `<tool_call>` + `<function=` + a partial
+        // parameter with NO closing tags. Must yield no tool call AND must not
+        // leak the raw fragment into the visible content (a leaked fragment was
+        // being treated as the agent's "final answer" and falsely terminating it).
+        let parsed =
+            parse_tool_calls("<tool_call>\n<function=bash>\n<parameter=command>\ngrep foo");
+        assert!(parsed.tool_calls.is_empty());
+        assert!(!parsed.content.contains("<tool_call>"));
+        assert!(!parsed.content.contains("<function="));
+        assert!(!parsed.content.contains("grep foo"));
+        assert_eq!(parsed.content, "");
     }
 
     #[test]
@@ -1675,5 +1967,31 @@ mod tests {
     fn build_tool_block_required_with_no_tools_is_empty() {
         let block = build_tool_block_with_choice(&[], &ToolChoiceMode::Required);
         assert!(block.is_empty());
+    }
+
+    #[test]
+    fn build_tool_block_renders_qwen3coder_native_header() {
+        let block = build_tool_block(&[ToolDefinition::new(
+            "shell",
+            "Run a shell command",
+            json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        )]);
+        // Qwen3.6-Coder native tools-block contract from the chat template.
+        assert!(block.contains("# Tools"));
+        assert!(block.contains("You have access to the following functions:"));
+        assert!(block.contains("<tools>"));
+        assert!(block.contains("</tools>"));
+        assert!(block.contains("<function=example_function_name>"));
+        assert!(block.contains("<parameter=example_parameter_1>"));
+        assert!(block.contains("<IMPORTANT>"));
+        assert!(block.contains("</IMPORTANT>"));
+        // The tool itself still serializes as compact OpenAI-function JSON.
+        assert!(block.contains(r#""name":"shell""#));
+        // The old Hermes JSON-call instruction is gone.
+        assert!(!block.contains(r#"Use <tool_call>{"name""#));
     }
 }
