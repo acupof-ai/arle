@@ -2934,14 +2934,6 @@ impl Qwen35DecodeGraph {
     }
 }
 
-/// One demoted Qwen3.6 slot for G3 whole-slot capacity spill: the complete
-/// device-state image in host DRAM. Unlike DSv4 there is no executor-level MTP
-/// spec chain to carry (`Qwen35SpecSlotState` is test-only — the executor has
-/// no `spec_slots` field), so the entry is just the image.
-struct Qwen35SlotSwapEntry {
-    image: crate::qwen35::Qwen35SlotImage,
-}
-
 /// Qwen3.5 / Qwen3.6 HYBRID executor: drives
 /// [`crate::qwen35::Qwen35Model::forward_tokens`] per single-row sub-step and
 /// [`crate::qwen35::Qwen35Model::forward_decode_batch`] for rows>1 pure-decode
@@ -2963,11 +2955,19 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Per-slot KV + recurrent state (one [`crate::qwen35::Qwen35SlotState`] per slot).
     /// A slot's recurrent state is EMPTY until its first request activates it.
     slots: Vec<crate::qwen35::Qwen35SlotState>,
-    /// G3 whole-slot capacity spill (L2 = host DRAM). An inactive/retracted
-    /// request parks its whole slot image here instead of being dropped +
-    /// recomputed; restored on resume. The BTreeMap of host images IS the L2
-    /// (mirror of DSv4's `slot_swap_store`) — no separate tier abstraction.
-    slot_swap_store: std::collections::BTreeMap<u64, Qwen35SlotSwapEntry>,
+    /// G3 whole-slot capacity spill: an inactive/retracted request parks its
+    /// whole slot image here (instead of being dropped + recomputed) and is
+    /// restored byte-exact on resume. Routes through the SAME `CudaKvTierStore`
+    /// transport as the page-granular `recall_tier` (the unified-tier plan — all
+    /// grains move bytes through ONE store kind by opaque `u64` key), so G3 gets
+    /// the managed 850 GB DRAM budget + NVMe spill + durability for free instead
+    /// of a private DRAM map. Sized for whole-slot images (one entry ≈ one
+    /// recurrent-block image), so its count cap = budget / image-bytes (the
+    /// budget-aware ~5500 cap, not the old `num_slots*2`). Always built — G3 is
+    /// default-on and independent of `--kv-recall` (the page grain). Keyed by the
+    /// engine's session key, a namespace disjoint from `recall_tier`'s
+    /// `tier_block_u64(slot, page)` keys (separate store ⇒ no aliasing).
+    slot_tier: CudaKvTierStore,
     /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
     /// finished request, popped by the next — so only ACTIVE slots hold a block,
     /// not all `num_slots`. Grows to `num_slots` at full concurrency (then HBM ==
@@ -3098,44 +3098,41 @@ impl Qwen35CudaExecutor {
         true
     }
 
-    /// Demote `slot`'s entire device state into the host store under `key`. The
-    /// copy is complete before returning (`swap_out_image` ends in `ctx.sync()`),
-    /// so the engine may free the slot immediately. Returns `Ok(false)` when the
-    /// store is at its v1 count cap (engine falls back to plain recompute).
+    /// Demote `slot`'s entire device state into the host `slot_tier` under `key`.
+    /// The copy is complete before returning (`swap_out_image` ends in
+    /// `ctx.sync()`), so the engine may free the slot immediately. The image is
+    /// serialized byte-exact ([`Qwen35SlotImage::to_bytes`]) and handed to the
+    /// shared `CudaKvTierStore` transport, which manages the 850 GB DRAM budget
+    /// (+ optional NVMe spill). Returns `Ok(false)` when the tier is at budget
+    /// (engine falls back to plain recompute, same contract as the old cap).
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         ensure!(
             slot < self.num_slots,
             "Qwen3.6 demote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        // v1 count cap, mirror of DSv4. The budget-aware cap
-        // (`dram_l2_budget / image_bytes`, ~5500 images at 147 MiB) is the
-        // tunable upgrade — not implemented here.
-        if !self.slot_swap_store.contains_key(&key)
-            && self.slot_swap_store.len() >= self.num_slots.saturating_mul(2)
-        {
-            return Ok(false);
-        }
         let Self {
             model,
             slots,
             full_attn_kv,
             recurrent_pool,
+            slot_tier,
             ..
         } = self;
         let pool = full_attn_kv
             .as_mut()
             .expect("full_attn_kv present (whole-slot demote)");
         let image = slots[slot].swap_out_image(&model.ctx, slot, pool, recurrent_pool)?;
-        self.slot_swap_store
-            .insert(key, Qwen35SlotSwapEntry { image });
-        Ok(true)
+        // The tier's own budget (host DRAM count cap + NVMe spill) replaces the
+        // old `num_slots*2` cap: `insert` returns false when no level has room,
+        // and `demote_slot` reports `Ok(false)` so the engine recomputes.
+        Ok(slot_tier.insert(key, image.to_bytes()))
     }
 
     /// Restore the whole-slot image stored under `key` into `slot`. The engine
     /// resumes decode at the demoted position right after this returns, and drops
     /// the entry via [`Self::drop_kv_slot_entries`] — the entry intentionally
-    /// stays in the store here. `swap_in_image` ends in `ctx.sync()`, so the
+    /// stays in the tier here. `swap_in_image` ends in `ctx.sync()`, so the
     /// device restore is complete before the host image can be dropped.
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
         ensure!(
@@ -3144,17 +3141,22 @@ impl Qwen35CudaExecutor {
             self.num_slots
         );
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+        // Read the serialized image out of the tier (host hit or NVMe read) and
+        // deserialize it byte-exact before touching the device.
+        let image = {
+            let bytes = self
+                .slot_tier
+                .read(key)
+                .map_err(|err| anyhow::anyhow!("Qwen3.6 whole-slot tier read key {key}: {err}"))?;
+            crate::qwen35::Qwen35SlotImage::from_bytes(bytes.as_ref())?
+        };
         let Self {
             model,
             slots,
             full_attn_kv,
             recurrent_pool,
-            slot_swap_store,
             ..
         } = self;
-        let entry = slot_swap_store.get(&key).ok_or_else(|| {
-            anyhow::anyhow!("Qwen3.6 whole-slot KV store has no image for key {key}")
-        })?;
         let pool = full_attn_kv
             .as_mut()
             .expect("full_attn_kv present (whole-slot promote)");
@@ -3166,14 +3168,12 @@ impl Qwen35CudaExecutor {
             num_linear,
             gdr_len,
             conv_len,
-            &entry.image,
+            &image,
         )
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        for key in keys {
-            self.slot_swap_store.remove(key);
-        }
+        self.slot_tier.remove(keys);
     }
 
     pub(crate) fn from_qwen35_safetensors(
@@ -3313,6 +3313,22 @@ impl Qwen35CudaExecutor {
             format_args!("pages={total_pool_pages} tokens={pool_token_budget}"),
         );
 
+        // G3 whole-slot spill tier: one entry == one serialized slot image. Its
+        // count cap = DRAM budget / per-image bytes ≈ the budget-aware ~5500
+        // (replaces the old `num_slots*2`). Size the per-image unit from the
+        // recurrent-block floor (gdr f32 + conv bf16, × num_linear) — the
+        // dominant fixed cost (~147 MiB); the variable full-attn pages ride on
+        // top. `max(1)` so a degenerate config can't divide by zero. Same
+        // `CudaKvTierStore` transport as the page-granular recall tier — the
+        // unified plan: every grain moves bytes through ONE store kind. NVMe
+        // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
+        let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
+        let slot_image_bytes = (num_linear * (gdr_state_len * 4 + conv_len * 2)).max(1);
+        let slot_tier = CudaKvTierStore::with_budget(
+            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+            slot_image_bytes,
+        );
+
         // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
         // not graph-capturable on this stack — TP≥2 stays eager, same as
         // dense) ∧ every layer's decode step is a pure device-kernel sequence.
@@ -3322,7 +3338,7 @@ impl Qwen35CudaExecutor {
         let executor = Self {
             model,
             slots,
-            slot_swap_store: std::collections::BTreeMap::new(),
+            slot_tier,
             recurrent_pool: Vec::new(),
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
