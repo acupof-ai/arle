@@ -125,37 +125,49 @@ fn run_config(config: ServeConfig) -> ExitCode {
         eprintln!("[ARLE serve] warning: {warning}");
     }
 
-    // Multi-rank TP CUDA models (DSv4, Qwen3.5/3.6 MoE): become the
-    // multiproc-serve COORDINATOR (rank 0). Bind the relay, spawn N-1 worker
-    // processes (one per GPU via INFER_CUDA_DEVICES / INFER_TP_SIZE), accept
-    // their relay connects, boot-ping, install the admission broadcaster — THEN
-    // fall through to the normal in-process serve below (rank 0 owns HTTP). The
-    // broadcaster fans out each request the rank-0 engine admits to the workers
-    // so they step their executors' NCCL `forward` in lockstep. The guard holds
-    // the relay + worker pipes for the serve loop's lifetime; dropping it on
-    // return EOFs the workers so they exit. On a single GPU it is a no-op and
-    // serve proceeds single-process. Dense Qwen3 skips this entirely.
-    //
-    // `// STAGE 3:` chunked-prefill scratch chunk-bounding + the decode path
-    // beyond a single short prompt are later stages (see Stage-2 markers in
-    // `serve_multiproc.rs` / `multiproc_relay.rs` / `execution.rs`).
+    // Multi-rank TP CUDA models (DSv4, Qwen3.5/3.6 MoE): SPMD (B) split. The parent
+    // becomes the engine-less coordinator — binds the relay, spawns all N workers,
+    // and runs the thin coordinator HTTP loop. Single GPU returns `None` and falls
+    // through to the byte-identical in-process path below; dense Qwen3 skips it.
     #[cfg(all(unix, feature = "cuda"))]
-    let _coordinator_guard = if config.backend == ServeBackend::Cuda
+    if config.backend == ServeBackend::Cuda
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
     {
         match crate::serve_multiproc::bind_relay_and_spawn_workers(
             &config.options.model_path,
             &config.options.engine_config,
         ) {
-            Ok(guard) => guard,
+            Ok(Some(coordinator)) => {
+                let crate::serve_multiproc::MultiprocCoordinator { relay, guard } = coordinator;
+                eprintln!(
+                    "[ARLE serve] starting cuda multiproc coordinator on {}:{}",
+                    config.options.bind, config.options.port,
+                );
+                let result = infer_api::serve_coordinator_http(
+                    &config.options.model_path,
+                    &config.options.bind,
+                    config.options.port,
+                    config.options.engine_config.max_thinking_tokens,
+                    relay,
+                );
+                // Keep the worker children alive until the serve loop returns.
+                drop(guard);
+                return match result {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("[ARLE serve] coordinator error: {err:#}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            // None: single GPU — fall through to the in-process serve below.
+            Ok(None) => {}
             Err(err) => {
                 eprintln!("[ARLE serve] multiproc coordinator setup failed: {err:#}");
                 return ExitCode::FAILURE;
             }
         }
-    } else {
-        None
-    };
+    }
 
     eprintln!(
         "[ARLE serve] starting {} backend in-process on {}:{}",

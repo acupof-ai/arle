@@ -333,6 +333,30 @@ impl CompletionResponse {
             usage,
         }
     }
+
+    /// Build a completion response from already-decoded parts (the multiproc
+    /// coordinator path, which has no in-process `CompletedRequest`).
+    pub(crate) fn from_parts(
+        model: String,
+        text: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        finish: Option<&FinishReason>,
+    ) -> Self {
+        Self {
+            id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
+            object: "text_completion",
+            created: unix_time_secs(),
+            model,
+            choices: vec![CompletionChoice {
+                text,
+                index: 0,
+                logprobs: None,
+                finish_reason: finish_reason(finish).to_string(),
+            }],
+            usage: Usage::new(prompt_tokens, completion_tokens),
+        }
+    }
 }
 
 /// `GET /v1/models` response — the OpenAI model-list shape. The server serves a

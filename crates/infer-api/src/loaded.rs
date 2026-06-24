@@ -1595,37 +1595,52 @@ mod backend {
         Ok(infer_core::Engine::with_config(executor, kv, scheduler))
     }
 
-    /// Multiproc worker rank's directly-driven engine (rank 1..N-1).
+    /// Multiproc worker rank's directly-driven engine (rank 0..N-1; every rank is
+    /// a child worker under the SPMD / B split).
     ///
-    /// Unlike rank 0 (whose engine lives on a free-running [`ServeHandle`]
-    /// thread), a worker steps its engine SYNCHRONOUSLY — exactly once per
-    /// relayed `TickAdmissions` envelope — so admission lands at the same step
-    /// index on every rank (the lockstep contract; see
-    /// `infer_server::set_tick_broadcaster`). Built and driven on one thread.
-    ///
-    /// Known growth, mirroring rank 0: the engine's completed-request map is
-    /// never drained (no collector on workers), one entry per finished request.
+    /// A worker steps its engine SYNCHRONOUSLY — once per relayed `TickAdmissions`
+    /// — so admission lands at the same step index on every rank (the lockstep
+    /// contract). The output owner (rank 0) also tracks each request and emits its
+    /// terminal generation back via [`Self::drain_completions`]; followers discard
+    /// their TP-replicated tokens.
     #[cfg(feature = "cuda")]
-    pub struct CudaWorkerEngine(infer_core::Engine<CudaExecutor, CudaKvPool>);
+    pub struct CudaWorkerEngine {
+        engine: infer_core::Engine<CudaExecutor, CudaKvPool>,
+        /// Rank 0 owns the visible output; followers skip all output bookkeeping.
+        owns_output: bool,
+        /// engine handle -> coordinator request_id (output owner only). A handle is
+        /// removed once its terminal delta is emitted, which also prevents
+        /// re-emitting — no separate "already emitted" set needed.
+        tracked: std::collections::HashMap<infer_core::RequestHandle, u64>,
+    }
 
     #[cfg(feature = "cuda")]
     impl CudaWorkerEngine {
         /// Build the rank-R engine from the SAME config rank 0 resolved
-        /// (`ARLE_WORKER_ENGINE_CONFIG`); NCCL rank/world come from env during
-        /// executor construction.
-        pub fn load(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            Ok(Self(build_cuda_engine(model_path, config)?))
+        /// (`ARLE_WORKER_ENGINE_CONFIG`); NCCL rank/world come from env. `owns_output`
+        /// (rank 0) tracks + emits completions over the relay.
+        pub fn load(
+            model_path: &str,
+            config: &EngineLoadConfig,
+            owns_output: bool,
+        ) -> Result<Self> {
+            Ok(Self {
+                engine: build_cuda_engine(model_path, config)?,
+                owns_output,
+                tracked: std::collections::HashMap::new(),
+            })
         }
 
-        /// Inject one relayed request, mirroring rank 0's admission options
-        /// (`RequestOptions { sampling, ..default() }` — `admit_submission`).
+        /// Inject one relayed request. The output owner records the `request_id` ->
+        /// engine handle map so [`Self::drain_completions`] can route the result back.
         pub fn inject(
             &mut self,
+            request_id: u64,
             prompt_tokens: Vec<u32>,
             max_tokens: usize,
             sampling: infer_plan::SamplingParams,
         ) {
-            let _handle = self.0.submit_request_with_options(
+            let handle = self.engine.submit_request_with_options(
                 prompt_tokens,
                 max_tokens,
                 infer_core::RequestOptions {
@@ -1633,20 +1648,68 @@ mod backend {
                     ..infer_core::RequestOptions::default()
                 },
             );
+            if self.owns_output {
+                self.tracked.insert(handle, request_id);
+            }
         }
 
-        /// Whether the engine has no queued, active, or in-flight work —
-        /// evaluated on the same state rank 0 evaluates, so both sides step (or
-        /// skip) symmetrically per tick.
+        /// Whether the engine has no queued/active/in-flight work — same state
+        /// every rank evaluates, so all sides step or skip symmetrically per tick.
         #[must_use]
         pub fn is_idle(&self) -> bool {
-            self.0.is_idle()
+            self.engine.is_idle()
         }
 
         /// Run exactly one scheduler tick (apply previous output → admit
         /// waiting → build plan → submit forward).
         pub fn step(&mut self) -> Result<()> {
-            self.0.step()
+            self.engine.step()
+        }
+
+        /// Drain terminal completions (output owner only): emit one terminal delta
+        /// per finished tracked request, keyed by `request_id`. No-op on followers.
+        /// Abort propagation: once the engine is idle, a still-tracked handle that
+        /// never `completed` was dropped, so it gets a terminal ERROR delta rather
+        /// than leaving the HTTP client hanging.
+        pub fn drain_completions(&mut self) -> Vec<(u64, infer_server::RelayCompletionDelta)> {
+            if !self.owns_output || self.tracked.is_empty() {
+                return Vec::new();
+            }
+            // Idle engine: a tracked-but-not-completed handle was dropped.
+            let engine_idle = self.engine.is_idle();
+            let terminal: Vec<(infer_core::RequestHandle, u64)> = self
+                .tracked
+                .iter()
+                .filter(|(handle, _request_id)| {
+                    self.engine.completed(**handle).is_some() || engine_idle
+                })
+                .map(|(handle, request_id)| (*handle, *request_id))
+                .collect();
+            let mut out = Vec::with_capacity(terminal.len());
+            for (handle, request_id) in terminal {
+                let delta = match self.engine.completed(handle) {
+                    Some(completed) => infer_server::RelayCompletionDelta {
+                        text_delta: String::new(),
+                        token_ids: completed.generated_tokens.clone(),
+                        finish: true,
+                        finish_reason: completed.finish.clone(),
+                        error: None,
+                    },
+                    // Engine idle but the handle never completed → dropped request.
+                    None => infer_server::RelayCompletionDelta {
+                        text_delta: String::new(),
+                        token_ids: Vec::new(),
+                        finish: true,
+                        finish_reason: None,
+                        error: Some(format!(
+                            "request dropped by engine without completing (handle={handle:?})"
+                        )),
+                    },
+                };
+                self.tracked.remove(&handle);
+                out.push((request_id, delta));
+            }
+            out
         }
     }
 

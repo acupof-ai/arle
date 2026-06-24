@@ -38,6 +38,7 @@ use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
+mod coordinator;
 mod execution;
 mod http;
 mod metrics;
@@ -49,10 +50,12 @@ mod tokenizer;
 use execution::{ControlMessage, Submission, engine_loop};
 pub use execution::{CounterSnapshot, StreamItem};
 
+pub use coordinator::coordinator_router;
 pub use http::openai_router;
 pub use multiproc_relay::{
-    PendingRelayCoordinator, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, RelayWorker,
-    WireRequest, broadcast_tick, set_tick_broadcaster, tick_broadcaster_installed,
+    PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
+    RelayWorker, TcpChannel, WireRequest, broadcast_tick, set_tick_broadcaster,
+    tick_broadcaster_installed,
 };
 pub use schema::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatContentPart, ChatMessage,
