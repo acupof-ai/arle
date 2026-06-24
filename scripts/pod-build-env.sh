@@ -5,9 +5,19 @@ export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
 export CUDA_HOME=/usr/local/cuda
 export TORCH_CUDA_ARCH_LIST=9.0          # H20 == sm_90
 export CMAKE_CUDA_ARCHITECTURES=90
-# tilelang AOT venv (needed only for the full arle binary / cuda-kernels sm_90 AOT,
-# not for single-crate builds like -p autograd). Create with scripts/pod.sh setup-tilelang.
-export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-/host/arle-build/crates/cuda-kernels/tools/tilelang/.venv/bin/python}"
+# TileLang AOT regen — REQUIRED for full arle / cuda-kernels builds now that the
+# generated/ artifacts are gitignored (kernels regenerate on demand; nvcc 12.8+
+# cross-compiles every SM incl. Blackwell). Resolve a python that imports tilelang:
+# prefer the dedicated venv, else any python3 that has it (the build image ships it
+# via requirements-build.txt). If neither, leave unset — a from-source CUDA build
+# then fails loudly; install via `scripts/pod.sh setup-tilelang`. (Single-crate
+# builds like -p autograd don't touch this.)
+_tl_venv="${TREE:-/host/arle-build}/crates/cuda-kernels/tools/tilelang/.venv/bin/python"
+if [ -x "$_tl_venv" ]; then
+  export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-$_tl_venv}"
+elif command -v python3 >/dev/null 2>&1 && python3 -c "import tilelang" >/dev/null 2>&1; then
+  export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-$(command -v python3)}"
+fi
 # Fast network path: ckl's reverse SOCKS5 proxy (pod -> local network). The pod's
 # direct route to crates.io / static.rust-lang.org stalls; the proxy does not.
 export all_proxy="${all_proxy:-socks5h://127.0.0.1:1080}"
