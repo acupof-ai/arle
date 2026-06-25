@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use infer_api::{
     ChatPromptImage, ChatPromptMessage, InferenceEngine, LoadedInferenceEngine,
     MultimodalChatRequest, SamplingParams,
@@ -35,7 +35,8 @@ pub(crate) fn run(args: &OcrArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| args.mode.prompt().to_string());
 
-    let inputs = load_ocr_inputs(&args.image)
+    let page_selection = parse_page_selection(args.pages.as_deref())?;
+    let inputs = load_ocr_inputs(&args.image, page_selection.as_deref())
         .with_context(|| format!("failed to load image `{}`", args.image))?;
     let max_tokens = resolve_ocr_max_tokens(&model_source, args.max_tokens);
 
@@ -70,9 +71,9 @@ pub(crate) fn run(args: &OcrArgs) -> Result<()> {
                 "completion_tokens": completion_tokens,
             },
         });
-        println!("{}", serde_json::to_string(&doc)?);
+        write_ocr_output(args.output.as_deref(), &serde_json::to_string(&doc)?)?;
     } else {
-        println!("{text}");
+        write_ocr_output(args.output.as_deref(), &text)?;
     }
     Ok(())
 }
@@ -110,12 +111,12 @@ fn read_ocr_max_context(model_source: &str) -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
-fn load_ocr_inputs(source: &str) -> Result<Vec<ChatPromptImage>> {
+fn load_ocr_inputs(source: &str, page_selection: Option<&[usize]>) -> Result<Vec<ChatPromptImage>> {
     if !is_pdf_source(source) {
         return Ok(vec![crate::repl::load_cli_image(source)?]);
     }
     let pdf_path = materialize_pdf_source(source)?;
-    let page_pngs = render_pdf_pages(&pdf_path)?;
+    let page_pngs = render_pdf_pages(&pdf_path, page_selection)?;
     page_pngs
         .into_iter()
         .map(|page_png| crate::repl::load_cli_image(&page_png.to_string_lossy()))
@@ -167,31 +168,28 @@ fn download_pdf_to_temp(source: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn render_pdf_pages(pdf_path: &Path) -> Result<Vec<PathBuf>> {
+fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result<Vec<PathBuf>> {
     let renderer = std::env::var(PDF_RENDERER_ENV).unwrap_or_else(|_| "pdftoppm".to_string());
     let dir = std::env::temp_dir().join(format!("arle-ocr-page-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create temp dir {} failed", dir.display()))?;
     let out_prefix = dir.join("page");
-    let output = Command::new(&renderer)
-        .arg("-png")
-        .arg("-f")
-        .arg("1")
-        .arg(pdf_path)
-        .arg(&out_prefix)
-        .output()
-        .with_context(|| {
-            format!(
-                "spawn pdf renderer `{renderer}` failed; install poppler (`pdftoppm`) or set {PDF_RENDERER_ENV}"
-            )
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "pdf render failed via `{renderer}`: {}",
-            stderr.lines().last().unwrap_or("unknown error")
-        );
+    if let Some(page_selection) = page_selection {
+        let mut pngs = Vec::with_capacity(page_selection.len());
+        for page in page_selection {
+            let prefix = dir.join(format!("page-{page}"));
+            run_pdftoppm(&renderer, pdf_path, &prefix, Some(*page))
+                .with_context(|| format!("render pdf page {page} failed"))?;
+            let png = prefix.with_extension("png");
+            ensure!(
+                png.exists(),
+                "pdf renderer `{renderer}` produced no image for page {page}"
+            );
+            pngs.push(png);
+        }
+        return Ok(pngs);
     }
+    run_pdftoppm(&renderer, pdf_path, &out_prefix, None)?;
     let mut pngs = std::fs::read_dir(&dir)
         .with_context(|| format!("read rendered pages in {} failed", dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -204,6 +202,35 @@ fn render_pdf_pages(pdf_path: &Path) -> Result<Vec<PathBuf>> {
         dir.display()
     );
     Ok(pngs)
+}
+
+fn run_pdftoppm(renderer: &str, pdf_path: &Path, out_prefix: &Path, page: Option<usize>) -> Result<()> {
+    let mut cmd = Command::new(renderer);
+    cmd.arg("-png");
+    if let Some(page) = page {
+        cmd.arg("-f")
+            .arg(page.to_string())
+            .arg("-l")
+            .arg(page.to_string())
+            .arg("-singlefile");
+    }
+    let output = cmd
+        .arg(pdf_path)
+        .arg(out_prefix)
+        .output()
+        .with_context(|| {
+            format!(
+                "spawn pdf renderer `{renderer}` failed; install poppler (`pdftoppm`) or set {PDF_RENDERER_ENV}"
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "pdf render failed via `{renderer}`: {}",
+            stderr.lines().last().unwrap_or("unknown error")
+        ));
+    }
+    Ok(())
 }
 
 fn pdf_page_sort_key(path: &Path) -> usize {
@@ -226,11 +253,57 @@ fn format_pages(pages: &[String]) -> String {
         .join("\n\n")
 }
 
+fn parse_page_selection(input: Option<&str>) -> Result<Option<Vec<usize>>> {
+    let Some(input) = input.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let mut pages = Vec::new();
+    for part in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = parse_page_num(start)?;
+            let end = parse_page_num(end)?;
+            ensure!(start <= end, "invalid page range `{part}`: start > end");
+            pages.extend(start..=end);
+        } else {
+            pages.push(parse_page_num(part)?);
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    ensure!(!pages.is_empty(), "page selection is empty");
+    Ok(Some(pages))
+}
+
+fn parse_page_num(input: &str) -> Result<usize> {
+    let page = input
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid page number `{input}`"))?;
+    ensure!(page > 0, "page numbers are 1-based");
+    Ok(page)
+}
+
+fn write_ocr_output(path: Option<&Path>, text: &str) -> Result<()> {
+    if let Some(path) = path {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create output dir {} failed", parent.display()))?;
+        }
+        std::fs::write(path, text)
+            .with_context(|| format!("write output {} failed", path.display()))?;
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OCR_MAX_TOKENS, PDF_RENDERER_ENV, format_pages, is_pdf_source, pdf_page_sort_key,
-        read_ocr_max_context, render_pdf_pages,
+        DEFAULT_OCR_MAX_TOKENS, PDF_RENDERER_ENV, format_pages, is_pdf_source, parse_page_selection,
+        pdf_page_sort_key, read_ocr_max_context, render_pdf_pages, write_ocr_output,
     };
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -250,7 +323,7 @@ mod tests {
         let pdf = dir.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4").expect("write pdf");
         unsafe { std::env::set_var(PDF_RENDERER_ENV, "definitely-not-installed-pdftoppm"); }
-        let err = render_pdf_pages(&pdf).expect_err("missing renderer should fail");
+        let err = render_pdf_pages(&pdf, None).expect_err("missing renderer should fail");
         let msg = err.to_string();
         assert!(msg.contains("pdftoppm") || msg.contains(PDF_RENDERER_ENV));
         unsafe { std::env::remove_var(PDF_RENDERER_ENV); }
@@ -272,12 +345,35 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod");
         unsafe { std::env::set_var(PDF_RENDERER_ENV, &script); }
-        let out = render_pdf_pages(&pdf).expect("fake renderer works");
+        let out = render_pdf_pages(&pdf, None).expect("fake renderer works");
         assert_eq!(out.len(), 2);
         assert!(out[0].ends_with("page-1.png"));
         assert!(out[1].ends_with("page-2.png"));
         assert!(out[0].exists());
         assert!(out[1].exists());
+        unsafe { std::env::remove_var(PDF_RENDERER_ENV); }
+    }
+
+    #[test]
+    fn pdf_render_selected_pages_use_singlefile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = dir.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4").expect("write pdf");
+        let script = dir.path().join("fake-pdftoppm.sh");
+        let mut file = std::fs::File::create(&script).expect("create script");
+        writeln!(
+            file,
+            "#!/bin/sh\nfor last in \"$@\"; do :; done\nprintf 'fakepng' > \"${{last}}.png\"\n"
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod");
+        unsafe { std::env::set_var(PDF_RENDERER_ENV, &script); }
+        let out = render_pdf_pages(&pdf, Some(&[3, 1])).expect("selected pages render");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].ends_with("page-3.png"));
+        assert!(out[1].ends_with("page-1.png"));
         unsafe { std::env::remove_var(PDF_RENDERER_ENV); }
     }
 
@@ -317,5 +413,33 @@ mod tests {
         );
         assert_eq!(read_ocr_max_context("/definitely/missing"), None);
         assert_eq!(DEFAULT_OCR_MAX_TOKENS, 32_768);
+    }
+
+    #[test]
+    fn parses_page_selection() {
+        assert_eq!(parse_page_selection(None).expect("none"), None);
+        assert_eq!(
+            parse_page_selection(Some("1,3,5-7")).expect("pages"),
+            Some(vec![1, 3, 5, 6, 7])
+        );
+        assert_eq!(
+            parse_page_selection(Some("7,3,3,1")).expect("dedup"),
+            Some(vec![1, 3, 7])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_page_selection() {
+        assert!(parse_page_selection(Some("0")).is_err());
+        assert!(parse_page_selection(Some("3-1")).is_err());
+        assert!(parse_page_selection(Some("a")).is_err());
+    }
+
+    #[test]
+    fn writes_output_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("nested").join("ocr.txt");
+        write_ocr_output(Some(&out), "hello").expect("write output");
+        assert_eq!(std::fs::read_to_string(out).expect("read output"), "hello");
     }
 }

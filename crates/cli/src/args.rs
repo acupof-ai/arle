@@ -351,7 +351,7 @@ pub(crate) enum OcrMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
 #[command(
-    after_help = "Examples:\n  arle ocr page.png\n  arle ocr --mode markdown scan.jpg\n  arle ocr --mode free https://example.com/receipt.png\n  arle ocr --prompt \"<|grounding|>Extract the table.\" table.png\n\nThe DeepSeek-OCR model auto-downloads on first use (Metal/Apple Silicon only)."
+    after_help = "Examples:\n  arle ocr page.png\n  arle ocr --mode markdown scan.jpg\n  arle ocr --mode free https://example.com/receipt.png\n  arle ocr --prompt \"<|grounding|>Extract the table.\" table.png\n  arle ocr --pages 1,3,5-8 report.pdf\n  arle ocr --output out.md report.pdf\n\nThe DeepSeek-OCR model auto-downloads on first use (Metal/Apple Silicon only). PDFs are rendered page-by-page via pdftoppm."
 )]
 pub(crate) struct OcrArgs {
     /// Image to read — a local path or http(s) URL.
@@ -372,9 +372,17 @@ pub(crate) struct OcrArgs {
     #[arg(long)]
     pub(crate) model_path: Option<String>,
 
-    /// Max tokens to generate. `0`/`auto` picks a generous OCR default.
+    /// Max tokens to generate per page. `0`/`auto` uses the model context limit.
     #[arg(long, default_value_t = 0, value_parser = parse_max_tokens_or_auto)]
     pub(crate) max_tokens: usize,
+
+    /// PDF pages to OCR: `1`, `1,3,5-8`. Omit to process every page.
+    #[arg(long)]
+    pub(crate) pages: Option<String>,
+
+    /// Write the final OCR text to a file instead of stdout.
+    #[arg(long)]
+    pub(crate) output: Option<PathBuf>,
 
     /// Emit a JSON document ({ text, model, usage }) for scripts.
     #[arg(long, default_value_t = false)]
