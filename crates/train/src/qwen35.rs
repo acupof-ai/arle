@@ -251,10 +251,24 @@ impl Qwen35TensorParallelConfig {
 /// `[chunk_heads, seq, seq]` scores to avoid OOM at long seq.
 const ATTN_HEAD_CHUNK: usize = 8;
 
-/// Layers per gradient-checkpoint group: one checkpoint (one offload) per K
-/// layers instead of per layer, so K× fewer/larger host offloads (less PCIe
-/// traffic). The frozen/LoRA boundary still forces a group split.
-const CKPT_GROUP: usize = 4;
+/// Max layers per gradient-checkpoint group. Group checkpointing does one host
+/// offload per K layers (K× less PCIe), BUT a group's forward holds all K
+/// layers' live activations until it's saved — so K× the per-layer activation,
+/// which OOMs at long seq. `ckpt_group_size` derives K from seq_len: 1 at long
+/// seq (caps live activation), up to this max at short seq. The frozen/LoRA
+/// boundary still forces a group split.
+const CKPT_GROUP_MAX: usize = 8;
+
+/// Adaptive checkpoint group size: bound a group's live forward activations to
+/// ~8 GiB. Per-layer activation ≈ `seq × (hidden + 3×intermediate) × 4B` (MLP
+/// gate/up/act dominate); a group holds `group_size ×` that until saved.
+fn ckpt_group_size(seq_len: usize, hidden: usize, intermediate: usize) -> usize {
+    let per_layer = seq_len
+        .saturating_mul(hidden + 3 * intermediate)
+        .saturating_mul(4)
+        .max(1);
+    ((8usize << 30) / per_layer).clamp(1, CKPT_GROUP_MAX)
+}
 
 // Head-chunked causal SDPA: heads are independent so chunking is numerically exact;
 // bounds the live [chunk_heads, seq, seq] scores to avoid OOM at long seq.
@@ -3362,7 +3376,7 @@ impl Qwen35Model {
         trace_model_component(trace, "embedding", profile.embedding);
 
         if self.gradient_checkpointing && tape.enabled {
-            // Checkpoint layers in groups of CKPT_GROUP (one host offload per
+            // Checkpoint layers in adaptive groups (one host offload per
             // group). Numerically exact vs per-layer: same layer order, same
             // detach point (the LoRA boundary forces a group split), same params
             // in each checkpoint's saved inputs.
@@ -3388,7 +3402,11 @@ impl Qwen35Model {
             hidden = checkpoint_sequential(
                 hidden,
                 self.layers.len(),
-                CKPT_GROUP,
+                ckpt_group_size(
+                    batch * seq_len,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                ),
                 self.lora_layer_start,
                 store,
                 tape,
@@ -3490,7 +3508,11 @@ impl Qwen35Model {
             hidden = checkpoint_sequential(
                 hidden,
                 self.layers.len(),
-                CKPT_GROUP,
+                ckpt_group_size(
+                    batch * seq_len,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                ),
                 self.lora_layer_start,
                 store,
                 tape,
@@ -5775,12 +5797,13 @@ mod tests {
             .iter()
             .filter(|entry| entry.op == BackwardOp::Checkpoint)
             .count();
-        // Layers are checkpointed in groups of CKPT_GROUP (no LoRA boundary
-        // here), so one entry per group, not per layer.
-        let expected_groups = cfg.num_hidden_layers.div_ceil(super::CKPT_GROUP);
+        // Layers are checkpointed in adaptive (seq-len-derived) groups (no LoRA
+        // boundary here), so one entry per group, not per layer.
+        let group = super::ckpt_group_size(positions.len(), cfg.hidden_size, cfg.intermediate_size);
+        let expected_groups = cfg.num_hidden_layers.div_ceil(group);
         assert_eq!(
             checkpoint_entries, expected_groups,
-            "one checkpoint entry per CKPT_GROUP-sized layer group is required"
+            "one checkpoint entry per adaptive layer group is required"
         );
         let adapter_ids = model
             .adapter_name_map()
