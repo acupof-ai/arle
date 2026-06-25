@@ -134,9 +134,14 @@ struct DecoderLayer {
 };
 
 struct LayerCache {
+    // Fixed-capacity KV ring, lazily allocated on the first write to the layer's
+    // K/V dtype: [1, nkv, cap, hd] for keys, [1, nkv, cap, vhd] for values. Each
+    // step writes its slot in place via `slice_update` (O(1) traffic), versus the
+    // old `concatenate` that reallocated the whole history every token (O(ctx)).
     array keys = array(0);
     array values = array(0);
-    int len = 0;
+    int len = 0; // used length
+    int cap = 0; // allocated capacity (0 = not yet allocated)
 };
 
 // ── SAM-base encoder ─────────────────────────────────────────────────────
@@ -247,6 +252,7 @@ struct DeepseekOcrModel {
     // per-request state
     std::vector<LayerCache> layer_caches;
     int context_len = 0;
+    int kv_cap = 0; // per-request KV ring capacity (prompt + max_new, 256-rounded)
 
     array array_by_id(int32_t id) {
         if (id < 0 || id >= static_cast<int32_t>(weights.size())) {
@@ -287,15 +293,26 @@ struct DeepseekOcrModel {
         q = fast::rope(q, head_dim, /*traditional=*/false, rope_theta, 1.0f, offset);
         k = fast::rope(k, head_dim, /*traditional=*/false, rope_theta, 1.0f, offset);
 
-        array k_full = k;
-        array v_full = v;
-        if (cache.len > 0) {
-            k_full = concatenate(std::vector<array>{cache.keys, k}, 2);
-            v_full = concatenate(std::vector<array>{cache.values, v}, 2);
+        // Fixed-capacity KV ring: write this step's K/V in place at the cursor and
+        // read back the [0, len+s) prefix. Avoids the per-step full-history
+        // `concatenate` (O(ctx) traffic/token) the old path paid; the slot write
+        // is donated in place because `layer_caches` is decoded against directly
+        // (no aliasing copy), mirroring the canonical Qwen35 cache loop.
+        const int cap = (kv_cap > 0) ? kv_cap : (cache.len + s);
+        if (cache.cap != cap || cache.len == 0) {
+            // (Re)allocate the ring to the request capacity on first write.
+            cache.keys = zeros({1, num_kv_heads, cap, head_dim}, k.dtype());
+            cache.values = zeros({1, num_kv_heads, cap, v_head_dim}, v.dtype());
+            cache.cap = cap;
         }
-        cache.keys = k_full;
-        cache.values = v_full;
-        cache.len += s;
+        const int end = cache.len + s;
+        cache.keys =
+            slice_update(cache.keys, k, {0, 0, cache.len, 0}, {1, num_kv_heads, end, head_dim});
+        cache.values =
+            slice_update(cache.values, v, {0, 0, cache.len, 0}, {1, num_kv_heads, end, v_head_dim});
+        cache.len = end;
+        auto k_full = slice(cache.keys, {0, 0, 0, 0}, {1, num_kv_heads, end, head_dim});
+        auto v_full = slice(cache.values, {0, 0, 0, 0}, {1, num_kv_heads, end, v_head_dim});
 
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         std::string mask_mode = (s > 1) ? "causal" : "";
@@ -680,9 +697,14 @@ struct DeepseekOcrModel {
 
     // ── Generate ────────────────────────────────────────────────────────
 
-    void reset_request_state() {
+    void reset_request_state(int total_tokens) {
         layer_caches.assign(layers.size(), LayerCache{});
         context_len = 0;
+        // Round the KV ring capacity up to a 256-token chunk (mirrors the
+        // canonical Qwen35 loop) so the ring is allocated once per request.
+        constexpr int KV_CACHE_CHUNK = 256;
+        const int need = std::max(1, total_tokens);
+        kv_cap = ((need + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK;
     }
 
     array commit_tokens_and_logits(const int32_t* tokens, int len) {
@@ -691,9 +713,9 @@ struct DeepseekOcrModel {
         }
         auto token_ids = array_from_i32(tokens, static_cast<int32_t>(len));
         auto embeds = token_embeddings(token_ids);
-        auto next = layer_caches;
-        auto hidden = decode(token_ids, embeds, next, context_len);
-        layer_caches = std::move(next);
+        // Decode directly against `layer_caches` (no aliasing copy) so the ring's
+        // `slice_update` is donated in place rather than copying the whole buffer.
+        auto hidden = decode(token_ids, embeds, layer_caches, context_len);
         context_len += len;
         return logits_from_hidden(hidden);
     }
@@ -725,9 +747,7 @@ struct DeepseekOcrModel {
         if (seen != n_img) {
             throw std::invalid_argument("<image> placeholder count != vision embedding count");
         }
-        auto next = layer_caches;
-        auto hidden = decode(token_ids, x, next, context_len);
-        layer_caches = std::move(next);
+        auto hidden = decode(token_ids, x, layer_caches, context_len);
         context_len += len;
         return logits_from_hidden(hidden);
     }
@@ -747,9 +767,7 @@ struct DeepseekOcrModel {
     // and return next-position logits. All graph-building, no eval.
     array commit_lazy_token(const array& token_id) {
         auto embeds = token_embeddings(token_id); // [1, hidden]
-        auto next = layer_caches;
-        auto hidden = decode(token_id, embeds, next, context_len);
-        layer_caches = std::move(next);
+        auto hidden = decode(token_id, embeds, layer_caches, context_len);
         context_len += 1;
         return logits_from_hidden(hidden);
     }
@@ -1112,7 +1130,7 @@ int32_t deepseek_ocr_generate_causal(void* model, const int32_t* prompt, int32_t
             throw std::invalid_argument("DeepSeek-OCR generate requires a non-empty prompt");
         }
         random::seed(seed);
-        m->reset_request_state();
+        m->reset_request_state(prompt_len + std::max(max_new_tokens, 0));
         if (cancelled(cancel_fn, cancel_ctx)) {
             throw std::runtime_error("DeepSeek-OCR generation cancelled");
         }
@@ -1140,7 +1158,7 @@ int32_t deepseek_ocr_generate_causal_image(void* model, const int32_t* prompt, i
             throw std::invalid_argument("DeepSeek-OCR image generate requires a non-empty prompt");
         }
         random::seed(seed);
-        m->reset_request_state();
+        m->reset_request_state(prompt_len + std::max(max_new_tokens, 0));
         if (cancelled(cancel_fn, cancel_ctx)) {
             throw std::runtime_error("DeepSeek-OCR generation cancelled");
         }
