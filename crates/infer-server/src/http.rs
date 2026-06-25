@@ -172,7 +172,7 @@ where
     // `<image>\n<text>` SFT layout.
     let prompt =
         if multimodal_kind == Some(infer_plan::MultimodalKind::DeepseekOcr) && !images.is_empty() {
-            build_deepseek_ocr_prompt(&request.messages)
+            crate::multimodal::build_deepseek_ocr_prompt(&request.messages)
         } else {
             let tokenizer = state
                 .tokenizer
@@ -501,35 +501,6 @@ fn expand_image_markers(
         _ => expand_gemma4_image_markers(prompt, images),
     };
     expanded.map_err(|err| ApiError::bad_request(format!("{err}")))
-}
-
-/// Build a DeepSeek-OCR prompt from chat messages, emitting one `<image>` marker
-/// per image part and concatenating text parts (the model's `<image>\n<text>`
-/// SFT layout). The model's chat template is too trivial to render image parts.
-fn build_deepseek_ocr_prompt(messages: &[crate::schema::ChatMessage]) -> String {
-    // The reference processor always prepends BOS; the server's `encode` skips
-    // special tokens, so emit the BOS marker explicitly (it encodes to id 0).
-    let mut prompt = String::from(crate::multimodal::DEEPSEEK_OCR_BOS_MARKER);
-    for message in messages {
-        match &message.content {
-            Some(ChatContent::Text(text)) => prompt.push_str(text),
-            Some(ChatContent::Parts(parts)) => {
-                for part in parts {
-                    match part.normalized_kind() {
-                        "image" => prompt.push_str(crate::multimodal::DEEPSEEK_OCR_IMAGE_MARKER),
-                        "text" => {
-                            if let Some(text) = &part.text {
-                                prompt.push_str(text);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None => {}
-        }
-    }
-    prompt
 }
 
 fn image_data_url(part: &ChatContentPart) -> Result<&str, ApiError> {

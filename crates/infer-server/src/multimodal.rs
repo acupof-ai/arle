@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use infer_plan::MultimodalImage;
 
+use crate::schema::{ChatContent, ChatMessage};
+
 pub const GEMMA4_IMAGE_MARKER: &str = "<|image|>";
 pub const GEMMA4_BOI_MARKER: &str = "<|image>";
 pub const GEMMA4_EOI_MARKER: &str = "<image|>";
@@ -196,4 +198,51 @@ pub fn expand_deepseek_ocr_image_markers(
     }
     output.push_str(rest);
     Ok(output)
+}
+
+/// Build a DeepSeek-OCR prompt from chat messages in the reference processor's
+/// `<image>\n<text>` layout: BOS, then per message the image marker(s) first and
+/// the text after (newline-separated). The model's chat template is too trivial
+/// to render image parts, and crucially never emits BOS — so we prepend
+/// [`DEEPSEEK_OCR_BOS_MARKER`] explicitly (it encodes to id 0 even with
+/// `add_special_tokens=false`).
+///
+/// This is the single source of truth for the OCR prompt shared by the HTTP
+/// server and the in-process (`complete_multimodal_chat`) path. Two failure
+/// modes it guards against: (1) no BOS → the decoder runs without a position-0
+/// token and degenerates into a non-stopping `{"text":"image"}…` loop that burns
+/// the whole token budget; (2) text-before-image ordering → garbled output, since
+/// the model was trained with the image soft tokens ahead of the instruction.
+pub fn build_deepseek_ocr_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::from(DEEPSEEK_OCR_BOS_MARKER);
+    for message in messages {
+        match &message.content {
+            Some(ChatContent::Text(text)) => prompt.push_str(text),
+            Some(ChatContent::Parts(parts)) => {
+                // Image markers first (reference `<image>\n<text>` SFT layout),
+                // regardless of the order parts arrive in.
+                let mut image_count = 0usize;
+                for part in parts {
+                    if part.normalized_kind() == "image" {
+                        prompt.push_str(DEEPSEEK_OCR_IMAGE_MARKER);
+                        image_count += 1;
+                    }
+                }
+                let mut wrote_text = false;
+                for part in parts {
+                    if part.normalized_kind() == "text" {
+                        if let Some(text) = &part.text {
+                            if image_count > 0 && !wrote_text {
+                                prompt.push('\n');
+                            }
+                            prompt.push_str(text);
+                            wrote_text = true;
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    prompt
 }
