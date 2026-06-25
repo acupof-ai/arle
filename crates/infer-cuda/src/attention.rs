@@ -280,14 +280,21 @@ impl Dsv4LayerKvLayout {
             .map_or(0, |pool| pool.page_size)
     }
 
-    fn flashmla_pool_pages_for_seq_len(&self, seq_len: usize) -> Result<usize> {
-        if self.flashmla_slot_pages == 0 {
-            return Ok(0);
-        }
-        let page_size = self.flashmla_pool()?.page_size.max(1);
-        Ok(seq_len.div_ceil(page_size).min(self.flashmla_slot_pages))
-    }
-
+    /// Advance the FlashMLA band cursor by `append_len` tokens, drawing the slot's
+    /// WHOLE fixed-layout band (`flashmla_slot_pages` = `total_blocks` pages) on
+    /// the first append.
+    ///
+    /// The band is NOT a sequential KV cache: the sliding-window ring lives at
+    /// slot-logical pages `[0, sw_blocks)` and the compressed region at
+    /// `[sw_blocks, total_blocks)`, both addressed by FIXED slot-logical block id
+    /// (see `flashmla_pack_sw_ring` / `flashmla_pack_compressed_delta` /
+    /// `fp8_sw_offsets`). So the readers/pack kernels need ALL `total_blocks`
+    /// pages resident from the first token — a `ceil(seq_len/page_size)` draw
+    /// would leave the SW ring / comp region unmapped. The whole band is drawn +
+    /// zeroed up front in [`Self::reset_flashmla_slot`] (the admission hook, which
+    /// has the `DeviceContext` for the zero); this only advances the logical
+    /// cursor, so the `seq_len == append_pos` invariant tracks position, not band
+    /// size. A draw here (band missing) is a harness/ordering bug — fail loudly.
     pub(crate) fn flashmla_alloc_append(
         &mut self,
         slot_idx: usize,
@@ -296,20 +303,17 @@ impl Dsv4LayerKvLayout {
         if append_len == 0 || self.flashmla_slot_pages == 0 {
             return Ok(());
         }
-        let slot_page_budget = self.flashmla_slot_pages;
+        let band_pages = self.flashmla_slot_pages;
         let pool = self.flashmla_pool_mut()?;
-        let needed_pages = pool.append_pages_needed(slot_idx, append_len);
-        let live_pages = pool.page_indices(slot_idx).len();
         ensure!(
-            live_pages + needed_pages <= slot_page_budget,
-            "DSv4 FlashMLA slot {slot_idx} append would exceed slot page budget: live={} + need={} > {}",
-            live_pages,
-            needed_pages,
-            slot_page_budget
+            pool.page_indices(slot_idx).len() == band_pages,
+            "DSv4 FlashMLA slot {slot_idx} band not drawn ({} pages, need {band_pages}) before cursor advance \
+             — reset_flashmla_slot must draw the band first",
+            pool.page_indices(slot_idx).len()
         );
-        pool.alloc_tokens(slot_idx, append_len)
-            .map(|_| ())
-            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} append alloc failed: {e}"))
+        let new_cursor = pool.seq_len(slot_idx) + append_len;
+        pool.set_band_cursor(slot_idx, new_cursor)
+            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} cursor advance failed: {e}"))
     }
 
     pub(crate) fn flashmla_free_slot(&mut self, slot_idx: usize) -> Result<()> {
@@ -320,19 +324,36 @@ impl Dsv4LayerKvLayout {
         Ok(())
     }
 
+    /// Set the FlashMLA band's logical cursor to `seq_len` (band stays resident).
+    /// Used by the position-0 prefix-restore path: `restore_to` draws the band
+    /// with cursor 0, then the slot-level swap-in sets it to the restored length
+    /// so the tail prefill's `seq_len == append_pos` invariant holds.
+    pub(crate) fn flashmla_set_band_cursor(
+        &mut self,
+        slot_idx: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        if self.flashmla_slot_pages == 0 {
+            return Ok(());
+        }
+        self.flashmla_pool_mut()?
+            .set_band_cursor(slot_idx, seq_len)
+            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} band cursor set failed: {e}"))
+    }
+
     /// H2: clamp the FlashMLA pool's per-slot append cursor back to `new_len`
     /// tokens on an MTP reject — the pool advances 1 token/decode-tick but the
     /// MTP commit can roll back N drafted tokens, so the pool seq_len must shrink
     /// in lockstep with the compressor/indexer/DSA truncate or the next tick's
-    /// `append_pos != pool seq_len` aborts the prepare invariant.
+    /// `append_pos != pool seq_len` aborts the prepare invariant. Cursor-only:
+    /// the fixed-layout band stays fully resident (never recycle band pages).
     pub(crate) fn flashmla_truncate_slot(&mut self, slot_idx: usize, new_len: usize) -> Result<()> {
         if self.flashmla_slot_pages == 0 {
             return Ok(());
         }
         self.flashmla_pool_mut()?
-            .truncate_slot(slot_idx, new_len)
-            .map(|_| ())
-            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} truncate failed: {e}"))
+            .set_band_cursor(slot_idx, new_len)
+            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} cursor truncate failed: {e}"))
     }
 
     pub(crate) fn flashmla_slot_first_block_or_zero(&self, slot_idx: usize) -> Result<usize> {
@@ -901,13 +922,14 @@ impl Dsv4LayerKvLayout {
             // #85 P2 Stage B: a shared `TokenKVPool` of packed MLA latent records,
             // sized from the PROFILED FREE-VRAM token budget (not `× num_slots`,
             // not capped at max_seq) — the dominant per-slot KV term becomes one
-            // dynamic shared pool. Slots start EMPTY and draw a contiguous band
-            // (`alloc_tokens(slot, tokens_per_slot)`) on admission via
-            // `reset_flashmla_slot`; `free_slot` returns it on release. The band
-            // stays contiguous (one alloc per freed slot), so the read/batched/
-            // graph paths keep their band-base addressing until the Stage-B
-            // read-kernel rework lands; the pack write side already routes the
-            // device page table (step 3).
+            // dynamic shared pool. Slots start EMPTY and draw their WHOLE
+            // fixed-layout band (`alloc_band_pages(slot, total_blocks)`) on
+            // admission via `reset_flashmla_slot`; `free_slot` returns it on
+            // release. The band is total_blocks pages (SW ring + comp region
+            // addressed by fixed slot-logical block id — NOT ceil(seq_len)), and
+            // each active slot's draw is contiguous so the read/batched/graph
+            // paths keep their band-base addressing; the concurrent-fragmented
+            // case (interleaved per-slot draws) is a separate later effort.
             let format = KVFormat::PackedBytes {
                 bytes_per_token: kv_arena.bytes_per_token,
             };
@@ -1080,13 +1102,17 @@ impl Dsv4LayerKvLayout {
     /// run — that contiguity is what licenses the band-base addressing the
     /// device-side pack/index kernels still use. Stage B must hand those
     /// kernels a device-resident table before tables may fragment.
+    ///
+    /// The expected page count is the slot's ACTUAL drawn pages (`table.len()`),
+    /// not the per-slot reservation (`flashmla_slot_pages`): a slot with no band
+    /// yet has an empty table (handled by `contiguous_page_table_byte_range`'s
+    /// `expected_pages > 0` guard), and a live slot draws its WHOLE band on
+    /// admission (`flashmla_alloc_append`), so for the single-request/sequential
+    /// case `table.len() == flashmla_slot_pages`. The contiguity check stays —
+    /// the draw remains contiguous per slot.
     fn flashmla_pages_byte_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
         let table = self.flashmla_page_table(slot_idx)?;
-        let range = contiguous_page_table_byte_range(
-            table,
-            self.flashmla_slot_pages,
-            self.flashmla_page_bytes,
-        )?;
+        let range = contiguous_page_table_byte_range(table, table.len(), self.flashmla_page_bytes)?;
         let pool_bytes = self.flashmla_pool_data()?.len();
         ensure!(
             range.end <= pool_bytes,
@@ -1123,17 +1149,37 @@ impl Dsv4LayerKvLayout {
         ctx: &DeviceContext,
         flash: &Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
-        // Stage-B payoff path: reset no longer draws the whole max_seq band.
-        // Order (C2): the executor frees the slot, then resets, then
-        // `prepare_kv_batch()` draws fresh pages (`append_len`) — reset must run
-        // BEFORE the prepare draw. Reset only zeros pages the slot currently owns
-        // (none after a fresh-prefill `free_slot`; a restored prefix image keeps
-        // its repopulated page table).
-        let table = self.flashmla_page_table(flash.slot_idx)?.to_vec();
-        if table.is_empty() {
+        // Admission hook (runs after `free_slot`, BEFORE `prepare_kv_batch`):
+        // draw the slot's WHOLE fixed-layout band + zero it. The band is NOT a
+        // sequential cache — the SW ring + compressed region are addressed by
+        // fixed slot-logical block id, so all `flashmla_slot_pages` (=
+        // `total_blocks`) pages must be resident from the first token (a
+        // `ceil(seq_len/page_size)` draw left the ring/comp region unmapped →
+        // "page table len 1 != expected slot pages N"). The draw is contiguous
+        // per slot (ascending identity run); the concurrent-fragmented case
+        // (interleaved per-slot draws over the shared pool, needing a device
+        // page-table read path) is a separate later effort — single active draw.
+        // `prepare_kv_batch`'s `flashmla_alloc_append` then only advances the
+        // logical cursor. Cursor starts at 0 (the band is full, seq_len is 0).
+        let band_pages = self.flashmla_slot_pages;
+        if band_pages == 0 {
             return Ok(());
         }
+        self.flashmla_pool_mut()?
+            .alloc_band_pages(flash.slot_idx, band_pages, 0)
+            .map_err(|e| anyhow!("DSv4 shared FlashMLA band draw failed: {e}"))?;
+        let table = self.flashmla_page_table(flash.slot_idx)?.to_vec();
+        // Zero the freshly-drawn band: the dynamic pool recycles physical pages
+        // across slots, so a redrawn band carries the prior occupant's bytes; the
+        // SW bootstrap / comp-delta pack only write live positions, so an
+        // un-zeroed band would leak stale FP8 records into masked/unpacked slots.
         let payload = vec![0u8; table.len() * self.flashmla_page_bytes];
+        let range_bytes = table.len() * self.flashmla_page_bytes;
+        ensure!(
+            range_bytes == flash.fp8_kv_pool_len,
+            "DSv4 FlashMLA band reset bytes {range_bytes} != slot band bytes {}",
+            flash.fp8_kv_pool_len
+        );
         self.flashmla_pool_mut()?
             .copy_pages_from_host(ctx, &table, &payload)
             .map_err(|e| anyhow!("DSv4 shared FlashMLA slot reset failed: {e}"))?;
@@ -3371,14 +3417,25 @@ impl Dsv4FlashMlaImage {
         pool: &mut Dsv4LayerKvLayout,
         flash: &mut Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
-        // Restore lands on the target slot's pages by page-table lookup.
-        let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         ensure!(
             self.fp8_kv_pool_pages.len() == flash.fp8_kv_pool_len,
             "DSv4 swap FlashMLA restore payload {} != slot band bytes {}",
             self.fp8_kv_pool_pages.len(),
             flash.fp8_kv_pool_len
         );
+        // The position-0 prefix-restore path (default-off) does NOT run the
+        // `reset_flashmla_slot` admission hook (it sets `prefill_start_pos =
+        // matched_len`, skipping the `start_pos==0` draw), so the target slot may
+        // have no band yet. Draw the WHOLE fixed-layout band here so the restored
+        // payload (= `total_blocks` pages) lands on a resident, contiguous table.
+        if pool.flashmla_page_table(flash.slot_idx)?.is_empty() {
+            let band_pages = pool.flashmla_slot_pages;
+            pool.flashmla_pool_mut()?
+                .alloc_band_pages(flash.slot_idx, band_pages, 0)
+                .map_err(|e| anyhow!("DSv4 swap FlashMLA restore band draw failed: {e}"))?;
+        }
+        // Restore lands on the target slot's pages by page-table lookup.
+        let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         pool.flashmla_pool_mut()?
             .copy_pages_from_host(ctx, &table, &self.fp8_kv_pool_pages)
             .map_err(|e| anyhow!("DSv4 swap FlashMLA pool page H2D failed: {e}"))?;

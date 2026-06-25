@@ -1127,8 +1127,16 @@ impl Dsv4SlotState {
         for (layer_idx, (state, layer_image)) in
             self.attention.iter_mut().zip(&image.layers).enumerate()
         {
+            let flashmla_slot_idx = state.flashmla_slot_idx();
             let pool = kv_adapter.layer_mut(layer_idx)?;
             state.swap_in_image(ctx, pool, layer_image)?;
+            // `restore_to` drew the FlashMLA band with cursor 0; set it to the
+            // restored logical length so the tail prefill's `seq_len ==
+            // append_pos` invariant holds (the band is full, only the cursor
+            // tracks position).
+            if let Some(slot_idx) = flashmla_slot_idx {
+                pool.flashmla_set_band_cursor(slot_idx, image.seq_len)?;
+            }
         }
         self.seq_len = image.seq_len;
         // Same request-boundary discipline as `reset`: re-arm one eager warm
