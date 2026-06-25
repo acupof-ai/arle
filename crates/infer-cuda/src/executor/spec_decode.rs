@@ -327,7 +327,7 @@ impl Dsv4CudaExecutor {
         // 4. Commit: truncate, restore the rejected ring tail (draft layer-0
         //    writes), then fold from the persisted verify rows.
         self.model
-            .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+            .truncate_slot(&mut self.slots[slot_idx], &mut self.kv_adapter, start_pos)?;
         self.model.restore_spec_ring_tail(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -498,7 +498,7 @@ impl Dsv4CudaExecutor {
             }
 
             self.model
-                .truncate_slot(&mut self.slots[slot_idx], start_pos)?;
+                .truncate_slot(&mut self.slots[slot_idx], &mut self.kv_adapter, start_pos)?;
             self.model.restore_spec_ring_tail(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,

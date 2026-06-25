@@ -334,6 +334,7 @@ pub fn dsv4_flashmla_decode_build_indices_raw(
     mode_int: i32,
     page_block_size: usize,
     page_table: Option<&CudaSlice<i32>>,
+    total_blocks: usize,
 ) -> Result<()> {
     let (pt_ptr, num_logical_pages, _gp) = match page_table {
         Some(table) => {
@@ -355,6 +356,7 @@ pub fn dsv4_flashmla_decode_build_indices_raw(
             page_block_size as i32,
             pt_ptr,
             num_logical_pages,
+            total_blocks as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -378,6 +380,7 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
     mode_int: i32,
     page_block_size: usize,
     page_table: Option<&CudaSlice<i32>>,
+    total_blocks: usize,
 ) -> Result<()> {
     let (pt_ptr, num_logical_pages, _gp) = match page_table {
         Some(table) => {
@@ -399,6 +402,7 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
             page_block_size as i32,
             pt_ptr,
             num_logical_pages,
+            total_blocks as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -413,13 +417,17 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
 /// shifted by `slot_layer_block_offsets[row] * page_block_size`, matching
 /// FlashMLA's absolute slot addressing over one contiguous shared FP8 KV base.
 /// Active scheduler slots are not required to be row-contiguous.
-#[allow(clippy::too_many_arguments)]
+///
 /// `page_table` is the OPTIONAL Stage-B per-row logical→physical page table
-/// (`[b, num_logical_pages]`): `None` (every current caller) keeps the Stage-A
-/// band path byte-for-byte; `Some(table)` routes each row's indices to
-/// POOL-absolute and SKIPS the `slot_layer_block_offsets` band shift (identity
-/// per-row table = the Stage-A index after the band shift). `table.len()` must
-/// be a multiple of `b`.
+/// (`[max_batch, page_table_row_width]`): `None` (Stage-A band path) keeps the
+/// kernel byte-for-byte; `Some(table)` routes each row's indices to POOL-absolute
+/// and SKIPS the `slot_layer_block_offsets` band shift (identity per-row table =
+/// the Stage-A index after the band shift). `page_table_row_width` is the FIXED
+/// row stride the host writes at (`table.len() / max_batch`, = per-slot
+/// `total_blocks`), independent of the active row count `b ≤ max_batch` — the
+/// kernel reads `page_table + row * row_width` and bounds-checks logical pages
+/// against it, so it MUST match the host stride (not `table.len()/b`, which only
+/// equals it when `b == max_batch`).
 #[allow(clippy::too_many_arguments)]
 pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     ctx: &DeviceContext,
@@ -437,16 +445,22 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     page_block_size: usize,
     total_blocks: usize,
     page_table: Option<&CudaSlice<i32>>,
+    page_table_row_width: usize,
 ) -> Result<()> {
     let (pt_ptr, num_logical_pages, _gp) = match page_table {
         Some(table) => {
             anyhow::ensure!(
-                b > 0 && table.len() % b == 0,
-                "batched page table len {} not a multiple of b {b}",
+                page_table_row_width > 0 && table.len() % page_table_row_width == 0,
+                "batched page table len {} not a multiple of row width {page_table_row_width}",
+                table.len()
+            );
+            anyhow::ensure!(
+                b * page_table_row_width <= table.len(),
+                "batched page table: b {b} × row width {page_table_row_width} exceeds len {}",
                 table.len()
             );
             let (ptr, guard) = table.device_ptr(&ctx.stream);
-            (ptr as *const i32, (table.len() / b) as i32, Some(guard))
+            (ptr as *const i32, page_table_row_width as i32, Some(guard))
         }
         None => (std::ptr::null(), 0, None),
     };

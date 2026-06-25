@@ -1968,7 +1968,7 @@ impl Qwen35Model {
     /// per-slot budget excludes it (the `kv_bytes` term is 0). The slot clamp
     /// then reflects only the small recurrent state; the pool reserves the bulk
     /// of free VRAM separately (profiled AFTER this clamp, dense-style).
-    fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
+    pub(crate) fn per_slot_kv_bytes(&self) -> (usize, usize, usize, usize) {
         let c = &self.config;
         let num_full = c.num_full_attention_layers();
         let num_linear = c.num_hidden_layers - num_full;

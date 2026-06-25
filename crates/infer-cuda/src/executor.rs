@@ -440,8 +440,11 @@ impl RealCudaExecutor {
     /// Re-budget the host-demoted tier store (`0` disables; pre-serve only). No-op on
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        if let Self::Qwen(q) = self {
-            q.set_kv_tier_budget_bytes(bytes);
+        match self {
+            Self::Qwen(q) => q.set_kv_tier_budget_bytes(bytes),
+            // L2: the Qwen3.6 arm's G3 slot_tier also honors the explicit cap.
+            Self::Qwen35(q) => q.set_kv_tier_budget_bytes(bytes),
+            Self::Dsv4(_) => {}
         }
     }
 
@@ -526,6 +529,18 @@ impl RealCudaExecutor {
             Self::Qwen(q) => Some(q.kv.max_total_pages),
             Self::Qwen35(q) => q.full_attn_pool_pages(),
             Self::Dsv4(d) => d.kv_adapter.flashmla_total_pages(),
+        }
+    }
+
+    /// Device pool page size (tokens/page), for arms whose host admission pool
+    /// must mirror the device pool's page granularity. DSv4's MLA latent pool
+    /// pages at `page_block_size` (64), NOT `config.page_size` (16) — the host
+    /// `CudaKvPool` must use this or it gates at 1/4 device token capacity (H3).
+    /// `None` where the host page size already matches the device default.
+    pub(crate) fn effective_page_size(&self) -> Option<usize> {
+        match self {
+            Self::Qwen(_) | Self::Qwen35(_) => None,
+            Self::Dsv4(d) => d.kv_adapter.flashmla_page_size(),
         }
     }
 
@@ -2618,8 +2633,6 @@ impl Dsv4CudaExecutor {
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Vec<SlotToken>> {
         validate_dsv4_prefill_kv_batch(row, kv_batch)?;
-        let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
-        validate_dsv4_prefill_kv_view(row, &kv_view)?;
         ensure!(
             row.slot < self.num_slots,
             "prefill slot {} outside DSv4 executor slots {}",
@@ -2627,6 +2640,10 @@ impl Dsv4CudaExecutor {
             self.num_slots
         );
         ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+        // C2: free+reset BEFORE prepare_kv_batch (free-then-alloc, matching the
+        // Qwen3.5 executor). prepare_kv_batch draws pages + advances seq_len; if
+        // the reset ran after, fresh prefill wrote into an EMPTY page table and a
+        // reused slot aborted the prepare seq_len==append_pos invariant.
         if row.start_pos == 0 {
             let layer_count = self.kv_adapter.num_layers();
             for layer_idx in 0..layer_count {
@@ -2637,6 +2654,8 @@ impl Dsv4CudaExecutor {
             self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
             self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
         }
+        let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
+        validate_dsv4_prefill_kv_view(row, &kv_view)?;
         let position = (row.start_pos + row.tokens.len()) as u64;
         let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
         let tokens = self.forward_prefill_tokens(
@@ -2906,6 +2925,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// engine's session key, a namespace disjoint from `recall_tier`'s
     /// `tier_block_u64(slot, page)` keys (separate store ⇒ no aliasing).
     slot_tier: CudaKvTierStore,
+    /// Per-unit size (one whole-slot recurrent-block image) for the `slot_tier`
+    /// budget, stored so `set_dram_fraction` / `set_kv_tier_budget_bytes` can
+    /// re-budget the tier post-construction without recomputing it (L2).
+    slot_image_bytes: usize,
     /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
     /// finished request, popped by the next — so only ACTIVE slots hold a block,
     /// not all `num_slots`. Grows to `num_slots` at full concurrency (then HBM ==
@@ -3193,10 +3216,19 @@ impl Qwen35CudaExecutor {
         // `total_pages` — num_slots is a zero-HBM soft cap, it never multiplies
         // the pool. The profiled budget raises this on an ample card.
         let requested_pages = total_pages.max(1);
+        // H1: the per-slot recurrent block (gdr + conv) is reserved out of the
+        // SAME free VRAM `kv_budget_num_slots` clamped against. Subtract that
+        // reservation from free BEFORE profiling the full-attn pool, so
+        // weights + recurrent×slots + pool ≤ mem_fraction×free (mirrors DSv4
+        // dsv4.rs:1687-1691). Per-rank free, num_slots already min-reduced.
+        let (_per_slot, _kv_bytes, gdr_bytes, conv_bytes) = model.per_slot_kv_bytes();
+        let per_slot_recurrent = gdr_bytes.saturating_add(conv_bytes);
+        let recurrent_reservation = per_slot_recurrent.saturating_mul(num_slots) as u64;
         let total_pool_pages = match model.ctx.mem_info_bytes() {
             Ok((free, total)) => {
+                let free_after_recurrent = (free as u64).saturating_sub(recurrent_reservation);
                 let profiled_tokens = infer_seam::profile_kv_pool_tokens(
-                    free as u64,
+                    free_after_recurrent,
                     total as u64,
                     cell_bytes_per_token,
                     mem_fraction_static,
@@ -3205,13 +3237,17 @@ impl Qwen35CudaExecutor {
                 let sized = profiled_pages.max(requested_pages).max(1);
                 log::info!(
                     "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
-                     total {}MB, mem_fraction_static {mem_fraction_static}, cell \
+                     total {}MB, recurrent reservation {}MB ({num_slots} slots × {}MB), \
+                     free_after_recurrent {}MB, mem_fraction_static {mem_fraction_static}, cell \
                      {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
                      kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} \
                      ({profiled_pages} pages); requested floor {requested_pages} pages \
                      -> sizing {sized} pages",
                     free >> 20,
                     total >> 20,
+                    recurrent_reservation >> 20,
+                    per_slot_recurrent >> 20,
+                    free_after_recurrent >> 20,
                 );
                 sized
             }
@@ -3277,6 +3313,7 @@ impl Qwen35CudaExecutor {
             model,
             slots,
             slot_tier,
+            slot_image_bytes,
             recurrent_pool: Vec::new(),
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
@@ -3384,10 +3421,21 @@ impl Qwen35CudaExecutor {
     }
 
     /// Apply the `--dram-fraction` knob: store it so the lazily-built L3 recall
-    /// tier sizes its host-DRAM budget at that fraction. Pre-serve only (the tier
-    /// is not yet built — it allocates on the first `set_kv_recall(true)`).
+    /// tier sizes its host-DRAM budget at that fraction, AND re-budget the eager
+    /// G3 `slot_tier` from measured DRAM at this fraction (L2 — it was pinned at
+    /// `DEFAULT_DRAM_FRACTION` at construction, ignoring the flag). Pre-serve only
+    /// (drops any existing entries, like the dense arm).
     pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
         self.dram_fraction = fraction;
+        self.slot_tier =
+            CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), self.slot_image_bytes);
+    }
+
+    /// Explicit `--kv-t1-budget-bytes` cap for the G3 `slot_tier` (L2). Runs AFTER
+    /// `set_dram_fraction`, so the explicit cap wins. Pre-serve only (drops any
+    /// existing entries).
+    pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
     }
 
     /// Opt into session KV-recall (`--kv-recall`, default off). The paged
