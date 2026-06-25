@@ -5913,17 +5913,12 @@ fn flashmla_pack_compressed_delta(
     // prefill / request boundaries), which always execute eagerly (the graph
     // warm pass — see `CudaGraphState::rearm_warm`).
     {
-        let range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+        // Stage-B: hand the POOL base + device page table so the kernel routes
+        // the slot-LOGICAL compressed block to its physical pool block (fragmented
+        // band safe; identity table == band byte-for-byte).
+        let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
         let pool_buf = pool.flashmla_pool_data_mut()?;
-        ensure!(
-            range.end <= pool_buf.len() && range.len() == flash.fp8_kv_pool_len,
-            "DSv4 FlashMLA shared compressed-delta table range {:?} invalid pool_len={} slot_len={}",
-            range,
-            pool_buf.len(),
-            flash.fp8_kv_pool_len
-        );
-        let mut pool_view = pool_buf.slice_mut(range);
-        let (pool_ptr, _pg) = pool_view.device_ptr_mut(&ctx.stream);
+        let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
         let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
         let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
         flash_kv::dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
@@ -5935,6 +5930,7 @@ fn flashmla_pack_compressed_delta(
             flash.sw_blocks,
             64,
             config.head_dim,
+            Some(&page_table),
         )?;
     }
     let start_row = flash.fp8_kv_comp_packed_rows;
