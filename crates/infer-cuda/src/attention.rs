@@ -288,7 +288,11 @@ impl Dsv4LayerKvLayout {
         Ok(seq_len.div_ceil(page_size).min(self.flashmla_slot_pages))
     }
 
-    fn flashmla_alloc_append(&mut self, slot_idx: usize, append_len: usize) -> Result<()> {
+    pub(crate) fn flashmla_alloc_append(
+        &mut self,
+        slot_idx: usize,
+        append_len: usize,
+    ) -> Result<()> {
         if append_len == 0 || self.flashmla_slot_pages == 0 {
             return Ok(());
         }
@@ -314,6 +318,21 @@ impl Dsv4LayerKvLayout {
         }
         self.flashmla_pool_mut()?.free_slot(slot_idx);
         Ok(())
+    }
+
+    /// H2: clamp the FlashMLA pool's per-slot append cursor back to `new_len`
+    /// tokens on an MTP reject — the pool advances 1 token/decode-tick but the
+    /// MTP commit can roll back N drafted tokens, so the pool seq_len must shrink
+    /// in lockstep with the compressor/indexer/DSA truncate or the next tick's
+    /// `append_pos != pool seq_len` aborts the prepare invariant.
+    pub(crate) fn flashmla_truncate_slot(&mut self, slot_idx: usize, new_len: usize) -> Result<()> {
+        if self.flashmla_slot_pages == 0 {
+            return Ok(());
+        }
+        self.flashmla_pool_mut()?
+            .truncate_slot(slot_idx, new_len)
+            .map(|_| ())
+            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} truncate failed: {e}"))
     }
 
     pub(crate) fn flashmla_slot_first_block_or_zero(&self, slot_idx: usize) -> Result<usize> {
@@ -1105,10 +1124,11 @@ impl Dsv4LayerKvLayout {
         flash: &Dsv4FlashMlaDecodeState,
     ) -> Result<()> {
         // Stage-B payoff path: reset no longer draws the whole max_seq band.
-        // Allocation now happens incrementally from `prepare_kv_batch()` via the
-        // row's `append_len`; reset only zeros whatever pages are currently owned
-        // by this slot (fresh occupant after executor-side `free_slot`, or a
-        // restored prefix image that already repopulated its page table).
+        // Order (C2): the executor frees the slot, then resets, then
+        // `prepare_kv_batch()` draws fresh pages (`append_len`) — reset must run
+        // BEFORE the prepare draw. Reset only zeros pages the slot currently owns
+        // (none after a fresh-prefill `free_slot`; a restored prefix image keeps
+        // its repopulated page table).
         let table = self.flashmla_page_table(flash.slot_idx)?.to_vec();
         if table.is_empty() {
             return Ok(());
@@ -3762,6 +3782,12 @@ impl Dsv4LayerAttentionState {
         if let Some(indexer) = &mut self.indexer {
             indexer.compressed.seq_len = compressed_rows;
         }
+    }
+
+    /// This layer's FlashMLA pool slot index (the per-slot append cursor the
+    /// H2 truncate must clamp), or `None` when this layer has no FlashMLA decode.
+    pub(crate) fn flashmla_slot_idx(&self) -> Option<usize> {
+        self.flashmla.as_ref().map(|f| f.slot_idx)
     }
 
     pub(crate) fn truncate_decode_len(
@@ -6659,6 +6685,8 @@ fn try_flashmla_decode_attention(
             mode_int,
             64,
             build_page_table.as_ref(),
+            // M1: whole-pool page count — mask any routed physical page >= this.
+            pool.flashmla_total_pages(),
         )?;
     }
     drop(indices_guard);

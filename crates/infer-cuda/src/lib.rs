@@ -383,16 +383,31 @@ impl CudaExecutor {
     }
 
     /// Actual shared device-pool page count for the paged-pool models (dense
-    /// Qwen3 + Qwen3.6, profiled from measured free VRAM at construction). The
-    /// host admission `CudaKvPool` must mirror this 1:1 — not the requested
-    /// `total_pages`. `None` for the placeholder and for DSv4 (slot MLA arena),
-    /// whose admission stays per-slot this phase.
+    /// Qwen3 + Qwen3.6 + DSv4 MLA latent pool), profiled from measured free VRAM
+    /// at construction. The host admission `CudaKvPool` must mirror this 1:1 —
+    /// not the requested `total_pages`. `None` only for the placeholder. DSv4
+    /// returns `Some(flashmla_total_pages)` (its MLA pool is free-VRAM-sized),
+    /// paired with [`Self::effective_page_size`] (64-tok pages, not config 16).
     #[must_use]
     pub fn effective_total_pages(&self) -> Option<usize> {
         match &self.inner {
             CudaExecutorInner::Placeholder => None,
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.effective_total_pages(),
+        }
+    }
+
+    /// Device pool page size (tokens/page) for arms whose host admission pool
+    /// must mirror device granularity. DSv4's MLA pool pages at 64
+    /// (`page_block_size`), not `config.page_size` (16) — the host pool must use
+    /// this or it admits at 1/4 the device token capacity (H3). `None` (and the
+    /// placeholder) ⇒ the host page size already matches the device default.
+    #[must_use]
+    pub fn effective_page_size(&self) -> Option<usize> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => None,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.effective_page_size(),
         }
     }
 

@@ -521,6 +521,7 @@ unsafe extern "C" {
         page_block_size: i32,
         page_table: *const i32,
         num_logical_pages: i32,
+        total_blocks: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -540,6 +541,7 @@ unsafe extern "C" {
         page_block_size: i32,
         page_table: *const i32,
         num_logical_pages: i32,
+        total_blocks: i32,
         stream: CUstream,
     ) -> CUresult;
 

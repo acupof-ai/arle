@@ -63,13 +63,18 @@ namespace {
 // batched kernel SKIPS its `block_offset` add. `page_table == nullptr`
 // (Stage-A default) keeps `out` slot-relative verbatim; an identity table
 // (`page_table[i] = first + i`) reproduces the band path index-for-index.
+// `total_blocks` is the whole-pool physical page count; a routed physical page
+// >= total_blocks (table drift / over-admission) is masked, restoring the band
+// path's `block_offset >= total_blocks` guard the route fn replaced. <=0 skips it.
 __device__ __forceinline__ int32_t arle_dsv4_decode_route_index(
         int32_t out, const int32_t* __restrict__ page_table,
-        int num_logical_pages, int page_block_size) {
+        int num_logical_pages, int page_block_size, int total_blocks) {
     if (out < 0 || page_table == nullptr) return out;
     const int logical = out / page_block_size;
     if (logical < 0 || logical >= num_logical_pages) return -1;
-    return page_table[logical] * page_block_size + (out % page_block_size);
+    const int physical = page_table[logical];
+    if (physical < 0 || (total_blocks > 0 && physical >= total_blocks)) return -1;
+    return physical * page_block_size + (out % page_block_size);
 }
 
 __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
@@ -83,7 +88,8 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
         int mode_int,
         int page_block_size,
         const int32_t* __restrict__ page_table, // Stage-B nullable logical→physical page table
-        int num_logical_pages) {
+        int num_logical_pages,
+        int total_blocks) {                      // whole-pool page count for the route OOB guard
     if (start_pos < 0) return -1;
     // SW slot count for this decode token. Decode is single-token (s_q=1)
     // so the SW window covers positions [max(0, start_pos - sw + 1), start_pos].
@@ -101,7 +107,7 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
         int32_t out = block_id * page_block_size + row_in_block;
         // Defensive: if a position would map past sw_blocks (config drift), mask.
         if (block_id >= sw_blocks) out = -1;
-        return arle_dsv4_decode_route_index(out, page_table, num_logical_pages, page_block_size);
+        return arle_dsv4_decode_route_index(out, page_table, num_logical_pages, page_block_size, total_blocks);
     } else if (tid < sw_count + max_compressed_keys) {
         const int k = tid - sw_count;
         if (mode_int == 1) {
@@ -119,7 +125,7 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
                 const int row_in_block = c % page_block_size;
                 return arle_dsv4_decode_route_index(
                     abs_block * page_block_size + row_in_block, page_table,
-                    num_logical_pages, page_block_size);
+                    num_logical_pages, page_block_size, total_blocks);
             } else {
                 return -1;
             }
@@ -142,7 +148,7 @@ __device__ __forceinline__ int32_t arle_dsv4_flashmla_decode_index_at(
                 const int row_in_block = r % page_block_size;
                 return arle_dsv4_decode_route_index(
                     abs_block * page_block_size + row_in_block, page_table,
-                    num_logical_pages, page_block_size);
+                    num_logical_pages, page_block_size, total_blocks);
             } else {
                 return -1;
             }
@@ -167,13 +173,14 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_kernel(
         int page_block_size,
         const int32_t* __restrict__ page_table,
         int num_logical_pages,
+        int total_blocks,
         int topk_unified) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= topk_unified) return;
     indices[tid] = arle_dsv4_flashmla_decode_index_at(
         tid, selected, sw_blocks, sliding_window, start_pos,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        page_table, num_logical_pages);
+        page_table, num_logical_pages, total_blocks);
 }
 
 __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
@@ -188,6 +195,7 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
         int page_block_size,
         const int32_t* __restrict__ page_table,
         int num_logical_pages,
+        int total_blocks,
         int topk_unified) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= topk_unified) return;
@@ -195,7 +203,7 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel(
     indices[tid] = arle_dsv4_flashmla_decode_index_at(
         tid, selected, sw_blocks, sliding_window, start_pos,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        page_table, num_logical_pages);
+        page_table, num_logical_pages, total_blocks);
 }
 
 __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
@@ -233,7 +241,7 @@ __global__ void arle_dsv4_flashmla_decode_build_indices_batched_kernel(
     int32_t out = arle_dsv4_flashmla_decode_index_at(
         tid, selected_row, sw_blocks, sliding_window, start_pos[row],
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        page_table_row, num_logical_pages);
+        page_table_row, num_logical_pages, total_blocks);
     if (out >= 0 && page_table == nullptr) {
         const int block_offset = slot_layer_block_offsets[row];
         if (block_offset < 0 || block_offset >= total_blocks) {
@@ -280,6 +288,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
         int page_block_size,
         const int32_t* page_table,
         int num_logical_pages,
+        int total_blocks,
         cudaStream_t stream) {
     if (indices == nullptr) return cudaErrorInvalidValue;
     if (sliding_window <= 0 || start_pos < 0) return cudaErrorInvalidValue;
@@ -297,7 +306,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_cuda(
     arle_dsv4_flashmla_decode_build_indices_kernel<<<grid, kBlock, 0, stream>>>(
         indices, selected, sw_blocks, sliding_window, start_pos,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        page_table, num_logical_pages, topk_unified);
+        page_table, num_logical_pages, total_blocks, topk_unified);
     return cudaGetLastError();
 }
 
@@ -313,6 +322,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
         int page_block_size,
         const int32_t* page_table,
         int num_logical_pages,
+        int total_blocks,
         cudaStream_t stream) {
     if (indices == nullptr || start_pos_ptr == nullptr) return cudaErrorInvalidValue;
     if (sliding_window <= 0) return cudaErrorInvalidValue;
@@ -330,7 +340,7 @@ cudaError_t arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
     arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_kernel<<<grid, kBlock, 0, stream>>>(
         indices, selected, sw_blocks, sliding_window, start_pos_ptr,
         max_compressed_keys, compress_ratio, mode_int, page_block_size,
-        page_table, num_logical_pages, topk_unified);
+        page_table, num_logical_pages, total_blocks, topk_unified);
     return cudaGetLastError();
 }
 
