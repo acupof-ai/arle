@@ -10221,6 +10221,79 @@ fn dsv4_wo_a_grouped_linear(
         shape.rows_per_group,
         shape.cols_per_group
     );
+    // Dense BF16 `wo_a` (FP8 re-serialization leaves the tiny low-rank wo_a
+    // unquantized) has no per-group FP8 scales — the loader builds the per-group
+    // base-pointer table with `scale_rows_per_group=0`. On TP<o_groups the rank
+    // owns >1 output group, so this grouped path is taken; route through a
+    // per-group dense BF16 GEMM instead of the FP8/FP4 route-GEMV (which asserts
+    // non-empty scales below). Each group is independent: gather group `g`'s
+    // column slice from the token-major `[seq, groups*cols]` activation into
+    // contiguous `[seq, cols]`, run `gemm_cuda` with group `g`'s `[rows, cols]`
+    // weight block (contiguous rows `[g*rows, (g+1)*rows)` of `wo_a`), then
+    // scatter the `[seq, rows]` result back into the `[seq, groups*rows]` latent.
+    if attention.wo_a.as_ref().expect("DSv4 wo_a").weight_format == WeightFormat::DenseBf16 {
+        let seq = local_attn.seq_len;
+        let cols = shape.cols_per_group;
+        let rows = shape.rows_per_group;
+        let wo_a = attention.wo_a.as_ref().expect("DSv4 wo_a");
+        let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, seq)? };
+        let mut out_g = unsafe { HiddenStates::uninit(ctx, rows, seq)? };
+        // Cache raw pointers once: the buffers are not reallocated across the
+        // group loop (same single inference stream), so per-iteration mutable +
+        // immutable `device_ptr` calls would falsely collide on SyncOnDrop.
+        let (wo_a_base, _wg) = wo_a.data.device_ptr(&ctx.stream);
+        let (src_ptr, _sg) = local_attn.data.device_ptr(&ctx.stream);
+        let (in_ptr, _ig) = in_g.data.device_ptr_mut(&ctx.stream);
+        let (out_ptr, _og) = out_g.data.device_ptr_mut(&ctx.stream);
+        let (dst_ptr, _dg) = latent.data.device_ptr_mut(&ctx.stream);
+        let stream = ctx.stream.cu_stream();
+        for group in 0..shape.groups {
+            unsafe {
+                ffi::dsv4_oproj_group_gather_cuda(
+                    src_ptr as *const ffi::Half,
+                    in_ptr as *mut ffi::Half,
+                    i32::try_from(seq)?,
+                    i32::try_from(shape.groups)?,
+                    i32::try_from(cols)?,
+                    i32::try_from(group)?,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gather failed: {e}"))?;
+            }
+            // SAFETY: group `g`'s weight block is contiguous rows
+            // `[g*rows, (g+1)*rows)` of the `[groups*rows, cols]` dense `wo_a`,
+            // i.e. offset `g*rows*cols` bf16 elements from the base pointer.
+            let w_g = unsafe { (wo_a_base as *const ffi::Half).add(group * rows * cols) };
+            unsafe {
+                ffi::gemm_cuda(
+                    w_g,
+                    in_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    i32::try_from(rows)?,
+                    i32::try_from(seq)?,
+                    i32::try_from(cols)?,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gemm failed: {e}"))?;
+            }
+            unsafe {
+                ffi::dsv4_oproj_group_scatter_cuda(
+                    out_ptr as *const ffi::Half,
+                    dst_ptr as *mut ffi::Half,
+                    i32::try_from(seq)?,
+                    i32::try_from(shape.groups)?,
+                    i32::try_from(rows)?,
+                    i32::try_from(group)?,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA scatter failed: {e}"))?;
+            }
+        }
+        return Ok(());
+    }
     ensure!(
         attention
             .wo_a_groups
