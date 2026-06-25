@@ -1142,7 +1142,12 @@ impl Dsv4SlotState {
         Ok(())
     }
 
-    pub(crate) fn truncate(&mut self, layers: &[Dsv4Layer], new_len: usize) -> Result<()> {
+    pub(crate) fn truncate(
+        &mut self,
+        layers: &[Dsv4Layer],
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        new_len: usize,
+    ) -> Result<()> {
         ensure!(
             new_len <= self.seq_len,
             "DSv4 slot truncate cannot grow from {} to {new_len}",
@@ -1155,8 +1160,14 @@ impl Dsv4SlotState {
             self.attention.len()
         );
         self.seq_len = new_len;
-        for (layer, state) in layers.iter().zip(&mut self.attention) {
+        for (layer_idx, (layer, state)) in layers.iter().zip(&mut self.attention).enumerate() {
             state.truncate_decode_len(layer.mode, layer.compress_ratio, new_len);
+            // H2: clamp the FlashMLA pool cursor in lockstep (see flashmla_truncate_slot).
+            if let Some(slot_idx) = state.flashmla_slot_idx() {
+                kv_adapter
+                    .layer_mut(layer_idx)?
+                    .flashmla_truncate_slot(slot_idx, new_len)?;
+            }
         }
         Ok(())
     }
@@ -1742,8 +1753,13 @@ impl Dsv4Model {
         })
     }
 
-    pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
-        slot.truncate(&self.layers, new_len)
+    pub(crate) fn truncate_slot(
+        &self,
+        slot: &mut Dsv4SlotState,
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        new_len: usize,
+    ) -> Result<()> {
+        slot.truncate(&self.layers, kv_adapter, new_len)
     }
 
     /// Snapshot the speculative-verify boundary ring slot before depth-K verify.
@@ -1826,6 +1842,18 @@ impl Dsv4Model {
         }
         std::hint::black_box(keepalive.len());
         drop(keepalive);
+        // H2: advance the FlashMLA pool cursor by the committed token count so
+        // `pool.seq_len(slot) == start_pos + m` matches `slot.seq_len` — the next
+        // decode tick's prepare_kv_batch validates `pool.seq_len == append_pos`.
+        // commit_layer_fold packs the accepted ring positions but does NOT draw
+        // pool tokens; the prior truncate rolled the cursor back to start_pos.
+        for (layer_idx, state) in slot.attention.iter().enumerate() {
+            if let Some(slot_idx) = state.flashmla_slot_idx() {
+                kv_adapter
+                    .layer_mut(layer_idx)?
+                    .flashmla_alloc_append(slot_idx, m)?;
+            }
+        }
         slot.seq_len = start_pos + m;
         Ok(())
     }

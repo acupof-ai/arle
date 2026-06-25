@@ -1467,7 +1467,10 @@ mod backend {
     ///     from measured free VRAM (`profile_kv_pool_tokens`) and derives per-slot
     ///     length as total/num_slots, exactly like dense. Admission MUST equal the
     ///     device pool's ACTUAL page count (`effective_total_pages()`), not the old
-    ///     `num_slots × 32768`.
+    ///     `num_slots × 32768`. The host pool ALSO mirrors the device page SIZE
+    ///     (64-tok `page_block_size`, via `effective_page_size()`), not
+    ///     `config.page_size` (16) — H3: page_size mismatch gated host admission
+    ///     at 1/4 device token capacity → early-OOM with no tier to evict.
     ///
     /// `CudaKvPool::new` allocates NO HBM (just a `Vec<u32>` of page ids).
     ///
@@ -1715,14 +1718,18 @@ mod backend {
         // scheduler-visible capacity that diverged from the executor's would
         // diverge the deterministic planner.
         let num_slots = executor.effective_num_slots().unwrap_or(num_slots);
-        // Paged-pool models (dense Qwen3 + Qwen3.6) profile their device KV pool
-        // from measured free VRAM (`profile_kv_pool_tokens`), so the host
-        // admission pool must mirror that ACTUAL page count, not the requested
-        // `config.total_pages`. DSv4 reports `None` and the per-kind branch below
-        // ignores this argument.
+        // Paged-pool models (dense Qwen3 + Qwen3.6 + DSv4 MLA pool) profile their
+        // device KV pool from measured free VRAM (`profile_kv_pool_tokens`), so
+        // the host admission pool must mirror that ACTUAL page count, not the
+        // requested `config.total_pages`.
         let paged_pool_pages = executor
             .effective_total_pages()
             .unwrap_or(config.total_pages);
+        // H3: the host pool's page_size must match the device pool's page
+        // granularity. DSv4's MLA pool pages at 64 (`page_block_size`), not
+        // `config.page_size` (16) — using 16 would gate host admission at 1/4 the
+        // device token capacity and early-OOM (DSv4 has no tier to evict).
+        let page_size = executor.effective_page_size().unwrap_or(page_size);
         let total_pages = cuda_admission_total_pages(kind, config, page_size, paged_pool_pages);
         if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
             && paged_pool_pages != config.total_pages
@@ -1734,6 +1741,18 @@ mod backend {
                 config.total_pages,
                 config.mem_fraction_static
             );
+        }
+        // M2: scheduler_config() raised max_prompt_tokens from the REQUESTED
+        // total_pages; on the dense-Qwen3/Qwen3.6 arm the device pool is profiled
+        // from free VRAM and may be SMALLER, so bind the ingress caps DOWN to the
+        // profiled pool capacity and to max_total_tokens — else a long prompt
+        // clears ingress, can't draw enough pages, and silently completes empty.
+        // Mirrors DSv4 (max_seq clamp) and Metal (resource-guard clamp).
+        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35) {
+            let profiled_capacity = total_pages.saturating_mul(page_size).max(1);
+            scheduler.max_total_tokens = scheduler.max_total_tokens.min(profiled_capacity);
+            scheduler.max_prompt_tokens =
+                scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
         }
         if num_slots != scheduler.num_slots {
             log::warn!(

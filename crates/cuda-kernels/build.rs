@@ -1046,30 +1046,37 @@ fn generate_tilelang_artifacts_per_sm(
         if let Some(entry) = &cache_entry {
             // Require the .complete marker (written last under an atomic rename), not
             // just the .c — a torn/killed/concurrent store must read as a miss.
+            // M3: a concurrent store's `remove_dir_all` can race this restore copy.
+            // On copy error, fall through to regen (log + continue to the build
+            // path below) instead of aborting the whole build.
             if !force_regen && entry.join(".complete").is_file() {
-                copy_dir_recursive(entry, &out_artifact_dir).unwrap_or_else(|err| {
-                    panic!(
-                        "restore cached TileLang artifact {} -> {}: {err}",
-                        entry.display(),
-                        out_artifact_dir.display()
-                    )
-                });
-                let func = std::fs::read_to_string(entry.join("meta.txt"))
-                    .ok()
-                    .and_then(|m| {
-                        m.lines().find_map(|line| {
-                            line.strip_prefix("FUNC_NAME=")
-                                .map(|f| f.trim().to_string())
-                        })
-                    })
-                    .unwrap_or_else(|| func_name.clone());
-                println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
-                results.push((
-                    sm_token.clone(),
-                    func,
-                    out_artifact_dir.join(format!("{per_sm_out_name}.c")),
-                ));
-                continue;
+                match copy_dir_recursive(entry, &out_artifact_dir) {
+                    Ok(()) => {
+                        let func = std::fs::read_to_string(entry.join("meta.txt"))
+                            .ok()
+                            .and_then(|m| {
+                                m.lines().find_map(|line| {
+                                    line.strip_prefix("FUNC_NAME=")
+                                        .map(|f| f.trim().to_string())
+                                })
+                            })
+                            .unwrap_or_else(|| func_name.clone());
+                        println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
+                        results.push((
+                            sm_token.clone(),
+                            func,
+                            out_artifact_dir.join(format!("{per_sm_out_name}.c")),
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        println!(
+                            "cargo:warning=cache restore raced (regenerating): {} -> {}: {err}",
+                            entry.display(),
+                            out_artifact_dir.display()
+                        );
+                    }
+                }
             }
         }
 
