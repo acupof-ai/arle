@@ -472,6 +472,8 @@ unsafe extern "C" {
         sw_blocks: i32,
         page_block_size: i32,
         stride_elems: i32,
+        page_table: *const i32,
+        num_logical_pages: i32,
         stream: CUstream,
     ) -> CUresult;
 }
