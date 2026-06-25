@@ -78,6 +78,12 @@ pub struct SchedulerConfig {
     /// default) means unbounded; the deepep_ll DSv4 arm reports its LL dispatch
     /// cap so the planner never builds a forward the executor would reject.
     pub max_tokens_per_step: usize,
+    /// Opt-in slot oversubscription: admit more waiters than `num_slots` by
+    /// demoting (parking) the longest-running decode's whole-slot image to the
+    /// DRAM tier to free a slot, round-robin. Requires a whole-slot tier
+    /// executor (`kv_slot_tier_enabled`). Default false → byte-identical to a
+    /// build without this trigger; only changes WHEN the proven demote fires.
+    pub slot_oversubscription: bool,
 }
 
 impl SchedulerConfig {
@@ -116,6 +122,7 @@ impl Default for SchedulerConfig {
             chunked_prefill_size: 2_048,
             enable_prefix_cache: true,
             max_tokens_per_step: usize::MAX,
+            slot_oversubscription: false,
         }
     }
 }
@@ -237,6 +244,23 @@ enum WaitingInsertBias {
     AfterEqual,
 }
 
+/// Minimum tokens an oversubscription-admitted request must decode before it
+/// is eligible to be parked again. A just-resumed request runs at least this
+/// many steps before yielding, bounding park/resume ping-pong (most binding at
+/// num_slots=1, where two requests would otherwise swap every step).
+const OVERSUBSCRIPTION_MIN_SLICE: usize = 8;
+
+/// Result of attempting to admit the front waiter onto one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmitOutcome {
+    /// Admitted onto the slot; the slot is consumed.
+    Admitted,
+    /// No waiting request to admit.
+    NoWaiter,
+    /// The front waiter does not fit the current per-tick budget.
+    Throttled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestPhase {
     Prefilling { progress: usize },
@@ -268,6 +292,16 @@ struct RequestState {
     swap_seq_len: usize,
     finish: Option<FinishReason>,
     waiting_hint: WaitingRequestHint,
+    /// Monotonic stamp set each time this request is admitted/resumed into a
+    /// slot. The oversubscription victim selector picks the smallest stamp
+    /// (longest continuous run since its last admit); a just-resumed request
+    /// gets the largest stamp so it is never the immediate victim (no thrash).
+    admit_seq: u64,
+    /// `generated_tokens.len()` captured at the last admit. The oversubscription
+    /// victim must have decoded at least `OVERSUBSCRIPTION_MIN_SLICE` tokens
+    /// since then, so a just-resumed request runs a bit before it can be parked
+    /// again — bounding ping-pong churn at num_slots=1.
+    admit_gen_mark: usize,
 }
 
 impl RequestState {
@@ -292,6 +326,8 @@ impl RequestState {
             swap_seq_len: 0,
             finish: None,
             waiting_hint: WaitingRequestHint::default(),
+            admit_seq: 0,
+            admit_gen_mark: 0,
         }
     }
 
@@ -362,6 +398,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     kv_system_metrics: KvSystemMetrics,
     /// Next backend tier-store key; monotonically burned (failures included).
     next_tier_key: u64,
+    /// Monotonic admit stamp source for oversubscription victim selection;
+    /// each admit/resume into a slot burns one (see `RequestState::admit_seq`).
+    next_admit_seq: u64,
     /// Optional per-token observer invoked as each token is committed to a
     /// request, so a serving layer can stream tokens live. `None` by default —
     /// when unset, token commit behavior is byte-identical to before.
@@ -427,6 +466,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             kv_tier_stats: KvTierStats::default(),
             kv_system_metrics: KvSystemMetrics::default(),
             next_tier_key: 0,
+            next_admit_seq: 0,
             on_token: None,
         }
     }
@@ -947,96 +987,207 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut remaining_pages = self.kv.free_pages();
         self.evict_prefix_cache_if_below_low_water();
 
-        while !free_slots.is_empty() && !self.waiting.is_empty() {
-            let Some(candidate) = self.waiting.front() else {
-                break;
-            };
-            let prefix_match = if self.config.enable_prefix_cache {
-                let matched = self
-                    .radix
-                    .peek_longest_prefix_match(&candidate.prompt_tokens);
-                self.clamp_prefix_to_backend(matched)
-            } else {
-                PrefixMatch::empty()
-            };
-            // Backends without page-radix reuse (DSv4) may still hold a
-            // position-0 whole-slot prefix image. The page route reports
-            // `matched_len == 0` for them, so budget the prefill/pages against
-            // the executor's cached prefix length when it is longer. This only
-            // affects budgeting; the actual restore happens at attach below.
-            // Skipped for swap re-admissions: they restore the FULL sequence via
-            // `restore_swapped_slot` (consuming the slot) and never take the
-            // cached-prefix attach path, so the cached length is irrelevant to
-            // their prefill (which is 0).
-            let reuse_matched_len =
-                if self.config.enable_prefix_cache && candidate.swap_key.is_none() {
-                    prefix_match.matched_len.max(
-                        self.executor
-                            .cached_prefix_match_len(&candidate.prompt_tokens)
-                            .min(candidate.prompt_len()),
-                    )
-                } else {
-                    prefix_match.matched_len
-                };
-            let prefill_tokens = candidate.prompt_len().saturating_sub(reuse_matched_len);
-            if prefill_tokens > 0 && active_prefills >= max_prefills {
-                break;
-            }
-            // Long prompts are admitted and chunked across ticks (the planner
-            // caps per-tick prefill tokens). The per-tick budget only throttles
-            // how many NEW requests we admit at once: stop once it is consumed.
-            if prefill_tokens > 0 && remaining_prefill_tokens == 0 {
-                break;
-            }
-
-            let pages_needed = self.request_pages_needed_after_prefix(candidate, reuse_matched_len);
-            if self.kv.is_active() && pages_needed > remaining_pages {
-                let reclaimed = self.evict_prefix_cache_for_pages(pages_needed - remaining_pages);
-                remaining_pages = remaining_pages.saturating_add(reclaimed);
-                if pages_needed > remaining_pages {
-                    break;
+        while let Some(&slot) = free_slots.first() {
+            match self.try_admit_front_waiter(
+                slot,
+                &mut remaining_prefill_tokens,
+                &mut active_prefills,
+                max_prefills,
+                &mut remaining_pages,
+            )? {
+                AdmitOutcome::Admitted => {
+                    free_slots.remove(0);
                 }
+                AdmitOutcome::NoWaiter | AdmitOutcome::Throttled => break,
             }
+        }
 
-            let slot = free_slots.remove(0);
-            let mut request = self
-                .waiting
-                .pop_front()
-                .expect("waiting.front() was Some above");
-            if let Some(key) = request.swap_key.take() {
-                // Whole-slot re-admission: restore the swapped device image
-                // and resume decode (falls back to recompute internally).
-                self.restore_swapped_slot(slot, &mut request, key)?;
-            } else if self.attach_cached_prefix(slot, &mut request)? > 0 {
-                // Position-0 whole-slot prefix reuse (DSv4): the executor
-                // restored the cached prefix image and set `prefill_start_pos`;
-                // the tail re-prefills. No page-radix attach for this request.
-            } else {
-                let prefix_match = if self.config.enable_prefix_cache {
-                    // Tier-aware: demoted blocks in the match are promoted
-                    // back into fresh pages here, so attach sees a
-                    // resident-only match.
-                    self.lookup_prefix_for_attach(&request.prompt_tokens)
-                } else {
-                    PrefixMatch::empty()
-                };
-                self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
-                self.record_attached_prefix_metrics(request.reused_prefix_pages.len());
-            }
-
-            remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
-                request
-                    .prompt_len()
-                    .saturating_sub(request.prefill_start_pos),
-            );
-            remaining_pages = remaining_pages.saturating_sub(pages_needed);
-            if matches!(request.phase, RequestPhase::Prefilling { .. }) {
-                active_prefills += 1;
-            }
-            self.active.insert(slot, request);
+        // P5 — slot-pressure oversubscription. After the budget-bounded admit
+        // loop above drains every free slot, if waiters remain we may demote
+        // (park) the longest-running decode's whole-slot image to free a slot
+        // and admit a waiter in its place, round-robin. Default-off and the
+        // whole-slot tier gate keep this byte-identical to before when unused;
+        // it only adds WHEN the proven demote/resume fires.
+        if self.config.slot_oversubscription && self.executor.kv_slot_tier_enabled() {
+            self.admit_via_oversubscription(
+                &mut remaining_prefill_tokens,
+                &mut active_prefills,
+                max_prefills,
+                &mut remaining_pages,
+            )?;
         }
 
         Ok(())
+    }
+
+    /// Admit the front waiter onto `slot`, advancing the per-tick budgets.
+    /// Returns `Admitted` on success, `NoWaiter` if the queue is empty, or
+    /// `Throttled` if the front waiter does not fit the current per-tick budget
+    /// (prefill concurrency / token budget / KV pages). The single canonical
+    /// admit body, shared by the main loop and the oversubscription trigger.
+    fn try_admit_front_waiter(
+        &mut self,
+        slot: usize,
+        remaining_prefill_tokens: &mut usize,
+        active_prefills: &mut usize,
+        max_prefills: usize,
+        remaining_pages: &mut usize,
+    ) -> Result<AdmitOutcome> {
+        let Some(candidate) = self.waiting.front() else {
+            return Ok(AdmitOutcome::NoWaiter);
+        };
+        let prefix_match = if self.config.enable_prefix_cache {
+            let matched = self
+                .radix
+                .peek_longest_prefix_match(&candidate.prompt_tokens);
+            self.clamp_prefix_to_backend(matched)
+        } else {
+            PrefixMatch::empty()
+        };
+        // Backends without page-radix reuse (DSv4) may still hold a
+        // position-0 whole-slot prefix image. The page route reports
+        // `matched_len == 0` for them, so budget the prefill/pages against
+        // the executor's cached prefix length when it is longer. This only
+        // affects budgeting; the actual restore happens at attach below.
+        // Skipped for swap re-admissions: they restore the FULL sequence via
+        // `restore_swapped_slot` (consuming the slot) and never take the
+        // cached-prefix attach path, so the cached length is irrelevant to
+        // their prefill (which is 0).
+        let reuse_matched_len = if self.config.enable_prefix_cache && candidate.swap_key.is_none() {
+            prefix_match.matched_len.max(
+                self.executor
+                    .cached_prefix_match_len(&candidate.prompt_tokens)
+                    .min(candidate.prompt_len()),
+            )
+        } else {
+            prefix_match.matched_len
+        };
+        let prefill_tokens = candidate.prompt_len().saturating_sub(reuse_matched_len);
+        if prefill_tokens > 0 && *active_prefills >= max_prefills {
+            return Ok(AdmitOutcome::Throttled);
+        }
+        // Long prompts are admitted and chunked across ticks (the planner
+        // caps per-tick prefill tokens). The per-tick budget only throttles
+        // how many NEW requests we admit at once: stop once it is consumed.
+        if prefill_tokens > 0 && *remaining_prefill_tokens == 0 {
+            return Ok(AdmitOutcome::Throttled);
+        }
+
+        let pages_needed = self.request_pages_needed_after_prefix(candidate, reuse_matched_len);
+        if self.kv.is_active() && pages_needed > *remaining_pages {
+            let reclaimed = self.evict_prefix_cache_for_pages(pages_needed - *remaining_pages);
+            *remaining_pages = remaining_pages.saturating_add(reclaimed);
+            if pages_needed > *remaining_pages {
+                return Ok(AdmitOutcome::Throttled);
+            }
+        }
+
+        let mut request = self
+            .waiting
+            .pop_front()
+            .expect("waiting.front() was Some above");
+        if let Some(key) = request.swap_key.take() {
+            // Whole-slot re-admission: restore the swapped device image
+            // and resume decode (falls back to recompute internally).
+            self.restore_swapped_slot(slot, &mut request, key)?;
+        } else if self.attach_cached_prefix(slot, &mut request)? > 0 {
+            // Position-0 whole-slot prefix reuse (DSv4): the executor
+            // restored the cached prefix image and set `prefill_start_pos`;
+            // the tail re-prefills. No page-radix attach for this request.
+        } else {
+            let prefix_match = if self.config.enable_prefix_cache {
+                // Tier-aware: demoted blocks in the match are promoted
+                // back into fresh pages here, so attach sees a
+                // resident-only match.
+                self.lookup_prefix_for_attach(&request.prompt_tokens)
+            } else {
+                PrefixMatch::empty()
+            };
+            self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
+            self.record_attached_prefix_metrics(request.reused_prefix_pages.len());
+        }
+
+        *remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
+            request
+                .prompt_len()
+                .saturating_sub(request.prefill_start_pos),
+        );
+        *remaining_pages = remaining_pages.saturating_sub(pages_needed);
+        if matches!(request.phase, RequestPhase::Prefilling { .. }) {
+            *active_prefills += 1;
+        }
+        // Fresh admit stamp + generation mark: a just-admitted/resumed request
+        // is the youngest (never the immediate victim) and must decode a min
+        // slice before it can be parked again (bounds ping-pong churn).
+        request.admit_seq = self.next_admit_seq;
+        self.next_admit_seq = self.next_admit_seq.wrapping_add(1);
+        request.admit_gen_mark = request.generated_tokens.len();
+        self.active.insert(slot, request);
+        Ok(AdmitOutcome::Admitted)
+    }
+
+    /// P5 oversubscription trigger: free slots by parking the longest-running
+    /// decode (smallest `admit_seq`) and admit a waiter in its place, capped at
+    /// `num_slots/4` (>=1) preemptions per call to bound swap churn. Terminates:
+    /// each iteration either demotes+admits one (decrementing the bounded cap)
+    /// or breaks (no eligible victim / waiter throttled / queue empty).
+    fn admit_via_oversubscription(
+        &mut self,
+        remaining_prefill_tokens: &mut usize,
+        active_prefills: &mut usize,
+        max_prefills: usize,
+        remaining_pages: &mut usize,
+    ) -> Result<()> {
+        let cap = self.config.num_slots.div_ceil(4).max(1);
+        let mut preempted = 0usize;
+        while preempted < cap && !self.waiting.is_empty() {
+            let Some(victim_slot) = self.oversubscription_victim() else {
+                break;
+            };
+            // Park `AfterEqual`: the victim yields to the existing equal-priority
+            // waiter so we admit THAT one, not re-admit the just-parked victim.
+            self.requeue_preempted_decode_with_bias(victim_slot, WaitingInsertBias::AfterEqual);
+            *remaining_pages = self.kv.free_pages();
+            // The freed slot may not match `victim_slot` if requeue reshuffled;
+            // admit onto whichever slot is now free. There is exactly one.
+            let Some(free_slot) = self.free_slots().into_iter().next() else {
+                break;
+            };
+            match self.try_admit_front_waiter(
+                free_slot,
+                remaining_prefill_tokens,
+                active_prefills,
+                max_prefills,
+                remaining_pages,
+            )? {
+                AdmitOutcome::Admitted => preempted += 1,
+                // Demoted but the waiter still won't fit (throttle) or vanished:
+                // stop rather than churn the parked victim back and forth.
+                AdmitOutcome::Throttled | AdmitOutcome::NoWaiter => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// The oversubscription victim: among `Decoding` requests that have decoded
+    /// at least `OVERSUBSCRIPTION_MIN_SLICE` tokens since their last admit, the
+    /// one with the smallest `admit_seq` (longest continuous run). Prefilling /
+    /// just-admitted requests are skipped — only a materialized decode has a
+    /// whole-slot image to park; the min-slice floor + oldest-first selection
+    /// prevent demote-resume thrash (a just-resumed request runs a slice first).
+    fn oversubscription_victim(&self) -> Option<usize> {
+        self.active
+            .iter()
+            .filter(|(_, request)| {
+                matches!(request.phase, RequestPhase::Decoding)
+                    && request
+                        .generated_tokens
+                        .len()
+                        .saturating_sub(request.admit_gen_mark)
+                        >= OVERSUBSCRIPTION_MIN_SLICE
+            })
+            .min_by_key(|(_, request)| request.admit_seq)
+            .map(|(&slot, _)| slot)
     }
 
     fn free_slots(&self) -> Vec<usize> {
@@ -2686,6 +2837,110 @@ mod tests {
         // The discriminator: the prompt prefilled exactly once — a recompute
         // fallback would have prefilled it twice.
         assert_eq!(engine.throughput_stats().prefill_tokens, 8);
+        Ok(())
+    }
+
+    /// P5 slot-pressure trigger: with `slot_oversubscription` on and a single
+    /// physical slot, admitting a second request parks the running decode's
+    /// whole-slot image (demote) to free the slot; the waiter runs, then the
+    /// parked request resumes via promote with its generation intact.
+    #[test]
+    fn oversubscription_parks_running_decode_to_admit_waiter() -> Result<()> {
+        let config = SchedulerConfig {
+            slot_oversubscription: true,
+            ..test_config(1)
+        };
+        let mut engine = Engine::with_config(
+            SlotTierMockExecutor::enabled(),
+            MockKvPool::with_capacity(1, 4, 64),
+            config,
+        );
+
+        // Request A occupies the only slot and decodes past the min slice so it
+        // is an eligible park victim (a just-resumed request would not be).
+        let a = engine.submit_request((1..=8).collect(), 20);
+        for _ in 0..(OVERSUBSCRIPTION_MIN_SLICE + 3) {
+            engine.step()?;
+        }
+        let (&slot, request) = engine.active.iter().next().expect("A active");
+        assert_eq!(slot, 0);
+        assert!(matches!(request.phase, RequestPhase::Decoding));
+        let a_gen_at_arrival = request.generated_tokens.len();
+        assert!(
+            a_gen_at_arrival >= OVERSUBSCRIPTION_MIN_SLICE,
+            "A decoded past the min slice: {a_gen_at_arrival}"
+        );
+        // A's monotonic echo generation is exactly [9, 10, ...].
+        let a_gen_prefix: Vec<u32> = (9..9 + a_gen_at_arrival as u32).collect();
+        assert_eq!(request.generated_tokens, a_gen_prefix);
+
+        // Request B arrives; no free slot, so the next admit oversubscribes:
+        // A (the only eligible Decoding request) is parked.
+        let b = engine.submit_request((20..=24).collect(), 3);
+        engine.step()?;
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.demoted_slots, 1, "A parked to free the slot: {tier:?}");
+        let parked = engine
+            .waiting
+            .iter()
+            .find(|r| r.handle == a)
+            .expect("A parked");
+        // Generation preserved (not reset to recompute) and the whole-slot key
+        // is carried so re-admission promotes instead of re-prefilling.
+        assert!(
+            parked.generated_tokens.starts_with(&a_gen_prefix),
+            "generation preserved, not reset: {:?}",
+            parked.generated_tokens
+        );
+        assert!(parked.swap_key.is_some(), "A carries its whole-slot key");
+        // B holds the freed slot — A genuinely yielded it.
+        assert!(engine.active.values().any(|r| r.handle == b), "B admitted");
+
+        // B runs to completion on the freed slot, then A resumes via promote
+        // and runs to its length cap. B's short run (< min slice) never makes B
+        // a victim, so there is no park ping-pong: exactly one demote/promote.
+        engine.run_to_idle()?;
+        let done_b = engine.completed(b).expect("B completed");
+        assert_finished(done_b);
+        assert_eq!(done_b.generated_tokens, vec![25, 26, 27]);
+        let done_a = engine.completed(a).expect("A completed");
+        assert_finished(done_a);
+        // A resumed (promote), did NOT restart: full monotonic [9..=28], 20 tokens.
+        assert_eq!(done_a.generated_tokens, (9..=28).collect::<Vec<u32>>());
+        let tier = engine.kv_tier_stats();
+        assert_eq!(
+            tier.demoted_slots, 1,
+            "exactly one park (no thrash): {tier:?}"
+        );
+        assert_eq!(tier.promoted_slots, 1, "A resumed via promote: {tier:?}");
+        assert_eq!(tier.slot_promote_failures, 0);
+        // A's prompt prefilled exactly once (8) + B's prompt (5): a recompute
+        // fallback for A would have re-prefilled its 8.
+        assert_eq!(engine.throughput_stats().prefill_tokens, 13);
+        Ok(())
+    }
+
+    /// Default-off byte-identity guard: with `slot_oversubscription` false the
+    /// trigger never fires — a second request simply waits for the slot, no
+    /// demote, identical to before this knob.
+    #[test]
+    fn oversubscription_off_never_parks() -> Result<()> {
+        let mut engine = Engine::with_config(
+            SlotTierMockExecutor::enabled(),
+            MockKvPool::with_capacity(1, 4, 64),
+            test_config(1), // slot_oversubscription defaults false
+        );
+        let a = engine.submit_request((1..=8).collect(), 4);
+        engine.step()?;
+        engine.step()?;
+        let b = engine.submit_request((20..=24).collect(), 3);
+        engine.run_to_idle()?;
+
+        assert_eq!(engine.kv_tier_stats().demoted_slots, 0, "no park when off");
+        let done_a = engine.completed(a).expect("A completed");
+        assert_eq!(done_a.generated_tokens, vec![9, 10, 11, 12]);
+        let done_b = engine.completed(b).expect("B completed");
+        assert_eq!(done_b.generated_tokens, vec![25, 26, 27]);
         Ok(())
     }
 
