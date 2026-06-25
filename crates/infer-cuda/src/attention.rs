@@ -84,6 +84,16 @@ pub(crate) struct Dsv4CompressorState {
     prev_overlap_kv: CudaSlice<half::bf16>,
     prev_overlap_score: CudaSlice<half::bf16>,
     compressed: HiddenStates,
+    compressed_capacity: usize,
+    ring_rows: usize,
+}
+
+/// Indexer key-staging ring depth (rows): 2 × the max per-forward query chunk.
+const DSV4_INDEXER_STAGING_RING_ROWS: usize = 2 * DSV4_PREFILL_QUERY_CHUNK;
+
+/// Indexer staging-ring depth (rows) — exported for kv_budget_plan.
+pub(crate) fn dsv4_indexer_staging_ring_rows() -> usize {
+    DSV4_INDEXER_STAGING_RING_ROWS
 }
 
 impl Dsv4CompressorState {
@@ -93,9 +103,16 @@ impl Dsv4CompressorState {
         ratio: usize,
         overlap: bool,
         max_seq_len: usize,
+        staging_ring: bool,
     ) -> Result<Self> {
         let width = if overlap { 2 * head_dim } else { head_dim };
-        let compressed_rows = max_seq_len.div_ceil(ratio).max(1);
+        let compressed_capacity = max_seq_len.div_ceil(ratio).max(1);
+        let ring_rows = if staging_ring {
+            DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity)
+        } else {
+            compressed_capacity
+        };
+        let compressed_rows = ring_rows;
         Ok(Self {
             pending_kv: ctx
                 .stream
@@ -114,7 +131,14 @@ impl Dsv4CompressorState {
                 .alloc_zeros::<half::bf16>(ratio * head_dim)
                 .map_err(|e| anyhow::anyhow!("DSv4 compressor prev score alloc failed: {e}"))?,
             compressed: HiddenStates::zeros(ctx, head_dim, compressed_rows)?,
+            compressed_capacity,
+            ring_rows,
         })
+    }
+
+    #[inline]
+    pub(crate) fn compressed_capacity(&self) -> usize {
+        self.compressed_capacity
     }
 
     fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
@@ -1986,6 +2010,10 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             // errors/2026-06-14-dsv4-batched-flashmla-decode-phaseB-correctness-kill.md).
             shape.total_blocks * self.max_batch,
             Some(&self.page_table_batched),
+            // Fixed row stride the host writes at (upload_row_meta row_width =
+            // page_table_batched.len()/max_batch = per-slot total_blocks),
+            // independent of active n — the kernel reads page_table + row*width.
+            shape.total_blocks,
         )?;
         drop(indices_guard);
         drop(start_guard);
@@ -3502,6 +3530,7 @@ impl Dsv4LayerAttentionState {
                 compress_ratio,
                 overlap,
                 max_seq_len,
+                false,
             )?)
         } else {
             None
@@ -3520,6 +3549,7 @@ impl Dsv4LayerAttentionState {
                 index_ratio,
                 true,
                 max_seq_len,
+                mode == DeepSeekV4AttentionMode::SparseIndexed,
             )?)
         } else {
             None
@@ -8047,6 +8077,10 @@ pub(crate) fn mla_attention_decode_graph(
             dsa_official,
             ..
         } = state;
+        let keys_capacity = indexer_state_ref
+            .as_ref()
+            .map(|s| s.compressed_capacity())
+            .unwrap_or(0);
         let index_keys = &indexer_state_ref
             .as_ref()
             .expect("indexer state checked above")
@@ -8061,6 +8095,15 @@ pub(crate) fn mla_attention_decode_graph(
             hidden,
             &scratch.c_q_normed,
             index_keys,
+            keys_capacity,
+            // This decode-graph path is CompressedSparse-only (asserted above) →
+            // full-retention compressor keys, base 0. (SparseIndexed would pass
+            // start_pos; kept explicit so the base stays correct if relaxed.)
+            if mode == DeepSeekV4AttentionMode::SparseIndexed {
+                start_pos
+            } else {
+                0
+            },
             official,
             shared,
             pool,
@@ -8939,6 +8982,11 @@ pub(crate) fn mla_attention_prepare(
                 .as_ref()
                 .map(|s| s.compressed.seq_len)
                 .unwrap_or(0);
+            let keys_capacity = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed_capacity())
+                .unwrap_or(0);
             let index_keys = &state
                 .indexer
                 .as_ref()
@@ -8953,6 +9001,14 @@ pub(crate) fn mla_attention_prepare(
                 hidden,
                 &c_q_normed,
                 index_keys,
+                keys_capacity,
+                // Staging-ring base: SparseIndexed stages window-relative to
+                // start_pos; the compressor-indexer retains full history (base 0).
+                if mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    start_pos
+                } else {
+                    0
+                },
                 official,
                 dsa_shared,
                 pool,
@@ -9574,6 +9630,11 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 .as_ref()
                 .map(|s| s.compressed.seq_len)
                 .unwrap_or(0);
+            let keys_capacity = state
+                .indexer
+                .as_ref()
+                .map(|s| s.compressed_capacity())
+                .unwrap_or(0);
             let index_keys = &state
                 .indexer
                 .as_ref()
@@ -9593,6 +9654,14 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 normed_row,
                 c_q_normed_row,
                 index_keys,
+                keys_capacity,
+                // Staging-ring base: SparseIndexed stages window-relative to
+                // start_pos; the compressor-indexer retains full history (base 0).
+                if mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    start_pos
+                } else {
+                    0
+                },
                 official,
                 dsa_shared,
                 pool,
@@ -10861,19 +10930,33 @@ fn sparse_indexed_index_key_forward(
         config.index_head_dim
     );
 
-    // Append into the ring at absolute rows [start_pos, start_pos + seq_len): for
-    // ratio=1 this is a plain bf16 dtod copy at element offset
-    // `start_pos * index_head_dim`. Frozen-KV verify never advances state.
-    let capacity = state.compressed.data.len() / config.index_head_dim;
+    // Stage this forward's delta into the STAGING RING. The ring holds only the
+    // live delta — `csa_select_official` drains [packed_rows..rows_after) into
+    // the DSA pools in the SAME forward (drain-immediate), so the full history
+    // never lives here. Each forward stages its `seq_len` rows CONTIGUOUSLY from
+    // ring row 0 (window base = this forward's `start_pos`); the drain recovers
+    // row `r` at ring offset `r - start_pos`. Staging from 0 (NOT
+    // `start_pos % ring_rows`) keeps the delta contiguous for ANY start_pos —
+    // decode/MTP start_pos is not chunk-aligned, so a modulo base could straddle
+    // the wrap, but the offset-0 window never does. The LOGICAL committed count
+    // is `compressed.seq_len`, bounded by the logical capacity. Frozen-KV verify
+    // never advances state.
     ensure!(
-        start_pos + seq_len <= capacity,
-        "DSv4 SparseIndexed index-key ring overflow: start_pos {start_pos} + seq_len {seq_len} \
-         exceeds capacity {capacity}"
+        start_pos + seq_len <= state.compressed_capacity,
+        "DSv4 SparseIndexed index-key logical overflow: start_pos {start_pos} + seq_len {seq_len} \
+         exceeds capacity {}",
+        state.compressed_capacity
+    );
+    ensure!(
+        seq_len <= state.ring_rows,
+        "DSv4 SparseIndexed index-key forward delta {seq_len} exceeds staging-ring depth {} \
+         (one forward must fit contiguously; raise DSV4_INDEXER_STAGING_RING_ROWS)",
+        state.ring_rows
     );
     if !dsv4_verify_frozen() {
-        let lo = start_pos * config.index_head_dim;
-        let hi = (start_pos + seq_len) * config.index_head_dim;
-        let mut dst = state.compressed.data.slice_mut(lo..hi);
+        // Window-relative: ring rows [0, seq_len) for absolute [start_pos, start_pos+seq_len).
+        let hi = seq_len * config.index_head_dim;
+        let mut dst = state.compressed.data.slice_mut(0..hi);
         ctx.stream
             .memcpy_dtod(&normed.data, &mut dst)
             .map_err(|e| anyhow!("DSv4 SparseIndexed index-key ring D2D failed: {e}"))?;
@@ -11400,6 +11483,9 @@ fn csa_select_decode_graph(
     hidden: &HiddenStates,
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
+    keys_capacity: usize,
+    // Ring window base for `keys` (see `csa_select_official`).
+    keys_window_base: usize,
     official: &mut Dsv4DsaOfficialState,
     shared: &mut Dsv4DsaSharedScratch,
     pool: &mut Dsv4LayerKvLayout,
@@ -11445,7 +11531,7 @@ fn csa_select_decode_graph(
         weights.hidden_dim
     );
     let key_count = if start_pos_device.is_some() {
-        keys.data.len() / keys.hidden_dim
+        keys_capacity
     } else {
         keys.seq_len
     };
@@ -11465,6 +11551,7 @@ fn csa_select_decode_graph(
         key_count,
         start_pos,
         start_pos_device,
+        keys_window_base,
         layer_idx,
         ratio,
         local_index_heads,
@@ -11498,6 +11585,10 @@ fn csa_select(
     hidden: &HiddenStates,
     c_q_normed: &HiddenStates,
     keys: &HiddenStates,
+    keys_capacity: usize,
+    // Ring window base for `keys` (see `csa_select_official`): `start_pos` for the
+    // SparseIndexed staging ring, `0` for the full-retention compressor.
+    keys_window_base: usize,
     official: Option<&mut Dsv4DsaOfficialState>,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     pool: &mut Dsv4LayerKvLayout,
@@ -11573,7 +11664,7 @@ fn csa_select(
             // Graph replay must not bake the current compressed-key seq_len. The
             // selector computes `available = min(key_count, abs_pos / ratio)`, so
             // capacity preserves the same causal set while staying replay-safe.
-            keys.data.len() / keys.hidden_dim
+            keys_capacity
         }
     } else {
         keys.seq_len
@@ -11608,6 +11699,7 @@ fn csa_select(
             key_count,
             start_pos,
             start_pos_device,
+            keys_window_base,
             layer_idx,
             ratio,
             local_index_heads,
@@ -11676,6 +11768,7 @@ fn csa_select(
         key_count,
         start_pos,
         start_pos_device,
+        keys_window_base,
         layer_idx,
         ratio,
         local_index_heads,
@@ -11702,6 +11795,11 @@ fn csa_select_official(
     key_count: usize,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
+    // Ring window base for reading the `keys` staging buffer: `start_pos` for the
+    // SparseIndexed indexer (its delta is staged window-relative from ring row 0
+    // every forward), `0` for the full-retention compressor (absolute offsets).
+    // Row `r` of the delta is read at `keys.data[(r - keys_window_base) * ihd]`.
+    keys_window_base: usize,
     _layer_idx: usize,
     ratio: usize,
     local_index_heads: usize,
@@ -11771,14 +11869,36 @@ fn csa_select_official(
             official.packed_rows,
             indexer_rows_before
         );
-        let src_offset = official.packed_rows * config.index_head_dim;
-        let src = keys
-            .data
-            .slice(src_offset..src_offset + newly_packed * config.index_head_dim);
+        let ihd = config.index_head_dim;
+        let keys_ring_rows = keys.data.len() / ihd;
+        // The SOURCE `keys.data` is the indexer's STAGING RING: the live delta
+        // [packed_rows..rows_after) was staged this same forward window-relative
+        // to `keys_window_base` (= `start_pos` for the SparseIndexed ring; `0`
+        // for the full-retention compressor, where the buffer holds every row at
+        // its absolute offset). Recover row `r` at ring offset `r - window_base`.
+        // The DESTINATION `rotated_keys` stays at the ABSOLUTE `packed_rows`
+        // offset (it retains the full history). Drain-immediate guarantees the
+        // window base never trails `packed_rows`.
+        ensure!(
+            official.packed_rows >= keys_window_base,
+            "DSv4 official DSA packed_rows {} precedes keys window base {keys_window_base} \
+             (drain-immediate invariant violated)",
+            official.packed_rows
+        );
+        let src_ring_row = official.packed_rows - keys_window_base;
+        ensure!(
+            src_ring_row + newly_packed <= keys_ring_rows,
+            "DSv4 official DSA index-key delta straddles staging ring: ring_off {src_ring_row} \
+             + newly_packed {newly_packed} > ring_rows {keys_ring_rows} (packed_rows {} base {keys_window_base})",
+            official.packed_rows
+        );
+        let src_offset = src_ring_row * ihd;
+        let dst_offset = official.packed_rows * ihd;
+        let src = keys.data.slice(src_offset..src_offset + newly_packed * ihd);
         {
             let mut rotated = official
                 .rotated_keys
-                .slice_mut(src_offset..src_offset + newly_packed * config.index_head_dim);
+                .slice_mut(dst_offset..dst_offset + newly_packed * ihd);
             let (src_ptr, _sg) = src.device_ptr(&ctx.stream);
             let (rot_ptr, _rg) = rotated.device_ptr_mut(&ctx.stream);
             unsafe {
@@ -11797,7 +11917,7 @@ fn csa_select_official(
         {
             let rotated = official
                 .rotated_keys
-                .slice(src_offset..src_offset + newly_packed * config.index_head_dim);
+                .slice(dst_offset..dst_offset + newly_packed * ihd);
             let (rot_store_ptr, _rsg) = rotated.device_ptr(&ctx.stream);
             let cache_range = pool.dsa_slot_range(official.slot_idx)?;
             let cache_pool = pool
