@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use infer_api::{
@@ -39,11 +40,33 @@ pub(crate) fn run(args: &OcrArgs) -> Result<()> {
     let inputs = load_ocr_inputs(&args.image, page_selection.as_deref())
         .with_context(|| format!("failed to load image `{}`", args.image))?;
     let max_tokens = resolve_ocr_max_tokens(&model_source, args.max_tokens);
+    let page_count = inputs.len();
+    if page_count > 1 {
+        eprintln!("[ocr] OCRing {} pages...", page_count);
+    }
 
-    let mut pages = Vec::with_capacity(inputs.len());
+    let mut pages = Vec::with_capacity(page_count);
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
+    let started_at = Instant::now();
     for (index, image) in inputs.into_iter().enumerate() {
+        if page_count > 1 {
+            let done = index;
+            if done == 0 {
+                eprintln!("[ocr] page {}/{}", index + 1, page_count);
+            } else {
+                let elapsed = started_at.elapsed().as_secs_f64();
+                let avg = elapsed / done as f64;
+                let remain = avg * (page_count - done) as f64;
+                eprintln!(
+                    "[ocr] page {}/{} · elapsed {:.0}s · eta {:.0}s",
+                    index + 1,
+                    page_count,
+                    elapsed,
+                    remain
+                );
+            }
+        }
         let request = MultimodalChatRequest {
             messages: vec![ChatPromptMessage::user_with_images(
                 prompt.clone(),
@@ -175,6 +198,7 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
         .with_context(|| format!("create temp dir {} failed", dir.display()))?;
     let out_prefix = dir.join("page");
     if let Some(page_selection) = page_selection {
+        eprintln!("[ocr] Rendering {} selected PDF pages...", page_selection.len());
         let mut pngs = Vec::with_capacity(page_selection.len());
         for page in page_selection {
             let prefix = dir.join(format!("page-{page}"));
@@ -189,6 +213,7 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
         }
         return Ok(pngs);
     }
+    eprintln!("[ocr] Rendering all PDF pages...");
     run_pdftoppm(&renderer, pdf_path, &out_prefix, None)?;
     let mut pngs = std::fs::read_dir(&dir)
         .with_context(|| format!("read rendered pages in {} failed", dir.display()))?
@@ -201,6 +226,7 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
         "pdf renderer `{renderer}` produced no images under {}",
         dir.display()
     );
+    eprintln!("[ocr] Rendered {} PDF pages.", pngs.len());
     Ok(pngs)
 }
 
