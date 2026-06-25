@@ -6469,6 +6469,16 @@ fn try_flashmla_decode_attention(
     } else {
         0
     };
+    // Stage-B: route the device page table so build_indices emits POOL-ABSOLUTE
+    // physical indices (slot-logical page -> physical pool page), fed against the
+    // WHOLE-pool base below (matches the batched path, which routes the table for
+    // every mode). On a contiguous identity table (Stage-A) this is byte-equal to
+    // the old slot-relative + band-slice path (gate: `dsv4_decode_route_index`
+    // host bit-identity test); once the pool fragments it lets the slot draw
+    // non-contiguous pages. V32/GLM also route here: only the WRITE/pack side
+    // lacks a V32 device-page-table kernel; the read-side table is mode-neutral
+    // and their contiguous identity band stays byte-equal.
+    let build_page_table = Some(pool.flashmla_device_page_table(ctx, flash.slot_idx)?);
     let (indices_ptr, indices_guard) = scratch.indices.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
     {
@@ -6492,8 +6502,7 @@ fn try_flashmla_decode_attention(
             },
             mode_int,
             64,
-            // Stage-A: null page table = slot-relative path (byte-unchanged).
-            None,
+            build_page_table.as_ref(),
         )?;
     }
     drop(indices_guard);
@@ -6504,17 +6513,12 @@ fn try_flashmla_decode_attention(
     // there. Saves 43 sched-meta calls/token as a side effect.
 
     let (q_ptr, q_guard) = q_prepared.data.device_ptr(&ctx.stream);
-    let pool_range = pool.flashmla_pages_byte_range(flash.slot_idx)?;
+    // Stage-B: feed the FlashMLA decode kernel the WHOLE-pool base; the indices
+    // built above are POOL-ABSOLUTE (page table routed), matching the batched
+    // path. V32/GLM still route a contiguous identity table so whole-pool base +
+    // band-equal indices stay byte-identical to the old per-slot slice.
     let pool_buf = pool.flashmla_pool_data()?;
-    ensure!(
-        pool_range.end <= pool_buf.len() && pool_range.len() == flash.fp8_kv_pool_len,
-        "DSv4 FlashMLA shared fwd table range {:?} invalid pool_len={} slot_len={}",
-        pool_range,
-        pool_buf.len(),
-        flash.fp8_kv_pool_len
-    );
-    let pool_view = pool_buf.slice(pool_range);
-    let (pool_ptr, pool_guard) = pool_view.device_ptr(&ctx.stream);
+    let (pool_ptr, pool_guard) = pool_buf.device_ptr(&ctx.stream);
     let (out_ptr, out_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
     let (lse_out_ptr, lse_guard) = scratch.lse_out.device_ptr_mut(&ctx.stream);
     let (lse_accum_ptr, lse_accum_guard) = scratch.lse_accum.device_ptr_mut(&ctx.stream);
