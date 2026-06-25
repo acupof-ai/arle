@@ -279,7 +279,15 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
     sw_blocks: usize,
     page_block_size: usize,
     stride_elems: usize,
+    page_table: Option<&CudaSlice<i32>>,
 ) -> Result<()> {
+    let (pt_ptr, num_logical_pages, _gp) = match page_table {
+        Some(table) => {
+            let (ptr, guard) = table.device_ptr(&ctx.stream);
+            (ptr as *const i32, table.len() as i32, Some(guard))
+        }
+        None => (std::ptr::null(), 0, None),
+    };
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
             compressed_ptr as *const ffi::Half,
@@ -289,6 +297,8 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
             sw_blocks as i32,
             page_block_size as i32,
             stride_elems as i32,
+            pt_ptr,
+            num_logical_pages,
             ctx.stream.cu_stream(),
         )
         .result()?;

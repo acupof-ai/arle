@@ -461,7 +461,9 @@ __global__ void dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel(
     int ratio,
     int sw_blocks,
     int page_block_size,
-    int stride_elems)
+    int stride_elems,
+    const int* __restrict__ page_table,
+    int num_logical_pages)
 {
     // MODEL1-only (DSv4 CSA) — GLM has no compressor so this kernel is never
     // launched on the GLM path. Self-contained MODEL1 constants (NoPE=448).
@@ -475,7 +477,13 @@ __global__ void dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel(
     const int pos = *start_pos;
     if (pos < 0 || ratio <= 0 || ((pos + 1) % ratio) != 0) return;
     const int compressed_row = pos / ratio;
-    const int block_id = sw_blocks + compressed_row / page_block_size;
+    int block_id = sw_blocks + compressed_row / page_block_size;
+    // Stage-B: route the slot-LOGICAL block to its physical pool block via the
+    // page table (identity table == band path, byte-for-byte). null table = band.
+    if (page_table != nullptr) {
+        if (block_id >= num_logical_pages) return;
+        block_id = page_table[block_id];
+    }
     const int row = compressed_row % page_block_size;
 
     const int tid = threadIdx.x;
@@ -737,6 +745,8 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_
     int sw_blocks,
     int page_block_size,
     int stride_elems,
+    const int* page_table,
+    int num_logical_pages,
     cudaStream_t stream)
 {
     if (compressed == nullptr || packed_kv == nullptr || start_pos == nullptr) {
@@ -745,7 +755,10 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_
     if (ratio <= 0 || sw_blocks < 0 || page_block_size <= 0 || stride_elems < 448 + HEAD_DIM_ROPE) {
         return cudaErrorInvalidValue;
     }
+    if (page_table != nullptr && num_logical_pages <= 0) {
+        return cudaErrorInvalidValue;
+    }
     dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(
-        compressed, packed_kv, start_pos, ratio, sw_blocks, page_block_size, stride_elems);
+        compressed, packed_kv, start_pos, ratio, sw_blocks, page_block_size, stride_elems, page_table, num_logical_pages);
     return cudaGetLastError();
 }
