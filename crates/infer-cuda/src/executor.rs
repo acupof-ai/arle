@@ -518,16 +518,14 @@ impl RealCudaExecutor {
     }
 
     /// Actual shared device-pool page count, for the paged-pool models (dense
-    /// Qwen3 + Qwen3.6). Both profile their pool from measured free VRAM at
-    /// construction (`profile_kv_pool_tokens`), so this is the page count the
+    /// Qwen3 + Qwen3.6 + DSv4 MLA latent pool). All three profile their pool
+    /// from measured free VRAM at construction, so this is the page count the
     /// host admission pool MUST mirror 1:1 — not the requested `total_pages`.
-    /// `None` for DSv4 (slot MLA arena, no shared page pool); its admission stays
-    /// per-slot this phase.
     pub(crate) fn effective_total_pages(&self) -> Option<usize> {
         match self {
             Self::Qwen(q) => Some(q.kv.max_total_pages),
             Self::Qwen35(q) => q.full_attn_pool_pages(),
-            Self::Dsv4(_) => None,
+            Self::Dsv4(d) => d.kv_adapter.flashmla_total_pages(),
         }
     }
 
@@ -2013,8 +2011,9 @@ impl Dsv4CudaExecutor {
         let weights_used_at_model_load = mem_dbg("after model load (weights+experts)");
         // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
         // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
-        let num_slots = model.kv_budget_num_slots(num_slots, max_seq_len)?;
-        let kv_adapter = model.new_kv_adapter(max_seq_len, num_slots)?;
+        let budget = model.kv_budget_plan(num_slots, max_seq_len)?;
+        let num_slots = budget.num_slots;
+        let kv_adapter = model.new_kv_adapter(max_seq_len, budget)?;
         mem_dbg("after new_kv_adapter (KV pools)");
         // [vram-ledger] PREDICTED adapter device bytes + per-component breakdown.
         log::info!(
@@ -2629,6 +2628,12 @@ impl Dsv4CudaExecutor {
         );
         ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
         if row.start_pos == 0 {
+            let layer_count = self.kv_adapter.num_layers();
+            for layer_idx in 0..layer_count {
+                self.kv_adapter
+                    .layer_mut(layer_idx)?
+                    .flashmla_free_slot(row.slot)?;
+            }
             self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
             self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
         }
