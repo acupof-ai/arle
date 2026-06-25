@@ -328,12 +328,69 @@ pub(crate) enum AgentFrontendArg {
 pub(crate) enum CliCommand {
     /// Agent REPL and one-shot prompt execution.
     Run(Box<RunArgs>),
+    /// One-shot image OCR with DeepSeek-OCR (auto-downloads the model).
+    Ocr(Box<OcrArgs>),
     /// OpenAI-compatible serving through the matching backend binary.
     Serve(Box<ServeArgs>),
     /// Training jobs.
     Train(Box<TrainArgs>),
     /// Model utilities (download from Hugging Face).
     Model(Box<ModelArgs>),
+}
+
+/// OCR mode → prompt preset for DeepSeek-OCR.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum OcrMode {
+    /// Plain text extraction (`<|grounding|>Free OCR.`).
+    Free,
+    /// Text + bounding-box grounding (`<|grounding|>OCR this image.`).
+    Grounding,
+    /// Convert the document to Markdown (`<|grounding|>Convert the document to markdown.`).
+    Markdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  arle ocr page.png\n  arle ocr --mode markdown scan.jpg\n  arle ocr --mode free https://example.com/receipt.png\n  arle ocr --prompt \"<|grounding|>Extract the table.\" table.png\n\nThe DeepSeek-OCR model auto-downloads on first use (Metal/Apple Silicon only)."
+)]
+pub(crate) struct OcrArgs {
+    /// Image to read — a local path or http(s) URL.
+    pub(crate) image: String,
+
+    /// OCR preset. Ignored when `--prompt` is given.
+    #[arg(long, value_enum, default_value_t = OcrMode::Free)]
+    pub(crate) mode: OcrMode,
+
+    /// Override the OCR instruction prompt verbatim (include any `<|grounding|>`
+    /// marker you want; do NOT add a literal `<image>` marker — the image is
+    /// spliced in automatically).
+    #[arg(long)]
+    pub(crate) prompt: Option<String>,
+
+    /// Model directory or HuggingFace id. Defaults to the bundled DeepSeek-OCR
+    /// model and downloads it if missing.
+    #[arg(long)]
+    pub(crate) model_path: Option<String>,
+
+    /// Max tokens to generate. `0`/`auto` picks a generous OCR default.
+    #[arg(long, default_value_t = 0, value_parser = parse_max_tokens_or_auto)]
+    pub(crate) max_tokens: usize,
+
+    /// Emit a JSON document ({ text, model, usage }) for scripts.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+}
+
+impl OcrMode {
+    /// The DeepSeek-OCR instruction prompt for this mode (no `<image>` marker —
+    /// the engine splices the image automatically).
+    pub(crate) fn prompt(self) -> &'static str {
+        match self {
+            Self::Free => "<|grounding|>Free OCR.",
+            Self::Grounding => "<|grounding|>OCR this image.",
+            Self::Markdown => "<|grounding|>Convert the document to markdown.",
+        }
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -495,7 +552,7 @@ pub(crate) struct ServeArgs {
     /// token pool gets `free − total × (1 − frac)`; the rest is headroom for
     /// activations/scratch. Clamped to `[0.5, 0.97]`. Wired for CUDA dense Qwen3
     /// + Qwen3.6 + Metal (one shared pool); DSv4 keeps per-slot sizing for now.
-    /// Default 0.9.
+    ///   Default 0.9.
     #[arg(long, default_value_t = 0.9)]
     pub(crate) mem_fraction_static: f64,
 
