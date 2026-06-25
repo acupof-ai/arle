@@ -1937,6 +1937,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: student_seq,
+            // The autograd student co-resides with this engine, so the engine
+            // must NOT greedily reserve 0.9 of free VRAM (the SGLang default) —
+            // its KV pool is num_slots-based (small). Cap the static reservation
+            // so the student's weights + writeback activations fit alongside.
+            mem_fraction_static: 0.2,
             ..EngineLoadConfig::default()
         },
     )
