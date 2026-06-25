@@ -751,7 +751,7 @@ fn resolve_run_images(run_args: &RunArgs) -> Result<Vec<ChatPromptImage>> {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn load_cli_image(source: &str) -> Result<ChatPromptImage> {
+pub(crate) fn load_cli_image(source: &str) -> Result<ChatPromptImage> {
     let source = source.trim();
     anyhow::ensure!(!source.is_empty(), "image source must not be empty");
     if source.starts_with("http://") || source.starts_with("https://") {
@@ -913,12 +913,15 @@ fn handle_repl_input(
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn is_direct_chat_backend(backend_name: &str) -> bool {
-    matches!(backend_name, "metal-diffusion-gemma" | "metal-gemma4")
+    matches!(
+        backend_name,
+        "metal-diffusion-gemma" | "metal-gemma4" | "metal-deepseek-ocr"
+    )
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn supports_cli_images(backend_name: &str) -> bool {
-    backend_name == "metal-gemma4"
+    matches!(backend_name, "metal-gemma4" | "metal-deepseek-ocr")
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -1952,7 +1955,7 @@ mod tests {
         count_export_turns, detect_family, format_iso8601_utc, format_tool_call_line,
         handle_export_command, handle_models_command, is_direct_chat_backend, parse_repl_command,
         render_history_markdown, resolve_export_path, run_direct_chat_completion,
-        truncate_one_line,
+        supports_cli_images, truncate_one_line,
     };
     use agent::AgentSession;
     use chat::ChatMessage;
@@ -2034,7 +2037,11 @@ mod tests {
     fn diffusion_backend_uses_direct_chat_template_path() {
         assert!(is_direct_chat_backend("metal-diffusion-gemma"));
         assert!(is_direct_chat_backend("metal-gemma4"));
+        assert!(is_direct_chat_backend("metal-deepseek-ocr"));
         assert!(!is_direct_chat_backend("metal"));
+        assert!(supports_cli_images("metal-gemma4"));
+        assert!(supports_cli_images("metal-deepseek-ocr"));
+        assert!(!supports_cli_images("metal"));
 
         let mut engine = FakeChatEngine {
             rendered: "<bos><|turn>user\nSay hi<turn|>\n<|turn>model\n".to_string(),

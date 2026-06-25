@@ -101,7 +101,10 @@ fn snapshot_is_servable(path: &Path) -> bool {
     {
         servable |= is_diffusion
             || matches!(model_type, "qwen3_5" | "qwen3_5_moe")
-            || arch_contains("Qwen3_5");
+            || arch_contains("Qwen3_5")
+            // DeepSeek-OCR VLM (Metal-only) — the `arle ocr` model.
+            || model_type == "deepseekocr"
+            || arch_contains("UnlimitedOCR");
     }
     #[cfg(feature = "cuda")]
     {

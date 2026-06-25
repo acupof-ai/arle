@@ -16,6 +16,8 @@ mod model_picker;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod modelscope;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod ocr;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod runtime_report;
@@ -81,6 +83,19 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
         Some(CliCommand::Serve(command)) => return serve::run_serve(&args, *command),
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+        Some(CliCommand::Ocr(ocr_args)) => match ocr::run(&ocr_args) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("[ARLE] error: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        Some(CliCommand::Ocr(_)) => {
+            eprintln!("[ARLE] error: `arle ocr` requires a metal/cuda/cpu backend build");
+            return ExitCode::FAILURE;
+        }
         Some(CliCommand::Run(run_args)) => match run_impl(args, Some(*run_args)) {
             Ok(()) => return ExitCode::SUCCESS,
             Err(err) => {
