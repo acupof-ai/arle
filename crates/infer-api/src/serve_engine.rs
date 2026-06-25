@@ -231,15 +231,22 @@ where
             !images.is_empty(),
             "multimodal chat request must include at least one image"
         );
-        let prompt = self
-            .tokenizer
-            .render_chat(&server_messages)
-            .map_err(|err| anyhow!("render multimodal chat prompt failed: {err}"))?;
+        // DeepSeek-OCR's chat template is trivial and emits no BOS; rendering it
+        // here is what produced the non-stopping `{"text":"image"}…` loop on the
+        // in-process path. Build the prompt via the shared BOS-prefixed builder
+        // (same source of truth as the HTTP server) instead of `render_chat`.
         let prompt = match multimodal_kind {
             Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+                let prompt = infer_server::multimodal::build_deepseek_ocr_prompt(&server_messages);
                 infer_server::multimodal::expand_deepseek_ocr_image_markers(&prompt, &images)
             }
-            _ => infer_server::multimodal::expand_gemma4_image_markers(&prompt, &images),
+            _ => {
+                let prompt = self
+                    .tokenizer
+                    .render_chat(&server_messages)
+                    .map_err(|err| anyhow!("render multimodal chat prompt failed: {err}"))?;
+                infer_server::multimodal::expand_gemma4_image_markers(&prompt, &images)
+            }
         }
         .map_err(|err| anyhow!("expand image prompt markers failed: {err}"))?;
         let prompt_token_ids = self
