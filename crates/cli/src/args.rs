@@ -603,6 +603,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) chunked_prefill_size: Option<usize>,
 
+    /// Opt into slot oversubscription: admit more concurrent requests than
+    /// `--max-running-requests` by parking the longest-running decode's
+    /// whole-slot KV image to the DRAM tier (round-robin) to free a slot for a
+    /// waiter. Requires a whole-slot tier backend; default off (byte-identical).
+    #[arg(long, default_value_t = false)]
+    pub(crate) slot_oversubscription: bool,
+
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     pub(crate) train_control_url: Option<String>,

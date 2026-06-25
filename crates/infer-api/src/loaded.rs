@@ -95,6 +95,11 @@ pub struct EngineLoadConfig {
     /// without `--kv-ssd-max-bytes`.
     #[serde(default = "default_ssd_fraction")]
     pub ssd_fraction: f64,
+    /// Opt-in slot oversubscription: admit more waiters than `num_slots` by
+    /// parking the longest-running decode's whole-slot image to the DRAM tier
+    /// (requires a whole-slot tier backend). Default false → byte-identical.
+    #[serde(default)]
+    pub slot_oversubscription: bool,
 }
 
 /// SGLang's default static-memory fraction (0.9): 90% of VRAM for weights+KV,
@@ -139,6 +144,7 @@ impl Default for EngineLoadConfig {
             mem_fraction_static: default_mem_fraction_static(),
             dram_fraction: default_dram_fraction(),
             ssd_fraction: default_ssd_fraction(),
+            slot_oversubscription: false,
         }
     }
 }
@@ -350,6 +356,7 @@ mod backend {
                 .max(per_req_cap.saturating_sub(gen_reserve));
             config.max_total_tokens = self.max_total_tokens;
             config.chunked_prefill_size = self.chunked_prefill_size;
+            config.slot_oversubscription = self.slot_oversubscription;
             config
         }
     }
