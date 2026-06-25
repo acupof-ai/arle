@@ -40,6 +40,10 @@ impl CatalogEntry {
 
 use CompiledBackend::{Cpu, Cuda, Metal};
 
+/// Canonical DeepSeek-OCR model (MXFP8 MLX). Used by `arle ocr` and the agent
+/// `ocr` tool as the default, auto-downloaded VLM. Metal-only.
+pub(crate) const DEEPSEEK_OCR_MODEL_ID: &str = "sahilchachra/unlimited-ocr-mxfp8-mlx";
+
 /// Curated catalog of selectable models. Display order is decided by
 /// `recommend_models` (flagship picks first), not by position here.
 pub(crate) const CATALOG: &[CatalogEntry] = &[

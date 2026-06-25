@@ -13,6 +13,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use tokenizers::Tokenizer;
+use tokenizers::decoders::DecoderWrapper;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 
 #[cfg(test)]
 use crate::schema::ChatContent;
@@ -127,6 +129,18 @@ impl OpenAiTokenizer {
         self.inner
             .decode(token_ids, true)
             .map_err(|err| anyhow!("decode generated tokens failed: {err}"))
+    }
+
+    /// Force a byte-level (GPT-2) decoder, overriding whatever the checkpoint's
+    /// `tokenizer.json` declared. DeepSeek-OCR ships a byte-level BPE vocab
+    /// (`Ġ`=space, `Ċ`=newline) but a mismatched Metaspace/ByteFallback decoder,
+    /// so its raw decode leaks `Ġ`/`Ċ` glyphs and drops spaces — useless OCR
+    /// text. The reference HF `tokenizers` library reproduces the same bug; the
+    /// fix is to decode with `ByteLevel`, which maps the byte alphabet back to
+    /// real UTF-8. Scoped to the OCR load path; other models keep their decoder.
+    pub fn force_byte_level_decoder(&mut self) {
+        self.inner
+            .with_decoder(Some(DecoderWrapper::ByteLevel(ByteLevel::default())));
     }
 
     /// Render OpenAI chat messages into the model's prompt form.

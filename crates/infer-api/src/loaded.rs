@@ -1353,7 +1353,11 @@ mod backend {
             "--kv-ssd-path: DeepSeek-OCR Metal owns no page-addressable KV tier store"
         );
 
-        let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
+        let mut tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
+        // DeepSeek-OCR's tokenizer.json ships a byte-level BPE vocab but a
+        // mismatched decoder, leaking `Ġ`/`Ċ` glyphs into the OCR text. Force a
+        // byte-level decoder so the output is real UTF-8.
+        tokenizer.force_byte_level_decoder();
         let model_id = crate::serve_engine::model_id_from_path(model_path);
         let model_source = resolved.to_string_lossy().to_string();
         let mut scheduler = config.scheduler_config();
