@@ -723,6 +723,90 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
+    /// Reserve a FIXED-LAYOUT band of `page_count` contiguous physical pages for
+    /// `slot` while advancing the logical cursor by `seq_tokens` (≤ band
+    /// capacity).
+    ///
+    /// Unlike [`Self::alloc_tokens`] (page count derived from `seq_len`), this
+    /// is for caches whose pages are addressed by a FIXED slot-logical block
+    /// offset, not by sequential position — e.g. the DSv4 FlashMLA band, where
+    /// the sliding-window ring occupies logical pages `[0, sw_blocks)` and the
+    /// compressed region `[sw_blocks, total_blocks)`. Those readers need ALL
+    /// `total_blocks` pages resident regardless of how many tokens are live, so
+    /// the band is drawn whole on admission; `seq_tokens` only tracks the
+    /// logical position for the `seq_len == append_pos` invariant. Idempotent: a
+    /// slot that already owns its band just advances the cursor.
+    pub fn alloc_band_pages(
+        &mut self,
+        slot: usize,
+        page_count: usize,
+        seq_tokens: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "TokenKVPool::alloc_band_pages slot {slot} out of range {}",
+            self.num_slots
+        );
+        let live = self.page_indices[slot].len();
+        ensure!(
+            live == 0 || live == page_count,
+            "TokenKVPool::alloc_band_pages slot {slot} holds {live} pages, expected 0 (fresh) or {page_count} (re-cursor)"
+        );
+        ensure!(
+            seq_tokens <= page_count.saturating_mul(self.page_size),
+            "TokenKVPool::alloc_band_pages slot {slot} seq_tokens {seq_tokens} exceeds band capacity {} ({page_count} pages)",
+            page_count.saturating_mul(self.page_size)
+        );
+        if live == 0 {
+            if page_count > self.free_pages.len() {
+                return Err(anyhow!(
+                    "TokenKVPool: out of pages (band requested {page_count} pages, available {})",
+                    self.free_pages.len()
+                ));
+            }
+            // Pop ascending so the band is a contiguous identity run (free_pages
+            // is built descending; LIFO pop yields 0,1,2,…). One draw per admitted
+            // slot keeps the band-base addressing the DSv4 read/pack kernels use;
+            // the concurrent-fragmented case (interleaved per-slot draws across a
+            // shared pool) is a separate later effort — keep one slot active.
+            let mut new_pages = Vec::with_capacity(page_count);
+            for _ in 0..page_count {
+                let idx = self
+                    .free_pages
+                    .pop()
+                    .expect("invariant: free_pages.len() >= page_count checked above");
+                self.page_attach_count[idx as usize] = 1;
+                new_pages.push(idx);
+            }
+            self.page_indices[slot] = new_pages;
+        }
+        self.seq_lens[slot] = seq_tokens;
+        Ok(())
+    }
+
+    /// Roll the logical cursor back to `new_len` tokens WITHOUT recycling any
+    /// band pages — the fixed-layout-band counterpart of [`Self::truncate_slot`].
+    ///
+    /// [`Self::truncate_slot`] recycles trailing pages (`keep = ceil(new_len /
+    /// page_size)`), which is correct for a sequential cache but would dismantle
+    /// a fixed-layout band (the SW ring / comp region must stay fully resident).
+    /// Used on a DSv4 MTP reject: only the cursor shrinks so the next tick's
+    /// `seq_len == append_pos` invariant holds; the band is untouched.
+    pub fn set_band_cursor(&mut self, slot: usize, new_len: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "TokenKVPool::set_band_cursor slot {slot} out of range {}",
+            self.num_slots
+        );
+        ensure!(
+            new_len <= self.page_indices[slot].len().saturating_mul(self.page_size),
+            "TokenKVPool::set_band_cursor slot {slot} new_len {new_len} exceeds band capacity {}",
+            self.page_indices[slot].len().saturating_mul(self.page_size)
+        );
+        self.seq_lens[slot] = new_len;
+        Ok(())
+    }
+
     /// Allocate detached physical pages that are not yet owned by any slot.
     ///
     /// This is the minimal pool primitive needed by the session-restore path:
