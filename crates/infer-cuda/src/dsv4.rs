@@ -1609,8 +1609,13 @@ impl Dsv4Model {
             // index_ratio (=1 for GLM, full-length).
             if layer.mode.has_indexer() {
                 let index_cc = max_seq_len.div_ceil(index_ratio).max(1);
-                state_caches_per_slot = state_caches_per_slot.saturating_add(
+                let index_band_rows = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    crate::attention::dsv4_indexer_staging_ring_rows().min(index_cc)
+                } else {
                     index_cc
+                };
+                state_caches_per_slot = state_caches_per_slot.saturating_add(
+                    index_band_rows
                         .saturating_mul(self.config.index_head_dim)
                         .saturating_mul(2),
                 );
