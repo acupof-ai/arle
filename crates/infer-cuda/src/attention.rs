@@ -1766,6 +1766,13 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .checked_mul(head_dim)
             .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d overflow"))?;
         let tp_gather_cols = h_q_d; // tp_world * local_heads * head_dim == global h_q * head_dim
+        // Size the per-row page table for the WIDEST layer's band (CSA total_blocks);
+        // narrower SW-only layers use a row_width prefix of this shared buffer.
+        let max_total_blocks = layer_shapes
+            .iter()
+            .map(|s| s.total_blocks)
+            .max()
+            .unwrap_or(0);
         Ok(Self {
             indices: ctx
                 .stream
@@ -1775,7 +1782,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             slot_block_offsets: ctx.stream.alloc_zeros::<i32>(max_batch)?,
             page_table_batched: ctx
                 .stream
-                .alloc_zeros::<i32>(max_batch * layer_shapes[0].total_blocks)?,
+                .alloc_zeros::<i32>(max_batch * max_total_blocks)?,
             lse_out: ctx.stream.alloc_zeros::<f32>(max_batch * h_q)?,
             lse_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q)?,
             o_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q_d)?,
@@ -1884,9 +1891,12 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             .map_err(|e| anyhow!("DSv4 batched decode block-offset H2D failed: {e}"))?;
         if n > 0 {
             let row_width = page_tables[0].len();
+            // Capacity check: the scratch is sized for the WIDEST layer's band
+            // (max_total_blocks); narrower layers write a row_width prefix and the
+            // kernel strides by this layer's shape.total_blocks (== row_width).
             ensure!(
-                row_width * self.max_batch == self.page_table_batched.len(),
-                "DSv4 batched decode page-table width {} inconsistent with scratch len {} max_batch {}",
+                row_width * self.max_batch <= self.page_table_batched.len(),
+                "DSv4 batched decode page-table width {} exceeds scratch len {} max_batch {}",
                 row_width,
                 self.page_table_batched.len(),
                 self.max_batch
