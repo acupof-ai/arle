@@ -5254,10 +5254,13 @@ fn cuda_add_into_device(
         });
     }
 
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (add_into_device)"))?;
+    let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
+        eprintln!(
+            "[add_into_device] alloc_zeros FAILED size={size} ({} MiB) shape={shape:?}",
+            size * 4 / (1 << 20)
+        );
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (add_into_device)")
+    })?;
     let n = i32::try_from(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda add_into length exceeds i32"))?;
     launch_1d(
