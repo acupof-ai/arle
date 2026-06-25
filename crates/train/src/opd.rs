@@ -2996,6 +2996,9 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     // positions it is given, so a 1-position call returns that position's CE.)
     let mut loss_sum = 0.0f32;
     let mut ti = 0usize; // loss_targets is ascending in p; walk it per window.
+    eprintln!(
+        "[masked-writeback] seq_len={seq_len} total_targets={total_targets} window_size={window_size}"
+    );
 
     for window in sequence_windows(seq_len, window_size)? {
         // Collect the loss targets whose predicting position p lies in
@@ -3008,6 +3011,12 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         if window_targets.is_empty() {
             continue;
         }
+        eprintln!(
+            "[masked-writeback] window [{}, {}) targets={}",
+            window.start,
+            window.end,
+            window_targets.len()
+        );
 
         tape.entries.clear();
         tape.set_enabled(true);
