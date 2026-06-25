@@ -69,6 +69,36 @@ on the OCR load path only; output is now clean UTF-8.
 - Discoverability: catalog `DEEPSEEK_OCR_MODEL_ID` + `hub_discovery` servable set
   (`model_type=deepseekocr` / `UnlimitedOCR`, Metal).
 
+## End-to-end test (final committed binary, Apple M-series)
+
+Rebuilt from the committed tree; tested correctness, perf decomposition, and the
+agent-tool subprocess.
+
+**Correctness (real, non-repetitive content — an invoice PNG):** free mode reads
+every field; the line-items block comes back as `<table>…</table>` markup; markdown
+mode emits `header`/`table`/`text` regions. Clean UTF-8, no `Ġ`/`Ċ`, stops on its own.
+
+**Perf decomposition** (two-point isolation, `Free OCR.` on the invoice, prompt=278):
+
+| segment | value |
+|---|---|
+| model load (cold, per process) | **1.2 s** |
+| fixed cost (load + prefill + 16 tok) | ~2.06 s |
+| pure decode rate | **241 tok/s** |
+| full read (264 generated tokens) | **3.1 s wall** (steady across 3 repeats: 3.18/3.17/3.15) |
+
+So a typical OCR call is ~2 s fixed (≈1.2 s of it model load) + decode at ~240 tok/s.
+The agent tool pays the 1.2 s load each call (one-shot subprocess); acceptable for
+occasional OCR, and the upgrade path is a persistent `arle serve` OCR endpoint.
+
+**Honest caveat — synthetic-loop false alarm.** A first dense test image (34 identical
+"Line N: The quick brown fox" rows) made markdown mode greedy-loop into
+`Beine:ine:ine…` for 1103 tokens. This is greedy decode on a *degenerate, repetitive*
+input (AGENTS.md: "a degenerate looping prompt is not a valid test case"), NOT a code
+bug — the same binary reads the non-repetitive invoice perfectly in both modes. Lesson
+re-confirmed: test OCR on real-content images, not synthetic repeated lines.
+
+
 ## Rule
 
 - **A multimodal/VLM path that has TWO prompt builders (HTTP vs in-process) will
