@@ -17,15 +17,17 @@ enum BuiltinToolKind {
     Read,
     Write,
     Replace,
+    Ocr,
 }
 
 impl BuiltinToolKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Bash,
         Self::Python,
         Self::Read,
         Self::Write,
         Self::Replace,
+        Self::Ocr,
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -35,6 +37,7 @@ impl BuiltinToolKind {
             "read" => Some(Self::Read),
             "write" => Some(Self::Write),
             "replace" => Some(Self::Replace),
+            "ocr" => Some(Self::Ocr),
             _ => None,
         }
     }
@@ -46,6 +49,7 @@ impl BuiltinToolKind {
             Self::Read => "read",
             Self::Write => "write",
             Self::Replace => "replace",
+            Self::Ocr => "ocr",
         }
     }
 
@@ -60,6 +64,11 @@ impl BuiltinToolKind {
                 "Write content to a file, creating parent directories and overwriting any existing file."
             }
             Self::Replace => "Replace a single unique occurrence of a string in a file.",
+            Self::Ocr => {
+                "Extract text from an image file (PNG/JPG/…) or image URL using the local \
+                 DeepSeek-OCR model. The model downloads automatically on first use \
+                 (Apple Silicon / Metal only). Pass mode=markdown for documents/tables."
+            }
         }
     }
 
@@ -125,6 +134,21 @@ impl BuiltinToolKind {
                 },
                 "required": ["path", "old", "new"]
             }),
+            Self::Ocr => json!({
+                "type": "object",
+                "properties": {
+                    "image": {
+                        "type": "string",
+                        "description": "Path to a local image file or an http(s) image URL."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["free", "grounding", "markdown"],
+                        "description": "free = plain text (default); markdown = document/table layout; grounding = text + bounding boxes."
+                    }
+                },
+                "required": ["image"]
+            }),
         }
     }
 
@@ -153,6 +177,10 @@ impl BuiltinToolKind {
                 argument_as_str(arguments, "path"),
                 argument_as_str(arguments, "old"),
                 argument_as_str(arguments, "new"),
+            ),
+            Self::Ocr => execute_ocr(
+                argument_as_str(arguments, "image"),
+                argument_as_str(arguments, "mode"),
             ),
         }
     }
@@ -1207,6 +1235,119 @@ fn execute_replace(path: &str, old: &str, new: &str) -> String {
     }
 }
 
+/// Canonical DeepSeek-OCR model id (mirrors `cli::model_catalog::DEEPSEEK_OCR_MODEL_ID`).
+const OCR_MODEL_ID: &str = "sahilchachra/unlimited-ocr-mxfp8-mlx";
+
+/// Run OCR on an image by shelling out to `arle ocr <image> --json --mode <mode>`.
+///
+/// Self-invokes the running binary (`current_exe`) so the agent reuses the exact
+/// same OCR path as the CLI: backend isolation (no GPU deps in this crate), no
+/// second big model held in-process, and auto-download on first use. Reports
+/// whether the model is already cached locally so the agent can set expectations
+/// (first call may take a minute to download ~3.6 GB).
+fn execute_ocr(image: &str, mode: &str) -> String {
+    let image = image.trim();
+    if image.is_empty() {
+        return "ERROR: 'image' is required (a local path or http(s) URL)".to_string();
+    }
+    // Resolve a local path against the sandbox workdir so relative paths match
+    // the other tools; URLs and absolute paths pass through unchanged.
+    let image_arg = if image.starts_with("http://") || image.starts_with("https://") {
+        image.to_string()
+    } else {
+        resolve_sandbox_path(image).to_string_lossy().into_owned()
+    };
+
+    let mode = match mode.trim() {
+        "" | "free" => "free",
+        "grounding" => "grounding",
+        "markdown" => "markdown",
+        other => return format!("ERROR: unknown ocr mode '{other}' (free|grounding|markdown)"),
+    };
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return format!("ERROR: cannot locate the arle binary for OCR: {e}"),
+    };
+
+    let model_cached = ocr_model_is_cached();
+    if !model_cached {
+        log::info!("ocr tool: DeepSeek-OCR model not cached; `arle ocr` will download it on first use");
+    }
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("ocr")
+        .arg(&image_arg)
+        .arg("--mode")
+        .arg(mode)
+        .arg("--json");
+    // OCR (load + optional download + inference) can exceed the shell sandbox's
+    // 30s budget; give it a dedicated, generous timeout.
+    let timeout = if model_cached {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(900)
+    };
+    match run_command_with_timeout(&mut cmd, timeout) {
+        Ok(TimedCommandResult::Finished(output)) => {
+            if output.status.success() {
+                let text = ocr_extract_text(&output.stdout);
+                if text.trim().is_empty() {
+                    "(no text detected in the image)".to_string()
+                } else {
+                    text
+                }
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                format!(
+                    "ERROR: OCR failed: {}",
+                    err.lines().last().unwrap_or("unknown error")
+                )
+            }
+        }
+        Ok(TimedCommandResult::TimedOut(_)) => {
+            "ERROR: OCR timed out (model download or inference took too long)".to_string()
+        }
+        Err(e) => format!("ERROR: failed to run OCR: {e}"),
+    }
+}
+
+/// Parse the `{ "text": … }` document `arle ocr --json` prints; fall back to the
+/// raw stdout if it isn't the expected shape.
+fn ocr_extract_text(stdout: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(stdout);
+    let line = raw.lines().rev().find(|l| l.trim_start().starts_with('{'));
+    if let Some(line) = line
+        && let Ok(v) = serde_json::from_str::<Value>(line)
+        && let Some(text) = v.get("text").and_then(Value::as_str)
+    {
+        return text.to_string();
+    }
+    raw.trim().to_string()
+}
+
+/// Best-effort check for whether the DeepSeek-OCR model is already in the HF
+/// cache (`$HF_HOME/hub` / `~/.cache/huggingface/hub/models--<org>--<repo>` with
+/// a non-empty `snapshots/`). Kept dependency-light so the `tools` crate stays
+/// host-only (no infer-util / infer-metal dep).
+fn ocr_model_is_cached() -> bool {
+    let hub_root = if let Some(v) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        PathBuf::from(v)
+    } else if let Some(v) = std::env::var_os("HF_HOME") {
+        PathBuf::from(v).join("hub")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache/huggingface/hub")
+    } else {
+        return false;
+    };
+    let dir_name = format!("models--{}", OCR_MODEL_ID.replace('/', "--"));
+    let snapshots = hub_root.join(dir_name).join("snapshots");
+    std::fs::read_dir(&snapshots)
+        .map(|mut entries| entries.any(|e| e.is_ok()))
+        .unwrap_or(false)
+}
+
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
@@ -1534,5 +1675,32 @@ mod tests {
                 .unwrap_err()
                 .contains("empty")
         );
+    }
+
+    #[test]
+    fn ocr_tool_is_registered_with_schema() {
+        let ocr = builtin_tools()
+            .into_iter()
+            .find(|t| t.name == "ocr")
+            .expect("ocr tool registered");
+        // Required `image` param + the mode enum the agent picks from.
+        assert_eq!(ocr.parameters["required"][0], "image");
+        let modes = &ocr.parameters["properties"]["mode"]["enum"];
+        assert!(modes.as_array().expect("mode enum").iter().any(|m| m == "markdown"));
+    }
+
+    #[test]
+    fn ocr_extract_text_parses_json_and_falls_back() {
+        // The `arle ocr --json` document shape.
+        let json = br#"{"text":"hello world","model":"x","usage":{}}"#;
+        assert_eq!(super::ocr_extract_text(json), "hello world");
+        // Non-JSON stdout passes through as raw text.
+        assert_eq!(super::ocr_extract_text(b"plain text out\n"), "plain text out");
+    }
+
+    #[test]
+    fn ocr_requires_image_argument() {
+        assert!(super::execute_ocr("", "free").contains("required"));
+        assert!(super::execute_ocr("x.png", "bogus").contains("unknown ocr mode"));
     }
 }
