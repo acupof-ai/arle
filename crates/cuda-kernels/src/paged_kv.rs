@@ -752,11 +752,9 @@ impl TokenKVPool {
             live == 0 || live == page_count,
             "TokenKVPool::alloc_band_pages slot {slot} holds {live} pages, expected 0 (fresh) or {page_count} (re-cursor)"
         );
-        ensure!(
-            seq_tokens <= page_count.saturating_mul(self.page_size),
-            "TokenKVPool::alloc_band_pages slot {slot} seq_tokens {seq_tokens} exceeds band capacity {} ({page_count} pages)",
-            page_count.saturating_mul(self.page_size)
-        );
+        // `seq_tokens` is the LOGICAL cursor (restore length / 0 for a fresh draw)
+        // — unbounded by the physical band (it wraps mod sw / compresses to
+        // max_seq/cr), bounded by max_seq at ingress, NOT by page_count×page_size.
         if live == 0 {
             if page_count > self.free_pages.len() {
                 return Err(anyhow!(
@@ -798,11 +796,12 @@ impl TokenKVPool {
             "TokenKVPool::set_band_cursor slot {slot} out of range {}",
             self.num_slots
         );
-        ensure!(
-            new_len <= self.page_indices[slot].len().saturating_mul(self.page_size),
-            "TokenKVPool::set_band_cursor slot {slot} new_len {new_len} exceeds band capacity {}",
-            self.page_indices[slot].len().saturating_mul(self.page_size)
-        );
+        // The cursor is the LOGICAL sequence position — unbounded by the physical
+        // band: a fixed-layout band wraps (SW ring mod sw) and compresses (comp
+        // region to max_seq/cr), so the logical position routinely exceeds the
+        // band's page capacity. It is bounded by max_seq at ingress, NOT here.
+        // (A band-capacity check here wrongly broke both decode-advance and MTP
+        // truncation once a sequence outgrew the band — #review long-ctx.)
         self.seq_lens[slot] = new_len;
         Ok(())
     }
