@@ -47,6 +47,12 @@ pub(crate) struct Dsv4MlaKvArena {
     pub num_layers: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Dsv4KvBudgetPlan {
+    pub(crate) num_slots: usize,
+    pub(crate) pool_budget_bytes_per_layer: usize,
+}
+
 /// Packed bytes per token the FlashMLA sparse-FP8 decode reads for the canonical
 /// MODEL1 NoPE=448 / RoPE=64 shape (`dsv4_fp8_kv_pack` doc):
 /// 448 fp8 NoPE + 128 bf16 RoPE + 8 e8m0 scales = 584.
@@ -1396,7 +1402,7 @@ impl Dsv4Model {
     pub(crate) fn new_kv_adapter(
         &self,
         max_seq_len: usize,
-        num_slots: usize,
+        budget: Dsv4KvBudgetPlan,
     ) -> Result<crate::attention::Dsv4KvAdapter> {
         // The eager B=1 path uses the FP8 decode-band MoE lane. The shared
         // routed-MoE scratch is decode-graph-only; do not let GPU-router env
@@ -1440,7 +1446,8 @@ impl Dsv4Model {
             max_seq_len,
             &self.kv_arena,
             self.tp.config().world_size,
-            num_slots,
+            budget.num_slots,
+            budget.pool_budget_bytes_per_layer,
             mla_decode,
             if needs_moe_decode_shared {
                 self.layers.first().map(|layer| {
@@ -1486,11 +1493,11 @@ impl Dsv4Model {
     /// the same construction point (collective). A rank that cannot query its
     /// memory contributes `i32::MAX` (does not bind) instead of skipping the
     /// collective.
-    pub(crate) fn kv_budget_num_slots(
+    pub(crate) fn kv_budget_plan(
         &self,
         requested: usize,
         max_seq_len: usize,
-    ) -> Result<usize> {
+    ) -> Result<Dsv4KvBudgetPlan> {
         const MEM_FRACTION: f64 = 0.9;
         const PER_SLOT_OVERHEAD_X: usize = 2;
         let arena_per_slot = max_seq_len
@@ -1639,49 +1646,60 @@ impl Dsv4Model {
             ),
             _ => 0,
         };
-        let per_slot = arena_per_slot
-            .saturating_mul(PER_SLOT_OVERHEAD_X)
-            .saturating_add(dsa_rotated_per_slot)
+        let per_slot = dsa_rotated_per_slot
             .saturating_add(state_caches_per_slot)
             .saturating_add(dsa_batched_per_slot);
-        let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
-            Ok((free, _total)) => {
-                // Neutral budget kernel (infer-seam): floor(free × fraction) −
-                // Σfixed, then / per_slot. The two saturating_subs fold into one
-                // fixed term (byte-identical, proven by the kernel unit test).
-                let budget = infer_seam::SlotBudget::from_free(
-                    free,
-                    MEM_FRACTION,
-                    dsa_shared_bytes
+        let (affordable_local, pool_budget_bytes_per_layer_local): (i32, usize) =
+            match cudarc::driver::result::mem_get_info() {
+                Ok((free, _total)) => {
+                    let fixed_without_pool = dsa_shared_bytes
                         .saturating_add(moe_decode_shared_bytes)
                         .saturating_add(shared_expert_scratch_bytes)
-                        .saturating_add(mla_decode_bytes),
-                    per_slot,
-                );
-                log::info!(
-                    "DSv4 KV budget: free {}MB, per_slot {}MB (arena×2 {}MB + rotated {}MB + \
-                     state caches {}MB), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, shared MLA decode {}MB",
-                    free >> 20,
-                    per_slot >> 20,
-                    arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
-                    dsa_rotated_per_slot >> 20,
-                    state_caches_per_slot >> 20,
-                    dsa_shared_bytes >> 20,
-                    moe_decode_shared_bytes >> 20,
-                    shared_expert_scratch_bytes >> 20,
-                    mla_decode_bytes >> 20,
-                );
-                budget
-                    .affordable()
-                    .map_or(i32::MAX, |n| i32::try_from(n).unwrap_or(i32::MAX))
-            }
-            // Can't query (no active context / driver error) → don't bind
-            // the min; the other ranks' budgets still apply.
-            Err(_) => i32::MAX,
-        };
+                        .saturating_add(mla_decode_bytes);
+                    let budget_before_pool = infer_seam::SlotBudget::from_free(
+                        free,
+                        MEM_FRACTION,
+                        fixed_without_pool,
+                        per_slot.max(1),
+                    );
+                    let affordable = budget_before_pool
+                        .affordable()
+                        .map_or(i32::MAX, |n| i32::try_from(n).unwrap_or(i32::MAX));
+                    let slots_cap = requested.max(1);
+                    let reserved_for_slots =
+                        per_slot.saturating_mul(slots_cap.min(affordable.max(0) as usize));
+                    let pool_budget_total = budget_before_pool
+                        .budget_bytes
+                        .saturating_sub(reserved_for_slots);
+                    let pool_budget_bytes_per_layer =
+                        pool_budget_total / self.kv_arena.num_layers.max(1);
+                    log::info!(
+                        "DSv4 KV budget: free {}MB, per_slot {}MB (arena×2 {}MB moved to shared pool + rotated {}MB + \
+                         state caches {}MB), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
+                         shared MLA decode {}MB, pool_per_layer {}MB",
+                        free >> 20,
+                        per_slot >> 20,
+                        arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
+                        dsa_rotated_per_slot >> 20,
+                        state_caches_per_slot >> 20,
+                        dsa_shared_bytes >> 20,
+                        moe_decode_shared_bytes >> 20,
+                        shared_expert_scratch_bytes >> 20,
+                        mla_decode_bytes >> 20,
+                        pool_budget_bytes_per_layer >> 20,
+                    );
+                    (affordable, pool_budget_bytes_per_layer)
+                }
+                Err(_) => (i32::MAX, 0),
+            };
         let affordable =
             self.tp
                 .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
+        let pool_budget_bytes_per_layer = self.tp.all_reduce_min_scalar_i32(
+            &self.ctx,
+            i32::try_from(pool_budget_bytes_per_layer_local.min(i32::MAX as usize))
+                .unwrap_or(i32::MAX),
+        )? as usize;
         // Reject-below-fixed guard (parity with Metal's fits_fixed): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
         // hold even one slot's KV arena + selector/compressor state at this
@@ -1704,18 +1722,19 @@ impl Dsv4Model {
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
         if clamped {
             log::warn!(
-                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (arena×2 ~{}MB + \
+                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (shared-pool path: arena moved out of divisor; \
                  per-slot selector/compressor caches ~{}MB) + shared DSA scratch ~{}MB exceeds the \
                  cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
-                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}. \
-                 Lower INFER_DSV4_MAX_SEQ_LEN ({max_seq_len}) to raise concurrency.",
+                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
                 per_slot >> 20,
-                arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
                 dsa_rotated_per_slot.saturating_add(state_caches_per_slot) >> 20,
                 dsa_shared_bytes >> 20,
             );
         }
-        Ok(planned)
+        Ok(Dsv4KvBudgetPlan {
+            num_slots: planned,
+            pool_budget_bytes_per_layer,
+        })
     }
 
     pub(crate) fn truncate_slot(&self, slot: &mut Dsv4SlotState, new_len: usize) -> Result<()> {
@@ -2397,6 +2416,7 @@ impl Dsv4Model {
                 // ── 1. per-row PREPARE + pack + Q-gather.
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
+                let mut page_tables = Vec::with_capacity(n);
                 let _prep_t = if phase_time {
                     ctx.stream.synchronize().ok();
                     Some(std::time::Instant::now())
@@ -2662,7 +2682,9 @@ impl Dsv4Model {
                             anyhow!("DSv4 batched decode lane: single-row decode scratch missing")
                         })?;
                         let slot = &mut slots[slot_ids[r]];
-                        slot_block_offsets.push(layer_pool.flashmla_slot_first_block(slot_ids[r])?);
+                        slot_block_offsets
+                            .push(layer_pool.flashmla_slot_first_block_or_zero(slot_ids[r])?);
+                        page_tables.push(layer_pool.flashmla_page_table_padded_i32(slot_ids[r])?);
                         // Batched CSA select: thread this row's gather sink (q_i /
                         // weights staging + key_count capture). `csa_select` then
                         // runs cache writes only and returns `selected: None`; the
@@ -2958,6 +2980,7 @@ impl Dsv4Model {
                         layer.compress_ratio,
                         &start_positions[..n],
                         &slot_block_offsets,
+                        &page_tables,
                     )?;
                     let sm_scale = prepared[0].sm_scale;
                     flash_batch.decode_lane_fwd(
