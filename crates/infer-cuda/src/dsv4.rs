@@ -2314,6 +2314,37 @@ impl Dsv4Model {
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
 
+        // FINISH F1 batched destination: ONE contiguous token-major
+        // `[n, local_width]` buffer for `slice_out_batched` (replaces N per-row
+        // `slice_out_row` calls). Reused across layers (each layer overwrites all
+        // n rows before the finish reads them; WAR resolved by stream order).
+        // local_width is uniform across DSv4 layers (all wq_b.rows equal), so
+        // layer 0's value sizes it for every layer. Only allocated on the batched
+        // lane. Held in keepalive (premature-free hazard under disabled events).
+        let mut local_attn_batched = if batched_attn_lane {
+            // SAFETY: every [r*local_width, (r+1)*local_width) span is written by
+            // slice_out_batched before the finish kernels / O-LoRA read it.
+            let lab = unsafe { HiddenStates::uninit(&self.ctx, local_width, n)? };
+            keepalive.keep_hidden(&lab);
+            lab
+        } else {
+            unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
+        };
+        // Reused [local_width, 1] scratch for the GROUPED O-LoRA per-row fallback
+        // (groups > 1: the grouped decode-DeepGEMM lane slices per-group columns
+        // within one row and cannot batch over M). Each row of the inverse-roped
+        // `local_attn_batched` is copied here, then mla_oproj(token_count=1) runs
+        // the per-slot grouped decode — byte-identical to the prior per-row path.
+        // Single-group models (Qwen3.6 MODEL1 at TP>1) never touch this. Only
+        // allocated on the batched lane.
+        let mut local_attn_row = if batched_attn_lane {
+            let lar = unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
+            keepalive.keep_hidden(&lar);
+            lar
+        } else {
+            unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
+        };
+
         // Full-flatten is canonical for MODEL1 B>1 decode. Per layer it batches
         // compressor state update (where a compressor exists), inverse-RoPE, and
         // SW-window write into one launch over N rows. SparseIndexed has no main
@@ -2536,6 +2567,30 @@ impl Dsv4Model {
                     None
                 };
                 let (compressor_kv_score, indexer_kv_score) = (main, indexer);
+                // ── 0b'. Batched (m=N) indexer-query / gating-weights projection
+                // pre-pass (CSA only). The per-row `csa_select` runs the indexer
+                // `wq_b` (over c_q_normed) + `weights_proj` (over normed) as m=1
+                // GEMVs that re-read the full weight per decode row — the last
+                // batchable GEMM left in the prepare loop. Batch them into ONE m=N
+                // GEMM each here; each row's `[width,1]` slice then feeds
+                // `csa_select` via `indexer_query_precomputed`, skipping the GEMVs.
+                // Touches NO slot state. SparseIndexed keeps the per-row GEMVs (no
+                // batch pre-pass) — byte-identical.
+                let indexer_query_kv_score =
+                    if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
+                        match layer.attention.indexer.as_ref() {
+                            Some(indexer) => Some(crate::attention::indexer_query_batch_prepass(
+                                &self.ctx,
+                                indexer,
+                                &proj.c_q_normed,
+                                &normed,
+                                &mut keepalive,
+                            )?),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                 // ── 0c. Full-flatten P1a: per-row compressor
                 // STATE-update DEFER (gather each row's ring-state pointers + advance
                 // compressed.seq_len, NO per-row FFI) → ONE
@@ -2800,6 +2855,21 @@ impl Dsv4Model {
                                     .map(|(ikv, iscore)| (ikv as &_, iscore as &_)),
                             }
                         });
+                        // CSA indexer-query batched pre-pass: slice this row's
+                        // `[width,1]` columns of `q_i`/`weights` so `csa_select`
+                        // skips the per-row m=1 GEMVs. Owned buffers bound at
+                        // iteration scope (outlive the prepare call that borrows
+                        // them through `indexer_query_precomputed`). `None` when the
+                        // pre-pass didn't run (SparseIndexed / no indexer) →
+                        // byte-identical per-row GEMVs.
+                        let indexer_query_row = match indexer_query_kv_score.as_ref() {
+                            Some((q_i, weights)) => Some((slice_row(q_i)?, slice_row(weights)?)),
+                            None => None,
+                        };
+                        let indexer_query_precomputed =
+                            indexer_query_row.as_ref().map(|(q_i, weights)| {
+                                crate::attention::Dsv4IndexerQueryPrecomputed { q_i, weights }
+                            });
                         let skip_compressor = full_flatten;
                         let idx_before_override = if full_flatten {
                             indexer_rows_before.get(r).copied()
@@ -2825,6 +2895,7 @@ impl Dsv4Model {
                             Some(&slot.start_pos_device),
                             batched_gather,
                             compressor_precomputed,
+                            indexer_query_precomputed,
                             skip_compressor,
                             idx_before_override,
                             &mut keepalive,
@@ -3072,30 +3143,40 @@ impl Dsv4Model {
                     } else {
                         Vec::new()
                     };
+                    // F1 batched: when full_flatten, slice ALL n rows' global-head
+                    // output into the contiguous `local_attn_batched` in ONE launch,
+                    // replacing the N per-row `slice_out_row` memcpy/TP-slices.
+                    if full_flatten {
+                        let local_heads = prepared[0].local_heads;
+                        let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
+                            kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                        let flash_batch = flash_batch.ok_or_else(|| {
+                            anyhow!("DSv4 batched decode lane: batch scratch missing")
+                        })?;
+                        flash_batch.slice_out_batched(
+                            &self.ctx,
+                            &self.config,
+                            &self.tp,
+                            n,
+                            local_heads,
+                            &mut local_attn_batched,
+                        )?;
+                    }
+                    let local_width_row = local_attn_batched.hidden_dim;
                     for r in 0..n {
                         // One mutable borrow of row r's prepared state; field
                         // accesses below are disjoint (k_prepared/scalars `&`,
                         // local_attn `&mut`) so the borrow checker splits them.
                         let p = &mut prepared[r];
-                        {
-                            let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
-                                kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                            let flash_batch = flash_batch.ok_or_else(|| {
-                                anyhow!("DSv4 batched decode lane: batch scratch missing")
-                            })?;
-                            flash_batch.slice_out_row(
-                                &self.ctx,
-                                &self.config,
-                                &self.tp,
-                                r,
-                                p.local_heads,
-                                &mut p.local_attn,
-                            )?;
-                        }
                         if full_flatten {
-                            // Resolve this row's device pointers (single-stream:
-                            // ptrs stay valid; buffers not reallocated this step).
-                            let (op, og) = p.local_attn.data.device_ptr(&ctx.stream);
+                            // Gather this row's device pointers for the batched
+                            // FINISH kernels. The output pointer is row r's slice of
+                            // the contiguous `local_attn_batched` (the F2 O-LoRA then
+                            // reads the same buffer). Single-stream: ptrs stay valid.
+                            let row_view = local_attn_batched
+                                .data
+                                .slice(r * local_width_row..(r + 1) * local_width_row);
+                            let (op, og) = row_view.device_ptr(&ctx.stream);
                             out_ptrs.push(op);
                             drop(og);
                             let (kp, kg) = p.k_prepared.data.device_ptr(&ctx.stream);
@@ -3107,8 +3188,23 @@ impl Dsv4Model {
                             swcache_ptrs.push(cp);
                             drop(cg);
                         } else {
-                            // Per-row FINISH: inverse-RoPE
-                            // + SW-window write, one launch each per row.
+                            // Per-row lane (unchanged): slice this row out, then
+                            // per-row inverse-RoPE + SW-window write, one launch each.
+                            {
+                                let (_layer_pool, _dsa, flash_batch, _flashmla_scratch, _prefill) =
+                                    kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                                let flash_batch = flash_batch.ok_or_else(|| {
+                                    anyhow!("DSv4 batched decode lane: batch scratch missing")
+                                })?;
+                                flash_batch.slice_out_row(
+                                    &self.ctx,
+                                    &self.config,
+                                    &self.tp,
+                                    r,
+                                    p.local_heads,
+                                    &mut p.local_attn,
+                                )?;
+                            }
                             let slot = &mut slots[slot_ids[r]];
                             let sw_window = slot.attention[layer_idx].sw_window_cache_mut();
                             crate::attention::flashmla_decode_finish_row(
@@ -3166,29 +3262,78 @@ impl Dsv4Model {
                         ptr_keepalive.push(kprep_arr);
                         ptr_keepalive.push(swcache_arr);
                     }
-                    // Pass F2: per-row O-LoRA → attn_out (consumes the now
-                    // inverse-roped `local_attn`). Per-row; token=1; no per-row alloc.
-                    for r in 0..n {
-                        let p = &prepared[r];
-                        let slot = &mut slots[slot_ids[r]];
+                    // Pass F2: O-LoRA → attn_out (consumes the inverse-roped output).
+                    // full_flatten batches over N when the O-LoRA is the plain-o
+                    // (GLM, seq-parametric dsv4_linear) or single-output-group
+                    // (Qwen3.6 MODEL1 at TP>1: groups==1, decode-DeepGEMM M=n) case
+                    // — ONE mla_oproj(token_count=n) reading the contiguous
+                    // `local_attn_batched`, writing directly into `attn_out`
+                    // ([hidden, n]); no per-row alloc, no per-row copy-out. The
+                    // grouped-decode lane (groups>1) stays per-row (reported
+                    // fallback): copy each row into `local_attn_row`, run
+                    // mla_oproj(token_count=1) into attn_out_row, copy out.
+                    // Only the full_flatten path consults the O-LoRA group count
+                    // (the !full_flatten lane is always per-row); compute lazily so
+                    // the per-row lane never touches wo_a.
+                    let oproj_single_group = full_flatten
+                        && (layer.attention.o_proj.is_some() // plain-o: seq-parametric
+                            || local_attn_batched.hidden_dim
+                                / layer.attention.wo_a.as_ref().expect("DSv4 wo_a").cols
+                                == 1);
+                    if oproj_single_group {
+                        // Batched O-LoRA over all N rows in one call. local_attn_batched
+                        // is [local_width, n]; the decode lane reads it token-major.
+                        let slot = &mut slots[slot_ids[0]];
                         crate::attention::mla_oproj(
                             &self.ctx,
                             &layer.attention,
                             &mut slot.attention[layer_idx],
-                            // Decode (token_count=1): the prefill DeepGEMM lane is
-                            // never taken, so the shared scratch is not needed.
+                            // Decode: prefill DeepGEMM lane never taken. The decode
+                            // lane reuses slot 0's shared transient fused_wqkv scratch
+                            // at M=n (active_counts=[n], restored to [1] internally).
                             None,
-                            &p.local_attn,
-                            1,
+                            &local_attn_batched,
+                            n,
                             &mut keepalive,
-                            &mut attn_out_row,
+                            &mut attn_out,
                         )?;
-                        let mut dst = attn_out
-                            .data
-                            .slice_mut(r * hidden_size..(r + 1) * hidden_size);
-                        ctx.stream
-                            .memcpy_dtod(&attn_out_row.data, &mut dst)
-                            .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
+                    } else {
+                        let local_width_row = local_attn_batched.hidden_dim;
+                        for r in 0..n {
+                            // Source of the inverse-roped row: full_flatten put it in
+                            // `local_attn_batched` (grouped fallback path); the
+                            // per-row lane left it in `p.local_attn`.
+                            let row_src: &HiddenStates = if full_flatten {
+                                let row_view = local_attn_batched
+                                    .data
+                                    .slice(r * local_width_row..(r + 1) * local_width_row);
+                                ctx.stream
+                                    .memcpy_dtod(&row_view, &mut local_attn_row.data)
+                                    .map_err(|e| {
+                                        anyhow!("DSv4 grouped O-LoRA row copy-in failed: {e}")
+                                    })?;
+                                &local_attn_row
+                            } else {
+                                &prepared[r].local_attn
+                            };
+                            let slot = &mut slots[slot_ids[r]];
+                            crate::attention::mla_oproj(
+                                &self.ctx,
+                                &layer.attention,
+                                &mut slot.attention[layer_idx],
+                                None,
+                                row_src,
+                                1,
+                                &mut keepalive,
+                                &mut attn_out_row,
+                            )?;
+                            let mut dst = attn_out
+                                .data
+                                .slice_mut(r * hidden_size..(r + 1) * hidden_size);
+                            ctx.stream
+                                .memcpy_dtod(&attn_out_row.data, &mut dst)
+                                .map_err(|e| anyhow!("DSv4 batched attn copy-out failed: {e}"))?;
+                        }
                     }
                 }
                 if let Some(t) = _finish_t {
