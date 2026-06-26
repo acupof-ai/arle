@@ -554,7 +554,7 @@ fn read_model_generation_max_tokens(model_path: &str) -> Option<usize> {
 /// `context_length` (GGUF / llama.cpp convention) from `<model_path>/config.json`.
 /// Returns `None` for any failure (missing path, bad JSON, missing field).
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn read_model_max_context(model_path: &str) -> Option<usize> {
+pub(crate) fn read_model_max_context(model_path: &str) -> Option<usize> {
     let cfg = read_model_config(model_path)?;
     cfg.get("max_position_embeddings")
         .and_then(|v| v.as_u64())
