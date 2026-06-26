@@ -2690,6 +2690,58 @@ impl Dsv4Model {
                 } else {
                     Vec::new()
                 };
+                // ── 0d. Full-flatten P1b: per-row DSA CACHE WRITE (block (a) of
+                // `csa_select_official`: Hadamard rotate of the newly-packed index
+                // keys + FP8 fused-store into each slot's cache band + `packed_rows`
+                // advance) hoisted out of the prepare loop into ONE batched pre-pass
+                // over all N slots. Runs AFTER P1a (the batched compressor-update
+                // wrote `indexer.compressed`, the staging ring this reads) and
+                // BEFORE the prepare loop (whose per-row `csa_select` then skips the
+                // cache write via `cache_writes_in_prepass`). Gated to the
+                // CompressedSparse full-flatten lane with the official DSA path
+                // engaged; SparseIndexed keeps its per-row cache write in the loop.
+                let cache_writes_in_prepass = use_batched_dsa_select
+                    && full_flatten
+                    && layer.mode == DeepSeekV4AttentionMode::CompressedSparse;
+                if cache_writes_in_prepass {
+                    let mut cache_ptrs =
+                        crate::attention::Dsv4DsaCacheWriteBatchPtrs::with_capacity(n);
+                    for r in 0..n {
+                        let (layer_pool, dsa_shared, _fb, _fs, _pf) =
+                            kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                        let dsa_shared = dsa_shared.ok_or_else(|| {
+                            anyhow!("DSv4 full-flatten P1b: shared DSA scratch missing")
+                        })?;
+                        let slot = &mut slots[slot_ids[r]];
+                        let state = &mut slot.attention[layer_idx];
+                        // P1a already advanced `compressed.seq_len` to the AFTER
+                        // count; `before[r]` is the captured pre-advance value.
+                        let indexer_rows_after =
+                            state.indexer_compressed_seq_len().ok_or_else(|| {
+                                anyhow!("DSv4 full-flatten P1b: indexer state missing")
+                            })?;
+                        crate::attention::dsv4_dsa_cache_write_gather_row(
+                            &self.ctx,
+                            &self.config,
+                            state,
+                            layer_pool,
+                            dsa_shared,
+                            indexer_rows_before[r],
+                            indexer_rows_after,
+                            // CompressedSparse compressor-indexer retains full
+                            // history → window base 0 (matches csa_select).
+                            0,
+                            &mut cache_ptrs,
+                        )?;
+                    }
+                    crate::attention::dsv4_dsa_cache_write_batched(
+                        &self.ctx,
+                        n,
+                        &cache_ptrs,
+                        &mut ptr_keepalive,
+                        &mut keepalive,
+                    )?;
+                }
                 let _compidx_t = if phase_time {
                     ctx.stream.synchronize().ok();
                     Some(std::time::Instant::now())
@@ -2784,6 +2836,10 @@ impl Dsv4Model {
                                 key_counts: dsa_key_counts
                                     .as_mut()
                                     .expect("batched DSA key_counts present"),
+                                // CompressedSparse full-flatten: P1b already wrote
+                                // the cache; csa_select skips the per-row write.
+                                // SparseIndexed (no P1b): false → per-row write.
+                                cache_writes_in_prepass,
                             })
                         } else {
                             None
