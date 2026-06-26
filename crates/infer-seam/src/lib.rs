@@ -345,6 +345,21 @@ pub trait BackendExecutor {
     fn release_inference_scratch(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Drop the engine's KV pool WITHOUT offloading weights, freeing its HBM for a
+    /// co-resident OPD writeback whose fresh autograd forward does NOT use this
+    /// engine's KV cache (so the pool is dead during the writeback). Default no-op
+    /// (backends without a droppable pool are unaffected). Paired with
+    /// [`Self::ensure_kv_pool`], which re-acquires it before the next rollout.
+    fn release_kv_pool(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
+    /// rollout. Default no-op; idempotent if the pool is already resident.
+    fn ensure_kv_pool(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

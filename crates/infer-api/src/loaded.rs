@@ -749,6 +749,54 @@ mod backend {
             }
         }
 
+        /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
+        /// headroom: the writeback's fresh autograd forward never reads this
+        /// engine's KV). CUDA Qwen3.5/3.6 only; other arms are no-ops, so this is
+        /// safe to call unconditionally on the agent-OPD writeback path.
+        pub fn release_kv_pool(&self) -> Result<()> {
+            match self {
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.release_kv_pool(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => Ok(()),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => Ok(()),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => Ok(()),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => Ok(()),
+            }
+        }
+
+        /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the
+        /// next rollout. CUDA Qwen3.5/3.6 only; other arms are no-ops.
+        pub fn ensure_kv_pool(&self) -> Result<()> {
+            match self {
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.ensure_kv_pool(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => Ok(()),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => Ok(()),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => Ok(()),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => Ok(()),
+            }
+        }
+
         /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
         /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
         /// CPU arms reject it.

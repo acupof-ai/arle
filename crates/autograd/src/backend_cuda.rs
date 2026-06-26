@@ -1053,6 +1053,10 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn device_mem_info(&self) -> Option<(usize, usize)> {
+        self.mem_get_info().ok()
+    }
+
     fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {

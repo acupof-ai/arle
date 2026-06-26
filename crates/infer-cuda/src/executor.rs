@@ -608,6 +608,26 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Drop the rollout engine's full-attn KV pool (Qwen3.5/3.6 only); a no-op on
+    /// the other arms. agent-OPD writeback headroom — see `Qwen35CudaExecutor`.
+    pub(crate) fn release_kv_pool(&mut self) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.release_kv_pool(),
+            Self::Qwen(_) => Ok(()),
+            Self::Dsv4(_) => Ok(()),
+        }
+    }
+
+    /// Re-acquire the rollout engine's full-attn KV pool (Qwen3.5/3.6 only) before
+    /// the next agent-OPD round's rollout; a no-op on the other arms.
+    pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.ensure_kv_pool(),
+            Self::Qwen(_) => Ok(()),
+            Self::Dsv4(_) => Ok(()),
+        }
+    }
+
     /// Reload the model's device weights from the host snapshot.
     pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
         match self {
@@ -3002,6 +3022,13 @@ pub(crate) struct Qwen35CudaExecutor {
     /// (`--dram-fraction`, default 0.5). Stored at construction; consumed when
     /// `set_kv_recall(true)` builds `recall_tier`.
     dram_fraction: f64,
+    /// `mem_fraction_static` + requested page floor captured at construction so
+    /// `ensure_kv_pool` can RE-PROFILE and rebuild `full_attn_kv` identically
+    /// after `release_kv_pool` dropped it (agent-OPD rollout→writeback→rollout:
+    /// the dead pool is freed for the co-resident autograd writeback, then
+    /// re-acquired before the next round's rollout). Not on the serve path.
+    kv_pool_mem_fraction_static: f64,
+    kv_pool_requested_pages: usize,
 }
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
@@ -3210,10 +3237,79 @@ impl Qwen35CudaExecutor {
         // Shared paged full-attn KV pool — the DEFAULT substrate (Phase 2 of the
         // shared-paged-KV migration). Built EAGERLY here, profile-sized from
         // MEASURED free VRAM after weights load (SGLang's mem_fraction_static),
-        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). The
-        // per-token cell cost is the pool's own charge for one token across all
-        // full-attn layers (storage + work bytes), exactly the dense recipe.
+        // NOT `num_slots × max_seq_len` (the per-slot contiguous waste). The same
+        // build is re-run by `ensure_kv_pool` after `release_kv_pool` drops it on
+        // the agent-OPD writeback path — extracted into `build_full_attn_kv_pool`.
         let pool_t0 = Instant::now();
+        let requested_pages = total_pages.max(1);
+        let full_attn_kv =
+            Self::build_full_attn_kv_pool(&model, num_slots, requested_pages, mem_fraction_static)?;
+        cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
+
+        // G3 whole-slot spill tier: one entry == one serialized slot image. Its
+        // count cap = DRAM budget / per-image bytes ≈ the budget-aware ~5500
+        // (replaces the old `num_slots*2`). Size the per-image unit from the
+        // recurrent-block floor (gdr f32 + conv bf16, × num_linear) — the
+        // dominant fixed cost (~147 MiB); the variable full-attn pages ride on
+        // top. `max(1)` so a degenerate config can't divide by zero. Same
+        // `CudaKvTierStore` transport as the page-granular recall tier — the
+        // unified plan: every grain moves bytes through ONE store kind. NVMe
+        // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
+        let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
+        let slot_image_bytes = (num_linear * (gdr_state_len * 4 + conv_len * 2)).max(1);
+        let slot_tier = CudaKvTierStore::with_budget(
+            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+            slot_image_bytes,
+        );
+
+        // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
+        // not graph-capturable on this stack — TP≥2 stays eager, same as
+        // dense) ∧ every layer's decode step is a pure device-kernel sequence.
+        let decode_graph_armed = qwen35_decode_graph_enabled()
+            && model.tp.is_single()
+            && model.decode_graph_unsupported_reason().is_none();
+        let executor = Self {
+            model,
+            slots,
+            slot_tier,
+            slot_image_bytes,
+            recurrent_pool: Vec::new(),
+            workspace: crate::qwen35::Qwen35Workspace::new(),
+            num_slots,
+            decode_graph_armed,
+            decode_graph: None,
+            batch_decode: None,
+            kv_recall: false,
+            recall_cfg: crate::recall::default_recall_config(),
+            recall: (0..num_slots)
+                .map(|_| crate::recall::CudaRecallState::default())
+                .collect(),
+            recall_quant_warned: false,
+            full_attn_kv: Some(full_attn_kv),
+            recall_tier: None,
+            recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
+            dram_fraction: DEFAULT_DRAM_FRACTION,
+            kv_pool_mem_fraction_static: mem_fraction_static,
+            kv_pool_requested_pages: total_pages.max(1),
+        };
+        cuda_startup_log(
+            "qwen35_executor_total",
+            total_t0,
+            format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
+        );
+        Ok(executor)
+    }
+
+    /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
+    /// VRAM (SGLang's `mem_fraction_static`), floored at `requested_pages`. The
+    /// constructor's eager build and `ensure_kv_pool`'s post-release rebuild both
+    /// go through here so the re-acquired pool matches the original sizing recipe.
+    fn build_full_attn_kv_pool(
+        model: &crate::qwen35::Qwen35Model,
+        num_slots: usize,
+        requested_pages: usize,
+        mem_fraction_static: f64,
+    ) -> Result<PagedKVPool> {
         let num_full = model.config.num_full_attention_layers();
         let local_kv_heads = model.local_kv_heads();
         let head_dim = model.config.head_dim;
@@ -3224,10 +3320,6 @@ impl Qwen35CudaExecutor {
             1,
             KVFormat::BF16,
         ) as u64;
-        // ONE shared dynamic-draw pool (mirrors dense at :788): floor at pure
-        // `total_pages` — num_slots is a zero-HBM soft cap, it never multiplies
-        // the pool. The profiled budget raises this on an ample card.
-        let requested_pages = total_pages.max(1);
         // H1: the per-slot recurrent block (gdr + conv) is reserved out of the
         // SAME free VRAM `kv_budget_num_slots` clamped against. Subtract that
         // reservation from free BEFORE profiling the full-attn pool, so
@@ -3293,62 +3385,72 @@ impl Qwen35CudaExecutor {
             "Qwen3.6 full-attn paged pool page_size={} != {SUPPORTED_PAGE_SIZE}",
             full_attn_kv.page_size
         );
-        cuda_startup_log(
-            "qwen35_paged_pool_alloc",
-            pool_t0,
-            format_args!("pages={total_pool_pages} tokens={pool_token_budget}"),
-        );
+        Ok(full_attn_kv)
+    }
 
-        // G3 whole-slot spill tier: one entry == one serialized slot image. Its
-        // count cap = DRAM budget / per-image bytes ≈ the budget-aware ~5500
-        // (replaces the old `num_slots*2`). Size the per-image unit from the
-        // recurrent-block floor (gdr f32 + conv bf16, × num_linear) — the
-        // dominant fixed cost (~147 MiB); the variable full-attn pages ride on
-        // top. `max(1)` so a degenerate config can't divide by zero. Same
-        // `CudaKvTierStore` transport as the page-granular recall tier — the
-        // unified plan: every grain moves bytes through ONE store kind. NVMe
-        // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
-        let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
-        let slot_image_bytes = (num_linear * (gdr_state_len * 4 + conv_len * 2)).max(1);
-        let slot_tier = CudaKvTierStore::with_budget(
-            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-            slot_image_bytes,
-        );
-
-        // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
-        // not graph-capturable on this stack — TP≥2 stays eager, same as
-        // dense) ∧ every layer's decode step is a pure device-kernel sequence.
-        let decode_graph_armed = qwen35_decode_graph_enabled()
-            && model.tp.is_single()
-            && model.decode_graph_unsupported_reason().is_none();
-        let executor = Self {
-            model,
-            slots,
-            slot_tier,
-            slot_image_bytes,
-            recurrent_pool: Vec::new(),
-            workspace: crate::qwen35::Qwen35Workspace::new(),
-            num_slots,
-            decode_graph_armed,
-            decode_graph: None,
-            batch_decode: None,
-            kv_recall: false,
-            recall_cfg: crate::recall::default_recall_config(),
-            recall: (0..num_slots)
-                .map(|_| crate::recall::CudaRecallState::default())
-                .collect(),
-            recall_quant_warned: false,
-            full_attn_kv: Some(full_attn_kv),
-            recall_tier: None,
-            recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
-            dram_fraction: DEFAULT_DRAM_FRACTION,
+    /// Drop the shared paged full-attn KV pool, returning its HBM to the device
+    /// async pool (trimmed to the OS so a co-resident allocator sees it free).
+    /// agent-OPD ONLY: the masked-CE writeback's `forward_hidden_states` is a
+    /// FRESH autograd forward that does NOT read this engine's KV cache, so the
+    /// rollout pool is DEAD during the writeback — freeing it widens the writeback
+    /// headroom. `ensure_kv_pool` re-acquires it before the next round's rollout.
+    /// Precondition: all in-flight rollout work has synced (the round's rollout
+    /// completed + LoRA synced before the writeback closure runs). No-op if the
+    /// pool was already released. Errors if any slot still holds resident pages
+    /// (a live request would lose its KV) — agent-OPD finishes all rollouts before
+    /// the writeback, so the pool is empty.
+    pub(crate) fn release_kv_pool(&mut self) -> Result<()> {
+        let Some(pool) = self.full_attn_kv.as_ref() else {
+            return Ok(());
         };
-        cuda_startup_log(
-            "qwen35_executor_total",
-            total_t0,
-            format_args!("slots={num_slots} max_seq_len={max_seq_len}"),
+        let freed = pool.device_bytes();
+        // Drain in-flight device work referencing the pool BEFORE dropping it (no
+        // kernel may still read the slices we are about to free).
+        self.model.ctx.sync()?;
+        // Drop enqueues `cuMemFreeAsync` for every pool slice on the model stream
+        // — the frees are ASYNC, so they have NOT executed yet here.
+        self.full_attn_kv = None;
+        // Sync AGAIN so the enqueued async frees actually complete and the blocks
+        // return to the device async pool; only THEN can the trim return them to
+        // the OS. Without this second sync the trim runs before any block is back
+        // in the pool → nothing trimmed → `mem_get_info` still shows them used (the
+        // bug the first version hit: pool dropped but VRAM not reclaimed).
+        self.model.ctx.sync()?;
+        // Return the freed async-pool blocks to the OS so the co-resident autograd
+        // writeback's allocator + `mem_get_info` see them free (the pool's release
+        // threshold is u64::MAX, so a drop alone only caches the blocks). The
+        // device default async pool is per-DEVICE (shared across the infer + train
+        // contexts on this GPU), so the trimmed bytes are available to autograd.
+        if let Err(e) = self.model.ctx.trim_memory_pool() {
+            log::warn!("release_kv_pool: trim_memory_pool failed (non-fatal): {e}");
+        }
+        log::info!(
+            "Qwen3.6 released full-attn KV pool: freed {}MB (agent-OPD writeback headroom)",
+            freed >> 20
         );
-        Ok(executor)
+        Ok(())
+    }
+
+    /// Re-acquire the shared paged full-attn KV pool after `release_kv_pool`
+    /// dropped it (agent-OPD next-round rollout). Re-profiles from current free
+    /// VRAM with the construction-time `mem_fraction_static` + requested floor.
+    /// No-op (idempotent) if the pool is already resident.
+    pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
+        if self.full_attn_kv.is_some() {
+            return Ok(());
+        }
+        let pool = Self::build_full_attn_kv_pool(
+            &self.model,
+            self.num_slots,
+            self.kv_pool_requested_pages,
+            self.kv_pool_mem_fraction_static,
+        )?;
+        log::info!(
+            "Qwen3.6 re-acquired full-attn KV pool: {}MB (agent-OPD next-round rollout)",
+            pool.device_bytes() >> 20
+        );
+        self.full_attn_kv = Some(pool);
+        Ok(())
     }
 
     /// Boot-time decode-graph verdict log (mirrors the dense `warmup` info
