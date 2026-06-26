@@ -328,8 +328,18 @@ async fn chat_completions(
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     request.validate()?;
     let sampling = request.sampling_params();
-    let mut max_tokens = sampling.max_new_tokens.unwrap_or(16);
-    if state.max_thinking_tokens > 0 && request.enable_thinking() {
+    // A configured thinking budget also flips the server default to thinking-on
+    // (so terminus/litellm, which can't set the kwarg, still gets the split +
+    // budget); `0` keeps it off and byte-identical. Mirrors the in-process path.
+    let thinking = request.enable_thinking(state.max_thinking_tokens > 0);
+    let mut max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
+        if thinking && state.max_thinking_tokens > 0 {
+            state.max_thinking_tokens
+        } else {
+            16
+        }
+    });
+    if state.max_thinking_tokens > 0 && thinking {
         max_tokens = max_tokens.min(state.max_thinking_tokens);
     }
     let prompt = {
@@ -349,7 +359,7 @@ async fn chat_completions(
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
-        request.enable_thinking(),
+        thinking,
     )))
 }
 
