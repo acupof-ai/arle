@@ -697,6 +697,39 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    /// Batched (grid.y=slot) Hadamard rotate: ONE `<<<dim3(blocks_per_slot, n)>>>`
+    /// launch replacing n per-row [`dsv4_dsa_hadamard128_bf16_cuda`] calls. Each
+    /// slot's base ptr / row offsets / row count come from the host-gathered
+    /// device pointer/offset arrays (`*_arr[slot]`); `max_rows` sizes the x-grid.
+    /// Math byte-identical to n single-row launches.
+    pub fn dsv4_dsa_hadamard128_batched_cuda(
+        keys_src_arr: *const *const super::Half,
+        src_ring_row_arr: *const i32,
+        rotated_dst_arr: *const *mut super::Half,
+        dst_row_arr: *const i32,
+        newly_packed_arr: *const i32,
+        n: i32,
+        max_rows: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// Batched (grid.y=slot) FP8 fused-store: ONE `<<<dim3(blocks_per_slot, n)>>>`
+    /// launch replacing n per-row [`dsv4_dsa_fused_store_index_k_cache_cuda`]
+    /// calls. Each slot's rotated-key base / cache band base / slot-local
+    /// cache-loc array come from the host-gathered device arrays (the cache-loc
+    /// array is `*const *const i64` — an array OF i64-ptrs). `max_tokens` sizes
+    /// the x-grid. Math byte-identical to n single-row launches.
+    pub fn dsv4_dsa_fused_store_index_k_cache_batched_cuda(
+        key_arr: *const *const super::Half,
+        cache_arr: *const *mut u8,
+        out_cache_loc_arr: *const *const i64,
+        newly_packed_arr: *const i32,
+        n: i32,
+        max_tokens: i32,
+        page_size: i32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
         context_lens: *mut i32,
         positions: *mut i32,
