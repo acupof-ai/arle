@@ -78,14 +78,16 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/deepep_buffer.hpp");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let Ok(deepep_dir) = std::env::var("ARLE_DEEPEP_DIR") else {
-        println!(
-            "cargo:warning=ARLE_DEEPEP_DIR unset — deepep-sys stub only \
-             (set to the deepseek-ai/DeepEP source tree to enable)."
-        );
-        println!("cargo:rustc-cfg=deepep_stub");
-        return;
-    };
+    // Default to the vendored DeepEP checkout (pinned d4f41e4); ARLE_DEEPEP_DIR
+    // overrides for an external tree. The intranode/layout build is self-contained
+    // (no NVSHMEM) — only the opt-in internode_ll path needs ARLE_DEEPEP_NVSHMEM_DIR.
+    println!("cargo:rerun-if-changed=vendor/deepep/csrc");
+    let deepep_dir = std::env::var("ARLE_DEEPEP_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/vendor/deepep",
+            std::env::var("CARGO_MANIFEST_DIR").unwrap()
+        )
+    });
     let deepep_root = PathBuf::from(&deepep_dir);
     // DeepEP intranode/layout kernels (upstream csrc/kernels/legacy tree,
     // pinned d4f41e4). The pinned checkout is the only layout we support;
