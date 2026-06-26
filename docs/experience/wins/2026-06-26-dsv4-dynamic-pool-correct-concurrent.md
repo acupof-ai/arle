@@ -40,6 +40,14 @@ build_indices, compressed-delta, batched decode) — one contiguous holdout corr
 whole path. Verify with a needle (exact retrieval) + a concurrency c-sweep, never just
 boot/throughput (boot passed for months while decode was silently wrong on >1-page prompts).
 
+## Perf (TP=4, non-stream, warm)
+- TTFT ~884ms @ p~512, ~2.6s @ p~8192 (prefill scales with length).
+- ITL 23ms @ c=1 → 43 tok/s pure decode.
+- Throughput c=1/8/16/32 = 31/43/57/66 tok/s — concurrency correct but SUB-LINEAR;
+  per-req ITL degrades 23ms→480ms @ c=32. MoE decode is compute-bound (experts
+  gathered per-token → b=32 forward ≈ 20× b=1, no batch amortization). This is the
+  serial-forward ceiling, NOT a slot/pool limit — the dynamic pool did its job.
+
 ## Remaining (separate)
 - Throughput (63 tok/s @ c=32) is serial-forward-bound (MoE all-to-all + MLA + DSA + MTP),
   not slot-bound — a separate optimization (batched decode / graph / DP-attn).
