@@ -53,7 +53,7 @@ use crate::{
 };
 #[cfg(feature = "cuda")]
 use crate::{infer_student::InferStudent, lora::LoraConfig};
-use autograd::ops::{add, mul_scalar, slice};
+use autograd::ops::{add, fused_linear_distill::fused_linear_ce_loss_indexed, mul_scalar, slice};
 
 /// Context to route the OPD student rollout through the in-process infer engine
 /// (`InferStudent`) instead of the train-crate hand-written decode kernel. This
@@ -2924,19 +2924,30 @@ fn build_masked_loss_targets(
     targets
 }
 
-/// Masked single-trajectory CE writeback for agent-OPD: ONE masked next-token
-/// CE over the whole `prompt ++ response` trajectory, windowed over the
-/// SEQUENCE so only a `[window, vocab]` logits tile is ever live.
+/// Masked single-trajectory CE writeback for agent-OPD: ONE checkpointed
+/// forward over the whole `prompt ++ response` trajectory → hidden states, then
+/// a CHUNKED fused cross-entropy on the masked (LLM-generated) positions that
+/// never materializes the full `[seq, vocab]` logits tile.
 ///
-/// Replaces the O(N²) per-pair explosion (each pair re-forwarded the full
-/// ~30K-token prefix and materialized a dense `[seq, vocab]` logits tensor →
-/// `cuda alloc_zeros failed`). The windowed loop mirrors the windowed-KL
-/// distill path: per window `forward_logits_window` re-forwards the prefix up
-/// to `window.end` and applies the lm_head only to the window
-/// (`[1, window_len, vocab]`); gradients ACCUMULATE across windows into the
-/// param grads (cleanup keeps params+grads); `optimizer.step` runs ONCE after
-/// the loop. The returned scalar is the mean CE per masked (LLM-generated)
-/// token.
+/// Replaces the prior O(N²) windowed loop (each `sequence_windows` window
+/// re-forwarded the growing prefix via `forward_logits_window` and materialized
+/// a `[1, window, vocab]` f32 tile — 1.9 GB at window=2048, which `alloc_zeros`
+/// failed on the fragmented caching pool at the 64 GB-resident shared-base
+/// engine; shrinking the window only moved the OOM window-to-window). Now:
+/// `forward_hidden_states` once (gradient-checkpointed) → `[1, seq, hidden]`,
+/// then `fused_linear_ce_loss_indexed(hidden, lm_head, positions, targets,
+/// chunk_rows)` chunks over the masked positions, computing
+/// `logits_chunk = hidden_chunk @ lm_headᵀ` + CE + gradient per chunk and
+/// freeing each — peak transient ≈ `chunk * vocab * 4` bytes (≈0.25 GB at
+/// chunk=256, vocab=248320), so it fits at 64 GB resident with ~30 GB headroom.
+///
+/// `window_size` is reused as `chunk_rows` (positions per chunk; default
+/// 256-512). The fused loss already produces the mean CE per masked token (and
+/// the `/N` gradient), so `backward` + a single `optimizer.step` apply the
+/// per-token-mean update — the effective LR stays independent of trajectory
+/// length. The lm_head's `d_weight` only flows if it is trainable; under
+/// `--share-frozen-base` the head is frozen/tied so only `d_hidden` flows. The
+/// returned scalar is the mean CE per masked (LLM-generated) token.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_ce_step<O: Optimizer>(
     student: &Qwen35Model,
@@ -2985,86 +2996,65 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         return Ok(0.0);
     }
     let total_targets = loss_targets.len();
+    let chunk_rows = window_size; // reused: positions per fused-CE chunk.
 
-    let mut tape = Tape::new();
-    // Offload per-layer grad-checkpoints to host RAM during each window's forward
-    // (re-fetched on backward) so the long-trajectory forward doesn't pin ~30 GB.
-    tape.set_offload_checkpoints(true);
-    let keep_extra: HashSet<TensorId> = HashSet::new();
-    // Sum of per-position CE across all windows; divide by total_targets at the
-    // end for the mean CE per masked token. (cross_entropy_loss means over the
-    // positions it is given, so a 1-position call returns that position's CE.)
-    let mut loss_sum = 0.0f32;
-    let mut ti = 0usize; // loss_targets is ascending in p; walk it per window.
-    eprintln!(
-        "[masked-writeback] seq_len={seq_len} total_targets={total_targets} window_size={window_size}"
-    );
-
-    for window in sequence_windows(seq_len, window_size)? {
-        // Collect the loss targets whose predicting position p lies in
-        // [window.start, window.end). loss_targets is sorted ascending in p.
-        let window_start_ti = ti;
-        while ti < total_targets && loss_targets[ti].0 < window.end {
-            ti += 1;
+    // Split the (predicting-position p, target token) pairs into the parallel
+    // i32 index/target arrays the fused chunked CE consumes. `p` indexes the
+    // hidden tensor's sequence rows; the targets are the hard next tokens.
+    let mut position_indices: Vec<i32> = Vec::with_capacity(total_targets);
+    let mut target_tokens: Vec<i32> = Vec::with_capacity(total_targets);
+    for &(p, target) in &loss_targets {
+        // Guard tokenizer/vocab misalignment with a clear OPD error before the
+        // autograd bounds check (the lm_head's [vocab, hidden] also enforces it).
+        if target >= vocab {
+            return Err(OpdError::InvalidInput(format!(
+                "masked writeback target token {target} at position {p} exceeds vocab={vocab}"
+            )));
         }
-        let window_targets = &loss_targets[window_start_ti..ti];
-        if window_targets.is_empty() {
-            continue;
-        }
-        eprintln!(
-            "[masked-writeback] window [{}, {}) targets={}",
-            window.start,
-            window.end,
-            window_targets.len()
-        );
-
-        tape.entries.clear();
-        tape.set_enabled(true);
-
-        // [1, window_len, vocab]; window_len = window.end - window.start.
-        let logits = student
-            .forward_logits_window(store, &mut tape, &full, &positions, window)
-            .map_err(|err| map_qwen35_forward_error("masked writeback student", err))?;
-
-        // Per-position slice + single-target CE, summed. Correctness-first;
-        // each slice is [1, 1, vocab] so only one position's softmax is live.
-        let mut window_loss: Option<TensorId> = None;
-        for &(p, target) in window_targets {
-            let local = p - window.start;
-            let row = slice(
-                logits,
-                &[0, local, 0],
-                &[1, local + 1, vocab],
-                store,
-                &mut tape,
-            )
-            .map_err(OpdError::from)?;
-            let ce =
-                cross_entropy_loss(row, &[target], store, &mut tape).map_err(OpdError::from)?;
-            window_loss = Some(match window_loss {
-                None => ce,
-                Some(prev) => add(prev, ce, store, &mut tape).map_err(OpdError::from)?,
-            });
-        }
-        let window_loss = window_loss.expect("window_targets is non-empty");
-
-        let lv = store.to_host(window_loss).map_err(OpdError::from)?[0];
-        loss_sum += lv;
-        // Scale by 1/total_targets BEFORE backward so the accumulated gradient
-        // is the mean CE per masked token — keeps the effective LR independent
-        // of trajectory length (raw-sum grad would scale the step with token
-        // count).
-        let inv = 1.0 / total_targets as f32;
-        let scaled = mul_scalar(window_loss, inv, store, &mut tape).map_err(OpdError::from)?;
-        backward_with_optional_profile(scaled, lv * inv, store, &mut tape)?;
-        cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
+        position_indices.push(p as i32);
+        target_tokens.push(target as i32);
     }
 
+    let mut tape = Tape::new();
+    // Offload per-layer grad-checkpoints to host RAM during the (single)
+    // long-trajectory forward (re-fetched on backward) so it doesn't pin ~30 GB.
+    tape.set_offload_checkpoints(true);
+    tape.set_enabled(true);
+    let keep_extra: HashSet<TensorId> = HashSet::new();
+    eprintln!(
+        "[masked-writeback] seq_len={seq_len} total_targets={total_targets} chunk_rows={chunk_rows}"
+    );
+
+    // ONE checkpointed forward over prompt++response → [1, seq, hidden]. No
+    // per-window re-forward of the growing prefix (was O(N²)).
+    let hidden = student
+        .forward_hidden_states(store, &mut tape, &full, &positions)
+        .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?;
+
+    // Chunked fused CE: per chunk computes hidden_chunk @ lm_headᵀ → logits → CE
+    // → gradient, freeing each chunk. Never materializes [seq, vocab]. The loss
+    // is already the mean CE per masked token and the gradient is scaled by 1/N,
+    // so backward (seed 1.0) applies the per-token-mean update directly.
+    let loss = fused_linear_ce_loss_indexed(
+        hidden,
+        student.lm_head_weight_id(),
+        &position_indices,
+        &target_tokens,
+        chunk_rows,
+        store,
+        &mut tape,
+    )
+    .map_err(OpdError::from)?;
+
+    let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
+    cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
 
-    // Mean CE per masked token (matches the per-token-mean gradient applied above).
-    Ok(loss_sum / total_targets as f32)
+    eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
+    // Mean CE per masked token (the fused loss already applied the 1/N mean).
+    Ok(loss_value)
 }
 
 pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(
