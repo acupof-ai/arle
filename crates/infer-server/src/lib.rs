@@ -529,6 +529,14 @@ where
         self.run_on_executor(|executor| executor.reload_weights())?
     }
 
+    /// Release the engine's inference forward scratch WITHOUT offloading weights or
+    /// evicting KV (OPD rollout->writeback VRAM reclaim). Runs on the engine thread
+    /// (between scheduler steps) via the out-of-band control seam, so the release
+    /// never races an in-flight forward step. Blocks until the round-trip completes.
+    pub fn release_inference_scratch(&self) -> Result<()> {
+        self.run_on_executor(|executor| executor.release_inference_scratch())?
+    }
+
     /// Close the submit channel and join the engine thread.
     ///
     /// The engine drains its in-flight and waiting work to completion before the

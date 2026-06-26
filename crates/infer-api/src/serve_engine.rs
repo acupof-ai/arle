@@ -50,6 +50,13 @@ where
         self.serve.reload_engine_weights()
     }
 
+    /// Release the engine's inference forward scratch WITHOUT offloading weights or
+    /// evicting KV (OPD rollout->writeback VRAM reclaim). Threads down to the backend
+    /// executor on the engine thread via the [`ServeHandle`] control channel.
+    pub fn release_inference_scratch(&self) -> Result<()> {
+        self.serve.release_inference_scratch()
+    }
+
     /// Generate token ids from an already-tokenized prompt through the serving
     /// scheduler. This is the programmatic OPD rollout surface: unlike
     /// `forward_token_logits`, it keeps one request alive in infer-core, so the

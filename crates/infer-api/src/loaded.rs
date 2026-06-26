@@ -724,6 +724,31 @@ mod backend {
             }
         }
 
+        /// Release the engine's inference forward scratch WITHOUT offloading weights
+        /// or evicting KV (OPD rollout->writeback VRAM reclaim). CUDA-only behavior;
+        /// Metal/CPU/other arms are no-ops (no `Qwen35Workspace`-style scratch to
+        /// release) so this is safe to call unconditionally on the writeback path.
+        pub fn release_inference_scratch(&self) -> Result<()> {
+            match self {
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.release_inference_scratch(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => Ok(()),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => Ok(()),
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => Ok(()),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => Ok(()),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => Ok(()),
+            }
+        }
+
         /// Fold a fresh student LoRA update into the resident Qwen3.5/3.6
         /// projection weights (OPD per-step re-merge). CUDA-only: the Metal /
         /// CPU arms reject it.

@@ -597,6 +597,17 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Release inference forward scratch (Qwen3.5/3.6 only); a no-op on the
+    /// dense-Qwen3 and DSv4 arms (no `Qwen35Workspace`), so this is safe to call
+    /// unconditionally on the OPD writeback path.
+    pub(crate) fn release_inference_scratch(&mut self) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.release_inference_scratch(),
+            Self::Qwen(_) => Ok(()),
+            Self::Dsv4(_) => Ok(()),
+        }
+    }
+
     /// Reload the model's device weights from the host snapshot.
     pub(crate) fn reload_engine_weights(&mut self) -> Result<()> {
         match self {
@@ -4029,6 +4040,22 @@ impl Qwen35CudaExecutor {
         // reload (the gate flag stays armed).
         self.decode_graph = None;
         Ok(freed)
+    }
+
+    /// Release the inference forward scratch (24K-shaped workspace + batched-decode
+    /// scratch + captured decode graphs) WITHOUT offloading weights or touching KV.
+    /// The freed device blocks return to the shared CUmemAllocAsync caching pool the
+    /// co-resident OPD writeback's autograd reuses (OPD `EngineOffloadMode::Off`
+    /// rollout->writeback never offloads, so the scratch otherwise OOMs the writeback).
+    /// This is `offload_engine_weights`'s scratch-teardown MINUS the weight offload —
+    /// weights and per-slot KV / recurrent state stay resident.
+    fn release_inference_scratch(&mut self) -> Result<()> {
+        self.workspace.release();
+        if let Some(bd) = self.batch_decode.as_mut() {
+            bd.release();
+        }
+        self.decode_graph = None;
+        Ok(())
     }
 
     /// Reload the model's device weights from the host snapshot.

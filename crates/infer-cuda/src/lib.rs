@@ -731,6 +731,15 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Real(real) => real.reload_engine_weights(),
         }
     }
+
+    fn release_inference_scratch(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            // No real device scratch to release without the cuda backend.
+            CudaExecutorInner::Placeholder => Ok(()),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.release_inference_scratch(),
+        }
+    }
 }
 
 #[cfg(test)]

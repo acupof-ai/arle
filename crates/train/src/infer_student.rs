@@ -81,6 +81,18 @@ impl InferStudent {
         engine.reload_engine_weights()
     }
 
+    /// Release the rollout engine's inference forward scratch WITHOUT offloading
+    /// weights or evicting KV, freeing VRAM for the co-resident OPD writeback
+    /// (the agent-OPD rollout->writeback path never offloads, so the 24K-shaped
+    /// scratch otherwise OOMs the masked-CE writeback).
+    pub fn release_inference_scratch(&self) -> Result<()> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.release_inference_scratch()
+    }
+
     /// Generate `rollout_len` tokens from `prompt_ids` through the infer
     /// scheduler/KV path and return the full prompt+generated rollout.
     ///

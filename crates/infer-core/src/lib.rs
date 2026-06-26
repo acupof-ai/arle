@@ -535,6 +535,18 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.executor.reload_weights()
     }
 
+    /// Release the backend's inference forward scratch (workspace / batched-decode /
+    /// captured graphs) WITHOUT offloading weights or evicting KV, so a co-resident
+    /// OPD writeback reuses the VRAM. Delegates to
+    /// [`BackendExecutor::release_inference_scratch`] (default no-op). The engine
+    /// must be idle (no in-flight step); the rollout has synced before this is called.
+    ///
+    /// # Errors
+    /// Propagates any error returned by the backend executor's scratch release.
+    pub fn release_inference_scratch(&mut self) -> Result<()> {
+        self.executor.release_inference_scratch()
+    }
+
     /// Submit a normal-priority request into the waiting queue.
     pub fn submit_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestHandle {
         self.submit_request_with_options(prompt_tokens, max_tokens, RequestOptions::default())
@@ -588,6 +600,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Lazily warm the backend before the first step does any real work.
         self.warmup()?;
 
+        let diag = std::env::var_os("ARLE_STEP_DIAG").is_some();
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
@@ -596,6 +609,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 }
                 PollResult::NotReady(inflight) => {
                     self.inflight = Some(inflight);
+                    if diag {
+                        eprintln!("[STEP-DIAG] inflight NotReady (forward submitted, not done)");
+                    }
                     return Ok(());
                 }
             }
@@ -603,14 +619,35 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         let budget = self.governor.step_budget();
         if self.governor.should_yield() || budget.max_tokens == 0 || budget.max_micros == 0 {
+            if diag {
+                eprintln!(
+                    "[STEP-DIAG] gate: should_yield={} max_tokens={} max_micros={}",
+                    self.governor.should_yield(),
+                    budget.max_tokens,
+                    budget.max_micros
+                );
+            }
             std::thread::yield_now();
             return Ok(());
         }
 
         self.admit_waiting()?;
+        if diag {
+            eprintln!(
+                "[STEP-DIAG] post-admit: active={} waiting={}",
+                self.active.len(),
+                self.waiting.len()
+            );
+        }
         let mut plan = self.build_forward_plan();
         self.apply_step_budget(&mut plan, budget);
         if plan.is_idle() {
+            if diag {
+                eprintln!(
+                    "[STEP-DIAG] plan idle after build (active={})",
+                    self.active.len()
+                );
+            }
             return Ok(());
         }
 
@@ -621,6 +658,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         self.allocate_for_plan(&plan)?;
         log::trace!("infer-core submit plan: mode={:?}", plan.mode);
+        if diag {
+            eprintln!("[STEP-DIAG] SUBMIT plan mode={:?}", plan.mode);
+        }
         self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
         self.pending_plan = Some(plan);
         Ok(())
