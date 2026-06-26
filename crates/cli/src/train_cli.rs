@@ -1833,6 +1833,30 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     Ok(())
 }
 
+/// Log device VRAM `(used / free / total MiB)` at an agent-OPD milestone when
+/// `ARLE_OPD_VRAM_TRACE` is set (default off — zero overhead on the hot path).
+/// Attributes the resident-floor + writeback transient breakdown without
+/// `nvidia-smi`. Uses the train backend's bound CUDA context (the single-GPU
+/// agent-OPD device), so `device_mem_info` reflects the whole-process resident.
+#[cfg(feature = "cuda")]
+fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
+    if std::env::var("ARLE_OPD_VRAM_TRACE").is_err() {
+        return;
+    }
+    match backend.device_mem_info() {
+        Some((free, total)) => {
+            let used = total.saturating_sub(free);
+            eprintln!(
+                "[opd-vram] {label}: used={}MiB free={}MiB total={}MiB",
+                used >> 20,
+                free >> 20,
+                total >> 20,
+            );
+        }
+        None => eprintln!("[opd-vram] {label}: device_mem_info unavailable"),
+    }
+}
+
 /// Agent-OPD RFT loop: the student drives the read/write/replace/bash tool loop
 /// against a per-task repo sandbox (SWE-bench-Pro); the reward is EXECUTION (the
 /// hidden tests are run on `git diff`), no text judge is loaded; passing
@@ -1951,6 +1975,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         },
     )
     .with_context(|| format!("load rollout engine from {}", student_dir.display()))?;
+    log_opd_vram(
+        "after rollout engine load (KV pool alloc'd)",
+        &train_backend,
+    );
 
     // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
     // engine's resident FP8 base pointers and pass them into the autograd student
@@ -2032,6 +2060,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         train_backend.clone(),
         vocab,
     );
+    log_opd_vram(
+        "after autograd student load (resident floor)",
+        &train_backend,
+    );
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
 
@@ -2052,6 +2084,17 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             "[synthetic-writeback] seq={n} prompt_len={prompt_len} response_len={} (all masked)",
             response_ids.len()
         );
+        log_opd_vram("synthetic-writeback pre-release", &train_backend);
+        // Mirror the real round closure: release BOTH the inference scratch and
+        // the (dead) rollout KV pool before the masked-CE writeback, so the
+        // diagnostic reproduces the real writeback's resident floor.
+        if let Err(err) = infer_student.release_inference_scratch() {
+            eprintln!("[synthetic-writeback] release inference scratch failed: {err}");
+        }
+        if let Err(err) = infer_student.release_kv_pool() {
+            eprintln!("[synthetic-writeback] release KV pool failed: {err}");
+        }
+        log_opd_vram("synthetic-writeback pre-writeback", &train_backend);
         let started = std::time::Instant::now();
         let loss = masked_writeback_ce_step(
             &student,
@@ -2065,6 +2108,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             args.writeback_window,
             &mut store,
         )?;
+        log_opd_vram("synthetic-writeback post-writeback", &train_backend);
         eprintln!(
             "[synthetic-writeback] DONE loss={loss:.6} elapsed={:?}",
             started.elapsed()
@@ -2101,6 +2145,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     };
 
     for round in 0..args.rounds {
+        // Re-acquire the rollout KV pool the PREVIOUS round's writeback closure
+        // dropped (no-op on round 0 / when the pool is resident). The rollout
+        // below needs it; the writeback frees it again at the end of the round.
+        if let Err(err) = infer_student.ensure_kv_pool() {
+            eprintln!("[agent-opd] ensure KV pool (round {round}) failed: {err}");
+        }
         // Fresh closures each round so the &mut store / &mut optimizer borrows
         // are released before the per-round checkpoint reuses the store.
         let report = {
@@ -2127,6 +2177,20 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     } else {
                         eprintln!("[agent-opd] released inference scratch");
                     }
+                    // Free the DEAD rollout KV pool: the writeback's
+                    // `forward_hidden_states` is a fresh autograd forward that does
+                    // NOT read this engine's KV cache, so the rollout pool is idle
+                    // during the writeback. Dropping it (~KV-pool GB) is the
+                    // headroom that lets the ~16-24K writeback forward fit. The
+                    // round's rollout has synced before the closure runs, so the
+                    // pool holds no resident pages; `ensure_kv_pool` re-acquires it
+                    // at the top of the next round.
+                    if let Err(err) = infer_student.release_kv_pool() {
+                        eprintln!("[agent-opd] release KV pool failed: {err}");
+                    } else {
+                        eprintln!("[agent-opd] released rollout KV pool");
+                    }
+                    log_opd_vram("agent-opd pre-writeback", &train_backend);
                     let writeback_result = masked_writeback_ce_step(
                         student_ref,
                         all_ref,
@@ -2154,6 +2218,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             report.trained_pairs,
             report.mean_train_loss
         );
+        log_opd_vram(&format!("after round {round} writeback"), &train_backend);
 
         // Sync the trained LoRA into the rollout engine (always): the next round
         // needs this round's improved student. Round 0 sampled from base.

@@ -260,13 +260,26 @@ const ATTN_HEAD_CHUNK: usize = 8;
 const CKPT_GROUP_MAX: usize = 8;
 
 /// Adaptive checkpoint group size: bound a group's live forward activations to
-/// ~8 GiB. Per-layer activation ≈ `seq × (hidden + 3×intermediate) × 4B` (MLP
-/// gate/up/act dominate); a group holds `group_size ×` that until saved.
+/// ~8 GiB. The per-layer peak is dominated by the ATTENTION transient at long
+/// seq — head-chunked SDPA holds `chunk×seq²` scores plus the same again for
+/// softmax (capped ~6 GiB/term by `head_chunked_sdpa_recompute`), and the linear
+/// attention layers carry comparable chunk-state buffers — NOT the MLP
+/// `seq×(hidden+3×intermediate)` term the original formula used (it under-counted
+/// the seq=16000 peak ~6×: measured +43 GiB for a 2-layer group vs the formula's
+/// ~7 GiB, so it returned group_size=2 and OOMed). Model the peak as the MLP term
+/// PLUS the ~12 GiB attention transient floor (scores+softmax, both head-chunked);
+/// at seq≳8000 this drives group_size→1 so a single layer's recompute fits on top
+/// of the post-release floor. A group holds `group_size ×` this until saved.
 fn ckpt_group_size(seq_len: usize, hidden: usize, intermediate: usize) -> usize {
-    let per_layer = seq_len
+    // MLP gate/up/act activations.
+    let mlp = seq_len
         .saturating_mul(hidden + 3 * intermediate)
-        .saturating_mul(4)
-        .max(1);
+        .saturating_mul(4);
+    // Head-chunked SDPA scores + softmax, each capped ~6 GiB by the chunker, plus
+    // linear-attention chunk state of the same order — a ~12 GiB attention floor
+    // that the MLP-only estimate ignored.
+    let attn_floor = 12usize << 30;
+    let per_layer = mlp.saturating_add(attn_floor).max(1);
     ((8usize << 30) / per_layer).clamp(1, CKPT_GROUP_MAX)
 }
 
@@ -286,25 +299,46 @@ fn head_chunked_sdpa_recompute(
         .shape
         .clone();
     let (batch, heads, seq, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
-    // Adaptive: bound the [chunk, seq, seq] scores transient to ~6 GiB so long
-    // writeback sequences don't OOM (8 heads at 32K = 34 GB); short sequences
-    // keep the caller's chunk. `seq*seq*4` bytes per head.
+    // Adaptive: bound the per-chunk transient to ~8 GiB so long writeback
+    // sequences don't OOM. `causal_sdpa` holds ~4 simultaneous `[chunk, seq, seq]`
+    // buffers (scores, scaled, masked, probs), so the live cost is `4×chunk×seq²×4B`
+    // — the OLD budget counted only ONE buffer (`seq²×4`), under-bounding the peak
+    // 4× and (combined with the per-chunk transients piling up across the loop)
+    // OOMing at seq=16000. Budget the full 4-buffer footprint. `seq*seq*4` per head.
     let per_head = seq.saturating_mul(seq).saturating_mul(4).max(1);
-    let chunk = chunk.min((6usize << 30) / per_head).max(1);
+    let chunk = chunk
+        .min((8usize << 30) / per_head.saturating_mul(4))
+        .max(1);
     if chunk >= heads {
         return Ok(causal_sdpa_recompute(q, k, v, store, tape)?);
     }
 
+    // When `tape` is disabled (the recompute runs INSIDE a checkpoint group's
+    // forward) the per-chunk SDPA intermediates — `scores`/`scaled`/`masked`/
+    // `probs`, 4×`[chunk, seq, seq]` ≈ 20 GiB at seq=16000 — have no backward
+    // dependency, but nothing frees them until the checkpoint group boundary, so
+    // they PILE UP across the head-chunk loop (5 chunks → ~100 GiB → OOM). Free
+    // each chunk's transients before the next iteration, keeping only its output.
+    // Tape-on (eager / backward replay) keeps the old behavior: the intermediates
+    // are tape-referenced and must survive, so the per-chunk free is skipped.
+    let free_chunk_transients = !tape.enabled;
     let mut chunks: Vec<TensorId> = Vec::new();
     let mut h0 = 0usize;
     while h0 < heads {
         let h1 = (h0 + chunk).min(heads);
+        let live_before = free_chunk_transients
+            .then(|| store.live_ids().into_iter().collect::<HashSet<TensorId>>());
         let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
         let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
         let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-        chunks.push(causal_sdpa_recompute(
-            q_chunk, k_chunk, v_chunk, store, tape,
-        )?);
+        let out = causal_sdpa_recompute(q_chunk, k_chunk, v_chunk, store, tape)?;
+        if let Some(live_before) = live_before {
+            // Keep only this chunk's output; free scores/scaled/masked/probs and
+            // the q/k/v slices created since `live_before`.
+            let keep = HashSet::from([out]);
+            store.free_new_except(&live_before, &keep)?;
+        }
+        chunks.push(out);
         h0 = h1;
     }
     Ok(cat_heads(&chunks, store, tape)?)
@@ -5959,6 +5993,7 @@ mod tests {
         for chunk in [4usize, 2, 1] {
             let mut tape = Tape::new();
             tape.set_enabled(false);
+            let live_before = store.live_tensor_count();
             let out = super::head_chunked_sdpa_recompute(q, k, v, chunk, &mut store, &mut tape)?;
             let got = store.to_host(out)?;
             let max_abs = reference
@@ -5971,6 +6006,23 @@ mod tests {
                 max_abs < 1e-4,
                 "chunk={chunk} diverged from unchunked: max_abs={max_abs:.3e}"
             );
+            // Tape-disabled (recompute / checkpoint-forward) path must FREE each
+            // chunk's scores/scaled/masked/probs transients before the next chunk
+            // — the writeback-OOM fix. Without it, the per-chunk `[chunk,seq,seq]`
+            // buffers pile up across the head loop (~100 GiB at seq=16000). When
+            // the loop actually runs (chunk < HEADS) only the chunk outputs + cat
+            // result survive, so net live growth is bounded and INDEPENDENT of the
+            // chunk count (it would scale with `heads/chunk` if the transients
+            // leaked). (chunk >= HEADS early-returns the unchunked path — no loop.)
+            if chunk < HEADS {
+                let grew = store.live_tensor_count() - live_before;
+                let n_chunks = HEADS.div_ceil(chunk);
+                assert!(
+                    grew <= n_chunks + 4,
+                    "chunk={chunk}: {grew} tensors live (>{}); per-chunk SDPA transients not freed",
+                    n_chunks + 4
+                );
+            }
         }
         Ok(())
     }

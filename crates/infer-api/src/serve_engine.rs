@@ -57,6 +57,20 @@ where
         self.serve.release_inference_scratch()
     }
 
+    /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
+    /// headroom: the writeback's fresh autograd forward never reads this engine's
+    /// KV). Threads to the backend executor on the engine thread via the
+    /// [`ServeHandle`] control channel.
+    pub fn release_kv_pool(&self) -> Result<()> {
+        self.serve.release_kv_pool()
+    }
+
+    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
+    /// rollout. Threads to the backend executor on the engine thread.
+    pub fn ensure_kv_pool(&self) -> Result<()> {
+        self.serve.ensure_kv_pool()
+    }
+
     /// Generate token ids from an already-tokenized prompt through the serving
     /// scheduler. This is the programmatic OPD rollout surface: unlike
     /// `forward_token_logits`, it keeps one request alive in infer-core, so the

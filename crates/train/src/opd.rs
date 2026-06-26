@@ -2949,6 +2949,27 @@ fn build_masked_loss_targets(
 /// `--share-frozen-base` the head is frozen/tied so only `d_hidden` flows. The
 /// returned scalar is the mean CE per masked (LLM-generated) token.
 #[allow(clippy::too_many_arguments)]
+/// Log device VRAM at a writeback milestone when `ARLE_OPD_VRAM_TRACE` is set
+/// (default off). Brackets the `forward_hidden_states` peak to attribute the
+/// writeback's forward-activation transient (the ~34 GB term).
+fn log_writeback_vram(store: &TensorStore, label: &str) {
+    if std::env::var("ARLE_OPD_VRAM_TRACE").is_err() {
+        return;
+    }
+    match store.backend().device_mem_info() {
+        Some((free, total)) => {
+            let used = total.saturating_sub(free);
+            eprintln!(
+                "[opd-vram] masked-writeback {label}: used={}MiB free={}MiB total={}MiB",
+                used >> 20,
+                free >> 20,
+                total >> 20,
+            );
+        }
+        None => eprintln!("[opd-vram] masked-writeback {label}: device_mem_info unavailable"),
+    }
+}
+
 pub fn masked_writeback_ce_step<O: Optimizer>(
     student: &Qwen35Model,
     all_model_params: &[TensorId],
@@ -3027,9 +3048,11 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
 
     // ONE checkpointed forward over prompt++response → [1, seq, hidden]. No
     // per-window re-forward of the growing prefix (was O(N²)).
+    log_writeback_vram(store, "pre forward_hidden_states");
     let hidden = student
         .forward_hidden_states(store, &mut tape, &full, &positions)
         .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?;
+    log_writeback_vram(store, "post forward_hidden_states");
 
     // Chunked fused CE: per chunk computes hidden_chunk @ lm_headᵀ → logits → CE
     // → gradient, freeing each chunk. Never materializes [seq, vocab]. The loss

@@ -740,6 +740,22 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Real(real) => real.release_inference_scratch(),
         }
     }
+
+    fn release_kv_pool(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => Ok(()),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.release_kv_pool(),
+        }
+    }
+
+    fn ensure_kv_pool(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => Ok(()),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.ensure_kv_pool(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -537,6 +537,19 @@ where
         self.run_on_executor(|executor| executor.release_inference_scratch())?
     }
 
+    /// Drop the engine's KV pool WITHOUT offloading weights (OPD writeback
+    /// headroom). Runs on the engine thread via the control seam, so it never
+    /// races an in-flight forward. Blocks until the round-trip completes.
+    pub fn release_kv_pool(&self) -> Result<()> {
+        self.run_on_executor(|executor| executor.release_kv_pool())?
+    }
+
+    /// Re-acquire the engine's KV pool before the next rollout (after
+    /// [`Self::release_kv_pool`]). Runs on the engine thread; blocks until done.
+    pub fn ensure_kv_pool(&self) -> Result<()> {
+        self.run_on_executor(|executor| executor.ensure_kv_pool())?
+    }
+
     /// Close the submit channel and join the engine thread.
     ///
     /// The engine drains its in-flight and waiting work to completion before the
