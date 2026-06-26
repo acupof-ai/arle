@@ -994,6 +994,7 @@ impl QwenCudaExecutor {
     /// device pages (`(key, page)`), complete on return. Identical transport to
     /// `promote_prefix_pages`; the difference is the entry point
     /// (relevance-prefetch at prefill vs prefix-hit promote), per R5.
+    #[allow(dead_code)] // WIP: R5 relevance-prefetch entry point, not yet wired
     pub(crate) fn prefetch_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
         self.promote_prefix_pages(entries)
     }

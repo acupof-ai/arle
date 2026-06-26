@@ -408,7 +408,7 @@ impl Qwen35SlotImage {
     /// than restore garbage.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut pos = 0usize;
-        let mut take_u64 = |pos: &mut usize| -> Result<u64> {
+        let take_u64 = |pos: &mut usize| -> Result<u64> {
             let end = pos
                 .checked_add(8)
                 .ok_or_else(|| anyhow!("slot image header overflow"))?;
@@ -1486,6 +1486,7 @@ pub(crate) struct Qwen35Model {
     /// file names + lengths + mtimes). Stamps the durable KV-recall manifest so
     /// a restart after an OPD weight update (which rewrites the checkpoint, so
     /// the mtimes/lengths shift) discards the now-stale recalled KV.
+    #[allow(dead_code)] // WIP: durable KV-recall manifest weight-version stamp, not yet wired
     weights_epoch: String,
 }
 
@@ -2490,6 +2491,7 @@ impl Qwen35Model {
 
     /// Cheap model/weights-version tag for the durable KV-recall manifest. See
     /// the `weights_epoch` field.
+    #[allow(dead_code)] // WIP: paired with the durable KV-recall manifest stamp
     pub(crate) fn weights_epoch(&self) -> &str {
         &self.weights_epoch
     }
