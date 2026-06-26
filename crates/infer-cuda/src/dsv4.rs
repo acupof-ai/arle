@@ -2340,6 +2340,10 @@ impl Dsv4Model {
         // disabled-event-tracking premature-free hazard). Only pushed when
         // `full_flatten` is on.
         let mut ptr_keepalive: Vec<CudaSlice<u64>> = Vec::new();
+        // Op "c" batched pack: the per-slot device page tables feeding the batched
+        // pack's pointer array. Held to function return (same premature-free guard
+        // as `ptr_keepalive`; the inert N>1 `keep_i32` would not retain them).
+        let mut pack_pt_keepalive: Vec<CudaSlice<i32>> = Vec::new();
 
         // Decode-phase timing accumulators (only ever touched when phase_time).
         let (mut csa_ms, mut sw_ms, mut moe_ms) = (0f64, 0f64, 0f64);
@@ -2750,6 +2754,30 @@ impl Dsv4Model {
                 };
                 {
                     let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched_prepare");
+                    // Op "c" batched KV pack (MODEL1 only): when `pack_batched` is on,
+                    // the per-row pack's SW one-token + compressed-delta launches are
+                    // HOISTED out of this loop into ONE batched launch each after it
+                    // (the SW-ring BOOTSTRAP stays per-row — once per slot). Gather
+                    // each row's k_prepared NoPE/RoPE base, compressor `compressed`
+                    // base (0 = no-op for no-compressor rows), and per-slot device
+                    // page table here; the table CudaSlices live in `pack_page_tables`
+                    // to outlive the post-loop launch. V32 (head_dim==576) and
+                    // SparseIndexed (!full_flatten) keep the per-row pack byte-for-byte.
+                    let pack_batched = full_flatten && self.config.head_dim != 576;
+                    let mut pack_nope_ptrs: Vec<u64> = Vec::new();
+                    let mut pack_rope_ptrs: Vec<u64> = Vec::new();
+                    let mut pack_compressed_ptrs: Vec<u64> = Vec::new();
+                    let mut pack_pt_ptrs: Vec<u64> = Vec::new();
+                    let mut pack_page_tables: Vec<CudaSlice<i32>> = Vec::new();
+                    let mut pack_sw_blocks: usize = 0;
+                    let mut pack_num_logical_pages: usize = 0;
+                    if pack_batched {
+                        pack_nope_ptrs.reserve(n);
+                        pack_rope_ptrs.reserve(n);
+                        pack_compressed_ptrs.reserve(n);
+                        pack_pt_ptrs.reserve(n);
+                        pack_page_tables.reserve(n);
+                    }
                     for r in 0..n {
                         let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
                         ctx.stream
@@ -2946,18 +2974,60 @@ impl Dsv4Model {
                         // batch scratch are disjoint (slots vs kv_adapter fields).
                         let (flash, sw_window, compressed) =
                             slot.attention[layer_idx].flashmla_pack_borrow(want_compressed)?;
-                        crate::attention::flashmla_decode_pack_row(
-                            &self.ctx,
-                            &self.config,
-                            layer.compress_ratio,
-                            flash,
-                            flashmla_scratch,
-                            layer_pool,
-                            sw_window,
-                            &row_prepared.k_prepared,
-                            compressed,
-                            &slot.start_pos_device,
-                        )?;
+                        if pack_batched {
+                            // Op "c": run the once-per-slot SW-ring BOOTSTRAP here
+                            // (no-op after the first decode); gather this row's pack
+                            // pointers + per-slot device page table for the ONE
+                            // batched SW+compressed pack issued after the loop.
+                            crate::attention::flashmla_pack_sw_ring(
+                                &self.ctx,
+                                flash,
+                                flashmla_scratch,
+                                layer_pool,
+                                sw_window,
+                                &self.config,
+                            )?;
+                            let slot_idx = flash.slot_idx();
+                            pack_sw_blocks = flash.sw_blocks();
+                            let (nope_ptr, ng) =
+                                row_prepared.k_prepared.data.device_ptr(&self.ctx.stream);
+                            pack_nope_ptrs.push(nope_ptr);
+                            pack_rope_ptrs.push(
+                                nope_ptr
+                                    + crate::attention::flashmla_pack_rope_offset_bytes(
+                                        &self.config,
+                                    ),
+                            );
+                            drop(ng);
+                            match compressed {
+                                Some(c) => {
+                                    let (cp, cg) = c.data.device_ptr(&self.ctx.stream);
+                                    pack_compressed_ptrs.push(cp);
+                                    drop(cg);
+                                }
+                                None => pack_compressed_ptrs.push(0),
+                            }
+                            let page_table =
+                                layer_pool.flashmla_device_page_table(&self.ctx, slot_idx)?;
+                            pack_num_logical_pages = page_table.len();
+                            let (pt, pg) = page_table.device_ptr(&self.ctx.stream);
+                            pack_pt_ptrs.push(pt);
+                            drop(pg);
+                            pack_page_tables.push(page_table);
+                        } else {
+                            crate::attention::flashmla_decode_pack_row(
+                                &self.ctx,
+                                &self.config,
+                                layer.compress_ratio,
+                                flash,
+                                flashmla_scratch,
+                                layer_pool,
+                                sw_window,
+                                &row_prepared.k_prepared,
+                                compressed,
+                                &slot.start_pos_device,
+                            )?;
+                        }
                         flash_batch.gather_q_row(
                             &self.ctx,
                             &self.config,
@@ -3000,6 +3070,50 @@ impl Dsv4Model {
                             keepalive.keep_i32(sel);
                         }
                         prepared.push(row_prepared);
+                    }
+                    // Op "c": ONE batched SW one-token + compressed-delta pack over
+                    // all N rows, replacing the 2×N per-row launches above. Issued
+                    // here (after the prepare loop's per-row gathers, before
+                    // build_layer_batch_meta / the batched fwd read the pool). The
+                    // per-slot device page tables (`pack_page_tables`) and the
+                    // uploaded ptr arrays are kept alive past the launch via
+                    // `ptr_keepalive` / `keepalive` (premature-free guard).
+                    if pack_batched && n > 0 {
+                        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_batched");
+                        let pool_ptr = {
+                            let (layer_pool, _dsa, _flash_batch, _flashmla_scratch, _prefill) =
+                                kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                            layer_pool.flashmla_pool_base_ptr(&self.ctx)?
+                        };
+                        let positions = batched_positions.as_ref().ok_or_else(|| {
+                            anyhow!("DSv4 op-c batched pack: batched positions missing")
+                        })?;
+                        let nope_arr = crate::ops::upload_u64(&self.ctx, &pack_nope_ptrs)?;
+                        let rope_arr = crate::ops::upload_u64(&self.ctx, &pack_rope_ptrs)?;
+                        let compressed_arr =
+                            crate::ops::upload_u64(&self.ctx, &pack_compressed_ptrs)?;
+                        let pt_arr = crate::ops::upload_u64(&self.ctx, &pack_pt_ptrs)?;
+                        crate::attention::flashmla_decode_pack_batched(
+                            &self.ctx,
+                            &self.config,
+                            layer.compress_ratio,
+                            pack_sw_blocks,
+                            n,
+                            pool_ptr,
+                            &nope_arr,
+                            &rope_arr,
+                            &compressed_arr,
+                            positions,
+                            &pt_arr,
+                            pack_num_logical_pages,
+                        )?;
+                        ptr_keepalive.push(nope_arr);
+                        ptr_keepalive.push(rope_arr);
+                        ptr_keepalive.push(compressed_arr);
+                        ptr_keepalive.push(pt_arr);
+                        // The per-slot device page-table buffers feed the launch's
+                        // pointer array; hold them to function return.
+                        pack_pt_keepalive.append(&mut pack_page_tables);
                     }
                 }
                 if let Some(t) = _compidx_t {

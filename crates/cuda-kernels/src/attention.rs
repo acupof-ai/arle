@@ -306,6 +306,101 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
     Ok(())
 }
 
+/// Batched (b=N) MODEL1 SW one-token pack: ONE launch over `n` decode rows. The
+/// pointer-array form of [`dsv4_fp8_kv_pack_strided_raw`] for the batched decode
+/// lane — `nope_arr`/`rope_arr` hold N device pointers (each = a row's
+/// `k_prepared` NoPE / RoPE base), `page_table_arr` holds N per-slot device
+/// page-table pointers, `start_pos` is the contiguous `[N]` decode positions,
+/// `packed_kv_ptr` is the single shared pool base. Ring slot + page-table route
+/// are computed on device from `start_pos[row]` (graph-replay safe). n=1 with the
+/// singleton arrays is byte-identical to the per-row fill + strided pack.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_fp8_kv_pack_strided_batched_raw(
+    ctx: &DeviceContext,
+    nope_arr: &CudaSlice<u64>,
+    rope_arr: &CudaSlice<u64>,
+    packed_kv_ptr: u64,
+    start_pos: &CudaSlice<i32>,
+    n: usize,
+    page_block_size: usize,
+    sliding_window: usize,
+    stride_nope_elems: usize,
+    stride_rope_elems: usize,
+    page_table_arr: &CudaSlice<u64>,
+    num_logical_pages: usize,
+) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let (nope_a, _gn) = nope_arr.device_ptr(&ctx.stream);
+    let (rope_a, _gr) = rope_arr.device_ptr(&ctx.stream);
+    let (start_a, _gs) = start_pos.device_ptr(&ctx.stream);
+    let (pt_a, _gp) = page_table_arr.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_strided_batched_cuda(
+            nope_a as *const *const ffi::Half,
+            rope_a as *const *const ffi::Half,
+            packed_kv_ptr as *mut u8,
+            start_a as *const i32,
+            n as i32,
+            page_block_size as i32,
+            sliding_window as i32,
+            stride_nope_elems as i32,
+            stride_rope_elems as i32,
+            pt_a as *const *const i32,
+            num_logical_pages as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Batched (b=N) MODEL1 compressed-delta pack: ONE launch over `n` decode rows.
+/// The pointer-array form of
+/// [`dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw`] — `compressed_arr`
+/// holds N device pointers (a row's compressor `compressed` base, or `0`/null for
+/// rows with no compressor → kernel no-op). Each row early-outs on
+/// `(pos+1)%ratio != 0`. n=1 byte-identical to the per-row compressed pack.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
+    ctx: &DeviceContext,
+    compressed_arr: &CudaSlice<u64>,
+    packed_kv_ptr: u64,
+    start_pos: &CudaSlice<i32>,
+    n: usize,
+    ratio: usize,
+    sw_blocks: usize,
+    page_block_size: usize,
+    stride_elems: usize,
+    page_table_arr: &CudaSlice<u64>,
+    num_logical_pages: usize,
+) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let (comp_a, _gc) = compressed_arr.device_ptr(&ctx.stream);
+    let (start_a, _gs) = start_pos.device_ptr(&ctx.stream);
+    let (pt_a, _gp) = page_table_arr.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::arle_dsv4_fp8_kv_pack_completed_compressor_row_batched_cuda(
+            comp_a as *const *const ffi::Half,
+            packed_kv_ptr as *mut u8,
+            start_a as *const i32,
+            n as i32,
+            ratio as i32,
+            sw_blocks as i32,
+            page_block_size as i32,
+            stride_elems as i32,
+            pt_a as *const *const i32,
+            num_logical_pages as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Phase D-4 step 1 — DSv4 FlashMLA sparse-decode indices builder.
 ///
 /// Builds the unified per-decode-token indices row in block-paged coords

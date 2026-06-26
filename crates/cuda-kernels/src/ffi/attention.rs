@@ -476,6 +476,48 @@ unsafe extern "C" {
         num_logical_pages: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Batched (b=N) MODEL1 SW one-token pack: ONE launch over `n` decode rows,
+    /// each writing its CURRENT token into its own SW ring slot. `nope_arr` /
+    /// `rope_arr` are N device pointers (each = that row's `k_prepared` NoPE /
+    /// RoPE base); `page_table_arr` is N per-slot device page-table pointers
+    /// (each `num_logical_pages` long, `null` = Stage-A band); `packed_kv` is the
+    /// single shared pool base. n=1 is byte-identical to the per-row fill +
+    /// `arle_dsv4_fp8_kv_pack_strided_cuda(n_tokens=1)`.
+    pub fn arle_dsv4_fp8_kv_pack_strided_batched_cuda(
+        nope_arr: *const *const Half,
+        rope_arr: *const *const Half,
+        packed_kv: *mut u8,
+        start_pos: *const i32,
+        n: i32,
+        page_block_size: i32,
+        sliding_window: i32,
+        stride_nope_elems: i32,
+        stride_rope_elems: i32,
+        page_table_arr: *const *const i32,
+        num_logical_pages: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Batched (b=N) MODEL1 compressed-delta pack: ONE launch over `n` decode
+    /// rows. `compressed_arr[row]` is that row's compressor `compressed` base
+    /// (`null` for rows with no compressor → no-op); each row early-outs on
+    /// `(pos+1)%ratio != 0`. `page_table_arr` is N per-slot device page-table
+    /// pointers. n=1 is byte-identical to
+    /// `arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda`.
+    pub fn arle_dsv4_fp8_kv_pack_completed_compressor_row_batched_cuda(
+        compressed_arr: *const *const Half,
+        packed_kv: *mut u8,
+        start_pos: *const i32,
+        n: i32,
+        ratio: i32,
+        sw_blocks: i32,
+        page_block_size: i32,
+        stride_elems: i32,
+        page_table_arr: *const *const i32,
+        num_logical_pages: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 // ============================================================================
