@@ -3612,6 +3612,13 @@ impl Dsv4DsaOfficialImage {
 }
 
 impl Dsv4LayerAttentionState {
+    /// This layer-state's indexer compressed-key row count (`compressed.seq_len`),
+    /// or `None` if the layer has no indexer. Used by the batched P1b cache-write
+    /// pre-pass to read `indexer_rows_after` (P1a already advanced it).
+    pub(crate) fn indexer_compressed_seq_len(&self) -> Option<usize> {
+        self.indexer.as_ref().map(|s| s.compressed.seq_len)
+    }
+
     /// PHASE B (#60) split borrow for the batched decode pack loop: this slot's
     /// FlashMLA decode arena (`&mut`), the bf16 SW ring (`&`), and — for HCA —
     /// the compressed-key pool (`&`, disjoint field, `None` for SW). Errors if
@@ -11827,6 +11834,304 @@ impl Dsv4CompressorBatchPtrs {
     }
 }
 
+/// Host-gathered per-slot device arrays for the batched DSA cache-write (block
+/// (a) of [`csa_select_official`]): the Hadamard rotate of each slot's
+/// newly-packed index-key rows + the FP8 fused-store into each slot's cache
+/// band. Each `Vec` holds one entry per row (push exactly one per slot via
+/// [`dsv4_dsa_cache_write_gather_row`]); the `u64` ptr arrays + `i32` offset/count
+/// arrays are uploaded by [`dsv4_dsa_cache_write_batched`]. The READ side
+/// ([`csa_select_official_batched`]) is unaffected — it reads the populated cache.
+#[derive(Default)]
+pub(crate) struct Dsv4DsaCacheWriteBatchPtrs {
+    keys_src: Vec<u64>, // per-slot staging-ring base (state.indexer.compressed.data)
+    rotated_dst: Vec<u64>, // per-slot rotated_keys base (offset 0; hadamard DEST, + (dst_row+r)*ihd)
+    rotated_src: Vec<u64>, // per-slot rotated_keys PRE-OFFSET base = rotated_dst + dst_row*ihd (fused-store SRC, reads row r from 0)
+    cache_band: Vec<u64>,  // per-slot dsa cache band base (pool.dsa_slot_range)
+    cache_locs: Vec<u64>,  // per-slot cache_locs slice base (shared.cache_locs + packed_rows)
+    src_ring_row: Vec<i32>, // per-slot packed_rows - keys_window_base
+    dst_row: Vec<i32>,     // per-slot packed_rows (absolute)
+    newly_packed: Vec<i32>, // per-slot row count (0 => slot skipped by the kernel guard)
+}
+
+impl Dsv4DsaCacheWriteBatchPtrs {
+    pub(crate) fn with_capacity(n: usize) -> Self {
+        Self {
+            keys_src: Vec::with_capacity(n),
+            rotated_dst: Vec::with_capacity(n),
+            rotated_src: Vec::with_capacity(n),
+            cache_band: Vec::with_capacity(n),
+            cache_locs: Vec::with_capacity(n),
+            src_ring_row: Vec::with_capacity(n),
+            dst_row: Vec::with_capacity(n),
+            newly_packed: Vec::with_capacity(n),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys_src.len()
+    }
+}
+
+/// Gather one slot's DSA cache-write inputs into `ptrs` and ADVANCE this slot's
+/// `official.packed_rows` to `indexer_rows_after` — the host half of block (a)
+/// of [`csa_select_official`], hoisted into the P1b batched pre-pass. Re-asserts
+/// the same preflight invariants block (a) does (rotated_keys length, packed_rows
+/// vs indexer rows, the staging-ring straddle, the drain-immediate window-base
+/// invariant, the cache-band range). `keys_window_base` is `0` for the
+/// full-retention CompressedSparse compressor-indexer (P1b is gated to that). A
+/// slot with `newly_packed == 0` pushes a clean skip-entry (the kernel guard
+/// early-returns) and leaves `packed_rows` unchanged. Mirrors the per-row block
+/// (a) at [`csa_select_official`] exactly, so the batched launch is byte-identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsv4_dsa_cache_write_gather_row(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    state: &mut Dsv4LayerAttentionState,
+    pool: &mut Dsv4LayerKvLayout,
+    shared: &Dsv4DsaSharedScratch,
+    indexer_rows_before: usize,
+    indexer_rows_after: usize,
+    keys_window_base: usize,
+    ptrs: &mut Dsv4DsaCacheWriteBatchPtrs,
+) -> Result<()> {
+    let ihd = config.index_head_dim;
+    // The staging-ring source `keys` is the indexer's `compressed` HiddenStates.
+    let keys_len = state
+        .indexer
+        .as_ref()
+        .map(|s| s.compressed.data.len())
+        .ok_or_else(|| anyhow!("DSv4 batched DSA cache-write requires indexer state"))?;
+    let official = state
+        .dsa_official
+        .as_mut()
+        .ok_or_else(|| anyhow!("DSv4 batched DSA cache-write requires official per-slot state"))?;
+    ensure!(
+        official.rotated_keys.len() == shared.compressed_capacity * shared.head_dim,
+        "DSv4 batched DSA rotated_keys len {} mismatches shared scratch capacity {}x{}",
+        official.rotated_keys.len(),
+        shared.compressed_capacity,
+        shared.head_dim
+    );
+    ensure!(
+        indexer_rows_after <= shared.compressed_capacity
+            && indexer_rows_before <= indexer_rows_after,
+        "DSv4 batched DSA key rows before={indexer_rows_before} after={indexer_rows_after} \
+         capacity={}",
+        shared.compressed_capacity
+    );
+    let newly_packed = indexer_rows_after.saturating_sub(official.packed_rows);
+    if newly_packed == 0 {
+        // Clean skip-entry: keep array lengths == n, kernel guard early-returns,
+        // packed_rows unchanged (== indexer_rows_after when newly_packed==0).
+        ptrs.keys_src.push(0);
+        ptrs.rotated_dst.push(0);
+        ptrs.rotated_src.push(0);
+        ptrs.cache_band.push(0);
+        ptrs.cache_locs.push(0);
+        ptrs.src_ring_row.push(0);
+        ptrs.dst_row.push(0);
+        ptrs.newly_packed.push(0);
+        return Ok(());
+    }
+    ensure!(
+        official.packed_rows <= indexer_rows_before,
+        "DSv4 batched DSA packed rows {} ahead of indexer rows before {indexer_rows_before}",
+        official.packed_rows
+    );
+    let keys_ring_rows = keys_len / ihd;
+    ensure!(
+        official.packed_rows >= keys_window_base,
+        "DSv4 batched DSA packed_rows {} precedes keys window base {keys_window_base} \
+         (drain-immediate invariant violated)",
+        official.packed_rows
+    );
+    let src_ring_row = official.packed_rows - keys_window_base;
+    ensure!(
+        src_ring_row + newly_packed <= keys_ring_rows,
+        "DSv4 batched DSA index-key delta straddles staging ring: ring_off {src_ring_row} \
+         + newly_packed {newly_packed} > ring_rows {keys_ring_rows} (packed_rows {} base {keys_window_base})",
+        official.packed_rows
+    );
+    let dst_row = official.packed_rows;
+    // Cache band base for this slot (bands disjoint by slot_idx).
+    let cache_range = pool.dsa_slot_range(official.slot_idx)?;
+    let cache_pool = pool
+        .dsa_key_cache
+        .as_mut()
+        .ok_or_else(|| anyhow!("DSv4 batched DSA shared key-cache missing"))?;
+    ensure!(
+        cache_range.end <= cache_pool.len() && cache_range.len() == official.key_cache_len,
+        "DSv4 batched DSA shared key-cache range {:?} invalid pool_len={} slot_len={}",
+        cache_range,
+        cache_pool.len(),
+        official.key_cache_len
+    );
+    // The raw u64 ptr stays valid after the guard drops — single-stream, buffer
+    // not reallocated; the launch later re-reads it via the uploaded array.
+    let cache_band_ptr = {
+        let mut cache_view = cache_pool.slice_mut(cache_range);
+        let (p, g) = cache_view.device_ptr_mut(&ctx.stream);
+        drop(g);
+        p
+    };
+    // keys_src base (offset 0; the kernel applies (src_ring_row + r) * ihd).
+    let keys_src_ptr = {
+        let keys = &state_indexer_compressed(state)?.data;
+        let (p, g) = keys.device_ptr(&ctx.stream);
+        drop(g);
+        p
+    };
+    let official = state
+        .dsa_official
+        .as_mut()
+        .ok_or_else(|| anyhow!("DSv4 batched DSA cache-write requires official per-slot state"))?;
+    // rotated_keys base (offset 0; the hadamard kernel applies (dst_row + r) * ihd).
+    let rotated_dst_ptr = {
+        let (p, g) = official.rotated_keys.device_ptr_mut(&ctx.stream);
+        drop(g);
+        p
+    };
+    // The fused-store reads rotated_keys at ABSOLUTE dst_offset (= dst_row*ihd),
+    // its per-warp body indexing rows 0..newly_packed — mirror the per-row block
+    // (a) which passes the `rotated.slice(dst_offset..)` view as the store source.
+    // bf16 = 2 bytes; dst_offset elems = dst_row * ihd.
+    let rotated_src_ptr = rotated_dst_ptr
+        + (dst_row as u64) * (ihd as u64) * (std::mem::size_of::<half::bf16>() as u64);
+    // cache_locs slice base at packed_rows (the kernel reads [tok] from here).
+    let cache_locs_ptr = {
+        let locs = shared.cache_locs.slice(official.packed_rows..);
+        let (p, g) = locs.device_ptr(&ctx.stream);
+        drop(g);
+        p
+    };
+
+    ptrs.keys_src.push(keys_src_ptr);
+    ptrs.rotated_dst.push(rotated_dst_ptr);
+    ptrs.rotated_src.push(rotated_src_ptr);
+    ptrs.cache_band.push(cache_band_ptr);
+    ptrs.cache_locs.push(cache_locs_ptr);
+    ptrs.src_ring_row.push(i32::try_from(src_ring_row)?);
+    ptrs.dst_row.push(i32::try_from(dst_row)?);
+    ptrs.newly_packed.push(i32::try_from(newly_packed)?);
+    official.packed_rows = indexer_rows_after;
+    Ok(())
+}
+
+/// Borrow this layer-state's indexer `compressed` HiddenStates (shared by the
+/// cache-write gather to resolve the staging-ring source ptr). Errors if the
+/// indexer state is absent.
+fn state_indexer_compressed(state: &Dsv4LayerAttentionState) -> Result<&HiddenStates> {
+    Ok(&state
+        .indexer
+        .as_ref()
+        .ok_or_else(|| anyhow!("DSv4 batched DSA cache-write requires indexer state"))?
+        .compressed)
+}
+
+/// Batched DSA cache-write (block (a) of [`csa_select_official`]): ONE
+/// `<<<dim3(.,n)>>>` Hadamard-rotate launch + ONE FP8 fused-store launch over all
+/// n slots, replacing the n per-row pairs. `ptrs` holds the host-gathered per-slot
+/// base ptrs / offsets / counts (built by [`dsv4_dsa_cache_write_gather_row`]).
+/// `max_rows` = max over slots of newly_packed (the x-grid bound; 0 => the
+/// launchers early-return). Uploads the seven arrays, launches both kernels on
+/// `ctx.stream`, then holds the uploaded arrays in `ptr_keepalive` (the N>1
+/// keepalive is inert, so explicit retention guards the disabled-event-tracking
+/// premature free until the next stream sync — same as the compressor wrapper).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsv4_dsa_cache_write_batched(
+    ctx: &DeviceContext,
+    n: usize,
+    ptrs: &Dsv4DsaCacheWriteBatchPtrs,
+    ptr_keepalive: &mut Vec<CudaSlice<u64>>,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    ensure!(
+        ptrs.len() == n
+            && ptrs.rotated_dst.len() == n
+            && ptrs.rotated_src.len() == n
+            && ptrs.cache_band.len() == n
+            && ptrs.cache_locs.len() == n
+            && ptrs.src_ring_row.len() == n
+            && ptrs.dst_row.len() == n
+            && ptrs.newly_packed.len() == n,
+        "DSv4 batched DSA cache-write pointer-array length mismatch (expected {n})"
+    );
+    if n == 0 {
+        return Ok(());
+    }
+    let max_rows = ptrs.newly_packed.iter().copied().max().unwrap_or(0);
+    if max_rows == 0 {
+        return Ok(()); // every slot skipped this step.
+    }
+    let keys_src_arr = crate::ops::upload_u64(ctx, &ptrs.keys_src)?;
+    let rotated_dst_arr = crate::ops::upload_u64(ctx, &ptrs.rotated_dst)?;
+    let rotated_src_arr = crate::ops::upload_u64(ctx, &ptrs.rotated_src)?;
+    let cache_band_arr = crate::ops::upload_u64(ctx, &ptrs.cache_band)?;
+    let cache_locs_arr = crate::ops::upload_u64(ctx, &ptrs.cache_locs)?;
+    let src_ring_row_arr = crate::ops::upload_i32(ctx, &ptrs.src_ring_row)?;
+    let dst_row_arr = crate::ops::upload_i32(ctx, &ptrs.dst_row)?;
+    let newly_packed_arr = crate::ops::upload_i32(ctx, &ptrs.newly_packed)?;
+    {
+        let (keys_src_a, g0) = keys_src_arr.device_ptr(&ctx.stream);
+        let (rotated_dst_a, g1) = rotated_dst_arr.device_ptr(&ctx.stream);
+        let (rotated_src_a, g1b) = rotated_src_arr.device_ptr(&ctx.stream);
+        let (cache_band_a, g2) = cache_band_arr.device_ptr(&ctx.stream);
+        let (cache_locs_a, g3) = cache_locs_arr.device_ptr(&ctx.stream);
+        let (src_ring_row_a, g4) = src_ring_row_arr.device_ptr(&ctx.stream);
+        let (dst_row_a, g5) = dst_row_arr.device_ptr(&ctx.stream);
+        let (newly_packed_a, g6) = newly_packed_arr.device_ptr(&ctx.stream);
+        // SAFETY: all per-slot ptrs valid on ctx.stream; arrays hold n entries;
+        // src/dst offsets + counts mirror the per-row block (a) exactly. The
+        // hadamard writes rotated_keys at (dst_row+r); the fused-store reads the
+        // PRE-OFFSET `rotated_src` base (= rotated + dst_row*ihd) at row r-from-0.
+        unsafe {
+            ffi::dsv4_dsa_hadamard128_batched_cuda(
+                keys_src_a as *const *const ffi::Half,
+                src_ring_row_a as *const i32,
+                rotated_dst_a as *const *mut ffi::Half,
+                dst_row_a as *const i32,
+                newly_packed_a as *const i32,
+                n as i32,
+                max_rows,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        unsafe {
+            ffi::dsv4_dsa_fused_store_index_k_cache_batched_cuda(
+                rotated_src_a as *const *const ffi::Half,
+                cache_band_a as *const *mut u8,
+                cache_locs_a as *const *const i64,
+                newly_packed_a as *const i32,
+                n as i32,
+                max_rows,
+                64,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        drop(g0);
+        drop(g1);
+        drop(g1b);
+        drop(g2);
+        drop(g3);
+        drop(g4);
+        drop(g5);
+        drop(g6);
+    }
+    ptr_keepalive.push(keys_src_arr);
+    ptr_keepalive.push(rotated_dst_arr);
+    ptr_keepalive.push(rotated_src_arr);
+    ptr_keepalive.push(cache_band_arr);
+    ptr_keepalive.push(cache_locs_arr);
+    // i32 offset/count arrays held via the forward keepalive (Arc-retained), same
+    // premature-free guard as the u64 ptr arrays above.
+    keepalive.keep_i32(&src_ring_row_arr);
+    keepalive.keep_i32(&dst_row_arr);
+    keepalive.keep_i32(&newly_packed_arr);
+    Ok(())
+}
+
 /// Batched (m=N) compressor STATE update: ONE `<<<n, BLOCK>>>` launch
 /// running each row's per-slot compressor ring update (RoPE/RMSNorm/store into
 /// pending/overlap/compressed), replacing the N per-row
@@ -11991,6 +12296,13 @@ pub(crate) struct Dsv4DsaBatchedGather<'a> {
     /// Per-row captured `key_count` (push exactly one per call), for the batched
     /// context_lens (`min(key_count_r, abs_pos_r/ratio)`).
     pub(crate) key_counts: &'a mut Vec<i32>,
+    /// `true` when the per-row CACHE WRITES (block (a)) already ran in the ONE
+    /// batched P1b pre-pass ([`dsv4_dsa_cache_write_batched`]) BEFORE the prepare
+    /// loop — so `csa_select` must NOT run the per-row
+    /// `csa_select_official(cache_writes_only=true)` again (and `packed_rows` was
+    /// already advanced in P1b). `false` (SparseIndexed full-flatten=false lane,
+    /// which has no P1b) → the per-row cache write still runs here.
+    pub(crate) cache_writes_in_prepass: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12243,35 +12555,41 @@ fn csa_select(
     // `official` + shared scratch). Never reached on the single-row / prefill
     // path (batched_gather stays None there → byte-identical below).
     if let Some(gather) = batched_gather {
-        let official = official.ok_or_else(|| {
-            anyhow!("DSv4 batched DSA gather requires official per-slot DSA state")
-        })?;
-        let shared = dsa_shared
-            .ok_or_else(|| anyhow!("DSv4 batched DSA gather requires shared DSA scratch"))?;
-        // Cache writes only (block (a) of csa_select_official); returns None.
-        csa_select_official(
-            ctx,
-            config,
-            &q_i,
-            &weights,
-            keys,
-            official,
-            shared,
-            pool,
-            indexer_rows_before,
-            indexer_rows_after,
-            key_count,
-            start_pos,
-            start_pos_device,
-            keys_window_base,
-            layer_idx,
-            ratio,
-            local_index_heads,
-            score_scale,
-            None,
-            /* cache_writes_only */ true,
-            keepalive,
-        )?;
+        // Per-row CACHE WRITES (block (a) of csa_select_official). When the ONE
+        // batched P1b pre-pass already populated all N slots' DSA caches
+        // (`cache_writes_in_prepass`, the CompressedSparse full-flatten lane),
+        // skip this per-row write + `packed_rows` advance — they ran in P1b. The
+        // SparseIndexed lane (no P1b) still runs the per-row write here.
+        if !gather.cache_writes_in_prepass {
+            let official = official.ok_or_else(|| {
+                anyhow!("DSv4 batched DSA gather requires official per-slot DSA state")
+            })?;
+            let shared = dsa_shared
+                .ok_or_else(|| anyhow!("DSv4 batched DSA gather requires shared DSA scratch"))?;
+            csa_select_official(
+                ctx,
+                config,
+                &q_i,
+                &weights,
+                keys,
+                official,
+                shared,
+                pool,
+                indexer_rows_before,
+                indexer_rows_after,
+                key_count,
+                start_pos,
+                start_pos_device,
+                keys_window_base,
+                layer_idx,
+                ratio,
+                local_index_heads,
+                score_scale,
+                None,
+                /* cache_writes_only */ true,
+                keepalive,
+            )?;
+        }
         // Gather this row's q_i/weights (bf16) into the N-row staging at row r.
         // q_i is `[local_index_heads*index_head_dim, 1]`, weights `[local_index_heads, 1]`.
         let r = gather.row;

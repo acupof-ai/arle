@@ -252,6 +252,80 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void hadamard128_bf16_kernel(
   out_vec.store(out_ptr, lane_id);
 }
 
+// Batched (grid.y=slot) Hadamard rotate over n slots' newly-packed index-key
+// rows. blockIdx.y selects the slot; blockIdx.x walks that slot's rows (4 warps
+// per block, one 128-dim row per warp). Per-slot base pointers / offsets / row
+// counts come from the host-gathered arrays; `src` is WINDOW-relative
+// (`src_ring_row + r`) into the staging ring, `dst` is ABSOLUTE (`dst_row + r`)
+// into rotated_keys. With n=1, slot=0, this is byte-identical to the per-row
+// `hadamard128_bf16_kernel` (same warp body, same offsets). The per-warp body is
+// copied verbatim.
+__global__ __launch_bounds__(kFusedQBlockSize, 16) void hadamard128_bf16_batched_kernel(
+    const bf16_t* const* __restrict__ keys_src_arr,
+    const int32_t* __restrict__ src_ring_row_arr,
+    bf16_t* const* __restrict__ rotated_dst_arr,
+    const int32_t* __restrict__ dst_row_arr,
+    const int32_t* __restrict__ newly_packed_arr,
+    int n) {
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kVecSize = 4;
+  static_assert(kHeadDim == kWarpSize * kVecSize);
+
+  using Storage = AlignedVec<bf16_t, kVecSize>;
+  using Float4 = AlignedVec<float, kVecSize>;
+
+  const int slot = blockIdx.y;
+  if (slot >= n) return;
+  const auto warp_id = threadIdx.x / kWarpSize;
+  const auto lane_id = threadIdx.x % kWarpSize;
+  const int r = static_cast<int>(blockIdx.x * kFusedQNumWarps + warp_id);
+  if (r >= newly_packed_arr[slot]) return;
+
+  const auto in_ptr =
+      keys_src_arr[slot] + static_cast<int64_t>(src_ring_row_arr[slot] + r) * kHeadDim;
+  auto out_ptr =
+      rotated_dst_arr[slot] + static_cast<int64_t>(dst_row_arr[slot] + r) * kHeadDim;
+
+  Storage input_vec;
+  input_vec.load(in_ptr, lane_id);
+  Float4 data;
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) {
+    data[i] = bf16_to_float(input_vec[i]);
+  }
+
+  {
+    float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+    data[0] = a0 + a1;
+    data[1] = a0 - a1;
+    data[2] = a2 + a3;
+    data[3] = a2 - a3;
+  }
+  {
+    float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+    data[0] = a0 + a2;
+    data[1] = a1 + a3;
+    data[2] = a0 - a2;
+    data[3] = a1 - a3;
+  }
+#pragma unroll
+  for (uint32_t mask = 1; mask < kWarpSize; mask <<= 1) {
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpSize);
+      data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
+    }
+  }
+
+  Storage out_vec;
+  const float scale = rsqrtf(static_cast<float>(kHeadDim));
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) {
+    out_vec[i] = float_to_bf16(data[i] * scale);
+  }
+  out_vec.store(out_ptr, lane_id);
+}
+
 // ---------------------------------------------------------------------------
 // SGLang fused_store_index_k_cache, raw C ABI.
 // ---------------------------------------------------------------------------
@@ -275,6 +349,59 @@ __global__ void fused_store_indexer_cache_kernel(
 
   const auto index = static_cast<int64_t>(indices[global_wid]);
   const auto elems = reinterpret_cast<const InStorage*>(input)[global_tid];
+  float2 x = __bfloat1622float2(elems[0]);
+  float2 y = __bfloat1622float2(elems[1]);
+  const auto local_max = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(y.x), fabsf(y.y)));
+  const auto abs_max = warp_reduce_max_xor(local_max);
+  const auto scale = fmaxf(1e-4f, abs_max) / kFP8Max;
+  const auto inv_scale = 1.0f / scale;
+
+  const int32_t page = static_cast<int32_t>(index >> kPageBits);
+  const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
+  auto page_ptr = cache + page * kPageBytes;
+  auto value_ptr = page_ptr + offset * 128;
+  auto scale_ptr = page_ptr + (128ll << kPageBits) + offset * 4;
+
+  OutStorage result;
+  result[0] = pack_fp8(x.x * inv_scale, x.y * inv_scale);
+  result[1] = pack_fp8(y.x * inv_scale, y.y * inv_scale);
+  reinterpret_cast<OutStorage*>(value_ptr)[lane_id] = result;
+  reinterpret_cast<float*>(scale_ptr)[0] = scale;
+}
+
+// Batched (grid.y=slot) FP8 fused-store over n slots' newly-packed rows. Each
+// warp (32 lanes, one 128-dim key row) stores one token of slot `blockIdx.y`
+// into that slot's cache band. The x-grid is PER-SLOT: `slot_local_wid` indexes
+// this slot's token (the per-row kernel's `global_wid`), bounded by
+// `newly_packed_arr[slot]`. The input read uses `key_arr[slot]` at the
+// slot-local thread id, and the cache loc / band base are slot-local
+// (`out_cache_loc_arr[slot][tok]` into `cache_arr[slot]`), so the page/offset
+// math is unchanged. With n=1, slot=0, this is byte-identical to the per-row
+// `fused_store_indexer_cache_kernel`. The per-warp body is copied verbatim.
+template <typename IndicesT, uint32_t kPageBits>
+__global__ void fused_store_indexer_cache_batched_kernel(
+    const bf16_t* const* __restrict__ key_arr,
+    uint8_t* const* __restrict__ cache_arr,
+    const IndicesT* const* __restrict__ out_cache_loc_arr,
+    const int32_t* __restrict__ newly_packed_arr,
+    int n) {
+  constexpr int64_t kPageBytes = 132ll << kPageBits;
+
+  const int slot = blockIdx.y;
+  if (slot >= n) return;
+  const auto slot_local_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto slot_local_wid = slot_local_tid / kWarpSize;
+  const auto lane_id = threadIdx.x % kWarpSize;
+  if (slot_local_wid >= static_cast<uint32_t>(newly_packed_arr[slot])) return;
+
+  using KeyT2 = bf16x2_t;
+  using InStorage = AlignedVec<KeyT2, 2>;
+  using OutStorage = AlignedVec<fp8x2_e4m3_t, 2>;
+
+  const bf16_t* input = key_arr[slot];
+  uint8_t* cache = cache_arr[slot];
+  const auto index = static_cast<int64_t>(out_cache_loc_arr[slot][slot_local_wid]);
+  const auto elems = reinterpret_cast<const InStorage*>(input)[slot_local_tid];
   float2 x = __bfloat1622float2(elems[0]);
   float2 y = __bfloat1622float2(elems[1]);
   const auto local_max = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(y.x), fabsf(y.y)));
@@ -600,6 +727,72 @@ extern "C" CUresult dsv4_dsa_fused_store_index_k_cache_cuda(
       <<<blocks, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
           reinterpret_cast<const bf16_t*>(key), index_k_with_scale, out_cache_loc,
           static_cast<uint32_t>(num_tokens));
+  return static_cast<CUresult>(cudaGetLastError());
+}
+
+// Batched (grid.y=slot) Hadamard rotate: ONE `<<<dim3(blocks_per_slot, n), 128>>>`
+// launch replacing n single-row `dsv4_dsa_hadamard128_bf16_cuda` calls. Per-slot
+// base ptrs / row offsets / row counts come from the host-gathered device arrays;
+// `max_rows` (= max over slots of newly_packed) sizes the x-grid bound. Math is
+// byte-identical to n single-row launches.
+extern "C" CUresult dsv4_dsa_hadamard128_batched_cuda(
+    const uint16_t* const* keys_src_arr,
+    const int32_t* src_ring_row_arr,
+    uint16_t* const* rotated_dst_arr,
+    const int32_t* dst_row_arr,
+    const int32_t* newly_packed_arr,
+    int n,
+    int max_rows,
+    CUstream stream) {
+  if (n < 0 || max_rows < 0 || stream == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (n == 0 || max_rows == 0) return CUDA_SUCCESS;
+  if (keys_src_arr == nullptr || src_ring_row_arr == nullptr || rotated_dst_arr == nullptr ||
+      dst_row_arr == nullptr || newly_packed_arr == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const uint32_t blocks_per_slot =
+      (static_cast<uint32_t>(max_rows) + kFusedQNumWarps - 1) / kFusedQNumWarps;
+  dim3 grid(blocks_per_slot, static_cast<uint32_t>(n), 1);
+  hadamard128_bf16_batched_kernel<<<grid, kFusedQBlockSize, 0,
+                                    reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<const bf16_t* const*>(keys_src_arr), src_ring_row_arr,
+      reinterpret_cast<bf16_t* const*>(rotated_dst_arr), dst_row_arr, newly_packed_arr, n);
+  return static_cast<CUresult>(cudaGetLastError());
+}
+
+// Batched (grid.y=slot) FP8 fused-store: ONE `<<<dim3(blocks_per_slot, n), 128>>>`
+// launch replacing n single-row `dsv4_dsa_fused_store_index_k_cache_cuda` calls.
+// Per-slot rotated-key base / cache band base / slot-local cache-loc array come
+// from the host-gathered device arrays; `max_tokens` (= max over slots of
+// newly_packed) sizes the x-grid bound. Math is byte-identical to n single-row
+// launches.
+extern "C" CUresult dsv4_dsa_fused_store_index_k_cache_batched_cuda(
+    const uint16_t* const* key_arr,
+    uint8_t* const* cache_arr,
+    const int64_t* const* out_cache_loc_arr,
+    const int32_t* newly_packed_arr,
+    int n,
+    int max_tokens,
+    int page_size,
+    CUstream stream) {
+  if (n < 0 || max_tokens < 0 || page_size != 64 || stream == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (n == 0 || max_tokens == 0) return CUDA_SUCCESS;
+  if (key_arr == nullptr || cache_arr == nullptr || out_cache_loc_arr == nullptr ||
+      newly_packed_arr == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const int threads = 128;
+  const uint32_t blocks_per_slot =
+      (static_cast<uint32_t>(max_tokens) * 32 + threads - 1) / threads;
+  dim3 grid(blocks_per_slot, static_cast<uint32_t>(n), 1);
+  fused_store_indexer_cache_batched_kernel<int64_t, 6>
+      <<<grid, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+          reinterpret_cast<const bf16_t* const*>(key_arr), cache_arr, out_cache_loc_arr,
+          newly_packed_arr, n);
   return static_cast<CUresult>(cudaGetLastError());
 }
 
