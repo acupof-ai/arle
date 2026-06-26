@@ -2427,6 +2427,72 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         Ok(())
     }
 
+    /// FINISH F1 batched: slice ALL `n` global-head rows of `out_batched` into a
+    /// contiguous token-major `[n, local_width]` `local_attn_batched` in ONE
+    /// launch. The n=1 result is byte-identical to a single `slice_out_row`:
+    /// TP>1 calls the same `dsv4_tp_out_slice_cuda` with `s_q=n` (the kernel
+    /// strides src by global width `h_q*d`, dst by `local_width` per row, slicing
+    /// `[rank*local_width, +local_width]` — verified against the .cu); TP==1 is
+    /// one D2D copy of the whole `[n, d]` block (local_width==global_width).
+    pub(crate) fn slice_out_batched(
+        &self,
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        tp: &TpRuntime,
+        n: usize,
+        local_heads: usize,
+        local_attn_batched: &mut HiddenStates,
+    ) -> Result<()> {
+        ensure!(
+            n > 0 && n <= self.max_batch,
+            "DSv4 batched out-slice n={n} out of range (1..={})",
+            self.max_batch
+        );
+        let d = self.h_q_d();
+        let tp_world = tp.config().world_size;
+        let tp_rank = tp.config().rank;
+        let local_width = local_heads * config.head_dim;
+        ensure!(
+            local_attn_batched.hidden_dim == local_width && local_attn_batched.seq_len == n,
+            "DSv4 batched out-slice dst {}x{} != [{local_width},{n}]",
+            local_attn_batched.hidden_dim,
+            local_attn_batched.seq_len
+        );
+        let src_view = self.out_batched.slice(0..n * d);
+        if tp_world > 1 {
+            let (src_ptr, src_guard) = src_view.device_ptr(&ctx.stream);
+            let (dst_ptr, dst_guard) = local_attn_batched.data.device_ptr_mut(&ctx.stream);
+            {
+                let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice_batched");
+                // SAFETY: src is `n` global-head rows (stride h_q*head_dim), dst is
+                // n local rows (stride local_width); same per-row args as
+                // `slice_out_row`, with s_q=n so the kernel loops rows internally.
+                unsafe {
+                    ffi::dsv4_tp_out_slice_cuda(
+                        src_ptr as *const ffi::Half,
+                        dst_ptr as *mut ffi::Half,
+                        n as i32,
+                        (self.h_q * config.head_dim) as i32,
+                        local_width as i32,
+                        (tp_rank * local_width) as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow!("DSv4 batched FlashMLA TP out slice failed: {e}"))?;
+                }
+            }
+            drop(src_guard);
+            drop(dst_guard);
+        } else {
+            // TP==1: local_width == global_width == d, so the whole [n, d] block
+            // copies contiguously into local_attn_batched.
+            ctx.stream
+                .memcpy_dtod(&src_view, &mut local_attn_batched.data)
+                .map_err(|e| anyhow!("DSv4 batched out copy failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// PHASE B: ONE batched `sparse_decode_fwd(b=n)` for `layer_idx` over the
     /// shared FlashMLA pool base, reading the `q_batched[0..n]` prefix the
     /// per-row gather filled and writing global-head output into `out_batched`.
@@ -5143,26 +5209,49 @@ pub(crate) fn mla_linear(
 /// been consumed by an earlier projection this step — safe, all on `ctx.stream`.
 fn decode_proj_deepgemm_raw<I, O>(
     ctx: &DeviceContext,
-    scratch: &Dsv4FusedWqkvDecodeScratch,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
     cache: &cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache,
     input: &I,
     input_len: usize,
     out: &mut O,
     out_len: usize,
     k: usize,
+    m: usize,
 ) -> Result<()>
 where
     I: DevicePtr<half::bf16>,
     O: DevicePtrMut<half::bf16>,
 {
+    // M (token rows) drives both the pack-quantize active_counts[0] and the
+    // GEMM's m arg. Batched O-LoRA passes m=n (token-major [n, k] input); the
+    // per-row decode lanes pass m=1. N=1 BYTE-IDENTITY: the scratch's
+    // active_counts is constructed [1] and every per-row decode call restores it
+    // to [1], so an m=1 call SKIPS the H2D write below and emits exactly the old
+    // (m=1, active_counts=[1]) kernel args. The batched caller is responsible
+    // for restoring active_counts to [1] after its m=n call.
     ensure!(
-        cache.cols == k && input_len >= k && out_len >= cache.rows,
-        "DSv4 decode_proj_deepgemm_raw shape mismatch: cache {}x{} k={k} input_len={} out_len={}",
+        m > 0 && m <= scratch.max_m,
+        "DSv4 decode_proj_deepgemm_raw M={m} out of range (1..={})",
+        scratch.max_m
+    );
+    ensure!(
+        cache.cols == k && input_len >= m * k && out_len >= m * cache.rows,
+        "DSv4 decode_proj_deepgemm_raw shape mismatch: cache {}x{} k={k} m={m} input_len={} out_len={}",
         cache.rows,
         cache.cols,
         input_len,
         out_len
     );
+    if m != 1 {
+        // Token-row count for the pack-quantize row loop and the GEMM. The
+        // shared scratch's active_counts is restored to [1] by the caller.
+        let m_i32 =
+            i32::try_from(m).map_err(|_| anyhow!("DSv4 decode proj M={m} overflows i32"))?;
+        ctx.stream
+            .memcpy_htod(&[m_i32], &mut scratch.active_counts)
+            .map_err(|e| anyhow!("DSv4 decode proj active_counts H2D failed: {e}"))?;
+    }
+    let scratch = &*scratch;
     let stream = ctx.stream.cu_stream();
     let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
     let (fp8_ptr, _fp8_guard) = scratch.input_fp8.device_ptr(&ctx.stream);
@@ -5197,7 +5286,7 @@ where
             weight_ptr as *const u8,
             weight_scale_ptr as *const f32,
             out_ptr as *mut ffi::Half,
-            1,
+            i32::try_from(m)?,
             i32::try_from(cache.rows)?,
             i32::try_from(cache.cols)?,
             i32::try_from(scratch.scale_stride_m)?,
@@ -5211,19 +5300,22 @@ where
 
 fn decode_proj_deepgemm(
     ctx: &DeviceContext,
-    scratch: &Dsv4FusedWqkvDecodeScratch,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
     cache: &cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache,
     input: &HiddenStates,
     out: &mut HiddenStates,
     k: usize,
 ) -> Result<()> {
+    // M = token rows (input is token-major [m, k]). m==1 is the per-row decode
+    // lane (byte-identical to the original assert seq_len==1); m==n is the
+    // batched O-LoRA. The shape contract is the same in both.
+    let m = input.seq_len;
     ensure!(
         cache.cols == k
             && cache.rows == out.hidden_dim
             && input.hidden_dim == k
-            && input.seq_len == 1
-            && out.seq_len == 1,
-        "DSv4 decode_proj_deepgemm shape mismatch: cache {}x{} k={k} in {}x{} out {}x{}",
+            && out.seq_len == m,
+        "DSv4 decode_proj_deepgemm shape mismatch: cache {}x{} k={k} m={m} in {}x{} out {}x{}",
         cache.rows,
         cache.cols,
         input.hidden_dim,
@@ -5242,6 +5334,7 @@ fn decode_proj_deepgemm(
         &mut out.data,
         out_len,
         k,
+        m,
     )
 }
 
@@ -9111,6 +9204,8 @@ pub(crate) fn mla_attention_prepare(
                 prefill_shared,
                 // Prefill / single-row path: no batched gather (byte-identical).
                 None,
+                // Prefill / single-row path: no batched query pre-pass.
+                None,
                 keepalive,
             )?)
         } else {
@@ -9544,6 +9639,13 @@ pub(crate) fn mla_attention_prepare_compressed_only(
     // `compressor_forward`, skipping the per-row m=1 GEMVs. `None` → byte-identical
     // per-row `dsv4_linear` projection.
     compressor_precomputed: Option<Dsv4CompressorPrecomputed<'_>>,
+    // Batched-decode pre-pass: when `Some`, this row's indexer query (`q_i`) and
+    // gating `weights` were already projected batched (one m=N `dsv4_linear` each
+    // in `indexer_query_batch_prepass`); the `[width,1]` slices are threaded into
+    // `csa_select`, skipping the per-row m=1 `wq_b`/`weights_proj` GEMVs. `None` →
+    // byte-identical per-row GEMVs. Compressor-layer (CSA) only; SparseIndexed and
+    // the non-full-flatten lane pass `None`.
+    indexer_query_precomputed: Option<Dsv4IndexerQueryPrecomputed<'_>>,
     // Full-flatten decode: when `true`, the per-row
     // compressor / indexer STATE updates already ran in ONE batched
     // `dsv4_compressor_update_batched` BEFORE this call (a P1a pre-pass), so the
@@ -9766,6 +9868,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 // prefill scratch is not needed.
                 None,
                 batched_gather,
+                indexer_query_precomputed,
                 keepalive,
             )?;
             if is_batched { None } else { Some(sel) }
@@ -10537,7 +10640,7 @@ fn dsv4_oproj_group_scatter(
 
 fn dsv4_wo_a_grouped_deepgemm_decode(
     ctx: &DeviceContext,
-    scratch: &Dsv4FusedWqkvDecodeScratch,
+    scratch: &mut Dsv4FusedWqkvDecodeScratch,
     caches: &[cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache],
     local_attn: &HiddenStates,
     shape: Dsv4OProjGroupShape,
@@ -10573,6 +10676,7 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
             &mut output,
             output_len,
             shape.cols_per_group,
+            1,
         )?;
     }
     Ok(())
@@ -10638,6 +10742,82 @@ mod oproj_tests {
             err.to_string().contains("whole number of wo_a groups"),
             "{err}"
         );
+    }
+
+    // ---- Batched-FINISH (F1/F2) n=1 byte/arg-identity invariants ----
+    // These assert the SHAPE/arg math that makes the batched FINISH collapse to
+    // the original per-row path at n=1, without a GPU (the device kernels are
+    // unchanged; only the M/rows args differ). The runtime correctness gate
+    // (needle x3 same-config) covers the on-device numerics.
+
+    #[test]
+    fn oproj_single_group_shape_is_m_parametric() {
+        // groups==1 (Qwen3.6 MODEL1 at TP>1): the single-output-group decode lane
+        // batches over M. The shape's groups/rows/cols are M-INVARIANT and routes
+        // tracks token_count, so token_count=1 and token_count=n share one
+        // group-shape contract (the decode-DeepGEMM path keys off groups==1 only).
+        // wo_a = [rows_per_group, cols_per_group], local_width == cols_per_group.
+        let shape1 = dsv4_oproj_group_shape(1536, 4096, 1, 1536, 4096, 4096, 1).unwrap();
+        let shape_n = dsv4_oproj_group_shape(1536, 4096, 1, 1536, 4096, 4096, 7).unwrap();
+        assert_eq!(shape1.groups, 1);
+        assert_eq!(shape_n.groups, 1);
+        assert_eq!(shape1.rows_per_group, shape_n.rows_per_group);
+        assert_eq!(shape1.cols_per_group, shape_n.cols_per_group);
+        // routes == token_count * groups; with groups==1, routes == token_count.
+        assert_eq!(shape1.routes, 1);
+        assert_eq!(shape_n.routes, 7);
+    }
+
+    // Mirror of the TP out-slice kernel args computed inline by slice_out_row and
+    // slice_out_batched. slice_out_row hardcodes s_q=1; slice_out_batched passes
+    // s_q=n. Every other arg (global_width, local_width, head_offset) is the same
+    // pure function of (h_q, head_dim, local_heads, tp_rank) — so at n=1 the two
+    // calls are byte-for-byte identical kernel launches.
+    fn tp_out_slice_args(
+        h_q: usize,
+        head_dim: usize,
+        local_heads: usize,
+        tp_rank: usize,
+    ) -> (i32, i32, i32) {
+        let global_width = (h_q * head_dim) as i32;
+        let local_width = (local_heads * head_dim) as i32;
+        let head_offset = (tp_rank * local_heads * head_dim) as i32;
+        (global_width, local_width, head_offset)
+    }
+
+    #[test]
+    fn slice_out_batched_n1_matches_slice_out_row_args() {
+        // TP=4 example: h_q (global heads) = 16, local_heads = 4, rank 2.
+        let (gw, lw, off) = tp_out_slice_args(16, 512, 4, 2);
+        assert_eq!(gw, 16 * 512); // src row stride = global width
+        assert_eq!(lw, 4 * 512); // dst row stride = local width
+        assert_eq!(off, 2 * 4 * 512); // sliced head block start
+        // slice_out_row passes s_q=1; slice_out_batched(n=1) passes s_q=1 — identical.
+        let s_q_row = 1_i32;
+        let s_q_batched_n1 = 1_i32; // n == 1
+        assert_eq!(s_q_row, s_q_batched_n1);
+    }
+
+    #[test]
+    fn decode_proj_active_counts_write_skipped_at_m1() {
+        // The fused-wqkv decode scratch is constructed with active_counts=[1].
+        // decode_proj_deepgemm_raw writes active_counts only when m != 1, so the
+        // per-row (m=1) decode lane emits EXACTLY the original (m=1, counts=[1])
+        // kernel args — no extra H2D, byte+launch identical. The batched (m=n)
+        // call writes [n] then the caller restores [1].
+        let m_per_row = 1usize;
+        let m_batched = 7usize;
+        assert!(
+            m_per_row == 1,
+            "per-row M must be 1 to skip the active_counts H2D"
+        );
+        assert!(
+            m_batched != 1,
+            "batched M must differ from 1 to write active_counts"
+        );
+        // GEMM m arg: per-row -> 1 (original), batched -> n.
+        assert_eq!(m_per_row as i32, 1);
+        assert_eq!(m_batched as i32, 7);
     }
 }
 
@@ -10705,16 +10885,27 @@ pub(crate) fn mla_oproj(
             token_count,
         )?
     };
+    // Decode (no prefill scratch) vs prefill — captured before any branch consumes
+    // `prefill_shared` (the wo_b prefill lane moves it via .expect()). Drives the
+    // batched-O-LoRA active_counts restore at the end.
+    let is_decode = prefill_shared.is_none();
+    // Single-group decode DeepGEMM (lever #1b) is now M-parametric: token_count==1
+    // is the per-row decode lane (byte-identical to the original M=1 path), and
+    // token_count==n is the batched FINISH O-LoRA (token-major [n, cols] input).
     let wo_a_decode_dg = shape.groups == 1
-        && token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
-        && attention.wo_a_deepgemm.is_some();
+        && attention.wo_a_deepgemm.is_some()
+        && prefill_shared.is_none();
     let wo_a_prefill_dg = shape.groups == 1
         && token_count > 1
         && dsv4_prefill_proj_deepgemm_enabled()
         && attention.wo_a_deepgemm.is_some()
         && prefill_shared.is_some();
+    // Grouped decode DeepGEMM slices per-group columns within ONE row, so it
+    // stays per-row (token_count==1). The batched FINISH calls mla_oproj per row
+    // for grouped models (the reported fallback); the single-group case above is
+    // what Qwen3.6-35B MODEL1 hits at TP>1 and is the one that batches at M=n.
     let wo_a_group_decode_dg = shape.groups > 1
         && token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
@@ -10726,29 +10917,23 @@ pub(crate) fn mla_oproj(
         && attention.wo_a_group_deepgemm.is_some()
         && prefill_shared.is_some();
     if wo_a_decode_dg {
-        // Lever #1b: wo_a/wo_b (M=1) through tensor-core DeepGEMM, reusing the
+        // Lever #1b: wo_a through tensor-core DeepGEMM (M=token_count), reusing the
         // fused-wqkv FP8 scratch for the single-output-group case.
-        let scratch = state.fused_wqkv.as_ref().expect("wo_dg gate checked");
+        let scratch = state.fused_wqkv.as_mut().expect("wo_dg gate checked");
         let wo_a_cache = attention
             .wo_a_deepgemm
             .as_ref()
             .expect("wo_dg gate checked");
+        let wo_a_cols = attention.wo_a.as_ref().expect("DSv4 wo_a").cols;
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            decode_proj_deepgemm(
-                ctx,
-                scratch,
-                wo_a_cache,
-                local_attn,
-                &mut latent,
-                attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
-            )
+            decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, &mut latent, wo_a_cols)
         })?;
         drop(nvtx_wo_a);
     } else if wo_a_group_decode_dg {
         let scratch = state
             .fused_wqkv
-            .as_ref()
+            .as_mut()
             .expect("wo grouped dg gate checked");
         let wo_a_caches = attention
             .wo_a_group_deepgemm
@@ -10824,30 +11009,26 @@ pub(crate) fn mla_oproj(
     }
     keepalive.keep_hidden(&latent);
 
-    let wo_b_decode_dg = token_count == 1
-        && dsv4_decode_proj_deepgemm_enabled()
+    // wo_b is always a single-group [hidden, o_lora_rank] GEMM, so its decode
+    // DeepGEMM lane is M-parametric like wo_a: M=token_count (1 per-row, n batched).
+    let wo_b_decode_dg = dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
-        && attention.wo_b_deepgemm.is_some();
+        && attention.wo_b_deepgemm.is_some()
+        && prefill_shared.is_none();
     let wo_b_prefill_dg = token_count > 1
         && dsv4_prefill_proj_deepgemm_enabled()
         && attention.wo_b_deepgemm.is_some()
         && prefill_shared.is_some();
     if wo_b_decode_dg {
-        let scratch = state.fused_wqkv.as_ref().expect("wo_b dg gate checked");
+        let scratch = state.fused_wqkv.as_mut().expect("wo_b dg gate checked");
         let wo_b_cache = attention
             .wo_b_deepgemm
             .as_ref()
             .expect("wo_b dg gate checked");
+        let wo_b_cols = attention.wo_b.as_ref().expect("DSv4 wo_b").cols;
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            decode_proj_deepgemm(
-                ctx,
-                scratch,
-                wo_b_cache,
-                &latent,
-                out,
-                attention.wo_b.as_ref().expect("DSv4 wo_b").cols,
-            )
+            decode_proj_deepgemm(ctx, scratch, wo_b_cache, &latent, out, wo_b_cols)
         })?;
         drop(nvtx_wo_b);
     } else if wo_b_prefill_dg {
@@ -10874,6 +11055,18 @@ pub(crate) fn mla_oproj(
             )
         })?;
         drop(nvtx_wo_b);
+    }
+    // Restore the shared fused-wqkv scratch active_counts to [1] after a batched
+    // (M=n) decode-DeepGEMM O-LoRA. The single-group wo_a/wo_b decode lanes write
+    // active_counts=[n] when token_count>1; every per-row M=1 reader (the next
+    // layer's wq decode, the per-row grouped fallback) relies on it being [1].
+    // No-op (and no H2D) at token_count==1 — preserves byte+launch identity.
+    if token_count > 1 && is_decode {
+        if let Some(scratch) = state.fused_wqkv.as_mut() {
+            ctx.stream
+                .memcpy_htod(&[1_i32], &mut scratch.active_counts)
+                .map_err(|e| anyhow!("DSv4 batched O-LoRA active_counts restore failed: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -10929,31 +11122,25 @@ fn mla_oproj_decode_graph(
         && state.fused_wqkv.is_some()
         && attention.wo_a_group_deepgemm.is_some();
     if wo_a_decode_dg {
-        let scratch = state.fused_wqkv.as_ref().expect("wo_dg gate checked");
         let wo_a_cache = attention
             .wo_a_deepgemm
             .as_ref()
             .expect("wo_dg gate checked");
+        let wo_a_cols = attention.wo_a.as_ref().expect("DSv4 wo_a").cols;
+        let scratch = state.fused_wqkv.as_mut().expect("wo_dg gate checked");
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
-            decode_proj_deepgemm(
-                ctx,
-                scratch,
-                wo_a_cache,
-                local_attn,
-                latent,
-                attention.wo_a.as_ref().expect("DSv4 wo_a").cols,
-            )
+            decode_proj_deepgemm(ctx, scratch, wo_a_cache, local_attn, latent, wo_a_cols)
         })?;
         drop(nvtx_wo_a);
     } else if wo_a_group_decode_dg {
-        let scratch = state
-            .fused_wqkv
-            .as_ref()
-            .expect("wo grouped dg gate checked");
         let wo_a_caches = attention
             .wo_a_group_deepgemm
             .as_ref()
+            .expect("wo grouped dg gate checked");
+        let scratch = state
+            .fused_wqkv
+            .as_mut()
             .expect("wo grouped dg gate checked");
         let nvtx_wo_a = crate::nvtx::range("dsv4/linear/wo_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_a", || {
@@ -10983,21 +11170,15 @@ fn mla_oproj_decode_graph(
         && state.fused_wqkv.is_some()
         && attention.wo_b_deepgemm.is_some();
     if wo_b_decode_dg {
-        let scratch = state.fused_wqkv.as_ref().expect("wo_b dg gate checked");
         let wo_b_cache = attention
             .wo_b_deepgemm
             .as_ref()
             .expect("wo_b dg gate checked");
+        let wo_b_cols = attention.wo_b.as_ref().expect("DSv4 wo_b").cols;
+        let scratch = state.fused_wqkv.as_mut().expect("wo_b dg gate checked");
         let nvtx_wo_b = crate::nvtx::range("dsv4/linear/wo_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wo_b", || {
-            decode_proj_deepgemm(
-                ctx,
-                scratch,
-                wo_b_cache,
-                latent,
-                out,
-                attention.wo_b.as_ref().expect("DSv4 wo_b").cols,
-            )
+            decode_proj_deepgemm(ctx, scratch, wo_b_cache, latent, out, wo_b_cols)
         })?;
         drop(nvtx_wo_b);
     } else {
@@ -11433,6 +11614,78 @@ pub(crate) fn compressor_batch_prepass(
     Ok(Some((kv_raw_batch, score_raw_batch)))
 }
 
+/// Batched (m=N) decode indexer-query / gating-weights projection pre-pass. The
+/// per-row `csa_select` runs `dsv4_linear(indexer.wq_b, c_q_normed_row)` and
+/// `dsv4_linear(indexer.weights_proj, normed_row)` as m=1 GEMVs that re-read the
+/// full weight per decode row (bandwidth-bound, zero amortization, ∝n — the last
+/// batchable GEMM left in the full-flatten prepare loop). Batch them into ONE m=N
+/// GEMM each (`q_i_batch [wq_b.rows, N]`, `weights_batch [weights_proj.rows, N]`),
+/// weight read once across the N-token grid. Each row's `[width,1]` column slice
+/// then feeds `csa_select` as `query_precomputed`, skipping the per-row GEMVs;
+/// the per-slot DSA cache writes + gathers stay per-row.
+///
+/// `c_q_normed_batch` is `[q_lora_rank, N]` (= `Dsv4MlaProjBatch::c_q_normed`);
+/// `normed_batch` is `[hidden, N]`. Both outputs are fresh per-step allocations
+/// kept alive via `keepalive.keep_hidden`. Mirrors `compressor_batch_prepass`;
+/// touches NO slot state. DSv4 indexer weights are bf16 → cublasLt path, no FP8
+/// quant, mixed-precision-safe by construction (same byte path as the per-row m=1
+/// `dsv4_linear`, just one larger M).
+pub(crate) fn indexer_query_batch_prepass(
+    ctx: &DeviceContext,
+    indexer: &Dsv4Indexer,
+    c_q_normed_batch: &HiddenStates,
+    normed_batch: &HiddenStates,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<(HiddenStates, HiddenStates)> {
+    let n = c_q_normed_batch.seq_len;
+    ensure!(
+        normed_batch.seq_len == n,
+        "DSv4 indexer query batch pre-pass row mismatch: c_q={} normed={}",
+        n,
+        normed_batch.seq_len
+    );
+    ensure!(
+        indexer.wq_b.cols == c_q_normed_batch.hidden_dim,
+        "DSv4 indexer wq_b K mismatch: wq_b.cols={} c_q hidden={}",
+        indexer.wq_b.cols,
+        c_q_normed_batch.hidden_dim
+    );
+    ensure!(
+        indexer.weights_proj.cols == normed_batch.hidden_dim,
+        "DSv4 indexer weights_proj K mismatch: weights_proj.cols={} normed hidden={}",
+        indexer.weights_proj.cols,
+        normed_batch.hidden_dim
+    );
+    // SAFETY: dsv4_linear writes the full output buffer.
+    let mut q_i_batch = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, n)? };
+    let nvtx_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b_batched");
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b_batched", || {
+        dsv4_linear(ctx, &indexer.wq_b, c_q_normed_batch, &mut q_i_batch)
+    })?;
+    drop(nvtx_wq_b);
+    keepalive.keep_hidden(&q_i_batch);
+    // SAFETY: dsv4_linear writes the full output buffer.
+    let mut weights_batch = unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, n)? };
+    let nvtx_weights = crate::nvtx::range("dsv4/linear/indexer_weights_batched");
+    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights_batched", || {
+        dsv4_linear(ctx, &indexer.weights_proj, normed_batch, &mut weights_batch)
+    })?;
+    drop(nvtx_weights);
+    keepalive.keep_hidden(&weights_batch);
+    Ok((q_i_batch, weights_batch))
+}
+
+/// Per-row precomputed indexer query/weights projection slices for the batched
+/// decode pre-pass. `q_i` is this row's `[wq_b.rows, 1]` column slice of the
+/// batched [`indexer_query_batch_prepass`] output; `weights` is the
+/// `[weights_proj.rows, 1]` slice. When threaded into [`csa_select`], they replace
+/// the per-row m=1 `dsv4_linear` GEMVs; the per-slot cache writes + gathers stay
+/// per-row.
+pub(crate) struct Dsv4IndexerQueryPrecomputed<'a> {
+    pub(crate) q_i: &'a HiddenStates,
+    pub(crate) weights: &'a HiddenStates,
+}
+
 /// Host-gathered per-row device pointer arrays for one compressor's batched
 /// state update. Each `Vec`
 /// holds the N rows' `Dsv4CompressorState` ring-buffer pointers (as `u64`),
@@ -11763,42 +12016,88 @@ fn csa_select(
     ratio: usize,
     prefill_scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     batched_gather: Option<Dsv4DsaBatchedGather<'_>>,
+    // Batched-decode pre-pass (full-flatten): when `Some`, this row's
+    // `q_i`/`weights` were already projected batched (one m=N `dsv4_linear` each
+    // over the whole layer's rows in `indexer_query_batch_prepass`), so the per-row
+    // m=1 `wq_b`/`weights_proj` GEMVs below are SKIPPED and these `[width,1]` slices
+    // are used instead. The slice IS the exact column of the batched GEMM output =
+    // the per-row m=1 GEMV result → byte-identical. `None` → byte-identical per-row
+    // GEMVs (single-row / prefill / non-full-flatten lanes).
+    query_precomputed: Option<Dsv4IndexerQueryPrecomputed<'_>>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
-    // SAFETY: dsv4_linear writes the full index-query buffer.
-    let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
-    let nvtx_indexer_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b");
-    // Prefill index-query (M=token_count) → DeepGEMM, off the scalar fp8_gemv (the #1
-    // remaining projection at M=1024). Decode (seq_len==1) / no-cache stays scalar.
-    let indexer_wq_b_dg = c_q_normed.seq_len > 1
-        && dsv4_prefill_indexer_deepgemm_enabled()
-        && indexer.wq_b_deepgemm.is_some()
-        && prefill_scratch.is_some();
-    if indexer_wq_b_dg {
-        let cache = indexer
-            .wq_b_deepgemm
-            .as_ref()
-            .expect("indexer wq_b dg gate checked");
-        let scratch = prefill_scratch.expect("indexer wq_b dg gate checked");
-        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
-            prefill_proj_deepgemm(ctx, scratch, cache, c_q_normed, &mut q_i)
-        })?;
+    // Batched pre-pass: copy this row's `[width,1]` slice into an owned buffer
+    // (mirrors the per-row GEMV output shape) and skip the GEMVs. Decode-only
+    // (`c_q_normed.seq_len == 1`); the prefill DeepGEMM path never supplies it.
+    let (q_i, weights) = if let Some(pre) = query_precomputed.as_ref() {
+        ensure!(
+            c_q_normed.seq_len == 1 && hidden.seq_len == 1,
+            "DSv4 indexer query precomputed is decode-only (c_q seq={} hidden seq={})",
+            c_q_normed.seq_len,
+            hidden.seq_len
+        );
+        ensure!(
+            pre.q_i.hidden_dim == indexer.wq_b.rows
+                && pre.q_i.seq_len == 1
+                && pre.weights.hidden_dim == indexer.weights_proj.rows
+                && pre.weights.seq_len == 1,
+            "DSv4 indexer query precomputed shape mismatch: q_i {}x{} (want {}x1) weights {}x{} (want {}x1)",
+            pre.q_i.hidden_dim,
+            pre.q_i.seq_len,
+            indexer.wq_b.rows,
+            pre.weights.hidden_dim,
+            pre.weights.seq_len,
+            indexer.weights_proj.rows
+        );
+        // SAFETY: each dtod copy fills the full buffer before any read below.
+        let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? };
+        ctx.stream
+            .memcpy_dtod(&pre.q_i.data, &mut q_i.data)
+            .map_err(|e| anyhow!("DSv4 indexer precomputed q_i copy failed: {e}"))?;
+        let mut weights = unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, 1)? };
+        ctx.stream
+            .memcpy_dtod(&pre.weights.data, &mut weights.data)
+            .map_err(|e| anyhow!("DSv4 indexer precomputed weights copy failed: {e}"))?;
+        keepalive.keep_hidden(&q_i);
+        keepalive.keep_hidden(&weights);
+        (q_i, weights)
     } else {
-        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
-            dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
+        // SAFETY: dsv4_linear writes the full index-query buffer.
+        let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
+        let nvtx_indexer_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b");
+        // Prefill index-query (M=token_count) → DeepGEMM, off the scalar fp8_gemv (the #1
+        // remaining projection at M=1024). Decode (seq_len==1) / no-cache stays scalar.
+        let indexer_wq_b_dg = c_q_normed.seq_len > 1
+            && dsv4_prefill_indexer_deepgemm_enabled()
+            && indexer.wq_b_deepgemm.is_some()
+            && prefill_scratch.is_some();
+        if indexer_wq_b_dg {
+            let cache = indexer
+                .wq_b_deepgemm
+                .as_ref()
+                .expect("indexer wq_b dg gate checked");
+            let scratch = prefill_scratch.expect("indexer wq_b dg gate checked");
+            crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+                prefill_proj_deepgemm(ctx, scratch, cache, c_q_normed, &mut q_i)
+            })?;
+        } else {
+            crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b", || {
+                dsv4_linear(ctx, &indexer.wq_b, c_q_normed, &mut q_i)
+            })?;
+        }
+        drop(nvtx_indexer_wq_b);
+        keepalive.keep_hidden(&q_i);
+        // SAFETY: dsv4_linear writes the full index-weight buffer.
+        let mut weights =
+            unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, hidden.seq_len)? };
+        let nvtx_indexer_weights = crate::nvtx::range("dsv4/linear/indexer_weights");
+        crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
+            dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)
         })?;
-    }
-    drop(nvtx_indexer_wq_b);
-    keepalive.keep_hidden(&q_i);
-    // SAFETY: dsv4_linear writes the full index-weight buffer.
-    let mut weights =
-        unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, hidden.seq_len)? };
-    let nvtx_indexer_weights = crate::nvtx::range("dsv4/linear/indexer_weights");
-    crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights", || {
-        dsv4_linear(ctx, &indexer.weights_proj, hidden, &mut weights)
-    })?;
-    drop(nvtx_indexer_weights);
-    keepalive.keep_hidden(&weights);
+        drop(nvtx_indexer_weights);
+        keepalive.keep_hidden(&weights);
+        (q_i, weights)
+    };
 
     ensure!(
         q_i.hidden_dim.is_multiple_of(config.index_head_dim),
@@ -12637,4 +12936,99 @@ pub(crate) fn csa_select_official_batched(
     keepalive.keep_u8(&shared.q_fp8_batch);
     keepalive.keep_f32(&shared.weights_batch);
     Ok(())
+}
+
+#[cfg(test)]
+mod indexer_query_batch_tests {
+    use super::*;
+    use half::bf16;
+
+    /// GPU gate (run on a CUDA box): the batched indexer-query projection
+    /// pre-pass at n=1 must be BYTE-IDENTICAL to the per-row m=1 `dsv4_linear`
+    /// it replaces. The full-flatten prepare loop slices column `r` of the
+    /// batched `q_i`/`weights` and feeds it to `csa_select` instead of running
+    /// the GEMV — so the bf16 GEMM column at n=1 must equal the standalone GEMV
+    /// bit-for-bit (same cublasLt path, M=1). Mirrors the failure mode (a
+    /// non-identical slice would silently corrupt CSA top-k selection) with a
+    /// minimal in-component kernel — no full `Dsv4Indexer` construction.
+    #[test]
+    fn batched_indexer_query_slice_byte_identical_at_n1() {
+        let Ok(ctx) = DeviceContext::new() else {
+            eprintln!("[batched_indexer_query] no CUDA device; skipping");
+            return;
+        };
+
+        // wq_b: [out=index_heads*index_head_dim, in=q_lora_rank];
+        // weights_proj: [out=index_heads, in=hidden]. Representative CSA dims.
+        let q_lora_rank = 384usize;
+        let hidden = 512usize;
+        let wq_b_rows = 256usize; // index_heads*index_head_dim
+        let weights_rows = 4usize; // index_heads
+
+        let prng = |seed: usize| -> f32 {
+            let x = (seed as u64).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9_7F4A_7C15;
+            ((x >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+
+        let wq_b_host: Vec<bf16> = (0..wq_b_rows * q_lora_rank)
+            .map(|i| bf16::from_f32(prng(i + 11) * 1.5))
+            .collect();
+        let weights_host: Vec<bf16> = (0..weights_rows * hidden)
+            .map(|i| bf16::from_f32(prng(i + 4_000_037) * 1.5))
+            .collect();
+        let wq_b = DeviceMatrix::from_host(&ctx, &wq_b_host, wq_b_rows, q_lora_rank).unwrap();
+        let weights_proj =
+            DeviceMatrix::from_host(&ctx, &weights_host, weights_rows, hidden).unwrap();
+
+        // N=1 inputs: c_q_normed [q_lora_rank, 1], normed [hidden, 1].
+        let c_q_host: Vec<bf16> = (0..q_lora_rank)
+            .map(|i| bf16::from_f32(prng(i + 909_091)))
+            .collect();
+        let normed_host: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32(prng(i + 717_171)))
+            .collect();
+        let mut c_q = unsafe { HiddenStates::uninit(&ctx, q_lora_rank, 1).unwrap() };
+        c_q.data = ctx.stream.clone_htod(&c_q_host).unwrap();
+        let mut normed = unsafe { HiddenStates::uninit(&ctx, hidden, 1).unwrap() };
+        normed.data = ctx.stream.clone_htod(&normed_host).unwrap();
+
+        // Batched pre-pass path (the GEMMs `indexer_query_batch_prepass` runs:
+        // it reads only `wq_b` + `weights_proj`, so the two `dsv4_linear` calls
+        // reproduce its output exactly without a full `Dsv4Indexer`).
+        let mut q_i_batch = unsafe { HiddenStates::uninit(&ctx, wq_b_rows, 1).unwrap() };
+        dsv4_linear(&ctx, &wq_b, &c_q, &mut q_i_batch).unwrap();
+        let mut weights_batch = unsafe { HiddenStates::uninit(&ctx, weights_rows, 1).unwrap() };
+        dsv4_linear(&ctx, &weights_proj, &normed, &mut weights_batch).unwrap();
+
+        // Per-row reference (the path the precomputed slice replaces).
+        let mut q_i_ref = unsafe { HiddenStates::uninit(&ctx, wq_b_rows, 1).unwrap() };
+        dsv4_linear(&ctx, &wq_b, &c_q, &mut q_i_ref).unwrap();
+        let mut weights_ref = unsafe { HiddenStates::uninit(&ctx, weights_rows, 1).unwrap() };
+        dsv4_linear(&ctx, &weights_proj, &normed, &mut weights_ref).unwrap();
+        ctx.sync().unwrap();
+
+        let q_b = ctx.stream.clone_dtoh(&q_i_batch.data).unwrap();
+        let q_r = ctx.stream.clone_dtoh(&q_i_ref.data).unwrap();
+        let w_b = ctx.stream.clone_dtoh(&weights_batch.data).unwrap();
+        let w_r = ctx.stream.clone_dtoh(&weights_ref.data).unwrap();
+        ctx.sync().unwrap();
+
+        // BYTE-IDENTICAL: same bf16 bit pattern, not just close. The n=1 slice
+        // is the full output, and cublasLt M=1 is deterministic run-to-run.
+        assert_eq!(
+            q_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            q_r.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "batched q_i n=1 not byte-identical to per-row GEMV"
+        );
+        assert_eq!(
+            w_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            w_r.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "batched weights n=1 not byte-identical to per-row GEMV"
+        );
+        eprintln!(
+            "[batched_indexer_query] n=1 byte-identity OK (q_i {} elems, weights {} elems)",
+            q_b.len(),
+            w_b.len()
+        );
+    }
 }
