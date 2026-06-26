@@ -3737,6 +3737,48 @@ impl HiddenStates {
     pub fn device_bytes(&self) -> usize {
         self.data.len() * std::mem::size_of::<bf16>()
     }
+
+    /// Borrowed view over the whole buffer (`seq_len` columns).
+    pub fn as_view(&self) -> HiddenStatesView<'_> {
+        HiddenStatesView {
+            data: self.data.slice(..),
+            hidden_dim: self.hidden_dim,
+            seq_len: self.seq_len,
+        }
+    }
+
+    /// Borrowed view of column `r` (`[hidden_dim, 1]`). Same device address +
+    /// length the per-row D2D copy would have produced — read-only, zero copy.
+    pub fn col(&self, r: usize) -> HiddenStatesView<'_> {
+        let w = self.hidden_dim;
+        HiddenStatesView {
+            data: self.data.slice(r * w..(r + 1) * w),
+            hidden_dim: w,
+            seq_len: 1,
+        }
+    }
+}
+
+/// Borrowed column view into a contiguous `[hidden_dim, seq_len]` [`HiddenStates`].
+/// Feeds the identical device pointer the per-row D2D copy produced → bit-identical
+/// reads, zero copy. Read-only.
+pub struct HiddenStatesView<'a> {
+    pub data: cudarc::driver::CudaView<'a, bf16>,
+    pub hidden_dim: usize,
+    pub seq_len: usize,
+}
+
+impl<'a> HiddenStatesView<'a> {
+    /// Reborrow this view at the same span, preserving lifetime `'a`
+    /// (cudarc `CudaView::slice(..)` returns `Self`). Lets owned and borrowed
+    /// indexer-query sources be unified to one `HiddenStatesView` value.
+    pub fn as_self_view(&self) -> HiddenStatesView<'a> {
+        HiddenStatesView {
+            data: self.data.slice(..),
+            hidden_dim: self.hidden_dim,
+            seq_len: self.seq_len,
+        }
+    }
 }
 
 /// Cached raw CUDA device pointer for a pre-allocated buffer.

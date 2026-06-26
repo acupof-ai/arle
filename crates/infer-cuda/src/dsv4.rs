@@ -2924,20 +2924,20 @@ impl Dsv4Model {
                                     .map(|(ikv, iscore)| (ikv as &_, iscore as &_)),
                             }
                         });
-                        // CSA indexer-query batched pre-pass: slice this row's
-                        // `[width,1]` columns of `q_i`/`weights` so `csa_select`
-                        // skips the per-row m=1 GEMVs. Owned buffers bound at
-                        // iteration scope (outlive the prepare call that borrows
-                        // them through `indexer_query_precomputed`). `None` when the
-                        // pre-pass didn't run (SparseIndexed / no indexer) →
-                        // byte-identical per-row GEMVs.
-                        let indexer_query_row = match indexer_query_kv_score.as_ref() {
-                            Some((q_i, weights)) => Some((slice_row(q_i)?, slice_row(weights)?)),
-                            None => None,
-                        };
+                        // CSA indexer-query batched pre-pass: borrow this row's
+                        // `[width,1]` column VIEW of `q_i`/`weights` so `csa_select`
+                        // skips the per-row m=1 GEMVs AND the per-row D2D re-copy —
+                        // the view feeds the prepass column's device pointer straight
+                        // into the gather (zero copy; same address the old per-row
+                        // copy produced → byte-identical). `None` when the pre-pass
+                        // didn't run (SparseIndexed / no indexer) → byte-identical
+                        // per-row GEMVs.
                         let indexer_query_precomputed =
-                            indexer_query_row.as_ref().map(|(q_i, weights)| {
-                                crate::attention::Dsv4IndexerQueryPrecomputed { q_i, weights }
+                            indexer_query_kv_score.as_ref().map(|(q_i, weights)| {
+                                crate::attention::Dsv4IndexerQueryPrecomputed {
+                                    q_i: q_i.col(r),
+                                    weights: weights.col(r),
+                                }
                             });
                         let skip_compressor = full_flatten;
                         let idx_before_override = if full_flatten {
