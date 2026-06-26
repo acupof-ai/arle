@@ -389,6 +389,9 @@ pub(crate) struct OcrArgs {
     pub(crate) json: bool,
 }
 
+// Used only by the backend-gated `ocr` module — gate to match (the `OcrMode`
+// enum + `OcrArgs` stay ungated for CLI parsing under any feature set).
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl OcrMode {
     /// The DeepSeek-OCR instruction prompt for this mode (no `<image>` marker —
     /// the engine splices the image automatically).
