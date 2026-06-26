@@ -406,8 +406,31 @@ mod tests {
     feature = "cpu"
 ))]
 async fn shutdown_signal(shutdown: infer_server::ServeShutdown) {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        shutdown.request();
-        log::info!("shutdown signal received");
+    // SIGINT or SIGTERM (kill/pod_serve.sh/orchestrators send SIGTERM): without
+    // handling SIGTERM the coordinator dies un-gracefully (drop(guard) skipped) → TP
+    // workers reaped mid-NCCL-collective → wedged/leaked GPU contexts.
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                log::warn!(
+                    "SIGTERM handler install failed ({e}); SIGTERM won't shut down gracefully"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
     }
+    shutdown.request();
+    log::info!("shutdown signal received");
 }
