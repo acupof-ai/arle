@@ -2738,6 +2738,9 @@ impl Dsv4Model {
                             &mut cache_ptrs,
                         )?;
                     }
+                    if n >= 2 {
+                        eprintln!("DSV4BATCH P1b-cachewrite n={n} L={layer_idx}");
+                    }
                     crate::attention::dsv4_dsa_cache_write_batched(
                         &self.ctx,
                         n,
@@ -2945,6 +2948,9 @@ impl Dsv4Model {
                         } else {
                             None
                         };
+                        if n >= 2 {
+                            eprintln!("DSV4BATCH prepare-row r={r} n={n} L={layer_idx}");
+                        }
                         let row_prepared = crate::attention::mla_attention_prepare_compressed_only(
                             &self.ctx,
                             &self.config,
@@ -3009,7 +3015,7 @@ impl Dsv4Model {
                             }
                             let page_table =
                                 layer_pool.flashmla_device_page_table(&self.ctx, slot_idx)?;
-                            pack_num_logical_pages = page_table.len();
+                            pack_num_logical_pages = pack_num_logical_pages.max(page_table.len());
                             let (pt, pg) = page_table.device_ptr(&self.ctx.stream);
                             pack_pt_ptrs.push(pt);
                             drop(pg);
@@ -3093,6 +3099,9 @@ impl Dsv4Model {
                         let compressed_arr =
                             crate::ops::upload_u64(&self.ctx, &pack_compressed_ptrs)?;
                         let pt_arr = crate::ops::upload_u64(&self.ctx, &pack_pt_ptrs)?;
+                        if n >= 2 {
+                            eprintln!("DSV4BATCH pack n={n} L={layer_idx}");
+                        }
                         crate::attention::flashmla_decode_pack_batched(
                             &self.ctx,
                             &self.config,
@@ -3196,6 +3205,9 @@ impl Dsv4Model {
                     })?;
                     let flash_batch = flash_batch
                         .ok_or_else(|| anyhow!("DSv4 batched CSA select: batch scratch missing"))?;
+                    if n >= 2 {
+                        eprintln!("DSV4BATCH select n={n} L={layer_idx}");
+                    }
                     crate::attention::csa_select_official_batched(
                         &self.ctx,
                         &self.config,
