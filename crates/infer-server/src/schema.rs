@@ -572,11 +572,13 @@ impl ChatCompletionResponse {
         model: String,
         completed: CompletedRequest,
         content: String,
+        enable_thinking: bool,
     ) -> Self {
         let usage = Usage::new(
             completed.prompt_tokens.len(),
             completed.generated_tokens.len(),
         );
+        let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
@@ -587,6 +589,7 @@ impl ChatCompletionResponse {
                 message: AssistantMessage {
                     role: "assistant",
                     content,
+                    reasoning_content,
                 },
                 finish_reason: finish_reason(completed.finish.as_ref()).to_string(),
             }],
@@ -600,7 +603,9 @@ impl ChatCompletionResponse {
         prompt_tokens: usize,
         completion_tokens: usize,
         finish: Option<&FinishReason>,
+        enable_thinking: bool,
     ) -> Self {
+        let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
@@ -611,6 +616,7 @@ impl ChatCompletionResponse {
                 message: AssistantMessage {
                     role: "assistant",
                     content,
+                    reasoning_content,
                 },
                 finish_reason: finish_reason(finish).to_string(),
             }],
@@ -630,6 +636,51 @@ pub struct ChatChoice {
 pub struct AssistantMessage {
     pub role: &'static str,
     pub content: String,
+    /// Thinking-model reasoning lifted out of `content` (everything before
+    /// `</think>`). Absent for non-thinking outputs so the wire shape stays
+    /// byte-identical to before for those.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+const THINK_END: &str = "</think>";
+
+/// Split a thinking-model's generated text into `(reasoning_content, content)`.
+///
+/// The chat template pre-fills `<think>\n` into the *prompt*, so the model emits
+/// `reasoning</think>answer` (closer + answer). We split on the closer to give
+/// API consumers a clean `content` (the actual answer/commands).
+/// - Thinking OFF: byte-identical passthrough `(None, text)` — no scan, so an
+///   answer that legitimately contains a literal `</think>` is never truncated
+///   (matches SGLang/vLLM: parse reasoning only when the lane is active).
+/// - Thinking ON, has `</think>`: reasoning = text before it (leading `<think>`
+///   stripped, trimmed); content = text after it (leading whitespace trimmed).
+/// - Thinking ON, no `</think>`: truncated thinking → all reasoning, empty
+///   content (the answer never arrived; a max_tokens concern, not ours).
+/// Empty reasoning collapses to `None` so the field is omitted.
+///
+// ponytail: only the non-streaming chat builders split reasoning; chat
+// streaming (SSE delta) is gated off in `validate()`, so there's no chat SSE
+// builder to split yet — wire it here if/when chat streaming lands.
+fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
+    if !enable_thinking {
+        return (None, text.to_string());
+    }
+    let (reasoning, content) = match text.find(THINK_END) {
+        Some(idx) => (
+            text[..idx]
+                .trim_start()
+                .trim_start_matches("<think>")
+                .trim(),
+            text[idx + THINK_END.len()..].trim_start(),
+        ),
+        // Truncated thinking: the closer never arrived, so neither did the answer.
+        None => (text.trim(), ""),
+    };
+    (
+        (!reasoning.is_empty()).then(|| reasoning.to_string()),
+        content.to_string(),
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -827,6 +878,81 @@ mod tests {
         }))
         .unwrap();
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn split_reasoning_lifts_thinking_out_of_content() {
+        // (a) closer + answer
+        assert_eq!(
+            split_reasoning("reason</think>answer", true),
+            (Some("reason".to_string()), "answer".to_string())
+        );
+        // (b) leading <think> opener stripped
+        assert_eq!(
+            split_reasoning("<think>r</think>a", true),
+            (Some("r".to_string()), "a".to_string())
+        );
+        // (c) no closer + thinking on → all reasoning, empty content
+        assert_eq!(
+            split_reasoning("only thinking no close", true),
+            (Some("only thinking no close".to_string()), String::new())
+        );
+        // (d) no closer + thinking off → byte-identical passthrough
+        assert_eq!(
+            split_reasoning("plain answer", false),
+            (None, "plain answer".to_string())
+        );
+        // (e) whitespace around the closer is trimmed off the content
+        assert_eq!(
+            split_reasoning("r\n</think>\n\nanswer", true),
+            (Some("r".to_string()), "answer".to_string())
+        );
+        // (f) BLOCKER fix: thinking OFF never scans — a literal `</think>` in a
+        // non-thinking answer passes through byte-identically (not truncated).
+        assert_eq!(
+            split_reasoning("The closing tag is </think> in HTML.", false),
+            (None, "The closing tag is </think> in HTML.".to_string())
+        );
+        // (g) multiple closers → split on the FIRST; stray closer stays in content
+        assert_eq!(
+            split_reasoning("r1</think>mid</think>answer", true),
+            (Some("r1".to_string()), "mid</think>answer".to_string())
+        );
+        // (h) empty reasoning → None (no `"reasoning_content":""` on the wire)
+        assert_eq!(
+            split_reasoning("</think>answer", true),
+            (None, "answer".to_string())
+        );
+        assert_eq!(
+            split_reasoning("<think></think>answer", true),
+            (None, "answer".to_string())
+        );
+        // (i) empty output
+        assert_eq!(split_reasoning("", true), (None, String::new()));
+        // (j) leading whitespace before the opener still strips it
+        assert_eq!(
+            split_reasoning(" <think>r</think>a", true),
+            (Some("r".to_string()), "a".to_string())
+        );
+    }
+
+    #[test]
+    fn assistant_message_omits_reasoning_when_absent() {
+        let resp = ChatCompletionResponse::from_parts(
+            "Qwen3-8B".to_string(),
+            "plain answer".to_string(),
+            3,
+            2,
+            Some(&FinishReason::Stop),
+            false,
+        );
+        let v = serde_json::to_value(&resp).expect("serialize");
+        let message = &v["choices"][0]["message"];
+        assert_eq!(message["content"], "plain answer");
+        assert!(
+            message.get("reasoning_content").is_none(),
+            "reasoning_content must be omitted for non-thinking output"
+        );
     }
 
     #[test]
