@@ -1134,23 +1134,6 @@ impl Dsv4LayerKvLayout {
         Ok(range)
     }
 
-    /// First physical pool BLOCK of one slot's contiguous FlashMLA band (#60
-    /// batched lane): `slot_layer_block_offsets[row]` for the batched indices
-    /// builder, which translates each row's slot-relative indices to
-    /// pool-absolute coords via `block_offset * page_block_size`. Derives from
-    /// the same table-routed contiguous byte range as the single-row path, so it
-    /// inherits the Stage-A contiguity invariant.
-    pub(crate) fn flashmla_slot_first_block(&self, slot_idx: usize) -> Result<usize> {
-        let range = self.flashmla_pages_byte_range(slot_idx)?;
-        ensure!(
-            self.flashmla_page_bytes > 0 && range.start % self.flashmla_page_bytes == 0,
-            "DSv4 FlashMLA slot {slot_idx} band start {} not page-block aligned ({})",
-            range.start,
-            self.flashmla_page_bytes
-        );
-        Ok(range.start / self.flashmla_page_bytes)
-    }
-
     fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
         Self::slot_range(slot_idx, self.dsa_slot_bytes, self.num_slots)
     }
