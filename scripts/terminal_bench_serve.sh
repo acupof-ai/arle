@@ -17,9 +17,8 @@
 # the node (and, via the tunnel local-forward set up by the eval script) the Mac
 # can reach it.
 #
-# Usage (on the pod, e.g. via `pod` / a pod tmux session):
-#   ARLE_BIN=/host/arle-build/target/release/arle \
-#     scripts/terminal_bench_serve.sh
+# Usage (on the pod, e.g. via `pod` / a pod tmux session), TP=1 on a free GPU:
+#   CUDA_VISIBLE_DEVICES=4 PORT=8100 scripts/terminal_bench_serve.sh
 #
 # Env overrides:
 #   ARLE_BIN     path to the prebuilt arle binary
@@ -28,10 +27,11 @@
 #   PORT         listen port          (default: 8000)
 #   BIND         bind address         (default: 0.0.0.0 — required for the
 #                                       node/Mac to reach it over host-net)
-#   INFER_CUDA_DEVICES  comma list of GPU ordinals to use; its count is the TP
-#                       world size (project memory: this is the TP=N trigger).
-#                       Set to FREE GPUs (e.g. "4,5,6,7") so the serve does not
-#                       collide with another workload on GPUs 0-3.
+#   CUDA_VISIBLE_DEVICES  pin a single FREE GPU ordinal (e.g. 4). The 27B FP8
+#                       weights fit on one H20; serve TP=1 today (TP>1 needs an
+#                       HD256 q6_kv1 prefill kernel that the AOT set lacks). The
+#                       single-GPU path otherwise targets ordinal 0, which may be
+#                       occupied by another workload.
 #   EXTRA_FLAGS  extra `arle serve` flags (e.g. "--max-total-tokens 32768")
 #
 # The served OpenAI model id is the model-dir basename: `Qwen3.6-27B-FP8`
@@ -55,16 +55,23 @@ if [[ ! -d "$MODEL_PATH" ]]; then
 fi
 
 MODEL_ID="$(basename "$MODEL_PATH")"
-# Qwen3.6 (model_type=qwen3_5) takes the multiproc TP serve path; its TP world
-# size is the count of INFER_CUDA_DEVICES. Default to all 8 H20s; override to a
-# free subset (e.g. 4,5,6,7) to avoid colliding with another workload.
-export INFER_CUDA_DEVICES="${INFER_CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
+# DEVICE SELECTION (measured 2026-06-26):
+#   - The 27B FP8 weights (~30 GB) fit on ONE H20 (97 GB) — serve TP=1.
+#   - TP>1 (multiproc) is BLOCKED today: the AOT kernel set has only the
+#     HD256 q24_kv4 prefill kernel; at TP=4 the q6_kv1 shard shape errors
+#     `no HD256 paged prefill kernel for q6_kv1` at tick #0.
+#   - The single-GPU path IGNORES INFER_CUDA_DEVICES for the ordinal (always
+#     targets ordinal 0). Use CUDA_VISIBLE_DEVICES=<free-gpu> to pin a free
+#     card (it then appears as ordinal 0). On the shared box GPUs 0-3 are often
+#     held by another serve, so e.g. CUDA_VISIBLE_DEVICES=4.
+GPU_NOTE="(set CUDA_VISIBLE_DEVICES=<free-gpu> for a single free card)"
+[[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && GPU_NOTE="CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[tb-serve] arle:       $ARLE_BIN"
-echo "[tb-serve] devices:    INFER_CUDA_DEVICES=$INFER_CUDA_DEVICES  (TP world size = device count)"
+echo "[tb-serve] devices:    ${GPU_NOTE}"
 echo "[tb-serve] model:      $MODEL_PATH  (OpenAI model id: $MODEL_ID)"
 echo "[tb-serve] endpoint:   http://${BIND}:${PORT}/v1  (chat: /v1/chat/completions)"
 echo "[tb-serve] TB --model: openai/${MODEL_ID}   -k api_base=http://localhost:${PORT}/v1"
-echo "[tb-serve] starting (cuda, 8xH20 multiproc TP)…"
+echo "[tb-serve] starting (cuda, TP=1 single-GPU)…"
 
 # shellcheck disable=SC2086
 exec "$ARLE_BIN" serve \
