@@ -349,6 +349,7 @@ async fn chat_completions(
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
+        request.enable_thinking(),
     )))
 }
 

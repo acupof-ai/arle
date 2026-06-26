@@ -193,6 +193,7 @@ where
             prompt_token_count,
             output.generated_tokens.len(),
             Some(&output.finish),
+            request.enable_thinking(),
         )));
     }
     let prompt_tokens = encode(&state, &prompt)?;
@@ -202,6 +203,7 @@ where
         state.model.clone(),
         completed,
         content,
+        request.enable_thinking(),
     )))
 }
 
