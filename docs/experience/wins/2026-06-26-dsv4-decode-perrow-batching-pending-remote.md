@@ -28,13 +28,20 @@ n=1 byte-identical (gather idx == old slice; m=1 skips active_counts H2D) + CPU 
   (no view variant), so the per-row copies are structurally required until the consumer API
   is reworked. Bigger structural change (task 5).
 
-## Why perf is pending-remote
-DSv4-Flash needs **TP≥4** (MoE replicated at the allreduce backend → ~91GB/rank; TP=2 needs
->97GB/rank → OOM, confirmed). The 8×H20 box was heavily contended during this work (ckl
-debug-serve on GPUs 0-3, other jobs on 5-6) — only 2 GPUs free, < the 4×91GB needed. So the
-c-sweep + decode-phase finish-delta (the actual win measurement) could not run. Re-verify
-when 4 GPUs (≥91GB free) are available: needle exact + perf c-sweep + decode-phase finish
-should drop from 15.6ms@n5.
+## Measured (TP=4, GPUs 0-3 freed, 30befcd9)
+needle exact=3 all lengths (correctness ✓). Finish batched WORKED: decode-phase n=8
+`finish=14.7ms` (flat — per-row would scale to ~24ms). BUT throughput UNCHANGED: c=1/8/16/32
+= 10.9(cold)/39.5/56.3/65.3 tok/s ≈ baseline 31/43/57/66. The finish was only ~12% of the
+88-119ms step; the DOMINANT batchable per-row cost is the PREPARE (~41ms @ n=8: proj 3 +
+compidx/indexer-compressor cache-write 18 + pack/gathers ~20) + MoE (54ms, 45%, physics —
+needs batch≥32-64). So grouped O-LoRA is CORRECT + a real (flat) batch, but MARGINAL at TP=4.
+
+## The real lever (task 5, NOT done)
+The prepare per-row (~41ms) is the throughput lever: (a) DSA indexer cache-write + (c)
+flashmla_pack → batched slot-scatter kernels (NEW FP8/Hadamard .cu, pod-verified), (b)
+gathers → consumer-API rework (owned &HiddenStates → views). Structural, multi-step.
+afd6d717 (small GEMMs) + 30befcd9 (grouped O-LoRA) are both CORRECT but the throughput
+needle won't move until the prepare cache-write/pack are batched. TP≥4 required (TP=2 OOMs).
 
 ## Rule
 DSv4 TP=4 verify needs 4 dedicated ≥91GB GPUs (TP can't go lower — weights don't shard
