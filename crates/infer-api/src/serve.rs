@@ -271,16 +271,28 @@ pub fn serve_coordinator_http(
     max_thinking_tokens: usize,
     relay: infer_server::RelayCoordinator,
 ) -> Result<()> {
+    // Opt-in startup tracing (ARLE_COORD_MARK=1) — see serve_multiproc.rs markers 1-5;
+    // these (6-10) cover the post-barrier HTTP bring-up.
+    let mark = std::env::var_os("ARLE_COORD_MARK").is_some();
     let tokenizer = infer_server::OpenAiTokenizer::from_model_dir(model_path)
         .with_context(|| format!("coordinator tokenizer load for {model_path}"))?;
+    if mark {
+        eprintln!("[COORD-MARK] 6/10 tokenizer loaded; building coordinator_router");
+    }
     let model_id = crate::serve_engine::model_id_from_path(model_path);
     let shutdown = infer_server::ServeShutdown::new();
     let router = infer_server::coordinator_router(relay, tokenizer, model_id, max_thinking_tokens);
+    if mark {
+        eprintln!("[COORD-MARK] 7/10 coordinator_router built; building tokio runtime");
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build coordinator serve tokio runtime")?;
+    if mark {
+        eprintln!("[COORD-MARK] 8/10 tokio runtime built; entering block_on to bind {bind}:{port}");
+    }
 
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind((bind, port))
@@ -289,7 +301,15 @@ pub fn serve_coordinator_http(
         let addr = listener
             .local_addr()
             .context("failed to read listener local address")?;
+        if mark {
+            eprintln!("[COORD-MARK] 9/10 HTTP listener bound on {addr}; starting axum::serve");
+        }
         log::info!("serving OpenAI v1 (multiproc coordinator) on http://{addr} ({model_path})");
+        if mark {
+            eprintln!(
+                "[COORD-MARK] 10/10 serving OpenAI v1 (multiproc coordinator) on http://{addr}"
+            );
+        }
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown_signal(shutdown))
             .await
