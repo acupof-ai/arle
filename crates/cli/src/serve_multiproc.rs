@@ -121,8 +121,17 @@ pub(crate) fn bind_relay_and_spawn_workers(
         );
     }
 
+    // Opt-in startup tracing (ARLE_COORD_MARK=1): unbuffered eprintln markers at
+    // every coordinator bring-up step. The `log::info!` lines below don't flush
+    // through the multiproc stderr redirect, so a startup hang shows no progress;
+    // these pin which step wedged (the LAST `[COORD-MARK]` printed).
+    let mark = std::env::var_os("ARLE_COORD_MARK").is_some();
+
     // 1. Bind relay BEFORE spawning workers so the port can be exported via env.
     let pending = RelayCoordinator::bind().context("multiproc relay bind")?;
+    if mark {
+        eprintln!("[COORD-MARK] 1/10 relay bound port={}", pending.port());
+    }
     // SAFETY: env write happens before child spawn, on the single CLI thread
     // (clap parsing is done, no tokio runtime built yet for the serve path).
     unsafe {
@@ -135,11 +144,20 @@ pub(crate) fn bind_relay_and_spawn_workers(
 
     // 2. Spawn ALL N worker processes (rank 0..world_size); rank 0 is a child too.
     let mut children = spawn_workers(model_path, world_size)?;
+    if mark {
+        eprintln!("[COORD-MARK] 2/10 spawned {world_size} workers; accepting connects");
+    }
 
     // 3. Accept ALL N worker relay connects (rank 0 included).
     let mut relay = pending
         .accept_symmetric(world_size, RELAY_TIMEOUT)
         .context("multiproc relay accept")?;
+    if mark {
+        eprintln!(
+            "[COORD-MARK] 3/10 accepted {} connects",
+            relay.worker_count()
+        );
+    }
     log::info!(
         "[multiproc-coord] relay accepted {} worker connects (ranks {:?})",
         relay.worker_count(),
@@ -151,11 +169,17 @@ pub(crate) fn bind_relay_and_spawn_workers(
     relay
         .broadcast(&RelayEnvelope::BootPing { request_id: 0 })
         .context("multiproc relay boot-ping")?;
+    if mark {
+        eprintln!("[COORD-MARK] 4/10 boot-ping broadcast; entering engine-ready barrier");
+    }
 
     // 5. Engine-ready barrier: block until all N ranks report `EngineReady` before
     //    binding HTTP, else requests broadcast into socket buffers while workers are
     //    still in NCCL rendezvous. Fails fast if a child exits during the build.
     wait_all_engines_ready(&relay, &mut children, world_size)?;
+    if mark {
+        eprintln!("[COORD-MARK] 5/10 engine-ready barrier passed; returning to HTTP bring-up");
+    }
     log::info!("[multiproc-coord] all {world_size} worker engines ready; opening HTTP");
 
     Ok(Some(MultiprocCoordinator {
