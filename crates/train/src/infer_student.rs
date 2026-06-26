@@ -93,6 +93,31 @@ impl InferStudent {
         engine.release_inference_scratch()
     }
 
+    /// Drop the rollout engine's KV pool before the co-resident masked-CE
+    /// writeback. The writeback's `forward_hidden_states` is a FRESH autograd
+    /// forward that does NOT read this engine's KV cache, so the pool is DEAD
+    /// during the writeback — freeing it (~KV-pool GB) is the agent-OPD writeback
+    /// headroom lever. The rollout has finished + synced before this is called, so
+    /// the pool holds no resident pages. Re-acquired by [`Self::ensure_kv_pool`]
+    /// before the next round's rollout.
+    pub fn release_kv_pool(&self) -> Result<()> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.release_kv_pool()
+    }
+
+    /// Re-acquire the rollout engine's KV pool dropped by
+    /// [`Self::release_kv_pool`] before the next round's rollout. Idempotent.
+    pub fn ensure_kv_pool(&self) -> Result<()> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.ensure_kv_pool()
+    }
+
     /// Generate `rollout_len` tokens from `prompt_ids` through the infer
     /// scheduler/KV path and return the full prompt+generated rollout.
     ///

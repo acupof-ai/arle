@@ -364,6 +364,13 @@ impl Tape {
         function_id
     }
 
+    /// Number of registered checkpoint replay closures (one per checkpoint
+    /// group). OPD VRAM attribution only — each closure captures host-side
+    /// `Arc`s (the layer stack), not per-group device tensors.
+    pub fn checkpoint_fn_count(&self) -> usize {
+        self.checkpoint_fns.len()
+    }
+
     pub fn backward(
         &mut self,
         loss_id: TensorId,
@@ -1104,6 +1111,82 @@ mod tests {
             (xg, wg)
         }
         assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn checkpoint_frozen_group_offload_drops_input_hidden_device_residency() {
+        // Regression for the agent-OPD writeback OOM: a FROZEN checkpoint group
+        // (no trainable input → no tape entry, no backward replay) used to PIN
+        // its input hidden in VRAM under `offload_checkpoints`, because the hidden
+        // sits in `keep` here and then in every later group's `live_before`, so no
+        // `free_new_except` ever reclaims it — +156 MiB/group, unbounded over the
+        // frozen prefix. The fix drops the frozen group's input-hidden device
+        // residency. Mirror the failure minimally: a frozen group whose input is
+        // device-resident must NOT keep a device handle on that input afterward.
+        let mut store = TensorStore::default();
+        // Frozen "hidden" (requires_grad=false) made device-resident.
+        let hidden = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], false).expect("h"));
+        store.ensure_device(hidden).expect("upload hidden");
+        store
+            .replace_device_handle(
+                hidden,
+                store.tensor(hidden).unwrap().device_handle.clone().unwrap(),
+            )
+            .expect("device-authoritative");
+        assert!(store.tensor(hidden).unwrap().device_handle.is_some());
+
+        let mut tape = Tape::new();
+        tape.set_offload_checkpoints(true);
+        // Frozen group: the single non-param input is the hidden, requires_grad=false.
+        let out = ops::checkpoint(
+            vec![hidden],
+            &mut store,
+            &mut tape,
+            |store, tape, inputs| ops::mul_scalar(inputs[0], 2.0, store, tape),
+        )
+        .expect("frozen checkpoint forward");
+
+        // No tape entry recorded (frozen ⇒ no backward replay).
+        assert!(
+            tape.entries.is_empty(),
+            "frozen group must record no checkpoint entry"
+        );
+        // The leak fix: the input hidden's DEVICE residency is dropped.
+        assert!(
+            store.tensor(hidden).unwrap().device_handle.is_none(),
+            "frozen group input hidden must not retain a device handle (was the leak)"
+        );
+        // The forward output is still correct and usable.
+        assert_eq!(store.to_host(out).expect("out"), vec![4.0, -6.0]);
+    }
+
+    #[test]
+    fn checkpoint_frozen_group_default_path_keeps_device_residency() {
+        // The fix is gated to `offload_checkpoints`; the DEFAULT path (offload
+        // OFF) must stay byte-identical — the frozen input keeps its device handle.
+        let mut store = TensorStore::default();
+        let hidden = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], false).expect("h"));
+        store.ensure_device(hidden).expect("upload hidden");
+        store
+            .replace_device_handle(
+                hidden,
+                store.tensor(hidden).unwrap().device_handle.clone().unwrap(),
+            )
+            .expect("device-authoritative");
+
+        let mut tape = Tape::new();
+        // offload_checkpoints defaults OFF.
+        let _ = ops::checkpoint(
+            vec![hidden],
+            &mut store,
+            &mut tape,
+            |store, tape, inputs| ops::mul_scalar(inputs[0], 2.0, store, tape),
+        )
+        .expect("frozen checkpoint forward");
+        assert!(
+            store.tensor(hidden).unwrap().device_handle.is_some(),
+            "default (offload-off) path must keep the input's device handle (byte-identical)"
+        );
     }
 
     #[test]

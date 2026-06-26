@@ -547,6 +547,26 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.executor.release_inference_scratch()
     }
 
+    /// Drop the backend's KV pool WITHOUT offloading weights (OPD writeback
+    /// headroom: the writeback's fresh autograd forward never reads this engine's
+    /// KV). Delegates to [`BackendExecutor::release_kv_pool`] (default no-op). The
+    /// engine must be idle (all rollouts synced before this is called).
+    ///
+    /// # Errors
+    /// Propagates any error returned by the backend executor's pool release.
+    pub fn release_kv_pool(&mut self) -> Result<()> {
+        self.executor.release_kv_pool()
+    }
+
+    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
+    /// rollout. Delegates to [`BackendExecutor::ensure_kv_pool`] (default no-op).
+    ///
+    /// # Errors
+    /// Propagates any error returned by the backend executor's pool re-acquire.
+    pub fn ensure_kv_pool(&mut self) -> Result<()> {
+        self.executor.ensure_kv_pool()
+    }
+
     /// Submit a normal-priority request into the waiting queue.
     pub fn submit_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestHandle {
         self.submit_request_with_options(prompt_tokens, max_tokens, RequestOptions::default())
