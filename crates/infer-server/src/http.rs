@@ -152,12 +152,25 @@ where
 {
     request.validate()?;
     let sampling = request.sampling_params();
-    let mut max_tokens = sampling.max_new_tokens.unwrap_or(16);
-    // Bound runaway thinking: when the request turns thinking on and the server
-    // has a budget configured, clamp the generation budget so a slow think can't
-    // run away / time out. `0` budget (default) leaves max_tokens untouched, so
-    // the non-thinking and unconfigured paths stay byte-identical.
-    if state.max_thinking_tokens > 0 && request.enable_thinking() {
+    // A configured thinking budget (`--max-thinking-tokens N>0`) also flips the
+    // server-side default to thinking-on, so clients that can't set
+    // `chat_template_kwargs.enable_thinking` (terminus/litellm) still get the
+    // reasoning split + a generous budget. `0` (default) keeps thinking-off and
+    // the path byte-identical to before.
+    let thinking = request.enable_thinking(state.max_thinking_tokens > 0);
+    // When thinking is on and the request omits max_tokens, default to the
+    // thinking budget (not the bare 16) so the model can finish thinking AND
+    // emit the answer — a 16-token cap truncates mid-think (finish_reason=length)
+    // and terminus aborts. The request's own max_tokens still wins when set.
+    let mut max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
+        if thinking && state.max_thinking_tokens > 0 {
+            state.max_thinking_tokens
+        } else {
+            16
+        }
+    });
+    // Bound runaway thinking: clamp the budget so a slow think can't run away.
+    if state.max_thinking_tokens > 0 && thinking {
         max_tokens = max_tokens.min(state.max_thinking_tokens);
     }
     let multimodal_kind = state
@@ -193,7 +206,7 @@ where
             prompt_token_count,
             output.generated_tokens.len(),
             Some(&output.finish),
-            request.enable_thinking(),
+            thinking,
         )));
     }
     let prompt_tokens = encode(&state, &prompt)?;
@@ -203,7 +216,7 @@ where
         state.model.clone(),
         completed,
         content,
-        request.enable_thinking(),
+        thinking,
     )))
 }
 

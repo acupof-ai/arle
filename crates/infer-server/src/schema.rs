@@ -127,16 +127,19 @@ impl ChatCompletionRequest {
         )
     }
 
-    /// Whether `chat_template_kwargs.enable_thinking` is set truthy. Used only
-    /// to decide if the max-thinking-token budget applies; absent or
-    /// non-boolean → `false` (no budget clamp, today's behavior).
+    /// Whether `chat_template_kwargs.enable_thinking` is set truthy. Used to
+    /// decide if the thinking budget applies AND if the serve lifts reasoning
+    /// into `reasoning_content`. The request value wins when present; absent or
+    /// non-boolean falls back to `default_on` (the server-side default — clients
+    /// that can't set the kwarg, e.g. terminal-bench's terminus/litellm, still
+    /// get the split when the operator turns the budget on).
     #[must_use]
-    pub(crate) fn enable_thinking(&self) -> bool {
+    pub(crate) fn enable_thinking(&self, default_on: bool) -> bool {
         self.chat_template_kwargs
             .as_ref()
             .and_then(|kwargs| kwargs.get("enable_thinking"))
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+            .unwrap_or(default_on)
     }
 }
 
@@ -657,6 +660,7 @@ const THINK_END: &str = "</think>";
 ///   stripped, trimmed); content = text after it (leading whitespace trimmed).
 /// - Thinking ON, no `</think>`: truncated thinking → all reasoning, empty
 ///   content (the answer never arrived; a max_tokens concern, not ours).
+///
 /// Empty reasoning collapses to `None` so the field is omitted.
 ///
 // ponytail: only the non-streaming chat builders split reasoning; chat
@@ -878,6 +882,39 @@ mod tests {
         }))
         .unwrap();
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn enable_thinking_request_value_wins_over_server_default() {
+        // request omits the kwarg → falls back to the server default
+        let absent: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(!absent.enable_thinking(false), "absent + default off → off");
+        assert!(
+            absent.enable_thinking(true),
+            "absent + default on → on (terminus/litellm path: split fires)"
+        );
+        // request sets it explicitly → that wins regardless of the default
+        let on: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .unwrap();
+        assert!(
+            on.enable_thinking(false),
+            "request true overrides default off"
+        );
+        let off: ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .unwrap();
+        assert!(
+            !off.enable_thinking(true),
+            "request false overrides default on"
+        );
     }
 
     #[test]
