@@ -1061,6 +1061,15 @@ impl Dsv4LayerKvLayout {
         Ok(self.flashmla_pool_mut()?.k_data_slice_mut(0))
     }
 
+    /// Shared FlashMLA pool base device pointer (batched pack: one base, N rows
+    /// write disjoint bands via their per-slot page tables). Uniform across rows.
+    pub(crate) fn flashmla_pool_base_ptr(&mut self, ctx: &DeviceContext) -> Result<u64> {
+        let pool_buf = self.flashmla_pool_data_mut()?;
+        let (ptr, guard) = pool_buf.device_ptr_mut(&ctx.stream);
+        drop(guard);
+        Ok(ptr)
+    }
+
     /// One slot's page table: slot-logical page → physical pool page
     /// (FlashMLA's FFI calls our 64-token page a "block"). The ONLY source of band addresses (#85 P2) — token counts and
     /// block counts come from the pool's table, never re-derived from
@@ -1080,7 +1089,7 @@ impl Dsv4LayerKvLayout {
     /// pages and this device table routes them to the (dynamically-drawn)
     /// physical blocks. Identity-table == band (Phase 1 gate), so this is
     /// correct under the contiguous-band invariant and ready for fragmentation.
-    fn flashmla_device_page_table(
+    pub(crate) fn flashmla_device_page_table(
         &self,
         ctx: &DeviceContext,
         slot_idx: usize,
@@ -1440,6 +1449,18 @@ impl Dsv4FlashMlaDecodeState {
         self.fp8_kv_comp_packed_rows = 0;
         pool.reset_flashmla_slot(ctx, self)?;
         Ok(())
+    }
+
+    /// This (slot, layer) FlashMLA decode state's pool slot index — the ONLY
+    /// per-row varying input selecting the page table in the batched pack (op "c").
+    pub(crate) fn slot_idx(&self) -> usize {
+        self.slot_idx
+    }
+
+    /// SW sub-pool block count (= `ceil(sliding_window/page_block_size)`, uniform
+    /// across a layer's slots); the batched compressed-delta pack's `sw_blocks`.
+    pub(crate) fn sw_blocks(&self) -> usize {
+        self.sw_blocks
     }
 
     /// Exact requested device bytes owned by this per-(slot,layer) FlashMLA
@@ -5870,7 +5891,7 @@ fn flashmla_mode_int(mode: DeepSeekV4AttentionMode) -> i32 {
     }
 }
 
-fn flashmla_pack_sw_ring(
+pub(crate) fn flashmla_pack_sw_ring(
     ctx: &DeviceContext,
     flash: &mut Dsv4FlashMlaDecodeState,
     scratch: &mut Dsv4FlashMlaDecodeScratch,
@@ -7090,6 +7111,82 @@ fn try_flashmla_decode_attention(
         config,
     )?;
     Ok(true)
+}
+
+/// Canonical batched KV pack for the MODEL1 batched decode lane (#60 op "c"):
+/// the per-step ∝n pack work — ONE batched SW one-token pack + ONE batched
+/// compressed-delta pack over all N rows — replacing the N `flashmla_decode_pack_row`
+/// launches' 2×N per-step packs (the SW-ring BOOTSTRAP stays per-row; it fires
+/// once per slot lifetime, off the per-step hot path). All per-slot inputs are
+/// pre-gathered device-pointer arrays this step: `nope_arr[r]`/`rope_arr[r]` =
+/// row r's `k_prepared` NoPE / RoPE base (rope offset computed host-side, matching
+/// `flashmla_pack_one_sw_token`); `compressed_arr[r]` = row r's compressor
+/// `compressed` base (0/null for SparseIndexed / no-compressor rows → kernel
+/// no-op, == per-row None); `page_table_arr[r]` = row r's per-slot device page
+/// table (each `total_blocks` long). `start_pos` is the contiguous `[N]` decode
+/// positions (== each slot's `start_pos_device` scalar, byte-identical). `pool_ptr`
+/// is the single shared pool base (uniform; rows write disjoint bands via their
+/// page tables). `sw_blocks`/`compress_ratio`/`num_logical_pages` (= total_blocks)
+/// are uniform per layer. n=1 == the per-row pack, byte-for-byte. MODEL1 only
+/// (head_dim==512); V32/SparseIndexed callers keep [`flashmla_decode_pack_row`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flashmla_decode_pack_batched(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    compress_ratio: usize,
+    sw_blocks: usize,
+    n: usize,
+    pool_ptr: u64,
+    nope_arr: &CudaSlice<u64>,
+    rope_arr: &CudaSlice<u64>,
+    compressed_arr: &CudaSlice<u64>,
+    start_pos: &CudaSlice<i32>,
+    page_table_arr: &CudaSlice<u64>,
+    num_logical_pages: usize,
+) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_one_batched");
+        flash_kv::dsv4_fp8_kv_pack_strided_batched_raw(
+            ctx,
+            nope_arr,
+            rope_arr,
+            pool_ptr,
+            start_pos,
+            n,
+            64,
+            config.sliding_window,
+            config.head_dim,
+            config.head_dim,
+            page_table_arr,
+            num_logical_pages,
+        )?;
+    }
+    {
+        let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed_batched");
+        flash_kv::dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
+            ctx,
+            compressed_arr,
+            pool_ptr,
+            start_pos,
+            n,
+            compress_ratio,
+            sw_blocks,
+            64,
+            config.head_dim,
+            page_table_arr,
+            num_logical_pages,
+        )?;
+    }
+    Ok(())
+}
+
+/// Host-side rope-base offset for a row's `k_prepared` NoPE pointer, matching
+/// `flashmla_pack_one_sw_token` (rope = nope + (head_dim - qk_rope_head_dim)*2 B).
+pub(crate) fn flashmla_pack_rope_offset_bytes(config: &DeepSeekV4Config) -> u64 {
+    (config.head_dim - config.qk_rope_head_dim) as u64 * 2
 }
 
 /// PHASE B (#60) per-row KV pack for the batched decode lane: the EXACT pack

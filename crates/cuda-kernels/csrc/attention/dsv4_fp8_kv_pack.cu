@@ -568,6 +568,261 @@ __global__ void dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel(
     }
 }
 
+// === Batched (b=N) MODEL1 packs for the batched decode lane ======================
+//
+// KERNEL A — batched SW one-token pack. ONE launch (grid = (1, n, 1)) packs each
+// slot's CURRENT decode token into its own SW ring slot. `blockIdx.y = row`
+// selects the slot; the per-slot inputs are the device-pointer arrays
+// `nope_arr[row]`/`rope_arr[row]` (each = that row's `k_prepared` NoPE/RoPE base)
+// and the per-slot device page table `page_table_arr[row]`. The ring slot is
+// computed ON DEVICE from `start_pos[row]` (folds `dsv4_fp8_kv_fill_one_sw_slot_*`
+// inline) so CUDA-graph replay across positions stays correct. The inner
+// NoPE-quant + RoPE copy body is BYTE-IDENTICAL to `dsv4_fp8_kv_pack_kernel<448>`
+// at token 0 (n=1, row=0 reproduces `flashmla_pack_one_sw_token`). `packed_kv` is
+// the single shared pool base (uniform across rows). MODEL1 only (NoPE=448);
+// V32/SparseIndexed stay per-row.
+__global__ void dsv4_fp8_kv_pack_strided_batched_kernel(
+    const __nv_bfloat16* const* __restrict__ nope_arr,
+    const __nv_bfloat16* const* __restrict__ rope_arr,
+    uint8_t* __restrict__ packed_kv,
+    const int* __restrict__ start_pos,
+    int n,
+    int page_block_size,
+    int sliding_window,
+    int stride_nope_elems,
+    int stride_rope_elems,
+    const int* const* __restrict__ page_table_arr,
+    int num_logical_pages)
+{
+    constexpr int HEAD_DIM_NOPE    = 448;
+    constexpr int NUM_TILES        = HEAD_DIM_NOPE / QUANT_TILE_SIZE;  // 7
+    constexpr int NUM_SCALES       = 8;                                // 7 used + 1 pad
+    constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;       // 576
+    constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;    // 584
+
+    const int row = blockIdx.y;
+    if (row >= n) return;
+
+    // Ring-slot math folded inline from dsv4_fp8_kv_fill_one_sw_slot_*: the SW
+    // pack always writes the CURRENT token (t=0) at ring = pos % sliding_window.
+    const int pos = start_pos[row];
+    const int ring_idx = (sliding_window > 0 && pos >= 0) ? (pos % sliding_window) : 0;
+    int block_id = ring_idx / page_block_size;
+    const int rrow = ring_idx % page_block_size;
+    // Stage-B: route the slot-LOGICAL page through this row's device table.
+    const int* page_table = page_table_arr[row];
+    if (page_table != nullptr) {
+        if (block_id < 0 || block_id >= num_logical_pages) return;
+        block_id = page_table[block_id];
+    }
+
+    // Single token per row (t=0): the per-token strides only matter for n_tokens>1
+    // inputs; here each row points at its own [1, head_dim] k_prepared base.
+    (void)stride_nope_elems;
+    (void)stride_rope_elems;
+    const __nv_bfloat16* nope = nope_arr[row];
+    const __nv_bfloat16* rope = rope_arr[row];
+
+    const int64_t block_stride = (int64_t)page_block_size * TOKEN_BYTES;
+    uint8_t* block_base = packed_kv + (int64_t)block_id * block_stride;
+    uint8_t* token_data_base = block_base + (int64_t)rrow * TOKEN_DATA_BYTES;
+    uint8_t* token_scales_base =
+        block_base + (int64_t)page_block_size * TOKEN_DATA_BYTES
+        + (int64_t)rrow * NUM_SCALES;
+
+    __shared__ float s_warp_max[2];
+    __shared__ float s_scale_f;
+
+    const int tid = threadIdx.x;
+    const bool is_nope = (tid < NOPE_THREADS);
+    const int nope_lane = is_nope ? tid : -1;
+    const int rope_lane = (tid >= NOPE_THREADS) ? (tid - NOPE_THREADS) : -1;
+
+    // === BYTE-IDENTICAL body of dsv4_fp8_kv_pack_kernel<448> at t=0 ===
+    #pragma unroll
+    for (int tile = 0; tile < NUM_TILES; ++tile) {
+        float v = 0.0f;
+        if (is_nope) {
+            const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
+            v = __bfloat162float(nope[dim_idx]);
+        }
+        if (is_nope) {
+            float a = fabsf(v);
+            float warp_max = warp_reduce_max(a);
+            if ((nope_lane & 31) == 0) {
+                s_warp_max[nope_lane >> 5] = warp_max;
+            }
+        }
+        __syncthreads();
+        if (is_nope && nope_lane == 0) {
+            float amax = fmaxf(s_warp_max[0], s_warp_max[1]);
+            uint8_t byte;
+            __nv_bfloat16 scale_bf16;
+            if (amax <= 0.0f || !isfinite(amax)) {
+                byte = 0;
+                scale_bf16 = __float2bfloat16(1.0f);
+            } else {
+                int e_amax;
+                (void)frexpf(amax, &e_amax);
+                int e = e_amax - 9;
+                float trial = ldexpf(448.0f, e);
+                if (trial < amax) {
+                    e += 1;
+                }
+                if (e < -126) {
+                    e = -126;
+                } else if (e > 127) {
+                    e = 127;
+                }
+                byte = (uint8_t)(e + 127);
+                scale_bf16 = __float2bfloat16(ldexpf(1.0f, e));
+            }
+            s_scale_f = __bfloat162float(scale_bf16);
+            token_scales_base[tile] = byte;
+            if (tile == NUM_TILES - 1) {
+                for (int i = NUM_TILES; i < NUM_SCALES; ++i) {
+                    token_scales_base[i] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        if (is_nope) {
+            float scale_f = s_scale_f;
+            float quantized = (scale_f != 0.0f) ? (v / scale_f) : 0.0f;
+            __nv_fp8_e4m3 fp8_v = __nv_fp8_e4m3(quantized);
+            const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
+            token_data_base[dim_idx] = (uint8_t)fp8_v.__x;
+        }
+    }
+    if (!is_nope && rope_lane < HEAD_DIM_ROPE) {
+        __nv_bfloat16* rope_base = reinterpret_cast<__nv_bfloat16*>(
+            token_data_base + HEAD_DIM_NOPE);
+        rope_base[rope_lane] = rope[rope_lane];
+    }
+}
+
+// KERNEL B — batched compressed-delta pack. ONE launch (grid = (1, n, 1)). Each
+// slot packs AT MOST one just-completed compressor row this step; the internal
+// `(pos+1)%ratio != 0` early-out makes non-completing rows (and rows whose slot
+// has no compressor, signalled by `compressed_arr[row] == nullptr`) no-op, BYTE-
+// IDENTICAL to the per-row `flashmla_pack_compressed_delta` None/no-op. The body
+// is the verbatim `dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel`
+// with per-row addressing (`compressed_arr[row]`, `start_pos[row]`,
+// `page_table_arr[row]`). MODEL1 (CSA/HCA) only.
+__global__ void dsv4_fp8_kv_pack_completed_compressor_row_batched_kernel(
+    const __nv_bfloat16* const* __restrict__ compressed_arr,
+    uint8_t* __restrict__ packed_kv,
+    const int* __restrict__ start_pos,
+    int n,
+    int ratio,
+    int sw_blocks,
+    int page_block_size,
+    int stride_elems,
+    const int* const* __restrict__ page_table_arr,
+    int num_logical_pages)
+{
+    constexpr int HEAD_DIM_NOPE    = 448;
+    constexpr int NUM_TILES        = HEAD_DIM_NOPE / QUANT_TILE_SIZE;  // 7
+    constexpr int NUM_SCALES       = 8;                                // 7 used + 1 pad
+    constexpr int TOKEN_DATA_BYTES = HEAD_DIM_NOPE + ROPE_BYTES;       // 576
+    constexpr int TOKEN_BYTES      = TOKEN_DATA_BYTES + NUM_SCALES;    // 584
+
+    const int row = blockIdx.y;
+    if (row >= n) return;
+    // Rows whose slot has no compressor (SparseIndexed / want_compressed=false)
+    // pass a null base → no-op (== the per-row `Some(compressed)` else None gate).
+    const __nv_bfloat16* compressed = compressed_arr[row];
+    if (compressed == nullptr) return;
+
+    const int pos = start_pos[row];
+    if (pos < 0 || ratio <= 0 || ((pos + 1) % ratio) != 0) return;
+    const int compressed_row = pos / ratio;
+    int block_id = sw_blocks + compressed_row / page_block_size;
+    const int* page_table = page_table_arr[row];
+    if (page_table != nullptr) {
+        if (block_id >= num_logical_pages) return;
+        block_id = page_table[block_id];
+    }
+    const int rrow = compressed_row % page_block_size;
+
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* nope = compressed + (int64_t)compressed_row * stride_elems;
+    const __nv_bfloat16* rope = nope + HEAD_DIM_NOPE;
+
+    const int64_t block_stride = (int64_t)page_block_size * TOKEN_BYTES;
+    uint8_t* block_base = packed_kv + (int64_t)block_id * block_stride;
+    uint8_t* token_data_base = block_base + (int64_t)rrow * TOKEN_DATA_BYTES;
+    uint8_t* token_scales_base =
+        block_base + (int64_t)page_block_size * TOKEN_DATA_BYTES
+        + (int64_t)rrow * NUM_SCALES;
+
+    __shared__ float s_warp_max[2];
+    __shared__ float s_scale_f;
+
+    const bool is_nope = (tid < NOPE_THREADS);
+    const int nope_lane = is_nope ? tid : -1;
+    const int rope_lane = (tid >= NOPE_THREADS) ? (tid - NOPE_THREADS) : -1;
+
+    #pragma unroll
+    for (int tile = 0; tile < NUM_TILES; ++tile) {
+        float v = 0.0f;
+        if (is_nope) {
+            const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
+            v = __bfloat162float(nope[dim_idx]);
+        }
+        if (is_nope) {
+            float a = fabsf(v);
+            float warp_max = warp_reduce_max(a);
+            if ((nope_lane & 31) == 0) {
+                s_warp_max[nope_lane >> 5] = warp_max;
+            }
+        }
+        __syncthreads();
+        if (is_nope && nope_lane == 0) {
+            float amax = fmaxf(s_warp_max[0], s_warp_max[1]);
+            uint8_t byte;
+            __nv_bfloat16 scale_bf16;
+            if (amax <= 0.0f || !isfinite(amax)) {
+                byte = 0;
+                scale_bf16 = __float2bfloat16(1.0f);
+            } else {
+                int e_amax;
+                (void)frexpf(amax, &e_amax);
+                int e = e_amax - 9;
+                float trial = ldexpf(448.0f, e);
+                if (trial < amax) {
+                    e += 1;
+                }
+                if (e < -126) {
+                    e = -126;
+                } else if (e > 127) {
+                    e = 127;
+                }
+                byte = (uint8_t)(e + 127);
+                scale_bf16 = __float2bfloat16(ldexpf(1.0f, e));
+            }
+            s_scale_f = __bfloat162float(scale_bf16);
+            token_scales_base[tile] = byte;
+            if (tile == NUM_TILES - 1) {
+                token_scales_base[NUM_SCALES - 1] = 0;
+            }
+        }
+        __syncthreads();
+        if (is_nope) {
+            float scale_f = s_scale_f;
+            float quantized = (scale_f != 0.0f) ? (v / scale_f) : 0.0f;
+            __nv_fp8_e4m3 fp8_v = __nv_fp8_e4m3(quantized);
+            const int dim_idx = tile * QUANT_TILE_SIZE + nope_lane;
+            token_data_base[dim_idx] = (uint8_t)fp8_v.__x;
+        }
+    }
+    if (!is_nope && rope_lane < HEAD_DIM_ROPE) {
+        __nv_bfloat16* rope_base = reinterpret_cast<__nv_bfloat16*>(
+            token_data_base + HEAD_DIM_NOPE);
+        rope_base[rope_lane] = rope[rope_lane];
+    }
+}
+
 } // namespace
 
 // ===== Public C entries =====
@@ -760,5 +1015,77 @@ extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_
     }
     dsv4_fp8_kv_pack_completed_compressor_row_start_pos_kernel<<<1, THREADS_PER_BLOCK, 0, stream>>>(
         compressed, packed_kv, start_pos, ratio, sw_blocks, page_block_size, stride_elems, page_table, num_logical_pages);
+    return cudaGetLastError();
+}
+
+// Batched (b=N) MODEL1 SW one-token pack. One launch, grid=(1,n,1), block=128.
+// `nope_arr`/`rope_arr` are N device pointers (each = a row's k_prepared NoPE /
+// RoPE base); `page_table_arr` is N device page-table pointers (one per slot,
+// each `num_logical_pages` long); `packed_kv` is the single shared pool base;
+// `start_pos` is the contiguous `[N]` decode positions. n=1 == the per-row
+// `arle_dsv4_fp8_kv_pack_strided_cuda(n_tokens=1)` + fill (byte-identical).
+extern "C" cudaError_t arle_dsv4_fp8_kv_pack_strided_batched_cuda(
+    const __nv_bfloat16* const* nope_arr,
+    const __nv_bfloat16* const* rope_arr,
+    uint8_t* packed_kv,
+    const int* start_pos,
+    int n,
+    int page_block_size,
+    int sliding_window,
+    int stride_nope_elems,
+    int stride_rope_elems,
+    const int* const* page_table_arr,
+    int num_logical_pages,
+    cudaStream_t stream)
+{
+    if (n == 0) return cudaSuccess;
+    if (n < 0 || page_block_size <= 0 || sliding_window <= 0) return cudaErrorInvalidValue;
+    if (stride_nope_elems < 448 || stride_rope_elems < HEAD_DIM_ROPE) {
+        return cudaErrorInvalidValue;
+    }
+    if (nope_arr == nullptr || rope_arr == nullptr || packed_kv == nullptr
+        || start_pos == nullptr || page_table_arr == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(1, (unsigned)n, 1);
+    dim3 block(THREADS_PER_BLOCK, 1, 1);
+    dsv4_fp8_kv_pack_strided_batched_kernel<<<grid, block, 0, stream>>>(
+        nope_arr, rope_arr, packed_kv, start_pos, n,
+        page_block_size, sliding_window, stride_nope_elems, stride_rope_elems,
+        page_table_arr, num_logical_pages);
+    return cudaGetLastError();
+}
+
+// Batched (b=N) MODEL1 compressed-delta pack. One launch, grid=(1,n,1),
+// block=128. `compressed_arr[row]` is a row's compressor `compressed` base
+// (nullptr for rows with no compressor → no-op); the kernel early-outs per row
+// on `(pos+1)%ratio != 0`, so non-completing rows write nothing. n=1 ==
+// `arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda` (byte-identical).
+extern "C" cudaError_t arle_dsv4_fp8_kv_pack_completed_compressor_row_batched_cuda(
+    const __nv_bfloat16* const* compressed_arr,
+    uint8_t* packed_kv,
+    const int* start_pos,
+    int n,
+    int ratio,
+    int sw_blocks,
+    int page_block_size,
+    int stride_elems,
+    const int* const* page_table_arr,
+    int num_logical_pages,
+    cudaStream_t stream)
+{
+    if (n == 0) return cudaSuccess;
+    if (n < 0 || ratio <= 0 || sw_blocks < 0 || page_block_size <= 0
+        || stride_elems < 448 + HEAD_DIM_ROPE) {
+        return cudaErrorInvalidValue;
+    }
+    if (compressed_arr == nullptr || packed_kv == nullptr || start_pos == nullptr
+        || page_table_arr == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(1, (unsigned)n, 1);
+    dsv4_fp8_kv_pack_completed_compressor_row_batched_kernel<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
+        compressed_arr, packed_kv, start_pos, n, ratio, sw_blocks,
+        page_block_size, stride_elems, page_table_arr, num_logical_pages);
     return cudaGetLastError();
 }
