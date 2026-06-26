@@ -256,6 +256,21 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     }
 
     let mut engine_config = resolve_engine_config(backend, serve_args)?;
+    // DSv4 multiproc auto-context: resolve max_total_tokens from the checkpoint
+    // when unset. CUDA-only (the gate fns are CUDA-gated) — no non-CUDA path.
+    #[cfg(feature = "cuda")]
+    if backend == ServeBackend::Cuda
+        && serve_args.max_prompt_tokens.is_none()
+        && serve_args.max_total_tokens.is_none()
+        && infer_api::cuda_model_takes_multiproc_serve(&model_path)
+        && let Some(max_ctx) = crate::read_model_max_context(&model_path)
+    {
+        log::info!(
+            "DSv4 max context: auto-resolved to {max_ctx} from {model_path}/config.json (max_position_embeddings)"
+        );
+        engine_config.max_prompt_tokens = max_ctx;
+        engine_config.max_total_tokens = max_ctx;
+    }
     let spec = resolve_spec_options(backend, serve_args);
     let kv_ssd = resolve_kv_ssd_options(serve_args)?;
     // Lower MTP spec into the engine config at the CLI level so BOTH paths carry the
@@ -437,12 +452,6 @@ fn resolve_engine_config(
     if let Some(value) = serve_args.max_running_requests {
         config.num_slots = value;
     }
-    if let Some(value) = serve_args.total_pages {
-        config.total_pages = value;
-    }
-    if let Some(value) = serve_args.page_size {
-        config.page_size = value;
-    }
     if let Some(value) = serve_args.max_prompt_tokens {
         config.max_prompt_tokens = value;
     }
@@ -456,6 +465,7 @@ fn resolve_engine_config(
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = value;
     }
+    config.slot_oversubscription = serve_args.slot_oversubscription;
     if serve_args.kv_t1_budget_bytes.is_some() {
         config.kv_t1_budget_bytes = serve_args.kv_t1_budget_bytes;
     }
@@ -480,19 +490,6 @@ fn resolve_engine_config(
             ));
         }
         config.max_prompt_tokens = config.max_total_tokens;
-    }
-
-    if !matches!(backend, ServeBackend::Hip | ServeBackend::Vulkan) {
-        let capacity_tokens = config
-            .total_pages
-            .checked_mul(config.page_size)
-            .ok_or_else(|| "--total-pages * --page-size overflows usize".to_string())?;
-        if capacity_tokens < config.max_total_tokens {
-            return Err(format!(
-                "KV capacity is too small for one max-length request: total_pages({}) * page_size({}) = {} tokens, max_total_tokens={}",
-                config.total_pages, config.page_size, capacity_tokens, config.max_total_tokens
-            ));
-        }
     }
 
     Ok(config)
@@ -927,8 +924,6 @@ mod tests {
             "--low-impact",
             "--num-slots",
             "2",
-            "--total-pages",
-            "2048",
             "--max-prompt-tokens",
             "8192",
             "--max-total-tokens",
@@ -936,38 +931,13 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(config.options.engine_config.num_slots, 2);
-        assert_eq!(config.options.engine_config.total_pages, 2048);
         assert_eq!(config.options.engine_config.max_prompt_tokens, 8192);
         assert_eq!(config.options.engine_config.max_total_tokens, 16_384);
     }
 
     #[test]
-    fn engine_budget_rejects_capacity_below_max_total() {
-        if skip_if_no_backend() || matches!(compiled_backend_flag(), "hip" | "vulkan") {
-            return;
-        }
-        let (args, serve) = parse_serve(&[
-            "arle",
-            "serve",
-            "--backend",
-            compiled_backend_flag(),
-            "--model-path",
-            "model",
-            "--total-pages",
-            "1",
-            "--page-size",
-            "16",
-            "--max-prompt-tokens",
-            "16",
-            "--max-total-tokens",
-            "32",
-        ]);
-        let err = resolve_config(&args, &serve).expect_err("capacity rejected");
-        assert!(err.contains("KV capacity is too small"), "got: {err}");
-    }
-
-    #[test]
-    fn hip_engine_budget_ignores_paged_kv_capacity_flags() {
+    fn hip_engine_budget_keeps_internal_paged_kv_defaults() {
+        let defaults = EngineLoadConfig::default();
         let (_args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -975,17 +945,16 @@ mod tests {
             "hip",
             "--model-path",
             "model.gguf",
-            "--total-pages",
-            "1",
-            "--page-size",
-            "16",
             "--max-prompt-tokens",
             "16",
             "--max-total-tokens",
             "32",
         ]);
         let config = resolve_engine_config(ServeBackend::Hip, &serve).expect("HIP config resolves");
-        assert_eq!(config.total_pages, 1);
+        // total_pages/page_size are no longer user-facing; the internal defaults
+        // (the executor's profiling floor) are preserved untouched.
+        assert_eq!(config.total_pages, defaults.total_pages);
+        assert_eq!(config.page_size, defaults.page_size);
         assert_eq!(config.max_total_tokens, 32);
     }
 
