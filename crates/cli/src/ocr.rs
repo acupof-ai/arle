@@ -162,9 +162,13 @@ fn materialize_pdf_source(source: &str) -> Result<PathBuf> {
     }
     let path = source.strip_prefix("file://").unwrap_or(source);
     let path = Path::new(path);
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat pdf {} failed", path.display()))?;
-    ensure!(meta.is_file(), "pdf {} is not a regular file", path.display());
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("stat pdf {} failed", path.display()))?;
+    ensure!(
+        meta.is_file(),
+        "pdf {} is not a regular file",
+        path.display()
+    );
     Ok(path.to_path_buf())
 }
 
@@ -198,7 +202,10 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
         .with_context(|| format!("create temp dir {} failed", dir.display()))?;
     let out_prefix = dir.join("page");
     if let Some(page_selection) = page_selection {
-        eprintln!("[ocr] Rendering {} selected PDF pages...", page_selection.len());
+        eprintln!(
+            "[ocr] Rendering {} selected PDF pages...",
+            page_selection.len()
+        );
         let mut pngs = Vec::with_capacity(page_selection.len());
         for page in page_selection {
             let prefix = dir.join(format!("page-{page}"));
@@ -218,7 +225,10 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
     let mut pngs = std::fs::read_dir(&dir)
         .with_context(|| format!("read rendered pages in {} failed", dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
         .collect::<Vec<_>>();
     pngs.sort_by_key(|path| pdf_page_sort_key(path.as_path()));
     ensure!(
@@ -230,7 +240,12 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
     Ok(pngs)
 }
 
-fn run_pdftoppm(renderer: &str, pdf_path: &Path, out_prefix: &Path, page: Option<usize>) -> Result<()> {
+fn run_pdftoppm(
+    renderer: &str,
+    pdf_path: &Path,
+    out_prefix: &Path,
+    page: Option<usize>,
+) -> Result<()> {
     let mut cmd = Command::new(renderer);
     cmd.arg("-png");
     if let Some(page) = page {
@@ -328,8 +343,9 @@ fn write_ocr_output(path: Option<&Path>, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OCR_MAX_TOKENS, PDF_RENDERER_ENV, format_pages, is_pdf_source, parse_page_selection,
-        pdf_page_sort_key, read_ocr_max_context, render_pdf_pages, write_ocr_output,
+        DEFAULT_OCR_MAX_TOKENS, PDF_RENDERER_ENV, format_pages, is_pdf_source,
+        parse_page_selection, pdf_page_sort_key, read_ocr_max_context, render_pdf_pages,
+        write_ocr_output,
     };
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -348,11 +364,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = dir.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4").expect("write pdf");
-        unsafe { std::env::set_var(PDF_RENDERER_ENV, "definitely-not-installed-pdftoppm"); }
+        unsafe {
+            std::env::set_var(PDF_RENDERER_ENV, "definitely-not-installed-pdftoppm");
+        }
         let err = render_pdf_pages(&pdf, None).expect_err("missing renderer should fail");
         let msg = err.to_string();
         assert!(msg.contains("pdftoppm") || msg.contains(PDF_RENDERER_ENV));
-        unsafe { std::env::remove_var(PDF_RENDERER_ENV); }
+        unsafe {
+            std::env::remove_var(PDF_RENDERER_ENV);
+        }
     }
 
     #[test]
@@ -370,14 +390,18 @@ mod tests {
         let mut perms = std::fs::metadata(&script).expect("meta").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod");
-        unsafe { std::env::set_var(PDF_RENDERER_ENV, &script); }
+        unsafe {
+            std::env::set_var(PDF_RENDERER_ENV, &script);
+        }
         let out = render_pdf_pages(&pdf, None).expect("fake renderer works");
         assert_eq!(out.len(), 2);
         assert!(out[0].ends_with("page-1.png"));
         assert!(out[1].ends_with("page-2.png"));
         assert!(out[0].exists());
         assert!(out[1].exists());
-        unsafe { std::env::remove_var(PDF_RENDERER_ENV); }
+        unsafe {
+            std::env::remove_var(PDF_RENDERER_ENV);
+        }
     }
 
     #[test]
@@ -395,12 +419,16 @@ mod tests {
         let mut perms = std::fs::metadata(&script).expect("meta").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod");
-        unsafe { std::env::set_var(PDF_RENDERER_ENV, &script); }
+        unsafe {
+            std::env::set_var(PDF_RENDERER_ENV, &script);
+        }
         let out = render_pdf_pages(&pdf, Some(&[3, 1])).expect("selected pages render");
         assert_eq!(out.len(), 2);
         assert!(out[0].ends_with("page-3.png"));
         assert!(out[1].ends_with("page-1.png"));
-        unsafe { std::env::remove_var(PDF_RENDERER_ENV); }
+        unsafe {
+            std::env::remove_var(PDF_RENDERER_ENV);
+        }
     }
 
     #[test]
