@@ -65,14 +65,30 @@ Mac:localhost:8000  ──ssh -L──►  node:localhost:8000  ──host-net�
    (litellm api_base)              (tn tunnel 12222)                  (Qwen3.6-27B-FP8, TP)
 ```
 
-### GPU selection (important)
+### GPU selection (important) — and the TP=4 kernel gap
 
 `Qwen3.6-27B` (`model_type=qwen3_5`, arch `Qwen3_5ForConditionalGeneration`)
-classifies as `Qwen35` and takes the **multiproc TP** serve path; the TP world
-size is the count of `INFER_CUDA_DEVICES`. **Set it to FREE GPUs.** On the
-shared box GPUs 0-3 are often held by another DSv4 serve (port 8095); use
-`INFER_CUDA_DEVICES=4,5,6,7` for a TP=4 serve on the free half. Without a free
-GPU the load OOMs at `upload tensor lm_head.weight`.
+classifies as `Qwen35`. With **multiple** `INFER_CUDA_DEVICES` it takes the
+multiproc TP path — but the current AOT kernel set (`cuda-kernels/kernels.toml`)
+only ships the HD256 paged-prefill kernel for the `q24_kv4` shape (TP=1). At
+**TP=4** the per-shard shape is `q6_kv1` (24/4 q-heads, 4/4 kv-heads) and the
+forward dies at tick #0 with **`no HD256 paged prefill kernel for q6_kv1`**
+(measured 2026-06-26). So **serve this model at TP=1 today.**
+
+The 27B FP8 weights (~30 GB) fit on one H20 (97 GB). **Serve single-GPU on a
+free card**, but note: the single-GPU in-process path **ignores
+`INFER_CUDA_DEVICES` for the device ordinal** (it always targets ordinal 0). Use
+the standard **`CUDA_VISIBLE_DEVICES=<free-gpu>`** so the free card appears as
+ordinal 0:
+
+```bash
+# on the pod — TP=1 on free GPU 4 (GPUs 0-3 held by another serve):
+CUDA_VISIBLE_DEVICES=4 PORT=8100 scripts/terminal_bench_serve.sh
+```
+
+Without a free card the load OOMs at `upload tensor lm_head.weight` (GPU 0 full).
+A TP>1 serve needs the `q6_kv1` (and other shard-shape) HD256 prefill kernels
+added to the AOT set first — tracked for the eval campaign, not this harness.
 
 ## The two scripts
 
@@ -126,16 +142,43 @@ results json scored pass/fail).
 - **Pod**: a built `arle` binary, the model at `/host/Qwen3.6-27B-FP8`, free
   GPUs for the TP serve.
 
-## Smoke result
+## Smoke result (2026-06-26) — integration PROVEN, task not yet passing
 
-See the dated wins entry under `docs/experience/wins/` (or the commit body if
-`pending-remote`): records whether terminus reached our serve, issued shell
-commands, and got a pass/fail verdict on `hello-world`.
+Ran `hello-world` end-to-end (TB on the Mac, serve TP=1 on pod GPU 4 @ :8100,
+`ssh -L` over the tn tunnel). **The full chain works:**
+
+- TB built `tb__hello-world__client` Docker image + ran the container.
+- terminus/litellm reached our serve through the tunnel: serve `/v1/stats`
+  showed `requests_completed: 2, prefill_tokens: 962, generated_tokens: 46` —
+  the model received requests and generated.
+- TB's test ran and wrote `results.json` with a scored verdict.
+
+**Verdict: `hello-world` ✗, accuracy 0%, `failure_mode: unknown_agent_error`.**
+Decoded at the case level (the only honest way to read a 0%):
+
+- terminus asks for a **strict JSON-schema** response (the command batch).
+- Qwen3.6-27B is a **thinking model**: our serve emits the reasoning prose
+  **inline in `message.content`** (no `reasoning_content` split). The first real
+  run also hit the serve's **default max-output cap** mid-preamble
+  (`finish_reason: length`), so litellm got truncated non-JSON → terminus parsed
+  nothing → the agent `exit`ed without ever creating `hello.txt`.
+- Direct probe confirms: with `max_tokens=3000` the model finishes (`stop`) but
+  `content` is `"Here's a thinking process:\n1. Analyze User Input…"` — the
+  thinking, not the bare JSON.
+
+This is a **model-serving-config gap, NOT an integration bug**. The harness
+wiring is complete and verified. Campaign-side fixes (next, not this task):
+① split reasoning into `reasoning_content` (or disable thinking via the chat
+template / a `/no_think`-style flag) so `content` is clean JSON; ② raise the
+serve's default max output cap; ③ optionally a terminus prompt/parser that
+strips a thinking block before the JSON.
 
 ## What's not yet covered
 
-- Full-suite scoring + a leaderboard-comparable number (this is harness setup,
-  not the eval campaign).
+- The thinking-token → clean-JSON serve fix above (blocks any task pass).
+- A TP>1 HD256 prefill kernel for the `q6_kv1` shard shape (today: TP=1 only).
+- Full-suite scoring + a leaderboard-comparable number (harness setup, not the
+  eval campaign).
 - A `pending-remote` path if the Mac cannot keep Docker + the tunnel up for a
   long full run; consider a Docker-capable Linux host co-located with the pod
   network to drop the `ssh -L` hop.
