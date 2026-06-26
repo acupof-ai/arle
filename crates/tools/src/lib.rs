@@ -1272,7 +1272,9 @@ fn execute_ocr(image: &str, mode: &str) -> String {
 
     let model_cached = ocr_model_is_cached();
     if !model_cached {
-        log::info!("ocr tool: DeepSeek-OCR model not cached; `arle ocr` will download it on first use");
+        log::info!(
+            "ocr tool: DeepSeek-OCR model not cached; `arle ocr` will download it on first use"
+        );
     }
 
     let mut cmd = Command::new(&exe);
@@ -1346,7 +1348,6 @@ fn ocr_model_is_cached() -> bool {
         .map(|mut entries| entries.any(|e| e.is_ok()))
         .unwrap_or(false)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1686,7 +1687,13 @@ mod tests {
         // Required `image` param + the mode enum the agent picks from.
         assert_eq!(ocr.parameters["required"][0], "image");
         let modes = &ocr.parameters["properties"]["mode"]["enum"];
-        assert!(modes.as_array().expect("mode enum").iter().any(|m| m == "markdown"));
+        assert!(
+            modes
+                .as_array()
+                .expect("mode enum")
+                .iter()
+                .any(|m| m == "markdown")
+        );
     }
 
     #[test]
@@ -1695,7 +1702,10 @@ mod tests {
         let json = br#"{"text":"hello world","model":"x","usage":{}}"#;
         assert_eq!(super::ocr_extract_text(json), "hello world");
         // Non-JSON stdout passes through as raw text.
-        assert_eq!(super::ocr_extract_text(b"plain text out\n"), "plain text out");
+        assert_eq!(
+            super::ocr_extract_text(b"plain text out\n"),
+            "plain text out"
+        );
     }
 
     #[test]
