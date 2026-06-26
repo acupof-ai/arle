@@ -336,6 +336,15 @@ pub trait BackendExecutor {
     fn reload_weights(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Release the inference forward scratch (workspace / batched-decode scratch /
+    /// captured graphs) WITHOUT offloading weights or evicting KV, so a co-resident
+    /// OPD writeback reuses the VRAM (the OPD rollout->writeback path never offloads).
+    /// The default is a no-op (returns `Ok`) so backends without an inference
+    /// scratch surface are unaffected; the scratch rebuilds lazily on the next step.
+    fn release_inference_scratch(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
