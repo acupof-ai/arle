@@ -54,5 +54,7 @@
 //!   types and stay inside `infer::model::*`.
 
 pub use super::paged_kv::{EVICTED_PAGE, PagedKVPool};
-pub use super::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, RawDevicePtr};
+pub use super::tensor::{
+    DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesView, RawDevicePtr,
+};
 pub use super::tilelang::TileLangDecodeMetadata;

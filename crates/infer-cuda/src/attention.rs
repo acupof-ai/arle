@@ -8,7 +8,9 @@ use cuda_kernels::attention as flash_kv;
 use cuda_kernels::ffi;
 use cuda_kernels::kv_quant;
 use cuda_kernels::moe as cuda_moe;
-use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
+use cuda_kernels::prelude::{
+    DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesView, PagedKVPool,
+};
 use cuda_kernels::tensor::{WeightFormat, cache_ptr};
 use cuda_kernels::{KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -11881,14 +11883,15 @@ pub(crate) fn indexer_query_batch_prepass(
 }
 
 /// Per-row precomputed indexer query/weights projection slices for the batched
-/// decode pre-pass. `q_i` is this row's `[wq_b.rows, 1]` column slice of the
+/// decode pre-pass. `q_i` is this row's `[wq_b.rows, 1]` column VIEW of the
 /// batched [`indexer_query_batch_prepass`] output; `weights` is the
-/// `[weights_proj.rows, 1]` slice. When threaded into [`csa_select`], they replace
-/// the per-row m=1 `dsv4_linear` GEMVs; the per-slot cache writes + gathers stay
-/// per-row.
+/// `[weights_proj.rows, 1]` view. When threaded into [`csa_select`], they replace
+/// the per-row m=1 `dsv4_linear` GEMVs AND the per-row D2D re-copy — the view
+/// feeds the prepass column's device pointer straight into the gather (zero copy);
+/// the per-slot cache writes + gathers stay per-row.
 pub(crate) struct Dsv4IndexerQueryPrecomputed<'a> {
-    pub(crate) q_i: &'a HiddenStates,
-    pub(crate) weights: &'a HiddenStates,
+    pub(crate) q_i: HiddenStatesView<'a>,
+    pub(crate) weights: HiddenStatesView<'a>,
 }
 
 /// Host-gathered per-row device pointer arrays for one compressor's batched
@@ -12536,10 +12539,15 @@ fn csa_select(
     query_precomputed: Option<Dsv4IndexerQueryPrecomputed<'_>>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<CudaSlice<i32>> {
-    // Batched pre-pass: copy this row's `[width,1]` slice into an owned buffer
-    // (mirrors the per-row GEMV output shape) and skip the GEMVs. Decode-only
-    // (`c_q_normed.seq_len == 1`); the prefill DeepGEMM path never supplies it.
-    let (q_i, weights) = if let Some(pre) = query_precomputed.as_ref() {
+    // Batched pre-pass: this row's `q_i`/`weights` are a borrowed `[width,1]`
+    // column VIEW of the batched prepass output — ZERO copy (the view's device
+    // pointer is the exact column the per-row D2D copy would have produced). The
+    // GEMVs are skipped. Decode-only (`c_q_normed.seq_len == 1`); the prefill
+    // DeepGEMM path never supplies it. `owned_*` stays `None` here: the only
+    // consumer needing `&HiddenStates` (the non-batched `csa_select_official`
+    // fallback below) is unreachable when precomputed (proven: precomputed Some
+    // ⟹ CompressedSparse + dsa-official + batch-scratch ⟹ batched_gather Some).
+    let (owned_q_i, owned_weights) = if let Some(pre) = query_precomputed.as_ref() {
         ensure!(
             c_q_normed.seq_len == 1 && hidden.seq_len == 1,
             "DSv4 indexer query precomputed is decode-only (c_q seq={} hidden seq={})",
@@ -12559,18 +12567,7 @@ fn csa_select(
             pre.weights.seq_len,
             indexer.weights_proj.rows
         );
-        // SAFETY: each dtod copy fills the full buffer before any read below.
-        let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? };
-        ctx.stream
-            .memcpy_dtod(&pre.q_i.data, &mut q_i.data)
-            .map_err(|e| anyhow!("DSv4 indexer precomputed q_i copy failed: {e}"))?;
-        let mut weights = unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, 1)? };
-        ctx.stream
-            .memcpy_dtod(&pre.weights.data, &mut weights.data)
-            .map_err(|e| anyhow!("DSv4 indexer precomputed weights copy failed: {e}"))?;
-        keepalive.keep_hidden(&q_i);
-        keepalive.keep_hidden(&weights);
-        (q_i, weights)
+        (None, None)
     } else {
         // SAFETY: dsv4_linear writes the full index-query buffer.
         let mut q_i = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, c_q_normed.seq_len)? };
@@ -12606,7 +12603,27 @@ fn csa_select(
         })?;
         drop(nvtx_indexer_weights);
         keepalive.keep_hidden(&weights);
-        (q_i, weights)
+        (Some(q_i), Some(weights))
+    };
+
+    // Unified VIEW over q_i/weights for all reads below: owned buffer's full view
+    // (non-precomputed) or the prepass column view (precomputed) — identical
+    // device pointer + width either way → byte-identical reads.
+    let q_i = match owned_q_i.as_ref() {
+        Some(o) => o.as_view(),
+        None => query_precomputed
+            .as_ref()
+            .expect("owned_q_i None ⟹ precomputed Some")
+            .q_i
+            .as_self_view(),
+    };
+    let weights = match owned_weights.as_ref() {
+        Some(o) => o.as_view(),
+        None => query_precomputed
+            .as_ref()
+            .expect("owned_weights None ⟹ precomputed Some")
+            .weights
+            .as_self_view(),
     };
 
     ensure!(
@@ -12658,6 +12675,17 @@ fn csa_select(
         // skip this per-row write + `packed_rows` advance — they ran in P1b. The
         // SparseIndexed lane (no P1b) still runs the per-row write here.
         if !gather.cache_writes_in_prepass {
+            // `cache_writes_in_prepass` is false only on the SparseIndexed lane,
+            // which never supplies `query_precomputed` (CompressedSparse-only) →
+            // `owned_*` is Some, so `csa_select_official` reads the owned
+            // `&HiddenStates` (signature unchanged). Asserted, not assumed.
+            let (owned_q_i, owned_weights) = (owned_q_i.as_ref(), owned_weights.as_ref());
+            let q_i = owned_q_i.ok_or_else(|| {
+                anyhow!("DSv4 batched DSA per-row cache write needs owned q_i (precomputed only on the prepass lane)")
+            })?;
+            let weights = owned_weights.ok_or_else(|| {
+                anyhow!("DSv4 batched DSA per-row cache write needs owned weights (precomputed only on the prepass lane)")
+            })?;
             let official = official.ok_or_else(|| {
                 anyhow!("DSv4 batched DSA gather requires official per-slot DSA state")
             })?;
@@ -12666,8 +12694,8 @@ fn csa_select(
             csa_select_official(
                 ctx,
                 config,
-                &q_i,
-                &weights,
+                q_i,
+                weights,
                 keys,
                 official,
                 shared,
@@ -12689,6 +12717,8 @@ fn csa_select(
         }
         // Gather this row's q_i/weights (bf16) into the N-row staging at row r.
         // q_i is `[local_index_heads*index_head_dim, 1]`, weights `[local_index_heads, 1]`.
+        // Source is the unified VIEW (`q_i`/`weights`): the prepass column view
+        // (precomputed, zero copy) or the owned buffer's view (non-precomputed).
         let r = gather.row;
         let q_width = q_i.data.len();
         let w_width = weights.data.len();
@@ -12729,6 +12759,17 @@ fn csa_select(
             .map_err(|e| anyhow!("DSv4 batched DSA empty selected alloc failed: {e}"));
     }
 
+    // Non-batched single-row / prefill fallback: `batched_gather` is None here,
+    // and precomputed Some ⟹ batched_gather Some (CompressedSparse + dsa-official
+    // + batch-scratch), so this path is never reached when precomputed → `owned_*`
+    // is Some, and `csa_select_official` reads the owned `&HiddenStates`
+    // (signature unchanged). Asserted, not assumed.
+    let q_i = owned_q_i.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 CSA non-batched select needs owned q_i (precomputed ⟹ batched gather)")
+    })?;
+    let weights = owned_weights.as_ref().ok_or_else(|| {
+        anyhow!("DSv4 CSA non-batched select needs owned weights (precomputed ⟹ batched gather)")
+    })?;
     let official =
         official.ok_or_else(|| anyhow!("DSv4 CSA select requires official DSA per-slot state"))?;
     let shared = dsa_shared
@@ -12736,8 +12777,8 @@ fn csa_select(
     csa_select_official(
         ctx,
         config,
-        &q_i,
-        &weights,
+        q_i,
+        weights,
         keys,
         official,
         shared,
