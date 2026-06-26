@@ -10652,32 +10652,75 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         caches.len(),
         shape.groups
     );
+    // M-parametric over n: each group is ONE DeepGEMM at M=n. Group `g`'s columns
+    // are strided in the token-major `[n, groups*cols_per_group]` activation, so
+    // gather them into contiguous `[cols_per_group, n]`, GEMM(m=n) into
+    // `[rows_per_group, n]`, then scatter back into the `[n, groups*rows_per_group]`
+    // latent. The gather/scatter kernels are already num_tokens-parametric and the
+    // GEMM is M-parametric. N=1 BYTE-IDENTITY: at n=1 gather/scatter index group g
+    // at exactly the offsets the old per-row `slice()` used, m=1 skips the
+    // active_counts H2D, so the GEMM args are unchanged and the copies are bit-exact.
+    let n = local_attn.seq_len;
     ensure!(
-        local_attn.seq_len == 1 && latent.seq_len == 1,
-        "DSv4 grouped O-LoRA decode DeepGEMM expects one row, got local={} latent={}",
-        local_attn.seq_len,
+        latent.seq_len == n,
+        "DSv4 grouped O-LoRA decode DeepGEMM seq mismatch: local={n} latent={}",
         latent.seq_len
     );
+    let cols = shape.cols_per_group;
+    let rows = shape.rows_per_group;
+    let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, n)? };
+    let mut out_g = unsafe { HiddenStates::uninit(ctx, rows, n)? };
+    let in_len = in_g.data.len();
+    let out_len = out_g.data.len();
     for (group, cache) in caches.iter().enumerate() {
-        let input_start = group * shape.cols_per_group;
-        let input_end = input_start + shape.cols_per_group;
-        let output_start = group * shape.rows_per_group;
-        let output_end = output_start + shape.rows_per_group;
-        let input = local_attn.data.slice(input_start..input_end);
-        let mut output = latent.data.slice_mut(output_start..output_end);
-        let input_len = input.len();
-        let output_len = output.len();
+        // Scope the gather guards so `in_g.data`'s mutable SyncOnDrop guard drops
+        // before the GEMM re-borrows it immutably.
+        {
+            let (src_ptr, _src_guard) = local_attn.data.device_ptr(&ctx.stream);
+            let (in_ptr, _in_guard) = in_g.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_oproj_group_gather_cuda(
+                    src_ptr as *const ffi::Half,
+                    in_ptr as *mut ffi::Half,
+                    i32::try_from(n)?,
+                    i32::try_from(shape.groups)?,
+                    i32::try_from(cols)?,
+                    i32::try_from(group)?,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 grouped O-LoRA decode gather failed: {e}"))?;
+            }
+        }
         decode_proj_deepgemm_raw(
             ctx,
             scratch,
             cache,
-            &input,
-            input_len,
-            &mut output,
-            output_len,
-            shape.cols_per_group,
-            1,
+            &in_g.data,
+            in_len,
+            &mut out_g.data,
+            out_len,
+            cols,
+            n,
         )?;
+        // Scope the scatter guards symmetrically.
+        {
+            let (out_ptr, _out_guard) = out_g.data.device_ptr(&ctx.stream);
+            let (dst_ptr, _dst_guard) = latent.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dsv4_oproj_group_scatter_cuda(
+                    out_ptr as *const ffi::Half,
+                    dst_ptr as *mut ffi::Half,
+                    i32::try_from(n)?,
+                    i32::try_from(shape.groups)?,
+                    i32::try_from(rows)?,
+                    i32::try_from(group)?,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 grouped O-LoRA decode scatter failed: {e}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -10819,6 +10862,64 @@ mod oproj_tests {
         assert_eq!(m_per_row as i32, 1);
         assert_eq!(m_batched as i32, 7);
     }
+
+    // The gather kernel index: src_idx = (row*groups + group)*cols_per_group + col.
+    // The scatter kernel index: dst_idx = (row*groups + group)*rows_per_group + col.
+    fn group_gather_src_idx(
+        row: usize,
+        group: usize,
+        groups: usize,
+        cols_per_group: usize,
+        col: usize,
+    ) -> usize {
+        (row * groups + group) * cols_per_group + col
+    }
+    fn group_scatter_dst_idx(
+        row: usize,
+        group: usize,
+        groups: usize,
+        rows_per_group: usize,
+        col: usize,
+    ) -> usize {
+        (row * groups + group) * rows_per_group + col
+    }
+
+    #[test]
+    fn grouped_decode_batched_n1_byte_identical_to_per_row_slice() {
+        // n=1 BIT-IDENTITY: the M-parametric grouped decode (gather/GEMM/scatter)
+        // must, at n=1, touch EXACTLY the offsets the deleted per-row path used:
+        //   old input  = local_attn.data.slice(group*cols .. group*cols + cols)
+        //   old output = latent.data.slice(group*rows .. group*rows + rows)
+        // and the GEMM m-arg is 1 (skips the active_counts H2D). TP=4 grouped
+        // example: 2 output groups owned by one rank, cols=4096, rows=1536.
+        let (groups, cols, rows) = (2usize, 4096usize, 1536usize);
+        let n = 1usize;
+        let row = 0usize; // n==1 -> only row 0
+        for group in 0..groups {
+            // Old per-row contiguous slice start/end (the deleted code).
+            let old_in_start = group * cols;
+            let old_out_start = group * rows;
+            // New gather/scatter walk the same span, element-for-element.
+            assert_eq!(
+                group_gather_src_idx(row, group, groups, cols, 0),
+                old_in_start
+            );
+            assert_eq!(
+                group_gather_src_idx(row, group, groups, cols, cols - 1),
+                old_in_start + cols - 1
+            );
+            assert_eq!(
+                group_scatter_dst_idx(row, group, groups, rows, 0),
+                old_out_start
+            );
+            assert_eq!(
+                group_scatter_dst_idx(row, group, groups, rows, rows - 1),
+                old_out_start + rows - 1
+            );
+        }
+        // GEMM m-arg at n=1 is 1 — the original per-row arg, so no active_counts H2D.
+        assert_eq!(n as i32, 1);
+    }
 }
 
 /// O-LoRA output projection, extracted from `mla_attention` so the batched-decode
@@ -10902,15 +11003,15 @@ pub(crate) fn mla_oproj(
         && dsv4_prefill_proj_deepgemm_enabled()
         && attention.wo_a_deepgemm.is_some()
         && prefill_shared.is_some();
-    // Grouped decode DeepGEMM slices per-group columns within ONE row, so it
-    // stays per-row (token_count==1). The batched FINISH calls mla_oproj per row
-    // for grouped models (the reported fallback); the single-group case above is
-    // what Qwen3.6-35B MODEL1 hits at TP>1 and is the one that batches at M=n.
+    // Grouped decode DeepGEMM is now M-parametric (gather/GEMM/scatter per group
+    // over n rows), so the batched FINISH routes groups>1 here at M=n directly —
+    // one grouped-GEMM per group, no per-row loop. Decode lane only (no prefill
+    // scratch); grouped prefill stays on its own gate below.
     let wo_a_group_decode_dg = shape.groups > 1
-        && token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
-        && attention.wo_a_group_deepgemm.is_some();
+        && attention.wo_a_group_deepgemm.is_some()
+        && prefill_shared.is_none();
     let wo_a_group_prefill_dg = shape.groups > 1
         && token_count > 1
         && dsv4_prefill_proj_deepgemm_enabled()

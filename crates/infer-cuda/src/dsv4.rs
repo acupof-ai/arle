@@ -2330,21 +2330,6 @@ impl Dsv4Model {
         } else {
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
-        // Reused [local_width, 1] scratch for the GROUPED O-LoRA per-row fallback
-        // (groups > 1: the grouped decode-DeepGEMM lane slices per-group columns
-        // within one row and cannot batch over M). Each row of the inverse-roped
-        // `local_attn_batched` is copied here, then mla_oproj(token_count=1) runs
-        // the per-slot grouped decode — byte-identical to the prior per-row path.
-        // Single-group models (Qwen3.6 MODEL1 at TP>1) never touch this. Only
-        // allocated on the batched lane.
-        let mut local_attn_row = if batched_attn_lane {
-            let lar = unsafe { HiddenStates::uninit(&self.ctx, local_width, 1)? };
-            keepalive.keep_hidden(&lar);
-            lar
-        } else {
-            unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
-        };
-
         // Full-flatten is canonical for MODEL1 B>1 decode. Per layer it batches
         // compressor state update (where a compressor exists), inverse-RoPE, and
         // SW-window write into one launch over N rows. SparseIndexed has no main
@@ -3263,24 +3248,15 @@ impl Dsv4Model {
                         ptr_keepalive.push(swcache_arr);
                     }
                     // Pass F2: O-LoRA → attn_out (consumes the inverse-roped output).
-                    // full_flatten batches over N when the O-LoRA is the plain-o
-                    // (GLM, seq-parametric dsv4_linear) or single-output-group
-                    // (Qwen3.6 MODEL1 at TP>1: groups==1, decode-DeepGEMM M=n) case
-                    // — ONE mla_oproj(token_count=n) reading the contiguous
-                    // `local_attn_batched`, writing directly into `attn_out`
-                    // ([hidden, n]); no per-row alloc, no per-row copy-out. The
-                    // grouped-decode lane (groups>1) stays per-row (reported
-                    // fallback): copy each row into `local_attn_row`, run
-                    // mla_oproj(token_count=1) into attn_out_row, copy out.
-                    // Only the full_flatten path consults the O-LoRA group count
-                    // (the !full_flatten lane is always per-row); compute lazily so
-                    // the per-row lane never touches wo_a.
-                    let oproj_single_group = full_flatten
-                        && (layer.attention.o_proj.is_some() // plain-o: seq-parametric
-                            || local_attn_batched.hidden_dim
-                                / layer.attention.wo_a.as_ref().expect("DSv4 wo_a").cols
-                                == 1);
-                    if oproj_single_group {
+                    // full_flatten batches over N in ONE mla_oproj(token_count=n):
+                    // plain-o (GLM, seq-parametric dsv4_linear), single-output-group
+                    // (Qwen3.6 MODEL1 at TP>1, decode-DeepGEMM M=n), AND grouped
+                    // (groups>1, gather/GEMM/scatter M=n per group) all converge here
+                    // reading the contiguous `local_attn_batched` and writing directly
+                    // into `attn_out` ([hidden, n]) — no per-row alloc, no copy-out.
+                    // The !full_flatten lane (SparseIndexed) stays per-row over
+                    // `prepared[r].local_attn`.
+                    if full_flatten {
                         // Batched O-LoRA over all N rows in one call. local_attn_batched
                         // is [local_width, n]; the decode lane reads it token-major.
                         let slot = &mut slots[slot_ids[0]];
@@ -3298,24 +3274,8 @@ impl Dsv4Model {
                             &mut attn_out,
                         )?;
                     } else {
-                        let local_width_row = local_attn_batched.hidden_dim;
                         for r in 0..n {
-                            // Source of the inverse-roped row: full_flatten put it in
-                            // `local_attn_batched` (grouped fallback path); the
-                            // per-row lane left it in `p.local_attn`.
-                            let row_src: &HiddenStates = if full_flatten {
-                                let row_view = local_attn_batched
-                                    .data
-                                    .slice(r * local_width_row..(r + 1) * local_width_row);
-                                ctx.stream
-                                    .memcpy_dtod(&row_view, &mut local_attn_row.data)
-                                    .map_err(|e| {
-                                        anyhow!("DSv4 grouped O-LoRA row copy-in failed: {e}")
-                                    })?;
-                                &local_attn_row
-                            } else {
-                                &prepared[r].local_attn
-                            };
+                            let row_src = &prepared[r].local_attn;
                             let slot = &mut slots[slot_ids[r]];
                             crate::attention::mla_oproj(
                                 &self.ctx,
