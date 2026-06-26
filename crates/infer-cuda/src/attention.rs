@@ -7149,7 +7149,10 @@ pub(crate) fn flashmla_decode_pack_batched(
             num_logical_pages,
         )?;
     }
-    {
+    // compress_ratio==0 layers (DSv4-Flash 0/1/last) have NO compressor — skip the
+    // completed-compressor pack. The batched FFI rejects ratio<=0 with INVALID_VALUE;
+    // the single-row path skips it too (passes compressed=None for these layers).
+    if compress_ratio > 0 {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_compressed_batched");
         flash_kv::dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
             ctx,
