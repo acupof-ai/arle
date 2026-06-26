@@ -2127,20 +2127,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     } else {
                         eprintln!("[agent-opd] released inference scratch");
                     }
-                    if let Ok(out) = std::process::Command::new("nvidia-smi")
-                        .args([
-                            "--query-gpu=index,memory.used",
-                            "--format=csv,noheader,nounits",
-                        ])
-                        .output()
-                    {
-                        eprintln!(
-                            "[agent-opd] pre-writeback GPU used (MB): {}",
-                            String::from_utf8_lossy(&out.stdout)
-                                .replace('\n', " | ")
-                                .trim()
-                        );
-                    }
                     let writeback_result = masked_writeback_ce_step(
                         student_ref,
                         all_ref,
@@ -2154,22 +2140,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         store_ref,
                     )
                     .map_err(anyhow::Error::from);
-                    // Post-writeback memory: paired with the pre-writeback line so the
-                    // writeback's memory trajectory (the OOM signal) is visible.
-                    if let Ok(out) = std::process::Command::new("nvidia-smi")
-                        .args([
-                            "--query-gpu=index,memory.used",
-                            "--format=csv,noheader,nounits",
-                        ])
-                        .output()
-                    {
-                        eprintln!(
-                            "[agent-opd] post-writeback GPU used (MB): {}",
-                            String::from_utf8_lossy(&out.stdout)
-                                .replace('\n', " | ")
-                                .trim()
-                        );
-                    }
                     writeback_result
                 },
             )?
