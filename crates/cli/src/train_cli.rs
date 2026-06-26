@@ -1929,7 +1929,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         student_dir
             .to_str()
             .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
-        true,
+        // agent-OPD: NO decode CUDA-graph. Its captured workspace (~30 GB on the
+        // 27B MoE, captured during the rollout's decode) would co-reside with the
+        // masked-CE writeback and OOM it (post-rollout engine ~87 GB vs ~55 GB
+        // no-graph). Eager rollout is slower but the writeback is the binding
+        // constraint — reclaiming that room lets the loop close end-to-end.
+        false,
         EngineLoadConfig {
             num_slots: args.rollout_num_slots,
             page_size: 16,
