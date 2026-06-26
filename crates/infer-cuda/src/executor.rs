@@ -750,9 +750,9 @@ impl QwenCudaExecutor {
     /// `mem_fraction_static` (default 0.9): the dense shared paged pool is sized
     /// from MEASURED free VRAM after weights load (`infer_seam::profile_kv_pool_tokens`,
     /// SGLang-style), NOT the requested `total_pages`. `total_pages` becomes a
-    /// minimum-capacity floor: the profiled pool is the larger of the two so an
-    /// explicit `--total-pages` never shrinks below the request, but a large card
-    /// gets the extra capacity for more concurrency.
+    /// minimum-capacity floor: the profiled pool is the larger of the two so the
+    /// internal `total_pages` default never shrinks the pool below it, but a large
+    /// card gets the extra capacity for more concurrency.
     pub(crate) fn from_qwen3_bf16_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
