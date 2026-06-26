@@ -2116,7 +2116,32 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 &cfg,
                 round,
                 |prompt_ids: &[u32], response_ids: &[u32], response_mask: &[u8]| {
-                    masked_writeback_ce_step(
+                    // Release the rollout engine's inference forward scratch (24K-shaped
+                    // workspace) BEFORE the masked-CE writeback: the agent-OPD path runs
+                    // EngineOffloadMode::Off so the scratch otherwise stays resident and
+                    // OOMs the writeback's logits alloc. The rollout has synced before the
+                    // closure runs, so the release precondition holds; the freed blocks
+                    // return to the shared caching pool the writeback autograd reuses.
+                    if let Err(err) = infer_student.release_inference_scratch() {
+                        eprintln!("[agent-opd] release inference scratch failed: {err}");
+                    } else {
+                        eprintln!("[agent-opd] released inference scratch");
+                    }
+                    if let Ok(out) = std::process::Command::new("nvidia-smi")
+                        .args([
+                            "--query-gpu=index,memory.used",
+                            "--format=csv,noheader,nounits",
+                        ])
+                        .output()
+                    {
+                        eprintln!(
+                            "[agent-opd] pre-writeback GPU used (MB): {}",
+                            String::from_utf8_lossy(&out.stdout)
+                                .replace('\n', " | ")
+                                .trim()
+                        );
+                    }
+                    let writeback_result = masked_writeback_ce_step(
                         student_ref,
                         all_ref,
                         trainable_ref,
@@ -2128,7 +2153,24 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         writeback_window,
                         store_ref,
                     )
-                    .map_err(anyhow::Error::from)
+                    .map_err(anyhow::Error::from);
+                    // Post-writeback memory: paired with the pre-writeback line so the
+                    // writeback's memory trajectory (the OOM signal) is visible.
+                    if let Ok(out) = std::process::Command::new("nvidia-smi")
+                        .args([
+                            "--query-gpu=index,memory.used",
+                            "--format=csv,noheader,nounits",
+                        ])
+                        .output()
+                    {
+                        eprintln!(
+                            "[agent-opd] post-writeback GPU used (MB): {}",
+                            String::from_utf8_lossy(&out.stdout)
+                                .replace('\n', " | ")
+                                .trim()
+                        );
+                    }
+                    writeback_result
                 },
             )?
         };

@@ -396,6 +396,132 @@ pub fn fused_linear_distill_loss_sparse(
     Ok(loss_id)
 }
 
+/// Forward-once chunked fused cross-entropy on HARD target tokens at a sparse
+/// set of hidden positions — the masked-CE writeback core (agent-OPD).
+///
+/// Mirrors [`fused_linear_distill_loss_sparse`] but replaces the per-row
+/// teacher-distribution KL with single-target CE, and takes the loss positions
+/// as an explicit `position_indices` list into `hidden`'s rows (the masked /
+/// LLM-generated predicting positions are a non-contiguous subset, so a
+/// `row_start..num_rows` range cannot express them). Per chunk it materializes
+/// only `[chunk_len, vocab]` logits in f32, never the full `[seq, vocab]` tile,
+/// and frees each chunk before the next — peak transient ≈ `chunk * vocab * 4`
+/// bytes instead of `seq * vocab * 4`.
+///
+/// `hidden`: `[1, seq, hidden_dim]` (or any shape whose last dim is
+/// `hidden_dim`); `weight`: `[vocab, hidden_dim]` (the lm_head, `logits =
+/// hidden @ weightᵀ`). `position_indices[i]` selects hidden row `p_i`;
+/// `target_tokens[i]` is its hard target token id. Loss = mean over the
+/// supplied positions of `-log_softmax(logits)[target]`; gradient
+/// `d_logits = (softmax - onehot(target)) / N` (N = #positions). `d_hidden`
+/// flows always (if `hidden.requires_grad`); `d_weight` only when the lm_head is
+/// trainable — in `--share-frozen-base` the head is frozen/tied, so only
+/// `d_hidden` is produced. f32 numerics throughout.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_linear_ce_loss_indexed(
+    hidden: TensorId,
+    weight: TensorId,
+    position_indices: &[i32],
+    target_tokens: &[i32],
+    chunk_rows: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let shape = validate_ce_indexed_inputs(hidden, weight, position_indices, target_tokens, store)?;
+    if chunk_rows == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_ce_loss_indexed: chunk_rows must be > 0",
+        ));
+    }
+
+    let need_hidden_grad = store.tensor(hidden)?.requires_grad;
+    let need_weight_grad = store.tensor(weight)?.requires_grad;
+    let requires_grad = need_hidden_grad || need_weight_grad;
+    let hidden_data = store.to_host(hidden)?;
+    let weight_data = store.to_host(weight)?;
+
+    let mut grad_hidden = need_hidden_grad.then(|| vec![0.0_f32; hidden_data.len()]);
+    let mut grad_weight = need_weight_grad.then(|| vec![0.0_f32; weight_data.len()]);
+    let num_targets = position_indices.len();
+    // CE with temperature=1: loss = mean over positions of -log p[target];
+    // d_logits = (softmax - onehot) / N. Both share the 1/N mean scale.
+    let inv_n = 1.0_f32 / num_targets as f32;
+    let mut loss_sum = 0.0_f32;
+
+    for chunk_start in (0..num_targets).step_by(chunk_rows) {
+        let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_targets);
+        for local in chunk_start..chunk_end {
+            let hidden_row = position_indices[local] as usize;
+            let target = target_tokens[local] as usize;
+            let hidden_base = hidden_row * shape.hidden_dim;
+            let hidden_slice = &hidden_data[hidden_base..hidden_base + shape.hidden_dim];
+
+            let mut logits = vec![0.0_f32; shape.vocab];
+            for (vocab_index, logit) in logits.iter_mut().enumerate() {
+                let weight_base = vocab_index * shape.hidden_dim;
+                let mut dot = 0.0_f32;
+                for hidden_index in 0..shape.hidden_dim {
+                    dot += hidden_slice[hidden_index] * weight_data[weight_base + hidden_index];
+                }
+                *logit = dot;
+            }
+
+            let log_probs = log_softmax_row(&logits);
+            loss_sum -= log_probs[target];
+
+            let mut dlogits = vec![0.0_f32; shape.vocab];
+            for (vocab_index, dlogit) in dlogits.iter_mut().enumerate() {
+                *dlogit = inv_n * log_probs[vocab_index].exp();
+            }
+            dlogits[target] -= inv_n;
+
+            if let Some(grad_hidden) = grad_hidden.as_mut() {
+                for hidden_index in 0..shape.hidden_dim {
+                    let mut grad = 0.0_f32;
+                    for (vocab_index, &dlogit) in dlogits.iter().enumerate() {
+                        grad += dlogit * weight_data[vocab_index * shape.hidden_dim + hidden_index];
+                    }
+                    grad_hidden[hidden_base + hidden_index] += grad;
+                }
+            }
+            if let Some(grad_weight) = grad_weight.as_mut() {
+                for (vocab_index, &grad) in dlogits.iter().enumerate() {
+                    let weight_base = vocab_index * shape.hidden_dim;
+                    for hidden_index in 0..shape.hidden_dim {
+                        grad_weight[weight_base + hidden_index] +=
+                            grad * hidden_slice[hidden_index];
+                    }
+                }
+            }
+        }
+    }
+
+    let loss_id = store.alloc(Tensor::new(
+        vec![loss_sum * inv_n],
+        Vec::new(),
+        requires_grad,
+    )?);
+    if requires_grad {
+        let grad_hidden_id = grad_hidden
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.hidden_shape.clone(), false)?)))
+            .transpose()?;
+        let grad_weight_id = grad_weight
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
+            .transpose()?;
+        tape.record(TapeEntry {
+            op: BackwardOp::FusedLinearDistill,
+            output_id: loss_id,
+            input_ids: smallvec![hidden, weight],
+            saved: SavedContext::FusedLinearDistillCtx {
+                grad_hidden: grad_hidden_id,
+                grad_weight: grad_weight_id,
+            },
+        });
+    }
+
+    Ok(loss_id)
+}
+
 pub(crate) fn fused_linear_distill_backward(
     entry: &TapeEntry,
     output_grad_id: TensorId,
@@ -736,6 +862,99 @@ fn validate_sparse_inputs(
     }
 
     Ok((shape, teacher_topk_log_prob_data))
+}
+
+fn validate_ce_indexed_inputs(
+    hidden: TensorId,
+    weight: TensorId,
+    position_indices: &[i32],
+    target_tokens: &[i32],
+    store: &TensorStore,
+) -> Result<FusedLinearDistillShape> {
+    let hidden_tensor = store
+        .get(hidden)
+        .ok_or(AutogradError::InvalidTensorId(hidden))?;
+    let weight_tensor = store
+        .get(weight)
+        .ok_or(AutogradError::InvalidTensorId(weight))?;
+    if hidden_tensor.shape.len() < 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 2",
+            got: hidden_tensor.shape.len(),
+        });
+    }
+    if weight_tensor.shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: weight_tensor.shape.len(),
+        });
+    }
+    if position_indices.is_empty() {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_ce_loss_indexed: position_indices must be non-empty",
+        ));
+    }
+    if position_indices.len() != target_tokens.len() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: position_indices.len(),
+            got: target_tokens.len(),
+        });
+    }
+
+    let hidden_dim = *hidden_tensor
+        .shape
+        .last()
+        .ok_or(AutogradError::InvalidRank {
+            expected: "at least 2",
+            got: 0,
+        })?;
+    let vocab = weight_tensor.shape[0];
+    if hidden_dim == 0 || vocab == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_ce_loss_indexed: hidden_dim and vocab must be non-zero",
+        ));
+    }
+    if weight_tensor.shape[1] != hidden_dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![vocab, hidden_dim],
+            got: weight_tensor.shape.clone(),
+        });
+    }
+
+    let total_rows = hidden_tensor.size / hidden_dim;
+    for &row in position_indices {
+        if row < 0 {
+            return Err(AutogradError::TapeInvariant(
+                "fused_linear_ce_loss_indexed: position indices must be non-negative",
+            ));
+        }
+        if row as usize >= total_rows {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: row as usize,
+                upper: total_rows,
+            });
+        }
+    }
+    for &token in target_tokens {
+        if token < 0 {
+            return Err(AutogradError::TapeInvariant(
+                "fused_linear_ce_loss_indexed: target tokens must be non-negative",
+            ));
+        }
+        if token as usize >= vocab {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: token as usize,
+                upper: vocab,
+            });
+        }
+    }
+
+    Ok(FusedLinearDistillShape {
+        hidden_shape: hidden_tensor.shape.clone(),
+        weight_shape: weight_tensor.shape.clone(),
+        hidden_dim,
+        vocab,
+    })
 }
 
 fn log_softmax_row(row: &[f32]) -> Vec<f32> {
