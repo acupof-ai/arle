@@ -191,68 +191,6 @@ impl TensorStore {
             .sum()
     }
 
-    /// Live DEVICE bytes (genuinely-retained allocations) and the count of
-    /// DISTINCT allocations. OPD VRAM attribution: (1) dedups by the underlying
-    /// `Arc` storage pointer so `clone_tensor`-aliased handles count once, not N
-    /// times; (2) uses each handle's TRUE element width (f32/bf16/fp8), not the
-    /// `size×4` aggregate that over-counts FP8 weights as f32. Distinguishes a
-    /// real leak from an async-free artifact in `mem_get_info`.
-    pub fn live_device_bytes(&self) -> (usize, usize) {
-        let mut seen = HashSet::new();
-        let mut bytes = 0usize;
-        for tensor in self.tensors.iter().filter_map(Option::as_ref) {
-            if let Some(handle) = tensor.device_handle.as_ref() {
-                let (key, b) = handle.alloc_key_and_bytes();
-                if key != 0 && seen.insert(key) {
-                    bytes += b;
-                }
-            }
-        }
-        (bytes, seen.len())
-    }
-
-    /// Per-allocation survivor dump for OPD VRAM attribution
-    /// (`ARLE_OPD_VRAM_TRACE`): one line per DISTINCT device allocation (deduped
-    /// by `Arc` storage pointer), largest first, with shape + true bytes +
-    /// alias count + requires_grad. This is the per-tensor decode the root-cause
-    /// needs — `(shape, bytes, n_aliases)` names exactly WHAT accumulates, not
-    /// just how much. Returns `(line, bytes)` pairs.
-    pub fn device_survivors_by_alloc(&self) -> Vec<(String, usize)> {
-        use std::collections::HashMap;
-        // key -> (bytes, alias_count, sample_shape, any_requires_grad)
-        let mut by_alloc: HashMap<usize, (usize, usize, Vec<usize>, bool)> = HashMap::new();
-        for tensor in self.tensors.iter().filter_map(Option::as_ref) {
-            if let Some(handle) = tensor.device_handle.as_ref() {
-                let (key, b) = handle.alloc_key_and_bytes();
-                if key == 0 {
-                    continue;
-                }
-                let entry = by_alloc.entry(key).or_insert((
-                    b,
-                    0,
-                    tensor.shape.clone(),
-                    tensor.requires_grad,
-                ));
-                entry.1 += 1;
-                entry.3 |= tensor.requires_grad;
-            }
-        }
-        let mut rows: Vec<(String, usize)> = by_alloc
-            .into_values()
-            .map(|(bytes, aliases, shape, rg)| {
-                (
-                    format!(
-                        "shape={shape:?} bytes={}MiB aliases={aliases} grad={rg}",
-                        bytes >> 20
-                    ),
-                    bytes,
-                )
-            })
-            .collect();
-        rows.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
-        rows
-    }
-
     pub fn free_new_except(
         &mut self,
         live_before: &HashSet<TensorId>,
