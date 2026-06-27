@@ -2291,6 +2291,10 @@ impl Dsv4Model {
         } else {
             None
         };
+        // Batched CSA select-metadata device build (default OFF). Read once; when
+        // ON, `csa_select_official_batched` computes block_table/context_lens/
+        // positions on-device instead of host-build + per-step H2D.
+        let use_device_meta = crate::attention::dsv4_dsa_device_meta_enabled()?;
         // Per-row [*, 1] scratch for the batched projection slice copy-in (each
         // row's c_q_normed / q_prepared / k_prepared sliced out of the batched
         // pre-pass output before the per-slot compressor/pack consume it).
@@ -3173,18 +3177,22 @@ impl Dsv4Model {
                     // Byte-equivalent to the single-row GPU fill:
                     //   context_lens[r] = min(key_count_r, abs_pos_r / ratio)
                     //   positions[r]    = abs_pos_r   (abs_pos_r = start_positions[r])
+                    // Skipped entirely on the device-meta path (kernel computes the
+                    // same values on-device); empty Vecs are ignored there.
                     let mut context_lens_host = Vec::with_capacity(n);
                     let mut positions_host = Vec::with_capacity(n);
-                    for r in 0..n {
-                        let abs_pos = i32::try_from(start_positions[r]).map_err(|_| {
-                            anyhow!(
-                                "DSv4 batched CSA abs_pos {} overflows i32",
-                                start_positions[r]
-                            )
-                        })?;
-                        let avail = (abs_pos / ratio as i32).min(key_counts[r]);
-                        context_lens_host.push(avail);
-                        positions_host.push(abs_pos);
+                    if !use_device_meta {
+                        for r in 0..n {
+                            let abs_pos = i32::try_from(start_positions[r]).map_err(|_| {
+                                anyhow!(
+                                    "DSv4 batched CSA abs_pos {} overflows i32",
+                                    start_positions[r]
+                                )
+                            })?;
+                            let avail = (abs_pos / ratio as i32).min(key_counts[r]);
+                            context_lens_host.push(avail);
+                            positions_host.push(abs_pos);
+                        }
                     }
                     let local_index_heads = self.config.index_n_heads;
                     let score_scale = (self.config.index_head_dim as f32).powf(-0.5)
@@ -3211,6 +3219,11 @@ impl Dsv4Model {
                         score_scale,
                         flash_batch.selected_batched_mut(),
                         &mut keepalive,
+                        use_device_meta,
+                        i32::try_from(ratio)?,
+                        batched_positions.as_ref(),
+                        &key_counts,
+                        &mut pack_pt_keepalive,
                     )?;
                 }
                 if let Some(t) = _batchedread_t {

@@ -5820,6 +5820,15 @@ pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
     Ok(true)
 }
 
+/// Batched-decode CSA select-metadata DEVICE build (default OFF). When ON, the
+/// per-step block_table/context_lens/positions host builds + 3 `memcpy_htod` are
+/// replaced by ONE on-device kernel (removes the per-step H2D a CUDA graph can't
+/// bake). Default-off so the baseline stays byte-for-byte unchanged; flip on the
+/// pod to A/B via `ARLE_DSV4_DSA_DEVICE_META=1`.
+pub(crate) fn dsv4_dsa_device_meta_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_DSA_DEVICE_META")
+}
+
 fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
     if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
         return Ok(true);
@@ -13246,6 +13255,13 @@ fn csa_select_official(
 ///     FlashMLA batch scratch's `selected_batched`; written here BEFORE
 ///     `build_layer_batch_meta` reads it)
 ///   - `shared.page_table_identity_batch` is READ-ONLY (identity).
+/// `use_device_meta` (gate, default OFF): when true the (b1)/(b2) host builds +
+/// 3 `memcpy_htod` are replaced by ONE on-device `dsv4_dsa_build_select_meta_cuda`
+/// launch from device inputs (`start_pos_device`/slot_ids/key_counts), removing
+/// the per-step H2D (graph-capturable). `ratio` is the layer compress ratio
+/// (=1 for SparseIndexed) — the host's `context_lens[r]=min(abs_pos/ratio,
+/// key_count_r)` divisor. `start_pos_device` is the [n] abs-position array
+/// (== `positions`). `key_counts`/`meta_keepalive` only consulted when on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn csa_select_official_batched(
     ctx: &DeviceContext,
@@ -13262,6 +13278,11 @@ pub(crate) fn csa_select_official_batched(
     score_scale: f32,
     out_selected: &mut CudaSlice<i32>,
     keepalive: &mut Dsv4ForwardKeepalive,
+    use_device_meta: bool,
+    ratio: i32,
+    start_pos_device: Option<&CudaSlice<i32>>,
+    key_counts: &[i32],
+    meta_keepalive: &mut Vec<CudaSlice<i32>>,
 ) -> Result<()> {
     ensure!(
         n > 0 && n <= shared.decode_max_batch,
@@ -13284,13 +13305,17 @@ pub(crate) fn csa_select_official_batched(
         weights_batch.seq_len,
         n
     );
+    // Host context_lens/positions only consumed by the host (H2D) path; the
+    // device-meta path computes them on-device and passes empty Vecs.
     ensure!(
-        slot_ids.len() == n && context_lens_host.len() == n && positions_host.len() == n,
-        "DSv4 batched DSA host arrays slot_ids={} lens={} pos={} != n {}",
+        slot_ids.len() == n
+            && (use_device_meta || (context_lens_host.len() == n && positions_host.len() == n)),
+        "DSv4 batched DSA host arrays slot_ids={} lens={} pos={} != n {} (device_meta={})",
         slot_ids.len(),
         context_lens_host.len(),
         positions_host.len(),
-        n
+        n,
+        use_device_meta
     );
     ensure!(
         q_i_batch.hidden_dim == local_index_heads * config.index_head_dim,
@@ -13315,40 +13340,100 @@ pub(crate) fn csa_select_official_batched(
 
     let num_pages = shared.num_pages;
 
-    // (b1) per-row block_table band: row r → slot r's DSA band = `num_pages`
-    // contiguous blocks based at `slot_idx * num_pages` (alignment proven in the
-    // brief: dsa_slot_bytes = num_pages*64*(index_head_dim+4), block base =
-    // slot_idx*num_pages, total pool blocks = num_slots*num_pages). H2D into
-    // `block_table_batch[0..n*num_pages]`, block_table_stride = num_pages.
-    {
-        let mut block_table_h = Vec::with_capacity(n * num_pages);
-        for &slot_idx in slot_ids.iter() {
-            let base = slot_idx
-                .checked_mul(num_pages)
-                .ok_or_else(|| anyhow!("DSv4 batched DSA block table base overflow"))?;
-            for b in 0..num_pages {
-                block_table_h.push(
-                    i32::try_from(base + b)
-                        .map_err(|_| anyhow!("DSv4 batched DSA block id overflows i32"))?,
-                );
+    if use_device_meta {
+        // (b0) DEVICE path: ONE kernel computes block_table/context_lens/positions
+        // on-device from device inputs, byte-identical to the (b1)/(b2) host builds
+        // — no per-step H2D. Upload the small slot_ids/key_counts (held in
+        // `meta_keepalive` to the layer-loop's function return, like
+        // `pack_pt_keepalive`, so they outlive this async launch).
+        ensure!(
+            key_counts.len() == n,
+            "DSv4 batched DSA device-meta key_counts {} != n {}",
+            key_counts.len(),
+            n
+        );
+        let start_pos = start_pos_device.ok_or_else(|| {
+            anyhow!("DSv4 batched DSA device-meta: start_pos_device (batched_positions) missing")
+        })?;
+        ensure!(
+            start_pos.len() >= n,
+            "DSv4 batched DSA device-meta start_pos len {} < n {}",
+            start_pos.len(),
+            n
+        );
+        let slot_ids_i32: Vec<i32> = slot_ids
+            .iter()
+            .map(|&s| {
+                i32::try_from(s).map_err(|_| anyhow!("DSv4 batched DSA slot_id {s} overflows i32"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let slot_ids_dev = crate::ops::upload_i32(ctx, &slot_ids_i32)?;
+        let key_counts_dev = crate::ops::upload_i32(ctx, key_counts)?;
+        {
+            let mut bt = shared.block_table_batch.slice_mut(0..n * num_pages);
+            let mut lens = shared.context_lens_batch.slice_mut(0..n);
+            let mut pos = shared.positions_batch.slice_mut(0..n);
+            let (bt_ptr, _btg) = bt.device_ptr_mut(&ctx.stream);
+            let (lens_ptr, _lg) = lens.device_ptr_mut(&ctx.stream);
+            let (pos_ptr, _pg) = pos.device_ptr_mut(&ctx.stream);
+            let (slot_ptr, _sg) = slot_ids_dev.device_ptr(&ctx.stream);
+            let (sp_ptr, _spg) = start_pos.device_ptr(&ctx.stream);
+            let (kc_ptr, _kcg) = key_counts_dev.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::dsv4_dsa_build_select_meta_cuda(
+                    bt_ptr as *mut i32,
+                    lens_ptr as *mut i32,
+                    pos_ptr as *mut i32,
+                    slot_ptr as *const i32,
+                    sp_ptr as *const i32,
+                    kc_ptr as *const i32,
+                    i32::try_from(n)?,
+                    i32::try_from(num_pages)?,
+                    ratio,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("DSv4 batched DSA build_select_meta failed: {e}"))?;
             }
         }
-        let mut bt = shared.block_table_batch.slice_mut(0..n * num_pages);
-        ctx.stream
-            .memcpy_htod(&block_table_h, &mut bt)
-            .map_err(|e| anyhow!("DSv4 batched DSA block_table H2D failed: {e}"))?;
-    }
+        meta_keepalive.push(slot_ids_dev);
+        meta_keepalive.push(key_counts_dev);
+    } else {
+        // (b1) per-row block_table band: row r → slot r's DSA band = `num_pages`
+        // contiguous blocks based at `slot_idx * num_pages` (alignment proven in the
+        // brief: dsa_slot_bytes = num_pages*64*(index_head_dim+4), block base =
+        // slot_idx*num_pages, total pool blocks = num_slots*num_pages). H2D into
+        // `block_table_batch[0..n*num_pages]`, block_table_stride = num_pages.
+        {
+            let mut block_table_h = Vec::with_capacity(n * num_pages);
+            for &slot_idx in slot_ids.iter() {
+                let base = slot_idx
+                    .checked_mul(num_pages)
+                    .ok_or_else(|| anyhow!("DSv4 batched DSA block table base overflow"))?;
+                for b in 0..num_pages {
+                    block_table_h.push(
+                        i32::try_from(base + b)
+                            .map_err(|_| anyhow!("DSv4 batched DSA block id overflows i32"))?,
+                    );
+                }
+            }
+            let mut bt = shared.block_table_batch.slice_mut(0..n * num_pages);
+            ctx.stream
+                .memcpy_htod(&block_table_h, &mut bt)
+                .map_err(|e| anyhow!("DSv4 batched DSA block_table H2D failed: {e}"))?;
+        }
 
-    // (b2) context_lens / positions: H2D the host-captured byte-equivalent values.
-    {
-        let mut lens = shared.context_lens_batch.slice_mut(0..n);
-        ctx.stream
-            .memcpy_htod(context_lens_host, &mut lens)
-            .map_err(|e| anyhow!("DSv4 batched DSA context_lens H2D failed: {e}"))?;
-        let mut pos = shared.positions_batch.slice_mut(0..n);
-        ctx.stream
-            .memcpy_htod(positions_host, &mut pos)
-            .map_err(|e| anyhow!("DSv4 batched DSA positions H2D failed: {e}"))?;
+        // (b2) context_lens / positions: H2D the host-captured byte-equivalent values.
+        {
+            let mut lens = shared.context_lens_batch.slice_mut(0..n);
+            ctx.stream
+                .memcpy_htod(context_lens_host, &mut lens)
+                .map_err(|e| anyhow!("DSv4 batched DSA context_lens H2D failed: {e}"))?;
+            let mut pos = shared.positions_batch.slice_mut(0..n);
+            ctx.stream
+                .memcpy_htod(positions_host, &mut pos)
+                .map_err(|e| anyhow!("DSv4 batched DSA positions H2D failed: {e}"))?;
+        }
     }
 
     // (c) fused Q indexer rope+hadamard+quant over the N gathered rows.
