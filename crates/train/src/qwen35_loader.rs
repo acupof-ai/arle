@@ -72,10 +72,10 @@ use crate::{
 /// into this plain struct. `layer_idx` + `proj_suffix` (e.g.
 /// `"self_attn.q_proj"`) form the key the loader matches against a planned
 /// tensor's `train_name` (`*.layers.{layer_idx}.{proj_suffix}.weight`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SharedFrozenBaseEntry {
     pub layer_idx: usize,
-    pub proj_suffix: &'static str,
+    pub proj_suffix: String,
     pub weight_ptr: u64,
     pub scale_ptr: u64,
     pub rows: usize,
@@ -606,10 +606,31 @@ fn dtype_to_bf16_bits(view: &TensorView<'_>, name: &str) -> Result<Vec<u16>> {
             bytes.len()
         )));
     }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect())
+    // The safetensors BF16 payload is little-endian u16. The old
+    // `chunks_exact(2).map(u16::from_le_bytes).collect()` ran one scalar
+    // `core::ptr::write::<u16>` per element — single-threaded over the giant
+    // frozen-base tensors (`embed_tokens` + `lm_head` are each [248320, 5120] =
+    // 1.27 B u16), so the 27B student load spun ~minutes on one core (GPU idle,
+    // RSS flat) and the over-long load got reaped by the box watchdog before it
+    // finished. Bulk-copy the bytes into the `Vec<u16>` instead (one memcpy),
+    // then byte-swap only on a big-endian host. x86-64/aarch64 are LE, so this
+    // is a straight memcpy there — the per-element loop is fully eliminated.
+    let mut out = vec![0u16; bytes.len() / 2];
+    {
+        // SAFETY: `out` owns `out.len()` u16 = `bytes.len()` contiguous bytes; a
+        // `[u8]` view over its buffer is valid for that exact length, properly
+        // sized/aligned (u16 alignment ⊇ u8), and non-overlapping with `bytes`
+        // (fresh alloc). `copy_from_slice` asserts equal length.
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes.len()) };
+        out_bytes.copy_from_slice(bytes);
+    }
+    if cfg!(target_endian = "big") {
+        for v in &mut out {
+            *v = v.swap_bytes();
+        }
+    }
+    Ok(out)
 }
 
 // ─────────────────────────── public entry point ──────────────────────────────
@@ -1414,6 +1435,34 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn dtype_to_bf16_bits_bulk_matches_scalar_reference() {
+        // Mirror the load-time conversion of the giant frozen-base tables: build
+        // a BF16 safetensors view over a known little-endian payload and assert
+        // the bulk-copy path produces EXACTLY the old per-element
+        // `chunks_exact(2).map(u16::from_le_bytes)` result (the fix must be
+        // byte-identical, only faster). Covers odd values, 0x0000, 0xFFFF, and a
+        // non-zero low/high byte so any endian/stride bug surfaces.
+        let words: Vec<u16> = (0u16..4096).chain([0, 0xFFFF, 0x1234, 0xABCD]).collect();
+        let mut bytes = Vec::with_capacity(words.len() * 2);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let shape = vec![words.len()];
+        let view = safetensors::tensor::TensorView::new(Dtype::BF16, shape, &bytes)
+            .expect("construct BF16 view");
+        let got = dtype_to_bf16_bits(&view, "test.weight").expect("convert");
+        let reference: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(got, reference, "bulk bf16-bits conversion diverged");
+        assert_eq!(
+            got, words,
+            "bf16 bits must equal the source little-endian u16"
+        );
     }
 
     #[test]

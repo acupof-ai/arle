@@ -4889,6 +4889,38 @@ impl MoeFp8ExpertGroup {
         Ok(())
     }
 
+    /// Device weight+scale pointers for the `[num_rows, cols]` sub-matrix of
+    /// expert `group` starting at `row_offset` rows. For `--share-frozen-base`
+    /// MoE borrow: lets the train student alias a routed expert's FP8 gate/up/down
+    /// slice zero-copy. `row_offset` and `num_rows` must be 128-aligned (block grid).
+    /// Scale pointer carries the f32 element-size stride (mirrors `scale_ptr_table`).
+    /// Returns (weight_ptr, scale_ptr, rows, cols, block_m=128, block_k=128).
+    pub(crate) fn expert_slice_fp8_ptrs(
+        &self,
+        ctx: &DeviceContext,
+        group: usize,
+        row_offset: usize,
+        num_rows: usize,
+    ) -> Option<(u64, u64, usize, usize, usize, usize)> {
+        if group >= self.groups || !row_offset.is_multiple_of(128) || !num_rows.is_multiple_of(128)
+        {
+            return None;
+        }
+        if row_offset + num_rows > self.rows {
+            return None;
+        }
+        let (wbase, _wg) = self.weight.device_ptr(&ctx.stream);
+        let (sbase, _sg) = self.scales.device_ptr(&ctx.stream);
+        let group_stride = self.rows * self.cols;
+        let weight_ptr = wbase + (group * group_stride + row_offset * self.cols) as u64;
+        let scale_group_stride = self.scale_rows * self.scale_cols;
+        let scale_elem_size = std::mem::size_of::<f32>() as u64;
+        let scale_ptr = sbase
+            + ((group * scale_group_stride + (row_offset / 128) * self.scale_cols) as u64
+                * scale_elem_size);
+        Some((weight_ptr, scale_ptr, num_rows, self.cols, 128, 128))
+    }
+
     fn qweight_ptr_table(&self, ctx: &DeviceContext, row_offset: usize) -> Result<CudaSlice<u64>> {
         ensure!(
             row_offset < self.rows && row_offset.is_multiple_of(128),
