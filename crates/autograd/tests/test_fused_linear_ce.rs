@@ -30,9 +30,11 @@ fn deterministic_vec(len: usize, seed: u64) -> Vec<f32> {
 
 /// Reference CE over the masked rows: build full logits = hidden @ lm_headᵀ,
 /// slice to the masked rows, then stock `cross_entropy_loss` math. Returns the
-/// loss and the full-shape `d_hidden` (zeros at non-masked rows).
-#[allow(clippy::type_complexity)]
-fn reference_masked_ce(
+/// loss and the full-shape `d_hidden` (zeros at non-masked rows). Runs on
+/// whatever backend `store` carries (CPU reference or a GPU backend).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn reference_masked_ce_in(
+    mut store: TensorStore,
     hidden_data: &[f32],
     weight_data: &[f32],
     seq: usize,
@@ -41,7 +43,6 @@ fn reference_masked_ce(
     positions: &[i32],
     targets: &[i32],
 ) -> Result<(f32, Vec<f32>)> {
-    let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let hidden = store.from_slice(hidden_data, &[seq, hidden_dim])?;
     store.get_mut(hidden).expect("hidden").requires_grad = true;
@@ -80,7 +81,10 @@ fn reference_masked_ce(
 }
 
 /// Fused path: one call, chunked over positions, never materializing [seq, vocab].
-fn fused_masked_ce(
+/// Runs on whatever backend `store` carries.
+#[allow(clippy::too_many_arguments)]
+fn fused_masked_ce_in(
+    mut store: TensorStore,
     hidden_data: &[f32],
     weight_data: &[f32],
     seq: usize,
@@ -90,7 +94,6 @@ fn fused_masked_ce(
     targets: &[i32],
     chunk_rows: usize,
 ) -> Result<(f32, Vec<f32>)> {
-    let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let hidden = store.from_slice(hidden_data, &[1, seq, hidden_dim])?;
     store.get_mut(hidden).expect("hidden").requires_grad = true;
@@ -111,6 +114,53 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f32, f32::max)
+}
+
+/// CPU-reference convenience wrappers (default backend).
+#[allow(clippy::type_complexity)]
+fn reference_masked_ce(
+    hidden_data: &[f32],
+    weight_data: &[f32],
+    seq: usize,
+    hidden_dim: usize,
+    vocab: usize,
+    positions: &[i32],
+    targets: &[i32],
+) -> Result<(f32, Vec<f32>)> {
+    reference_masked_ce_in(
+        TensorStore::default(),
+        hidden_data,
+        weight_data,
+        seq,
+        hidden_dim,
+        vocab,
+        positions,
+        targets,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fused_masked_ce(
+    hidden_data: &[f32],
+    weight_data: &[f32],
+    seq: usize,
+    hidden_dim: usize,
+    vocab: usize,
+    positions: &[i32],
+    targets: &[i32],
+    chunk_rows: usize,
+) -> Result<(f32, Vec<f32>)> {
+    fused_masked_ce_in(
+        TensorStore::default(),
+        hidden_data,
+        weight_data,
+        seq,
+        hidden_dim,
+        vocab,
+        positions,
+        targets,
+        chunk_rows,
+    )
 }
 
 #[test]
@@ -188,5 +238,105 @@ fn fused_linear_ce_matches_reference_sparse_positions() -> Result<()> {
     // Non-masked rows must be exactly zero in both; masked rows must match.
     let grad_err = max_abs(&ref_grad, &fused_grad);
     assert!(grad_err < 1e-3, "d_hidden mismatch: max_abs_err={grad_err}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU-path gate: the CUDA fused chunked-CE (`Device::Cpu` dispatch is bypassed,
+// so the device path under test runs) must match the CPU materialize-then-CE
+// reference on BOTH the loss and `d_hidden`, on dense and sparse positions.
+// Runs only on a CUDA box (the autograd CUDA backend binds cudarc device 0).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn cuda_store() -> TensorStore {
+    use autograd::backend_cuda::CudaBackend;
+    use std::sync::Arc;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    TensorStore::with_backend(Arc::new(backend))
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn fused_linear_ce_gpu_matches_reference_dense() -> Result<()> {
+    let (seq, hidden_dim, vocab) = (8usize, 16usize, 32usize);
+    let hidden_data = deterministic_vec(seq * hidden_dim, 7);
+    let weight_data = deterministic_vec(vocab * hidden_dim, 11);
+    let positions: Vec<i32> = (0..seq as i32).collect();
+    let targets: Vec<i32> = (0..seq).map(|i| ((i * 5 + 3) % vocab) as i32).collect();
+
+    // Reference on CPU (ground truth); fused path on the GPU store.
+    let (ref_loss, ref_grad) = reference_masked_ce(
+        &hidden_data,
+        &weight_data,
+        seq,
+        hidden_dim,
+        vocab,
+        &positions,
+        &targets,
+    )?;
+    let (fused_loss, fused_grad) = fused_masked_ce_in(
+        cuda_store(),
+        &hidden_data,
+        &weight_data,
+        seq,
+        hidden_dim,
+        vocab,
+        &positions,
+        &targets,
+        3,
+    )?;
+
+    assert!(
+        (ref_loss - fused_loss).abs() < 1e-3,
+        "GPU loss mismatch: ref={ref_loss} fused={fused_loss}"
+    );
+    let grad_err = max_abs(&ref_grad, &fused_grad);
+    assert!(
+        grad_err < 1e-3,
+        "GPU d_hidden mismatch: max_abs_err={grad_err}"
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn fused_linear_ce_gpu_matches_reference_sparse_positions() -> Result<()> {
+    let (seq, hidden_dim, vocab) = (8usize, 16usize, 32usize);
+    let hidden_data = deterministic_vec(seq * hidden_dim, 23);
+    let weight_data = deterministic_vec(vocab * hidden_dim, 29);
+    let positions: Vec<i32> = vec![1, 2, 5];
+    let targets: Vec<i32> = vec![7, 30, 14];
+
+    let (ref_loss, ref_grad) = reference_masked_ce(
+        &hidden_data,
+        &weight_data,
+        seq,
+        hidden_dim,
+        vocab,
+        &positions,
+        &targets,
+    )?;
+    let (fused_loss, fused_grad) = fused_masked_ce_in(
+        cuda_store(),
+        &hidden_data,
+        &weight_data,
+        seq,
+        hidden_dim,
+        vocab,
+        &positions,
+        &targets,
+        2,
+    )?;
+
+    assert!(
+        (ref_loss - fused_loss).abs() < 1e-3,
+        "GPU loss mismatch: ref={ref_loss} fused={fused_loss}"
+    );
+    let grad_err = max_abs(&ref_grad, &fused_grad);
+    assert!(
+        grad_err < 1e-3,
+        "GPU d_hidden mismatch: max_abs_err={grad_err}"
+    );
     Ok(())
 }
