@@ -5796,6 +5796,17 @@ impl Dsv4Model {
             }
             graph.tail_graph.set_bypass(true);
         }
+        // Graph-safe CSA-read lane (opt-in): the READ is graph-capturable but the
+        // cache WRITE (block (a)) is not yet device-shape driven, so run the attn
+        // portion EAGER (bypass capture) to exercise + needle-verify the shape-
+        // stable read without baking the variable-shape cache write. The MoE
+        // portion still captures. When OFF (default), capture as before.
+        let csa_read_lane = crate::attention::dsv4_decode_graph_csa_read_enabled()?;
+        if csa_read_lane && !whole_step {
+            for s in graph.layers.iter_mut() {
+                s.attn_graph.set_bypass(true);
+            }
+        }
         // The whole per-token forward (loop + tail) as one closure: when whole_step,
         // captured as ONE graph (graph.whole_graph); else run eagerly with the existing
         // per-portion captures. advance_decode_len is host bookkeeping that must run
@@ -5815,8 +5826,8 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, flashmla_scratch) =
-                        kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
+                    let (attn_pool, dsa_shared, flashmla_scratch, _prefill) =
+                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     attn_graph.run_or_capture(|| {
                         crate::ops::embedding_batch(
                             &self.ctx,
@@ -5858,7 +5869,7 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
-                            None,
+                            dsa_shared,
                             flashmla_scratch,
                             start_pos,
                             Some(&slot.start_pos_device),
@@ -5882,8 +5893,8 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, flashmla_scratch) =
-                        kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
+                    let (attn_pool, dsa_shared, flashmla_scratch, _prefill) =
+                        kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     attn_graph.run_or_capture(|| {
                         crate::ops::add_batch(
                             &self.ctx,
@@ -5928,7 +5939,7 @@ impl Dsv4Model {
                             attn_normed,
                             attn_state,
                             attn_pool,
-                            None,
+                            dsa_shared,
                             flashmla_scratch,
                             start_pos,
                             Some(&slot.start_pos_device),

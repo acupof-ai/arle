@@ -3625,6 +3625,20 @@ impl Dsv4LayerAttentionState {
         self.indexer.as_ref().map(|s| s.compressed.seq_len)
     }
 
+    /// This layer-state's official-DSA slot index, or `None` if there is no
+    /// per-slot DSA state. Constant for the slot's lifetime — used to lazy-init
+    /// the graph CSA select's persistent n=1 device-meta slot-id buffer.
+    pub(crate) fn dsa_official_slot_idx(&self) -> Option<usize> {
+        self.dsa_official.as_ref().map(|s| s.slot_idx)
+    }
+
+    /// This layer-state's indexer compressed-key CAPACITY (the constant the graph
+    /// CSA select needs as `key_count` — the on-device `min(abs_pos/ratio,
+    /// key_count)` recovers the live causal length). `None` if no indexer.
+    pub(crate) fn indexer_compressed_capacity(&self) -> Option<usize> {
+        self.indexer.as_ref().map(|s| s.compressed_capacity())
+    }
+
     /// PHASE B (#60) split borrow for the batched decode pack loop: this slot's
     /// FlashMLA decode arena (`&mut`), the bf16 SW ring (`&`), and — for HCA —
     /// the compressed-key pool (`&`, disjoint field, `None` for SW). Errors if
@@ -5829,6 +5843,19 @@ pub(crate) fn dsv4_dsa_device_meta_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_DSA_DEVICE_META")
 }
 
+/// Single-row decode-graph CSA READ via the graph-safe n=1 batched device-meta
+/// select (opt-in, default OFF). When ON, the CSA decode-graph path runs the
+/// READ (logits + topk) through `csa_select_official_batched` at n=1 with
+/// PERSISTENT slot_id/key_count device buffers — no per-step `upload_i32` H2D,
+/// so the READ is graph-capturable. The cache WRITE (block (a), still host-shape
+/// driven) is NOT yet graph-capturable, so the surrounding `ARLE_DSV4_DECODE_GRAPH`
+/// bail stays until a device-driven index-key packer lands; this gate lets the
+/// READ path be exercised eagerly (warm runs) and A/B'd on the pod meanwhile.
+/// Implies device-meta (the READ needs the on-device build).
+pub(crate) fn dsv4_decode_graph_csa_read_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_DECODE_GRAPH_CSA")
+}
+
 fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
     if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
         return Ok(true);
@@ -7745,6 +7772,15 @@ pub(crate) struct Dsv4MlaDecodeGraphScratch {
     csa_q_i: Option<HiddenStates>,
     csa_weights: Option<HiddenStates>,
     csa_selected: Option<CudaSlice<i32>>,
+    // Persistent n=1 device-meta inputs for the graph-safe CSA READ (the batched
+    // device-meta select reads these instead of per-step `upload_i32`, which the
+    // capture audit rejects). Both are GRAPH-LIFETIME CONSTANTS: `csa_slot_id_dev`
+    // is the slot's index, `csa_key_count_dev` the indexer compressed capacity.
+    // Lazy-initialized on the first eager/warm run (H2D outside capture) and never
+    // rewritten — guarded by `csa_meta_initialized`.
+    csa_slot_id_dev: Option<CudaSlice<i32>>,
+    csa_key_count_dev: Option<CudaSlice<i32>>,
+    csa_meta_initialized: bool,
 }
 
 impl Dsv4MlaDecodeGraphScratch {
@@ -7843,25 +7879,33 @@ impl Dsv4MlaDecodeGraphScratch {
             } else {
                 (None, None)
             };
-        let (csa_q_i, csa_weights, csa_selected) = if mode.has_indexer() {
-            let indexer = attention
-                .indexer
-                .as_ref()
-                .ok_or_else(|| anyhow!("DSv4 graph scratch mode {mode:?} requires indexer"))?;
-            (
-                Some(unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? }),
-                Some(unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, 1)? }),
-                Some(
-                    ctx.stream
-                        .alloc_zeros::<i32>(config.index_topk)
-                        .map_err(|e| {
-                            anyhow!("DSv4 graph CSA selected scratch alloc failed: {e}")
-                        })?,
-                ),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (csa_q_i, csa_weights, csa_selected, csa_slot_id_dev, csa_key_count_dev) =
+            if mode.has_indexer() {
+                let indexer = attention
+                    .indexer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 graph scratch mode {mode:?} requires indexer"))?;
+                (
+                    Some(unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? }),
+                    Some(unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, 1)? }),
+                    Some(
+                        ctx.stream
+                            .alloc_zeros::<i32>(config.index_topk)
+                            .map_err(|e| {
+                                anyhow!("DSv4 graph CSA selected scratch alloc failed: {e}")
+                            })?,
+                    ),
+                    // n=1 persistent device-meta inputs (one element each).
+                    Some(ctx.stream.alloc_zeros::<i32>(1).map_err(|e| {
+                        anyhow!("DSv4 graph CSA slot-id scratch alloc failed: {e}")
+                    })?),
+                    Some(ctx.stream.alloc_zeros::<i32>(1).map_err(|e| {
+                        anyhow!("DSv4 graph CSA key-count scratch alloc failed: {e}")
+                    })?),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
         Ok(Self {
             c_q: unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, 1)? },
             c_q_normed: unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, 1)? },
@@ -7879,6 +7923,9 @@ impl Dsv4MlaDecodeGraphScratch {
             csa_q_i,
             csa_weights,
             csa_selected,
+            csa_slot_id_dev,
+            csa_key_count_dev,
+            csa_meta_initialized: false,
         })
     }
 
@@ -7921,6 +7968,16 @@ impl Dsv4MlaDecodeGraphScratch {
             )
             .saturating_add(
                 self.csa_selected
+                    .as_ref()
+                    .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
+            )
+            .saturating_add(
+                self.csa_slot_id_dev
+                    .as_ref()
+                    .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
+            )
+            .saturating_add(
+                self.csa_key_count_dev
                     .as_ref()
                     .map_or(0, |s| s.len().saturating_mul(std::mem::size_of::<i32>())),
             )
@@ -8275,12 +8332,21 @@ pub(crate) fn mla_attention_decode_graph(
         )?;
     }
     if mode.has_indexer() {
-        if matches!(
-            std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        ) {
+        // Graph-safe READ lane (opt-in): route the CSA READ through the n=1 batched
+        // device-meta select reading persistent slot_id/key_count buffers. The cache
+        // WRITE (block (a)) is still host-shape driven (not yet graph-capturable), so
+        // this lane runs EAGER (the caller bypasses attn-graph capture); it makes the
+        // shape-stable read reachable + needle-testable. When OFF, the legacy bail
+        // keeps decode-graph from running the non-capturable per-tile CSA select.
+        let csa_read_lane = dsv4_decode_graph_csa_read_enabled()?;
+        if !csa_read_lane
+            && matches!(
+                std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+                Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+            )
+        {
             anyhow::bail!(
-                "DSv4 decode-graph does not support the official CSA select; run without ARLE_DSV4_DECODE_GRAPH=1"
+                "DSv4 decode-graph does not support the official CSA select; run without ARLE_DSV4_DECODE_GRAPH=1 (or set ARLE_DSV4_DECODE_GRAPH_CSA=1 for the eager graph-safe-read lane)"
             );
         }
         ensure!(
@@ -8343,29 +8409,69 @@ pub(crate) fn mla_attention_decode_graph(
             .expect("indexer state checked above")
             .compressed
             .seq_len;
-        let csa_q_i = scratch
-            .csa_q_i
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 graph CSA q_i scratch missing"))?;
-        let csa_weights = scratch
-            .csa_weights
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 graph CSA weights scratch missing"))?;
-        let csa_selected = scratch
-            .csa_selected
-            .as_mut()
-            .ok_or_else(|| anyhow!("DSv4 graph CSA selected scratch missing"))?;
         let shared =
             dsa_shared.ok_or_else(|| anyhow!("DSv4 graph CSA shared DSA scratch missing"))?;
+        // Read-only constants for the graph-safe read lane (slot index + key
+        // capacity), pulled BEFORE the mutable csa-scratch borrows below.
+        let slot_idx = state
+            .dsa_official_slot_idx()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA official DSA state missing"))?;
+        let keys_capacity = state.indexer_compressed_capacity().unwrap_or(0);
+        // LAZY-INIT the persistent n=1 device-meta inputs ONCE, on an eager/warm
+        // run (H2D OUTSIDE any capture). slot_id + key_count are graph-lifetime
+        // constants; the capture audit forbids re-doing the H2D inside replay.
+        if csa_read_lane && !scratch.csa_meta_initialized {
+            let slot_id_i32 = i32::try_from(slot_idx)
+                .map_err(|_| anyhow!("DSv4 graph CSA slot_idx {slot_idx} overflows i32"))?;
+            let key_count_i32 = i32::try_from(keys_capacity).map_err(|_| {
+                anyhow!("DSv4 graph CSA key capacity {keys_capacity} overflows i32")
+            })?;
+            let slot_id_dev = scratch
+                .csa_slot_id_dev
+                .as_mut()
+                .ok_or_else(|| anyhow!("DSv4 graph CSA slot-id device buffer missing"))?;
+            ctx.stream
+                .memcpy_htod(&[slot_id_i32], slot_id_dev)
+                .map_err(|e| anyhow!("DSv4 graph CSA slot-id H2D failed: {e}"))?;
+            let key_count_dev = scratch
+                .csa_key_count_dev
+                .as_mut()
+                .ok_or_else(|| anyhow!("DSv4 graph CSA key-count device buffer missing"))?;
+            ctx.stream
+                .memcpy_htod(&[key_count_i32], key_count_dev)
+                .map_err(|e| anyhow!("DSv4 graph CSA key-count H2D failed: {e}"))?;
+            scratch.csa_meta_initialized = true;
+        }
+        // Disjoint-field borrows: c_q_normed (read) + csa scratch (mut) + the
+        // persistent device-meta refs.
+        let Dsv4MlaDecodeGraphScratch {
+            c_q_normed,
+            csa_q_i,
+            csa_weights,
+            csa_selected,
+            csa_slot_id_dev,
+            csa_key_count_dev,
+            ..
+        } = scratch;
+        let csa_q_i = csa_q_i
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA q_i scratch missing"))?;
+        let csa_weights = csa_weights
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA weights scratch missing"))?;
+        let csa_selected = csa_selected
+            .as_mut()
+            .ok_or_else(|| anyhow!("DSv4 graph CSA selected scratch missing"))?;
+        let (slot_id_dev, key_count_dev) = if csa_read_lane {
+            (csa_slot_id_dev.as_ref(), csa_key_count_dev.as_ref())
+        } else {
+            (None, None)
+        };
         let Dsv4LayerAttentionState {
             indexer: indexer_state_ref,
             dsa_official,
             ..
         } = state;
-        let keys_capacity = indexer_state_ref
-            .as_ref()
-            .map(|s| s.compressed_capacity())
-            .unwrap_or(0);
         let index_keys = &indexer_state_ref
             .as_ref()
             .expect("indexer state checked above")
@@ -8373,12 +8479,17 @@ pub(crate) fn mla_attention_decode_graph(
         let official = dsa_official
             .as_mut()
             .ok_or_else(|| anyhow!("DSv4 graph CSA official DSA state missing"))?;
+        ensure!(
+            official.slot_idx == slot_idx,
+            "DSv4 graph CSA slot index mismatch: official {} != staged {slot_idx}",
+            official.slot_idx
+        );
         csa_select_decode_graph(
             ctx,
             config,
             indexer,
             hidden,
-            &scratch.c_q_normed,
+            c_q_normed,
             index_keys,
             keys_capacity,
             // This decode-graph path is CompressedSparse-only (asserted above) →
@@ -8401,6 +8512,9 @@ pub(crate) fn mla_attention_decode_graph(
             csa_weights,
             csa_selected,
             layer_idx,
+            slot_id_dev,
+            key_count_dev,
+            slot_idx,
             keepalive,
         )?;
         selected_ready = true;
@@ -12423,6 +12537,14 @@ fn csa_select_decode_graph(
     weights: &mut HiddenStates,
     selected: &mut CudaSlice<i32>,
     layer_idx: usize,
+    // GRAPH-SAFE READ lane (opt-in `ARLE_DSV4_DECODE_GRAPH_CSA`): when both are
+    // `Some`, route the READ (logits + topk) through the n=1 batched device-meta
+    // select reading these PERSISTENT slot_id/key_count buffers (no per-step H2D).
+    // When `None`, fall back to the per-tile `csa_select_official` READ (eager only;
+    // not graph-capturable, used when the read lane is off).
+    slot_id_dev: Option<&CudaSlice<i32>>,
+    key_count_dev: Option<&CudaSlice<i32>>,
+    slot_idx: usize,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(
@@ -12462,6 +12584,77 @@ fn csa_select_decode_graph(
     };
     let score_scale =
         (config.index_head_dim as f32).powf(-0.5) * (config.index_n_heads as f32).powf(-0.5);
+
+    // GRAPH-SAFE READ lane: cache WRITES (block (a)) via `cache_writes_only`, then
+    // the READ via the n=1 batched device-meta select reading persistent buffers.
+    // Both `slot_id_dev`/`key_count_dev` Some ⟹ caller pre-staged them (graph lane).
+    if let (Some(slot_id_dev), Some(key_count_dev)) = (slot_id_dev, key_count_dev) {
+        // (a) per-row CACHE WRITES only — populate this slot's DSA key cache for
+        // the rows committed this step. (Still host-shape driven; NOT yet graph-
+        // capturable — gated behind the surrounding decode-graph bail.)
+        let cache_ret = csa_select_official(
+            ctx,
+            config,
+            q_i,
+            weights,
+            keys,
+            official,
+            shared,
+            pool,
+            indexer_rows_before,
+            indexer_rows_after,
+            key_count,
+            start_pos,
+            start_pos_device,
+            keys_window_base,
+            layer_idx,
+            ratio,
+            local_index_heads,
+            score_scale,
+            None,
+            /* cache_writes_only */ true,
+            keepalive,
+        )?;
+        ensure!(
+            cache_ret.is_none(),
+            "DSv4 graph CSA cache-write pass unexpectedly returned selected output"
+        );
+        // (b)-(f) graph-safe READ at n=1 via the batched device-meta select. The
+        // q_i/weights scratch ARE the [width,1] n=1 batch (no gather). Persistent
+        // slot_id/key_count device buffers + start_pos_device ⟹ no per-step H2D.
+        let mut empty_keepalive: Vec<CudaSlice<i32>> = Vec::new();
+        csa_select_official_batched(
+            ctx,
+            config,
+            &*q_i,
+            &*weights,
+            shared,
+            pool,
+            1,
+            &[slot_idx],
+            &[],
+            &[],
+            local_index_heads,
+            score_scale,
+            selected,
+            keepalive,
+            /* use_device_meta */ true,
+            i32::try_from(ratio)?,
+            start_pos_device,
+            &[],
+            &mut empty_keepalive,
+            Some(slot_id_dev),
+            Some(key_count_dev),
+        )?;
+        ensure!(
+            empty_keepalive.is_empty(),
+            "DSv4 graph CSA read uploaded meta despite persistent buffers"
+        );
+        return Ok(());
+    }
+
+    // Eager READ fallback (read lane off): per-tile `csa_select_official` READ. Not
+    // graph-capturable (per-step alloc/host-shape) — only reached eagerly.
     let selected_return = csa_select_official(
         ctx,
         config,
