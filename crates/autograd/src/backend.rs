@@ -258,55 +258,6 @@ pub enum DeviceHandle {
     CudaFp8BlockScaled(CudaFp8BlockScaledStorage),
 }
 
-impl DeviceHandle {
-    /// `(alloc_key, actual_device_bytes)` for OPD VRAM attribution
-    /// (`ARLE_OPD_VRAM_TRACE`). `alloc_key` is the underlying `Arc` storage
-    /// pointer — stable per allocation, equal for `Arc`-aliased clones — so a
-    /// survivor dump can DEDUP by allocation (multiple tensor slots that share
-    /// one `clone_tensor`'d handle are one real allocation, not N). Bytes use
-    /// the TRUE element width (f32=4, bf16=2, fp8 weight=1 + scales), not the
-    /// `size×4` aggregate that over-counts FP8 weights as f32. CPU handles
-    /// report key 0 (no device residency to attribute).
-    #[cfg(feature = "cuda")]
-    pub fn alloc_key_and_bytes(&self) -> (usize, usize) {
-        match self {
-            DeviceHandle::Cpu(_) => (0, 0),
-            #[cfg(feature = "metal")]
-            DeviceHandle::Metal(_) => (0, 0),
-            DeviceHandle::Cuda(s) => {
-                let slice = s.slice();
-                (
-                    std::sync::Arc::as_ptr(&s.inner) as usize,
-                    slice.len() * std::mem::size_of::<f32>(),
-                )
-            }
-            DeviceHandle::CudaBf16(s) => {
-                let slice = s.slice();
-                (
-                    std::sync::Arc::as_ptr(&s.inner) as usize,
-                    slice.len() * std::mem::size_of::<u16>(),
-                )
-            }
-            DeviceHandle::CudaFp8BlockScaled(s) => {
-                // Borrowed views over foreign-owned bytes do NOT count against
-                // this engine's allocation budget (the infer engine frees them).
-                if s.borrowed {
-                    return (0, 0);
-                }
-                (
-                    std::sync::Arc::as_ptr(&s.weight) as usize,
-                    s.weight().len() + s.scales().len() * std::mem::size_of::<f32>(),
-                )
-            }
-        }
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    pub fn alloc_key_and_bytes(&self) -> (usize, usize) {
-        (0, 0)
-    }
-}
-
 type QwenDecodePrepareQHost = (Vec<f32>, Option<Vec<f32>>, Vec<usize>);
 type QwenDecodePrepareKvHost = (Vec<f32>, Vec<f32>, Vec<usize>);
 
@@ -454,9 +405,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Device VRAM `(free_bytes, total_bytes)` for this backend's context, or
-    /// `None` for host/CPU backends with no device memory. Used by OPD VRAM
-    /// attribution (`ARLE_OPD_VRAM_TRACE`) to log per-phase resident bytes
-    /// without a `&CudaBackend` downcast or shelling out to `nvidia-smi`.
+    /// `None` for host/CPU backends with no device memory. Lets OPD log
+    /// per-phase resident bytes without a `&CudaBackend` downcast or shelling
+    /// out to `nvidia-smi`.
     fn device_mem_info(&self) -> Option<(usize, usize)> {
         None
     }
