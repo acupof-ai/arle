@@ -5826,8 +5826,11 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, dsa_shared, flashmla_scratch, _prefill) =
+                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                    // Default decode stays byte-identical (None) unless the CSA read-lane is
+                    // on; the unconditional dsa_shared swap hung eager c=1 decode.
+                    let dsa_shared = if csa_read_lane { dsa_shared_raw } else { None };
                     attn_graph.run_or_capture(|| {
                         crate::ops::embedding_batch(
                             &self.ctx,
@@ -5893,8 +5896,11 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, dsa_shared, flashmla_scratch, _prefill) =
+                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
+                    // Default decode stays byte-identical (None) unless the CSA read-lane is
+                    // on; the unconditional dsa_shared swap hung eager c=1 decode.
+                    let dsa_shared = if csa_read_lane { dsa_shared_raw } else { None };
                     attn_graph.run_or_capture(|| {
                         crate::ops::add_batch(
                             &self.ctx,
