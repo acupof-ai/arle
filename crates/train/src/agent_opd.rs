@@ -64,9 +64,29 @@ pub fn tokens_record_to_pairs(
     pairs
 }
 
+/// Held-out eval pass-rate: fraction of tasks solved (`passed / total`), `0.0`
+/// when no tasks. Backend-independent so the aggregation is unit-testable
+/// without a GPU; the cuda-gated `AgentEvalReport::pass_rate` delegates here.
+pub fn pass_rate(passed: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        passed as f32 / total as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tokens_record_to_pairs;
+    use super::{pass_rate, tokens_record_to_pairs};
+
+    #[test]
+    fn pass_rate_aggregates_held_out_pass_fail() {
+        assert_eq!(pass_rate(0, 0), 0.0, "no tasks -> 0.0 (no div-by-zero)");
+        assert_eq!(pass_rate(0, 2), 0.0, "all fail -> 0.0");
+        assert_eq!(pass_rate(2, 2), 1.0, "all pass -> 1.0");
+        assert!((pass_rate(1, 2) - 0.5).abs() < 1e-6, "1/2 -> 0.5");
+        assert!((pass_rate(1, 3) - 0.333_333).abs() < 1e-5, "1/3 -> ~0.333");
+    }
 
     #[test]
     fn pairs_mask_out_tool_tokens() {
@@ -170,6 +190,156 @@ mod cuda_rollout {
         pub no_token_record: usize,
         pub trained_pairs: usize,
         pub mean_train_loss: f32,
+    }
+
+    /// Per-task held-out eval outcome: did the current student (greedy, no
+    /// training) produce a patch that passes the hidden tests?
+    #[derive(Clone, Debug)]
+    pub struct AgentEvalTaskResult {
+        pub instance_id: String,
+        /// True iff the rollout produced a non-empty diff AND `score_workdir`
+        /// reported the hidden tests passing.
+        pub passed: bool,
+        /// True iff the rollout edited the tree at all (diff non-empty).
+        pub edited: bool,
+        /// Last line of the test log / a short note (error / no-edit).
+        pub note: String,
+    }
+
+    /// Held-out eval roll-up: per-task pass/fail plus the aggregate pass-rate.
+    #[derive(Clone, Debug, Default)]
+    pub struct AgentEvalReport {
+        pub tasks: Vec<AgentEvalTaskResult>,
+    }
+
+    impl AgentEvalReport {
+        pub fn passed(&self) -> usize {
+            self.tasks.iter().filter(|t| t.passed).count()
+        }
+        pub fn edited(&self) -> usize {
+            self.tasks.iter().filter(|t| t.edited).count()
+        }
+        /// Fraction of held-out tasks the student solved (0.0 when no tasks).
+        pub fn pass_rate(&self) -> f32 {
+            super::pass_rate(self.passed(), self.tasks.len())
+        }
+    }
+
+    /// EVAL-ONLY pass over a HELD-OUT task set: drive the SAME agent rollout +
+    /// `score_workdir` harness with the current student, but train NOTHING — no
+    /// writeback, no optimizer step, ONE greedy/low-temp sample per task. The
+    /// reward is the same execution signal as the train loop (hidden tests on
+    /// `git diff`), so the aggregate `pass_rate` measures whether the model
+    /// actually got better at coding (baseline → round-N generalization), not
+    /// just train loss.
+    ///
+    /// `eval_temperature` should be `0.0` (greedy) or a small value; the harness
+    /// reads the engine in a `&mut` lock exactly like the train rollout but never
+    /// calls back into the optimizer.
+    pub fn run_agentic_opd_eval(
+        student: &InferStudent,
+        tasks: &[(SweTask, PathBuf)],
+        cfg: &AgentOpdConfig,
+        eval_temperature: f32,
+        label: &str,
+    ) -> Result<AgentEvalReport> {
+        let tool_defs = coding_tools();
+        let policy = NoPolicy;
+        let settings = AgentSettings {
+            max_turns: cfg.max_turns,
+            max_tokens: cfg.max_tokens,
+            temperature: eval_temperature,
+        };
+
+        let mut report = AgentEvalReport::default();
+        for (task, staged_tree) in tasks {
+            let workdir = boot_workdir(
+                &cfg.work_root,
+                &task.instance_id,
+                staged_tree,
+                task.before_repo_set_cmd.as_deref(),
+            )
+            .with_context(|| format!("boot eval sandbox for {}", task.instance_id))?;
+            let executor = SandboxToolExecutor::new(
+                workdir.clone(),
+                cfg.bash_timeout_secs,
+                cfg.pythonpath.clone(),
+            );
+            let overview = executor.execute(&ToolCall::new(
+                "bash",
+                json!({ "command": "ls && echo '---' && git log -1 --oneline 2>/dev/null" }),
+            ));
+            let user_prompt = format!(
+                "{}\n\nRepo layout (cwd = repo root):\n{}",
+                agent_user_prompt(task),
+                overview
+            );
+
+            // Single greedy rollout per held-out task (best-of-N would inflate the
+            // pass-rate vs the production single-shot the eval is meant to predict).
+            reset_workdir(&workdir)
+                .with_context(|| format!("reset eval sandbox for {}", task.instance_id))?;
+            let mut session = AgentSession::with_system_prompt(agent_system_prompt(task));
+            let result = {
+                let mut guard = student
+                    .engine()
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("eval engine lock poisoned: {e}"))?;
+                session.run_turn(
+                    &mut *guard,
+                    &user_prompt,
+                    &tool_defs,
+                    &executor,
+                    &policy,
+                    settings,
+                )
+            };
+            let (passed, edited, note) = match result {
+                Err(e) => (false, false, format!("rollout error: {e}")),
+                Ok(result) => {
+                    let diff = diff_workdir(&workdir).unwrap_or_default();
+                    if diff.trim().is_empty() {
+                        (
+                            false,
+                            false,
+                            format!("no edits (turns={})", result.tool_calls_executed),
+                        )
+                    } else {
+                        match score_workdir(
+                            &workdir,
+                            &task.test_patch,
+                            &task.fail_to_pass(),
+                            cfg.pythonpath.as_deref(),
+                            cfg.test_timeout_secs,
+                        ) {
+                            Ok((passed, log)) => {
+                                (passed, true, log.lines().last().unwrap_or("").to_string())
+                            }
+                            Err(e) => (false, true, format!("score error: {e}")),
+                        }
+                    }
+                }
+            };
+            eprintln!(
+                "[agent-opd-eval {label}] {} passed={passed} edited={edited} :: {note}",
+                task.instance_id
+            );
+            report.tasks.push(AgentEvalTaskResult {
+                instance_id: task.instance_id.clone(),
+                passed,
+                edited,
+                note,
+            });
+        }
+
+        eprintln!(
+            "[agent-opd-eval {label}] held-out pass_rate={:.4} ({}/{} tasks, {} edited)",
+            report.pass_rate(),
+            report.passed(),
+            report.tasks.len(),
+            report.edited(),
+        );
+        Ok(report)
     }
 
     /// Run the agent-OPD loop. `tasks` pairs each [`SweTask`] with the directory
@@ -399,4 +569,7 @@ mod cuda_rollout {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_rollout::{AgentOpdConfig, AgentRoundReport, run_agentic_opd_round};
+pub use cuda_rollout::{
+    AgentEvalReport, AgentEvalTaskResult, AgentOpdConfig, AgentRoundReport, run_agentic_opd_eval,
+    run_agentic_opd_round,
+};
