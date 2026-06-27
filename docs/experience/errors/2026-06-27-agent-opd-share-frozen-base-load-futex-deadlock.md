@@ -77,18 +77,50 @@ lock/sync deadlock at the engine↔autograd boundary, not at file I/O.
   GPU exclusively mine → the futex deadlock above is the real, attributable
   blocker.
 
-## Fix
+## Fix (resolved 2026-06-28)
 
-Not yet fixed — blocker handed back. Decomposition for the next pass:
-1. Bisect the deadlock: `--no-share-frozen-base` takes the OTHER load-order branch
-   (`train_cli.rs:2044` — student loaded FIRST, no borrow), which sidesteps the
-   engine↔autograd import entirely. A/B that to confirm the deadlock is in the
-   share path (cheap one-flag test).
-2. If confirmed, audit the lock/stream ordering in
-   `import_fp8_block_scaled_device_ptr` (`backend_cuda.rs:1147`,
-   `upgrade_device_ptr` + the `CudaFp8BlockScaledStorage::new_borrowed` context
-   guard) vs the rollout engine's outstanding stream work — likely a missing
-   `stream_wait` / a mutex held across the import loop.
+**The "futex / 186-thread" decode was a MIS-SAMPLE; the real stack is `poll()`
+with 4 threads.** Reproduced clean on GPU 7 (own tree `/host/arle-opd-deadlock`,
+no contention) and read `/proc/<pid>/syscall` + per-thread `wchan` directly (gdb
+attach trips the node's ELKEID anti-debug and reaps the target, so `/proc` was the
+SOLID signal): the main thread is in `poll(nfds=2, timeout=-1)` (`__x64_sys_poll`),
+NOT `futex_wait`; the process has 4 threads, not 186 (the 180-thread figure was the
+idle 180-core rayon/OpenMP pool, all legitimately parked). Instrumenting the loader
+(`ARLE_OPD_LOAD_TRACE`) proved the share-frozen-base load **completes** — all 851
+tensors materialize; the import path (`import_fp8_block_scaled_device_ptr`,
+`upgrade_device_ptr`) is a pure pointer-wrap and never blocks.
+
+**Root cause: the post-load cross-stream handoff fence at `train_cli.rs` called
+`train_backend.device_synchronize()` = `cuCtxSynchronize`, which drains the ENTIRE
+device primary context.** The co-resident rollout engine shares that primary
+context (both backends `cuDevicePrimaryCtxRetain` the same ordinal) but runs its
+streams with cudarc event-tracking DISABLED (`DeviceContext::on_device`
+→ `ctx.disable_event_tracking()`, `cuda-kernels/src/tensor.rs:341`) and idle-parks
+between scheduler steps. `cuCtxSynchronize` blocks forever in `poll()` waiting on
+the engine's never-host-progressed streams. (This reconciles the "GPU flat at
+3 MiB" too: the student's async uploads were submitted but the FIRST sync — the
+fence — deadlocks before they execute, so VRAM never climbs.)
+
+**Fix:** add `Backend::stream_synchronize` (`cuStreamSynchronize` on the train
+backend's OWN default stream only — does NOT touch the engine's streams) and use it
+for the two share-frozen-base handoff fences (`train_cli.rs` agent-opd + rubric-opd).
+The engine's resident FP8 base was already committed by its own load+warmup, so the
+fence only needs the student's own upload stream drained. `device_synchronize`
+(`cuCtxSynchronize`) is LEFT unchanged — its other callers (opd.rs weight
+offload/reload fences) intentionally drain the whole context to order train work
+ahead of an infer reload. Gated to the `!no_share_frozen_base` path; default serve
+byte-identical.
+
+**Verified:** with the fix the fence clears immediately
+(`[opd-load-trace] post stream-sync OK`) and GPU residency climbs to **35.7 GB**
+(vs the deadlocked baseline stuck at 3 MiB) — load + weight upload complete. The
+`--no-share-frozen-base` A/B (STEP 1) confirmed attribution: no-share loads the
+student first with no co-resident engine and never deadlocks.
+
+A SEPARATE downstream blocker remains in the rollout phase (the process clears the
+fence then dies during generation — a distinct crash, not this deadlock); the
+sandbox `process_group(0)` → `setsid` fork-safety fix (a multithreaded-CUDA-parent
+`fork()` hazard) is bundled but the held-out pass-rate is not yet reached.
 
 ## Rule
 

@@ -1610,14 +1610,18 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
     };
 
     // When sharing, the autograd student's frozen base now ALIASES the engine's
-    // resident FP8 bytes. Drain all in-flight device work (the engine upload + the
-    // student's own trainable-suffix uploads) before the first autograd forward so
-    // the shared bytes are guaranteed valid across the (separate) train/infer
-    // streams on the shared primary context (cross-stream handoff fence).
+    // resident FP8 bytes. Drain the autograd backend's OWN upload stream (the
+    // student's trainable-suffix uploads) before the first autograd forward so the
+    // shared bytes are guaranteed valid across the (separate) train/infer streams
+    // on the shared primary context (cross-stream handoff fence). MUST be
+    // stream-scoped, NOT `cuCtxSynchronize`: the co-resident engine's streams on
+    // this shared primary context run event-tracking-disabled + idle-parked, so a
+    // context-wide drain deadlocks (see the agent-OPD share-frozen-base fix). The
+    // engine's resident FP8 base was already written by its own load+warmup.
     if !args.no_share_frozen_base {
         train_backend
-            .device_synchronize()
-            .context("device sync before first shared-base autograd forward")?;
+            .stream_synchronize()
+            .context("stream sync before first shared-base autograd forward")?;
     }
 
     // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
@@ -2148,12 +2152,28 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         }
     };
 
-    // Shared-base bytes alias the engine's resident FP8 — drain in-flight device
-    // work before the first autograd forward (cross-stream handoff fence).
+    // Shared-base bytes alias the engine's resident FP8 — drain the autograd
+    // backend's OWN in-flight uploads before the first autograd forward
+    // (cross-stream handoff fence). MUST be a stream-scoped sync, NOT a
+    // context-wide `cuCtxSynchronize`: the co-resident rollout engine shares this
+    // device primary context but runs its streams with cudarc event-tracking
+    // DISABLED and idle-parked between scheduler steps, so a `cuCtxSynchronize`
+    // here blocks forever in poll() draining the engine's never-host-progressed
+    // streams (measured deadlock — main thread poll(nfds=2,-1), GPU flat, all
+    // 851 student tensors already materialized). The engine's resident FP8 base
+    // weights are fully written by its own load+warmup before this point, so the
+    // borrow only needs the student's own upload stream drained.
     if !args.no_share_frozen_base {
+        let opd_load_trace = std::env::var("ARLE_OPD_LOAD_TRACE").is_ok();
+        if opd_load_trace {
+            eprintln!("[opd-load-trace] pre stream-sync (share-frozen-base handoff fence)");
+        }
         train_backend
-            .device_synchronize()
-            .context("device sync before first shared-base autograd forward")?;
+            .stream_synchronize()
+            .context("stream sync before first shared-base autograd forward")?;
+        if opd_load_trace {
+            eprintln!("[opd-load-trace] post stream-sync OK; building InferStudent");
+        }
     }
 
     // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
