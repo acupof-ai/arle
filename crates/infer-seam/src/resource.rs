@@ -97,10 +97,13 @@ pub fn clamp_to_affordable(requested: usize, affordable: usize) -> (usize, bool)
     (planned, planned < requested)
 }
 
-/// Bounds for `mem_fraction_static`: a backend never claims less than half nor
-/// more than ~all of HBM for KV — leave room for activations/scratch even at the
-/// top, and don't collapse the pool to nothing at the bottom.
-const MEM_FRACTION_STATIC_MIN: f64 = 0.5;
+/// Bounds for `mem_fraction_static`: a backend never claims more than ~all of HBM
+/// for KV (leave room for activations/scratch even at the top). The lower bound is
+/// small (not 0.5) so an explicitly co-resident caller — OPD's rollout engine
+/// sharing VRAM with a trainable student — can deliberately shrink its KV pool;
+/// `PROFILE_KV_TOKENS_FLOOR` still guarantees the pool never collapses to zero, so
+/// the floor (not a 0.5 clamp) is what protects admission at the bottom.
+const MEM_FRACTION_STATIC_MIN: f64 = 0.05;
 const MEM_FRACTION_STATIC_MAX: f64 = 0.97;
 
 /// Floor on the profiled token pool: a transient tiny free-VRAM reading (another
@@ -421,9 +424,9 @@ mod tests {
         let high = profile_kv_pool_tokens(free, total, cell, 0.99);
         let at_max = profile_kv_pool_tokens(free, total, cell, 0.97);
         assert_eq!(high, at_max);
-        // 0.1 clamps to 0.5 (reserve cap): larger reserve than the request → fewer tokens.
-        let low = profile_kv_pool_tokens(free, total, cell, 0.1);
-        let at_min = profile_kv_pool_tokens(free, total, cell, 0.5);
+        // 0.01 clamps to 0.05 (reserve cap): larger reserve than the request → fewer tokens.
+        let low = profile_kv_pool_tokens(free, total, cell, 0.01);
+        let at_min = profile_kv_pool_tokens(free, total, cell, 0.05);
         assert_eq!(low, at_min);
         assert!(low < high, "tighter fraction must size a smaller pool");
         // NaN resolves to the conservative max, not a panic / NaN propagation.
@@ -443,7 +446,8 @@ mod tests {
     #[test]
     fn clamp_mem_fraction_static_band() {
         assert_eq!(clamp_mem_fraction_static(0.9), 0.9);
-        assert_eq!(clamp_mem_fraction_static(0.1), 0.5);
+        assert_eq!(clamp_mem_fraction_static(0.1), 0.1); // honored: above the 0.05 min
+        assert_eq!(clamp_mem_fraction_static(0.01), 0.05); // below min → clamped up
         assert_eq!(clamp_mem_fraction_static(1.5), 0.97);
         assert_eq!(clamp_mem_fraction_static(f64::NAN), 0.97);
     }
