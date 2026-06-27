@@ -1360,6 +1360,43 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_name = "N")]
     pub(crate) task_limit: Option<usize>,
 
+    /// HELD-OUT eval task set (SWE-bench-Pro JSONL, SAME schema as --dataset but
+    /// SEPARATE tasks — no overlap, so the pass-rate measures generalization).
+    /// When set, an eval-only rollout+score pass runs at round boundaries (a
+    /// round-0 baseline BEFORE any training, then every --eval-every rounds) and
+    /// the held-out PASS-RATE is logged next to mean_train_loss. Eval never
+    /// trains (no writeback, no optimizer step, greedy sampling).
+    #[arg(long, value_name = "FILE")]
+    pub(crate) eval_dataset: Option<PathBuf>,
+
+    /// Staged repos for the held-out --eval-dataset tasks
+    /// (`<eval-staged-root>/<instance_id>/`). Defaults to --staged-root when the
+    /// eval tasks live under the same staged tree.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) eval_staged_root: Option<PathBuf>,
+
+    /// Cap on the number of held-out eval tasks (from the head of
+    /// --eval-dataset).
+    #[arg(long, value_name = "N")]
+    pub(crate) eval_n: Option<usize>,
+
+    /// Run the held-out eval every N rounds (plus the round-0 baseline). 0 = off
+    /// (only the baseline runs, if --eval-dataset is set). Default 1 (every round).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) eval_every: usize,
+
+    /// Directory for the per-round eval dumps (eval_round{N}.jsonl with per-task
+    /// pass/fail + the aggregate pass-rate). Defaults to --save-lora-adapters,
+    /// then --save-checkpoint, then the current dir.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) eval_out_dir: Option<PathBuf>,
+
+    /// Sampling temperature for the held-out eval rollout (0.0 = greedy). Kept
+    /// separate from --rollout-temperature so eval is deterministic-ish while
+    /// training samples diversely.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_temperature, allow_hyphen_values = true)]
+    pub(crate) eval_temperature: f32,
+
     /// Agent rollouts generated per task each round (best-of-N).
     #[arg(long, default_value_t = 4)]
     pub(crate) samples_per_prompt: usize,
