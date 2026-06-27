@@ -323,17 +323,18 @@ pub struct StudentLoraUpdate {
 /// these pointers as a NON-OWNING view instead of allocating their own ~27 GB
 /// copy.
 ///
-/// `layer_idx` + `proj_suffix` (e.g. `"self_attn.q_proj"`) form a stable key
-/// the train loader matches against its `train_name`
+/// `layer_idx` + `proj_suffix` (e.g. `"self_attn.q_proj"`, or a per-expert path
+/// like `"mlp.experts.3.gate_proj"`) form a stable key the train loader matches
+/// against its `train_name`
 /// (`model.(language_model.)?layers.{layer_idx}.{proj_suffix}.weight`).
 /// `weight_ptr` / `scale_ptr` are raw `CUdeviceptr`s into the engine's resident
 /// VRAM; the borrower must keep the engine base resident (no offload of the
 /// shared base) for the borrow's lifetime. All fields are plain values (`Send`),
 /// so the table crosses the engine-thread control seam safely.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SharedFp8BaseProjection {
     pub layer_idx: usize,
-    pub proj_suffix: &'static str,
+    pub proj_suffix: String,
     pub weight_ptr: u64,
     pub scale_ptr: u64,
     pub rows: usize,
@@ -3661,51 +3662,288 @@ impl Qwen35Model {
     /// Read-only borrow of every resident FP8 block-scaled base projection's
     /// device pointers, for train-infer weight sharing (`--share-frozen-base`).
     ///
-    /// Walks each layer's full-attention (q/k/v/o) and dense-MLP
-    /// (gate/up/down) projections, emitting a [`SharedFp8BaseProjection`] for
-    /// every one stored as resident block-scaled FP8 (the layout
-    /// `DeviceMatrix::from_fp8_block_scaled` produces). Linear-attention and MoE
-    /// projections are intentionally skipped: the OPD student's shared frozen
-    /// base is the dense-projection set the train loader whitelists
-    /// (`is_fp8_cuda_frozen_base_tensor`); the train side picks the subset it
-    /// actually shares (frozen, non-LoRA-target tensors) by matching
+    /// Walks each layer's full-attention (q/k/v/o), linear-attention
+    /// (in_proj_qkv/z + out_proj — in_proj_a/b are tiny BF16 and skipped by the
+    /// FP8 filter), dense-MLP (gate/up/down), and MoE projections, emitting a
+    /// [`SharedFp8BaseProjection`] for every one stored as resident block-scaled
+    /// FP8. MoE routed experts come from either
+    /// the per-expert `DeviceMatrix` vecs (DeepGEMM disabled) or sliced out of
+    /// the fused `w13`/`down` grouped FP8 buffers (default), and the shared
+    /// expert from its individual FP8 matrices. The train side picks the subset
+    /// it actually shares (frozen, non-LoRA-target tensors) by matching
     /// `(layer_idx, proj_suffix)`. Read-only: returns raw pointers, never
-    /// exposes mutation. Single-GPU only (TP shards would split the base).
+    /// exposes mutation. Single-GPU only — TP/EP shards would split the base, so
+    /// group index equals global expert index.
     pub(crate) fn frozen_base_fp8_pointers(&self) -> Result<Vec<SharedFp8BaseProjection>> {
         ensure!(
             self.tp.is_single(),
             "frozen-base FP8 sharing is single-GPU only; got TP world_size={}",
             self.tp.config().world_size
         );
+        let ctx = &self.ctx;
+        // Plain helper (not a closure) so the grouped-buffer `out.push` calls
+        // below don't conflict with a captured `&mut out` borrow.
+        fn push(
+            out: &mut Vec<SharedFp8BaseProjection>,
+            ctx: &DeviceContext,
+            layer_idx: usize,
+            suffix: String,
+            m: &DeviceMatrix,
+        ) {
+            if let Some((weight_ptr, scale_ptr, rows, cols, block_m, block_k)) =
+                m.fp8_block_scaled_ptrs(ctx)
+            {
+                out.push(SharedFp8BaseProjection {
+                    layer_idx,
+                    proj_suffix: suffix,
+                    weight_ptr,
+                    scale_ptr,
+                    rows,
+                    cols,
+                    block_m,
+                    block_k,
+                });
+            }
+        }
         let mut out = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let mut push = |suffix: &'static str, m: &DeviceMatrix| {
-                if let Some((weight_ptr, scale_ptr, rows, cols, block_m, block_k)) =
-                    m.fp8_block_scaled_ptrs(&self.ctx)
-                {
-                    out.push(SharedFp8BaseProjection {
-                        layer_idx,
-                        proj_suffix: suffix,
-                        weight_ptr,
-                        scale_ptr,
-                        rows,
-                        cols,
-                        block_m,
-                        block_k,
-                    });
-                }
-            };
             if let Qwen35Attn::Full(full) = &layer.attn {
-                push("self_attn.q_proj", &full.q_proj);
-                push("self_attn.k_proj", &full.k_proj);
-                push("self_attn.v_proj", &full.v_proj);
-                push("self_attn.o_proj", &full.o_proj);
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "self_attn.q_proj".to_string(),
+                    &full.q_proj,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "self_attn.k_proj".to_string(),
+                    &full.k_proj,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "self_attn.v_proj".to_string(),
+                    &full.v_proj,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "self_attn.o_proj".to_string(),
+                    &full.o_proj,
+                );
+            }
+            if let Qwen35Attn::Linear(lin) = &layer.attn {
+                // Gated-delta linear attention. in_proj_qkv/z + out_proj ship as
+                // resident FP8 in the Qwen3.5/3.6 hybrid checkpoint; in_proj_a/b
+                // are tiny per-head BF16 (fp8_block_scaled_ptrs skips them via the
+                // format filter). The train student names these
+                // `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` (HF spec).
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "linear_attn.in_proj_qkv".to_string(),
+                    &lin.in_proj_qkv,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "linear_attn.in_proj_z".to_string(),
+                    &lin.in_proj_z,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "linear_attn.in_proj_b".to_string(),
+                    &lin.in_proj_b,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "linear_attn.in_proj_a".to_string(),
+                    &lin.in_proj_a,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "linear_attn.out_proj".to_string(),
+                    &lin.out_proj,
+                );
             }
             if let Some(mlp) = &layer.mlp {
-                push("mlp.gate_proj", &mlp.gate_proj);
-                push("mlp.up_proj", &mlp.up_proj);
-                push("mlp.down_proj", &mlp.down_proj);
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "mlp.gate_proj".to_string(),
+                    &mlp.gate_proj,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "mlp.up_proj".to_string(),
+                    &mlp.up_proj,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "mlp.down_proj".to_string(),
+                    &mlp.down_proj,
+                );
             }
+            if let Some(moe) = &layer.moe {
+                // Shared expert: always individual FP8 DeviceMatrix (mirror dense).
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "mlp.shared_expert.gate_proj".to_string(),
+                    &moe.shared_gate,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "mlp.shared_expert.up_proj".to_string(),
+                    &moe.shared_up,
+                );
+                push(
+                    &mut out,
+                    ctx,
+                    layer_idx,
+                    "mlp.shared_expert.down_proj".to_string(),
+                    &moe.shared_down,
+                );
+
+                // Routed experts. Two storage layouts:
+                //  (A) per-expert Vec<DeviceMatrix> populated (DeepGEMM disabled) -> borrow each directly.
+                //  (B) fused FP8 grouped buffers (default) -> slice per-expert ptrs into the group.
+                if !moe.gate.is_empty() {
+                    // Layout A: per-expert DeviceMatrix retained.
+                    for (e, m) in moe.gate.iter().enumerate() {
+                        push(
+                            &mut out,
+                            ctx,
+                            layer_idx,
+                            format!("mlp.experts.{e}.gate_proj"),
+                            m,
+                        );
+                    }
+                    for (e, m) in moe.up.iter().enumerate() {
+                        push(
+                            &mut out,
+                            ctx,
+                            layer_idx,
+                            format!("mlp.experts.{e}.up_proj"),
+                            m,
+                        );
+                    }
+                    for (e, m) in moe.down.iter().enumerate() {
+                        push(
+                            &mut out,
+                            ctx,
+                            layer_idx,
+                            format!("mlp.experts.{e}.down_proj"),
+                            m,
+                        );
+                    }
+                } else {
+                    // Layout B: slice into the fused grouped FP8 buffers.
+                    // Single-GPU: group index == global expert index.
+                    if let Some(w13) = &moe.w13_fp8_grouped {
+                        // rows = 2*moe_intermediate; gate = rows[0..mi], up = rows[mi..2*mi].
+                        let mi = w13.rows / 2;
+                        for e in 0..w13.groups {
+                            if let Some(p) = w13.expert_slice_fp8_ptrs(ctx, e, 0, mi) {
+                                out.push(SharedFp8BaseProjection {
+                                    layer_idx,
+                                    proj_suffix: format!("mlp.experts.{e}.gate_proj"),
+                                    weight_ptr: p.0,
+                                    scale_ptr: p.1,
+                                    rows: p.2,
+                                    cols: p.3,
+                                    block_m: p.4,
+                                    block_k: p.5,
+                                });
+                            }
+                            if let Some(p) = w13.expert_slice_fp8_ptrs(ctx, e, mi, mi) {
+                                out.push(SharedFp8BaseProjection {
+                                    layer_idx,
+                                    proj_suffix: format!("mlp.experts.{e}.up_proj"),
+                                    weight_ptr: p.0,
+                                    scale_ptr: p.1,
+                                    rows: p.2,
+                                    cols: p.3,
+                                    block_m: p.4,
+                                    block_k: p.5,
+                                });
+                            }
+                        }
+                    }
+                    if let Some(down) = &moe.down_fp8_grouped {
+                        for e in 0..down.groups {
+                            if let Some(p) = down.expert_slice_fp8_ptrs(ctx, e, 0, down.rows) {
+                                out.push(SharedFp8BaseProjection {
+                                    layer_idx,
+                                    proj_suffix: format!("mlp.experts.{e}.down_proj"),
+                                    weight_ptr: p.0,
+                                    scale_ptr: p.1,
+                                    rows: p.2,
+                                    cols: p.3,
+                                    block_m: p.4,
+                                    block_k: p.5,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var("ARLE_SHARE_BASE_DIAG").is_ok() {
+            let mut attn = 0usize;
+            let mut lin = 0usize;
+            let mut mlp = 0usize;
+            let mut shared = 0usize;
+            let mut experts = 0usize;
+            for e in &out {
+                if e.proj_suffix.starts_with("self_attn") {
+                    attn += 1;
+                } else if e.proj_suffix.starts_with("linear_attn") {
+                    lin += 1;
+                } else if e.proj_suffix.starts_with("mlp.shared_expert") {
+                    shared += 1;
+                } else if e.proj_suffix.starts_with("mlp.experts") {
+                    experts += 1;
+                } else if e.proj_suffix.starts_with("mlp.") {
+                    mlp += 1;
+                }
+            }
+            eprintln!(
+                "[share-base-diag] emitted {} entries: full_attn={attn} linear_attn={lin} dense_mlp={mlp} shared_expert={shared} routed_experts={experts}; sample suffixes: {:?}",
+                out.len(),
+                out.iter()
+                    .take(10)
+                    .map(|e| (
+                        e.layer_idx,
+                        e.proj_suffix.as_str(),
+                        e.rows,
+                        e.cols,
+                        e.block_m,
+                        e.block_k
+                    ))
+                    .collect::<Vec<_>>()
+            );
         }
         Ok(out)
     }
