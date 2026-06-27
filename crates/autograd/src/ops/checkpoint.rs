@@ -23,34 +23,10 @@ where
 
     let input_ids = input_ids.into_iter().collect::<SmallVec<[TensorId; 2]>>();
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
-    // Gated per-group VRAM probe (ARLE_OPD_VRAM_TRACE): the writeback's forward
-    // OOMs inside the FIRST checkpoint group, so attribute the within-group peak.
-    let vram_trace = std::env::var("ARLE_OPD_VRAM_TRACE").is_ok();
-    if vram_trace {
-        if let Some((free, total)) = store.backend().device_mem_info() {
-            eprintln!(
-                "[opd-vram] ckpt-group pre-forward: used={}MiB free={}MiB inputs={}",
-                (total - free) >> 20,
-                free >> 20,
-                input_ids.len(),
-            );
-        }
-    }
     let was_enabled = tape.enabled;
     tape.enabled = false;
     let forward_result = replay(store, tape, &input_ids);
     tape.enabled = was_enabled;
-    if vram_trace {
-        if let Some((free, total)) = store.backend().device_mem_info() {
-            let (live_dev, live_cnt) = store.live_device_bytes();
-            eprintln!(
-                "[opd-vram] ckpt-group post-forward: used={}MiB free={}MiB store_live_device={}MiB ({live_cnt} tensors)",
-                (total - free) >> 20,
-                free >> 20,
-                live_dev >> 20,
-            );
-        }
-    }
     let output_id = match forward_result {
         Ok(output_id) => output_id,
         Err(err) => {
@@ -100,21 +76,6 @@ where
             if hidden_id != output_id {
                 store.drop_device_residency(hidden_id)?;
             }
-        }
-    }
-
-    if vram_trace {
-        // Post-free/post-offload survivor decode: dump the DISTINCT device
-        // allocations that remain live, largest first. This is the per-tensor
-        // root-cause decode — names exactly WHAT accumulates each group.
-        let (live_dev, live_cnt) = store.live_device_bytes();
-        eprintln!(
-            "[opd-vram] ckpt-group post-free: device={live_dev_mib}MiB ({live_cnt} allocs) checkpoint_fns={fns}",
-            live_dev_mib = live_dev >> 20,
-            fns = tape.checkpoint_fn_count(),
-        );
-        for (line, _) in store.device_survivors_by_alloc().into_iter().take(8) {
-            eprintln!("[opd-vram]   survivor {line}");
         }
     }
 
