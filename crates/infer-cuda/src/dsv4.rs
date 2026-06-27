@@ -3224,6 +3224,11 @@ impl Dsv4Model {
                         batched_positions.as_ref(),
                         &key_counts,
                         &mut pack_pt_keepalive,
+                        // Eager batched lane: slot_ids/key_counts uploaded inside
+                        // (not graph-replayed). The graph-safe persistent-buffer
+                        // lane is the single-row decode-graph path only.
+                        None,
+                        None,
                     )?;
                 }
                 if let Some(t) = _batchedread_t {

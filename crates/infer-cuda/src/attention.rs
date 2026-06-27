@@ -13283,6 +13283,14 @@ pub(crate) fn csa_select_official_batched(
     start_pos_device: Option<&CudaSlice<i32>>,
     key_counts: &[i32],
     meta_keepalive: &mut Vec<CudaSlice<i32>>,
+    // GRAPH-SAFE device-meta inputs (single-row decode-graph lane). When BOTH are
+    // `Some`, the device-meta path reads these PERSISTENT device buffers instead
+    // of doing two per-step `upload_i32` (H2D allocs the capture audit rejects).
+    // The eager batched lane passes `None` → the `upload_i32` path is unchanged.
+    // `slot_ids_dev` holds the n slot indices (constant per slot); `key_counts_dev`
+    // the n key capacities (constant for the graph). Require `use_device_meta`.
+    slot_ids_dev: Option<&CudaSlice<i32>>,
+    key_counts_dev: Option<&CudaSlice<i32>>,
 ) -> Result<()> {
     ensure!(
         n > 0 && n <= shared.decode_max_batch,
@@ -13343,15 +13351,7 @@ pub(crate) fn csa_select_official_batched(
     if use_device_meta {
         // (b0) DEVICE path: ONE kernel computes block_table/context_lens/positions
         // on-device from device inputs, byte-identical to the (b1)/(b2) host builds
-        // — no per-step H2D. Upload the small slot_ids/key_counts (held in
-        // `meta_keepalive` to the layer-loop's function return, like
-        // `pack_pt_keepalive`, so they outlive this async launch).
-        ensure!(
-            key_counts.len() == n,
-            "DSv4 batched DSA device-meta key_counts {} != n {}",
-            key_counts.len(),
-            n
-        );
+        // — no per-step H2D.
         let start_pos = start_pos_device.ok_or_else(|| {
             anyhow!("DSv4 batched DSA device-meta: start_pos_device (batched_positions) missing")
         })?;
@@ -13361,14 +13361,52 @@ pub(crate) fn csa_select_official_batched(
             start_pos.len(),
             n
         );
-        let slot_ids_i32: Vec<i32> = slot_ids
-            .iter()
-            .map(|&s| {
-                i32::try_from(s).map_err(|_| anyhow!("DSv4 batched DSA slot_id {s} overflows i32"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let slot_ids_dev = crate::ops::upload_i32(ctx, &slot_ids_i32)?;
-        let key_counts_dev = crate::ops::upload_i32(ctx, key_counts)?;
+        // GRAPH-SAFE lane: caller pre-staged slot_ids/key_counts into PERSISTENT
+        // device buffers (no per-step `upload_i32` → no host-memcpy node the
+        // capture audit rejects). Eager lane (both None): upload here as before,
+        // holding the uploads in `meta_keepalive` so they outlive the async launch.
+        let (slot_ids_owned, key_counts_owned) = match (slot_ids_dev, key_counts_dev) {
+            (Some(_), Some(_)) => (None, None),
+            (None, None) => {
+                ensure!(
+                    key_counts.len() == n,
+                    "DSv4 batched DSA device-meta key_counts {} != n {}",
+                    key_counts.len(),
+                    n
+                );
+                let slot_ids_i32: Vec<i32> = slot_ids
+                    .iter()
+                    .map(|&s| {
+                        i32::try_from(s)
+                            .map_err(|_| anyhow!("DSv4 batched DSA slot_id {s} overflows i32"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    Some(crate::ops::upload_i32(ctx, &slot_ids_i32)?),
+                    Some(crate::ops::upload_i32(ctx, key_counts)?),
+                )
+            }
+            _ => anyhow::bail!(
+                "DSv4 batched DSA device-meta: slot_ids_dev/key_counts_dev must both be Some or both None"
+            ),
+        };
+        let slot_ids_ref = slot_ids_dev.unwrap_or_else(|| {
+            slot_ids_owned
+                .as_ref()
+                .expect("eager lane uploaded slot_ids")
+        });
+        let key_counts_ref = key_counts_dev.unwrap_or_else(|| {
+            key_counts_owned
+                .as_ref()
+                .expect("eager lane uploaded key_counts")
+        });
+        ensure!(
+            slot_ids_ref.len() >= n && key_counts_ref.len() >= n,
+            "DSv4 batched DSA device-meta buffers too small slot_ids={} key_counts={} n={}",
+            slot_ids_ref.len(),
+            key_counts_ref.len(),
+            n
+        );
         {
             let mut bt = shared.block_table_batch.slice_mut(0..n * num_pages);
             let mut lens = shared.context_lens_batch.slice_mut(0..n);
@@ -13376,9 +13414,9 @@ pub(crate) fn csa_select_official_batched(
             let (bt_ptr, _btg) = bt.device_ptr_mut(&ctx.stream);
             let (lens_ptr, _lg) = lens.device_ptr_mut(&ctx.stream);
             let (pos_ptr, _pg) = pos.device_ptr_mut(&ctx.stream);
-            let (slot_ptr, _sg) = slot_ids_dev.device_ptr(&ctx.stream);
+            let (slot_ptr, _sg) = slot_ids_ref.device_ptr(&ctx.stream);
             let (sp_ptr, _spg) = start_pos.device_ptr(&ctx.stream);
-            let (kc_ptr, _kcg) = key_counts_dev.device_ptr(&ctx.stream);
+            let (kc_ptr, _kcg) = key_counts_ref.device_ptr(&ctx.stream);
             unsafe {
                 ffi::dsv4_dsa_build_select_meta_cuda(
                     bt_ptr as *mut i32,
@@ -13396,8 +13434,13 @@ pub(crate) fn csa_select_official_batched(
                 .map_err(|e| anyhow!("DSv4 batched DSA build_select_meta failed: {e}"))?;
             }
         }
-        meta_keepalive.push(slot_ids_dev);
-        meta_keepalive.push(key_counts_dev);
+        // Eager lane uploads outlive the async launch via `meta_keepalive`; the
+        // graph-safe lane's buffers are persistent (owned by the caller) → nothing
+        // to push.
+        if let (Some(s), Some(k)) = (slot_ids_owned, key_counts_owned) {
+            meta_keepalive.push(s);
+            meta_keepalive.push(k);
+        }
     } else {
         // (b1) per-row block_table band: row r → slot r's DSA band = `num_pages`
         // contiguous blocks based at `slot_idx * num_pages` (alignment proven in the
