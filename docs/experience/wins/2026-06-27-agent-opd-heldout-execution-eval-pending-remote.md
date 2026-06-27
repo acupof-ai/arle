@@ -1,10 +1,25 @@
-# Agent-OPD held-out execution eval — wired + committed, run PENDING-REMOTE
+# Agent-OPD held-out execution eval — wired + committed; e2e ATTEMPTED on H20, blocked by a node-governance kill
+
+> **UPDATE 2026-06-27 (e2e attempt):** the held-out eval data was built + locally
+> validated as real tasks and pushed to the H20 box, the binary built green, and
+> every loop component (both 27B loads, the fast GPU chunked-CE writeback fwd/bwd,
+> AdamW, bare engine decode, sandbox cp/git/pytest) verified in isolation — BUT the
+> full agent-OPD loop is **killed by a silent external SIGKILL at the dual-27B
+> ~58.8 GB resident floor** (5/5 reproductions, no RUN_EXIT / no panic / no CUDA
+> error even under `CUDA_LAUNCH_BLOCKING=1`). Root-caused to **node-level GPU
+> governance (ELKEID HIDS box), NOT an ARLE code bug** — only the dual-model
+> co-residency dies; every single-engine workload survives. Full write-up +
+> isolation table + footprint-reduction options:
+> [errors/2026-06-27-agent-opd-full-loop-killed-by-node-governance-not-code.md](../errors/2026-06-27-agent-opd-full-loop-killed-by-node-governance-not-code.md).
+> The held-out pass-rate trend (baseline → round-N) is therefore **still not
+> measured** — needs an un-governed box or a footprint-reduction lever.
 
 Status: the missing measurement component is wired + every local gate green
 (cuda,no-cuda check clean; `cargo test -p cli` train_cli 10/10; new
 `pass_rate_aggregates_held_out_pass_fail` unit test green). The end-to-end eval
-RUN (does the held-out pass-rate climb baseline → round-N?) is BLOCKED on GPU +
-the SWE-bench-Pro staged repos — honest pending-remote.
+RUN (does the held-out pass-rate climb baseline → round-N?) is BLOCKED — first on
+GPU + staged repos (now provisioned + validated), then on the node-governance kill
+documented above.
 
 ## Why this exists
 A systematic audit found agent-OPD had **zero** held-out eval: `TrainAgentOpdArgs`
