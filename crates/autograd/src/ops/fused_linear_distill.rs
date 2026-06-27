@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::Device,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -434,6 +435,22 @@ pub fn fused_linear_ce_loss_indexed(
         ));
     }
 
+    // GPU backends (CUDA/Metal) run the chunked CE through the existing
+    // device-resident ops (embedding row-gather + matmul_bt + log_softmax +
+    // gather + sum); the host scalar loop below stays the CPU reference path.
+    if !matches!(store.backend().device(), Device::Cpu) {
+        return fused_linear_ce_loss_indexed_device(
+            hidden,
+            weight,
+            position_indices,
+            target_tokens,
+            chunk_rows,
+            &shape,
+            store,
+            tape,
+        );
+    }
+
     let need_hidden_grad = store.tensor(hidden)?.requires_grad;
     let need_weight_grad = store.tensor(weight)?.requires_grad;
     let requires_grad = need_hidden_grad || need_weight_grad;
@@ -508,6 +525,142 @@ pub fn fused_linear_ce_loss_indexed(
         let grad_weight_id = grad_weight
             .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
             .transpose()?;
+        tape.record(TapeEntry {
+            op: BackwardOp::FusedLinearDistill,
+            output_id: loss_id,
+            input_ids: smallvec![hidden, weight],
+            saved: SavedContext::FusedLinearDistillCtx {
+                grad_hidden: grad_hidden_id,
+                grad_weight: grad_weight_id,
+            },
+        });
+    }
+
+    Ok(loss_id)
+}
+
+/// GPU path for [`fused_linear_ce_loss_indexed`] — same masked-CE math and same
+/// per-chunk free discipline, but built from the existing device-resident
+/// autograd ops instead of a host scalar loop (no `to_host` of the
+/// `[vocab, hidden]` lm_head or the `[seq, hidden]` activations). Per
+/// position-chunk: `embedding(hidden_rows, chunk_positions)` (row-gather) →
+/// `matmul_bt(rows, weight)` → `log_softmax` → `gather(targets)` → `sum`, scaled
+/// by `-1/N`; a per-chunk sub-tape `backward_collect` yields the chunk's
+/// `grad_hidden` (and `grad_weight` if the head is trainable), accumulated into a
+/// running full-shape device grad and the chunk's `[chunk, vocab]` logits freed
+/// before the next chunk. The accumulated grads are saved on the `FusedLinearDistill`
+/// tape entry, so outer backward scales them by the upstream exactly like the host
+/// path.
+#[allow(clippy::too_many_arguments)]
+fn fused_linear_ce_loss_indexed_device(
+    hidden: TensorId,
+    weight: TensorId,
+    position_indices: &[i32],
+    target_tokens: &[i32],
+    chunk_rows: usize,
+    shape: &FusedLinearDistillShape,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let need_hidden_grad = store.tensor(hidden)?.requires_grad;
+    let need_weight_grad = store.tensor(weight)?.requires_grad;
+    let requires_grad = need_hidden_grad || need_weight_grad;
+    let num_targets = position_indices.len();
+    let inv_n = 1.0_f32 / num_targets as f32;
+
+    // 2D view [total_rows, hidden_dim] so `embedding` can row-gather chunk
+    // positions. reshape is a metadata-only lazy op; grad flows back to `hidden`.
+    let total_rows = store.tensor(hidden)?.size / shape.hidden_dim;
+    let mut view_tape = Tape::new();
+    view_tape.set_enabled(requires_grad);
+    let hidden_2d = crate::ops::reshape(
+        hidden,
+        &[total_rows, shape.hidden_dim],
+        store,
+        &mut view_tape,
+    )?;
+
+    let mut loss_sum = 0.0_f32;
+    let mut grad_hidden_2d_accum: Option<TensorId> = None;
+    let mut grad_weight_accum: Option<TensorId> = None;
+
+    for chunk_start in (0..num_targets).step_by(chunk_rows) {
+        let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_targets);
+        let chunk_positions: Vec<usize> = position_indices[chunk_start..chunk_end]
+            .iter()
+            .map(|&p| p as usize)
+            .collect();
+        let chunk_targets: Vec<usize> = target_tokens[chunk_start..chunk_end]
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+
+        // Per-chunk sub-tape so each chunk's [chunk, vocab] logits/intermediates
+        // are dropped after its backward, never retained across chunks.
+        let mut chunk_tape = Tape::new();
+        chunk_tape.set_enabled(requires_grad);
+
+        // `embedding` row-gathers but emits a [1, chunk, hidden] (implicit batch
+        // dim); reshape to rank-2 [chunk, hidden] so matmul_bt's rank-2 backward
+        // applies. reshape grad flows straight through to the embedding output.
+        let chunk_len = chunk_positions.len();
+        let hidden_rows_3d =
+            crate::ops::embedding(hidden_2d, &chunk_positions, store, &mut chunk_tape)?;
+        let hidden_rows = crate::ops::reshape(
+            hidden_rows_3d,
+            &[chunk_len, shape.hidden_dim],
+            store,
+            &mut chunk_tape,
+        )?;
+        let logits = crate::ops::matmul_bt(hidden_rows, weight, store, &mut chunk_tape)?;
+        let log_probs = crate::ops::log_softmax(logits, store, &mut chunk_tape)?;
+        let gathered =
+            crate::ops::gather_last_dim(log_probs, &chunk_targets, store, &mut chunk_tape)?;
+        let summed = crate::ops::sum(gathered, store, &mut chunk_tape)?;
+        // loss contribution = -(Σ log p[target]) / N; backward seed 1.0 then
+        // gives d_logits = (softmax - onehot)/N, matching the host path.
+        let chunk_loss = crate::ops::mul_scalar(summed, -inv_n, store, &mut chunk_tape)?;
+        loss_sum += store.to_host(chunk_loss)?[0];
+
+        if requires_grad {
+            let grads = chunk_tape.backward_collect(chunk_loss, store)?;
+            if need_hidden_grad {
+                if let Some(&g) = grads.get(&hidden_2d) {
+                    grad_hidden_2d_accum = Some(match grad_hidden_2d_accum {
+                        None => store.clone_tensor(g)?,
+                        Some(acc) => crate::ops::add(acc, g, store, &mut view_tape)?,
+                    });
+                }
+            }
+            if need_weight_grad {
+                if let Some(&g) = grads.get(&weight) {
+                    grad_weight_accum = Some(match grad_weight_accum {
+                        None => store.clone_tensor(g)?,
+                        Some(acc) => crate::ops::add(acc, g, store, &mut view_tape)?,
+                    });
+                }
+            }
+        }
+    }
+
+    let loss_id = store.alloc(Tensor::new(vec![loss_sum], Vec::new(), requires_grad)?);
+    if requires_grad {
+        // Re-shape the [total_rows, hidden_dim] grad back to the original hidden
+        // shape (host copy, mirroring the CPU path's saved-grad tensor).
+        let grad_hidden_id = match grad_hidden_2d_accum {
+            Some(g) => {
+                let data = store.to_host(g)?;
+                Some(store.alloc(Tensor::new(data, shape.hidden_shape.clone(), false)?))
+            }
+            None => None,
+        };
+        let grad_weight_id = match grad_weight_accum {
+            Some(g) => {
+                let data = store.to_host(g)?;
+                Some(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?))
+            }
+            None => None,
+        };
         tape.record(TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
