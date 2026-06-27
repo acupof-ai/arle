@@ -1857,6 +1857,66 @@ fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
     }
 }
 
+/// Run ONE held-out eval pass (eval-only: no writeback, no optimizer step) over
+/// `eval_tasks` with the CURRENT student, write `eval_round{label}.jsonl`
+/// (per-task pass/fail + the aggregate pass-rate), and return the pass-rate so
+/// the caller can log it next to `mean_train_loss`. `label` is `"base"` for the
+/// round-0 baseline or the round index otherwise.
+#[cfg(feature = "cuda")]
+fn run_agent_opd_eval_pass(
+    infer_student: &train::infer_student::InferStudent,
+    eval_tasks: &[(train::swe_dataset::SweTask, PathBuf)],
+    cfg: &train::agent_opd::AgentOpdConfig,
+    eval_temperature: f32,
+    out_dir: &Path,
+    label: &str,
+) -> Result<f32> {
+    use std::io::Write;
+
+    let report = train::agent_opd::run_agentic_opd_eval(
+        infer_student,
+        eval_tasks,
+        cfg,
+        eval_temperature,
+        label,
+    )?;
+    let pass_rate = report.pass_rate();
+
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create eval out dir {}", out_dir.display()))?;
+    let out_path = out_dir.join(format!("eval_round_{label}.jsonl"));
+    let mut file = fs::File::create(&out_path)
+        .with_context(|| format!("create eval out {}", out_path.display()))?;
+    // Per-task pass/fail lines, then one aggregate line so a downstream reader
+    // gets both the breakdown and the held-out pass-rate from the same file.
+    for t in &report.tasks {
+        let line = serde_json::json!({
+            "instance_id": t.instance_id,
+            "passed": t.passed,
+            "edited": t.edited,
+            "note": t.note,
+        });
+        writeln!(file, "{line}")?;
+    }
+    let agg = serde_json::json!({
+        "aggregate": true,
+        "label": label,
+        "pass_rate": pass_rate,
+        "passed": report.passed(),
+        "edited": report.edited(),
+        "tasks": report.tasks.len(),
+    });
+    writeln!(file, "{agg}")?;
+    file.flush()?;
+    eprintln!(
+        "[arle train agent-opd] eval[{label}]: held-out pass_rate={pass_rate:.4} ({}/{} tasks) -> {}",
+        report.passed(),
+        report.tasks.len(),
+        out_path.display(),
+    );
+    Ok(pass_rate)
+}
+
 /// Agent-OPD RFT loop: the student drives the read/write/replace/bash tool loop
 /// against a per-task repo sandbox (SWE-bench-Pro); the reward is EXECUTION (the
 /// hidden tests are run on `git diff`), no text judge is loaded; passing
@@ -1915,6 +1975,62 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         tasks.len(),
         args.dataset.display()
     );
+
+    // HELD-OUT eval tasks (separate from --dataset). Staged under
+    // --eval-staged-root (falls back to --staged-root). Loaded once up front so
+    // the round-0 baseline + per-round eval reuse the same set.
+    let eval_tasks: Vec<(SweTask, PathBuf)> = match args.eval_dataset.as_deref() {
+        Some(eval_path) => {
+            let eval_staged_root = args
+                .eval_staged_root
+                .as_deref()
+                .unwrap_or(args.staged_root.as_path());
+            let mut eval_raw = train::swe_dataset::load_swe_tasks(eval_path)?;
+            if let Some(n) = args.eval_n {
+                eval_raw.truncate(n);
+            }
+            // Guard the held-out invariant: an overlap with the train set would
+            // turn the pass-rate into a train-set memorization metric.
+            let train_ids: std::collections::HashSet<&str> =
+                tasks.iter().map(|(t, _)| t.instance_id.as_str()).collect();
+            let overlap: Vec<&str> = eval_raw
+                .iter()
+                .map(|t| t.instance_id.as_str())
+                .filter(|id| train_ids.contains(id))
+                .collect();
+            if !overlap.is_empty() {
+                bail!(
+                    "--eval-dataset overlaps --dataset on {} task(s) (e.g. {}); the eval set MUST be \
+                     held-out so the pass-rate measures generalization, not memorization",
+                    overlap.len(),
+                    overlap.first().copied().unwrap_or("")
+                );
+            }
+            let eval_tasks: Vec<(SweTask, PathBuf)> = eval_raw
+                .into_iter()
+                .map(|t| {
+                    let tree = eval_staged_root.join(&t.instance_id);
+                    (t, tree)
+                })
+                .collect();
+            eprintln!(
+                "[arle train agent-opd] loaded {} HELD-OUT eval tasks from {} (staged under {})",
+                eval_tasks.len(),
+                eval_path.display(),
+                eval_staged_root.display()
+            );
+            eval_tasks
+        }
+        None => Vec::new(),
+    };
+    // Eval dumps land in --eval-out-dir, else next to the LoRA adapters / full
+    // checkpoint, else the current dir.
+    let eval_out_dir: PathBuf = args
+        .eval_out_dir
+        .clone()
+        .or_else(|| args.save_lora_adapters.clone())
+        .or_else(|| args.save_checkpoint.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     // Rollout engine (student) — own KV/scheduler path for the multi-turn agent
     // tool loop. Size for the full accumulated agent conversation: up to
@@ -2144,6 +2260,23 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         config
     };
 
+    // Round-0 BASELINE held-out eval BEFORE any training: the un-tuned student's
+    // pass-rate. Every per-round eval is read against this, so the operator sees
+    // baseline → round-N improvement (the whole point — train loss alone cannot
+    // tell you the model got better at coding). The KV pool is resident here
+    // (just loaded); the round loop re-acquires it via `ensure_kv_pool`.
+    let mut baseline_pass_rate: Option<f32> = None;
+    if !eval_tasks.is_empty() {
+        baseline_pass_rate = Some(run_agent_opd_eval_pass(
+            &infer_student,
+            &eval_tasks,
+            &cfg,
+            args.eval_temperature,
+            &eval_out_dir,
+            "base",
+        )?);
+    }
+
     for round in 0..args.rounds {
         // Re-acquire the rollout KV pool the PREVIOUS round's writeback closure
         // dropped (no-op on round 0 / when the pool is resident). The rollout
@@ -2225,6 +2358,40 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         infer_student
             .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
             .context("sync trained LoRA into rollout engine")?;
+
+        // HELD-OUT eval of THIS round's student (rollout engine now holds the
+        // round-N LoRA). Eval-only: drives the same rollout+score harness with no
+        // writeback / optimizer step, logs the held-out pass-rate vs the round-0
+        // baseline. Runs every --eval-every rounds (0 = off) and always on the
+        // final round so the operator sees the final pass-rate. The round's
+        // writeback closure freed the KV pool, so re-acquire it for the eval.
+        let is_final_round = round + 1 == args.rounds;
+        let do_eval = !eval_tasks.is_empty()
+            && (is_final_round || (args.eval_every > 0 && (round + 1) % args.eval_every == 0));
+        if do_eval {
+            if let Err(err) = infer_student.ensure_kv_pool() {
+                eprintln!("[agent-opd] ensure KV pool before eval (round {round}) failed: {err}");
+            }
+            let pass_rate = run_agent_opd_eval_pass(
+                &infer_student,
+                &eval_tasks,
+                &cfg,
+                args.eval_temperature,
+                &eval_out_dir,
+                &(round + 1).to_string(),
+            )?;
+            match baseline_pass_rate {
+                Some(base) => eprintln!(
+                    "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} (baseline={base:.4}, Δ={:+.4}) train_mean_loss={:.4}",
+                    pass_rate - base,
+                    report.mean_train_loss
+                ),
+                None => eprintln!(
+                    "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} train_mean_loss={:.4}",
+                    report.mean_train_loss
+                ),
+            }
+        }
 
         // Fast adapter-only (LoRA) save as a mainstream HF PEFT adapter dir
         // (adapter_config.json + adapter_model.safetensors) — loadable by HF PEFT
