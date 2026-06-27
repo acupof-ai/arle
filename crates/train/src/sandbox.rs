@@ -45,19 +45,55 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///
 /// Returns `(combined_output, exit_code, killed_by_timeout)`.
 fn run_captured(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
 ) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
-    use std::os::unix::process::CommandExt;
-
     let tmp = tempfile::NamedTempFile::new()?;
     let stdout_handle = tmp.reopen()?;
     let stderr_handle = stdout_handle.try_clone()?; // dup'd fd shares the offset → interleaved
+
+    // Re-parent the tool command under the standalone `setsid` binary so it runs
+    // in its OWN session+group (leader pid == the spawned child's pid). On a
+    // timeout we `kill -KILL -<pgid>` the whole subtree and reap any backgrounded
+    // grandchildren.
+    //
+    // We DO NOT use `Command::process_group(0)`. That routes the group change
+    // through an in-child `pre_exec` hook between `fork()` and `exec()`; in the
+    // agent-OPD rollout the parent is a MULTI-THREADED, CUDA-resident process, so
+    // `fork()` snapshots a libc/CUDA lock held by another (now-absent) thread and
+    // the child's `setpgid` deadlocks before `exec` — the round-0 repo-overview
+    // `bash -lc` never runs, the rollout hangs the full `bash_timeout_secs`, and
+    // the group-kill then SIGKILLs the whole student tree (the load deadlock is
+    // fixed by stream_synchronize, this is the NEXT blocker on the same loop). The
+    // standalone `setsid` binary creates the new session AFTER `exec`, so there is
+    // no in-child hook and the spawn stays fork-safe.
+    let prog = command.get_program().to_owned();
+    let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
+    let envs: Vec<_> = command
+        .get_envs()
+        .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+        .collect();
+    let cwd = command.get_current_dir().map(|d| d.to_owned());
+
+    let mut command = Command::new("setsid");
+    command.arg(prog).args(args);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    for (key, val) in envs {
+        match val {
+            Some(v) => {
+                command.env(key, v);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
     command
         .stdin(Stdio::null())
         .stdout(stdout_handle)
-        .stderr(stderr_handle)
-        .process_group(0); // new group; pgid == child pid, so we can signal the whole tree
+        .stderr(stderr_handle);
 
     let mut child = command.spawn()?;
     let pgid = child.id() as i32;

@@ -806,6 +806,13 @@ fn load_qwen35_from_hf_dir_inner(
 
     // 3) Qwen35Config → fresh model. The load mode controls whether loaded
     //    slots remain frozen for teachers/eval or trainable for OPD students.
+    let load_trace = std::env::var("ARLE_OPD_LOAD_TRACE").is_ok();
+    if load_trace {
+        eprintln!(
+            "[opd-load-trace] pre model-construct (shared_base={})",
+            shared_base.is_some()
+        );
+    }
     let mut model = match mode {
         LoadMode::FrozenEval => Qwen35Model::new_for_checkpoint_load(&cfg, store)?,
         LoadMode::TrainableStudent => Qwen35Model::new(&cfg, store)?,
@@ -829,6 +836,9 @@ fn load_qwen35_from_hf_dir_inner(
             }
         }
     };
+    if load_trace {
+        eprintln!("[opd-load-trace] post model-construct OK");
+    }
     if !matches!(mode, LoadMode::FrozenEval) && opd_gradient_checkpointing_enabled() {
         model.set_gradient_checkpointing(true);
     }
@@ -848,8 +858,21 @@ fn load_qwen35_from_hf_dir_inner(
     )?;
 
     // 5) Materialize each train parameter from the safetensors.
-    for planned in &load_plan {
+    for (i, planned) in load_plan.iter().enumerate() {
+        if load_trace {
+            eprintln!(
+                "[opd-load-trace] materialize[{i}/{}] {}",
+                load_plan.len(),
+                planned.train_name
+            );
+        }
         load_planned_tensor_into_slot(planned, &safetensors_views, shared_base, store)?;
+    }
+    if load_trace {
+        eprintln!(
+            "[opd-load-trace] all {} tensors materialized",
+            load_plan.len()
+        );
     }
 
     Ok(model)

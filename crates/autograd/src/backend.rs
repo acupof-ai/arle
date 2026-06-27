@@ -404,6 +404,23 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(())
     }
 
+    /// Drain only THIS backend's own default stream (`cuStreamSynchronize` for
+    /// CUDA), leaving any co-resident foreign context's streams untouched.
+    /// Default no-op for host/CPU backends.
+    ///
+    /// Unlike [`Backend::device_synchronize`] (`cuCtxSynchronize`, which drains
+    /// the entire device primary context), this is the correct fence when a
+    /// co-resident inference engine SHARES the device primary context but runs
+    /// its streams with cudarc event-tracking disabled and idle-parked between
+    /// scheduler steps: a context-wide sync there blocks forever draining the
+    /// engine's never-host-progressed streams (the `--share-frozen-base` student
+    /// load deadlock). Used for the share-frozen-base cross-stream handoff fence,
+    /// which only needs the train backend's own uploads drained — the borrowed
+    /// engine base weights were already written by the engine's own load+warmup.
+    fn stream_synchronize(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Device VRAM `(free_bytes, total_bytes)` for this backend's context, or
     /// `None` for host/CPU backends with no device memory. Lets OPD log
     /// per-phase resident bytes without a `&CudaBackend` downcast or shelling

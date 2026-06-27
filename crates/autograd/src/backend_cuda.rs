@@ -1053,6 +1053,26 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn stream_synchronize(&self) -> Result<()> {
+        #[cfg(feature = "no-cuda")]
+        {
+            Ok(())
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            // `cuStreamSynchronize` on THIS backend's own default stream only —
+            // does NOT drain a co-resident foreign context's streams (unlike
+            // `device_synchronize`/`cuCtxSynchronize`). Required for the
+            // `--share-frozen-base` handoff fence: the shared device primary
+            // context's other streams belong to the idle-parked rollout engine
+            // (event-tracking disabled), so a context-wide sync deadlocks.
+            self.stream
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("cuda stream_synchronize failed"))
+        }
+    }
+
     fn device_mem_info(&self) -> Option<(usize, usize)> {
         self.mem_get_info().ok()
     }
