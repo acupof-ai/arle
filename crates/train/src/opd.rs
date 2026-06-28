@@ -3039,8 +3039,18 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     let mut tape = Tape::new();
     // Offload per-layer grad-checkpoints to host RAM during the (single)
     // long-trajectory forward (re-fetched on backward) so it doesn't pin ~30 GB.
-    tape.set_offload_checkpoints(true);
+    // Default ON (long agentic trajectories need it to fit). The H2D re-upload is
+    // serialized on the host thread and starves the GPU (gdb: the writeback's host
+    // wall is `cuMemcpyHtoDAsync`), so for SHORT sequences that already fit
+    // resident, set `ARLE_OPD_WRITEBACK_OFFLOAD=0` to keep checkpoints on-device
+    // and run fully GPU-bound. errors/2026-06-28-agent-opd-writeback-host-bound-is-checkpoint-offload-htod-not-host-ce.
+    let offload_checkpoints = !matches!(
+        std::env::var("ARLE_OPD_WRITEBACK_OFFLOAD").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    );
+    tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
+    eprintln!("[masked-writeback] offload_checkpoints={offload_checkpoints}");
     let keep_extra: HashSet<TensorId> = HashSet::new();
     eprintln!(
         "[masked-writeback] seq_len={seq_len} total_targets={total_targets} chunk_rows={chunk_rows}"
@@ -3049,15 +3059,19 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     // ONE checkpointed forward over prompt++response → [1, seq, hidden]. No
     // per-window re-forward of the growing prefix (was O(N²)).
     log_writeback_vram(store, "pre forward_hidden_states");
+    let t_fwd = Instant::now();
     let hidden = student
         .forward_hidden_states(store, &mut tape, &full, &positions)
         .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?;
+    let fwd_secs = t_fwd.elapsed().as_secs_f64();
     log_writeback_vram(store, "post forward_hidden_states");
+    eprintln!("[masked-writeback] phase=forward_hidden_states seconds={fwd_secs:.3}");
 
     // Chunked fused CE: per chunk computes hidden_chunk @ lm_headᵀ → logits → CE
     // → gradient, freeing each chunk. Never materializes [seq, vocab]. The loss
     // is already the mean CE per masked token and the gradient is scaled by 1/N,
     // so backward (seed 1.0) applies the per-token-mean update directly.
+    let t_ce = Instant::now();
     let loss = fused_linear_ce_loss_indexed(
         hidden,
         student.lm_head_weight_id(),
@@ -3070,10 +3084,18 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     .map_err(OpdError::from)?;
 
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    let ce_secs = t_ce.elapsed().as_secs_f64();
+    eprintln!("[masked-writeback] phase=fused_ce seconds={ce_secs:.3}");
+    let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
+    let bwd_secs = t_bwd.elapsed().as_secs_f64();
+    eprintln!("[masked-writeback] phase=backward seconds={bwd_secs:.3}");
+    let t_opt = Instant::now();
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
+    let opt_secs = t_opt.elapsed().as_secs_f64();
+    eprintln!("[masked-writeback] phase=optimizer_cleanup seconds={opt_secs:.3}");
 
     eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
     // Mean CE per masked token (the fused loss already applied the 1/N mean).
