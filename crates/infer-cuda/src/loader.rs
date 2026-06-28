@@ -295,6 +295,10 @@ pub(crate) struct PageMeta {
     pub(crate) positions: CudaSlice<i32>,
     pub(crate) seq_len: usize,
     pub(crate) num_pages: usize,
+    /// Decode batch size (rows). 1 for prefill/single-row decode (byte-identical
+    /// to before this field existed); B>1 only for [`Self::for_decode_batch`],
+    /// which drives the batched paged-decode kernel over B independent rows.
+    pub(crate) batch: usize,
     /// Host copy of the request's prefix length (tokens already in the pool
     /// before this forward). Quant formats use it to size the prefix refill.
     pub(crate) start_pos: usize,
@@ -386,6 +390,7 @@ impl PageMeta {
             positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
             seq_len,
             num_pages,
+            batch: 1,
             start_pos,
             new_token_rows,
             prefix_token_rows,
@@ -438,7 +443,89 @@ impl PageMeta {
             positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
             seq_len: 1,
             num_pages,
+            batch: 1,
             start_pos: total_len - 1,
+            new_token_rows: None,
+            prefix_token_rows: None,
+            quant_decode_meta: None,
+        })
+    }
+
+    /// Batched decode page table (BF16 only): one decode row per `rows` entry,
+    /// each `(slot, total_len)` describing that row's current cache length
+    /// (INCLUDING this step's just-appended token). Concatenates each row's
+    /// page-id list into `kv_indices`, with `kv_indptr` the per-row prefix sum
+    /// and `kv_last_page_len`/`positions` one entry per row. `seq_len` stays 1
+    /// (decode dispatch); `batch` carries the row count so the prep + paged
+    /// attention launch over `(B, B, 1)`. The TileLang decode kernel reads each
+    /// row's `[kv_indptr[b], kv_indptr[b+1])` page slice and derives its own KV
+    /// length, so rows attend only their own slot's pages.
+    pub(crate) fn for_decode_batch(
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        rows: &[(usize, usize)],
+    ) -> Result<Self> {
+        ensure!(
+            pool.format == KVFormat::BF16,
+            "batched paged decode is BF16-only, got {:?}",
+            pool.format
+        );
+        ensure!(!rows.is_empty(), "batched decode page table needs >=1 row");
+        let batch = rows.len();
+        let mut q_indptr: Vec<i32> = Vec::with_capacity(batch + 1);
+        let mut kv_indptr: Vec<i32> = Vec::with_capacity(batch + 1);
+        let mut kv_indices: Vec<i32> = Vec::new();
+        let mut last_page_lens: Vec<i32> = Vec::with_capacity(batch);
+        let mut positions: Vec<i32> = Vec::with_capacity(batch);
+        q_indptr.push(0);
+        kv_indptr.push(0);
+        let mut total_pages = 0usize;
+        for &(slot, total_len) in rows {
+            ensure!(total_len > 0, "decode row slot {slot} has empty cache");
+            ensure!(
+                pool.seq_len(slot) == total_len,
+                "PagedKVPool seq_len {} != decode-row total_len {} for slot {}",
+                pool.seq_len(slot),
+                total_len,
+                slot
+            );
+            let num_pages = total_len.div_ceil(pool.page_size);
+            let pages = pool.page_indices(slot);
+            ensure!(
+                pages.len() >= num_pages,
+                "slot {} has {} pages, expected at least {}",
+                slot,
+                pages.len(),
+                num_pages
+            );
+            for &page in &pages[..num_pages] {
+                kv_indices.push(page as i32);
+            }
+            total_pages += num_pages;
+            let last_page_len = total_len % pool.page_size;
+            let last_page_len = if last_page_len == 0 {
+                pool.page_size
+            } else {
+                last_page_len
+            };
+            last_page_lens.push(last_page_len as i32);
+            positions.push((total_len - 1) as i32);
+            q_indptr.push((q_indptr.len()) as i32);
+            kv_indptr.push(total_pages as i32);
+        }
+        Ok(Self {
+            q_indptr: upload_i32(ctx, &q_indptr)?,
+            kv_indptr: upload_i32(ctx, &kv_indptr)?,
+            kv_indices: upload_i32(ctx, &kv_indices)?,
+            kv_last_page_len: upload_i32(ctx, &last_page_lens)?,
+            page_table_offsets: upload_i32(ctx, &[0])?,
+            start_positions: upload_i32(ctx, &positions)?,
+            positions: upload_i32(ctx, &positions)?,
+            seq_len: 1,
+            num_pages: total_pages,
+            batch,
+            // Batched decode is BF16-only; quant refill fields stay None.
+            start_pos: 0,
             new_token_rows: None,
             prefix_token_rows: None,
             quant_decode_meta: None,
