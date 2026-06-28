@@ -531,6 +531,29 @@ pub fn score_workdir(
     timeout_secs: u64,
 ) -> Result<(bool, String)> {
     if !test_patch.trim().is_empty() {
+        // The hidden test_patch is ground truth; the student must not be able to
+        // block or skew scoring by editing the (hidden) test files it touches.
+        // Reset just those paths to the committed base before applying, so
+        // `git apply` lands cleanly even if the rollout dirtied a test file — the
+        // student's SOURCE fix in other files is preserved. (Without this, a
+        // plain `git apply` against a student-dirtied test file fails "patch does
+        // not apply" and a real fix is mis-scored as failing.)
+        for line in test_patch.lines() {
+            if let Some(path) = line.strip_prefix("+++ b/") {
+                let path = path.trim_end();
+                if path.is_empty() || path == "/dev/null" {
+                    continue;
+                }
+                let mut checkout = Command::new("git");
+                checkout
+                    .arg("-C")
+                    .arg(workdir)
+                    .args(["checkout", "--", path]);
+                // Ignore failure: a path the patch CREATES has no base to reset to.
+                let _ = plain_output(&mut checkout, "git checkout test path");
+            }
+        }
+
         let patch_file = workdir.join(".arle_test_patch.diff");
         fs::write(&patch_file, test_patch)
             .with_context(|| format!("failed to write test patch {}", patch_file.display()))?;
@@ -726,6 +749,59 @@ mod tests {
         let (passed, log) =
             score_workdir(&workdir, "", &["test_x.py::test_y".into()], None, 60).unwrap();
         assert!(!passed, "failing test must not pass; log: {log}");
+    }
+
+    #[test]
+    fn score_resets_student_dirtied_test_file_before_applying_patch() {
+        // Regression: a rollout that edits a (hidden) test file used to make the
+        // plain `git apply` of the base-context test_patch fail "patch does not
+        // apply", mis-scoring a real fix as failing. score_workdir now resets the
+        // patch's paths to base first, so apply lands cleanly.
+        let probe = Command::new("python3")
+            .args(["-m", "pytest", "--version"])
+            .output();
+        match probe {
+            Ok(out) if out.status.success() => {}
+            _ => return,
+        }
+
+        let work_root = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        fs::write(
+            staged.path().join("test_x.py"),
+            "def test_y():\n    assert True\n",
+        )
+        .unwrap();
+        let workdir = boot_workdir(work_root.path(), "inst_dirty", staged.path(), None).unwrap();
+
+        // Student DIRTIES the test file — base-context `git apply` would now fail.
+        fs::write(workdir.join("test_x.py"), "STUDENT GARBAGE\n").unwrap();
+
+        // test_patch (a git diff vs base) flips the assertion True -> False.
+        let test_patch = concat!(
+            "diff --git a/test_x.py b/test_x.py\n",
+            "--- a/test_x.py\n",
+            "+++ b/test_x.py\n",
+            "@@ -1,2 +1,2 @@\n",
+            " def test_y():\n",
+            "-    assert True\n",
+            "+    assert False\n",
+        );
+
+        // Must NOT bail on apply (the reset makes it land), and the patched test
+        // (assert False) then fails → passed=false.
+        let (passed, log) = score_workdir(
+            &workdir,
+            test_patch,
+            &["test_x.py::test_y".into()],
+            None,
+            60,
+        )
+        .unwrap();
+        assert!(
+            !passed,
+            "patched test asserts False → must fail; log: {log}"
+        );
     }
 
     /// Routing through the spawner helper must produce byte-identical sandbox
