@@ -34,21 +34,27 @@ The zombie `comm` breakdown is our own corpse-trail, not a leak in any one tool:
    `setsid` group leader dies with the group, so any surviving child reparents to
    pid 1. Unavoidable for a killed detached job whenever pid 1 doesn't reap.
 
-## Fix
+## Fix — APPLIED 2026-06-28 (permanent)
 
-**Existing 1809: only pid 1 can reap them.** Nothing else can `wait()` on another
-process's children, and `sleep` won't. They clear **only** when pid 1 exits —
-i.e. a one-time restart of the `pod sh` keepalive / container. That is a devops
-action on shared infra; do not self-trigger it.
+The box is a **k8s static pod** (`/etc/kubernetes/manifests/sglang-test.yaml`,
+kubelet-managed; `/host` = hostPath `/root`, persistent). pid 1 was
+`command: ["sleep","infinity"]`. Fix:
 
-**Permanent fix (one-time, devops): make pid 1 a reaping init.** Restart the
-keepalive under `tini` (or `docker run --init`):
+1. Staged a static `tini` (v0.19.0, x86-64) at `/host/bin/tini` (= node
+   `/root/bin/tini`, persistent — survives every recreate).
+2. Backed up the manifest (`/root/sglang-test.yaml.bak-pretini`) and `/work`
+   emptyDir → `/host/work-backup-pretini` (recreate wipes the emptyDir).
+3. Changed **only** the command line to a reaping init:
+   `command: ["/host/bin/tini","--","sleep","infinity"]` (atomic mv into the
+   manifest dir; kubelet auto-recreated the pod in ~35 s).
 
-```
-# static-pod / container command, instead of `sleep infinity`:
-tini -s -- sleep infinity        # tini reaps reparented children
-# or docker:  docker run --init ...
-```
+**Result (verified):** pid 1 = tini; **zombies 1809 → 0**; an orphan-spawn test
+leaves **0** zombies (tini reaps). `/host` trees/models/caches/venv + the arle
+binary survived; 8 GPUs back; `~/bin/pod` (crictl exec by container *name*)
+recovered automatically. Reversible: restore `sglang-test.yaml.bak-pretini`.
+
+Existing zombies could only ever be cleared by pid 1 exiting (the recreate did
+that); the tini init prevents recurrence regardless of source.
 
 **Prevention we own (no restart):** the pre-CUDA sandbox-spawner
 ([`crates/train/src/spawner.rs`]) removes source (1): the helper is a non-CUDA
