@@ -737,9 +737,11 @@ mod tests {
     #[test]
     fn spawner_routing_matches_direct() {
         use crate::spawner::{LISTEN_ENV, SOCKET_ENV, serve_loop};
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One lock shared with spawner.rs's server test — cargo runs both in
+        // parallel and they race on the same process-global spawner env.
+        let _guard = crate::spawner::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Stand up the helper on a temp socket in a background thread.
         let sock_dir = tempfile::tempdir().unwrap();

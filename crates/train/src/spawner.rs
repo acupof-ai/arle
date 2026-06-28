@@ -48,6 +48,13 @@ pub const SOCKET_ENV: &str = "ARLE_SPAWNER_SOCKET";
 /// pre-spawner `sandbox::POLL_INTERVAL`.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Serializes tests that mutate the process-global spawner env vars
+/// (`LISTEN_ENV`/`SOCKET_ENV`). Cargo runs tests in parallel threads, so without
+/// one shared lock across BOTH this module and `crate::sandbox`, two
+/// server-standup tests race on the same global env and bind the wrong socket.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One subprocess to run. Mirrors the fields the sandbox sets on a `Command`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnRequest {
@@ -427,9 +434,11 @@ mod tests {
     /// server paths without needing CUDA.
     #[test]
     fn server_client_echo_roundtrip() {
+        // Serialize with sandbox.rs's routing test — both mutate global env.
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("spawn.sock");
-        // SAFETY: test-local, single-threaded setup before spawning the server.
+        // SAFETY: serialized by TEST_ENV_LOCK; single-threaded setup before the server.
         unsafe {
             std::env::set_var(LISTEN_ENV, &sock);
         }
