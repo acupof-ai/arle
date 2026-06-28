@@ -23,6 +23,87 @@ use anyhow::{Context, Result, anyhow, bail};
 use chat::ToolCall;
 use tools::{apply_replace, format_read};
 
+use crate::spawner::{SpawnClient, SpawnRequest, SpawnResponse};
+
+/// Build a [`SpawnRequest`] from a `Command` (program/args/cwd/env) for the helper.
+fn request_from_command(
+    command: &Command,
+    combined_timeout: bool,
+    timeout: Duration,
+) -> SpawnRequest {
+    SpawnRequest {
+        program: command.get_program().to_string_lossy().into_owned(),
+        args: command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect(),
+        cwd: command.get_current_dir().map(|d| d.to_owned()),
+        env: command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect(),
+        combined_timeout,
+        timeout_s: timeout.as_secs(),
+    }
+}
+
+/// Run a `Command` via the pre-CUDA spawner helper. `combined_timeout=true`
+/// mirrors `run_captured` (setsid + process-group timeout, combined output);
+/// `false` mirrors `Command::output()` (separate stdout/stderr, no timeout).
+fn spawn_via_helper(
+    client: &SpawnClient,
+    command: &Command,
+    combined_timeout: bool,
+    timeout: Duration,
+) -> std::io::Result<SpawnResponse> {
+    client.run(&request_from_command(command, combined_timeout, timeout))
+}
+
+/// Captured result of a plain (no-timeout, separate streams) spawn — the subset
+/// of `std::process::Output` the cp/git call sites use.
+struct PlainOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    success: bool,
+    /// Human-readable exit status for error messages.
+    status: String,
+}
+
+/// `Command::output()` equivalent, routed through the spawner helper when its env
+/// is set (agent-OPD rollout) and run directly otherwise (byte-identical default).
+/// This is the `combined_timeout=false` path: stdout/stderr stay separate, no
+/// timeout. Covers cp/git (`run_checked`), `git diff`, and `git apply`.
+fn plain_output(command: &mut Command, label: &str) -> Result<PlainOutput> {
+    if let Some(client) = SpawnClient::from_env() {
+        let resp = spawn_via_helper(&client, command, false, Duration::ZERO)
+            .with_context(|| format!("failed to spawn `{label}` via sandbox-spawner"))?;
+        let success = resp.exit_code == Some(0);
+        return Ok(PlainOutput {
+            stdout: resp.stdout,
+            stderr: resp.stderr,
+            success,
+            status: match resp.exit_code {
+                Some(c) => format!("exit code: {c}"),
+                None => "terminated by signal".to_string(),
+            },
+        });
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("failed to spawn `{label}`"))?;
+    Ok(PlainOutput {
+        status: output.status.to_string(),
+        success: output.status.success(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
 /// Maximum characters of combined stdout/stderr surfaced from a bash tool
 /// result before head+tail clipping kicks in.
 const BASH_OUTPUT_CLIP: usize = 8000;
@@ -48,6 +129,14 @@ fn run_captured(
     command: Command,
     timeout: Duration,
 ) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
+    // Route through the pre-CUDA spawner helper when agent-OPD set its socket env;
+    // the helper does the setsid fork on a non-CUDA process (dodges ELKEID). When
+    // unset (normal serve/CLI) we spawn directly below — byte-identical default.
+    if let Some(client) = SpawnClient::from_env() {
+        let resp = spawn_via_helper(&client, &command, true, timeout)?;
+        return Ok((resp.stdout, resp.exit_code, resp.timed_out));
+    }
+
     let tmp = tempfile::NamedTempFile::new()?;
     let stdout_handle = tmp.reopen()?;
     let stderr_handle = stdout_handle.try_clone()?; // dup'd fd shares the offset → interleaved
@@ -419,13 +508,10 @@ pub fn boot_workdir(
 /// `git -C workdir diff` — the agent's candidate patch (unstaged edits vs the
 /// committed base).
 pub fn diff_workdir(workdir: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("diff")
-        .output()
-        .with_context(|| format!("failed to run git diff in {}", workdir.display()))?;
-    if !output.status.success() {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(workdir).arg("diff");
+    let output = plain_output(&mut command, "git diff")?;
+    if !output.success {
         bail!(
             "git diff failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -448,15 +534,15 @@ pub fn score_workdir(
         let patch_file = workdir.join(".arle_test_patch.diff");
         fs::write(&patch_file, test_patch)
             .with_context(|| format!("failed to write test patch {}", patch_file.display()))?;
-        let apply = Command::new("git")
+        let mut apply_cmd = Command::new("git");
+        apply_cmd
             .arg("-C")
             .arg(workdir)
             .arg("apply")
-            .arg(&patch_file)
-            .output()
-            .with_context(|| format!("failed to run git apply in {}", workdir.display()))?;
+            .arg(&patch_file);
+        let apply = plain_output(&mut apply_cmd, "git apply")?;
         let _ = fs::remove_file(&patch_file);
-        if !apply.status.success() {
+        if !apply.success {
             bail!(
                 "git apply of test_patch failed: {}",
                 String::from_utf8_lossy(&apply.stderr)
@@ -513,11 +599,10 @@ pub fn reset_workdir(workdir: &Path) -> Result<()> {
 }
 
 /// Run a `Command` and return an error including stderr if it does not exit 0.
+/// Routes through the sandbox-spawner when its env is set (agent-OPD rollout).
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {
-    let output = command
-        .output()
-        .with_context(|| format!("failed to spawn `{label}`"))?;
-    if !output.status.success() {
+    let output = plain_output(command, label)?;
+    if !output.success {
         return Err(anyhow!(
             "`{label}` failed ({}): {}",
             output.status,
@@ -641,5 +726,97 @@ mod tests {
         let (passed, log) =
             score_workdir(&workdir, "", &["test_x.py::test_y".into()], None, 60).unwrap();
         assert!(!passed, "failing test must not pass; log: {log}");
+    }
+
+    /// Routing through the spawner helper must produce byte-identical sandbox
+    /// behavior to the default direct path. Stand up `serve_loop` on a temp
+    /// socket, then run the cp/git (`boot_workdir`), bash, and `git diff` paths
+    /// once routed (`ARLE_SPAWNER_SOCKET` set) and once direct (unset), asserting
+    /// equivalence. Serialized on a global lock because the spawner env is
+    /// process-global and Rust runs tests in parallel.
+    #[test]
+    fn spawner_routing_matches_direct() {
+        use crate::spawner::{LISTEN_ENV, SOCKET_ENV, serve_loop};
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Stand up the helper on a temp socket in a background thread.
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock = sock_dir.path().join("spawn.sock");
+        // SAFETY: serialized by ENV_LOCK; no rollout threads in the test.
+        unsafe {
+            std::env::set_var(LISTEN_ENV, &sock);
+        }
+        let server = std::thread::spawn(serve_loop);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !sock.exists() {
+            assert!(std::time::Instant::now() < deadline, "helper never bound");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The helper inherits LISTEN_ENV; clear it for the test process so the
+        // client path is selected only when SOCKET_ENV is set below.
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::remove_var(LISTEN_ENV);
+        }
+
+        // Build a staged tree once; run boot/bash/diff direct, then routed.
+        let run_once = |routed: bool| -> (String, String) {
+            // SAFETY: serialized by ENV_LOCK.
+            unsafe {
+                if routed {
+                    std::env::set_var(SOCKET_ENV, &sock);
+                } else {
+                    std::env::remove_var(SOCKET_ENV);
+                }
+            }
+            assert_eq!(
+                crate::spawner::SpawnClient::from_env().is_some(),
+                routed,
+                "from_env() gating must match the env state"
+            );
+            let work_root = tempfile::tempdir().unwrap();
+            let staged = tempfile::tempdir().unwrap();
+            fs::write(staged.path().join("a.txt"), "x\n").unwrap();
+            // boot_workdir exercises cp -a + git init/add/commit via run_checked.
+            let workdir =
+                boot_workdir(work_root.path(), "inst_route", staged.path(), None).unwrap();
+            // bash via run_captured (combined_timeout path).
+            let exec = SandboxToolExecutor::new(workdir.clone(), 30, None);
+            let bashed = exec.execute(&call("bash", json!({"cmd": "echo ROUTE_MARKER"})));
+            // edit + git diff via diff_workdir (plain_output path).
+            exec.execute(&call("write", json!({"path": "a.txt", "content": "y\n"})));
+            let diff = diff_workdir(&workdir).unwrap();
+            // Normalize the workdir-specific temp path out of outputs.
+            (
+                bashed,
+                diff.replace(&workdir.to_string_lossy().to_string(), "WD"),
+            )
+        };
+
+        let (bash_direct, diff_direct) = run_once(false);
+        let (bash_routed, diff_routed) = run_once(true);
+
+        assert!(
+            bash_routed.contains("ROUTE_MARKER") && bash_routed.contains("[exit 0]"),
+            "routed bash: {bash_routed}"
+        );
+        assert_eq!(bash_direct, bash_routed, "bash output must match direct");
+        assert!(
+            diff_routed.contains("a.txt"),
+            "routed diff must mention a.txt: {diff_routed}"
+        );
+        assert_eq!(
+            diff_direct, diff_routed,
+            "git diff output must match direct"
+        );
+
+        // SAFETY: serialized by ENV_LOCK; teardown.
+        unsafe {
+            std::env::remove_var(SOCKET_ENV);
+        }
+        drop(server); // detached; process exit reaps it
+        let _ = std::fs::remove_file(&sock);
     }
 }
