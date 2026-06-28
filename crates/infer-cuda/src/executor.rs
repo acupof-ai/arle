@@ -1035,12 +1035,14 @@ impl QwenCudaExecutor {
         if rows == 0 {
             return Ok(StepOutput { tokens: Vec::new() });
         }
-        ensure!(
-            rows == 1,
-            "R6 clean CUDA forward is single-row only, got {} prefill + {} decode rows",
-            plan.prefill_rows.len(),
-            plan.decode_rows.len()
-        );
+        // Multi-row plans (continuous batching): N prefill rows + M decode rows,
+        // total > 1. Includes the MIXED case (a new request prefilling while
+        // another decodes). Prefill rows run sequentially as single-row sub-steps,
+        // then the M decode rows run as ONE batch. total == 1 falls through to the
+        // single-row fast path below (byte-identical, incl. captured-graph/recall).
+        if rows > 1 {
+            return self.submit_multi_row(plan, host_kv, kv_batch);
+        }
         ensure!(
             kv_batch.rows.len() == 1,
             "KV batch descriptor carries {} rows for a single-row plan",
@@ -1145,6 +1147,233 @@ impl QwenCudaExecutor {
                 finish: None,
             }],
         })
+    }
+
+    /// Multi-row plan (continuous batching), total rows > 1. Handles pure-decode
+    /// (N=0, M>1) and MIXED (N>=1 prefill + M>=0 decode) alike: prefill rows run
+    /// SEQUENTIALLY as single-row sub-steps, then the M decode rows run as ONE
+    /// batch. Mirrors the DSv4 executor's mixed-plan structure.
+    ///
+    /// Plan rows always address disjoint slots (a request is either Prefilling or
+    /// Decoding), so the sequential prefill sub-steps are math-identical to
+    /// consecutive single-mode ticks. The descriptor commit order is prefill rows
+    /// first, then decode rows (`KvBatchDescriptor::from_plan`), so plan rows map
+    /// onto descriptor rows by index. Output order is prefill tokens then decode
+    /// tokens, each tagged with its row's slot.
+    fn submit_multi_row(
+        &mut self,
+        plan: &ForwardPlan,
+        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
+    ) -> Result<StepOutput> {
+        let rows = plan.decode_rows.len() + plan.prefill_rows.len();
+        ensure!(
+            kv_batch.rows.len() == rows,
+            "KV batch descriptor has {} rows for a {rows}-row plan",
+            kv_batch.rows.len()
+        );
+        let mut seen_slots = std::collections::BTreeSet::new();
+        for slot in plan
+            .prefill_rows
+            .iter()
+            .map(|row| row.slot)
+            .chain(plan.decode_rows.iter().map(|row| row.slot))
+        {
+            ensure!(
+                seen_slots.insert(slot),
+                "CUDA plan schedules slot {slot} more than once per tick"
+            );
+        }
+
+        let n_prefill = plan.prefill_rows.len();
+        let mut tokens = Vec::with_capacity(rows);
+        for (idx, row) in plan.prefill_rows.iter().enumerate() {
+            let sub_batch = kv_batch.subset(idx..idx + 1)?;
+            tokens.push(self.submit_prefill_row(row, &sub_batch)?);
+        }
+        if !plan.decode_rows.is_empty() {
+            let sub_batch = kv_batch.subset(n_prefill..kv_batch.rows.len())?;
+            tokens.extend(self.submit_decode_batch(&plan.decode_rows, host_kv, &sub_batch)?);
+        }
+        Ok(StepOutput { tokens })
+    }
+
+    /// One prefill row as its own single-row sub-step (mirror + forward_tokens).
+    /// `kv_batch` is the row's single-row (sub-)descriptor — indistinguishable from
+    /// what a prefill-only tick delivers. Byte-identical to the single-row prefill
+    /// arm of [`Self::submit`].
+    fn submit_prefill_row(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        kv_batch: &KvBatchDescriptor,
+    ) -> Result<SlotToken> {
+        ensure!(
+            kv_batch.rows.len() == 1,
+            "prefill sub-batch carries {} rows (expected 1)",
+            kv_batch.rows.len()
+        );
+        let kv_row = &kv_batch.rows[0];
+        let pages = &kv_batch.flat_page_ids[kv_row.page_range.clone()];
+        ensure!(
+            row.slot < self.num_slots,
+            "prefill slot {} outside CUDA executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        ensure!(!row.tokens.is_empty(), "prefill row must carry tokens");
+        let expected_len = row.start_pos + row.tokens.len();
+        ensure!(
+            kv_row.slot == row.slot
+                && kv_row.append_pos == row.start_pos
+                && kv_row.append_len == row.tokens.len(),
+            "KV batch row (slot {}, append {}+{}) does not match prefill row (slot {}, {}+{})",
+            kv_row.slot,
+            kv_row.append_pos,
+            kv_row.append_len,
+            row.slot,
+            row.start_pos,
+            row.tokens.len()
+        );
+        self.advance_slot_progress(row.slot, kv_row.slot_epoch, row.start_pos, expected_len)?;
+        self.kv.mirror_slot(row.slot, pages, expected_len)?;
+        let position = expected_len as u64;
+        let token = self.model.forward_tokens(
+            row.slot,
+            &row.tokens,
+            row.start_pos,
+            &mut self.kv,
+            &row.params,
+            position,
+        )?;
+        Ok(SlotToken {
+            slot: row.slot,
+            token,
+            logprob: None,
+            finish: None,
+        })
+    }
+
+    /// Run `decode_rows` (M >= 1) as ONE batched decode. `kv_batch` is the
+    /// decode-only (sub-)descriptor whose rows align by index with `decode_rows`.
+    ///
+    /// BF16 + single-GPU + recall-inactive → the true batched path (one prep +
+    /// one batched paged attention over `(M, M, 1)`, MLP/norm batched over M rows,
+    /// per-row sample). Any of TP-collective / quant KV / active recall falls back
+    /// to per-row sequential decode (the single-row machinery, correctness floor)
+    /// rather than crash. Output order matches `decode_rows`.
+    fn submit_decode_batch(
+        &mut self,
+        decode_rows: &[DecodeRow],
+        host_kv: &mut dyn KvPool,
+        kv_batch: &KvBatchDescriptor,
+    ) -> Result<Vec<SlotToken>> {
+        let batch = decode_rows.len();
+        ensure!(
+            kv_batch.rows.len() == batch,
+            "KV batch descriptor carries {} rows for a {}-row decode plan",
+            kv_batch.rows.len(),
+            batch
+        );
+
+        // Per-row validate + mirror is shared by both lanes (the device KV pool
+        // must hold every row's just-appended token before any forward reads it).
+        for (row, kv_row) in decode_rows.iter().zip(&kv_batch.rows) {
+            ensure!(
+                row.slot < self.num_slots,
+                "decode slot {} outside CUDA executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(
+                kv_row.slot == row.slot
+                    && kv_row.append_pos == row.kv_seq_len
+                    && kv_row.append_len == 1,
+                "KV batch row (slot {}, append {}+{}) does not match decode row (slot {}, kv_seq_len {})",
+                kv_row.slot,
+                kv_row.append_pos,
+                kv_row.append_len,
+                row.slot,
+                row.kv_seq_len
+            );
+            let pages = &kv_batch.flat_page_ids[kv_row.page_range.clone()];
+            self.advance_slot_progress(
+                row.slot,
+                kv_row.slot_epoch,
+                row.kv_seq_len,
+                row.kv_seq_len + 1,
+            )?;
+            self.kv.mirror_slot(row.slot, pages, row.kv_seq_len + 1)?;
+        }
+
+        // Correctness floor: the batched paged kernels are BF16 single-GPU only,
+        // and recall needs the per-row restricted page table the batched meta does
+        // not carry. Any of these → per-row sequential decode.
+        let recall_on = self.kv_recall && self.kv.format == KVFormat::BF16;
+        let can_batch =
+            self.kv.format == KVFormat::BF16 && !self.model.tp.is_collective() && !recall_on;
+        if !can_batch {
+            let mut tokens = Vec::with_capacity(batch);
+            for row in decode_rows {
+                let position = row.kv_seq_len.saturating_add(1) as u64;
+                // KV already mirrored above; run the per-row forward. Recall reuses
+                // its restricted-table path when active.
+                let token = if let Some(token) = self.try_recall_decode(row, position, host_kv)? {
+                    token
+                } else {
+                    self.model.forward_tokens(
+                        row.slot,
+                        &[row.last_token],
+                        row.kv_seq_len,
+                        &mut self.kv,
+                        &row.params,
+                        position,
+                    )?
+                };
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+            return Ok(tokens);
+        }
+
+        // True batched decode. Build the M-row page table from the freshly mirrored
+        // slots, run one forward, sample M tokens (one per row's params/position).
+        let last_tokens: Vec<u32> = decode_rows.iter().map(|r| r.last_token).collect();
+        let params: Vec<SamplingParams> = decode_rows.iter().map(|r| r.params.clone()).collect();
+        let positions: Vec<u64> = decode_rows
+            .iter()
+            .map(|r| r.kv_seq_len.saturating_add(1) as u64)
+            .collect();
+        let batch_rows: Vec<(usize, usize)> = decode_rows
+            .iter()
+            .map(|r| (r.slot, r.kv_seq_len + 1))
+            .collect();
+        let meta = PageMeta::for_decode_batch(&self.model.ctx, &self.kv, &batch_rows)?;
+        let out_tokens = self.model.forward_decode_batch(
+            &last_tokens,
+            &mut self.kv,
+            &meta,
+            &params,
+            &positions,
+        )?;
+        ensure!(
+            out_tokens.len() == batch,
+            "batched decode returned {} tokens for {batch} rows",
+            out_tokens.len()
+        );
+        Ok(decode_rows
+            .iter()
+            .zip(out_tokens)
+            .map(|(row, token)| SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
     }
 
     /// Warmup the B=1 decode graph before serving.

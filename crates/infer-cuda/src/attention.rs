@@ -4989,7 +4989,7 @@ fn decode_attention(
                 num_kv_heads as i32,
                 pool.page_size as i32,
                 stride_page as i32,
-                1,
+                meta.batch as i32,
                 rms_eps,
                 ctx.stream.cu_stream(),
             )
@@ -5097,8 +5097,10 @@ fn run_tilelang_paged(
     .ok_or_else(|| {
         anyhow::anyhow!("unsupported HD128 q/kv head config q{num_q_heads}_kv{num_kv_heads}")
     })?;
+    // Decode: one Q row per request → bsz = batch, total_q = batch, max_q = 1.
+    // B=1 evaluates to (1,1,1), byte-identical to the prior literal.
     let (bsz, total_q, max_q) = if decode {
-        (1, 1, 1)
+        (meta.batch as i32, meta.batch as i32, 1)
     } else {
         (1, meta.seq_len as i32, meta.seq_len as i32)
     };

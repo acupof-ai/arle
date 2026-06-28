@@ -96,6 +96,8 @@ impl DecodeGraphContext {
                 positions: alloc_i32(ctx, 1)?,
                 seq_len,
                 num_pages: 0,
+                // Captured graph is B=1 only (batch fixed at DECODE_GRAPH_BATCH).
+                batch: 1,
                 // Quant-KV metadata: the decode graph never runs under quant
                 // formats (warmup hard-disables the graph for non-BF16 pools).
                 start_pos: 0,
