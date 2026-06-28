@@ -45,6 +45,16 @@ use clap::Parser;
 use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
+    // Pre-CUDA sandbox-spawner helper entry. When `ARLE_SPAWNER_LISTEN` is set
+    // (only by `SpawnerHandle::launch`, which re-exec's THIS binary before any
+    // CUDA/thread init), this process is the non-CUDA spawn helper: run the
+    // request/response loop and exit. MUST be the very first thing in `run` —
+    // before the logger, clap, or any thread spawns — so the helper stays a plain
+    // single-threaded non-CUDA process that ELKEID never SIGABRTs on `fork()`.
+    if std::env::var(train::spawner::LISTEN_ENV).is_ok() {
+        return ExitCode::from(train::spawner::serve_loop() as u8);
+    }
+
     // Install the logger FIRST, before any subcommand dispatch. `serve`, `train`,
     // and `model` early-return from the match below and never reach `run_impl`'s
     // init, so without this they would run with NO logger — every `log::error!`

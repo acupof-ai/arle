@@ -42,6 +42,8 @@ pub mod rubric_opd;
 pub mod sandbox;
 #[path = "server.rs"]
 pub mod server;
+#[path = "spawner.rs"]
+pub mod spawner;
 #[path = "swe_dataset.rs"]
 pub mod swe_dataset;
 #[path = "teacher_infer.rs"]

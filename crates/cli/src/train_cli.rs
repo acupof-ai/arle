@@ -1950,6 +1950,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         alpha: args.lora_alpha,
     };
 
+    // Pre-CUDA sandbox-spawner: fork ONE non-CUDA helper to own all rollout
+    // subprocess spawns (bash/cp/git/pytest) BEFORE the first CUDA context below.
+    // The parent is still non-CUDA-resident here, so this single fork is
+    // ELKEID-safe; the helper then does the forking on a process that never
+    // touches CUDA. `_spawner`'s Drop reaps the helper at function exit. Sets
+    // `ARLE_SPAWNER_SOCKET`, routing `crate::sandbox` through the helper; when
+    // unset (normal serve/CLI) sandbox spawns directly, byte-identical default.
+    let _spawner = train::spawner::SpawnerHandle::launch()
+        .context("launch pre-CUDA sandbox-spawner helper")?;
+
     let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
 
     // Vocab from the checkpoint config (not the autograd student) so the rollout
