@@ -34,27 +34,47 @@ The zombie `comm` breakdown is our own corpse-trail, not a leak in any one tool:
    `setsid` group leader dies with the group, so any surviving child reparents to
    pid 1. Unavoidable for a killed detached job whenever pid 1 doesn't reap.
 
-## Fix — APPLIED 2026-06-28 (permanent)
+## Fix attempted 2026-06-28 — tini init REVERTED (ELKEID kills foreign pid 1)
 
 The box is a **k8s static pod** (`/etc/kubernetes/manifests/sglang-test.yaml`,
 kubelet-managed; `/host` = hostPath `/root`, persistent). pid 1 was
-`command: ["sleep","infinity"]`. Fix:
+`command: ["sleep","infinity"]`. Attempt:
 
-1. Staged a static `tini` (v0.19.0, x86-64) at `/host/bin/tini` (= node
-   `/root/bin/tini`, persistent — survives every recreate).
-2. Backed up the manifest (`/root/sglang-test.yaml.bak-pretini`) and `/work`
-   emptyDir → `/host/work-backup-pretini` (recreate wipes the emptyDir).
-3. Changed **only** the command line to a reaping init:
-   `command: ["/host/bin/tini","--","sleep","infinity"]` (atomic mv into the
-   manifest dir; kubelet auto-recreated the pod in ~35 s).
+1. Staged static `tini` (v0.19.0) at `/host/bin/tini`; backed up the manifest
+   (`/root/sglang-test.yaml.bak-pretini`) and `/work` → `/host/work-backup-pretini`.
+2. Changed the command to `["/host/bin/tini","--","sleep","infinity"]`; kubelet
+   recreated the pod (~35 s). **Initial result looked good:** pid 1 = tini,
+   **zombies 1809 → 0**, orphan-spawn test reaped to 0, `/host` + GPUs intact.
 
-**Result (verified):** pid 1 = tini; **zombies 1809 → 0**; an orphan-spawn test
-leaves **0** zombies (tini reaps). `/host` trees/models/caches/venv + the arle
-binary survived; 8 GPUs back; `~/bin/pod` (crictl exec by container *name*)
-recovered automatically. Reversible: restore `sglang-test.yaml.bak-pretini`.
+**But it CRASHLOOPED.** The container was then **SIGKILL'd (exit 137) every
+~3.5 min** (`crictl` ATTEMPT climbed to 8) — NOT OOM (node had 1.8 TB free, no
+dmesg/kubelet OOM). The box had been stable 5 days on `sleep infinity`; the only
+change was the command. Cause (high-confidence): the **ELKEID kernel HIDS kills
+the unrecognized static `/host/bin/tini` running as pid 1** — same class as the
+fork-hook that SIGABRTs CUDA forks on this box ([[reference_h20_pod_elkeid_kills_cuda_forks]]).
+A foreign binary as pid 1 is exactly what a HIDS flags.
 
-Existing zombies could only ever be cleared by pid 1 exiting (the recreate did
-that); the tini init prevents recurrence regardless of source.
+**REVERTED** to `["sleep","infinity"]` (restored the backup manifest) → fresh pod,
+ATTEMPT 0, stable again. A crashlooping shared GPU box is far worse than the
+harmless zombies, so stability wins.
+
+**Side effect of the recreate:** the rust toolchain lived in the container's
+**ephemeral** root (`~/.rustup`/`~/.cargo`), so each recreate wiped the pinned
+1.95.0 (only the image's 1.96.0 stable survives). With the SOCKS build-proxy also
+down, rebuilds are blocked until the proxy returns or the toolchain is local-fed.
+Lesson: **put the toolchain on `/host`** (persistent) so a recreate never wipes it.
+
+## Fix — STILL OPEN (needs devops / HIDS-trusted init)
+
+A reaping init is the right permanent fix, but on this ELKEID box it must be a
+**HIDS-trusted** init, which is outside container reach:
+- devops whitelists `tini` in ELKEID, then the manifest-command swap above works; OR
+- the container runtime is configured with a runtime-provided init (`--init`-style,
+  a trusted path) instead of a foreign `/host` binary; OR
+- bake a trusted init into the image.
+
+Until then: `sleep infinity` (stable, harmless zombies slowly re-accrue — verified
+zero capacity impact: 0.04 % of pid_max, no GPU/mem held).
 
 **Prevention we own (no restart):** the pre-CUDA sandbox-spawner
 ([`crates/train/src/spawner.rs`]) removes source (1): the helper is a non-CUDA
