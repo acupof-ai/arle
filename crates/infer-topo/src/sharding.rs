@@ -180,26 +180,73 @@ pub(crate) fn parse_parallel_env_usize(
 ///
 /// Returns `(num_q_heads_local, num_kv_heads_local)`.
 ///
+/// Two regimes:
+/// * **Shard** (`num_kv_heads >= world_size`, divisible): each rank owns
+///   `num_kv_heads / world_size` distinct KV heads — the original, byte-identical
+///   path (e.g. 64Q/8KV @ TP8 → 8Q/1KV; 32Q/32KV @ TP4 → 8Q/8KV).
+/// * **Replicate** (`num_kv_heads < world_size`, `world_size % num_kv_heads == 0`):
+///   too few KV heads to give each rank one, so each KV head is *replicated*
+///   across `world_size / num_kv_heads` ranks. Every rank holds exactly ONE KV
+///   head (`local_kv_heads == 1`) and its `num_q_heads / world_size` Q heads
+///   (e.g. 32Q/2KV @ TP4 → 8Q/1KV, ranks 0,1 replicate KV head 0, ranks 2,3 KV
+///   head 1). Replicated ranks load IDENTICAL K/V weights ([`kv_load_block_index`])
+///   and write identical cache rows, so each computes correct GQA locally.
+///
+/// `num_q_heads` must always be divisible by `world_size` (Q is partitioned,
+/// never replicated, in either regime).
+///
 /// # Errors
-/// Returns an error if `num_q_heads` or `num_kv_heads` is not divisible by
-/// `world_size` (GQA head assignment must be uniform across TP ranks).
+/// Returns an error if `num_q_heads` is not divisible by `world_size`, or if
+/// `num_kv_heads` neither divides nor evenly-replicates across `world_size`.
 pub fn head_shard(
     num_q_heads: usize,
     num_kv_heads: usize,
     tp: &TpConfig,
 ) -> Result<(usize, usize)> {
-    let require_divisible = |label: &str, n: usize| -> Result<()> {
-        if !n.is_multiple_of(tp.world_size) {
-            bail!(
-                "{label} ({n}) not divisible by world_size ({})",
-                tp.world_size
-            );
-        }
-        Ok(())
-    };
-    require_divisible("num_q_heads", num_q_heads)?;
-    require_divisible("num_kv_heads", num_kv_heads)?;
-    Ok((num_q_heads / tp.world_size, num_kv_heads / tp.world_size))
+    let world = tp.world_size;
+    if !num_q_heads.is_multiple_of(world) {
+        bail!("num_q_heads ({num_q_heads}) not divisible by world_size ({world})");
+    }
+    let local_q = num_q_heads / world;
+    if num_kv_heads.is_multiple_of(world) {
+        // Shard regime (covers the equal case): byte-identical to the legacy path.
+        return Ok((local_q, num_kv_heads / world));
+    }
+    if num_kv_heads != 0 && world.is_multiple_of(num_kv_heads) {
+        // Replicate regime: one KV head per rank, replicated `world/kv` ways.
+        return Ok((local_q, 1));
+    }
+    bail!(
+        "num_kv_heads ({num_kv_heads}) neither divides world_size ({world}) nor \
+         replicates evenly (world_size % num_kv_heads != 0)"
+    )
+}
+
+/// Which global KV-head block index this rank loads from the K/V projection
+/// weight (head-block-major). The loader multiplies this by `local_kv_heads *
+/// head_dim` to get the row offset of its KV weight slice.
+///
+/// * **Shard**: returns `tp.rank` (byte-identical to the original
+///   `rank * local_rows` offset — distinct heads per rank).
+/// * **Replicate**: returns `tp.rank / replicas` where `replicas = world /
+///   num_kv_heads`, so each replica group of consecutive ranks loads the SAME KV
+///   head (the source of the replicated-K/V-identity invariant).
+///
+/// # Errors
+/// Mirrors [`head_shard`]'s divisibility/replication contract.
+pub fn kv_load_block_index(num_kv_heads: usize, tp: &TpConfig) -> Result<usize> {
+    let world = tp.world_size;
+    if num_kv_heads.is_multiple_of(world) {
+        return Ok(tp.rank);
+    }
+    if num_kv_heads != 0 && world.is_multiple_of(num_kv_heads) {
+        let replicas = world / num_kv_heads;
+        return Ok(tp.rank / replicas);
+    }
+    bail!(
+        "num_kv_heads ({num_kv_heads}) neither divides world_size ({world}) nor \
+         replicates evenly (world_size % num_kv_heads != 0)"
+    )
 }
 
 /// Type of parallel linear layer.
@@ -447,6 +494,85 @@ mod tests {
         let tp = TpConfig::new(8, 0).unwrap();
         let err = head_shard(30, 8, &tp).unwrap_err().to_string();
         assert!(err.contains("num_q_heads"), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------- head_shard: KV replication
+
+    // Qwen3.5-122B-A10B: 32 Q heads, 2 KV heads, TP=4. 2 KV heads < 4 ranks ->
+    // replicate each KV head 4/2 = 2 ways. Every rank: 8 Q heads, 1 KV head.
+    // Ranks {0,1} replicate KV head 0; ranks {2,3} replicate KV head 1.
+    #[test]
+    fn head_shard_122b_q32_kv2_tp4_replicates() {
+        for rank in 0..4 {
+            let tp = TpConfig::new(4, rank).unwrap();
+            let (q, kv) = head_shard(32, 2, &tp).unwrap();
+            assert_eq!(q, 8, "rank {rank} local Q heads (partitioned)");
+            assert_eq!(kv, 1, "rank {rank} local KV heads (one replicated head)");
+            // Block index: ranks 0,1 -> head 0; ranks 2,3 -> head 1.
+            let block = kv_load_block_index(2, &tp).unwrap();
+            assert_eq!(block, rank / 2, "rank {rank} replicated KV-head block");
+        }
+        // Replica pairs load the SAME KV head -> identical K/V weights.
+        assert_eq!(
+            kv_load_block_index(2, &TpConfig::new(4, 0).unwrap()).unwrap(),
+            kv_load_block_index(2, &TpConfig::new(4, 1).unwrap()).unwrap(),
+        );
+        assert_eq!(
+            kv_load_block_index(2, &TpConfig::new(4, 2).unwrap()).unwrap(),
+            kv_load_block_index(2, &TpConfig::new(4, 3).unwrap()).unwrap(),
+        );
+        // Distinct heads across replica groups.
+        assert_ne!(
+            kv_load_block_index(2, &TpConfig::new(4, 0).unwrap()).unwrap(),
+            kv_load_block_index(2, &TpConfig::new(4, 2).unwrap()).unwrap(),
+        );
+    }
+
+    // Divisible case stays byte-identical: 64Q/8KV @ TP8 unchanged, and the
+    // KV-load block index equals the rank (the legacy `rank * local_rows` offset).
+    #[test]
+    fn head_shard_64q_8kv_tp8_shard_regime_unchanged() {
+        for rank in 0..8 {
+            let tp = TpConfig::new(8, rank).unwrap();
+            let (q, kv) = head_shard(64, 8, &tp).unwrap();
+            assert_eq!(q, 8, "rank {rank} local Q heads");
+            assert_eq!(
+                kv, 1,
+                "rank {rank} local KV heads (distinct, not replicated)"
+            );
+            assert_eq!(
+                kv_load_block_index(8, &tp).unwrap(),
+                rank,
+                "rank {rank} shard-regime block index == rank"
+            );
+        }
+    }
+
+    // 1 KV head (full MQA) across TP=4 -> replicate the single head onto all 4
+    // ranks; every rank's block index is 0.
+    #[test]
+    fn head_shard_mqa_q32_kv1_tp4_replicates_all() {
+        for rank in 0..4 {
+            let tp = TpConfig::new(4, rank).unwrap();
+            let (q, kv) = head_shard(32, 1, &tp).unwrap();
+            assert_eq!(q, 8);
+            assert_eq!(kv, 1);
+            assert_eq!(
+                kv_load_block_index(1, &tp).unwrap(),
+                0,
+                "rank {rank} -> head 0"
+            );
+        }
+    }
+
+    // Replication requires CLEAN replication: world_size % num_kv_heads == 0.
+    // 3 KV heads @ TP4: 3 doesn't divide 4 and 4 % 3 != 0 -> reject loudly.
+    #[test]
+    fn head_shard_kv3_tp4_rejects_unclean_replication() {
+        let tp = TpConfig::new(4, 0).unwrap();
+        let err = head_shard(32, 3, &tp).unwrap_err().to_string();
+        assert!(err.contains("num_kv_heads"), "got: {err}");
+        assert!(kv_load_block_index(3, &tp).is_err());
     }
 
     // ---------------------------------------------------------------- TpLinearConfig
