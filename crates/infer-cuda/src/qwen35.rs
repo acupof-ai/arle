@@ -1674,6 +1674,14 @@ impl Qwen35Model {
     }
 
     /// This rank's full-attention K/V width (`local_kv_heads * head_dim`).
+    ///
+    /// Single source for every full-attn K/V cache / pool size on this rank.
+    /// CACHE-IDENTITY INVARIANT (KV replication, kv_heads < world_size): each
+    /// rank holds `local_kv_heads == 1` KV head, and ranks in the same replica
+    /// group loaded IDENTICAL k/v projection weights ([`infer_topo::kv_load_block_index`])
+    /// AND see the same `normed` hidden states, so their per-rank-local cache rows
+    /// are bit-identical. GQA then runs independently per rank against its own
+    /// copy — no cross-replica KV exchange is needed or done.
     fn local_full_attn_kv_dim(&self) -> usize {
         self.local_kv_heads * self.config.head_dim
     }
@@ -2110,28 +2118,46 @@ impl Qwen35Model {
 
         let tp_cfg = *tp.config();
         let world = tp_cfg.world_size;
-        // Per-rank GQA head counts. `head_shard` requires both counts divide the
-        // world size (kv_heads=2 caps Qwen3.6-35B at TP∈{1,2}), keeping every
-        // rank's attention shape uniform — the full-attn kernels and the all-reduce
-        // both rely on it.
+        // Per-rank full-attn GQA head counts. `head_shard` shards KV when
+        // num_kv_heads >= world (e.g. Qwen3.6-35B kv=8 @ TP8 -> 1/rank) and
+        // REPLICATES when num_kv_heads < world (Qwen3.5-122B kv=2 @ TP4 -> every
+        // rank holds 1 replicated KV head + its Q-head shard). Replicas load
+        // identical K/V weights (`kv_load_block_index`) so each computes GQA
+        // independently; the divisible case stays byte-identical.
         let (local_q_heads, local_kv_heads) = if tp_cfg.is_single() {
             (m.num_attention_heads, m.num_key_value_heads)
         } else {
             infer_topo::head_shard(m.num_attention_heads, m.num_key_value_heads, &tp_cfg)
                 .map_err(|e| anyhow!("Qwen3.5 TP full-attention head shard failed: {e}"))?
         };
-        // Gated-delta head counts. Both must divide the world size so a
-        // contiguous head-major block shard preserves the v-per-k grouping
-        // (gated_delta_rule.cu maps k_head = v_head * Kh / Vh): each rank's
-        // v-head range then reads exactly its own k-head range.
+        // KV-head block index this rank loads (== rank in the shard regime;
+        // shared within a replica group in the replication regime). Q always
+        // partitions by `tp_cfg.rank`.
+        let kv_block = if tp_cfg.is_single() {
+            0
+        } else {
+            infer_topo::kv_load_block_index(m.num_key_value_heads, &tp_cfg)
+                .map_err(|e| anyhow!("Qwen3.5 TP full-attention KV block index: {e}"))?
+        };
+        // Gated-delta head counts. The linear (gated-delta) heads are large
+        // (Qwen3.5/3.6: Kh=16, Vh=32), so they SHARD cleanly at the TP sizes that
+        // need full-attn KV replication (122B @ TP4: 16->4, 32->8). We keep the
+        // strict divisibility contract here — a contiguous head-major block shard
+        // preserves the v-per-k grouping (gated_delta_rule.cu maps
+        // k_head = v_head * Kh / Vh): each rank's v-head range reads exactly its
+        // own k-head range. Linear-head replication would need a different shard
+        // (the k/v grouping can't be split by replica), so reject it loudly
+        // rather than silently mis-shard.
         ensure!(
             m.linear_num_key_heads.is_multiple_of(world),
-            "Qwen3.5 TP: linear_num_key_heads ({}) not divisible by world_size ({world})",
+            "Qwen3.5 TP: linear_num_key_heads ({}) not divisible by world_size ({world}) \
+             — gated-delta linear heads must shard (replication unsupported on the linear path)",
             m.linear_num_key_heads
         );
         ensure!(
             m.linear_num_value_heads.is_multiple_of(world),
-            "Qwen3.5 TP: linear_num_value_heads ({}) not divisible by world_size ({world})",
+            "Qwen3.5 TP: linear_num_value_heads ({}) not divisible by world_size ({world}) \
+             — gated-delta linear heads must shard (replication unsupported on the linear path)",
             m.linear_num_value_heads
         );
         let local_linear_k_heads = m.linear_num_key_heads / world;
@@ -2212,26 +2238,29 @@ impl Qwen35Model {
                     // `head*2*HD + d`, the gate kernel at `head*2*HD + HD + d`),
                     // so a whole-head slice with per-head row block 2*head_dim
                     // carries each head's query rows AND its matching gate rows.
+                    // Q partitions by rank; K/V load the replica-aware KV block
+                    // (== rank in the shard regime; shared within a replica group
+                    // when kv_heads < world_size, giving identical K/V weights).
                     q_proj: loader.load_qkv_head_sharded_quant_aware(
                         &ctx,
                         &full.q_proj,
                         local_q_heads,
                         m.head_dim * 2,
-                        &tp_cfg,
+                        tp_cfg.rank,
                     )?,
                     k_proj: loader.load_qkv_head_sharded_quant_aware(
                         &ctx,
                         &full.k_proj,
                         local_kv_heads,
                         m.head_dim,
-                        &tp_cfg,
+                        kv_block,
                     )?,
                     v_proj: loader.load_qkv_head_sharded_quant_aware(
                         &ctx,
                         &full.v_proj,
                         local_kv_heads,
                         m.head_dim,
-                        &tp_cfg,
+                        kv_block,
                     )?,
                     // Row-parallel: each rank holds the o_proj input columns of
                     // its own heads; the forward all-reduces the partial sums.
@@ -2278,7 +2307,7 @@ impl Qwen35Model {
                             &lin.in_proj_z,
                             local_linear_v_heads,
                             m.linear_value_head_dim,
-                            &tp_cfg,
+                            tp_cfg.rank,
                         )?,
                         // b/a are ONE SCALAR PER V HEAD (gated_delta_rule.cu reads
                         // `b_proj[token*Vh + v_head]`) → per-head row count 1.
@@ -2287,14 +2316,14 @@ impl Qwen35Model {
                             &lin.in_proj_b,
                             local_linear_v_heads,
                             1,
-                            &tp_cfg,
+                            tp_cfg.rank,
                         )?,
                         in_proj_a: loader.load_qkv_head_sharded(
                             &ctx,
                             &lin.in_proj_a,
                             local_linear_v_heads,
                             1,
-                            &tp_cfg,
+                            tp_cfg.rank,
                         )?,
                         // Depthwise conv: channel rows mirror the qkv block shard.
                         conv1d_weight: load_conv1d_sharded(

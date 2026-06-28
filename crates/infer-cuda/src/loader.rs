@@ -100,27 +100,32 @@ impl CudaModel {
                     // TP: Q/K/V column-parallel on whole-head boundaries (so the
                     // o_proj input shard and head count agree); gate/up plain
                     // column-parallel; o_proj/down_proj row-parallel.
+                    // Q partitions by rank; K/V use the replica-aware KV block
+                    // index (== rank when kv_heads >= world_size; shared within a
+                    // replica group when kv_heads < world_size).
+                    let kv_block =
+                        infer_topo::kv_load_block_index(config.num_key_value_heads, &tp_cfg)?;
                     (
                         loader.load_qkv_head_sharded(
                             &ctx,
                             &names.q_proj,
                             local_q_heads,
                             head_dim,
-                            &tp_cfg,
+                            tp_cfg.rank,
                         )?,
                         loader.load_qkv_head_sharded(
                             &ctx,
                             &names.k_proj,
                             local_kv_heads,
                             head_dim,
-                            &tp_cfg,
+                            kv_block,
                         )?,
                         loader.load_qkv_head_sharded(
                             &ctx,
                             &names.v_proj,
                             local_kv_heads,
                             head_dim,
-                            &tp_cfg,
+                            kv_block,
                         )?,
                         loader.load_matrix_sharded(
                             &ctx,
@@ -990,13 +995,22 @@ impl SafetensorLoader {
     /// `head_dim` is the PER-HEAD ROW COUNT, not necessarily the attention
     /// head_dim: the gated Qwen3.5/3.6 q_proj interleaves `[query; gate]` per
     /// head, so its per-head row block is `2 * head_dim`.
+    ///
+    /// `block_index` selects which `local_heads`-wide head block this rank loads.
+    /// Q passes `tp.rank` (distinct heads per rank). KV passes
+    /// [`infer_topo::kv_load_block_index`]: in the shard regime that equals
+    /// `tp.rank` (byte-identical to the legacy `rank * local_rows` offset); in the
+    /// KV-replication regime (kv_heads < world_size) consecutive ranks in a
+    /// replica group share the same `block_index`, so they load IDENTICAL K/V
+    /// weights — the cache-identity invariant that lets each replica compute GQA
+    /// independently.
     pub(crate) fn load_qkv_head_sharded(
         &self,
         ctx: &DeviceContext,
         name: &str,
         local_heads: usize,
         head_dim: usize,
-        tp: &infer_topo::TpConfig,
+        block_index: usize,
     ) -> Result<DeviceMatrix> {
         const BF16_ELEM_SIZE: usize = 2;
         let tensor = self.borrow_bf16_tensor(name)?;
@@ -1008,13 +1022,12 @@ impl SafetensorLoader {
         let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
         let total_rows = rows;
         let local_rows = local_heads * head_dim;
-        let offset = tp.rank * local_rows;
+        let offset = block_index * local_rows;
         ensure!(
             offset + local_rows <= total_rows,
             "{name}: head shard [{offset}, {}) exceeds rows {total_rows} \
-             (local_heads={local_heads}, head_dim={head_dim}, rank={})",
+             (local_heads={local_heads}, head_dim={head_dim}, block_index={block_index})",
             offset + local_rows,
-            tp.rank
         );
         let spec = infer_topo::ShardingSpec {
             offset,
@@ -1074,17 +1087,18 @@ impl SafetensorLoader {
         self.load_quant_or_dense_view(ctx, &view, shard)
     }
 
-    /// Quant-aware twin of [`Self::load_qkv_head_sharded`].
+    /// Quant-aware twin of [`Self::load_qkv_head_sharded`]. `block_index` has the
+    /// same Q-vs-replicated-KV meaning (see that method's docs).
     pub(crate) fn load_qkv_head_sharded_quant_aware(
         &self,
         ctx: &DeviceContext,
         name: &str,
         local_heads: usize,
         head_dim: usize,
-        tp: &infer_topo::TpConfig,
+        block_index: usize,
     ) -> Result<DeviceMatrix> {
         let Some(view) = self.quant_view_for(name)? else {
-            return self.load_qkv_head_sharded(ctx, name, local_heads, head_dim, tp);
+            return self.load_qkv_head_sharded(ctx, name, local_heads, head_dim, block_index);
         };
         ensure!(
             view.logical_shape.len() == 2,
@@ -1094,14 +1108,13 @@ impl SafetensorLoader {
         );
         let total_rows = view.logical_shape[0];
         let local_rows = local_heads * head_dim;
-        let offset = tp.rank * local_rows;
+        let offset = block_index * local_rows;
         ensure!(
             offset + local_rows <= total_rows,
             "{}: head shard [{offset}, {}) exceeds rows {total_rows} \
-             (local_heads={local_heads}, head_dim={head_dim}, rank={})",
+             (local_heads={local_heads}, head_dim={head_dim}, block_index={block_index})",
             view.name,
             offset + local_rows,
-            tp.rank
         );
         self.load_quant_or_dense_view(
             ctx,
