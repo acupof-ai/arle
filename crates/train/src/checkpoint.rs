@@ -264,10 +264,7 @@ struct OptimTensorView {
 
 impl OptimTensorView {
     fn from_f32(shape: Vec<usize>, values: &[f32]) -> Self {
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for v in values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
+        let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         Self { shape, bytes }
     }
 }
