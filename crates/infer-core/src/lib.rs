@@ -2164,6 +2164,137 @@ mod testing {
         }
     }
 
+    /// Mirrors the Qwen3.6 hybrid (recurrent + full-attn paged) executor across an
+    /// AGENTIC RE-PREFILL turn boundary — the path that produced the
+    /// `materialized state len != DecodeRow.kv_seq_len` (Δ=42) crash at ~4.5K
+    /// tokens. Each agent turn submits a NEW request whose prompt is a growing
+    /// superset of the prior turn (prior context + tool output), so it lands on
+    /// the same slot and reuses the published page-radix prefix at `start_pos =
+    /// matched_len`. The decisive detail: the slot's device counter carries the
+    /// PRIOR turn's `prompt + generated` length (HIGHER than this turn's
+    /// `matched_len`), so the attach must REWIND it to `matched_len`. The bug was
+    /// `restore_recurrent_sidecar` skipping that rewind (the slot stayed at the
+    /// stale higher value while the host pool reset to `matched_len`).
+    ///
+    /// `rewind_on_attach=true` models the fix (`set_seq_len(matched_len)` inside
+    /// `restore_prefix_sidecar`); `false` reproduces the pre-fix drift so the test
+    /// proves it actually catches the regression rather than passing vacuously.
+    #[derive(Debug, Clone)]
+    pub(super) struct HybridReprefillMirror {
+        materialized: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, usize>>>,
+        decode_log: std::rc::Rc<std::cell::RefCell<Vec<(usize, usize, usize)>>>,
+        /// The fix: rewind the device counter to `matched_len` on prefix attach.
+        rewind_on_attach: bool,
+    }
+
+    impl HybridReprefillMirror {
+        pub(super) fn new(rewind_on_attach: bool) -> Self {
+            Self {
+                materialized: std::rc::Rc::new(std::cell::RefCell::new(
+                    std::collections::HashMap::new(),
+                )),
+                decode_log: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                rewind_on_attach,
+            }
+        }
+
+        pub(super) fn decode_log(&self) -> Vec<(usize, usize, usize)> {
+            self.decode_log.borrow().clone()
+        }
+    }
+
+    impl BackendExecutor for HybridReprefillMirror {
+        type Inflight = MockInflight;
+
+        // Opt into page-radix prefix reuse exactly like the real Qwen3.5/3.6
+        // executor — the default seam impl is fail-closed (0), which would route
+        // every turn through a fresh `start_pos == 0` prefill and never exercise
+        // the re-prefill rewind this test targets.
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            pages_only_reusable_prefix_blocks(blocks, |_| false)
+        }
+
+        // The hybrid override: `attach_prefix_to_request` calls this after
+        // `kv.attach_pages()` reset the HOST pool's seq_len to `matched_len`. The
+        // device-side counter MUST be rewound to match (the `1b0f0459` fix). With
+        // `rewind_on_attach == false` we leave the stale higher value in place,
+        // reproducing the drift.
+        fn restore_prefix_sidecar(
+            &mut self,
+            slot: usize,
+            _tokens: &[u32],
+            matched_len: usize,
+            _prefix_pages: &[u32],
+        ) -> Result<()> {
+            if self.rewind_on_attach {
+                self.materialized.borrow_mut().insert(slot, matched_len);
+            }
+            Ok(())
+        }
+
+        fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let mut tokens = Vec::new();
+            let mut materialized = self.materialized.borrow_mut();
+
+            for row in &plan.prefill_rows {
+                let entry = materialized.entry(row.slot).or_insert(0);
+                if row.start_pos == 0 {
+                    *entry = 0;
+                } else if *entry != row.start_pos {
+                    // The real `prefill_row_paged_default` readiness guard
+                    // (`pool.seq_len(slot) == start_pos`): a stale (un-rewound)
+                    // device counter trips here on the tail prefill.
+                    bail!(
+                        "hybrid mirror: re-prefill expects materialized {} == start_pos {} for slot {} \
+                         (device counter not rewound to matched_len on prefix attach)",
+                        *entry,
+                        row.start_pos,
+                        row.slot
+                    );
+                }
+                *entry += row.tokens.len();
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.tokens.last().copied().map_or(1, |last| last + 1),
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            for row in &plan.decode_rows {
+                let entry = materialized.entry(row.slot).or_insert(0);
+                self.decode_log
+                    .borrow_mut()
+                    .push((row.slot, *entry, row.kv_seq_len));
+                // The invariant asserted at executor.rs `submit_decode_row`.
+                if *entry != row.kv_seq_len {
+                    bail!(
+                        "hybrid mirror: materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+                        *entry,
+                        row.kv_seq_len,
+                        row.slot
+                    );
+                }
+                *entry += 1;
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token: row.last_token + 1,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+
+            Ok(MockInflight {
+                output: StepOutput { tokens },
+                return_not_ready_once: false,
+            })
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::Ready(inflight.output))
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) struct HoldGovernor;
 
@@ -2397,12 +2528,90 @@ mod tests {
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool, KvAllocator, KvQuery};
 
     use super::testing::{
-        DeviceMirrorExecutor, HoldGovernor, LimitedPrefixExecutor, MockExecutor, MockKvPool,
-        PrefixStoreMockExecutor, SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor,
-        SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor,
-        WarmupCountingExecutor,
+        DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror, LimitedPrefixExecutor,
+        MockExecutor, MockKvPool, PrefixStoreMockExecutor, SamplingExecutor, SingleRowExecutor,
+        SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor,
+        TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
+
+    /// Drive `turns` agentic re-prefills on one slot: each turn's prompt is the
+    /// prior turn's full text (prompt + the deterministic generated tokens) plus
+    /// `tool_tokens` appended "tool output", so the page-radix prefix grows and
+    /// every turn after the first re-prefills from `start_pos = matched_len`.
+    /// Returns the executor probe for invariant inspection. The page size is 16,
+    /// so a multi-page prompt forces a non-trivial block-aligned `matched_len`.
+    fn run_agentic_reprefill(
+        rewind_on_attach: bool,
+        turns: usize,
+        base_prompt: usize,
+        gen_per_turn: usize,
+        tool_tokens: usize,
+    ) -> (HybridReprefillMirror, Result<()>) {
+        let executor = HybridReprefillMirror::new(rewind_on_attach);
+        let probe = executor.clone();
+        let mut config = test_config(1);
+        config.chunked_prefill_size = 64;
+        config.enable_prefix_cache = true;
+        // 16-token pages, ample capacity for a ~few-thousand-token conversation.
+        let mut engine =
+            Engine::with_config(executor, MockKvPool::with_capacity(1, 16, 4096), config);
+
+        // Conversation token stream; each turn appends generated + tool tokens.
+        let mut convo: Vec<u32> = (0..base_prompt as u32).map(|t| t + 1).collect();
+        let result = (|| -> Result<()> {
+            for turn in 0..turns {
+                let handle = engine.submit_request(convo.clone(), gen_per_turn.max(1));
+                engine.run_to_idle()?;
+                let completed = engine
+                    .completed(handle)
+                    .ok_or_else(|| anyhow::anyhow!("turn {turn} did not complete"))?;
+                // Grow the conversation: append this turn's generated tokens, then
+                // the next "tool output" — the next turn re-prefills this superset.
+                convo.extend_from_slice(&completed.generated_tokens);
+                convo.extend((0..tool_tokens as u32).map(|t| 50_000 + turn as u32 * 100 + t));
+            }
+            Ok(())
+        })();
+        (probe, result)
+    }
+
+    /// The fix (`rewind_on_attach = true`): a multi-turn agentic re-prefill never
+    /// drifts the decode counter — `materialized == kv_seq_len` at every decode
+    /// across every turn boundary, even as the conversation grows past several
+    /// pages (the ~4.5K-token shape that crashed on the pre-`1b0f0459` tree).
+    #[test]
+    fn agentic_reprefill_keeps_seq_len_in_lockstep() {
+        let (probe, result) = run_agentic_reprefill(true, 6, 40, 5, 24);
+        result.expect("agentic re-prefill must not drift seq_len with the rewind fix");
+        let log = probe.decode_log();
+        assert!(!log.is_empty(), "expected decode rows across the turns");
+        for (k, &(slot, materialized, kv_seq_len)) in log.iter().enumerate() {
+            assert_eq!(slot, 0);
+            assert_eq!(
+                materialized, kv_seq_len,
+                "decode {k}: materialized {materialized} != kv_seq_len {kv_seq_len} \
+                 (re-prefill seq_len drift)"
+            );
+        }
+    }
+
+    /// The drift the fix prevents: skipping the device-counter rewind on prefix
+    /// attach reproduces the exact failure — the tail re-prefill (or the first
+    /// decode) trips the readiness/invariant guard with the stale higher counter.
+    /// This proves the lockstep test above is not vacuous.
+    #[test]
+    fn agentic_reprefill_without_rewind_fails_loud() {
+        let (_probe, result) = run_agentic_reprefill(false, 6, 40, 5, 24);
+        let err = result.expect_err(
+            "without the device-counter rewind, the re-prefill MUST surface the drift, not pass",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("start_pos") || msg.contains("kv_seq_len") || msg.contains("materialized"),
+            "expected the seq_len drift guard, got: {msg}"
+        );
+    }
 
     fn submit_with_sampling(
         engine: &mut Engine<StopTokenExecutor, MockKvPool>,
