@@ -2409,16 +2409,19 @@ mod tests {
                     settings(),
                 )
                 .expect("turn");
-            let mut run_ids = Vec::new();
-            for msg in &result.messages {
-                if let MessageContent::Blocks(blocks) = &msg.content {
-                    for block in blocks {
-                        if let ContentBlock::ToolUse { id, .. } = block {
-                            run_ids.push(id.clone());
-                        }
-                    }
-                }
-            }
+            let run_ids: Vec<_> = result
+                .messages
+                .iter()
+                .filter_map(|msg| match &msg.content {
+                    MessageContent::Blocks(blocks) => Some(blocks.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
             ids.push(run_ids);
         }
         assert_eq!(ids[0], ids[1]);

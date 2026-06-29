@@ -278,22 +278,19 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// `arle` binary. The arle binary normally lives at
 /// `<ws>/target/release/arle`, so the sibling eli is `<ws>/../eli/target/...`.
 fn sibling_eli_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        // exe = <ws>/target/<profile>/arle → climb to <ws> then to <ws>/..
-        if let Some(ws) = exe
-            .parent() // target/<profile>
-            .and_then(Path::parent) // target
-            .and_then(Path::parent)
-        {
-            if let Some(parent) = ws.parent() {
-                out.push(parent.join("eli/target/release/eli"));
-                out.push(parent.join("eli/target/debug/eli"));
-            }
-        }
-    }
-    // CWD-relative dev fallback.
-    out.push(PathBuf::from("../eli/target/release/eli"));
+    // exe = <ws>/target/<profile>/arle → climb to <ws> then to <ws>/..
+    let mut out = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let ws = exe.parent()?.parent()?.parent()?;
+            let parent = ws.parent()?;
+            Some(vec![
+                parent.join("eli/target/release/eli"),
+                parent.join("eli/target/debug/eli"),
+            ])
+        })
+        .unwrap_or_default();
+    out.push(PathBuf::from("../eli/target/release/eli")); // CWD-relative dev fallback
     out
 }
 
