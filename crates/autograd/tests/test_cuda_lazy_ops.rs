@@ -93,20 +93,16 @@ fn max_err(dev: &[f32], host: &[f32]) -> (f32, f32, usize) {
 /// vocab-wide sum) and only relax the absolute floor for the
 /// backward where the math demands it.
 fn max_err_with_tol(dev: &[f32], host: &[f32], atol: f32, rtol: f32) -> (f32, f32, usize) {
-    let mut worst_excess = 0.0_f32;
-    let mut worst_abs = 0.0_f32;
-    let mut worst_idx = 0_usize;
-    for (i, (d, h)) in dev.iter().zip(host.iter()).enumerate() {
-        let abs_diff = (d - h).abs();
-        let tol = atol + rtol * h.abs();
-        let excess = abs_diff / tol;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_abs = abs_diff;
-            worst_idx = i;
-        }
-    }
-    (worst_excess, worst_abs, worst_idx)
+    dev.iter()
+        .zip(host.iter())
+        .enumerate()
+        .map(|(i, (d, h))| {
+            let abs_diff = (d - h).abs();
+            let excess = abs_diff / (atol + rtol * h.abs());
+            (excess, abs_diff, i)
+        })
+        .max_by(|(e1, _, _), (e2, _, _)| e1.total_cmp(e2))
+        .unwrap_or((0.0, 0.0, 0))
 }
 
 #[test]
