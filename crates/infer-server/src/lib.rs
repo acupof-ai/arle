@@ -566,24 +566,22 @@ impl BackendExecutor for EchoExecutor {
     type Inflight = StepOutput;
 
     fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-        let mut tokens = Vec::with_capacity(plan.prefill_rows.len() + plan.decode_rows.len());
-        for row in &plan.prefill_rows {
-            let token = row.tokens.last().copied().map_or(1, |last| last + 1);
-            tokens.push(SlotToken {
+        let tokens = plan
+            .prefill_rows
+            .iter()
+            .map(|row| SlotToken {
                 slot: row.slot,
-                token,
+                token: row.tokens.last().copied().map_or(1, |last| last + 1),
                 logprob: None,
                 finish: None,
-            });
-        }
-        for row in &plan.decode_rows {
-            tokens.push(SlotToken {
+            })
+            .chain(plan.decode_rows.iter().map(|row| SlotToken {
                 slot: row.slot,
                 token: row.last_token + 1,
                 logprob: None,
                 finish: None,
-            });
-        }
+            }))
+            .collect();
         Ok(StepOutput { tokens })
     }
 
