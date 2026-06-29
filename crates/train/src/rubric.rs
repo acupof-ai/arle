@@ -168,13 +168,18 @@ impl Rubric {
         let Some(map) = value.as_object() else {
             return reject;
         };
-        let mut passed = Vec::with_capacity(self.criteria.len());
-        for c in &self.criteria {
-            match map.get(&c.key).and_then(|v| v.as_bool()) {
-                Some(b) => passed.push((c.key.clone(), b)),
-                None => return reject, // missing/malformed key -> never accepted
-            }
-        }
+        let Some(passed) = self
+            .criteria
+            .iter()
+            .map(|c| {
+                map.get(&c.key)
+                    .and_then(|v| v.as_bool())
+                    .map(|b| (c.key.clone(), b))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return reject; // missing/malformed key -> never accepted
+        };
         let accepted = self
             .criteria
             .iter()
