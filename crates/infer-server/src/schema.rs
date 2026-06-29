@@ -264,7 +264,7 @@ impl ChatContentPart {
 }
 
 fn validate_common(_stream: Option<bool>, max_tokens: Option<usize>) -> Result<(), ApiError> {
-    if matches!(max_tokens, Some(0)) {
+    if max_tokens == Some(0) {
         return Err(ApiError::bad_request(
             "max_tokens must be greater than zero",
         ));
