@@ -133,13 +133,16 @@ impl SafetensorsRegistry {
     }
 
     pub fn save_from(&self, store: &mut TensorStore, path: &Path) -> Result<()> {
-        let mut data = Vec::with_capacity(self.map.len());
-        for (name, id) in &self.map {
-            let shape = store.tensor(*id)?.shape.clone();
-            let host = store.to_host(*id)?;
-            let bytes: Vec<u8> = host.iter().flat_map(|value| value.to_le_bytes()).collect();
-            data.push((name.clone(), TensorFileView { shape, bytes }));
-        }
+        let data = self
+            .map
+            .iter()
+            .map(|(name, id)| -> Result<_> {
+                let shape = store.tensor(*id)?.shape.clone();
+                let host = store.to_host(*id)?;
+                let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok((name.clone(), TensorFileView { shape, bytes }))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         serialize_to_file(data, None, path)
             .map_err(|err| tape_invariant(format!("failed to serialize safetensors: {err}")))?;
@@ -151,16 +154,19 @@ impl SafetensorsRegistry {
     // for training-side roundtrip tests; this bf16 path is the one whose
     // output infer can actually consume end-to-end.
     pub fn save_from_bf16(&self, store: &mut TensorStore, path: &Path) -> Result<()> {
-        let mut data = Vec::with_capacity(self.map.len());
-        for (name, id) in &self.map {
-            let shape = store.tensor(*id)?.shape.clone();
-            let host = store.to_host(*id)?;
-            let bytes: Vec<u8> = host
-                .iter()
-                .flat_map(|value| bf16::from_f32(*value).to_le_bytes())
-                .collect();
-            data.push((name.clone(), TensorFileBf16View { shape, bytes }));
-        }
+        let data = self
+            .map
+            .iter()
+            .map(|(name, id)| -> Result<_> {
+                let shape = store.tensor(*id)?.shape.clone();
+                let host = store.to_host(*id)?;
+                let bytes: Vec<u8> = host
+                    .iter()
+                    .flat_map(|v| bf16::from_f32(*v).to_le_bytes())
+                    .collect();
+                Ok((name.clone(), TensorFileBf16View { shape, bytes }))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         serialize_to_file(data, None, path).map_err(|err| {
             tape_invariant(format!("failed to serialize bf16 safetensors: {err}"))
