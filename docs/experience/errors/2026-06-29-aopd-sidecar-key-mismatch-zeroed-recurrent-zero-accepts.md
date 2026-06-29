@@ -102,8 +102,26 @@ accepts** (samples 0, 2, 3 passed; sample 1 failed exit 4):
 [agent-opd] ansible__ansible-f327e65 sample 3: passed=true (turns=6)
 ```
 
-**With fix + eval**: `f8e861bb` binary running OPD with eval-every 1 — pending (run
-killed previously; new run started post-build).
+**Fourth bug: soundness crash on partial page cleanup (f8e861bb introduced)**:
+`restore_recurrent_sidecar` returned Err without cleaning up `full_attn_kv` or
+resetting `slot.seq_len()`. The page-radix path in `prefix.rs:89-98` caught the
+Err but CONTINUED (log warn + proceed) — kept stale `full_attn_kv` seq_len (4777)
+with `start_pos=4704` → soundness gate: "device pool seq_len 4777 != start_pos 4704".
+
+Fix `16a8247f`: (a) executor `None` branch also frees `full_attn_kv` + resets
+`seq_len=0`; (b) `prefix.rs` sidecar-error branch now releases pages
+(`kv.free_slot + radix.release_blocks + kv.release_pages`) and returns Ok() with
+`prefill_start_pos=0`.
+
+**Performance side-effect of full-recompute fallback**: sidecar captures at
+PREFILL completion only, not decode. Decode tokens advance the radix cache past
+the last sidecar capture. Each turn where decode generated ≥16 tokens → radix
+matches past the sidecar entry → fallback → full re-prefill from 0. For
+0ea40e0's long multi-turn eval (7000+ tokens), ~4 fallbacks per eval run.
+Fix: capture sidecar at decode completion too (pending, perf not correctness).
+
+**With fix `16a8247f` + eval**: 0ea40e0 `passed=true`, 12734fa `edited=true`
+[exit 4], 5e36960 running; f327e65 training in progress.
 
 ## Rule
 
