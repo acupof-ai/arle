@@ -27,7 +27,7 @@ use crate::multiproc_relay::{
 };
 use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
-    ModelsResponse,
+    ModelsResponse, StatsResponse,
 };
 use crate::sse_util::{completion_stream_chunk, finish_reason, unix_time_secs};
 use crate::tokenizer::OpenAiTokenizer;
@@ -51,6 +51,11 @@ pub struct CoordinatorHandle {
     /// Registered/unregistered directly (not via the `RelayCoordinator` mutex) so
     /// HTTP (un)register never contends with the lockstep loop's blocking broadcast.
     sinks: CompletionSinks,
+    /// Relay handle for stats queries to rank-0.
+    relay: Arc<Mutex<RelayCoordinator>>,
+    /// Monotonic counter for stats query request IDs (separate from request IDs to
+    /// avoid collisions with completion sink IDs).
+    stats_request_id: AtomicU64,
 }
 
 impl CoordinatorHandle {
@@ -91,12 +96,15 @@ pub fn coordinator_router(
         in_flight,
         submit_tx,
         sinks,
+        relay,
+        stats_request_id: AtomicU64::new(0),
     });
 
     Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
@@ -408,4 +416,27 @@ async fn metrics(
         )],
         String::from("# arle multiproc coordinator: per-rank engine counters not aggregated\n"),
     )
+}
+
+async fn stats(
+    State(state): State<Arc<CoordinatorHandle>>,
+) -> Result<Json<StatsResponse>, ApiError> {
+    let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
+    // Register awaiter BEFORE sending to avoid a race with the reader thread.
+    let rx = state
+        .relay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .register_stats_awaiter(request_id);
+    state
+        .relay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send_stats_query(request_id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let wire = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .map_err(|_| ApiError::internal("stats query timed out"))?
+        .map_err(|_| ApiError::internal("stats oneshot closed"))?;
+    Ok(Json(StatsResponse::from_wire(wire)))
 }

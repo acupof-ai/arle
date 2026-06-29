@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::execution::CounterSnapshot;
+use crate::multiproc_relay::WireStats;
 
 /// Minimal `/v1/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
@@ -465,6 +466,69 @@ impl StatsResponse {
                 recall_rate: None,
                 not_available_reason: "per-level ssd recall counters are not split out yet; \
                                        disk spill activity is included in the kv_tier block",
+            },
+        }
+    }
+
+    pub(crate) fn from_wire(w: WireStats) -> Self {
+        Self {
+            scheduler: SchedulerStats {
+                active_requests: w.active_requests,
+                queue_depth: w.queue_depth,
+                kv_free_pages: w.kv_free_pages,
+            },
+            throughput: ThroughputStatsResponse {
+                steps: w.throughput_steps,
+                prefill_tokens: w.throughput_prefill_tokens,
+                generated_tokens: w.throughput_generated_tokens,
+                requests_completed: w.throughput_requests_completed,
+            },
+            prefix_cache: PrefixCacheStatsResponse {
+                lookups: w.prefix_lookups,
+                hits: w.prefix_hits,
+                hit_rate: ratio(w.prefix_hits, w.prefix_lookups),
+                hit_tokens: w.prefix_hit_tokens,
+                hit_pages: w.prefix_hit_pages,
+                published_pages: w.prefix_published_pages,
+                cached_pages: w.prefix_cached_pages,
+            },
+            kv_tier: KvTierStatsResponse {
+                available: false,
+                demoted_pages: 0,
+                promoted_pages: 0,
+                promote_failures: 0,
+                resident_blocks: 0,
+                demoted_slots: 0,
+                promoted_slots: 0,
+                slot_promote_failures: 0,
+            },
+            kv_system: KvSystemMetricsResponse {
+                resident_pages: 0,
+                resident_evictable_pages: 0,
+                host_demoted_pages: 0,
+                host_demoted_pending_inflight: 0,
+                disk_pages: 0,
+                reuse_hit_resident: 0,
+                reuse_hit_host_demoted: 0,
+                reuse_hit_disk: 0,
+                reuse_miss: 0,
+                demote_mset_count: 0,
+                demote_mset_copy_bytes: 0,
+                demote_mset_copy_ms: 0,
+                promote_mget_count: 0,
+                promote_mget_copy_bytes: 0,
+                promote_mget_copy_ms: 0,
+                fetch_wait_ms: 0,
+                fallback_recompute: 0,
+                prefix_match_full_blocks: 0,
+                prefix_match_clamped_blocks: 0,
+            },
+            ssd_recall: SsdRecallStats {
+                available: false,
+                lookups: 0,
+                hits: 0,
+                recall_rate: None,
+                not_available_reason: "multiproc coordinator: kv_tier/kv_system not yet relayed",
             },
         }
     }
