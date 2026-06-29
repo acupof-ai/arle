@@ -91,26 +91,13 @@ pub const QWEN35_FULL_LAYER_OPS: &[Qwen35Op] = &[
 ];
 
 pub fn qwen35_forward_ops(layer_types: &[qwen35_spec::LayerType]) -> Vec<Qwen35Op> {
-    let mut ops = Vec::with_capacity(
-        3 + layer_types.len()
-            * QWEN35_FULL_LAYER_OPS
-                .len()
-                .max(QWEN35_LINEAR_LAYER_OPS.len()),
-    );
-    ops.push(Qwen35Op::TokenEmbedding);
-    for layer_type in layer_types {
-        match layer_type {
-            qwen35_spec::LayerType::LinearAttention => {
-                ops.extend_from_slice(QWEN35_LINEAR_LAYER_OPS);
-            }
-            qwen35_spec::LayerType::FullAttention => {
-                ops.extend_from_slice(QWEN35_FULL_LAYER_OPS);
-            }
-        }
-    }
-    ops.push(Qwen35Op::FinalRmsNorm);
-    ops.push(Qwen35Op::LmHead);
-    ops
+    std::iter::once(Qwen35Op::TokenEmbedding)
+        .chain(layer_types.iter().flat_map(|lt| match lt {
+            qwen35_spec::LayerType::LinearAttention => QWEN35_LINEAR_LAYER_OPS.iter().copied(),
+            qwen35_spec::LayerType::FullAttention => QWEN35_FULL_LAYER_OPS.iter().copied(),
+        }))
+        .chain([Qwen35Op::FinalRmsNorm, Qwen35Op::LmHead])
+        .collect()
 }
 
 pub fn qwen35_launcher_kind(op: Qwen35Op) -> Qwen35LauncherKind {

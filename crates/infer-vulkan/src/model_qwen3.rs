@@ -48,14 +48,10 @@ pub const DENSE_QWEN3_LAYER_OPS: &[Qwen3Op] = &[
 ];
 
 pub fn dense_qwen3_forward_ops(num_layers: usize) -> Vec<Qwen3Op> {
-    let mut ops = Vec::with_capacity(2 + num_layers * DENSE_QWEN3_LAYER_OPS.len() + 2);
-    ops.push(Qwen3Op::Embedding);
-    for _ in 0..num_layers {
-        ops.extend_from_slice(DENSE_QWEN3_LAYER_OPS);
-    }
-    ops.push(Qwen3Op::FinalRmsNorm);
-    ops.push(Qwen3Op::LmHead);
-    ops
+    std::iter::once(Qwen3Op::Embedding)
+        .chain((0..num_layers).flat_map(|_| DENSE_QWEN3_LAYER_OPS.iter().copied()))
+        .chain([Qwen3Op::FinalRmsNorm, Qwen3Op::LmHead])
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

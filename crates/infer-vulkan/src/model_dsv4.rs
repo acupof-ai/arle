@@ -95,16 +95,11 @@ pub const DSV4_FALLBACK_LAYER_OPS: &[Dsv4Op] = &[
 ];
 
 pub fn dsv4_fallback_forward_ops(num_layers: usize) -> Vec<Dsv4Op> {
-    let mut ops = Vec::with_capacity(4 + num_layers * DSV4_FALLBACK_LAYER_OPS.len());
-    ops.push(Dsv4Op::TokenEmbedding);
-    ops.push(Dsv4Op::MhcExpand);
-    for _ in 0..num_layers {
-        ops.extend_from_slice(DSV4_FALLBACK_LAYER_OPS);
-    }
-    ops.push(Dsv4Op::MhcHeadPre);
-    ops.push(Dsv4Op::FinalRmsNorm);
-    ops.push(Dsv4Op::LmHead);
-    ops
+    [Dsv4Op::TokenEmbedding, Dsv4Op::MhcExpand]
+        .into_iter()
+        .chain((0..num_layers).flat_map(|_| DSV4_FALLBACK_LAYER_OPS.iter().copied()))
+        .chain([Dsv4Op::MhcHeadPre, Dsv4Op::FinalRmsNorm, Dsv4Op::LmHead])
+        .collect()
 }
 
 pub fn dsv4_launcher_kind(op: Dsv4Op) -> Dsv4LauncherKind {
