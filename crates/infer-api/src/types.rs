@@ -396,15 +396,14 @@ pub trait InferenceEngine: Send {
     /// [`ServeInferenceEngine`](crate::ServeInferenceEngine) instances override
     /// this to use the tokenizer's checkpoint template.
     fn render_chat_prompt(&self, messages: &[ChatPromptMessage]) -> Result<String> {
-        if messages.is_empty() {
-            return Err(anyhow!("messages must contain at least one message"));
-        }
+        anyhow::ensure!(
+            !messages.is_empty(),
+            "messages must contain at least one message"
+        );
         let mut out = String::new();
         for message in messages {
             let role = message.role.trim();
-            if role.is_empty() {
-                return Err(anyhow!("message role must not be empty"));
-            }
+            anyhow::ensure!(!role.is_empty(), "message role must not be empty");
             out.push_str("<|im_start|>");
             out.push_str(role);
             out.push('\n');
