@@ -5851,7 +5851,7 @@ impl Dsv4Model {
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     // Default decode stays byte-identical (None) unless the CSA read-lane is
                     // on; the unconditional dsa_shared swap hung eager c=1 decode.
-                    let dsa_shared = if csa_read_lane { dsa_shared_raw } else { None };
+                    let dsa_shared = dsa_shared_raw.filter(|_| csa_read_lane);
                     attn_graph.run_or_capture(|| {
                         crate::ops::embedding_batch(
                             &self.ctx,
@@ -5921,7 +5921,7 @@ impl Dsv4Model {
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     // Default decode stays byte-identical (None) unless the CSA read-lane is
                     // on; the unconditional dsa_shared swap hung eager c=1 decode.
-                    let dsa_shared = if csa_read_lane { dsa_shared_raw } else { None };
+                    let dsa_shared = dsa_shared_raw.filter(|_| csa_read_lane);
                     attn_graph.run_or_capture(|| {
                         crate::ops::add_batch(
                             &self.ctx,

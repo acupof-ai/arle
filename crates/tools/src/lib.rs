@@ -883,7 +883,7 @@ fn extract_arithmetic_expression(text: &str) -> Option<String> {
         has_operator = false;
     }
 
-    if best.is_empty() { None } else { Some(best) }
+    (!best.is_empty()).then_some(best)
 }
 
 fn asks_for_exact_scalar_output(user_input: &str) -> bool {
@@ -1139,20 +1139,19 @@ pub fn format_read(contents: &str, path: &str, start: Option<i64>, end: Option<i
     let start = start.unwrap_or(1).clamp(1, total);
     let end = end.unwrap_or(start + READ_WINDOW - 1).clamp(start, total);
 
-    let mut out = String::new();
-    for n in start..=end {
-        let line = lines[(n - 1) as usize];
-        if line.chars().count() > MAX_LINE_CHARS {
-            let clipped: String = line.chars().take(MAX_LINE_CHARS).collect();
-            out.push_str(&format!("{n}\t{clipped}… (line truncated)\n"));
-        } else {
-            out.push_str(&format!("{n}\t{line}\n"));
-        }
-    }
-    if out.ends_with('\n') {
-        out.pop();
-    }
-    let mut out = clip_middle(&out, 20_000);
+    let joined = (start..=end)
+        .map(|n| {
+            let line = lines[(n - 1) as usize];
+            if line.chars().count() > MAX_LINE_CHARS {
+                let clipped: String = line.chars().take(MAX_LINE_CHARS).collect();
+                format!("{n}\t{clipped}… (line truncated)")
+            } else {
+                format!("{n}\t{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = clip_middle(&joined, 20_000);
     if start > 1 || end < total {
         out.push_str(&format!("\n[lines {start}-{end} of {total}]"));
     }
