@@ -1217,31 +1217,34 @@ mod backend {
             let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
                 model_path, &resolved, config, kv_ssd, shutdown,
             )?;
-            return Ok(infer_server::openai_router(
+            return Ok(infer_server::coordinator_local_router(
                 serve,
                 tokenizer,
                 model_id,
                 config.max_thinking_tokens,
+                Some(infer_plan::MultimodalKind::Gemma4),
             ));
         }
         if infer_metal::model_dir_is_gemma4(&resolved) {
             let (serve, tokenizer, model_id) =
                 metal_gemma4_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
-            return Ok(infer_server::openai_router(
+            return Ok(infer_server::coordinator_local_router(
                 serve,
                 tokenizer,
                 model_id,
                 config.max_thinking_tokens,
+                Some(infer_plan::MultimodalKind::Gemma4),
             ));
         }
         if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
             let (serve, tokenizer, model_id) =
                 metal_deepseek_ocr_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
-            return Ok(infer_server::openai_router(
+            return Ok(infer_server::coordinator_local_router(
                 serve,
                 tokenizer,
                 model_id,
                 config.max_thinking_tokens,
+                Some(infer_plan::MultimodalKind::DeepseekOcr),
             ));
         }
         let (serve, tokenizer, model_id) =
@@ -1251,6 +1254,7 @@ mod backend {
             tokenizer,
             model_id,
             config.max_thinking_tokens,
+            None,
         ))
     }
 
@@ -2006,6 +2010,7 @@ mod backend {
             tokenizer,
             model_id,
             config.max_thinking_tokens,
+            None,
         ))
     }
 
@@ -2158,6 +2163,7 @@ mod backend {
             tokenizer,
             model_id,
             config.max_thinking_tokens,
+            None,
         ))
     }
 
@@ -2176,6 +2182,7 @@ mod backend {
             tokenizer,
             model_id,
             config.max_thinking_tokens,
+            None,
         ))
     }
 
@@ -2211,6 +2218,7 @@ mod backend {
             tokenizer,
             model_id,
             config.max_thinking_tokens,
+            None,
         ))
     }
 
