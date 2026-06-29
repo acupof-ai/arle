@@ -106,15 +106,15 @@ pub fn plan_recall(cache_len: usize, block_scores: &[f32], cfg: &RecallConfig) -
 
     // Assemble sink + selected blocks + local, then merge adjacent ranges so the
     // gather does the fewest slices.
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(idx.len() + 2);
-    if cfg.n_init > 0 {
-        ranges.push((0, cfg.n_init));
-    }
-    for &b in &idx {
-        let start = mid_lo + b * cfg.l_bs;
-        ranges.push((start, start + cfg.l_bs));
-    }
-    ranges.push((local_start, cache_len));
+    let ranges: Vec<(usize, usize)> = (cfg.n_init > 0)
+        .then_some((0, cfg.n_init))
+        .into_iter()
+        .chain(idx.iter().map(|&b| {
+            let s = mid_lo + b * cfg.l_bs;
+            (s, s + cfg.l_bs)
+        }))
+        .chain(std::iter::once((local_start, cache_len)))
+        .collect();
     RecallPlan {
         ranges: merge_adjacent(ranges),
         recalled_blocks: idx,
