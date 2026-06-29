@@ -423,38 +423,6 @@ fn history_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".arle-history"))
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn legacy_history_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".arle-history"))
-}
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn migrate_legacy_history(path: &Path) {
-    if path.exists() {
-        return;
-    }
-    let Some(legacy_path) = legacy_history_path() else {
-        return;
-    };
-    if !legacy_path.exists() {
-        return;
-    }
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        log::debug!("Skipping history migration to {}: {err}", path.display());
-        return;
-    }
-    if let Err(err) = std::fs::copy(&legacy_path, path) {
-        log::debug!(
-            "Skipping history migration from {} to {}: {err}",
-            legacy_path.display(),
-            path.display()
-        );
-    }
-}
-
 /// Read one logical input from rustyline. Lines ending with `\` are joined
 /// with `\n` until a line without a trailing backslash is entered.
 ///
@@ -570,9 +538,6 @@ fn run_interactive_repl(
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
 
-    if let Some(path) = history.as_ref() {
-        migrate_legacy_history(path);
-    }
     if let Some(path) = history.as_ref()
         && let Err(err) = editor.load_history(path)
     {
