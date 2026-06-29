@@ -464,24 +464,22 @@ impl MetalExecutor {
     /// Feature-free placeholder forward: one deterministic token per scheduled
     /// row, so the submit/poll seam is exercisable on CPU without MLX.
     fn placeholder_forward(plan: &ForwardPlan) -> StepOutput {
-        let mut tokens = Vec::with_capacity(plan.decode_rows.len() + plan.prefill_rows.len());
-        for row in &plan.decode_rows {
-            tokens.push(SlotToken {
+        let tokens = plan
+            .decode_rows
+            .iter()
+            .map(|row| SlotToken {
                 slot: row.slot,
                 token: row.last_token.wrapping_add(1),
                 logprob: None,
                 finish: None,
-            });
-        }
-        for row in &plan.prefill_rows {
-            let token = row.tokens.last().copied().unwrap_or(0).wrapping_add(1);
-            tokens.push(SlotToken {
+            })
+            .chain(plan.prefill_rows.iter().map(|row| SlotToken {
                 slot: row.slot,
-                token,
+                token: row.tokens.last().copied().unwrap_or(0).wrapping_add(1),
                 logprob: None,
                 finish: None,
-            });
-        }
+            }))
+            .collect();
         StepOutput { tokens }
     }
 }
