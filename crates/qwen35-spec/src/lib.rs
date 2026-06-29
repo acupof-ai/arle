@@ -963,24 +963,16 @@ impl Qwen35Config {
         let ids = match fs::read_to_string(&generation_config_path) {
             Ok(content) => {
                 let value: serde_json::Value = serde_json::from_str(&content)?;
-                let mut ids = Vec::new();
-                if let Some(eos) = value.get("eos_token_id") {
-                    match eos {
-                        serde_json::Value::Number(number) => {
-                            if let Some(id) = number.as_u64() {
-                                ids.push(id as u32);
-                            }
-                        }
-                        serde_json::Value::Array(array) => {
-                            for item in array {
-                                if let Some(id) = item.as_u64() {
-                                    ids.push(id as u32);
-                                }
-                            }
-                        }
-                        _ => {}
+                let ids: Vec<u32> = match value.get("eos_token_id") {
+                    Some(serde_json::Value::Number(n)) => {
+                        n.as_u64().into_iter().map(|id| id as u32).collect()
                     }
-                }
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|id| id as u32))
+                        .collect(),
+                    _ => vec![],
+                };
                 if ids.is_empty() {
                     vec![fallback_eos]
                 } else {
