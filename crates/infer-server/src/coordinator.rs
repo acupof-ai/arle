@@ -284,9 +284,7 @@ async fn submit_and_collect(
     while let Some(delta) = rx.recv().await {
         generated_tokens.extend_from_slice(&delta.token_ids);
         let done = delta.is_done();
-        if delta.error.is_some() {
-            error = delta.error;
-        }
+        error = error.or(delta.error);
         if done {
             finish = delta.finish_reason;
             break;

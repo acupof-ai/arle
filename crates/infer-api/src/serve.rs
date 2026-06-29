@@ -170,11 +170,15 @@ pub const DEFAULT_MTP_DRAFT_TOPK: usize = 1;
 
 impl ServeSpecOptions {
     #[must_use]
+    pub fn mtp_enabled(&self) -> bool {
+        self.mtp_draft_tokens.is_some() || self.mtp_draft_topk.is_some()
+    }
+
+    #[must_use]
     pub fn requested(&self) -> bool {
         self.spec_type != ServeSpecType::None
             || self.mtp_draft_model.is_some()
-            || self.mtp_draft_tokens.is_some()
-            || self.mtp_draft_topk.is_some()
+            || self.mtp_enabled()
     }
 }
 
@@ -206,9 +210,7 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
              CUDA DSv4 uses the checkpoint-native MTP head"
         );
     }
-    let spec_type = if opts.spec.spec_type == ServeSpecType::None
-        && (opts.spec.mtp_draft_tokens.is_some() || opts.spec.mtp_draft_topk.is_some())
-    {
+    let spec_type = if opts.spec.spec_type == ServeSpecType::None && opts.spec.mtp_enabled() {
         ServeSpecType::Mtp
     } else {
         opts.spec.spec_type
