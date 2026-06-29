@@ -99,12 +99,13 @@ where
         std::hint::black_box(route());
     }
 
-    let mut times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        let started = Instant::now();
-        std::hint::black_box(route());
-        times.push(started.elapsed().as_secs_f64());
-    }
+    let mut times: Vec<f64> = (0..RUNS)
+        .map(|_| {
+            let started = Instant::now();
+            std::hint::black_box(route());
+            started.elapsed().as_secs_f64()
+        })
+        .collect();
     times.sort_by(f64::total_cmp);
     let median = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;
