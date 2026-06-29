@@ -206,18 +206,20 @@ fn render_pdf_pages(pdf_path: &Path, page_selection: Option<&[usize]>) -> Result
             "[ocr] Rendering {} selected PDF pages...",
             page_selection.len()
         );
-        let mut pngs = Vec::with_capacity(page_selection.len());
-        for page in page_selection {
-            let prefix = dir.join(format!("page-{page}"));
-            run_pdftoppm(&renderer, pdf_path, &prefix, Some(*page))
-                .with_context(|| format!("render pdf page {page} failed"))?;
-            let png = prefix.with_extension("png");
-            ensure!(
-                png.exists(),
-                "pdf renderer `{renderer}` produced no image for page {page}"
-            );
-            pngs.push(png);
-        }
+        let pngs = page_selection
+            .iter()
+            .map(|page| {
+                let prefix = dir.join(format!("page-{page}"));
+                run_pdftoppm(&renderer, pdf_path, &prefix, Some(*page))
+                    .with_context(|| format!("render pdf page {page} failed"))?;
+                let png = prefix.with_extension("png");
+                ensure!(
+                    png.exists(),
+                    "pdf renderer `{renderer}` produced no image for page {page}"
+                );
+                Ok(png)
+            })
+            .collect::<Result<Vec<_>>>()?;
         return Ok(pngs);
     }
     eprintln!("[ocr] Rendering all PDF pages...");
