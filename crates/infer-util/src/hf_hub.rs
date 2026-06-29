@@ -374,8 +374,7 @@ fn snapshot_dirs(cache_repo_dir: &Path) -> Vec<PathBuf> {
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .collect();
-    snapshots.sort();
-    snapshots.reverse();
+    snapshots.sort_unstable_by(|a, b| b.cmp(a));
     snapshots
 }
 

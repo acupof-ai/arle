@@ -1668,25 +1668,19 @@ mod testing {
     /// `last_token + 1`. Real backends sample; the mocks just need a deterministic
     /// monotonically-advancing token so the engine's slot bookkeeping is exercised.
     fn echo_tokens(plan: &ForwardPlan) -> Vec<SlotToken> {
-        let mut tokens = Vec::new();
-        for row in &plan.prefill_rows {
-            let token = row.tokens.last().copied().map_or(1, |last| last + 1);
-            tokens.push(SlotToken {
-                slot: row.slot,
-                token,
-                logprob: None,
-                finish: None,
-            });
-        }
-        for row in &plan.decode_rows {
-            tokens.push(SlotToken {
-                slot: row.slot,
-                token: row.last_token + 1,
-                logprob: None,
-                finish: None,
-            });
-        }
-        tokens
+        let prefill = plan.prefill_rows.iter().map(|row| SlotToken {
+            slot: row.slot,
+            token: row.tokens.last().copied().map_or(1, |last| last + 1),
+            logprob: None,
+            finish: None,
+        });
+        let decode = plan.decode_rows.iter().map(|row| SlotToken {
+            slot: row.slot,
+            token: row.last_token + 1,
+            logprob: None,
+            finish: None,
+        });
+        prefill.chain(decode).collect()
     }
 
     impl BackendExecutor for MockExecutor {
