@@ -895,17 +895,16 @@ fn session_prompt_messages(
     user_input: &str,
     images: &[ChatPromptImage],
 ) -> Vec<ChatPromptMessage> {
-    let mut messages = Vec::new();
-    for message in session.messages() {
-        let role = message.role.as_str();
-        if role == "tool" || !message.tool_calls.is_empty() {
-            continue;
-        }
-        if role == "system" && message.content.trim().is_empty() {
-            continue;
-        }
-        messages.push(ChatPromptMessage::new(role, message.content.clone()));
-    }
+    let mut messages: Vec<ChatPromptMessage> = session
+        .messages()
+        .filter(|m| {
+            let role = m.role.as_str();
+            role != "tool"
+                && m.tool_calls.is_empty()
+                && !(role == "system" && m.content.trim().is_empty())
+        })
+        .map(|m| ChatPromptMessage::new(m.role.as_str(), m.content.clone()))
+        .collect();
     messages.push(ChatPromptMessage::user_with_images(
         user_input,
         images.to_vec(),
