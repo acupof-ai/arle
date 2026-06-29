@@ -179,11 +179,8 @@ fn is_weighted_model_dir(path: &Path) -> bool {
         return false;
     };
     entries.filter_map(std::result::Result::ok).any(|entry| {
-        entry.path().is_file()
-            && matches!(
-                entry.path().extension().and_then(|ext| ext.to_str()),
-                Some("safetensors")
-            )
+        let p = entry.path();
+        p.is_file() && p.extension().is_some_and(|e| e == "safetensors")
     })
 }
 
