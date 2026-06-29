@@ -530,6 +530,7 @@ pub(crate) struct Qwen35RecurrentSnapshot {
 
 impl Qwen35RecurrentSnapshot {
     /// Approximate host byte size (for cap accounting).
+    #[allow(dead_code)]
     pub(crate) fn host_bytes(&self) -> usize {
         self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()

@@ -3285,6 +3285,7 @@ pub(crate) struct Qwen35CudaExecutor {
 
     /// Model checkpoint path for deriving the weights epoch tag at durable
     /// NVMe spill time (`set_kv_recall` / `set_kv_tier_disk`).
+    #[allow(dead_code)]
     model_path: std::path::PathBuf,
     /// Weights-version tag from the checkpoint (`weights_epoch_tag`). Stamped
     /// into the durable recall manifest so a restart drops stale KV after an
