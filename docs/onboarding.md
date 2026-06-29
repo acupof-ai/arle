@@ -106,7 +106,7 @@ crates/cli/src/train_cli.rs → train::opd → autograd
 
 | 你要改… | 先读 | 模块入口 crate |
 | --- | --- | --- |
-| HTTP / OpenAI API | `crates/infer-server/src/http.rs`、`schema.rs` | `infer-server` |
+| HTTP / OpenAI API | `crates/infer-server/src/coordinator.rs`、`schema.rs` | `infer-server` |
 | 连续批调度 / batching | `crates/infer-core/src/planner.rs`、`lib.rs`（Engine） | `infer-core` |
 | KV pool / prefix cache | `crates/infer-core/src/prefix.rs`、`radix.rs`；seam 契约 `crates/infer-seam/src/kv.rs` | `infer-core` + `infer-seam` |
 | CUDA kernel | `crates/cuda-kernels/csrc/` | [`crates/cuda-kernels/AGENTS.md`](../crates/cuda-kernels/AGENTS.md) |

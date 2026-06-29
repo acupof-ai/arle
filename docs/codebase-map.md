@@ -118,7 +118,8 @@ Key files:
 src/main.rs -> cli::run()
   -> cli/src/serve.rs  (front-door arg parse + backend resolution)
   -> infer_api front door (feature-selected backend)
-       infer_server::ServeHandle::spawn (engine thread + OpenAI/axum HTTP facade)
+       infer_server::ServeHandle::spawn (engine thread)
+       + infer_server::coordinator_local_router / coordinator_router (single HTTP facade for all backends)
        -> infer_core::Engine<E, K>  (scheduler + radix prefix + overlap)
           -> infer_cuda::CudaExecutor   (CUDA: paged KV, TileLang + native CUDA, TP/EP, DSv4-Flash)
           -> infer_metal::MetalExecutor (Metal: MLX packed varlen decode)
@@ -130,11 +131,15 @@ Key files:
 - `crates/cli/src/serve.rs`: `arle serve` front-door — backend resolution +
   invocation (arg parse, port/bind, backend label)
 - `crates/infer-server/src/lib.rs`: `ServeHandle::spawn` / `submit` / `collect`
-  engine thread
+  engine thread; `coordinator_local_router` (single-process: wraps ServeHandle in
+  an in-process relay)
 - `crates/infer-server/src/execution.rs`: per-request execution loop driving the
   engine
-- `crates/infer-server/src/http.rs` + `crates/infer-server/src/schema.rs`:
-  OpenAI v1 wire facade (axum) and the fixed request/response schema
+- `crates/infer-server/src/coordinator.rs` + `crates/infer-server/src/schema.rs`:
+  the one OpenAI v1 HTTP facade (axum) for all backends — chat/completions, models,
+  `/v1/stats`, `/metrics`; schema and request/response types
+- `crates/infer-server/src/multiproc_relay.rs`: relay protocol (`RelayCoordinator`,
+  `LocalChannel*` in-process variant, `WireStats`)
 - `crates/infer-server/src/tokenizer.rs`: tokenizer wiring for the serve path
 - `crates/infer-core/src/lib.rs`: device-neutral `Engine<E, K>` + `SchedulerConfig`
 - `crates/infer-cuda/src/executor.rs`: CUDA `BackendExecutor` impl
@@ -288,9 +293,17 @@ host-only seam with zero device coupling.
 > Old home: `infer/src/http_server.rs` + `infer/src/http_server/openai_v1.rs`.
 
 - `crates/infer-server/src/lib.rs` + `execution.rs`: the `ServeHandle` engine
-  loop.
-- `crates/infer-server/src/http.rs` + `schema.rs`: the fixed OpenAI wire facade
-  (axum) and schema.
+  loop; `coordinator_local_router` entry for single-process backends (wraps
+  ServeHandle in `RelayCoordinator::new_local()` + `serve_handle_relay_driver`).
+- `crates/infer-server/src/coordinator.rs` + `schema.rs`: the **single** OpenAI v1
+  HTTP facade used by all backends (single-process and multi-process alike) —
+  `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/stats`, `/metrics`.
+- `crates/infer-server/src/multiproc_relay.rs`: relay protocol shared by both paths
+  (`RelayCoordinator`; TCP channels for multi-process, `LocalChannel*` in-process
+  for single-process).
+- `crates/infer-server/src/multimodal.rs`: image extract / preprocess helpers for
+  vision backends (Gemma4, DeepSeek-OCR, DiffusionGemma) routed via
+  `LocalMultimodalTx` in-process channel to `run_on_executor`.
 - `crates/infer-server/src/tokenizer.rs`: tokenizer wiring.
 
 Metal is wired via the `metal` feature; non-Metal builds fall back to an
@@ -469,7 +482,7 @@ CI (`.github/workflows/ci.yml`) builds and tests `infer-api`, `cli`, the
 - The front door: `crates/infer-api/src/lib.rs` (`InferenceEngine` /
   `LoadedInferenceEngine`) → `crates/infer-api/src/serve_engine.rs`.
 - Serving: `crates/infer-server/src/lib.rs` (`ServeHandle::spawn` / `submit` /
-  `collect`).
+  `collect`) + `coordinator.rs` (HTTP facade).
 - Agent CLI path: `src/main.rs` → `crates/cli/src/lib.rs` →
   `crates/infer-api/src/lib.rs` → `crates/agent/src/lib.rs`.
 - Model discovery: `crates/infer-util/src/hf_hub.rs` (`resolve_model_source`)
