@@ -1001,7 +1001,6 @@ fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
     Ok(records)
 }
 
-
 /// File-backed mmap page-slot store — one file per disk tier namespace, a
 /// fixed-size slot per page. Writes memcpy into the mapping (no per-page
 /// syscall); reads return `&[u8]` slices directly from the mapping (zero-copy).
@@ -1060,10 +1059,7 @@ impl KvMmapStore {
                 .map_mut(&file)?
         };
 
-        let mut free_list = Vec::with_capacity(num_slots as usize);
-        for i in 0..num_slots {
-            free_list.push(i);
-        }
+        let free_list: Vec<u32> = (0..num_slots).collect();
 
         Ok(Self {
             _file: file,
@@ -1083,10 +1079,7 @@ impl KvMmapStore {
             .and_then(|t| usize::try_from(t).ok())
             .ok_or_else(|| invalid("total bytes overflow"))?;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
         let actual = file.metadata()?.len() as usize;
         if actual < total_bytes {
             return Err(io::Error::new(
