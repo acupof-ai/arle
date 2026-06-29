@@ -63,10 +63,6 @@ pub struct CounterSnapshot {
 /// it each tick, the frontend reads it.
 type CounterHandle = Arc<Mutex<CounterSnapshot>>;
 
-fn submit_trace_enabled() -> bool {
-    std::env::var_os("ARLE_SERVE_SUBMIT_TRACE").is_some()
-}
-
 /// Publish the engine's current counters to the shared snapshot.
 fn publish_counters<E: BackendExecutor, K: KvPool>(
     engine: &Engine<E, K>,
@@ -156,7 +152,7 @@ fn engine_loop_with_tick_broadcaster<E, K>(
     // observer installed below; entries are removed when their `Done` is emitted.
     let streamers: Streamers = Rc::new(RefCell::new(HashMap::new()));
     let mut submit_open = true;
-    let trace_submit = submit_trace_enabled();
+    let trace_submit = crate::submit_trace_enabled();
 
     // Forward each committed token to its request's live stream (if any). Runs on
     // the engine thread inside `engine.step()`, so it shares `streamers` via the
