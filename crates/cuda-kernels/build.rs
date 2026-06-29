@@ -505,34 +505,31 @@ fn normalize_ws(s: &str) -> String {
 /// `flashqla_specs` loops ran unconditionally regardless of `gdr_only`. The
 /// flashqla gate (sm90 + env flag) is applied by the caller.
 fn registry_to_specs(reg: &Registry, gdr_only: bool) -> Vec<(TileLangKernelSpec, &RegKernel)> {
-    let mut out = Vec::new();
-    for k in &reg.kernels {
-        let is_gdr = k.kernel_family == "gdr";
-        let is_flashqla = k.kernel_family == "flashqla";
-        if gdr_only && !is_gdr && !is_flashqla {
-            continue; // attention/fp8 stubbed by write_tilelang_attention_stub_sources
-        }
-        let abi = reg
-            .abis
-            .get(&k.abi)
-            .unwrap_or_else(|| panic!("kernel {} references unknown abi {}", k.kernel_name, k.abi));
-        let spec = TileLangKernelSpec {
-            artifact_dir: k.artifact_dir.clone(),
-            kernel_path: k.py_module.clone(),
-            kernel_name: k.kernel_name.clone(),
-            out_name: k.out_name.clone(),
-            kernel_family: k.kernel_family.clone(),
-            kernel_key: k.kernel_key.clone(),
-            num_q_heads: k.q_heads,
-            num_kv_heads: k.kv_heads,
-            public_decl: abi.c_decl.clone(),
-            extern_decl: abi.c_decl.clone(),
-            call_args: abi.call_args.clone(),
-            allow_sm70: k.allow_sm70,
-        };
-        out.push((spec, k));
-    }
-    out
+    reg.kernels
+        .iter()
+        // attention/fp8 stubbed by write_tilelang_attention_stub_sources
+        .filter(|k| !gdr_only || k.kernel_family == "gdr" || k.kernel_family == "flashqla")
+        .map(|k| {
+            let abi = reg.abis.get(&k.abi).unwrap_or_else(|| {
+                panic!("kernel {} references unknown abi {}", k.kernel_name, k.abi)
+            });
+            let spec = TileLangKernelSpec {
+                artifact_dir: k.artifact_dir.clone(),
+                kernel_path: k.py_module.clone(),
+                kernel_name: k.kernel_name.clone(),
+                out_name: k.out_name.clone(),
+                kernel_family: k.kernel_family.clone(),
+                kernel_key: k.kernel_key.clone(),
+                num_q_heads: k.q_heads,
+                num_kv_heads: k.kv_heads,
+                public_decl: abi.c_decl.clone(),
+                extern_decl: abi.c_decl.clone(),
+                call_args: abi.call_args.clone(),
+                allow_sm70: k.allow_sm70,
+            };
+            (spec, k)
+        })
+        .collect()
 }
 
 // ---- FFI emitter: registry -> OUT_DIR/ffi_tilelang_generated.rs ------------
@@ -769,14 +766,18 @@ fn find_tilelang_python() -> Result<String, String> {
     let tool_venv = PathBuf::from("tools/tilelang/.venv/bin/python");
     let local_venv = PathBuf::from(".venv/bin/python");
     let mut diagnostics = Vec::new();
-    let mut candidates = Vec::new();
-    if tool_venv.exists() {
-        candidates.push(tool_venv.to_string_lossy().to_string());
-    }
-    if local_venv.exists() {
-        candidates.push(local_venv.to_string_lossy().to_string());
-    }
-    candidates.extend(["python3".to_string(), "python".to_string()]);
+    let candidates: Vec<String> = [
+        tool_venv
+            .exists()
+            .then(|| tool_venv.to_string_lossy().to_string()),
+        local_venv
+            .exists()
+            .then(|| local_venv.to_string_lossy().to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(["python3".to_string(), "python".to_string()])
+    .collect();
 
     for candidate in candidates {
         match probe_tilelang_python(&candidate) {
