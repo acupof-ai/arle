@@ -270,10 +270,10 @@ pub fn emit_run_start(
     scalars: &[(&str, f64)],
     bools: &[(&str, bool)],
 ) {
-    let mut strings = Vec::with_capacity(extra_strings.len() + 2);
-    strings.push(("run_id", run_id));
-    strings.push(("job", job));
-    strings.extend(extra_strings.iter().copied());
+    let strings: Vec<(&str, &str)> = [("run_id", run_id), ("job", job)]
+        .into_iter()
+        .chain(extra_strings.iter().copied())
+        .collect();
     metrics.emit_event(&TrainEvent {
         kind: "run_start",
         step: Some(step),
