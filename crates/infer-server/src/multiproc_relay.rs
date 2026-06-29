@@ -244,6 +244,33 @@ pub struct WireStats {
 }
 
 impl WireStats {
+    /// Reverse of [`from_counters`]: reconstruct a [`crate::CounterSnapshot`] from
+    /// wire stats. Fields not carried by the wire protocol (kv_tier, kv_system)
+    /// are zeroed.
+    pub fn into_counter_snapshot(self) -> crate::CounterSnapshot {
+        crate::CounterSnapshot {
+            active_requests: self.active_requests,
+            queue_depth: self.queue_depth,
+            kv_free_pages: self.kv_free_pages,
+            throughput: infer_core::ThroughputStats {
+                steps: self.throughput_steps,
+                prefill_tokens: self.throughput_prefill_tokens,
+                generated_tokens: self.throughput_generated_tokens,
+                requests_completed: self.throughput_requests_completed,
+            },
+            prefix_cache: infer_core::PrefixCacheStats {
+                lookups: self.prefix_lookups,
+                hits: self.prefix_hits,
+                hit_tokens: self.prefix_hit_tokens,
+                hit_pages: self.prefix_hit_pages,
+                published_pages: self.prefix_published_pages,
+                cached_pages: self.prefix_cached_pages,
+            },
+            kv_tier: Default::default(),
+            kv_system: Default::default(),
+        }
+    }
+
     /// Build from a [`crate::CounterSnapshot`] (single-process local backend).
     pub fn from_counters(c: &crate::CounterSnapshot) -> Self {
         Self {
