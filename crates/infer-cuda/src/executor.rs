@@ -3355,7 +3355,11 @@ impl Qwen35CudaExecutor {
         if !slot_state.has_recurrent() {
             return Ok(()); // pure full-attn path — nothing to capture
         }
-        let mat_len = slot_state.seq_len().min(tokens.len());
+        // ponytail: page-align so the capture key matches restore's matched_len (radix
+        // returns a page-16-aligned length). Raw seq_len is 16-aligned only ~1/16 of
+        // the time → every restore missed → zeroed recurrent state → 0 edits / 0 accepts.
+        let mat_len =
+            (slot_state.seq_len().min(tokens.len()) / SUPPORTED_PAGE_SIZE) * SUPPORTED_PAGE_SIZE;
         if mat_len == 0 {
             return Ok(());
         }
