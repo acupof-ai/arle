@@ -603,27 +603,29 @@ pub fn cat_heads(
         });
     }
     let (batch, seq, head_dim) = (first_shape[0], first_shape[2], first_shape[3]);
-    let mut head_counts = Vec::with_capacity(inputs.len());
-    let mut total_heads = 0usize;
-    let mut requires_grad = false;
-    for &id in inputs {
-        let t = store.tensor(id)?;
-        if t.shape.len() != 4 {
-            return Err(AutogradError::InvalidRank {
-                expected: "4",
-                got: t.shape.len(),
-            });
-        }
-        if t.shape[0] != batch || t.shape[2] != seq || t.shape[3] != head_dim {
-            return Err(AutogradError::ShapeMismatch {
-                expected: first_shape.clone(),
-                got: t.shape.clone(),
-            });
-        }
-        head_counts.push(t.shape[1]);
-        total_heads += t.shape[1];
-        requires_grad |= t.requires_grad;
-    }
+    let head_counts: Vec<usize> = inputs
+        .iter()
+        .map(|&id| {
+            let t = store.tensor(id)?;
+            if t.shape.len() != 4 {
+                return Err(AutogradError::InvalidRank {
+                    expected: "4",
+                    got: t.shape.len(),
+                });
+            }
+            if t.shape[0] != batch || t.shape[2] != seq || t.shape[3] != head_dim {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: first_shape.clone(),
+                    got: t.shape.clone(),
+                });
+            }
+            Ok(t.shape[1])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let total_heads: usize = head_counts.iter().sum();
+    let requires_grad = inputs
+        .iter()
+        .any(|&id| store.tensor(id).map_or(false, |t| t.requires_grad));
 
     let out_shape = vec![batch, total_heads, seq, head_dim];
     let mut data = vec![0.0_f32; batch * total_heads * seq * head_dim];
