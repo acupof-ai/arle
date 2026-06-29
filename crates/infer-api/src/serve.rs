@@ -271,6 +271,13 @@ pub fn serve_coordinator_http(
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
 
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 fn bind_and_serve(
     bind: &str,
     port: u16,
