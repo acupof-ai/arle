@@ -139,8 +139,7 @@ impl Default for ServeShutdown {
 /// Receipt for a submitted request.
 ///
 /// Holds the engine-assigned [`RequestHandle`] and the private back-channel on
-/// which that request's [`CompletedRequest`] will arrive. Collect the result
-/// via [`RequestTicket::collect`] or [`ServeHandle::collect`].
+/// which that request's [`CompletedRequest`] will arrive. Collect via [`RequestTicket::collect`].
 pub struct RequestTicket {
     handle: RequestHandle,
     completion_rx: Receiver<CompletedRequest>,
@@ -617,25 +616,17 @@ where
     let (relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
     let serve = Arc::new(serve);
 
-    let coord_multimodal = if let Some(kind) = multimodal_kind {
-        let (multimodal_tx, multimodal_rx) =
-            std::sync::mpsc::sync_channel::<LocalMultimodalRequest>(8);
-        std::thread::Builder::new()
-            .name("arle-local-relay-driver".to_string())
-            .spawn(move || {
-                serve_handle_relay_driver(serve, engine_recv, engine_tx, Some(multimodal_rx));
-            })
-            .expect("spawn arle-local-relay-driver");
-        Some((multimodal_tx, kind))
-    } else {
-        std::thread::Builder::new()
-            .name("arle-local-relay-driver".to_string())
-            .spawn(move || {
-                serve_handle_relay_driver(serve, engine_recv, engine_tx, None);
-            })
-            .expect("spawn arle-local-relay-driver");
-        None
+    let (multimodal_rx, coord_multimodal) = match multimodal_kind {
+        Some(kind) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<LocalMultimodalRequest>(8);
+            (Some(rx), Some((tx, kind)))
+        }
+        None => (None, None),
     };
+    std::thread::Builder::new()
+        .name("arle-local-relay-driver".to_string())
+        .spawn(move || serve_handle_relay_driver(serve, engine_recv, engine_tx, multimodal_rx))
+        .expect("spawn arle-local-relay-driver");
 
     coordinator::coordinator_router(
         relay,
@@ -655,18 +646,13 @@ fn relay_stream(
     for item in rx {
         let delta = match item {
             execution::StreamItem::Token { token, .. } => multiproc_relay::RelayCompletionDelta {
-                text_delta: String::new(),
                 token_ids: vec![token],
-                finish: false,
-                finish_reason: None,
-                error: None,
+                ..Default::default()
             },
             execution::StreamItem::Done(completed) => multiproc_relay::RelayCompletionDelta {
-                text_delta: String::new(),
-                token_ids: Vec::new(),
                 finish: true,
                 finish_reason: completed.finish.clone(),
-                error: None,
+                ..Default::default()
             },
         };
         if tx
@@ -776,11 +762,9 @@ fn serve_handle_relay_driver<E, K>(
                             let _ = engine_tx.send(RelayEnvelope::Completion {
                                 request_id,
                                 delta: multiproc_relay::RelayCompletionDelta {
-                                    text_delta: String::new(),
-                                    token_ids: Vec::new(),
                                     finish: true,
-                                    finish_reason: None,
                                     error: Some(e.to_string()),
+                                    ..Default::default()
                                 },
                             });
                         }
