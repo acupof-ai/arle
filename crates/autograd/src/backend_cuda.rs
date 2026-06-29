@@ -6263,21 +6263,22 @@ fn cuda_clip_grad_norm_device(
     }
 
     let scale = (f64::from(max_norm) / pre_clip_norm) as f32;
-    let mut out_slices = Vec::with_capacity(grads.len());
-    for (_, shape) in grads {
-        let size = shape_size(shape);
-        out_slices.push(backend.stream.alloc_zeros::<f32>(size).map_err(|_| {
-            AutogradError::TapeInvariant("cuda alloc_zeros failed (grad_clip scaled)")
-        })?);
-    }
+    let mut out_slices = grads
+        .iter()
+        .map(|(_, shape)| {
+            backend
+                .stream
+                .alloc_zeros::<f32>(shape_size(shape))
+                .map_err(|_| {
+                    AutogradError::TapeInvariant("cuda alloc_zeros failed (grad_clip scaled)")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut out_ptrs = Vec::with_capacity(out_slices.len());
-    let mut out_guards = Vec::with_capacity(out_slices.len());
-    for out in &mut out_slices {
-        let (ptr, guard) = out.device_ptr_mut(&backend.stream);
-        out_ptrs.push(ptr);
-        out_guards.push(guard);
-    }
+    let (out_ptrs, out_guards): (Vec<_>, Vec<_>) = out_slices
+        .iter_mut()
+        .map(|out| out.device_ptr_mut(&backend.stream))
+        .unzip();
     let mut d_out_ptrs = backend
         .stream
         .clone_htod(&out_ptrs)

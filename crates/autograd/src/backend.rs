@@ -1278,19 +1278,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             });
         }
         let rows = shape_size(shape) / vocab;
-        let mut out = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let base = row * vocab;
-            let mut best_idx = 0usize;
-            let mut best_val = f32::NEG_INFINITY;
-            for (idx, &value) in host[base..base + vocab].iter().enumerate() {
-                if value > best_val {
-                    best_val = value;
-                    best_idx = idx;
-                }
-            }
-            out.push(best_idx as f32);
-        }
+        let out: Vec<f32> = host
+            .chunks(vocab)
+            .take(rows)
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map_or(0.0, |(idx, _)| idx as f32)
+            })
+            .collect();
         self.upload(&out, &[rows])
     }
 
@@ -2429,13 +2426,14 @@ pub fn dequantize_fp8_block_scaled_host(
     let rows = shape[0];
     let cols = shape[1];
     let scale_cols = cols.div_ceil(block_k);
-    let mut out = Vec::with_capacity(weight.len());
-    for row in 0..rows {
-        for col in 0..cols {
-            let scale = scales[(row / block_m) * scale_cols + (col / block_k)];
-            out.push(fp8_e4m3_to_f32(weight[row * cols + col]) * scale);
-        }
-    }
+    let out = (0..rows)
+        .flat_map(|row| {
+            (0..cols).map(move |col| {
+                let scale = scales[(row / block_m) * scale_cols + (col / block_k)];
+                fp8_e4m3_to_f32(weight[row * cols + col]) * scale
+            })
+        })
+        .collect();
     Ok(out)
 }
 
