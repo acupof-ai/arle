@@ -1011,14 +1011,10 @@ pub fn render_structured_chatml_with_spans(
     add_generation_prompt: bool,
 ) -> RenderedChatMl {
     let mut prompt = String::new();
-    let mut spans = Vec::with_capacity(messages.len());
-
-    for message in messages {
-        spans.push(append_structured_chatml_message_with_span(
-            &mut prompt,
-            message,
-        ));
-    }
+    let spans: Vec<_> = messages
+        .iter()
+        .map(|message| append_structured_chatml_message_with_span(&mut prompt, message))
+        .collect();
     if add_generation_prompt {
         prompt.push_str("<|im_start|>assistant\n");
     }
@@ -1298,15 +1294,10 @@ pub fn render_chatml_with_spans(
     add_generation_prompt: bool,
 ) -> RenderedChatMl {
     let mut prompt = String::new();
-    let mut spans = Vec::with_capacity(messages.len());
-
-    for message in messages {
-        spans.push(append_chatml_message_with_span(
-            &mut prompt,
-            message.role,
-            message.content,
-        ));
-    }
+    let spans: Vec<_> = messages
+        .iter()
+        .map(|message| append_chatml_message_with_span(&mut prompt, message.role, message.content))
+        .collect();
     if add_generation_prompt {
         prompt.push_str("<|im_start|>assistant\n");
     }
