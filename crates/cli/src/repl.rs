@@ -1778,29 +1778,20 @@ fn resolve_export_path(path_arg: &str) -> PathBuf {
 fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
     let ts = iso8601_utc_now();
     let turns = count_export_turns(history);
-
-    let mut out = String::new();
-    out.push_str(&format!("# ARLE conversation — {model_id}\n\n"));
-    out.push_str(&format!("> Started: {ts}\n"));
-    out.push_str("> Mode: agent\n");
-    out.push_str(&format!("> Turns: {turns}\n\n"));
-
-    for msg in history.iter().skip(1) {
-        match &msg.role {
-            chat::ChatRole::User => {
-                out.push_str("## You\n\n");
-                out.push_str(msg.content.trim_end());
-                out.push_str("\n\n");
-            }
+    let body: String = history
+        .iter()
+        .skip(1)
+        .filter_map(|msg| match &msg.role {
+            chat::ChatRole::User => Some(format!("## You\n\n{}\n\n", msg.content.trim_end())),
             chat::ChatRole::Assistant => {
-                out.push_str("## Assistant\n\n");
-                out.push_str(msg.content.trim_end());
-                out.push_str("\n\n");
+                Some(format!("## Assistant\n\n{}\n\n", msg.content.trim_end()))
             }
-            _ => { /* system / tool / other — skip */ }
-        }
-    }
-    out
+            _ => None,
+        })
+        .collect();
+    format!(
+        "# ARLE conversation — {model_id}\n\n> Started: {ts}\n> Mode: agent\n> Turns: {turns}\n\n{body}"
+    )
 }
 
 /// Minimal RFC3339 UTC timestamp, no external deps.

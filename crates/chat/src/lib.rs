@@ -86,17 +86,11 @@ impl OpenAiChatContent {
     pub fn to_text(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
-            Self::Parts(parts) => {
-                let mut out = String::new();
-                for part in parts {
-                    if part.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            out.push_str(text);
-                        }
-                    }
-                }
-                out
-            }
+            Self::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect(),
         }
     }
 
