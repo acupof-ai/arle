@@ -720,14 +720,17 @@ impl BackendExecutor for CudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
+        prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = (slot, tokens, matched_len);
+                let _ = (slot, tokens, matched_len, prefix_pages);
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.restore_prefix_sidecar(slot, tokens, matched_len),
+            CudaExecutorInner::Real(real) => {
+                real.restore_prefix_sidecar(slot, tokens, matched_len, prefix_pages)
+            }
         }
     }
 
