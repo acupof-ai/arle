@@ -34,17 +34,20 @@ fn build_optional_u8_ptr_table(
     label: &str,
     get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<u8>>,
 ) -> Result<CudaSlice<u64>> {
-    let mut host = Vec::with_capacity(experts.len());
-    for (idx, expert) in experts.iter().enumerate() {
-        let slice = get(expert).ok_or_else(|| {
-            anyhow::anyhow!(
-                "expert {idx} missing {label} for {} quant table",
-                expert.weight_format
-            )
-        })?;
-        let (ptr, _guard) = slice.device_ptr(&ctx.stream);
-        host.push(ptr);
-    }
+    let host = experts
+        .iter()
+        .enumerate()
+        .map(|(idx, expert)| {
+            let slice = get(expert).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "expert {idx} missing {label} for {} quant table",
+                    expert.weight_format
+                )
+            })?;
+            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
+            Ok(ptr)
+        })
+        .collect::<Result<Vec<_>>>()?;
     ctx.stream
         .clone_htod(&host)
         .map_err(|e| anyhow::anyhow!("expert {label} ptr table H2D failed: {e}"))
@@ -56,17 +59,20 @@ fn build_optional_f32_ptr_table(
     label: &str,
     get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<f32>>,
 ) -> Result<CudaSlice<u64>> {
-    let mut host = Vec::with_capacity(experts.len());
-    for (idx, expert) in experts.iter().enumerate() {
-        let slice = get(expert).ok_or_else(|| {
-            anyhow::anyhow!(
-                "expert {idx} missing {label} for {} quant table",
-                expert.weight_format
-            )
-        })?;
-        let (ptr, _guard) = slice.device_ptr(&ctx.stream);
-        host.push(ptr);
-    }
+    let host = experts
+        .iter()
+        .enumerate()
+        .map(|(idx, expert)| {
+            let slice = get(expert).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "expert {idx} missing {label} for {} quant table",
+                    expert.weight_format
+                )
+            })?;
+            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
+            Ok(ptr)
+        })
+        .collect::<Result<Vec<_>>>()?;
     ctx.stream
         .clone_htod(&host)
         .map_err(|e| anyhow::anyhow!("expert {label} ptr table H2D failed: {e}"))

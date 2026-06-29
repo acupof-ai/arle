@@ -1081,32 +1081,24 @@ impl TokenKVPool {
                     }
 
                     if self.format.has_scales() {
-                        let mut k_scales = Vec::with_capacity(scale_len);
-                        for chunk in payload
-                            [cursor..cursor + scale_len * std::mem::size_of::<f32>()]
-                            .chunks_exact(std::mem::size_of::<f32>())
-                        {
-                            let bytes: [u8; 4] =
-                                chunk.try_into().expect("f32 chunk size must be exact");
-                            k_scales.push(f32::from_le_bytes(bytes));
-                        }
-                        cursor += scale_len * std::mem::size_of::<f32>();
+                        let k_scales: Vec<f32> = payload
+                            [cursor..cursor + scale_len * size_of::<f32>()]
+                            .chunks_exact(size_of::<f32>())
+                            .map(|c| f32::from_le_bytes(c.try_into().expect("f32 chunk")))
+                            .collect();
+                        cursor += scale_len * size_of::<f32>();
                         let mut k_scale_view =
                             self.k_scales[layer].slice_mut(scale_start..scale_end);
                         ctx.stream
                             .memcpy_htod(&k_scales, &mut k_scale_view)
                             .map_err(|e| anyhow!("paged_kv copy K scales htod failed: {e}"))?;
 
-                        let mut v_scales = Vec::with_capacity(scale_len);
-                        for chunk in payload
-                            [cursor..cursor + scale_len * std::mem::size_of::<f32>()]
-                            .chunks_exact(std::mem::size_of::<f32>())
-                        {
-                            let bytes: [u8; 4] =
-                                chunk.try_into().expect("f32 chunk size must be exact");
-                            v_scales.push(f32::from_le_bytes(bytes));
-                        }
-                        cursor += scale_len * std::mem::size_of::<f32>();
+                        let v_scales: Vec<f32> = payload
+                            [cursor..cursor + scale_len * size_of::<f32>()]
+                            .chunks_exact(size_of::<f32>())
+                            .map(|c| f32::from_le_bytes(c.try_into().expect("f32 chunk")))
+                            .collect();
+                        cursor += scale_len * size_of::<f32>();
                         let mut v_scale_view =
                             self.v_scales[layer].slice_mut(scale_start..scale_end);
                         ctx.stream
@@ -1115,30 +1107,22 @@ impl TokenKVPool {
                     }
 
                     if self.format.has_norms() {
-                        let mut k_norms = Vec::with_capacity(scale_len);
-                        for chunk in payload
+                        let k_norms: Vec<u16> = payload
                             [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
                             .chunks_exact(std::mem::size_of::<u16>())
-                        {
-                            let bytes: [u8; 2] =
-                                chunk.try_into().expect("u16 chunk size must be exact");
-                            k_norms.push(u16::from_le_bytes(bytes));
-                        }
+                            .map(|c| u16::from_le_bytes(c.try_into().expect("u16 chunk")))
+                            .collect();
                         cursor += scale_len * std::mem::size_of::<u16>();
                         let mut k_norm_view = self.k_norms[layer].slice_mut(scale_start..scale_end);
                         ctx.stream
                             .memcpy_htod(&k_norms, &mut k_norm_view)
                             .map_err(|e| anyhow!("paged_kv copy K norms htod failed: {e}"))?;
 
-                        let mut v_norms = Vec::with_capacity(scale_len);
-                        for chunk in payload
+                        let v_norms: Vec<u16> = payload
                             [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
                             .chunks_exact(std::mem::size_of::<u16>())
-                        {
-                            let bytes: [u8; 2] =
-                                chunk.try_into().expect("u16 chunk size must be exact");
-                            v_norms.push(u16::from_le_bytes(bytes));
-                        }
+                            .map(|c| u16::from_le_bytes(c.try_into().expect("u16 chunk")))
+                            .collect();
                         cursor += scale_len * std::mem::size_of::<u16>();
                         let mut v_norm_view = self.v_norms[layer].slice_mut(scale_start..scale_end);
                         ctx.stream
@@ -1748,13 +1732,12 @@ impl TokenKVPool {
             "token range [{start_pos}, {}) exceeds seq_len={seq_len}",
             start_pos + token_count
         );
-        let mut rows = Vec::with_capacity(token_count);
-        for pos in start_pos..start_pos + token_count {
-            let page_idx = self.page_indices[slot][pos / self.page_size];
-            let offset = (pos % self.page_size) as u32;
-            rows.push(page_idx * self.page_size as u32 + offset);
-        }
-        rows
+        (start_pos..start_pos + token_count)
+            .map(|pos| {
+                let page_idx = self.page_indices[slot][pos / self.page_size];
+                page_idx * self.page_size as u32 + (pos % self.page_size) as u32
+            })
+            .collect()
     }
 
     /// Whether the pool has allocated buffers.
@@ -1953,13 +1936,10 @@ impl TokenKVPool {
 
     /// Build TileLang page-indices array (concatenated physical page ids).
     pub fn build_indices(&self, slots: &[usize]) -> Vec<i32> {
-        let mut indices = Vec::new();
-        for &slot in slots {
-            for &idx in &self.page_indices[slot] {
-                indices.push(idx as i32);
-            }
-        }
-        indices
+        slots
+            .iter()
+            .flat_map(|&slot| self.page_indices[slot].iter().map(|&idx| idx as i32))
+            .collect()
     }
 
     /// Build the token-row index of the newest token in each slot.
@@ -1982,9 +1962,10 @@ impl TokenKVPool {
 
     /// Build TileLang last_page_len array.
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
-        let mut last_page_lens = Vec::with_capacity(slots.len());
-        self.fill_last_page_lens(slots, &mut last_page_lens);
-        last_page_lens
+        slots
+            .iter()
+            .map(|&slot| self.slot_last_page_len(slot) as i32)
+            .collect()
     }
 
     pub fn fill_last_page_lens<'a>(&self, slots: &[usize], scratch: &'a mut Vec<i32>) -> &'a [i32] {
@@ -2874,12 +2855,12 @@ mod tests {
             start_pos: usize,
             token_count: usize,
         ) -> Vec<u32> {
-            let mut rows = Vec::with_capacity(token_count);
-            for pos in start_pos..start_pos + token_count {
-                let page = self.page_indices[slot][pos / self.page_size];
-                rows.push(page * self.page_size as u32 + (pos % self.page_size) as u32);
-            }
-            rows
+            (start_pos..start_pos + token_count)
+                .map(|pos| {
+                    let page = self.page_indices[slot][pos / self.page_size];
+                    page * self.page_size as u32 + (pos % self.page_size) as u32
+                })
+                .collect()
         }
 
         fn build_last_indices(&self, slots: &[usize]) -> Vec<i32> {

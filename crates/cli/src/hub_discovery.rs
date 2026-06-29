@@ -164,43 +164,37 @@ pub(crate) fn discover_hub_snapshots() -> Vec<HubSnapshot> {
         return Vec::new();
     };
 
-    let mut out: Vec<HubSnapshot> = Vec::new();
-    for repo_entry in read.flatten() {
-        let repo_dir = repo_entry.path();
-        let repo_name = repo_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if !repo_name.starts_with("models--") {
-            continue;
-        }
-        let snapshots_dir = repo_dir.join("snapshots");
-        let Ok(snaps) = fs::read_dir(&snapshots_dir) else {
-            continue;
-        };
-        for snap_entry in snaps.flatten() {
+    let mut out: Vec<HubSnapshot> = read
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("models--"))
+        })
+        .flat_map(|repo_entry| {
+            let snapshots_dir = repo_entry.path().join("snapshots");
+            fs::read_dir(snapshots_dir).into_iter().flatten().flatten()
+        })
+        .filter_map(|snap_entry| {
             let snap_path = snap_entry.path();
-            if !snap_path.is_dir() {
-                continue;
+            if !snap_path.is_dir()
+                || !snapshot_has_usable_content(&snap_path)
+                || !snapshot_is_servable(&snap_path)
+                || snapshot_is_draft_only(&snap_path)
+            {
+                return None;
             }
-            if !snapshot_has_usable_content(&snap_path) {
-                continue;
-            }
-            let Some(model_id) = decode_hub_snapshot_path(&snap_path) else {
-                continue;
-            };
             // Offer only what the compiled backend's serve path can actually
             // load (config model_type/architectures), and never a draft-only
             // half (DFlash drafts ship without a tokenizer).
-            if !snapshot_is_servable(&snap_path) || snapshot_is_draft_only(&snap_path) {
-                continue;
-            }
-            out.push(HubSnapshot {
+            let model_id = decode_hub_snapshot_path(&snap_path)?;
+            Some(HubSnapshot {
                 model_id,
                 path: snap_path,
-            });
-        }
-    }
+            })
+        })
+        .collect();
 
     out.sort_by_key(|s| std::cmp::Reverse(snapshot_mtime(&s.path)));
     out
