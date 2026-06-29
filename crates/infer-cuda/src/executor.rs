@@ -3330,12 +3330,8 @@ impl Qwen35CudaExecutor {
     /// `capture_recurrent_sidecar` after prefill and restored in
     /// `restore_recurrent_sidecar` at page-radix attach time. Pure full-attn
     /// checkpoints work identically (no sidecar to capture or restore).
-    pub(crate) fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
-        // Hybrid models need both recurrent state AND full-attention KV pages
-        // to correctly reuse a prefix. The recurrent sidecar captures linear-attn
-        // state, but full-attn KV page content is not yet cached alongside it.
-        // Disable prefix reuse until the full-attn KV sidecar is implemented.
-        0
+    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        pages_only_reusable_prefix_blocks(blocks, |_| false)
     }
 
     /// Capture the slot's recurrent state as a prefix sidecar, keyed by the
@@ -3363,7 +3359,23 @@ impl Qwen35CudaExecutor {
                 self.prefix_sidecar.remove(&evict_key);
             }
         }
-        let snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
+        let mut snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
+        // D2H snapshot full-attention KV pages so the sidecar is complete for prefix reuse.
+        // snapshot_recurrent already synchronized the stream, so device pages are flushed.
+        if let Some(pool) = self.full_attn_kv.as_ref() {
+            let pages = pool.page_indices(slot).to_vec();
+            if !pages.is_empty() {
+                match pool.copy_pages_to_host(&self.model.ctx, &pages) {
+                    Ok(data) => snap.full_attn_kv = Some(data),
+                    Err(e) => {
+                        log::warn!(
+                            "slot {slot}: full-attn KV D2H failed: {e}; skipping sidecar entry"
+                        );
+                        return Ok(()); // don't add incomplete sidecar
+                    }
+                }
+            }
+        }
         self.prefix_sidecar.insert(key, snap);
         Ok(())
     }
@@ -3383,10 +3395,6 @@ impl Qwen35CudaExecutor {
         _prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         let matched_len = matched_len.min(tokens.len());
-        // NOTE: full_attn_kv device pool is NOT synced here.
-        // reusable_prefix_blocks returns 0 for hybrid models, so this function
-        // is currently unreachable. When full-attn KV sidecar is added, this
-        // is where the H2D restore of full-attn pages will go.
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Acquire first so the device buffers exist for H2D restore.
@@ -3397,16 +3405,39 @@ impl Qwen35CudaExecutor {
             conv_len,
             &mut self.recurrent_pool,
         )?;
-        match self.prefix_sidecar.get(&key).cloned() {
-            Some(snap) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap),
+
+        let snap = self.prefix_sidecar.get(&key).cloned();
+
+        // Restore recurrent state (gdr + conv).
+        match snap.as_ref() {
+            Some(s) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, s)?,
             None => {
                 log::debug!(
                     "no recurrent sidecar for prefix matched_len={matched_len} \
                      (key={key:#018x}); starting with zeroed recurrent state"
                 );
-                Ok(())
             }
         }
+
+        // Sync device KV pool so prefill_row_paged_default sees pool.seq_len(slot) == matched_len.
+        // This must run regardless of sidecar hit/miss: free prior occupant, alloc fresh pages,
+        // optionally restore KV content from the snapshot.
+        if let Some(pool) = self.full_attn_kv.as_mut() {
+            pool.free_slot(slot);
+            let new_pages = pool.alloc_tokens(slot, matched_len).map_err(|e| {
+                anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
+            })?;
+            if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
+                // H2D: write cached KV content into the freshly allocated pages.
+                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data)
+                    .map_err(|e| {
+                        anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
+                    })?;
+            }
+            // Stream-order: the H2D copies above are ordered before any subsequent
+            // kernel on the same stream — no explicit synchronize needed here.
+        }
+        Ok(())
     }
 
     /// G3 whole-slot spill is single-rank today (mirror of DSv4's guard).

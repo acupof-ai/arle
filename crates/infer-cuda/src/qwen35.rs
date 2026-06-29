@@ -521,6 +521,9 @@ pub(crate) struct Qwen35RecurrentSnapshot {
     pub(crate) gdr: Vec<Vec<f32>>,
     /// `[num_linear]` conv1d rings (bf16), copied verbatim from device.
     pub(crate) conv: Vec<Vec<bf16>>,
+    /// Serialized full-attention KV pages captured at prefill end.
+    /// `None` when the executor has no `full_attn_kv` pool (non-paged path).
+    pub(crate) full_attn_kv: Option<Vec<u8>>,
 }
 
 impl Qwen35RecurrentSnapshot {
@@ -528,6 +531,7 @@ impl Qwen35RecurrentSnapshot {
     pub(crate) fn host_bytes(&self) -> usize {
         self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
+            + self.full_attn_kv.as_ref().map_or(0, |v| v.len())
     }
 }
 
@@ -676,7 +680,11 @@ impl Qwen35SlotState {
         ctx.stream
             .synchronize()
             .map_err(|e| anyhow!("sync after recurrent snapshot: {e}"))?;
-        Ok(Qwen35RecurrentSnapshot { gdr, conv })
+        Ok(Qwen35RecurrentSnapshot {
+            gdr,
+            conv,
+            full_attn_kv: None,
+        })
     }
 
     /// H2D restore from a sidecar snapshot. The slot MUST have acquired recurrent
