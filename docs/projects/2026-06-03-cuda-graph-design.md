@@ -187,7 +187,7 @@ Rationale, grounded in the rewrite's own altitude principle
    replays a graph or runs eager is the executor's private decision keyed off
    `plan.decode_rows.len()`. The two-arg trait is a speculative interface with no
    real engine-side caller — exactly the pattern the project bans
-   ([`feedback_no_speculative_interface_shaping.md`](../../../.claude/projects/-Users-user-code-agent-infer/memory/feedback_no_speculative_interface_shaping.md):
+   ([`feedback_no_speculative_interface_shaping.md`](../../../.claude/projects/-Users-user-code-arle/memory/feedback_no_speculative_interface_shaping.md):
    *"traits/handles trail real callers"*).
 3. **Warmup is already a seam method.** `BackendExecutor::warmup(&mut self)`
    exists (infer-seam L50-52). Graph capture *is* warmup. Engine-core calls

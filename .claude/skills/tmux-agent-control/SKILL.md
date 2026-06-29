@@ -208,7 +208,7 @@ User wants you to start a fresh peer agent (typically a peer Claude Code or Code
 
 ```bash
 # Peer Claude Code (bypassing permission prompts, in the right cwd)
-tmux new-session -d -s 6 -c /path/to/code/agent-infer 'claude --allow-dangerously-skip-permissions'
+tmux new-session -d -s 6 -c /path/to/code/arle 'claude --allow-dangerously-skip-permissions'
 
 # Peer Codex (YOLO mode)
 tmux new-session -d -s 7 -c /path/to/code/some-other-repo 'codex --dangerously-bypass-approvals-and-sandbox'

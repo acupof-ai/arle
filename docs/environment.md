@@ -39,7 +39,7 @@ document the debug-only status here.
 
 ---
 
-## 1b. Cargo Feature 决策表（root `agent-infer` 包）
+## 1b. Cargo Feature 决策表（root `arle` 包）
 
 来源：根 `Cargo.toml` `[features]`。完整说明见
 [`onboarding.md`](onboarding.md) §4。

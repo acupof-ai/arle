@@ -1,7 +1,7 @@
 # Agent-first architecture priorities
 
 **Status**: Active — opened 2026-04-13 as the top-level architecture track for
-turning `agent-infer` into the strongest inference engine for agent sequences.
+turning `arle` into the strongest inference engine for agent sequences.
 
 **Goal**: every agent turn reuses the maximum possible prior work, every tool
 call is syntactically valid on first try, and every session can survive a
@@ -250,7 +250,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 
 ### Tier C — DX: defines whether newcomers can succeed
 
-#### C1. Single `agent-infer serve` command with runtime backend detection
+#### C1. Single `arle serve` command with runtime backend detection
 - **What**: One CLI entry point that picks CUDA / Metal / CPU at runtime
   via feature detection (`nvidia-smi` / macOS sysctl / fallback). Hides
   the `--no-default-features --features metal,no-cuda,cli` matrix.
@@ -260,7 +260,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   - `crates/cli/src/args.rs` — add `serve` subcommand.
   - `infer/src/server_engine.rs::LoadedInferenceEngine::load` — runtime
     dispatch rather than compile-time cfg walls.
-- **Exit**: `cargo install agent-infer && agent-infer serve` produces a
+- **Exit**: `cargo install arle && arle serve` produces a
   working server on Linux+CUDA, macOS+Metal, and CPU fallback, with no
   feature flags.
 
@@ -275,13 +275,13 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   - `README.md` — replace Docker-first example with the Rust one.
 - **Exit**: `cargo run --example agent_loop` works on all three backends.
 
-#### C3. `GET /v1/trace/<req_id>` + `agent-infer doctor`
+#### C3. `GET /v1/trace/<req_id>` + `arle doctor`
 - **What**:
   - Trace endpoint returns the per-request event timeline captured by
     `infer::events::EventSink`: enqueue / prefill_start / first_token /
     decode_step count / completed, with per-phase milliseconds and
     `prefix_hit_tokens`.
-  - `agent-infer doctor` prints startup self-check: CUDA version, free
+  - `arle doctor` prints startup self-check: CUDA version, free
     VRAM, `hf_hub` cache location, detected model architecture, tokenizer
     sanity, recommended `--num-slots`.
 - **Why**: Agent developers cannot answer "why was this turn 6s" without
@@ -298,9 +298,9 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 #### C4. Pyo3 embedding crate
 - **What**: `crates/infer-python` exposing `infer.Engine`,
   `engine.complete`, `engine.stream` via pyo3 + maturin. Replaces the
-  currently non-existent `agent_infer/` package (CLAUDE.md references a
+  currently non-existent `arle/` package (CLAUDE.md references a
   directory that is not on disk).
-- **Why**: Research users cannot adopt `agent-infer` if they cannot
+- **Why**: Research users cannot adopt `arle` if they cannot
   `import` it. vLLM, SGLang, and llama.cpp all ship Python bindings.
 - **Where**:
   - New crate: `crates/infer-python/`.
@@ -368,7 +368,7 @@ after A1 lands.
 12. **B3** — generic HF fallback
 13. **C4** — Pyo3 embedding crate
 
-A1+A2+A3 together are what take `agent-infer` from "building blocks" to
+A1+A2+A3 together are what take `arle` from "building blocks" to
 "actually agent-grade". Everything after that compounds, but nothing after
 A4 is on the critical path for the stated goal.
 
@@ -382,7 +382,7 @@ A4 is on the critical path for the stated goal.
 - **New model families via hand-written fast paths**. B3 handles the
   breadth need via a generic slow path; hand-written fast paths remain
   opportunistic.
-- **Training / fine-tuning**. Out of scope; `agent-infer` is an
+- **Training / fine-tuning**. Out of scope; `arle` is an
   inference engine.
 - **Multi-replica distributed serving**. A2's session-sticky routing is
   the groundwork, but distributed scheduling is deferred until the

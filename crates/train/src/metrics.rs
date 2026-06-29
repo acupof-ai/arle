@@ -24,7 +24,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 
 const DEFAULT_SHARED_BUFFER_CAPACITY: usize = 1024;
-const OTLP_SERVICE_NAME_DEFAULT: &str = "agent-infer.train";
+const OTLP_SERVICE_NAME_DEFAULT: &str = "arle.train";
 const WANDB_MODE_DEFAULT: &str = "offline";
 
 /// A single metric observation for a training step.
@@ -282,7 +282,7 @@ impl OtlpLogSink {
                 Resource::builder_empty()
                     .with_attributes([
                         KeyValue::new("service.name", config.service_name),
-                        KeyValue::new("service.namespace", "agent-infer"),
+                        KeyValue::new("service.namespace", "arle"),
                         KeyValue::new("telemetry.sdk.language", "rust"),
                     ])
                     .build(),
@@ -694,7 +694,7 @@ impl MlflowSink {
                 })
                 .unwrap_or_else(|| default_run_id("mlflow"));
             let mut tags = vec![
-                serde_json::json!({"key": "source.name", "value": "agent-infer/train"}),
+                serde_json::json!({"key": "source.name", "value": "arle/train"}),
                 serde_json::json!({"key": "mlflow.runName", "value": run_name}),
             ];
             if let Some(event) = event {

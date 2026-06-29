@@ -492,7 +492,7 @@ fn otlp_log_sink_posts_metric_and_event_records() {
 
     let mut sink = OtlpLogSink::new(OtlpLogConfig {
         endpoint: format!("http://{}", addr),
-        service_name: "agent-infer.train.test".into(),
+        service_name: "arle.train.test".into(),
         timeout: Some(Duration::from_secs(2)),
         headers: vec![("x-test-token".into(), "abc123".into())],
     })
@@ -568,7 +568,7 @@ with capture.open("w", encoding="utf-8") as out:
 
     {
         let mut sink = WandbProcessSink::new(WandbConfig {
-            project: "agent-infer-tests".into(),
+            project: "arle-tests".into(),
             entity: Some("ci".into()),
             name: Some("wandb-process-sink".into()),
             notes: Some("unit-test".into()),
@@ -607,7 +607,7 @@ with capture.open("w", encoding="utf-8") as out:
     let lines = read_lines(&capture_path);
     assert_eq!(lines.len(), 4, "env + metric + event + finish");
     let env: serde_json::Value = serde_json::from_str(&lines[0]).expect("env json");
-    assert_eq!(env["project"], serde_json::json!("agent-infer-tests"));
+    assert_eq!(env["project"], serde_json::json!("arle-tests"));
     assert_eq!(env["mode"], serde_json::json!("offline"));
     assert_eq!(env["entity"], serde_json::json!("ci"));
     assert_eq!(env["group"], serde_json::json!("train"));
