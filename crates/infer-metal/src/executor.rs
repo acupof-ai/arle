@@ -1862,32 +1862,31 @@ fn decode_metal_t2_record(bytes: &[u8], expected_kind: u8) -> anyhow::Result<Dec
         "Metal KV T2 record kind mismatch: expected={expected_kind}, got={kind}"
     );
     let id_count = cursor.u32()? as usize;
-    let mut ids = Vec::with_capacity(id_count);
-    for _ in 0..id_count {
-        ids.push(cursor.u64()?);
-    }
+    let ids: Vec<u64> = (0..id_count)
+        .map(|_| cursor.u64())
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let cache_len = usize::try_from(cursor.u64()?)
         .map_err(|_| anyhow::anyhow!("Metal KV T2 cache_len exceeds usize"))?;
     let array_count = cursor.u32()? as usize;
-    let mut arrays = Vec::with_capacity(array_count);
-    for _ in 0..array_count {
-        let dtype_raw = cursor.i32()?;
-        let dtype = mlx::Dtype::from_raw(dtype_raw)
-            .ok_or_else(|| anyhow::anyhow!("Metal KV T2 unknown dtype {dtype_raw}"))?;
-        let ndim = cursor.u32()? as usize;
-        let mut shape = Vec::with_capacity(ndim);
-        for _ in 0..ndim {
-            shape.push(cursor.i32()?);
-        }
-        let byte_len = usize::try_from(cursor.u64()?)
-            .map_err(|_| anyhow::anyhow!("Metal KV T2 array byte_len exceeds usize"))?;
-        anyhow::ensure!(
-            byte_len == expected_array_nbytes(&shape, dtype)?,
-            "Metal KV T2 array byte size mismatch for shape={shape:?} dtype={dtype:?}"
-        );
-        let data = cursor.take(byte_len)?;
-        arrays.push(mlx::MlxArray::from_bytes(data, &shape, dtype));
-    }
+    let arrays: Vec<mlx::MlxArray> = (0..array_count)
+        .map(|_| {
+            let dtype_raw = cursor.i32()?;
+            let dtype = mlx::Dtype::from_raw(dtype_raw)
+                .ok_or_else(|| anyhow::anyhow!("Metal KV T2 unknown dtype {dtype_raw}"))?;
+            let ndim = cursor.u32()? as usize;
+            let shape: Vec<i32> = (0..ndim)
+                .map(|_| cursor.i32())
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let byte_len = usize::try_from(cursor.u64()?)
+                .map_err(|_| anyhow::anyhow!("Metal KV T2 array byte_len exceeds usize"))?;
+            anyhow::ensure!(
+                byte_len == expected_array_nbytes(&shape, dtype)?,
+                "Metal KV T2 array byte size mismatch for shape={shape:?} dtype={dtype:?}"
+            );
+            let data = cursor.take(byte_len)?;
+            Ok(mlx::MlxArray::from_bytes(data, &shape, dtype))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     anyhow::ensure!(
         cursor.offset == bytes.len(),
         "Metal KV T2 record has {} trailing bytes",
@@ -2376,26 +2375,26 @@ impl MetalSlotState {
         let capacity = round_up_capacity(capacity_tokens);
         let kv_flat = allocate_kv_flat(config, kv_cache_dtype, capacity);
 
-        let mut gdr_flat = Vec::with_capacity(config.arch.num_linear_attention_layers() * 2);
-        for _ in 0..config.arch.num_linear_attention_layers() {
-            gdr_flat.push(mlx::zeros(
-                &[
-                    1,
-                    config.arch.linear.num_value_heads as i32,
-                    config.arch.linear.value_dim as i32,
-                    config.arch.linear.key_dim as i32,
-                ],
-                mlx::Dtype::Float32,
-            ));
-            gdr_flat.push(mlx::zeros(
-                &[
-                    1,
-                    (config.arch.linear.conv_kernel - 1) as i32,
-                    config.arch.linear.qkv_dim() as i32,
-                ],
-                mlx::Dtype::Bfloat16,
-            ));
-        }
+        let la = &config.arch.linear;
+        let gdr_flat: Vec<mlx::MlxArray> = (0..config.arch.num_linear_attention_layers())
+            .flat_map(|_| {
+                [
+                    mlx::zeros(
+                        &[
+                            1,
+                            la.num_value_heads as i32,
+                            la.value_dim as i32,
+                            la.key_dim as i32,
+                        ],
+                        mlx::Dtype::Float32,
+                    ),
+                    mlx::zeros(
+                        &[1, (la.conv_kernel - 1) as i32, la.qkv_dim() as i32],
+                        mlx::Dtype::Bfloat16,
+                    ),
+                ]
+            })
+            .collect();
 
         Self {
             slot,
@@ -2708,10 +2707,11 @@ impl MetalSlotState {
         // grown buffers are the ones the next `begin_session` binds.
         self.drain_session(model)?;
         let new_capacity = round_up_capacity(required.max(capacity.saturating_mul(2))) as usize;
-        let mut grown = Vec::with_capacity(self.kv_flat.len());
-        for array in &self.kv_flat {
-            grown.push(grow_kv_seq_axis(array, new_capacity)?);
-        }
+        let grown: Vec<_> = self
+            .kv_flat
+            .iter()
+            .map(|array| grow_kv_seq_axis(array, new_capacity))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         // Materialize before re-binding so the concatenation is not replayed
         // lazily on every subsequent step's forward graph.
         let refs: Vec<&mlx::MlxArray> = grown.iter().collect();
@@ -3009,31 +3009,35 @@ fn allocate_kv_flat(
     match kv_cache_dtype {
         MetalKvCacheDtype::Bf16 => {
             let cache_shape = [1, nkv, capacity, hd];
-            let mut kv_flat = Vec::with_capacity(full_layers * 2);
-            for _ in 0..full_layers {
-                kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
-                kv_flat.push(mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16));
-            }
-            kv_flat
+            (0..full_layers)
+                .flat_map(|_| {
+                    [
+                        mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16),
+                        mlx::zeros(&cache_shape, mlx::Dtype::Bfloat16),
+                    ]
+                })
+                .collect()
         }
         MetalKvCacheDtype::Int8 => {
             let group_size = int8_kv_group_size(config.head_dim)
                 .expect("validated before slot allocation") as i32;
             let packed_shape = [1, nkv, capacity, hd / 4];
             let scale_shape = [1, nkv, capacity, hd / group_size];
-            let mut kv_flat = Vec::with_capacity(full_layers * 6);
-            for _ in 0..full_layers {
-                // K: packed uint32 data + bf16 scale/bias, then V with the same
-                // layout. C++ session code interprets n_kv=6*full_layers as
-                // quantized KV.
-                kv_flat.push(mlx::zeros(&packed_shape, mlx::Dtype::Uint32));
-                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
-                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
-                kv_flat.push(mlx::zeros(&packed_shape, mlx::Dtype::Uint32));
-                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
-                kv_flat.push(mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16));
-            }
-            kv_flat
+            // K: packed uint32 data + bf16 scale/bias, then V with the same
+            // layout. C++ session code interprets n_kv=6*full_layers as
+            // quantized KV.
+            (0..full_layers)
+                .flat_map(|_| {
+                    [
+                        mlx::zeros(&packed_shape, mlx::Dtype::Uint32),
+                        mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16),
+                        mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16),
+                        mlx::zeros(&packed_shape, mlx::Dtype::Uint32),
+                        mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16),
+                        mlx::zeros(&scale_shape, mlx::Dtype::Bfloat16),
+                    ]
+                })
+                .collect()
         }
     }
 }
