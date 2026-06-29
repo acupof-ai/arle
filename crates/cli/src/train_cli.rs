@@ -3289,12 +3289,10 @@ fn inspect_model_source(source: &Path, allow_download: bool) -> Result<ModelInsp
     } else {
         resolve_model_dir_local_only(source)
     };
-    let mut notes = Vec::new();
-    if !allow_download && resolved_dir.is_none() {
-        notes.push(
-            "model source is not local/cached; dry-run skipped remote resolution".to_string(),
-        );
-    }
+    let notes: Vec<String> = (!allow_download && resolved_dir.is_none())
+        .then(|| "model source is not local/cached; dry-run skipped remote resolution".to_string())
+        .into_iter()
+        .collect();
     let summary = resolved_dir
         .as_deref()
         .map(inspect_resolved_model_dir)
