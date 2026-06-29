@@ -107,16 +107,16 @@ fn fetch_file(repo: &ApiRepo, filename: &str, model_id: &str) -> Result<PathBuf>
 }
 
 fn local_model_search_candidates(model_id_or_path: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
     let model_name = model_id_or_path
         .rsplit('/')
         .next()
         .unwrap_or(model_id_or_path)
         .trim();
 
-    for base in common_local_roots() {
-        candidates.push(base.join(model_name));
-    }
+    let mut candidates: Vec<PathBuf> = common_local_roots()
+        .into_iter()
+        .map(|base| base.join(model_name))
+        .collect();
 
     if let Some((org, repo)) = model_id_or_path.split_once('/') {
         let cache_repo_dir = huggingface_hub_root().join(format!("models--{org}--{repo}"));
@@ -128,17 +128,18 @@ fn local_model_search_candidates(model_id_or_path: &str) -> Vec<PathBuf> {
 }
 
 fn common_local_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join("models"));
-        roots.push(cwd.join("infer").join("models"));
-    }
-    if let Some(home) = home_dir() {
-        roots.push(home.join("models"));
-        roots.push(home.join("llm"));
-        roots.push(home.join(".cache").join("mlx-models"));
-    }
-    roots
+    let cwd_roots = std::env::current_dir()
+        .ok()
+        .into_iter()
+        .flat_map(|cwd| [cwd.join("models"), cwd.join("infer").join("models")]);
+    let home_roots = home_dir().into_iter().flat_map(|home| {
+        [
+            home.join("models"),
+            home.join("llm"),
+            home.join(".cache").join("mlx-models"),
+        ]
+    });
+    cwd_roots.chain(home_roots).collect()
 }
 
 fn huggingface_hub_root() -> PathBuf {

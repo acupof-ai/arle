@@ -234,19 +234,20 @@ where
             .serve
             .run_on_executor(|executor| executor.multimodal_kind())
             .unwrap_or(None);
-        let mut images = Vec::new();
-        for message in &req.messages {
-            for image in &message.images {
-                let prepared = match multimodal_kind {
+        let images = req
+            .messages
+            .iter()
+            .flat_map(|msg| &msg.images)
+            .map(|image| {
+                match multimodal_kind {
                     Some(infer_plan::MultimodalKind::DeepseekOcr) => {
                         infer_server::multimodal::preprocess_deepseek_ocr_image(&image.data)
                     }
                     _ => infer_server::multimodal::preprocess_gemma4_image(&image.data),
                 }
-                .map_err(|err| anyhow!("preprocess image {} failed: {err}", image.source))?;
-                images.push(prepared);
-            }
-        }
+                .map_err(|err| anyhow!("preprocess image {} failed: {err}", image.source))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let server_messages = server_chat_messages(req.messages.as_slice());
         anyhow::ensure!(
             !images.is_empty(),
