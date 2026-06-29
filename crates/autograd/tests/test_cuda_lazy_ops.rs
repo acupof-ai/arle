@@ -1216,7 +1216,7 @@ fn cuda_embedding_backward_device_matches_cpu() {
     // because B*S=1024 << V=248070, but the kernel must remain correct under
     // ANY id distribution. Use `rng_ids` for a deterministic LCG sequence.
     let ids_random = rng_ids(0x1d5, B * S, V as i32);
-    let ids_random_i32: Vec<i32> = ids_random.iter().map(|&i| i).collect();
+    let ids_random_i32: Vec<i32> = ids_random.iter().copied().collect();
     let ids_random_usize: Vec<usize> = ids_random.iter().map(|&i| i as usize).collect();
 
     // Host reference uses the existing scatter_add reference path.
