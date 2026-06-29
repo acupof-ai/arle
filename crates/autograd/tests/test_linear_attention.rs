@@ -2,7 +2,9 @@ mod helpers;
 
 use autograd::{
     Result, Tape, TensorStore,
-    ops::{LinearAttentionParams, linear_attention_core, mul, sum},
+    ops::{
+        LinearAttentionParams, linear_attention_core, linear_attention_core_with_carry, mul, sum,
+    },
 };
 #[cfg(any(feature = "metal", feature = "cuda"))]
 use helpers::max_abs_err;
@@ -1224,4 +1226,214 @@ fn cuda_linear_attention_qwen36_27b_chunked_grad_matches_cpu() -> Result<()> {
         "cuda qwen36-27b chunked linear_attention",
         2.0e-2,
     )
+}
+
+// ── OPD frozen-prompt-KV de-risk: prompt-boundary state + conv carry ──────────
+// Proves the ONLY genuinely-new math: carrying the gated-delta SSM state + the
+// causal-conv window across a [0..k] prompt / [k..N] generated split reproduces
+// the full-sequence suffix exactly. This is the license-or-kill gate — if the
+// split is bit-equivalent (≤1e-6) to the monolithic run on the generated rows,
+// the linear-attn wall is cleared and the rest of the feature is mechanical wiring.
+
+/// Run the full sequence in one call (no carry) and return all `output` rows plus
+/// the boundary `final_state`.
+fn la_full(
+    fixture: &LinearAttentionFixture,
+    params: LinearAttentionParams,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let mut store = TensorStore::default();
+    let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
+    let z_shape = [params.batch, params.seq_len, z_dim(params)];
+    let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+
+    let qkv = store.from_slice(&fixture.qkv, &qkv_shape)?;
+    let z = store.from_slice(&fixture.z, &z_shape)?;
+    let b_proj = store.from_slice(&fixture.b_proj, &head_shape)?;
+    let a_proj = store.from_slice(&fixture.a_proj, &head_shape)?;
+    let conv1d_weight = store.from_slice(
+        &fixture.conv1d_weight,
+        &[qkv_dim(params), params.conv_kernel],
+    )?;
+    let dt_bias = store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+    let a_log = store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+    let norm_weight = store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+
+    let (output, final_state, _conv_window) = linear_attention_core_with_carry(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        None,
+        None,
+        true,
+        &mut store,
+    )?;
+    Ok((
+        store.to_host(output)?,
+        store.to_host(final_state.expect("captured final_state"))?,
+    ))
+}
+
+/// Run a single segment with an optional carried `(initial_state, initial_conv_window)`,
+/// capturing the boundary. `seg_params` carries `seq_len = b - a`; the slices are
+/// the fixture's rows `[a..b]` along the sequence axis (batch == 1).
+#[allow(clippy::type_complexity)]
+fn la_segment(
+    fixture: &LinearAttentionFixture,
+    full_params: LinearAttentionParams,
+    a: usize,
+    b: usize,
+    initial: Option<(&[f32], &[f32])>,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    assert_eq!(full_params.batch, 1, "slice helper assumes batch == 1");
+    let seg_len = b - a;
+    let mut params = full_params;
+    params.seq_len = seg_len;
+
+    let qd = qkv_dim(full_params);
+    let zd = z_dim(full_params);
+    let hd = full_params.num_value_heads;
+
+    let qkv_slice = &fixture.qkv[a * qd..b * qd];
+    let z_slice = &fixture.z[a * zd..b * zd];
+    let b_slice = &fixture.b_proj[a * hd..b * hd];
+    let a_slice = &fixture.a_proj[a * hd..b * hd];
+
+    let mut store = TensorStore::default();
+    let qkv = store.from_slice(qkv_slice, &[1, seg_len, qd])?;
+    let z = store.from_slice(z_slice, &[1, seg_len, zd])?;
+    let b_proj = store.from_slice(b_slice, &[1, seg_len, hd])?;
+    let a_proj = store.from_slice(a_slice, &[1, seg_len, hd])?;
+    let conv1d_weight = store.from_slice(&fixture.conv1d_weight, &[qd, full_params.conv_kernel])?;
+    let dt_bias = store.from_slice(&fixture.dt_bias, &[hd])?;
+    let a_log = store.from_slice(&fixture.a_log, &[hd])?;
+    let norm_weight = store.from_slice(&fixture.norm_weight, &[full_params.value_dim])?;
+
+    let conv_window = full_params.conv_kernel - 1;
+    let (initial_state, initial_conv_window) = match initial {
+        Some((state, window)) => {
+            let state_id = store.from_slice(
+                state,
+                &[
+                    1,
+                    full_params.num_value_heads,
+                    full_params.key_dim,
+                    full_params.value_dim,
+                ],
+            )?;
+            let window_id = store.from_slice(window, &[1, conv_window, qd])?;
+            (Some(state_id), Some(window_id))
+        }
+        None => (None, None),
+    };
+
+    let (output, final_state, conv_window_id) = linear_attention_core_with_carry(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        initial_state,
+        initial_conv_window,
+        true,
+        &mut store,
+    )?;
+    Ok((
+        store.to_host(output)?,
+        store.to_host(final_state.expect("captured final_state"))?,
+        store.to_host(conv_window_id.expect("captured conv_window"))?,
+    ))
+}
+
+fn assert_split_carry_exact(params: LinearAttentionParams, k: usize, label: &str) -> Result<()> {
+    let fixture = LinearAttentionFixture::new(params);
+    let n = params.seq_len;
+    let zd = z_dim(params);
+
+    // BASELINE: full sequence in one shot.
+    let (output_full, final_state_full) = la_full(&fixture, params)?;
+
+    // SPLIT: prompt [0..k] with capture, then generated [k..N] seeded with the boundary.
+    let (_prompt_out, state_k, window_k) = la_segment(&fixture, params, 0, k, None)?;
+    let (gen_out, final_state_split, _gen_window) =
+        la_segment(&fixture, params, k, n, Some((&state_k, &window_k)))?;
+
+    // ASSERT: generated-segment outputs == full-sequence rows [k..N], bit-equivalent.
+    let full_suffix = &output_full[k * zd..n * zd];
+    let (idx, max_diff) = max_err_with_index(&gen_out, full_suffix);
+    assert!(
+        max_diff <= 1.0e-6,
+        "{label}: split suffix output diverged at flat idx {idx} (row {}, ch {}): max_abs_diff={max_diff:.3e} > 1e-6",
+        k + idx / zd,
+        idx % zd,
+    );
+
+    // ASSERT: split's final_state == full final_state (Markov carry is exact).
+    let (sidx, smax) = max_err_with_index(&final_state_split, &final_state_full);
+    assert!(
+        smax <= 1.0e-6,
+        "{label}: split final_state diverged at idx {sidx}: max_abs_diff={smax:.3e} > 1e-6",
+    );
+    Ok(())
+}
+
+#[test]
+fn linear_attention_prompt_boundary_carry_is_exact() -> Result<()> {
+    // Small isolated shapes — no model / LoRA / checkpoint confounders, JUST the
+    // gated-delta recurrence + causal conv. conv_kernel=4 forces a real 3-row
+    // ring carry across the boundary (the off-by-one risk).
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 32,
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_dim: 6,
+        value_dim: 4,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    };
+    // Split mid-sequence (k=12), and stress the conv ring at boundaries near the
+    // kernel width (k < conv_kernel and k just past it) plus a late split.
+    assert_split_carry_exact(params, 12, "k=12")?;
+    assert_split_carry_exact(params, 1, "k=1")?; // k < conv_kernel-1: short prompt
+    assert_split_carry_exact(params, 3, "k=3")?; // k == conv_kernel-1
+    assert_split_carry_exact(params, 4, "k=4")?; // k == conv_kernel
+    assert_split_carry_exact(params, 31, "k=31")?; // single generated row
+    Ok(())
+}
+
+#[test]
+fn linear_attention_carry_none_matches_full_first_rows() -> Result<()> {
+    // Sanity: a carry-less segment [0..k] reproduces the full run's first k rows
+    // (the Option=None path is identical to today's absolute-position-0 behavior).
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 20,
+        num_key_heads: 2,
+        num_value_heads: 4,
+        key_dim: 8,
+        value_dim: 8,
+        conv_kernel: 3,
+        eps: 1.0e-5,
+    };
+    let fixture = LinearAttentionFixture::new(params);
+    let (output_full, _) = la_full(&fixture, params)?;
+    let k = 7;
+    let (prompt_out, _, _) = la_segment(&fixture, params, 0, k, None)?;
+    let zd = z_dim(params);
+    let (idx, max_diff) = max_err_with_index(&prompt_out, &output_full[0..k * zd]);
+    assert!(
+        max_diff <= 1.0e-6,
+        "carry-none prefix diverged at idx {idx}: max_abs_diff={max_diff:.3e}",
+    );
+    Ok(())
 }

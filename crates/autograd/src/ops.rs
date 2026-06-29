@@ -375,7 +375,7 @@ pub fn matmul_bt_with_site(
     matmul::matmul_bt_with_site(a, b, store, tape, site)
 }
 
-pub use linear_attention::LinearAttentionParams;
+pub use linear_attention::{LinearAttentionParams, linear_attention_core_with_carry};
 
 pub fn linear_attention_core(
     qkv: TensorId,
