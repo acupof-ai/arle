@@ -2786,17 +2786,19 @@ impl Dsv4CudaExecutor {
                 committed.len(),
                 batch.rows.len()
             );
-            let mut tokens = Vec::new();
-            for (&slot, chain) in batch.slot_ids.iter().zip(committed) {
-                for token in chain {
-                    tokens.push(SlotToken {
+            let tokens: Vec<SlotToken> = batch
+                .slot_ids
+                .iter()
+                .zip(committed)
+                .flat_map(|(&slot, chain)| {
+                    chain.into_iter().map(move |token| SlotToken {
                         slot,
                         token,
                         logprob: None,
                         finish: None,
-                    });
-                }
-            }
+                    })
+                })
+                .collect();
             return Ok(tokens);
         }
 
