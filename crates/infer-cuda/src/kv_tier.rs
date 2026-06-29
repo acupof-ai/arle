@@ -225,7 +225,6 @@ impl DiskTier {
 
     /// Parse a manifest file's bytes into `(epoch, [(key, byte_len)])`. Returns
     /// `None` for a missing/empty/foreign-magic file (caller starts cold).
-    #[allow(dead_code)] // WIP: durable KV-recall manifest replay, not yet wired
     fn parse_manifest(bytes: &[u8]) -> Option<(String, Vec<(u64, u64)>)> {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
@@ -361,7 +360,6 @@ impl CudaKvTierStore {
     /// block's `{key, byte_len}` plus `epoch`; [`Self::load`] replays it.
     ///
     /// Returns `false` only when the namespace directory cannot be created.
-    #[allow(dead_code)] // WIP: durable KV-recall persistence, not yet wired
     pub(crate) fn set_disk_durable(
         &mut self,
         root: PathBuf,
@@ -409,7 +407,6 @@ impl CudaKvTierStore {
     /// new epoch never reads stale KV).
     ///
     /// Returns whether any block was reloaded.
-    #[allow(dead_code)] // WIP: durable KV-recall manifest replay, not yet wired
     pub(crate) fn load(
         &mut self,
         root: PathBuf,
@@ -483,7 +480,6 @@ impl CudaKvTierStore {
     /// Per-process *durable* namespace: stable across restarts (process id
     /// only). The recall tier re-derives the same path on load to re-address
     /// the prior session's blobs + manifest.
-    #[allow(dead_code)] // WIP: durable KV-recall namespace, not yet wired
     fn durable_namespace(root: PathBuf) -> PathBuf {
         root.join(format!("arle-kv-recall-{}", std::process::id()))
     }
