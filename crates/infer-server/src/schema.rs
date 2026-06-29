@@ -15,7 +15,6 @@ use infer_plan::{FinishReason, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::execution::CounterSnapshot;
 use crate::multiproc_relay::WireStats;
 
 /// Minimal `/v1/completions` request body.
@@ -383,73 +382,6 @@ pub struct StatsResponse {
 }
 
 impl StatsResponse {
-    #[allow(dead_code)] // used only in tests; from_wire is the production path
-    pub(crate) fn from_counters(counters: CounterSnapshot) -> Self {
-        Self {
-            scheduler: SchedulerStats {
-                active_requests: counters.active_requests,
-                queue_depth: counters.queue_depth,
-                kv_free_pages: counters.kv_free_pages,
-            },
-            throughput: ThroughputStatsResponse {
-                steps: counters.throughput.steps,
-                prefill_tokens: counters.throughput.prefill_tokens,
-                generated_tokens: counters.throughput.generated_tokens,
-                requests_completed: counters.throughput.requests_completed,
-            },
-            kv_tier: KvTierStatsResponse {
-                available: counters.kv_tier.demoted_pages > 0
-                    || counters.kv_tier.resident_blocks > 0
-                    || counters.kv_tier.demoted_slots > 0,
-                demoted_pages: counters.kv_tier.demoted_pages,
-                promoted_pages: counters.kv_tier.promoted_pages,
-                promote_failures: counters.kv_tier.promote_failures,
-                resident_blocks: counters.kv_tier.resident_blocks,
-                demoted_slots: counters.kv_tier.demoted_slots,
-                promoted_slots: counters.kv_tier.promoted_slots,
-                slot_promote_failures: counters.kv_tier.slot_promote_failures,
-            },
-            kv_system: KvSystemMetricsResponse {
-                resident_pages: counters.kv_system.resident_pages,
-                resident_evictable_pages: counters.kv_system.resident_evictable_pages,
-                host_demoted_pages: counters.kv_system.host_demoted_pages,
-                host_demoted_pending_inflight: counters.kv_system.host_demoted_pending_inflight,
-                disk_pages: counters.kv_system.disk_pages,
-                reuse_hit_resident: counters.kv_system.reuse_hit_resident,
-                reuse_hit_host_demoted: counters.kv_system.reuse_hit_host_demoted,
-                reuse_hit_disk: counters.kv_system.reuse_hit_disk,
-                reuse_miss: counters.kv_system.reuse_miss,
-                demote_mset_count: counters.kv_system.demote_mset_count,
-                demote_mset_copy_bytes: counters.kv_system.demote_mset_copy_bytes,
-                demote_mset_copy_ms: counters.kv_system.demote_mset_copy_ms,
-                promote_mget_count: counters.kv_system.promote_mget_count,
-                promote_mget_copy_bytes: counters.kv_system.promote_mget_copy_bytes,
-                promote_mget_copy_ms: counters.kv_system.promote_mget_copy_ms,
-                fetch_wait_ms: counters.kv_system.fetch_wait_ms,
-                fallback_recompute: counters.kv_system.fallback_recompute,
-                prefix_match_full_blocks: counters.kv_system.prefix_match_full_blocks,
-                prefix_match_clamped_blocks: counters.kv_system.prefix_match_clamped_blocks,
-            },
-            prefix_cache: PrefixCacheStatsResponse {
-                lookups: counters.prefix_cache.lookups,
-                hits: counters.prefix_cache.hits,
-                hit_rate: ratio(counters.prefix_cache.hits, counters.prefix_cache.lookups),
-                hit_tokens: counters.prefix_cache.hit_tokens,
-                hit_pages: counters.prefix_cache.hit_pages,
-                published_pages: counters.prefix_cache.published_pages,
-                cached_pages: counters.prefix_cache.cached_pages,
-            },
-            ssd_recall: SsdRecallStats {
-                available: false,
-                lookups: 0,
-                hits: 0,
-                recall_rate: None,
-                not_available_reason: "per-level ssd recall counters are not split out yet; \
-                                       disk spill activity is included in the kv_tier block",
-            },
-        }
-    }
-
     pub(crate) fn from_wire(w: WireStats) -> Self {
         Self {
             scheduler: SchedulerStats {
@@ -806,67 +738,6 @@ mod tests {
         assert_eq!(v["data"][0]["object"], "model");
         assert_eq!(v["data"][0]["owned_by"], "arle");
         assert!(v["data"][0]["created"].is_u64());
-    }
-
-    #[test]
-    fn stats_response_reports_prefix_rate_and_ssd_unavailable() {
-        let resp = StatsResponse::from_counters(CounterSnapshot {
-            active_requests: 0,
-            queue_depth: 0,
-            kv_free_pages: 7,
-            prefix_cache: infer_core::PrefixCacheStats {
-                lookups: 4,
-                hits: 3,
-                hit_tokens: 96,
-                hit_pages: 6,
-                published_pages: 8,
-                cached_pages: 8,
-            },
-            throughput: infer_core::ThroughputStats {
-                steps: 12,
-                prefill_tokens: 300,
-                generated_tokens: 48,
-                requests_completed: 3,
-            },
-            kv_tier: infer_core::KvTierStats::default(),
-            kv_system: infer_core::KvSystemMetrics {
-                resident_pages: 2,
-                resident_evictable_pages: 1,
-                host_demoted_pages: 3,
-                host_demoted_pending_inflight: 0,
-                disk_pages: 4,
-                reuse_hit_resident: 5,
-                reuse_hit_host_demoted: 6,
-                reuse_hit_disk: 7,
-                reuse_miss: 8,
-                demote_mset_count: 9,
-                demote_mset_copy_bytes: 10,
-                demote_mset_copy_ms: 11,
-                promote_mget_count: 12,
-                promote_mget_copy_bytes: 13,
-                promote_mget_copy_ms: 14,
-                fetch_wait_ms: 15,
-                fallback_recompute: 16,
-                prefix_match_full_blocks: 17,
-                prefix_match_clamped_blocks: 18,
-            },
-        });
-
-        let v = serde_json::to_value(&resp).expect("serialize");
-        assert_eq!(v["scheduler"]["kv_free_pages"], 7);
-        assert_eq!(v["prefix_cache"]["hit_rate"], 0.75);
-        assert_eq!(v["prefix_cache"]["hit_tokens"], 96);
-        assert_eq!(v["throughput"]["generated_tokens"], 48);
-        assert_eq!(v["throughput"]["requests_completed"], 3);
-        assert_eq!(v["kv_tier"]["available"], false);
-        assert_eq!(v["kv_tier"]["demoted_pages"], 0);
-        assert_eq!(v["kv_system"]["resident_pages"], 2);
-        assert_eq!(v["kv_system"]["host_demoted_pages"], 3);
-        assert_eq!(v["kv_system"]["disk_pages"], 4);
-        assert_eq!(v["kv_system"]["promote_mget_copy_bytes"], 13);
-        assert_eq!(v["kv_system"]["prefix_match_clamped_blocks"], 18);
-        assert_eq!(v["ssd_recall"]["available"], false);
-        assert!(v["ssd_recall"]["recall_rate"].is_null());
     }
 
     #[test]
