@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use infer_core::CompletedRequest;
-use infer_plan::{DiffusionGenerateOutput, FinishReason, MultimodalImage, SamplingParams};
+use infer_plan::{DiffusionGenerateOutput, MultimodalImage, SamplingParams};
 use infer_seam::{BackendExecutor, KvPool};
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;

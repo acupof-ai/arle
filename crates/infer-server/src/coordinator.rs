@@ -8,7 +8,6 @@
 //! per-request sinks the async handlers await. TP=1 never reaches here.
 //! See `docs/plans/2026-06-24-multiproc-control-data-plane-redesign.md`.
 
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as SyncSender};
 use std::sync::{Arc, Mutex};
@@ -16,13 +15,11 @@ use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use infer_plan::{FinishReason, SamplingParams};
 use serde_json::json;
-use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use crate::multiproc_relay::{
@@ -214,147 +211,33 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Wire up and immediately return an SSE [`Response`]; the relay deltas are
-/// forwarded token-by-token to the client via a spawned tokio task. `_guard` lives
-/// inside the task so `in_flight` stays > 0 (keeping the lockstep loop stepping)
-/// until the terminal delta — or until the worker drains naturally on disconnect.
-fn stream_coord_completion(
-    state: Arc<CoordinatorHandle>,
-    prompt_tokens: Vec<u32>,
-    max_tokens: usize,
-    sampling: SamplingParams,
-) -> Result<Response, ApiError> {
-    let prompt_len = prompt_tokens.len();
-    let request_id = state.alloc_request_id();
-    let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel::<RelayCompletionDelta>();
-
-    state
-        .sinks
-        .register(request_id, sink_tx)
-        .map_err(ApiError::from)?;
-    state.in_flight.fetch_add(1, Ordering::AcqRel);
-    let guard = InFlightGuard {
-        in_flight: Arc::clone(&state.in_flight),
-        sinks: state.sinks.clone(),
-        request_id,
-    };
-
-    if state
-        .submit_tx
-        .send(CoordSubmission {
-            request: WireRequest {
-                request_id,
-                prompt_tokens,
-                max_tokens,
-                sampling,
-            },
-        })
-        .is_err()
-    {
-        // guard drops here → in_flight decremented, sink unregistered.
-        return Err(ApiError::internal(
-            "coordinator lockstep loop closed; cannot submit",
-        ));
-    }
-
-    let model = state.model.clone();
-    let tokenizer = state
-        .tokenizer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
-    tokio::spawn(async move {
-        let _guard = guard; // keeps in_flight > 0 for the lockstep loop
-        drive_coord_sse(model, prompt_len, tokenizer, sink_rx, sse_tx).await;
-    });
-
-    Ok(Sse::new(ReceiverStream::new(sse_rx))
-        .keep_alive(KeepAlive::default())
-        .into_response())
-}
-
-async fn drive_coord_sse(
-    model: String,
-    prompt_len: usize,
-    tokenizer: crate::tokenizer::OpenAiTokenizer,
-    mut sink_rx: tokio::sync::mpsc::UnboundedReceiver<RelayCompletionDelta>,
-    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-) {
+// Workers send one terminal delta with all token IDs; the relay is not yet
+// per-token. SSE here is wire-format only — content is collected then flushed.
+fn sse_response(model: &str, outcome: &CollectedGeneration, text: String) -> Response {
     let id = format!("cmpl-{}", Uuid::new_v4().simple());
     let created = unix_time_secs();
-    let mut completion_tokens: usize = 0;
-    // Accumulate token_ids from all deltas; decoded to text on terminal emit.
-    // (Workers currently send one terminal delta with all IDs; streaming
-    // per-token relay is a STAGE 2 upgrade.)
-    let mut all_token_ids: Vec<u32> = Vec::new();
-
-    while let Some(delta) = sink_rx.recv().await {
-        completion_tokens += delta.token_ids.len();
-        all_token_ids.extend_from_slice(&delta.token_ids);
-        let is_done = delta.is_done();
-
-        if let Some(err) = &delta.error {
-            let chunk = json!({"error": {"message": err, "type": "server_error"}});
-            let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
-            return;
-        }
-
-        if !delta.text_delta.is_empty() {
-            let chunk = completion_stream_chunk(&id, created, &model, delta.text_delta, None, None);
-            if tx
-                .send(Ok(Event::default().data(chunk.to_string())))
-                .await
-                .is_err()
-            {
-                // Client disconnected. MUST drain to terminal so the lockstep loop
-                // keeps stepping for the worker until it finishes (mirrors the
-                // in-process `ticket.collect()` fallback in `drive_completion_sse`).
-                while let Some(d) = sink_rx.recv().await {
-                    if d.is_done() {
-                        break;
-                    }
-                }
-                return;
-            }
-        }
-
-        if is_done {
-            // Decode accumulated token_ids to text (workers send IDs, not text).
-            let text = if !all_token_ids.is_empty() {
-                tokenizer.decode(&all_token_ids).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            if !text.is_empty() {
-                let chunk = completion_stream_chunk(&id, created, &model, text, None, None);
-                if tx
-                    .send(Ok(Event::default().data(chunk.to_string())))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let usage = json!({
-                "prompt_tokens": prompt_len,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_len + completion_tokens,
-            });
-            let chunk = completion_stream_chunk(
-                &id,
-                created,
-                &model,
-                String::new(),
-                Some(finish_reason(delta.finish_reason.as_ref())),
-                Some(usage),
-            );
-            let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
-            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-            return;
-        }
-    }
-    // sink_rx EOF (fail_all on worker-group failure) — let sse_tx drop to close stream.
+    let n = outcome.generated_tokens.len();
+    let usage = json!({"prompt_tokens": outcome.prompt_tokens, "completion_tokens": n, "total_tokens": outcome.prompt_tokens + n});
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        completion_stream_chunk(&id, created, model, text, None, None),
+        completion_stream_chunk(
+            &id,
+            created,
+            model,
+            String::new(),
+            Some(finish_reason(outcome.finish.as_ref())),
+            Some(usage)
+        ),
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Submit one request and collect its full generation by draining relay deltas.
@@ -453,11 +336,11 @@ async fn completions(
     let sampling = request.sampling_params();
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
     let prompt_tokens = encode(&state, &request.prompt)?;
-    if request.stream.unwrap_or(false) {
-        return stream_coord_completion(state, prompt_tokens, max_tokens, sampling);
-    }
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
     let text = decode(&state, &outcome.generated_tokens)?;
+    if request.stream.unwrap_or(false) {
+        return Ok(sse_response(&state.model, &outcome, text));
+    }
     Ok(Json(CompletionResponse::from_parts(
         state.model.clone(),
         text,
