@@ -417,23 +417,32 @@ fn parse_registry(text: &str) -> Registry {
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| panic!("abi.{name} missing call")),
             );
-            let mut rust_args = Vec::new();
-            if let Some(rows) = body.get("rust").and_then(|v| v.as_array()) {
-                for row in rows {
-                    let pair = row.as_array().unwrap_or_else(|| {
-                        panic!("abi.{name}.rust rows must be [name, ty] arrays")
-                    });
-                    let arg_name = pair[0]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("abi.{name}.rust arg name must be a string"))
-                        .to_string();
-                    let arg_ty = pair[1]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("abi.{name}.rust arg ty must be a string"))
-                        .to_string();
-                    rust_args.push((arg_name, arg_ty));
-                }
-            }
+            let rust_args: Vec<(String, String)> = body
+                .get("rust")
+                .and_then(|v| v.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| {
+                            let pair = row.as_array().unwrap_or_else(|| {
+                                panic!("abi.{name}.rust rows must be [name, ty] arrays")
+                            });
+                            let n = pair[0]
+                                .as_str()
+                                .unwrap_or_else(|| {
+                                    panic!("abi.{name}.rust arg name must be a string")
+                                })
+                                .to_string();
+                            let t = pair[1]
+                                .as_str()
+                                .unwrap_or_else(|| {
+                                    panic!("abi.{name}.rust arg ty must be a string")
+                                })
+                                .to_string();
+                            (n, t)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             abis.insert(
                 name.clone(),
                 AbiSig {
