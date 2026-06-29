@@ -273,12 +273,11 @@ pub fn route(gate_logits: &[f32], bias: &[f32], cfg: &MoeConfig) -> Result<Vec<R
             cfg.num_experts
         );
     }
-    let num_tokens = gate_logits.len() / cfg.num_experts;
-    let mut out = Vec::with_capacity(num_tokens);
-    for t in 0..num_tokens {
-        let row = &gate_logits[t * cfg.num_experts..(t + 1) * cfg.num_experts];
-        out.push(route_token(row, bias, cfg)?);
-    }
+    let n = cfg.num_experts;
+    let out = gate_logits
+        .chunks(n)
+        .map(|row| route_token(row, bias, cfg))
+        .collect::<Result<Vec<_>>>()?;
     Ok(out)
 }
 
@@ -383,15 +382,15 @@ mod tests {
     }
 
     fn expert_outputs(num_tokens: usize, num_experts: usize, hidden_dim: usize) -> Vec<f32> {
-        let mut out = Vec::with_capacity(num_tokens * num_experts * hidden_dim);
-        for token in 0..num_tokens {
-            for expert in 0..num_experts {
-                for dim in 0..hidden_dim {
-                    out.push((token as f32 + 1.0) * 1000.0 + expert as f32 * 10.0 + dim as f32);
-                }
-            }
-        }
-        out
+        (0..num_tokens)
+            .flat_map(|token| {
+                (0..num_experts).flat_map(move |expert| {
+                    (0..hidden_dim).map(move |dim| {
+                        (token as f32 + 1.0) * 1000.0 + expert as f32 * 10.0 + dim as f32
+                    })
+                })
+            })
+            .collect()
     }
 
     fn expert_row(

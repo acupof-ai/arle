@@ -1428,10 +1428,9 @@ mod testing {
                     self.free_pages.len()
                 );
             }
-            let mut pages = Vec::with_capacity(count);
-            for _ in 0..count {
-                pages.push(self.free_pages.pop().expect("free page count checked"));
-            }
+            let pages = (0..count)
+                .map(|_| self.free_pages.pop().expect("free page count checked"))
+                .collect();
             Ok(pages)
         }
 
