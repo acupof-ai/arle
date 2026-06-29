@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in agent-infer
+about: Report a bug in arle
 title: "[bug] "
 labels: bug
 ---
@@ -34,7 +34,7 @@ What actually happens. Include error messages or logs.
 - **Backend**: (e.g. CUDA, Metal, CPU)
 - **GPU / Metal chip / CPU**: (e.g. A100-40GB, M4 Pro)
 - **CUDA / macOS / compiler version**: (e.g. CUDA 12.8, macOS 15.4)
-- **agent-infer version/commit**: 
+- **arle version/commit**: 
 - **OS**: 
 - **Model**: (e.g. Qwen3-4B)
 - **Command / server flags**: (e.g. `infer --num-slots 4 --cuda-graph true`)
