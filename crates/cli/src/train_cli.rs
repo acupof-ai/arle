@@ -1934,7 +1934,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use train::{
         infer_student::InferStudent,
         lora::{LoraAdapterConfig, LoraConfig, LoraTargetSet},
-        opd::masked_writeback_ce_step,
+        opd::masked_writeback_ce_step_dispatch,
         qwen35_checkpoint::{
             ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StudentWeights,
             save_named_qwen35_student_checkpoint,
@@ -2242,7 +2242,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         }
         log_opd_vram("synthetic-writeback pre-writeback", &train_backend);
         let started = std::time::Instant::now();
-        let loss = masked_writeback_ce_step(
+        let loss = masked_writeback_ce_step_dispatch(
             &student,
             all_params.as_slice(),
             trainable.as_slice(),
@@ -2354,7 +2354,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         eprintln!("[agent-opd] released rollout KV pool");
                     }
                     log_opd_vram("agent-opd pre-writeback", &train_backend);
-                    let writeback_result = masked_writeback_ce_step(
+                    let writeback_result = masked_writeback_ce_step_dispatch(
                         student_ref,
                         all_ref,
                         trainable_ref,
