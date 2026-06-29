@@ -2971,7 +2971,7 @@ impl Dsv4DsaSharedScratch {
             .map(|v| i64::try_from(v).expect("compressed capacity fits i64"))
             .collect();
         let freqs_cis_h = dsv4_dsa_freqs_cis_real(config, compress_ratio, max_seq_len)?;
-        let page_table_elems = query_tile
+        let _ = query_tile
             .checked_mul(num_pages)
             .ok_or_else(|| anyhow!("DSv4 official DSA page table size overflow"))?;
         let page_table_h: Vec<i32> = (0..query_tile)

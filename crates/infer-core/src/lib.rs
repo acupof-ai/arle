@@ -2880,18 +2880,24 @@ mod tests {
         let first = engine.submit_request((1..=8).collect(), 2);
         engine.run_to_idle()?;
         assert_finished(engine.completed(first).expect("first completed"));
+        // Two captures per request: prefill (prompt only) + finish-slot sidecar
+        // (prompt + generated echo tokens). Echo rule: last_prompt+1 = 9, then
+        // last_decode+1 = 10 for max_new_tokens=2.
         assert_eq!(
             captured.borrow().as_slice(),
-            &[vec![1, 2, 3, 4, 5, 6, 7, 8]],
-            "prefill completion captured the position-0 prompt image"
+            &[
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ],
+            "prefill + finish-sidecar captures the position-0 prefix"
         );
         assert!(
             restored.borrow().is_empty(),
             "no restore on the first (cold) request"
         );
 
-        // Second request: its leading 8 tokens equal the cached prompt, so the
-        // engine restores the cached prefix and re-prefills only the tail.
+        // Second request: leading 10 tokens match the sidecar-captured sequence
+        // [1..10] (prefill captured [1..8]; finish-sidecar extended to [1..10]).
         let before_hits = engine.kv_system_metrics().reuse_hit_resident;
         let second = engine.submit_request((1..=12).collect(), 2);
         engine.run_to_idle()?;
@@ -2899,8 +2905,8 @@ mod tests {
         let restores = restored.borrow();
         assert_eq!(restores.len(), 1, "exactly one cached-prefix restore fired");
         assert_eq!(
-            restores[0].1, 8,
-            "restored the full 8-token cached leading prefix"
+            restores[0].1, 10,
+            "restored the sidecar-captured 10-token leading prefix"
         );
         assert!(
             engine.kv_system_metrics().reuse_hit_resident > before_hits,
@@ -3895,7 +3901,7 @@ mod tests {
             MockKvPool::with_capacity(1, 4, 8),
             test_config(1),
         );
-        let _first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
+        let first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(first).expect("first completed"));
