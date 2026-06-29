@@ -86,7 +86,7 @@ print(client.chat.completions.create(
 
 <sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = 单流生成速率 · <a href="benchmarks/README.md">快照 + 方法</a></sub>
 
-**推测解码击穿 HBM 带宽墙。** Qwen3.6-27B(OptiQ 4/8-bit):模型自带的 NextN/MTP 头出草稿、base 校验,**输出与 greedy 比特一致** —— **12.3 → 18.1 tok/s(+47%)**,越过任何 kernel 都够不到的 15.2 tok/s HBM 下限。
+**推测解码击穿 HBM 带宽墙。** Qwen3.6-27B(OptiQ 4/8-bit):模型自带的 NextN/MTP 头出草稿、base 校验,**输出与 greedy 比特一致** —— **12.3 → 17.75 tok/s(+44%)**,越过任何 kernel 都够不到的 15.2 tok/s HBM 下限。
 
 <sub>质量不掉:PPL 7.82(vs uniform-4bit 8.56)· 68.8% 草稿接受率 · 默认开,<code>--no-speculative</code> 可关。</sub>
 
