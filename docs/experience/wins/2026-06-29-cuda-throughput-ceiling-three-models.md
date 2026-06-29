@@ -74,3 +74,9 @@ DSv4 batched page-table assertion fix (commit `3c8cc484`, HEAD) required for cra
 | Qwen3.6-27B-FP8 | CUDA single GPU | 1 | 80.5 | 16 |
 | Qwen3.5-122B-A10B | CUDA NCCL | 4 | 53.0 | 2 |
 | DeepSeek-V4-Flash-FP8 | CUDA NCCL | 4 | 44.3 | 4 |
+
+## Follow-up (same day)
+
+- **Qwen3.5-122B fp8 KV** (`356e0072`): c=4 = 49.8 tok/s (−4% vs bf16), c=2 = 45.7 (−14%). Licensed at c≥2. See [`2026-06-29-qwen35-fp8-kv-bench.md`](2026-06-29-qwen35-fp8-kv-bench.md).
+- **DSv4 deepep intranode fix** (`8e6a0350`): `mk_align=1` bug fixed; c=4 = 38.4 tok/s with deepep. allreduce (43.2) still wins on single-node. See [`2026-06-29-dsv4-deepep-intranode-fix.md`](2026-06-29-dsv4-deepep-intranode-fix.md).
+- **DSv4 allreduce ceiling confirmed** (`arle-build`, num-slots=4): c=4 = 45.1, c=8 = 45.4 tok/s — matches original 44.3 within noise.
