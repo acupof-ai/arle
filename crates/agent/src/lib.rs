@@ -1652,7 +1652,8 @@ mod tests {
 
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains(r#""name":"bash""#));
-        assert!(prompt.contains(r#""command":"pwd""#));
+        assert!(prompt.contains("<function=bash>"));
+        assert!(prompt.contains("<parameter=command>"));
     }
 
     #[test]
