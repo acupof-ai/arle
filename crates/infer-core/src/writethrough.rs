@@ -319,14 +319,12 @@ mod tests {
             // not merely excluded from attention.
             if !drop.is_empty() {
                 let drop_set: std::collections::HashSet<u32> = drop.iter().copied().collect();
-                let kept: Vec<(u32, u64)> = resident
+                (resident, access) = resident
                     .iter()
                     .copied()
                     .zip(access.iter().copied())
                     .filter(|(p, _)| !drop_set.contains(p))
-                    .collect();
-                resident = kept.iter().map(|&(p, _)| p).collect();
-                access = kept.iter().map(|&(_, a)| a).collect();
+                    .unzip();
             }
             assert!(
                 resident.len() <= budget_pages,
