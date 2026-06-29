@@ -538,20 +538,24 @@ pub fn score_workdir(
         // student's SOURCE fix in other files is preserved. (Without this, a
         // plain `git apply` against a student-dirtied test file fails "patch does
         // not apply" and a real fix is mis-scored as failing.)
+        // A `+++ b/<path>` is a real file header only when it directly follows a
+        // `--- ` line — gating on that avoids mistaking a patch CONTENT line that
+        // happens to start with `+++ b/` for a path to reset.
+        let mut after_minus_header = false;
         for line in test_patch.lines() {
-            if let Some(path) = line.strip_prefix("+++ b/") {
+            if after_minus_header && let Some(path) = line.strip_prefix("+++ b/") {
                 let path = path.trim_end();
-                if path.is_empty() || path == "/dev/null" {
-                    continue;
+                if !path.is_empty() && path != "/dev/null" {
+                    let mut checkout = Command::new("git");
+                    checkout
+                        .arg("-C")
+                        .arg(workdir)
+                        .args(["checkout", "--", path]);
+                    // Ignore failure: a path the patch CREATES has no base to reset to.
+                    let _ = plain_output(&mut checkout, "git checkout test path");
                 }
-                let mut checkout = Command::new("git");
-                checkout
-                    .arg("-C")
-                    .arg(workdir)
-                    .args(["checkout", "--", path]);
-                // Ignore failure: a path the patch CREATES has no base to reset to.
-                let _ = plain_output(&mut checkout, "git checkout test path");
             }
+            after_minus_header = line.starts_with("--- ");
         }
 
         let patch_file = workdir.join(".arle_test_patch.diff");
