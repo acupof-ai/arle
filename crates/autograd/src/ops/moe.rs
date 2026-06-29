@@ -172,18 +172,19 @@ pub fn moe_topk_softmax(
     let experts = input.shape[1];
     validate_top_k(top_k, experts)?;
 
-    let mut indices = Vec::with_capacity(tokens * top_k);
-    for token in 0..tokens {
-        let row = &input.data[token * experts..(token + 1) * experts];
-        let mut order: Vec<usize> = (0..experts).collect();
-        order.sort_by(|&lhs, &rhs| {
-            row[rhs]
-                .partial_cmp(&row[lhs])
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| lhs.cmp(&rhs))
-        });
-        indices.extend_from_slice(&order[..top_k]);
-    }
+    let indices: Vec<usize> = (0..tokens)
+        .flat_map(|token| {
+            let row = &input.data[token * experts..(token + 1) * experts];
+            let mut order: Vec<usize> = (0..experts).collect();
+            order.sort_by(|&lhs, &rhs| {
+                row[rhs]
+                    .partial_cmp(&row[lhs])
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| lhs.cmp(&rhs))
+            });
+            order.into_iter().take(top_k)
+        })
+        .collect();
 
     moe_topk_softmax_with_indices(logits, top_k, &indices, store, tape)
 }
@@ -369,10 +370,10 @@ pub fn moe_gather_rows(
         }
     }
 
-    let mut data = Vec::with_capacity(rows.len() * cols);
-    for &row in rows {
-        data.extend_from_slice(&input.data[row * cols..(row + 1) * cols]);
-    }
+    let data: Vec<f32> = rows
+        .iter()
+        .flat_map(|&row| input.data[row * cols..(row + 1) * cols].iter().copied())
+        .collect();
     let output_id = store.alloc(Tensor::new(
         data,
         vec![rows.len(), cols],

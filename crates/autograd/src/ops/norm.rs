@@ -128,16 +128,15 @@ fn rmsnorm_host_eager(
     let output_id = store.alloc(Tensor::new(output, x_tensor.shape.clone(), requires_grad)?);
     if requires_grad {
         let rows = x_tensor.size / hidden;
-        let mut inv_rms = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let base = row * hidden;
-            let mut sum_sq = 0.0;
-            for col in 0..hidden {
-                let value = x_tensor.data[base + col];
-                sum_sq += value * value;
-            }
-            inv_rms.push(1.0 / ((sum_sq / hidden as f32) + eps).sqrt());
-        }
+        let inv_rms: Vec<f32> = (0..rows)
+            .map(|row| {
+                let sum_sq: f32 = x_tensor.data[row * hidden..(row + 1) * hidden]
+                    .iter()
+                    .map(|&v| v * v)
+                    .sum();
+                1.0 / ((sum_sq / hidden as f32) + eps).sqrt()
+            })
+            .collect();
         tape.record(TapeEntry {
             op: BackwardOp::RMSNorm,
             output_id,
@@ -257,17 +256,15 @@ pub(crate) fn rmsnorm_backward(
 
     let rows = x_tensor.size / hidden;
     let inv_rms = if inv_rms.is_empty() {
-        let mut computed = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let base = row * hidden;
-            let mut sum_sq = 0.0;
-            for col in 0..hidden {
-                let value = x_tensor.data[base + col];
-                sum_sq += value * value;
-            }
-            computed.push(1.0 / ((sum_sq / hidden as f32) + eps).sqrt());
-        }
-        computed
+        (0..rows)
+            .map(|row| {
+                let sum_sq: f32 = x_tensor.data[row * hidden..(row + 1) * hidden]
+                    .iter()
+                    .map(|&v| v * v)
+                    .sum();
+                1.0 / ((sum_sq / hidden as f32) + eps).sqrt()
+            })
+            .collect()
     } else if inv_rms.len() != rows {
         return Err(AutogradError::TapeInvariant(
             "rmsnorm inverse-rms rows mismatch",

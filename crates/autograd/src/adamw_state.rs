@@ -47,26 +47,22 @@ impl AdamW {
     /// yet (e.g. param never received a gradient) are silently omitted — they
     /// have nothing to save.
     pub fn export_state(&self, names: &[(TensorId, String)]) -> AdamWState {
-        let mut params = Vec::with_capacity(names.len());
-        let mut covered = 0usize;
-
-        for (id, name) in names {
-            let Some((m, v)) = self.moments_host(*id) else {
-                // No moments recorded yet for this TensorId. Nothing to save.
-                continue;
-            };
-            covered += 1;
-            let shape = self.param_shape(*id).unwrap_or_else(|| vec![m.len()]);
-            params.push(AdamWParamState {
-                name: name.clone(),
-                m,
-                v,
-                shape,
-            });
-        }
+        let params: Vec<AdamWParamState> = names
+            .iter()
+            .filter_map(|(id, name)| {
+                let (m, v) = self.moments_host(*id)?;
+                let shape = self.param_shape(*id).unwrap_or_else(|| vec![m.len()]);
+                Some(AdamWParamState {
+                    name: name.clone(),
+                    m,
+                    v,
+                    shape,
+                })
+            })
+            .collect();
 
         let total_internal = self.state_len();
-        let skipped_export = total_internal.saturating_sub(covered);
+        let skipped_export = total_internal.saturating_sub(params.len());
 
         AdamWState {
             step: self.step_count() as u64,
