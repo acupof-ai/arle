@@ -466,15 +466,9 @@ fn resolve_engine_config(
         config.chunked_prefill_size = value;
     }
     config.slot_oversubscription = serve_args.slot_oversubscription;
-    if serve_args.kv_t1_budget_bytes.is_some() {
-        config.kv_t1_budget_bytes = serve_args.kv_t1_budget_bytes;
-    }
-    if serve_args.memory_budget_bytes.is_some() {
-        config.memory_budget_bytes = serve_args.memory_budget_bytes;
-    }
-    if serve_args.system_reserve_bytes.is_some() {
-        config.system_reserve_bytes = serve_args.system_reserve_bytes;
-    }
+    config.kv_t1_budget_bytes = serve_args.kv_t1_budget_bytes;
+    config.memory_budget_bytes = serve_args.memory_budget_bytes;
+    config.system_reserve_bytes = serve_args.system_reserve_bytes;
     config.allow_swap = serve_args.allow_swap;
 
     // A user-supplied --max-prompt-tokens above the total is a genuine

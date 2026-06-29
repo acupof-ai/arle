@@ -82,8 +82,8 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
         TrainCommand::Opd(args) => run_opd(args),
         TrainCommand::SelfOpd(args) => run_self_opd(args),
-        TrainCommand::RubricOpd(args) => run_rubric_opd(args),
-        TrainCommand::AgentOpd(args) => run_agent_opd(args),
+        TrainCommand::RubricOpd(args) => exit_from_result(run_rubric_opd_impl(args)),
+        TrainCommand::AgentOpd(args) => exit_from_result(run_agent_opd_impl(args)),
     }
 }
 
@@ -1291,20 +1291,12 @@ fn run_self_opd(args: TrainSelfOpdArgs) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn run_rubric_opd(args: TrainRubricOpdArgs) -> ExitCode {
-    exit_from_result(run_rubric_opd_impl(args))
-}
-
 #[cfg(not(feature = "cuda"))]
 fn run_rubric_opd_impl(_args: TrainRubricOpdArgs) -> Result<()> {
     bail!(
         "rubric-opd requires the cuda feature (the Flash judge + rollout engines are \
          CUDA-only). Build with --features cuda,nccl."
     )
-}
-
-fn run_agent_opd(args: TrainAgentOpdArgs) -> ExitCode {
-    exit_from_result(run_agent_opd_impl(args))
 }
 
 #[cfg(not(feature = "cuda"))]
