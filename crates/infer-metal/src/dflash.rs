@@ -751,12 +751,14 @@ impl DFlashDraftState {
         let initial = i32::try_from(initial_tokens).unwrap_or(i32::MAX.saturating_sub(256));
         let capacity = ((initial + 255) / 256 + 1) * 256;
         let shape = [1, n_kv_heads, capacity.max(256), head_dim];
-        let mut k_caches = Vec::with_capacity(num_layers);
-        let mut v_caches = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            k_caches.push(mlx::zeros(&shape, mlx::Dtype::Bfloat16));
-            v_caches.push(mlx::zeros(&shape, mlx::Dtype::Bfloat16));
-        }
+        let (k_caches, v_caches): (Vec<_>, Vec<_>) = (0..num_layers)
+            .map(|_| {
+                (
+                    mlx::zeros(&shape, mlx::Dtype::Bfloat16),
+                    mlx::zeros(&shape, mlx::Dtype::Bfloat16),
+                )
+            })
+            .unzip();
         Self {
             k_caches,
             v_caches,
@@ -777,22 +779,14 @@ impl DFlashDraftState {
     }
 
     fn active_kv_flat(&self) -> Vec<MlxArray> {
-        let mut flat = Vec::with_capacity(self.k_caches.len() * 2);
-        for layer in 0..self.k_caches.len() {
-            flat.push(mlx::slice(
-                &self.k_caches[layer],
-                &[0, 0, 0, 0],
-                &[1, self.n_kv_heads, self.len, self.head_dim],
-                &[1, 1, 1, 1],
-            ));
-            flat.push(mlx::slice(
-                &self.v_caches[layer],
-                &[0, 0, 0, 0],
-                &[1, self.n_kv_heads, self.len, self.head_dim],
-                &[1, 1, 1, 1],
-            ));
-        }
-        flat
+        let lo = [0, 0, 0, 0];
+        let hi = [1, self.n_kv_heads, self.len, self.head_dim];
+        let st = [1, 1, 1, 1];
+        self.k_caches
+            .iter()
+            .zip(&self.v_caches)
+            .flat_map(|(k, v)| [mlx::slice(k, &lo, &hi, &st), mlx::slice(v, &lo, &hi, &st)])
+            .collect()
     }
 
     fn replace_active_kv_flat(&mut self, flat: Vec<MlxArray>) -> Result<()> {
