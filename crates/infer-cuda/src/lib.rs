@@ -715,6 +715,22 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn restore_prefix_sidecar(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, tokens, matched_len);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.restore_prefix_sidecar(slot, tokens, matched_len),
+        }
+    }
+
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.

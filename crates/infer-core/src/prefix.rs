@@ -83,6 +83,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Err(err);
         }
 
+        // Restore the recurrent sidecar for hybrid models (Qwen3.5/3.6). No-op for
+        // full-attention-only backends. On miss, logs a debug message and proceeds
+        // with zeroed recurrent (graceful degradation — same as pre-#85 fresh prefill).
+        if let Err(err) = self.executor.restore_prefix_sidecar(
+            slot,
+            &request.prompt_tokens,
+            prefix_match.matched_len,
+        ) {
+            log::warn!(
+                "recurrent sidecar restore failed for slot {slot}: {err:#}; \
+                 proceeding with zeroed recurrent state"
+            );
+        }
+
         self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
         self.prefix_cache_stats.hit_tokens = self
             .prefix_cache_stats
