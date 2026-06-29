@@ -3846,7 +3846,7 @@ mod tests {
             test_config(2),
         );
         // First request: fills one sealed block (tokens 1..=4) → published to radix.
-        let first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
+        let _first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
         engine.run_to_idle()?;
         let free_after_first = engine.kv_free_pages();
 
@@ -3895,7 +3895,7 @@ mod tests {
             MockKvPool::with_capacity(1, 4, 8),
             test_config(1),
         );
-        let first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
+        let _first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(first).expect("first completed"));

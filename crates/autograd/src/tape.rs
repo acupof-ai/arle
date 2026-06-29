@@ -16,6 +16,7 @@ use crate::{
 // and by the P2 device-residency gate inside `merge_grad`.
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum SavedContext {
     None,
     Tensor(TensorId),
