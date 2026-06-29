@@ -310,6 +310,20 @@ ffi = true
 [[kernel]]
 head_dim = 256
 q_heads = 8
+kv_heads = 1
+phase = "prefill"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
+artifact_dir = "batch_prefill_paged_hd256_q8_kv1"
+kernel_name = "tilelang_batch_prefill_paged_hd256_q8_kv1_run"
+out_name = "tilelang_batch_prefill_paged_hd256_q8_kv1"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 8
 kv_heads = 2
 phase = "prefill"
 abi = "paged_attn_v1"
@@ -383,6 +397,20 @@ ffi = true
 # ===========================================================================
 # BF16 decode (paged_attn_v1) — kernel_family "attention".
 # ===========================================================================
+
+[[kernel]]
+head_dim = 256
+q_heads = 8
+kv_heads = 1
+phase = "decode"
+abi = "paged_attn_v1"
+kernel_family = "attention"
+py_module = "tools/tilelang/batch_decode_paged_hd256.py"
+artifact_dir = "batch_decode_paged_hd256_q8_kv1"
+kernel_name = "tilelang_batch_decode_paged_hd256_q8_kv1_run"
+out_name = "tilelang_batch_decode_paged_hd256_q8_kv1"
+allow_sm70 = false
+ffi = true
 
 [[kernel]]
 head_dim = 256
