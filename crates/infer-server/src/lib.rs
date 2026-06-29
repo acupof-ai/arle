@@ -45,6 +45,7 @@ mod metrics;
 pub mod multimodal;
 pub mod multiproc_relay;
 mod schema;
+mod sse_util;
 mod tokenizer;
 
 use execution::{ControlMessage, Submission, engine_loop};

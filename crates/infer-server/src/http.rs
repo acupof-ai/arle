@@ -10,7 +10,6 @@ use std::convert::Infallible;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header;
@@ -30,6 +29,7 @@ use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatContentPart,
     CompletionRequest, CompletionResponse, ModelsResponse, StatsResponse,
 };
+use crate::sse_util::{completion_stream_chunk, finish_reason, unix_time_secs};
 use crate::tokenizer::OpenAiTokenizer;
 use crate::{RequestTicket, ServeHandle, StreamItem};
 
@@ -405,43 +405,6 @@ fn send_sse_json(
 ) -> bool {
     tx.blocking_send(Ok(Event::default().data(value.to_string())))
         .is_ok()
-}
-
-fn completion_stream_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    text: String,
-    finish: Option<&str>,
-    usage: Option<serde_json::Value>,
-) -> serde_json::Value {
-    json!({
-        "id": id,
-        "object": "text_completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "text": text,
-            "index": 0,
-            "logprobs": null,
-            "finish_reason": finish,
-        }],
-        "usage": usage,
-    })
-}
-
-fn finish_reason(reason: Option<&FinishReason>) -> &'static str {
-    match reason {
-        Some(FinishReason::Stop) => "stop",
-        Some(FinishReason::Length) | None => "length",
-        Some(FinishReason::Abort) => "abort",
-    }
-}
-
-fn unix_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 fn generate_multimodal<E, K>(
