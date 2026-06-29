@@ -56,9 +56,11 @@ pub fn tokens_record_to_pairs(
         if completion.is_empty() {
             continue;
         }
-        let mut prefix = Vec::with_capacity(prompt_ids.len() + span_start);
-        prefix.extend_from_slice(prompt_ids);
-        prefix.extend_from_slice(&response_ids[..span_start]);
+        let prefix: Vec<u32> = prompt_ids
+            .iter()
+            .copied()
+            .chain(response_ids[..span_start].iter().copied())
+            .collect();
         pairs.push((prefix, completion));
     }
     pairs
