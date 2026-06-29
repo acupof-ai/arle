@@ -55,7 +55,7 @@ pub use coordinator::coordinator_router;
 pub use http::openai_router;
 pub use multiproc_relay::{
     PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
-    RelayWorker, TcpChannel, WireRequest, broadcast_tick, set_tick_broadcaster,
+    RelayWorker, TcpChannel, WireRequest, WireStats, broadcast_tick, set_tick_broadcaster,
     tick_broadcaster_installed,
 };
 pub use schema::{
@@ -579,6 +579,15 @@ impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
     }
 }
 
+// ServeHandle<E, K> is Send regardless of whether E or K are Send: every field
+// is independently Send (channels, Arc, AtomicUsize, PhantomData<fn()->(E,K)>).
+// The E/K values themselves live exclusively on the engine thread and are never
+// moved out through the public ServeHandle API. Rust's conservative auto-trait
+// inference denies Send because of the generic parameters, but the send-safety
+// proof is field-by-field: Sender<Submission>, Sender<ControlMessage<E,K>>
+// (ControlMessage is Box<dyn FnOnce+Send>, always Send), Arc<Mutex<_>>, etc.
+unsafe impl<E: BackendExecutor, K: KvPool> Send for ServeHandle<E, K> {}
+
 /// A tiny in-crate executor that echoes each row's input forward by `+1`.
 ///
 /// Mirrors the engine-core test mock's token rule so the serve layer can be
@@ -616,6 +625,101 @@ impl BackendExecutor for EchoExecutor {
 
     fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
         Ok(PollResult::Ready(inflight))
+    }
+}
+
+/// Single-process coordinator HTTP router using a local in-process relay.
+///
+/// Identical route surface as [`coordinator_router`] (single HTTP implementation);
+/// request handling goes through the relay protocol over an in-process channel
+/// rather than TCP. Vision models (Gemma4, DeepseekOcr, DiffusionGemma) should
+/// use [`openai_router`] instead — the relay wire format does not carry multimodal
+/// data.
+pub fn coordinator_local_router<E, K>(
+    serve: ServeHandle<E, K>,
+    tokenizer: tokenizer::OpenAiTokenizer,
+    model: impl Into<String>,
+    max_thinking_tokens: usize,
+) -> axum::Router
+where
+    E: infer_seam::BackendExecutor + 'static,
+    K: infer_seam::KvPool + 'static,
+{
+    use multiproc_relay::RelayCoordinator;
+    use std::sync::Arc;
+
+    let (relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
+    let serve = Arc::new(serve);
+
+    std::thread::Builder::new()
+        .name("arle-local-relay-driver".to_string())
+        .spawn(move || {
+            serve_handle_relay_driver(serve, engine_recv, engine_tx);
+        })
+        .expect("spawn arle-local-relay-driver");
+
+    coordinator::coordinator_router(relay, tokenizer, model.into(), max_thinking_tokens)
+}
+
+fn serve_handle_relay_driver<E, K>(
+    serve: std::sync::Arc<ServeHandle<E, K>>,
+    mut engine_recv: multiproc_relay::LocalChannelRecv,
+    engine_tx: std::sync::mpsc::SyncSender<multiproc_relay::RelayEnvelope>,
+) where
+    E: infer_seam::BackendExecutor + 'static,
+    K: infer_seam::KvPool + 'static,
+{
+    use multiproc_relay::{RelayChannel, RelayEnvelope, WireStats};
+
+    loop {
+        match engine_recv.recv() {
+            Ok(Some(RelayEnvelope::TickAdmissions { seq: _, requests })) => {
+                for wire in requests {
+                    let request_id = wire.request_id;
+                    let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
+                    let serve_clone = std::sync::Arc::clone(&serve);
+                    let tx_clone = engine_tx.clone();
+                    std::thread::spawn(move || {
+                        let result = serve_clone
+                            .submit(prompt_tokens, max_tokens, sampling)
+                            .and_then(|ticket| ticket.collect());
+                        let delta = match result {
+                            Ok(completed) => multiproc_relay::RelayCompletionDelta {
+                                text_delta: String::new(),
+                                token_ids: completed.generated_tokens.clone(),
+                                finish: true,
+                                finish_reason: completed.finish.clone(),
+                                error: None,
+                            },
+                            Err(e) => multiproc_relay::RelayCompletionDelta {
+                                text_delta: String::new(),
+                                token_ids: Vec::new(),
+                                finish: true,
+                                finish_reason: None,
+                                error: Some(e.to_string()),
+                            },
+                        };
+                        let _ = tx_clone.send(RelayEnvelope::Completion { request_id, delta });
+                    });
+                }
+            }
+            Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
+                let counters = serve.counters();
+                let data = WireStats::from_counters(&counters);
+                let _ = engine_tx.send(RelayEnvelope::StatsResponse { request_id, data });
+            }
+            Ok(Some(RelayEnvelope::Shutdown)) | Ok(None) => {
+                log::info!("[local-relay-driver] shutdown");
+                return;
+            }
+            Ok(Some(other)) => {
+                log::debug!("[local-relay-driver] unexpected envelope: {other:?}");
+            }
+            Err(e) => {
+                log::error!("[local-relay-driver] recv error: {e:#}");
+                return;
+            }
+        }
     }
 }
 

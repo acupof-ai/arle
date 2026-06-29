@@ -62,7 +62,8 @@ pub use serve_engine::ServeInferenceEngine;
 // the `infer-cuda` re-export pattern above).
 pub use infer_server::{
     PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
-    RelayWorker, TcpChannel, WireRequest, set_tick_broadcaster,
+    RelayWorker, TcpChannel, WireRequest, WireStats, coordinator_local_router,
+    set_tick_broadcaster,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy

@@ -1246,7 +1246,7 @@ mod backend {
         }
         let (serve, tokenizer, model_id) =
             metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
-        Ok(infer_server::openai_router(
+        Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
             model_id,
@@ -1916,6 +1916,31 @@ mod backend {
             self.engine.step()
         }
 
+        /// Snapshot prefix-cache stats for the coordinator `/v1/stats` relay.
+        pub fn prefix_cache_stats(&self) -> infer_core::PrefixCacheStats {
+            self.engine.prefix_cache_stats()
+        }
+
+        /// Snapshot throughput counters for the coordinator `/v1/stats` relay.
+        pub fn throughput_stats(&self) -> infer_core::ThroughputStats {
+            self.engine.throughput_stats()
+        }
+
+        /// Active (running) request count.
+        pub fn active_count(&self) -> usize {
+            self.engine.active_count()
+        }
+
+        /// Waiting (queued) request count.
+        pub fn waiting_count(&self) -> usize {
+            self.engine.waiting_count()
+        }
+
+        /// Free KV pages remaining.
+        pub fn kv_free_pages(&self) -> usize {
+            self.engine.kv_free_pages()
+        }
+
         /// Drain terminal completions (output owner only): emit one terminal delta
         /// per finished tracked request, keyed by `request_id`. No-op on followers.
         /// Abort propagation: once the engine is idle, a still-tracked handle that
@@ -1965,7 +1990,7 @@ mod backend {
 
     /// Single-GPU CUDA serve router. Builds the same `ServeHandle` as
     /// [`LoadedInferenceEngine::load_cuda`] via [`cuda_serve_handle`], then wraps
-    /// it in [`infer_server::openai_router`].
+    /// it in [`infer_server::coordinator_local_router`].
     #[cfg(feature = "cuda")]
     fn router_cuda(
         model_path: &str,
@@ -1976,7 +2001,7 @@ mod backend {
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) =
             cuda_serve_handle(model_path, enable_cuda_graph, config, kv_ssd, shutdown)?;
-        Ok(infer_server::openai_router(
+        Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
             model_id,
@@ -2120,7 +2145,7 @@ mod backend {
 
     /// HIP serve router. Builds the same `ServeHandle` as
     /// [`LoadedInferenceEngine::load_hip`] via [`hip_serve_handle`], then wraps
-    /// it in [`infer_server::openai_router`]. Mirrors [`router_cuda`].
+    /// it in [`infer_server::coordinator_local_router`]. Mirrors [`router_cuda`].
     #[cfg(feature = "hip")]
     fn router_hip(
         model_path: &str,
@@ -2128,7 +2153,7 @@ mod backend {
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::openai_router(
+        Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
             model_id,
@@ -2138,7 +2163,7 @@ mod backend {
 
     /// Vulkan serve router. Builds the same `ServeHandle` as
     /// [`LoadedInferenceEngine::load_vulkan`] via [`vulkan_serve_handle`], then
-    /// wraps it in [`infer_server::openai_router`]. Mirrors [`router_hip`].
+    /// wraps it in [`infer_server::coordinator_local_router`]. Mirrors [`router_hip`].
     #[cfg(feature = "vulkan")]
     fn router_vulkan(
         model_path: &str,
@@ -2146,7 +2171,7 @@ mod backend {
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config, shutdown)?;
-        Ok(infer_server::openai_router(
+        Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
             model_id,
@@ -2156,7 +2181,7 @@ mod backend {
 
     /// Portable CPU serve router: the placeholder `MetalExecutor` over the real
     /// backend-neutral host paged KV pool (no MLX, no CUDA), wrapped in
-    /// [`infer_server::openai_router`]. Mirrors
+    /// [`infer_server::coordinator_local_router`]. Mirrors
     /// [`LoadedInferenceEngine::load_cpu`].
     #[cfg(all(
         feature = "cpu",
@@ -2170,7 +2195,7 @@ mod backend {
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
-        use infer_server::{OpenAiTokenizer, openai_router};
+        use infer_server::OpenAiTokenizer;
 
         if config.mtp_draft_tokens.is_some() || config.mtp_draft_topk.is_some() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
@@ -2181,7 +2206,7 @@ mod backend {
         let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
         let serve =
             ServeHandle::spawn_with_shutdown(executor, kv, config.scheduler_config(), shutdown);
-        Ok(openai_router(
+        Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
             model_id,
