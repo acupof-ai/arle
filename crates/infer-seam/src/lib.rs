@@ -325,11 +325,15 @@ pub trait BackendExecutor {
     /// prefix of length `matched_len`. Called by `attach_prefix_to_request` after
     /// `kv.attach_pages()` succeeds. Default no-op for full-attention-only backends
     /// (CUDA Qwen dense, Metal); only Qwen3.5/3.6 hybrid overrides this.
+    ///
+    /// `prefix_pages` are the physical host-pool page ids already attached to the
+    /// slot — the hybrid override uses them to sync the device KV pool seq_len.
     fn restore_prefix_sidecar(
         &mut self,
         _slot: usize,
         _tokens: &[u32],
         _matched_len: usize,
+        _prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         Ok(())
     }

@@ -90,6 +90,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             slot,
             &request.prompt_tokens,
             prefix_match.matched_len,
+            &prefix_match.block_ids,
         ) {
             log::warn!(
                 "recurrent sidecar restore failed for slot {slot}: {err:#}; \
