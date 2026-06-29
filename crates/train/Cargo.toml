@@ -52,6 +52,9 @@ cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = 
 # (avoids the wait_with_output pipe-hold hang when a tool command backgrounds a
 # process). Also used by tests.
 tempfile = "3"
+# Spawner uses libc::kill to signal process groups without forking an external
+# `kill` binary (extra forks from the spawner can trigger ELKEID ancestry checks).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

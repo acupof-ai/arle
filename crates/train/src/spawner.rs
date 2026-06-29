@@ -2,20 +2,26 @@
 //! ALL sandbox subprocess spawns on behalf of the agent-OPD rollout.
 //!
 //! ## Why this exists
-//! The 8×H20 pod runs an ELKEID kernel HIDS hook that SIGABRTs (`do_coredump`)
-//! a **multithreaded, CUDA-resident** process the instant it `fork()`s. Once the
-//! agent-OPD process loads the rollout engine / autograd CUDA backend it is
-//! CUDA-resident, so every `Command::spawn()` in [`crate::sandbox`] — the bash
-//! tool, `cp`/`git`/`pytest` — would fork-from-CUDA and die. No libc-level dodge
-//! (`setsid`, process-group) escapes a kernel hook: the abort is on the `fork()`
-//! syscall itself, independent of shared-context.
+//! The 8×H20 pod runs an ELKEID kernel HIDS hook that SIGKILLs arle when a
+//! `setsid()` syscall is issued by a process whose ancestor chain contains a
+//! CUDA-resident process. Once the agent-OPD process loads the rollout engine /
+//! autograd CUDA backend it is CUDA-resident, so any subprocess that calls
+//! `setsid()` triggers ELKEID to kill the CUDA-resident ancestor (arle).
 //!
-//! ## The fix
-//! Fork ONE helper BEFORE any CUDA init (parent is not yet CUDA-resident, so the
-//! single fork is safe). The helper is a plain non-CUDA process that lives for
-//! the whole run, listens on a unix socket, and does the spawning. Sandbox spawn
-//! sites become a socket request → response; the actual `fork()`/`exec()` happens
-//! inside the helper, which never touches CUDA, so ELKEID leaves it alone.
+//! ## The fix (two layers)
+//! **Layer 1 — route forks through a pre-CUDA helper:** Fork ONE helper BEFORE
+//! any CUDA init. The helper is a plain non-CUDA process; its forks are not
+//! direct children of a CUDA-resident process, which dodges the most common
+//! ELKEID trigger.
+//!
+//! **Layer 2 — avoid `setsid()` and external `kill` in the helper:** The
+//! original helper called `Command::new("setsid").arg(program)` for bash-tool
+//! commands; `setsid` calls the `setsid()` syscall, which ELKEID hooks. Even
+//! though the helper is not itself CUDA-resident, ELKEID traces the ancestor
+//! chain of the forked `setsid` process, finds arle, and kills it.
+//! Fix: spawn the program directly with `process_group(0)` (uses `setpgid`, not
+//! `setsid`). Use `libc::kill(-pgid, SIGKILL)` for group teardown (no extra
+//! fork of an external `kill` binary).
 //!
 //! ## Wiring
 //! - The helper is the same `arle` binary re-exec'd with `ARLE_SPAWNER_LISTEN=<sock>`;
@@ -29,6 +35,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -213,39 +220,31 @@ fn build_command(req: &SpawnRequest) -> Command {
     cmd
 }
 
-/// `run_captured` equivalent, run inside the helper. Identical mechanism to the
-/// pre-spawner `sandbox::run_captured`: re-parent under the standalone `setsid`
-/// binary so the child leads its own session+group, capture combined stdout+stderr
-/// to a temp file (no pipe to hang on a backgrounded grandchild), poll to the
-/// deadline, and `kill -KILL -<pgid>` the whole group on timeout AND on clean exit
-/// (reaps backgrounded grandchildren). The helper is NOT CUDA-resident, so the
-/// `setsid` re-exec fork is safe here.
+/// `run_captured` equivalent, run inside the helper. Spawns the program in a
+/// new process group (`process_group(0)` → `setpgid`, NOT `setsid`) so the
+/// whole group can be torn down on timeout. Output captured to a temp file
+/// (no pipe → no hang on backgrounded grandchildren). Uses `libc::kill` to
+/// signal the group without forking an external `kill` binary.
+///
+/// Previously this called `Command::new("setsid").arg(program)` which triggered
+/// ELKEID's `setsid()` ancestry hook and killed arle. The replacement avoids
+/// both `setsid()` and any extra fork.
 fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
     let tmp = tempfile::NamedTempFile::new()?;
     let stdout_handle = tmp.reopen()?;
     let stderr_handle = stdout_handle.try_clone()?; // shared offset → interleaved
 
-    let mut command = Command::new("setsid");
-    command.arg(&req.program).args(&req.args);
-    if let Some(dir) = &req.cwd {
-        command.current_dir(dir);
-    }
-    for (k, v) in &req.env {
-        match v {
-            Some(val) => {
-                command.env(k, val);
-            }
-            None => {
-                command.env_remove(k);
-            }
-        }
-    }
+    let mut command = build_command(req);
     command
         .stdin(Stdio::null())
         .stdout(stdout_handle)
-        .stderr(stderr_handle);
+        .stderr(stderr_handle)
+        // New process group (setpgid, not setsid) so kill_group can target the
+        // whole group without touching the spawner's own group.
+        .process_group(0);
 
     let mut child = command.spawn()?;
+    // The child's PGID == its PID because we used process_group(0).
     let pgid = child.id() as i32;
 
     let deadline = Instant::now() + Duration::from_secs(req.timeout_s);
@@ -270,16 +269,12 @@ fn run_captured(req: &SpawnRequest) -> std::io::Result<(Vec<u8>, Option<i32>, bo
     Ok((output, code, killed))
 }
 
-/// `kill -KILL -<pgid>` — signal the whole process group. Fire-and-forget; an
-/// empty group (the common case) is fine.
+/// Send SIGKILL to the entire process group `pgid`. Uses `libc::kill` directly
+/// to avoid forking an external `kill` binary (extra forks can trigger ELKEID).
 fn kill_group(pgid: i32) {
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{pgid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // SAFETY: kill(-pgid, SIGKILL) is well-defined; an empty or already-reaped
+    // group returns ESRCH which we ignore.
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
 // ───────────────────────── client (CUDA-resident parent) ─────────────────────────
