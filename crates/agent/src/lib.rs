@@ -1084,21 +1084,23 @@ fn build_assistant_blocks(
     tool_calls: &[ToolCall],
     sub_turn_index: usize,
 ) -> Vec<ContentBlock> {
-    let mut blocks = Vec::with_capacity(1 + tool_calls.len());
     // Always emit a leading text block — even when empty — so the
     // schema's "assistant content is always blocks" invariant holds
     // and downstream consumers don't have to special-case empty text.
-    blocks.push(ContentBlock::Text {
+    std::iter::once(ContentBlock::Text {
         text: content.to_string(),
-    });
-    for (call_index, call) in tool_calls.iter().enumerate() {
-        blocks.push(ContentBlock::ToolUse {
-            id: tool_use_id(sub_turn_index, call_index),
-            name: call.name.clone(),
-            input: call.arguments.clone(),
-        });
-    }
-    blocks
+    })
+    .chain(
+        tool_calls
+            .iter()
+            .enumerate()
+            .map(|(call_index, call)| ContentBlock::ToolUse {
+                id: tool_use_id(sub_turn_index, call_index),
+                name: call.name.clone(),
+                input: call.arguments.clone(),
+            }),
+    )
+    .collect()
 }
 
 fn finish_reason_to_str(reason: FinishReason) -> &'static str {
