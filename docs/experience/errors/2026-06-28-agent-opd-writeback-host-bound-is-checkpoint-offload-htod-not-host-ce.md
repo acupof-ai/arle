@@ -53,20 +53,25 @@ trajectory length — not a pure-speed wall.
 
 ## Fix
 
-(pending — captured signal path is the cheap unblock; the structural fix is the
-license-or-kill target). Direction, in priority order:
+**Resolved 2026-06-30** via two commits:
 
-1. **Shrink the trajectory to capture the signal cheaply** (this session's path):
-   `--synthetic-writeback-seq <short>` (or fewer `--max-turns`) drops total seq so
-   the writeback fits and finishes in the GPU-bound regime, logging a real
-   `loss`/`trained_pairs`/`mean_loss` and unblocking the round-1 held-out Δ. A
-   small real signal beats a perfect blocked one.
-2. **Make the offload H2D overlap / batch** so the host thread isn't the
-   serialization point (async copy on a dedicated stream + one bulk transfer per
-   group instead of per-tensor), OR keep checkpoints resident
-   (`set_offload_checkpoints(false)`) when VRAM headroom permits — but that
-   re-introduces the O(seq²) memory term, so it is a tradeoff, not free.
-3. **Bound the O(seq²) attention** (the OOM term) independently of offload.
+1. **`0b7a1d89` — nested SDPA checkpoint** (`crates/train/src/qwen35.rs`):
+   When `tape.enabled` (inner_tape during `checkpoint_backward`), wrap each
+   `causal_sdpa_recompute` chunk in a nested `checkpoint` instead of letting ALL
+   chunks' `[scores/scaled/masked/probs]` accumulate simultaneously. This bounds
+   the inner backward's O(seq²) memory to ONE chunk at a time (~7 GiB for
+   seq=9597) vs the old 7-chunk × 6.6 GiB = 46 GiB pile-up.
+
+2. **`ARLE_OPD_WRITEBACK_OFFLOAD=1` (keep)**: Tried OFFLOAD=0 first (GPU-bound
+   backward, ~37 GB peak during forward) but the long forward (21 min) fills the
+   CUDA allocator cache with fragmented blocks → backward OOMs at 97422/97871 MiB
+   even though total live tensors are only ~50 GB. OFFLOAD=1 keeps the forward
+   lean (~37 GB peak) and the allocator cache small. The backward with nested SDPA
+   checkpoint should now be GPU-fast (H2D per layer = 276 MB = 23 ms, negligible)
+   with peak ~56 GB.
+
+Prior "fix direction" list (options 1-3 above) is superseded by the nested SDPA
+checkpoint, which addresses option 3 without requiring option 1 or option 2.
 
 ## Rule
 
