@@ -1012,8 +1012,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             log::debug!("finish_slot sidecar capture failed for slot {slot}: {err:#}");
         }
         self.publish_prefix_blocks(slot, &request);
-        self.release_reused_prefix(&request.reused_prefix_pages);
+        // free_slot BEFORE release_reused_prefix: reclaim_page sees page_refs>0
+        // and skips retained prefix pages; release_reused_prefix then drops the
+        // last ref and the page enters the free pool exactly once. Reversed order
+        // caused a double-push: release_pages dropped page_refs to 0 and pushed
+        // to free, then reclaim_page (page_refs absent → 0) pushed again.
         self.kv.free_slot(slot);
+        self.release_reused_prefix(&request.reused_prefix_pages);
         self.evict_prefix_cache_if_below_low_water();
         self.completed.insert(request.handle, request.into());
     }
@@ -3825,6 +3830,61 @@ mod tests {
             "at least one prefill and one decode step, got {}",
             stats.steps
         );
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_hit_no_double_free_on_finish() -> Result<()> {
+        // Regression: release_reused_prefix (kv.release_pages) then kv.free_slot
+        // (reclaim_page) both push the prefix page to the free list when page_refs
+        // hits 0 before the slot page table is cleared. The page ends up in the
+        // free list twice → two future slots get the same physical page → KV
+        // corruption / heap corruption in workers.
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 16),
+            test_config(2),
+        );
+        // First request: fills one sealed block (tokens 1..=4) → published to radix.
+        let first = engine.submit_request(vec![1, 2, 3, 4, 9], 1);
+        engine.run_to_idle()?;
+        let free_after_first = engine.kv_free_pages();
+
+        // Second request: prefix hit on the sealed block → the shared page gets
+        // retain_pages called (page_refs=1). On finish, the page must enter the
+        // free list exactly once.
+        let second = engine.submit_request(vec![1, 2, 3, 4, 10, 11], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        let free_after_second = engine.kv_free_pages();
+
+        // A third allocation must not see the prefix page listed twice.
+        // If double-pushed, two distinct allocs would get the same page.
+        let third = engine.submit_request(vec![20, 21, 22, 23, 24], 1);
+        let fourth = engine.submit_request(vec![30, 31, 32, 33, 34], 1);
+        engine.step()?;
+        let slots: Vec<_> = engine.active.iter().collect();
+        // Each admitted slot must have a distinct set of pages.
+        if slots.len() >= 2 {
+            let pages0: std::collections::HashSet<u32> = engine
+                .kv
+                .page_indices(*slots[0].0)
+                .iter()
+                .copied()
+                .collect();
+            let pages1: std::collections::HashSet<u32> = engine
+                .kv
+                .page_indices(*slots[1].0)
+                .iter()
+                .copied()
+                .collect();
+            assert!(
+                pages0.is_disjoint(&pages1),
+                "two active slots share a physical page — double-free regression: \
+                 slot0={pages0:?} slot1={pages1:?}"
+            );
+        }
+        let _ = (free_after_first, free_after_second, third, fourth);
         Ok(())
     }
 

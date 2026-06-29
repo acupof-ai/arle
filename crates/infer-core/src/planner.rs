@@ -178,8 +178,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 }
             }
         }
-        self.release_reused_prefix(&request.reused_prefix_pages);
+        // free_slot before release_reused_prefix — same ordering fix as finish_slot.
         self.kv.free_slot(slot);
+        self.release_reused_prefix(&request.reused_prefix_pages);
         if !published.is_empty() {
             self.demote_published_pages(&published);
         }
