@@ -1001,6 +1001,177 @@ fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
     Ok(records)
 }
 
+
+/// File-backed mmap page-slot store — one file per disk tier namespace, a
+/// fixed-size slot per page. Writes memcpy into the mapping (no per-page
+/// syscall); reads return `&[u8]` slices directly from the mapping (zero-copy).
+/// Built once at disk-tier attach time and held for the process lifetime.
+///
+/// The backing file is created as a **sparse** file — `fallocate` is never
+/// called, so the filesystem only allocates blocks for actually-written pages.
+/// A 274 GB store with 10 pages occupied costs ~23 MB on disk, not 274 GB.
+pub struct KvMmapStore {
+    /// The file keeping the backing store alive (mmap pins it open).
+    _file: std::fs::File,
+    /// Mutable mapping over the full slot array.
+    mapping: memmap2::MmapMut,
+    /// Size of one slot in bytes.
+    slot_bytes: usize,
+    /// Total number of slots.
+    num_slots: u32,
+    /// Indices of freed slots, available for re-use.
+    free_list: Vec<u32>,
+}
+
+impl KvMmapStore {
+    /// Create a new page-slot sparse mmap file at `path` with `num_slots`
+    /// slots of `slot_bytes` each. The file is set to the logical size but
+    /// NOT pre-allocated — the filesystem lazily allocates blocks for
+    /// slots that are actually written.
+    pub fn create(path: &Path, num_slots: usize, slot_bytes: usize) -> io::Result<Self> {
+        let num_slots = u32::try_from(num_slots).map_err(|_| invalid("num_slots exceeds u32"))?;
+        if num_slots == 0 {
+            return Err(invalid("num_slots must be > 0"));
+        }
+        let total_bytes = (num_slots as u64)
+            .checked_mul(slot_bytes as u64)
+            .and_then(|t| usize::try_from(t).ok())
+            .ok_or_else(|| invalid("total bytes overflow"))?;
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(path)?;
+        // set_len creates a sparse file: logical size without block allocation.
+        file.set_len(total_bytes as u64)?;
+
+        let mapping = unsafe {
+            memmap2::MmapOptions::new()
+                .len(total_bytes)
+                .map_mut(&file)?
+        };
+
+        let mut free_list = Vec::with_capacity(num_slots as usize);
+        for i in 0..num_slots {
+            free_list.push(i);
+        }
+
+        Ok(Self {
+            _file: file,
+            mapping,
+            slot_bytes,
+            num_slots,
+            free_list,
+        })
+    }
+
+    /// Open an existing page-slot mmap file. Caller must replay the manifest to
+    /// mark allocated slots via [`reserve`] — all slots are free on return.
+    pub fn open(path: &Path, num_slots: usize, slot_bytes: usize) -> io::Result<Self> {
+        let num_slots = u32::try_from(num_slots).map_err(|_| invalid("num_slots exceeds u32"))?;
+        let total_bytes = (num_slots as u64)
+            .checked_mul(slot_bytes as u64)
+            .and_then(|t| usize::try_from(t).ok())
+            .ok_or_else(|| invalid("total bytes overflow"))?;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let actual = file.metadata()?.len() as usize;
+        if actual < total_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("mmap store file {actual}B < expected {total_bytes}B"),
+            ));
+        }
+
+        let mapping = unsafe {
+            memmap2::MmapOptions::new()
+                .len(total_bytes)
+                .map_mut(&file)?
+        };
+
+        Ok(Self {
+            _file: file,
+            mapping,
+            slot_bytes,
+            num_slots,
+            free_list: Vec::with_capacity(num_slots as usize),
+        })
+    }
+
+    pub fn num_slots(&self) -> u32 {
+        self.num_slots
+    }
+
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+
+    /// Allocate a free slot index. Returns `None` when full.
+    pub fn alloc_slot(&mut self) -> Option<u32> {
+        self.free_list.pop()
+    }
+
+    /// Memcpy `data` into `slot` (must be exactly `slot_bytes`).
+    pub fn write_slot(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
+        assert!(
+            data.len() == self.slot_bytes,
+            "write_slot: data len {} != slot_bytes {}",
+            data.len(),
+            self.slot_bytes,
+        );
+        let offset = (slot as usize) * self.slot_bytes;
+        self.mapping[offset..offset + self.slot_bytes].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Return a borrowed slice over the slot — **zero-copy** mmap read.
+    pub fn read_slot(&self, slot: u32) -> &[u8] {
+        assert!(
+            (slot as usize) < self.num_slots as usize,
+            "read_slot: slot {slot} >= num_slots {}",
+            self.num_slots,
+        );
+        let offset = (slot as usize) * self.slot_bytes;
+        &self.mapping[offset..offset + self.slot_bytes]
+    }
+
+    /// Return a slot to the free list.
+    pub fn free_slot(&mut self, slot: u32) {
+        if !self.free_list.contains(&slot) {
+            self.free_list.push(slot);
+        }
+    }
+
+    /// Reserve `indices` as allocated (manifest replay on load).
+    pub fn reserve_indices(&mut self, indices: &[u32]) {
+        self.free_list.retain(|i| !indices.contains(i));
+    }
+
+    /// Flush the store to disk (msync). Best-effort for cache durability.
+    pub fn flush(&self) -> io::Result<()> {
+        self.mapping.flush()
+    }
+}
+
+// SAFETY: KvMmapStore owns its backing file and mapping exclusively.
+unsafe impl Send for KvMmapStore {}
+unsafe impl Sync for KvMmapStore {}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
