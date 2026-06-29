@@ -18,7 +18,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use infer_plan::{FinishReason, SamplingParams};
+use infer_plan::{FinishReason, MultimodalKind, SamplingParams};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -56,6 +56,10 @@ pub struct CoordinatorHandle {
     /// Monotonic counter for stats query request IDs (separate from request IDs to
     /// avoid collisions with completion sink IDs).
     stats_request_id: AtomicU64,
+    /// In-process channel to the multimodal driver thread (VLM backends only).
+    multimodal_tx: Option<crate::LocalMultimodalTx>,
+    /// Multimodal kind for the current backend (VLM backends only).
+    multimodal_kind: Option<MultimodalKind>,
 }
 
 impl CoordinatorHandle {
@@ -66,12 +70,15 @@ impl CoordinatorHandle {
 
 /// Build the coordinator router + spawn the lockstep loop thread. `relay` is the
 /// accepted [`RelayCoordinator`] (all N ranks connected via `accept_symmetric`).
-/// The lockstep loop runs for the process lifetime.
+/// The lockstep loop runs for the process lifetime. Pass `multimodal` for VLM
+/// backends; text-only backends pass `None`.
+#[allow(private_interfaces)]
 pub fn coordinator_router(
     relay: RelayCoordinator,
     tokenizer: OpenAiTokenizer,
     model: impl Into<String>,
     max_thinking_tokens: usize,
+    multimodal: Option<(crate::LocalMultimodalTx, MultimodalKind)>,
 ) -> Router {
     let sinks = relay.completion_sinks();
     let relay = Arc::new(Mutex::new(relay));
@@ -88,6 +95,11 @@ pub fn coordinator_router(
             .expect("spawn coordinator lockstep thread");
     }
 
+    let (multimodal_tx, multimodal_kind) = match multimodal {
+        Some((tx, kind)) => (Some(tx), Some(kind)),
+        None => (None, None),
+    };
+
     let state = Arc::new(CoordinatorHandle {
         model: model.into(),
         tokenizer: Mutex::new(tokenizer),
@@ -98,6 +110,8 @@ pub fn coordinator_router(
         sinks,
         relay,
         stats_request_id: AtomicU64::new(0),
+        multimodal_tx,
+        multimodal_kind,
     });
 
     Router::new()
@@ -379,6 +393,59 @@ async fn chat_completions(
     if state.max_thinking_tokens > 0 && thinking {
         max_tokens = max_tokens.min(state.max_thinking_tokens);
     }
+
+    // Multimodal dispatch: if the backend is a VLM and the request has images,
+    // route through the in-process multimodal channel instead of the relay.
+    if let Some(kind) = state.multimodal_kind {
+        let images = crate::multimodal::extract_images(&request.messages, Some(kind))?;
+        if !images.is_empty() {
+            let prompt = if kind == MultimodalKind::DeepseekOcr {
+                crate::multimodal::build_deepseek_ocr_prompt(&request.messages)
+            } else {
+                let tokenizer = state
+                    .tokenizer
+                    .lock()
+                    .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
+                tokenizer.render_chat_with_kwargs(
+                    &request.messages,
+                    request.chat_template_kwargs.as_ref(),
+                )?
+            };
+            let prompt = crate::multimodal::expand_image_markers(&prompt, &images, Some(kind))?;
+            let prompt_tokens = encode(&state, &prompt)?;
+            let prompt_token_count = prompt_tokens.len();
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            state
+                .multimodal_tx
+                .as_ref()
+                .ok_or_else(|| ApiError::internal("multimodal channel not initialized"))?
+                .send(crate::LocalMultimodalRequest {
+                    prompt_tokens,
+                    images,
+                    max_tokens,
+                    sampling,
+                    response_tx: resp_tx,
+                })
+                .map_err(|_| ApiError::internal("multimodal channel closed"))?;
+            let delta = tokio::time::timeout(std::time::Duration::from_secs(300), resp_rx)
+                .await
+                .map_err(|_| ApiError::internal("multimodal request timed out"))?
+                .map_err(|_| ApiError::internal("multimodal response channel closed"))?;
+            if let Some(err) = delta.error {
+                return Err(ApiError::internal(err));
+            }
+            let content = decode(&state, &delta.token_ids)?;
+            return Ok(Json(ChatCompletionResponse::from_parts(
+                state.model.clone(),
+                content,
+                prompt_token_count,
+                delta.token_ids.len(),
+                delta.finish_reason.as_ref(),
+                thinking,
+            )));
+        }
+    }
+
     let prompt = {
         let tokenizer = state
             .tokenizer
