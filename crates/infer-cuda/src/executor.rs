@@ -512,7 +512,8 @@ impl RealCudaExecutor {
     ) -> bool {
         match self {
             Self::Qwen(q) => q.set_kv_tier_disk(root, budget_bytes),
-            Self::Qwen35(_) | Self::Dsv4(_) => false,
+            Self::Qwen35(q) => q.set_kv_tier_disk(root, budget_bytes),
+            Self::Dsv4(_) => false,
         }
     }
 
@@ -3888,6 +3889,28 @@ impl Qwen35CudaExecutor {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
     }
 
+    /// Attach durable NVMe spill for the recall tier (`--kv-ssd-path`).
+    /// Pre-serve only. If `recall_tier` already exists, attaches L3 immediately;
+    /// otherwise stores the config for `set_kv_recall` to consume on first enable.
+    pub(crate) fn set_kv_tier_disk(
+        &mut self,
+        root: std::path::PathBuf,
+        budget_bytes: usize,
+    ) -> bool {
+        self.disk_root = Some(root);
+        self.disk_budget = Some(budget_bytes);
+        if let Some(tier) = self.recall_tier.as_mut() {
+            let page_bytes = tier.page_bytes();
+            tier.set_disk_durable(
+                self.disk_root.clone().unwrap(),
+                self.disk_budget.unwrap(),
+                page_bytes,
+                self.weights_epoch.clone(),
+            );
+        }
+        true
+    }
+
     /// Opt into session KV-recall (`--kv-recall`, default off). The paged
     /// full-attn pool (`full_attn_kv`) is ALWAYS resident since the shared-paged
     /// migration — the DEFAULT forward already attends it (full resident set, no
@@ -3910,10 +3933,28 @@ impl Qwen35CudaExecutor {
                 .ok_or_else(|| {
                     anyhow::anyhow!("--kv-recall: full-attn paged pool not allocated")
                 })?;
-            let tier = CudaKvTierStore::with_budget(
+            let mut tier = CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(self.dram_fraction),
                 page_bytes,
             );
+            // Try loading prior session durable NVMe spill if disk is configured.
+            // Falls through to set_disk_durable on first run or epoch mismatch.
+            if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {
+                let loaded = tier.load(
+                    root.clone(),
+                    *budget,
+                    page_bytes,
+                    self.weights_epoch.clone(),
+                );
+                if !loaded {
+                    tier.set_disk_durable(
+                        root.clone(),
+                        *budget,
+                        page_bytes,
+                        self.weights_epoch.clone(),
+                    );
+                }
+            }
             self.recall_tier = Some(tier);
         }
         Ok(())
