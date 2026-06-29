@@ -380,24 +380,32 @@ impl InferStudent {
         let mut layer_indices: Vec<usize> = layers.keys().copied().collect();
         layer_indices.sort_unstable();
 
-        let mut out_layers: Vec<StudentLoraLayer> = Vec::with_capacity(layer_indices.len());
-        for layer_idx in layer_indices {
-            let partial = layers.remove(&layer_idx).expect("layer present");
-            let mut projections = Vec::with_capacity(partial.projections.len());
-            for (projection, partial_proj) in partial.projections {
-                let label = projection.label();
-                let matrices =
-                    partial_proj.into_matrices(lora_config.rank, layer_idx, label.as_ref())?;
-                projections.push(StudentLoraProjectionUpdate {
-                    projection,
-                    matrices,
-                });
-            }
-            out_layers.push(StudentLoraLayer {
-                layer_idx,
-                projections,
-            });
-        }
+        let out_layers = layer_indices
+            .into_iter()
+            .map(|layer_idx| {
+                let partial = layers.remove(&layer_idx).expect("layer present");
+                let projections = partial
+                    .projections
+                    .into_iter()
+                    .map(|(projection, partial_proj)| {
+                        let label = projection.label();
+                        let matrices = partial_proj.into_matrices(
+                            lora_config.rank,
+                            layer_idx,
+                            label.as_ref(),
+                        )?;
+                        Ok(StudentLoraProjectionUpdate {
+                            projection,
+                            matrices,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(StudentLoraLayer {
+                    layer_idx,
+                    projections,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let update = StudentLoraUpdate {
             layers: out_layers,

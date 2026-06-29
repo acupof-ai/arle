@@ -309,38 +309,54 @@ impl OtlpLogSink {
 
 impl MetricSink for OtlpLogSink {
     fn emit(&mut self, sample: &MetricSample<'_>) {
-        let mut attrs = Vec::with_capacity(sample.fields.len() + 3);
-        attrs.push(("train.kind".to_string(), AnyValue::from("metric")));
-        attrs.push((
-            "train.phase".to_string(),
-            AnyValue::from(sample.phase.to_string()),
-        ));
-        attrs.push(("train.step".to_string(), AnyValue::from(sample.step as i64)));
-        for (key, value) in sample.fields {
-            attrs.push((format!("metric.{key}"), AnyValue::from(*value)));
-        }
+        let attrs: Vec<(String, AnyValue)> = [
+            ("train.kind".to_string(), AnyValue::from("metric")),
+            (
+                "train.phase".to_string(),
+                AnyValue::from(sample.phase.to_string()),
+            ),
+            ("train.step".to_string(), AnyValue::from(sample.step as i64)),
+        ]
+        .into_iter()
+        .chain(
+            sample
+                .fields
+                .iter()
+                .map(|(k, v)| (format!("metric.{k}"), AnyValue::from(*v))),
+        )
+        .collect();
         self.emit_log_record("metric", Severity::Info, attrs);
     }
 
     fn event(&mut self, event: &TrainEvent<'_>) {
-        let mut attrs =
-            Vec::with_capacity(event.strings.len() + event.scalars.len() + event.bools.len() + 2);
-        attrs.push((
+        let attrs: Vec<(String, AnyValue)> = std::iter::once((
             "train.kind".to_string(),
             AnyValue::from(event.kind.to_string()),
-        ));
-        if let Some(step) = event.step {
-            attrs.push(("train.step".to_string(), AnyValue::from(step as i64)));
-        }
-        for (key, value) in event.strings {
-            attrs.push((format!("event.{key}"), AnyValue::from((*value).to_string())));
-        }
-        for (key, value) in event.scalars {
-            attrs.push((format!("event.{key}"), AnyValue::from(*value)));
-        }
-        for (key, value) in event.bools {
-            attrs.push((format!("event.{key}"), AnyValue::from(*value)));
-        }
+        ))
+        .chain(
+            event
+                .step
+                .map(|s| ("train.step".to_string(), AnyValue::from(s as i64))),
+        )
+        .chain(
+            event
+                .strings
+                .iter()
+                .map(|(k, v)| (format!("event.{k}"), AnyValue::from((*v).to_string()))),
+        )
+        .chain(
+            event
+                .scalars
+                .iter()
+                .map(|(k, v)| (format!("event.{k}"), AnyValue::from(*v))),
+        )
+        .chain(
+            event
+                .bools
+                .iter()
+                .map(|(k, v)| (format!("event.{k}"), AnyValue::from(*v))),
+        )
+        .collect();
         let severity = match (
             event.kind,
             event

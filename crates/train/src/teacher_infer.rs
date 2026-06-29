@@ -214,39 +214,39 @@ impl<'a> MultiTeacher<'a> {
             }
         }
 
-        let mut resolved_routes = Vec::with_capacity(routes.len());
-        for route in routes {
-            if route.token_prefix.is_empty() {
-                return Err(TeacherForwardError::InvalidInput(format!(
-                    "MultiTeacher route for teacher '{}' has an empty token prefix; \
-                     use the default teacher instead",
-                    route.teacher_id
-                )));
-            }
-            let teacher_index = entries
-                .iter()
-                .position(|entry| entry.id == route.teacher_id)
-                .ok_or_else(|| {
-                    TeacherForwardError::InvalidInput(format!(
-                        "MultiTeacher route references unknown teacher id '{}'",
+        let resolved_routes = routes
+            .into_iter()
+            .map(|route| {
+                if route.token_prefix.is_empty() {
+                    return Err(TeacherForwardError::InvalidInput(format!(
+                        "MultiTeacher route for teacher '{}' has an empty token prefix; \
+                         use the default teacher instead",
                         route.teacher_id
-                    ))
-                })?;
-            resolved_routes.push(ResolvedTeacherRoute {
-                teacher_index,
-                token_prefix: route.token_prefix,
-            });
-        }
-
-        let mut parameter_ids = Vec::new();
-        let mut seen_params = HashSet::new();
-        for entry in &entries {
-            for &param_id in entry.teacher.parameter_ids() {
-                if seen_params.insert(param_id) {
-                    parameter_ids.push(param_id);
+                    )));
                 }
-            }
-        }
+                let teacher_index = entries
+                    .iter()
+                    .position(|entry| entry.id == route.teacher_id)
+                    .ok_or_else(|| {
+                        TeacherForwardError::InvalidInput(format!(
+                            "MultiTeacher route references unknown teacher id '{}'",
+                            route.teacher_id
+                        ))
+                    })?;
+                Ok(ResolvedTeacherRoute {
+                    teacher_index,
+                    token_prefix: route.token_prefix,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut seen_params = HashSet::new();
+        let parameter_ids: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| entry.teacher.parameter_ids())
+            .filter(|id| seen_params.insert(*id))
+            .copied()
+            .collect();
 
         Ok(Self {
             entries,
