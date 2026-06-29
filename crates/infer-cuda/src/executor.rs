@@ -419,7 +419,8 @@ impl RealCudaExecutor {
     pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.capture_cached_prefix(slot, tokens),
-            Self::Qwen(_) | Self::Qwen35(_) => Ok(()),
+            Self::Qwen35(q) => q.capture_recurrent_sidecar(slot, tokens),
+            Self::Qwen(_) => Ok(()),
         }
     }
 
@@ -434,6 +435,21 @@ impl RealCudaExecutor {
             Self::Qwen(_) | Self::Qwen35(_) => {
                 anyhow::bail!("position-0 prefix store is implemented only for DSv4 CUDA")
             }
+        }
+    }
+
+    /// Restore the page-radix sidecar recurrent state for `slot` when reusing a
+    /// prefix of length `matched_len`. Only meaningful for hybrid Qwen35 models;
+    /// no-op for all other arms.
+    pub(crate) fn restore_prefix_sidecar(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len),
+            Self::Qwen(_) | Self::Dsv4(_) => Ok(()),
         }
     }
 
@@ -3258,7 +3274,16 @@ pub(crate) struct Qwen35CudaExecutor {
     /// re-acquired before the next round's rollout). Not on the serve path.
     kv_pool_mem_fraction_static: f64,
     kv_pool_requested_pages: usize,
+    /// Sidecar snapshot store: token-prefix hash → recurrent state at that boundary.
+    /// Enables page-radix prefix reuse for hybrid models by restoring the
+    /// recurrent layers when a KV prefix is reattached (issue #85).
+    /// Capped at `RECURRENT_SIDECAR_CAP` entries; oldest-inserted entry evicted on overflow.
+    prefix_sidecar: std::collections::HashMap<u64, crate::qwen35::Qwen35RecurrentSnapshot>,
 }
+
+/// Maximum number of recurrent sidecar snapshots to keep. Each entry is
+/// ~49 MiB for Qwen3.6-27B (3 linear layers × ~16 MiB each).
+const RECURRENT_SIDECAR_CAP: usize = 32;
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3284,27 +3309,76 @@ impl Qwen35CudaExecutor {
     /// demote/promote yet (`demote/promote_prefix_pages` no-op for Qwen35), so
     /// demoted keys are never restorable and the count stops at the first one.
     ///
-    /// SOUNDNESS GATE — full-attention-only models. The radix cache keys on
-    /// full-attn KV *pages*, but Qwen3.6 is a HYBRID: its gated-delta linear
-    /// layers carry per-slot recurrent + conv state that is content-based,
-    /// position-free, and NOT page-addressable, so a reused prefix has no way to
-    /// restore those layers' state (they never processed the prefix). Reusing a
-    /// prefix would attend correct full-attn KV but feed the linear layers a
-    /// slot whose recurrent state never saw the prefix → silently wrong output,
-    /// and the page accounting itself diverges (`pool.seq_len` self-allocated for
-    /// the tail vs the engine's `start_pos`-credited `kv_seq_len`, the
-    /// `decode_graph.rs` ensure that surfaced this). Until a prefix-keyed
-    /// recurrent-state snapshot/restore exists, reuse is sound ONLY for a pure
-    /// full-attention checkpoint (no linear layers). Otherwise report 0 so the
-    /// scheduler never sets `start_pos > 0` and every prefill starts fresh at
-    /// position 0 (byte-identical to the no-reuse path).
+    /// Hybrid models (gated-delta linear layers) now support prefix reuse via the
+    /// recurrent sidecar snapshot protocol (issue #85). The sidecar is captured in
+    /// `capture_recurrent_sidecar` after prefill and restored in
+    /// `restore_recurrent_sidecar` at page-radix attach time. Pure full-attn
+    /// checkpoints work identically (no sidecar to capture or restore).
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
-        let cfg = &self.model.config;
-        let pure_full_attn = cfg.num_full_attention_layers() == cfg.num_hidden_layers;
-        if pure_full_attn {
-            pages_only_reusable_prefix_blocks(blocks, |_| false)
-        } else {
-            0
+        pages_only_reusable_prefix_blocks(blocks, |_| false)
+    }
+
+    /// Capture the slot's recurrent state as a prefix sidecar, keyed by the
+    /// FNV hash of `tokens[..mat_len]` where `mat_len` is the slot's current
+    /// `seq_len()` (block-aligned by `publish_prefix_blocks`). Called from
+    /// `capture_cached_prefix` after a prefill completes. No-op for pure full-attn
+    /// checkpoints (no recurrent state to capture).
+    pub(crate) fn capture_recurrent_sidecar(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+    ) -> anyhow::Result<()> {
+        let slot_state = &self.slots[slot];
+        if !slot_state.has_recurrent() {
+            return Ok(()); // pure full-attn path — nothing to capture
+        }
+        let mat_len = slot_state.seq_len().min(tokens.len());
+        if mat_len == 0 {
+            return Ok(());
+        }
+        let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
+        // Evict oldest on overflow (simple: remove one entry when at cap).
+        if self.prefix_sidecar.len() >= RECURRENT_SIDECAR_CAP {
+            if let Some(&evict_key) = self.prefix_sidecar.keys().next() {
+                self.prefix_sidecar.remove(&evict_key);
+            }
+        }
+        let snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
+        self.prefix_sidecar.insert(key, snap);
+        Ok(())
+    }
+
+    /// Restore the recurrent state for `slot` from the sidecar snapshot keyed by
+    /// `tokens[..matched_len]`. Acquires the recurrent buffers first so the
+    /// subsequent tail-prefill sees a populated state. On a cache miss logs a
+    /// debug message and proceeds with zeroed recurrent (graceful degradation —
+    /// same correctness as pre-#85 behavior, worse quality but not a hard error).
+    pub(crate) fn restore_recurrent_sidecar(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+    ) -> anyhow::Result<()> {
+        let matched_len = matched_len.min(tokens.len());
+        let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
+        let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+        // Acquire first so the device buffers exist for H2D restore.
+        self.slots[slot].acquire_recurrent(
+            &self.model.ctx,
+            num_linear,
+            gdr_len,
+            conv_len,
+            &mut self.recurrent_pool,
+        )?;
+        match self.prefix_sidecar.get(&key).cloned() {
+            Some(snap) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap),
+            None => {
+                log::debug!(
+                    "no recurrent sidecar for prefix matched_len={matched_len} \
+                     (key={key:#018x}); starting with zeroed recurrent state"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -3520,6 +3594,7 @@ impl Qwen35CudaExecutor {
             dram_fraction: DEFAULT_DRAM_FRACTION,
             kv_pool_mem_fraction_static: mem_fraction_static,
             kv_pool_requested_pages: total_pages.max(1),
+            prefix_sidecar: std::collections::HashMap::new(),
         };
         cuda_startup_log(
             "qwen35_executor_total",

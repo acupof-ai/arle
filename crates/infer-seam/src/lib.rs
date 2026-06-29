@@ -321,6 +321,19 @@ pub trait BackendExecutor {
         anyhow::bail!("backend has no position-0 prefix store")
     }
 
+    /// Restore the sidecar recurrent state for `slot` when reusing a page-radix
+    /// prefix of length `matched_len`. Called by `attach_prefix_to_request` after
+    /// `kv.attach_pages()` succeeds. Default no-op for full-attention-only backends
+    /// (CUDA Qwen dense, Metal); only Qwen3.5/3.6 hybrid overrides this.
+    fn restore_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Move the model's device weights to host RAM and free the VRAM (OPD teacher
     /// time-share), returning the device bytes freed. The default is a no-op
     /// (returns 0) so backends that do not support weight offload are unaffected.
