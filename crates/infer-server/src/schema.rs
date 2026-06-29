@@ -188,7 +188,7 @@ impl ChatContent {
                 .iter()
                 .filter_map(|part| {
                     (part.kind == "text")
-                        .then(|| part.text.as_deref())
+                        .then_some(part.text.as_deref())
                         .flatten()
                 })
                 .collect(),
