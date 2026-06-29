@@ -199,7 +199,7 @@ pub fn load_trainer_state_v2(
                 shape: m_shape,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     let metadata: &Option<HashMap<String, String>> = header_metadata.metadata();
     let step = metadata
