@@ -154,6 +154,116 @@ pub fn pick_free_port() -> Result<u16> {
     Ok(port)
 }
 
+/// In-process LocalChannel: coordinator→engine direction (send only).
+/// The SyncSender is Clone so the relay driver can hand copies to spawned threads.
+pub struct LocalChannelSend(pub(crate) std::sync::mpsc::SyncSender<RelayEnvelope>);
+
+/// In-process LocalChannel: engine←coordinator OR coordinator←engine (recv only).
+pub struct LocalChannelRecv(std::sync::mpsc::Receiver<RelayEnvelope>);
+
+impl RelayChannel for LocalChannelSend {
+    fn send(&mut self, e: &RelayEnvelope) -> Result<()> {
+        self.0
+            .send(e.clone())
+            .map_err(|_| anyhow::anyhow!("local channel: peer disconnected"))
+    }
+
+    fn recv(&mut self) -> Result<Option<RelayEnvelope>> {
+        Ok(None) // send-only side; never called
+    }
+
+    fn try_clone_channel(&self) -> Result<Box<dyn RelayChannel>> {
+        anyhow::bail!("LocalChannelSend is send-only; use clone_tx() instead")
+    }
+}
+
+impl LocalChannelSend {
+    /// Clone the underlying sender for use in spawned threads.
+    #[allow(dead_code)]
+    pub(crate) fn clone_tx(&self) -> std::sync::mpsc::SyncSender<RelayEnvelope> {
+        self.0.clone()
+    }
+}
+
+impl RelayChannel for LocalChannelRecv {
+    fn send(&mut self, _: &RelayEnvelope) -> Result<()> {
+        anyhow::bail!("LocalChannelRecv is recv-only")
+    }
+
+    fn recv(&mut self) -> Result<Option<RelayEnvelope>> {
+        match self.0.recv() {
+            Ok(e) => Ok(Some(e)),
+            Err(_) => Ok(None), // disconnected = EOF
+        }
+    }
+
+    fn try_clone_channel(&self) -> Result<Box<dyn RelayChannel>> {
+        anyhow::bail!("LocalChannelRecv is not cloneable")
+    }
+}
+
+/// Create a bidirectional in-process relay channel pair.
+///
+/// Returns:
+/// - `coord_send`: coordinator → engine (send TickAdmissions/StatsQuery)
+/// - `coord_recv`: coordinator ← engine (receive Completion/StatsResponse)
+/// - `engine_recv`: engine ← coordinator (receive TickAdmissions/StatsQuery)
+/// - `engine_tx`: engine → coordinator (send Completion/StatsResponse; Clone-able)
+pub fn local_relay_pair() -> (
+    LocalChannelSend,
+    LocalChannelRecv,
+    LocalChannelRecv,
+    std::sync::mpsc::SyncSender<RelayEnvelope>,
+) {
+    let (coord_to_engine_tx, engine_from_coord_rx) = std::sync::mpsc::sync_channel(64);
+    let (engine_to_coord_tx, coord_from_engine_rx) = std::sync::mpsc::sync_channel(64);
+    (
+        LocalChannelSend(coord_to_engine_tx),
+        LocalChannelRecv(coord_from_engine_rx),
+        LocalChannelRecv(engine_from_coord_rx),
+        engine_to_coord_tx,
+    )
+}
+
+/// Stats payload for the coordinator `/v1/stats` relay round-trip.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WireStats {
+    pub active_requests: usize,
+    pub queue_depth: usize,
+    pub kv_free_pages: usize,
+    pub throughput_steps: u64,
+    pub throughput_prefill_tokens: u64,
+    pub throughput_generated_tokens: u64,
+    pub throughput_requests_completed: u64,
+    pub prefix_lookups: u64,
+    pub prefix_hits: u64,
+    pub prefix_hit_tokens: u64,
+    pub prefix_hit_pages: u64,
+    pub prefix_published_pages: u64,
+    pub prefix_cached_pages: usize,
+}
+
+impl WireStats {
+    /// Build from a [`crate::CounterSnapshot`] (single-process local backend).
+    pub fn from_counters(c: &crate::CounterSnapshot) -> Self {
+        Self {
+            active_requests: c.active_requests,
+            queue_depth: c.queue_depth,
+            kv_free_pages: c.kv_free_pages,
+            throughput_steps: c.throughput.steps,
+            throughput_prefill_tokens: c.throughput.prefill_tokens,
+            throughput_generated_tokens: c.throughput.generated_tokens,
+            throughput_requests_completed: c.throughput.requests_completed,
+            prefix_lookups: c.prefix_cache.lookups,
+            prefix_hits: c.prefix_cache.hits,
+            prefix_hit_tokens: c.prefix_cache.hit_tokens,
+            prefix_hit_pages: c.prefix_cache.hit_pages,
+            prefix_published_pages: c.prefix_cache.published_pages,
+            prefix_cached_pages: c.prefix_cache.cached_pages,
+        }
+    }
+}
+
 /// Self-contained worker->coordinator completion delta (Stage 1).
 ///
 /// Mirrors the shape of the public `infer_api::CompletionStreamDelta` minus the
@@ -229,6 +339,11 @@ pub enum RelayEnvelope {
     /// (Coordinator can also just drop streams; this is the nicer path for
     /// telemetry/log capture.)
     Shutdown,
+    /// Coordinator-to-rank-0 stats probe. Bypasses lockstep tick sequencing;
+    /// the worker replies immediately with its current engine counters.
+    StatsQuery { request_id: u64 },
+    /// Rank-0-to-coordinator response to a `StatsQuery`.
+    StatsResponse { request_id: u64, data: WireStats },
 }
 
 /// Serializable counterpart of the rewrite serve request. Captures the minimum
@@ -267,6 +382,7 @@ pub struct RelayCoordinator {
     workers: BTreeMap<usize, Box<dyn RelayChannel>>,
     completion_sinks:
         Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>>,
+    stats_sinks: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<WireStats>>>>,
     completion_shutdown: Arc<AtomicBool>,
     /// Count of ranks that sent [`RelayEnvelope::EngineReady`]; the coordinator
     /// polls it via [`Self::ready_count`] before opening HTTP.
@@ -358,6 +474,10 @@ impl PendingRelayCoordinator {
             }
         }
         let completion_sinks = Arc::new(Mutex::new(HashMap::new()));
+        let stats_sinks = Arc::new(Mutex::new(HashMap::<
+            u64,
+            tokio::sync::oneshot::Sender<WireStats>,
+        >::new()));
         let completion_shutdown = Arc::new(AtomicBool::new(false));
         let ready_count = Arc::new(AtomicUsize::new(0));
         for (&rank, channel) in &workers {
@@ -368,6 +488,7 @@ impl PendingRelayCoordinator {
                 rank,
                 reader,
                 Arc::clone(&completion_sinks),
+                Arc::clone(&stats_sinks),
                 Arc::clone(&completion_shutdown),
                 Arc::clone(&ready_count),
             );
@@ -376,6 +497,7 @@ impl PendingRelayCoordinator {
             port: self.port,
             workers,
             completion_sinks,
+            stats_sinks,
             completion_shutdown,
             ready_count,
         })
@@ -422,6 +544,47 @@ impl RelayCoordinator {
     /// already running (e.g. in tests where both sides race at startup).
     pub fn bind_and_accept(world_size: usize, accept_timeout: Duration) -> Result<Self> {
         Self::bind()?.accept(world_size, accept_timeout)
+    }
+
+    /// Build a `RelayCoordinator` backed by a single in-process local "worker" (rank 0).
+    /// Returns the relay + the engine-side channels:
+    /// - `engine_recv`: engine reads from this (TickAdmissions / StatsQuery from coordinator)
+    /// - `engine_tx`: engine writes to this (Completion / StatsResponse to coordinator)
+    pub fn new_local() -> (
+        Self,
+        LocalChannelRecv,
+        std::sync::mpsc::SyncSender<RelayEnvelope>,
+    ) {
+        let (coord_send, coord_recv, engine_recv, engine_tx) = local_relay_pair();
+
+        let completion_sinks = Arc::new(Mutex::new(HashMap::new()));
+        let stats_sinks = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Mark rank-0 as ready immediately — no boot handshake for local workers.
+        let ready_count = Arc::new(AtomicUsize::new(1));
+
+        let mut workers = BTreeMap::new();
+        workers.insert(0usize, Box::new(coord_send) as Box<dyn RelayChannel>);
+
+        spawn_completion_reader(
+            0,
+            Box::new(coord_recv),
+            Arc::clone(&completion_sinks),
+            Arc::clone(&stats_sinks),
+            Arc::clone(&shutdown),
+            Arc::clone(&ready_count),
+        );
+
+        let relay = Self {
+            port: 0,
+            workers,
+            completion_sinks,
+            stats_sinks,
+            completion_shutdown: shutdown,
+            ready_count,
+        };
+
+        (relay, engine_recv, engine_tx)
     }
 
     #[must_use]
@@ -507,6 +670,29 @@ impl RelayCoordinator {
             })?;
         }
         Ok(())
+    }
+
+    /// Register a oneshot that will receive the stats response for `request_id`.
+    /// Must be called BEFORE `send_stats_query` to avoid a race.
+    pub fn register_stats_awaiter(
+        &self,
+        request_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<WireStats> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.stats_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, tx);
+        rx
+    }
+
+    /// Send a stats query to rank-0 (does NOT broadcast to all ranks).
+    pub fn send_stats_query(&mut self, request_id: u64) -> Result<()> {
+        let rank0 = self
+            .workers
+            .get_mut(&0)
+            .ok_or_else(|| anyhow::anyhow!("rank-0 worker not connected"))?;
+        rank0.send(&RelayEnvelope::StatsQuery { request_id })
     }
 }
 
@@ -636,6 +822,7 @@ fn spawn_completion_reader(
     completion_sinks: Arc<
         Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<RelayCompletionDelta>>>,
     >,
+    stats_sinks: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<WireStats>>>>,
     shutdown: Arc<AtomicBool>,
     ready_count: Arc<AtomicUsize>,
 ) {
@@ -645,6 +832,15 @@ fn spawn_completion_reader(
         .spawn(move || {
             loop {
                 match channel.recv() {
+                    Ok(Some(RelayEnvelope::StatsResponse { request_id, data })) => {
+                        if let Some(tx) = stats_sinks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&request_id)
+                        {
+                            let _ = tx.send(data);
+                        }
+                    }
                     Ok(Some(RelayEnvelope::Completion { request_id, delta })) => {
                         let done = delta.is_done();
                         let sink = {

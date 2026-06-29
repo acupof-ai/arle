@@ -16,7 +16,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use infer_api::{CudaWorkerEngine, EngineLoadConfig, RelayCoordinator, RelayEnvelope, RelayWorker};
+use infer_api::{
+    CudaWorkerEngine, EngineLoadConfig, RelayCoordinator, RelayEnvelope, RelayWorker, WireStats,
+};
 
 /// Relay accept / worker-connect timeout. Generous: a cold rank-0 build can
 /// take tens of seconds before it reaches the accept point.
@@ -366,6 +368,28 @@ fn run_lockstep_driver(
                         })?;
                 }
             }
+            Some(RelayEnvelope::StatsQuery { request_id }) => {
+                let prefix = engine.prefix_cache_stats();
+                let throughput = engine.throughput_stats();
+                let data = WireStats {
+                    active_requests: engine.active_count(),
+                    queue_depth: engine.waiting_count(),
+                    kv_free_pages: engine.kv_free_pages(),
+                    throughput_steps: throughput.steps,
+                    throughput_prefill_tokens: throughput.prefill_tokens,
+                    throughput_generated_tokens: throughput.generated_tokens,
+                    throughput_requests_completed: throughput.requests_completed,
+                    prefix_lookups: prefix.lookups,
+                    prefix_hits: prefix.hits,
+                    prefix_hit_tokens: prefix.hit_tokens,
+                    prefix_hit_pages: prefix.hit_pages,
+                    prefix_published_pages: prefix.published_pages,
+                    prefix_cached_pages: prefix.cached_pages,
+                };
+                if let Err(e) = relay.send(&RelayEnvelope::StatsResponse { request_id, data }) {
+                    log::warn!("[arle-worker rank={rank}] stats response send failed: {e:#}");
+                }
+            }
             Some(RelayEnvelope::BootPing { request_id }) => {
                 log::debug!("[arle-worker rank={rank}] boot-ping request_id={request_id}");
             }
@@ -380,6 +404,11 @@ fn run_lockstep_driver(
             Some(RelayEnvelope::EngineReady { rank: ready_rank }) => {
                 log::warn!(
                     "[arle-worker rank={rank}] unexpected engine-ready envelope (rank {ready_rank})"
+                );
+            }
+            Some(RelayEnvelope::StatsResponse { request_id, .. }) => {
+                log::warn!(
+                    "[arle-worker rank={rank}] unexpected stats response envelope request_id={request_id}"
                 );
             }
             Some(RelayEnvelope::Shutdown) => {
