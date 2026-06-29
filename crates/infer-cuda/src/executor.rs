@@ -3355,27 +3355,23 @@ impl Qwen35CudaExecutor {
         if !slot_state.has_recurrent() {
             return Ok(()); // pure full-attn path — nothing to capture
         }
-        // ponytail: page-align so the capture key matches restore's matched_len (radix
-        // returns a page-16-aligned length). Raw seq_len is 16-aligned only ~1/16 of
-        // the time → every restore missed → zeroed recurrent state → 0 edits / 0 accepts.
+        // ponytail: page-align so capture key == restore's matched_len (radix returns
+        // page-16-aligned length; raw seq_len aligns ~1/16 of the time → always-miss).
         let mat_len =
             (slot_state.seq_len().min(tokens.len()) / SUPPORTED_PAGE_SIZE) * SUPPORTED_PAGE_SIZE;
         if mat_len == 0 {
             return Ok(());
         }
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-        // Evict oldest on overflow (simple: remove one entry when at cap).
         if self.prefix_sidecar.len() >= RECURRENT_SIDECAR_CAP {
             if let Some(&evict_key) = self.prefix_sidecar.keys().next() {
                 self.prefix_sidecar.remove(&evict_key);
             }
         }
         let mut snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
-        // D2H snapshot full-attention KV pages so the sidecar is complete for prefix reuse.
-        // snapshot_recurrent already synchronized the stream, so device pages are flushed.
+        // snapshot_recurrent synchronizes the stream so pages are flushed before D2H.
         if let Some(pool) = self.full_attn_kv.as_ref() {
-            // Limit to exactly the pages covered by mat_len so the snapshot size matches
-            // what restore expects (matched_len pages, not total allocated pages).
+            // Limit to mat_len pages; slot may have one extra allocated-but-not-full page.
             let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
             let all_pages = pool.page_indices(slot);
             let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
