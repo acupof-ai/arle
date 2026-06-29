@@ -160,9 +160,7 @@ impl InferStudent {
         }
         validate_token_ids("generated rollout", &generated, self.vocab_size)?;
 
-        let mut rollout = Vec::with_capacity(prompt_ids.len() + rollout_len);
-        rollout.extend_from_slice(prompt_ids);
-        rollout.extend(generated);
+        let rollout: Vec<u32> = prompt_ids.iter().copied().chain(generated).collect();
         Ok(rollout)
     }
 
