@@ -94,10 +94,7 @@ pub fn coordinator_router(
             .expect("spawn coordinator lockstep thread");
     }
 
-    let (multimodal_tx, multimodal_kind) = match multimodal {
-        Some((tx, kind)) => (Some(tx), Some(kind)),
-        None => (None, None),
-    };
+    let (multimodal_tx, multimodal_kind) = multimodal.unzip();
 
     let state = Arc::new(CoordinatorHandle {
         model: model.into(),
@@ -259,19 +256,17 @@ fn streaming_submit(
         sinks: state.sinks.clone(),
         request_id,
     };
-    let submit_result = state.submit_tx.send(CoordSubmission {
-        request: WireRequest {
-            request_id,
-            prompt_tokens,
-            max_tokens,
-            sampling,
-        },
-    });
-    if submit_result.is_err() {
-        return Err(ApiError::internal(
-            "coordinator lockstep loop closed; cannot submit",
-        ));
-    }
+    state
+        .submit_tx
+        .send(CoordSubmission {
+            request: WireRequest {
+                request_id,
+                prompt_tokens,
+                max_tokens,
+                sampling,
+            },
+        })
+        .map_err(|_| ApiError::internal("coordinator lockstep loop closed; cannot submit"))?;
     Ok((rx, guard))
 }
 

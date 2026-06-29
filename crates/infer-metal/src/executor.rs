@@ -38,10 +38,7 @@ static METAL_T2_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
 #[cfg(feature = "metal")]
 #[must_use]
 pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
-    let (free, total) = match disk_free_total_bytes(root) {
-        Some((free, total)) => (Some(free), Some(total)),
-        None => (None, None),
-    };
+    let (free, total) = disk_free_total_bytes(root).unzip();
     infer_seam::nvme_l3_budget(
         free,
         total,
