@@ -30,20 +30,41 @@ namespace, disconnected from the host radix cache pool.
 
 `reusable_prefix_blocks` re-enabled: `pages_only_reusable_prefix_blocks(blocks, |_| false)`.
 
+## Bug Found After Initial Landing — seq_len Not Reset on Restore
+
+`restore_recurrent_sidecar` called `acquire_recurrent` without first releasing the prior
+occupant's recurrent block. Since prefix-reuse prefill has `start_pos != 0`, the
+`release_recurrent + acquire_recurrent` pair inside `submit_prefill_row` (guarded by
+`start_pos == 0`) was never reached. `acquire_recurrent`'s early return
+(`!gdr_states.is_empty() → return Ok(())`) silently kept the old block with `seq_len`
+from the completed request (e.g. 593). At the first decode step, `submit_decode_row`'s
+invariant `slot.seq_len == kv_seq_len` failed (`593 != 329`).
+
+Fix (commit `1b0f0459`): call `release_recurrent` before `acquire_recurrent` in
+`restore_recurrent_sidecar`, then `set_seq_len(matched_len)` after restoring the snapshot.
+
 ## Verification
 
-**Pod: H20 GPU 1, Qwen3-4B (CUDA), commit `a9748208`**
+**Initial smoke (Qwen3-4B, commit `a9748208`, c=1):**
 
 | | Cold (req 1) | Warm (req 2) |
 |---|---|---|
 | prompt tokens | 50 | 60 (same 50-tok prefix + 10 new) |
 | published_pages | 3 | — |
 | prefix hits | 0 | **1** |
-| hit_tokens | — | **48** |
-| hit_pages | — | **3** |
 | crash / assertion | none | **none** |
 
-`hit_rate=0.5`, `reuse_hit_resident=3`, no `pool seq_len != start_pos` error.
+**Production validation (Qwen3.5-122B-A10B TP=4 GPU 0,2,5,6, commit `1b0f0459`, 512 in / 256 out):**
+
+| concurrency | throughput (tok/s) | TTFT p50 |
+|---|---|---|
+| c=1 | 40.3 | 4.9s |
+| c=2 | **53.0** | 9.7s |
+| c=4 | 52.0 | 19.8s |
+| c=8 | 48.1 | 41.6s |
+
+No `Qwen3.5 materialized state len N != DecodeRow.kv_seq_len M` at any concurrency.
+Peak 53 tok/s at c=2 (4 slots, 122B-MoE, TP=4).
 
 ## Key Design Points
 
@@ -63,6 +84,7 @@ namespace, disconnected from the host radix cache pool.
 - `36cd91d5` — revert prefix reuse (full-attn KV not yet cached)
 - `ed32d3df` — full-attn KV sidecar: D2H capture + H2D restore + re-enable prefix reuse
 - `a9748208` — fix `*budget` deref in `set_kv_recall` (unrelated, same push)
+- `1b0f0459` — fix seq_len mismatch: release_recurrent + set_seq_len(matched_len) in restore
 
 ## Rule
 
