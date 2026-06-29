@@ -131,20 +131,25 @@ fn run_case(
     std::fs::create_dir_all(&case_dir).with_context(|| format!("create {case_dir}"))?;
 
     let exe = std::env::current_exe()?;
-    let mut children = Vec::with_capacity(world);
-    for (rank, device) in devices.iter().copied().enumerate().take(world) {
-        let child = std::process::Command::new(&exe)
-            .env("ARLE_A2_RANK", rank.to_string())
-            .env("ARLE_A2_WORLD", world.to_string())
-            .env("ARLE_A2_DIR", &case_dir)
-            .env("ARLE_A2_CUDA_DEVICE", device.to_string())
-            .env("ARLE_A2_PROBE_RANK", probe_rank.to_string())
-            .env("ARLE_A2_PROBE_INDEX", probe_index.to_string())
-            .env("ARLE_A2_PROBE_DELTA", format!("{delta:.9e}"))
-            .spawn()
-            .with_context(|| format!("spawn A2 rank {rank} case {label}"))?;
-        children.push((rank, child));
-    }
+    let children: Vec<(usize, std::process::Child)> = devices
+        .iter()
+        .copied()
+        .enumerate()
+        .take(world)
+        .map(|(rank, device)| {
+            let child = std::process::Command::new(&exe)
+                .env("ARLE_A2_RANK", rank.to_string())
+                .env("ARLE_A2_WORLD", world.to_string())
+                .env("ARLE_A2_DIR", &case_dir)
+                .env("ARLE_A2_CUDA_DEVICE", device.to_string())
+                .env("ARLE_A2_PROBE_RANK", probe_rank.to_string())
+                .env("ARLE_A2_PROBE_INDEX", probe_index.to_string())
+                .env("ARLE_A2_PROBE_DELTA", format!("{delta:.9e}"))
+                .spawn()
+                .with_context(|| format!("spawn A2 rank {rank} case {label}"))?;
+            Ok((rank, child))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     for (rank, mut child) in children {
         let status = child.wait()?;
         ensure!(
