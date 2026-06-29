@@ -1261,22 +1261,20 @@ pub(crate) fn build_target_hidden_from_captures(
         expected_layers,
         captured_hiddens.len()
     );
-    let mut per_layer = Vec::with_capacity(captured_hiddens.len());
-    for (idx, hidden) in captured_hiddens.iter().enumerate() {
-        let shape = hidden.shape();
-        ensure!(
-            shape.len() == 3 && shape[0] == 1 && shape[1] >= accepted_inputs,
-            "DFlash captured hidden #{idx} expected shape [1, >= {accepted_inputs}, H], got {shape:?}"
-        );
-        let hidden_size = shape[2];
-        let row = mlx::slice(
-            hidden,
-            &[0, 0, 0],
-            &[1, accepted_inputs, hidden_size],
-            &[1, 1, 1],
-        );
-        per_layer.push(mlx::reshape(&row, &[accepted_inputs, hidden_size]));
-    }
+    let per_layer = captured_hiddens
+        .iter()
+        .enumerate()
+        .map(|(idx, hidden)| {
+            let shape = hidden.shape();
+            ensure!(
+                shape.len() == 3 && shape[0] == 1 && shape[1] >= accepted_inputs,
+                "DFlash captured hidden #{idx} expected shape [1, >= {accepted_inputs}, H], got {shape:?}"
+            );
+            let hidden_size = shape[2];
+            let row = mlx::slice(hidden, &[0, 0, 0], &[1, accepted_inputs, hidden_size], &[1, 1, 1]);
+            Ok(mlx::reshape(&row, &[accepted_inputs, hidden_size]))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(mlx::concatenate_axis(&per_layer, 1))
 }
 
