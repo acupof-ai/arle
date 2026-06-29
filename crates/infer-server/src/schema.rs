@@ -404,43 +404,11 @@ impl StatsResponse {
                 published_pages: w.prefix_published_pages,
                 cached_pages: w.prefix_cached_pages,
             },
-            kv_tier: KvTierStatsResponse {
-                available: false,
-                demoted_pages: 0,
-                promoted_pages: 0,
-                promote_failures: 0,
-                resident_blocks: 0,
-                demoted_slots: 0,
-                promoted_slots: 0,
-                slot_promote_failures: 0,
-            },
-            kv_system: KvSystemMetricsResponse {
-                resident_pages: 0,
-                resident_evictable_pages: 0,
-                host_demoted_pages: 0,
-                host_demoted_pending_inflight: 0,
-                disk_pages: 0,
-                reuse_hit_resident: 0,
-                reuse_hit_host_demoted: 0,
-                reuse_hit_disk: 0,
-                reuse_miss: 0,
-                demote_mset_count: 0,
-                demote_mset_copy_bytes: 0,
-                demote_mset_copy_ms: 0,
-                promote_mget_count: 0,
-                promote_mget_copy_bytes: 0,
-                promote_mget_copy_ms: 0,
-                fetch_wait_ms: 0,
-                fallback_recompute: 0,
-                prefix_match_full_blocks: 0,
-                prefix_match_clamped_blocks: 0,
-            },
+            kv_tier: KvTierStatsResponse::default(),
+            kv_system: KvSystemMetricsResponse::default(),
             ssd_recall: SsdRecallStats {
-                available: false,
-                lookups: 0,
-                hits: 0,
-                recall_rate: None,
                 not_available_reason: "multiproc coordinator: kv_tier/kv_system not yet relayed",
+                ..SsdRecallStats::default()
             },
         }
     }
@@ -465,7 +433,7 @@ pub struct ThroughputStatsResponse {
 
 /// KV host-demoted counters. All zero until a backend with a tier
 /// store is configured (`available` keys off observed tier activity).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct KvTierStatsResponse {
     pub available: bool,
     pub demoted_pages: u64,
@@ -477,7 +445,7 @@ pub struct KvTierStatsResponse {
     pub slot_promote_failures: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct KvSystemMetricsResponse {
     pub resident_pages: usize,
     pub resident_evictable_pages: usize,
@@ -511,7 +479,7 @@ pub struct PrefixCacheStatsResponse {
     pub cached_pages: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SsdRecallStats {
     pub available: bool,
     pub lookups: u64,
