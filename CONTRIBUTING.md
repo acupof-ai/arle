@@ -51,7 +51,7 @@ cargo build --no-default-features --features no-cuda
 cargo build -p agent-infer --release --no-default-features --features cpu,no-cuda,cli --bin arle
 
 # Build (GPU). The cuda feature is no longer the default — pass it explicitly:
-cargo build -p infer --release --features cuda
+CUDA_HOME=/usr/local/cuda cargo build --release --features cuda
 
 # Test
 cargo test --no-default-features --features no-cuda   # Unit tests (~9s)
@@ -187,19 +187,26 @@ If you are preparing a release, use
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for the full system design.
+See [docs/architecture.md](docs/architecture.md) for the full system design and
+[docs/codebase-map.md](docs/codebase-map.md) for the workspace topology.
 
 Key entry points:
-- `infer/src/model.rs` — `ModelForward` trait (start here for new models)
-- `infer/src/scheduler/` — Continuous batching scheduler
-- `infer/src/ops/` — GPU operations (attention, norm, sampling)
+- `crates/infer-seam/src/` — host-only `BackendExecutor` / `KvPool` traits (the
+  device-neutral seam every backend implements)
+- `crates/infer-core/src/` — `Engine<E,K>`: continuous-batching scheduler,
+  RadixCache, chunked prefill, sampling
+- `crates/infer-cuda/src/` + `crates/infer-metal/src/` — backend executors and
+  per-model forward paths (attention, norm, sampling)
 
 ## Adding a New Model
 
-1. Create `infer/src/model/<name>/` with `config.rs`, `weights.rs`, `forward.rs`
-2. Implement `ModelForward` trait
-3. Register architecture in `infer/src/model_registry.rs`
-4. Add E2E test baseline in `infer/test_data/`
+1. Add the config + tensor-name + `Shard` contract under a `crates/<name>-spec/`
+   crate (see `crates/qwen35-spec/`, `crates/deepseek-spec/`)
+2. Implement the model forward in the relevant backend crate
+   (`crates/infer-cuda/src/` and/or `crates/infer-metal/src/`)
+3. Wire architecture detection where the backend dispatches on `architectures`
+4. Add correctness coverage (needle gate per `scripts/needle_gate.py`) and a
+   benchmark entry under `docs/experience/wins/`
 
 ## Reporting Issues
 

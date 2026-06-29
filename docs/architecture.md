@@ -35,8 +35,8 @@ authority rather than defining a second equal architecture.
 | `infer-plan` | Backend-neutral data IR: `ForwardPlan`, `ForwardMode`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device. | Any device or backend type |
 | `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll core + opt-in capability default-methods: stop ids, row/request caps, prefix reuse, KV page-tier and slot-tier hooks, OPD weight offload) + `KvPool` (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `KvBatchDescriptor` + `ResourceGovernor` + the backend-neutral `HostPagedKvPool`. No device types. | Concrete kernels, scheduler, model code |
 | `infer-core` | The one device-neutral `Engine<E,K>`: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry. No backend dependency. | Device kernels, HTTP, CLI |
-| `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
-| `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) over `mlx-sys`; `MetalKvPool` is only a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
+| `infer-cuda` | CUDA `BackendExecutor` + KV pool: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, GLM-5.2 (`glm_moe_dsa`, on the DSv4 path; forward landed, verification pending-remote), dense Qwen3 + Qwen3.5/3.6 hybrid+MoE (FP8 MoE via DeepGEMM, batched paged decode), over `cuda-kernels` | Scheduler logic, HTTP, terminal UX |
+| `infer-metal` | Metal MLX `BackendExecutor` (packed varlen decode) over `mlx-sys`: Qwen3.5/3.6 hybrid+MoE, plus the Gemma4 + DeepSeek-OCR VLMs and DiffusionGemma (block-diffusion); `MetalKvPool` is only a compatibility alias to `infer-seam::HostPagedKvPool` | Scheduler logic, HTTP, terminal UX |
 | `infer-hip` | HIP/ROCm `BackendExecutor` + KV pool (experimental AIPC lane, #76/#77): DSv4-Flash GGUF 2-bit shim-portable forward over `hip-sys`/`hip-kernels`; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP, datacenter CUDA paths (FlashMLA/DeepGEMM/DeepEP) |
 | `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4, Gemma4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
@@ -152,8 +152,8 @@ do not pre-split speculatively.
 | `infer-plan` | The data contract: `ForwardPlan`, `ForwardMode{Prefill,Decode,Mixed,Idle,Verify,Draft}`, `SamplingParams`, `StepOutput`, the pure host `sample_token`. No behavior, no device — the sole engine↔executor bridge. |
 | `infer-seam` | Host-only trait seam: `BackendExecutor` (submit/poll) + the `KvPool` split (`KvQuery`/`KvAllocator`/`KvPrefixStore`) + `HostPagedKvPool`, the shared production host page allocator. No device types. |
 | `infer-core` | The one device-neutral scheduler: admission, continuous batching, RadixCache, chunked prefill, overlap, slot lifecycle, sampling/streaming/telemetry, `Engine<E,K>`. No backend dependency. |
-| `infer-metal` | Metal MLX Qwen3.5/3.6 forward (packed varlen decode) as a thin `BackendExecutor`; `MetalKvPool` names the shared host allocator for compatibility. |
-| `infer-cuda` | CUDA executor as a thin seam impl over `cuda-kernels`: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, dense Qwen3 + Qwen3.5 MoE. |
+| `infer-metal` | Metal MLX Qwen3.5/3.6 hybrid+MoE forward (packed varlen decode) plus the Gemma4 + DeepSeek-OCR VLMs and DiffusionGemma, as a thin `BackendExecutor`; `MetalKvPool` names the shared host allocator for compatibility. |
+| `infer-cuda` | CUDA executor as a thin seam impl over `cuda-kernels`: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, GLM-5.2 (DSv4 path, verification pending-remote), dense Qwen3 + Qwen3.5/3.6 hybrid+MoE (FP8 MoE via DeepGEMM). |
 | `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
 | `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` (engine thread owning `Engine<E,K>`, submit/collect). |
@@ -201,7 +201,7 @@ parity in another.
 | Chunked prefill + decode-priority | Yes | Partial | No | No | No |
 | Quantized KV cache (`--kv-cache-dtype`) | Yes (INT8/FP8/TQ*) | Yes (INT8 default via MLX affine groups; BF16 fallback) | No | No | No |
 | Radix prefix cache + tiered KV (T0–T3) | Yes (T0 prod; T1–T2 Beta; T3 stub) | Beta (prefix reuse via snapshots; T2 local-SSD write-through) | No | No | No |
-| Speculative decode | Not shipped (plumbing only) | Beta (DFlash for Qwen3.5) | No | No | No |
+| Speculative decode | MTP for DSv4/Qwen3.6 (depth-2 ~1.03× net-win on H20); else plumbing only | Beta (DFlash for Qwen3.5; NextN/MTP shipped for Qwen3.6, +44% tok/s) | No | No | No |
 | Multi-GPU TP/PP/EP | TP=8 / EP=8 live (DSv4: DeepGEMM + DeepEP); PP not wired | No | No | No | No |
 | OPD teacher surface | Yes | No | No | No | No |
 | OpenAI HTTP (`/v1/chat/completions`, SSE) | Yes | Yes | Yes (synthetic) | Wired (validation pending-remote) | Wired (device pending) |
@@ -261,7 +261,10 @@ multi-GPU config is selected.
 
 DeepSeek-V4-Flash is the binding multi-GPU consumer (TP=8 / EP=8, FP8
 DeepGEMM MoE + DeepEP). The DSv4 contract scaffold lives in
-`crates/deepseek-spec`. Multi-GPU sequencing is tracked in
+`crates/deepseek-spec`. GLM-5.2 (`glm_moe_dsa`, DSv4-V3.2-DSA family, 256
+experts) is the in-flight DSv4-family addition riding the same CUDA path via
+an adapter — forward tranches landed, verification pending-remote (not
+production-verified). Multi-GPU sequencing is tracked in
 [`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
 
 DSv4 decode is under active kernel optimization on 8×H20 (adopt-best-first):
@@ -275,8 +278,10 @@ and [`plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md`](plans/2026-06-
 Prefill at production shapes is in repair (a MoE padded-layout i32 work-size
 overflow at >~1560 tokens).
 
-DeepSeek V4 is the #1 next-model priority and Qwen 3.6 is #2; the canonical
-ranking and rationale live in
+Qwen3.6 hybrid+MoE now serves on CUDA (FP8 MoE via DeepGEMM, batched paged
+decode — no longer Metal-only); the next DSv4-family in-flight addition is
+GLM-5.2 (verification pending-remote). The canonical model ranking and
+rationale live in
 [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order),
 with current support status in
 [`docs/support-matrix.md` §3](support-matrix.md#3-model-family-matrix).

@@ -2746,9 +2746,11 @@ fn tensor_bytes_to_f32(
     Ok(values)
 }
 
-// DSv4 FP8/FP4 + E8M0 loaders. Loader-only milestone: reachable from
-// `Dsv4Model::from_dsv4_fp8_safetensors`, which the executor enum branch wires
-// with the Piece 2/3 forward (see `feedback_necessity_not_callers`).
+// DSv4 FP8/FP4 + E8M0 loaders, reachable from
+// `Dsv4Model::from_dsv4_fp8_safetensors` (wired through the executor enum branch
+// and the DSv4/GLM forward). The `allow(dead_code)` is retained on necessity
+// grounds, not caller count (see `feedback_necessity_not_callers`): individual
+// dtype loaders are config-selected, so some read as dead under a given build.
 #[allow(dead_code)]
 impl SafetensorLoader {
     /// Dtype-agnostic full-tensor read (shape + raw bytes + dtype). The Qwen3.5
