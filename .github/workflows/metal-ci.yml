@@ -65,7 +65,7 @@ jobs:
         run: cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
 
       - name: cargo check (metal + no-cuda CLI)
-        run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --release --bin arle
+        run: cargo check --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
 
       - name: cargo check (metal train/autograd libs)
         run: |
@@ -90,7 +90,7 @@ jobs:
         run: cargo test -p cli --release --no-default-features --features metal,no-cuda
 
       - name: cargo test (metal + no-cuda ARLE CLI tests)
-        run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer --release
+        run: cargo test --no-default-features --features metal,no-cuda,cli -p arle --release
 
       # Serving is `arle serve` (cli/src/serve.rs); this build is the Metal
       # serve/bench surface and the release-shaped artifact.
@@ -98,7 +98,7 @@ jobs:
         run: >
           cargo build
           --no-default-features --features metal,no-cuda,cli
-          -p agent-infer --bin arle --release
+          -p arle --bin arle --release
 
       # Validate that the baseline snapshots are well-formed JSON.
       # NOTE: Actually running benchmarks requires a model and a Metal GPU,

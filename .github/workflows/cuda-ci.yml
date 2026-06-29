@@ -47,7 +47,7 @@ jobs:
 
       - name: cargo check (cuda + no-cuda CLI)
         run: >
-          cargo check -p agent-infer --release
+          cargo check -p arle --release
           --no-default-features --features cuda,no-cuda,cli
           --bin arle
 
@@ -56,7 +56,7 @@ jobs:
 
       - name: cargo test (cuda + no-cuda ARLE help/smoke path)
         run: >
-          cargo test -p agent-infer --release
+          cargo test -p arle --release
           --no-default-features --features cuda,no-cuda,cli
           --test cli_smoke
 

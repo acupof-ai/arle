@@ -44,7 +44,7 @@ jobs:
         run: >
           cargo build --release
           --no-default-features --features metal,no-cuda,cli
-          -p agent-infer --bin arle
+          -p arle --bin arle
 
       - name: Package macOS artifacts
         run: >
@@ -103,7 +103,7 @@ jobs:
           # decoupled from TORCH_CUDA_ARCH_LIST above, so the T1 binary carries
           # FlashMLA-sm_90a for H20/H100 while every other kernel covers sm_80..90.
           # Dispatched only on sm_90 by the runtime gate (dsv4_flashmla_decode).
-        run: cargo build --release --features cuda -p agent-infer --bin arle
+        run: cargo build --release --features cuda -p arle --bin arle
 
       - name: Package Linux artifacts
         run: |
@@ -202,7 +202,7 @@ jobs:
           # it out of the sm_70 binary to stay lean (the runtime gate never fires
           # here). build.rs swaps in a clean stub; no FlashMLA half-state.
           ARLE_CUDA_DISABLE_FLASHMLA: '1'
-        run: cargo build --release --features cuda -p agent-infer --bin arle
+        run: cargo build --release --features cuda -p arle --bin arle
 
       - name: Package Linux sm_70 artifacts
         run: |
@@ -260,7 +260,7 @@ jobs:
           # keep it out of the sm_100/sm_120 binary to stay lean (the runtime gate
           # never fires here). build.rs swaps in a clean stub; no FlashMLA half-state.
           ARLE_CUDA_DISABLE_FLASHMLA: '1'
-        run: cargo build --release --features cuda -p agent-infer --bin arle
+        run: cargo build --release --features cuda -p arle --bin arle
 
       - name: Package Linux Blackwell artifacts
         run: |
