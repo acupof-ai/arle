@@ -6,7 +6,7 @@
 //! ## Routing (the load-bearing facts, proven empirically 2026-06-22)
 //!
 //! Eli's provider layer (`nexil`) has a dedicated keyless **`local`** provider
-//! that collapses the `agent-infer` / `ollama` / `vllm` / `lmstudio` /
+//! that collapses the `arle` / `ollama` / `vllm` / `lmstudio` /
 //! `llama.cpp` aliases onto one OpenAI-Chat-Completions endpoint
 //! (`crates/nexil/src/core/provider_registry.rs`). To route Eli at a local
 //! `arle serve` we set, env-only (NEVER touching `~/.eli/config.toml`):

@@ -1620,7 +1620,7 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "agent-infer-{test_name}-{}-{nanos}.json",
+            "arle-{test_name}-{}-{nanos}.json",
             std::process::id()
         ))
     }

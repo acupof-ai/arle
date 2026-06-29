@@ -66,7 +66,7 @@ cohesive diff, no half-states, `cargo check` green for both `cpu,no-cuda` and
   async-rewrite the relay.
 
 ## Gate (this workflow): `cargo check` green
-- `cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli`
+- `cargo check -p arle --no-default-features --features cpu,no-cuda,cli`
 - `cargo check -p infer-api --no-default-features --features cuda,no-cuda --lib`
 - `cargo test -p infer-server --no-default-features` (relay unit tests still pass).
 - TP=1 path visibly unchanged (gated on world_size>1).

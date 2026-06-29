@@ -246,7 +246,7 @@ Shape:
       "id": "Qwen3-4B-bf16",
       "object": "model",
       "created": 1713620000,
-      "owned_by": "agent-infer",
+      "owned_by": "arle",
       "dflash": {
         "enabled": true,
         "draft": "z-lab/Qwen3-4B-DFlash-b16",

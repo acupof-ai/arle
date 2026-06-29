@@ -89,7 +89,7 @@ the change.
 ## 4 · Target topology
 
 ```
-agent-infer/
+arle/
 ├── pyproject.toml
 │   └── [project.optional-dependencies]
 │       └── bench = ["httpx==0.28.1", "guidellm[recommended]>=0.3"]   # ← NEW

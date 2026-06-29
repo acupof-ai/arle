@@ -172,7 +172,7 @@ remain the next runtime blocker.
 
 ## 4. Pretrain Stack (external, cold path)
 
-**主路: PyTorch + FSDP-zero3 + DeepSpeed-MoE expert-parallel**, repo 不入树, 单独 git submodule 或同账号下另一 repo (`agent-infer-pretrain`)。
+**主路: PyTorch + FSDP-zero3 + DeepSpeed-MoE expert-parallel**, repo 不入树, 单独 git submodule 或同账号下另一 repo (`arle-pretrain`)。
 
 **算力 sanity** (Chinchilla 6 FLOPs/param/token, H100 BF16 50% MFU ≈ 4 PFLOPS/卡):
 

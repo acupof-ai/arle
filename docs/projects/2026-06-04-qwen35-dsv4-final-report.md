@@ -255,15 +255,15 @@ Principle: `先用最好的再自己写`. Every lever leads with what to *adopt*
 ---
 
 Source docs (all absolute):
-- `/path/to/code/agent-infer/docs/plans/2026-06-04-dsv4-decode-sglang-class-perf.md` (§§5–10)
-- `/path/to/code/agent-infer/docs/plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`
-- `/path/to/code/agent-infer/docs/research/2026-06-05-flashmla-sparse-decode-already-vendored-wireup-spec.md`
-- `/path/to/code/agent-infer/docs/research/2026-06-05-dsv4-fp8-kernel-upstream-scan.md`
-- `/path/to/code/agent-infer/docs/research/2026-06-05-build-compile-speed-optimization.md`
-- `/path/to/code/agent-infer/docs/experience/wins/2026-06-05-dsv4-decode-scratch-pool-5x.md`, `-dsv4-decode-buffer-d2d-reduction.md`, `-dsv4-decode-breakable-graph-launch-overlapped.md`, `-dsv4-gpu-router-math-licensed-async-blocked.md`
-- `/path/to/code/agent-infer/docs/experience/errors/2026-06-05-fp8-linear-per-projection-deepgemm-no-win.md`
+- `/path/to/code/arle/docs/plans/2026-06-04-dsv4-decode-sglang-class-perf.md` (§§5–10)
+- `/path/to/code/arle/docs/plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`
+- `/path/to/code/arle/docs/research/2026-06-05-flashmla-sparse-decode-already-vendored-wireup-spec.md`
+- `/path/to/code/arle/docs/research/2026-06-05-dsv4-fp8-kernel-upstream-scan.md`
+- `/path/to/code/arle/docs/research/2026-06-05-build-compile-speed-optimization.md`
+- `/path/to/code/arle/docs/experience/wins/2026-06-05-dsv4-decode-scratch-pool-5x.md`, `-dsv4-decode-buffer-d2d-reduction.md`, `-dsv4-decode-breakable-graph-launch-overlapped.md`, `-dsv4-gpu-router-math-licensed-async-blocked.md`
+- `/path/to/code/arle/docs/experience/errors/2026-06-05-fp8-linear-per-projection-deepgemm-no-win.md`
 
-Drop target: `/path/to/code/agent-infer/docs/projects/2026-06-04-qwen35-dsv4-final-report.md` (after §3 Performance / before §4 Architecture). Note: this was READ-ONLY — the section above is returned as output, not written to disk.
+Drop target: `/path/to/code/arle/docs/projects/2026-06-04-qwen35-dsv4-final-report.md` (after §3 Performance / before §4 Architecture). Note: this was READ-ONLY — the section above is returned as output, not written to disk.
 
 
 ---

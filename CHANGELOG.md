@@ -748,7 +748,7 @@ and on GHCR (`ghcr.io/cklxx/arle:0.1.1`, `:0.1`, `:latest`).
   retain required delivery.
 - `cargo build` no longer requires an explicit backend feature on
   macOS — `default = ["cuda"]` was dropped from the workspace,
-  `agent-infer`, and `crates/cli` so a flag-less build no longer pulls
+  `arle`, and `crates/cli` so a flag-less build no longer pulls
   cudarc on platforms without nvcc.
 - Standalone `pretrain` / `train_sft` / `train_grpo` /
   `train_multi_turn` / `eval_lm` / `download_dataset` /
