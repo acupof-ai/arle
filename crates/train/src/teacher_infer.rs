@@ -977,10 +977,7 @@ mod tests {
     #[test]
     fn api_teacher_decodes_f32_base64_logits() -> Result<()> {
         let values = [1.25f32, -2.5, 3.75, 4.0];
-        let mut bytes = Vec::new();
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let response = ApiTeacherResponse {
             shape: vec![1, 4],
             dtype: "f32".to_owned(),
@@ -1030,10 +1027,10 @@ mod tests {
             bf16::from_f32(3.75),
             bf16::from_f32(4.0),
         ];
-        let mut bytes = Vec::new();
-        for value in values {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
         let response = ApiTeacherResponse {
             shape: vec![1, 1, 4],
             dtype: "bf16".to_owned(),
@@ -1105,10 +1102,7 @@ mod tests {
                 ));
             }
             let values = [0.5f32, 1.5, -2.0, 4.25];
-            let mut bytes = Vec::new();
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
             let body = serde_json::json!({
                 "shape": [1, 4],
                 "dtype": "f32",
