@@ -1539,31 +1539,30 @@ mod tests {
             candidate.sequences.len(),
             "reference and candidate must share prompt count"
         );
-        let mut per_prompt_match = Vec::with_capacity(reference.sequences.len());
         let mut first_diverging_prompt = None;
         let mut first_diverging_step = None;
-        for (idx, (ref_seq, cand_seq)) in reference
+        let per_prompt_match: Vec<f32> = reference
             .sequences
             .iter()
             .zip(candidate.sequences.iter())
             .enumerate()
-        {
-            let mut common = 0usize;
-            while common < ref_seq.len()
-                && common < cand_seq.len()
-                && ref_seq[common] == cand_seq[common]
-            {
-                common += 1;
-            }
-            let denom = ref_seq.len().max(1);
-            per_prompt_match.push(common as f32 / denom as f32);
-            if first_diverging_prompt.is_none()
-                && (common < ref_seq.len().min(cand_seq.len()) || ref_seq.len() != cand_seq.len())
-            {
-                first_diverging_prompt = Some(idx);
-                first_diverging_step = Some(common);
-            }
-        }
+            .map(|(idx, (ref_seq, cand_seq))| {
+                let common = ref_seq
+                    .iter()
+                    .zip(cand_seq.iter())
+                    .take_while(|(r, c)| r == c)
+                    .count();
+                let denom = ref_seq.len().max(1);
+                if first_diverging_prompt.is_none()
+                    && (common < ref_seq.len().min(cand_seq.len())
+                        || ref_seq.len() != cand_seq.len())
+                {
+                    first_diverging_prompt = Some(idx);
+                    first_diverging_step = Some(common);
+                }
+                common as f32 / denom as f32
+            })
+            .collect();
         let mean_match = if per_prompt_match.is_empty() {
             0.0
         } else {
