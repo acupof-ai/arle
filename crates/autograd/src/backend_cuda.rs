@@ -6273,7 +6273,7 @@ fn cuda_clip_grad_norm_device(
                     AutogradError::TapeInvariant("cuda alloc_zeros failed (grad_clip scaled)")
                 })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     let (out_ptrs, out_guards): (Vec<_>, Vec<_>) = out_slices
         .iter_mut()
