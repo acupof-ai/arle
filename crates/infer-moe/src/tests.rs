@@ -345,9 +345,7 @@ fn batch_route_matches_per_token() {
     let cfg = qwen36_cfg(4, 2, true);
     let t0 = [1.0, 2.0, 0.5, -0.5];
     let t1 = [-1.0, 0.0, 3.0, 1.0];
-    let mut flat = Vec::new();
-    flat.extend_from_slice(&t0);
-    flat.extend_from_slice(&t1);
+    let flat: Vec<f32> = t0.iter().chain(t1.iter()).copied().collect();
     let batch = route(&flat, &[], &cfg).unwrap();
     assert_eq!(batch.len(), 2);
     assert_eq!(batch[0], route_token(&t0, &[], &cfg).unwrap());
