@@ -547,19 +547,12 @@ fn server_chat_content(message: &ChatPromptMessage) -> infer_server::ChatContent
 /// Truncate at the first occurrence of any non-empty stop string, returning the
 /// prefix before it (or `None` if none matched).
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
-    let mut earliest = None::<usize>;
-    for stop in stops {
-        if stop.is_empty() {
-            continue;
-        }
-        if let Some(pos) = text.find(stop.as_str()) {
-            earliest = Some(match earliest {
-                None => pos,
-                Some(existing) => existing.min(pos),
-            });
-        }
-    }
-    earliest.map(|pos| text[..pos].to_string())
+    let pos = stops
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|stop| text.find(stop.as_str()))
+        .min()?;
+    Some(text[..pos].to_string())
 }
 
 /// Map the host-side stop-truncation outcome + engine finish to the public
