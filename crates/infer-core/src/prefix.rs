@@ -643,14 +643,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         };
 
-        let mut pages = promoted_pages.iter().copied();
-        let mut promote_entries = Vec::with_capacity(demoted.len());
-        for block in blocks {
-            if let PrefixBlock::DemotedKey(key) = *block {
-                let page = pages.next().expect("allocated one page per demoted key");
-                promote_entries.push((key, page));
-            }
-        }
+        let promote_entries: Vec<_> = blocks
+            .iter()
+            .filter_map(|block| match *block {
+                PrefixBlock::DemotedKey(key) => Some(key),
+                _ => None,
+            })
+            .zip(promoted_pages.iter().copied())
+            .collect();
 
         let started = Instant::now();
         let result = self.executor.promote_prefix_pages(&promote_entries);
