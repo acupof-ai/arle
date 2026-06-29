@@ -1170,16 +1170,15 @@ impl QwenCudaExecutor {
     }
 
     /// Multi-row plan (continuous batching), total rows > 1. Handles pure-decode
-    /// (N=0, M>1) and MIXED (N>=1 prefill + M>=0 decode) alike: prefill rows run
-    /// SEQUENTIALLY as single-row sub-steps, then the M decode rows run as ONE
-    /// batch. Mirrors the DSv4 executor's mixed-plan structure.
+    /// (N=0, M>1) and MIXED (N>=1 prefill + M>=0 decode) alike: the M decode
+    /// rows run as ONE batch FIRST, then prefill rows run SEQUENTIALLY as
+    /// single-row sub-steps. Decode-first minimises TTFT and ITL for in-flight
+    /// requests — prefill sub-steps are expensive and must not stall decode.
     ///
     /// Plan rows always address disjoint slots (a request is either Prefilling or
-    /// Decoding), so the sequential prefill sub-steps are math-identical to
-    /// consecutive single-mode ticks. The descriptor commit order is prefill rows
-    /// first, then decode rows (`KvBatchDescriptor::from_plan`), so plan rows map
-    /// onto descriptor rows by index. Output order is prefill tokens then decode
-    /// tokens, each tagged with its row's slot.
+    /// Decoding), so execution order is irrelevant for KV correctness. The
+    /// KvBatchDescriptor layout is unchanged (prefill rows at 0..n_prefill, decode
+    /// rows at n_prefill..total); only the GPU submission order is swapped.
     fn submit_multi_row(
         &mut self,
         plan: &ForwardPlan,
@@ -1207,13 +1206,15 @@ impl QwenCudaExecutor {
 
         let n_prefill = plan.prefill_rows.len();
         let mut tokens = Vec::with_capacity(rows);
-        for (idx, row) in plan.prefill_rows.iter().enumerate() {
-            let sub_batch = kv_batch.subset(idx..idx + 1)?;
-            tokens.push(self.submit_prefill_row(row, &sub_batch)?);
-        }
+        // Decode first: active decode requests get their next token before any
+        // prefill sub-step runs. Slots are disjoint so KV order is irrelevant.
         if !plan.decode_rows.is_empty() {
             let sub_batch = kv_batch.subset(n_prefill..kv_batch.rows.len())?;
             tokens.extend(self.submit_decode_batch(&plan.decode_rows, host_kv, &sub_batch)?);
+        }
+        for (idx, row) in plan.prefill_rows.iter().enumerate() {
+            let sub_batch = kv_batch.subset(idx..idx + 1)?;
+            tokens.push(self.submit_prefill_row(row, &sub_batch)?);
         }
         Ok(StepOutput { tokens })
     }

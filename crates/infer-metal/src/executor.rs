@@ -820,8 +820,10 @@ impl RealMetalExecutor {
             prefill_rows.len(),
             decode_rows.len()
         );
-        let mut tokens = self.run_dflash_prefill_rows(prefill_rows, kv)?.tokens;
-        tokens.extend(self.run_dflash_decode_rows(decode_rows)?.tokens);
+        // Decode first: minimise TTFT/ITL for active decode requests before
+        // running the more expensive prefill sub-steps.
+        let mut tokens = self.run_dflash_decode_rows(decode_rows)?.tokens;
+        tokens.extend(self.run_dflash_prefill_rows(prefill_rows, kv)?.tokens);
         Ok(MetalInflight::Ready(StepOutput { tokens }))
     }
 
