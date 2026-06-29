@@ -3397,7 +3397,11 @@ impl Qwen35CudaExecutor {
         let matched_len = matched_len.min(tokens.len());
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
-        // Acquire first so the device buffers exist for H2D restore.
+        // Release the prior occupant's recurrent block (if any) before acquiring a
+        // fresh one. The slot is reused from a completed request whose start_pos != 0
+        // path never triggers the release_recurrent + acquire_recurrent pair that
+        // submit_prefill_row runs at start_pos == 0 — so we must do it here.
+        self.slots[slot].release_recurrent(&mut self.recurrent_pool);
         self.slots[slot].acquire_recurrent(
             &self.model.ctx,
             num_linear,
@@ -3408,7 +3412,10 @@ impl Qwen35CudaExecutor {
 
         let snap = self.prefix_sidecar.get(&key).cloned();
 
-        // Restore recurrent state (gdr + conv).
+        // Restore recurrent state (gdr + conv tensors) then fix up seq_len.
+        // restore_recurrent_from_snapshot copies the device data but does not
+        // advance seq_len; we set it to matched_len so submit_decode_row's
+        // invariant check (slot.seq_len == kv_seq_len) holds on the first decode step.
         match snap.as_ref() {
             Some(s) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, s)?,
             None => {
@@ -3418,6 +3425,7 @@ impl Qwen35CudaExecutor {
                 );
             }
         }
+        self.slots[slot].set_seq_len(matched_len);
 
         // Sync device KV pool so prefill_row_paged_default sees pool.seq_len(slot) == matched_len.
         // This must run regardless of sidecar hit/miss: free prior occupant, alloc fresh pages,
