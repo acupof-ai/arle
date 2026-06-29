@@ -2050,12 +2050,10 @@ impl MetalPageStore {
         if pages.is_empty() {
             return;
         }
-        let mut released_logical_ids = Vec::new();
-        for page in pages {
-            if let Some(block) = self.pages.remove(page) {
-                released_logical_ids.push(block.logical_id);
-            }
-        }
+        let released_logical_ids: Vec<u64> = pages
+            .iter()
+            .filter_map(|page| self.pages.remove(page).map(|b| b.logical_id))
+            .collect();
         if released_logical_ids.is_empty() {
             return;
         }
@@ -2073,26 +2071,22 @@ impl MetalPageStore {
     }
 
     fn logical_key_for_pages(&self, pages: &[u32]) -> Option<Vec<u64>> {
-        let mut key = Vec::with_capacity(pages.len());
-        for page in pages {
-            key.push(self.pages.get(page)?.logical_id);
-        }
-        Some(key)
+        pages
+            .iter()
+            .map(|page| self.pages.get(page).map(|b| b.logical_id))
+            .collect()
     }
 
     fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -> Option<Vec<u64>> {
-        let mut key = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            let logical_id = match *block {
-                PrefixBlock::ResidentPage(page) => self.pages.get(&page)?.logical_id,
-                PrefixBlock::DemotedKey(tier_key) => self
-                    .ssd
-                    .as_ref()
-                    .and_then(|ssd| ssd.logical_id_for_tier_key(tier_key))?,
-            };
-            key.push(logical_id);
-        }
-        Some(key)
+        blocks
+            .iter()
+            .map(|block| match *block {
+                PrefixBlock::ResidentPage(page) => Some(self.pages.get(&page)?.logical_id),
+                PrefixBlock::DemotedKey(tier_key) => {
+                    self.ssd.as_ref()?.logical_id_for_tier_key(tier_key)
+                }
+            })
+            .collect()
     }
 
     fn prefix_available(&self, key: &[u64]) -> bool {
@@ -2163,10 +2157,11 @@ impl MetalPageStore {
         for (page_idx, page_id) in page_ids.iter().take(publish_pages).enumerate() {
             let start = page_idx * page_size;
             let end = start + page_size;
-            let mut kv_flat = Vec::with_capacity(slot.kv_flat.len());
-            for array in &slot.kv_flat {
-                kv_flat.push(slice_kv_tokens(array, start, end)?);
-            }
+            let kv_flat = slot
+                .kv_flat
+                .iter()
+                .map(|array| slice_kv_tokens(array, start, end))
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let owner = MetalPageOwner {
                 slot: slot.slot,
                 slot_epoch: slot.slot_epoch,
