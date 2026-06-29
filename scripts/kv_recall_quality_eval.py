@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """KV-as-memory recall-quality probe / mini-benchmark for Qwen3.6 (qwen3_5_moe).
 
-Verifies the doc thesis (https://redacted.larkoffice.com/docx/QHWydhfofob92Yx8NSpcP50Znnc):
+Verifies the doc thesis:
 does InfLLM-style semantic block-recall, applied ONLY to the 10/40 full-attention
 layers (the rest are GatedDeltaNet linear attn, no KV cache), restore long-context
 retrieval that StreamingLLM loses — on the 4-bit MoE canonical Metal model?
