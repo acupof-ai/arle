@@ -993,16 +993,22 @@ impl QwenCudaExecutor {
     /// Copy host tier entries back into freshly allocated device pages. The
     /// engine attaches the pages right after, so sync before returning.
     pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let page_bytes = self.kv.storage_bytes_per_page();
+        let mut buf = Vec::with_capacity(entries.len() * page_bytes);
+        let mut pages: Vec<u32> = Vec::with_capacity(entries.len());
         for &(key, page) in entries {
-            // Disjoint-field borrows: payload borrows self.tier; the copy
-            // borrows self.kv + self.model.
             let payload = self
                 .tier
                 .read(key)
                 .map_err(|err| anyhow::anyhow!("KV tier promote: {err}"))?;
-            self.kv
-                .copy_pages_from_host(&self.model.ctx, &[page], &payload)?;
+            pages.push(page);
+            buf.extend_from_slice(&payload);
         }
+        self.kv
+            .copy_pages_from_host(&self.model.ctx, &pages, &buf)?;
         self.model.ctx.sync()?;
         Ok(())
     }
