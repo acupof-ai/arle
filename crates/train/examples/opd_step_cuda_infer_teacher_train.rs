@@ -570,14 +570,12 @@ mod app {
     }
 
     fn parse_step_csv(raw: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-        let mut out = Vec::new();
-        for item in raw.split(',') {
-            let item = item.trim();
-            if item.is_empty() {
-                continue;
-            }
-            out.push(item.parse::<usize>()?);
-        }
+        let mut out = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()?;
         out.sort_unstable();
         out.dedup();
         Ok(out)
