@@ -75,7 +75,6 @@ fn download_from_hub(model_id: &str) -> Result<PathBuf> {
         .filter(|file| {
             Path::new(file.as_str())
                 .extension()
-                .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext == "safetensors")
                 && !file.contains("adapter")
         })
