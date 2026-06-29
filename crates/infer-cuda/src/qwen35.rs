@@ -1326,6 +1326,58 @@ impl Qwen35BatchDecodeState {
         Ok(())
     }
 
+    /// Recurrent-only pointer staging for the PAGED batched-decode lane: stage
+    /// the conv-ring + GDR-state tables (linear-attn layers) but SKIP the
+    /// contiguous full-attn `k_caches`/`v_caches` tables, which the shared-paged
+    /// default never allocates (touching them would deref an empty slice). Paged
+    /// full attention reads the shared pool via the per-step `PageMeta` instead,
+    /// so the conv/GDR tables are the only per-slot device pointers it needs.
+    /// Same `staged_slot_indices` cache key as the contiguous path; both lanes
+    /// share the invalidation hook. The two stagers never interleave on one
+    /// executor (a build is either paged or contiguous), so the cache key is
+    /// unambiguous.
+    fn stage_recurrent_pointer_tables(
+        &mut self,
+        ctx: &DeviceContext,
+        slots: &mut [Qwen35SlotState],
+        slot_indices: &[usize],
+    ) -> Result<()> {
+        if self.staged_slot_indices == slot_indices {
+            return Ok(());
+        }
+        let b = slot_indices.len();
+        ensure!(
+            b <= self.conv_host.len(),
+            "Qwen3.5 paged batched decode batch {} exceeds table capacity {}",
+            b,
+            self.conv_host.len()
+        );
+        for layer_idx in 0..self.conv_state_ptrs.len() {
+            for (r, &si) in slot_indices.iter().enumerate() {
+                let slot = &mut slots[si];
+                ensure!(
+                    layer_idx < slot.conv_states.len() && layer_idx < slot.gdr_states.len(),
+                    "Qwen3.5 paged batched decode linear layer {layer_idx} outside slot state \
+                     (conv={}, gdr={})",
+                    slot.conv_states.len(),
+                    slot.gdr_states.len()
+                );
+                let (conv_ptr, _gc) = slot.conv_states[layer_idx].data.device_ptr_mut(&ctx.stream);
+                let (gdr_ptr, _gg) = slot.gdr_states[layer_idx].device_ptr_mut(&ctx.stream);
+                self.conv_host[r] = conv_ptr;
+                self.gdr_host[r] = gdr_ptr;
+            }
+            ctx.stream
+                .memcpy_htod(&self.conv_host[..b], &mut self.conv_state_ptrs[layer_idx])
+                .map_err(|e| anyhow!("H2D qwen35 paged conv_state_ptrs layer {layer_idx}: {e}"))?;
+            ctx.stream
+                .memcpy_htod(&self.gdr_host[..b], &mut self.gdr_state_ptrs[layer_idx])
+                .map_err(|e| anyhow!("H2D qwen35 paged gdr_state_ptrs layer {layer_idx}: {e}"))?;
+        }
+        self.staged_slot_indices = slot_indices.to_vec();
+        Ok(())
+    }
+
     /// Invalidate the staged pointer-table cache so the next decode batch
     /// restages from the slots' CURRENT recurrent-block addresses. Required at a
     /// request boundary: with the free-list pool a slot's `gdr_states`/
@@ -6258,6 +6310,237 @@ impl Qwen35Model {
         Ok(out)
     }
 
+    /// PAGED batched decode (the shared-paged default lane): the exact body of
+    /// [`Self::forward_decode_batch`] (embed → layer loop → final norm → batched
+    /// lm_head + argmax), but full-attn layers route through
+    /// [`Self::full_attention_paged_batch`] against the shared `pool` + the
+    /// B-row `meta` ([`PageMeta::for_decode_batch`]) instead of the contiguous
+    /// per-slot caches. The engine has already appended this step's token to
+    /// each row's slot in the pool and built `meta`; this method only runs the
+    /// forward + samples. Linear (recurrent) layers are pool-independent and use
+    /// the SAME batched conv1d/GDR kernels as the contiguous lane.
+    ///
+    /// Caller contract (mirrors `forward_decode_batch`): one row per
+    /// `slot_indices`/`tokens`/`params`/`sample_positions`; `kv_seq_lens[r]` is
+    /// the pre-append length (== the engine's `DecodeRow.kv_seq_len`); `meta`
+    /// describes the same B rows POST-append (its `positions`/page slices carry
+    /// `kv_seq_lens[r]` as the query position). B==1 stays on the single-row
+    /// paged path; this only runs for B>1.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_decode_batch_paged(
+        &self,
+        slots: &mut [Qwen35SlotState],
+        bd: &mut Qwen35BatchDecodeState,
+        pool: &mut PagedKVPool,
+        meta: &crate::loader::PageMeta,
+        slot_indices: &[usize],
+        tokens: &[u32],
+        kv_seq_lens: &[usize],
+        params: &[SamplingParams],
+        sample_positions: &[u64],
+    ) -> Result<Vec<u32>> {
+        let b = tokens.len();
+        ensure!(
+            b >= 1,
+            "Qwen3.6 paged batched decode requires at least one row"
+        );
+        ensure!(
+            slot_indices.len() == b
+                && kv_seq_lens.len() == b
+                && params.len() == b
+                && sample_positions.len() == b,
+            "Qwen3.6 paged batched decode surface length mismatch: slots={} tokens={} kv_lens={} params={} positions={}",
+            slot_indices.len(),
+            b,
+            kv_seq_lens.len(),
+            params.len(),
+            sample_positions.len()
+        );
+        ensure!(
+            meta.batch == b && meta.seq_len == 1,
+            "Qwen3.6 paged batched decode meta (batch {}, seq_len {}) != {} rows",
+            meta.batch,
+            meta.seq_len,
+            b
+        );
+        // Pre-mutation validation: every row in bounds, recurrent resident, and
+        // the pool already holds this row's POST-append length (the engine
+        // appended one token per row before building `meta`).
+        for (r, &si) in slot_indices.iter().enumerate() {
+            ensure!(
+                si < slots.len(),
+                "Qwen3.6 paged batched decode slot {si} outside executor slots {}",
+                slots.len()
+            );
+            ensure!(
+                slots[si].seq_len() == kv_seq_lens[r],
+                "Qwen3.6 paged batched decode materialized seq_len {} != scheduler kv_seq_len {} for slot {si}",
+                slots[si].seq_len(),
+                kv_seq_lens[r]
+            );
+            ensure!(
+                slots[si].has_recurrent(),
+                "Qwen3.6 paged batched decode: slot {si} recurrent state not acquired"
+            );
+            ensure!(
+                pool.seq_len(si) == kv_seq_lens[r] + 1,
+                "Qwen3.6 paged batched decode: pool seq_len {} != kv_seq_len+1 {} for slot {si}",
+                pool.seq_len(si),
+                kv_seq_lens[r] + 1
+            );
+        }
+
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        let hidden_size = c.hidden_size;
+        let vocab = self.output_projection().rows;
+
+        // Stage the recurrent pointer tables ONLY (paged full-attn needs no
+        // contiguous K/V tables); no-op when the row→slot mapping is unchanged.
+        bd.stage_recurrent_pointer_tables(&self.ctx, slots, slot_indices)?;
+
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+
+        let Qwen35BatchDecodeState {
+            ws,
+            conv_state_ptrs,
+            gdr_state_ptrs,
+            logits_batch,
+            argmax,
+            ..
+        } = bd;
+        let Qwen35Workspace {
+            token_ids,
+            hidden,
+            normed,
+            hidden_mid,
+            attn_out,
+            mlp_out,
+            full,
+            linear,
+            dense,
+            moe,
+            logits: row_logits,
+            ..
+        } = ws;
+        let token_ids = token_ids.upload(&self.ctx, &token_ids_host)?;
+
+        let hidden = hidden.get(&self.ctx, hidden_size, b)?;
+        embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)?;
+        let normed = normed.get(&self.ctx, hidden_size, b)?;
+        let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, b)?;
+        let attn_out = attn_out.get(&self.ctx, hidden_size, b)?;
+        let mlp_out = mlp_out.get(&self.ctx, hidden_size, b)?;
+
+        let mut full_idx = 0usize;
+        let mut linear_idx = 0usize;
+        for layer in &self.layers {
+            rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
+
+            match &layer.attn {
+                Qwen35Attn::Full(full_attn) => {
+                    self.full_attention_paged_batch(
+                        full_attn, normed, full_idx, pool, meta, full, attn_out,
+                    )?;
+                    full_idx += 1;
+                }
+                Qwen35Attn::Linear(lin) => {
+                    ensure!(
+                        linear_idx < conv_state_ptrs.len(),
+                        "Qwen3.6 paged batched decode linear layer {linear_idx} outside pointer tables {}",
+                        conv_state_ptrs.len()
+                    );
+                    self.linear_attention_batch(
+                        lin,
+                        normed,
+                        &conv_state_ptrs[linear_idx],
+                        &gdr_state_ptrs[linear_idx],
+                        linear,
+                        attn_out,
+                    )?;
+                    linear_idx += 1;
+                }
+            }
+
+            add_batch(&self.ctx, hidden, attn_out, hidden_mid)?;
+            rms_norm_offset(
+                &self.ctx,
+                hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                normed,
+            )?;
+            let mlp_in: &HiddenStates = normed;
+            if let Some(moe_weights) = &layer.moe {
+                let cfg = self
+                    .moe_config
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("MoE layer present but model has no moe_config"))?;
+                moe_forward_into(
+                    &self.ctx,
+                    moe_weights,
+                    mlp_in,
+                    cfg,
+                    &self.expert_split,
+                    moe,
+                    mlp_out,
+                )?;
+            } else {
+                let mlp = layer
+                    .mlp
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("dense layer missing both mlp and moe weights"))?;
+                self.dense_mlp(mlp, mlp_in, dense, mlp_out)?;
+            }
+            self.tp.all_reduce_sum(&self.ctx, mlp_out)?;
+            add_batch(&self.ctx, hidden_mid, mlp_out, hidden)?;
+        }
+
+        rms_norm_offset(&self.ctx, hidden, &self.norm, eps, normed)?;
+        let logits_buf = logits_batch.get(&self.ctx, vocab, b)?;
+        gemm_batch(&self.ctx, self.output_projection(), normed, logits_buf)?;
+
+        // Host seq_len advance (device KV/conv/GDR advanced in-stream above).
+        for &si in slot_indices {
+            slots[si].advance_seq_len(1);
+        }
+
+        let argmax_buf = argmax.get(&self.ctx, b)?;
+        {
+            let (l_ptr, _gl) = logits_buf.data.device_ptr(&self.ctx.stream);
+            let (a_ptr, _ga) = argmax_buf.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: logits `[B, vocab]` bf16, argmax `[B]` i32, both on ctx.stream.
+            unsafe {
+                ffi::argmax_batch_cuda(
+                    l_ptr as *const ffi::Half,
+                    a_ptr as *mut i32,
+                    b as i32,
+                    vocab as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        self.ctx.sync()?;
+        let greedy_ids = self
+            .ctx
+            .stream
+            .clone_dtoh(argmax_buf)
+            .map_err(|e| anyhow!("D2H qwen36 paged batched argmax failed: {e}"))?;
+        let mut out = Vec::with_capacity(b);
+        for (r, p) in params.iter().enumerate() {
+            if p.is_greedy() {
+                out.push(greedy_ids[r] as u32);
+            } else {
+                let row_vec = row_logits.get(&self.ctx, vocab)?;
+                copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
+                let host = row_vec.to_host(&self.ctx)?;
+                out.push(infer_plan::sample_token(&host, p, sample_positions[r]));
+            }
+        }
+        Ok(out)
+    }
+
     /// Batched-decode full attention: batched q/k/v projections over all B
     /// rows, then one split-KV fused decode launch over grid.z = B. The kernel
     /// reads per-row positions / seq_lens and per-row K/V cache pointers from
@@ -6474,6 +6757,183 @@ impl Qwen35Model {
         // Row-parallel o_proj: ONE all-reduce over the exact `[hidden, B]`
         // buffer — message length is B valid columns by construction (no-op
         // single-GPU).
+        self.tp.all_reduce_sum(&self.ctx, out)?;
+        Ok(())
+    }
+
+    /// PAGED batched-decode full attention (the shared-paged default lane). Same
+    /// three-step structure as the single-row [`Self::full_attention_paged`]
+    /// (prep → ungated paged attention → separable sigmoid gate), but at
+    /// `batch_size == B` against a B-row [`PageMeta::for_decode_batch`] page
+    /// table: every HD256 kernel already grids over `batch_idx`
+    /// (`decode_prep_paged_hd256` grid `(num_kv_heads, B)` reading
+    /// `positions[b]`/`page_indptr[b]`; the TileLang decode kernel grids
+    /// `(1, num_q_heads, B)` via `bsz`; `attention_gate_paged_hd256` iterates
+    /// `q_dim * B`), so each row writes/attends ONLY its own slot's pages. The
+    /// gate is a SEPARABLE post-step on `q_full`'s gate half — no gated-paged
+    /// kernel needed. B==1 routes through `full_attention_paged` instead (kept
+    /// byte-identical), so this method only runs for B>1.
+    #[allow(clippy::too_many_arguments)]
+    fn full_attention_paged_batch(
+        &self,
+        attn: &FullAttn,
+        normed: &HiddenStates,
+        full_idx: usize,
+        pool: &mut PagedKVPool,
+        meta: &crate::loader::PageMeta,
+        fw: &mut FullAttnScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        let c = &self.config;
+        let b = normed.seq_len;
+        let q_dim = self.local_full_attn_q_dim();
+        let kv_dim = self.local_full_attn_kv_dim();
+        let q_proj_dim = self.local_full_attn_q_proj_dim();
+        let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
+        let stride_page = pool.kv_dim * pool.page_size;
+        ensure!(
+            meta.batch == b && meta.seq_len == 1,
+            "Qwen3.6 paged batched decode meta (batch {}, seq_len {}) != {} decode rows",
+            meta.batch,
+            meta.seq_len,
+            b
+        );
+
+        let FullAttnScratch {
+            q_full,
+            k_batch,
+            v_batch,
+            q_prepped,
+            attn_heads,
+            ..
+        } = fw;
+        let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
+        let k_batch = k_batch.get(&self.ctx, kv_dim, b)?;
+        let v_batch = v_batch.get(&self.ctx, kv_dim, b)?;
+        gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
+        gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
+        gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+
+        let q_prepped = q_prepped.get(&self.ctx, q_dim, b)?;
+        let attn_out = attn_heads.get(&self.ctx, q_dim, b)?;
+
+        let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
+        let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
+
+        // ── 1. Prep: q/k RMSNorm + partial RoPE; write each row's new K/V into
+        //    its slot's tail page (grid `(num_kv_heads, B)`, batch_size = B). ──
+        {
+            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (positions_ptr, _gp) = meta.positions.device_ptr(&self.ctx.stream);
+            let (kv_indices_ptr, _gi) = meta.kv_indices.device_ptr(&self.ctx.stream);
+            let (kv_indptr_ptr, _gpi) = meta.kv_indptr.device_ptr(&self.ctx.stream);
+            let (last_page_len_ptr, _gl) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+            // SAFETY: all buffers are live `[B, *]` device arrays on ctx.stream;
+            // meta's `[B]`/`[B+1]` page-table arrays were just uploaded; each
+            // row's tail page is allocated (engine appended one token per row).
+            unsafe {
+                ffi::decode_prep_paged_hd256_cuda(
+                    qf_ptr as *const ffi::Half,
+                    qp_ptr as *mut ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    positions_ptr as *const i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
+                    kv_indices_ptr as *const i32,
+                    kv_indptr_ptr as *const i32,
+                    last_page_len_ptr as *const i32,
+                    self.local_q_heads as i32,
+                    self.local_kv_heads as i32,
+                    pool.page_size as i32,
+                    stride_page as i32,
+                    b as i32,
+                    c.rotary_dim as i32,
+                    c.rms_norm_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        // ── 2. Paged decode over each row's page slice (`bsz=B`, RoPE pre-baked). ──
+        {
+            let kernel = ffi::resolve_paged_attn_v1(
+                c.head_dim as u32,
+                self.local_q_heads as u32,
+                self.local_kv_heads as u32,
+                ffi::AttnPhase::Decode,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "no HD256 paged decode kernel for q{}_kv{}",
+                    self.local_q_heads,
+                    self.local_kv_heads
+                )
+            })?;
+            let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
+            let (kv_indptr_ptr, _g2) = meta.kv_indptr.device_ptr(&self.ctx.stream);
+            let (kv_indices_ptr, _g3) = meta.kv_indices.device_ptr(&self.ctx.stream);
+            let (last_page_len_ptr, _g4) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: q/page-table/out buffers valid on ctx.stream; paged_attn_v1
+            // ABI — decode dispatches `(bsz, total_q, max_q) = (B, B, 1)`.
+            unsafe {
+                kernel(
+                    qp_ptr as *mut ffi::Half,
+                    q_indptr_ptr as *const i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
+                    kv_indptr_ptr as *const i32,
+                    kv_indices_ptr as *const i32,
+                    last_page_len_ptr as *const i32,
+                    ao_ptr as *mut ffi::Half,
+                    b as i32,
+                    b as i32,
+                    1,
+                    pool.max_total_pages as i32,
+                    meta.num_pages as i32,
+                    self.local_q_heads as i32,
+                    self.local_kv_heads as i32,
+                    pool.page_size as i32,
+                    sm_scale,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        // ── 3. Separable per-head sigmoid gate over all B rows. ──
+        {
+            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+            // SAFETY: q_full/attn_out are live `[B, *]` buffers on ctx.stream;
+            // the gate kernel iterates `q_dim * B`.
+            unsafe {
+                ffi::attention_gate_paged_hd256_cuda(
+                    qf_ptr as *const ffi::Half,
+                    o_ptr as *mut ffi::Half,
+                    self.local_q_heads as i32,
+                    b as i32,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)?;
         self.tp.all_reduce_sum(&self.ctx, out)?;
         Ok(())
     }

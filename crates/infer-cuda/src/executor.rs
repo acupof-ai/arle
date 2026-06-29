@@ -4668,14 +4668,43 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        // The contiguous batched-decode kernel reads each slot's per-slot
-        // `k_caches`/`v_caches`, which the shared-paged default no longer
-        // allocates. Under the paged default (always-on) and under `--kv-recall`
-        // (serial per-slot rescore/evict), decode routes per-row through
-        // `submit_decode_row` (paged forward). The batched lane only runs in the
-        // legacy contiguous build (no paged pool) with the env gate on.
-        if !qwen35_batched_decode_enabled() || self.recall_active() || self.full_attn_paged() {
-            // Sequential per-row fallback (A/B arm / escape hatch / paged / recall).
+        // Under the shared-paged default (always-on), B>1 decode batches over the
+        // shared `full_attn_kv` pool via the PAGED batched kernels (the contiguous
+        // `k_caches`/`v_caches` the legacy batched path reads are never allocated).
+        // BF16 single-GPU only: the batched-paged HD256 kernels are BF16, and a TP
+        // collective per-rank lockstep is handled by `forward_decode_batch_paged`'s
+        // all-reduces — but the correctness floor keeps quant-KV and `--kv-recall`
+        // (per-row restricted page table) on the serial per-row path.
+        if self.full_attn_paged() {
+            let paged_bf16 = self
+                .full_attn_kv
+                .as_ref()
+                .map(|p| p.format == KVFormat::BF16)
+                .unwrap_or(false);
+            if qwen35_batched_decode_enabled()
+                && paged_bf16
+                && !self.recall_active()
+                && self.model.tp.is_single()
+            {
+                return self.submit_decode_batch_paged(rows);
+            }
+            // Correctness floor: recall / quant-KV / TP → serial per-row paged.
+            let mut tokens = Vec::with_capacity(rows.len());
+            for row in rows {
+                let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
+                tokens.push(SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                });
+            }
+            return Ok(tokens);
+        }
+
+        // Legacy contiguous build (no paged pool — e.g. OPD weight offload): the
+        // contiguous batched lane (env-gated) or its serial A/B arm.
+        if !qwen35_batched_decode_enabled() || self.recall_active() {
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
@@ -4724,6 +4753,102 @@ impl Qwen35CudaExecutor {
         ensure!(
             sampled.len() == rows.len(),
             "Qwen3.5 batched decode returned {} tokens for {} rows",
+            sampled.len(),
+            rows.len()
+        );
+        Ok(slot_indices
+            .into_iter()
+            .zip(sampled)
+            .map(|(slot, token)| SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
+    }
+
+    /// A rows>1 pure-decode sub-batch over the SHARED-PAGED default lane: append
+    /// each row's new token to its slot in `full_attn_kv`, build ONE B-row page
+    /// table ([`PageMeta::for_decode_batch`]), and run a single batched-paged
+    /// forward ([`Qwen35Model::forward_decode_batch_paged`]). This is the paged
+    /// analogue of the contiguous [`Self::submit_decode_batch`] true-batch arm:
+    /// the per-row append + page-table build mirrors the single-row
+    /// [`Self::decode_row_paged_default`], so a B-row batch is byte-equivalent to
+    /// B sequential single-row paged decodes (each row attends only its own
+    /// slot's pages via its `kv_indptr` slice). BF16 single-GPU, no recall (gated
+    /// by the caller in `submit_decode_batch`).
+    fn submit_decode_batch_paged(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+        debug_assert!(rows.len() > 1);
+        // Append this step's token to every row's slot BEFORE building the page
+        // table (the pool must hold the POST-append length the meta encodes). The
+        // pool seq_len must equal the engine's kv_seq_len pre-append, exactly as
+        // `decode_row_paged_default` checks — a mismatch means an upstream prefill
+        // left the slot inconsistent (e.g. leaked radix reuse).
+        {
+            let pool = self
+                .full_attn_kv
+                .as_mut()
+                .expect("full_attn_kv present (full_attn_paged)");
+            for row in rows {
+                ensure!(
+                    pool.seq_len(row.slot) == row.kv_seq_len,
+                    "Qwen3.6 paged batched decode: pool seq_len {} != kv_seq_len {} for slot {}",
+                    pool.seq_len(row.slot),
+                    row.kv_seq_len,
+                    row.slot
+                );
+                pool.alloc_tokens(row.slot, 1)?;
+            }
+        }
+
+        let slot_indices: Vec<usize> = rows.iter().map(|r| r.slot).collect();
+        let tokens_in: Vec<u32> = rows.iter().map(|r| r.last_token).collect();
+        let kv_seq_lens: Vec<usize> = rows.iter().map(|r| r.kv_seq_len).collect();
+        let params: Vec<SamplingParams> = rows.iter().map(|r| r.params.clone()).collect();
+        let sample_positions: Vec<u64> = rows
+            .iter()
+            .map(|r| r.kv_seq_len.saturating_add(1) as u64)
+            .collect();
+        // Page table over the POST-append lengths (one row per slot).
+        let batch_rows: Vec<(usize, usize)> =
+            rows.iter().map(|r| (r.slot, r.kv_seq_len + 1)).collect();
+
+        if self.batch_decode.is_none() {
+            let num_full = self.model.config.num_full_attention_layers();
+            let num_linear = self.model.config.num_hidden_layers - num_full;
+            self.batch_decode = Some(crate::qwen35::Qwen35BatchDecodeState::new(
+                &self.model.ctx,
+                num_full,
+                num_linear,
+                self.num_slots,
+            )?);
+        }
+
+        let Self {
+            model,
+            slots,
+            batch_decode,
+            full_attn_kv,
+            ..
+        } = self;
+        let bd = batch_decode.as_mut().expect("batch_decode built above");
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        let meta = PageMeta::for_decode_batch(&model.ctx, pool, &batch_rows)?;
+        let sampled = model.forward_decode_batch_paged(
+            slots,
+            bd,
+            pool,
+            &meta,
+            &slot_indices,
+            &tokens_in,
+            &kv_seq_lens,
+            &params,
+            &sample_positions,
+        )?;
+        ensure!(
+            sampled.len() == rows.len(),
+            "Qwen3.6 paged batched decode returned {} tokens for {} rows",
             sampled.len(),
             rows.len()
         );
