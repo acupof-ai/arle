@@ -345,24 +345,19 @@ pub fn build_attn_cp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if cfg.attn_cp_size == cfg.tp_size {
         return build_tp_groups(cfg);
     }
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
+    let n = cfg.world_size() / cfg.tp_size;
     let attn_tp = cfg.attn_tp_size();
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for dp_idx in 0..cfg.attn_dp_size {
-            for attn_tp_idx in 0..attn_tp {
-                let st =
-                    tp_group_idx * cfg.tp_size + dp_idx * attn_tp * cfg.attn_cp_size + attn_tp_idx;
-                let en = tp_group_idx * cfg.tp_size
-                    + (dp_idx + 1) * attn_tp * cfg.attn_cp_size
-                    + attn_tp_idx;
-                let ranks: Vec<usize> = (st..en).step_by(attn_tp).collect();
-                group_ranks.push(ranks);
-            }
-        }
-    }
-    group_ranks
+    (0..n)
+        .flat_map(|g| {
+            (0..cfg.attn_dp_size).flat_map(move |d| {
+                (0..attn_tp).map(move |t| {
+                    let st = g * cfg.tp_size + d * attn_tp * cfg.attn_cp_size + t;
+                    let en = g * cfg.tp_size + (d + 1) * attn_tp * cfg.attn_cp_size + t;
+                    (st..en).step_by(attn_tp).collect()
+                })
+            })
+        })
+        .collect()
 }
 
 /// SGLang `parallel_state.py:1871-1883`.
@@ -372,17 +367,15 @@ pub fn build_attn_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if attn_tp == cfg.tp_size {
         return build_tp_groups(cfg);
     }
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for cp_dp_combined_idx in 0..(cfg.attn_cp_size * cfg.attn_dp_size) {
-            let st = tp_group_idx * cfg.tp_size + cp_dp_combined_idx * attn_tp;
-            let en = tp_group_idx * cfg.tp_size + (cp_dp_combined_idx + 1) * attn_tp;
-            group_ranks.push((st..en).collect());
-        }
-    }
-    group_ranks
+    let n = cfg.world_size() / cfg.tp_size;
+    (0..n)
+        .flat_map(|g| {
+            (0..cfg.attn_cp_size * cfg.attn_dp_size).map(move |i| {
+                let st = g * cfg.tp_size + i * attn_tp;
+                (st..st + attn_tp).collect()
+            })
+        })
+        .collect()
 }
 
 /// SGLang `parallel_state.py:1838-1853` (attn_dp uses same outer layout as
@@ -392,22 +385,21 @@ pub fn build_attn_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if cfg.attn_dp_size == 1 {
         return (0..cfg.world_size()).map(|r| vec![r]).collect();
     }
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
+    let n = cfg.world_size() / cfg.tp_size;
     let attn_tp = cfg.attn_tp_size();
     let stride = attn_tp * cfg.attn_cp_size;
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for cp_idx in 0..cfg.attn_cp_size {
-            for attn_tp_idx in 0..attn_tp {
-                let st = tp_group_idx * cfg.tp_size + cp_idx * attn_tp + attn_tp_idx;
-                let en = tp_group_idx * cfg.tp_size + cfg.tp_size;
-                let ranks: Vec<usize> = (st..en).step_by(stride).collect();
-                group_ranks.push(ranks);
-            }
-        }
-    }
-    group_ranks
+    (0..n)
+        .flat_map(|g| {
+            (0..cfg.attn_cp_size).flat_map(move |c| {
+                (0..attn_tp).map(move |t| {
+                    let st = g * cfg.tp_size + c * attn_tp + t;
+                    (st..g * cfg.tp_size + cfg.tp_size)
+                        .step_by(stride)
+                        .collect()
+                })
+            })
+        })
+        .collect()
 }
 
 /// SGLang `DataParallelController` request-ownership groups.
@@ -419,18 +411,16 @@ pub fn build_attn_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
 /// builds per-DP compute-owner groups.
 #[must_use]
 pub fn build_attn_owner_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
-    let owner_group_size = cfg.attn_tp_size() * cfg.attn_cp_size;
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for attn_dp_idx in 0..cfg.attn_dp_size {
-            let st = tp_group_idx * cfg.tp_size + attn_dp_idx * owner_group_size;
-            let en = st + owner_group_size;
-            group_ranks.push((st..en).collect());
-        }
-    }
-    group_ranks
+    let n = cfg.world_size() / cfg.tp_size;
+    let sz = cfg.attn_tp_size() * cfg.attn_cp_size;
+    (0..n)
+        .flat_map(|g| {
+            (0..cfg.attn_dp_size).map(move |d| {
+                let st = g * cfg.tp_size + d * sz;
+                (st..st + sz).collect()
+            })
+        })
+        .collect()
 }
 
 /// SGLang `parallel_state.py:1903-1919`.
@@ -442,20 +432,17 @@ pub fn build_moe_dp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if cfg.moe_dp_size == cfg.tp_size {
         return build_tp_groups(cfg);
     }
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
+    let n = cfg.world_size() / cfg.tp_size;
     let moe_tp = cfg.moe_tp_size();
     let stride = moe_tp * cfg.ep_size;
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for tp_ep_combined_idx in 0..(moe_tp * cfg.ep_size) {
-            let st = tp_group_idx * cfg.tp_size + tp_ep_combined_idx;
-            let en = (tp_group_idx + 1) * cfg.tp_size + tp_ep_combined_idx;
-            let ranks: Vec<usize> = (st..en).step_by(stride).collect();
-            group_ranks.push(ranks);
-        }
-    }
-    group_ranks
+    (0..n)
+        .flat_map(|g| {
+            (0..moe_tp * cfg.ep_size).map(move |i| {
+                let st = g * cfg.tp_size + i;
+                (st..(g + 1) * cfg.tp_size + i).step_by(stride).collect()
+            })
+        })
+        .collect()
 }
 
 /// SGLang `parallel_state.py:1929-1943`.
@@ -464,22 +451,18 @@ pub fn build_moe_ep_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if cfg.ep_size == cfg.tp_size {
         return build_tp_groups(cfg);
     }
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
+    let n = cfg.world_size() / cfg.tp_size;
     let moe_tp = cfg.moe_tp_size();
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for moe_dp_idx in 0..cfg.moe_dp_size {
-            for moe_tp_idx in 0..moe_tp {
-                let st =
-                    tp_group_idx * cfg.tp_size + moe_dp_idx * cfg.ep_size * moe_tp + moe_tp_idx;
-                let en = st + cfg.ep_size * moe_tp;
-                let ranks: Vec<usize> = (st..en).step_by(moe_tp).collect();
-                group_ranks.push(ranks);
-            }
-        }
-    }
-    group_ranks
+    (0..n)
+        .flat_map(|g| {
+            (0..cfg.moe_dp_size).flat_map(move |d| {
+                (0..moe_tp).map(move |t| {
+                    let st = g * cfg.tp_size + d * cfg.ep_size * moe_tp + t;
+                    (st..st + cfg.ep_size * moe_tp).step_by(moe_tp).collect()
+                })
+            })
+        })
+        .collect()
 }
 
 /// SGLang `parallel_state.py:1955-1970`.
@@ -489,17 +472,15 @@ pub fn build_moe_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     if moe_tp == cfg.tp_size {
         return build_tp_groups(cfg);
     }
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
-    let mut group_ranks = Vec::new();
-    for tp_group_idx in 0..num_tp_groups {
-        for ep_dp_combined_idx in 0..(cfg.ep_size * cfg.moe_dp_size) {
-            let st = tp_group_idx * cfg.tp_size + ep_dp_combined_idx * moe_tp;
-            let en = tp_group_idx * cfg.tp_size + (ep_dp_combined_idx + 1) * moe_tp;
-            group_ranks.push((st..en).collect());
-        }
-    }
-    group_ranks
+    let n = cfg.world_size() / cfg.tp_size;
+    (0..n)
+        .flat_map(|g| {
+            (0..cfg.ep_size * cfg.moe_dp_size).map(move |i| {
+                let st = g * cfg.tp_size + i * moe_tp;
+                (st..st + moe_tp).collect()
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
