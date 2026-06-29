@@ -3426,10 +3426,14 @@ impl Qwen35CudaExecutor {
         match snap.as_ref() {
             Some(s) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, s)?,
             None => {
-                log::debug!(
+                // ponytail: MISS → return Err so prefix.rs falls back to matched_len=0.
+                // A zeroed linear-attention state paired with a non-zero full-attention KV
+                // (from the radix cache) creates a cross-attention-type mismatch that
+                // corrupts model outputs. Full re-prefill is the only safe fallback.
+                return Err(anyhow::anyhow!(
                     "no recurrent sidecar for prefix matched_len={matched_len} \
-                     (key={key:#018x}); starting with zeroed recurrent state"
-                );
+                     (key={key:#018x}); falling back to full recompute"
+                ));
             }
         }
         self.slots[slot].set_seq_len(matched_len);
