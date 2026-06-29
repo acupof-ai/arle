@@ -1672,17 +1672,20 @@ fn next_token_sft_loss_from_logits(
             expected_shape, shape
         )));
     }
-    let mut targets = Vec::with_capacity(target_tokens.len());
-    for (index, &token_id) in target_tokens.iter().enumerate() {
-        if token_id as usize >= vocab {
-            return Err(OpdError::InvalidInput(format!(
-                "GKD SFT proxy target token {token_id} at target[{index}] is \
-                 outside vocab={vocab}. Hint: verify tokenizer/model vocab \
-                 alignment before mixing hard-token SFT into OPD."
-            )));
-        }
-        targets.push(token_id as usize);
-    }
+    let targets: Vec<usize> = target_tokens
+        .iter()
+        .enumerate()
+        .map(|(index, &token_id)| {
+            if token_id as usize >= vocab {
+                return Err(OpdError::InvalidInput(format!(
+                    "GKD SFT proxy target token {token_id} at target[{index}] is \
+                     outside vocab={vocab}. Hint: verify tokenizer/model vocab \
+                     alignment before mixing hard-token SFT into OPD."
+                )));
+            }
+            Ok(token_id as usize)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let shifted_logits = slice(
         student_logits,
         &[0, start_position, 0],
@@ -2774,9 +2777,11 @@ pub fn rubric_writeback_ce_step<O: Optimizer>(
         ));
     }
     let mut tape = Tape::new();
-    let mut full: Vec<usize> = Vec::with_capacity(prompt_ids.len() + completion_ids.len());
-    full.extend(prompt_ids.iter().map(|&t| t as usize));
-    full.extend(completion_ids.iter().map(|&t| t as usize));
+    let full: Vec<usize> = prompt_ids
+        .iter()
+        .map(|&t| t as usize)
+        .chain(completion_ids.iter().map(|&t| t as usize))
+        .collect();
     let logits = student
         .forward_tokens(&full, store, &mut tape)
         .map_err(OpdError::from)?;
@@ -2836,15 +2841,19 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     // Flat [B * max_len] input, each row = prompt ++ completion ++ pad(0). Causal
     // attention + right-padding means padding never affects earlier positions, and
     // the per-row CE only targets completion positions, so padding is inert.
-    let mut flat: Vec<usize> = Vec::with_capacity(b * max_len);
-    for (prompt, completion) in batch {
-        flat.extend(prompt.iter().map(|&t| t as usize));
-        flat.extend(completion.iter().map(|&t| t as usize));
-        flat.extend(std::iter::repeat_n(
-            0usize,
-            max_len - prompt.len() - completion.len(),
-        ));
-    }
+    let flat: Vec<usize> = batch
+        .iter()
+        .flat_map(|(prompt, completion)| {
+            prompt
+                .iter()
+                .map(|&t| t as usize)
+                .chain(completion.iter().map(|&t| t as usize))
+                .chain(std::iter::repeat_n(
+                    0usize,
+                    max_len - prompt.len() - completion.len(),
+                ))
+        })
+        .collect();
     let logits = student
         .forward_batch_tokens(&flat, b, max_len, store, &mut tape)
         .map_err(OpdError::from)?;
@@ -2994,9 +3003,11 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     }
 
     let prompt_len = prompt_ids.len();
-    let mut full: Vec<u32> = Vec::with_capacity(prompt_len + response_ids.len());
-    full.extend_from_slice(prompt_ids);
-    full.extend_from_slice(response_ids);
+    let full: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(response_ids.iter().copied())
+        .collect();
     let seq_len = full.len();
     if seq_len > u32::MAX as usize {
         return Err(OpdError::InvalidInput(format!(
@@ -3136,9 +3147,11 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     }
 
     let prompt_len = prompt_ids.len();
-    let mut full: Vec<u32> = Vec::with_capacity(prompt_len + response_ids.len());
-    full.extend_from_slice(prompt_ids);
-    full.extend_from_slice(response_ids);
+    let full: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(response_ids.iter().copied())
+        .collect();
     let seq_len = full.len();
     if seq_len > u32::MAX as usize {
         return Err(OpdError::InvalidInput(format!(
