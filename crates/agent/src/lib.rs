@@ -2392,38 +2392,37 @@ mod tests {
     fn tool_use_id_is_deterministic_across_runs() {
         // Same input → same IDs. We don't rely on UUIDs for tool_use ids
         // exactly so the trajectory stays diff-able across re-runs.
-        let mut ids = Vec::new();
-        for _ in 0..2 {
-            let mut session = AgentSession::new();
-            let mut engine = FakeEngine::new(vec![
-                "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
-                "done",
-            ]);
-            let result = session
-                .run_turn(
-                    &mut engine,
-                    "go",
-                    &[bash_def()],
-                    &StubToolExecutor::new("ok"),
-                    &NoopToolPolicy,
-                    settings(),
-                )
-                .expect("turn");
-            let run_ids: Vec<_> = result
-                .messages
-                .iter()
-                .filter_map(|msg| match &msg.content {
-                    MessageContent::Blocks(blocks) => Some(blocks.iter()),
-                    _ => None,
-                })
-                .flatten()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect();
-            ids.push(run_ids);
-        }
+        let ids: Vec<Vec<String>> = (0..2)
+            .map(|_| {
+                let mut session = AgentSession::new();
+                let mut engine = FakeEngine::new(vec![
+                    "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+                    "done",
+                ]);
+                session
+                    .run_turn(
+                        &mut engine,
+                        "go",
+                        &[bash_def()],
+                        &StubToolExecutor::new("ok"),
+                        &NoopToolPolicy,
+                        settings(),
+                    )
+                    .expect("turn")
+                    .messages
+                    .iter()
+                    .filter_map(|msg| match &msg.content {
+                        MessageContent::Blocks(blocks) => Some(blocks.iter()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
         assert_eq!(ids[0], ids[1]);
         assert_eq!(ids[0], vec!["tu_0_0".to_string()]);
     }
