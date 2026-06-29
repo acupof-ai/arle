@@ -770,7 +770,7 @@ impl CompletionSinks {
             let _ = sink.send(RelayCompletionDelta {
                 finish: true,
                 error: Some(message.to_string()),
-                ..RelayCompletionDelta::default()
+                ..Default::default()
             });
         }
     }
@@ -1127,7 +1127,7 @@ mod tests {
                     request_id: 11,
                     delta: RelayCompletionDelta {
                         finish: true,
-                        ..RelayCompletionDelta::default()
+                        ..Default::default()
                     },
                 })
                 .unwrap();
