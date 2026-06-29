@@ -704,14 +704,10 @@ mod tests {
 
     #[cfg(feature = "vulkan")]
     fn argmax_of(v: &[f32]) -> usize {
-        let mut best = 0usize;
-        let mut best_v = f32::NEG_INFINITY;
-        for (i, &x) in v.iter().enumerate() {
-            if x > best_v {
-                best_v = x;
-                best = i;
-            }
-        }
-        best
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 }

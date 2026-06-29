@@ -10,15 +10,12 @@ use crate::SamplingParams;
 /// Index of the maximum logit (greedy / argmax). Ties resolve to the lowest index.
 #[must_use]
 pub fn argmax_logit(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as u32
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 /// SplitMix64 — a tiny dependency-free mixer turning a seed into a u64 stream.

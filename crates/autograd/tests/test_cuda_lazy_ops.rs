@@ -59,19 +59,17 @@ fn cpu_argmax_last_dim(x: &[f32], shape: &[usize]) -> autograd::Result<Vec<f32>>
         got: 0,
     })?;
     let rows = shape.iter().product::<usize>() / vocab;
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let base = row * vocab;
-        let mut best_idx = 0usize;
-        let mut best_val = f32::NEG_INFINITY;
-        for (idx, &value) in x[base..base + vocab].iter().enumerate() {
-            if value > best_val {
-                best_val = value;
-                best_idx = idx;
-            }
-        }
-        out.push(best_idx as f32);
-    }
+    let out: Vec<f32> = (0..rows)
+        .map(|row| {
+            let base = row * vocab;
+            x[base..base + vocab]
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i as f32)
+                .unwrap_or(0.0)
+        })
+        .collect();
     Ok(out)
 }
 
