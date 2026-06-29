@@ -84,8 +84,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         // Restore the recurrent sidecar for hybrid models (Qwen3.5/3.6). No-op for
-        // full-attention-only backends. On miss, logs a debug message and proceeds
-        // with zeroed recurrent (graceful degradation — same as pre-#85 fresh prefill).
+        // full-attention-only backends. On miss, release the attached pages and fall
+        // back to full recompute — a zeroed linear-attn state with non-zero full-attn
+        // KV causes a cross-type mismatch that corrupts model output.
         if let Err(err) = self.executor.restore_prefix_sidecar(
             slot,
             &request.prompt_tokens,
@@ -94,8 +95,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         ) {
             log::warn!(
                 "recurrent sidecar restore failed for slot {slot}: {err:#}; \
-                 proceeding with zeroed recurrent state"
+                 full recompute fallback"
             );
+            // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
+            self.kv.free_slot(slot);
+            self.radix.release_blocks(&prefix_match.block_ids);
+            self.kv.release_pages(&prefix_match.block_ids);
+            // request.prefill_start_pos stays at 0 (the pre-attach default).
+            request.phase = RequestPhase::Prefilling { progress: 0 };
+            request.waiting_hint.immediate_reuse_tokens = 0;
+            request.waiting_hint.total_reuse_tokens = 0;
+            return Ok(());
         }
 
         self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
