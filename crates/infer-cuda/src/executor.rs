@@ -3329,8 +3329,12 @@ impl Qwen35CudaExecutor {
     /// `capture_recurrent_sidecar` after prefill and restored in
     /// `restore_recurrent_sidecar` at page-radix attach time. Pure full-attn
     /// checkpoints work identically (no sidecar to capture or restore).
-    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
-        pages_only_reusable_prefix_blocks(blocks, |_| false)
+    pub(crate) fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
+        // Hybrid models need both recurrent state AND full-attention KV pages
+        // to correctly reuse a prefix. The recurrent sidecar captures linear-attn
+        // state, but full-attn KV page content is not yet cached alongside it.
+        // Disable prefix reuse until the full-attn KV sidecar is implemented.
+        0
     }
 
     /// Capture the slot's recurrent state as a prefix sidecar, keyed by the
@@ -3375,22 +3379,13 @@ impl Qwen35CudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
-        prefix_pages: &[u32],
+        _prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         let matched_len = matched_len.min(tokens.len());
-
-        // Sync the device KV pool so seq_len(slot) == matched_len before the
-        // tail prefill runs. The host pool already has `matched_len` tokens
-        // attached (kv.attach_pages ran before this hook); mirror that here:
-        // free the prior occupant's tracking, then attach the prefix pages.
-        if let Some(pool) = self.full_attn_kv.as_mut() {
-            pool.free_slot(slot);
-            if !prefix_pages.is_empty() {
-                pool.attach_pages(slot, prefix_pages, matched_len)
-                    .map_err(|e| anyhow::anyhow!("device pool prefix attach failed: {e}"))?;
-            }
-        }
-
+        // NOTE: full_attn_kv device pool is NOT synced here.
+        // reusable_prefix_blocks returns 0 for hybrid models, so this function
+        // is currently unreachable. When full-attn KV sidecar is added, this
+        // is where the H2D restore of full-attn pages will go.
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Acquire first so the device buffers exist for H2D restore.
@@ -3965,15 +3960,14 @@ impl Qwen35CudaExecutor {
                 .as_mut()
                 .expect("full_attn_kv present (full_attn_paged)");
             // The pool must hold exactly `start_pos` tokens before appending the
-            // tail. For fresh requests `free_slot` ran at `start_pos == 0` in
-            // `submit_prefill_row`. For prefix-reuse requests `restore_recurrent_sidecar`
-            // synced the device pool via `free_slot` + `attach_pages` so seq_len ==
-            // matched_len == start_pos. A mismatch here means the device pool was
-            // not synced — fail loudly rather than double-count.
+            // tail. `free_slot` runs at `start_pos == 0` in `submit_prefill_row`;
+            // prefix reuse (start_pos > 0) is gated off for hybrid models by
+            // `reusable_prefix_blocks` returning 0, so this path always sees
+            // start_pos == 0. A mismatch here would mean a soundness gate failed.
             ensure!(
                 pool.seq_len(slot) == row.start_pos,
                 "Qwen3.6 default-paged prefill: device pool seq_len {} != start_pos {} for slot {} \
-                 (device pool was not synced before this forward — check restore_recurrent_sidecar)",
+                 (reusable_prefix_blocks soundness gate bypassed)",
                 pool.seq_len(slot),
                 row.start_pos,
                 slot
