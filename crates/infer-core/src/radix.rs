@@ -167,25 +167,17 @@ impl RadixCache {
     }
 
     fn match_inner(&self, tokens: &[u32]) -> PrefixMatch {
-        let mut node_idx = 0usize;
-        let mut block_ids = Vec::new();
-        let mut matched_len = 0usize;
-
-        for block in tokens.chunks_exact(self.block_size) {
-            let Some(&child_idx) = self.nodes[node_idx].children.get(block) else {
-                break;
-            };
-            let child = &self.nodes[child_idx];
-            let Some(page_id) = child.page_id else {
-                break;
-            };
-            block_ids.push(page_id);
-            matched_len += self.block_size;
-            node_idx = child_idx;
-        }
-
+        let block_ids: Vec<u32> = tokens
+            .chunks_exact(self.block_size)
+            .scan(0usize, |node_idx, block| {
+                let &child_idx = self.nodes[*node_idx].children.get(block)?;
+                let page_id = self.nodes[child_idx].page_id?;
+                *node_idx = child_idx;
+                Some(page_id)
+            })
+            .collect();
         PrefixMatch {
-            matched_len,
+            matched_len: block_ids.len() * self.block_size,
             block_ids,
         }
     }

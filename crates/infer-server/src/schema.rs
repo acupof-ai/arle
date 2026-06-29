@@ -187,14 +187,11 @@ impl ChatContent {
             Self::Parts(parts) => parts
                 .iter()
                 .filter_map(|part| {
-                    if part.kind == "text" {
-                        part.text.as_deref()
-                    } else {
-                        None
-                    }
+                    (part.kind == "text")
+                        .then(|| part.text.as_deref())
+                        .flatten()
                 })
-                .collect::<Vec<_>>()
-                .join(""),
+                .collect(),
         }
     }
 
