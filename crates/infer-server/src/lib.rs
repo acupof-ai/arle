@@ -756,26 +756,52 @@ fn serve_handle_relay_driver<E, K>(
                     let serve_clone = std::sync::Arc::clone(&serve);
                     let tx_clone = engine_tx.clone();
                     std::thread::spawn(move || {
-                        let result = serve_clone
-                            .submit(prompt_tokens, max_tokens, sampling)
-                            .and_then(|ticket| ticket.collect());
-                        let delta = match result {
-                            Ok(completed) => multiproc_relay::RelayCompletionDelta {
-                                text_delta: String::new(),
-                                token_ids: completed.generated_tokens.clone(),
-                                finish: true,
-                                finish_reason: completed.finish.clone(),
-                                error: None,
-                            },
-                            Err(e) => multiproc_relay::RelayCompletionDelta {
-                                text_delta: String::new(),
-                                token_ids: Vec::new(),
-                                finish: true,
-                                finish_reason: None,
-                                error: Some(e.to_string()),
-                            },
-                        };
-                        let _ = tx_clone.send(RelayEnvelope::Completion { request_id, delta });
+                        let result =
+                            serve_clone.submit_streaming(prompt_tokens, max_tokens, sampling);
+                        match result {
+                            Ok((_ticket, rx)) => {
+                                for item in rx {
+                                    match item {
+                                        execution::StreamItem::Token { token, .. } => {
+                                            let _ = tx_clone.send(RelayEnvelope::Completion {
+                                                request_id,
+                                                delta: multiproc_relay::RelayCompletionDelta {
+                                                    text_delta: String::new(),
+                                                    token_ids: vec![token],
+                                                    finish: false,
+                                                    finish_reason: None,
+                                                    error: None,
+                                                },
+                                            });
+                                        }
+                                        execution::StreamItem::Done(completed) => {
+                                            let _ = tx_clone.send(RelayEnvelope::Completion {
+                                                request_id,
+                                                delta: multiproc_relay::RelayCompletionDelta {
+                                                    text_delta: String::new(),
+                                                    token_ids: Vec::new(),
+                                                    finish: true,
+                                                    finish_reason: completed.finish.clone(),
+                                                    error: None,
+                                                },
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx_clone.send(RelayEnvelope::Completion {
+                                    request_id,
+                                    delta: multiproc_relay::RelayCompletionDelta {
+                                        text_delta: String::new(),
+                                        token_ids: Vec::new(),
+                                        finish: true,
+                                        finish_reason: None,
+                                        error: Some(e.to_string()),
+                                    },
+                                });
+                            }
+                        }
                     });
                 }
             }
