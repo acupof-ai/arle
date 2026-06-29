@@ -504,14 +504,9 @@ impl Dsv4SpecVerifyScratch {
     fn new(model: &Dsv4Model) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let stream_dim = hidden_size * model.config.hc_mult;
-        let mut layers = Vec::with_capacity(model.layers.len());
-        for _ in 0..model.layers.len() {
-            layers.push(Dsv4SpecVerifyLayerScratch::new(
-                &model.ctx,
-                hidden_size,
-                stream_dim,
-            )?);
-        }
+        let layers: Vec<_> = (0..model.layers.len())
+            .map(|_| Dsv4SpecVerifyLayerScratch::new(&model.ctx, hidden_size, stream_dim))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             embeddings: unsafe {
                 HiddenStates::uninit(&model.ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
@@ -653,10 +648,11 @@ impl Dsv4DecodeGraphScratch {
             .map_err(|e| anyhow!("DSv4 decode graph u32 token-id scratch alloc failed: {e}"))?;
         let embeddings = unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? };
         let initial_stream = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
-        let mut layers = Vec::with_capacity(model.layers.len());
-        for layer in &model.layers {
-            layers.push(Dsv4DecodeLayerGraphScratch::new(model, layer)?);
-        }
+        let layers: Vec<_> = model
+            .layers
+            .iter()
+            .map(|layer| Dsv4DecodeLayerGraphScratch::new(model, layer))
+            .collect::<Result<Vec<_>>>()?;
         let last_hidden = DeviceVec::zeros(&model.ctx, hidden_size)?;
         let last_normed = DeviceVec::zeros(&model.ctx, hidden_size)?;
         let head_stream_row = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
@@ -849,61 +845,68 @@ impl Dsv4SlotState {
         kv_adapter: &crate::attention::Dsv4KvAdapter,
     ) -> Result<Self> {
         ensure!(max_seq_len > 0, "DSv4 slot max_seq_len must be positive");
-        let mut attention = Vec::with_capacity(model.layers.len());
-        for (layer_idx, layer) in model.layers.iter().enumerate() {
-            let local_width = layer.attention.wq_b.rows;
-            ensure!(
-                local_width.is_multiple_of(model.config.head_dim),
-                "DSv4 slot attention local width {local_width} is not a multiple of head_dim {}",
-                model.config.head_dim
-            );
-            let pool = kv_adapter.layer(layer_idx)?;
-            attention.push(crate::attention::Dsv4LayerAttentionState::new(
-                &model.ctx,
-                &model.config,
-                layer.mode,
-                layer.compress_ratio,
-                max_seq_len,
-                &model.kv_arena,
-                local_width / model.config.head_dim,
-                model.tp.config().world_size,
-                slot_idx,
-                pool,
-            )?);
-        }
-        // Pre-allocate the per-layer spec-ring snapshot when spec decode is on.
-        // No per-step allocation; capture/restore only copies into these buffers.
-        let spec_rings = if model.spec_decode_on {
-            let mut rings = Vec::with_capacity(attention.len());
-            for state in &attention {
-                rings.push(state.alloc_spec_ring_snapshot(
+        let attention: Vec<_> = model
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, layer)| {
+                let local_width = layer.attention.wq_b.rows;
+                ensure!(
+                    local_width.is_multiple_of(model.config.head_dim),
+                    "DSv4 slot attention local width {local_width} is not a multiple of head_dim {}",
+                    model.config.head_dim
+                );
+                let pool = kv_adapter.layer(layer_idx)?;
+                crate::attention::Dsv4LayerAttentionState::new(
                     &model.ctx,
                     &model.config,
+                    layer.mode,
+                    layer.compress_ratio,
+                    max_seq_len,
                     &model.kv_arena,
-                    MAX_SPEC_DRAFT_DEPTH,
-                )?);
-            }
-            Some(rings)
-        } else {
-            None
-        };
+                    local_width / model.config.head_dim,
+                    model.tp.config().world_size,
+                    slot_idx,
+                    pool,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Pre-allocate the per-layer spec-ring snapshot when spec decode is on.
+        // No per-step allocation; capture/restore only copies into these buffers.
+        let spec_rings = model
+            .spec_decode_on
+            .then(|| {
+                attention
+                    .iter()
+                    .map(|state| {
+                        state.alloc_spec_ring_snapshot(
+                            &model.ctx,
+                            &model.config,
+                            &model.kv_arena,
+                            MAX_SPEC_DRAFT_DEPTH,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         // P2 commit-fold scratch: per-layer persisted verify rows.
-        let spec_normed = if model.spec_decode_on {
-            let mut cache = Vec::with_capacity(attention.len());
-            for _ in 0..attention.len() {
-                // SAFETY: rows are written by the verify lane before any read.
-                cache.push(unsafe {
-                    HiddenStates::uninit(
-                        &model.ctx,
-                        model.config.hidden_size,
-                        MAX_SPEC_VERIFY_ROWS,
-                    )?
-                });
-            }
-            Some(cache)
-        } else {
-            None
-        };
+        let spec_normed = model
+            .spec_decode_on
+            .then(|| {
+                (0..attention.len())
+                    .map(|_| {
+                        // SAFETY: rows are written by the verify lane before any read.
+                        unsafe {
+                            HiddenStates::uninit(
+                                &model.ctx,
+                                model.config.hidden_size,
+                                MAX_SPEC_VERIFY_ROWS,
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let spec_verify = if model.spec_decode_on {
             Some(Dsv4SpecVerifyScratch::new(model)?)
         } else {
@@ -1093,11 +1096,15 @@ impl Dsv4SlotState {
         ctx: &DeviceContext,
         kv_adapter: &crate::attention::Dsv4KvAdapter,
     ) -> Result<Dsv4SlotImage> {
-        let mut layers = Vec::with_capacity(self.attention.len());
-        for (layer_idx, state) in self.attention.iter().enumerate() {
-            let pool = kv_adapter.layer(layer_idx)?;
-            layers.push(state.swap_out_image(ctx, pool)?);
-        }
+        let layers: Vec<_> = self
+            .attention
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, state)| {
+                let pool = kv_adapter.layer(layer_idx)?;
+                state.swap_out_image(ctx, pool)
+            })
+            .collect::<Result<Vec<_>>>()?;
         // The clone_dtoh copies above are stream-ordered; the image's host
         // vectors are only valid once the stream drains.
         ctx.sync()?;
@@ -1431,37 +1438,39 @@ impl Dsv4Model {
         // routed-MoE scratch is decode-graph-only; do not let GPU-router env
         // selection switch eager decode back to the old pooled MoE path.
         let needs_moe_decode_shared = dsv4_decode_graph_enabled();
-        let mut specs = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            let local_width = layer.attention.wq_b.rows;
-            ensure!(
-                local_width.is_multiple_of(self.config.head_dim),
-                "DSv4 attention pool local width {local_width} is not a multiple of head_dim {}",
-                self.config.head_dim
-            );
-            specs.push((
-                layer.mode,
-                layer.compress_ratio,
-                local_width / self.config.head_dim,
-            ));
-        }
-        let mut mla_decode = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            let model1 = layer.attention.w_kc.is_none()
-                && layer.attention.w_vc.is_none()
-                && layer.attention.o_proj.is_none();
-            mla_decode.push(if model1 {
-                Some(crate::attention::Dsv4MlaDecodeGraphScratch::new(
-                    &self.ctx,
-                    &self.config,
-                    &layer.attention,
-                    layer.mode,
-                    layer.compress_ratio,
-                )?)
-            } else {
-                None
-            });
-        }
+        let specs: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let local_width = layer.attention.wq_b.rows;
+                ensure!(
+                    local_width.is_multiple_of(self.config.head_dim),
+                    "DSv4 attention pool local width {local_width} is not a multiple of head_dim {}",
+                    self.config.head_dim
+                );
+                Ok((layer.mode, layer.compress_ratio, local_width / self.config.head_dim))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mla_decode: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let model1 = layer.attention.w_kc.is_none()
+                    && layer.attention.w_vc.is_none()
+                    && layer.attention.o_proj.is_none();
+                model1
+                    .then(|| {
+                        crate::attention::Dsv4MlaDecodeGraphScratch::new(
+                            &self.ctx,
+                            &self.config,
+                            &layer.attention,
+                            layer.mode,
+                            layer.compress_ratio,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
         crate::attention::Dsv4KvAdapter::new(
             &self.ctx,
             &self.config,
@@ -1528,7 +1537,7 @@ impl Dsv4Model {
             .saturating_mul(self.kv_arena.num_layers);
         // Official-DSA selector memory splits into the ONE model-wide shared
         // scratch (a fixed subtraction from the budget) and the per-(slot,
-        // CSA-layer) stateful rotated_keys mirrors (a per-slot term). #67.
+        // CSA-layer) transient rotated_keys staging (a per-slot term). #67.
         let official_on = crate::attention::dsv4_dsa_official_enabled().unwrap_or(true);
         // First indexer layer's indexer ratio (CSA = compress_ratio; GLM
         // SparseIndexed → 1, full-sequence every-token-a-key). Widened from CSA-only
@@ -4701,6 +4710,12 @@ impl Dsv4Model {
         let use_deepep_transport = dsv4_use_deepep_transport()?;
         let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
         let ctx = &self.ctx;
+        // DEBUG: catch any deferred CUDA error from init/boot before first forward op.
+        if use_deepep_transport {
+            self.ctx.stream.synchronize().map_err(|e| {
+                anyhow!("DSv4 deepep: stream error at forward entry (before embed): {e}")
+            })?;
+        }
         let start_pos_device = if seq_len == 1 {
             let start_pos_i32 = i32::try_from(start_pos)
                 .map_err(|_| anyhow!("DSv4 start_pos {start_pos} overflows i32"))?;
@@ -4721,6 +4736,7 @@ impl Dsv4Model {
         let mut embeddings = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
         crate::stage_profile::profile(ctx, "dsv4/stage/embed", || {
             crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)
+                .map_err(|e| anyhow!("DSv4 embed lookup failed: {e}"))
         })?;
         keepalive.keep_hidden(&embeddings);
 
