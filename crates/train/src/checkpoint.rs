@@ -175,29 +175,31 @@ pub fn load_trainer_state_v2(
         }
     }
 
-    let mut params = Vec::with_capacity(order.len());
-    for name in &order {
-        let pair = groups.get(name).expect("just inserted");
-        let (m_shape, m_data) = pair
-            .m
-            .clone()
-            .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
-        let (v_shape, v_data) = pair
-            .v
-            .clone()
-            .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
-        if m_shape != v_shape {
-            return Err(CheckpointError::Safetensors(format!(
-                "optimizer.safetensors: '{name}' .m shape {m_shape:?} != .v shape {v_shape:?}"
-            )));
-        }
-        params.push(AdamWParamState {
-            name: name.clone(),
-            m: m_data,
-            v: v_data,
-            shape: m_shape,
-        });
-    }
+    let params = order
+        .iter()
+        .map(|name| {
+            let pair = groups.get(name).expect("just inserted");
+            let (m_shape, m_data) = pair
+                .m
+                .clone()
+                .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
+            let (v_shape, v_data) = pair
+                .v
+                .clone()
+                .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
+            if m_shape != v_shape {
+                return Err(CheckpointError::Safetensors(format!(
+                    "optimizer.safetensors: '{name}' .m shape {m_shape:?} != .v shape {v_shape:?}"
+                )));
+            }
+            Ok(AdamWParamState {
+                name: name.clone(),
+                m: m_data,
+                v: v_data,
+                shape: m_shape,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let metadata: &Option<HashMap<String, String>> = header_metadata.metadata();
     let step = metadata
