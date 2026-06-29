@@ -84,7 +84,7 @@ When the release surface changes:
 - the shared macOS packaging script is
   `scripts/package_macos_metal_artifact.sh`
 - for Metal-facing changes, make sure branch validation still covers the
-  exact `cargo build --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle --release`
+  exact `cargo build --no-default-features --features metal,no-cuda,cli -p arle --bin arle --release`
   path (the Metal release artifact), not just library checks
 
 ---

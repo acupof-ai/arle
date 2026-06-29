@@ -43,7 +43,7 @@ identity
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
 ```
 
-**训练端从零写**（参考 [mni-ml/framework](https://github.com/mni-ml/framework) 只读,不 vendor），**推理端复用** agent-infer 现有栈（FlashInfer / Triton AOT / Paged KV / Metal runtime）。这是一次 runtime-led 的认知提升 + 产品化工作。
+**训练端从零写**（参考 [mni-ml/framework](https://github.com/mni-ml/framework) 只读,不 vendor），**推理端复用** arle 现有栈（FlashInfer / Triton AOT / Paged KV / Metal runtime）。这是一次 runtime-led 的认知提升 + 产品化工作。
 
 > **Historical implementation note**
 > 下文的 workspace / 数据流 / `/v1/train/*` 更多是在定义 **目标架构**。
@@ -64,7 +64,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 
 ### 1.2 我们的差异点
 - **纯 Rust，统一权重权威**：目标态里训练 worker 和推理 worker 共享同一套 Rust 模型定义、权重注册表与 adapter 协议；实现上可以同进程，也可以通过异步 worker / 进程边界拆分，只要不引入 Python 热路径和额外的 weight-sync tax。当前实现还没完全收敛到这一步，但这仍是 Phase 6 的结构性目标。
-- **agent-infer 已有基建**：FlashInfer HD128/HD256、Paged KV、Radix prefix cache、chunked prefill、continuous batching、OpenAI v1 agent loop、Metal runtime。rollout 侧几乎不用新建。
+- **arle 已有基建**：FlashInfer HD128/HD256、Paged KV、Radix prefix cache、chunked prefill、continuous batching、OpenAI v1 agent loop、Metal runtime。rollout 侧几乎不用新建。
 - **LoRA-only 起步**：base 冻结 → **不需要穿过 FlashInfer / Marlin / 自研 GEMM 的 backward**，这是"纯 Rust 训推一体可行"的关键前提。
 
 ### 1.3 认知目标（非交付物，但是本项目的显式动机）
@@ -99,7 +99,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 | RL 算法 | GRPO（无 critic） | PPO / DPO / RLAIF（v2 可选） |
 | 模型 | Qwen3.5 architecture family（规模参数化，大小只是配置，不是第二套权威） | 多架构支持（v2） |
 | 权重共享 | `Arc<BaseWeights>` + `RwLock<LoRADelta>` double-buffer | 跨进程 shared memory |
-| Rollout | 复用 agent-infer scheduler + agent tool loop | 重写 rollout |
+| Rollout | 复用 arle scheduler + agent tool loop | 重写 rollout |
 | Reward | 单 verifier 起步（数学 exact-match / 代码单测） | Learned reward model |
 | 数据 | 在线 self-play，verifier-grounded | 离线 dataset loader（v2） |
 | Python 依赖 | **零** | HF `datasets` / tokenizers 以 tokenizers crate 替代 |
@@ -118,7 +118,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 │  │  Rollout      │──(prompt, resp, │  Trainer                 │  │
 │  │  Worker       │   reward, logp) │  ┌────────────────────┐  │  │
 │  │               │──────────────►  │  │ autograd tape      │  │  │
-│  │  agent-infer  │                 │  │  + LoRA fwd        │  │  │
+│  │  arle  │                 │  │  + LoRA fwd        │  │  │
 │  │  scheduler    │                 │  │  + GRPO loss       │  │  │
 │  │  + tool loop  │                 │  │  + AdamW step      │  │  │
 │  │  + FlashInfer │                 │  └──────────┬─────────┘  │  │
@@ -166,7 +166,7 @@ crates/
 │   ├── src/
 │   │   ├── lib.rs
 │   │   ├── lora.rs            ← LoRA adapter (A, B) + forward hook
-│   │   ├── hook.rs            ← 与 agent-infer base forward 的接合点
+│   │   ├── hook.rs            ← 与 arle base forward 的接合点
 │   │   ├── grpo.rs            ← GRPO loss + group-normalized advantage + KL 正则
 │   │   ├── rollout.rs         ← Trajectory buffer + scheduler subscription
 │   │   ├── reward.rs          ← Verifier trait + 数学 / 代码单测实现
@@ -181,7 +181,7 @@ crates/
 └── ...
 ```
 
-**命名**：按 ckl 指示，不加 `infer-` 前缀。`autograd` 和 `train` 作为 agent-infer workspace 的 sibling crates。
+**命名**：按 ckl 指示，不加 `infer-` 前缀。`autograd` 和 `train` 作为 arle workspace 的 sibling crates。
 
 ### 3.3 和现有模块的边界
 
@@ -203,7 +203,7 @@ crates/
 |---|---|---|---|---|
 | **M0** | Autograd 起手式 | `crates/autograd` 骨架：`TensorStore` + `Tape` + `BackwardOp::{Add, Mul, MulScalar}` + Sum reduce + CPU 路径 | `y = sum((a+b)*3); y.backward()` 对 a、b 梯度手验过；CPU-only，无 GPU | 3–5 天 |
 | **M1** | Autograd 核心 op 完整 | + matmul (CPU+cuBLAS) + log_softmax + gather + AdamW (CPU+CUDA) + Module trait | 玩具 2 层 MLP 在 CPU 和 CUDA 下收敛；每 op 有 grad_check 单测；AdamW 对拍 PyTorch 参考值 | 10–14 天 |
-| **M2** | LoRA 合入 agent-infer | `crates/train` 骨架 + LoRA adapter + agent-infer base forward hook + 合成数据 supervised fine-tune 路径 | Qwen3.5-family model + LoRA rank=8；合成 prompt→target 数据，train loss 明显下降；推理侧热切 adapter 后输出变化可见 | 14 天 |
+| **M2** | LoRA 合入 arle | `crates/train` 骨架 + LoRA adapter + arle base forward hook + 合成数据 supervised fine-tune 路径 | Qwen3.5-family model + LoRA rank=8；合成 prompt→target 数据，train loss 明显下降；推理侧热切 adapter 后输出变化可见 | 14 天 |
 | **M3** | GRPO + 单 verifier 闭环 | GRPO loss + advantage + trajectory buffer + rollout↔train 交替主循环 + 数学 verifier | 小型 GSM8K-like 数据集；reward 曲线上升（≥基线 +15% pass@1 on held-out subset）；闭环稳定跑 ≥6 小时无 OOM/崩 | 21 天 |
 | **M4** | Agent 自进化 MVP | Multi-turn agent tool loop 接入 + 多 verifier（数学 + 代码单测）+ 基础 curriculum（难度上移） | 连续 N 轮自生成任务，reward 非平凡（非 reward hack）上升；冒烟：Agent 能**解决自己上轮解决不了的任务** | 4–6 周 |
 | **M5** | Metal 支线对齐 | autograd 在 `mlx-sys` 上提供对应 op；Mac 上能跑 M2 的最小 demo (1.5B) | Mac M4 Pro 上 LoRA forward+backward 跑通；收敛曲线形状和 CUDA 一致 | 与 M3/M4 并行 |
@@ -219,7 +219,7 @@ crates/
 3. **数值 grad-check 双 backend 对拍**：CPU (f64 参考) vs CUDA (f32)，相对误差 < 1e-3。
 4. **No 半成品**（`feedback_no_half_states.md`）：每个 M 的 crate 要么完整可用，要么不 merge。
 5. **Experience 条目**：每个 M 的核心 bug / 非平凡学习写进 `docs/experience/errors/` 或 `docs/experience/wins/`。
-6. **对 agent-infer 现有测试零回归**：`cargo test --release` + `cargo test --release --test e2e` 都要过。
+6. **对 arle 现有测试零回归**：`cargo test --release` + `cargo test --release --test e2e` 都要过。
 
 ---
 
@@ -229,7 +229,7 @@ crates/
 |---|---|---|
 | 自写 autograd 数值精度坑 | 高 | 每个 op 强制 grad_check；CPU f64 参考路径作为 oracle |
 | cuBLAS row/col-major 踩坑 | 中 | M1 第一周全在 CPU 参考实现上对数值；CUDA 路径最后接入 |
-| agent-infer 的 `CudaDevice` 与 autograd crate 的 context 兼容 | 中 | M0 spike 验证，用同一个 `Arc<CudaDevice>` 注入两边 |
+| arle 的 `CudaDevice` 与 autograd crate 的 context 兼容 | 中 | M0 spike 验证，用同一个 `Arc<CudaDevice>` 注入两边 |
 | LoRA 热切时推理侧读到半更新权重 | 中 | double-buffer：写到 slot B，原子 `swap` 指针，读侧 Arc 不变 |
 | Rollout 和 Train 在一张卡上相互饿死 | 高 | M3 里要明确交替策略（先离线：跑 N 步 rollout → 训 K 步 → 再 rollout）；online 交替作为 M4 优化项 |
 | GRPO 实现错误导致 reward 上升但是 reward hack | 高 | 每个 M 保留 held-out verifier，且人工抽检 trajectory |
@@ -263,7 +263,7 @@ crates/
 ## 7. 依赖 / 不依赖
 
 **依赖**（必须先有）：
-- agent-infer 推理栈稳定（已有，CUDA/Metal 都跑通）
+- arle 推理栈稳定（已有，CUDA/Metal 都跑通）
 - `cudarc` + `cuBLAS` 可直调（已有）
 - `crates/cuda-kernels` 可被训练侧借鉴（已有）
 
@@ -277,7 +277,7 @@ crates/
 
 ## 8. 成功的样子（1 年后回看）
 
-> "ckl 在 2026-04-18 做了一个技术决策：不借壳，从零在 Rust 里写训练栈，然后和推理收敛到统一的训推权威。一年后 agent-infer 变成了：一个 OpenAI-compat agent 服务器 + 一个单机 RL trainer，通过异步边界对接。Qwen3-4B 上一个 demo agent 在数学 + 代码两类 verifier 上自进化 24h 后，pass@1 提升了两位数。代码只有 PyTorch+verl 栈的 1/10 行，但是 ckl 读懂了每一行，autograd 出现数值问题时 15 分钟定位。"
+> "ckl 在 2026-04-18 做了一个技术决策：不借壳，从零在 Rust 里写训练栈，然后和推理收敛到统一的训推权威。一年后 arle 变成了：一个 OpenAI-compat agent 服务器 + 一个单机 RL trainer，通过异步边界对接。Qwen3-4B 上一个 demo agent 在数学 + 代码两类 verifier 上自进化 24h 后，pass@1 提升了两位数。代码只有 PyTorch+verl 栈的 1/10 行，但是 ckl 读懂了每一行，autograd 出现数值问题时 15 分钟定位。"
 
 这是本项目的**成功画面**。如果一年后我们还在和 PyTorch/Megatron 的封装打交道，那就是失败。
 

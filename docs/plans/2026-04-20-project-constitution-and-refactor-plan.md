@@ -4,7 +4,7 @@
 **Started:** 2026-04-20
 **Owner:** ckl
 
-**Purpose:** turn `agent-infer` from a technically strong repository into a top-tier project with a clear identity, one authoritative documentation system, one coherent runtime boundary, and a smoother toolchain.
+**Purpose:** turn `arle` from a technically strong repository into a top-tier project with a clear identity, one authoritative documentation system, one coherent runtime boundary, and a smoother toolchain.
 
 ---
 
@@ -30,7 +30,7 @@ The goal of this plan is to fix that shape without flattening the ambition.
 
 ## 1. Project identity
 
-`agent-infer` is:
+`arle` is:
 
 > **A Rust-native agent inference runtime with integrated local self-evolution.**
 

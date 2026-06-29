@@ -181,7 +181,7 @@ regressions that Qwen3.5-0.8B (dense) can't.
 
 ```
 ARLE/
-├── src/                       ← thin `arle` binary (root package `agent-infer`)
+├── src/                       ← thin `arle` binary (root package `arle`)
 ├── crates/
 │   ├── infer-plan/            ← backend-independent forward IR (ForwardPlan)
 │   ├── infer-seam/            ← host-only traits: BackendExecutor, KvPool, KvBatchDescriptor
@@ -437,7 +437,7 @@ cargo build --release --no-default-features --features cpu,no-cuda           # p
 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 
 # Tests (CI-mirrored; see .github/workflows/*.yml for the full matrix):
-cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+cargo test -p arle --release --no-default-features --features cpu,no-cuda,cli
 cargo test -p cli --release --no-default-features --features metal,no-cuda   # Metal
 cargo test -p kv-native-sys --release
 ```

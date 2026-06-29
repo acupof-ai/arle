@@ -30,7 +30,7 @@ pub(crate) fn banner_marker_path() -> Option<PathBuf> {
 }
 
 fn legacy_banner_marker_path() -> Option<PathBuf> {
-    Some(config_home()?.join("agent-infer").join("seen"))
+    Some(config_home()?.join("arle").join("seen"))
 }
 
 fn marker_exists(path: &Path) -> bool {

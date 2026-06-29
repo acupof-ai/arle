@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-ARLE_ROOT="${ARLE_ROOT:-/data01/arle-opd-runs/agent-infer-73763ee8-longreasoning}"
+ARLE_ROOT="${ARLE_ROOT:-/data01/arle-opd-runs/arle-73763ee8-longreasoning}"
 ARLE_BIN="${ARLE_BIN:-/data01/arle-build/target/release/arle}"
 RUN_ROOT="${RUN_ROOT:-/data01/arle-opd-runs/opd-math-r1-35b-to-4b-r2048-$(date +%Y%m%d-%H%M%S)}"
 

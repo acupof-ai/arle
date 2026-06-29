@@ -426,7 +426,7 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn legacy_history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".agent-infer-history"))
+    Some(PathBuf::from(home).join(".arle-history"))
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]

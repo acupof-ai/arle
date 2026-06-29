@@ -1,4 +1,4 @@
-# Build-time Python dependencies for agent-infer.
+# Build-time Python dependencies for arle.
 # TileLang: AOT attention/GDR kernel codegen for the CUDA feature set.
 #
 # Pinned to the EXACT cu12 stack on the 8xH20 pod (verified 2026-06-15), which

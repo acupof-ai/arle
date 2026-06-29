@@ -115,7 +115,7 @@ hardware. Hypotheses to investigate on revival:
   per-c duration may surface different steady state.
 
 Raw artefacts on V100:
-`~/code/agent-infer/bench-output/2026-05-26-v100-sm70-arle-quick/`
+`~/code/arle/bench-output/2026-05-26-v100-sm70-arle-quick/`
 (`benchmarks.json` + `.csv` + `service_stats_trace.jsonl`).
 
 ## 5 · Why not now

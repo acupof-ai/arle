@@ -2,8 +2,8 @@
 
 Output:
 
-- `/path/to/code/agent-infer/diagrams/dsv4-prefill-d2h-bottleneck.png`
-- `/path/to/code/agent-infer/diagrams/dsv4-prefill-d2h-bottleneck.svg`
+- `/path/to/code/arle/diagrams/dsv4-prefill-d2h-bottleneck.png`
+- `/path/to/code/arle/diagrams/dsv4-prefill-d2h-bottleneck.svg`
 
 Key numbers shown in the diagram:
 

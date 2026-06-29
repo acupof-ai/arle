@@ -96,7 +96,7 @@ Single PPL is insufficient. Best practice is a multi-dimensional matrix:
 3. Long-context stress: NIAH sweep 4K→128K, LongBench multi-task
 4. End-to-end throughput: fixed batch size, compare tokens/s and memory
 
-## 5. Implementation Plan for agent-infer
+## 5. Implementation Plan for arle
 
 ### Phase 1: INT8 Per-token Per-head Symmetric (this PR)
 

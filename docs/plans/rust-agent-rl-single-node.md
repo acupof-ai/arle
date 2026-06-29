@@ -2,7 +2,7 @@
 
 **Status**: **Retired 2026-05-18** (superseded by [OPD-only pivot](../projects/2026-05-18-opd-only-pivot.md)) · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
 
-> **Retirement note**. M0–M2 (autograd + LoRA hook + agent-infer
+> **Retirement note**. M0–M2 (autograd + LoRA hook + arle
 > integration) substrate **survives** as OPD prerequisite. M3+
 > (GRPO closed-loop, agent self-evolving) milestones were deleted in
 > the OPD-only pivot — GRPO duplicates verl/TRL and the
@@ -53,8 +53,8 @@ git clone https://github.com/mni-ml/framework /tmp/mni-ml-framework
 ### 1.3 Feature flag 设计（workspace 级）
 
 - `autograd` crate 的 features：`cpu`（默认，f32 CPU 参考实现）、`cuda`、`metal`
-- `train` crate 的 features：继承 `autograd` + `rollout` flag 控制是否拉 agent-infer scheduler
-- 与现有 agent-infer features 不冲突：现有 `cuda` / `metal` / `no-cuda` 不变
+- `train` crate 的 features：继承 `autograd` + `rollout` flag 控制是否拉 arle scheduler
+- 与现有 arle features 不冲突：现有 `cuda` / `metal` / `no-cuda` 不变
 
 ---
 
@@ -130,11 +130,11 @@ M0 结束时 ckl 应该能用一句话说清：
 
 ---
 
-## 4. M2 — LoRA 合入 agent-infer（14 天）
+## 4. M2 — LoRA 合入 arle（14 天）
 
 ### 4.1 Scope
 
-`crates/train` 启动，LoRA adapter 定义清楚，和 agent-infer 的 base forward 成功拼在一起，能跑 supervised fine-tune（离 RL 还有一步）。
+`crates/train` 启动，LoRA adapter 定义清楚，和 arle 的 base forward 成功拼在一起，能跑 supervised fine-tune（离 RL 还有一步）。
 
 ### 4.2 任务分解
 
@@ -142,7 +142,7 @@ M0 结束时 ckl 应该能用一句话说清：
 |---|---|---|---|
 | M2.1 | 起 `crates/train/` 骨架 | `crates/train/Cargo.toml` | workspace build 绿 |
 | M2.2 | `LoRAAdapter { A: Parameter, B: Parameter, rank, alpha }`，`forward(x) -> B @ (A @ x) * scale` | `train/src/lora.rs` | 单测：rank=8，alpha=16，forward shape 正确，grad 流通 |
-| M2.3 | **Hook 设计**：在 `infer/src/ops/linear.rs` 加 `linear_with_lora` 可选路径，base 侧 `W @ x` 走 agent-infer 现有 kernel，LoRA 分支独立 cuBLAS 小 GEMM，结果相加 | `infer/src/ops/linear.rs` + `train/src/hook.rs` | 单测：frozen base + LoRA 前向与"base 单独跑 + LoRA 手算相加"数值一致 |
+| M2.3 | **Hook 设计**：在 `infer/src/ops/linear.rs` 加 `linear_with_lora` 可选路径，base 侧 `W @ x` 走 arle 现有 kernel，LoRA 分支独立 cuBLAS 小 GEMM，结果相加 | `infer/src/ops/linear.rs` + `train/src/hook.rs` | 单测：frozen base + LoRA 前向与"base 单独跑 + LoRA 手算相加"数值一致 |
 | M2.4 | `Arc<BaseWeights>` 零拷贝共享：autograd `GpuTensor` 支持"frozen view"模式，不参与 tape | `autograd/src/tensor.rs` | LoRA forward 不克隆 base weight，显存不翻倍 |
 | M2.5 | 合成数据 supervised fine-tune loop：随机生成 `(prompt_tokens, target_tokens)` pairs，cross-entropy loss，AdamW 更新 LoRA | `train/src/trainer.rs`，`train/tests/supervised.rs` | Qwen3.5-family model + LoRA rank=8，100 步 loss 明显下降（>50%） |
 | M2.6 | **热切**：LoRA delta 写完后，推理侧用新 adapter；double-buffer `Arc<RwLock<LoRAAdapters>>` 切换 | `train/src/weight_sync.rs` | 集成测试：训练 100 步后，推理同一 prompt 输出 token 分布明显变化 |
@@ -173,7 +173,7 @@ M0 结束时 ckl 应该能用一句话说清：
 
 | # | 任务 | 文件 | 验收 |
 |---|---|---|---|
-| M3.1 | Trajectory 结构：`Trajectory { prompt_ids, response_ids, step_logprobs, reward }` | `train/src/rollout.rs` | 单测：从一次 agent-infer 完成请求能构造 Trajectory |
+| M3.1 | Trajectory 结构：`Trajectory { prompt_ids, response_ids, step_logprobs, reward }` | `train/src/rollout.rs` | 单测：从一次 arle 完成请求能构造 Trajectory |
 | M3.2 | Scheduler 侧新增 trajectory emit channel（tokio mpsc）：每个请求完成时 emit | `infer/src/scheduler/` | 改动最小化，不影响推理 throughput（基准测试证明 < 1% 回归） |
 | M3.3 | **Group advantage**：对同一 prompt 采样 G 个 response，reward 归一化 `A_i = (r_i - mean) / std` | `train/src/grpo.rs` | 单测：输入 (G, rewards)，输出 advantages 有界、方向对 |
 | M3.4 | **GRPO loss**：`L = -E[min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)] + β * KL(π_θ || π_ref)` | `train/src/grpo.rs` | grad_check（ratio 的 autograd）；KL 项数值稳定 |
@@ -306,7 +306,7 @@ M0 Day 5:
 | E2E GRPO (M3) | `cargo test --release --test e2e_grpo -- --ignored` | CUDA，~1 h |
 | E2E self-evolve (M4) | `cargo test --release --test e2e_self_evolve -- --ignored` | CUDA，~24 h |
 
-### 9.2 CI 增量（不改 agent-infer 现有 CI）
+### 9.2 CI 增量（不改 arle 现有 CI）
 
 新增 job：
 - `cargo test -p autograd`（每次 push）
@@ -320,7 +320,7 @@ M0 Day 5:
 
 ### 10.1 Commit 规范
 
-按 agent-infer 现有 commitizen：`<type>(<scope>): <subject>`。新增 scopes：
+按 arle 现有 commitizen：`<type>(<scope>): <subject>`。新增 scopes：
 - `autograd` — autograd crate 本体
 - `train` — train crate 本体
 - `rl` — 跨 crate 的 RL 循环级改动
@@ -364,7 +364,7 @@ M0 Day 5:
 3. **不要 vendor mni-ml 代码**。读、理解、重写。
 4. **不要引入 candle / burn / tch**。这是项目的核心否定约束。
 5. **不要做多 backend 抽象层**（Backend trait + 实现）。CUDA / CPU / Metal 直接 `#[cfg]`，照 mni-ml 的做法。
-6. **不要在 M2 之前碰 agent-infer `infer/src/ops/linear.rs`**。M0/M1 纯粹在新 crate 里。
+6. **不要在 M2 之前碰 arle `infer/src/ops/linear.rs`**。M0/M1 纯粹在新 crate 里。
 7. **不要在 M3 之前碰 agent tool loop**。先单轮闭环，再多轮。
 8. **不要做 checkpoint / resume**。M1–M4 全程"进程不崩就不 checkpoint"。M5+ 再说。
 9. **不要做分布式**。任何 NCCL / MPI / Gloo / process-group 相关提案，本 plan 外。

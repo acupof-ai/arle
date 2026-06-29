@@ -26,7 +26,7 @@ authority rather than defining a second equal architecture.
 
 | Crate | Owns | Does not own |
 | --- | --- | --- |
-| workspace root package (`agent-infer`) | `arle` binary entrypoint only | REPL logic, backend loading |
+| workspace root package (`arle`) | `arle` binary entrypoint only | REPL logic, backend loading |
 | `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
 | `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
 | `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
@@ -85,7 +85,7 @@ infer-vulkan      -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-sp
 infer-server      -> infer-core, infer-seam, infer-plan
 infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, infer-hip, infer-vulkan, cuda-kernels]
 
-workspace root package (agent-infer)
+workspace root package (arle)
   -> cli
      -> infer-api
      -> agent (-> infer-api, chat, tools)

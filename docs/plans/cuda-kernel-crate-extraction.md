@@ -91,7 +91,7 @@ extracted crate from day one.
 > else below matches the final layout.
 
 ```
-agent-infer/                        ← workspace root (unchanged)
+arle/                        ← workspace root (unchanged)
 ├── crates/
 │   ├── agent/                ← unchanged
 │   ├── chat/                 ← unchanged

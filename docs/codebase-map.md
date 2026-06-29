@@ -23,7 +23,7 @@
 > (infer-plan → seam → core → cuda/metal → server/api, plus topo/moe/util).
 > `infer/src/**`, `-p infer`, `target/release/infer`, `metal_serve`,
 > `metal_bench`, `bench_serving`, and `cpu_serve` are **stale** — the only
-> binary the workspace produces is `arle` (root `agent-infer` package,
+> binary the workspace produces is `arle` (root `arle` package,
 > `src/main.rs`), and serving is `arle serve`. The leftover `infer/` directory
 > on disk (untracked `infer/src/{backend,model,scheduler,kv_tier}`) is **not a
 > workspace member, has no Cargo.toml, and is not built** — ignore it. Source
@@ -44,7 +44,7 @@ see [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority
 
 The repository has three practical layers:
 
-- workspace root package (`agent-infer`): thin binary wrapper in `src/main.rs`
+- workspace root package (`arle`): thin binary wrapper in `src/main.rs`
   that calls `cli::run()` to produce the `arle` binary (the only binary the
   workspace builds; gated on the default-on `cli` feature).
 - `crates/infer-*`: the device-neutral runtime crate graph (IR → seam → core →
@@ -61,7 +61,7 @@ The repository has three practical layers:
 Current workspace members (ownership and boundaries are listed in
 [architecture.md §Package Boundaries](architecture.md#package-boundaries)):
 
-- workspace root package `agent-infer` (produces the `arle` binary)
+- workspace root package `arle` (produces the `arle` binary)
 - **runtime crate graph:** `crates/infer-plan`, `crates/infer-seam`,
   `crates/infer-core`, `crates/infer-cuda`, `crates/infer-metal`,
   `crates/infer-hip`, `crates/infer-vulkan`,
@@ -95,7 +95,7 @@ src/main.rs
 
 Key files:
 
-- `src/main.rs`: `arle` binary entrypoint from the root `agent-infer` package
+- `src/main.rs`: `arle` binary entrypoint from the root `arle` package
 - `crates/cli/src/lib.rs`: CLI startup, backend selection,
   `infer_api::{InferenceEngine, LoadedInferenceEngine}` load + REPL drive
 - `crates/cli/src/repl.rs`: REPL loop, slash commands, terminal UX
@@ -386,7 +386,7 @@ These crates sit around the runtime graph:
 Current dependency direction (runtime graph):
 
 ```text
-workspace root package (agent-infer / arle bin)
+workspace root package (arle / arle bin)
   -> cli
      -> infer-api        (the single front door)
      -> infer-util
@@ -441,12 +441,12 @@ Integration / adapter tests:
 - `crates/infer-api/tests/adapter.rs`: the `InferenceEngine` adapter contract
   over the rewrite stack (the swap-in surface)
 - `tests/cli_smoke.rs`, `tests/cli_agent_live.rs`, `tests/cli_test_support.rs`:
-  root-package (`agent-infer`) CLI smoke + live agent paths
+  root-package (`arle`) CLI smoke + live agent paths
 - `crates/autograd/tests/`, `crates/train/tests/`: training-stack tests
 - `infer-moe` carries its reference-routing tests in `crates/infer-moe/src/tests.rs`
 
 CI (`.github/workflows/ci.yml`) builds and tests `infer-api`, `cli`, the
-`agent-infer` smoke path, and the support crates per backend (metal/cpu).
+`arle` smoke path, and the support crates per backend (metal/cpu).
 
 ### Bench and helper entrypoints
 
