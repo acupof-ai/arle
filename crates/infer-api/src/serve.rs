@@ -239,24 +239,13 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
     )
     .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build serve tokio runtime")?;
-
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind((opts.bind.as_str(), opts.port))
-            .await
-            .with_context(|| format!("failed to bind {}:{}", opts.bind, opts.port))?;
-        let addr = listener
-            .local_addr()
-            .context("failed to read listener local address")?;
-        log::info!("serving OpenAI v1 on http://{} ({})", addr, opts.model_path);
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal(shutdown))
-            .await
-            .context("serve loop error")
-    })
+    bind_and_serve(
+        opts.bind.as_str(),
+        opts.port,
+        router,
+        &opts.model_path,
+        shutdown,
+    )
 }
 
 /// Serve the multiproc SPMD coordinator HTTP front door (parent process, no TP
@@ -271,50 +260,40 @@ pub fn serve_coordinator_http(
     max_thinking_tokens: usize,
     relay: infer_server::RelayCoordinator,
 ) -> Result<()> {
-    // Opt-in startup tracing (ARLE_COORD_MARK=1) — see serve_multiproc.rs markers 1-5;
-    // these (6-10) cover the post-barrier HTTP bring-up.
-    let mark = std::env::var_os("ARLE_COORD_MARK").is_some();
     let tokenizer = infer_server::OpenAiTokenizer::from_model_dir(model_path)
         .with_context(|| format!("coordinator tokenizer load for {model_path}"))?;
-    if mark {
-        eprintln!("[COORD-MARK] 6/10 tokenizer loaded; building coordinator_router");
-    }
     let model_id = crate::serve_engine::model_id_from_path(model_path);
     let shutdown = infer_server::ServeShutdown::new();
     let router =
         infer_server::coordinator_router(relay, tokenizer, model_id, max_thinking_tokens, None);
-    if mark {
-        eprintln!("[COORD-MARK] 7/10 coordinator_router built; building tokio runtime");
-    }
+    bind_and_serve(bind, port, router, model_path, shutdown)
+}
 
+fn bind_and_serve(
+    bind: &str,
+    port: u16,
+    router: axum::Router,
+    label: &str,
+    shutdown: infer_server::ServeShutdown,
+) -> Result<()> {
+    let bind = bind.to_owned();
+    let label = label.to_owned();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to build coordinator serve tokio runtime")?;
-    if mark {
-        eprintln!("[COORD-MARK] 8/10 tokio runtime built; entering block_on to bind {bind}:{port}");
-    }
-
+        .context("failed to build serve tokio runtime")?;
     runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind((bind, port))
+        let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
             .await
             .with_context(|| format!("failed to bind {bind}:{port}"))?;
         let addr = listener
             .local_addr()
             .context("failed to read listener local address")?;
-        if mark {
-            eprintln!("[COORD-MARK] 9/10 HTTP listener bound on {addr}; starting axum::serve");
-        }
-        log::info!("serving OpenAI v1 (multiproc coordinator) on http://{addr} ({model_path})");
-        if mark {
-            eprintln!(
-                "[COORD-MARK] 10/10 serving OpenAI v1 (multiproc coordinator) on http://{addr}"
-            );
-        }
+        log::info!("serving OpenAI v1 on http://{addr} ({label})");
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown_signal(shutdown))
             .await
-            .context("coordinator serve loop error")
+            .context("serve loop error")
     })
 }
 
