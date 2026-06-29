@@ -446,9 +446,10 @@ impl RealCudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
+        prefix_pages: &[u32],
     ) -> Result<()> {
         match self {
-            Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len),
+            Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
             Self::Qwen(_) | Self::Dsv4(_) => Ok(()),
         }
     }
@@ -896,6 +897,10 @@ impl QwenCudaExecutor {
             kv,
             tier,
             dram_fraction: DEFAULT_DRAM_FRACTION,
+            model_path: model_path_buf,
+            weights_epoch,
+            disk_root: None,
+            disk_budget: None,
             num_slots,
             slot_progress,
             decode_ctx: None,
@@ -3267,6 +3272,20 @@ pub(crate) struct Qwen35CudaExecutor {
     /// (`--dram-fraction`, default 0.5). Stored at construction; consumed when
     /// `set_kv_recall(true)` builds `recall_tier`.
     dram_fraction: f64,
+
+    /// Model checkpoint path for deriving the weights epoch tag at durable
+    /// NVMe spill time (`set_kv_recall` / `set_kv_tier_disk`).
+    model_path: std::path::PathBuf,
+    /// Weights-version tag from the checkpoint (`weights_epoch_tag`). Stamped
+    /// into the durable recall manifest so a restart drops stale KV after an
+    /// OPD weight update.
+    weights_epoch: String,
+    /// Operator-provided NVMe root for durable recall spill (`--kv-ssd-path`).
+    /// `None` until `set_kv_tier_disk` wires it.
+    disk_root: Option<std::path::PathBuf>,
+    /// Budget bytes for durable NVMe recall spill (`--kv-ssd-max-bytes`).
+    /// `None` until `set_kv_tier_disk` wires it.
+    disk_budget: Option<usize>,
     /// `mem_fraction_static` + requested page floor captured at construction so
     /// `ensure_kv_pool` can RE-PROFILE and rebuild `full_attn_kv` identically
     /// after `release_kv_pool` dropped it (agent-OPD rollout→writeback→rollout:
@@ -3350,7 +3369,9 @@ impl Qwen35CudaExecutor {
 
     /// Restore the recurrent state for `slot` from the sidecar snapshot keyed by
     /// `tokens[..matched_len]`. Acquires the recurrent buffers first so the
-    /// subsequent tail-prefill sees a populated state. On a cache miss logs a
+    /// subsequent tail-prefill sees a populated state. Also syncs the device KV
+    /// pool (`full_attn_kv`) so its `seq_len(slot)` matches `matched_len` before
+    /// the next `prefill_row_paged_default` runs. On a sidecar cache miss logs a
     /// debug message and proceeds with zeroed recurrent (graceful degradation —
     /// same correctness as pre-#85 behavior, worse quality but not a hard error).
     pub(crate) fn restore_recurrent_sidecar(
@@ -3358,8 +3379,22 @@ impl Qwen35CudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
+        prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         let matched_len = matched_len.min(tokens.len());
+
+        // Sync the device KV pool so seq_len(slot) == matched_len before the
+        // tail prefill runs. The host pool already has `matched_len` tokens
+        // attached (kv.attach_pages ran before this hook); mirror that here:
+        // free the prior occupant's tracking, then attach the prefix pages.
+        if let Some(pool) = self.full_attn_kv.as_mut() {
+            pool.free_slot(slot);
+            if !prefix_pages.is_empty() {
+                pool.attach_pages(slot, prefix_pages, matched_len)
+                    .map_err(|e| anyhow::anyhow!("device pool prefix attach failed: {e}"))?;
+            }
+        }
+
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Acquire first so the device buffers exist for H2D restore.
@@ -3571,6 +3606,8 @@ impl Qwen35CudaExecutor {
         let decode_graph_armed = qwen35_decode_graph_enabled()
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
+        let model_path_buf = model_path.as_ref().to_path_buf();
+        let weights_epoch = crate::kv_tier::weights_epoch_tag(&model_path_buf);
         let executor = Self {
             model,
             slots,
@@ -3592,6 +3629,10 @@ impl Qwen35CudaExecutor {
             recall_tier: None,
             recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
             dram_fraction: DEFAULT_DRAM_FRACTION,
+            model_path: model_path_buf,
+            weights_epoch,
+            disk_root: None,
+            disk_budget: None,
             kv_pool_mem_fraction_static: mem_fraction_static,
             kv_pool_requested_pages: total_pages.max(1),
             prefix_sidecar: std::collections::HashMap::new(),
@@ -3927,19 +3968,16 @@ impl Qwen35CudaExecutor {
                 .full_attn_kv
                 .as_mut()
                 .expect("full_attn_kv present (full_attn_paged)");
-            // This self-allocating path materializes the slot from a fresh start
-            // (`free_slot` ran at `start_pos == 0` in `submit_prefill_row`), so
-            // the pool must hold exactly `start_pos` tokens before appending the
-            // tail. A `start_pos > 0` here means radix reuse leaked through the
-            // `reusable_prefix_blocks` soundness gate — fail loudly rather than
-            // double-count (`pool.seq_len` would end at the tail length, not
-            // `start_pos + tail`, surfacing as a confusing `decode_graph` mismatch
-            // many steps later). The hybrid recurrent state is unrestorable for a
-            // reused prefix regardless (see `reusable_prefix_blocks`).
+            // The pool must hold exactly `start_pos` tokens before appending the
+            // tail. For fresh requests `free_slot` ran at `start_pos == 0` in
+            // `submit_prefill_row`. For prefix-reuse requests `restore_recurrent_sidecar`
+            // synced the device pool via `free_slot` + `attach_pages` so seq_len ==
+            // matched_len == start_pos. A mismatch here means the device pool was
+            // not synced — fail loudly rather than double-count.
             ensure!(
                 pool.seq_len(slot) == row.start_pos,
-                "Qwen3.6 default-paged prefill: pool seq_len {} != start_pos {} for slot {} \
-                 (radix prefix reuse is not supported for the hybrid recurrent state)",
+                "Qwen3.6 default-paged prefill: device pool seq_len {} != start_pos {} for slot {} \
+                 (device pool was not synced before this forward — check restore_recurrent_sidecar)",
                 pool.seq_len(slot),
                 row.start_pos,
                 slot
