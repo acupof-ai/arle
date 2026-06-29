@@ -730,7 +730,7 @@ fn serve_handle_relay_driver<E, K>(
     );
     let (work_tx, work_rx) = std::sync::mpsc::channel::<WorkItem>();
     let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-    let n_workers = serve.max_live_requests.max(1).min(1024);
+    let n_workers = serve.max_live_requests.clamp(1, 1024);
     for _ in 0..n_workers {
         let work_rx = std::sync::Arc::clone(&work_rx);
         let tx = engine_tx.clone();
