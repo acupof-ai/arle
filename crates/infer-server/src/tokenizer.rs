@@ -191,25 +191,20 @@ impl OpenAiTokenizer {
 /// `true` if any system message follows a non-system message — i.e. the system
 /// block isn't already at the front (so a hoist is needed).
 fn needs_system_hoist(messages: &[ChatMessage]) -> bool {
-    let mut seen_non_system = false;
-    for m in messages {
-        if m.role == "system" {
-            if seen_non_system {
-                return true;
-            }
-        } else {
-            seen_non_system = true;
-        }
-    }
-    false
+    messages
+        .iter()
+        .skip_while(|m| m.role == "system")
+        .any(|m| m.role == "system")
 }
 
 /// All system messages first (original order), then the rest (original order).
 fn hoist_system_first(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut out = Vec::with_capacity(messages.len());
-    out.extend(messages.iter().filter(|m| m.role == "system").cloned());
-    out.extend(messages.iter().filter(|m| m.role != "system").cloned());
-    out
+    messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .cloned()
+        .chain(messages.iter().filter(|m| m.role != "system").cloned())
+        .collect()
 }
 
 /// Render the checkpoint's Jinja template with the standard HF context.
