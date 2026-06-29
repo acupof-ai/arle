@@ -1677,12 +1677,11 @@ mod backend {
         // resolved dtype threads into the dense-Qwen3 constructor below (#68 T3).
         let kv_dtype = infer_cuda::CudaKvCacheDtype::resolve(config.kv_cache_dtype)?;
         if kv_dtype != infer_cuda::CudaKvCacheDtype::Bf16
-            && !matches!(kind, CudaModelKind::Qwen3Dense)
+            && !matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
         {
             anyhow::bail!(
-                "--kv-cache-dtype {} is wired for the dense Qwen3 paged-KV path \
-                 (#68 T3); {kind:?} owns its KV state internally and does not \
-                 consume the paged quant pool",
+                "--kv-cache-dtype {} is not supported for {kind:?}; \
+                 only Qwen3Dense and Qwen35 support quantized paged KV",
                 kv_dtype.label()
             );
         }
@@ -1751,6 +1750,7 @@ mod backend {
                 model_path,
                 num_slots,
                 config.total_pages,
+                kv_dtype,
                 config.mem_fraction_static,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP

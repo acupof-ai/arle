@@ -315,6 +315,7 @@ impl CudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -323,6 +324,7 @@ impl CudaExecutor {
                     model_path,
                     num_slots,
                     total_pages,
+                    kv_dtype,
                     mem_fraction_static,
                 )?,
             )),
