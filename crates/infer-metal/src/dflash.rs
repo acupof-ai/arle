@@ -511,23 +511,24 @@ impl DFlashDraftWeights {
             })
         };
 
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            let p = |suffix: &str| format!("layers.{i}.{suffix}");
-            layers.push(DFlashDraftLayerWeights {
-                q_proj: load_proj(&p("self_attn.q_proj"))?,
-                k_proj: load_proj(&p("self_attn.k_proj"))?,
-                v_proj: load_proj(&p("self_attn.v_proj"))?,
-                o_proj: load_proj(&p("self_attn.o_proj"))?,
-                input_layernorm: load_norm(&p("input_layernorm.weight"))?,
-                post_attention_layernorm: load_norm(&p("post_attention_layernorm.weight"))?,
-                q_norm: load_norm(&p("self_attn.q_norm.weight"))?,
-                k_norm: load_norm(&p("self_attn.k_norm.weight"))?,
-                gate_proj: load_proj(&p("mlp.gate_proj"))?,
-                up_proj: load_proj(&p("mlp.up_proj"))?,
-                down_proj: load_proj(&p("mlp.down_proj"))?,
-            });
-        }
+        let layers = (0..config.num_hidden_layers)
+            .map(|i| -> anyhow::Result<_> {
+                let p = |suffix: &str| format!("layers.{i}.{suffix}");
+                Ok(DFlashDraftLayerWeights {
+                    q_proj: load_proj(&p("self_attn.q_proj"))?,
+                    k_proj: load_proj(&p("self_attn.k_proj"))?,
+                    v_proj: load_proj(&p("self_attn.v_proj"))?,
+                    o_proj: load_proj(&p("self_attn.o_proj"))?,
+                    input_layernorm: load_norm(&p("input_layernorm.weight"))?,
+                    post_attention_layernorm: load_norm(&p("post_attention_layernorm.weight"))?,
+                    q_norm: load_norm(&p("self_attn.q_norm.weight"))?,
+                    k_norm: load_norm(&p("self_attn.k_norm.weight"))?,
+                    gate_proj: load_proj(&p("mlp.gate_proj"))?,
+                    up_proj: load_proj(&p("mlp.up_proj"))?,
+                    down_proj: load_proj(&p("mlp.down_proj"))?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let zero = || mlx::zeros(&[1], mlx::Dtype::Bfloat16);
         let (hidden_norm, pre_fc_norm_embedding, pre_fc_norm_hidden) = if is_mtp {
