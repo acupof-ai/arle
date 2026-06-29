@@ -40,6 +40,33 @@ struct LinearAttentionForward {
     kv_mem: Vec<f32>,
     state_history: Vec<f32>,
     final_state: Vec<f32>,
+    /// Last `conv_kernel - 1` qkv input rows, laid out `[batch, conv_kernel-1, qkv_dim]`.
+    /// Captured so a follow-on segment can seed its causal conv ring instead of
+    /// zero-padding absolute-position-0 (OPD frozen-prompt-KV split). Empty when
+    /// `conv_kernel <= 1` (no ring to carry).
+    conv_tail: Vec<f32>,
+}
+
+/// Carried recurrent context for splitting a single linear-attention sequence
+/// across two `linear_attention_core` calls (prompt segment -> generated
+/// segment). The gated-delta recurrence is Markovian in `state`, and the conv1d
+/// is a fixed-width causal window, so seeding both reproduces the suffix exactly.
+///
+/// - `initial_state`: per-batch SSM state `[batch, num_value_heads, key_dim, value_dim]`
+///   (a prior segment's `final_state`); `None` seeds zeros (absolute position 0).
+/// - `initial_conv_window`: the prior segment's `conv_tail`
+///   `[batch, conv_kernel-1, qkv_dim]`; `None` zero-pads the conv ring.
+#[derive(Clone, Copy, Default)]
+struct LinearAttentionCarry<'a> {
+    initial_state: Option<&'a [f32]>,
+    initial_conv_window: Option<&'a [f32]>,
+}
+
+impl<'a> LinearAttentionCarry<'a> {
+    const NONE: Self = Self {
+        initial_state: None,
+        initial_conv_window: None,
+    };
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -246,6 +273,7 @@ pub fn linear_attention_core(
         &a_log_tensor.data,
         &norm_tensor.data,
         params,
+        LinearAttentionCarry::NONE,
     );
 
     let output_shape = vec![
@@ -302,6 +330,158 @@ pub fn linear_attention_core(
     }
 
     Ok(output_id)
+}
+
+/// Host linear-attention forward that can seed the recurrent state + causal-conv
+/// window from a prior segment and surface the boundary `final_state` + conv tail.
+///
+/// This is the OPD frozen-prompt-KV split primitive: the prompt pass runs with
+/// `capture_boundary = true` (off-tape, `requires_grad = false`) to harvest the
+/// boundary `(final_state, conv_window)`; the generated pass seeds them via
+/// `initial_state` / `initial_conv_window`. The split reproduces the full-sequence
+/// suffix exactly because the gated-delta recurrence is Markovian in `state` and
+/// the conv1d is a fixed-width causal window.
+///
+/// `initial_state` shape: `[batch, num_value_heads, key_dim, value_dim]`.
+/// `initial_conv_window` shape: `[batch, conv_kernel-1, qkv_dim]`.
+/// Returns `(output, Some(final_state) if capture, Some(conv_window) if capture)`.
+/// Host-only (no device dispatch, no tape) — the forward-correctness de-risk gate.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_core_with_carry(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    initial_state: Option<TensorId>,
+    initial_conv_window: Option<TensorId>,
+    capture_boundary: bool,
+    store: &mut TensorStore,
+) -> Result<(TensorId, Option<TensorId>, Option<TensorId>)> {
+    validate_shapes(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        store,
+    )?;
+
+    for tensor_id in [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ]
+    .into_iter()
+    .chain(initial_state)
+    .chain(initial_conv_window)
+    {
+        store.ensure_host(tensor_id)?;
+    }
+
+    let qkv_tensor = store.tensor_host(qkv)?;
+    let z_tensor = store.tensor_host(z)?;
+    let b_tensor = store.tensor_host(b_proj)?;
+    let a_tensor = store.tensor_host(a_proj)?;
+    let conv_tensor = store.tensor_host(conv1d_weight)?;
+    let dt_tensor = store.tensor_host(dt_bias)?;
+    let a_log_tensor = store.tensor_host(a_log)?;
+    let norm_tensor = store.tensor_host(norm_weight)?;
+
+    let conv_window = params.conv_kernel.saturating_sub(1);
+    let initial_state_data = initial_state.map(|id| store.tensor_host(id)).transpose()?;
+    let initial_conv_data = initial_conv_window
+        .map(|id| store.tensor_host(id))
+        .transpose()?;
+    if let Some(state_tensor) = initial_state_data.as_ref() {
+        let expected = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
+        if state_tensor.data.len() != expected {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![
+                    params.batch,
+                    params.num_value_heads,
+                    params.key_dim,
+                    params.value_dim,
+                ],
+                got: state_tensor.shape.clone(),
+            });
+        }
+    }
+    if let Some(window_tensor) = initial_conv_data.as_ref() {
+        let q_dim = params.num_key_heads * params.key_dim;
+        let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+        let expected = params.batch * conv_window * qkv_dim;
+        if window_tensor.data.len() != expected {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![params.batch, conv_window, qkv_dim],
+                got: window_tensor.shape.clone(),
+            });
+        }
+    }
+
+    let carry = LinearAttentionCarry {
+        initial_state: initial_state_data.as_ref().map(|t| t.data.as_slice()),
+        initial_conv_window: initial_conv_data.as_ref().map(|t| t.data.as_slice()),
+    };
+
+    let forward = linear_attention_forward(
+        &qkv_tensor.data,
+        &z_tensor.data,
+        &b_tensor.data,
+        &a_tensor.data,
+        &conv_tensor.data,
+        &conv_tensor.shape,
+        &dt_tensor.data,
+        &a_log_tensor.data,
+        &norm_tensor.data,
+        params,
+        carry,
+    );
+
+    let output_shape = vec![
+        params.batch,
+        params.seq_len,
+        params.num_value_heads * params.value_dim,
+    ];
+    let output_id = store.alloc(Tensor::new(forward.output, output_shape, false)?);
+
+    let (final_state_id, conv_window_id) = if capture_boundary {
+        let q_dim = params.num_key_heads * params.key_dim;
+        let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+        let final_state_id = store.alloc(Tensor::new(
+            forward.final_state,
+            vec![
+                params.batch,
+                params.num_value_heads,
+                params.key_dim,
+                params.value_dim,
+            ],
+            false,
+        )?);
+        let conv_window_id = store.alloc(Tensor::new(
+            forward.conv_tail,
+            vec![params.batch, conv_window, qkv_dim],
+            false,
+        )?);
+        (Some(final_state_id), Some(conv_window_id))
+    } else {
+        (None, None)
+    };
+
+    Ok((output_id, final_state_id, conv_window_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -893,6 +1073,7 @@ pub(crate) fn linear_attention_backward(
         &a_log_tensor.data,
         &norm_tensor.data,
         params,
+        LinearAttentionCarry::NONE,
     );
     record_elapsed_subop(&mut profile, "fwd_recompute", recompute_started);
 
@@ -1324,6 +1505,7 @@ fn linear_attention_forward(
     a_log: &[f32],
     norm_weight: &[f32],
     params: LinearAttentionParams,
+    carry: LinearAttentionCarry<'_>,
 ) -> LinearAttentionForward {
     let q_dim = params.num_key_heads * params.key_dim;
     let k_dim = q_dim;
@@ -1346,19 +1528,50 @@ fn linear_attention_forward(
     let mut final_state =
         vec![0.0_f32; params.batch * params.num_value_heads * params.key_dim * params.value_dim];
 
+    // Carried causal conv window: the prior segment's last `conv_kernel - 1`
+    // qkv rows, laid out `[batch, conv_kernel-1, qkv_dim]`. A relative offset of
+    // `r` in `-(conv_kernel-1)..=-1` maps to window row `r + (conv_kernel - 1)`.
+    let conv_window = params.conv_kernel.saturating_sub(1);
+    let mut conv_tail = vec![0.0_f32; params.batch * conv_window * qkv_dim];
+
+    let conv_window_input = |batch_idx: usize, src_rel: isize, channel: usize| -> f32 {
+        if src_rel >= 0 {
+            let input_idx = idx3(
+                batch_idx,
+                src_rel as usize,
+                channel,
+                params.seq_len,
+                qkv_dim,
+            );
+            qkv[input_idx]
+        } else {
+            // src_rel in -(conv_kernel-1)..=-1 — read the carried window (zero if absent).
+            match carry.initial_conv_window {
+                Some(window) => {
+                    let window_row = (src_rel + conv_window as isize) as usize;
+                    let window_idx = idx3(batch_idx, window_row, channel, conv_window, qkv_dim);
+                    window[window_idx]
+                }
+                None => 0.0,
+            }
+        }
+    };
+
     for batch_idx in 0..params.batch {
         let mut state = vec![0.0_f32; params.num_value_heads * params.key_dim * params.value_dim];
+        if let Some(initial_state) = carry.initial_state {
+            let state_len = state.len();
+            let base = batch_idx * params.num_value_heads * params.key_dim * params.value_dim;
+            state.copy_from_slice(&initial_state[base..base + state_len]);
+        }
         for seq_idx in 0..params.seq_len {
             for channel in 0..qkv_dim {
                 let mut sum = 0.0_f32;
                 for tap in 0..params.conv_kernel {
-                    if seq_idx + tap + 1 < params.conv_kernel {
-                        continue;
-                    }
-                    let src_seq = seq_idx + tap + 1 - params.conv_kernel;
-                    let input_idx = idx3(batch_idx, src_seq, channel, params.seq_len, qkv_dim);
-                    sum +=
-                        qkv[input_idx] * conv_weight_at(conv1d_weight, conv1d_shape, channel, tap);
+                    // src position relative to this segment's start; negative => carried window.
+                    let src_rel = seq_idx as isize + tap as isize + 1 - params.conv_kernel as isize;
+                    sum += conv_window_input(batch_idx, src_rel, channel)
+                        * conv_weight_at(conv1d_weight, conv1d_shape, channel, tap);
                 }
                 preact[idx3(batch_idx, seq_idx, channel, params.seq_len, qkv_dim)] = sum;
             }
@@ -1519,6 +1732,20 @@ fn linear_attention_forward(
 
         let final_base = batch_idx * params.num_value_heads * params.key_dim * params.value_dim;
         final_state[final_base..final_base + state.len()].copy_from_slice(&state);
+
+        // Capture this segment's conv tail: the last `conv_window` qkv input rows.
+        // A follow-on segment seeds these at relative offsets `-(conv_window)..=-1`.
+        // Short segment (seq_len < conv_window): a prior carried window is the
+        // correct source for the missing earliest rows — chain it through.
+        for window_row in 0..conv_window {
+            // window_row r holds the row at global relative offset `r - conv_window`
+            // measured from THIS segment's end (== next segment's start).
+            let src_rel = params.seq_len as isize + window_row as isize - conv_window as isize;
+            for channel in 0..qkv_dim {
+                conv_tail[idx3(batch_idx, window_row, channel, conv_window, qkv_dim)] =
+                    conv_window_input(batch_idx, src_rel, channel);
+            }
+        }
     }
 
     LinearAttentionForward {
@@ -1529,6 +1756,7 @@ fn linear_attention_forward(
         kv_mem,
         state_history,
         final_state,
+        conv_tail,
     }
 }
 
