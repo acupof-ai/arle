@@ -170,23 +170,22 @@ impl BackendExecutor for EchoExecutor {
     type Inflight = StepOutput;
 
     fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-        let mut tokens = Vec::with_capacity(plan.prefill_rows.len() + plan.decode_rows.len());
-        for row in &plan.prefill_rows {
-            tokens.push(SlotToken {
+        let tokens = plan
+            .prefill_rows
+            .iter()
+            .map(|row| SlotToken {
                 slot: row.slot,
                 token: row.tokens.last().copied().unwrap_or(0).wrapping_add(1),
                 logprob: None,
                 finish: None,
-            });
-        }
-        for row in &plan.decode_rows {
-            tokens.push(SlotToken {
+            })
+            .chain(plan.decode_rows.iter().map(|row| SlotToken {
                 slot: row.slot,
                 token: row.last_token.wrapping_add(1),
                 logprob: None,
                 finish: None,
-            });
-        }
+            }))
+            .collect();
         Ok(StepOutput { tokens })
     }
 
@@ -706,10 +705,10 @@ where
     E: BackendExecutor,
     K: KvPool,
 {
-    let mut handles = Vec::with_capacity(requests.len());
-    for (prompt, gen_tokens) in requests {
-        handles.push(engine.submit_request(prompt.clone(), *gen_tokens));
-    }
+    let handles: Vec<_> = requests
+        .iter()
+        .map(|(prompt, gen_tokens)| engine.submit_request(prompt.clone(), *gen_tokens))
+        .collect();
     let mut ticks = 0u64;
     let mut step_error = None;
     while !engine.is_idle() {
@@ -1004,23 +1003,22 @@ mod tests {
             ) -> Result<Self::Inflight> {
                 let rows = plan.prefill_rows.len() + plan.decode_rows.len();
                 self.max_rows.set(self.max_rows.get().max(rows));
-                let mut tokens = Vec::new();
-                for row in &plan.prefill_rows {
-                    tokens.push(SlotToken {
+                let tokens = plan
+                    .prefill_rows
+                    .iter()
+                    .map(|row| SlotToken {
                         slot: row.slot,
                         token: row.tokens.last().copied().unwrap_or(0).wrapping_add(1),
                         logprob: None,
                         finish: None,
-                    });
-                }
-                for row in &plan.decode_rows {
-                    tokens.push(SlotToken {
+                    })
+                    .chain(plan.decode_rows.iter().map(|row| SlotToken {
                         slot: row.slot,
                         token: row.last_token.wrapping_add(1),
                         logprob: None,
                         finish: None,
-                    });
-                }
+                    }))
+                    .collect();
                 Ok(StepOutput { tokens })
             }
             fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
@@ -1393,21 +1391,25 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     fn dsv4_parse_prompts(raw: &str) -> Result<Vec<Vec<u32>>> {
-        let mut prompts = Vec::new();
-        for chunk in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let ids: Vec<u32> = chunk
-                .split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(|t| {
-                    t.parse::<u32>().map_err(|e| {
-                        anyhow::anyhow!("bad token id `{t}` in INFER_DSV4_PROMPT_IDS: {e}")
+        let prompts = raw
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|chunk| {
+                let ids: Vec<u32> = chunk
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| {
+                        t.parse::<u32>().map_err(|e| {
+                            anyhow::anyhow!("bad token id `{t}` in INFER_DSV4_PROMPT_IDS: {e}")
+                        })
                     })
-                })
-                .collect::<Result<_>>()?;
-            anyhow::ensure!(!ids.is_empty(), "empty prompt in INFER_DSV4_PROMPT_IDS");
-            prompts.push(ids);
-        }
+                    .collect::<Result<_>>()?;
+                anyhow::ensure!(!ids.is_empty(), "empty prompt in INFER_DSV4_PROMPT_IDS");
+                Ok(ids)
+            })
+            .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(!prompts.is_empty(), "INFER_DSV4_PROMPT_IDS resolved empty");
         Ok(prompts)
     }
@@ -1859,18 +1861,12 @@ mod tests {
             let open = haystack[start..].find('[')? + start;
             let close = haystack[open..].find(']')? + open;
             let inner = &haystack[open + 1..close];
-            let mut out = Vec::new();
-            for tok in inner.split(',') {
-                let t = tok.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                out.push(
-                    t.parse::<u32>()
-                        .map_err(|e| anyhow::anyhow!("bad id '{t}': {e}"))
-                        .ok()?,
-                );
-            }
+            let out = inner
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse::<u32>().ok())
+                .collect::<Option<Vec<_>>>()?;
             Some(out)
         }
 
