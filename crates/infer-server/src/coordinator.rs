@@ -275,51 +275,14 @@ fn streaming_submit(
     Ok((rx, guard))
 }
 
-/// Submit one request and collect its full generation by draining relay deltas.
-/// `in_flight` brackets the request so the lockstep loop keeps stepping until it
-/// terminally completes; cancellation/early return is handled by [`InFlightGuard`].
 async fn submit_and_collect(
     state: &Arc<CoordinatorHandle>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampling: SamplingParams,
 ) -> Result<CollectedGeneration, ApiError> {
-    let request_id = state.alloc_request_id();
     let prompt_len = prompt_tokens.len();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayCompletionDelta>();
-
-    // Register the sink BEFORE submitting so no delta can race ahead of it.
-    state
-        .sinks
-        .register(request_id, tx)
-        .map_err(ApiError::from)?;
-
-    // Increment in_flight + arm the guard BEFORE submit: the increment-before-submit
-    // ordering is the load-bearing lockstep invariant (see `lockstep_loop`), and the
-    // guard releases both decrement + unregister on every early-return path.
-    state.in_flight.fetch_add(1, Ordering::AcqRel);
-    let _guard = InFlightGuard {
-        in_flight: Arc::clone(&state.in_flight),
-        sinks: state.sinks.clone(),
-        request_id,
-    };
-
-    let submit_result = state.submit_tx.send(CoordSubmission {
-        request: WireRequest {
-            request_id,
-            prompt_tokens,
-            max_tokens,
-            sampling,
-        },
-    });
-    if submit_result.is_err() {
-        return Err(ApiError::internal(
-            "coordinator lockstep loop closed; cannot submit",
-        ));
-    }
-
-    // Accumulate deltas until terminal. `recv()` also yields `None` when
-    // `fail_all` dropped the sender on worker-group failure (handled below).
+    let (mut rx, _guard) = streaming_submit(state, prompt_tokens, max_tokens, sampling)?;
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
     let mut error: Option<String> = None;
@@ -334,12 +297,9 @@ async fn submit_and_collect(
             break;
         }
     }
-
-    // `_guard` drops here (fetch_sub + unregister), as on any early return above.
     if let Some(message) = error {
         return Err(ApiError::internal(message));
     }
-
     Ok(CollectedGeneration {
         prompt_tokens: prompt_len,
         generated_tokens,
@@ -566,21 +526,18 @@ async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<Models
 async fn metrics(
     State(state): State<Arc<CoordinatorHandle>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    // Query rank-0 engine stats via relay and render as Prometheus text.
-    // kv_tier/kv_system are not relayed and render as zero.
     let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
-    let rx = state
-        .relay
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .register_stats_awaiter(request_id);
-    let counters = if state
-        .relay
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .send_stats_query(request_id)
-        .is_ok()
-    {
+    let (rx, query_ok) = {
+        let mut relay = state
+            .relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            relay.register_stats_awaiter(request_id),
+            relay.send_stats_query(request_id).is_ok(),
+        )
+    };
+    let counters = if query_ok {
         tokio::time::timeout(std::time::Duration::from_secs(2), rx)
             .await
             .ok()
@@ -604,17 +561,18 @@ async fn stats(
 ) -> Result<Json<StatsResponse>, ApiError> {
     let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
     // Register awaiter BEFORE sending to avoid a race with the reader thread.
-    let rx = state
-        .relay
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .register_stats_awaiter(request_id);
-    state
-        .relay
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .send_stats_query(request_id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (rx, send_result) = {
+        let mut relay = state
+            .relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rx = relay.register_stats_awaiter(request_id);
+        let result = relay
+            .send_stats_query(request_id)
+            .map_err(|e| ApiError::internal(e.to_string()));
+        (rx, result)
+    };
+    send_result?;
     let wire = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
         .await
         .map_err(|_| ApiError::internal("stats query timed out"))?
