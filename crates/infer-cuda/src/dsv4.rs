@@ -1990,12 +1990,13 @@ impl Dsv4Model {
         let stream_dim = self.config.hidden_size * self.config.hc_mult;
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
-        let mut hiddens = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-            self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
-            hiddens.push(h);
-        }
+        let hiddens = (0..n)
+            .map(|i| -> Result<_> {
+                let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
+                self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
+                Ok(h)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
         let argmax = self.mtp_argmax_batch(&logits)?;
         std::hint::black_box(keepalive.len());
@@ -2162,20 +2163,20 @@ impl Dsv4Model {
             start_positions,
         )?;
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample_batched");
-        let mut out_tokens = Vec::with_capacity(n);
-        for r in 0..n {
-            // `forward_stream_last_token` folds stream row `seq_len - 1`; passing
-            // `seq_len = r + 1` samples row r of the batched stream.
-            let token = self.forward_stream_last_token(
-                &stream,
-                r + 1,
-                &params[r],
-                positions[r],
-                None,
-                &mut keepalive,
-            )?;
-            out_tokens.push(token);
-        }
+        // `forward_stream_last_token` folds stream row `seq_len - 1`; passing
+        // `seq_len = r + 1` samples row r of the batched stream.
+        let out_tokens = (0..n)
+            .map(|r| {
+                self.forward_stream_last_token(
+                    &stream,
+                    r + 1,
+                    &params[r],
+                    positions[r],
+                    None,
+                    &mut keepalive,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(out_tokens)

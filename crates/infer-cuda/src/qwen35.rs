@@ -6515,17 +6515,19 @@ impl Qwen35Model {
             .stream
             .clone_dtoh(argmax_buf)
             .map_err(|e| anyhow!("D2H qwen35 batched argmax failed: {e}"))?;
-        let mut out = Vec::with_capacity(b);
-        for (r, p) in params.iter().enumerate() {
-            if p.is_greedy() {
-                out.push(greedy_ids[r] as u32);
-            } else {
+        let out = params
+            .iter()
+            .enumerate()
+            .map(|(r, p)| -> anyhow::Result<u32> {
+                if p.is_greedy() {
+                    return Ok(greedy_ids[r] as u32);
+                }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                out.push(infer_plan::sample_token(&host, p, sample_positions[r]));
-            }
-        }
+                Ok(infer_plan::sample_token(&host, p, sample_positions[r]))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(out)
     }
 
@@ -6746,17 +6748,19 @@ impl Qwen35Model {
             .stream
             .clone_dtoh(argmax_buf)
             .map_err(|e| anyhow!("D2H qwen36 paged batched argmax failed: {e}"))?;
-        let mut out = Vec::with_capacity(b);
-        for (r, p) in params.iter().enumerate() {
-            if p.is_greedy() {
-                out.push(greedy_ids[r] as u32);
-            } else {
+        let out = params
+            .iter()
+            .enumerate()
+            .map(|(r, p)| -> anyhow::Result<u32> {
+                if p.is_greedy() {
+                    return Ok(greedy_ids[r] as u32);
+                }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                out.push(infer_plan::sample_token(&host, p, sample_positions[r]));
-            }
-        }
+                Ok(infer_plan::sample_token(&host, p, sample_positions[r]))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(out)
     }
 
