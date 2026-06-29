@@ -54,6 +54,19 @@ Fix (commit `1b0f0459`): call `release_recurrent` before `acquire_recurrent` in
 | prefix hits | 0 | **1** |
 | crash / assertion | none | **none** |
 
+**seq_len drift audit (Qwen3.6-27B-FP8 GPU 1, commit `1b0f0459`, `ARLE_KVDRIFT_DEBUG=1`):**
+
+```
+PREFILL slot=0 start_pos=0  tokens=32 slot.seq_len=0  pool.seq_len=0   ← cold req
+PREFILL slot=0 start_pos=32 tokens=8  slot.seq_len=32 pool.seq_len=32
+RESTORE-SIDECAR slot=0 matched_len=32 slot.seq_len(before)=44 pool.seq_len(before)=44  ← no drift
+PREFILL slot=0 start_pos=32 tokens=13 slot.seq_len=32 pool.seq_len=32  ← warm tail-prefill aligned
+```
+
+- `slot.seq_len == pool.seq_len` at every checkpoint — no drift between the two KV state views
+- `DECODE-ASSERT` probe (fires only when assertion would fail) never appeared
+- `prefix_cache: hits=1, hit_pages=2, hit_tokens=32` — 40-token prompt = 2 full pages cached correctly
+
 **Production validation (Qwen3.5-122B-A10B TP=4 GPU 0,2,5,6, commit `1b0f0459`, 512 in / 256 out):**
 
 | concurrency | throughput (tok/s) | TTFT p50 |
