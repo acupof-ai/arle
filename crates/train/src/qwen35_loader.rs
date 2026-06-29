@@ -1690,10 +1690,7 @@ mod tests {
 
     impl TestTensorView {
         fn from_f32(shape: Vec<usize>, values: &[f32]) -> Self {
-            let mut bytes = Vec::with_capacity(values.len() * 4);
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
             Self {
                 dtype: Dtype::F32,
                 shape,
