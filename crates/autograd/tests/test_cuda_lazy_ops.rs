@@ -33,31 +33,24 @@ use autograd::{Backend, DeviceHandle};
 
 /// Deterministic LCG → uniform `(-half_range, half_range)` floats.
 /// Same seed → same sequence → host vs device replay identically.
+fn lcg_step(s: u64) -> u64 {
+    s.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
 fn rng_vec(seed: u64, n: usize, half_range: f32) -> Vec<f32> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let u = ((s >> 32) as u32 as f32) / (u32::MAX as f32);
-        out.push((u - 0.5) * 2.0 * half_range);
-    }
-    out
+    std::iter::successors(Some(lcg_step(seed)), |&s| Some(lcg_step(s)))
+        .take(n)
+        .map(|s| ((s >> 32) as u32 as f32 / u32::MAX as f32 - 0.5) * 2.0 * half_range)
+        .collect()
 }
 
 /// Deterministic LCG → uniform int32 in `[0, upper)`.
 fn rng_ids(seed: u64, n: usize, upper: i32) -> Vec<i32> {
-    let mut s = seed;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let u = (s >> 32) as u32;
-        out.push((u % (upper as u32)) as i32);
-    }
-    out
+    std::iter::successors(Some(lcg_step(seed)), |&s| Some(lcg_step(s)))
+        .take(n)
+        .map(|s| ((s >> 32) as u32 % (upper as u32)) as i32)
+        .collect()
 }
 
 fn cpu_argmax_last_dim(x: &[f32], shape: &[usize]) -> autograd::Result<Vec<f32>> {
