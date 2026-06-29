@@ -582,31 +582,34 @@ fn read_generated_rollout_tokens(
             host.len()
         )));
     }
-    let mut out = Vec::with_capacity(rollout_len);
-    for (index, &value) in host.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(OpdError::InvalidInput(format!(
-                "OPD generated rollout token at index {index} is non-finite ({value}). \
-                 Hint: check CUDA argmax output and student forward numerics."
-            )));
-        }
-        let rounded = value.round();
-        if (value - rounded).abs() > 0.0 {
-            return Err(OpdError::InvalidInput(format!(
-                "OPD generated rollout token at index {index} is not an exact \
-                 integer id ({value}). Hint: CUDA argmax should write exact \
-                 f32 token ids."
-            )));
-        }
-        if rounded < 0.0 || rounded as usize >= vocab {
-            return Err(OpdError::InvalidInput(format!(
-                "OPD generated rollout token id {rounded} at index {index} is \
-                 outside student.config().vocab_size={vocab}. Hint: check the \
-                 argmax kernel bounds and model vocab size."
-            )));
-        }
-        out.push(rounded as u32);
-    }
+    let out: Vec<u32> = host
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            if !value.is_finite() {
+                return Err(OpdError::InvalidInput(format!(
+                    "OPD generated rollout token at index {index} is non-finite ({value}). \
+                     Hint: check CUDA argmax output and student forward numerics."
+                )));
+            }
+            let rounded = value.round();
+            if (value - rounded).abs() > 0.0 {
+                return Err(OpdError::InvalidInput(format!(
+                    "OPD generated rollout token at index {index} is not an exact \
+                     integer id ({value}). Hint: CUDA argmax should write exact \
+                     f32 token ids."
+                )));
+            }
+            if rounded < 0.0 || rounded as usize >= vocab {
+                return Err(OpdError::InvalidInput(format!(
+                    "OPD generated rollout token id {rounded} at index {index} is \
+                     outside student.config().vocab_size={vocab}. Hint: check the \
+                     argmax kernel bounds and model vocab size."
+                )));
+            }
+            Ok(rounded as u32)
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(out)
 }
 
@@ -1777,9 +1780,11 @@ fn corpus_truth_sft_loss(
             )));
         }
     }
-    let mut sft_sequence = Vec::with_capacity(total_len);
-    sft_sequence.extend_from_slice(prompt_ids);
-    sft_sequence.extend_from_slice(corpus_tokens);
+    let sft_sequence: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(corpus_tokens.iter().copied())
+        .collect();
     let positions = (0..total_len as u32).collect::<Vec<_>>();
     let student_logits = student
         .forward(store, tape, &sft_sequence, &positions)
@@ -2299,11 +2304,10 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
                 store.accumulate_grad(target_id, grad_id)?;
             }
         }
-        let mut keep_grads = Vec::with_capacity(2);
-        if let Some(existing_hidden_grad) = hidden_grad {
-            keep_grads.push(existing_hidden_grad);
-        }
-        keep_grads.push(window_hidden_grad);
+        let keep_grads: Vec<_> = hidden_grad
+            .into_iter()
+            .chain([window_hidden_grad])
+            .collect();
         cleanup_window_backward_retaining_base(
             store,
             tape,
@@ -2636,9 +2640,11 @@ fn backward_windowed_gkd_loss<T: TeacherForward + ?Sized>(
                          max tokens."
                     )));
                 }
-                let mut sft_sequence = Vec::with_capacity(total_len);
-                sft_sequence.extend_from_slice(prompt_ids);
-                sft_sequence.extend_from_slice(corpus_tokens);
+                let sft_sequence: Vec<u32> = prompt_ids
+                    .iter()
+                    .copied()
+                    .chain(corpus_tokens.iter().copied())
+                    .collect();
                 let sft_positions = (0..total_len as u32).collect::<Vec<_>>();
                 for target_window in sequence_windows(corpus_tokens.len(), window_size)? {
                     let logits_window = SequenceWindow {
