@@ -44,12 +44,29 @@ Capture key and restore key now always agree. Residual: the snapshot is taken at
 `mat_len` (≤15 tokens before the true seq_len boundary) — a small double-count on
 restore; negligible versus full-zeroing. Exact boundary snapshot deferred.
 
+## Second bug: page count mismatch after key fix
+
+After the key-alignment fix (`2bc6b44d`), restores started hitting the cache but then
+failed with:
+```
+paged_kv host payload length mismatch: got 77594624 expected 76546048
+```
+
+The slot had 74 allocated full-attn KV pages (seq_len=1210, ceil(1210/16)=76 → 74
+actually allocated) but `matched_len=1168` expected 73 pages. The extra page is the
+slot's partially-filled "next" page that was allocated but not yet covered by the
+page-aligned mat_len.
+
+Fix `c96bfb50`: limit the D2H copy to `n_pages = mat_len / PAGE_SIZE` pages — the
+extra allocated-but-not-full page is excluded from the snapshot.
+
 ## Verification
 
-Pending-remote: rebuild on H20 pod with `2bc6b44d`, run OPD with
-`ARLE_KVDRIFT_DEBUG=1` and confirm:
-- `[kvdrift] SIDECAR-LOOKUP ... -> HIT` at every re-prefill (was always MISS)
-- ≥1 accept in the first round (was 0/N every round post seq_len-drift fix)
+Pod run with `2bc6b44d` + `c96bfb50` + `max-tokens 8192`:
+- `RESTORE-SIDECAR` appears at every re-prefill with zero "restore failed" or
+  "mismatch" errors
+- eval base: ansible__ansible-0ea40e0 `passed=true edited=true` (confirmed)
+- Training rollout running; accept verdict pending
 
 ## Rule
 
