@@ -1031,20 +1031,21 @@ impl CppQwen35Model {
             n_cap >= 0,
             "Qwen3.5 captured-hidden count was negative: {n_cap}"
         );
-        let mut out = Vec::with_capacity(n_cap as usize);
-        for idx in 0..n_cap {
-            let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-            let rc = unsafe { mlx_sys::qwen35_get_captured_hidden(self.raw, idx, &raw mut h_ptr) };
-            if rc != 0 {
-                return Err(mlx::check_mlx_error().unwrap_err());
-            }
-            anyhow::ensure!(
-                !h_ptr.is_null(),
-                "Qwen3.5 captured-hidden handle #{idx} was null"
-            );
-            out.push(unsafe { MlxArray::from_raw(h_ptr) });
-        }
-        Ok(out)
+        (0..n_cap)
+            .map(|idx| {
+                let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                let rc =
+                    unsafe { mlx_sys::qwen35_get_captured_hidden(self.raw, idx, &raw mut h_ptr) };
+                if rc != 0 {
+                    return Err(mlx::check_mlx_error().unwrap_err());
+                }
+                anyhow::ensure!(
+                    !h_ptr.is_null(),
+                    "Qwen3.5 captured-hidden handle #{idx} was null"
+                );
+                Ok(unsafe { MlxArray::from_raw(h_ptr) })
+            })
+            .collect()
     }
 
     pub(crate) fn drain_current_gdr_tapes(
