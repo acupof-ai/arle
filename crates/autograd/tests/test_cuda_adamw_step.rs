@@ -142,20 +142,16 @@ fn cuda_adamw_step_matches_cpu_5_steps() {
     fn max_err(dev: &[f32], host: &[f32]) -> (f32, f32, usize) {
         const ATOL: f32 = 1e-6;
         const RTOL: f32 = 1e-4;
-        let mut worst_excess = 0.0_f32;
-        let mut worst_abs = 0.0_f32;
-        let mut worst_idx = 0_usize;
-        for (i, (d, h)) in dev.iter().zip(host.iter()).enumerate() {
-            let abs_diff = (d - h).abs();
-            let tol = ATOL + (RTOL * h.abs());
-            let excess = abs_diff / tol; // > 1 means failed
-            if excess > worst_excess {
-                worst_excess = excess;
-                worst_abs = abs_diff;
-                worst_idx = i;
-            }
-        }
-        (worst_excess, worst_abs, worst_idx)
+        dev.iter()
+            .zip(host.iter())
+            .enumerate()
+            .map(|(i, (d, h))| {
+                let abs_diff = (d - h).abs();
+                let excess = abs_diff / (ATOL + RTOL * h.abs()); // > 1 means failed
+                (excess, abs_diff, i)
+            })
+            .max_by(|(e1, _, _), (e2, _, _)| e1.total_cmp(e2))
+            .unwrap_or((0.0, 0.0, 0))
     }
 
     let (param_excess, param_abs, param_idx) = max_err(&dev_param, &host_param);
