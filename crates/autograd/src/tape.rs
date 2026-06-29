@@ -105,6 +105,9 @@ pub enum SavedContext {
     CatHeadsCtx {
         head_counts: Vec<usize>,
     },
+    CatSeqCtx {
+        seq_counts: Vec<usize>,
+    },
     TransposeCtx {
         axis1: usize,
         axis2: usize,
@@ -144,6 +147,11 @@ pub enum SavedContext {
         a_inv: Option<TensorId>,
         chunk_state: Option<TensorId>,
         raw_output: Option<TensorId>,
+        /// OPD frozen-prompt-KV carry: seeds the recurrent state + conv window
+        /// from a prior (prompt) segment so the backward recompute reproduces the
+        /// forward exactly. `None` for the default full-sequence path.
+        initial_state: Option<TensorId>,
+        initial_conv_window: Option<TensorId>,
         batch: usize,
         seq_len: usize,
         num_key_heads: usize,
@@ -189,6 +197,7 @@ pub enum BackwardOp {
     Reshape,
     Slice,
     CatHeads,
+    CatSeq,
     Transpose,
     AddBroadcast,
     Embedding,
@@ -227,6 +236,7 @@ impl BackwardOp {
             BackwardOp::Reshape => "Reshape",
             BackwardOp::Slice => "Slice",
             BackwardOp::CatHeads => "CatHeads",
+            BackwardOp::CatSeq => "CatSeq",
             BackwardOp::Transpose => "Transpose",
             BackwardOp::AddBroadcast => "AddBroadcast",
             BackwardOp::Embedding => "Embedding",
@@ -615,6 +625,7 @@ impl Tape {
                     BackwardOp::Reshape => ops::reshape_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Slice => ops::slice_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatHeads => ops::cat_heads_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::CatSeq => ops::cat_seq_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Transpose => {
                         ops::transpose_backward(&entry, output_grad_id, store)?
                     }

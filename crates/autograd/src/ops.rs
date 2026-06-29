@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_backward};
-pub(crate) use attention::{cat_heads_backward, causal_sdpa_recompute_backward};
+pub(crate) use attention::{cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::all_reduce_sum_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
@@ -144,6 +144,27 @@ pub fn causal_sdpa_with_q_start(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     attention::causal_sdpa_with_q_start(q, k, v, q_start, store, tape)
+}
+
+pub fn head_chunked_sdpa_with_q_start(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    chunk: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    attention::head_chunked_sdpa_with_q_start(q, k, v, q_start, chunk, store, tape)
+}
+
+pub fn cat_seq(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    attention::cat_seq(a, b, store, tape)
 }
 
 pub fn cat_heads(
@@ -375,7 +396,9 @@ pub fn matmul_bt_with_site(
     matmul::matmul_bt_with_site(a, b, store, tape, site)
 }
 
-pub use linear_attention::{LinearAttentionParams, linear_attention_core_with_carry};
+pub use linear_attention::{
+    LinearAttentionParams, linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
+};
 
 pub fn linear_attention_core(
     qkv: TensorId,

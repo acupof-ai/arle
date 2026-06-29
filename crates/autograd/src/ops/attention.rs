@@ -707,6 +707,193 @@ pub(crate) fn cat_heads_backward(
     Ok(grads)
 }
 
+/// Head-chunked cached SDPA with a query-start offset: heads are independent so
+/// chunking is numerically exact, bounding the live `[chunk, q_len, kv_len]`
+/// scores to avoid OOM at long kv_len. Mirrors qwen35's
+/// `head_chunked_sdpa_recompute` but over `causal_sdpa_with_q_start` (the q rows
+/// start at absolute position `q_start`; `kv_len = q_start + q_len`). Used by the
+/// OPD frozen-prompt-KV gen-segment forward, where the gen rows query a
+/// prefix++gen concatenated K/V.
+pub fn head_chunked_sdpa_with_q_start(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    chunk: usize,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    let q_shape = store.tensor(q)?.shape.clone();
+    let k_shape = store.tensor(k)?.shape.clone();
+    let (batch, heads, q_len, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+    let kv_len = k_shape[2];
+    // Same adaptive transient cap as `head_chunked_sdpa_recompute`: bound the
+    // 4 simultaneous `[chunk, q_len, kv_len]` buffers (scores/scaled/masked/probs)
+    // to ~8 GiB.
+    let per_head = q_len.saturating_mul(kv_len).saturating_mul(4).max(1);
+    let chunk = chunk
+        .min((8usize << 30) / per_head.saturating_mul(4))
+        .max(1);
+    if chunk >= heads {
+        return causal_sdpa_with_q_start(q, k, v, q_start, store, tape);
+    }
+
+    // When the tape is disabled the per-chunk SDPA intermediates have no backward
+    // dependency but nothing frees them until a checkpoint boundary, so they pile
+    // up across the loop — free each chunk's transients before the next iteration.
+    let free_chunk_transients = !tape.enabled;
+    let mut chunks: Vec<TensorId> = Vec::new();
+    let mut h0 = 0usize;
+    while h0 < heads {
+        let h1 = (h0 + chunk).min(heads);
+        let live_before = free_chunk_transients
+            .then(|| store.live_ids().into_iter().collect::<HashSet<TensorId>>());
+        let q_chunk = slice(
+            q,
+            &[0, h0, 0, 0],
+            &[batch, h1, q_len, head_dim],
+            store,
+            tape,
+        )?;
+        let k_chunk = slice(
+            k,
+            &[0, h0, 0, 0],
+            &[batch, h1, kv_len, head_dim],
+            store,
+            tape,
+        )?;
+        let v_chunk = slice(
+            v,
+            &[0, h0, 0, 0],
+            &[batch, h1, kv_len, head_dim],
+            store,
+            tape,
+        )?;
+        let out = causal_sdpa_with_q_start(q_chunk, k_chunk, v_chunk, q_start, store, tape)?;
+        if let Some(live_before) = live_before {
+            let keep = HashSet::from([out]);
+            store.free_new_except(&live_before, &keep)?;
+        }
+        chunks.push(out);
+        h0 = h1;
+    }
+    cat_heads(&chunks, store, tape)
+}
+
+/// Concatenate two rank-4 `[batch, heads, seq_i, head_dim]` tensors along the
+/// SEQUENCE axis (axis 2). Taped: grad flows back to each input's seq slice (a
+/// `requires_grad = false` input — e.g. the OPD frozen prompt KV — is simply
+/// skipped in backward). Batch / heads / head_dim must match; only seq differs.
+pub fn cat_seq(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
+    for shape in [&a_shape, &b_shape] {
+        if shape.len() != 4 {
+            return Err(AutogradError::InvalidRank {
+                expected: "4",
+                got: shape.len(),
+            });
+        }
+    }
+    if a_shape[0] != b_shape[0] || a_shape[1] != b_shape[1] || a_shape[3] != b_shape[3] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: a_shape.clone(),
+            got: b_shape.clone(),
+        });
+    }
+    let (batch, heads, head_dim) = (a_shape[0], a_shape[1], a_shape[3]);
+    let (seq_a, seq_b) = (a_shape[2], b_shape[2]);
+    let total_seq = seq_a + seq_b;
+    let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
+
+    let mut data = vec![0.0_f32; batch * heads * total_seq * head_dim];
+    {
+        let a_host = store.tensor_host(a)?;
+        let b_host = store.tensor_host(b)?;
+        for bh in 0..(batch * heads) {
+            let out_base = bh * total_seq * head_dim;
+            let a_len = seq_a * head_dim;
+            let b_len = seq_b * head_dim;
+            let a_base = bh * a_len;
+            let b_base = bh * b_len;
+            data[out_base..out_base + a_len].copy_from_slice(&a_host.data[a_base..a_base + a_len]);
+            data[out_base + a_len..out_base + a_len + b_len]
+                .copy_from_slice(&b_host.data[b_base..b_base + b_len]);
+        }
+    }
+    let out_shape = vec![batch, heads, total_seq, head_dim];
+    let output_id = store.alloc(Tensor::new(data, out_shape, requires_grad)?);
+
+    if tape.enabled && requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::CatSeq,
+            output_id,
+            input_ids: smallvec![a, b],
+            saved: SavedContext::CatSeqCtx {
+                seq_counts: vec![seq_a, seq_b],
+            },
+        });
+    }
+    Ok(output_id)
+}
+
+pub(crate) fn cat_seq_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::CatSeqCtx { seq_counts } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "cat_seq backward missing saved context",
+        ));
+    };
+    let upstream = store.tensor_host(output_grad_id)?;
+    let upstream_shape = upstream.shape.clone();
+    if upstream_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: upstream_shape.len(),
+        });
+    }
+    let (batch, heads, total_seq, head_dim) = (
+        upstream_shape[0],
+        upstream_shape[1],
+        upstream_shape[2],
+        upstream_shape[3],
+    );
+
+    let mut grads = GradPairs::new();
+    let mut seq_offset = 0usize;
+    for (i, &input_id) in entry.input_ids.iter().enumerate() {
+        let seq_i = seq_counts[i];
+        if !store.tensor(input_id)?.requires_grad {
+            seq_offset += seq_i;
+            continue;
+        }
+        let mut grad = vec![0.0_f32; batch * heads * seq_i * head_dim];
+        for bh in 0..(batch * heads) {
+            let src_base = (bh * total_seq + seq_offset) * head_dim;
+            let dst_base = bh * seq_i * head_dim;
+            let len = seq_i * head_dim;
+            grad[dst_base..dst_base + len]
+                .copy_from_slice(&upstream.data[src_base..src_base + len]);
+        }
+        let grad_id = store.alloc(Tensor::new(
+            grad,
+            vec![batch, heads, seq_i, head_dim],
+            false,
+        )?);
+        grads.push((input_id, grad_id));
+        seq_offset += seq_i;
+    }
+    Ok(grads)
+}
+
 fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
     let mut data = vec![0.0; seq_len * seq_len];
     for row in 0..seq_len {
