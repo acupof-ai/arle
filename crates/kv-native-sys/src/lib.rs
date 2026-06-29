@@ -1488,10 +1488,7 @@ mod tests {
         const WARMUP_QUERIES: usize = 100_000;
 
         let arena = TestHostArena::new(REGION_LEN * REGIONS);
-        let mut regions = Vec::with_capacity(REGIONS);
-        for _ in 0..REGIONS {
-            regions.push(arena.reserve(REGION_LEN));
-        }
+        let regions: Vec<_> = (0..REGIONS).map(|_| arena.reserve(REGION_LEN)).collect();
         for region in regions.iter().step_by(2) {
             arena.release(*region);
         }
