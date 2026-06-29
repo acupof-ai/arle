@@ -325,28 +325,18 @@ impl RankCoord {
 /// SGLang `parallel_state.py:1789-1800`.
 #[must_use]
 pub fn build_tp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
-    let world = cfg.world_size();
-    let num_tp_groups = world / cfg.tp_size;
-    let mut group_ranks = Vec::with_capacity(num_tp_groups);
-    for tp_group_idx in 0..num_tp_groups {
-        let st = tp_group_idx * cfg.tp_size;
-        let en = (tp_group_idx + 1) * cfg.tp_size;
-        group_ranks.push((st..en).collect());
-    }
-    group_ranks
+    let n = cfg.world_size() / cfg.tp_size;
+    (0..n)
+        .map(|i| (i * cfg.tp_size..(i + 1) * cfg.tp_size).collect())
+        .collect()
 }
 
 /// SGLang `parallel_state.py:1981-1989`.
 #[must_use]
 pub fn build_pp_groups(cfg: MultiAxisConfig) -> Vec<Vec<usize>> {
     let world = cfg.world_size();
-    let num_pp_groups = world / cfg.pp_size;
-    let mut group_ranks = Vec::with_capacity(num_pp_groups);
-    for pp_group_idx in 0..num_pp_groups {
-        let ranks: Vec<usize> = (pp_group_idx..world).step_by(num_pp_groups).collect();
-        group_ranks.push(ranks);
-    }
-    group_ranks
+    let n = world / cfg.pp_size;
+    (0..n).map(|i| (i..world).step_by(n).collect()).collect()
 }
 
 /// SGLang `parallel_state.py:1838-1853`.
