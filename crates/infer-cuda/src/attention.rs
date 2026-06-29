@@ -2974,11 +2974,9 @@ impl Dsv4DsaSharedScratch {
         let page_table_elems = query_tile
             .checked_mul(num_pages)
             .ok_or_else(|| anyhow!("DSv4 official DSA page table size overflow"))?;
-        let mut page_table_h = Vec::with_capacity(page_table_elems);
-        for _ in 0..query_tile {
-            page_table_h
-                .extend((0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")));
-        }
+        let page_table_h: Vec<i32> = (0..query_tile)
+            .flat_map(|_| (0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")))
+            .collect();
         let num_sms = std::env::var("ARLE_DSV4_DSA_INDEXER_SMS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -2999,11 +2997,9 @@ impl Dsv4DsaSharedScratch {
         // N-row identity page-table: the `[0..num_pages)` identity block replicated
         // `decode_max_batch` times (stride=num_pages), so every row's topk reads
         // the same identity block (stride>0 required by the launch validator).
-        let mut page_table_batch_h = Vec::with_capacity(block_table_batch_elems);
-        for _ in 0..decode_max_batch {
-            page_table_batch_h
-                .extend((0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")));
-        }
+        let page_table_batch_h: Vec<i32> = (0..decode_max_batch)
+            .flat_map(|_| (0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")))
+            .collect();
         Ok(Self {
             cache_locs: ctx
                 .stream
@@ -3261,28 +3257,29 @@ fn dsv4_dsa_freqs_cis_real(
     let factor = config.rope_parameters.factor as f64;
     let beta_fast = config.rope_parameters.beta_fast as f64;
     let beta_slow = config.rope_parameters.beta_slow as f64;
-    let mut inv_freq = Vec::with_capacity(half);
-    for pair in 0..half {
-        let mut freq = 1.0f64 / base.powf((2 * pair) as f64 / dim as f64);
-        if original_seq_len > 0 {
-            let find_correction_dim = |num_rotations: f64| -> f64 {
-                dim as f64
-                    * ((original_seq_len as f64 / (num_rotations * 2.0 * std::f64::consts::PI))
-                        .ln())
-                    / (2.0 * base.ln())
-            };
-            let low = find_correction_dim(beta_fast).floor().max(0.0);
-            let high = find_correction_dim(beta_slow).ceil().min((dim - 1) as f64);
-            let mut high_adj = high;
-            if (low - high_adj).abs() < f64::EPSILON {
-                high_adj += 0.001;
+    let inv_freq: Vec<f64> = (0..half)
+        .map(|pair| {
+            let mut freq = 1.0f64 / base.powf((2 * pair) as f64 / dim as f64);
+            if original_seq_len > 0 {
+                let find_correction_dim = |num_rotations: f64| -> f64 {
+                    dim as f64
+                        * ((original_seq_len as f64 / (num_rotations * 2.0 * std::f64::consts::PI))
+                            .ln())
+                        / (2.0 * base.ln())
+                };
+                let low = find_correction_dim(beta_fast).floor().max(0.0);
+                let high = find_correction_dim(beta_slow).ceil().min((dim - 1) as f64);
+                let mut high_adj = high;
+                if (low - high_adj).abs() < f64::EPSILON {
+                    high_adj += 0.001;
+                }
+                let ramp = ((pair as f64 - low) / (high_adj - low)).clamp(0.0, 1.0);
+                let smooth = 1.0 - ramp;
+                freq = freq / factor * (1.0 - smooth) + freq * smooth;
             }
-            let ramp = ((pair as f64 - low) / (high_adj - low)).clamp(0.0, 1.0);
-            let smooth = 1.0 - ramp;
-            freq = freq / factor * (1.0 - smooth) + freq * smooth;
-        }
-        inv_freq.push(freq);
-    }
+            freq
+        })
+        .collect();
 
     let mut out = vec![0.0f32; max_seq_len * dim];
     for pos in 0..max_seq_len {
@@ -4469,13 +4466,15 @@ pub(crate) fn commit_layer_fold(
         let page_block_size = 64;
         // Stage-B: hand the kernel slot-LOGICAL pages + the device page table;
         // it resolves `block_id = table[logical]` into the dynamic pool.
-        let mut block_ids = Vec::with_capacity(m);
-        let mut rows = Vec::with_capacity(m);
-        for i in 0..m {
-            let slot_idx = (start_pos + i) % config.sliding_window;
-            block_ids.push((slot_idx / page_block_size) as i32);
-            rows.push((slot_idx % page_block_size) as i32);
-        }
+        let (block_ids, rows): (Vec<i32>, Vec<i32>) = (0..m)
+            .map(|i| {
+                let slot_idx = (start_pos + i) % config.sliding_window;
+                (
+                    (slot_idx / page_block_size) as i32,
+                    (slot_idx % page_block_size) as i32,
+                )
+            })
+            .unzip();
         let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
         ctx.stream
             .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
@@ -5931,12 +5930,14 @@ pub(crate) fn flashmla_pack_sw_ring(
     let page_block_size = 64;
     // Stage-B: slot-LOGICAL pages + device page table; the kernel resolves
     // `block_id = table[logical]` into the dynamic pool (pool BASE pointer).
-    let mut block_ids = Vec::with_capacity(sliding_window);
-    let mut rows = Vec::with_capacity(sliding_window);
-    for slot in 0..sliding_window {
-        block_ids.push((slot / page_block_size) as i32);
-        rows.push((slot % page_block_size) as i32);
-    }
+    let (block_ids, rows): (Vec<i32>, Vec<i32>) = (0..sliding_window)
+        .map(|slot| {
+            (
+                (slot / page_block_size) as i32,
+                (slot % page_block_size) as i32,
+            )
+        })
+        .unzip();
     let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
     ctx.stream
         .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
@@ -6103,12 +6104,9 @@ fn flashmla_pack_compressed_delta(
         return Ok(());
     }
     let n = end_row - start_row;
-    let mut block_ids = Vec::with_capacity(n);
-    let mut rows = Vec::with_capacity(n);
-    for row in start_row..end_row {
-        block_ids.push((flash.sw_blocks + row / 64) as i32);
-        rows.push((row % 64) as i32);
-    }
+    let (block_ids, rows): (Vec<i32>, Vec<i32>) = (start_row..end_row)
+        .map(|row| ((flash.sw_blocks + row / 64) as i32, (row % 64) as i32))
+        .unzip();
     ctx.stream
         .memcpy_htod(&block_ids, &mut scratch.comp_block_ids)
         .map_err(|e| anyhow!("DSv4 FlashMLA compressed block_ids H2D failed: {e}"))?;

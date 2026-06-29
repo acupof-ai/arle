@@ -3604,10 +3604,7 @@ impl Qwen35CudaExecutor {
         // recurrent block is drawn from `recurrent_pool` on its first request
         // (`acquire_recurrent` at the `start_pos == 0` prefill) and returned on
         // request finish. The pool starts empty and grows on demand.
-        let mut slots = Vec::with_capacity(num_slots);
-        for _ in 0..num_slots {
-            slots.push(model.new_slot_state());
-        }
+        let slots: Vec<_> = (0..num_slots).map(|_| model.new_slot_state()).collect();
         cuda_startup_log(
             "qwen35_slot_alloc",
             slots_t0,
