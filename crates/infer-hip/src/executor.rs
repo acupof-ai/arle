@@ -53,10 +53,12 @@ impl HipDsv4Executor {
         );
         #[cfg(feature = "hip")]
         if let Some(model) = self.model.as_mut() {
-            let mut logits = Vec::new();
-            for (i, &token) in tokens.iter().enumerate() {
-                logits = model.forward_token(slot, epoch, token, start_pos + i)?;
-            }
+            let logits = tokens
+                .iter()
+                .enumerate()
+                .try_fold(Vec::new(), |_, (i, &token)| {
+                    model.forward_token(slot, epoch, token, start_pos + i)
+                })?;
             return Ok(infer_plan::sample_token(&logits, params, position));
         }
         let _ = (slot, epoch, start_pos, params, position);
