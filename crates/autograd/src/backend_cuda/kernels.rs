@@ -466,8 +466,7 @@ where
 
 #[cfg(not(feature = "no-cuda"))]
 fn concat_sources() -> String {
-    let mut src = String::new();
-    for chunk in [
+    let mut src = [
         ELEMENTWISE_CU,
         SOFTMAX_CU,
         SILU_CU,
@@ -497,9 +496,8 @@ fn concat_sources() -> String {
         BRIDGE_CU,
         LINEAR_ATTENTION_CU,
         FP8_BLOCK_SCALED_CU,
-    ] {
-        src.push_str(chunk);
-        src.push('\n');
-    }
+    ]
+    .join("\n");
+    src.push('\n');
     src
 }
