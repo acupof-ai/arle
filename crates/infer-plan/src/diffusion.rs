@@ -534,15 +534,15 @@ fn initial_canvas(
     block_index: usize,
     valid_len: usize,
 ) -> Vec<u32> {
-    let mut canvas = Vec::with_capacity(config.canvas_length);
-    for i in 0..config.canvas_length {
-        if i < valid_len {
-            canvas.push(renoise_token(config, block_index, usize::MAX, i));
-        } else {
-            canvas.push(config.pad_token_id);
-        }
-    }
-    canvas
+    (0..config.canvas_length)
+        .map(|i| {
+            if i < valid_len {
+                renoise_token(config, block_index, usize::MAX, i)
+            } else {
+                config.pad_token_id
+            }
+        })
+        .collect()
 }
 
 fn renoise_token(
@@ -607,13 +607,11 @@ fn predict_row(
     let temp = temperature.max(0.0);
     let inv_t = if temp > 0.0 { 1.0 / temp } else { 1.0 };
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    let mut probs = Vec::with_capacity(logits.len());
-    for &logit in logits {
-        let p = ((logit - max) * inv_t).exp();
-        probs.push(p);
-        sum += p;
-    }
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&logit| ((logit - max) * inv_t).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
 
     if !sum.is_finite() || sum <= 0.0 {
         return (argmax as u32, argmax as u32, 0.0);
