@@ -202,7 +202,8 @@ is pending pod time** — see the dated `wins/` entries per row.
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Metal DFlash (Qwen3.5) | Substrate only | End-to-end correctness existed in the legacy tree, but the rewrite serve path has no Metal DFlash route. |
-| Metal DFlash (Qwen3.6 / Qwen3.5-MoE) | Substrate only / diagnostic | Target/draft assets exist, but rewrite serving is fail-closed until the external draft route is re-ported and benchmarked. |
+| Metal NextN/MTP (Qwen3.6) | **Shipped** | Qwen3.6-27B-MTP-4bit: 12.3 → 17.75 tok/s (+44%), 68.8% draft acceptance, bit-identical output. Default-on, `--no-speculative` to disable. ([wins](experience/wins/2026-06-21-metal-qwen36-mtp-spec-decode.md)) |
+| Metal DFlash (Qwen3.5-MoE) | Substrate only | Target/draft assets exist, but rewrite serving is fail-closed until the external draft route is re-ported and benchmarked. |
 | CUDA speculative decoding | DSv4 MTP (explicit opt-in) | `arle serve --backend cuda --spec-type mtp --mtp-draft-tokens N --mtp-draft-topk K` lowers into the DSv4 checkpoint-native MTP head. `N` is clamped `[1, 8]`; `K` is the per-level draft candidate width. The verifier stays on the chain-shaped path, so D2/T2 uses 3 verifier rows while top-k only widens candidate matching (`1c41c4a8`, [wins](experience/wins/2026-06-18-dsv4-batched-spec-surface-cleanup.md)). Classical/self/external draft routes remain not shipped; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See [`plans/2026-05-01-longctx-spec-decode-phase2.md`](plans/2026-05-01-longctx-spec-decode-phase2.md) and [`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md). |
 
 ---

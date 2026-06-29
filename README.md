@@ -92,7 +92,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 <sub>512-in / 128-out · c=1 · temp=0 · M4 Pro · build <code>4ea77e11</code> · decode = single-stream generation rate · <a href="benchmarks/README.md">snapshot + method</a></sub>
 
-**Speculative decode beats the HBM-bandwidth wall.** Qwen3.6-27B (OptiQ 4/8-bit): the model's own NextN/MTP head drafts, the base verifies, **output bit-identical to greedy** — **12.3 → 18.1 tok/s (+47%)**, past the 15.2 tok/s HBM floor no kernel can reach.
+**Speculative decode beats the HBM-bandwidth wall.** Qwen3.6-27B (OptiQ 4/8-bit): the model's own NextN/MTP head drafts, the base verifies, **output bit-identical to greedy** — **12.3 → 17.75 tok/s (+44%)**, past the 15.2 tok/s HBM floor no kernel can reach.
 
 <sub>Quality held: PPL 7.82 (vs 8.56 uniform-4bit) · 68.8% draft acceptance · default-on, <code>--no-speculative</code> to disable.</sub>
 
