@@ -23,8 +23,8 @@ fi
 if [[ ! -x "${BIN}" ]]; then
     echo "ARLE binary not found at ${BIN}" >&2
     echo "Build one of these first:" >&2
-    echo "  cargo build --release --features cli -p agent-infer --bin arle" >&2
-    echo "  cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle" >&2
+    echo "  cargo build --release --features cli -p arle --bin arle" >&2
+    echo "  cargo build --release --no-default-features --features metal,no-cuda,cli -p arle --bin arle" >&2
     exit 1
 fi
 

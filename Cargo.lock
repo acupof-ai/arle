@@ -37,16 +37,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-infer"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "cli",
- "infer-util",
- "serde_json",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -130,6 +120,16 @@ name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
+name = "arle"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "cli",
+ "infer-util",
+ "serde_json",
+]
 
 [[package]]
 name = "ash"

@@ -602,7 +602,7 @@ do_build() {
     local start
     start=$(date +%s)
 
-    cargo build --release --no-default-features --features "$arle_features" -p agent-infer --bin arle 2>&1 | while IFS= read -r line; do
+    cargo build --release --no-default-features --features "$arle_features" -p arle --bin arle 2>&1 | while IFS= read -r line; do
         case "$line" in
             *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
                 echo "  $line" ;;

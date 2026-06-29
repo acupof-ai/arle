@@ -65,7 +65,7 @@ jobs:
         run: |
           cargo clippy -p infer-api --no-default-features --features cpu,no-cuda --lib -- -D warnings
           cargo clippy -p cli --no-default-features --features no-cuda -- -D warnings
-          cargo clippy -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
+          cargo clippy -p arle --no-default-features --features cpu,no-cuda,cli --bin arle -- -D warnings
           cargo clippy -p autograd --features no-cuda --lib -- -D warnings
           cargo clippy -p train --features no-cuda --lib -- -D warnings
           cargo clippy -p kv-native-sys --all-targets -- -D warnings
@@ -80,7 +80,7 @@ jobs:
           CUDARC_CUDA_VERSION: "12080"
         run: |
           cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
-          cargo check -p agent-infer --release --no-default-features --features cuda,no-cuda,cli --bin arle
+          cargo check -p arle --release --no-default-features --features cuda,no-cuda,cli --bin arle
           cargo check -p cli --release --no-default-features --features cuda,no-cuda,nccl
 
   test:
@@ -99,7 +99,7 @@ jobs:
         run: |
           cargo test -p infer-api --release --no-default-features --features cpu,no-cuda --lib
           cargo test -p cli --release --no-default-features --features no-cuda
-          cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+          cargo test -p arle --release --no-default-features --features cpu,no-cuda,cli
 
       - name: cargo test (rewrite-stack core crates)
         # Device-neutral crates above the backend seam. infer-core is the

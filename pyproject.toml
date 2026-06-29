@@ -6,8 +6,8 @@
 #
 # Do not upload this to PyPI. The `Private :: Do Not Upload` classifier
 # below makes that explicit; the package name is `arle-pytools` for the
-# same reason — to avoid being confused with the Rust `agent-infer`
-# crate / `arle` binary if anyone ever runs `pip install agent-infer`.
+# same reason — to avoid being confused with the Rust `arle`
+# crate / `arle` binary if anyone ever runs `pip install arle`.
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]

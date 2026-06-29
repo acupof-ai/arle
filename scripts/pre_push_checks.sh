@@ -56,7 +56,7 @@ export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
 
 run python3 scripts/check_repo_hygiene.py
 run cargo fmt --all -- --check
-run cargo check -p agent-infer --no-default-features --features cpu,no-cuda,cli --bin arle
+run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
 run cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
 run cargo test --release \
@@ -68,7 +68,7 @@ METAL_CHECKS="${ARLE_PRE_PUSH_METAL:-${AGENT_INFER_PRE_PUSH_METAL:-0}}"
 
 if [[ "${METAL_CHECKS}" == "1" && "$(uname -s)" == "Darwin" ]]; then
     run cargo check -p infer-api --no-default-features --features metal,no-cuda --lib --release
-    run cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --release --bin arle
+    run cargo check --no-default-features --features metal,no-cuda,cli -p arle --release --bin arle
 elif [[ "${METAL_CHECKS}" == "1" ]]; then
     info "skipping Metal-only checks on non-macOS host"
 else

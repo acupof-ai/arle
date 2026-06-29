@@ -74,7 +74,7 @@ COPY . .
 # the binary is copied out because cache mounts are not part of the image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
-    cargo build --release --features cuda,cli -p agent-infer --bin arle \
+    cargo build --release --features cuda,cli -p arle --bin arle \
     && cp target/release/arle /usr/local/bin/arle
 
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS runtime
@@ -85,7 +85,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/arle /usr/local/bin/arle
-RUN ln -s /usr/local/bin/arle /usr/local/bin/agent-infer
 
 ENV LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64
 

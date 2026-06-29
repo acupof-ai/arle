@@ -27,15 +27,15 @@ hygiene:
 
 # ── Metal (macOS / Apple Silicon) ────────────────────────────────────────────
 build-metal:
-	cargo build --release --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
+	cargo build --release --no-default-features --features metal,no-cuda,cli -p arle --bin arle
 
 check-metal:
 	cargo check -p infer-api --no-default-features --features metal,no-cuda --lib
-	cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --bin arle
+	cargo check --no-default-features --features metal,no-cuda,cli -p arle --bin arle
 
 test-metal:
 	cargo test -p cli --release --no-default-features --features metal,no-cuda
-	cargo test -p agent-infer --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
+	cargo test -p arle --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
 
 bench-metal:
 	./scripts/bench_guidellm.sh make-bench-metal --model $(METAL_MODEL)
@@ -60,7 +60,7 @@ check-cuda:
 
 # ── Platform-agnostic ─────────────────────────────────────────────────────────
 test:
-	cargo test -p agent-infer --release --no-default-features --features cpu,no-cuda,cli
+	cargo test -p arle --release --no-default-features --features cpu,no-cuda,cli
 	cargo test --release \
 		-p infer-core -p infer-server -p infer-plan -p infer-seam \
 		-p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent

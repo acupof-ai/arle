@@ -43,7 +43,7 @@ echo "[train_and_chat] === SFT (2 steps, metal backend) ==="
 # --seq-len     : max tokens per example (pad/truncate)
 # --save-every  : trigger a checkpoint every N steps (here: the only one)
 cargo run --release --no-default-features --features metal,no-cuda,cli \
-  -p agent-infer --bin arle -- \
+  -p arle --bin arle -- \
   train sft \
   --model "$MODEL_PATH" \
   --data  "$SFT_DATA" \
@@ -66,7 +66,7 @@ fi
 
 echo "[train_and_chat] === generate 8 tokens from $(readlink "$CHECKPOINT") ==="
 echo "hi" | cargo run --release --no-default-features --features metal,no-cuda,cli \
-  -p agent-infer --bin arle -- \
+  -p arle --bin arle -- \
   --model-path "$CHECKPOINT" \
   --max-tokens 8 --non-interactive
 
