@@ -205,6 +205,7 @@ impl RealCudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
@@ -212,6 +213,7 @@ impl RealCudaExecutor {
                 model_path,
                 num_slots,
                 total_pages,
+                kv_dtype,
                 mem_fraction_static,
             )?,
         )))
@@ -3251,6 +3253,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// cycle read/write THIS one pool; `Option` only so the OPD-offload path can
     /// drop it. Device-only, self-allocating.
     full_attn_kv: Option<PagedKVPool>,
+    /// KV pool format (BF16 / FP8E4M3 / INT8). Captured at construction from the
+    /// `--kv-cache-dtype` flag; stored so `ensure_kv_pool` can rebuild the pool
+    /// with the same format after `release_kv_pool` drops it on the OPD path.
+    kv_format: KVFormat,
     /// L3 write-through tier for the recall cycle (host DRAM, optional NVMe spill):
     /// the source of truth for evict-dropped middle blocks. Allocated lazily on
     /// the first `set_kv_recall(true)` and sized to ONE pool page image. Keyed by
@@ -3564,6 +3570,7 @@ impl Qwen35CudaExecutor {
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
+        kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
@@ -3626,8 +3633,14 @@ impl Qwen35CudaExecutor {
         // the agent-OPD writeback path — extracted into `build_full_attn_kv_pool`.
         let pool_t0 = Instant::now();
         let requested_pages = total_pages.max(1);
-        let full_attn_kv =
-            Self::build_full_attn_kv_pool(&model, num_slots, requested_pages, mem_fraction_static)?;
+        let kv_format = kv_dtype.kv_format();
+        let full_attn_kv = Self::build_full_attn_kv_pool(
+            &model,
+            num_slots,
+            requested_pages,
+            mem_fraction_static,
+            kv_format,
+        )?;
         cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
 
         // G3 whole-slot spill tier: one entry == one serialized slot image. Its
@@ -3672,6 +3685,7 @@ impl Qwen35CudaExecutor {
                 .collect(),
             recall_quant_warned: false,
             full_attn_kv: Some(full_attn_kv),
+            kv_format,
             recall_tier: None,
             recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
             dram_fraction: DEFAULT_DRAM_FRACTION,
@@ -3700,17 +3714,14 @@ impl Qwen35CudaExecutor {
         num_slots: usize,
         requested_pages: usize,
         mem_fraction_static: f64,
+        kv_format: KVFormat,
     ) -> Result<PagedKVPool> {
         let num_full = model.config.num_full_attention_layers();
         let local_kv_heads = model.local_kv_heads();
         let head_dim = model.config.head_dim;
-        let cell_bytes_per_token = PagedKVPool::budget_bytes_for_tokens(
-            num_full,
-            local_kv_heads,
-            head_dim,
-            1,
-            KVFormat::BF16,
-        ) as u64;
+        let cell_bytes_per_token =
+            PagedKVPool::budget_bytes_for_tokens(num_full, local_kv_heads, head_dim, 1, kv_format)
+                as u64;
         // H1: the per-slot recurrent block (gdr + conv) is reserved out of the
         // SAME free VRAM `kv_budget_num_slots` clamped against. Subtract that
         // reservation from free BEFORE profiling the full-attn pool, so
@@ -3760,7 +3771,7 @@ impl Qwen35CudaExecutor {
             local_kv_heads,
             head_dim,
             pool_token_budget,
-            KVFormat::BF16,
+            kv_format,
         );
         let full_attn_kv = PagedKVPool::with_format(
             &model.ctx,
@@ -3769,7 +3780,7 @@ impl Qwen35CudaExecutor {
             head_dim,
             num_slots,
             pool_budget_bytes,
-            KVFormat::BF16,
+            kv_format,
         )?;
         ensure!(
             full_attn_kv.page_size == SUPPORTED_PAGE_SIZE,
@@ -3835,6 +3846,7 @@ impl Qwen35CudaExecutor {
             self.num_slots,
             self.kv_pool_requested_pages,
             self.kv_pool_mem_fraction_static,
+            self.kv_format,
         )?;
         log::info!(
             "Qwen3.6 re-acquired full-attn KV pool: {}MB (agent-OPD next-round rollout)",
