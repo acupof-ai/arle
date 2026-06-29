@@ -5,7 +5,7 @@
 # the ones that don't — so the snapshot documents real coverage, not guesses.
 # STRICTLY serial (no concurrent Metal loads).
 set -uo pipefail
-cd /path/to/code/agent-infer
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN=target/release/arle
 PORT=8000
 PROMPT=512; NOUT=128; K=6

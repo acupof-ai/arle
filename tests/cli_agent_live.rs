@@ -93,7 +93,7 @@ fn cli_run_prompt_executes_tool_for_local_file_query() {
         json["text"]
             .as_str()
             .expect("one-shot text")
-            .contains("/path/to/code/agent-infer"),
+            .contains(env!("CARGO_MANIFEST_DIR")),
         "CLI output did not contain the expected working directory\nstdout:\n{}\nstderr:\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)
@@ -177,7 +177,7 @@ fn cli_run_stdin_uses_shell_for_file_listing_queries() {
         json["text"]
             .as_str()
             .expect("one-shot text")
-            .contains("/path/to/code/agent-infer"),
+            .contains(env!("CARGO_MANIFEST_DIR")),
         "CLI shell output did not include the expected working directory\nstdout:\n{}\nstderr:\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)

@@ -3,7 +3,7 @@
 # models on the Metal backend. STRICTLY serial — one model loaded at a time
 # (two concurrent Metal loads swap->SSD-thrash->freeze on a 48 GB box).
 set -uo pipefail
-cd /path/to/code/agent-infer
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN=target/release/arle
 PORT=8000
 PROMPT=512

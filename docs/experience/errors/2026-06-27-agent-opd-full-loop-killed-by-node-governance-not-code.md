@@ -56,7 +56,7 @@ Ruled out, with evidence:
 
 What's left, and unique to the killed runs: a **sustained dual-27B ~58.8 GB GPU
 residency** (rollout engine + autograd student co-resident) on a box whose kernel
-log shows **`[ELKEID]`** (redacted HIDS) actively instrumenting executables, and
+log shows **`[ELKEID]`** (a host-based HIDS) actively instrumenting executables, and
 on which a foreign 87 GB GPU process vanished at the same time as the first kill.
 The signature (silent SIGKILL of the whole process tree, uncatchable, no CUDA/host
 OOM, footprint/wall-clock-correlated) is consistent with a **node-level GPU-memory
