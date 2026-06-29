@@ -3332,26 +3332,11 @@ impl std::fmt::Debug for Qwen35CudaExecutor {
 }
 
 impl Qwen35CudaExecutor {
-    /// Radix prefix reuse over the shared paged full-attn pool — same uniform
-    /// mechanism as dense Qwen3 (`pages_only_reusable_prefix_blocks` + the
-    /// infer-core radix cache). Resident pages only: Qwen3.6 has no prefix-tier
-    /// demote/promote yet (`demote/promote_prefix_pages` no-op for Qwen35), so
-    /// demoted keys are never restorable and the count stops at the first one.
-    ///
-    /// Hybrid models (gated-delta linear layers) now support prefix reuse via the
-    /// recurrent sidecar snapshot protocol (issue #85). The sidecar is captured in
-    /// `capture_recurrent_sidecar` after prefill and restored in
-    /// `restore_recurrent_sidecar` at page-radix attach time. Pure full-attn
-    /// checkpoints work identically (no sidecar to capture or restore).
+    /// `|_| false`: demote/promote is a no-op for Qwen35, so demoted pages are never restorable.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         pages_only_reusable_prefix_blocks(blocks, |_| false)
     }
 
-    /// Capture the slot's recurrent state as a prefix sidecar, keyed by the
-    /// FNV hash of `tokens[..mat_len]` where `mat_len` is the slot's current
-    /// `seq_len()` (block-aligned by `publish_prefix_blocks`). Called from
-    /// `capture_cached_prefix` after a prefill completes. No-op for pure full-attn
-    /// checkpoints (no recurrent state to capture).
     pub(crate) fn capture_recurrent_sidecar(
         &mut self,
         slot: usize,
@@ -3397,13 +3382,9 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Restore the recurrent state for `slot` from the sidecar snapshot keyed by
-    /// `tokens[..matched_len]`. Acquires the recurrent buffers first so the
-    /// subsequent tail-prefill sees a populated state. Also syncs the device KV
-    /// pool (`full_attn_kv`) so its `seq_len(slot)` matches `matched_len` before
-    /// the next `prefill_row_paged_default` runs. On a sidecar cache miss logs a
-    /// debug message and proceeds with zeroed recurrent (graceful degradation —
-    /// same correctness as pre-#85 behavior, worse quality but not a hard error).
+    /// Acquires recurrent buffers before restore so the tail-prefill sees populated state.
+    /// Also resets device KV pool seq_len to matched_len for the prefill_row_paged_default invariant.
+    /// Cache miss → zeroed recurrent (graceful degradation, not a hard error).
     pub(crate) fn restore_recurrent_sidecar(
         &mut self,
         slot: usize,
@@ -3429,10 +3410,7 @@ impl Qwen35CudaExecutor {
         }
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
-        // Release the prior occupant's recurrent block (if any) before acquiring a
-        // fresh one. The slot is reused from a completed request whose start_pos != 0
-        // path never triggers the release_recurrent + acquire_recurrent pair that
-        // submit_prefill_row runs at start_pos == 0 — so we must do it here.
+        // Reused slot: start_pos != 0 skips the normal release+acquire in submit_prefill_row.
         self.slots[slot].release_recurrent(&mut self.recurrent_pool);
         self.slots[slot].acquire_recurrent(
             &self.model.ctx,
@@ -3444,10 +3422,7 @@ impl Qwen35CudaExecutor {
 
         let snap = self.prefix_sidecar.get(&key).cloned();
 
-        // Restore recurrent state (gdr + conv tensors) then fix up seq_len.
-        // restore_recurrent_from_snapshot copies the device data but does not
-        // advance seq_len; we set it to matched_len so submit_decode_row's
-        // invariant check (slot.seq_len == kv_seq_len) holds on the first decode step.
+        // restore_recurrent_from_snapshot doesn't advance seq_len; set it for submit_decode_row invariant.
         match snap.as_ref() {
             Some(s) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, s)?,
             None => {
@@ -3459,23 +3434,19 @@ impl Qwen35CudaExecutor {
         }
         self.slots[slot].set_seq_len(matched_len);
 
-        // Sync device KV pool so prefill_row_paged_default sees pool.seq_len(slot) == matched_len.
-        // This must run regardless of sidecar hit/miss: free prior occupant, alloc fresh pages,
-        // optionally restore KV content from the snapshot.
+        // Must run regardless of sidecar hit/miss: free prior occupant, alloc fresh pages.
         if let Some(pool) = self.full_attn_kv.as_mut() {
             pool.free_slot(slot);
             let new_pages = pool.alloc_tokens(slot, matched_len).map_err(|e| {
                 anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
             if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
-                // H2D: write cached KV content into the freshly allocated pages.
                 pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data)
                     .map_err(|e| {
                         anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
                     })?;
             }
-            // Stream-order: the H2D copies above are ordered before any subsequent
-            // kernel on the same stream — no explicit synchronize needed here.
+            // Stream-order: H2D above is ordered before subsequent kernels; no explicit sync needed.
         }
         Ok(())
     }
