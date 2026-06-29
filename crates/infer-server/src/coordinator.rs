@@ -258,10 +258,15 @@ fn stream_coord_completion(
     }
 
     let model = state.model.clone();
+    let tokenizer = state
+        .tokenizer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::spawn(async move {
         let _guard = guard; // keeps in_flight > 0 for the lockstep loop
-        drive_coord_sse(model, prompt_len, sink_rx, sse_tx).await;
+        drive_coord_sse(model, prompt_len, tokenizer, sink_rx, sse_tx).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(sse_rx))
@@ -272,15 +277,21 @@ fn stream_coord_completion(
 async fn drive_coord_sse(
     model: String,
     prompt_len: usize,
+    tokenizer: crate::tokenizer::OpenAiTokenizer,
     mut sink_rx: tokio::sync::mpsc::UnboundedReceiver<RelayCompletionDelta>,
     tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let id = format!("cmpl-{}", Uuid::new_v4().simple());
     let created = unix_time_secs();
     let mut completion_tokens: usize = 0;
+    // Accumulate token_ids from all deltas; decoded to text on terminal emit.
+    // (Workers currently send one terminal delta with all IDs; streaming
+    // per-token relay is a STAGE 2 upgrade.)
+    let mut all_token_ids: Vec<u32> = Vec::new();
 
     while let Some(delta) = sink_rx.recv().await {
         completion_tokens += delta.token_ids.len();
+        all_token_ids.extend_from_slice(&delta.token_ids);
         let is_done = delta.is_done();
 
         if let Some(err) = &delta.error {
@@ -309,6 +320,22 @@ async fn drive_coord_sse(
         }
 
         if is_done {
+            // Decode accumulated token_ids to text (workers send IDs, not text).
+            let text = if !all_token_ids.is_empty() {
+                tokenizer.decode(&all_token_ids).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if !text.is_empty() {
+                let chunk = completion_stream_chunk(&id, created, &model, text, None, None);
+                if tx
+                    .send(Ok(Event::default().data(chunk.to_string())))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             let usage = json!({
                 "prompt_tokens": prompt_len,
                 "completion_tokens": completion_tokens,

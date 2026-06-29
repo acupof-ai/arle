@@ -92,6 +92,7 @@ NUM_THREADS = 128
 # full-attn family. Extend here + the build.rs list + the matching
 # FFI/Rust dispatch arms in lockstep when adding a new size.
 SUPPORTED_HEADS = (
+    (8, 1),    # Qwen3.5-122B-A10B at TP=4 (KV replication, 2 kv_heads / 2 → 1 per rank)
     (8, 2),    # Qwen3.5-0.8B
     (16, 2),   # Qwen3.6 MoE 30B-A3B
     (16, 4),   # Qwen3.5 medium / 14B / 32B-class
