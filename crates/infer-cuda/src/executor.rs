@@ -3395,6 +3395,21 @@ impl Qwen35CudaExecutor {
         _prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         let matched_len = matched_len.min(tokens.len());
+        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
+            let pool_len = self
+                .full_attn_kv
+                .as_ref()
+                .map_or(usize::MAX, |p| p.seq_len(slot));
+            eprintln!(
+                "[kvdrift] RESTORE-SIDECAR slot={} matched_len={} prompt_tokens={} prefix_pages={} slot.seq_len(before)={} pool.seq_len(before)={}",
+                slot,
+                matched_len,
+                tokens.len(),
+                _prefix_pages.len(),
+                self.slots[slot].seq_len(),
+                pool_len,
+            );
+        }
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Release the prior occupant's recurrent block (if any) before acquiring a
@@ -4030,6 +4045,21 @@ impl Qwen35CudaExecutor {
         position: u64,
     ) -> Result<u32> {
         let slot = row.slot;
+        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
+            let pool_len = self
+                .full_attn_kv
+                .as_ref()
+                .map_or(usize::MAX, |p| p.seq_len(slot));
+            eprintln!(
+                "[kvdrift] PREFILL slot={} start_pos={} tokens={} total={} slot.seq_len={} pool.seq_len={}",
+                slot,
+                row.start_pos,
+                row.tokens.len(),
+                row.total_tokens,
+                self.slots[slot].seq_len(),
+                pool_len,
+            );
+        }
         {
             let pool = self
                 .full_attn_kv
@@ -4765,6 +4795,22 @@ impl Qwen35CudaExecutor {
             row.slot,
             self.num_slots
         );
+        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some()
+            && self.slots[row.slot].seq_len() != row.kv_seq_len
+        {
+            let pool_len = self
+                .full_attn_kv
+                .as_ref()
+                .map_or(usize::MAX, |p| p.seq_len(row.slot));
+            eprintln!(
+                "[kvdrift] DECODE-ASSERT slot={} slot.seq_len={} row.kv_seq_len={} pool.seq_len={} (Δslot-row={})",
+                row.slot,
+                self.slots[row.slot].seq_len(),
+                row.kv_seq_len,
+                pool_len,
+                self.slots[row.slot].seq_len() as i64 - row.kv_seq_len as i64,
+            );
+        }
         ensure!(
             self.slots[row.slot].seq_len() == row.kv_seq_len,
             "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
