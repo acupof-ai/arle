@@ -213,6 +213,98 @@ pub fn expand_deepseek_ocr_image_markers(
 /// token and degenerates into a non-stopping `{"text":"image"}…` loop that burns
 /// the whole token budget; (2) text-before-image ordering → garbled output, since
 /// the model was trained with the image soft tokens ahead of the instruction.
+pub(crate) fn extract_images(
+    messages: &[crate::schema::ChatMessage],
+    kind: Option<infer_plan::MultimodalKind>,
+) -> Result<Vec<infer_plan::MultimodalImage>, crate::schema::ApiError> {
+    let mut images = Vec::new();
+    for message in messages {
+        let Some(crate::schema::ChatContent::Parts(parts)) = &message.content else {
+            continue;
+        };
+        for part in parts {
+            match part.normalized_kind() {
+                "image" => {
+                    let url = image_data_url(part)?;
+                    let bytes = decode_image_data_url(url)?;
+                    let preprocessed = match kind {
+                        Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+                            preprocess_deepseek_ocr_image(&bytes)
+                        }
+                        Some(infer_plan::MultimodalKind::Gemma4) => preprocess_gemma4_image(&bytes),
+                        None => {
+                            return Err(crate::schema::ApiError::bad_request(
+                                "image content requires a VLM backend (Gemma4 or DeepSeek-OCR)",
+                            ));
+                        }
+                    };
+                    images.push(preprocessed.map_err(|err| {
+                        crate::schema::ApiError::bad_request(format!("invalid image data: {err}"))
+                    })?);
+                }
+                "audio" | "video" => {
+                    return Err(crate::schema::ApiError::bad_request(
+                        "audio/video content parts are not supported by this VLM",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(images)
+}
+
+pub(crate) fn expand_image_markers(
+    prompt: &str,
+    images: &[infer_plan::MultimodalImage],
+    kind: Option<infer_plan::MultimodalKind>,
+) -> Result<String, crate::schema::ApiError> {
+    let expanded = match kind {
+        Some(infer_plan::MultimodalKind::DeepseekOcr) => {
+            expand_deepseek_ocr_image_markers(prompt, images)
+        }
+        _ => expand_gemma4_image_markers(prompt, images),
+    };
+    expanded.map_err(|err| crate::schema::ApiError::bad_request(format!("{err}")))
+}
+
+fn image_data_url(part: &crate::schema::ChatContentPart) -> Result<&str, crate::schema::ApiError> {
+    fn value_url(value: &serde_json::Value) -> Option<&str> {
+        value
+            .as_str()
+            .or_else(|| value.get("url").and_then(serde_json::Value::as_str))
+    }
+    part.image_url
+        .as_ref()
+        .and_then(value_url)
+        .or_else(|| part.input_image.as_ref().and_then(value_url))
+        .or_else(|| part.extra.get("image_url").and_then(value_url))
+        .or_else(|| part.extra.get("url").and_then(serde_json::Value::as_str))
+        .ok_or_else(|| {
+            crate::schema::ApiError::bad_request("image content part must include image_url.url")
+        })
+}
+
+fn decode_image_data_url(url: &str) -> Result<Vec<u8>, crate::schema::ApiError> {
+    use base64::Engine;
+    let Some((header, payload)) = url.split_once(',') else {
+        return Err(crate::schema::ApiError::bad_request(
+            "image_url must be a data:image/...;base64 URL",
+        ));
+    };
+    let header = header.to_ascii_lowercase();
+    if !header.starts_with("data:image/") || !header.ends_with(";base64") {
+        return Err(crate::schema::ApiError::bad_request(
+            "image_url must be a data:image/...;base64 URL",
+        ));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.as_bytes())
+        .map_err(|err| {
+            crate::schema::ApiError::bad_request(format!("invalid base64 image data: {err}"))
+        })
+}
+
 pub fn build_deepseek_ocr_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::from(DEEPSEEK_OCR_BOS_MARKER);
     for message in messages {

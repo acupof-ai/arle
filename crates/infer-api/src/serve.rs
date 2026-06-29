@@ -281,7 +281,8 @@ pub fn serve_coordinator_http(
     }
     let model_id = crate::serve_engine::model_id_from_path(model_path);
     let shutdown = infer_server::ServeShutdown::new();
-    let router = infer_server::coordinator_router(relay, tokenizer, model_id, max_thinking_tokens);
+    let router =
+        infer_server::coordinator_router(relay, tokenizer, model_id, max_thinking_tokens, None);
     if mark {
         eprintln!("[COORD-MARK] 7/10 coordinator_router built; building tokio runtime");
     }

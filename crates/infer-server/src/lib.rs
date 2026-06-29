@@ -40,7 +40,6 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 mod coordinator;
 mod execution;
-mod http;
 mod metrics;
 pub mod multimodal;
 pub mod multiproc_relay;
@@ -52,7 +51,18 @@ use execution::{ControlMessage, Submission, engine_loop};
 pub use execution::{CounterSnapshot, StreamItem};
 
 pub use coordinator::coordinator_router;
-pub use http::openai_router;
+
+/// In-process channel for multimodal requests from coordinator → relay driver.
+pub struct LocalMultimodalRequest {
+    pub prompt_tokens: Vec<u32>,
+    pub images: Vec<infer_plan::MultimodalImage>,
+    pub max_tokens: usize,
+    pub sampling: infer_plan::SamplingParams,
+    pub response_tx: tokio::sync::oneshot::Sender<multiproc_relay::RelayCompletionDelta>,
+}
+
+pub type LocalMultimodalTx = std::sync::mpsc::SyncSender<LocalMultimodalRequest>;
+pub(crate) type LocalMultimodalRx = std::sync::mpsc::Receiver<LocalMultimodalRequest>;
 pub use multiproc_relay::{
     PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
     RelayWorker, TcpChannel, WireRequest, WireStats, broadcast_tick, set_tick_broadcaster,
@@ -632,14 +642,14 @@ impl BackendExecutor for EchoExecutor {
 ///
 /// Identical route surface as [`coordinator_router`] (single HTTP implementation);
 /// request handling goes through the relay protocol over an in-process channel
-/// rather than TCP. Vision models (Gemma4, DeepseekOcr, DiffusionGemma) should
-/// use [`openai_router`] instead — the relay wire format does not carry multimodal
-/// data.
+/// rather than TCP. Pass `multimodal_kind` for VLM backends (Gemma4, DeepseekOcr,
+/// DiffusionGemma); text-only backends pass `None`.
 pub fn coordinator_local_router<E, K>(
     serve: ServeHandle<E, K>,
     tokenizer: tokenizer::OpenAiTokenizer,
     model: impl Into<String>,
     max_thinking_tokens: usize,
+    multimodal_kind: Option<infer_plan::MultimodalKind>,
 ) -> axum::Router
 where
     E: infer_seam::BackendExecutor + 'static,
@@ -651,25 +661,91 @@ where
     let (relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
     let serve = Arc::new(serve);
 
-    std::thread::Builder::new()
-        .name("arle-local-relay-driver".to_string())
-        .spawn(move || {
-            serve_handle_relay_driver(serve, engine_recv, engine_tx);
-        })
-        .expect("spawn arle-local-relay-driver");
+    let coord_multimodal = if let Some(kind) = multimodal_kind {
+        let (multimodal_tx, multimodal_rx) =
+            std::sync::mpsc::sync_channel::<LocalMultimodalRequest>(8);
+        std::thread::Builder::new()
+            .name("arle-local-relay-driver".to_string())
+            .spawn(move || {
+                serve_handle_relay_driver(serve, engine_recv, engine_tx, Some(multimodal_rx));
+            })
+            .expect("spawn arle-local-relay-driver");
+        Some((multimodal_tx, kind))
+    } else {
+        std::thread::Builder::new()
+            .name("arle-local-relay-driver".to_string())
+            .spawn(move || {
+                serve_handle_relay_driver(serve, engine_recv, engine_tx, None);
+            })
+            .expect("spawn arle-local-relay-driver");
+        None
+    };
 
-    coordinator::coordinator_router(relay, tokenizer, model.into(), max_thinking_tokens)
+    coordinator::coordinator_router(
+        relay,
+        tokenizer,
+        model.into(),
+        max_thinking_tokens,
+        coord_multimodal,
+    )
 }
 
 fn serve_handle_relay_driver<E, K>(
     serve: std::sync::Arc<ServeHandle<E, K>>,
     mut engine_recv: multiproc_relay::LocalChannelRecv,
     engine_tx: std::sync::mpsc::SyncSender<multiproc_relay::RelayEnvelope>,
+    multimodal_rx: Option<LocalMultimodalRx>,
 ) where
     E: infer_seam::BackendExecutor + 'static,
     K: infer_seam::KvPool + 'static,
 {
     use multiproc_relay::{RelayChannel, RelayEnvelope, WireStats};
+
+    if let Some(rx) = multimodal_rx {
+        let serve_mm = std::sync::Arc::clone(&serve);
+        std::thread::Builder::new()
+            .name("arle-local-multimodal".to_string())
+            .spawn(move || {
+                for req in rx {
+                    let serve_clone = std::sync::Arc::clone(&serve_mm);
+                    std::thread::spawn(move || {
+                        let result = serve_clone.run_on_executor(move |e| {
+                            e.generate_multimodal(
+                                &req.prompt_tokens,
+                                &req.images,
+                                req.max_tokens,
+                                &req.sampling,
+                            )
+                        });
+                        let delta = match result {
+                            Ok(Ok(Some(out))) => multiproc_relay::RelayCompletionDelta {
+                                text_delta: String::new(),
+                                token_ids: out.generated_tokens,
+                                finish: true,
+                                finish_reason: Some(out.finish),
+                                error: None,
+                            },
+                            Ok(Ok(None)) => multiproc_relay::RelayCompletionDelta {
+                                text_delta: String::new(),
+                                token_ids: Vec::new(),
+                                finish: true,
+                                finish_reason: None,
+                                error: Some("generate_multimodal returned None".to_string()),
+                            },
+                            Ok(Err(e)) | Err(e) => multiproc_relay::RelayCompletionDelta {
+                                text_delta: String::new(),
+                                token_ids: Vec::new(),
+                                finish: true,
+                                finish_reason: None,
+                                error: Some(e.to_string()),
+                            },
+                        };
+                        let _ = req.response_tx.send(delta);
+                    });
+                }
+            })
+            .expect("spawn arle-local-multimodal");
+    }
 
     loop {
         match engine_recv.recv() {
