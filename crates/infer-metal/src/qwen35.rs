@@ -170,63 +170,62 @@ pub(crate) fn load_qwen35_metal_weights(
             .count(),
     );
 
-    let mut layers = Vec::with_capacity(config.num_hidden_layers);
-    for i in 0..config.num_hidden_layers {
-        let layer_prefix = format!("{prefix}.layers.{i}");
-        let attention = match arch.layer_types[i] {
-            MetalQwen35LayerType::FullAttention => {
-                let attn_prefix = format!("{layer_prefix}.self_attn");
-                build_qwen35_full_attention(
-                    load_proj(&format!("{attn_prefix}.q_proj"))?,
-                    load_proj(&format!("{attn_prefix}.k_proj"))?,
-                    load_proj(&format!("{attn_prefix}.v_proj"))?,
-                    load_proj(&format!("{attn_prefix}.o_proj"))?,
-                    load_norm(&format!("{attn_prefix}.q_norm.weight"))?,
-                    load_norm(&format!("{attn_prefix}.k_norm.weight"))?,
-                )
-            }
-            MetalQwen35LayerType::LinearAttention => {
-                let attn_prefix = format!("{layer_prefix}.linear_attn");
-                build_qwen35_linear_attention(
-                    load_proj(&format!("{attn_prefix}.in_proj_qkv"))?,
-                    load_proj(&format!("{attn_prefix}.in_proj_z"))?,
-                    load_proj(&format!("{attn_prefix}.in_proj_b"))?,
-                    load_proj(&format!("{attn_prefix}.in_proj_a"))?,
-                    load_conv1d_weight(
-                        &get(&format!("{attn_prefix}.conv1d.weight"))?,
-                        &arch.linear,
-                    )?,
-                    get(&format!("{attn_prefix}.dt_bias"))?,
-                    as_dtype(&get(&format!("{attn_prefix}.A_log"))?, Dtype::Float32),
-                    get(&format!("{attn_prefix}.norm.weight"))?,
-                    load_proj(&format!("{attn_prefix}.out_proj"))?,
+    let layers = (0..config.num_hidden_layers)
+        .map(|i| {
+            let layer_prefix = format!("{prefix}.layers.{i}");
+            let attention = match arch.layer_types[i] {
+                MetalQwen35LayerType::FullAttention => {
+                    let attn_prefix = format!("{layer_prefix}.self_attn");
+                    build_qwen35_full_attention(
+                        load_proj(&format!("{attn_prefix}.q_proj"))?,
+                        load_proj(&format!("{attn_prefix}.k_proj"))?,
+                        load_proj(&format!("{attn_prefix}.v_proj"))?,
+                        load_proj(&format!("{attn_prefix}.o_proj"))?,
+                        load_norm(&format!("{attn_prefix}.q_norm.weight"))?,
+                        load_norm(&format!("{attn_prefix}.k_norm.weight"))?,
+                    )
+                }
+                MetalQwen35LayerType::LinearAttention => {
+                    let attn_prefix = format!("{layer_prefix}.linear_attn");
+                    build_qwen35_linear_attention(
+                        load_proj(&format!("{attn_prefix}.in_proj_qkv"))?,
+                        load_proj(&format!("{attn_prefix}.in_proj_z"))?,
+                        load_proj(&format!("{attn_prefix}.in_proj_b"))?,
+                        load_proj(&format!("{attn_prefix}.in_proj_a"))?,
+                        load_conv1d_weight(
+                            &get(&format!("{attn_prefix}.conv1d.weight"))?,
+                            &arch.linear,
+                        )?,
+                        get(&format!("{attn_prefix}.dt_bias"))?,
+                        as_dtype(&get(&format!("{attn_prefix}.A_log"))?, Dtype::Float32),
+                        get(&format!("{attn_prefix}.norm.weight"))?,
+                        load_proj(&format!("{attn_prefix}.out_proj"))?,
+                    )?
+                }
+            };
+            let mlp = if let Some(moe_cfg) = arch.moe.as_ref().filter(|moe| moe.is_moe_layer(i)) {
+                MlpKind::Moe(load_qwen35_moe_layer_weights(
+                    &tensors,
+                    &layer_prefix,
+                    moe_cfg,
+                )?)
+            } else {
+                build_qwen35_dense_mlp(
+                    load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?,
+                    load_proj(&format!("{layer_prefix}.mlp.up_proj"))?,
+                    load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
                 )?
-            }
-        };
-
-        let mlp = if let Some(moe_cfg) = arch.moe.as_ref().filter(|moe| moe.is_moe_layer(i)) {
-            MlpKind::Moe(load_qwen35_moe_layer_weights(
-                &tensors,
-                &layer_prefix,
-                moe_cfg,
-            )?)
-        } else {
-            build_qwen35_dense_mlp(
-                load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?,
-                load_proj(&format!("{layer_prefix}.mlp.up_proj"))?,
-                load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
-            )?
-        };
-
-        layers.push(MetalQwen35BlockWeights {
-            input_layernorm: load_norm(&format!("{layer_prefix}.input_layernorm.weight"))?,
-            attention,
-            post_attention_layernorm: load_norm(&format!(
-                "{layer_prefix}.post_attention_layernorm.weight"
-            ))?,
-            mlp,
-        });
-    }
+            };
+            Ok(MetalQwen35BlockWeights {
+                input_layernorm: load_norm(&format!("{layer_prefix}.input_layernorm.weight"))?,
+                attention,
+                post_attention_layernorm: load_norm(&format!(
+                    "{layer_prefix}.post_attention_layernorm.weight"
+                ))?,
+                mlp,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut weights = Qwen35MetalWeights {
         embedding: Qwen35Embedding::Dense(embed_tokens),
@@ -1077,23 +1076,23 @@ impl CppQwen35Model {
             count as usize == expected_tape_count,
             "Qwen3.5 DFlash expected {expected_tape_count} GDR tapes, got {count}"
         );
-        let mut tapes = Vec::with_capacity(expected_tape_count);
-        for idx in 0..expected_tape_count {
-            anyhow::ensure!(
-                !out_tapes[idx].is_null()
-                    && !out_k[idx].is_null()
-                    && !out_g[idx].is_null()
-                    && !out_qkv[idx].is_null(),
-                "Qwen3.5 DFlash GDR tape #{idx} contained a null handle"
-            );
-            tapes.push(Qwen35GdrTape {
-                innovation_tape: unsafe { MlxArray::from_raw(out_tapes[idx]) },
-                k: unsafe { MlxArray::from_raw(out_k[idx]) },
-                g: unsafe { MlxArray::from_raw(out_g[idx]) },
-                qkv: unsafe { MlxArray::from_raw(out_qkv[idx]) },
-            });
-        }
-        Ok(tapes)
+        (0..expected_tape_count)
+            .map(|idx| {
+                anyhow::ensure!(
+                    !out_tapes[idx].is_null()
+                        && !out_k[idx].is_null()
+                        && !out_g[idx].is_null()
+                        && !out_qkv[idx].is_null(),
+                    "Qwen3.5 DFlash GDR tape #{idx} contained a null handle"
+                );
+                Ok(Qwen35GdrTape {
+                    innovation_tape: unsafe { MlxArray::from_raw(out_tapes[idx]) },
+                    k: unsafe { MlxArray::from_raw(out_k[idx]) },
+                    g: unsafe { MlxArray::from_raw(out_g[idx]) },
+                    qkv: unsafe { MlxArray::from_raw(out_qkv[idx]) },
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
     }
 
     #[allow(clippy::too_many_arguments)]
