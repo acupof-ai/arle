@@ -3374,7 +3374,11 @@ impl Qwen35CudaExecutor {
         // D2H snapshot full-attention KV pages so the sidecar is complete for prefix reuse.
         // snapshot_recurrent already synchronized the stream, so device pages are flushed.
         if let Some(pool) = self.full_attn_kv.as_ref() {
-            let pages = pool.page_indices(slot).to_vec();
+            // Limit to exactly the pages covered by mat_len so the snapshot size matches
+            // what restore expects (matched_len pages, not total allocated pages).
+            let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
+            let all_pages = pool.page_indices(slot);
+            let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
             if !pages.is_empty() {
                 match pool.copy_pages_to_host(&self.model.ctx, &pages) {
                     Ok(data) => snap.full_attn_kv = Some(data),
