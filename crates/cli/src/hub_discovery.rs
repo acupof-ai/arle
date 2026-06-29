@@ -144,8 +144,7 @@ fn snapshot_is_draft_only(path: &Path) -> bool {
     };
     archs.iter().any(|item| {
         item.as_str()
-            .map(|s| DRAFT_ONLY_ARCHITECTURES.contains(&s))
-            .unwrap_or(false)
+            .is_some_and(|s| DRAFT_ONLY_ARCHITECTURES.contains(&s))
     })
 }
 

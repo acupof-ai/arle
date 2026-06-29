@@ -155,17 +155,10 @@ pub(crate) struct MetalDeepseekOcrConfig {
 }
 
 pub fn model_dir_is_deepseek_ocr(model_dir: &Path) -> bool {
-    let path = model_dir.join("config.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    let Some(root) = value.as_object() else {
-        return false;
-    };
-    is_deepseek_ocr_config(root)
+    try_read_config_json(model_dir)
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(is_deepseek_ocr_config)
 }
 
 fn is_deepseek_ocr_config(root: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -358,39 +351,36 @@ fn gemma4_vision_config_from_root(
 }
 
 pub fn model_dir_is_diffusion_gemma(model_dir: &Path) -> bool {
-    let path = model_dir.join("config.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Some(value) = try_read_config_json(model_dir) else {
         return false;
     };
     let Some(root) = value.as_object() else {
         return false;
     };
-    let text_config = root
+    let model = root
         .get("text_config")
-        .and_then(serde_json::Value::as_object);
-    let model = text_config.unwrap_or(root);
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(root);
     is_diffusion_gemma_config(root, model)
 }
 
 pub fn model_dir_is_gemma4(model_dir: &Path) -> bool {
-    let path = model_dir.join("config.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Some(value) = try_read_config_json(model_dir) else {
         return false;
     };
     let Some(root) = value.as_object() else {
         return false;
     };
-    let text_config = root
+    let model = root
         .get("text_config")
-        .and_then(serde_json::Value::as_object);
-    let model = text_config.unwrap_or(root);
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(root);
     is_gemma4_config(root, model) && !is_diffusion_gemma_config(root, model)
+}
+
+fn try_read_config_json(model_dir: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// Load a safetensors Qwen3.5/Qwen3.6 config for the clean Metal executor.
