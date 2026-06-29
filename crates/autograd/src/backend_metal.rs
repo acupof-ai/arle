@@ -2322,19 +2322,18 @@ fn mlx_embedding(weight: &[f32], vocab: usize, dim: usize, ids: &[i32]) -> Resul
     // Sanitize ids on the host: clamp OOB / negative to 0 so `mlx_take_axis`
     // never trips a bounds assertion, and track which output rows must be
     // zeroed (matches `cpu_embedding_forward` behavior).
-    let mut safe_ids: Vec<i32> = Vec::with_capacity(n_ids);
-    let mut row_mask: Vec<f32> = Vec::with_capacity(n_ids);
     let mut has_invalid = false;
-    for &id in ids {
-        if id < 0 || (id as usize) >= vocab {
-            safe_ids.push(0);
-            row_mask.push(0.0);
-            has_invalid = true;
-        } else {
-            safe_ids.push(id);
-            row_mask.push(1.0);
-        }
-    }
+    let (safe_ids, row_mask): (Vec<i32>, Vec<f32>) = ids
+        .iter()
+        .map(|&id| {
+            if id < 0 || (id as usize) >= vocab {
+                has_invalid = true;
+                (0i32, 0.0f32)
+            } else {
+                (id, 1.0f32)
+            }
+        })
+        .unzip();
 
     let weight_shape = [vocab as i32, dim as i32];
     let ids_shape = [n_ids as i32];
