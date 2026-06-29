@@ -88,11 +88,13 @@ pub fn shard_row_parallel(
     let row_stride = cols * elem_size;
     let col_start = spec.offset * elem_size;
     let col_len = spec.size * elem_size;
-    let mut out = Vec::with_capacity(rows * col_len);
-    for r in 0..rows {
-        let row_base = r * row_stride + col_start;
-        out.extend_from_slice(&bytes[row_base..row_base + col_len]);
-    }
+    let out: Vec<u8> = (0..rows)
+        .flat_map(|r| {
+            bytes[r * row_stride + col_start..r * row_stride + col_start + col_len]
+                .iter()
+                .copied()
+        })
+        .collect();
     Ok(ShardedBytes {
         bytes: out,
         rows,

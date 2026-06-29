@@ -1170,10 +1170,10 @@ mod real {
             if !bytes.len().is_multiple_of(4) {
                 return Err(VulkanError::InvalidSpirvLength(bytes.len()));
             }
-            let mut words = Vec::with_capacity(bytes.len() / 4);
-            for chunk in bytes.chunks_exact(4) {
-                words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-            }
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             Self::from_spirv_words(ctx, &words)
         }
 
@@ -2132,13 +2132,7 @@ void main() {
         const ADDENDS: [i32; 3] = [2, 4, 5];
         let expected: Vec<i32> = initial.iter().map(|&v| v + 2 + 4 + 5).collect();
 
-        let bytes_of = |v: &[i32]| -> Vec<u8> {
-            let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-            out
-        };
+        let bytes_of = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let ints_of = |b: &[u8]| -> Vec<i32> {
             b.chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -2154,12 +2148,8 @@ void main() {
             ComputePipeline::create_with_push_constants(&ctx, &shader, &[&layout], push_bytes)
                 .expect("create add pipeline");
         let groups = [(N as u32).div_ceil(64), 1, 1];
-        let push_for = |addend: i32| -> Vec<u8> {
-            let mut p = Vec::with_capacity(8);
-            p.extend_from_slice(&(N as u32).to_le_bytes());
-            p.extend_from_slice(&addend.to_le_bytes());
-            p
-        };
+        let push_for =
+            |addend: i32| -> Vec<u8> { [(N as u32).to_le_bytes(), addend.to_le_bytes()].concat() };
 
         // --- Path A: ONE CommandRecorder, 3 dispatches, barriers, ONE submit ---
         let chained = {
