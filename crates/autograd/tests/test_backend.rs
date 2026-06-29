@@ -36,18 +36,18 @@ fn _touch_refs() {
     let _ = cpu_scatter_add_rows_forward;
 }
 
+fn lcg_step(s: u64) -> u64 {
+    s.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
 fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
     let size: usize = shape.iter().product();
-    let mut out = Vec::with_capacity(size);
-    let mut s = seed;
-    for i in 0..size {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let normalised = ((s >> 32) as u32 as f32) / (u32::MAX as f32);
-        out.push((normalised - 0.5) * 2.0 + (i as f32) * 1e-4);
-    }
-    out
+    std::iter::successors(Some(lcg_step(seed)), |&s| Some(lcg_step(s)))
+        .take(size)
+        .enumerate()
+        .map(|(i, s)| ((s >> 32) as u32 as f32 / u32::MAX as f32 - 0.5) * 2.0 + i as f32 * 1e-4)
+        .collect()
 }
 
 fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
@@ -526,15 +526,14 @@ fn cpu_rope_matches_ops() {
     let half_dim = head_dim / 2;
     let shape = &[batch, heads, seq, head_dim];
     let x = make_rows(shape, 91);
-    let mut cos = Vec::with_capacity(seq * half_dim);
-    let mut sin = Vec::with_capacity(seq * half_dim);
-    for t in 0..seq {
-        for i in 0..half_dim {
-            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
-            cos.push(theta.cos());
-            sin.push(theta.sin());
-        }
-    }
+    let (cos, sin): (Vec<f32>, Vec<f32>) = (0..seq)
+        .flat_map(|t| {
+            (0..half_dim).map(move |i| {
+                let theta = t as f32 * (0.02 + i as f32 * 0.01);
+                (theta.cos(), theta.sin())
+            })
+        })
+        .unzip();
     let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
 
     // Route through ops::rope::rope so we catch any drift between the two.
@@ -719,15 +718,14 @@ fn cuda_backend_rope_matches_cpu() {
     let half_dim = head_dim / 2;
     let shape = &[batch, heads, seq, head_dim];
     let x = make_rows(shape, 55);
-    let mut cos = Vec::with_capacity(seq * half_dim);
-    let mut sin = Vec::with_capacity(seq * half_dim);
-    for t in 0..seq {
-        for i in 0..half_dim {
-            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
-            cos.push(theta.cos());
-            sin.push(theta.sin());
-        }
-    }
+    let (cos, sin): (Vec<f32>, Vec<f32>) = (0..seq)
+        .flat_map(|t| {
+            (0..half_dim).map(move |i| {
+                let theta = t as f32 * (0.02 + i as f32 * 0.01);
+                (theta.cos(), theta.sin())
+            })
+        })
+        .unzip();
     let got = backend
         .rope_forward(&x, shape, &cos, &sin)
         .expect("cuda rope");
@@ -892,15 +890,14 @@ fn metal_backend_rope_matches_cpu() {
     let half_dim = head_dim / 2;
     let shape = &[batch, heads, seq, head_dim];
     let x = make_rows(shape, 55);
-    let mut cos = Vec::with_capacity(seq * half_dim);
-    let mut sin = Vec::with_capacity(seq * half_dim);
-    for t in 0..seq {
-        for i in 0..half_dim {
-            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
-            cos.push(theta.cos());
-            sin.push(theta.sin());
-        }
-    }
+    let (cos, sin): (Vec<f32>, Vec<f32>) = (0..seq)
+        .flat_map(|t| {
+            (0..half_dim).map(move |i| {
+                let theta = t as f32 * (0.02 + i as f32 * 0.01);
+                (theta.cos(), theta.sin())
+            })
+        })
+        .unzip();
     let got = backend
         .rope_forward(&x, shape, &cos, &sin)
         .expect("metal rope");
