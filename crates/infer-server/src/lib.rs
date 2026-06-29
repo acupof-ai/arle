@@ -690,6 +690,38 @@ where
     )
 }
 
+fn relay_stream(
+    request_id: u64,
+    rx: std::sync::mpsc::Receiver<execution::StreamItem>,
+    tx: &std::sync::mpsc::SyncSender<multiproc_relay::RelayEnvelope>,
+) {
+    use multiproc_relay::RelayEnvelope;
+    for item in rx {
+        let delta = match item {
+            execution::StreamItem::Token { token, .. } => multiproc_relay::RelayCompletionDelta {
+                text_delta: String::new(),
+                token_ids: vec![token],
+                finish: false,
+                finish_reason: None,
+                error: None,
+            },
+            execution::StreamItem::Done(completed) => multiproc_relay::RelayCompletionDelta {
+                text_delta: String::new(),
+                token_ids: Vec::new(),
+                finish: true,
+                finish_reason: completed.finish.clone(),
+                error: None,
+            },
+        };
+        if tx
+            .send(RelayEnvelope::Completion { request_id, delta })
+            .is_err()
+        {
+            break; // coordinator gone
+        }
+    }
+}
+
 fn serve_handle_relay_driver<E, K>(
     serve: std::sync::Arc<ServeHandle<E, K>>,
     mut engine_recv: multiproc_relay::LocalChannelRecv,
@@ -747,62 +779,49 @@ fn serve_handle_relay_driver<E, K>(
             .expect("spawn arle-local-multimodal");
     }
 
+    // Pre-spawn a fixed pool of relay worker threads — one per engine slot.
+    // This replaces per-request thread::spawn which created O(c) threads in
+    // a burst and triggered ELKEID SIGKILL at c=1024.
+    type WorkItem = (u64, std::sync::mpsc::Receiver<execution::StreamItem>);
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<WorkItem>();
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    let n_workers = serve.max_live_requests.max(1).min(1024);
+    for _ in 0..n_workers {
+        let work_rx = std::sync::Arc::clone(&work_rx);
+        let tx = engine_tx.clone();
+        std::thread::Builder::new()
+            .name("arle-relay-worker".into())
+            .spawn(move || {
+                while let Ok((request_id, rx)) = work_rx.lock().unwrap().recv() {
+                    relay_stream(request_id, rx, &tx);
+                }
+            })
+            .expect("spawn relay worker");
+    }
+
     loop {
         match engine_recv.recv() {
             Ok(Some(RelayEnvelope::TickAdmissions { seq: _, requests })) => {
                 for wire in requests {
                     let request_id = wire.request_id;
                     let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
-                    let serve_clone = std::sync::Arc::clone(&serve);
-                    let tx_clone = engine_tx.clone();
-                    std::thread::spawn(move || {
-                        let result =
-                            serve_clone.submit_streaming(prompt_tokens, max_tokens, sampling);
-                        match result {
-                            Ok((_ticket, rx)) => {
-                                for item in rx {
-                                    match item {
-                                        execution::StreamItem::Token { token, .. } => {
-                                            let _ = tx_clone.send(RelayEnvelope::Completion {
-                                                request_id,
-                                                delta: multiproc_relay::RelayCompletionDelta {
-                                                    text_delta: String::new(),
-                                                    token_ids: vec![token],
-                                                    finish: false,
-                                                    finish_reason: None,
-                                                    error: None,
-                                                },
-                                            });
-                                        }
-                                        execution::StreamItem::Done(completed) => {
-                                            let _ = tx_clone.send(RelayEnvelope::Completion {
-                                                request_id,
-                                                delta: multiproc_relay::RelayCompletionDelta {
-                                                    text_delta: String::new(),
-                                                    token_ids: Vec::new(),
-                                                    finish: true,
-                                                    finish_reason: completed.finish.clone(),
-                                                    error: None,
-                                                },
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx_clone.send(RelayEnvelope::Completion {
-                                    request_id,
-                                    delta: multiproc_relay::RelayCompletionDelta {
-                                        text_delta: String::new(),
-                                        token_ids: Vec::new(),
-                                        finish: true,
-                                        finish_reason: None,
-                                        error: Some(e.to_string()),
-                                    },
-                                });
-                            }
+                    match serve.submit_streaming(prompt_tokens, max_tokens, sampling) {
+                        Ok((_ticket, rx)) => {
+                            let _ = work_tx.send((request_id, rx));
                         }
-                    });
+                        Err(e) => {
+                            let _ = engine_tx.send(RelayEnvelope::Completion {
+                                request_id,
+                                delta: multiproc_relay::RelayCompletionDelta {
+                                    text_delta: String::new(),
+                                    token_ids: Vec::new(),
+                                    finish: true,
+                                    finish_reason: None,
+                                    error: Some(e.to_string()),
+                                },
+                            });
+                        }
+                    }
                 }
             }
             Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
