@@ -10,8 +10,8 @@ use autograd::{
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
         MoeTopK, add, add_broadcast, all_reduce_sum, cat_heads, cat_seq, causal_sdpa_recompute,
-        causal_sdpa_with_q_start, checkpoint_sequential, embedding, head_chunked_sdpa_with_q_start,
-        linear_attention_core, linear_attention_core_with_carry,
+        causal_sdpa_with_q_start, checkpoint, checkpoint_sequential, embedding,
+        head_chunked_sdpa_with_q_start, linear_attention_core, linear_attention_core_with_carry,
         linear_attention_core_with_carry_taped, matmul_bt_with_site, moe_grouped_linear,
         moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
         repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
@@ -345,32 +345,42 @@ fn head_chunked_sdpa_recompute(
         return Ok(causal_sdpa_recompute(q, k, v, store, tape)?);
     }
 
-    // When `tape` is disabled (the recompute runs INSIDE a checkpoint group's
-    // forward) the per-chunk SDPA intermediates — `scores`/`scaled`/`masked`/
-    // `probs`, 4×`[chunk, seq, seq]` ≈ 20 GiB at seq=16000 — have no backward
-    // dependency, but nothing frees them until the checkpoint group boundary, so
-    // they PILE UP across the head-chunk loop (5 chunks → ~100 GiB → OOM). Free
-    // each chunk's transients before the next iteration, keeping only its output.
-    // Tape-on (eager / backward replay) keeps the old behavior: the intermediates
-    // are tape-referenced and must survive, so the per-chunk free is skipped.
-    let free_chunk_transients = !tape.enabled;
+    // Per-chunk transient control: keep only one chunk's scores/softmax live at a time.
+    //
+    // • tape disabled (outer checkpoint forward, no backward needed): capture
+    //   `live_before` before each chunk's slices and `free_new_except` after —
+    //   frees scores/scaled/masked/probs AND the q/k/v slices, keeping only `out`.
+    //
+    // • tape enabled (inner backward recompute, inner_tape is active): wrap each
+    //   chunk in a nested `checkpoint` so the inner backward re-executes each chunk
+    //   on demand instead of keeping ALL chunks' intermediates alive simultaneously.
+    //   Without this, 7 chunks × 4 × [8, seq, seq] ≈ 46 GiB pile up for one layer
+    //   at seq=7184 → OOM. With nested checkpointing, only ONE chunk's ~6.6 GiB
+    //   is live during its backward, giving ~48 GiB peak vs 94 GiB.
     let mut chunks: Vec<TensorId> = Vec::new();
     let mut h0 = 0usize;
     while h0 < heads {
         let h1 = (h0 + chunk).min(heads);
-        let live_before = free_chunk_transients
-            .then(|| store.live_ids().into_iter().collect::<HashSet<TensorId>>());
-        let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-        let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-        let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-        let out = causal_sdpa_recompute(q_chunk, k_chunk, v_chunk, store, tape)?;
-        if let Some(live_before) = live_before {
+        if tape.enabled {
+            let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+            let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+            let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+            let out = checkpoint(vec![q_chunk, k_chunk, v_chunk], store, tape, |s, t, inp| {
+                causal_sdpa_recompute(inp[0], inp[1], inp[2], s, t)
+            })?;
+            chunks.push(out);
+        } else {
+            let live_before = store.live_ids().into_iter().collect::<HashSet<TensorId>>();
+            let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+            let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+            let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
+            let out = causal_sdpa_recompute(q_chunk, k_chunk, v_chunk, store, tape)?;
             // Keep only this chunk's output; free scores/scaled/masked/probs and
             // the q/k/v slices created since `live_before`.
             let keep = HashSet::from([out]);
             store.free_new_except(&live_before, &keep)?;
+            chunks.push(out);
         }
-        chunks.push(out);
         h0 = h1;
     }
     Ok(cat_heads(&chunks, store, tape)?)
