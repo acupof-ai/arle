@@ -4937,41 +4937,42 @@ fn new_sparse_mlp(
     let shared_down_proj_name = leak_name(names.shared_expert_down_proj.clone());
     let shared_expert_gate_name = leak_name(names.shared_expert_gate.clone());
 
-    let mut experts = Vec::with_capacity(cfg.num_experts);
-    for expert_idx in 0..cfg.num_experts {
-        let gate_proj_name = leak_name(names.expert_gate_proj(expert_idx));
-        let up_proj_name = leak_name(names.expert_up_proj(expert_idx));
-        let down_proj_name = leak_name(names.expert_down_proj(expert_idx));
-        experts.push(Qwen35SparseExpert {
-            gate_proj: linear_with_base_init(
-                gate_proj_name,
-                cfg.hidden_size,
-                cfg.moe_intermediate_size,
-                base_requires_grad,
-                lora_for_name(lora, lora_target_set, gate_proj_name),
-                materialize_frozen_base,
-                store,
-            )?,
-            up_proj: linear_with_base_init(
-                up_proj_name,
-                cfg.hidden_size,
-                cfg.moe_intermediate_size,
-                base_requires_grad,
-                lora_for_name(lora, lora_target_set, up_proj_name),
-                materialize_frozen_base,
-                store,
-            )?,
-            down_proj: linear_with_base_init(
-                down_proj_name,
-                cfg.moe_intermediate_size,
-                cfg.hidden_size,
-                base_requires_grad,
-                lora_for_name(lora, lora_target_set, down_proj_name),
-                materialize_frozen_base,
-                store,
-            )?,
-        });
-    }
+    let experts = (0..cfg.num_experts)
+        .map(|expert_idx| {
+            let gate_proj_name = leak_name(names.expert_gate_proj(expert_idx));
+            let up_proj_name = leak_name(names.expert_up_proj(expert_idx));
+            let down_proj_name = leak_name(names.expert_down_proj(expert_idx));
+            Ok(Qwen35SparseExpert {
+                gate_proj: linear_with_base_init(
+                    gate_proj_name,
+                    cfg.hidden_size,
+                    cfg.moe_intermediate_size,
+                    base_requires_grad,
+                    lora_for_name(lora, lora_target_set, gate_proj_name),
+                    materialize_frozen_base,
+                    store,
+                )?,
+                up_proj: linear_with_base_init(
+                    up_proj_name,
+                    cfg.hidden_size,
+                    cfg.moe_intermediate_size,
+                    base_requires_grad,
+                    lora_for_name(lora, lora_target_set, up_proj_name),
+                    materialize_frozen_base,
+                    store,
+                )?,
+                down_proj: linear_with_base_init(
+                    down_proj_name,
+                    cfg.moe_intermediate_size,
+                    cfg.hidden_size,
+                    base_requires_grad,
+                    lora_for_name(lora, lora_target_set, down_proj_name),
+                    materialize_frozen_base,
+                    store,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Qwen35SparseMlp {
         router_gate: linear_with_base_init(

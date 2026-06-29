@@ -438,12 +438,8 @@ impl Buffer {
         }
         // Flatten peer handles into a contiguous byte buffer for the C
         // call (C side reads world_size × 64 bytes).
-        let mut handle_blob = Vec::with_capacity(world_size * IPC_HANDLE_BYTES);
-        let mut device_ids = Vec::with_capacity(world_size);
-        for (h, did) in peers {
-            handle_blob.extend_from_slice(h);
-            device_ids.push(*did);
-        }
+        let handle_blob: Vec<u8> = peers.iter().flat_map(|(h, _)| h.iter().copied()).collect();
+        let device_ids: Vec<_> = peers.iter().map(|(_, did)| *did).collect();
         let status = unsafe {
             native::arle_deepep_buffer_sync(
                 self.handle,

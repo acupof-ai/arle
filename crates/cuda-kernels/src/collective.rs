@@ -339,10 +339,7 @@ mod nccl_backend {
             }
             ctx.stream.synchronize()?;
             let recv_words = ctx.stream.clone_dtoh(&recv)?;
-            let mut out = Vec::with_capacity(per_rank_bytes * self.world_size);
-            for word in recv_words {
-                out.extend_from_slice(&word.to_ne_bytes());
-            }
+            let out: Vec<u8> = recv_words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             if out.len() != per_rank_bytes * self.world_size {
                 bail!(
                     "all_gather_bytes produced {} bytes, expected {}",

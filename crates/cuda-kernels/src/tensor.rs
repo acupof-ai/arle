@@ -104,20 +104,19 @@ pub fn cuda_alloc_trace_summary_since(
         return None;
     }
     let trace = CUDA_ALLOC_TRACE.lock().ok()?;
-    let mut entries = Vec::new();
-    for (key, current) in trace.iter() {
-        let before = start.entries.get(key).copied().unwrap_or_default();
-        let calls = current.calls.saturating_sub(before.calls);
-        let bytes = current.bytes.saturating_sub(before.bytes);
-        if calls == 0 && bytes == 0 {
-            continue;
-        }
-        entries.push(CudaAllocTraceEntry {
-            key: key.clone(),
-            calls,
-            bytes,
-        });
-    }
+    let mut entries: Vec<CudaAllocTraceEntry> = trace
+        .iter()
+        .filter_map(|(key, current)| {
+            let before = start.entries.get(key).copied().unwrap_or_default();
+            let calls = current.calls.saturating_sub(before.calls);
+            let bytes = current.bytes.saturating_sub(before.bytes);
+            (calls != 0 || bytes != 0).then(|| CudaAllocTraceEntry {
+                key: key.clone(),
+                calls,
+                bytes,
+            })
+        })
+        .collect();
     entries.sort_by(|a, b| {
         b.calls
             .cmp(&a.calls)

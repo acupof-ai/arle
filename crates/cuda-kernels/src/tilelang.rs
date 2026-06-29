@@ -729,9 +729,11 @@ impl TileLangDecodeMetadata {
             return Ok(false);
         }
 
-        let mut all_slots = Vec::with_capacity(request_count);
-        all_slots.extend_from_slice(decode_slot_indices);
-        all_slots.extend_from_slice(prefill_slot_indices);
+        let all_slots: Vec<usize> = decode_slot_indices
+            .iter()
+            .copied()
+            .chain(prefill_slot_indices.iter().copied())
+            .collect();
 
         self.positions_scratch.clear();
         self.positions_scratch.extend(
@@ -876,11 +878,10 @@ impl TileLangDecodeMetadata {
 }
 
 fn flatten_page_indices<'a>(page_groups: impl IntoIterator<Item = &'a [u32]>) -> Vec<i32> {
-    let mut flat = Vec::new();
-    for group in page_groups {
-        flat.extend(group.iter().map(|&idx| idx as i32));
-    }
-    flat
+    page_groups
+        .into_iter()
+        .flat_map(|group| group.iter().map(|&idx| idx as i32))
+        .collect()
 }
 
 fn can_append_decode_step(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {

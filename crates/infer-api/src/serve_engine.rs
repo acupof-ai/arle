@@ -159,22 +159,24 @@ where
         // Pass 1: tokenize + submit every request without waiting (fills the
         // batcher). Keep the request + its prompt token ids alongside the ticket
         // so pass 2 reproduces `run`'s post-processing exactly.
-        let mut pending = Vec::with_capacity(reqs.len());
-        for req in reqs {
-            let prompt_token_ids = self
-                .tokenizer
-                .encode(&req.prompt)
-                .map_err(|err| anyhow!("tokenize prompt failed: {err}"))?;
-            let ticket = self
-                .serve
-                .submit(
-                    prompt_token_ids.clone(),
-                    req.max_tokens,
-                    req.sampling.clone(),
-                )
-                .map_err(|err| anyhow!("request submission failed: {err}"))?;
-            pending.push((ticket, prompt_token_ids, req));
-        }
+        let pending = reqs
+            .into_iter()
+            .map(|req| -> Result<_> {
+                let prompt_token_ids = self
+                    .tokenizer
+                    .encode(&req.prompt)
+                    .map_err(|err| anyhow!("tokenize prompt failed: {err}"))?;
+                let ticket = self
+                    .serve
+                    .submit(
+                        prompt_token_ids.clone(),
+                        req.max_tokens,
+                        req.sampling.clone(),
+                    )
+                    .map_err(|err| anyhow!("request submission failed: {err}"))?;
+                Ok((ticket, prompt_token_ids, req))
+            })
+            .collect::<Result<Vec<_>>>()?;
         // Pass 2: collect each ticket and project to `CompletionOutput` with the
         // same stop-string truncation + finish-reason logic as `run`.
         pending

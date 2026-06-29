@@ -201,15 +201,15 @@ impl TurboQuantLayerState {
 
         let codebook = TurboQuantCodebook::new(ctx, head_dim, bits)?;
 
-        let mut rotations = Vec::with_capacity(num_layers);
-        for layer_idx in 0..num_layers {
-            let seed = base_seed.wrapping_add((layer_idx as u64).wrapping_mul(7));
-            let rotation = match mode {
-                RotationMode::Full => TurboQuantRotation::new_full(ctx, head_dim, seed)?,
-                RotationMode::Hadamard => TurboQuantRotation::new_hadamard(ctx, head_dim, seed)?,
-            };
-            rotations.push(rotation);
-        }
+        let rotations = (0..num_layers)
+            .map(|layer_idx| {
+                let seed = base_seed.wrapping_add((layer_idx as u64).wrapping_mul(7));
+                match mode {
+                    RotationMode::Full => TurboQuantRotation::new_full(ctx, head_dim, seed),
+                    RotationMode::Hadamard => TurboQuantRotation::new_hadamard(ctx, head_dim, seed),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let packed_per_head = packed_bytes_per_head(head_dim, bits);
 
