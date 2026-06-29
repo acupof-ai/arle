@@ -41,7 +41,7 @@ authority rather than defining a second equal architecture.
 | `infer-vulkan` | Vulkan `BackendExecutor` + KV pool (experimental AIPC skeleton): host forward-order pins for Qwen3/3.5/3.6, DSv4, Gemma4 over `vulkan-sys`/`vulkan-kernels`; device execution pending the shader ABI; consumes the `infer-gguf` host substrate | Scheduler logic, HTTP |
 | `infer-topo` | TP/EP sharding: `head_shard`, column/row shard | Kernels, scheduler, HTTP |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig` | Backend kernels, scheduler |
-| `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` engine thread | Terminal UX, agent-session orchestration |
+| `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single facade for all backends) + tokenizer; `ServeHandle<E,K>` engine thread; relay protocol for both single-process (`LocalChannel*`) and multi-process (TCP) | Terminal UX, agent-session orchestration |
 | `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it. | Terminal UX, REPL logic |
 | `infer-util` | Backend-agnostic `hf_hub` + logging leaf crate | Anything backend- or model-specific |
 | `cuda-kernels` | CUDA kernel layer (`csrc/`, TileLang AOT, Rust FFI, paged-KV / TileLang metadata / graph-pool / tensor / kv_quant / kv_turboquant) | Model code, scheduler logic, tokenizer |
@@ -128,7 +128,8 @@ infer-metal              infer-cuda          thin executors, one seam impl each
                            DeepGEMM, DeepEP,
                            DSv4-Flash)
    ▲                         ▲
-infer-server    OpenAI v1 HTTP frontend: ServeHandle<E,K> engine thread + tokenizer
+infer-server    OpenAI v1 HTTP frontend: coordinator.rs (single HTTP facade for all backends)
+                + ServeHandle<E,K> engine thread + relay (LocalChannel / TCP)
    ▲
 infer-api       single front-door lib (LoadedInferenceEngine, EngineLoadConfig,
                 RawLogits, OPD teacher); backends plug in behind it
@@ -156,7 +157,7 @@ do not pre-split speculatively.
 | `infer-cuda` | CUDA executor as a thin seam impl over `cuda-kernels`: paged KV, TileLang AOT + native-CUDA kernels, TP/EP, DeepGEMM, DeepEP, DSv4-Flash, GLM-5.2 (DSv4 path, verification pending-remote), dense Qwen3 + Qwen3.5/3.6 hybrid+MoE (FP8 MoE via DeepGEMM). |
 | `infer-topo` | TP/EP sharding helpers: `head_shard`, column/row shard. |
 | `infer-moe` | Backend-neutral MoE routing: `route`, `RoutingDecision`, `MoeConfig`. |
-| `infer-server` | OpenAI v1 HTTP frontend + tokenizer; `ServeHandle<E,K>` (engine thread owning `Engine<E,K>`, submit/collect). |
+| `infer-server` | OpenAI v1 HTTP frontend (`coordinator.rs` — single axum router for all backends, both single-process and multi-process); `ServeHandle<E,K>` engine thread; relay protocol (`RelayCoordinator`, `LocalChannel*`, `WireStats`). |
 | `infer-api` | The single front-door lib: `LoadedInferenceEngine`, `EngineLoadConfig`, `RawLogits`, OPD-teacher surface. Backends plug in behind it via Cargo features (`cuda`/`metal`). |
 
 ### How the parallelism axes map onto the stack
