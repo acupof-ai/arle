@@ -15,15 +15,16 @@ fn f32_to_bf16_bits_round_nearest_even(value: f32) -> u16 {
 
 fn assert_close(actual: &[f32], expected: &[f32], atol: f32, rtol: f32) {
     assert_eq!(actual.len(), expected.len());
-    let mut worst = (0.0_f32, 0_usize, 0.0_f32, 0.0_f32);
-    for (idx, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
-        let abs = (got - want).abs();
-        let tol = atol + rtol * want.abs();
-        let excess = abs / tol;
-        if excess > worst.0 {
-            worst = (excess, idx, got, want);
-        }
-    }
+    let worst = actual
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+        .map(|(idx, (&got, &want))| {
+            let excess = (got - want).abs() / (atol + rtol * want.abs());
+            (excess, idx, got, want)
+        })
+        .max_by(|(e1, _, _, _), (e2, _, _, _)| e1.total_cmp(e2))
+        .unwrap_or((0.0, 0, 0.0, 0.0));
     assert!(
         worst.0 <= 1.0,
         "worst excess={} idx={} got={} want={}",
