@@ -19,7 +19,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use infer_plan::{FinishReason, MultimodalKind, SamplingParams};
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::multiproc_relay::{
@@ -233,33 +232,47 @@ impl Drop for InFlightGuard {
     }
 }
 
-// Workers send one terminal delta with all token IDs; the relay is not yet
-// per-token. SSE here is wire-format only — content is collected then flushed.
-fn sse_response(model: &str, outcome: &CollectedGeneration, text: String) -> Response {
-    let id = format!("cmpl-{}", Uuid::new_v4().simple());
-    let created = unix_time_secs();
-    let n = outcome.generated_tokens.len();
-    let usage = json!({"prompt_tokens": outcome.prompt_tokens, "completion_tokens": n, "total_tokens": outcome.prompt_tokens + n});
-    let body = format!(
-        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-        completion_stream_chunk(&id, created, model, text, None, None),
-        completion_stream_chunk(
-            &id,
-            created,
-            model,
-            String::new(),
-            Some(finish_reason(outcome.finish.as_ref())),
-            Some(usage)
-        ),
-    );
+/// Set up the relay sink + in_flight guard + submit for a streaming request.
+/// Returns the per-token delta receiver and the guard (caller must keep alive
+/// until streaming ends so `in_flight` is decremented only after the last delta).
+fn streaming_submit(
+    state: &Arc<CoordinatorHandle>,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    sampling: SamplingParams,
+) -> Result<
     (
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
+        tokio::sync::mpsc::UnboundedReceiver<RelayCompletionDelta>,
+        InFlightGuard,
+    ),
+    ApiError,
+> {
+    let request_id = state.alloc_request_id();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RelayCompletionDelta>();
+    state
+        .sinks
+        .register(request_id, tx)
+        .map_err(ApiError::from)?;
+    state.in_flight.fetch_add(1, Ordering::AcqRel);
+    let guard = InFlightGuard {
+        in_flight: Arc::clone(&state.in_flight),
+        sinks: state.sinks.clone(),
+        request_id,
+    };
+    let submit_result = state.submit_tx.send(CoordSubmission {
+        request: WireRequest {
+            request_id,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+        },
+    });
+    if submit_result.is_err() {
+        return Err(ApiError::internal(
+            "coordinator lockstep loop closed; cannot submit",
+        ));
+    }
+    Ok((rx, guard))
 }
 
 /// Submit one request and collect its full generation by draining relay deltas.
@@ -358,11 +371,90 @@ async fn completions(
     let sampling = request.sampling_params();
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
     let prompt_tokens = encode(&state, &request.prompt)?;
+
+    if request.stream.unwrap_or(false) {
+        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
+        let id = format!("cmpl-{}", Uuid::new_v4().simple());
+        let created = unix_time_secs();
+        let model = state.model.clone();
+        let state_clone = Arc::clone(&state);
+        // Bounded channel: backpressure keeps the task from racing too far ahead.
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::channel::<Result<Vec<u8>, std::convert::Infallible>>(64);
+        tokio::spawn(async move {
+            // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
+            let _guard = guard;
+            while let Some(delta) = rx.recv().await {
+                if let Some(err) = delta.error {
+                    let chunk = serde_json::to_string(&completion_stream_chunk(
+                        &id,
+                        created,
+                        &model,
+                        err,
+                        Some("error"),
+                        None,
+                    ))
+                    .unwrap_or_default();
+                    let _ = chunk_tx
+                        .send(Ok(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()))
+                        .await;
+                    break;
+                }
+                if !delta.token_ids.is_empty() {
+                    let text = {
+                        let tok = state_clone
+                            .tokenizer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        tok.decode(&delta.token_ids).unwrap_or_default()
+                    };
+                    let chunk = serde_json::to_string(&completion_stream_chunk(
+                        &id, created, &model, text, None, None,
+                    ))
+                    .unwrap_or_default();
+                    if chunk_tx
+                        .send(Ok(format!("data: {chunk}\n\n").into_bytes()))
+                        .await
+                        .is_err()
+                    {
+                        break; // Client disconnected; guard drops, releasing in_flight.
+                    }
+                }
+                if delta.finish {
+                    let fr = finish_reason(delta.finish_reason.as_ref());
+                    let final_chunk = serde_json::to_string(&completion_stream_chunk(
+                        &id,
+                        created,
+                        &model,
+                        String::new(),
+                        Some(fr),
+                        None,
+                    ))
+                    .unwrap_or_default();
+                    let _ = chunk_tx
+                        .send(Ok(
+                            format!("data: {final_chunk}\n\ndata: [DONE]\n\n").into_bytes()
+                        ))
+                        .await;
+                    break;
+                }
+            }
+        });
+        let body =
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(chunk_rx));
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
+            body,
+        )
+            .into_response());
+    }
+
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
     let text = decode(&state, &outcome.generated_tokens)?;
-    if request.stream.unwrap_or(false) {
-        return Ok(sse_response(&state.model, &outcome, text));
-    }
     Ok(Json(CompletionResponse::from_parts(
         state.model.clone(),
         text,
