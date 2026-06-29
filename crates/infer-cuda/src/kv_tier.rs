@@ -210,19 +210,20 @@ impl DiskTier {
             return None;
         }
         let epoch = lines.next()?.to_string();
-        let mut records = Vec::new();
-        for line in lines {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            let key: u64 = parts.next()?.parse().ok()?;
-            let slot_idx: u32 = parts.next()?.parse().ok()?;
-            // Third field (slot_bytes) parsed for forward-compat.
-            let _slot_bytes: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            records.push((key, slot_idx));
-        }
+        let records: Vec<(u64, u32)> = lines
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                let mut parts = line.split_whitespace();
+                let key: u64 = parts.next()?.parse().ok()?;
+                let slot_idx: u32 = parts.next()?.parse().ok()?;
+                // Third field (slot_bytes) parsed for forward-compat.
+                let _slot_bytes: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                Some((key, slot_idx))
+            })
+            .collect();
         Some((epoch, records))
     }
 }
