@@ -602,10 +602,9 @@ pub mod upload {
             //   blk.0.ffn_gate_exps.weight Q4_K [256] (144 B/256)-> KeepQuant(Q4K)
             let hidden = 8u64;
             let vocab = 4u64;
-            let mut embd = Vec::new();
-            for v in 0..(hidden * vocab) {
-                embd.extend_from_slice(&(v as f32).to_le_bytes());
-            }
+            let embd: Vec<u8> = (0..(hidden * vocab))
+                .flat_map(|v| (v as f32).to_le_bytes())
+                .collect();
             let norm: Vec<u8> = (0..hidden).flat_map(|v| (v as f32).to_le_bytes()).collect();
             // Q8_0: 34 B per 32-element block; one block. Distinct bytes so the
             // raw-vs-dequant path is exercised (we only assert sizes for it).
@@ -822,12 +821,9 @@ mod tests {
     fn embedding_lookup_gathers_correct_row() {
         // vocab=3, hidden=4, F32. Row t = [t*10+0 .. t*10+3].
         let (hidden, vocab) = (4usize, 3usize);
-        let mut bytes = Vec::new();
-        for t in 0..vocab {
-            for i in 0..hidden {
-                bytes.extend_from_slice(&((t * 10 + i) as f32).to_le_bytes());
-            }
-        }
+        let bytes: Vec<u8> = (0..vocab)
+            .flat_map(|t| (0..hidden).flat_map(move |i| ((t * 10 + i) as f32).to_le_bytes()))
+            .collect();
         let tbl = HostEmbeddingTable::new(GgmlType::F32, hidden, vocab, bytes).unwrap();
         assert_eq!(tbl.embed_row(0).unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
         assert_eq!(tbl.embed_row(2).unwrap(), vec![20.0, 21.0, 22.0, 23.0]);
