@@ -591,19 +591,17 @@ impl Qwen35SlotState {
         }
         let (gdr, conv) = match pool.pop() {
             Some(block) => block,
-            None => {
-                let mut gdr = Vec::with_capacity(num_linear);
-                let mut conv = Vec::with_capacity(num_linear);
-                for _ in 0..num_linear {
-                    gdr.push(
-                        ctx.stream
-                            .alloc_zeros::<f32>(gdr_state_len)
-                            .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?,
-                    );
-                    conv.push(DeviceVec::zeros(ctx, conv_len)?);
-                }
-                (gdr, conv)
-            }
+            None => (0..num_linear)
+                .map(|_| {
+                    let g = ctx
+                        .stream
+                        .alloc_zeros::<f32>(gdr_state_len)
+                        .map_err(|e| anyhow!("alloc gated-delta state failed: {e}"))?;
+                    Ok((g, DeviceVec::zeros(ctx, conv_len)?))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .unzip::<_, _, Vec<_>, Vec<_>>(),
         };
         self.gdr_states = gdr;
         self.conv_states = conv;
@@ -1326,26 +1324,35 @@ impl Qwen35BatchDecodeState {
             max_batch > 0,
             "Qwen3.5 batched decode requires max_batch > 0"
         );
-        let mut full_k_cache_ptrs = Vec::with_capacity(num_full_layers);
-        let mut full_v_cache_ptrs = Vec::with_capacity(num_full_layers);
-        for layer_idx in 0..num_full_layers {
-            full_k_cache_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
-                anyhow!("alloc qwen35 batch full_k_cache_ptrs layer {layer_idx}: {e}")
-            })?);
-            full_v_cache_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
-                anyhow!("alloc qwen35 batch full_v_cache_ptrs layer {layer_idx}: {e}")
-            })?);
-        }
-        let mut conv_state_ptrs = Vec::with_capacity(num_linear_layers);
-        let mut gdr_state_ptrs = Vec::with_capacity(num_linear_layers);
-        for layer_idx in 0..num_linear_layers {
-            conv_state_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
-                anyhow!("alloc qwen35 batch conv_state_ptrs layer {layer_idx}: {e}")
-            })?);
-            gdr_state_ptrs.push(ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
-                anyhow!("alloc qwen35 batch gdr_state_ptrs layer {layer_idx}: {e}")
-            })?);
-        }
+        let (full_k_cache_ptrs, full_v_cache_ptrs) =
+            (0..num_full_layers)
+                .map(|i| {
+                    let k = ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
+                        anyhow!("alloc qwen35 batch full_k_cache_ptrs layer {i}: {e}")
+                    })?;
+                    let v = ctx.stream.alloc_zeros::<u64>(max_batch).map_err(|e| {
+                        anyhow!("alloc qwen35 batch full_v_cache_ptrs layer {i}: {e}")
+                    })?;
+                    Ok((k, v))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .unzip::<_, _, Vec<_>, Vec<_>>();
+        let (conv_state_ptrs, gdr_state_ptrs) = (0..num_linear_layers)
+            .map(|i| {
+                let c = ctx
+                    .stream
+                    .alloc_zeros::<u64>(max_batch)
+                    .map_err(|e| anyhow!("alloc qwen35 batch conv_state_ptrs layer {i}: {e}"))?;
+                let g = ctx
+                    .stream
+                    .alloc_zeros::<u64>(max_batch)
+                    .map_err(|e| anyhow!("alloc qwen35 batch gdr_state_ptrs layer {i}: {e}"))?;
+                Ok((c, g))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip::<_, _, Vec<_>, Vec<_>>();
         Ok(Self {
             ws: Qwen35Workspace::new(),
             positions: SliceSlot::default(),

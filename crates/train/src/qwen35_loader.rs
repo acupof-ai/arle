@@ -1469,10 +1469,7 @@ mod tests {
         // byte-identical, only faster). Covers odd values, 0x0000, 0xFFFF, and a
         // non-zero low/high byte so any endian/stride bug surfaces.
         let words: Vec<u16> = (0u16..4096).chain([0, 0xFFFF, 0x1234, 0xABCD]).collect();
-        let mut bytes = Vec::with_capacity(words.len() * 2);
-        for w in &words {
-            bytes.extend_from_slice(&w.to_le_bytes());
-        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shape = vec![words.len()];
         let view = safetensors::tensor::TensorView::new(Dtype::BF16, shape, &bytes)
             .expect("construct BF16 view");

@@ -3450,17 +3450,18 @@ impl Qwen35Model {
         self.param_names = base.param_names.clone();
         let adapter_ids = self.adapter_names.values().copied().collect::<HashSet<_>>();
         let mut seen = HashSet::new();
-        let mut param_ids = Vec::with_capacity(base.param_ids.len() + adapter_ids.len());
-        for &id in &base.param_ids {
-            if seen.insert(id) {
-                param_ids.push(id);
-            }
-        }
-        for &id in &self.param_ids {
-            if adapter_ids.contains(&id) && seen.insert(id) {
-                param_ids.push(id);
-            }
-        }
+        let param_ids: Vec<_> = base
+            .param_ids
+            .iter()
+            .copied()
+            .chain(
+                self.param_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| adapter_ids.contains(id)),
+            )
+            .filter(|id| seen.insert(*id))
+            .collect();
         self.param_ids = param_ids;
         Ok(())
     }
@@ -6548,16 +6549,16 @@ mod tests {
     }
 
     fn det_vec(len: usize, seed: u64, scale: f32) -> Vec<f32> {
-        let mut state = seed;
-        let mut out = Vec::with_capacity(len);
-        for _ in 0..len {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let unit = ((state >> 40) as f32) / ((1u64 << 24) as f32);
-            out.push((unit - 0.5) * scale);
-        }
-        out
+        std::iter::successors(Some(seed), |&s| {
+            Some(
+                s.wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407),
+            )
+        })
+        .skip(1)
+        .take(len)
+        .map(|s| (((s >> 40) as f32) / ((1u64 << 24) as f32) - 0.5) * scale)
+        .collect()
     }
 
     #[test]
