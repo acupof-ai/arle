@@ -415,12 +415,11 @@ where
     fn acquire_live_request(&self) -> Result<()> {
         loop {
             let current = self.live_requests.load(Ordering::Acquire);
-            if current >= self.max_live_requests {
-                return Err(anyhow!(
-                    "server is busy: backend allows at most {} live request(s)",
-                    self.max_live_requests
-                ));
-            }
+            anyhow::ensure!(
+                current < self.max_live_requests,
+                "server is busy: backend allows at most {} live request(s)",
+                self.max_live_requests
+            );
             if self
                 .live_requests
                 .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
