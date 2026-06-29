@@ -268,6 +268,18 @@ impl SandboxToolExecutor {
     /// Spawn `bash -lc <cmd>` in the workdir with a Rust-enforced timeout and
     /// collect stdout+stderr into a single tool result string.
     fn run_bash(&self, cmd: &str) -> String {
+        // Confine the bash tool to the workdir: reject an absolute `cd` that
+        // escapes the sandbox. Without this, a `cd /abs/other-task-repo` reaches
+        // a SIBLING task's workdir (all per-task workdirs are flat-siblings under
+        // one --work-root, and the eval pass leaves its dirs there), so a single
+        // hallucinated absolute path makes the whole rollout edit the wrong repo
+        // and leave its own diff empty. Mirrors the `resolve()` jail the
+        // read/write/replace tools already enforce; the system prompt already
+        // tells the agent to use relative paths only.
+        if let Some(msg) = cd_escape_message(cmd, &self.workdir) {
+            return msg;
+        }
+
         let mut command = Command::new("bash");
         command.arg("-lc").arg(cmd).current_dir(&self.workdir);
 
@@ -379,6 +391,48 @@ impl ToolExecutor for SandboxToolExecutor {
             other => format!("Error: unknown tool '{other}'"),
         }
     }
+}
+
+/// Reject a bash command that `cd`s to an absolute path escaping `workdir`.
+///
+/// Returns `Some(error)` (a tool-surfaced rejection string) when the command
+/// contains a `cd <absolute>` whose target is not inside `workdir`; `None`
+/// otherwise. Only ABSOLUTE `cd` targets are checked — relative `cd subdir` and
+/// `cd ..` stay allowed (cwd stays inside the workdir at spawn time; the
+/// read/write/replace tools independently reject `..` path args). This is a
+/// pragmatic guard for the decoded escape vector (`cd /abs/sibling-task-repo`),
+/// not a full shell sandbox: a determined adversary can still escape via e.g.
+/// `pushd`/symlinks, but the agent-OPD student only ever emits a leading `cd`.
+fn cd_escape_message(cmd: &str, workdir: &Path) -> Option<String> {
+    // Canonicalize the workdir once so symlinked roots (e.g. /host -> ...) compare
+    // correctly; fall back to the raw path if canonicalization fails.
+    let root = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_owned());
+    // Split on shell statement separators so chained `... && cd /abs && ...` is
+    // caught, then look at each segment's leading word.
+    for segment in cmd.split(['&', '|', ';', '\n']) {
+        let mut words = segment.split_whitespace();
+        if words.next() != Some("cd") {
+            continue;
+        }
+        let Some(target) = words.next() else { continue };
+        // Strip surrounding quotes the model sometimes emits.
+        let target = target.trim_matches(|c| c == '"' || c == '\'');
+        let path = Path::new(target);
+        if !path.is_absolute() {
+            continue;
+        }
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        if !canon.starts_with(&root) {
+            return Some(format!(
+                "ERROR: absolute `cd {target}` escapes the sandbox. Your working \
+directory is the repo root; use RELATIVE paths only (e.g. `cd lib/ansible`, or \
+just reference files relative to the repo root). Do not `cd` to an absolute path."
+            ));
+        }
+    }
+    None
 }
 
 /// Clip a string to `max_chars` keeping HEAD + TAIL. Tests / tracebacks live at
@@ -727,6 +781,51 @@ mod tests {
         assert!(
             diff_after.trim().is_empty(),
             "diff after reset should be empty: {diff_after}"
+        );
+    }
+
+    #[test]
+    fn bash_rejects_absolute_cd_into_sibling_task() {
+        // Mirror the decoded accept-wall: two task workdirs are flat-siblings
+        // under one work_root; the agent's bash must not `cd` into the other.
+        let work_root = tempfile::tempdir().unwrap();
+        let mine = work_root.path().join("ansible__ansible-f327e65");
+        let sibling = work_root.path().join("ansible__ansible-0ea40e0");
+        fs::create_dir_all(&mine).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        let exec = SandboxToolExecutor::new(mine.clone(), 30, None);
+
+        // The exact escape vector decoded from the failing rollout.
+        let escape = format!("cd {} && find . -name '*.py'", sibling.display());
+        let out = exec.execute(&call("bash", json!({ "command": escape })));
+        assert!(
+            out.contains("escapes the sandbox"),
+            "absolute cd into sibling must be rejected: {out}"
+        );
+
+        // Chained mid-command escape is also caught.
+        let chained = format!("ls && cd {} && cat x", sibling.display());
+        let out2 = exec.execute(&call("bash", json!({ "command": chained })));
+        assert!(
+            out2.contains("escapes the sandbox"),
+            "chained absolute cd must be rejected: {out2}"
+        );
+
+        // Relative navigation inside the workdir stays allowed (no rejection).
+        fs::create_dir_all(mine.join("lib")).unwrap();
+        let ok = exec.execute(&call("bash", json!({ "command": "cd lib && pwd" })));
+        assert!(
+            !ok.contains("escapes the sandbox"),
+            "relative cd must be allowed: {ok}"
+        );
+
+        // An absolute cd that stays INSIDE the workdir is allowed.
+        let inside = format!("cd {} && pwd", mine.join("lib").display());
+        let ok2 = exec.execute(&call("bash", json!({ "command": inside })));
+        assert!(
+            !ok2.contains("escapes the sandbox"),
+            "absolute cd inside workdir must be allowed: {ok2}"
         );
     }
 
