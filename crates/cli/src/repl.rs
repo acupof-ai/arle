@@ -897,6 +897,7 @@ fn session_prompt_messages(
 ) -> Vec<ChatPromptMessage> {
     let mut messages: Vec<ChatPromptMessage> = session
         .messages()
+        .iter()
         .filter(|m| {
             let role = m.role.as_str();
             role != "tool"
