@@ -1,9 +1,14 @@
+use std::collections::HashSet;
+
 use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
     backend::cpu_causal_sdpa_recompute_backward,
-    ops::{add_broadcast, matmul, mul_scalar, reshape, softmax, softmax_backward, transpose},
+    ops::{
+        add, add_broadcast, matmul, mul_scalar, reshape, slice, softmax, softmax_backward,
+        transpose,
+    },
     tape::{BackwardOp, GradPairs, SavedContext, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -305,6 +310,28 @@ pub(crate) fn causal_sdpa_recompute_backward(
     Ok(grads)
 }
 
+/// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live
+/// `[merged_heads, q_chunk, seq]` score/prob transients to avoid the O(seq²)
+/// peak (the writeback-OOM fix). The unchunked path materialized the full
+/// `[merged_heads, seq, seq]` scores + `[1, seq, seq]` mask + probs (~88 GB at
+/// seq=18168); q-chunking caps the peak at O(q_chunk·seq).
+fn sdpa_backward_q_chunk(merged_heads: usize, seq_len: usize) -> usize {
+    // ~6 simultaneous `[merged_heads, q_chunk, seq]` f32 transients per chunk
+    // (scores/scaled/masked/probs/d_probs/d_scores). Budget them to ~4 GiB.
+    let per_row = merged_heads
+        .saturating_mul(seq_len)
+        .saturating_mul(4)
+        .max(1);
+    ((4usize << 30) / per_row.saturating_mul(6)).clamp(1, seq_len)
+}
+
+// Chunked SDPA backward recompute. q-chunks the query rows so peak memory is
+// O(q_chunk·seq), not O(seq²): per chunk it recomputes scores/probs at
+// `[merged_heads, q_chunk, seq]` with a `[1, q_chunk, seq]` windowed causal mask.
+// grad_q is per-q-chunk (concatenated along seq); grad_k and grad_v accumulate
+// across q-chunks (they range over ALL kv positions). Numerically identical to
+// the unchunked backward — softmax is row-wise, so each q-row's gradient is
+// independent, and grad_k/grad_v are exact sums over q.
 #[allow(clippy::too_many_arguments)]
 fn causal_sdpa_recompute_backward_device(
     q: TensorId,
@@ -317,12 +344,42 @@ fn causal_sdpa_recompute_backward_device(
     need_grad_v: bool,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
+    let merged_heads = shape[0] * shape[1];
+    let q_chunk = sdpa_backward_q_chunk(merged_heads, shape[2]);
+    causal_sdpa_recompute_backward_device_chunked(
+        q,
+        k,
+        v,
+        upstream,
+        shape,
+        need_grad_q,
+        need_grad_k,
+        need_grad_v,
+        q_chunk,
+        store,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_sdpa_recompute_backward_device_chunked(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    upstream: TensorId,
+    shape: &[usize],
+    need_grad_q: bool,
+    need_grad_k: bool,
+    need_grad_v: bool,
+    q_chunk: usize,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
     let batch = shape[0];
     let heads = shape[1];
     let seq_len = shape[2];
     let head_dim = shape[3];
     let merged_heads = batch * heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    let q_chunk = q_chunk.clamp(1, seq_len.max(1));
     let mut tape = crate::Tape::new();
     tape.set_enabled(false);
 
@@ -336,54 +393,187 @@ fn causal_sdpa_recompute_backward_device(
         &mut tape,
     )?;
 
+    // Shared across chunks (no O(seq²) cost): k^T and v^T are `[merged_heads, *, *]`.
     let k_t = transpose(k_3d, 1, 2, store, &mut tape)?;
-    let scores = matmul(q_3d, k_t, store, &mut tape)?;
-    let scaled = mul_scalar(scores, scale, store, &mut tape)?;
-    let mask = causal_mask(seq_len, store)?;
-    let masked = add_broadcast(scaled, mask, store, &mut tape)?;
-    let probs = softmax(masked, store, &mut tape)?;
+    let v_t = if need_grad_q || need_grad_k {
+        Some(transpose(v_3d, 1, 2, store, &mut tape)?)
+    } else {
+        None
+    };
+
+    // Anchor for per-chunk transient cleanup: everything alloc'd from here on
+    // (except the kept accumulators / grad_q chunks) is freed after each chunk.
+    let live_before: HashSet<TensorId> = store.live_ids().into_iter().collect();
+
+    let mut grad_q_chunks: Vec<TensorId> = Vec::new();
+    let mut grad_k_acc: Option<TensorId> = None;
+    let mut grad_v_acc: Option<TensorId> = None;
+
+    let mut q0 = 0usize;
+    while q0 < seq_len {
+        let q1 = (q0 + q_chunk).min(seq_len);
+        let rows = q1 - q0;
+
+        let q_chunk_3d = slice(
+            q_3d,
+            &[0, q0, 0],
+            &[merged_heads, q1, head_dim],
+            store,
+            &mut tape,
+        )?;
+        let up_chunk_3d = slice(
+            upstream_3d,
+            &[0, q0, 0],
+            &[merged_heads, q1, head_dim],
+            store,
+            &mut tape,
+        )?;
+
+        // scores/probs for this q-chunk: `[merged_heads, rows, seq]`.
+        let scores = matmul(q_chunk_3d, k_t, store, &mut tape)?;
+        let scaled = mul_scalar(scores, scale, store, &mut tape)?;
+        // Windowed causal mask `[1, rows, seq]`, q_start=q0 — never the full seq².
+        let mask = causal_mask_window(rows, seq_len, q0, store)?;
+        let masked = add_broadcast(scaled, mask, store, &mut tape)?;
+        let probs = softmax(masked, store, &mut tape)?;
+
+        // grad_v contribution: probs^T @ upstream_chunk → `[merged_heads, seq, head_dim]`.
+        if need_grad_v {
+            let probs_t = transpose(probs, 1, 2, store, &mut tape)?;
+            let grad_v_part = matmul(probs_t, up_chunk_3d, store, &mut tape)?;
+            grad_v_acc = Some(match grad_v_acc {
+                None => grad_v_part,
+                Some(acc) => add(acc, grad_v_part, store, &mut tape)?,
+            });
+        }
+
+        if need_grad_q || need_grad_k {
+            let v_t = v_t.expect("v_t computed when need_grad_q || need_grad_k");
+            let d_probs = matmul(up_chunk_3d, v_t, store, &mut tape)?;
+            let softmax_entry = TapeEntry {
+                op: BackwardOp::Softmax,
+                output_id: probs,
+                input_ids: smallvec![masked],
+                saved: SavedContext::SoftmaxCtx { y: probs },
+            };
+            let d_scores_pairs = softmax_backward(&softmax_entry, d_probs, store)?;
+            let d_scores = d_scores_pairs
+                .iter()
+                .find_map(|(input_id, grad_id)| (*input_id == masked).then_some(*grad_id))
+                .ok_or(AutogradError::TapeInvariant(
+                    "causal_sdpa_recompute device backward missing softmax grad",
+                ))?;
+
+            // grad_q chunk: scale·(d_scores @ k) → `[merged_heads, rows, head_dim]`.
+            if need_grad_q {
+                let grad_q_part = matmul(d_scores, k_3d, store, &mut tape)?;
+                let grad_q_part = mul_scalar(grad_q_part, scale, store, &mut tape)?;
+                grad_q_chunks.push(grad_q_part);
+            }
+            // grad_k contribution: scale·(d_scores^T @ q_chunk) → `[merged_heads, seq, head_dim]`.
+            if need_grad_k {
+                let d_scores_t = transpose(d_scores, 1, 2, store, &mut tape)?;
+                let grad_k_part = matmul(d_scores_t, q_chunk_3d, store, &mut tape)?;
+                let grad_k_part = mul_scalar(grad_k_part, scale, store, &mut tape)?;
+                grad_k_acc = Some(match grad_k_acc {
+                    None => grad_k_part,
+                    Some(acc) => add(acc, grad_k_part, store, &mut tape)?,
+                });
+            }
+        }
+
+        // Free this chunk's `[*, rows, seq]` transients (scores/scaled/masked/
+        // probs/d_probs/d_scores + q/upstream slices); keep only the running
+        // accumulators and the per-chunk grad_q outputs. Bounds peak to O(q_chunk·seq).
+        let mut keep: HashSet<TensorId> = grad_q_chunks.iter().copied().collect();
+        keep.extend(grad_k_acc);
+        keep.extend(grad_v_acc);
+        store.free_new_except(&live_before, &keep)?;
+
+        q0 = q1;
+    }
 
     let mut grads = GradPairs::new();
     if need_grad_v {
-        let probs_t = transpose(probs, 1, 2, store, &mut tape)?;
-        let grad_v_3d = matmul(probs_t, upstream_3d, store, &mut tape)?;
+        let grad_v_3d = grad_v_acc.ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_recompute device backward: grad_v requested but no chunk produced it",
+        ))?;
         let grad_v = reshape(grad_v_3d, shape, store, &mut tape)?;
         grads.push((v, grad_v));
     }
-
-    if need_grad_q || need_grad_k {
-        let v_t = transpose(v_3d, 1, 2, store, &mut tape)?;
-        let d_probs = matmul(upstream_3d, v_t, store, &mut tape)?;
-        let softmax_entry = TapeEntry {
-            op: BackwardOp::Softmax,
-            output_id: probs,
-            input_ids: smallvec![masked],
-            saved: SavedContext::SoftmaxCtx { y: probs },
-        };
-        let d_scores_pairs = softmax_backward(&softmax_entry, d_probs, store)?;
-        let d_scores = d_scores_pairs
-            .iter()
-            .find_map(|(input_id, grad_id)| (*input_id == masked).then_some(*grad_id))
-            .ok_or(AutogradError::TapeInvariant(
-                "causal_sdpa_recompute device backward missing softmax grad",
-            ))?;
-
-        if need_grad_q {
-            let grad_q_3d = matmul(d_scores, k_3d, store, &mut tape)?;
-            let grad_q_3d = mul_scalar(grad_q_3d, scale, store, &mut tape)?;
-            let grad_q = reshape(grad_q_3d, shape, store, &mut tape)?;
-            grads.push((q, grad_q));
-        }
-        if need_grad_k {
-            let d_scores_t = transpose(d_scores, 1, 2, store, &mut tape)?;
-            let grad_k_3d = matmul(d_scores_t, q_3d, store, &mut tape)?;
-            let grad_k_3d = mul_scalar(grad_k_3d, scale, store, &mut tape)?;
-            let grad_k = reshape(grad_k_3d, shape, store, &mut tape)?;
-            grads.push((k, grad_k));
-        }
+    if need_grad_q {
+        // Concatenate per-q-chunk grads along the sequence axis.
+        let grad_q_3d = concat_seq_chunks(&grad_q_chunks, merged_heads, head_dim, store)?;
+        let grad_q = reshape(grad_q_3d, shape, store, &mut tape)?;
+        grads.push((q, grad_q));
+    }
+    if need_grad_k {
+        let grad_k_3d = grad_k_acc.ok_or(AutogradError::TapeInvariant(
+            "causal_sdpa_recompute device backward: grad_k requested but no chunk produced it",
+        ))?;
+        let grad_k = reshape(grad_k_3d, shape, store, &mut tape)?;
+        grads.push((k, grad_k));
     }
 
     Ok(grads)
+}
+
+/// Concatenate per-q-chunk grad tensors `[merged_heads, rows_i, head_dim]`
+/// along the sequence axis into `[merged_heads, seq, head_dim]`. Folds the
+/// backend's `concat_axis2` over rank-4 `[merged_heads, 1, rows, head_dim]`
+/// views (CUDA-resident; CPU fallback readback/upload). Tape-free recompute
+/// path, so no backward node is recorded.
+fn concat_seq_chunks(
+    chunks: &[TensorId],
+    merged_heads: usize,
+    head_dim: usize,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    if chunks.is_empty() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: 1,
+            got: 0,
+        });
+    }
+    if chunks.len() == 1 {
+        return Ok(chunks[0]);
+    }
+
+    // Accumulate the running concat as a device handle + its rank-4 shape.
+    store.ensure_device(chunks[0])?;
+    let mut acc_handle =
+        store
+            .tensor(chunks[0])?
+            .device_handle
+            .clone()
+            .ok_or(AutogradError::TapeInvariant(
+                "concat_seq_chunks: chunk missing device handle",
+            ))?;
+    let rows0 = store.tensor(chunks[0])?.shape[1];
+    let mut acc_shape = vec![merged_heads, 1, rows0, head_dim];
+
+    for &id in &chunks[1..] {
+        store.ensure_device(id)?;
+        let rows = store.tensor(id)?.shape[1];
+        let next_handle =
+            store
+                .tensor(id)?
+                .device_handle
+                .clone()
+                .ok_or(AutogradError::TapeInvariant(
+                    "concat_seq_chunks: chunk missing device handle",
+                ))?;
+        let next_shape = vec![merged_heads, 1, rows, head_dim];
+        let (out_handle, out_shape) =
+            store
+                .backend()
+                .concat_axis2(&acc_handle, &acc_shape, &next_handle, &next_shape)?;
+        acc_handle = out_handle;
+        acc_shape = out_shape;
+    }
+
+    let seq_total = acc_shape[2];
+    store.alloc_device_tensor(vec![merged_heads, seq_total, head_dim], acc_handle)
 }
 
 /// Concatenate rank-4 `[batch, heads_i, seq, head_dim]` tensors along the
@@ -632,4 +822,141 @@ fn validate_cached_attention_shapes(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu_causal_sdpa_recompute_backward;
+
+    fn det_vec(len: usize, seed: u32, scale: f32) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let unit = (state >> 8) as f32 / (u32::MAX >> 8) as f32;
+                (unit - 0.5) * scale
+            })
+            .collect()
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    // The chunked device backward must be numerically identical to the unchunked
+    // host reference (`cpu_causal_sdpa_recompute_backward`), the writeback-OOM fix
+    // gate: q-chunking only reorders an exact sum, so any divergence is a bug.
+    #[test]
+    fn chunked_sdpa_backward_matches_unchunked() -> Result<()> {
+        const BATCH: usize = 1;
+        const HEADS: usize = 3;
+        const SEQ: usize = 20;
+        const HEAD_DIM: usize = 8;
+        let shape = vec![BATCH, HEADS, SEQ, HEAD_DIM];
+        let size: usize = shape.iter().product();
+
+        let q_data = det_vec(size, 0x4d59_5df4, 0.4);
+        let k_data = det_vec(size, 0x7a35_2b19, 0.4);
+        let v_data = det_vec(size, 0x1f12_d9e7, 0.6);
+        let up_data = det_vec(size, 0x2c91_7b03, 0.5);
+
+        // Host reference grads (unchunked oracle).
+        let (ref_gq, ref_gk, ref_gv) = cpu_causal_sdpa_recompute_backward(
+            &q_data, &k_data, &v_data, &up_data, &shape, true, true, true,
+        )?;
+        let ref_gq = ref_gq.expect("grad_q");
+        let ref_gk = ref_gk.expect("grad_k");
+        let ref_gv = ref_gv.expect("grad_v");
+
+        // Exercise both a multi-chunk run (q_chunk=3 → 7 chunks over SEQ=20) and
+        // the single-chunk run (q_chunk=SEQ); both must match the oracle exactly.
+        for q_chunk in [3usize, SEQ] {
+            let mut store = TensorStore::default();
+            let q = store.alloc(Tensor::new(q_data.clone(), shape.clone(), true)?);
+            let k = store.alloc(Tensor::new(k_data.clone(), shape.clone(), true)?);
+            let v = store.alloc(Tensor::new(v_data.clone(), shape.clone(), true)?);
+            let upstream = store.alloc(Tensor::new(up_data.clone(), shape.clone(), false)?);
+            // Force the device path (Dirty::Both + handle) like the writeback runtime.
+            for id in [q, k, v, upstream] {
+                store.ensure_device(id)?;
+            }
+
+            let grads = causal_sdpa_recompute_backward_device_chunked(
+                q, k, v, upstream, &shape, true, true, true, q_chunk, &mut store,
+            )?;
+
+            let find = |target: TensorId| -> TensorId {
+                grads
+                    .iter()
+                    .find_map(|(id, gid)| (*id == target).then_some(*gid))
+                    .expect("grad present")
+            };
+            let got_gq = store.to_host(find(q))?;
+            let got_gk = store.to_host(find(k))?;
+            let got_gv = store.to_host(find(v))?;
+
+            let dq = max_abs_diff(&ref_gq, &got_gq);
+            let dk = max_abs_diff(&ref_gk, &got_gk);
+            let dv = max_abs_diff(&ref_gv, &got_gv);
+            eprintln!(
+                "chunked_sdpa_backward q_chunk={q_chunk} dq={dq:.3e} dk={dk:.3e} dv={dv:.3e}"
+            );
+            assert!(
+                dq < 1e-4,
+                "q_chunk={q_chunk} grad_q diverged: max_abs={dq:.3e}"
+            );
+            assert!(
+                dk < 1e-4,
+                "q_chunk={q_chunk} grad_k diverged: max_abs={dk:.3e}"
+            );
+            assert!(
+                dv < 1e-4,
+                "q_chunk={q_chunk} grad_v diverged: max_abs={dv:.3e}"
+            );
+        }
+
+        Ok(())
+    }
+
+    // Selective-grad paths (e.g. frozen K/V) must also match the oracle and not
+    // touch the un-requested grad accumulators.
+    #[test]
+    fn chunked_sdpa_backward_grad_q_only() -> Result<()> {
+        const SEQ: usize = 14;
+        const HEAD_DIM: usize = 8;
+        let shape = vec![1usize, 2, SEQ, HEAD_DIM];
+        let size: usize = shape.iter().product();
+        let q_data = det_vec(size, 0xa1b2_c3d4, 0.4);
+        let k_data = det_vec(size, 0x1357_9bdf, 0.4);
+        let v_data = det_vec(size, 0x2468_ace0, 0.6);
+        let up_data = det_vec(size, 0x0f0f_0f0f, 0.5);
+
+        let (ref_gq, _, _) = cpu_causal_sdpa_recompute_backward(
+            &q_data, &k_data, &v_data, &up_data, &shape, true, false, false,
+        )?;
+        let ref_gq = ref_gq.expect("grad_q");
+
+        let mut store = TensorStore::default();
+        let q = store.alloc(Tensor::new(q_data, shape.clone(), true)?);
+        let k = store.alloc(Tensor::new(k_data, shape.clone(), true)?);
+        let v = store.alloc(Tensor::new(v_data, shape.clone(), true)?);
+        let upstream = store.alloc(Tensor::new(up_data, shape.clone(), false)?);
+        for id in [q, k, v, upstream] {
+            store.ensure_device(id)?;
+        }
+
+        let grads = causal_sdpa_recompute_backward_device_chunked(
+            q, k, v, upstream, &shape, true, false, false, 4, &mut store,
+        )?;
+        assert_eq!(grads.len(), 1, "only grad_q requested");
+        let gid = grads[0].1;
+        let got_gq = store.to_host(gid)?;
+        let dq = max_abs_diff(&ref_gq, &got_gq);
+        assert!(dq < 1e-4, "grad_q-only diverged: max_abs={dq:.3e}");
+        Ok(())
+    }
 }
