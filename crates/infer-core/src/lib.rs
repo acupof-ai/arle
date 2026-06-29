@@ -4478,12 +4478,13 @@ mod tests {
             let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(8), config);
             let n = 64usize;
             let max_tokens = 128usize;
-            let mut handles = Vec::with_capacity(n);
-            for r in 0..n {
-                let mut prompt: Vec<u32> = vec![1u32; 384];
-                prompt[0] = r as u32 + 2; // distinct prefix -> no radix reuse
-                handles.push(engine.submit_request(prompt, max_tokens));
-            }
+            let handles: Vec<_> = (0..n)
+                .map(|r| {
+                    let mut prompt = vec![1u32; 384];
+                    prompt[0] = r as u32 + 2; // distinct prefix -> no radix reuse
+                    engine.submit_request(prompt, max_tokens)
+                })
+                .collect();
             let mut ticks = 0u64;
             let start = Instant::now();
             while !engine.is_idle() {
