@@ -106,7 +106,7 @@ print(client.chat.completions.create(
 
 同一套 loop 也提升 *agentic* 能力:think-on OPD 下 4B student 学会**拒绝不相关的工具调用 —— BFCL-live abstention 0.60 → 1.00**。[<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
-**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3.5 全家族(CUDA + Metal)· Qwen3.6(Metal)· DeepSeek-V4-Flash(CUDA 8×H20)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
+**稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3-dense + Qwen3.5/3.6(hybrid·MoE)on CUDA + Metal;DeepSeek-V4-Flash + GLM-5.2(CUDA 8×H20 TP=8/EP=8;GLM-5.2 verify pending)· Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma(Metal)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
 
@@ -136,8 +136,8 @@ flowchart TB
   Seam["<b>infer-plan IR · infer-seam</b><br/>the narrow waist: two host-only traits — BackendExecutor · KvPool"]
 
   subgraph Exec["Executors — a new backend = implement the two traits"]
-    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3.5 · DeepSeek-V4-Flash"]
-    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5 · Qwen3.6"]
+    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3-dense · Qwen3.5/3.6 hybrid·MoE<br/>DeepSeek-V4-Flash · GLM-5.2 (verify pending)"]
+    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5/3.6 hybrid·MoE · Gemma4 / DeepSeek-OCR VLM (bring-up)<br/>DiffusionGemma (quality pending)"]
   end
 
   Serve --> Server

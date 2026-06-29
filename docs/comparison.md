@@ -9,13 +9,15 @@ this page summarizes.
 > on consumer machines and edge devices. Pick **ARLE** if you specifically
 > want a Rust runtime where serving, the local agent loop, and the train / RL
 > stack share one set of model + scheduler code paths, and you are working on
-> Qwen3.5 today.
+> Qwen3.5 / 3.6.
 
 ## What ARLE is not
 
-ARLE is **not** a drop-in vLLM replacement. As of 2026-04-27 the supported-
-model list is short (Qwen3.5 family — 0.8B / 4B / 30B-A3B / 35B dense, hybrid
-linear-attn, and MoE paths, including 0.8B GGUF Q4_K_M and 4B); see
+ARLE is **not** a drop-in vLLM replacement. As of 2026-06-29 the supported-
+model list is focused: Qwen3.5 / 3.6 (hybrid linear-attn + MoE) on CUDA + Metal,
+plus Qwen3 dense and DeepSeek-V4-Flash (CUDA 8×H20 TP=8/EP=8); Gemma4 /
+DeepSeek-OCR / DiffusionGemma run on Metal (VLM / block-diffusion bring-up).
+GLM-5.2 is wired on the CUDA DSv4 path (verification pending-remote). See
 [support-matrix.md](support-matrix.md). If "support 50 model families on day
 one" is on your requirements list, use vLLM.
 
@@ -27,7 +29,7 @@ candle or directly at PyTorch.
 
 | | Language | Models | Multi-turn KV reuse | Train / RL surface | Best fit |
 |---|---|---|---|---|---|
-| **ARLE** | Pure Rust | Qwen3.5 family | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree On-Policy Distillation only (`arle train opd`) — teacher hosted in the runtime (`crates/infer-*`), student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces retired 2026-05-18. | Rust shops doing OPD on Qwen3.5; agent workloads that pay a heavy prefill tax per turn |
+| **ARLE** | Pure Rust | Qwen3.5/3.6 (CUDA + Metal), DeepSeek-V4-Flash + GLM-5.2 (CUDA), Gemma4 / DeepSeek-OCR / DiffusionGemma (Metal) | Slot-sticky + radix-backed tiered KV (T0 GPU → T1 host → T2 disk → T3 cluster-shared); CUDA + Metal | Same runtime, in-tree On-Policy Distillation only (`arle train opd`) — teacher hosted in the runtime (`crates/infer-*`), student LoRA on the same backend. Pretrain / SFT / GRPO / multi-turn surfaces retired 2026-05-18. | Rust shops doing OPD on Qwen3.5; agent workloads that pay a heavy prefill tax per turn |
 | **vLLM** | Python (CUDA / ROCm) | Broad (Llama, Qwen, Mistral, DeepSeek, …) | PagedAttention + prefix cache | Separate (vLLM serves; train is your problem) | Production Python serving with a wide model menu |
 | **SGLang** | Python | Broad | RadixAttention prefix tree | Structured generation / multi-step prompting strengths | Python serving with structured / agent prompting |
 | **mistral.rs** | Pure Rust | Broad (multimodal too) | KV cache + prefix cache | Inference-focused | Rust serving with broad model coverage |
@@ -62,10 +64,10 @@ shows. Read each project's own docs before committing.
 
 ## What ARLE is intentionally not racing
 
-- **Model coverage.** The ranked next-model queue on the
-  [ROADMAP](../ROADMAP.md#next-model-priority-order) is **DeepSeek V4 #1**
-  (substrate landing) and **Qwen 3.6 #2** (planned / scoping); Llama 3 / 4
-  and DeepSeek V3 / R1 sit further back. None are shipped today.
+- **Model coverage.** DeepSeek-V4-Flash and Qwen3.6 have shipped (Qwen3.6 now
+  serves on CUDA, not Metal-only); the ranked next-model queue on the
+  [ROADMAP](../ROADMAP.md#next-model-priority-order) is Llama 3 / 4 and DeepSeek
+  V3 / R1, which sit further back and are not carried today.
   vLLM / SGLang / mistral.rs / llama.cpp all have far broader coverage now.
 - **Multi-GPU tensor parallel.** Not in scope as of 2026-04-26. Single-GPU
   serving is the supported path.

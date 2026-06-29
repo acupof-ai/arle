@@ -43,13 +43,12 @@ edition = "2024"
 license = "MIT"
 publish = false
 
-# Workspace-wide lint posture. Only universally-agreed lints live here; crates
-# that want stricter pedantic enforcement (currently only `infer`) opt in via
-# their own `[lints.clippy]` block with `pedantic = "warn"`.
+# Workspace-wide lint posture. Only universally-agreed lints live here; a crate
+# that wants stricter pedantic enforcement opts in via its own `[lints.clippy]`
+# block with `pedantic = "warn"`.
 [workspace.lints.clippy]
 # Default-level lints that this codebase disables because they fire on
-# legitimate patterns. See infer/Cargo.toml for the `pedantic`-level allows
-# that only apply to the `infer` crate.
+# legitimate patterns.
 too_many_arguments = "allow"
 collapsible_if = "allow"
 collapsible_else_if = "allow"

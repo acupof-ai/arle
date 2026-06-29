@@ -96,7 +96,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 <sub>Quality held: PPL 7.82 (vs 8.56 uniform-4bit) · 68.8% draft acceptance · default-on, <code>--no-speculative</code> to disable.</sub>
 
-**NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8.
+**NVIDIA — DeepSeek-V4-Flash, 8×H20 (TP=8 / EP=8, FP8 MoE).** B=1 decode **53 tok/s** (prefill 23 ms); the concurrent batched-decode lane adds **+48%** at c=8. Qwen3.6 FP8 MoE now serves on CUDA too (batched paged decode, tok/s scales c=1→8).
 
 <p align="center">
   <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode 33.5 → 53.3 tok/s over the 2026-06-13 → 06-14 campaign" width="720">
@@ -112,7 +112,7 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 The same loop lifts *agentic* capability: with think-on OPD the 4B student learns to **decline irrelevant tool calls — BFCL-live abstention 0.60 → 1.00**. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
-**Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3.5 family (CUDA + Metal) · Qwen3.6 (Metal) · DeepSeek-V4-Flash (CUDA 8×H20). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
+**Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3-dense + Qwen3.5/3.6 (hybrid · MoE) on CUDA + Metal · DeepSeek-V4-Flash + GLM-5.2 (CUDA 8×H20 TP=8/EP=8; GLM-5.2 verify pending) · Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma (Metal). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
 ---
 
@@ -143,8 +143,8 @@ flowchart TB
   Seam["<b>infer-plan IR · infer-seam</b><br/>the narrow waist: two host-only traits — BackendExecutor · KvPool"]
 
   subgraph Exec["Executors — a new backend = implement the two traits"]
-    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3.5 · DeepSeek-V4-Flash"]
-    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5 · Qwen3.6"]
+    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3.5 · Qwen3.6 · DeepSeek-V4-Flash · GLM-5.2"]
+    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5 · Qwen3.6 · Gemma4 · DeepSeek-OCR · DiffusionGemma"]
   end
 
   Serve --> Server

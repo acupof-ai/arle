@@ -60,15 +60,33 @@ closed). The per-kernel/alloc/host-overhead micro-lever KILL stands.
 
 ## Next-Model Priority Order
 
-Currently shipped: Qwen3.5-family (CUDA + Metal), DSv4-Flash (CUDA 8×H20).
-The model-coverage queue is ranked, not parallel:
+Currently shipped: Qwen3-dense + Qwen3.5/3.6 hybrid·MoE (CUDA + Metal —
+Qwen3.6 now serves on CUDA via FP8 MoE/DeepGEMM, no longer Metal-only),
+DSv4-Flash (CUDA 8×H20 TP=8/EP=8). Metal also runs VLMs (Gemma4, DeepSeek-OCR
+bring-up) + DiffusionGemma. The model-coverage queue is ranked, not parallel:
 
 1. **DeepSeek V4 (DSv4-Flash)** — active substrate (Phase 0–2 above).
-2. **Qwen 3.6** — second priority. Metal canonical model today; CUDA
-   serving lands as the second `ModelKvAdapter` (Phase 3).
+2. **Qwen 3.6** — **CUDA serving landed** (no longer "next"): FP8 MoE via
+   DeepGEMM, batched paged decode scales c=1→8 (Qwen3.6-27B-FP8 1×H20 21→26
+   tok/s; wins `2026-06-29-cuda-qwen36-paged-batched-decode`). Metal canonical
+   model with NextN/MTP spec-decode shipped (wins
+   `2026-06-21-metal-qwen36-mtp-spec-decode`).
 
-Other families in the support matrix sit behind these two and are not
-actively scheduled.
+Active in-flight model items (no longer "Qwen3.6 next"):
+
+- **GLM-5.2** (`glm_moe_dsa`, DSv4-DSA family, 256 experts) — wired on the DSv4
+  CUDA path; forward tranches landed but **verification pending-remote** (wins
+  `2026-06-19` glm52-* all pending-remote). Not production-verified.
+- **Gemma4 / DeepSeek-OCR Metal VLMs** — Metal forward + image smoke landed;
+  **quality/throughput validation pending** (Gemma4 wins `2026-06-15` gemma4-*;
+  DeepSeek-OCR wired/bring-up, vision numerics not yet faithful, wins
+  `2026-06-24/25` deepseek-ocr-*).
+- **Qwen3.5-122B-A10B at TP4** — serves at TP4 via GQA KV-head replication (all
+  4 worker engines ready); **numerical-completion gate pending** a clean re-run
+  (wins `2026-06-29-cuda-gqa-replication-122b-tp4`).
+
+Other families in the support matrix sit behind these and are not actively
+scheduled.
 
 Backend queue: CUDA + Metal are shipped. **HIP/ROCm + Vulkan** are the AIPC
 lane ([#71](https://github.com/cklxx/arle/issues/71), #76/#77): code began
@@ -78,8 +96,10 @@ landing 2026-06-10/11 ahead of the Phase 3 ordering (`infer-hip`,
 [`2026-06-11-hip-onbox-runbook.md`](docs/plans/2026-06-11-hip-onbox-runbook.md)).
 **Phase-ordering ratification pending** — see
 [refactor roadmap §6](docs/plans/2026-06-12-architecture-refactor-roadmap.md).
-A `gemma-spec` + Vulkan Gemma4 order pin is also in-tree, **unranked** in the
-model queue above (same pending ratification).
+Gemma4 already has a working **Metal VLM forward** (`gemma-spec`; SWA + full
+attn, image-capable — smoke/bench landed, quality/throughput pending, see the
+in-flight items above); the in-tree Vulkan Gemma4 order pin remains **unranked**
+on the AIPC backend queue (same pending ratification).
 
 ## History
 

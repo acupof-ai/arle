@@ -283,9 +283,12 @@ pub(crate) struct Dsv4MoeLayer {
 /// only on GLM dense layers; DSv4 (all-MoE) never builds this.
 ///
 /// GPU-UNVERIFIABLE (pod): keeping the dense FFN in bf16 (vs FP8) trades VRAM for
-/// a simpler bring-up; the Tranche-D forward consumes `gate`/`up`/`down` directly.
+/// a simpler bring-up; the GLM dense forward consumes `gate`/`up`/`down` directly.
 ///
-/// All fields are consumed by the Tranche-D GLM forward (not yet wired).
+/// All fields are consumed by the GLM dense forward `dsv4_dense_mlp_forward`
+/// (wired via `Dsv4Layer::dense_mlp`). The `allow(dead_code)` stays because the
+/// DSv4-only build (every layer MoE) never constructs this — `dense_mlp` is
+/// `None` there — so the GLM-only fields read as dead under that config.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DenseMlp {
     /// Gate projection `[intermediate, hidden]` (bf16).
@@ -314,8 +317,9 @@ pub(crate) struct Dsv4Layer {
     pub compress_ratio: usize,
     /// GLM dense layers only (`config.per_layer_dense_mlp[i]`): a plain FFN that
     /// replaces the routed-expert forward. `Some` ⇒ the forward runs `dense_mlp`
-    /// instead of `moe`. DSv4 layers leave this `None`. Consumed by the Tranche-D
-    /// GLM forward (not yet wired).
+    /// instead of `moe`. DSv4 layers leave this `None`. Consumed by the GLM dense
+    /// forward `dsv4_dense_mlp_forward`; `allow(dead_code)` stays for the
+    /// DSv4-only build, where every layer is MoE and this is always `None`.
     #[allow(dead_code)]
     pub dense_mlp: Option<Dsv4DenseMlp>,
 }

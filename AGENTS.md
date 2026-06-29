@@ -6,218 +6,174 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 
 ---
 
-## §0 First principle — SOLID (truth-seeking, push to the extreme)
+## §0 First principle — SOLID (truth-seeking, pushed to the extreme)
 
-**Everything must be SOLID. Not SOLID enough → keep digging, keep breaking through.**
-Not a suggestion — the quality bar.
+**Everything must be SOLID. Not SOLID enough → keep digging.** The quality bar,
+not a suggestion.
 
-- **Inference ≠ SOLID**: source survey, code grep, doc analysis, callgraph
-  inference are all *hypothesis*, not evidence. Evidence = measured nsys trace /
-  bench numbers / runtime log counter / controlled-variable A/B. No evidence → no
-  conclusion; label it hypothesis.
-- **Confounders must be isolated**: one experiment changing N variables at once
-  (buffer pool + scheduler clamp + KV format + graph capture) → any result is
-  **unattributable**. Change one variable at a time, or run an explicit control to
-  isolate the confounder.
-- **Root-cause hypotheses also get license-or-kill**: license-or-kill is not just
-  for fixes — the **root-cause inference** itself needs a cheap experiment to
-  verify (nsys fraction / log counter / a second source read / A/B). Wrong root
-  cause → every sub-experiment is wasted.
-- **80% SOLID is not enough**: when you find a gap, dig to 95%+, or explicitly
-  declare "deferred, accepting the uncertainty". **No silent pass.**
-- **Self-check before shipping**: before any plan / wins / errors / brief /
-  recommendation lands, ask "Is this SOLID? Where's the gap? Dig, or explicitly
-  defer?". Below bar → reflect, keep digging.
-- **Cross-check framing from multiple angles**: when the same data yields
-  different conclusions under different framings (per-NVTX-window vs
-  per-wall-clock, per-launch vs per-token, per-layer vs per-request),
-  **wall-clock / per-request framing is ground truth**. A narrow-window X% share
-  ≠ the actual X% wall-clock impact. License-or-kill must use the wall-clock
-  framing — never deceive yourself with the narrow-window framing.
-- **Case-as-fact — attribute from decoded cases before overturning a hypothesis
-  (做算法以 case 为事实)**: a negative / bug result (a regression, a failed metric,
-  a subagent's "it's structural" summary) is a **case to debug at the token
-  level**, NOT a license to generalize into a structural conclusion that kills the
-  hypothesis. Before trusting any aggregate: ① **decode the actual model outputs**
-  per-case, per-step (base vs each checkpoint, on the *failing* slice); ② **audit
-  the eval harness for artifacts** — timeouts/errors silently bucketed as a class,
-  request-errors counted as wrong, a metric that rewards the wrong thing. The
-  aggregate **and** a plausible mechanism can *both* lie; the decoded cases are
-  ground truth. Once attributed at case level, the fix usually falls out — never
-  kill a hypothesis on a confounded experiment. **先归因清楚再推翻。**
+- **Inference ≠ evidence.** Source survey / grep / doc / callgraph are
+  *hypothesis*; evidence = measured nsys / bench numbers / runtime log counter /
+  controlled-variable A/B. No evidence → label it hypothesis, no conclusion.
+- **Isolate confounders.** One experiment changing N variables at once (buffer
+  pool + scheduler clamp + KV format + graph capture) is **unattributable** —
+  change one variable at a time, or run an explicit control.
+- **Root-cause hypotheses get license-or-kill too** — not just fixes. The
+  inference itself needs a cheap verify (nsys fraction / log counter / second
+  source read / A/B). Wrong root cause → every sub-experiment wasted.
+- **80% SOLID is not enough.** Dig to 95%+, or explicitly declare "deferred,
+  accepting the uncertainty". **No silent pass.**
+- **Self-check before shipping** any plan / wins / errors / brief /
+  recommendation: "Is this SOLID? Where's the gap? Dig, or explicitly defer?"
+- **Wall-clock / per-request framing is ground truth.** When framings disagree
+  (per-NVTX-window vs wall-clock, per-launch vs per-token, per-layer vs
+  per-request), a narrow-window X% share ≠ the actual wall-clock impact.
+  License-or-kill uses the wall-clock framing — never the narrow-window one.
+- **Case-as-fact — attribute decoded cases before overturning a hypothesis (做算法
+  以 case 为事实).** A negative/bug result (a regression, a failed metric, a
+  subagent's "it's structural") is a **case to debug at the token level**, NOT a
+  license to generalize into a structural KILL. Before trusting any aggregate:
+  ① **decode the actual model outputs** per-case/per-step on the *failing* slice;
+  ② **audit the eval harness for artifacts** (timeouts/errors bucketed as a
+  class, request-errors counted as wrong, a metric rewarding the wrong thing).
+  Aggregate **and** mechanism can both lie; decoded cases are ground truth. The
+  fix usually falls out once attributed at case level. **先归因清楚再推翻。**
 
 Empirical anchors:
-- **Agentic-OPD "structural" false-KILL** (2026-06-20): a −14pp agentic-OPD
-  regression + a plausible mechanism ("on-policy can't teach abstention") was
-  written up as a structural KILL — **wrong**. Decoding the cases: the gate's
-  "+42pp teacher abstention" was **14/17 teacher TIMEOUTS counted as abstention**
-  (a fake gate); the no-think teacher actually *over-calls* (33% abstain < base
-  46%); OPD faithfully distilled that bad target. Fixable (timeout-clean gate +
-  think-on teacher), hypothesis intact. The aggregate metric **and** the subagent
-  summary both misled; only the decoded cases were true.
+- **Agentic-OPD "structural" false-KILL** (2026-06-20): a −14pp regression +
+  plausible mechanism ("on-policy can't teach abstention") written up as a
+  structural KILL — **wrong**. The gate's "+42pp teacher abstention" was 14/17
+  teacher TIMEOUTS counted as abstention (fake gate); the think-on teacher
+  actually over-calls (33% abstain < base 46%). Aggregate **and** subagent
+  summary both misled; only decoded cases were true. Fixable, hypothesis intact.
 - **M_pf-graph Phase 0 KILL** (2026-05-08): the errors entry was 80% SOLID and
-  still fell — 3 gaps: launch-overhead share not nsys-verified / SGLang
-  graph-trigger count not measured against a control / 4 variables changed at once
-  → the strategic conclusion was wholly void.
-- **M_pf-graph v2 framing trap** (2026-05-08 EOD+19): nsys "55.7% of prefill
-  window" looked like a PASS, but 191ms / 60s trace = 6.4ms per prefill / 1995ms
-  TTFT = **0.32% wall-clock**, far below the 10% kill threshold. **Lesson**: nsys
-  "X% of NVTX window" must cross-check the "Y ms / per-request total" framing; take
-  the more conservative as the license-or-kill baseline.
+  still void — launch-overhead share not nsys-verified / graph-trigger count not
+  measured against a control / 4 variables changed at once.
+- **M_pf-graph v2 framing trap** (2026-05-08): nsys "55.7% of prefill window"
+  looked like a PASS, but 191ms / 60s trace = 6.4ms per prefill / 1995ms TTFT =
+  **0.32% wall-clock**, far below the 10% kill threshold. nsys "X% of NVTX
+  window" must cross-check "Y ms / per-request total"; take the conservative one.
 
 ---
 
-## §0.1 Decompose to the implementation level — unravel it, leave nothing out
+## §0.1 Decompose to the implementation level
 
-For a hard/complex task, **don't be intimidated by the difficulty**: unravel it
-into atomic tasks → draw the dependency DAG (who blocks whom) → compute the
-critical path + budget. Fine-grained enough, and the plan falls out on its own.
+For a hard/complex task, don't be intimidated: unravel into atomic tasks →
+dependency DAG (who blocks whom) → critical path + budget. Fine-grained enough,
+the plan falls out on its own.
 
-- **Down to the implementation level, not the principle level.** "Pre-allocate,
-  don't copy big buffers" is a principle, not a spec; go to the exact buffer /
-  size / call site / precondition. **Claude produces the line-level spec, the
-  executor copies it verbatim** — free improvisation drops fields (empirical: the
-  DSv4 rollback snapshot's first version missed the `sw_window` + `fp8_kv_pool`
-  buffers).
-- **Every state change must enumerate each mutated buffer and prove each one.**
-  rollback / cache / scratch / fusion / quant all count: list **every** device
-  buffer the operation writes, and for each give the disposition + **exact
-  precondition** — never rely on "should self-heal": ① rolled back by an existing
-  path (name it); ② self-heals (write the precondition — e.g. a ring buffer's
-  speculative write self-heals **only** for seq_len < ring_size; beyond that it
-  aliases a live slot); ③ must snapshot/restore. Full enumeration is what exposes
-  the gap a partial fix missed.
+- **To the implementation level, not the principle level.** "Pre-allocate, don't
+  copy big buffers" is a principle, not a spec — go to the exact buffer / size /
+  call site / precondition. **Claude produces the line-level spec, the executor
+  copies it verbatim**; free improvisation drops fields (the DSv4 rollback
+  snapshot's first version missed the `sw_window` + `fp8_kv_pool` buffers).
+- **Every state change enumerates each mutated buffer and proves each.** rollback
+  / cache / scratch / fusion / quant: list **every** device buffer written, give
+  each a disposition + **exact precondition** — never "should self-heal":
+  ① rolled back by an existing path (name it); ② self-heals (write the
+  precondition — a ring's speculative write self-heals **only** for seq_len <
+  ring_size; beyond that it aliases a live slot); ③ snapshot/restore. Full
+  enumeration exposes the gap a partial fix missed.
 - **Inline speed into correctness.** Pre-allocate once and reuse (no per-step
   alloc — churn + the disabled-event-tracking premature-free); copy at the
-  smallest grain (the ring moves one slot → store only that one slot, not the
-  whole ring); fold the whole thing into the opt-in path, the default baseline
-  stays byte-for-byte unchanged, A/B-verify the baseline tok/s doesn't regress.
+  smallest grain (ring moves one slot → store that one slot, not the whole ring);
+  fold into the opt-in path, default baseline byte-for-byte unchanged,
+  A/B-verify the baseline tok/s doesn't regress.
 - **Correct inference ≠ baseline identity.** The gate for spec-decode / quant /
-  kernel-swap is **correct inference** (needle retrieval + the same-config-twice
+  kernel-swap is **correct inference** (needle retrieval + same-config-twice
   non-determinism floor + self-consistency: the new kernel's own autoregressive
-  output is the reference), **not** token-exact-vs-baseline (confounded by MoE
-  run-to-run non-determinism). A degenerate (looping) prompt is not a valid test
-  case.
-- **Root-cause on a clean baseline.** Don't design the next fix's detail on a
-  confounded baseline; land + isolate the precondition first (a broken s_q=K
-  running on a baseline that still has the rollback bug → the garbage is
-  confounded; refining on a dirty baseline is self-deception).
+  output is the reference), NOT token-exact-vs-baseline (confounded by MoE
+  non-determinism). A degenerate (looping) prompt is not a valid test case.
+- **Root-cause on a clean baseline.** Land + isolate the precondition first;
+  refining a fix on a baseline that still has the bug confounds the garbage.
 
 Empirical anchor:
-- **DSv4 EAGLE rollback** (2026-06-06): `truncate_decode_len` only restored
+- **DSv4 EAGLE rollback** (2026-06-06): `truncate_decode_len` restored only
   `compressed.seq_len`, missing `pending_kv`/`prev_overlap` → the draft corrupted
-  at the compression boundary; full enumeration then revealed it also missed the
-  `sw_window` + `fp8_kv_pool` ring slots (self-heals only for seq_len <
-  sliding_window). Byte-identity had been used as the EAGLE gate (violating my own
-  MoE-non-determinism memory), misjudging possible non-determinism as a bug.
+  at the compression boundary; full enumeration then exposed the missing
+  `sw_window` + `fp8_kv_pool` ring slots (self-heal only for seq_len <
+  sliding_window). Byte-identity had been (wrongly) used as the EAGLE gate.
 
-**Implementation gate — simple before you start (skill
-[`understand-until-simple`](.claude/skills/understand-until-simple/SKILL.md)).**
-Before writing ANY implementation code, clear this gate: ① decompose to the atomic
-level (a concrete **file:line / kernel / loop**, not a concept) ② get measured
-evidence (controlled-variable profile / A-B, not inference) ③ let the measurement
-**correct** your hypotheses (the load-bearing assumption is exactly the one you
-must measure, not guess) ④ until you can state the fix in **one sentence + one
-measured number** and name the next wall. **Still saying "hard / tough / complex /
-multi-day" means you haven't decomposed enough — "hard" is a confession of
-not-yet-decomposed, not a property of the problem; keep decomposing.** Can't
-compress it to one sentence = you don't understand it yet, no code.
+**Implementation gate — simple before you start** (skill
+[`understand-until-simple`](.claude/skills/understand-until-simple/SKILL.md)).
+Before ANY implementation code: ① decompose to the atomic level (a concrete
+**file:line / kernel / loop**, not a concept) ② get measured evidence
+(controlled-variable A/B, not inference) ③ let measurement **correct** your
+hypotheses (the load-bearing assumption is exactly the one to measure) ④ until
+you can state the fix in **one sentence + one measured number** and name the next
+wall. **Still saying "hard / tough / multi-day" means not yet decomposed — "hard"
+is a confession, not a property; keep decomposing.** Can't compress to one
+sentence = no code.
 
-**Cost comes AFTER the concrete work, never before (ckl 2026-06-20).** Sequence
-is mandatory: ① investigate to the file:line decomposition first → ② only THEN
-evaluate cost. **Do not label difficulty / risk / "infeasible" / "multi-day"
-before the steps are concrete** — a cost guessed ahead of the decomposition adds
-confusion, not information (it raises perplexity, biases the work down, and
-pre-commits you to a wrong size). When the work is clear the plan is usually
-*simple*; state the steps and proceed. If you catch yourself ranking risk or
-estimating effort before you can name the file:line steps, stop and go decompose
-— the estimate is noise. Empirical: the DSv4 prefix-reuse investigation
-(2026-06-20) decomposed cleanly into 6 file:line steps reusing the existing
-`Dsv4LayerImage` capture/restore, yet still got wrapped in "hard / likely
-infeasible cheaply / HIGH risk" — the hedging was pure noise on top of a clear plan.
-
-Empirical: DSv4 batched decode (2026-06-14) was hand-waved as "very hard,
-multi-day new infra"; reading the code + measuring the step decomposition
-collapsed it to "one per-row `for` loop at `dsv4.rs:1872` → batch it → ~2×
-aggregate, MoE 3.70× sub-linear doesn't cap" — the "hard" was just un-decomposed.
+**Cost comes AFTER the concrete work, never before** (ckl 2026-06-20). ①
+investigate to the file:line decomposition first → ② only THEN evaluate cost.
+**Don't label difficulty / risk / "infeasible" / "multi-day" before the steps are
+concrete** — a cost guessed ahead of decomposition raises perplexity, biases the
+work down, pre-commits a wrong size. Catch yourself ranking risk before naming
+file:line steps → stop and decompose; the estimate is noise. Empirical: DSv4
+prefix-reuse (2026-06-20) decomposed into 6 file:line steps reusing the existing
+`Dsv4LayerImage` capture/restore, yet got wrapped in "hard / infeasible / HIGH
+risk" — pure noise. DSv4 batched decode (2026-06-14) hand-waved "very hard,
+multi-day new infra"; reading the code collapsed it to "one per-row `for` loop at
+`dsv4.rs:1872` → batch it → ~2× aggregate, MoE 3.70× sub-linear doesn't cap".
 
 ---
 
 ## Project shape
 
-`ARLE` is a Rust-native, device-neutral inference runtime with integrated
-local agent and **On-Policy Distillation (OPD)** workflows. The runtime
-remains primary:
+`ARLE` is a Rust-native, device-neutral inference runtime with integrated local
+agent and **On-Policy Distillation (OPD)** workflows. The runtime is primary:
 
-- The **`infer-*` rewrite stack owns serving/runtime truth**: `infer-plan`
-  (IR) → `infer-seam` (host-only traits) → `infer-core`
-  (Engine/scheduler/RadixCache) → `infer-cuda`/`infer-metal` (executors) →
-  `infer-server`/`infer-api`, with `infer-topo`/`infer-moe`/`infer-util` as
-  shared leaves. The monolithic `infer/` crate was **deleted 2026-06-04**
-  (`e81b98fb`, ~167k LOC) — any doc/command referencing `infer/` or
-  `-p infer` is stale.
-- `arle` is the runtime-led CLI front door for local agent, OPD train,
-  and eval workflows. `infer-api` (`LoadedInferenceEngine`) is the single
-  programmatic front door.
-- `train` extends the same runtime/model authority via **OPD only**;
-  it is not a second equal product line with its own independent
-  truth surface. Scratch pretrain, SFT, GRPO, and multi-turn RL
-  surfaces have been deleted (2026-05-18 pivot — see
-  [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md))
-  because the industry baseline made pretrain unwinnable (322× gap)
-  and SFT/GRPO/multi-turn duplicate mature OSS (vLLM+verl, TRL,
-  axolotl). OPD is the one training axis where ARLE's runtime
-  authority is structurally differentiating: it needs a strong
-  inference path for the teacher and tight latency to score student
-  rollouts — both already in the `infer-*` runtime (teacher surface on
-  `infer-api`).
+- **`infer-*` rewrite stack owns serving/runtime truth**: `infer-plan` (IR) →
+  `infer-seam` (host-only traits) → `infer-core` (Engine/scheduler/RadixCache) →
+  `infer-cuda`/`infer-metal` (executors) → `infer-server`/`infer-api`;
+  `infer-topo`/`infer-moe`/`infer-util` are shared leaves. The monolithic
+  `infer/` crate was **deleted 2026-06-04** (`e81b98fb`, ~167k LOC) — any
+  doc/command referencing `infer/` or `-p infer` is stale.
+- `arle` is the runtime-led CLI front door (local agent, OPD train, eval).
+  `infer-api` (`LoadedInferenceEngine`) is the single programmatic front door.
+- `train` extends the same runtime/model authority via **OPD only** — not a
+  second equal product line. Scratch pretrain / SFT / GRPO / multi-turn RL were
+  deleted (2026-05-18 pivot —
+  [`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md)):
+  pretrain unwinnable (322× gap), SFT/GRPO/multi-turn duplicate mature OSS
+  (vLLM+verl, TRL, axolotl). OPD is the one axis where ARLE's runtime authority
+  structurally differentiates — strong teacher inference + tight student-scoring
+  latency, both already in the `infer-*` runtime (teacher surface on `infer-api`).
 
 No PyTorch and no Python on the hot path. Two backends plug into one seam
 (`infer_seam::{BackendExecutor, KvPool}` — two host-only traits): the CUDA
-continuous-batching executor (Linux/NVIDIA, `cudarc` + vendored official
-kernels FlashMLA/DeepGEMM/DeepEP + TileLang AOT + native CUDA C) and the
-Metal executor (Apple Silicon, `crates/mlx-sys` C++ bridge — continuous
-batching with variable-length packed decode via mlx-lm `BatchKVCache`
-pattern). The same `infer_core::Engine<E, K>` drives both; adding a backend
-means implementing the two seam traits, not touching scheduler/cache/server.
-Models: Qwen3.5-family (CUDA + Metal), Qwen3.6 (Metal), DSv4-Flash
-(CUDA 8×H20 TP=8/EP=8).
+continuous-batching executor (Linux/NVIDIA, `cudarc` + vendored FlashMLA/DeepGEMM/
+DeepEP + TileLang AOT + native CUDA C) and the Metal executor (Apple Silicon,
+`crates/mlx-sys` C++ bridge — continuous batching, variable-length packed decode
+via mlx-lm `BatchKVCache`). The same `infer_core::Engine<E, K>` drives both; a new
+backend = implementing the two seam traits, not touching scheduler/cache/server.
+Models: Qwen3-dense + Qwen3.5/3.6 (hybrid·MoE) on CUDA + Metal; DeepSeek-V4-Flash
++ GLM-5.2 (CUDA 8×H20 TP=8/EP=8; GLM-5.2 verify pending); Qwen3.6 + Gemma4 ·
+DeepSeek-OCR VLMs + DiffusionGemma (Metal). Full tiers: docs/support-matrix.md.
 
-**Metal canonical model — globally unified (2026-05-07).** All Metal
-backend development, benchmarking, and testing uses
-`mlx-community/Qwen3.6-35B-A3B-4bit` (MoE, ~19 GB, cached at
+**Metal canonical model — globally unified (2026-05-07):
+`mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE, ~19 GB, cached at
 `~/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit`).
-
-- **Why**: Qwen3.6 is the canonical Metal production target per
-  [`README.md`](README.md) backend matrix and the
-  [`ROADMAP.md`](ROADMAP.md) Next-Model priority queue. Benching against
-  the production shape catches MoE-specific perf and correctness
-  regressions that Qwen3.5-0.8B (dense) cannot surface.
-- **Scope**: every Metal serve invocation (`arle serve --backend metal`;
-  the legacy `metal_serve` bin is deleted), `scripts/bench_*.sh`
-  default, smoke test, and `docs/experience/wins`/`errors` entry on the
-  Metal track must use Qwen3.6. CUDA-side benches keep their existing
-  defaults.
-- **Opt-out**: Qwen3.5-0.8B-MLX-4bit and friends remain in
-  `models/` for unit tests that explicitly need a small model;
-  set `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` and document
-  the reason in the test/wins entry.
-- **Bench-script invocation**: `./scripts/bench_*.sh <label> --model
-  mlx-community/Qwen3.6-35B-A3B-4bit` (HF id; the serve path resolves to
-  the cached snapshot). Direct: `arle serve --backend metal --model-path
-  mlx-community/Qwen3.6-35B-A3B-4bit`.
-- **Auto-wired-limit** (always-on since
-  [`2026-05-07-bench-qwen36-mle-perf.md`](docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md)):
-  the rewrite Metal executor auto-pins model weights via
-  `mlx::set_wired_limit` at construction
-  (`infer-metal/src/wired_limit.rs`). Computes
-  (model dir size + 1 GiB headroom) and follows HF cache symlinks.
-  Drops c=1 p99 from 86 ms → 15 ms on Qwen3.6 (−82%). The monolith-era
-  `--wired-limit-bytes` flag (and its `0` opt-out) no longer exists.
+Production target per [`README.md`](README.md) backend matrix +
+[`ROADMAP.md`](ROADMAP.md) Next-Model queue; catches MoE perf/correctness
+regressions that Qwen3.5-0.8B (dense) can't.
+- **Scope**: every Metal serve (`arle serve --backend metal`; legacy
+  `metal_serve` bin deleted), `scripts/bench_*.sh` default, smoke test, and
+  Metal-track `wins`/`errors` entry. CUDA benches keep existing defaults.
+- **Opt-out**: small models stay in `models/` for unit tests that need one — set
+  `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` and document the reason.
+- **Bench invocation**: `./scripts/bench_*.sh <label> --model
+  mlx-community/Qwen3.6-35B-A3B-4bit` (HF id resolves to the cached snapshot).
+  Direct: `arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit`.
+- **Auto-wired-limit** (always-on,
+  [2026-05-07-bench-qwen36-mle-perf](docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md)):
+  the Metal executor auto-pins weights via `mlx::set_wired_limit` at construction
+  (`infer-metal/src/wired_limit.rs`; model dir size + 1 GiB headroom, follows HF
+  symlinks). c=1 p99 86 → 15 ms on Qwen3.6 (−82%). Monolith-era
+  `--wired-limit-bytes` flag gone.
 - **MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER — not a default.**
-  Qwen3.5-dense-only tune; on Qwen3.6 MoE benched wash-or-loss because 95% of
-  step is `mx::async_eval` encoding ~600-1000 primitives — buffer cap doesn't
-  help. Per-workload matched-A/B only.
+  Qwen3.5-dense-only tune; on Qwen3.6 MoE benched wash-or-loss (95% of step is
+  `mx::async_eval` encoding ~600-1000 primitives). Per-workload matched-A/B only.
   Refs: [baseline](docs/experience/wins/2026-05-07-bench-qwen36-baseline.md),
   [encode-bottleneck](docs/experience/wins/2026-05-07-bench-qwen36-encode-bottleneck.md).
 
@@ -251,9 +207,8 @@ ARLE/
 ```
 
 CUDA kernels live at `crates/cuda-kernels/csrc/` + `vendor/`
-(adopt-official-first; hand-rolled only for the genuine gap).
-
-Workspace topology source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
+(adopt-official-first; hand-rolled only for the genuine gap). Workspace topology
+source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
 
 ---
 
@@ -266,7 +221,7 @@ Workspace topology source of truth: [`docs/codebase-map.md`](docs/codebase-map.m
 | **Explore** (trace callers, grep prior art, list trait implementors) | You can name every file you will touch. |
 | **Plan** (ask "how would this fail?" first; >5 files or irreversible → stop + flag) | Written approach the user accepted. |
 | **Implement** (check prior art in `crates/infer-*/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
-| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path; **bench entry per §Benchmarks** if diff is in-scope) | Tests green, `cargo clippy -- -D warnings` clean, **wins/ entry committed (or stub with `pending-remote`)**. |
+| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path; **bench entry per §Benchmarks** if in-scope) | Tests green, `cargo clippy -- -D warnings` clean, **wins/ entry committed (or stub `pending-remote`)**. |
 | **Reflect** (bug >1 attempt → `docs/experience/errors/`; correction → feedback memory) | Experience entry committed. |
 
 Skip rules: trivial → Implement + Verify; exploration questions → Explore only.
@@ -274,12 +229,11 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 ### Editing
 
 - **Preserve by default.** Never delete content not explicitly in scope.
-- **Keep code simple and uniform.** Prefer deletion-style refactors:
-  remove obsolete paths, collapse duplicate helpers/branches, and converge on
-  one canonical flow instead of layering adapters.
-- **`AGENTS.md` is canonical.** If a sibling `CLAUDE.md` exists, keep both
-  files as full rule documents and keep their contents aligned; do not
-  collapse one into a thin pointer.
+- **Keep code simple and uniform.** Prefer deletion-style refactors: remove
+  obsolete paths, collapse duplicate helpers/branches, converge on one canonical
+  flow instead of layering adapters.
+- **`AGENTS.md` is canonical.** A sibling `CLAUDE.md` stays a full rule document
+  aligned with it, not a thin pointer.
 - **Approach-first for >3 files or architectural decisions** — outline and wait.
 - **No half-states** (`feedback_no_half_states.md`): finish a refactor unit or
   revert it, never leave parallel old+new paths in the tree.
@@ -287,182 +241,176 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 ### Backend isolation (CRITICAL)
 
 - `#[cfg(feature = "cuda")]` / `#[cfg(feature = "metal")]` gating; **never
-  `cfg`-leak backend types into cross-backend modules** — everything above
-  the seam (`infer-core`/`-server`/`-api`) stays device-neutral; backend
-  types live only in `infer-cuda` / `infer-metal`.
+  `cfg`-leak backend types into cross-backend modules** — everything above the
+  seam (`infer-core`/`-server`/`-api`) stays device-neutral; backend types live
+  only in `infer-cuda` / `infer-metal`.
 - CUDA stubs on non-CUDA targets: `todo!("GPU required: ...")`.
 - Pre-push type check on Mac without nvcc:
   `cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib`.
 
-### Delegation (general-purpose subagents execute, Codex reviews, parallel by default)
+### Delegation (subagents execute, Codex reviews, parallel by default)
 
-Claude = **direction + integration**. Execution runs through **`general-purpose`
-subagents** (Agent tool). Research/mapping runs through **`Explore`**; large
-cross-cutting plans through **`Plan`**. Review runs through **`codex review`
-at the Bash tool** — a shell command, not a subagent.
-
-**DO NOT use `codex:codex-rescue` or `mcp__openmax__execute_with_codex` for
-execution** — both hang ("codex hangs", observed 2026-04-19). See
-`memory/feedback_codex_subagent_hangs.md`. The review-via-Bash path is
-unaffected.
-
-Reserve direct hand-written diffs for edits ≤ ~3 files / trivial mechanical
-changes.
+Claude = **direction + integration**. Execution → **`general-purpose`** subagents
+(Agent tool); research/mapping → **`Explore`**; large cross-cutting plans →
+**`Plan`**; review → **`codex review` at the Bash tool** (a shell command, not a
+subagent). **DO NOT use `codex:codex-rescue` / `mcp__openmax__execute_with_codex`
+for execution** — both hang ("codex hangs", observed 2026-04-19;
+`feedback_codex_subagent_hangs.md`); review-via-Bash is unaffected. Reserve direct hand-written diffs for ≤ ~3 files / trivial
+mechanical changes.
 
 | Area | Owner |
 |------|-------|
 | Docs, planning, architecture, roadmaps | Claude |
-| Code execution (implement/refactor/tests) | **`general-purpose` subagent** (delegate via Agent tool) |
+| Code execution (implement/refactor/tests) | **`general-purpose` subagent** |
 | Broad codebase exploration / scope mapping | **`Explore` subagent** |
 | Implementation planning spanning >5 files | **`Plan` subagent** |
 | Code review of non-trivial diffs | **Claude runs `codex review` at Bash** |
 | Stuck-problem rescue (2-strike hand-off) | **`general-purpose` with full context** |
 
-- **Parallel by default.** Independent delegated tasks → single message,
-  multiple Agent calls. Serial only when data-dependent.
-- **Code review invocation:** `codex review --uncommitted` (or `--commit <sha>` /
-  `--base <branch>`) at Bash, run in background + tee to tmp file —
-  non-blocking (`feedback_codex_review_async.md`).
+- **Parallel by default.** Independent delegated tasks → single message, multiple
+  Agent calls. Serial only when data-dependent.
+- **Code review:** `codex review --uncommitted` (or `--commit <sha>` / `--base
+  <branch>`) at Bash, background + tee to tmp — non-blocking
+  (`feedback_codex_review_async.md`).
 - **2-strike rule:** two failed subagent attempts → hand-write the diff (if
-  small) or re-brief a fresh `general-purpose` with notes on what prior
-  attempts tried and why they failed.
+  small) or re-brief a fresh `general-purpose` with what prior attempts tried.
 
 ### Execution hygiene (Claude and delegated agents alike)
 
 - Surface known failure logs upfront so the same blocker isn't re-discovered.
-- Pin SKU / shape / scope at exact granularity, not by fuzzy name — otherwise everything gets enabled then narrowed down.
-- Before patching an upstream component, grep the raise point and lock the root cause first.
-- When probing install / directory / env layout, enumerate candidate paths upfront, not fail-then-retry.
-- PR branches start from `upstream/main`, never from a local WIP branch — defaults pick current HEAD, so state it explicitly.
-- Verify a patched upstream lib in an isolated dir, never the existing dev install, to dodge editable / `.pth` finder hijacks.
-- When an upstream patch crosses a size or cross-cutting-policy threshold, pause and ack before landing.
-- Regression tests should mirror the failure mode with a minimal in-component kernel, not by importing caller code.
+- Pin SKU / shape / scope at exact granularity, not by fuzzy name — else
+  everything gets enabled then narrowed down.
+- Before patching an upstream component, grep the raise point and lock the root
+  cause first.
+- Probing install / directory / env layout: enumerate candidate paths upfront,
+  not fail-then-retry.
+- PR branches start from `upstream/main`, never a local WIP branch — defaults
+  pick current HEAD, so state it explicitly.
+- Verify a patched upstream lib in an isolated dir, never the existing dev
+  install (dodges editable / `.pth` finder hijacks).
+- Upstream patch crossing a size or cross-cutting-policy threshold → pause + ack
+  before landing.
+- Regression tests mirror the failure mode with a minimal in-component kernel,
+  not by importing caller code.
 
 ### Benchmarks
 
 - **Spec — always read first:**
   [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md) — mandatory
   report sections (Goal · Hypothesis · Params · Env · Results · Problems ·
-  Learnings), goal taxonomy, watch-list during runs, and **auto-iteration
-  rules** (§6: when to loop, when to stop, information-volume triggers),
-  and **§7 hard-won protocol rules** (correctness gate, sweep≠fixed-c,
-  duration adequacy, param-alignment via the §3.2 envelope log, server
-  lifecycle hygiene). Internal info sources (§3: `/v1/stats` service trace,
-  scheduling envelope, K6 OOM detector) are first-class report content.
-  Applies to both benchmarks and traces.
+  Learnings), goal taxonomy, watch-list, **auto-iteration rules** (§6: when to
+  loop/stop, information-volume triggers), and **§7 hard-won protocol rules**
+  (correctness gate, sweep≠fixed-c, duration adequacy, param-alignment via §3.2
+  envelope log, server lifecycle hygiene). Internal info sources (§3: `/v1/stats`
+  service trace, scheduling envelope, K6 OOM detector) are first-class report
+  content. Applies to benchmarks and traces.
 - **MANDATORY — every runtime change produces a bench entry.** A diff isn't
-  "done" until a dated entry lands under `docs/experience/wins/` (or
-  `errors/` on regression). Verify-phase exit condition. No entry → not shipped.
+  "done" until a dated entry lands under `docs/experience/wins/` (or `errors/` on
+  regression). Verify-phase exit condition. No entry → not shipped.
   - **In scope:** `crates/infer-*/src/`, `crates/cuda-kernels/csrc/`,
     `crates/mlx-sys/src/`, `src/`, `scripts/bench_*.{sh,py}` param changes,
     feature-flag default flips, hot-path dep bumps.
-  - **Exempt:** docs / `AGENTS.md` / `CLAUDE.md` / memory / dev-only tooling
-    / gitignored output. State so in the commit body.
-  - **Minimum:** one `scripts/bench_guidellm.sh` run vs latest baseline for
+  - **Exempt:** docs / `AGENTS.md` / `CLAUDE.md` / memory / dev-only tooling /
+    gitignored output. State so in the commit body.
+  - **Minimum:** one `scripts/bench_guidellm.sh` run vs latest baseline for the
     affected backend+model, with Δ% row. Full sweep only for optimization /
     architectural changes.
   - **Can't run locally** (e.g. CUDA on a Mac): commit body cites the remote
-    ticket; stub the entry under `wins/` with `pending-remote`. No silent skips.
+    ticket; stub the `wins/` entry with `pending-remote`. No silent skips.
   - **Auto-iterate** per spec §7; cross-link wins back to the commissioning
     project/plan.
-- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
-  using the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
+- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md` using
+  the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
   skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.
 - **Canonical tool: `scripts/bench_guidellm.sh <label>`** — thin wrapper around
   [`vllm-project/guidellm`](https://github.com/vllm-project/guidellm) (vLLM
-  official, LLM-native TTFT/ITL/tok-s metrics, sweep profile, HTML report).
-  Canonical params are locked in
-  [`docs/plans/guidellm-integration.md`](docs/plans/guidellm-integration.md) §3;
+  official, LLM-native TTFT/ITL/tok-s, sweep profile, HTML report). Canonical
+  params locked in
+  [`docs/plans/guidellm-integration.md`](docs/plans/guidellm-integration.md) §3 —
   changing them is a deliberate commit, not a flag flip.
 - Include: GPU model, CUDA/Metal version, model, num_slots, non-default flags,
-  feature set. Raw output table, not summaries.
-- Install the Python dep once: `pip install -e .[bench]` (guidellm ships in
-  the `bench` extra).
+  feature set. Raw output table, not summaries. Install once:
+  `pip install -e .[bench]` (guidellm ships in the `bench` extra).
 
 ### Git
 
 - Commitizen: `<type>(<scope>): <subject>`. Scopes: `metal`, `cuda`,
   `scheduler`, `qwen3`, `qwen35`, `http`, `kv-tier`, `docs`.
-- Commit directly to `main` (no feature branches — `feedback_commit_to_main.md`).
-- **Always commit and push from the current branch in the current workspace.**
-  Do not create a separate worktree or alternate checkout to prepare or ship
-  code changes.
-- **Commit small tranches immediately.** Each small, self-contained change
-  should land as its own commit. Run the relevant verification after that
-  commit; if verification finds issues, fix them in a follow-up commit instead
-  of folding multiple micro-changes into one opaque diff.
-- **Never use `git stash` to move unrelated user changes out of the way.**
-  Leave other people's dirty paths in place, work around them, and commit only
-  your own files by explicit path.
-- After `git mv` + batch Edits, re-check `git status` and re-stage by path —
-  the fmt hook de-stages renames (`feedback_git_mv_with_fmt_hook.md`).
+- Commit directly to `main`, from the current branch in the current workspace —
+  no feature branches, no separate worktree/alternate checkout
+  (`feedback_commit_to_main.md`).
+- **Commit small tranches immediately.** Each self-contained change lands as its
+  own commit; run verification after, fix issues in a follow-up commit, don't
+  fold micro-changes into one opaque diff.
+- **Never `git stash`** unrelated user changes — leave others' dirty paths in
+  place, commit only your own files by explicit path.
+- After `git mv` + batch Edits, re-check `git status` and re-stage by path — the
+  fmt hook de-stages renames (`feedback_git_mv_with_fmt_hook.md`).
 
 ### Code conventions
 
-- **Flat module layout, no `mod.rs`.** `src/ops.rs` declares `#[path = "ops/attention.rs"] mod attention;`
-  siblings; models follow `model/qwen3.rs` + `model/qwen3/`.
+- **Flat module layout, no `mod.rs`.** `src/ops.rs` declares `#[path =
+  "ops/attention.rs"] mod attention;` siblings; models follow `model/qwen3.rs` +
+  `model/qwen3/`.
 - Weights `&self` (immutable, pool-shared); per-request mutable state in `State`
   associated types.
-- **Comments stay concise** — ≤1-2 lines on the non-obvious *why*, not what the
-  code does; no multi-line essay blocks in source. Load-bearing invariant/ordering
-  notes stay, but compressed.
+- **Comments concise** — ≤1-2 lines on the non-obvious *why*, not what the code
+  does; no essay blocks. Load-bearing invariant/ordering notes stay, compressed.
 
 ### GPU kernel work
 
-Touching `crates/cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths?
-Evaluate against the project-specific heat map in
-[`docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md`](docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md)
-— that's where the audited priorities live. Measure with `ncu` (CUDA) or
-Xcode Metal capture / MLX instruments (Metal).
+Touching `crates/cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths? Evaluate
+against the project-specific heat map in
+[`docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md`](docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md).
+Measure with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal).
 
 ### Distilled lessons (cross-module, recurring ≥3 entries)
 
-- **SLO verdict must come from the SLO workload, not a smoke shape.** A c=1 short-prompt
-  nsys breakdown predicting "2× win" routinely flips on the production prompt length
-  because the path's scaling curve is shape-specific
-  (`errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md`).
-- **`plan_label=mixed` / "executes new path" is reachability evidence, not a license to land.**
-  c-sweep must clear TTFT *and* ITL *and* output throughput before any default flip
-  (`errors/2026-05-25-axis2-mixed-default-kill.md`, `errors/2026-05-26-qwen35-hybrid-mixed-kill.md`,
+- **SLO verdict from the SLO workload, not a smoke shape** — a c=1 short-prompt
+  nsys "2× win" routinely flips on production prompt length (path scaling is
+  shape-specific) (`errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md`).
+- **`plan_label=mixed` / "executes new path" is reachability, not a license** —
+  c-sweep must clear TTFT *and* ITL *and* output throughput before a default flip
+  (`errors/2026-05-25-axis2-mixed-default-kill.md`,
+  `errors/2026-05-26-qwen35-hybrid-mixed-kill.md`,
   `errors/2026-05-25-axis3-chunked-prefill-size-kill.md`).
-- **Backend / quant / decoding default flips need multi-shape verification.** Single-shape ROI
-  shows "what's possible"; ≥2 binding production shapes show "what's safe to default"
+- **Default flips need multi-shape verification** — single-shape ROI shows what's
+  possible; ≥2 binding production shapes show what's safe
   (`wins/2026-05-08-prefill-cap-8-multi-shape-safe-default-flip.md`,
   `errors/2026-05-08-w4-c8-deadlock-confirms-workload-dependent.md`).
-- **A/B must be same-binary, same-shell, same-prompt, two env flips, side-by-side.** Cross-day
-  baseline-vs-treatment claims don't survive — intermediate commits drift backend / KV dtype
-  / scheduler tuning (`wins/2026-05-27-dsv4-native-deepep-perf-ab.md`).
-- **Smoke-output garbage is config-suspect first, code-suspect second.** When a new GPU forward
-  path produces nonsense, A/B against the prod backend on the *same* config before staring at
-  the new code; if prod is also broken, the serving config is the bug
-  (`wins/2026-05-27-dsv4-native-deepep-pod-e2e.md`).
-- **Launch-count source-survey is hypothesis, not evidence.** For tiny CUDA operators, a fused-kernel
-  rewrite is only licensed by a paired component A/B (or nsys/CUDA-event profile) under the
-  same sync framing the runtime uses (`errors/2026-05-12-fp8-kv-pair-quantize-fusion-no-license.md`,
+- **A/B must be same-binary, same-shell, same-prompt, two env flips,
+  side-by-side** — cross-day claims drift backend / KV dtype / scheduler tuning
+  (`wins/2026-05-27-dsv4-native-deepep-perf-ab.md`).
+- **Smoke-output garbage is config-suspect first** — A/B against the prod backend
+  on the *same* config before staring at new code; if prod also breaks, the
+  serving config is the bug (`wins/2026-05-27-dsv4-native-deepep-pod-e2e.md`).
+- **Launch-count source-survey is hypothesis** — a fused-kernel rewrite for tiny
+  CUDA ops is licensed only by a paired component A/B (or nsys/CUDA-event) under
+  the runtime's sync framing
+  (`errors/2026-05-12-fp8-kv-pair-quantize-fusion-no-license.md`,
   `errors/2026-05-21-arle-cuda-opd-swiglu-fused-kill.md`).
-- **Capability/quality claims with magnitude < 5pp on small-n evals (≤200 samples) MUST run
-  multi-seed (≥5) and report mean ± σ + Wilson 95% CI before the wins entry ships.** Picking
-  "best ckpt across save-every-10" is a positively-biased estimator
+- **Capability claims <5pp on small-n (≤200) evals need multi-seed (≥5) +
+  mean±σ + Wilson 95% CI** before the wins entry — "best ckpt across
+  save-every-10" is positively biased
   (`errors/2026-05-28-mmlu-cross-base-was-noise.md`).
-- **Pod-side probe trust is conditional on git+symbol checks.** Before flipping a default based on
-  pod output, verify the pod tree is a git repo at HEAD and `strings target/release/arle | grep <symbol>`
-  shows the change actually landed — the binary proves *some* tree was current
-  *whenever it was last built*, not that the current source built it
+- **Pod-side probe trust is conditional on git+symbol checks** — verify the pod
+  tree is a git repo at HEAD and `strings target/release/arle | grep <symbol>`
+  shows the change landed; the binary proves some tree was current *whenever last
+  built*, not that current source built it
   (`errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md`).
-- **Decode greedy-token decode the actual generation when a metric looks catastrophic.** Three weeks
-  of "FP8 KV is broken" investigation collapsed when one `eprintln!` of decoded tokens showed the
-  metric was a test-framework artifact (`errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`).
-- **`scripts/dsv4_toolchain.sh` validates DSv4 build-flow before launch.** Native DeepEP / DeepGEMM
-  consumers need env-checked source + compile-time prereqs; without the toolchain helper users
-  get a stub binary that errors at runtime
-  (`wins/2026-05-27-dsv4-native-deepep-run-guide.md`).
+- **Greedy-decode the actual generation when a metric looks catastrophic** — 3
+  weeks of "FP8 KV broken" collapsed when one `eprintln!` showed a test-framework
+  artifact (`errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md`).
+- **`scripts/dsv4_toolchain.sh` validates DSv4 build-flow before launch** —
+  native DeepEP/DeepGEMM need env-checked source + compile prereqs, else a stub
+  binary errors at runtime (`wins/2026-05-27-dsv4-native-deepep-run-guide.md`).
 
 ---
 
 ## Memory
 
-- **Always-load:** auto-memory index + latest 3 of `docs/experience/errors/`
-  and `docs/experience/wins/`.
+- **Always-load:** auto-memory index + latest 3 of `docs/experience/errors/` and
+  `docs/experience/wins/`.
 - **On-demand:** `docs/plans/`, `docs/projects/`, `docs/research/`, full
   experience entries, `ROADMAP.md`.
 - **User correction → write preventive feedback memory before resuming.**
@@ -496,38 +444,38 @@ cargo test -p kv-native-sys --release
 
 **KV precision parity gate — re-ported 2026-06-10 (#58).** The monolith's
 trajectory-match audit is superseded by the correct-inference gate
-(`scripts/needle_gate.py` + `scripts/lever_gate.sh`): needle ladder
-x3 same-config repeats vs the baseline envelope, NOT byte-identity (MoE
+(`scripts/needle_gate.py` + `scripts/lever_gate.sh`): needle ladder x3
+same-config repeats vs the baseline envelope, NOT byte-identity (MoE
 non-determinism). DSv4 lever verdicts
-([wins entry](docs/experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md)):
-FlashMLA decode + fused-wqkv correctness LICENSED — default flips still need
-a wall-clock perf license per the bench spec; pooled/contig-MoE flip KILLED
-(-24%). Qwen dense KV-dtype matrix **resolved 2026-06-12 (#68)**: seam-level
-kv-dtype dispatch landed (`--kv-cache-dtype`, default bf16 unchanged);
-INT8/FP8 correctness LICENSED (needle exact 15/15 DET = BF16 envelope);
-the initial decode −77% at B=1 was an uncached per-layer-per-step
-`cudaGetDeviceProperties` in the quant decode shim — fixed same day
-(static SM-count cache), post-fix −27% vs bf16+graph / −7% vs eager bf16
-— opt-in only, no default flip without a perf license;
-TQ4 DEFERRED (TurboQuant page_size=1 vs TileLang PAGE_SIZE=16). Verdicts:
-[wins entry](docs/experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md).
+([wins](docs/experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md)):
+FlashMLA decode + fused-wqkv correctness LICENSED (default flips still need a
+wall-clock perf license); pooled/contig-MoE flip KILLED (−24%). Qwen dense
+KV-dtype matrix **resolved 2026-06-12 (#68)**: seam-level kv-dtype dispatch
+landed (`--kv-cache-dtype`, default bf16 unchanged); INT8/FP8 correctness
+LICENSED (needle exact 15/15 DET = BF16 envelope); the initial decode −77% at B=1
+was an uncached per-layer-per-step `cudaGetDeviceProperties` in the quant decode
+shim — fixed same day (static SM-count cache), post-fix −27% vs bf16+graph / −7%
+vs eager bf16 — opt-in only, no default flip without a perf license; TQ4 DEFERRED
+(TurboQuant page_size=1 vs TileLang PAGE_SIZE=16). Verdicts:
+[wins](docs/experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md).
 
-Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt `CMAKE_CUDA_ARCHITECTURES`),
-`INFER_TILELANG_PYTHON` (TileLang AOT Python), `INFER_TEST_MODEL_PATH`
-(default `models/Qwen3.5-4B`). Full list: [`docs/environment.md`](docs/environment.md).
-SM tier policy: [`docs/plans/sm-coverage.md`](docs/plans/sm-coverage.md).
+Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt
+`CMAKE_CUDA_ARCHITECTURES`), `INFER_TILELANG_PYTHON` (TileLang AOT Python),
+`INFER_TEST_MODEL_PATH` (default `models/Qwen3.5-4B`). Full list:
+[`docs/environment.md`](docs/environment.md). SM tier policy:
+[`docs/plans/sm-coverage.md`](docs/plans/sm-coverage.md).
 
-Disk hygiene: `cargo sweep --time 30` (weekly) prunes target/ artifacts
-older than 30 days. Dev profile already keeps deps DWARF-free (see root
-`Cargo.toml` `[profile.dev.package."*"] debug = false`).
+Disk hygiene: `cargo sweep --time 30` (weekly) prunes target/ artifacts older
+than 30 days. Dev profile keeps deps DWARF-free (root `Cargo.toml`
+`[profile.dev.package."*"] debug = false`).
 
 ---
 
 ## Module Guides
 
-Load the relevant `AGENTS.md` **before** editing inside a module. The
-per-module guides under the old `infer/src/**` were deleted with the
-monolith; for the `infer-*` rewrite crates the module truth is
+Load the relevant `AGENTS.md` **before** editing inside a module. The per-module
+guides under the old `infer/src/**` were deleted with the monolith; for the
+`infer-*` rewrite crates the module truth is
 [`docs/architecture.md`](docs/architecture.md) +
 [`docs/codebase-map.md`](docs/codebase-map.md).
 

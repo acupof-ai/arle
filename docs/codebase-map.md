@@ -35,8 +35,10 @@ This document is the canonical workspace-topology truth: where files live,
 what each crate owns, and where to start reading. For ownership boundaries
 and crate-admission governance see [architecture.md](architecture.md);
 support status by surface lives in [support-matrix.md](support-matrix.md).
-DSV4 is the **#1 next-model priority** and Qwen 3.6 the **#2** — see
-[`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order).
+Qwen3.6 now serves on CUDA (FP8 MoE + batched paged decode — no longer
+Metal-only); the in-flight model additions are GLM-5.2 (wired on the DSv4 CUDA
+path, verification pending-remote) and the Metal VLMs (Gemma4, DeepSeek-OCR) —
+see [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order).
 
 ## 1. Workspace at a glance
 
@@ -71,7 +73,7 @@ Current workspace members (ownership and boundaries are listed in
 - **control plane / helpers:** `crates/agent`, `crates/chat`, `crates/cli`,
   `crates/tools`
 - **specs:** `crates/qwen3-spec`, `crates/qwen35-spec`, `crates/deepseek-spec`,
-  `crates/gemma-spec`
+  `crates/gemma-spec`, `crates/deepseek-ocr-spec`
 - **training:** `crates/autograd`, `crates/train`
 - **substrate:** `crates/infer-gguf`, `crates/kv-native-sys`,
   `crates/xgrammar-sys`, `crates/agent-bench`
