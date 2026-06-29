@@ -116,12 +116,45 @@ Fix `16a8247f`: (a) executor `None` branch also frees `full_attn_kv` + resets
 **Performance side-effect of full-recompute fallback**: sidecar captures at
 PREFILL completion only, not decode. Decode tokens advance the radix cache past
 the last sidecar capture. Each turn where decode generated ≥16 tokens → radix
-matches past the sidecar entry → fallback → full re-prefill from 0. For
-0ea40e0's long multi-turn eval (7000+ tokens), ~4 fallbacks per eval run.
-Fix: capture sidecar at decode completion too (pending, perf not correctness).
+matches past the sidecar entry → fallback → full re-prefill from 0. 17
+fallbacks observed in sidecarfix run (10 during eval, 7 during training).
 
-**With fix `16a8247f` + eval**: 0ea40e0 `passed=true`, 12734fa `edited=true`
-[exit 4], 5e36960 running; f327e65 training in progress.
+Fix `7c461c80`: capture sidecar in `finish_slot` using prompt + generated tokens
+before `publish_prefix_blocks`. Subsequent agentic turns that match at the
+decode-extended seq_len will hit the sidecar instead of falling back.
+
+**With fix `16a8247f` + eval (sidecarfix run, GPU 7)**: f327e65 → **4/4 accepts**:
+- sample 0: passed=true (turns=5)
+- sample 1: passed=true (turns=8)
+- sample 2: passed=true (turns=5)
+- sample 3: passed=true (turns=7)
+
+Writeback: seq_len=7184, total_targets=604, chunk_rows=2048 — **OOM during backward**
+(`cuda alloc_zeros failed` at 94778/97871 MiB, 2026-06-30). Root cause: fifth bug below.
+
+**Fifth bug: SDPA chunk intermediates pile up in inner backward (inner_tape)**
+
+`head_chunked_sdpa_recompute` with `tape.enabled` (inner_tape active inside
+`checkpoint_backward`) kept ALL chunks' `scores/scaled/masked/probs` alive
+simultaneously for the inner backward. At seq=7184 with ATTN_HEAD_CHUNK=8:
+7 chunks × 4 × [8, 7184, 7184] × 4B = 46 GiB for ONE layer's SDPA alone.
+With model (27 GB) + lm_head (4.3 GB) + grad accum (6.6 GB) + Adam (1 GB)
+= 84.9 GB base + 46 GB SDPA transients → 94 GB peak → OOM.
+
+The pile-up happened because the "tape-on: old behavior, intermediates survive"
+comment at `qwen35.rs:354` (pre-fix) was accepted as correct — but it's only
+correct for EAGER forward. In the inner backward's recompute, ALL chunk
+intermediates must survive until the inner backward completes. At long seq, this
+is too large.
+
+Fix `0b7a1d89`: when `tape.enabled`, wrap each `causal_sdpa_recompute` call in
+a nested `checkpoint` so the inner backward re-executes each chunk on demand
+(one at a time, ~6.6 GiB) instead of keeping all 7 simultaneously (~46 GiB).
+Peak drops from 94 GiB to ~48 GiB for seq=7184.
+
+**allfix run launched (2026-06-30)**: `ARLE_OPD_WRITEBACK_OFFLOAD=0` (GPU-bound
+backward) + `0b7a1d89` (nested SDPA checkpoint). Expected: backward GPU-bound
+in ~15 min vs 54 min CPU-bound. Status: running on GPU 7.
 
 ## Rule
 
