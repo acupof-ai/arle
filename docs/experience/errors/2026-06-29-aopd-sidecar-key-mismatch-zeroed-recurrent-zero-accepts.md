@@ -60,16 +60,35 @@ page-aligned mat_len.
 Fix `c96bfb50`: limit the D2H copy to `n_pages = mat_len / PAGE_SIZE` pages — the
 extra allocated-but-not-full page is excluded from the snapshot.
 
-## Verification
+## Verification (COMPLETE — 2026-06-29)
 
-Pod run with `2bc6b44d` + `c96bfb50` + `max-tokens 8192`:
-- `RESTORE-SIDECAR` appears at every re-prefill with zero "restore failed" or
-  "mismatch" errors
-- eval base: ansible__ansible-0ea40e0 `passed=true edited=true` (confirmed)
-- Training rollout running; accept verdict pending
+Pod run (`run_fixsidecar_opd4.log`) with `2bc6b44d` + `c96bfb50` + `max-tokens 8192`:
+- `RESTORE-SIDECAR` at every re-prefill, zero "restore failed" or "mismatch" errors ✓
+- Eval base + eval[1]: 0ea40e0 `passed=true edited=true` via multi-turn sidecar
+  (base: start_pos=0 fresh; eval[1]: `matched_len=1168 → 3296 new tokens → pass`) ✓
+- Training round 0: 0/4 accepts for f327e65 — model generates prose-Stop for
+  samples 0 (211 fresh tokens), 1 (3 tail tokens after sidecar-at-960), 3 (3 tokens);
+  sample 2 explored (sub_turn with re-prefill at 2673 tokens) but stopped without edit
+
+**Training 0-accept is model capability on this specific task**, not infrastructure:
+- The sidecar correctly preserves state (0ea40e0 passes with same sidecar path)
+- f327e65 (FQCN validation) and the 2 failing eval tasks (12734fa, 5e36960) all
+  produce prose-Stop even with correct recurrent state and full user message visible
+- 12734fa eval: `matched_len=752`, 896 new tokens → still 0 turns (plenty of context)
+- Fix: use tasks the current student can solve (ensure at least one accept per round)
+
+**Secondary issue — sample 1+ 3-token tail**: after sample 0's radix caches the
+963-token prompt, subsequent samples see `matched_len=960` → only 3 new tail tokens.
+Model can still generate correctly (recurrent state encodes full user message), but the
+narrow window makes exploration less likely. Mitigated by temperature diversity; root
+cause is the page-16 alignment of the sidecar-capture vs the prompt length.
 
 ## Rule
 
 **Silent 0-accept ≠ model capability failure.** Check sidecar HIT rate before
 concluding the model can't solve the task. A sidecar key divergence zeroes recurrent
 state silently — no crash, no assertion, just a model that forgets every turn.
+
+**After infrastructure fixes, 0-accept = task selection problem.** Verify that at
+least one training task is solvable by the current checkpoint before interpreting 0
+accepts as a sidecar regression.
