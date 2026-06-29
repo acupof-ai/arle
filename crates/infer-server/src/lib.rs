@@ -332,6 +332,32 @@ where
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Result<RequestTicket> {
+        self.do_submit(prompt, max_tokens, sampling, None)
+    }
+
+    pub fn submit_streaming(
+        &self,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+    ) -> Result<(RequestTicket, Receiver<StreamItem>)> {
+        let (stream_tx, stream_rx) = mpsc::channel::<StreamItem>();
+        let ticket = self.do_submit(prompt, max_tokens, sampling, Some(stream_tx))?;
+        Ok((ticket, stream_rx))
+    }
+
+    fn do_submit(
+        &self,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+        stream_tx: Option<mpsc::Sender<StreamItem>>,
+    ) -> Result<RequestTicket> {
+        let mode = if stream_tx.is_some() {
+            "streaming"
+        } else {
+            "blocking"
+        };
         self.acquire_live_request()?;
         let submit_tx = self.submit_tx.as_ref().ok_or_else(|| {
             self.release_live_request();
@@ -346,7 +372,7 @@ where
                 sampling,
                 handle_tx,
                 completion_tx,
-                stream_tx: None,
+                stream_tx,
             })
             .is_err()
         {
@@ -366,7 +392,7 @@ where
         if let Some(start) = trace_start {
             let wait_ms = start.elapsed().as_secs_f64() * 1000.0;
             log::info!(
-                "[serve-submit] mode=blocking handle={} wait_ms={wait_ms:.1} live={} max_live={}",
+                "[serve-submit] mode={mode} handle={} wait_ms={wait_ms:.1} live={} max_live={}",
                 handle.id(),
                 self.live_requests.load(Ordering::Acquire),
                 self.max_live_requests
@@ -377,76 +403,6 @@ where
             completion_rx,
             live_requests: Arc::clone(&self.live_requests),
         })
-    }
-
-    /// Submit a request and additionally receive its tokens live.
-    ///
-    /// Like [`submit`](Self::submit) but returns a [`StreamItem`] receiver that
-    /// yields each token as it commits, then a terminal [`StreamItem::Done`]. The
-    /// returned [`RequestTicket`] still resolves the full completion via
-    /// [`collect`](RequestTicket::collect) — streaming is additive.
-    pub fn submit_streaming(
-        &self,
-        prompt: Vec<u32>,
-        max_tokens: usize,
-        sampling: SamplingParams,
-    ) -> Result<(RequestTicket, Receiver<StreamItem>)> {
-        self.acquire_live_request()?;
-        let submit_tx = self.submit_tx.as_ref().ok_or_else(|| {
-            self.release_live_request();
-            anyhow!("ServeHandle already shut down")
-        })?;
-        let (handle_tx, handle_rx) = mpsc::channel::<RequestHandle>();
-        let (completion_tx, completion_rx) = mpsc::channel::<CompletedRequest>();
-        let (stream_tx, stream_rx) = mpsc::channel::<StreamItem>();
-        if submit_tx
-            .send(Submission {
-                prompt,
-                max_tokens,
-                sampling,
-                handle_tx,
-                completion_tx,
-                stream_tx: Some(stream_tx),
-            })
-            .is_err()
-        {
-            self.release_live_request();
-            return Err(anyhow!("engine thread closed; cannot submit"));
-        }
-        let trace_start = submit_trace_enabled().then(Instant::now);
-        let handle = match handle_rx.recv() {
-            Ok(handle) => handle,
-            Err(_) => {
-                self.release_live_request();
-                return Err(anyhow!(
-                    "engine thread closed before assigning a request handle"
-                ));
-            }
-        };
-        if let Some(start) = trace_start {
-            let wait_ms = start.elapsed().as_secs_f64() * 1000.0;
-            log::info!(
-                "[serve-submit] mode=streaming handle={} wait_ms={wait_ms:.1} live={} max_live={}",
-                handle.id(),
-                self.live_requests.load(Ordering::Acquire),
-                self.max_live_requests
-            );
-        }
-        Ok((
-            RequestTicket {
-                handle,
-                completion_rx,
-                live_requests: Arc::clone(&self.live_requests),
-            },
-            stream_rx,
-        ))
-    }
-
-    /// Block until the request behind `ticket` completes and return its result.
-    ///
-    /// Convenience wrapper over [`RequestTicket::collect`].
-    pub fn collect(&self, ticket: RequestTicket) -> Result<CompletedRequest> {
-        ticket.collect()
     }
 
     /// Snapshot of the engine's live scheduler counters (active requests, queue
