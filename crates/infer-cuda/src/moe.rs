@@ -3567,6 +3567,13 @@ mod dsv4_gpu {
             keepalive.keep_i32(&counts);
             keepalive.keep_i32(&offsets);
             keepalive.keep_i32(&scan_total);
+            // mk_align must be 64 or 128 (C gate in deepgemm_native.cu rejects
+            // any other value with CUDA_ERROR_INVALID_VALUE).
+            let contig_align = if recv_slots <= DSV4_DECODE_CONTIG_MAX_ROUTES {
+                DSV4_DECODE_CONTIG_ALIGN
+            } else {
+                DEEPGEMM_CONTIG_ALIGN
+            };
             unsafe {
                 moe::dsv4_count_local_experts(
                     cache_ptr(&recv_topk_i32, ctx),
@@ -3577,20 +3584,23 @@ mod dsv4_gpu {
                     experts_per_rank,
                     ctx.stream.cu_stream(),
                 )?;
-                moe::dsv4_exclusive_scan_i32(
+                moe::moe_exclusive_scan_aligned_i32(
                     cache_ptr(&counts, ctx),
                     cache_ptr(&offsets, ctx),
                     cache_ptr(&scan_total, ctx),
                     experts_per_rank,
+                    contig_align,
                     ctx.stream.cu_stream(),
                 )?;
             }
+            let packed_rows =
+                deepgemm_contig_rows_cap(recv_slots.max(1), experts_per_rank, contig_align);
 
-            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
-            let packed_route_slot = alloc_neg1_i32(ctx, recv_slots.max(1))?;
+            let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, packed_rows)?;
+            let packed_route_slot = alloc_neg1_i32(ctx, packed_rows)?;
             let packed_weight = ctx
                 .stream
-                .alloc_zeros::<f32>(recv_slots.max(1))
+                .alloc_zeros::<f32>(packed_rows)
                 .map_err(|e| anyhow::anyhow!("DSv4 DeepEP packed_weight alloc failed: {e}"))?;
             let cursors = ctx
                 .stream
@@ -3625,7 +3635,7 @@ mod dsv4_gpu {
                 &packed_hidden,
                 &counts,
                 &offsets,
-                1,
+                contig_align,
                 swiglu_limit,
                 keepalive,
             )?;
@@ -3633,12 +3643,14 @@ mod dsv4_gpu {
             let route_out = HiddenStates::zeros(ctx, hidden_dim, recv_slots.max(1))?;
             keepalive.keep_hidden(&route_out);
             unsafe {
+                // With aligned packing, valid routes span positions 0..packed_rows
+                // (not just 0..recv_slots): must iterate the full packed range.
                 moe::dsv4_scatter_all_route_slots(
                     cache_ptr(&expert_out.data, ctx),
                     cache_ptr(&route_out.data, ctx),
                     cache_ptr(&packed_route_slot, ctx),
                     cache_ptr(&packed_weight, ctx),
-                    recv_slots,
+                    packed_rows,
                     hidden_dim,
                     ctx.stream.cu_stream(),
                 )?;
