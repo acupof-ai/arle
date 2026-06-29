@@ -103,14 +103,13 @@ pub fn dequantize_row_f32(data: &[u8], k: usize) -> Result<Vec<f32>> {
 /// ggml-quants.c:495-509.
 pub fn dequantize_row_q8_0(data: &[u8], k: usize) -> Result<Vec<f32>> {
     let nb = check_blocks(data.len(), k, QK8_0, BLOCK_Q8_0_BYTES, "q8_0")?;
-    let mut y = Vec::with_capacity(k);
-    for i in 0..nb {
-        let b = &data[i * BLOCK_Q8_0_BYTES..];
-        let d = f16_at(b, 0);
-        for j in 0..QK8_0 {
-            y.push(f32::from(b[2 + j] as i8) * d);
-        }
-    }
+    let y = (0..nb)
+        .flat_map(|i| {
+            let b = &data[i * BLOCK_Q8_0_BYTES..];
+            let d = f16_at(b, 0);
+            (0..QK8_0).map(move |j| f32::from(b[2 + j] as i8) * d)
+        })
+        .collect();
     Ok(y)
 }
 
