@@ -60,35 +60,63 @@ page-aligned mat_len.
 Fix `c96bfb50`: limit the D2H copy to `n_pages = mat_len / PAGE_SIZE` pages — the
 extra allocated-but-not-full page is excluded from the snapshot.
 
-## Verification (COMPLETE — 2026-06-29)
+## Third bug: sidecar miss still zeroes linear attention (cross-attention mismatch)
 
-Pod run (`run_fixsidecar_opd4.log`) with `2bc6b44d` + `c96bfb50` + `max-tokens 8192`:
-- `RESTORE-SIDECAR` at every re-prefill, zero "restore failed" or "mismatch" errors ✓
-- Eval base + eval[1]: 0ea40e0 `passed=true edited=true` via multi-turn sidecar
-  (base: start_pos=0 fresh; eval[1]: `matched_len=1168 → 3296 new tokens → pass`) ✓
-- Training round 0: 0/4 accepts for f327e65 — model generates prose-Stop for
-  samples 0 (211 fresh tokens), 1 (3 tail tokens after sidecar-at-960), 3 (3 tokens);
-  sample 2 explored (sub_turn with re-prefill at 2673 tokens) but stopped without edit
+After `2bc6b44d` + `c96bfb50`, restores HIT the sidecar for within-session re-prefills.
+But eval tasks (0ea40e0) and training tasks (f327e65) share the same 752-token system
+prompt prefix. The radix cache returns `matched_len=752` for f327e65's first turn
+(after 0ea40e0 built radix pages), but there is NO sidecar entry at 752 tokens —
+0ea40e0's first prefill captured at 1168, not 752.
 
-**Training 0-accept is model capability on this specific task**, not infrastructure:
-- The sidecar correctly preserves state (0ea40e0 passes with same sidecar path)
-- f327e65 (FQCN validation) and the 2 failing eval tasks (12734fa, 5e36960) all
-  produce prose-Stop even with correct recurrent state and full user message visible
-- 12734fa eval: `matched_len=752`, 896 new tokens → still 0 turns (plenty of context)
-- Fix: use tasks the current student can solve (ensure at least one accept per round)
+On miss, the previous code silently zeroed linear-attention recurrent state while
+leaving full-attention KV intact (from the radix cache):
+```
+// miss branch — original code:
+log::debug!("no recurrent sidecar ... starting with zeroed recurrent state");
+// → then sets seq_len=752, allocs KV pool for 752 tokens
+```
 
-**Secondary issue — sample 1+ 3-token tail**: after sample 0's radix caches the
-963-token prompt, subsequent samples see `matched_len=960` → only 3 new tail tokens.
-Model can still generate correctly (recurrent state encodes full user message), but the
-narrow window makes exploration less likely. Mitigated by temperature diversity; root
-cause is the page-16 alignment of the sidecar-capture vs the prompt length.
+The model then processes the remaining 319 tokens (user message) with:
+- Full attention: sees all 1071 tokens via KV cache (752 radix + 319 new) ✓
+- Linear attention: only "knows" the last 319 tokens (recurrent state zero at t=0–751) ✗
+
+This cross-attention-type mismatch corrupts output: the model generates plain text
+instead of JSON tool calls, producing 0 edits.
+
+Fix `f8e861bb`: return `Err` on miss → `prefix.rs:162-173` catches it, calls
+`kv.free_slot(slot)`, returns `Ok(0)` (matched_len=0). Both attention types then
+start from scratch via full re-prefill.
+
+## Verification
+
+**Before fix (run_fixsidecar_opd4.log, hinted run)**: training tasks hit matched_len=752
+sidecar MISS → 0/4 accepts for f327e65; model outputs plain text (prose-Stop).
+
+**After fix (run_freshtest.log, --eval-every 999)**: running training tasks without
+eval[base] first → empty sidecar → all tasks start fresh at matched_len=0 → **3/4
+accepts** (samples 0, 2, 3 passed; sample 1 failed exit 4):
+```
+[agent-opd] ansible__ansible-f327e65 sample 0: passed=true (turns=12)
+[agent-opd] ansible__ansible-f327e65 sample 1: passed=false (turns=14) [exit 4]
+[agent-opd] ansible__ansible-f327e65 sample 2: passed=true (turns=5)
+[agent-opd] ansible__ansible-f327e65 sample 3: passed=true (turns=6)
+```
+
+**With fix + eval**: `f8e861bb` binary running OPD with eval-every 1 — pending (run
+killed previously; new run started post-build).
 
 ## Rule
 
-**Silent 0-accept ≠ model capability failure.** Check sidecar HIT rate before
-concluding the model can't solve the task. A sidecar key divergence zeroes recurrent
-state silently — no crash, no assertion, just a model that forgets every turn.
+**Silent 0-accept ≠ model capability failure.** Check sidecar HIT rate AND sidecar
+miss behavior before concluding. A miss with zeroed linear state vs. non-zero full-
+attention KV corrupts model outputs silently — no crash, 0 accepts, looks like a
+capability regression.
 
-**After infrastructure fixes, 0-accept = task selection problem.** Verify that at
-least one training task is solvable by the current checkpoint before interpreting 0
-accepts as a sidecar regression.
+**On sidecar miss, fall back to full recompute.** Never let a partial (zeroed linear +
+non-zero full) attention state reach the model. The cross-type mismatch is worse than
+the recompute cost.
+
+**Incorrect intermediate attribution (2026-06-29)**: after the first two fixes, 0/4
+training accepts were attributed to "model capability on this task" — wrong. The
+third bug (miss → zeroed state) was still present; fresh-start test immediately
+showed 3/4 accepts.
