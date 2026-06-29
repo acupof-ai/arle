@@ -56,21 +56,17 @@ pub(crate) fn physical_token_rows(
     num_tokens: usize,
 ) -> Result<Vec<i32>> {
     ensure!(page_size > 0, "paged-KV page_size must be non-zero");
-    let mut rows = Vec::with_capacity(num_tokens);
-    for offset in 0..num_tokens {
-        let pos = start_pos + offset;
-        let logical_page = pos / page_size;
-        let token_in_page = pos % page_size;
-        let physical = physical_page(table, logical_page)? as usize;
-        let row = physical
-            .checked_mul(page_size)
-            .and_then(|base| base.checked_add(token_in_page))
-            .ok_or_else(|| anyhow!("paged-KV physical token row overflow at pos {pos}"))?;
-        rows.push(
-            i32::try_from(row)
-                .map_err(|_| anyhow!("paged-KV physical token row {row} exceeds i32"))?,
-        );
-    }
+    let rows = (0..num_tokens)
+        .map(|offset| {
+            let pos = start_pos + offset;
+            let physical = physical_page(table, pos / page_size)? as usize;
+            let row = physical
+                .checked_mul(page_size)
+                .and_then(|base| base.checked_add(pos % page_size))
+                .ok_or_else(|| anyhow!("paged-KV physical token row overflow at pos {pos}"))?;
+            i32::try_from(row).map_err(|_| anyhow!("paged-KV physical token row {row} exceeds i32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(rows)
 }
 

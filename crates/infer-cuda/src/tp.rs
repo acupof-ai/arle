@@ -708,12 +708,9 @@ mod tests {
             // x restricted to this rank's input columns.
             let x_shard: Vec<f32> = x[spec.range()].to_vec();
             // W restricted to the same input columns, kept row-major [out, size].
-            let mut w_shard = Vec::with_capacity(out_dim * spec.size);
-            for o in 0..out_dim {
-                for i in spec.range() {
-                    w_shard.push(w[o * in_dim + i]);
-                }
-            }
+            let w_shard: Vec<f32> = (0..out_dim)
+                .flat_map(|o| spec.range().map(move |i| w[o * in_dim + i]))
+                .collect();
             partials.push(dense_gemv(&x_shard, &w_shard, out_dim, spec.size));
         }
         // The shards exactly cover the input dim (no overlap, no gap).
