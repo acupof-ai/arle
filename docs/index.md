@@ -16,7 +16,10 @@ Phase 1 batched serving lane
 ([`plans/2026-06-07-unified-batched-kvpool-abstraction.md`](plans/2026-06-07-unified-batched-kvpool-abstraction.md);
 `cd421794` made c≥2 exist as a sequential plan-split, bench
 pending-remote) → Phase 2 frozen-KV MTP default-good → Phase 3 product
-re-aim (W3/W4 baseline, OPD GPU resume, Qwen3.6 adapter). DSv4 perf
+re-aim (W3/W4 baseline, OPD GPU resume; Qwen3.6 adapter now
+serving on CUDA — hybrid + FP8 MoE, batched paged decode
+[`experience/wins/2026-06-29-cuda-qwen36-paged-batched-decode.md`](experience/wins/2026-06-29-cuda-qwen36-paged-batched-decode.md)).
+DSv4 perf
 coordinates: decode ~26–27 ms/token vs same-pod SGLang 15.89 no-spec /
 8.24 +EAGLE; 5–6 ms is an H100 number, not an H20 target. deepep_ll is
 correct but gated (B=1 −55%, its batched lane pending Phase 1 —
@@ -120,7 +123,7 @@ marked as the current source of truth, treat it as historical context.
 | [projects/2026-06-04-qwen35-dsv4-final-report.md](projects/2026-06-04-qwen35-dsv4-final-report.md) | Active — rewrite verification + perf | The question is the post-rewrite (`infer-*` crates, branch `arch/ideal-inference-engine`) verification & performance verdict across Metal + CUDA, TP/EP, FP8 DeepGEMM MoE, DeepEP — including the honest DSv4 incremental-decode-broken correction and the SGLang-class perf push. Companion detail: [projects/2026-06-04-rewrite-completion-verification-report.md](projects/2026-06-04-rewrite-completion-verification-report.md). |
 | [projects/2026-05-24-opd-mainline-task-backlog.md](projects/2026-05-24-opd-mainline-task-backlog.md) | Historical — superseded by strategy v2 | The question is the past OPD mainline task order or session artifact ledger; current OPD sequencing is master strategy v2 Phase 3. |
 | [projects/2026-05-18-opd-only-pivot.md](projects/2026-05-18-opd-only-pivot.md) | Active — product boundary | The question is why training scope is OPD-only and why scratch pretrain/SFT/GRPO/multi-turn surfaces stay deleted. |
-| [projects/2026-05-01-deepseek-v4-readiness.md](projects/2026-05-01-deepseek-v4-readiness.md) | Active — #1 next-model | The question is DeepSeek V4 readiness, the DS0–DS8 gap matrix, and current 8xH20 DeepEP decode hot path. |
+| [projects/2026-05-01-deepseek-v4-readiness.md](projects/2026-05-01-deepseek-v4-readiness.md) | Active — DSv4 serving; GLM-5.2 verify pending-remote | The question is DeepSeek V4 readiness, the DS0–DS8 gap matrix, and current 8xH20 DeepEP decode hot path. (Qwen3.6 now serves on CUDA + Metal; the in-flight model additions are GLM-5.2 — wired on the DSv4 path, verification pending-remote — and the Metal VLMs Gemma4 / DeepSeek-OCR.) |
 | [projects/2026-04-30-longctx-32k-128k-leadership.md](projects/2026-04-30-longctx-32k-128k-leadership.md) | Paused — restarts at strategy v2 Phase 3 | The question is the 32k–128k longctx world-#1 mission (4 phase plan, baseline panel, hardware tiers, Phase 1 SGLang-row close + the Phase 2 spec-decode regression that the frozen-KV redesign now addresses). |
 | [projects/2026-05-02-agent-load-mission-expansion.md](projects/2026-05-02-agent-load-mission-expansion.md) | Paused — restarts at strategy v2 Phase 3 | The question is the agent-load world-#1 expansion: W3 short-prompt multi-turn, W4 tool-call resume, session affinity, prefix-cache reuse, four-engine baseline gates (cross-engine baseline still never run). |
 | [projects/2026-05-01-multi-gpu-f0-readiness.md](projects/2026-05-01-multi-gpu-f0-readiness.md) | Active | The question is single-node multi-GPU F0 readiness, TP/PP/EP axes, NCCL smoke, the gap matrix to real multi-rank serving. |

@@ -224,16 +224,14 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                              not a standalone target. Drafts ship without a tokenizer and only assist \
                              speculative decoding for a paired target.\n\
                              Hint: load the matching target instead — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit` \
-                             for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft.\n\
-                             Hint: for Apple Silicon DFlash speculative serving, see `./scripts/run_dflash.sh serve`."
+                             for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft."
                         ));
                     }
                 }
                 return Err(anyhow::anyhow!(
                     "failed to load model from `{model_source}`: {err:#}\n\
                      Hint: verify --model-path points to a model directory with config.json.\n\
-                     Hint: for Apple Silicon, try `./scripts/run_dflash.sh serve`.\n\
-                     Hint: direct Metal smoke: `cargo run --release -p infer --bin metal_bench -- --model <path>`."
+                     Hint: direct Metal smoke: `arle serve --backend metal --model-path <path>`."
                 ));
             }
         };
