@@ -804,18 +804,18 @@ pub mod app {
         if raw.eq_ignore_ascii_case("none") {
             return Ok(Vec::new());
         }
-        let mut steps = Vec::new();
-        for part in raw.split(',') {
-            let trimmed = part.trim();
-            if trimmed.is_empty() {
-                return Err(format!("--eval-steps contains an empty item in `{raw}`").into());
-            }
-            steps.push(
+        let mut steps = raw
+            .split(',')
+            .map(|part| -> AnyResult<usize> {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    return Err(format!("--eval-steps contains an empty item in `{raw}`").into());
+                }
                 trimmed
                     .parse::<usize>()
-                    .map_err(|err| format!("invalid --eval-steps item `{trimmed}`: {err}"))?,
-            );
-        }
+                    .map_err(|err| format!("invalid --eval-steps item `{trimmed}`: {err}").into())
+            })
+            .collect::<AnyResult<Vec<_>>>()?;
         steps.sort_unstable();
         steps.dedup();
         Ok(steps)
