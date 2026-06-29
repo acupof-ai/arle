@@ -512,6 +512,40 @@ pub(crate) struct Qwen35SlotState {
 /// the next one — same dims for every slot, so any block fits any slot.
 pub(crate) type RecurrentBlock = (Vec<CudaSlice<f32>>, Vec<DeviceVec>);
 
+/// D2H snapshot of the recurrent state at a prefix boundary.
+/// Used by the sidecar prefix-cache to restore the recurrent layers
+/// when reusing a Qwen3.5/3.6 hybrid prefix via the page-radix path.
+#[derive(Clone)]
+pub(crate) struct Qwen35RecurrentSnapshot {
+    /// `[num_linear]` gated-delta states (f32), copied verbatim from device.
+    pub(crate) gdr: Vec<Vec<f32>>,
+    /// `[num_linear]` conv1d rings (bf16), copied verbatim from device.
+    pub(crate) conv: Vec<Vec<bf16>>,
+}
+
+impl Qwen35RecurrentSnapshot {
+    /// Approximate host byte size (for cap accounting).
+    pub(crate) fn host_bytes(&self) -> usize {
+        self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
+            + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
+    }
+}
+
+/// FNV-1a hash of a token id slice — used to key the recurrent sidecar.
+pub(crate) fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut h = FNV_OFFSET;
+    for &t in tokens {
+        let bytes = t.to_le_bytes();
+        for b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
+}
+
 impl Qwen35SlotState {
     /// A fresh idle slot: allocate NOTHING. The recurrent state (~147 MiB) is a
     /// fixed-size per-request state — not token-addressable like the paged
@@ -612,6 +646,69 @@ impl Qwen35SlotState {
     /// `acquire_recurrent` hook was missed at the request's `start_pos == 0`.
     pub(crate) fn has_recurrent(&self) -> bool {
         !self.gdr_states.is_empty()
+    }
+
+    /// D2H snapshot of the current recurrent state. Returns an error if
+    /// the slot has no recurrent state (unacquired).
+    pub(crate) fn snapshot_recurrent(
+        &self,
+        ctx: &DeviceContext,
+    ) -> Result<Qwen35RecurrentSnapshot> {
+        if self.gdr_states.is_empty() {
+            anyhow::bail!("snapshot_recurrent: slot recurrent state not acquired");
+        }
+        let mut gdr = Vec::with_capacity(self.gdr_states.len());
+        for s in &self.gdr_states {
+            gdr.push(
+                ctx.stream
+                    .clone_dtoh(s)
+                    .map_err(|e| anyhow!("gdr D2H failed: {e}"))?,
+            );
+        }
+        let mut conv = Vec::with_capacity(self.conv_states.len());
+        for c in &self.conv_states {
+            conv.push(
+                ctx.stream
+                    .clone_dtoh(&c.data)
+                    .map_err(|e| anyhow!("conv D2H failed: {e}"))?,
+            );
+        }
+        ctx.stream
+            .synchronize()
+            .map_err(|e| anyhow!("sync after recurrent snapshot: {e}"))?;
+        Ok(Qwen35RecurrentSnapshot { gdr, conv })
+    }
+
+    /// H2D restore from a sidecar snapshot. The slot MUST have acquired recurrent
+    /// buffers before calling (call `acquire_recurrent` first). Errors if
+    /// dims mismatch (stale snapshot from a different checkpoint).
+    pub(crate) fn restore_recurrent_from_snapshot(
+        &mut self,
+        ctx: &DeviceContext,
+        snap: &Qwen35RecurrentSnapshot,
+    ) -> Result<()> {
+        ensure!(
+            snap.gdr.len() == self.gdr_states.len() && snap.conv.len() == self.conv_states.len(),
+            "recurrent sidecar dim mismatch: snapshot gdr={}/conv={} vs slot gdr={}/conv={}",
+            snap.gdr.len(),
+            snap.conv.len(),
+            self.gdr_states.len(),
+            self.conv_states.len()
+        );
+        for (s, h) in self.gdr_states.iter_mut().zip(&snap.gdr) {
+            ctx.stream
+                .memcpy_htod(h, s)
+                .map_err(|e| anyhow!("gdr H2D restore failed: {e}"))?;
+        }
+        for (c, h) in self.conv_states.iter_mut().zip(&snap.conv) {
+            ctx.stream
+                .memcpy_htod(h, &mut c.data)
+                .map_err(|e| anyhow!("conv H2D restore failed: {e}"))?;
+        }
+        ctx.stream
+            .synchronize()
+            .map_err(|e| anyhow!("sync after recurrent restore: {e}"))?;
+        Ok(())
     }
 
     /// Advance the materialized length by `n` tokens. The captured decode
