@@ -317,6 +317,8 @@ pub fn linear_attention_core(
                 a_inv: None,
                 chunk_state: None,
                 raw_output: None,
+                initial_state: None,
+                initial_conv_window: None,
                 batch: params.batch,
                 seq_len: params.seq_len,
                 num_key_heads: params.num_key_heads,
@@ -482,6 +484,200 @@ pub fn linear_attention_core_with_carry(
     };
 
     Ok((output_id, final_state_id, conv_window_id))
+}
+
+/// TAPED carry variant for the OPD frozen-prompt-KV generated segment: runs the
+/// gated-delta forward seeded from a prior (prompt) segment's `initial_state` +
+/// `initial_conv_window`, records `BackwardOp::LinearAttention` so grad flows
+/// into the 8 projection inputs exactly as `linear_attention_core` does. The
+/// carry inputs are CONSTANTS (the frozen prompt KV, `requires_grad = false`) —
+/// they are NOT in `input_ids`, so no grad flows into them. The backward
+/// (`linear_attention_backward`) re-seeds the SAME carry into its recompute via
+/// the two new `LinearAttentionCtx` fields, which is required for correct
+/// boundary grads.
+///
+/// Host-only: the carry-aware device kernel is deferred to the pod increment, so
+/// this always takes the host recording branch (the gates run on the host
+/// backend). The default `linear_attention_core` device path is untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_core_with_carry_taped(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    initial_state: Option<TensorId>,
+    initial_conv_window: Option<TensorId>,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    validate_shapes(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        store,
+    )?;
+
+    let requires_grad = [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ]
+    .into_iter()
+    .try_fold(false, |acc, tensor_id| {
+        store
+            .tensor(tensor_id)
+            .map(|tensor| acc || tensor.requires_grad)
+    })?;
+
+    // Always host (carry-aware device kernel deferred to pod increment).
+    for tensor_id in [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ]
+    .into_iter()
+    .chain(initial_state)
+    .chain(initial_conv_window)
+    {
+        store.ensure_host(tensor_id)?;
+    }
+
+    let qkv_tensor = store.tensor_host(qkv)?;
+    let z_tensor = store.tensor_host(z)?;
+    let b_tensor = store.tensor_host(b_proj)?;
+    let a_tensor = store.tensor_host(a_proj)?;
+    let conv_tensor = store.tensor_host(conv1d_weight)?;
+    let dt_tensor = store.tensor_host(dt_bias)?;
+    let a_log_tensor = store.tensor_host(a_log)?;
+    let norm_tensor = store.tensor_host(norm_weight)?;
+
+    let conv_window = params.conv_kernel.saturating_sub(1);
+    let initial_state_data = initial_state.map(|id| store.tensor_host(id)).transpose()?;
+    let initial_conv_data = initial_conv_window
+        .map(|id| store.tensor_host(id))
+        .transpose()?;
+    if let Some(state_tensor) = initial_state_data.as_ref() {
+        let expected = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
+        if state_tensor.data.len() != expected {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![
+                    params.batch,
+                    params.num_value_heads,
+                    params.key_dim,
+                    params.value_dim,
+                ],
+                got: state_tensor.shape.clone(),
+            });
+        }
+    }
+    if let Some(window_tensor) = initial_conv_data.as_ref() {
+        let q_dim = params.num_key_heads * params.key_dim;
+        let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
+        let expected = params.batch * conv_window * qkv_dim;
+        if window_tensor.data.len() != expected {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![params.batch, conv_window, qkv_dim],
+                got: window_tensor.shape.clone(),
+            });
+        }
+    }
+
+    let carry = LinearAttentionCarry {
+        initial_state: initial_state_data.as_ref().map(|t| t.data.as_slice()),
+        initial_conv_window: initial_conv_data.as_ref().map(|t| t.data.as_slice()),
+    };
+
+    let forward = linear_attention_forward(
+        &qkv_tensor.data,
+        &z_tensor.data,
+        &b_tensor.data,
+        &a_tensor.data,
+        &conv_tensor.data,
+        &conv_tensor.shape,
+        &dt_tensor.data,
+        &a_log_tensor.data,
+        &norm_tensor.data,
+        params,
+        carry,
+    );
+
+    let output_shape = vec![
+        params.batch,
+        params.seq_len,
+        params.num_value_heads * params.value_dim,
+    ];
+    let output_id = store.alloc(Tensor::new(forward.output, output_shape, requires_grad)?);
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::LinearAttention,
+            output_id,
+            input_ids: smallvec![
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight
+            ],
+            saved: SavedContext::LinearAttentionCtx {
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight,
+                preact: None,
+                qkv_conv: None,
+                q: None,
+                k: None,
+                v: None,
+                g: None,
+                g_cumsum: None,
+                beta: None,
+                a_inv: None,
+                chunk_state: None,
+                raw_output: None,
+                initial_state,
+                initial_conv_window,
+                batch: params.batch,
+                seq_len: params.seq_len,
+                num_key_heads: params.num_key_heads,
+                num_value_heads: params.num_value_heads,
+                key_dim: params.key_dim,
+                value_dim: params.value_dim,
+                conv_kernel: params.conv_kernel,
+                eps: params.eps,
+            },
+        });
+    }
+
+    Ok(output_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -695,6 +891,8 @@ fn try_linear_attention_forward_device(
                 a_inv: Some(a_inv_id),
                 chunk_state: Some(chunk_state_id),
                 raw_output: Some(raw_output_id),
+                initial_state: None,
+                initial_conv_window: None,
                 batch: params.batch,
                 seq_len: params.seq_len,
                 num_key_heads: params.num_key_heads,
@@ -961,6 +1159,8 @@ pub(crate) fn linear_attention_backward(
         a_inv,
         chunk_state,
         raw_output,
+        initial_state,
+        initial_conv_window,
         batch,
         seq_len,
         num_key_heads,
@@ -999,31 +1199,39 @@ pub(crate) fn linear_attention_backward(
         store,
     )?;
 
-    if let Some(grads) = try_linear_attention_backward_device(
-        output_grad_id,
-        qkv,
-        z,
-        b_proj,
-        a_proj,
-        conv1d_weight,
-        dt_bias,
-        a_log,
-        norm_weight,
-        preact,
-        qkv_conv,
-        q,
-        k,
-        v,
-        g,
-        g_cumsum,
-        beta,
-        a_inv,
-        chunk_state,
-        raw_output,
-        params,
-        store,
-    )? {
-        return Ok(grads);
+    // The OPD frozen-prompt-KV carry path is host-only (see
+    // `linear_attention_core_with_carry_taped`); when it is present the device
+    // fast path has no carry-aware kernel, so fall through to the host recompute
+    // that re-seeds the carry below. The default path (no carry) keeps the device
+    // backward unchanged.
+    let has_carry = initial_state.is_some() || initial_conv_window.is_some();
+    if !has_carry {
+        if let Some(grads) = try_linear_attention_backward_device(
+            output_grad_id,
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            preact,
+            qkv_conv,
+            q,
+            k,
+            v,
+            g,
+            g_cumsum,
+            beta,
+            a_inv,
+            chunk_state,
+            raw_output,
+            params,
+            store,
+        )? {
+            return Ok(grads);
+        }
     }
 
     let mut profile =
@@ -1038,7 +1246,11 @@ pub(crate) fn linear_attention_backward(
         dt_bias,
         a_log,
         norm_weight,
-    ] {
+    ]
+    .into_iter()
+    .chain(initial_state)
+    .chain(initial_conv_window)
+    {
         store.ensure_host(tensor_id)?;
     }
 
@@ -1059,6 +1271,19 @@ pub(crate) fn linear_attention_backward(
             got: upstream.shape,
         });
     }
+    // Re-seed the OPD frozen-prompt-KV carry so the recompute reproduces the
+    // forward's preact (conv taps) + initial recurrent state exactly — without
+    // this the boundary grads of the generated segment would be wrong. The carry
+    // tensors are constants (requires_grad=false); the grad scan never propagates
+    // into them, so only the seeding matters here.
+    let initial_state_data = initial_state.map(|id| store.tensor_host(id)).transpose()?;
+    let initial_conv_data = initial_conv_window
+        .map(|id| store.tensor_host(id))
+        .transpose()?;
+    let carry = LinearAttentionCarry {
+        initial_state: initial_state_data.as_ref().map(|t| t.data.as_slice()),
+        initial_conv_window: initial_conv_data.as_ref().map(|t| t.data.as_slice()),
+    };
     record_elapsed_subop(&mut profile, "host_materialize", materialize_started);
 
     let recompute_started = subop_started(&profile);
@@ -1073,7 +1298,7 @@ pub(crate) fn linear_attention_backward(
         &a_log_tensor.data,
         &norm_tensor.data,
         params,
-        LinearAttentionCarry::NONE,
+        carry,
     );
     record_elapsed_subop(&mut profile, "fwd_recompute", recompute_started);
 
