@@ -2285,36 +2285,40 @@ impl MetalPageStore {
             )
         })?;
 
-        let mut kv_flat = Vec::with_capacity(first_block.kv_flat.len());
         let capacity = round_up_capacity(capacity_tokens.max(prefix_tokens)) as usize;
-        for array_idx in 0..first_block.kv_flat.len() {
-            let mut page_arrays = Vec::with_capacity(key.len());
-            for page in &slot_pages[..prefix_pages] {
-                let block = self.pages.get(page).ok_or_else(|| {
-                    anyhow::anyhow!("Metal prefix attach missing K/V page {page} for slot {slot}")
-                })?;
-                let array = block.kv_flat.get(array_idx).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Metal prefix attach K/V page {page} is missing array index {array_idx}"
-                    )
-                })?;
-                page_arrays.push(array.clone());
-            }
-            let prefix_array = concatenate_or_single(page_arrays);
-            let shape = prefix_array.shape().to_vec();
-            anyhow::ensure!(
-                shape.len() == 4 && shape[2] as usize == prefix_tokens,
-                "Metal prefix K/V materialization shape mismatch for slot {slot}: shape={shape:?}, prefix_tokens={prefix_tokens}"
-            );
-            if capacity > prefix_tokens {
-                let mut zero_shape = shape;
-                zero_shape[2] = usize_to_i32(capacity - prefix_tokens)?;
-                let zeros = mlx::zeros(&zero_shape, prefix_array.dtype());
-                kv_flat.push(mlx::concatenate_axis(&[prefix_array, zeros], 2));
-            } else {
-                kv_flat.push(prefix_array);
-            }
-        }
+        let kv_flat = (0..first_block.kv_flat.len())
+            .map(|array_idx| -> anyhow::Result<_> {
+                let page_arrays = slot_pages[..prefix_pages]
+                    .iter()
+                    .map(|page| -> anyhow::Result<_> {
+                        let block = self.pages.get(page).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Metal prefix attach missing K/V page {page} for slot {slot}"
+                            )
+                        })?;
+                        block.kv_flat.get(array_idx).cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Metal prefix attach K/V page {page} is missing array index {array_idx}"
+                            )
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let prefix_array = concatenate_or_single(page_arrays);
+                let shape = prefix_array.shape().to_vec();
+                anyhow::ensure!(
+                    shape.len() == 4 && shape[2] as usize == prefix_tokens,
+                    "Metal prefix K/V materialization shape mismatch for slot {slot}: shape={shape:?}, prefix_tokens={prefix_tokens}"
+                );
+                Ok(if capacity > prefix_tokens {
+                    let mut zero_shape = shape;
+                    zero_shape[2] = usize_to_i32(capacity - prefix_tokens)?;
+                    let zeros = mlx::zeros(&zero_shape, prefix_array.dtype());
+                    mlx::concatenate_axis(&[prefix_array, zeros], 2)
+                } else {
+                    prefix_array
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(MetalSlotState::from_arrays(
             slot,
