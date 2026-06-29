@@ -287,10 +287,9 @@ impl<'a> Reader<'a> {
                     count <= self.buf.len() as u64,
                     "GGUF array count {count} exceeds file"
                 );
-                let mut out = Vec::with_capacity(count as usize);
-                for _ in 0..count {
-                    out.push(self.value(elem_type, depth + 1)?);
-                }
+                let out: Vec<_> = (0..count)
+                    .map(|_| self.value(elem_type, depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
                 GgufValue::Array(out)
             }
             10 => GgufValue::U64(self.u64()?),
@@ -352,10 +351,7 @@ impl GgufFile {
             let name = r.string()?;
             let n_dims = r.u32()?;
             ensure!(n_dims <= 4, "tensor {name}: {n_dims} dims > GGML_MAX_DIMS");
-            let mut dims = Vec::with_capacity(n_dims as usize);
-            for _ in 0..n_dims {
-                dims.push(r.u64()?);
-            }
+            let dims: Vec<u64> = (0..n_dims).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
             let ggml_type = GgmlType::from_id(r.u32()?)?;
             let offset = r.u64()?;
             index.insert(name.clone(), i as usize);
