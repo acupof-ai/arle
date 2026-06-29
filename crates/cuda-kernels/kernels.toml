@@ -686,6 +686,152 @@ allow_sm70 = false
 ffi = true
 
 # ===========================================================================
+# FP8 KV HD256 (Qwen3.5 full-attn layers). paged_attn_fp8_v1 ABI.
+# 5 head configs × 2 phases (decode + prefill) = 10 entries.
+# allow_sm70 = false (FP8 requires Ampere+).
+# ===========================================================================
+
+[[kernel]]
+head_dim = 256
+q_heads = 8
+kv_heads = 1
+phase = "decode"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
+artifact_dir = "batch_decode_paged_hd256_fp8_q8_kv1"
+kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv1_run"
+out_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv1"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 8
+kv_heads = 2
+phase = "decode"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
+artifact_dir = "batch_decode_paged_hd256_fp8_q8_kv2"
+kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv2_run"
+out_name = "tilelang_batch_decode_paged_hd256_fp8_q8_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 16
+kv_heads = 2
+phase = "decode"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
+artifact_dir = "batch_decode_paged_hd256_fp8_q16_kv2"
+kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv2_run"
+out_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 16
+kv_heads = 4
+phase = "decode"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
+artifact_dir = "batch_decode_paged_hd256_fp8_q16_kv4"
+kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv4_run"
+out_name = "tilelang_batch_decode_paged_hd256_fp8_q16_kv4"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 24
+kv_heads = 4
+phase = "decode"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_decode_paged_hd256_fp8.py"
+artifact_dir = "batch_decode_paged_hd256_fp8_q24_kv4"
+kernel_name = "tilelang_batch_decode_paged_hd256_fp8_q24_kv4_run"
+out_name = "tilelang_batch_decode_paged_hd256_fp8_q24_kv4"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 8
+kv_heads = 1
+phase = "prefill"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
+artifact_dir = "batch_prefill_paged_hd256_fp8_q8_kv1"
+kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv1_run"
+out_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv1"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 8
+kv_heads = 2
+phase = "prefill"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
+artifact_dir = "batch_prefill_paged_hd256_fp8_q8_kv2"
+kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv2_run"
+out_name = "tilelang_batch_prefill_paged_hd256_fp8_q8_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 16
+kv_heads = 2
+phase = "prefill"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
+artifact_dir = "batch_prefill_paged_hd256_fp8_q16_kv2"
+kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv2_run"
+out_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv2"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 16
+kv_heads = 4
+phase = "prefill"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
+artifact_dir = "batch_prefill_paged_hd256_fp8_q16_kv4"
+kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv4_run"
+out_name = "tilelang_batch_prefill_paged_hd256_fp8_q16_kv4"
+allow_sm70 = false
+ffi = true
+
+[[kernel]]
+head_dim = 256
+q_heads = 24
+kv_heads = 4
+phase = "prefill"
+abi = "paged_attn_fp8_v1"
+kernel_family = "attention_fp8"
+py_module = "tools/tilelang/batch_prefill_paged_hd256_fp8.py"
+artifact_dir = "batch_prefill_paged_hd256_fp8_q24_kv4"
+kernel_name = "tilelang_batch_prefill_paged_hd256_fp8_q24_kv4_run"
+out_name = "tilelang_batch_prefill_paged_hd256_fp8_q24_kv4"
+allow_sm70 = false
+ffi = true
+
+# ===========================================================================
 # Gated Delta Rule (Qwen3.5 fixed shape). build-only (ffi=false); 6 phases.
 # kernel_family "gdr"; allow_sm70=true (all phases).
 # ===========================================================================

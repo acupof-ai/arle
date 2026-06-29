@@ -32,7 +32,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
+use cuda_kernels::KVFormat;
 use cuda_kernels::ffi;
+use cuda_kernels::kv_quant;
 use cuda_kernels::moe as cuda_moe;
 use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, PagedKVPool};
 use cuda_kernels::tensor::{
@@ -5467,26 +5469,54 @@ impl Qwen35Model {
             )?;
         }
 
-        // ── 2. Paged attention over the recall page table (RoPE pre-baked). ──
-        {
-            let kernel = ffi::resolve_paged_attn_v1(
-                c.head_dim as u32,
-                self.local_q_heads as u32,
-                self.local_kv_heads as u32,
-                if decode {
-                    ffi::AttnPhase::Decode
-                } else {
-                    ffi::AttnPhase::Prefill
-                },
-            )
-            .ok_or_else(|| {
+        // ── 1.5. For quantized pools: BF16 work buffer → quantized data buffer. ──
+        // The prep kernel above wrote the new tokens BF16 into `k_work` / `v_work`
+        // (= `k_ptr` / `v_ptr` for FP8/INT8 pools). Quantize them into `k_data[layer]`
+        // so the FP8 attention kernel can read the complete token history (prefix from
+        // prior steps + new tokens just written) from one contiguous FP8 pool.
+        if rc.pool.format != KVFormat::BF16 {
+            let new_rows = rc.meta.new_token_rows.as_ref().ok_or_else(|| {
                 anyhow!(
-                    "no HD256 paged {} kernel for q{}_kv{}",
-                    if decode { "decode" } else { "prefill" },
-                    self.local_q_heads,
-                    self.local_kv_heads
+                    "Qwen35 full-attn FP8/INT8 pool missing new_token_rows in PageMeta \
+                     (format={:?})",
+                    rc.pool.format
                 )
             })?;
+            let kv_dim = self.local_full_attn_kv_dim();
+            match rc.pool.format {
+                KVFormat::FP8E4M3 => {
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        rc.pool.k_ptr(full_idx, &self.ctx.stream),
+                        rc.pool.k_data_ptr(full_idx, &self.ctx.stream),
+                        rc.pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                        new_rows,
+                        self.local_kv_heads,
+                        c.head_dim,
+                        kv_dim,
+                        seq_len,
+                    )?;
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        rc.pool.v_ptr(full_idx, &self.ctx.stream),
+                        rc.pool.v_data_ptr(full_idx, &self.ctx.stream),
+                        rc.pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                        new_rows,
+                        self.local_kv_heads,
+                        c.head_dim,
+                        kv_dim,
+                        seq_len,
+                    )?;
+                }
+                other => anyhow::bail!(
+                    "Qwen35 full-attn paged: unsupported pool format {other:?} \
+                     (only BF16 and FP8E4M3 are wired)"
+                ),
+            }
+        }
+
+        // ── 2. Paged attention over the recall page table (RoPE pre-baked). ──
+        {
             let (bsz, total_q, max_q) = if decode {
                 (1, 1, 1)
             } else {
@@ -5498,36 +5528,108 @@ impl Qwen35Model {
             let (kv_indices_ptr, _g3) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
             let (last_page_len_ptr, _g4) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
             let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: q/page-table/out buffers valid on ctx.stream; kernel
-            // signature from the paged_attn_v1 ABI (18-arg base BF16).
+            let phase = if decode {
+                ffi::AttnPhase::Decode
+            } else {
+                ffi::AttnPhase::Prefill
+            };
             qwen35_profile(
                 &self.ctx,
                 "qwen/full_paged/attention",
                 Some(full_idx),
                 seq_len,
                 || {
-                    unsafe {
-                        kernel(
-                            qp_ptr as *mut ffi::Half,
-                            q_indptr_ptr as *const i32,
-                            k_pool_ptr as *mut ffi::Half,
-                            v_pool_ptr as *mut ffi::Half,
-                            kv_indptr_ptr as *const i32,
-                            kv_indices_ptr as *const i32,
-                            last_page_len_ptr as *const i32,
-                            ao_ptr as *mut ffi::Half,
-                            bsz,
-                            total_q,
-                            max_q,
-                            rc.pool.max_total_pages as i32,
-                            rc.meta.num_pages as i32,
-                            self.local_q_heads as i32,
-                            self.local_kv_heads as i32,
-                            rc.pool.page_size as i32,
-                            sm_scale,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
+                    match rc.pool.format {
+                        KVFormat::BF16 => {
+                            // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
+                            let kernel = ffi::resolve_paged_attn_v1(
+                                c.head_dim as u32,
+                                self.local_q_heads as u32,
+                                self.local_kv_heads as u32,
+                                phase,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "no HD256 paged {} kernel for q{}_kv{}",
+                                    if decode { "decode" } else { "prefill" },
+                                    self.local_q_heads,
+                                    self.local_kv_heads
+                                )
+                            })?;
+                            unsafe {
+                                kernel(
+                                    qp_ptr as *mut ffi::Half,
+                                    q_indptr_ptr as *const i32,
+                                    k_pool_ptr as *mut ffi::Half,
+                                    v_pool_ptr as *mut ffi::Half,
+                                    kv_indptr_ptr as *const i32,
+                                    kv_indices_ptr as *const i32,
+                                    last_page_len_ptr as *const i32,
+                                    ao_ptr as *mut ffi::Half,
+                                    bsz,
+                                    total_q,
+                                    max_q,
+                                    rc.pool.max_total_pages as i32,
+                                    rc.meta.num_pages as i32,
+                                    self.local_q_heads as i32,
+                                    self.local_kv_heads as i32,
+                                    rc.pool.page_size as i32,
+                                    sm_scale,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
+                        }
+                        KVFormat::FP8E4M3 => {
+                            // SAFETY: kernel signature from paged_attn_fp8_v1 ABI (20-arg).
+                            // k/v data buffers are FP8; scales are per-token per-kv-head f32.
+                            let kernel = ffi::resolve_paged_attn_fp8_v1(
+                                c.head_dim as u32,
+                                self.local_q_heads as u32,
+                                self.local_kv_heads as u32,
+                                phase,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "no HD256 FP8 paged {} kernel for q{}_kv{}",
+                                    if decode { "decode" } else { "prefill" },
+                                    self.local_q_heads,
+                                    self.local_kv_heads
+                                )
+                            })?;
+                            let k_data = rc.pool.k_data_ptr(full_idx, &self.ctx.stream);
+                            let v_data = rc.pool.v_data_ptr(full_idx, &self.ctx.stream);
+                            let k_scales = rc.pool.k_scales_ptr(full_idx, &self.ctx.stream);
+                            let v_scales = rc.pool.v_scales_ptr(full_idx, &self.ctx.stream);
+                            unsafe {
+                                kernel(
+                                    qp_ptr as *mut ffi::Half,
+                                    q_indptr_ptr as *const i32,
+                                    k_data as *const u8,
+                                    v_data as *const u8,
+                                    k_scales as *const f32,
+                                    v_scales as *const f32,
+                                    kv_indptr_ptr as *const i32,
+                                    kv_indices_ptr as *const i32,
+                                    last_page_len_ptr as *const i32,
+                                    ao_ptr as *mut ffi::Half,
+                                    bsz,
+                                    total_q,
+                                    max_q,
+                                    rc.pool.max_total_pages as i32,
+                                    rc.meta.num_pages as i32,
+                                    self.local_q_heads as i32,
+                                    self.local_kv_heads as i32,
+                                    rc.pool.page_size as i32,
+                                    sm_scale,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
+                        }
+                        other => anyhow::bail!(
+                            "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
+                        ),
                     }
                     Ok(())
                 },

@@ -604,13 +604,7 @@ fn emit_ffi_generated(reg: &Registry, out_dir: &Path) {
         "resolve_paged_attn_split_merge_v1",
         "PagedAttnSplitMergeV1Fn",
     );
-    emit_resolve_mono(
-        &mut s,
-        reg,
-        "paged_attn_fp8_v1",
-        "resolve_paged_attn_fp8_v1",
-        "PagedAttnFp8V1Fn",
-    );
+    emit_resolve_paged_attn_fp8_v1(&mut s, reg);
 
     let out = out_dir.join("ffi_tilelang_generated.rs");
     std::fs::write(&out, s).expect("write ffi_tilelang_generated.rs");
@@ -636,6 +630,35 @@ fn emit_resolve_paged_attn_v1(s: &mut String, reg: &Registry) {
         .kernels
         .iter()
         .filter(|k| k.ffi && k.abi == "paged_attn_v1")
+    {
+        let (hd, q, kv) = (k.head_dim.unwrap(), k.q_heads.unwrap(), k.kv_heads.unwrap());
+        writeln!(
+            s,
+            "        ({hd}, {q}, {kv}, {}) => {}_cuda,",
+            phase_variant(&k.phase),
+            k.kernel_name
+        )
+        .unwrap();
+    }
+    s.push_str("        _ => return None,\n    })\n}\n\n");
+}
+
+/// Phase-aware resolver for FP8 paged attention. Mirrors `emit_resolve_paged_attn_v1`
+/// but for `paged_attn_fp8_v1` kernels — decode and prefill FP8 kernels share the same
+/// C ABI and are disambiguated by the `phase` dimension (same `(hd, q, kv)` tuples
+/// exist for both phases, so a 3-arg mono-dispatch would collide).
+fn emit_resolve_paged_attn_fp8_v1(s: &mut String, reg: &Registry) {
+    use std::fmt::Write as _;
+    s.push_str(
+        "#[allow(dead_code)]\n\
+         pub fn resolve_paged_attn_fp8_v1(head_dim: u32, q_heads: u32, kv_heads: u32, \
+         phase: AttnPhase) -> Option<PagedAttnFp8V1Fn> {\n\
+         \x20   Some(match (head_dim, q_heads, kv_heads, phase) {\n",
+    );
+    for k in reg
+        .kernels
+        .iter()
+        .filter(|k| k.ffi && k.abi == "paged_attn_fp8_v1")
     {
         let (hd, q, kv) = (k.head_dim.unwrap(), k.q_heads.unwrap(), k.kv_heads.unwrap());
         writeln!(
