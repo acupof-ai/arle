@@ -11,7 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use infer_core::CompletedRequest;
 use infer_plan::{FinishReason, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -318,26 +317,6 @@ pub struct CompletionResponse {
 }
 
 impl CompletionResponse {
-    pub(crate) fn from_completed(model: String, completed: CompletedRequest, text: String) -> Self {
-        let usage = Usage::new(
-            completed.prompt_tokens.len(),
-            completed.generated_tokens.len(),
-        );
-        Self {
-            id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
-            object: "text_completion",
-            created: unix_time_secs(),
-            model,
-            choices: vec![CompletionChoice {
-                text,
-                index: 0,
-                logprobs: None,
-                finish_reason: finish_reason(completed.finish.as_ref()).to_string(),
-            }],
-            usage,
-        }
-    }
-
     /// Build a completion response from already-decoded parts (the multiproc
     /// coordinator path, which has no in-process `CompletedRequest`).
     pub(crate) fn from_parts(
@@ -404,6 +383,7 @@ pub struct StatsResponse {
 }
 
 impl StatsResponse {
+    #[allow(dead_code)] // used only in tests; from_wire is the production path
     pub(crate) fn from_counters(counters: CounterSnapshot) -> Self {
         Self {
             scheduler: SchedulerStats {
@@ -635,35 +615,6 @@ pub struct ChatCompletionResponse {
 }
 
 impl ChatCompletionResponse {
-    pub(crate) fn from_completed(
-        model: String,
-        completed: CompletedRequest,
-        content: String,
-        enable_thinking: bool,
-    ) -> Self {
-        let usage = Usage::new(
-            completed.prompt_tokens.len(),
-            completed.generated_tokens.len(),
-        );
-        let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
-        Self {
-            id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
-            object: "chat.completion",
-            created: unix_time_secs(),
-            model,
-            choices: vec![ChatChoice {
-                index: 0,
-                message: AssistantMessage {
-                    role: "assistant",
-                    content,
-                    reasoning_content,
-                },
-                finish_reason: finish_reason(completed.finish.as_ref()).to_string(),
-            }],
-            usage,
-        }
-    }
-
     pub(crate) fn from_parts(
         model: String,
         content: String,

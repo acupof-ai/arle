@@ -472,16 +472,38 @@ async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<Models
 }
 
 async fn metrics(
-    State(_state): State<Arc<CoordinatorHandle>>,
+    State(state): State<Arc<CoordinatorHandle>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
-    // The coordinator owns no engine counters (the per-rank engines hold them);
-    // expose a minimal scrape surface so monitoring probes do not 404.
+    // Query rank-0 engine stats via relay and render as Prometheus text.
+    // kv_tier/kv_system are not relayed and render as zero.
+    let request_id = state.stats_request_id.fetch_add(1, Ordering::Relaxed);
+    let rx = state
+        .relay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .register_stats_awaiter(request_id);
+    let counters = if state
+        .relay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send_stats_query(request_id)
+        .is_ok()
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|w| w.into_counter_snapshot())
+            .unwrap_or_default()
+    } else {
+        crate::execution::CounterSnapshot::default()
+    };
     (
         [(
             header::CONTENT_TYPE,
             crate::metrics::PROMETHEUS_CONTENT_TYPE,
         )],
-        String::from("# arle multiproc coordinator: per-rank engine counters not aggregated\n"),
+        crate::metrics::render_prometheus(&counters, &state.model),
     )
 }
 
