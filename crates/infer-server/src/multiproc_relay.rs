@@ -879,7 +879,7 @@ fn spawn_completion_reader(
                         let remove = match sink {
                             Some(tx) => tx.send(delta).is_err() || done,
                             None => {
-                                log::warn!(
+                                log::debug!(
                                     "[relay-coordinator] completion for unknown request_id={request_id} from rank {rank}"
                                 );
                                 done
