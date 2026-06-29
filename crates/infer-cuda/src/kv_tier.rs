@@ -115,10 +115,7 @@ pub(crate) fn default_t1_budget_bytes(dram_fraction: f64) -> usize {
 }
 
 pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
-    let (free, total) = match disk_free_total_bytes(root) {
-        Some((free, total)) => (Some(free), Some(total)),
-        None => (None, None),
-    };
+    let (free, total) = disk_free_total_bytes(root).unzip();
     let budget = nvme_l3_budget(
         free,
         total,
