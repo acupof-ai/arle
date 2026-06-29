@@ -782,7 +782,13 @@ fn serve_handle_relay_driver<E, K>(
     // Pre-spawn a fixed pool of relay worker threads — one per engine slot.
     // This replaces per-request thread::spawn which created O(c) threads in
     // a burst and triggered ELKEID SIGKILL at c=1024.
-    type WorkItem = (u64, std::sync::mpsc::Receiver<execution::StreamItem>);
+    // Ticket held alongside rx so live_requests is decremented only after the
+    // worker finishes, not the moment submit_streaming returns.
+    type WorkItem = (
+        u64,
+        RequestTicket,
+        std::sync::mpsc::Receiver<execution::StreamItem>,
+    );
     let (work_tx, work_rx) = std::sync::mpsc::channel::<WorkItem>();
     let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
     let n_workers = serve.max_live_requests.max(1).min(1024);
@@ -792,8 +798,9 @@ fn serve_handle_relay_driver<E, K>(
         std::thread::Builder::new()
             .name("arle-relay-worker".into())
             .spawn(move || {
-                while let Ok((request_id, rx)) = work_rx.lock().unwrap().recv() {
+                while let Ok((request_id, _ticket, rx)) = work_rx.lock().unwrap().recv() {
                     relay_stream(request_id, rx, &tx);
+                    // _ticket drops here — live_requests decremented after relay completes
                 }
             })
             .expect("spawn relay worker");
@@ -806,8 +813,8 @@ fn serve_handle_relay_driver<E, K>(
                     let request_id = wire.request_id;
                     let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
                     match serve.submit_streaming(prompt_tokens, max_tokens, sampling) {
-                        Ok((_ticket, rx)) => {
-                            let _ = work_tx.send((request_id, rx));
+                        Ok((ticket, rx)) => {
+                            let _ = work_tx.send((request_id, ticket, rx));
                         }
                         Err(e) => {
                             let _ = engine_tx.send(RelayEnvelope::Completion {
