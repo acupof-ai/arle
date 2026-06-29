@@ -374,13 +374,12 @@ impl Dsv4LayerKvLayout {
             table.len(),
             self.flashmla_slot_pages
         );
-        let mut out = Vec::with_capacity(self.flashmla_slot_pages);
-        for &page in table {
-            out.push(
-                i32::try_from(page)
-                    .map_err(|_| anyhow!("DSv4 FlashMLA page {page} exceeds i32"))?,
-            );
-        }
+        let mut out = table
+            .iter()
+            .map(|&page| {
+                i32::try_from(page).map_err(|_| anyhow!("DSv4 FlashMLA page {page} exceeds i32"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let pad = out.last().copied().unwrap_or(0);
         out.resize(self.flashmla_slot_pages, pad);
         Ok(out)
@@ -437,21 +436,23 @@ impl Dsv4KvAdapter {
             mla_decode.len(),
             layer_specs.len()
         );
-        let mut layers = Vec::with_capacity(layer_specs.len());
-        for &(mode, compress_ratio, local_heads) in layer_specs {
-            layers.push(Dsv4LayerKvLayout::new(
-                ctx,
-                config,
-                mode,
-                compress_ratio,
-                max_seq_len,
-                kv_arena,
-                local_heads,
-                tp_world,
-                num_slots,
-                flashmla_pool_budget_bytes_per_layer,
-            )?);
-        }
+        let layers = layer_specs
+            .iter()
+            .map(|&(mode, compress_ratio, local_heads)| {
+                Dsv4LayerKvLayout::new(
+                    ctx,
+                    config,
+                    mode,
+                    compress_ratio,
+                    max_seq_len,
+                    kv_arena,
+                    local_heads,
+                    tp_world,
+                    num_slots,
+                    flashmla_pool_budget_bytes_per_layer,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         // Build the ONE shared official-DSA scratch when any indexer layer
         // exists. Widened to has_indexer() so GLM SparseIndexed (every layer)
         // also builds the scratch. All indexer layers must agree on the indexer
@@ -515,18 +516,20 @@ impl Dsv4KvAdapter {
         // scratch and the new single-row shared scratch). Both gate on the same
         // `dsv4_flashmla_decode_alloc_enabled` predicate as the per-slot state.
         let (flashmla_batch, flashmla_scratch) = if dsv4_flashmla_decode_alloc_enabled()? {
-            let mut layer_shapes = Vec::with_capacity(layer_specs.len());
-            for &(mode, compress_ratio, local_heads) in layer_specs {
-                layer_shapes.push(Dsv4FlashMlaDecodeShape::new(
-                    config,
-                    mode,
-                    compress_ratio,
-                    max_seq_len,
-                    kv_arena,
-                    local_heads,
-                    tp_world,
-                )?);
-            }
+            let layer_shapes = layer_specs
+                .iter()
+                .map(|&(mode, compress_ratio, local_heads)| {
+                    Dsv4FlashMlaDecodeShape::new(
+                        config,
+                        mode,
+                        compress_ratio,
+                        max_seq_len,
+                        kv_arena,
+                        local_heads,
+                        tp_world,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
             let batch = if config.head_dim == 512 {
                 Some(Dsv4FlashMlaDecodeBatchScratch::new(
                     ctx,
@@ -2796,9 +2799,9 @@ const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
 
 /// Per-(slot, CSA-layer) STATEFUL half of the official DSA selector.
 ///
-/// Only the pieces that carry cross-call state live here: the `rotated_keys`
-/// mirror (incrementally written as compressed keys arrive), the
-/// `packed_rows` progress counter, and the slot's key-cache band binding.
+/// Only the pieces that carry cross-call state live here: the `packed_rows`
+/// progress counter and the slot's key-cache band binding. `rotated_keys` is a
+/// transient drain-immediate staging buffer (delta-sized, NOT full history).
 /// Every per-forward scratch buffer and every constant table is shared across
 /// slots AND layers in [`Dsv4DsaSharedScratch`] (issue #67 — the per-slot ×
 /// per-layer copies of the `logits` tile alone made 256K boot impossible).
@@ -2833,7 +2836,9 @@ impl Dsv4DsaOfficialState {
             key_cache_len: key_cache_bytes,
             rotated_keys: ctx
                 .stream
-                .alloc_zeros::<half::bf16>(compressed_capacity * config.index_head_dim)
+                .alloc_zeros::<half::bf16>(
+                    dsv4_dsa_rotated_ring_rows(compressed_capacity) * config.index_head_dim,
+                )
                 .map_err(|e| anyhow!("DSv4 official DSA rotated key alloc failed: {e}"))?,
             packed_rows: 0,
         })
@@ -2846,9 +2851,9 @@ impl Dsv4DsaOfficialState {
     }
 
     /// Exact requested device bytes owned by this per-(slot,CSA-layer) DSA
-    /// state: the `rotated_keys` bf16 mirror only. The slot's `dsa_key_cache`
-    /// band is owned by [`Dsv4LayerKvLayout::dsa_key_cache`] (summed there once),
-    /// not here.
+    /// state: the transient `rotated_keys` staging buffer only. The slot's
+    /// `dsa_key_cache` band is owned by [`Dsv4LayerKvLayout::dsa_key_cache`]
+    /// (summed there once), not here.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.rotated_keys.len() * std::mem::size_of::<half::bf16>()
@@ -3195,7 +3200,7 @@ pub(crate) fn dsv4_dsa_batched_scratch_bytes_per_slot(
 }
 
 /// Device bytes of ONE per-(slot, CSA-layer) [`Dsv4DsaOfficialState`] — the
-/// stateful `rotated_keys` mirror. Feeds the per-slot term of
+/// transient `rotated_keys` staging buffer. Feeds the per-slot term of
 /// `Dsv4Model::kv_budget_num_slots`.
 pub(crate) fn dsv4_dsa_rotated_keys_bytes(
     config: &DeepSeekV4Config,
@@ -3203,7 +3208,19 @@ pub(crate) fn dsv4_dsa_rotated_keys_bytes(
     max_seq_len: usize,
 ) -> usize {
     let cc = max_seq_len.div_ceil(compress_ratio.max(1)).max(1);
-    cc.saturating_mul(config.index_head_dim).saturating_mul(2)
+    dsv4_dsa_rotated_ring_rows(cc)
+        .saturating_mul(config.index_head_dim)
+        .saturating_mul(2)
+}
+
+/// Transient depth (rows) of the DSA Hadamard-rotated-key staging buffer.
+/// Rotated keys are drain-immediate: Hadamard writes the per-forward delta and
+/// `fused_store_index_k_cache` reads it into the FP8 `dsa_key_cache` in the SAME
+/// forward, so only the live delta lives here — NOT the full history (that lives
+/// in the FP8 cache the paged-MQA-logits kernel reads). Bounded by the indexer
+/// staging ring, which already caps `newly_packed`.
+fn dsv4_dsa_rotated_ring_rows(compressed_capacity: usize) -> usize {
+    DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity.max(1))
 }
 
 pub(crate) fn dsv4_dsa_key_cache_bytes(
@@ -3536,11 +3553,9 @@ impl Dsv4FlashMlaImage {
 /// of the shared official-DSA key cache.
 struct Dsv4DsaOfficialImage {
     packed_rows: usize,
-    /// Incrementally-written rotated-key mirror. Snapshot the full buffer
-    /// because old packed rows are not proven reconstructible from current state.
-    rotated_keys: Vec<half::bf16>,
     /// Full `dsa_slot_range` band: the FP8 indexer key cache read by the
-    /// paged-MQA logits kernel.
+    /// paged-MQA logits kernel. This holds the full key history; `rotated_keys`
+    /// is a transient per-forward staging buffer and needs no snapshot.
     key_cache_slot: Vec<u8>,
 }
 
@@ -3564,10 +3579,6 @@ impl Dsv4DsaOfficialImage {
         );
         Ok(Self {
             packed_rows: official.packed_rows,
-            rotated_keys: ctx
-                .stream
-                .clone_dtoh(&official.rotated_keys)
-                .map_err(|e| anyhow!("DSv4 swap DSA rotated keys D2H failed: {e}"))?,
             key_cache_slot: ctx
                 .stream
                 .clone_dtoh(&pool_buf.slice(range))
@@ -3581,12 +3592,6 @@ impl Dsv4DsaOfficialImage {
         pool: &mut Dsv4LayerKvLayout,
         official: &mut Dsv4DsaOfficialState,
     ) -> Result<()> {
-        ensure!(
-            self.rotated_keys.len() == official.rotated_keys.len(),
-            "DSv4 swap DSA rotated keys image len {} != state len {}",
-            self.rotated_keys.len(),
-            official.rotated_keys.len()
-        );
         let range = pool.dsa_slot_range(official.slot_idx)?;
         let pool_buf = pool
             .dsa_key_cache
@@ -3601,9 +3606,6 @@ impl Dsv4DsaOfficialImage {
             pool_buf.len(),
             self.key_cache_slot.len()
         );
-        ctx.stream
-            .memcpy_htod(&self.rotated_keys, &mut official.rotated_keys)
-            .map_err(|e| anyhow!("DSv4 swap DSA rotated keys H2D failed: {e}"))?;
         let mut view = pool_buf.slice_mut(range);
         ctx.stream
             .memcpy_htod(&self.key_cache_slot, &mut view)
@@ -3613,7 +3615,7 @@ impl Dsv4DsaOfficialImage {
     }
 
     fn host_bytes(&self) -> usize {
-        self.rotated_keys.len() * std::mem::size_of::<half::bf16>() + self.key_cache_slot.len()
+        self.key_cache_slot.len()
     }
 }
 
@@ -12117,10 +12119,11 @@ pub(crate) fn dsv4_dsa_cache_write_gather_row(
         .as_mut()
         .ok_or_else(|| anyhow!("DSv4 batched DSA cache-write requires official per-slot state"))?;
     ensure!(
-        official.rotated_keys.len() == shared.compressed_capacity * shared.head_dim,
-        "DSv4 batched DSA rotated_keys len {} mismatches shared scratch capacity {}x{}",
+        official.rotated_keys.len()
+            == dsv4_dsa_rotated_ring_rows(shared.compressed_capacity) * shared.head_dim,
+        "DSv4 batched DSA rotated staging ring len {} mismatches {}x{}",
         official.rotated_keys.len(),
-        shared.compressed_capacity,
+        dsv4_dsa_rotated_ring_rows(shared.compressed_capacity),
         shared.head_dim
     );
     ensure!(
@@ -12163,7 +12166,6 @@ pub(crate) fn dsv4_dsa_cache_write_gather_row(
          + newly_packed {newly_packed} > ring_rows {keys_ring_rows} (packed_rows {} base {keys_window_base})",
         official.packed_rows
     );
-    let dst_row = official.packed_rows;
     // Cache band base for this slot (bands disjoint by slot_idx).
     let cache_range = pool.dsa_slot_range(official.slot_idx)?;
     let cache_pool = pool
@@ -12196,18 +12198,17 @@ pub(crate) fn dsv4_dsa_cache_write_gather_row(
         .dsa_official
         .as_mut()
         .ok_or_else(|| anyhow!("DSv4 batched DSA cache-write requires official per-slot state"))?;
-    // rotated_keys base (offset 0; the hadamard kernel applies (dst_row + r) * ihd).
+    // rotated_keys is a transient drain-immediate ring: Hadamard writes the delta
+    // at ring-relative 0 and the fused-store reads it back the same launch, so
+    // BOTH the hadamard dst and the store src are ring-relative 0 (dst_row, the
+    // absolute packed-row offset, no longer indexes into rotated_keys — only into
+    // cache_locs / the FP8 cache band).
     let rotated_dst_ptr = {
         let (p, g) = official.rotated_keys.device_ptr_mut(&ctx.stream);
         drop(g);
         p
     };
-    // The fused-store reads rotated_keys at ABSOLUTE dst_offset (= dst_row*ihd),
-    // its per-warp body indexing rows 0..newly_packed — mirror the per-row block
-    // (a) which passes the `rotated.slice(dst_offset..)` view as the store source.
-    // bf16 = 2 bytes; dst_offset elems = dst_row * ihd.
-    let rotated_src_ptr = rotated_dst_ptr
-        + (dst_row as u64) * (ihd as u64) * (std::mem::size_of::<half::bf16>() as u64);
+    let rotated_src_ptr = rotated_dst_ptr;
     // cache_locs slice base at packed_rows (the kernel reads [tok] from here).
     let cache_locs_ptr = {
         let locs = shared.cache_locs.slice(official.packed_rows..);
@@ -12222,7 +12223,8 @@ pub(crate) fn dsv4_dsa_cache_write_gather_row(
     ptrs.cache_band.push(cache_band_ptr);
     ptrs.cache_locs.push(cache_locs_ptr);
     ptrs.src_ring_row.push(i32::try_from(src_ring_row)?);
-    ptrs.dst_row.push(i32::try_from(dst_row)?);
+    // Ring-relative: rotated_keys dst row is always 0 (transient drain-immediate).
+    ptrs.dst_row.push(0);
     ptrs.newly_packed.push(i32::try_from(newly_packed)?);
     official.packed_rows = indexer_rows_after;
     Ok(())
@@ -13064,10 +13066,11 @@ fn csa_select_official(
     );
 
     ensure!(
-        official.rotated_keys.len() == shared.compressed_capacity * shared.head_dim,
-        "DSv4 official DSA rotated_keys len {} mismatches shared scratch capacity {}x{}",
+        official.rotated_keys.len()
+            == dsv4_dsa_rotated_ring_rows(shared.compressed_capacity) * shared.head_dim,
+        "DSv4 official DSA rotated staging ring len {} mismatches {}x{}",
         official.rotated_keys.len(),
-        shared.compressed_capacity,
+        dsv4_dsa_rotated_ring_rows(shared.compressed_capacity),
         shared.head_dim
     );
 
@@ -13102,8 +13105,18 @@ fn csa_select_official(
              + newly_packed {newly_packed} > ring_rows {keys_ring_rows} (packed_rows {} base {keys_window_base})",
             official.packed_rows
         );
+        // `rotated_keys` is a transient drain-immediate staging buffer: Hadamard
+        // writes the delta at ring offset 0 and the fused-store reads it back the
+        // same forward, so the dst is ALWAYS ring-relative 0 (not absolute
+        // `packed_rows`). `newly_packed <= ring_rows` is guaranteed by the source
+        // staging-ring straddle check above (same depth), re-asserted for clarity.
+        let rotated_ring_rows = official.rotated_keys.len() / ihd;
+        ensure!(
+            newly_packed <= rotated_ring_rows,
+            "DSv4 official DSA delta {newly_packed} exceeds rotated staging ring {rotated_ring_rows}"
+        );
         let src_offset = src_ring_row * ihd;
-        let dst_offset = official.packed_rows * ihd;
+        let dst_offset = 0usize;
         let src = keys.data.slice(src_offset..src_offset + newly_packed * ihd);
         {
             let mut rotated = official

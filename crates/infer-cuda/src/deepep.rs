@@ -235,15 +235,15 @@ impl DeepEpTransport {
             .all_gather_bytes(ctx, &local_device_id.to_ne_bytes(), 4)
             .map_err(|e| anyhow!("DeepEP device-id all_gather failed: {e}"))?;
 
-        let mut peers = Vec::with_capacity(cfg.world_size);
-        for peer in 0..cfg.world_size {
-            let h0 = peer * deepep_sys::IPC_HANDLE_BYTES;
-            let mut handle = [0u8; deepep_sys::IPC_HANDLE_BYTES];
-            handle.copy_from_slice(&gathered_handles[h0..h0 + deepep_sys::IPC_HANDLE_BYTES]);
-            let id0 = peer * 4;
-            let device_id = u32::from_ne_bytes(gathered_ids[id0..id0 + 4].try_into()?);
-            peers.push((handle, device_id));
-        }
+        let peers = gathered_handles
+            .chunks_exact(deepep_sys::IPC_HANDLE_BYTES)
+            .zip(gathered_ids.chunks_exact(4))
+            .map(|(hb, ib)| {
+                let handle: [u8; deepep_sys::IPC_HANDLE_BYTES] = hb.try_into()?;
+                let device_id = u32::from_ne_bytes(ib.try_into()?);
+                Ok((handle, device_id))
+            })
+            .collect::<Result<Vec<_>>>()?;
         buffer
             .sync(&peers)
             .map_err(|e| anyhow!("DeepEP Buffer::sync failed: {e}"))?;
