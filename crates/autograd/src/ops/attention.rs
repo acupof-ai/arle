@@ -625,7 +625,7 @@ pub fn cat_heads(
     let total_heads: usize = head_counts.iter().sum();
     let requires_grad = inputs
         .iter()
-        .any(|&id| store.tensor(id).map_or(false, |t| t.requires_grad));
+        .any(|&id| store.tensor(id).is_ok_and(|t| t.requires_grad));
 
     let out_shape = vec![batch, total_heads, seq, head_dim];
     let mut data = vec![0.0_f32; batch * total_heads * seq * head_dim];
