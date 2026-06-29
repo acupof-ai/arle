@@ -3971,16 +3971,12 @@ impl Qwen35CudaExecutor {
             // Try loading prior session durable NVMe spill if disk is configured.
             // Falls through to set_disk_durable on first run or epoch mismatch.
             if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {
-                let loaded = tier.load(
-                    root.clone(),
-                    *budget,
-                    page_bytes,
-                    self.weights_epoch.clone(),
-                );
+                let loaded =
+                    tier.load(root.clone(), budget, page_bytes, self.weights_epoch.clone());
                 if !loaded {
                     tier.set_disk_durable(
                         root.clone(),
-                        *budget,
+                        budget,
                         page_bytes,
                         self.weights_epoch.clone(),
                     );
