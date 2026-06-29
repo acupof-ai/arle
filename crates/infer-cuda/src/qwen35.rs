@@ -663,22 +663,24 @@ impl Qwen35SlotState {
         if self.gdr_states.is_empty() {
             anyhow::bail!("snapshot_recurrent: slot recurrent state not acquired");
         }
-        let mut gdr = Vec::with_capacity(self.gdr_states.len());
-        for s in &self.gdr_states {
-            gdr.push(
+        let gdr = self
+            .gdr_states
+            .iter()
+            .map(|s| {
                 ctx.stream
                     .clone_dtoh(s)
-                    .map_err(|e| anyhow!("gdr D2H failed: {e}"))?,
-            );
-        }
-        let mut conv = Vec::with_capacity(self.conv_states.len());
-        for c in &self.conv_states {
-            conv.push(
+                    .map_err(|e| anyhow!("gdr D2H failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let conv = self
+            .conv_states
+            .iter()
+            .map(|c| {
                 ctx.stream
                     .clone_dtoh(&c.data)
-                    .map_err(|e| anyhow!("conv D2H failed: {e}"))?,
-            );
-        }
+                    .map_err(|e| anyhow!("conv D2H failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         ctx.stream
             .synchronize()
             .map_err(|e| anyhow!("sync after recurrent snapshot: {e}"))?;
@@ -851,22 +853,24 @@ impl Qwen35SlotState {
         let full_attn_pages = full_attn_kv.copy_pages_to_host(ctx, &pages)?;
         let full_attn_page_count = pages.len();
         // (b) + (c) recurrent + conv D2H (stream-ordered; sync below covers them).
-        let mut gdr_host = Vec::with_capacity(self.gdr_states.len());
-        for s in &self.gdr_states {
-            gdr_host.push(
+        let gdr_host = self
+            .gdr_states
+            .iter()
+            .map(|s| {
                 ctx.stream
                     .clone_dtoh(s)
-                    .map_err(|e| anyhow!("Qwen3.6 swap gdr-state D2H failed: {e}"))?,
-            );
-        }
-        let mut conv_host = Vec::with_capacity(self.conv_states.len());
-        for c in &self.conv_states {
-            conv_host.push(
+                    .map_err(|e| anyhow!("Qwen3.6 swap gdr-state D2H failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let conv_host = self
+            .conv_states
+            .iter()
+            .map(|c| {
                 ctx.stream
                     .clone_dtoh(&c.data)
-                    .map_err(|e| anyhow!("Qwen3.6 swap conv-state D2H failed: {e}"))?,
-            );
-        }
+                    .map_err(|e| anyhow!("Qwen3.6 swap conv-state D2H failed: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         // The clone_dtoh copies above are stream-ordered; drain before the host
         // image is stored/read (matches DSv4 swap_out_image's trailing sync).
         ctx.sync()?;
