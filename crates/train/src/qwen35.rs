@@ -9,11 +9,12 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, all_reduce_sum, cat_heads, causal_sdpa_recompute,
-        causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_core,
-        matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
-        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        MoeTopK, add, add_broadcast, all_reduce_sum, cat_heads, cat_seq, causal_sdpa_recompute,
+        causal_sdpa_with_q_start, checkpoint_sequential, embedding, head_chunked_sdpa_with_q_start,
+        linear_attention_core, linear_attention_core_with_carry,
+        linear_attention_core_with_carry_taped, matmul_bt_with_site, moe_grouped_linear,
+        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
+        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
 };
 use half::bf16;
@@ -72,6 +73,37 @@ struct Qwen35LinearAttention {
 enum Qwen35Attention {
     Full(Qwen35FullAttention),
     Linear(Qwen35LinearAttention),
+}
+
+/// OPD frozen-prompt-KV: a full-attention layer's captured prompt-prefix K/V
+/// (repeat_kv'd, at absolute positions `0..gen_start`, `requires_grad=false`).
+/// Only K/V are captured — the prompt's Q is never queried by the gen segment.
+#[derive(Debug, Clone, Copy)]
+struct PrefixKv {
+    k: TensorId,
+    v: TensorId,
+}
+
+/// OPD frozen-prompt-KV: a linear-attention layer's captured boundary recurrent
+/// state + causal-conv window after the prompt prefix (`requires_grad=false`).
+#[derive(Debug, Clone, Copy)]
+struct PrefixState {
+    state: TensorId,
+    conv_window: TensorId,
+}
+
+/// Per-layer captured prompt prefix for the frozen-prompt-KV writeback split.
+#[derive(Debug, Clone, Copy)]
+enum LayerPrefix {
+    Full(PrefixKv),
+    Linear(PrefixState),
+}
+
+/// One captured prefix per model layer (phase-1 prompt pass output), consumed by
+/// the phase-2 taped gen-segment forward.
+#[derive(Debug, Clone)]
+struct WritebackPrefixCache {
+    layers: Vec<LayerPrefix>,
 }
 
 #[derive(Debug, Clone)]
@@ -708,6 +740,115 @@ impl Qwen35Layer {
             tape,
         )?;
         let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
+        Ok(add(x, mlp_out, store, tape)?)
+    }
+
+    /// OPD frozen-prompt-KV phase 1 (per layer, OFF-TAPE): capture this layer's
+    /// prompt-prefix attention state (K/V for full attention, recurrent
+    /// state+conv window for linear attention) AND propagate the prompt hidden
+    /// through the full residual block so the next layer's capture sees the
+    /// correct input. `x` is `[batch, gen_start, hidden]`. Returns
+    /// `(next_prompt_hidden, LayerPrefix)`. The caller passes a DISABLED tape.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_capture_prefix(
+        &self,
+        x: TensorId,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos_prefix: TensorId,
+        sin_prefix: TensorId,
+        batch: usize,
+        gen_start: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<(TensorId, LayerPrefix)> {
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let (attn_out, prefix) = match &self.self_attn {
+            Qwen35Attention::Full(attn) => {
+                let prefix = self.forward_full_attention_capture_prefix_kv(
+                    h, attn, cfg, tp, cos_prefix, sin_prefix, batch, gen_start, store, tape,
+                )?;
+                // The prompt residual stream needs the layer's attention output;
+                // recompute it via the standard full-sequence path (off-tape).
+                let attn_out = self.forward_full_attention(
+                    h, attn, cfg, tp, cos_prefix, sin_prefix, batch, gen_start, store, tape,
+                )?;
+                (attn_out, LayerPrefix::Full(prefix))
+            }
+            Qwen35Attention::Linear(attn) => {
+                let prefix = self.forward_linear_attention_capture_prefix_state(
+                    h, attn, cfg, batch, gen_start, store, tape,
+                )?;
+                let attn_out =
+                    self.forward_linear_attention(h, attn, cfg, batch, gen_start, store, tape)?;
+                (attn_out, LayerPrefix::Linear(prefix))
+            }
+        };
+        let x = add(x, attn_out, store, tape)?;
+        let h = qwen35_rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        let mlp_out = self.forward_mlp(h, cfg, tp, batch, gen_start, store, tape)?;
+        let next = add(x, mlp_out, store, tape)?;
+        Ok((next, prefix))
+    }
+
+    /// OPD frozen-prompt-KV phase 2 (per layer, TAPED): residual block over the
+    /// gen rows only (`x` = `[batch, gen_len, hidden]`), where attention consumes
+    /// this layer's captured prefix. RMSNorm + MLP are position-local, so the gen
+    /// residual stream is exact given the seeded attention.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gen_segment(
+        &self,
+        x: TensorId,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos_gen: TensorId,
+        sin_gen: TensorId,
+        layer_prefix: &LayerPrefix,
+        batch: usize,
+        gen_start: usize,
+        gen_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let attn_out = match (&self.self_attn, layer_prefix) {
+            (Qwen35Attention::Full(attn), LayerPrefix::Full(prefix_kv)) => self
+                .forward_full_attention_gen_segment(
+                    h, attn, cfg, tp, cos_gen, sin_gen, prefix_kv, batch, gen_start, gen_len,
+                    store, tape,
+                )?,
+            (Qwen35Attention::Linear(attn), LayerPrefix::Linear(prefix_state)) => self
+                .forward_linear_attention_gen_segment(
+                    h,
+                    attn,
+                    cfg,
+                    prefix_state,
+                    batch,
+                    gen_len,
+                    store,
+                    tape,
+                )?,
+            _ => {
+                return Err(Qwen35Error::InvalidConfig(
+                    "frozen-prompt-KV layer prefix kind does not match the layer attention kind",
+                ));
+            }
+        };
+        let x = add(x, attn_out, store, tape)?;
+        let h = qwen35_rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        let mlp_out = self.forward_mlp(h, cfg, tp, batch, gen_len, store, tape)?;
         Ok(add(x, mlp_out, store, tape)?)
     }
 
@@ -1571,6 +1712,183 @@ impl Qwen35Layer {
         maybe_tp_all_reduce(out, tp, store, tape)
     }
 
+    /// OPD frozen-prompt-KV phase 1: compute the prompt prefix's repeat_kv'd K/V
+    /// at absolute positions `0..gen_start` (k_proj/v_proj → split_heads →
+    /// k_norm → rope(cos/sin sliced to the prefix) → repeat_kv), returning them
+    /// as `requires_grad=false` constants. Off-tape (caller passes a disabled
+    /// tape). Only K/V — the prompt's Q is never queried by the gen segment.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full_attention_capture_prefix_kv(
+        &self,
+        h_prefix: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos_prefix: TensorId,
+        sin_prefix: TensorId,
+        batch: usize,
+        gen_start: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<PrefixKv> {
+        let local_attention_heads = tp.local_attention_heads(cfg)?;
+        let local_key_value_heads = tp.local_key_value_heads(cfg)?;
+        let k = attn.k_proj.forward(h_prefix, store, tape)?;
+        let v = attn.v_proj.forward(h_prefix, store, tape)?;
+        let k = split_heads(
+            k,
+            batch,
+            gen_start,
+            local_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let v = split_heads(
+            v,
+            batch,
+            gen_start,
+            local_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+        let k = rope(k, cos_prefix, sin_prefix, store, tape)?;
+        let kv_repeat = local_attention_heads / local_key_value_heads;
+        let k = repeat_kv(k, kv_repeat, store, tape)?;
+        let v = repeat_kv(v, kv_repeat, store, tape)?;
+        // Pin as constants so the gen-segment concat treats them as frozen.
+        store.set_requires_grad(k, false)?;
+        store.set_requires_grad(v, false)?;
+        Ok(PrefixKv { k, v })
+    }
+
+    /// OPD frozen-prompt-KV phase 2: TAPED full attention over the gen rows only
+    /// (`h_gen` is `[batch, gen_len, hidden]`). Projects Q/K/V for the gen rows,
+    /// q_norm/k_norm, rope at gen positions (cos_gen/sin_gen already sliced to
+    /// `gen_start..seq_len`), repeat_kv, then concatenates the frozen prefix K/V
+    /// along the seq axis (grad flows into k_gen/v_gen only) and runs cached SDPA
+    /// with `q_start = gen_start`. The gate/merge/o_proj/all_reduce tail is
+    /// identical to `forward_full_attention`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full_attention_gen_segment(
+        &self,
+        h_gen: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos_gen: TensorId,
+        sin_gen: TensorId,
+        prefix_kv: &PrefixKv,
+        batch: usize,
+        gen_start: usize,
+        gen_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let q_full = attn.q_proj.forward(h_gen, store, tape)?;
+        let local_attention_heads = tp.local_attention_heads(cfg)?;
+        let local_key_value_heads = tp.local_key_value_heads(cfg)?;
+        let (q, gate) = if cfg.full_attn_gated {
+            let q_full = reshape(
+                q_full,
+                &[batch, gen_len, local_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            let q = slice(
+                q_full,
+                &[0, 0, 0, 0],
+                &[batch, gen_len, local_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            let gate = slice(
+                q_full,
+                &[0, 0, 0, cfg.head_dim],
+                &[batch, gen_len, local_attention_heads, cfg.head_dim * 2],
+                store,
+                tape,
+            )?;
+            (
+                transpose(q, 1, 2, store, tape)?,
+                Some(transpose(gate, 1, 2, store, tape)?),
+            )
+        } else {
+            let q = reshape(
+                q_full,
+                &[batch, gen_len, local_attention_heads, cfg.head_dim],
+                store,
+                tape,
+            )?;
+            (transpose(q, 1, 2, store, tape)?, None)
+        };
+
+        let k = attn.k_proj.forward(h_gen, store, tape)?;
+        let v = attn.v_proj.forward(h_gen, store, tape)?;
+        let k = split_heads(
+            k,
+            batch,
+            gen_len,
+            local_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let v = split_heads(
+            v,
+            batch,
+            gen_len,
+            local_key_value_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+
+        let q = qwen35_rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+        let k = qwen35_rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+        let q = rope(q, cos_gen, sin_gen, store, tape)?;
+        let k = rope(k, cos_gen, sin_gen, store, tape)?;
+
+        let kv_repeat = local_attention_heads / local_key_value_heads;
+        let k_gen = repeat_kv(k, kv_repeat, store, tape)?;
+        let v_gen = repeat_kv(v, kv_repeat, store, tape)?;
+
+        // Concatenate the frozen prefix K/V (positions 0..gen_start) with the gen
+        // K/V (positions gen_start..seq_len) along the seq axis. The prefix is a
+        // constant leaf so grad flows only into k_gen/v_gen.
+        let k_full = cat_seq(prefix_kv.k, k_gen, store, tape)?;
+        let v_full = cat_seq(prefix_kv.v, v_gen, store, tape)?;
+
+        let attn_hidden = head_chunked_sdpa_with_q_start(
+            q,
+            k_full,
+            v_full,
+            gen_start,
+            ATTN_HEAD_CHUNK,
+            store,
+            tape,
+        )?;
+        let attn_hidden = if let Some(gate) = gate {
+            let gate = sigmoid(gate, store, tape)?;
+            mul(attn_hidden, gate, store, tape)?
+        } else {
+            attn_hidden
+        };
+        let attn_hidden = merge_heads(
+            attn_hidden,
+            batch,
+            gen_len,
+            local_attention_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let out = attn.o_proj.forward(attn_hidden, store, tape)?;
+        maybe_tp_all_reduce(out, tp, store, tape)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_full_attention_profiled(
         &self,
@@ -2098,6 +2416,106 @@ impl Qwen35Layer {
                 conv_kernel: cfg.linear_conv_kernel_dim,
                 eps: cfg.rms_norm_eps,
             },
+            store,
+            tape,
+        )?;
+        Ok(attn.out_proj.forward(linear, store, tape)?)
+    }
+
+    /// OPD frozen-prompt-KV phase 1: run the gated-delta recurrence over the
+    /// prompt prefix (`h_prefix` = rows `0..gen_start`) off-tape via
+    /// `linear_attention_core_with_carry` with `capture_boundary=true`, returning
+    /// the boundary recurrent state + conv window as `requires_grad=false`
+    /// constants. The output is discarded (only the boundary carry matters).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_linear_attention_capture_prefix_state(
+        &self,
+        h_prefix: TensorId,
+        attn: &Qwen35LinearAttention,
+        cfg: &Qwen35Config,
+        batch: usize,
+        gen_start: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<PrefixState> {
+        let qkv = attn.in_proj_qkv.forward(h_prefix, store, tape)?;
+        let z = attn.in_proj_z.forward(h_prefix, store, tape)?;
+        let b_proj = attn.in_proj_b.forward(h_prefix, store, tape)?;
+        let a_proj = attn.in_proj_a.forward(h_prefix, store, tape)?;
+        let (_, final_state, conv_window) = linear_attention_core_with_carry(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            attn.conv1d_weight,
+            attn.dt_bias,
+            attn.a_log,
+            attn.norm,
+            LinearAttentionParams {
+                batch,
+                seq_len: gen_start,
+                num_key_heads: cfg.linear_num_key_heads,
+                num_value_heads: cfg.linear_num_value_heads,
+                key_dim: cfg.linear_key_head_dim,
+                value_dim: cfg.linear_value_head_dim,
+                conv_kernel: cfg.linear_conv_kernel_dim,
+                eps: cfg.rms_norm_eps,
+            },
+            None,
+            None,
+            true,
+            store,
+        )?;
+        let state = final_state.ok_or(Qwen35Error::InvalidConfig(
+            "linear-attention prefix capture must return a boundary state",
+        ))?;
+        let conv_window = conv_window.ok_or(Qwen35Error::InvalidConfig(
+            "linear-attention prefix capture must return a conv window",
+        ))?;
+        Ok(PrefixState { state, conv_window })
+    }
+
+    /// OPD frozen-prompt-KV phase 2: TAPED gated-delta recurrence over the gen
+    /// rows only (`h_gen` = rows `gen_start..seq_len`), seeded from the captured
+    /// prefix `(state, conv_window)` so the suffix is reproduced exactly. Grad
+    /// flows into the gen rows' projections; the carry is a constant.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_linear_attention_gen_segment(
+        &self,
+        h_gen: TensorId,
+        attn: &Qwen35LinearAttention,
+        cfg: &Qwen35Config,
+        prefix_state: &PrefixState,
+        batch: usize,
+        gen_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let qkv = attn.in_proj_qkv.forward(h_gen, store, tape)?;
+        let z = attn.in_proj_z.forward(h_gen, store, tape)?;
+        let b_proj = attn.in_proj_b.forward(h_gen, store, tape)?;
+        let a_proj = attn.in_proj_a.forward(h_gen, store, tape)?;
+        let linear = linear_attention_core_with_carry_taped(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            attn.conv1d_weight,
+            attn.dt_bias,
+            attn.a_log,
+            attn.norm,
+            LinearAttentionParams {
+                batch,
+                seq_len: gen_len,
+                num_key_heads: cfg.linear_num_key_heads,
+                num_value_heads: cfg.linear_num_value_heads,
+                key_dim: cfg.linear_key_head_dim,
+                value_dim: cfg.linear_value_head_dim,
+                conv_kernel: cfg.linear_conv_kernel_dim,
+                eps: cfg.rms_norm_eps,
+            },
+            Some(prefix_state.state),
+            Some(prefix_state.conv_window),
             store,
             tape,
         )?;
@@ -3809,6 +4227,191 @@ impl Qwen35Model {
             .map(|&id| id as usize)
             .collect::<Vec<_>>();
         self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)
+    }
+
+    /// OPD frozen-prompt-KV writeback forward: forward+backward ONLY the
+    /// generated segment (`gen_ids` = rows `gen_start..seq_len`), seeding each
+    /// layer's attention from the prompt prefix (`prompt_ids` = rows
+    /// `0..gen_start`) captured off-tape. Returns `[1, gen_len, hidden]`.
+    ///
+    /// Two phases:
+    ///  1. OFF-TAPE prompt pass (no checkpoint, no offload): embed the prompt,
+    ///     run the layers with the tape disabled; at each layer capture the
+    ///     prefix K/V (full) or boundary state+conv (linear) AND propagate the
+    ///     prompt hidden so the next layer's capture sees the correct input. The
+    ///     prompt hidden is discarded after.
+    ///  2. TAPED gen pass: embed ONLY `gen_ids` fresh → `[1, gen_len, hidden]`
+    ///     (RMSNorm + MLP are position-local, so feeding `embed(gen_ids)` is
+    ///     exact — only attention reads the prefix). Run the layers via
+    ///     `checkpoint_sequential` (or a per-layer loop when checkpointing is
+    ///     off), each consuming its captured prefix, then final_norm.
+    pub fn forward_hidden_states_gen_segment(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        prompt_ids: &[u32],
+        gen_ids: &[u32],
+        prompt_positions: &[u32],
+        gen_positions: &[u32],
+    ) -> Result<TensorId> {
+        if prompt_ids.len() != prompt_positions.len() {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: prompt_ids.len(),
+                expected_len: prompt_positions.len(),
+            });
+        }
+        if gen_ids.len() != gen_positions.len() {
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: gen_ids.len(),
+                expected_len: gen_positions.len(),
+            });
+        }
+        if gen_ids.is_empty() {
+            return Err(Qwen35Error::InvalidConfig(
+                "frozen-prompt-KV forward requires at least one generated token",
+            ));
+        }
+        let gen_start = prompt_ids.len();
+        let gen_len = gen_ids.len();
+        let batch = 1usize;
+
+        // ---- PHASE 1: off-tape prompt prefix capture ----
+        let prefix_cache = if gen_start > 0 {
+            let prompt_token_indices = prompt_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+            let prompt_pos = prompt_positions
+                .iter()
+                .map(|&id| id as usize)
+                .collect::<Vec<_>>();
+            let cos_prefix = select_cache_rows(self.cos_cache, &prompt_pos, store)?;
+            let sin_prefix = select_cache_rows(self.sin_cache, &prompt_pos, store)?;
+
+            let mut prefix_tape = Tape::new();
+            prefix_tape.set_enabled(false);
+            let mut prompt_hidden = embedding(
+                self.embed_tokens,
+                &prompt_token_indices,
+                store,
+                &mut prefix_tape,
+            )?;
+            prompt_hidden = reshape(
+                prompt_hidden,
+                &[batch, gen_start, self.config.hidden_size],
+                store,
+                &mut prefix_tape,
+            )?;
+            let mut layers = Vec::with_capacity(self.layers.len());
+            for layer in &self.layers {
+                let (next, prefix) = layer.forward_capture_prefix(
+                    prompt_hidden,
+                    &self.config,
+                    self.tp,
+                    cos_prefix,
+                    sin_prefix,
+                    batch,
+                    gen_start,
+                    store,
+                    &mut prefix_tape,
+                )?;
+                prompt_hidden = next;
+                layers.push(prefix);
+            }
+            WritebackPrefixCache { layers }
+        } else {
+            // gen_start == 0: no prefix; an empty cache forces the gen pass to seed
+            // from zeros (equivalent to the full sequence with no prompt).
+            return Err(Qwen35Error::InvalidConfig(
+                "frozen-prompt-KV forward requires a non-empty prompt prefix",
+            ));
+        };
+
+        // ---- PHASE 2: taped gen-segment forward ----
+        let gen_token_indices = gen_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let gen_pos = gen_positions
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        let cos_gen = select_cache_rows(self.cos_cache, &gen_pos, store)?;
+        let sin_gen = select_cache_rows(self.sin_cache, &gen_pos, store)?;
+
+        let mut hidden = embedding(self.embed_tokens, &gen_token_indices, store, tape)?;
+        hidden = reshape(
+            hidden,
+            &[batch, gen_len, self.config.hidden_size],
+            store,
+            tape,
+        )?;
+
+        if self.gradient_checkpointing && tape.enabled {
+            let cache = Arc::new(prefix_cache);
+            let layers = Arc::new(self.layers.clone());
+            let cfg = self.config.clone();
+            let tp = self.tp;
+            let (cos_id, sin_id) = (cos_gen, sin_gen);
+            let layer_fn = {
+                let layers = Arc::clone(&layers);
+                let cache = Arc::clone(&cache);
+                move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
+                    layers[idx]
+                        .forward_gen_segment(
+                            h,
+                            &cfg,
+                            tp,
+                            cos_id,
+                            sin_id,
+                            &cache.layers[idx],
+                            batch,
+                            gen_start,
+                            gen_len,
+                            s,
+                            t,
+                        )
+                        .map_err(qwen35_to_autograd)
+                }
+            };
+            let param_ids: Vec<Vec<TensorId>> = self
+                .layers
+                .iter()
+                .map(|l| l.checkpoint_param_ids(store))
+                .collect();
+            hidden = checkpoint_sequential(
+                hidden,
+                self.layers.len(),
+                ckpt_group_size(
+                    batch * gen_len,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                ),
+                self.lora_layer_start,
+                store,
+                tape,
+                |idx| param_ids[idx].clone(),
+                layer_fn,
+            )?;
+        } else {
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
+                hidden = layer.forward_gen_segment(
+                    hidden,
+                    &self.config,
+                    self.tp,
+                    cos_gen,
+                    sin_gen,
+                    &prefix_cache.layers[layer_index],
+                    batch,
+                    gen_start,
+                    gen_len,
+                    store,
+                    tape,
+                )?;
+            }
+        }
+        qwen35_rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )
     }
 
     pub fn logits_from_hidden_window(
