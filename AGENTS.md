@@ -232,6 +232,10 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 - **Keep code simple and uniform.** Prefer deletion-style refactors: remove
   obsolete paths, collapse duplicate helpers/branches, converge on one canonical
   flow instead of layering adapters.
+- **Module reorganisation is in scope for deletion passes.** Merging, splitting,
+  reordering, renaming — the target is the minimum correct arrangement, not
+  preserving the original structure. Large-scale restructuring (>5 files) follows
+  the Approach-first rule below.
 - **`AGENTS.md` is canonical.** A sibling `CLAUDE.md` stays a full rule document
   aligned with it, not a thin pointer.
 - **Approach-first for >3 files or architectural decisions** — outline and wait.
@@ -356,6 +360,17 @@ mechanical changes.
   associated types.
 - **Comments concise** — ≤1-2 lines on the non-obvious *why*, not what the code
   does; no essay blocks. Load-bearing invariant/ordering notes stay, compressed.
+- **Code as poetry — every expression earns its place.** Use the stdlib's
+  vocabulary when it names the operation exactly: `.unzip()` over a 4-line match,
+  `ensure!` over `if { return Err }`, `.is_some_and()` over `.map().unwrap_or()`,
+  iterator chains over for-push when the shape is a direct formula. The test:
+  *can a reader parse the intent in one pass without re-reading?* Named
+  temporaries that just alias the previous line add noise; the range
+  `i * tp_size..(i+1) * tp_size` is already named.
+- **Module ordering is part of the design.** Items should appear in dependency
+  order — helpers before callers, types before impls that use them, public API
+  before internals. Arbitrary ordering forces readers to scroll; ordered code
+  reads like a proof.
 
 ### GPU kernel work
 
