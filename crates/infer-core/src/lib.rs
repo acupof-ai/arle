@@ -998,6 +998,19 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.throughput_stats.requests_completed.saturating_add(1);
         request.phase = RequestPhase::Finished;
         request.finish = Some(reason);
+        // Capture sidecar at final seq_len (prompt + decode tokens) before publishing
+        // radix pages. Without this, decode tokens advance the radix cache past the
+        // last prefill-time sidecar capture, causing full re-prefill fallbacks on every
+        // subsequent agentic turn that generates ≥16 tokens.
+        let full_tokens: Vec<u32> = request
+            .prompt_tokens
+            .iter()
+            .chain(request.generated_tokens.iter())
+            .copied()
+            .collect();
+        if let Err(err) = self.executor.capture_cached_prefix(slot, &full_tokens) {
+            log::debug!("finish_slot sidecar capture failed for slot {slot}: {err:#}");
+        }
         self.publish_prefix_blocks(slot, &request);
         self.release_reused_prefix(&request.reused_prefix_pages);
         self.kv.free_slot(slot);
