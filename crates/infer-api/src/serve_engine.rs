@@ -522,26 +522,28 @@ fn server_chat_content(message: &ChatPromptMessage) -> infer_server::ChatContent
     if message.images.is_empty() {
         return infer_server::ChatContent::Text(message.content.clone());
     }
-    let mut parts =
-        Vec::with_capacity(message.images.len() + usize::from(!message.content.is_empty()));
-    if !message.content.is_empty() {
-        parts.push(infer_server::ChatContentPart {
+    let parts = (!message.content.is_empty())
+        .then(|| infer_server::ChatContentPart {
             kind: "text".to_string(),
             text: Some(message.content.clone()),
             image_url: None,
             input_image: None,
             extra: serde_json::Map::new(),
-        });
-    }
-    for _ in &message.images {
-        parts.push(infer_server::ChatContentPart {
-            kind: "image".to_string(),
-            text: None,
-            image_url: None,
-            input_image: None,
-            extra: serde_json::Map::new(),
-        });
-    }
+        })
+        .into_iter()
+        .chain(
+            message
+                .images
+                .iter()
+                .map(|_| infer_server::ChatContentPart {
+                    kind: "image".to_string(),
+                    text: None,
+                    image_url: None,
+                    input_image: None,
+                    extra: serde_json::Map::new(),
+                }),
+        )
+        .collect();
     infer_server::ChatContent::Parts(parts)
 }
 
