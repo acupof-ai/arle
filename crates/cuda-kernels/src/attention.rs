@@ -554,10 +554,14 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
 ) -> Result<()> {
     let (pt_ptr, num_logical_pages, _gp) = match page_table {
         Some(table) => {
+            // The shared page-table buffer is allocated for max_total_blocks (widest
+            // layer). Narrower layers use a smaller row_width and write only
+            // n*row_width entries into it — so divisibility of the full buffer by
+            // the current layer's row_width is NOT required. The correct bound is
+            // that the active portion (b * row_width) fits in the buffer.
             anyhow::ensure!(
-                page_table_row_width > 0 && table.len() % page_table_row_width == 0,
-                "batched page table len {} not a multiple of row width {page_table_row_width}",
-                table.len()
+                page_table_row_width > 0,
+                "batched page table row width must be > 0"
             );
             anyhow::ensure!(
                 b * page_table_row_width <= table.len(),

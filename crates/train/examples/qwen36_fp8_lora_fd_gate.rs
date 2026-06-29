@@ -49,6 +49,8 @@ mod app {
         check_route_stability: bool,
         freeze_base_routes: bool,
         sparse_logit_probe: bool,
+        frozen_prompt_kv: bool,
+        prompt_len: usize,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +111,16 @@ mod app {
         let positions = (0..args.tokens.len() as u32).collect::<Vec<_>>();
         if args.profile_forward_only {
             profile_forward_only(&student, &mut store, &args, &positions)?;
+            return Ok(());
+        }
+
+        if args.frozen_prompt_kv {
+            // Runtime check deferred to the pod increment (carry-aware device
+            // kernel + a real FP8 checkpoint). Here we wire + compile the gate:
+            // an FD check on the frozen gen-segment forward at a response-position
+            // probe. The host taped carry is gated by Gate A's parity tests; this
+            // pod-side gate confirms it on the production FP8 model.
+            run_frozen_prompt_kv_gate(&student, &mut store, &args, &backend)?;
             return Ok(());
         }
 
@@ -294,6 +306,8 @@ mod app {
         let mut check_route_stability = false;
         let mut freeze_base_routes = false;
         let mut sparse_logit_probe = false;
+        let mut frozen_prompt_kv = false;
+        let mut prompt_len = 0usize;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -335,6 +349,12 @@ mod app {
                 "--check-route-stability" => check_route_stability = true,
                 "--freeze-base-routes" => freeze_base_routes = true,
                 "--sparse-logit-probe" => sparse_logit_probe = true,
+                "--frozen-prompt-kv" => frozen_prompt_kv = true,
+                "--prompt-len" => {
+                    prompt_len = next_arg("--prompt-len", &mut args)?
+                        .parse()
+                        .context("parse --prompt-len")?;
+                }
                 "-h" | "--help" => {
                     println!(
                         "usage: cargo run -p train --example qwen36_fp8_lora_fd_gate \
@@ -343,7 +363,8 @@ mod app {
                          [--target-adapter NAME|auto:routed-up] [--eps F] [--tokens CSV] \
                          [--mode mlp-layer|full-model|tail] [--layer N] [--profile-backward] \
                          [--profile-forward-only] [--check-route-stability] \
-                         [--freeze-base-routes] [--sparse-logit-probe]"
+                         [--freeze-base-routes] [--sparse-logit-probe] \
+                         [--frozen-prompt-kv --prompt-len N]"
                     );
                     std::process::exit(0);
                 }
@@ -368,6 +389,20 @@ mod app {
         if sparse_logit_probe && !matches!(mode, GateMode::FullModel | GateMode::Tail) {
             bail!("--sparse-logit-probe requires --mode full-model or --mode tail");
         }
+        if frozen_prompt_kv {
+            // gen_start = prompt_len - 1, so the prefix needs >= 1 token and the
+            // gen segment (boundary ++ generated) needs >= 2 tokens total.
+            if prompt_len < 2 {
+                bail!("--frozen-prompt-kv requires --prompt-len >= 2");
+            }
+            if prompt_len >= tokens.len() {
+                bail!(
+                    "--frozen-prompt-kv requires --prompt-len < tokens ({} >= {})",
+                    prompt_len,
+                    tokens.len()
+                );
+            }
+        }
         Ok(Args {
             model,
             device,
@@ -383,6 +418,8 @@ mod app {
             check_route_stability,
             freeze_base_routes,
             sparse_logit_probe,
+            frozen_prompt_kv,
+            prompt_len,
         })
     }
 
@@ -708,6 +745,130 @@ mod app {
             frozen_routes,
         )?;
         scalar_host(store, loss)
+    }
+
+    /// Frozen-prompt-KV gate: FD-check the analytic gradient of a probe-weighted
+    /// loss over the frozen gen-segment hidden against finite differences on the
+    /// target LoRA adapter. `gen_start = prompt_len - 1`; the prefix is captured
+    /// off-tape and the gen segment (boundary ++ generated tokens) is forwarded
+    /// taped. Confirms the host taped carry on the production FP8 model.
+    fn run_frozen_prompt_kv_gate(
+        model: &Qwen35Model,
+        store: &mut TensorStore,
+        args: &Args,
+        backend: &Arc<CudaBackend>,
+    ) -> Result<()> {
+        let gen_start = args.prompt_len - 1;
+        let prompt_prefix: Vec<u32> = args.tokens[0..gen_start].to_vec();
+        let gen_ids: Vec<u32> = args.tokens[gen_start..].to_vec();
+        let prompt_positions: Vec<u32> = (0..gen_start as u32).collect();
+        let gen_positions: Vec<u32> = (gen_start as u32..args.tokens.len() as u32).collect();
+
+        // Deterministic probe over the gen hidden [1, gen_len, hidden].
+        let gen_len = gen_ids.len();
+        let probe_len = gen_len * model.config().hidden_size;
+        let probe_data = deterministic_vec(probe_len, 0x9c3f_11ae_5577_d00d, 0.01);
+        let probe = store.alloc(Tensor::new(
+            probe_data,
+            vec![1, gen_len, model.config().hidden_size],
+            false,
+        )?);
+
+        // Analytic pass.
+        let mut tape = Tape::new();
+        tape.set_enabled(true);
+        let hidden = model
+            .forward_hidden_states_gen_segment(
+                store,
+                &mut tape,
+                &prompt_prefix,
+                &gen_ids,
+                &prompt_positions,
+                &gen_positions,
+            )
+            .context("frozen gen-segment analytic forward")?;
+        let weighted = mul(hidden, probe, store, &mut tape)?;
+        let loss = sum(weighted, store, &mut tape)?;
+        let loss_base = scalar_host(store, loss)?;
+        let grads = tape.backward(loss, store)?;
+        backend
+            .device_synchronize()
+            .context("synchronize after frozen analytic backward")?;
+
+        let target = *model
+            .adapter_name_map()
+            .get(args.target_adapter.as_str())
+            .with_context(|| format!("adapter {} not found", args.target_adapter))?;
+        let grad_id = *grads
+            .get(&target)
+            .with_context(|| format!("missing gradient for {}", args.target_adapter))?;
+        let grad = store.to_host(grad_id)?;
+        let index = largest_nonzero_index(&grad).with_context(|| {
+            format!(
+                "frozen gen-segment gradient for {} has no non-zero element",
+                args.target_adapter
+            )
+        })?;
+        let analytic = grad[index];
+
+        // Finite-diff pass: perturb the selected adapter element.
+        let fd_loss = |store: &mut TensorStore| -> Result<f32> {
+            let mut tape = Tape::new();
+            tape.set_enabled(false);
+            let hidden = model
+                .forward_hidden_states_gen_segment(
+                    store,
+                    &mut tape,
+                    &prompt_prefix,
+                    &gen_ids,
+                    &prompt_positions,
+                    &gen_positions,
+                )
+                .context("frozen gen-segment fd forward")?;
+            let weighted = mul(hidden, probe, store, &mut tape)?;
+            let loss = sum(weighted, store, &mut tape)?;
+            scalar_host(store, loss)
+        };
+
+        let original = tensor_value(store, target, index)?;
+        set_tensor_value(store, target, index, original + args.eps)?;
+        let loss_plus = fd_loss(store)?;
+        set_tensor_value(store, target, index, original - args.eps)?;
+        let loss_minus = fd_loss(store)?;
+        set_tensor_value(store, target, index, original)?;
+        backend
+            .device_synchronize()
+            .context("synchronize after frozen finite diff")?;
+
+        let numeric = (loss_plus - loss_minus) / (2.0 * args.eps);
+        let rel_err = rel_err(analytic, numeric);
+        println!(
+            "qwen36_fp8_lora_frozen_prompt_kv_result prompt_len={} gen_start={} gen_len={} \
+             target={} index={} eps={:.1e} loss_base={:.9e} loss_minus={:.9e} loss_plus={:.9e} \
+             analytic={:.9e} numeric={:.9e} rel_err={:.3e}",
+            args.prompt_len,
+            gen_start,
+            gen_len,
+            args.target_adapter,
+            index,
+            args.eps,
+            loss_base,
+            loss_minus,
+            loss_plus,
+            analytic,
+            numeric,
+            rel_err
+        );
+        if rel_err > 1.0e-2 {
+            bail!(
+                "Qwen3.6 FP8 frozen-prompt-KV finite diff failed: target={} analytic={:.9e} \
+                 numeric={numeric:.9e} rel_err={rel_err:.3e}",
+                args.target_adapter,
+                analytic
+            );
+        }
+        println!("qwen36_fp8_lora_frozen_prompt_kv PASS");
+        Ok(())
     }
 
     fn collect_base_moe_routes(
