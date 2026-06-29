@@ -10088,7 +10088,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 indexer_query_precomputed,
                 keepalive,
             )?;
-            if is_batched { None } else { Some(sel) }
+            (!is_batched).then_some(sel)
         } else {
             None
         }

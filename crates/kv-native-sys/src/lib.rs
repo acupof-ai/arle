@@ -197,14 +197,17 @@ pub fn block_path_sharded(root: &Path, fingerprint: [u8; 16]) -> io::Result<Path
 }
 
 fn block_filename(fingerprint: [u8; 16]) -> String {
-    let mut filename = String::with_capacity(35);
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in fingerprint.iter() {
-        filename.push(HEX[(byte >> 4) as usize] as char);
-        filename.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    filename.push_str(".kv");
-    filename
+    fingerprint
+        .iter()
+        .flat_map(|b| {
+            [
+                HEX[(b >> 4) as usize] as char,
+                HEX[(b & 0xf) as usize] as char,
+            ]
+        })
+        .chain(".kv".chars())
+        .collect()
 }
 
 pub fn write_block_atomic(root: &Path, fingerprint: [u8; 16], bytes: &[u8]) -> io::Result<()> {

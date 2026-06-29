@@ -2622,7 +2622,7 @@ impl MetalSlotState {
         // A single contiguous full range == today's default read; keep `None` so
         // the decode hot path stays byte-identical when the session fits.
         let is_full = plan.ranges.len() == 1 && plan.ranges[0] == (0, self.cache_len);
-        self.recall_ranges = if is_full { None } else { Some(plan.ranges) };
+        self.recall_ranges = (!is_full).then_some(plan.ranges);
         // TODO(kv-recall L3): this is the RESIDENT variant — full KV stays in
         // `slot.kv_flat` (HBM) and recall restricts *attention* to the selected
         // ranges (the page-gather), saving decode compute. The plan-doc L3 tier

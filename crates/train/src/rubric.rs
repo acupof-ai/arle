@@ -385,7 +385,7 @@ pub fn select_by_self_consistency(rollouts: &[String]) -> Selection {
         .iter()
         .map(|r| {
             let norm = normalize_math_answer(r);
-            if norm.is_empty() { None } else { Some(norm) }
+            (!norm.is_empty()).then_some(norm)
         })
         .collect();
 
