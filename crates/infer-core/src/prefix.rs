@@ -217,35 +217,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         Ok(matched_len)
     }
 
-    fn record_prefix_tier_hits(&mut self, blocks: &[PrefixBlock]) {
-        if blocks.is_empty() {
-            return;
-        }
-        for block in blocks {
-            match *block {
-                PrefixBlock::ResidentPage(_) => {
-                    self.kv_system_metrics.reuse_hit_resident =
-                        self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
-                }
-                PrefixBlock::DemotedKey(key) => match self
-                    .executor
-                    .kv_tier_location(key)
-                    .unwrap_or(KvTierLocation::HostDemoted)
-                {
-                    KvTierLocation::HostDemoted => {
-                        self.kv_system_metrics.reuse_hit_host_demoted = self
-                            .kv_system_metrics
-                            .reuse_hit_host_demoted
-                            .saturating_add(1);
-                    }
-                    KvTierLocation::Disk => {
-                        self.kv_system_metrics.reuse_hit_disk =
-                            self.kv_system_metrics.reuse_hit_disk.saturating_add(1);
-                    }
-                },
-            }
-        }
-    }
+    // record_prefix_tier_hits moved into materialize_prefix_blocks.
 
     pub(crate) fn alloc_with_prefix_reclaim(&mut self, slot: usize, tokens: usize) -> Result<()> {
         let needed = self.kv.append_pages_needed(slot, tokens);
@@ -599,7 +571,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .min(blocks.len());
         blocks.truncate(reusable);
         let block_ids = self.materialize_prefix_blocks(&blocks);
-        self.record_prefix_tier_hits(&blocks[..block_ids.len().min(blocks.len())]);
+        // record_prefix_tier_hits now lives inside materialize_prefix_blocks
+        // so block locations are captured before promotion removes entries.
         self.drain_dropped_tier_keys();
         PrefixMatch {
             matched_len: block_ids.len() * self.radix.block_size(),
@@ -621,13 +594,43 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             })
             .collect::<Vec<_>>();
         if demoted.is_empty() {
-            return blocks
+            let ids: Vec<_> = blocks
                 .iter()
                 .filter_map(|block| match *block {
                     PrefixBlock::ResidentPage(page) => Some(page),
                     PrefixBlock::DemotedKey(_) => None,
                 })
                 .collect();
+            // All-resident: count every block as a resident hit.
+            for _ in &ids {
+                self.kv_system_metrics.reuse_hit_resident =
+                    self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
+            }
+            return ids;
+        }
+
+        // Snapshot per-block location BEFORE promotion (the promote path
+        // removes entries from the tier store, so a post-promote query
+        // would lose the disk/host attribution).
+        for block in blocks {
+            match *block {
+                PrefixBlock::ResidentPage(_) => {
+                    self.kv_system_metrics.reuse_hit_resident =
+                        self.kv_system_metrics.reuse_hit_resident.saturating_add(1);
+                }
+                PrefixBlock::DemotedKey(key) => match self.executor.kv_tier_location(key) {
+                    Some(KvTierLocation::HostDemoted) | None => {
+                        self.kv_system_metrics.reuse_hit_host_demoted = self
+                            .kv_system_metrics
+                            .reuse_hit_host_demoted
+                            .saturating_add(1);
+                    }
+                    Some(KvTierLocation::Disk) => {
+                        self.kv_system_metrics.reuse_hit_disk =
+                            self.kv_system_metrics.reuse_hit_disk.saturating_add(1);
+                    }
+                },
+            }
         }
 
         let promoted_pages = match self.kv.alloc_detached_pages(demoted.len()) {
