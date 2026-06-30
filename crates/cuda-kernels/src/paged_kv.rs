@@ -399,6 +399,17 @@ impl TokenKVPool {
         }
     }
 
+    fn claim_mirrored_page(&mut self, page: u32) {
+        let idx = page as usize;
+        if self.page_attach_count[idx] == 0
+            && self.page_ref_count[idx] == 0
+            && let Some(pos) = self.free_pages.iter().position(|&p| p == page)
+        {
+            self.free_pages.swap_remove(pos);
+        }
+        self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
+    }
+
     /// Create a new token-level KV pool.
     ///
     /// `budget_bytes` controls how much GPU memory to allocate for the pool.
@@ -723,65 +734,6 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
-    /// Reserve a FIXED-LAYOUT band of `page_count` contiguous physical pages for
-    /// `slot` while advancing the logical cursor by `seq_tokens` (≤ band
-    /// capacity).
-    ///
-    /// Unlike [`Self::alloc_tokens`] (page count derived from `seq_len`), this
-    /// is for caches whose pages are addressed by a FIXED slot-logical block
-    /// offset, not by sequential position — e.g. the DSv4 FlashMLA band, where
-    /// the sliding-window ring occupies logical pages `[0, sw_blocks)` and the
-    /// compressed region `[sw_blocks, total_blocks)`. Those readers need ALL
-    /// `total_blocks` pages resident regardless of how many tokens are live, so
-    /// the band is drawn whole on admission; `seq_tokens` only tracks the
-    /// logical position for the `seq_len == append_pos` invariant. Idempotent: a
-    /// slot that already owns its band just advances the cursor.
-    pub fn alloc_band_pages(
-        &mut self,
-        slot: usize,
-        page_count: usize,
-        seq_tokens: usize,
-    ) -> Result<()> {
-        ensure!(
-            slot < self.num_slots,
-            "TokenKVPool::alloc_band_pages slot {slot} out of range {}",
-            self.num_slots
-        );
-        let live = self.page_indices[slot].len();
-        ensure!(
-            live == 0 || live == page_count,
-            "TokenKVPool::alloc_band_pages slot {slot} holds {live} pages, expected 0 (fresh) or {page_count} (re-cursor)"
-        );
-        // `seq_tokens` is the LOGICAL cursor (restore length / 0 for a fresh draw)
-        // — unbounded by the physical band (it wraps mod sw / compresses to
-        // max_seq/cr), bounded by max_seq at ingress, NOT by page_count×page_size.
-        if live == 0 {
-            if page_count > self.free_pages.len() {
-                return Err(anyhow!(
-                    "TokenKVPool: out of pages (band requested {page_count} pages, available {})",
-                    self.free_pages.len()
-                ));
-            }
-            // Pop ascending so the band is a contiguous identity run (free_pages
-            // is built descending; LIFO pop yields 0,1,2,…). One draw per admitted
-            // slot keeps the band-base addressing the DSv4 read/pack kernels use;
-            // the concurrent-fragmented case (interleaved per-slot draws across a
-            // shared pool) is a separate later effort — keep one slot active.
-            let mut new_pages = Vec::with_capacity(page_count);
-            for _ in 0..page_count {
-                let idx = self
-                    .free_pages
-                    .pop()
-                    .expect("invariant: free_pages.len() >= page_count checked above");
-                self.page_attach_count[idx as usize] = 1;
-                new_pages.push(idx);
-            }
-            self.page_indices[slot] = new_pages;
-        }
-        self.seq_lens[slot] = seq_tokens;
-        Ok(())
-    }
-
     /// Roll the logical cursor back to `new_len` tokens WITHOUT recycling any
     /// band pages — the fixed-layout-band counterpart of [`Self::truncate_slot`].
     ///
@@ -905,7 +857,21 @@ impl TokenKVPool {
                 self.max_total_pages
             );
         }
-        self.page_indices[slot].clear();
+        let old_pages = std::mem::take(&mut self.page_indices[slot]);
+        for page in old_pages.iter().copied() {
+            if page == EVICTED_PAGE {
+                continue;
+            }
+            let idx = page as usize;
+            self.page_attach_count[idx] = self.page_attach_count[idx].saturating_sub(1);
+            self.recycle_page_if_unreferenced(page);
+        }
+        for &page in pages {
+            if page == EVICTED_PAGE {
+                continue;
+            }
+            self.claim_mirrored_page(page);
+        }
         self.page_indices[slot].extend_from_slice(pages);
         self.seq_lens[slot] = seq_len;
         Ok(())
@@ -2727,6 +2693,31 @@ mod tests {
             self.seq_lens[slot] = seq_len;
         }
 
+        fn claim_mirrored_page(&mut self, page: u32) {
+            let idx = page as usize;
+            if self.page_attach_count[idx] == 0
+                && self.page_ref_count[idx] == 0
+                && let Some(pos) = self.free_pages.iter().position(|&p| p == page)
+            {
+                self.free_pages.swap_remove(pos);
+            }
+            self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
+        }
+
+        fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) {
+            let old = std::mem::take(&mut self.page_indices[slot]);
+            for page in old {
+                self.page_attach_count[page as usize] =
+                    self.page_attach_count[page as usize].saturating_sub(1);
+                self.recycle_page_if_unreferenced(page);
+            }
+            for &page in pages {
+                self.claim_mirrored_page(page);
+            }
+            self.page_indices[slot].extend_from_slice(pages);
+            self.seq_lens[slot] = seq_len;
+        }
+
         fn retain(&mut self, pages: &[u32]) {
             for &p in pages {
                 self.page_ref_count[p as usize] = self.page_ref_count[p as usize].saturating_add(1);
@@ -3017,6 +3008,36 @@ mod tests {
             pool.build_quantized_decode_indptr(&[0, 1]),
             vec![0, 2, 5, 4, 1]
         );
+    }
+
+    #[test]
+    fn mirror_band_claims_pages_and_releases_old_band() {
+        let mut pool = MockPool::new(8, 2, 16);
+        pool.mirror_band(0, &[2, 3, 4], 0);
+        assert_eq!(pool.page_indices[0], vec![2, 3, 4]);
+        assert_eq!(pool.seq_lens[0], 0);
+        for page in [2, 3, 4] {
+            assert_eq!(pool.page_attach_count[page as usize], 1);
+            assert!(
+                !pool.free_pages.contains(&page),
+                "mirrored active page {page} must not be allocatable"
+            );
+        }
+
+        pool.mirror_band(0, &[5, 6], 7);
+        assert_eq!(pool.page_indices[0], vec![5, 6]);
+        assert_eq!(pool.seq_lens[0], 7);
+        for page in [2, 3, 4] {
+            assert_eq!(pool.page_attach_count[page as usize], 0);
+            assert!(
+                pool.free_pages.contains(&page),
+                "old mirrored page {page} should return to free list"
+            );
+        }
+        for page in [5, 6] {
+            assert_eq!(pool.page_attach_count[page as usize], 1);
+            assert!(!pool.free_pages.contains(&page));
+        }
     }
 
     #[test]
