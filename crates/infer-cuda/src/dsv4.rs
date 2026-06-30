@@ -25,6 +25,81 @@ use infer_plan::SamplingParams;
 use crate::loader::SafetensorLoader;
 use crate::moe_config::ExpertSplit;
 
+fn dsv4_nan_trace_enabled() -> bool {
+    std::env::var_os("ARLE_DSV4_NAN_TRACE").is_some()
+        && std::env::var("INFER_TP_RANK")
+            .ok()
+            .as_deref()
+            .unwrap_or("0")
+            == "0"
+}
+
+fn dsv4_trace_values(label: &str, len: usize, values: impl Iterator<Item = f32>) {
+    if !dsv4_nan_trace_enabled() {
+        return;
+    }
+    let mut finite = 0usize;
+    let mut nan = 0usize;
+    let mut pos_inf = 0usize;
+    let mut neg_inf = 0usize;
+    let mut first_bad = None;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for (idx, value) in values.enumerate() {
+        if value.is_nan() {
+            nan += 1;
+            first_bad.get_or_insert(idx);
+        } else if value == f32::INFINITY {
+            pos_inf += 1;
+            first_bad.get_or_insert(idx);
+        } else if value == f32::NEG_INFINITY {
+            neg_inf += 1;
+            first_bad.get_or_insert(idx);
+        } else {
+            finite += 1;
+            min = min.min(value);
+            max = max.max(value);
+        }
+    }
+    if nan + pos_inf + neg_inf > 0 {
+        println!(
+            "[dsv4-nan] {label} len={len} checked={} finite={finite} nan={nan} pos_inf={pos_inf} neg_inf={neg_inf} first_bad={:?} min={min:.6} max={max:.6}",
+            finite + nan + pos_inf + neg_inf,
+            first_bad
+        );
+    }
+}
+
+fn dsv4_trace_hidden(ctx: &DeviceContext, label: impl AsRef<str>, x: &HiddenStates) -> Result<()> {
+    if !dsv4_nan_trace_enabled() {
+        return Ok(());
+    }
+    let len = x.data.len();
+    let check = len.min(8192);
+    let host = ctx
+        .stream
+        .clone_dtoh(&x.data.slice(0..check))
+        .map_err(|e| anyhow!("DSv4 NaN trace hidden D2H failed: {e}"))?;
+    ctx.sync()?;
+    dsv4_trace_values(label.as_ref(), len, host.iter().map(|v| v.to_f32()));
+    Ok(())
+}
+
+fn dsv4_trace_vec(ctx: &DeviceContext, label: impl AsRef<str>, x: &DeviceVec) -> Result<()> {
+    if !dsv4_nan_trace_enabled() {
+        return Ok(());
+    }
+    let len = x.data.len();
+    let check = len.min(8192);
+    let host = ctx
+        .stream
+        .clone_dtoh(&x.data.slice(0..check))
+        .map_err(|e| anyhow!("DSv4 NaN trace vec D2H failed: {e}"))?;
+    ctx.sync()?;
+    dsv4_trace_values(label.as_ref(), len, host.iter().map(|v| v.to_f32()));
+    Ok(())
+}
+
 /// MLA latent KV arena descriptor (kv_heads = 1).
 ///
 /// Unlike the per-head BF16 [`cuda_kernels::prelude::PagedKVPool`], MLA caches a
@@ -4373,17 +4448,20 @@ impl Dsv4Model {
                 .map_err(|e| anyhow!("DSv4 hidden capture D2D failed: {e}"))?;
             keepalive.keep_vec(out);
         }
+        dsv4_trace_vec(ctx, "head/last_hidden", &last_hidden)?;
 
         // ── Final norm + lm_head projection + sample (last token row).
         let mut last_normed = DeviceVec::zeros(ctx, hidden_size)?;
         crate::stage_profile::profile(ctx, "dsv4/stage/head_norm", || {
             crate::ops::rms_norm_vec(ctx, &last_hidden, &self.norm, eps, &mut last_normed)
         })?;
+        dsv4_trace_vec(ctx, "head/last_normed", &last_normed)?;
         keepalive.keep_vec(&last_normed);
         let mut logits = DeviceVec::zeros(ctx, self.lm_head.rows)?;
         crate::stage_profile::profile(ctx, "dsv4/stage/lm_head_project", || {
             self.lm_head_project(&last_normed, &mut logits)
         })?;
+        dsv4_trace_vec(ctx, "head/logits", &logits)?;
         keepalive.keep_vec(&logits);
         let token = crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
             crate::executor::sample_cuda_token(ctx, &logits, params, position)
@@ -4772,6 +4850,7 @@ impl Dsv4Model {
             crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut embeddings)
                 .map_err(|e| anyhow!("DSv4 embed lookup failed: {e}"))
         })?;
+        dsv4_trace_hidden(ctx, "embed", &embeddings)?;
         keepalive.keep_hidden(&embeddings);
 
         // Wide HC residual stream from the token embeddings.
@@ -4786,6 +4865,7 @@ impl Dsv4Model {
                 &mut stream,
             )
         })?;
+        dsv4_trace_hidden(ctx, "stream/embed_hc", &stream)?;
         keepalive.keep_hidden(&stream);
         drop(nvtx_embed);
         let sparse_verify_meta = match verify {
@@ -4845,6 +4925,7 @@ impl Dsv4Model {
                 })?;
                 Some(mhc)
             };
+            dsv4_trace_hidden(ctx, format!("layer{layer_idx}/attn_norm"), &normed)?;
             keepalive.keep_hidden(&normed);
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
@@ -4944,6 +5025,7 @@ impl Dsv4Model {
                     }
                 })?;
             }
+            dsv4_trace_hidden(ctx, format!("layer{layer_idx}/attn_out"), &attn_out)?;
             keepalive.keep_hidden(&attn_out);
             // Row-parallel O-LoRA: sum the per-rank partials (no-op single-GPU).
             {
@@ -4973,6 +5055,7 @@ impl Dsv4Model {
                     crate::ops::add_batch(&self.ctx, &attn_out, &stream, &mut attn_stream)
                 })?;
             }
+            dsv4_trace_hidden(ctx, format!("layer{layer_idx}/attn_stream"), &attn_stream)?;
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
 
@@ -5013,6 +5096,7 @@ impl Dsv4Model {
                 })?;
                 Some(mhc)
             };
+            dsv4_trace_hidden(ctx, format!("layer{layer_idx}/ffn_norm"), &normed)?;
             keepalive.keep_hidden(&normed);
             // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
             // replaces the routed-expert + shared-expert MoE entirely.
@@ -5158,6 +5242,7 @@ impl Dsv4Model {
                         &mut keepalive,
                     )?;
                 }
+                dsv4_trace_hidden(ctx, format!("layer{layer_idx}/moe_out"), &moe_out)?;
                 keepalive.keep_hidden(&moe_out);
                 let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
                 let mut shared_owned = None;
@@ -5297,6 +5382,7 @@ impl Dsv4Model {
                         .expect("multi-token shared expert allocates owned output")
                 };
                 keepalive.keep_hidden(shared);
+                dsv4_trace_hidden(ctx, format!("layer{layer_idx}/shared"), shared)?;
                 if let Some(fence) = shared_ready.as_ref() {
                     ctx.wait_on_pipeline_fence(fence, CudaPipelineStreamKind::Compute)?;
                 }
@@ -5304,6 +5390,11 @@ impl Dsv4Model {
                 crate::stage_profile::profile(ctx, "dsv4/stage/shared_add", || {
                     crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)
                 })?;
+                dsv4_trace_hidden(
+                    ctx,
+                    format!("layer{layer_idx}/moe_with_shared"),
+                    &moe_with_shared,
+                )?;
                 keepalive.keep_hidden(&moe_with_shared);
             }
             // SAFETY: hc_post / add_batch writes the full stream buffer.
@@ -5327,6 +5418,7 @@ impl Dsv4Model {
                     crate::ops::add_batch(&self.ctx, &moe_with_shared, &stream, &mut ffn_stream)
                 })?;
             }
+            dsv4_trace_hidden(ctx, format!("layer{layer_idx}/ffn_stream"), &ffn_stream)?;
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
         }
