@@ -63,7 +63,8 @@ fn main() {
     // The upstream MLX CMakeLists still references FetchContent, but every
     // dependency is pinned to a repository-local source tree and network
     // access is disabled.
-    let mlx_dst = cmake::Config::new(&mlx_vendor_dir)
+    let mut cmake_cfg = cmake::Config::new(&mlx_vendor_dir);
+    cmake_cfg
         .define("MLX_BUILD_METAL", "ON")
         .define("MLX_BUILD_ACCELERATE", "ON")
         .define("MLX_BUILD_TESTS", "OFF")
@@ -92,8 +93,20 @@ fn main() {
             "FETCHCONTENT_SOURCE_DIR_GGUFLIB",
             gguflib_vendor_dir.as_os_str().to_string_lossy().as_ref(),
         )
-        .build_target("mlx")
-        .build();
+        .build_target("mlx");
+    // Use ninja when available: better dependency tracking and faster starts
+    // than make on large C++ trees.
+    if tool_on_path("ninja") {
+        cmake_cfg.generator("Ninja");
+    }
+    // Use sccache as cmake C/C++ compiler launcher when available: dramatically
+    // speeds up clean rebuilds of the MLX source tree by caching object files.
+    if tool_on_path("sccache") {
+        cmake_cfg
+            .define("CMAKE_C_COMPILER_LAUNCHER", "sccache")
+            .define("CMAKE_CXX_COMPILER_LAUNCHER", "sccache");
+    }
+    let mlx_dst = cmake_cfg.build();
 
     let mlx_build = mlx_dst.join("build");
 
@@ -215,6 +228,16 @@ fn target_profile_dir(out_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(profile_dir.to_path_buf())
+}
+
+/// Returns `true` if `name` is an executable found on PATH.
+fn tool_on_path(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
 }
 
 /// Locate the active clang's `libclang_rt.osx.a` via
