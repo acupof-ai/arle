@@ -237,14 +237,9 @@ mod tests {
     // Build a fake [rows, cols] u16 (bf16-sized) weight where element (r, c) is
     // encoded as `r * cols + c`, so a slice's bytes are trivially checkable.
     fn fake_weight(rows: usize, cols: usize) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(rows * cols * 2);
-        for r in 0..rows {
-            for c in 0..cols {
-                let v = (r * cols + c) as u16;
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        bytes
+        (0..rows)
+            .flat_map(|r| (0..cols).flat_map(move |c| ((r * cols + c) as u16).to_le_bytes()))
+            .collect()
     }
 
     fn decode(bytes: &[u8]) -> Vec<u16> {

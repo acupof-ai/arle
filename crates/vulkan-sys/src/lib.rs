@@ -714,14 +714,11 @@ mod real {
                 .command_buffer_count(1);
             let buffers = unsafe { self.ctx.device.allocate_command_buffers(&alloc) }
                 .map_err(|e| vk_error("allocating Vulkan command buffer", e))?;
-            let command_buffer = match buffers.first().copied() {
-                Some(command_buffer) => command_buffer,
-                None => {
-                    return Err(VulkanError::Runtime(
-                        "Vulkan command buffer allocation returned no buffers".to_string(),
-                    ));
-                }
-            };
+            let command_buffer = buffers.first().copied().ok_or_else(|| {
+                VulkanError::Runtime(
+                    "Vulkan command buffer allocation returned no buffers".to_string(),
+                )
+            })?;
             let result = (|| {
                 let begin = vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
