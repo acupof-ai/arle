@@ -45,36 +45,37 @@ impl MoeWithLora {
             store,
         )?;
 
-        let mut experts = Vec::with_capacity(cfg.num_experts);
-        for expert in 0..cfg.num_experts {
-            let base = format!("{prefix}.experts.{expert}");
-            experts.push(SwiGluExpert {
-                gate: LinearWithLora::new(
-                    leak_name(format!("{base}.gate_proj.weight")),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                    Some(cfg.lora),
-                    store,
-                )?,
-                up: LinearWithLora::new(
-                    leak_name(format!("{base}.up_proj.weight")),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                    Some(cfg.lora),
-                    store,
-                )?,
-                down: LinearWithLora::new(
-                    leak_name(format!("{base}.down_proj.weight")),
-                    cfg.intermediate_size,
-                    cfg.hidden_size,
-                    false,
-                    Some(cfg.lora),
-                    store,
-                )?,
-            });
-        }
+        let experts = (0..cfg.num_experts)
+            .map(|expert| {
+                let base = format!("{prefix}.experts.{expert}");
+                Ok(SwiGluExpert {
+                    gate: LinearWithLora::new(
+                        leak_name(format!("{base}.gate_proj.weight")),
+                        cfg.hidden_size,
+                        cfg.intermediate_size,
+                        false,
+                        Some(cfg.lora),
+                        store,
+                    )?,
+                    up: LinearWithLora::new(
+                        leak_name(format!("{base}.up_proj.weight")),
+                        cfg.hidden_size,
+                        cfg.intermediate_size,
+                        false,
+                        Some(cfg.lora),
+                        store,
+                    )?,
+                    down: LinearWithLora::new(
+                        leak_name(format!("{base}.down_proj.weight")),
+                        cfg.intermediate_size,
+                        cfg.hidden_size,
+                        false,
+                        Some(cfg.lora),
+                        store,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             router,
