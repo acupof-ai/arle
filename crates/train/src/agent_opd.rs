@@ -383,7 +383,12 @@ mod cuda_rollout {
             let mut loss_sum = 0.0f32;
             let mut loss_steps = 0usize;
 
+            eprintln!(
+                "[dbg-opd] run_agentic_opd_round entered, {} tasks",
+                tasks.len()
+            );
             for (task, staged_tree) in tasks {
+                eprintln!("[dbg-opd] boot_workdir for {}", task.instance_id);
                 report.tasks += 1;
                 let workdir = boot_workdir(
                     &cfg.work_root,
@@ -392,6 +397,7 @@ mod cuda_rollout {
                     task.before_repo_set_cmd.as_deref(),
                 )
                 .with_context(|| format!("boot sandbox for {}", task.instance_id))?;
+                eprintln!("[dbg-opd] boot_workdir done for {}", task.instance_id);
                 let executor = SandboxToolExecutor::new(
                     workdir.clone(),
                     cfg.bash_timeout_secs,
@@ -401,10 +407,16 @@ mod cuda_rollout {
                 // Env-info reflecting the SANDBOX (not the host): a one-shot repo
                 // overview prepended to the first user turn so the agent doesn't
                 // burn turns rediscovering the layout.
+                eprintln!(
+                    "[dbg-opd] executor.execute(bash ls) for {} spawner_socket={:?}",
+                    task.instance_id,
+                    std::env::var("ARLE_SPAWNER_SOCKET").ok()
+                );
                 let overview = executor.execute(&ToolCall::new(
                     "bash",
                     json!({ "command": "ls && echo '---' && git log -1 --oneline 2>/dev/null" }),
                 ));
+                eprintln!("[dbg-opd] overview done len={}", overview.len());
                 let user_prompt = format!(
                     "{}\n\nRepo layout (cwd = repo root):\n{}",
                     agent_user_prompt(task),
@@ -413,15 +425,17 @@ mod cuda_rollout {
 
                 let mut distinct_passed_this_task = 0usize;
                 for sample in 0..cfg.samples_per_prompt {
+                    eprintln!("[dbg-opd] sample={sample} reset_workdir");
                     reset_workdir(&workdir)
                         .with_context(|| format!("reset sandbox for {}", task.instance_id))?;
-
+                    eprintln!("[dbg-opd] sample={sample} run_turn START");
                     let mut session = AgentSession::with_system_prompt(agent_system_prompt(task));
                     let result = {
                         let mut guard = student
                             .engine()
                             .lock()
                             .map_err(|e| anyhow::anyhow!("rollout engine lock poisoned: {e}"))?;
+                        eprintln!("[dbg-opd] sample={sample} engine locked, calling run_turn");
                         session.run_turn(
                             &mut *guard,
                             &user_prompt,
