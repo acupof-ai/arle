@@ -921,17 +921,10 @@ impl Dsv4FlashMlaImage {
             self.fp8_kv_pool_pages.len(),
             flash.fp8_kv_pool_len
         );
-        // The position-0 prefix-restore path (default-off) does NOT run the
-        // `reset_flashmla_slot` admission hook (it sets `prefill_start_pos =
-        // matched_len`, skipping the `start_pos==0` draw), so the target slot may
-        // have no band yet. Draw the WHOLE fixed-layout band here so the restored
-        // payload (= `total_blocks` pages) lands on a resident, contiguous table.
-        if pool.flashmla_page_table(flash.slot_idx)?.is_empty() {
-            let band_pages = pool.flashmla_slot_pages;
-            pool.flashmla_pool_mut()?
-                .alloc_band_pages(flash.slot_idx, band_pages, 0)
-                .map_err(|e| anyhow!("DSv4 swap FlashMLA restore band draw failed: {e}"))?;
-        }
+        ensure!(
+            !pool.flashmla_page_table(flash.slot_idx)?.is_empty(),
+            "DSv4 FlashMLA restore requires mirrored host slot page table"
+        );
         // Restore lands on the target slot's pages by page-table lookup.
         let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         pool.flashmla_pool_mut()?
@@ -1240,7 +1233,7 @@ impl Dsv4LayerAttentionState {
             indexer.reset(ctx)?;
         }
         if let Some(flashmla) = &mut self.flashmla {
-            flashmla.reset(ctx, pool)?;
+            flashmla.reset();
         }
         if let Some(dsa) = &mut self.dsa_official {
             dsa.reset(ctx, pool)?;

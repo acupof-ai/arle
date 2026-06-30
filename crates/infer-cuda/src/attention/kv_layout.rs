@@ -206,9 +206,7 @@ impl Dsv4LayerKvLayout {
             .map_or(0, |pool| pool.page_size)
     }
 
-    /// Advance the FlashMLA band cursor by `append_len` tokens, drawing the slot's
-    /// WHOLE fixed-layout band (`flashmla_slot_pages` = `total_blocks` pages) on
-    /// the first append.
+    /// Advance the FlashMLA band cursor by `append_len` tokens.
     ///
     /// The band is NOT a sequential KV cache: the sliding-window ring lives at
     /// slot-logical pages `[0, sw_blocks)` and the compressed region at
@@ -216,11 +214,10 @@ impl Dsv4LayerKvLayout {
     /// (see `flashmla_pack_sw_ring` / `flashmla_pack_compressed_delta` /
     /// `fp8_sw_offsets`). So the readers/pack kernels need ALL `total_blocks`
     /// pages resident from the first token — a `ceil(seq_len/page_size)` draw
-    /// would leave the SW ring / comp region unmapped. The whole band is drawn +
-    /// zeroed up front in [`Self::reset_flashmla_slot`] (the admission hook, which
-    /// has the `DeviceContext` for the zero); this only advances the logical
-    /// cursor, so the `seq_len == append_pos` invariant tracks position, not band
-    /// size. A draw here (band missing) is a harness/ordering bug — fail loudly.
+    /// would leave the SW ring / comp region unmapped. The band is adopted from
+    /// the host slot page table by `prepare_kv_batch`; this method only advances
+    /// the logical cursor, so the `seq_len == append_pos` invariant tracks
+    /// position, not band size.
     pub(crate) fn flashmla_alloc_append(
         &mut self,
         slot_idx: usize,
@@ -233,8 +230,7 @@ impl Dsv4LayerKvLayout {
         let pool = self.flashmla_pool_mut()?;
         ensure!(
             pool.page_indices(slot_idx).len() == band_pages,
-            "DSv4 FlashMLA slot {slot_idx} band not drawn ({} pages, need {band_pages}) before cursor advance \
-             — reset_flashmla_slot must draw the band first",
+            "DSv4 FlashMLA slot {slot_idx} band not mirrored ({} pages, need {band_pages}) before cursor advance",
             pool.page_indices(slot_idx).len()
         );
         let new_cursor = pool.seq_len(slot_idx) + append_len;
@@ -307,6 +303,21 @@ impl Dsv4LayerKvLayout {
         let pad = out.last().copied().unwrap_or(0);
         out.resize(self.flashmla_slot_pages, pad);
         Ok(out)
+    }
+
+    pub(crate) fn flashmla_zero_band(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_idx: usize,
+    ) -> Result<()> {
+        if self.flashmla_slot_pages == 0 {
+            return Ok(());
+        }
+        let table = self.flashmla_page_table(slot_idx)?.to_vec();
+        let payload = vec![0u8; table.len() * self.flashmla_page_bytes];
+        self.flashmla_pool_mut()?
+            .copy_pages_from_host(ctx, &table, &payload)
+            .map_err(|e| anyhow!("DSv4 shared FlashMLA slot zero failed: {e}"))
     }
 }
 
@@ -799,6 +810,18 @@ impl Dsv4KvAdapter {
         }
         Ok(())
     }
+
+    pub(crate) fn zero_slot_band(&mut self, ctx: &DeviceContext, slot: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 zero slot {slot} outside adapter slots {}",
+            self.num_slots
+        );
+        for layer in &mut self.layers {
+            layer.flashmla_zero_band(ctx, slot)?;
+        }
+        Ok(())
+    }
 }
 
 impl ModelKvAdapter for Dsv4KvAdapter {
@@ -931,17 +954,12 @@ impl Dsv4LayerKvLayout {
             .checked_mul(kv_arena.bytes_per_token)
             .ok_or_else(|| anyhow!("DSv4 shared FlashMLA page byte size overflow"))?;
         let flashmla_kv_pool = if flashmla_slot_pages > 0 {
-            // #85 P2 Stage B: a shared `TokenKVPool` of packed MLA latent records,
-            // sized from the PROFILED FREE-VRAM token budget (not `× num_slots`,
-            // not capped at max_seq) — the dominant per-slot KV term becomes one
-            // dynamic shared pool. Slots start EMPTY and draw their WHOLE
-            // fixed-layout band (`alloc_band_pages(slot, total_blocks)`) on
-            // admission via `reset_flashmla_slot`; `free_slot` returns it on
-            // release. The band is total_blocks pages (SW ring + comp region
-            // addressed by fixed slot-logical block id — NOT ceil(seq_len)), and
-            // each active slot's draw is contiguous so the read/batched/graph
-            // paths keep their band-base addressing; the concurrent-fragmented
-            // case (interleaved per-slot draws) is a separate later effort.
+            // Shared packed MLA latent pool. DSv4 does not self-allocate a
+            // sequential table here: `prepare_kv_batch` mirrors the
+            // host-owned fixed band (`flat_slot_page_ids`) into this pool, so
+            // engine/radix/tier page identity is the single source of truth.
+            // The band is total_blocks pages (SW ring + comp region addressed
+            // by fixed slot-logical block id, NOT ceil(seq_len)).
             let format = KVFormat::PackedBytes {
                 bytes_per_token: kv_arena.bytes_per_token,
             };
@@ -1149,48 +1167,6 @@ impl Dsv4LayerKvLayout {
 
     pub(super) fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
         Self::slot_range(slot_idx, self.dsa_slot_bytes, self.num_slots)
-    }
-
-    pub(super) fn reset_flashmla_slot(
-        &mut self,
-        ctx: &DeviceContext,
-        flash: &Dsv4FlashMlaDecodeState,
-    ) -> Result<()> {
-        // Admission hook (runs after `free_slot`, BEFORE `prepare_kv_batch`):
-        // draw the slot's WHOLE fixed-layout band + zero it. The band is NOT a
-        // sequential cache — the SW ring + compressed region are addressed by
-        // fixed slot-logical block id, so all `flashmla_slot_pages` (=
-        // `total_blocks`) pages must be resident from the first token (a
-        // `ceil(seq_len/page_size)` draw left the ring/comp region unmapped →
-        // "page table len 1 != expected slot pages N"). The draw is contiguous
-        // per slot (ascending identity run); the concurrent-fragmented case
-        // (interleaved per-slot draws over the shared pool, needing a device
-        // page-table read path) is a separate later effort — single active draw.
-        // `prepare_kv_batch`'s `flashmla_alloc_append` then only advances the
-        // logical cursor. Cursor starts at 0 (the band is full, seq_len is 0).
-        let band_pages = self.flashmla_slot_pages;
-        if band_pages == 0 {
-            return Ok(());
-        }
-        self.flashmla_pool_mut()?
-            .alloc_band_pages(flash.slot_idx, band_pages, 0)
-            .map_err(|e| anyhow!("DSv4 shared FlashMLA band draw failed: {e}"))?;
-        let table = self.flashmla_page_table(flash.slot_idx)?.to_vec();
-        // Zero the freshly-drawn band: the dynamic pool recycles physical pages
-        // across slots, so a redrawn band carries the prior occupant's bytes; the
-        // SW bootstrap / comp-delta pack only write live positions, so an
-        // un-zeroed band would leak stale FP8 records into masked/unpacked slots.
-        let payload = vec![0u8; table.len() * self.flashmla_page_bytes];
-        let range_bytes = table.len() * self.flashmla_page_bytes;
-        ensure!(
-            range_bytes == flash.fp8_kv_pool_len,
-            "DSv4 FlashMLA band reset bytes {range_bytes} != slot band bytes {}",
-            flash.fp8_kv_pool_len
-        );
-        self.flashmla_pool_mut()?
-            .copy_pages_from_host(ctx, &table, &payload)
-            .map_err(|e| anyhow!("DSv4 shared FlashMLA slot reset failed: {e}"))?;
-        Ok(())
     }
 
     pub(super) fn reset_dsa_slot(
