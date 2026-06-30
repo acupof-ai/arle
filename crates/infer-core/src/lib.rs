@@ -1961,34 +1961,34 @@ mod testing {
         type Inflight = MockInflight;
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
-            let mut tokens = Vec::new();
-
-            for row in &plan.prefill_rows {
-                let position = (row.start_pos + row.tokens.len()) as u64;
-                self.observed
-                    .borrow_mut()
-                    .push((row.slot, position, row.params.clone()));
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token: sample_token(&self.logits, &row.params, position),
-                    logprob: None,
-                    finish: None,
-                });
-            }
-
-            for row in &plan.decode_rows {
-                let position = row.kv_seq_len.saturating_add(1) as u64;
-                self.observed
-                    .borrow_mut()
-                    .push((row.slot, position, row.params.clone()));
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token: sample_token(&self.logits, &row.params, position),
-                    logprob: None,
-                    finish: None,
-                });
-            }
-
+            let tokens = plan
+                .prefill_rows
+                .iter()
+                .map(|row| {
+                    let position = (row.start_pos + row.tokens.len()) as u64;
+                    self.observed
+                        .borrow_mut()
+                        .push((row.slot, position, row.params.clone()));
+                    SlotToken {
+                        slot: row.slot,
+                        token: sample_token(&self.logits, &row.params, position),
+                        logprob: None,
+                        finish: None,
+                    }
+                })
+                .chain(plan.decode_rows.iter().map(|row| {
+                    let position = row.kv_seq_len.saturating_add(1) as u64;
+                    self.observed
+                        .borrow_mut()
+                        .push((row.slot, position, row.params.clone()));
+                    SlotToken {
+                        slot: row.slot,
+                        token: sample_token(&self.logits, &row.params, position),
+                        logprob: None,
+                        finish: None,
+                    }
+                }))
+                .collect();
             Ok(MockInflight {
                 output: StepOutput { tokens },
                 return_not_ready_once: false,

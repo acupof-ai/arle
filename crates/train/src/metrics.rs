@@ -1234,41 +1234,50 @@ fn build_sink_inner(
     jsonl_path: Option<&Path>,
     also_stdout: bool,
     append: bool,
-    mut extra_sinks: Vec<Box<dyn MetricSink>>,
+    extra_sinks: Vec<Box<dyn MetricSink>>,
 ) -> anyhow::Result<Box<dyn MetricSink>> {
-    let mut sinks: Vec<Box<dyn MetricSink>> = Vec::new();
-    if let Some(config) = WandbConfig::from_env() {
-        sinks.push(Box::new(WandbProcessSink::new(config)?));
-    }
-    if let Some(config) = OtlpLogConfig::from_env() {
-        sinks.push(Box::new(OtlpLogSink::new(config)?));
-    }
-    if let Some(config) = MlflowConfig::from_env() {
-        sinks.push(Box::new(MlflowSink::new(config)));
-    }
-    if let Some(path) = jsonl_path {
-        let sink = if append {
-            JsonlSink::open_append(path)
-        } else {
-            JsonlSink::create(path)
-        };
-        let sink = sink.map_err(|e| {
-            anyhow::anyhow!(
-                "failed to {} JSONL metrics sink at {}: {}",
-                if append { "open" } else { "create" },
-                path.display(),
-                e
-            )
-        })?;
-        sinks.push(Box::new(sink));
-    }
-    if also_stdout {
-        sinks.push(Box::new(StdoutSink));
-    }
-    sinks.append(&mut extra_sinks);
+    let wandb = WandbConfig::from_env()
+        .map(|config| {
+            Ok::<_, anyhow::Error>(Box::new(WandbProcessSink::new(config)?) as Box<dyn MetricSink>)
+        })
+        .transpose()?;
+    let otlp = OtlpLogConfig::from_env()
+        .map(|config| {
+            Ok::<_, anyhow::Error>(Box::new(OtlpLogSink::new(config)?) as Box<dyn MetricSink>)
+        })
+        .transpose()?;
+    let mlflow = MlflowConfig::from_env()
+        .map(|config| {
+            Ok::<_, anyhow::Error>(Box::new(MlflowSink::new(config)) as Box<dyn MetricSink>)
+        })
+        .transpose()?;
+    let jsonl = jsonl_path
+        .map(|path| {
+            let sink = if append {
+                JsonlSink::open_append(path)
+            } else {
+                JsonlSink::create(path)
+            };
+            sink.map(|s| Box::new(s) as Box<dyn MetricSink>)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to {} JSONL metrics sink at {}: {}",
+                        if append { "open" } else { "create" },
+                        path.display(),
+                        e
+                    )
+                })
+        })
+        .transpose()?;
+    let stdout = also_stdout.then(|| Box::new(StdoutSink) as Box<dyn MetricSink>);
+    let mut sinks: Vec<Box<dyn MetricSink>> = [wandb, otlp, mlflow, jsonl, stdout]
+        .into_iter()
+        .flatten()
+        .chain(extra_sinks)
+        .collect();
     Ok(match sinks.len() {
         0 => Box::new(NullSink),
-        1 => sinks.into_iter().next().expect("single sink"),
+        1 => sinks.pop().expect("single sink"),
         _ => Box::new(MultiSink::new(sinks)),
     })
 }

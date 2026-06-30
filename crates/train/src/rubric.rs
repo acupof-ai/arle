@@ -89,42 +89,30 @@ impl Rubric {
     /// Render the prompt sent to the judge model. Asks for a single JSON object
     /// keyed by each criterion `key` with boolean values, emitted as the final line.
     pub fn judge_prompt(&self, problem: &str, rollout: &str) -> String {
-        let mut s = String::new();
-        s.push_str("You are a strict grader for ");
-        s.push_str(&self.task);
-        s.push_str(". Evaluate the SOLUTION against each criterion below.\n\n");
-        s.push_str("PROBLEM:\n");
-        s.push_str(problem);
-        s.push_str("\n\nSOLUTION:\n");
-        s.push_str(rollout);
-        s.push_str("\n\nCRITERIA:\n");
-        for c in &self.criteria {
-            let tag = match c.kind {
-                CriterionKind::Factual => "factual",
-                CriterionKind::Process => "process",
-            };
-            s.push_str("- ");
-            s.push_str(&c.key);
-            s.push_str(" (");
-            s.push_str(tag);
-            s.push_str("): ");
-            s.push_str(&c.description);
-            s.push('\n');
-        }
-        s.push_str(
-            "\nReason briefly, then on the FINAL line output ONLY a JSON object mapping \
-             every criterion key to true or false, e.g. {",
-        );
-        for (i, c) in self.criteria.iter().enumerate() {
-            if i > 0 {
-                s.push_str(", ");
-            }
-            s.push('"');
-            s.push_str(&c.key);
-            s.push_str("\": true");
-        }
-        s.push_str("}\n");
-        s
+        let criteria = self
+            .criteria
+            .iter()
+            .map(|c| {
+                let tag = match c.kind {
+                    CriterionKind::Factual => "factual",
+                    CriterionKind::Process => "process",
+                };
+                format!("- {} ({tag}): {}\n", c.key, c.description)
+            })
+            .collect::<String>();
+        let example = self
+            .criteria
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}\"{}\"): true", if i > 0 { ", " } else { "" }, c.key))
+            .collect::<String>();
+        format!(
+            "You are a strict grader for {task}. Evaluate the SOLUTION against each criterion \
+             below.\n\nPROBLEM:\n{problem}\n\nSOLUTION:\n{rollout}\n\nCRITERIA:\n{criteria}\n\
+             Reason briefly, then on the FINAL line output ONLY a JSON object mapping every \
+             criterion key to true or false, e.g. {{{example}}}\n",
+            task = self.task
+        )
     }
 
     /// Render a prompt asking a strong solver to PRODUCE a correct solution
@@ -132,22 +120,18 @@ impl Rubric {
     /// the solution carries the answer format the rubric checks. Vocab-agnostic:
     /// the solver's text is re-tokenized into the student vocab as a CE target.
     pub fn solve_prompt(&self, problem: &str) -> String {
-        let mut s = String::new();
-        s.push_str("You are an expert solving a ");
-        s.push_str(&self.task);
-        s.push_str(" problem. Produce a correct, complete, self-contained solution.\n\n");
-        s.push_str("PROBLEM:\n");
-        s.push_str(problem);
-        s.push_str("\n\nThe solution MUST satisfy:\n");
-        for c in &self.criteria {
-            if c.kind == CriterionKind::Factual {
-                s.push_str("- ");
-                s.push_str(&c.description);
-                s.push('\n');
-            }
-        }
-        s.push_str("\nThink step by step, then state the final answer.\n");
-        s
+        let requirements = self
+            .criteria
+            .iter()
+            .filter(|c| c.kind == CriterionKind::Factual)
+            .map(|c| format!("- {}\n", c.description))
+            .collect::<String>();
+        format!(
+            "You are an expert solving a {task} problem. Produce a correct, complete, \
+             self-contained solution.\n\nPROBLEM:\n{problem}\n\nThe solution MUST \
+             satisfy:\n{requirements}\nThink step by step, then state the final answer.\n",
+            task = self.task
+        )
     }
 
     /// Parse a judge output into a [`Verdict`]. Extracts the last balanced `{...}`
