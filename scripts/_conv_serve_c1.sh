@@ -20,7 +20,6 @@ setsid bash -lc '
   export ARLE_DSV4_INCREMENTAL_KV=1
   export ARLE_DSV4_EXPERT_BACKEND=deepgemm
   export ARLE_DSV4_LOCAL_GROUPED_EXPERTS=0
-  export ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1
   export ARLE_DEEPGEMM_ROOT=/data01/build/arle/crates/cuda-kernels/vendor/deepgemm
   export ARLE_DEEPGEMM_LIBRARY_ROOT=/data01/build/arle/crates/cuda-kernels/vendor/deepgemm/deep_gemm
   export CUDA_HOME=/usr/local/cuda

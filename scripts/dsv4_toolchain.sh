@@ -341,7 +341,7 @@ build_infer() {
         native-deepep|native_deepep|deepep|deepep_ll|deepep-ll|deepep_low_latency|native_deepep_ll)
             features="deepep" ;;
     esac
-    ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
+    \
         cargo build --release --features "$features" --bin arle
 }
 
