@@ -1603,13 +1603,6 @@ pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
 }
 
 fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
-    if let Ok(raw) = std::env::var("ARLE_DSV4_FLASHMLA_PREFILL") {
-        return match raw.as_str() {
-            "0" | "false" | "FALSE" | "off" | "OFF" => Ok(false),
-            "1" | "true" | "TRUE" | "on" | "ON" => Ok(true),
-            other => bail!("ARLE_DSV4_FLASHMLA_PREFILL={other:?} must be boolean"),
-        };
-    }
     // Default ON: vendored FlashMLA sparse prefill replaces the scalar
     // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
     // 4096-token warm prefill 7189 -> 4299 ms, and the 2048-token edge case is

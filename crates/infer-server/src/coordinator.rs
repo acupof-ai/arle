@@ -293,13 +293,6 @@ async fn submit_and_collect(
     if let Some(message) = error {
         return Err(ApiError::internal(message));
     }
-    if std::env::var_os("ARLE_DEBUG_TOKEN_IDS").is_some() {
-        log::info!(
-            "[token-ids] prompt_tokens={} generated_tokens={:?}",
-            prompt_len,
-            generated_tokens
-        );
-    }
     Ok(CollectedGeneration {
         prompt_tokens: prompt_len,
         generated_tokens,
