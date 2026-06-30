@@ -675,11 +675,11 @@ impl Qwen35Layer {
     /// This layer's trainable param ids — fed to `checkpoint_sequential`'s
     /// `layer_params` so each group's saved inputs carry every layer's params
     /// (that's how `requires_grad` is true and param grads come back).
-    fn checkpoint_param_ids(&self, store: &TensorStore) -> Vec<TensorId> {
+    fn checkpoint_param_ids(&self, skip_experts: bool, store: &TensorStore) -> Vec<TensorId> {
         let mut params = Vec::new();
         params.push(self.input_layernorm);
         params.push(self.post_attention_layernorm);
-        collect_mlp_ids(&self.mlp, &mut params);
+        collect_mlp_ids(&self.mlp, skip_experts, &mut params);
         match &self.self_attn {
             Qwen35Attention::Full(attn) => {
                 collect_linear_ids(&attn.q_proj, &mut params);
@@ -2617,6 +2617,7 @@ pub struct Qwen35Model {
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
     lora_layer_start: Option<usize>,
+    lora_skip_experts: bool,
     layers: Vec<Qwen35Layer>,
     embed_tokens: TensorId,
     final_norm: TensorId,
@@ -2642,6 +2643,7 @@ impl Qwen35Model {
             None,
             LoraTargetSet::AllLinear,
             None,
+            false,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::ScratchTrain,
             store,
@@ -2822,6 +2824,7 @@ impl Qwen35Model {
             None,
             LoraTargetSet::AllLinear,
             None,
+            false,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2839,6 +2842,7 @@ impl Qwen35Model {
             None,
             LoraTargetSet::AllLinear,
             None,
+            false,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: false,
@@ -2857,6 +2861,7 @@ impl Qwen35Model {
             lora,
             LoraTargetSet::AllLinear,
             None,
+            false,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2886,6 +2891,7 @@ impl Qwen35Model {
             Some(lora),
             target_set,
             lora_layer_start,
+            false,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2898,10 +2904,16 @@ impl Qwen35Model {
         cfg: &Qwen35Config,
         lora: LoraConfig,
         target_set: LoraTargetSet,
+        lora_skip_experts: bool,
         store: &mut TensorStore,
     ) -> Result<Self> {
         Self::new_with_lora_targets_for_checkpoint_load_layer_start(
-            cfg, lora, target_set, None, store,
+            cfg,
+            lora,
+            target_set,
+            None,
+            lora_skip_experts,
+            store,
         )
     }
 
@@ -2910,6 +2922,7 @@ impl Qwen35Model {
         lora: LoraConfig,
         target_set: LoraTargetSet,
         lora_layer_start: Option<usize>,
+        lora_skip_experts: bool,
         store: &mut TensorStore,
     ) -> Result<Self> {
         Self::new_internal(
@@ -2917,6 +2930,7 @@ impl Qwen35Model {
             Some(lora),
             target_set,
             lora_layer_start,
+            lora_skip_experts,
             Qwen35TensorParallelConfig::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: false,
@@ -2950,6 +2964,7 @@ impl Qwen35Model {
             Some(lora),
             target_set,
             lora_layer_start,
+            false,
             tp,
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -2999,6 +3014,7 @@ impl Qwen35Model {
         lora: Option<LoraConfig>,
         lora_target_set: LoraTargetSet,
         lora_layer_start: Option<usize>,
+        lora_skip_experts: bool,
         tp: Qwen35TensorParallelConfig,
         mode: Qwen35InitMode,
         store: &mut TensorStore,
@@ -3094,6 +3110,7 @@ impl Qwen35Model {
                     materialize_frozen_base,
                     layer_lora,
                     lora_target_set,
+                    lora_skip_experts,
                     store,
                 )?))
             } else {
@@ -3416,6 +3433,7 @@ impl Qwen35Model {
             lora,
             lora_target_set,
             lora_layer_start,
+            lora_skip_experts,
             layers,
             embed_tokens,
             final_norm,
@@ -3496,6 +3514,7 @@ impl Qwen35Model {
             self.lora,
             self.lora_target_set,
             self.lora_layer_start,
+            self.lora_skip_experts,
             self.tp,
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
@@ -3860,7 +3879,7 @@ impl Qwen35Model {
             let param_ids: Vec<Vec<TensorId>> = self
                 .layers
                 .iter()
-                .map(|l| l.checkpoint_param_ids(store))
+                .map(|l| l.checkpoint_param_ids(self.lora_skip_experts, store))
                 .collect();
             hidden = checkpoint_sequential(
                 hidden,
@@ -3966,7 +3985,7 @@ impl Qwen35Model {
             let param_ids: Vec<Vec<TensorId>> = self
                 .layers
                 .iter()
-                .map(|l| l.checkpoint_param_ids(store))
+                .map(|l| l.checkpoint_param_ids(self.lora_skip_experts, store))
                 .collect();
             hidden = checkpoint_sequential(
                 hidden,
@@ -4382,7 +4401,7 @@ impl Qwen35Model {
             let param_ids: Vec<Vec<TensorId>> = self
                 .layers
                 .iter()
-                .map(|l| l.checkpoint_param_ids(store))
+                .map(|l| l.checkpoint_param_ids(self.lora_skip_experts, store))
                 .collect();
             hidden = checkpoint_sequential(
                 hidden,
@@ -4929,6 +4948,7 @@ fn new_sparse_mlp(
     materialize_frozen_base: bool,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
+    lora_skip_experts: bool,
     store: &mut TensorStore,
 ) -> Result<Qwen35SparseMlp> {
     let router_gate_name = leak_name(names.router_gate.clone());
@@ -4936,6 +4956,10 @@ fn new_sparse_mlp(
     let shared_up_proj_name = leak_name(names.shared_expert_up_proj.clone());
     let shared_down_proj_name = leak_name(names.shared_expert_down_proj.clone());
     let shared_expert_gate_name = leak_name(names.shared_expert_gate.clone());
+
+    // When --lora-skip-experts is set, routed expert projections are frozen
+    // (no LoRA adapters). Only attention + shared expert carry LoRA.
+    let expert_lora = if lora_skip_experts { None } else { lora };
 
     let experts = (0..cfg.num_experts)
         .map(|expert_idx| {
@@ -4948,7 +4972,7 @@ fn new_sparse_mlp(
                     cfg.hidden_size,
                     cfg.moe_intermediate_size,
                     base_requires_grad,
-                    lora_for_name(lora, lora_target_set, gate_proj_name),
+                    lora_for_name(expert_lora, lora_target_set, gate_proj_name),
                     materialize_frozen_base,
                     store,
                 )?,
@@ -4957,7 +4981,7 @@ fn new_sparse_mlp(
                     cfg.hidden_size,
                     cfg.moe_intermediate_size,
                     base_requires_grad,
-                    lora_for_name(lora, lora_target_set, up_proj_name),
+                    lora_for_name(expert_lora, lora_target_set, up_proj_name),
                     materialize_frozen_base,
                     store,
                 )?,
@@ -4966,7 +4990,7 @@ fn new_sparse_mlp(
                     cfg.moe_intermediate_size,
                     cfg.hidden_size,
                     base_requires_grad,
-                    lora_for_name(lora, lora_target_set, down_proj_name),
+                    lora_for_name(expert_lora, lora_target_set, down_proj_name),
                     materialize_frozen_base,
                     store,
                 )?,
@@ -5132,7 +5156,7 @@ fn collect_linear_ids(linear: &LinearWithLora, ids: &mut Vec<TensorId>) {
     ids.extend(linear.adapter_name_map().values().copied());
 }
 
-fn collect_mlp_ids(mlp: &Qwen35Mlp, ids: &mut Vec<TensorId>) {
+fn collect_mlp_ids(mlp: &Qwen35Mlp, skip_experts: bool, ids: &mut Vec<TensorId>) {
     match mlp {
         Qwen35Mlp::Dense(dense) => {
             collect_linear_ids(&dense.gate_proj, ids);
@@ -5145,10 +5169,12 @@ fn collect_mlp_ids(mlp: &Qwen35Mlp, ids: &mut Vec<TensorId>) {
             collect_linear_ids(&sparse.shared_up_proj, ids);
             collect_linear_ids(&sparse.shared_down_proj, ids);
             collect_linear_ids(&sparse.shared_expert_gate, ids);
-            for expert in &sparse.experts {
-                collect_linear_ids(&expert.gate_proj, ids);
-                collect_linear_ids(&expert.up_proj, ids);
-                collect_linear_ids(&expert.down_proj, ids);
+            if !skip_experts {
+                for expert in &sparse.experts {
+                    collect_linear_ids(&expert.gate_proj, ids);
+                    collect_linear_ids(&expert.up_proj, ids);
+                    collect_linear_ids(&expert.down_proj, ids);
+                }
             }
         }
     }

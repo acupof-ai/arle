@@ -1515,6 +1515,13 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 0)]
     pub(crate) synthetic_writeback_seq: usize,
 
+    /// Skip LoRA on all routed MoE expert projections (gate/up/down per expert).
+    /// Keeps LoRA only on attention projections (q/k/v/o) and shared experts.
+    /// Drops LoRA params from ~6.1B to ~59M and Adam state from ~49 GB to ~0.5 GB,
+    /// enabling multiple writebacks per round without --writeback-cap.
+    #[arg(long, default_value_t = false)]
+    pub(crate) lora_skip_experts: bool,
+
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,

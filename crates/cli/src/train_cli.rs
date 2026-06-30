@@ -1511,6 +1511,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                 lora.clone(),
                 target_set,
                 args.lora_layer_start,
+                false,
                 None,
                 &mut store,
             )
@@ -1594,6 +1595,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                 lora,
                 target_set,
                 args.lora_layer_start,
+                false,
                 shared_base,
                 &mut store,
             )
@@ -2060,6 +2062,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 lora,
                 target_set,
                 args.lora_layer_start,
+                args.lora_skip_experts,
                 None,
                 &mut store,
             )
@@ -2147,6 +2150,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 lora,
                 target_set,
                 args.lora_layer_start,
+                args.lora_skip_experts,
                 shared_base,
                 &mut store,
             )
