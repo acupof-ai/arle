@@ -87,11 +87,6 @@ abs_path() {
 }
 
 resolve_deepgemm_env() {
-    local native="${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}"
-    if [[ "$native" != "1" && "$native" != "true" && "$native" != "TRUE" && "$native" != "yes" && "$native" != "YES" ]]; then
-        return 0
-    fi
-
     local root="${ARLE_DEEPGEMM_ROOT:-$ROOT/crates/cuda-kernels/vendor/deepgemm}"
     root="$(abs_path "$root")"
     local library_root="${ARLE_DEEPGEMM_LIBRARY_ROOT:-$root/deep_gemm}"
@@ -270,7 +265,7 @@ echo "ARLE_CUDA_KERNEL_SET=$ARLE_CUDA_KERNEL_SET"
 echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-}"
 echo "ARLE_NVCC_WRAPPER=${ARLE_NVCC_WRAPPER:-}"
 echo "ARLE_NVCC_SPLIT_COMPILE=$ARLE_NVCC_SPLIT_COMPILE"
-echo "ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=${ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE:-}"
+echo "ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=${ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE:-}"
 echo "ARLE_DEEPGEMM_ROOT=${ARLE_DEEPGEMM_ROOT:-}"
 echo "ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}"
 echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"

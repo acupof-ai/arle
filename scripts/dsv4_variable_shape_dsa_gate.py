@@ -306,7 +306,6 @@ def main() -> int:
         "INFER_DSV4_MAX_NEW": str(args.max_new),
         "CUDA_HOME": os.environ.get("CUDA_HOME", "/usr/local/cuda"),
         "CUDARC_CUDA_VERSION": os.environ.get("CUDARC_CUDA_VERSION", "12090"),
-        "ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE": "1",
         "ARLE_DEEPEP_DIR": os.environ.get(
             "ARLE_DEEPEP_DIR", str((repo_root / "../DeepEP").resolve())
         ),

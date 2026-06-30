@@ -2099,7 +2099,6 @@ fn main() {
     cu_files.sort();
 
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
-    println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
@@ -2145,16 +2144,15 @@ fn main() {
     // — a Hopper sm_90 target AND the vendored source present — so FP8 prefill takes the
     // fastest path with no manual flag (it was opt-in, leaving production on the ~20×
     // slower dequant→GEMM fallback). Mirrors the FlashMLA auto-detect above. Opt out with
-    // ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1; ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 forces it on
-    // (e.g. a non-default arch). If unbuilt/unsupported, the runtime preflight falls back
-    // to dequant→GEMM (never GEMV for prefill — see infer-cuda quant_linear).
+    // ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1. If unbuilt/unsupported, the runtime preflight
+    // falls back to dequant→GEMM (never GEMV for prefill — see infer-cuda quant_linear).
     let deepgemm_buildable = sm_targets.iter().any(|s| s.sm.starts_with("90"))
         && deepgemm_library_root.is_dir()
         && deepgemm_cutlass_include
             .join("cutlass/arch/barrier.h")
             .is_file();
-    let enable_deepgemm_native = !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE")
-        && (env_flag("ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE") || deepgemm_buildable);
+    let enable_deepgemm_native =
+        !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE") && deepgemm_buildable;
     if enable_deepgemm_native {
         println!(
             "cargo:warning=DeepGEMM native enabled (sm_90 + vendored source; set ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1 to opt out)"
