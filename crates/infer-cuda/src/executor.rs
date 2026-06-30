@@ -1008,7 +1008,7 @@ impl QwenCudaExecutor {
             buf.extend_from_slice(&payload);
         }
         self.kv
-            .copy_pages_from_host_on_copy_stream(&self.model.ctx, &pages, &buf)?;
+            .copy_pages_from_host(&self.model.ctx, &pages, &buf, true)?;
         self.model.ctx.sync_copy()?;
         Ok(())
     }
@@ -3446,7 +3446,7 @@ impl Qwen35CudaExecutor {
                 anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
             if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
-                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data)
+                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data, false)
                     .map_err(|e| {
                         anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
                     })?;
@@ -4299,7 +4299,7 @@ impl Qwen35CudaExecutor {
             };
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 if let Some(new_page) = pool.reinstate_slot_page(slot, logical) {
-                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
+                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload, false)?;
                 }
             }
         }
