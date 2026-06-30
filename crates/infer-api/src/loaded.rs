@@ -1649,7 +1649,7 @@ mod backend {
             anyhow::ensure!(
                 consumed,
                 "--kv-ssd-path: the loaded model has no page-addressable KV tier store \
-                 (Qwen3-dense + Qwen3.6 + DSv4 slot swap)"
+                 (Qwen3-dense + Qwen3.6 + DSv4 FlashMLA page-tier)"
             );
         }
         Ok((serve, tokenizer, model_id))
@@ -1818,7 +1818,7 @@ mod backend {
         // H3: the host pool's page_size must match the device pool's page
         // granularity. DSv4's MLA pool pages at 64 (`page_block_size`), not
         // `config.page_size` (16) — using 16 would gate host admission at 1/4 the
-        // device token capacity and early-OOM (DSv4 has no tier to evict).
+        // device token capacity and early-OOM
         let page_size = executor.effective_page_size().unwrap_or(page_size);
         let total_pages = cuda_admission_total_pages(kind, config, page_size, paged_pool_pages);
         if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35)
