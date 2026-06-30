@@ -108,12 +108,12 @@ impl MetalSsdTier {
         })
     }
 
-pub(super)     fn has_prefix(&self, key: &[u64]) -> bool {
+    pub(super) fn has_prefix(&self, key: &[u64]) -> bool {
         self.records
             .contains_key(&MetalDiskKey::Prefix(key.to_vec()))
     }
 
-pub(super)     fn write_page(&mut self, block: &MetalPageBlock) -> bool {
+    pub(super) fn write_page(&mut self, block: &MetalPageBlock) -> bool {
         match encode_metal_t2_page(block) {
             Ok(bytes) => self.write_record(MetalDiskKey::Page(block.logical_id), &bytes),
             Err(err) => {
@@ -126,7 +126,7 @@ pub(super)     fn write_page(&mut self, block: &MetalPageBlock) -> bool {
         }
     }
 
-pub(super)     fn write_prefix(&mut self, key: &[u64], snapshot: &MetalPrefixSnapshot) -> bool {
+    pub(super) fn write_prefix(&mut self, key: &[u64], snapshot: &MetalPrefixSnapshot) -> bool {
         match encode_metal_t2_prefix(key, snapshot) {
             Ok(bytes) => self.write_record(MetalDiskKey::Prefix(key.to_vec()), &bytes),
             Err(err) => {
@@ -136,7 +136,7 @@ pub(super)     fn write_prefix(&mut self, key: &[u64], snapshot: &MetalPrefixSna
         }
     }
 
-pub(super)     fn bind_tier_key(&mut self, tier_key: u64, block: &MetalPageBlock) -> bool {
+    pub(super) fn bind_tier_key(&mut self, tier_key: u64, block: &MetalPageBlock) -> bool {
         if !self
             .records
             .contains_key(&MetalDiskKey::Page(block.logical_id))
@@ -148,7 +148,7 @@ pub(super)     fn bind_tier_key(&mut self, tier_key: u64, block: &MetalPageBlock
         true
     }
 
-pub(super)     fn read_tier_page(&mut self, tier_key: u64) -> anyhow::Result<MetalPageBlock> {
+    pub(super) fn read_tier_page(&mut self, tier_key: u64) -> anyhow::Result<MetalPageBlock> {
         let logical_id = *self
             .tier_to_logical
             .get(&tier_key)
@@ -156,29 +156,29 @@ pub(super)     fn read_tier_page(&mut self, tier_key: u64) -> anyhow::Result<Met
         self.read_page(logical_id)
     }
 
-pub(super)     fn logical_id_for_tier_key(&self, tier_key: u64) -> Option<u64> {
+    pub(super) fn logical_id_for_tier_key(&self, tier_key: u64) -> Option<u64> {
         self.tier_to_logical.get(&tier_key).copied()
     }
 
-pub(super)     fn read_page(&mut self, logical_id: u64) -> anyhow::Result<MetalPageBlock> {
+    pub(super) fn read_page(&mut self, logical_id: u64) -> anyhow::Result<MetalPageBlock> {
         let key = MetalDiskKey::Page(logical_id);
         self.read_record(&key)?;
         decode_metal_t2_page(&self.read_scratch, logical_id)
     }
 
-pub(super)     fn read_prefix(&mut self, key: &[u64]) -> anyhow::Result<MetalPrefixSnapshot> {
+    pub(super) fn read_prefix(&mut self, key: &[u64]) -> anyhow::Result<MetalPrefixSnapshot> {
         let disk_key = MetalDiskKey::Prefix(key.to_vec());
         self.read_record(&disk_key)?;
         decode_metal_t2_prefix(&self.read_scratch, key)
     }
 
-pub(super)     fn drop_tier_entries(&mut self, keys: &[u64]) {
+    pub(super) fn drop_tier_entries(&mut self, keys: &[u64]) {
         for key in keys {
             self.tier_to_logical.remove(key);
         }
     }
 
-pub(super)     fn read_record(&mut self, key: &MetalDiskKey) -> anyhow::Result<()> {
+    pub(super) fn read_record(&mut self, key: &MetalDiskKey) -> anyhow::Result<()> {
         let fingerprint = metal_t2_fingerprint(key);
         kv_native_sys::read_block_into_sharded(&self.root, fingerprint, &mut self.read_scratch)
             .map_err(|err| anyhow::anyhow!("Metal KV T2 read for {key:?}: {err}"))?;
@@ -186,7 +186,7 @@ pub(super)     fn read_record(&mut self, key: &MetalDiskKey) -> anyhow::Result<(
         Ok(())
     }
 
-pub(super)     fn write_record(&mut self, key: MetalDiskKey, bytes: &[u8]) -> bool {
+    pub(super) fn write_record(&mut self, key: MetalDiskKey, bytes: &[u8]) -> bool {
         if bytes.len() > self.budget_bytes {
             log::warn!(
                 "Metal KV T2 record {key:?} has {} bytes, exceeding budget {}",
@@ -230,7 +230,7 @@ pub(super)     fn write_record(&mut self, key: MetalDiskKey, bytes: &[u8]) -> bo
         true
     }
 
-pub(super)     fn touch_record(&mut self, key: &MetalDiskKey) {
+    pub(super) fn touch_record(&mut self, key: &MetalDiskKey) {
         let Some(old_stamp) = self.records.get(key).map(|record| record.stamp) else {
             return;
         };
@@ -242,7 +242,7 @@ pub(super)     fn touch_record(&mut self, key: &MetalDiskKey) {
         self.lru.insert((stamp, key.clone()));
     }
 
-pub(super)     fn evict_one_excluding(&mut self, excluded: &MetalDiskKey) -> bool {
+    pub(super) fn evict_one_excluding(&mut self, excluded: &MetalDiskKey) -> bool {
         let candidate = self
             .lru
             .iter()
@@ -260,7 +260,7 @@ pub(super)     fn evict_one_excluding(&mut self, excluded: &MetalDiskKey) -> boo
         true
     }
 
-pub(super)     fn is_pinned(&self, key: &MetalDiskKey) -> bool {
+    pub(super) fn is_pinned(&self, key: &MetalDiskKey) -> bool {
         match key {
             MetalDiskKey::Page(logical_id) => self
                 .tier_to_logical
@@ -270,7 +270,7 @@ pub(super)     fn is_pinned(&self, key: &MetalDiskKey) -> bool {
         }
     }
 
-pub(super)     fn next_stamp(&mut self) -> u64 {
+    pub(super) fn next_stamp(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
     }
@@ -290,7 +290,7 @@ pub fn metal_t2_namespace(root: PathBuf) -> PathBuf {
 
 #[cfg(feature = "metal")]
 pub fn metal_t2_fingerprint(key: &MetalDiskKey) -> [u8; 16] {
-pub(super)     fn mix(hash: &mut u64, bytes: &[u8]) {
+    pub(super) fn mix(hash: &mut u64, bytes: &[u8]) {
         const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
         for byte in bytes {
             *hash ^= u64::from(*byte);
@@ -494,23 +494,23 @@ impl<'a> MetalT2Cursor<'a> {
         Ok(slice)
     }
 
-pub(super)     fn u8(&mut self) -> anyhow::Result<u8> {
+    pub(super) fn u8(&mut self) -> anyhow::Result<u8> {
         Ok(self.take(1)?[0])
     }
 
-pub(super)     fn u32(&mut self) -> anyhow::Result<u32> {
+    pub(super) fn u32(&mut self) -> anyhow::Result<u32> {
         let mut raw = [0u8; 4];
         raw.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(raw))
     }
 
-pub(super)     fn i32(&mut self) -> anyhow::Result<i32> {
+    pub(super) fn i32(&mut self) -> anyhow::Result<i32> {
         let mut raw = [0u8; 4];
         raw.copy_from_slice(self.take(4)?);
         Ok(i32::from_le_bytes(raw))
     }
 
-pub(super)     fn u64(&mut self) -> anyhow::Result<u64> {
+    pub(super) fn u64(&mut self) -> anyhow::Result<u64> {
         let mut raw = [0u8; 8];
         raw.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(raw))
@@ -568,7 +568,12 @@ pub fn dtype_size(dtype: mlx::Dtype) -> usize {
 
 #[cfg(feature = "metal")]
 impl MetalPageStore {
-    pub(super) fn set_ssd(&mut self, root: PathBuf, budget_bytes: usize, bytes_per_page: usize) -> bool {
+    pub(super) fn set_ssd(
+        &mut self,
+        root: PathBuf,
+        budget_bytes: usize,
+        bytes_per_page: usize,
+    ) -> bool {
         let Some(ssd) = MetalSsdTier::new(root, budget_bytes, bytes_per_page) else {
             return false;
         };
@@ -582,19 +587,19 @@ impl MetalPageStore {
         true
     }
 
-pub(super)     fn kv_tier_capacity_pages(&self) -> usize {
+    pub(super) fn kv_tier_capacity_pages(&self) -> usize {
         self.ssd.as_ref().map_or(0, |ssd| ssd.capacity_pages)
     }
 
-pub(super)     fn kv_tier_page_bytes(&self) -> usize {
+    pub(super) fn kv_tier_page_bytes(&self) -> usize {
         self.ssd.as_ref().map_or(0, |ssd| ssd.bytes_per_page)
     }
 
-pub(super)     fn kv_tier_disk_pages(&self) -> usize {
+    pub(super) fn kv_tier_disk_pages(&self) -> usize {
         self.ssd.as_ref().map_or(0, |ssd| ssd.tier_to_logical.len())
     }
 
-pub(super)     fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+    pub(super) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         self.ssd.as_ref().and_then(|ssd| {
             ssd.tier_to_logical
                 .contains_key(&key)
@@ -605,7 +610,7 @@ pub(super)     fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTier
     /// Largest leading block count for which Metal has a complete restore
     /// image. Demoted keys are checked before promotion, so an unusable prefix
     /// tail is never read back from T2.
-pub(super)     fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+    pub(super) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         (1..=blocks.len())
             .rev()
             .find(|&k| {
@@ -615,7 +620,7 @@ pub(super)     fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize
             .unwrap_or(0)
     }
 
-pub(super)     fn release_pages(&mut self, pages: &[u32]) {
+    pub(super) fn release_pages(&mut self, pages: &[u32]) {
         if pages.is_empty() {
             return;
         }
@@ -633,20 +638,20 @@ pub(super)     fn release_pages(&mut self, pages: &[u32]) {
         });
     }
 
-pub(super)     fn next_logical_id(&mut self) -> u64 {
+    pub(super) fn next_logical_id(&mut self) -> u64 {
         let id = self.next_logical_id.max(1);
         self.next_logical_id = id.saturating_add(1);
         id
     }
 
-pub(super)     fn logical_key_for_pages(&self, pages: &[u32]) -> Option<Vec<u64>> {
+    pub(super) fn logical_key_for_pages(&self, pages: &[u32]) -> Option<Vec<u64>> {
         pages
             .iter()
             .map(|page| self.pages.get(page).map(|b| b.logical_id))
             .collect()
     }
 
-pub(super)     fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -> Option<Vec<u64>> {
+    pub(super) fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -> Option<Vec<u64>> {
         blocks
             .iter()
             .map(|block| match *block {
@@ -658,11 +663,11 @@ pub(super)     fn logical_key_for_prefix_blocks(&self, blocks: &[PrefixBlock]) -
             .collect()
     }
 
-pub(super)     fn prefix_available(&self, key: &[u64]) -> bool {
+    pub(super) fn prefix_available(&self, key: &[u64]) -> bool {
         self.prefixes.contains_key(key) || self.ssd.as_ref().is_some_and(|ssd| ssd.has_prefix(key))
     }
 
-pub(super)     fn ensure_prefix_snapshot_resident(&mut self, key: &[u64]) -> anyhow::Result<()> {
+    pub(super) fn ensure_prefix_snapshot_resident(&mut self, key: &[u64]) -> anyhow::Result<()> {
         if self.prefixes.contains_key(key) {
             return Ok(());
         }
@@ -675,7 +680,7 @@ pub(super)     fn ensure_prefix_snapshot_resident(&mut self, key: &[u64]) -> any
         Ok(())
     }
 
-pub(super)     fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
+    pub(super) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyhow::Result<usize> {
         let Some(ssd) = self.ssd.as_mut() else {
             return Ok(0);
         };
@@ -692,7 +697,7 @@ pub(super)     fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> anyh
         Ok(accepted)
     }
 
-pub(super)     fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
+    pub(super) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> anyhow::Result<()> {
         let ssd = self
             .ssd
             .as_mut()
@@ -707,13 +712,17 @@ pub(super)     fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> any
         Ok(())
     }
 
-pub(super)     fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
+    pub(super) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
         if let Some(ssd) = self.ssd.as_mut() {
             ssd.drop_tier_entries(keys);
         }
     }
 
-pub(super)     fn publish_slot(&mut self, slot: &MetalSlotState, kv: &dyn KvPool) -> anyhow::Result<()> {
+    pub(super) fn publish_slot(
+        &mut self,
+        slot: &MetalSlotState,
+        kv: &dyn KvPool,
+    ) -> anyhow::Result<()> {
         let page_size = kv.page_size().max(1);
         let full_pages = slot.cache_len / page_size;
         if full_pages == 0 {
@@ -803,7 +812,7 @@ pub(super)     fn publish_slot(&mut self, slot: &MetalSlotState, kv: &dyn KvPool
         Ok(())
     }
 
-pub(super)     fn materialize_slot_from_prefix(
+    pub(super) fn materialize_slot_from_prefix(
         &mut self,
         slot: usize,
         slot_epoch: u64,
