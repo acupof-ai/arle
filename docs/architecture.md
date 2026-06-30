@@ -51,7 +51,7 @@ authority rather than defining a second equal architecture.
 | `hip-sys` / `hip-kernels` | Thin hand-declared HIP runtime FFI (stubs off-box) / HIP kernel build + FFI layer (llama.cpp-adapted IQ2_XXS/Q2_K mmvq corpus, hipcc-gated) | Model code, scheduler logic |
 | `vulkan-sys` / `vulkan-kernels` | ash-backed Vulkan loader wrapper / glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` | Model code, scheduler logic |
 | `infer-gguf` | GGUF container reading (v2/v3 memmap reader), CPU dequant (llama.cpp ports), per-arch GGUF→spec-config mappers (`deepseek4`) | Model forward code, scheduler |
-| `kv-native-sys` | Local persistence substrate (file/block ABI, mmap, WAL, shm descriptors) for the KV-tier disk/shared transport path | Tier policy, scheduler, GPU code |
+| `kv-native-sys` | `KvMmapStore` (sparse mmap page-slot store): memcpy writes, zero-copy reads. WAL/shm/mm/descriptors unused — kept for future shared-memory tier. | Tier policy, scheduler, GPU code |
 | `qwen3-spec` / `qwen35-spec` | Shared train↔infer Qwen config + canonical tensor names + `Shard` annotations | Implementation code |
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
 | `gemma-spec` | Gemma4 config spec (consumer today: `infer-vulkan` order pin; unranked in the model queue — ratification pending, roadmap §6) | Implementation code |
