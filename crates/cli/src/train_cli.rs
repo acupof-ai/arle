@@ -1227,8 +1227,11 @@ fn parse_lora_target_set(raw: &str) -> Result<train::lora::LoraTargetSet> {
     use train::lora::LoraTargetSet;
     match raw {
         "attention-qv" | "attention_qv" | "qv" => Ok(LoraTargetSet::AttentionQv),
+        "attention-full" | "attention_full" | "full-attn" => Ok(LoraTargetSet::AttentionFull),
         "all-linear" | "all_linear" | "all" => Ok(LoraTargetSet::AllLinear),
-        other => bail!("unknown --lora-target-set {other:?} (expected attention-qv or all-linear)"),
+        other => bail!(
+            "unknown --lora-target-set {other:?} (expected attention-qv, attention-full, or all-linear)"
+        ),
     }
 }
 
@@ -2282,6 +2285,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         let mut config = LoraAdapterConfig::new(student_dir.display().to_string(), "qwen35", lora);
         config.target_modules = match target_set {
             LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
+            LoraTargetSet::AttentionFull => vec![
+                "q_proj".to_owned(),
+                "k_proj".to_owned(),
+                "v_proj".to_owned(),
+                "o_proj".to_owned(),
+                "in_proj_qkv".to_owned(),
+                "out_proj".to_owned(),
+            ],
             LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
         };
         config
