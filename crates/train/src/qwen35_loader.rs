@@ -702,6 +702,7 @@ pub fn load_qwen35_lora_from_hf_dir_with_layer_start(
         lora,
         target_set,
         lora_layer_start,
+        false,
         None,
         store,
     )
@@ -722,6 +723,7 @@ pub fn load_qwen35_lora_from_hf_dir_with_shared_base(
     lora: LoraConfig,
     target_set: LoraTargetSet,
     lora_layer_start: Option<usize>,
+    lora_skip_experts: bool,
     shared_base: Option<SharedFrozenBaseTable<'_>>,
     store: &mut TensorStore,
 ) -> Result<Qwen35Model> {
@@ -733,6 +735,7 @@ pub fn load_qwen35_lora_from_hf_dir_with_shared_base(
             lora,
             target_set,
             lora_layer_start,
+            lora_skip_experts,
         },
         shared_base,
     ) {
@@ -752,6 +755,7 @@ enum LoadMode {
         lora: LoraConfig,
         target_set: LoraTargetSet,
         lora_layer_start: Option<usize>,
+        lora_skip_experts: bool,
     },
 }
 
@@ -820,6 +824,7 @@ fn load_qwen35_from_hf_dir_inner(
             lora,
             target_set,
             lora_layer_start,
+            lora_skip_experts,
         } => {
             if let Some(start) = lora_layer_start {
                 Qwen35Model::new_with_lora_targets_for_checkpoint_load_layer_start(
@@ -827,11 +832,16 @@ fn load_qwen35_from_hf_dir_inner(
                     lora,
                     target_set,
                     Some(start),
+                    lora_skip_experts,
                     store,
                 )?
             } else {
                 Qwen35Model::new_with_lora_targets_for_checkpoint_load(
-                    &cfg, lora, target_set, store,
+                    &cfg,
+                    lora,
+                    target_set,
+                    lora_skip_experts,
+                    store,
                 )?
             }
         }
