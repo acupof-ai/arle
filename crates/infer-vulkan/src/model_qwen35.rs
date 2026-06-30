@@ -338,6 +338,8 @@ impl VulkanQwen35Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vulkan")]
+    use crate::utils::argmax_of;
     use qwen35_spec::LayerType;
 
     fn qwen35_config() -> qwen35_spec::Qwen35Config {
@@ -700,14 +702,5 @@ mod tests {
             "at least one prompt produced degenerate (single-token-repeat) output — \
              inspect the printed continuations for the numeric symptom"
         );
-    }
-
-    #[cfg(feature = "vulkan")]
-    fn argmax_of(v: &[f32]) -> usize {
-        v.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
     }
 }
