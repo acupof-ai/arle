@@ -413,7 +413,7 @@ impl StatsResponse {
             prefix_cache: PrefixCacheStatsResponse {
                 lookups: prefix.lookups,
                 hits: prefix.hits,
-                hit_rate: ratio(prefix.hits, prefix.lookups),
+                hit_rate: ratio(prefix.hits.min(prefix.lookups), prefix.lookups),
                 hit_tokens: prefix.hit_tokens,
                 hit_pages: prefix.hit_pages,
                 published_pages: prefix.published_pages,
@@ -817,10 +817,14 @@ mod tests {
     #[test]
     fn stats_response_relays_tier_counters() {
         let mut counters = crate::execution::CounterSnapshot::default();
+        counters.prefix_cache.lookups = 2;
+        counters.prefix_cache.hits = 5;
         counters.kv_tier.demoted_slots = 2;
         counters.kv_system.reuse_hit_host_demoted = 3;
         counters.kv_system.disk_pages = 4;
         let stats = StatsResponse::from_counters(counters);
+        assert_eq!(stats.prefix_cache.hit_rate, Some(1.0));
+        assert_eq!(stats.prefix_cache.hits, 5);
         assert!(stats.kv_tier.available);
         assert_eq!(stats.kv_tier.demoted_slots, 2);
         assert_eq!(stats.kv_system.reuse_hit_host_demoted, 3);
