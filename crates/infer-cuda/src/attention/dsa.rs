@@ -613,16 +613,21 @@ impl Dsv4LayerImage {
                 .map_or(0, Dsv4DsaOfficialImage::host_bytes)
 
     pub(crate) fn serialize_into(&self, buf: &mut Vec<u8>) {
-        let mut n: u16 = 1; // sw_window always present
-        if self.compressor.is_some() { n += 1 }
-        if self.indexer.is_some() { n += 1 }
-        if self.flashmla.is_some() { n += 1 }
-        if self.dsa_official.is_some() { n += 1 }
-        buf.extend_from_slice(&n.to_le_bytes());
+        // Flags byte: bit 0=compressor, bit 1=indexer, bit 2=flashmla, bit 3=dsa_official.
+        let mut flags: u8 = 0;
+        if self.compressor.is_some() { flags |= 0x01 }
+        if self.indexer.is_some()    { flags |= 0x02 }
+        if self.flashmla.is_some()   { flags |= 0x04 }
+        if self.dsa_official.is_some() { flags |= 0x08 }
+        buf.push(flags);
 
         let push_bf16 = |buf: &mut Vec<u8>, v: &[half::bf16]| {
-            let raw: &[u8] = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
-            buf.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            let byte_len = v.len().saturating_mul(2);
+            buf.extend_from_slice(&(byte_len as u32).to_le_bytes());
+            // SAFETY: half::bf16 is #[repr(transparent)] over u16.
+            // Each bf16 has 2-byte alignment; the &[bf16] source is aligned.
+            // The destination (buf) is a Vec<u8> with byte alignment — fine.
+            let raw: &[u8] = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, byte_len) };
             buf.extend_from_slice(raw);
         };
         let push_compressor = |buf: &mut Vec<u8>, c: &Dsv4CompressorImage| {
@@ -634,7 +639,7 @@ impl Dsv4LayerImage {
 
         push_bf16(buf, &self.sw_window_cache);
         if let Some(ref c) = self.compressor { push_compressor(buf, c); }
-        if let Some(ref c) = self.indexer { push_compressor(buf, c); }
+        if let Some(ref c) = self.indexer    { push_compressor(buf, c); }
         if let Some(ref f) = self.flashmla {
             buf.extend_from_slice(&(f.fp8_kv_pool_pages.len() as u32).to_le_bytes());
             buf.extend_from_slice(&f.fp8_kv_pool_pages);
@@ -646,49 +651,57 @@ impl Dsv4LayerImage {
     }
 
     pub(crate) fn deserialize_from(bytes: &[u8]) -> Result<(Self, usize)> {
-        anyhow::ensure!(bytes.len() >= 2, "Dsv4LayerImage: too short");
-        let n = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as usize;
-        let mut pos = 2usize;
-        macro_rules! read_bf16 {
-            () => {{
-                anyhow::ensure!(pos + 4 <= bytes.len(), "truncated");
-                let len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
-                pos += 4;
-                anyhow::ensure!(pos + len <= bytes.len(), "truncated field");
-                let v: Vec<half::bf16> = unsafe {
-                    std::slice::from_raw_parts(bytes[pos..pos+len].as_ptr() as *const half::bf16, len / 2)
-                }.to_vec();
-                pos += len;
-                v
-            }};
-        }
-        macro_rules! read_compressor {
-            () => {{
-                Dsv4CompressorImage {
-                    pending_kv: read_bf16!(), pending_score: read_bf16!(),
-                    prev_overlap_kv: read_bf16!(), prev_overlap_score: read_bf16!(),
-                    compressed_data: read_bf16!(),
-                    compressed_seq_len: {
-                        let v = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap()) as usize;
-                        pos += 8; v
-                    },
-                }
-            }};
-        }
-        let sw = read_bf16!();
-        let compressor = if n > 1 { Some(read_compressor!()) } else { None };
-        let indexer = if n > 2 { Some(read_compressor!()) } else { None };
-        let flashmla = if n > 3 {
-            anyhow::ensure!(pos + 4 <= bytes.len(), "truncated fp8");
-            let len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
+        anyhow::ensure!(bytes.len() >= 1, "Dsv4LayerImage: too short");
+        let flags = bytes[0];
+        let mut pos = 1usize;
+
+        let read_bf16 = |pos: &mut usize, bytes: &[u8]| -> Result<Vec<half::bf16>> {
+            anyhow::ensure!(*pos + 4 <= bytes.len(), "Dsv4LayerImage: truncated at bf16 len");
+            let byte_len = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().unwrap()) as usize;
+            *pos += 4;
+            anyhow::ensure!(*pos + byte_len <= bytes.len(), "Dsv4LayerImage: truncated bf16 data");
+            // Safe: construct bf16 values from LE byte pairs without alignment requirements.
+            anyhow::ensure!(byte_len % 2 == 0, "Dsv4LayerImage: bf16 byte_len {byte_len} is odd");
+            let v: Vec<half::bf16> = bytes[*pos..*pos+byte_len]
+                .chunks_exact(2)
+                .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            *pos += byte_len;
+            Ok(v)
+        };
+
+        let read_compressor = |pos: &mut usize, bytes: &[u8]| -> Result<Dsv4CompressorImage> {
+            Ok(Dsv4CompressorImage {
+                pending_kv: read_bf16(pos, bytes)?, pending_score: read_bf16(pos, bytes)?,
+                prev_overlap_kv: read_bf16(pos, bytes)?, prev_overlap_score: read_bf16(pos, bytes)?,
+                compressed_data: read_bf16(pos, bytes)?,
+                compressed_seq_len: {
+                    anyhow::ensure!(*pos + 8 <= bytes.len(), "Dsv4LayerImage: truncated at seq_len");
+                    let v = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().unwrap()) as usize;
+                    *pos += 8; v
+                },
+            })
+        };
+
+        let sw = read_bf16(&mut pos, bytes)?;
+        let compressor = (flags & 0x01 != 0).then(|| read_compressor(&mut pos, bytes)).transpose()?;
+        let indexer    = (flags & 0x02 != 0).then(|| read_compressor(&mut pos, bytes)).transpose()?;
+        let flashmla = if flags & 0x04 != 0 {
+            anyhow::ensure!(pos + 4 <= bytes.len(), "Dsv4LayerImage: truncated at fp8 len");
+            let byte_len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
             pos += 4;
-            let fp = bytes[pos..pos+len].to_vec();
-            pos += len;
+            anyhow::ensure!(pos + byte_len <= bytes.len(), "Dsv4LayerImage: truncated fp8 data");
+            let fp = bytes[pos..pos+byte_len].to_vec();
+            pos += byte_len;
             Some(Dsv4FlashMlaImage { fp8_kv_pool_pages: fp })
         } else { None };
-        let dsa_official = if n > 4 {
-            Some(Dsv4DsaOfficialImage { kv_cache: read_bf16!(), score_cache: read_bf16!() })
+        let dsa_official = if flags & 0x08 != 0 {
+            Some(Dsv4DsaOfficialImage {
+                kv_cache: read_bf16(&mut pos, bytes)?,
+                score_cache: read_bf16(&mut pos, bytes)?,
+            })
         } else { None };
+
         Ok((Self { sw_window_cache: sw, compressor, indexer, flashmla, dsa_official }, pos))
     }
     }
