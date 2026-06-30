@@ -22,6 +22,9 @@ impl LoraConfig {
 pub enum LoraTargetSet {
     AllLinear,
     AttentionQv,
+    /// DAPO-style: full attention q/k/v/o + linear attention in_proj_qkv/out_proj.
+    /// Covers all attention projections across both layer types; skips MLP entirely.
+    AttentionFull,
 }
 
 impl LoraTargetSet {
@@ -29,6 +32,7 @@ impl LoraTargetSet {
         match self {
             Self::AllLinear => "all-linear",
             Self::AttentionQv => "attention-qv",
+            Self::AttentionFull => "attention-full",
         }
     }
 
@@ -38,6 +42,14 @@ impl LoraTargetSet {
             Self::AttentionQv => {
                 base_name.ends_with(".self_attn.q_proj.weight")
                     || base_name.ends_with(".self_attn.v_proj.weight")
+            }
+            Self::AttentionFull => {
+                base_name.ends_with(".self_attn.q_proj.weight")
+                    || base_name.ends_with(".self_attn.k_proj.weight")
+                    || base_name.ends_with(".self_attn.v_proj.weight")
+                    || base_name.ends_with(".self_attn.o_proj.weight")
+                    || base_name.ends_with(".linear_attn.in_proj_qkv.weight")
+                    || base_name.ends_with(".linear_attn.out_proj.weight")
             }
         }
     }

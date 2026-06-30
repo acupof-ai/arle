@@ -962,7 +962,7 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, default_value_t = 32.0)]
     pub(crate) lora_alpha: f32,
 
-    /// LoRA target set: `attention-qv` (q/v only) or `all-linear`.
+    /// LoRA target set: `attention-qv`, `attention-full` (q/k/v/o + linear-attn), or `all-linear`.
     #[arg(long, default_value = "attention-qv")]
     pub(crate) lora_target_set: String,
 
@@ -1108,7 +1108,7 @@ pub(crate) struct TrainSelfOpdArgs {
     #[arg(long, default_value_t = 32.0)]
     pub(crate) lora_alpha: f32,
 
-    /// LoRA target set: `attention-qv` (q/v only) or `all-linear`.
+    /// LoRA target set: `attention-qv`, `attention-full` (q/k/v/o + linear-attn), or `all-linear`.
     #[arg(long, default_value = "attention-qv")]
     pub(crate) lora_target_set: String,
 
@@ -1273,7 +1273,7 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 64.0)]
     pub(crate) lora_alpha: f32,
 
-    /// LoRA target set: `attention-qv` or `all-linear`.
+    /// LoRA target set: `attention-qv`, `attention-full` (q/k/v/o + linear-attn), or `all-linear`.
     #[arg(long, default_value = "all-linear")]
     pub(crate) lora_target_set: String,
 
@@ -1479,7 +1479,7 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 64.0)]
     pub(crate) lora_alpha: f32,
 
-    /// LoRA target set: `attention-qv` or `all-linear`.
+    /// LoRA target set: `attention-qv`, `attention-full` (q/k/v/o + linear-attn), or `all-linear`.
     #[arg(long, default_value = "all-linear")]
     pub(crate) lora_target_set: String,
 
