@@ -91,6 +91,7 @@ live in this file.
 | Stability levels and compatibility posture | [stability-policy.md](stability-policy.md) | Do not redefine tiers elsewhere. |
 | Workspace topology and module entry points | [codebase-map.md](codebase-map.md) | Source of truth for "what exists today". |
 | Architecture ownership and boundaries | [architecture.md](architecture.md) | The `infer-*` rewrite crates (`infer-core`/`-seam`/`-cuda`/`-metal`/`-server`/`-api`) own runtime truth. |
+| DSv4/GLM prefill+decode paths & kernels | [architecture-dsv4.md](architecture-dsv4.md) | Mechanism-level map: FlashMLA prefill/decode, DeepGEMM grouped MoE, DSA indexer, MTP spec-decode + rollback; DSpark survey. |
 | Benchmark and trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) | `guidellm` is the canonical e2e benchmark path. |
 | Canonical e2e bench tool + parameter set | [plans/guidellm-integration.md](plans/guidellm-integration.md) | Wrapper script `scripts/bench_guidellm.sh` uses these params verbatim. |
 | Capability and agent-code evals | [eval.md](eval.md) | MMLU and SWE-bench Pro workflows; ARLE engine owns the candidate answer/patch, deterministic graders own only scoring. |
