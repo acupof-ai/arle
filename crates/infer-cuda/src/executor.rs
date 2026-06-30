@@ -306,7 +306,11 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_capacity_pages(),
-            Self::Dsv4(_) => 0,
+            Self::Dsv4(d) => d.kv_adapter.layers.iter()
+                .filter_map(|l| l.flashmla_tier.as_ref())
+                .map(|t| t.capacity_pages())
+                .min()
+                .unwrap_or(0),
             Self::Qwen35(_) => 0,
         }
     }
@@ -338,7 +342,9 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
             Self::Qwen(q) => q.kv_tier_location(key),
-            Self::Dsv4(_) => None,
+            Self::Dsv4(d) => d.kv_adapter.layers.iter().find_map(|l| {
+                l.flashmla_tier.as_ref().and_then(|t| t.contains(key).then(|| t.location(key)).flatten())
+            }),
             Self::Qwen35(_) => None,
         }
     }
@@ -2426,19 +2432,42 @@ impl Dsv4CudaExecutor {
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.slot_tier
-            .set_disk(root, budget_bytes, self.slot_image_bytes)
+        self.slot_tier.set_disk(root.clone(), budget_bytes, self.slot_image_bytes);
+        let n = self.kv_adapter.flashmla_layer_count();
+        if n == 0 { return true; }
+        let per_layer = budget_bytes / n.max(1) as usize;
+        let mut ok = true;
+        for idx in 0..n {
+            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                if !layer.set_flashmla_tier_disk(&root, per_layer) { ok = false; }
+            }
+        }
+        ok
     }
 
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
+        let per_layer = if self.kv_adapter.flashmla_layer_count() > 0 {
+            bytes / self.kv_adapter.flashmla_layer_count() as usize
+        } else { return; };
+        for idx in 0..self.kv_adapter.flashmla_layer_count() {
+            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                layer.init_flashmla_tier(per_layer);
+            }
+        }
     }
 
     pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
-        self.slot_tier = CudaKvTierStore::with_budget(
-            default_t1_budget_bytes(fraction),
-            self.slot_image_bytes,
-        );
+        let budget = default_t1_budget_bytes(fraction);
+        self.slot_tier = CudaKvTierStore::with_budget(budget, self.slot_image_bytes);
+        let n = self.kv_adapter.flashmla_layer_count();
+        if n == 0 { return; }
+        let per_layer = (budget / n as usize).max(1);
+        for idx in 0..n {
+            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                layer.init_flashmla_tier(per_layer);
+            }
+        }
     }
 
     /// Whole-slot swap is single-rank today.
@@ -4033,6 +4062,14 @@ impl Qwen35CudaExecutor {
     /// existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
+        let per_layer = if self.kv_adapter.flashmla_layer_count() > 0 {
+            bytes / self.kv_adapter.flashmla_layer_count() as usize
+        } else { return; };
+        for idx in 0..self.kv_adapter.flashmla_layer_count() {
+            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                layer.init_flashmla_tier(per_layer);
+            }
+        }
     }
 
     /// Attach durable NVMe spill for the recall tier (`--kv-ssd-path`).
