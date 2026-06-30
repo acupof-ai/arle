@@ -306,35 +306,40 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_capacity_pages(),
-            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+            Self::Dsv4(_) => 0,
+            Self::Qwen35(_) => 0,
         }
     }
 
     pub(crate) fn kv_tier_page_bytes(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_page_bytes(),
-            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+            Self::Dsv4(_) => 0,
+            Self::Qwen35(_) => 0,
         }
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_host_demoted_pages(),
-            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+            Self::Dsv4(_) => 0,
+            Self::Qwen35(_) => 0,
         }
     }
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_disk_pages(),
-            Self::Qwen35(_) | Self::Dsv4(_) => 0,
+            Self::Dsv4(_) => 0,
+            Self::Qwen35(_) => 0,
         }
     }
 
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
             Self::Qwen(q) => q.kv_tier_location(key),
-            Self::Qwen35(_) | Self::Dsv4(_) => None,
+            Self::Dsv4(_) => None,
+            Self::Qwen35(_) => None,
         }
     }
 
@@ -351,14 +356,16 @@ impl RealCudaExecutor {
     pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
         match self {
             Self::Qwen(q) => q.demote_prefix_pages(entries),
-            Self::Qwen35(_) | Self::Dsv4(_) => Ok(0),
+            Self::Dsv4(_) => Ok(0),
+            Self::Qwen35(_) => Ok(0),
         }
     }
 
     pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
         match self {
             Self::Qwen(q) => q.promote_prefix_pages(entries),
-            Self::Qwen35(_) | Self::Dsv4(_) => {
+            Self::Dsv4(_) => Ok(()),
+            Self::Qwen35(_) => {
                 anyhow::bail!(
                     "page-granular KV tier store is implemented only for dense Qwen3 CUDA"
                 )
@@ -463,7 +470,7 @@ impl RealCudaExecutor {
             Self::Qwen(q) => q.set_kv_tier_budget_bytes(bytes),
             // L2: the Qwen3.6 arm's G3 slot_tier also honors the explicit cap.
             Self::Qwen35(q) => q.set_kv_tier_budget_bytes(bytes),
-            Self::Dsv4(_) => {}
+            Self::Dsv4(d) => d.set_kv_tier_budget_bytes(bytes)
         }
     }
 
@@ -476,7 +483,7 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.set_dram_fraction(fraction),
             Self::Qwen35(q) => q.set_dram_fraction(fraction),
-            Self::Dsv4(_) => {}
+            Self::Dsv4(d) => d.set_dram_fraction(fraction)
         }
     }
 
@@ -1008,7 +1015,7 @@ impl QwenCudaExecutor {
             buf.extend_from_slice(&payload);
         }
         self.kv
-            .copy_pages_from_host(&self.model.ctx, &pages, &buf, true)?;
+            .copy_pages_from_host_on_copy_stream(&self.model.ctx, &pages, &buf)?;
         self.model.ctx.sync_copy()?;
         Ok(())
     }
@@ -2390,6 +2397,7 @@ impl Dsv4CudaExecutor {
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
             .collect();
+        let slot_image_bytes = kv_adapter.max_slot_image_bytes().max(1);
         Ok(Self {
             model,
             slots,
@@ -2402,10 +2410,10 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
-            slot_image_bytes: kv_adapter.max_slot_image_bytes().max(1),
+            slot_image_bytes,
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-                kv_adapter.max_slot_image_bytes().max(1),
+                slot_image_bytes,
             ),
             prefix_cache: Dsv4PrefixCache::from_env(),
         })
@@ -2419,6 +2427,17 @@ impl Dsv4CudaExecutor {
     ) -> bool {
         self.slot_tier
             .set_disk(root, budget_bytes, self.slot_image_bytes)
+    }
+
+    pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
+    }
+
+    pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
+        self.slot_tier = CudaKvTierStore::with_budget(
+            default_t1_budget_bytes(fraction),
+            self.slot_image_bytes,
+        );
     }
 
     /// Whole-slot swap is single-rank today.
@@ -2460,7 +2479,8 @@ impl Dsv4CudaExecutor {
         if bytes.len() > self.slot_image_bytes {
             log::warn!(
                 "DSv4 slot image {} bytes exceeds tier page budget {}; falling back to recompute",
-                bytes.len(), self.slot_image_bytes
+                bytes.len(),
+                self.slot_image_bytes
             );
             return Ok(false);
         }
@@ -3446,7 +3466,7 @@ impl Qwen35CudaExecutor {
                 anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
             if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
-                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data, false)
+                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data)
                     .map_err(|e| {
                         anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
                     })?;
@@ -4299,7 +4319,7 @@ impl Qwen35CudaExecutor {
             };
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 if let Some(new_page) = pool.reinstate_slot_page(slot, logical) {
-                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload, false)?;
+                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
                 }
             }
         }
