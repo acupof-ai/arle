@@ -3600,15 +3600,9 @@ impl SafetensorLoader {
                 tp,
             )?
         };
-        // DeepGEMM-layout cache for the decode wq_b projection (lever #1: residual
-        // scalar GEMV → tensor-core). Built under the same gate as the fused
-        // wq_a|wkv cache so the runtime ARLE_DSV4_DECODE_PROJ_DEEPGEMM flag can A/B
-        // it without a rebuild. DSv4-only (FP8 path).
-        let wq_b_deepgemm = if !glm && crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
-            Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wq_b)?)
-        } else {
-            None
-        };
+        // DeepGEMM-layout cache for the decode wq_b projection (residual scalar
+        // GEMV → tensor-core).
+        let wq_b_deepgemm = self.decode_proj_cache(ctx, &wq_b)?;
         // Output projection. DSv4: low-rank wo_a→wo_b (+ per-group tables). GLM
         // (`plain_o_proj`): a single plain `o_proj` [hidden, num_heads*v_head_dim],
         // and the kv_b absorption split (w_kc/w_vc).
@@ -4092,6 +4086,25 @@ impl SafetensorLoader {
         Ok(out)
     }
 
+    /// DeepGEMM repack of one decode projection weight, or `None`. Built only when
+    /// the decode-DeepGEMM alloc gate is on AND the weight is raw FP8 block-scaled
+    /// — the GLM dialect dequantizes to bf16, so the FP8 check alone excludes it
+    /// (no `!glm` needed). The single canonical builder for every per-projection
+    /// decode cache (wq_b, wo, compressor wkv/wgate, indexer weights_proj).
+    fn decode_proj_cache(
+        &self,
+        ctx: &DeviceContext,
+        weight: &DeviceMatrix,
+    ) -> Result<Option<cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache>> {
+        if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()?
+            && weight.weight_format == WeightFormat::Dsv4Fp8BlockScaled
+        {
+            Ok(Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, weight)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Load one compressor sub-block (`wkv`/`wgate`/`ape` matrices + `norm` vec).
     /// GLM uses F32 `weight_scale_inv` scales, so its compressor projections are
     /// dequantized to bf16. DSv4 keeps the original dtype-dispatching path.
@@ -4108,11 +4121,15 @@ impl SafetensorLoader {
                 self.load_dsv4_global_matrix(ctx, name)
             }
         };
+        let wkv = load_matrix(&names.wkv)?;
+        let wgate = load_matrix(&names.wgate)?;
         Ok(crate::dsv4::Dsv4Compressor {
-            wkv: load_matrix(&names.wkv)?,
-            wgate: load_matrix(&names.wgate)?,
+            wkv_deepgemm: self.decode_proj_cache(ctx, &wkv)?,
+            wgate_deepgemm: self.decode_proj_cache(ctx, &wgate)?,
             ape: load_matrix(&names.ape)?,
             norm: self.load_dsv4_vec(ctx, &names.norm)?,
+            wkv,
+            wgate,
         })
     }
 
@@ -4134,12 +4151,9 @@ impl SafetensorLoader {
         };
         // The decode DeepGEMM cache is built only for the FP8 DSv4 wq_b; GLM's
         // dequantized bf16 wq_b uses the scalar/dense path.
-        let wq_b_deepgemm = if !glm && crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()? {
-            Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, &wq_b)?)
-        } else {
-            None
-        };
+        let wq_b_deepgemm = self.decode_proj_cache(ctx, &wq_b)?;
         let weights_proj = self.load_dsv4_global_matrix(ctx, &names.weights_proj)?;
+        let weights_proj_deepgemm = self.decode_proj_cache(ctx, &weights_proj)?;
         let (compressor, wk, k_norm, k_norm_bias) = if glm {
             let wk = match names.wk.as_ref() {
                 Some(n) => Some(self.load_dsv4_block_scaled_dialect(ctx, n)?),
@@ -4173,6 +4187,7 @@ impl SafetensorLoader {
             k_norm,
             k_norm_bias,
             wq_b_deepgemm,
+            weights_proj_deepgemm,
         })
     }
 
