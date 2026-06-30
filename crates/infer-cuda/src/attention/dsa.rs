@@ -611,6 +611,7 @@ impl Dsv4LayerImage {
                 .dsa_official
                 .as_ref()
                 .map_or(0, Dsv4DsaOfficialImage::host_bytes)
+    }
 
     pub(crate) fn serialize_into(&self, buf: &mut Vec<u8>) {
         // Flags byte: bit 0=compressor, bit 1=indexer, bit 2=flashmla, bit 3=dsa_official.
@@ -641,12 +642,15 @@ impl Dsv4LayerImage {
         if let Some(ref c) = self.compressor { push_compressor(buf, c); }
         if let Some(ref c) = self.indexer    { push_compressor(buf, c); }
         if let Some(ref f) = self.flashmla {
+            buf.push(u8::from(f.fp8_kv_sw_bootstrapped));
+            buf.extend_from_slice(&(f.fp8_kv_comp_packed_rows as u64).to_le_bytes());
             buf.extend_from_slice(&(f.fp8_kv_pool_pages.len() as u32).to_le_bytes());
             buf.extend_from_slice(&f.fp8_kv_pool_pages);
         }
         if let Some(ref d) = self.dsa_official {
-            push_bf16(buf, &d.kv_cache);
-            push_bf16(buf, &d.score_cache);
+            buf.extend_from_slice(&(d.packed_rows as u64).to_le_bytes());
+            buf.extend_from_slice(&(d.key_cache_slot.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&d.key_cache_slot);
         }
     }
 
@@ -687,23 +691,32 @@ impl Dsv4LayerImage {
         let compressor = (flags & 0x01 != 0).then(|| read_compressor(&mut pos, bytes)).transpose()?;
         let indexer    = (flags & 0x02 != 0).then(|| read_compressor(&mut pos, bytes)).transpose()?;
         let flashmla = if flags & 0x04 != 0 {
+            anyhow::ensure!(pos + 9 <= bytes.len(), "Dsv4LayerImage: truncated at flashmla scalars");
+            let fp8_kv_sw_bootstrapped = bytes[pos] != 0;
+            pos += 1;
+            let fp8_kv_comp_packed_rows = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
             anyhow::ensure!(pos + 4 <= bytes.len(), "Dsv4LayerImage: truncated at fp8 len");
-            let byte_len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
+            let byte_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             anyhow::ensure!(pos + byte_len <= bytes.len(), "Dsv4LayerImage: truncated fp8 data");
-            let fp = bytes[pos..pos+byte_len].to_vec();
+            let fp = bytes[pos..pos + byte_len].to_vec();
             pos += byte_len;
-            Some(Dsv4FlashMlaImage { fp8_kv_pool_pages: fp })
+            Some(Dsv4FlashMlaImage { fp8_kv_sw_bootstrapped, fp8_kv_comp_packed_rows, fp8_kv_pool_pages: fp })
         } else { None };
         let dsa_official = if flags & 0x08 != 0 {
-            Some(Dsv4DsaOfficialImage {
-                kv_cache: read_bf16(&mut pos, bytes)?,
-                score_cache: read_bf16(&mut pos, bytes)?,
-            })
+            anyhow::ensure!(pos + 12 <= bytes.len(), "Dsv4LayerImage: truncated at dsa scalars");
+            let packed_rows = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let byte_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            anyhow::ensure!(pos + byte_len <= bytes.len(), "Dsv4LayerImage: truncated dsa data");
+            let key_cache_slot = bytes[pos..pos + byte_len].to_vec();
+            pos += byte_len;
+            Some(Dsv4DsaOfficialImage { packed_rows, key_cache_slot })
         } else { None };
 
         Ok((Self { sw_window_cache: sw, compressor, indexer, flashmla, dsa_official }, pos))
-    }
     }
 }
 
@@ -852,7 +865,7 @@ impl Dsv4FlashMlaImage {
         // Restore lands on the target slot's pages by page-table lookup.
         let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         pool.flashmla_pool_mut()?
-            .copy_pages_from_host(ctx, &table, &self.fp8_kv_pool_pages, false)
+            .copy_pages_from_host(ctx, &table, &self.fp8_kv_pool_pages)
             .map_err(|e| anyhow!("DSv4 swap FlashMLA pool page H2D failed: {e}"))?;
         flash.fp8_kv_sw_bootstrapped = self.fp8_kv_sw_bootstrapped;
         flash.fp8_kv_comp_packed_rows = self.fp8_kv_comp_packed_rows;

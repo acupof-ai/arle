@@ -1038,6 +1038,26 @@ impl TokenKVPool {
         ctx: &DeviceContext,
         pages: &[u32],
         payload: &[u8],
+    ) -> Result<()> {
+        self.copy_pages_from_host_impl(ctx, pages, payload, false)
+    }
+
+    /// As [`Self::copy_pages_from_host`], but enqueues copies on `copy_stream`.
+    /// Pair with `ctx.sync_copy()`.
+    pub fn copy_pages_from_host_on_copy_stream(
+        &mut self,
+        ctx: &DeviceContext,
+        pages: &[u32],
+        payload: &[u8],
+    ) -> Result<()> {
+        self.copy_pages_from_host_impl(ctx, pages, payload, true)
+    }
+
+    fn copy_pages_from_host_impl(
+        &mut self,
+        ctx: &DeviceContext,
+        pages: &[u32],
+        payload: &[u8],
         on_copy_stream: bool,
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
@@ -2526,7 +2546,7 @@ mod tests {
             }
         }
 
-        pool.copy_pages_from_host(&ctx, &[0], &payload, false)
+        pool.copy_pages_from_host(&ctx, &[0], &payload)
             .expect("seed source page");
         pool.copy_page_device_to_device(&ctx, 0, 1)
             .expect("copy page on device");
@@ -3390,7 +3410,7 @@ mod tests {
         let payload: Vec<u8> = (0..storage_bytes_per_page)
             .map(|byte| (byte % 251) as u8)
             .collect();
-        pool.copy_pages_from_host(&ctx, &[0], &payload, false)
+        pool.copy_pages_from_host(&ctx, &[0], &payload)
             .expect("seed source page");
         pool.copy_page_device_to_device(&ctx, 0, 1)
             .expect("copy page on device");

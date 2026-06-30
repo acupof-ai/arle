@@ -2,8 +2,7 @@
 # DSv4-Flash resident scalar-vs-FlashMLA A/B launcher (8xH20, TP=8/EP=8).
 #
 # Build first:
-#   ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
-#     cargo build --release -p infer-cuda --features cuda,nccl,deepep \
+#   cargo build --release -p infer-cuda --features cuda,nccl,deepep \
 #       --example dsv4_resident_ab
 #
 # Run:
