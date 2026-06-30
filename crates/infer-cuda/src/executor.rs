@@ -5390,7 +5390,22 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
         std::env::var("INFER_DSV4_AB_CURRENT_VARIANT").unwrap_or_else(|_| "unknown".to_string());
     let logits_host = logits.to_host(ctx)?;
     let mut best: Vec<(u32, f32)> = Vec::with_capacity(top_k);
+    let mut nan_count = 0usize;
+    let mut pos_inf_count = 0usize;
+    let mut neg_inf_count = 0usize;
     for (idx, &value) in logits_host.iter().enumerate() {
+        if value.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if value == f32::INFINITY {
+            pos_inf_count += 1;
+            continue;
+        }
+        if value == f32::NEG_INFINITY {
+            neg_inf_count += 1;
+            continue;
+        }
         if best.len() < top_k {
             best.push((idx as u32, value));
             best.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -5409,7 +5424,15 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
         [first, second, ..] => first.1 - second.1,
         _ => 0.0,
     };
-    println!("sample_topk variant={variant} position={position} top={best:?} margin={margin:.6}");
+    println!(
+        "sample_topk variant={variant} position={position} finite={} nan={} pos_inf={} neg_inf={} top={best:?} margin={margin:.6}",
+        logits_host
+            .len()
+            .saturating_sub(nan_count + pos_inf_count + neg_inf_count),
+        nan_count,
+        pos_inf_count,
+        neg_inf_count
+    );
     Ok(())
 }
 
