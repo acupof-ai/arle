@@ -88,7 +88,7 @@ impl MetalSlotState {
         }
     }
 
-pub(super)     fn from_arrays(
+    pub(super) fn from_arrays(
         slot: usize,
         slot_epoch: u64,
         cache_len: usize,
@@ -111,7 +111,10 @@ pub(super)     fn from_arrays(
         }
     }
 
-pub(super)     fn ensure_session_active(&mut self, model: &qwen35::CppQwen35Model) -> anyhow::Result<()> {
+    pub(super) fn ensure_session_active(
+        &mut self,
+        model: &qwen35::CppQwen35Model,
+    ) -> anyhow::Result<()> {
         if self.session_active {
             return Ok(());
         }
@@ -120,7 +123,7 @@ pub(super)     fn ensure_session_active(&mut self, model: &qwen35::CppQwen35Mode
         Ok(())
     }
 
-pub(super)     fn drain_session(&mut self, model: &qwen35::CppQwen35Model) -> anyhow::Result<()> {
+    pub(super) fn drain_session(&mut self, model: &qwen35::CppQwen35Model) -> anyhow::Result<()> {
         if !self.session_active {
             return Ok(());
         }
@@ -131,7 +134,7 @@ pub(super)     fn drain_session(&mut self, model: &qwen35::CppQwen35Model) -> an
         Ok(())
     }
 
-pub(super)     fn bf16_prefix_read_inputs(
+    pub(super) fn bf16_prefix_read_inputs(
         &self,
         cache_len: usize,
     ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
@@ -169,7 +172,7 @@ pub(super)     fn bf16_prefix_read_inputs(
     /// `slice_kv_tokens` + `concatenate_or_single`, no new MLX op. Which ranges to
     /// recall is the device-neutral policy (infer-core SessionMemory); this is only
     /// the executor primitive that attends them. `ranges` must be within `cache_len`.
-pub(super)     fn bf16_recall_read_inputs(
+    pub(super) fn bf16_recall_read_inputs(
         &self,
         ranges: &[(usize, usize)],
     ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
@@ -214,7 +217,10 @@ pub(super)     fn bf16_recall_read_inputs(
     /// a block's full KV is offloaded its rep stays here, keeping `q · rep`
     /// scorable. Cheap — only newly-completed blocks are recomputed each step.
     /// The mean is taken on the host from the (tiny) block K slice.
-pub(super)     fn update_block_reps(&mut self, cfg: &infer_core::RecallConfig) -> anyhow::Result<()> {
+    pub(super) fn update_block_reps(
+        &mut self,
+        cfg: &infer_core::RecallConfig,
+    ) -> anyhow::Result<()> {
         if cfg.l_bs == 0 || self.cache_len <= cfg.n_init + cfg.n_local {
             return Ok(());
         }
@@ -267,7 +273,7 @@ pub(super)     fn update_block_reps(&mut self, cfg: &infer_core::RecallConfig) -
     /// range (session still fits the budget) so the default page-read stays
     /// byte-identical. Requires bf16 KV (the only recall-built path); the query
     /// is the C++ emit (`take_recall_query`).
-pub(super)     fn recompute_recall_plan(
+    pub(super) fn recompute_recall_plan(
         &mut self,
         model: &qwen35::CppQwen35Model,
         cfg: &infer_core::RecallConfig,
@@ -306,7 +312,7 @@ pub(super)     fn recompute_recall_plan(
         Ok(())
     }
 
-pub(super)     fn int8_prefix_read_inputs(
+    pub(super) fn int8_prefix_read_inputs(
         &self,
         cache_len: usize,
     ) -> anyhow::Result<(Vec<mlx::MlxArray>, Vec<mlx::MlxArray>)> {
@@ -365,7 +371,7 @@ pub(super)     fn int8_prefix_read_inputs(
     /// `materialize_slot_from_prefix` treats it. Growing mutates `kv_flat`,
     /// which an open session owns, so the session is drained first; the caller
     /// re-activates it via `ensure_session_active`.
-pub(super)     fn ensure_kv_capacity(
+    pub(super) fn ensure_kv_capacity(
         &mut self,
         model: &qwen35::CppQwen35Model,
         needed: usize,
