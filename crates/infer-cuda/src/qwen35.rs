@@ -924,7 +924,7 @@ impl Qwen35SlotState {
             pages.len(),
             image.full_attn_page_count
         );
-        full_attn_kv.copy_pages_from_host(ctx, &pages, &image.full_attn_pages, false)?;
+        full_attn_kv.copy_pages_from_host(ctx, &pages, &image.full_attn_pages)?;
         // (b) + (c) acquire a fresh recurrent block (alloc+zero) then H2D-restore.
         self.acquire_recurrent(ctx, num_linear, gdr_state_len, conv_len, recurrent_pool)?;
         for (dst, src) in self.gdr_states.iter_mut().zip(&image.gdr_host) {

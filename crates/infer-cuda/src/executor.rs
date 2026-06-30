@@ -2387,7 +2387,6 @@ impl Dsv4CudaExecutor {
                 predicted_total >> 20
             );
         }
-        let slot_image_bytes = kv_adapter.max_slot_image_bytes().max(1);
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
             .collect();
@@ -2403,10 +2402,10 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
-            slot_image_bytes,
+            slot_image_bytes: kv_adapter.max_slot_image_bytes().max(1),
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-                slot_image_bytes,
+                kv_adapter.max_slot_image_bytes().max(1),
             ),
             prefix_cache: Dsv4PrefixCache::from_env(),
         })
@@ -3447,7 +3446,7 @@ impl Qwen35CudaExecutor {
                 anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
             if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
-                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data, false)
+                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data)
                     .map_err(|e| {
                         anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
                     })?;
@@ -4300,7 +4299,7 @@ impl Qwen35CudaExecutor {
             };
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 if let Some(new_page) = pool.reinstate_slot_page(slot, logical) {
-                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload, false)?;
+                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
                 }
             }
         }
