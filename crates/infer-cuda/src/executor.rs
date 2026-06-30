@@ -515,7 +515,7 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.set_kv_tier_disk(root, budget_bytes),
             Self::Qwen35(q) => q.set_kv_tier_disk(root, budget_bytes),
-            Self::Dsv4(_) => false,
+            Self::Dsv4(d) => d.set_kv_tier_disk(root, budget_bytes),
         }
     }
 
@@ -1795,12 +1795,18 @@ pub(crate) struct Dsv4CudaExecutor {
     /// Host images of demoted DSv4 slots, keyed by the engine-minted swap key.
     /// The count cap bounds host RAM; beyond it, the engine falls back to
     /// recompute instead of accumulating swap images.
-    slot_swap_store: std::collections::BTreeMap<u64, Dsv4SlotSwapEntry>,
     /// Cross-request position-0 prefix store. Maps a full captured prompt to its
     /// whole-slot KV image; a new request whose leading tokens exactly equal a
     /// stored prompt restores that prefix and re-prefills only the tail. LRU over
     /// a host-byte budget (see `Dsv4PrefixCache`). Default-on (pod-verified:
     /// correct + 11.7x prefill speedup); size knob `ARLE_DSV4_PREFIX_CACHE_BYTES`.
+    /// L2 DRAM + optional L3 NVMe tier for whole-slot swap images.
+    /// One "page" = one serialized slot image, sized to the max possible
+    /// byte count (`slot_image_bytes`). The mmap is sparse so padding
+    /// doesn't waste physical blocks.
+    slot_tier: CudaKvTierStore,
+    /// Upper-bound byte size of one serialized slot image.
+    slot_image_bytes: usize,
     prefix_cache: Dsv4PrefixCache,
 }
 
@@ -2003,12 +2009,6 @@ impl<P> PrefixImageStore<P> {
 /// the previous MTP stream (`forward_decode_tokens` errors on a missing
 /// pending), and the slot's spec state is overwritten by whichever request
 /// occupies the slot while this one is demoted.
-struct Dsv4SlotSwapEntry {
-    image: crate::dsv4::Dsv4SlotImage,
-    spec_pending: Option<u32>,
-    spec_hidden: Option<Vec<half::bf16>>,
-}
-
 #[derive(Default)]
 struct Dsv4SpecSlotState {
     pending: Option<u32>,
@@ -2402,9 +2402,23 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
-            slot_swap_store: std::collections::BTreeMap::new(),
+            slot_image_bytes: kv_adapter.max_slot_image_bytes().max(1),
+            slot_tier: CudaKvTierStore::with_budget(
+                default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+                kv_adapter.max_slot_image_bytes().max(1),
+            ),
             prefix_cache: Dsv4PrefixCache::from_env(),
         })
+    }
+
+    /// Attach the opt-in NVMe disk spill level (pre-serve only).
+    pub(crate) fn set_kv_tier_disk(
+        &mut self,
+        root: std::path::PathBuf,
+        budget_bytes: usize,
+    ) -> bool {
+        self.slot_tier
+            .set_disk(root, budget_bytes, self.slot_image_bytes)
     }
 
     /// Whole-slot swap is single-rank today.
@@ -2437,34 +2451,16 @@ impl Dsv4CudaExecutor {
             "DSv4 demote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        if !self.slot_swap_store.contains_key(&key)
-            && self.slot_swap_store.len() >= self.num_slots.saturating_mul(2)
-        {
+        if self.slot_tier.is_full() {
             return Ok(false);
         }
-        // Spec chain D2H first: the copies are stream-ordered, so the trailing
-        // sync inside `swap_out_image` covers them too.
-        let spec_pending = self.spec_slots[slot].pending;
-        let spec_hidden = match self.spec_slots[slot].hidden.as_ref() {
-            Some(hidden) => Some(
-                self.model
-                    .ctx
-                    .stream
-                    .clone_dtoh(&hidden.data)
-                    .map_err(|e| anyhow::anyhow!("DSv4 swap spec hidden D2H failed: {e}"))?,
-            ),
-            None => None,
-        };
         let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
-        self.slot_swap_store.insert(
-            key,
-            Dsv4SlotSwapEntry {
-                image,
-                spec_pending,
-                spec_hidden,
-            },
-        );
-        Ok(true)
+        let mut bytes = image.to_bytes();
+        // Pad to fixed page size so CudaKvTierStore's L2/L3 layers work.
+        if bytes.len() < self.slot_image_bytes {
+            bytes.resize(self.slot_image_bytes, 0);
+        }
+        Ok(self.slot_tier.insert(key, bytes))
     }
 
     /// Restore the whole-slot image stored under `key` into `slot`. The engine
@@ -2480,23 +2476,15 @@ impl Dsv4CudaExecutor {
             "DSv4 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        let entry = self.slot_swap_store.get(&key).ok_or_else(|| {
-            anyhow::anyhow!("DSv4 whole-slot KV store has no image for key {key}")
-        })?;
-        self.spec_slots[slot] = Dsv4SpecSlotState {
-            pending: entry.spec_pending,
-            hidden: match entry.spec_hidden.as_ref() {
-                Some(host) => Some(DeviceVec::from_host(&self.model.ctx, host)?),
-                None => None,
-            },
-        };
-        self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &entry.image)
+        let bytes = self.slot_tier.read(key)?;
+        let image = crate::dsv4::Dsv4SlotImage::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"))?;
+        self.spec_slots[slot] = Dsv4SpecSlotState::default();
+        self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &image)
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        for key in keys {
-            self.slot_swap_store.remove(key);
-        }
+        self.slot_tier.remove(keys);
     }
 
     /// Length of the longest stored position-0 prompt that is an exact leading
