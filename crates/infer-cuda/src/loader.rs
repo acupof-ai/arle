@@ -2746,6 +2746,50 @@ fn tensor_bytes_to_f32(
     Ok(values)
 }
 
+/// Saturating encode of `val` into the FP8 E4M3FN byte format used by DeepSeek V4.
+/// E4M3FN: 1 sign + 4 exp + 3 mant, bias=7, NaN={0x7F,0xFF}, no Inf.
+/// Max normal = 0x7E = (1+6/8)×2^8 = 448.0. Values are clamped to ±448 before
+/// encoding; NaN input is mapped to zero (weight tensors should never be NaN).
+fn encode_f8_e4m3fn_sat(val: f32) -> u8 {
+    const E4M3_MAX: f32 = 448.0;
+    const BIAS: i32 = 7;
+    let val = if val.is_nan() {
+        0.0
+    } else {
+        val.clamp(-E4M3_MAX, E4M3_MAX)
+    };
+    let sign: u8 = if val.is_sign_negative() { 0x80 } else { 0x00 };
+    let abs = val.abs();
+    if abs == 0.0 {
+        return sign;
+    }
+    let bits = abs.to_bits();
+    let f32_exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let fp8_biased_exp = f32_exp + BIAS;
+    if fp8_biased_exp <= 0 {
+        // Subnormal: 0.mmmm × 2^(1−7), i.e. value = mant × 2^(−9)
+        let mant = ((abs * 512.0).round() as i32).clamp(0, 7) as u8;
+        return sign | mant;
+    }
+    if fp8_biased_exp >= 15 {
+        return sign | 0x7E; // saturate to ±448.0
+    }
+    let fp8_biased_exp = fp8_biased_exp as u8;
+    let f32_mant = bits & 0x007F_FFFF;
+    // Round-to-nearest: add the guard bit (bit 19) before truncating to 3 bits.
+    let fp8_mant_raw = (f32_mant + (1 << 19)) >> 20;
+    if fp8_mant_raw > 7 {
+        // Carry into exponent; re-check saturation.
+        let new_exp = fp8_biased_exp + 1;
+        return if new_exp >= 15 {
+            sign | 0x7E
+        } else {
+            sign | (new_exp << 3)
+        };
+    }
+    sign | (fp8_biased_exp << 3) | (fp8_mant_raw as u8)
+}
+
 // DSv4 FP8/FP4 + E8M0 loaders, reachable from
 // `Dsv4Model::from_dsv4_fp8_safetensors` (wired through the executor enum branch
 // and the DSv4/GLM forward). The `allow(dead_code)` is retained on necessity
@@ -3445,17 +3489,37 @@ impl SafetensorLoader {
         })
     }
 
-    /// Load a DSv4 2D matrix dispatching on its on-disk dtype: BF16 →
-    /// `from_safetensors`, F8_E4M3/I8 → block-scaled. Used for embed/head, which
-    /// DSv4 checkpoints may ship in either precision.
+    /// Load a DSv4 2D matrix dispatching on its on-disk dtype: BF16/F32 tensors are
+    /// quantized to FP8 E4M3FN block-scaled (128×128 blocks, E8M0 scales) on the host
+    /// so every downstream linear routes through `mla_linear` / `dsv4_fp8_gemv_batch`
+    /// instead of the BF16 `gemv_handwritten_kernel`. F8_E4M3/I8 tensors keep the
+    /// native block-scaled path unchanged.
     pub(crate) fn load_dsv4_global_matrix(
         &self,
         ctx: &DeviceContext,
         name: &str,
     ) -> Result<DeviceMatrix> {
-        let dtype = self.borrow_raw_tensor(name)?.dtype;
-        match dtype {
-            Dtype::BF16 | Dtype::F32 => self.load_dsv4_bf16_matrix(ctx, name),
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D tensor, got shape {:?}",
+            tensor.shape
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        match tensor.dtype {
+            Dtype::BF16 | Dtype::F32 => {
+                let (fp8, scales, scale_rows, scale_cols) = Self::quantize_to_dsv4_fp8_host(
+                    name,
+                    tensor.dtype,
+                    tensor.bytes(),
+                    rows,
+                    cols,
+                )?;
+                DeviceMatrix::from_dsv4_fp8_block_scaled(
+                    ctx, &fp8, &scales, rows, cols, scale_rows, scale_cols,
+                )
+                .with_context(|| format!("upload quantized DSv4 FP8 matrix {name}"))
+            }
             Dtype::F8_E4M3 | Dtype::I8 => self.load_dsv4_block_scaled(ctx, name),
             other => bail!("{name}: unsupported DSv4 global matrix dtype {other:?}"),
         }
@@ -3849,6 +3913,88 @@ impl SafetensorLoader {
             .collect();
         DeviceMatrix::from_fp8_block_scaled(ctx, weight, &scales, rows, cols, BLOCK, BLOCK)
             .with_context(|| format!("upload GLM FP8 block-scaled MoE weight {name}"))
+    }
+
+    /// Quantize a BF16 or F32 row-major matrix to DSv4 FP8 E4M3FN block-scaled format
+    /// on the host. Uses 128×128 blocks with E8M0 per-block scales — the same layout
+    /// the DSv4 checkpoint uses for natively quantized weights. Returns
+    /// `(fp8_bytes, e8m0_scale_bytes, scale_rows, scale_cols)`. The caller uploads
+    /// via [`DeviceMatrix::from_dsv4_fp8_block_scaled`], then [`mla_linear`] dispatches
+    /// to `dsv4_fp8_gemv_batch_cuda` instead of the BF16 `gemv_handwritten_kernel`.
+    fn quantize_to_dsv4_fp8_host(
+        name: &str,
+        dtype: Dtype,
+        bytes: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
+        const BLOCK: usize = 128;
+        const E4M3_MAX: f32 = 448.0;
+        let vals: Vec<f32> = match dtype {
+            Dtype::BF16 => {
+                ensure!(
+                    bytes.len() == rows * cols * 2,
+                    "{name}: BF16 byte length {} != rows*cols*2={}",
+                    bytes.len(),
+                    rows * cols * 2
+                );
+                bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect()
+            }
+            Dtype::F32 => {
+                ensure!(
+                    bytes.len() == rows * cols * 4,
+                    "{name}: F32 byte length {} != rows*cols*4={}",
+                    bytes.len(),
+                    rows * cols * 4
+                );
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            }
+            other => bail!("{name}: quantize_to_dsv4_fp8_host: unexpected dtype {other:?}"),
+        };
+        let scale_rows = rows.div_ceil(BLOCK);
+        let scale_cols = cols.div_ceil(BLOCK);
+        let mut fp8_out = vec![0u8; rows * cols];
+        let mut scale_out = vec![0u8; scale_rows * scale_cols];
+        for br in 0..scale_rows {
+            let row_start = br * BLOCK;
+            let row_end = (row_start + BLOCK).min(rows);
+            for bc in 0..scale_cols {
+                let col_start = bc * BLOCK;
+                let col_end = (col_start + BLOCK).min(cols);
+                // Max abs value in this block drives the E8M0 scale.
+                let mut max_abs = 0.0f32;
+                for r in row_start..row_end {
+                    for c in col_start..col_end {
+                        let v = vals[r * cols + c].abs();
+                        if v > max_abs {
+                            max_abs = v;
+                        }
+                    }
+                }
+                // Smallest power-of-2 scale s.t. max_abs / scale ≤ E4M3_MAX.
+                // E8M0 byte b ↔ scale = 2^(b−127).
+                let scale_byte: u8 = if max_abs == 0.0 {
+                    127 // 2^0 = 1; arbitrary for all-zero block
+                } else {
+                    let b = ((max_abs / E4M3_MAX).log2() + 127.0).ceil() as i32;
+                    b.clamp(1, 254) as u8
+                };
+                let scale = 2.0f32.powi(scale_byte as i32 - 127);
+                scale_out[br * scale_cols + bc] = scale_byte;
+                for r in row_start..row_end {
+                    for c in col_start..col_end {
+                        fp8_out[r * cols + c] = encode_f8_e4m3fn_sat(vals[r * cols + c] / scale);
+                    }
+                }
+            }
+        }
+        Ok((fp8_out, scale_out, scale_rows, scale_cols))
     }
 
     /// Dequantize a DSv4/GLM block-scaled FP8 E4M3 matrix to host f32, applying the
