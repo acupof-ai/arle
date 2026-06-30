@@ -1388,7 +1388,7 @@ fn run_fused_wqkv_prefill(
         hidden.seq_len
     );
     let cache = attention.wqkv_a_deepgemm.as_ref().ok_or_else(|| {
-        anyhow!("ARLE_DSV4_FP8_LINEAR_DEEPGEMM=1 but DSv4 fused wqkv cache was not loaded")
+        anyhow!("DSv4 fused wqkv prefill requested but fused cache was not loaded")
     })?;
     ensure!(
         cache.rows == scratch.q_lora_rank + scratch.head_dim && cache.cols == scratch.hidden_dim,
@@ -1626,8 +1626,7 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
     // `dsv4_fp8_gemv_batch` (3.62ms, #1 decode GPU kernel). Default ON: licensed
     // 2026-06-07 on the TP=8/EP=8 pod, same-load A/B 38.2 -> 39.2 tok/s (+2.5%,
     // reproduced ×2) with the 37-tok needle retrieved bit-identically (divergence
-    // only in the free-continuation tail = legitimate FP8 numerics). Opt out with
-    // ARLE_DSV4_DECODE_PROJ_DEEPGEMM=0.
+    // only in the free-continuation tail = legitimate FP8 numerics).
     cuda_kernels::has_deepgemm_native()
 }
 
@@ -1636,7 +1635,6 @@ fn dsv4_decode_proj_deepgemm_enabled() -> bool {
 /// nsys breakdown). Default ON: licensed 2026-06-08 on the TP=8 pod — at M=1024 the
 /// prefill wq_b A/B cut total prefill_ms 14382 → 7628 (−47%) with the needle answer
 /// retrieved byte-identically (scalar fp8_gemv scales O(M); it's a decode GEMV).
-/// Opt out with ARLE_DSV4_PREFILL_PROJ_DEEPGEMM=0.
 fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
     cuda_kernels::has_deepgemm_native()
 }
@@ -1651,7 +1649,7 @@ fn dsv4_prefill_proj_deepgemm_enabled() -> bool {
 /// exact, and every run finds the needle region (selection intact). Same-binary A/B:
 /// 64K prefill 17.6s → 11.0s (−37%), 128K 42.7s → 23.0s (−46%). The exact-digit
 /// borderline at ≥2K is the pre-existing compression-fidelity residual (tracked
-/// separately), NOT a selection break. Opt out with ARLE_DSV4_PREFILL_INDEXER_DEEPGEMM=0.
+/// separately), NOT a selection break.
 fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
     cuda_kernels::has_deepgemm_native()
 }
@@ -3844,8 +3842,8 @@ pub(crate) fn mla_attention(
     // FlashMLA path inside the fwd.
     flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
     // Model-wide shared FP8 prefill DeepGEMM linear scratch (hoisted off the
-    // per-slot state). `Some` only when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is on AND
-    // the caller threads it. `None` on the decode (token_count==1) graph lane.
+    // per-slot state). `Some` only when native DeepGEMM is available and the caller
+    // threads it. `None` on the decode (token_count==1) graph lane.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
@@ -4769,8 +4767,8 @@ pub(crate) fn mla_attention_prepare(
     pool: &mut Dsv4LayerKvLayout,
     dsa_shared: Option<&mut Dsv4DsaSharedScratch>,
     // Model-wide shared FP8 prefill DeepGEMM linear scratch (hoisted off the
-    // per-slot state). `Some` only when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is on AND
-    // the caller threads it (the prefill projection lanes). `None` on the decode
+    // per-slot state). `Some` only when native DeepGEMM is available and the caller
+    // threads it (the prefill projection lanes). `None` on the decode
     // (token_count==1) graph/batched lanes, which never take a prefill branch.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     start_pos: usize,
@@ -4867,9 +4865,8 @@ pub(crate) fn mla_attention_prepare(
         .map_err(|_| anyhow::anyhow!("DSv4 MLA start_pos {start_pos} overflows i32"))?;
 
     // ── 1+2. Q/KV LoRA. Decode uses the existing B=1 fused (`wq_a | wkv`)
-    // path. Prefill can opt into the same fused weight cache via
-    // ARLE_DSV4_FP8_LINEAR_DEEPGEMM; the default branch below preserves the
-    // scalar reference order exactly.
+    // path. Prefill uses the same fused weight cache when native DeepGEMM is
+    // available; otherwise the scalar reference order remains intact.
     let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
     let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
@@ -4885,9 +4882,7 @@ pub(crate) fn mla_attention_prepare(
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
         let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
-            anyhow!(
-                "ARLE_DSV4_FP8_LINEAR_DEEPGEMM=1 but prefill fused wqkv scratch was not allocated"
-            )
+            anyhow!("DSv4 fused wqkv prefill requested but prefill scratch was not allocated")
         })?;
         let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused_prefill");
         crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_prefill", || {
@@ -6817,8 +6812,8 @@ pub(crate) fn mla_oproj(
     attention: &Dsv4Attention,
     state: &mut Dsv4LayerAttentionState,
     // Model-wide shared FP8 prefill DeepGEMM linear scratch (hoisted off the
-    // per-slot state). `Some` only when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is on AND
-    // the caller threads it; the prefill wo_a/wo_b DeepGEMM lane (token_count>1)
+    // per-slot state). `Some` only when native DeepGEMM is available and the caller
+    // threads it; the prefill wo_a/wo_b DeepGEMM lane (token_count>1)
     // gates on it. `None` on the decode (token_count==1) graph/batched lanes.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     local_attn: &HiddenStates,
