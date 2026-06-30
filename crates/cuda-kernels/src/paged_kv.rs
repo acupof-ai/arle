@@ -15,6 +15,7 @@
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr};
 use log::info;
+use std::sync::Arc;
 
 use super::ffi;
 use super::tensor::DeviceContext;
@@ -1038,11 +1039,33 @@ impl TokenKVPool {
         ctx: &DeviceContext,
         pages: &[u32],
         payload: &[u8],
+        on_copy_stream: bool,
+    ) -> Result<()> {
+        self.copy_pages_from_host_on(ctx, &stream, pages, payload)
+    }
+
+    /// Copy host pages on the async copy stream; pair with `ctx.sync_copy()`.
+    pub fn copy_pages_from_host_on_copy_stream(
+        &mut self,
+        ctx: &DeviceContext,
+        pages: &[u32],
+        payload: &[u8],
+    ) -> Result<()> {
+        self.copy_pages_from_host_on(ctx, &ctx.copy_stream, pages, payload)
+    }
+
+    fn copy_pages_from_host_on(
+        &mut self,
+        _ctx: &DeviceContext,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        pages: &[u32],
+        payload: &[u8],
     ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
             // See copy_pages_to_host: validate ids before any byte math.
             self.validate_page_ids(pages, "copy_pages_from_host")?;
+            let stream = if on_copy_stream { &ctx.copy_stream } else { &ctx.stream };
             let token_bytes = self.data_plane_bytes_per_page();
             let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;
@@ -1065,7 +1088,7 @@ impl TokenKVPool {
 
                 for layer in 0..self.num_layers {
                     let mut k_view = self.k_data[layer].slice_mut(data_start..data_end);
-                    ctx.stream
+                    stream
                         .memcpy_htod(&payload[cursor..cursor + token_bytes], &mut k_view)
                         .map_err(|e| anyhow!("paged_kv copy K page htod failed: {e}"))?;
                     cursor += token_bytes;
@@ -1074,7 +1097,7 @@ impl TokenKVPool {
                     // below skip themselves via has_scales/has_norms).
                     if !single_plane {
                         let mut v_view = self.v_data[layer].slice_mut(data_start..data_end);
-                        ctx.stream
+                        stream
                             .memcpy_htod(&payload[cursor..cursor + token_bytes], &mut v_view)
                             .map_err(|e| anyhow!("paged_kv copy V page htod failed: {e}"))?;
                         cursor += token_bytes;
@@ -1089,7 +1112,7 @@ impl TokenKVPool {
                         cursor += scale_len * size_of::<f32>();
                         let mut k_scale_view =
                             self.k_scales[layer].slice_mut(scale_start..scale_end);
-                        ctx.stream
+                        stream
                             .memcpy_htod(&k_scales, &mut k_scale_view)
                             .map_err(|e| anyhow!("paged_kv copy K scales htod failed: {e}"))?;
 
@@ -1101,7 +1124,7 @@ impl TokenKVPool {
                         cursor += scale_len * size_of::<f32>();
                         let mut v_scale_view =
                             self.v_scales[layer].slice_mut(scale_start..scale_end);
-                        ctx.stream
+                        stream
                             .memcpy_htod(&v_scales, &mut v_scale_view)
                             .map_err(|e| anyhow!("paged_kv copy V scales htod failed: {e}"))?;
                     }
@@ -1114,7 +1137,7 @@ impl TokenKVPool {
                             .collect();
                         cursor += scale_len * std::mem::size_of::<u16>();
                         let mut k_norm_view = self.k_norms[layer].slice_mut(scale_start..scale_end);
-                        ctx.stream
+                        stream
                             .memcpy_htod(&k_norms, &mut k_norm_view)
                             .map_err(|e| anyhow!("paged_kv copy K norms htod failed: {e}"))?;
 
@@ -1125,7 +1148,7 @@ impl TokenKVPool {
                             .collect();
                         cursor += scale_len * std::mem::size_of::<u16>();
                         let mut v_norm_view = self.v_norms[layer].slice_mut(scale_start..scale_end);
-                        ctx.stream
+                        stream
                             .memcpy_htod(&v_norms, &mut v_norm_view)
                             .map_err(|e| anyhow!("paged_kv copy V norms htod failed: {e}"))?;
                     }
@@ -1133,12 +1156,14 @@ impl TokenKVPool {
             }
 
             debug_assert_eq!(cursor, payload.len());
-            ctx.sync()?;
+            stream
+                .synchronize()
+                .map_err(|e| anyhow!("paged_kv copy sync failed: {e}"))?;
             Ok(())
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = ctx;
+            let _ = stream;
             let _ = pages;
             let _ = payload;
             Err(anyhow!(
@@ -2523,7 +2548,7 @@ mod tests {
             }
         }
 
-        pool.copy_pages_from_host(&ctx, &[0], &payload)
+        pool.copy_pages_from_host(&ctx, &[0], &payload, false)
             .expect("seed source page");
         pool.copy_page_device_to_device(&ctx, 0, 1)
             .expect("copy page on device");
@@ -3387,7 +3412,7 @@ mod tests {
         let payload: Vec<u8> = (0..storage_bytes_per_page)
             .map(|byte| (byte % 251) as u8)
             .collect();
-        pool.copy_pages_from_host(&ctx, &[0], &payload)
+        pool.copy_pages_from_host(&ctx, &[0], &payload, false)
             .expect("seed source page");
         pool.copy_page_device_to_device(&ctx, 0, 1)
             .expect("copy page on device");

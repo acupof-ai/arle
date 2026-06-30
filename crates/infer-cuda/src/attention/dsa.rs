@@ -852,7 +852,7 @@ impl Dsv4FlashMlaImage {
         // Restore lands on the target slot's pages by page-table lookup.
         let table = pool.flashmla_page_table(flash.slot_idx)?.to_vec();
         pool.flashmla_pool_mut()?
-            .copy_pages_from_host(ctx, &table, &self.fp8_kv_pool_pages)
+            .copy_pages_from_host(ctx, &table, &self.fp8_kv_pool_pages, false)
             .map_err(|e| anyhow!("DSv4 swap FlashMLA pool page H2D failed: {e}"))?;
         flash.fp8_kv_sw_bootstrapped = self.fp8_kv_sw_bootstrapped;
         flash.fp8_kv_comp_packed_rows = self.fp8_kv_comp_packed_rows;
