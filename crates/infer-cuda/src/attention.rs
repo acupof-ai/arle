@@ -5214,7 +5214,7 @@ pub(crate) fn mla_attention_prepare(
                 .expect("indexer state checked above")
                 .compressed;
             let official = state.dsa_official.as_mut();
-            Some(csa_select(
+            csa_select(
                 ctx,
                 config,
                 layer_idx,
@@ -5244,7 +5244,7 @@ pub(crate) fn mla_attention_prepare(
                 // Prefill / single-row path: no batched query pre-pass.
                 None,
                 keepalive,
-            )?)
+            )?
         } else {
             None
         }
@@ -5872,11 +5872,10 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 .compressed;
             let official = state.dsa_official.as_mut();
             // In the batched-decode lane (`batched_gather` Some) `csa_select`
-            // does cache writes + gather and returns an empty buffer → `selected`
-            // is `None` here (the batched select fills `selected_batched`). The
-            // single-row path keeps the real per-row `selected`.
-            let is_batched = batched_gather.is_some();
-            let sel = csa_select(
+            // does cache writes + gather and returns `None`; the batched select
+            // fills `selected_batched`. The single-row path keeps the real
+            // per-row `selected`.
+            csa_select(
                 ctx,
                 config,
                 layer_idx,
@@ -5907,8 +5906,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 batched_gather,
                 indexer_query_precomputed,
                 keepalive,
-            )?;
-            (!is_batched).then_some(sel)
+            )?
         } else {
             None
         }
@@ -8439,7 +8437,7 @@ fn csa_select(
     // GEMVs (single-row / prefill / non-full-flatten lanes).
     query_precomputed: Option<Dsv4IndexerQueryPrecomputed<'_>>,
     keepalive: &mut Dsv4ForwardKeepalive,
-) -> Result<CudaSlice<i32>> {
+) -> Result<Option<CudaSlice<i32>>> {
     // Batched pre-pass: this row's `q_i`/`weights` are a borrowed `[width,1]`
     // column VIEW of the batched prepass output — ZERO copy (the view's device
     // pointer is the exact column the per-row D2D copy would have produced). The
@@ -8653,11 +8651,7 @@ fn csa_select(
                 .map_err(|_| anyhow!("DSv4 batched DSA key_count {key_count} overflows i32"))?,
         );
         // No per-row selected: the batched select writes selected_batched directly.
-        // Return an empty buffer the caller maps to `selected: None`.
-        return ctx
-            .stream
-            .alloc_zeros::<i32>(0)
-            .map_err(|e| anyhow!("DSv4 batched DSA empty selected alloc failed: {e}"));
+        return Ok(None);
     }
 
     // Non-batched single-row / prefill fallback: `batched_gather` is None here,
@@ -8675,7 +8669,7 @@ fn csa_select(
         official.ok_or_else(|| anyhow!("DSv4 CSA select requires official DSA per-slot state"))?;
     let shared = dsa_shared
         .ok_or_else(|| anyhow!("DSv4 CSA select requires shared official DSA scratch"))?;
-    csa_select_official(
+    let selected = csa_select_official(
         ctx,
         config,
         q_i,
@@ -8698,7 +8692,8 @@ fn csa_select(
         /* cache_writes_only */ false,
         keepalive,
     )?
-    .ok_or_else(|| anyhow!("DSv4 CSA official select returned no selected output"))
+    .ok_or_else(|| anyhow!("DSv4 CSA official select returned no selected output"))?;
+    Ok(Some(selected))
 }
 
 #[allow(clippy::too_many_arguments)]
