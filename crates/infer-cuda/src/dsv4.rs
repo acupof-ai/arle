@@ -2583,56 +2583,39 @@ impl Dsv4Model {
                 // proj pre-pass used. Each row then reads its `[width,1]` column slice
                 // below unless full-flatten consumes the batched outputs directly.
                 // Touches NO slot state.
-                let main = match layer.attention.compressor.as_ref() {
-                    Some(compressor) => crate::attention::compressor_batch_prepass(
-                        &self.ctx,
-                        compressor,
-                        &normed,
-                        &mut keepalive,
-                    )?,
-                    None => None,
-                };
-                let indexer = if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
-                    match layer.attention.indexer.as_ref() {
-                        Some(indexer) => crate::attention::compressor_batch_prepass(
-                            &self.ctx,
-                            indexer
-                                .compressor
-                                .as_ref()
-                                .expect("DSv4 CSA indexer has a key compressor"),
-                            &normed,
-                            &mut keepalive,
+                // Batched (m=N) compressor/indexer key + query projections, routing
+                // FP8 weights through tensor-core DeepGEMM via the shared prefill
+                // scratch (same accessor as the proj pre-pass; one borrow for all).
+                let (compressor_kv_score, indexer_kv_score, indexer_query_kv_score) = {
+                    let (_lp, _dsa, _fb, _fs, mut prefill_shared) =
+                        kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
+                    let main = match layer.attention.compressor.as_ref() {
+                        Some(c) => crate::attention::compressor_batch_prepass(
+                            &self.ctx, c, &normed, prefill_shared.as_deref_mut(), &mut keepalive,
                         )?,
                         None => None,
-                    }
-                } else {
-                    None
-                };
-                let (compressor_kv_score, indexer_kv_score) = (main, indexer);
-                // ── 0b'. Batched (m=N) indexer-query / gating-weights projection
-                // pre-pass (CSA only). The per-row `csa_select` runs the indexer
-                // `wq_b` (over c_q_normed) + `weights_proj` (over normed) as m=1
-                // GEMVs that re-read the full weight per decode row — the last
-                // batchable GEMM left in the prepare loop. Batch them into ONE m=N
-                // GEMM each here; each row's `[width,1]` slice then feeds
-                // `csa_select` via `indexer_query_precomputed`, skipping the GEMVs.
-                // Touches NO slot state. SparseIndexed keeps the per-row GEMVs (no
-                // batch pre-pass) — byte-identical.
-                let indexer_query_kv_score =
-                    if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
-                        match layer.attention.indexer.as_ref() {
-                            Some(indexer) => Some(crate::attention::indexer_query_batch_prepass(
-                                &self.ctx,
-                                indexer,
-                                &proj.c_q_normed,
-                                &normed,
-                                &mut keepalive,
-                            )?),
-                            None => None,
-                        }
-                    } else {
-                        None
                     };
+                    let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
+                        (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
+                            crate::attention::compressor_batch_prepass(
+                                &self.ctx,
+                                idx.compressor.as_ref().expect("DSv4 CSA indexer has a key compressor"),
+                                &normed, prefill_shared.as_deref_mut(), &mut keepalive,
+                            )?
+                        }
+                        _ => None,
+                    };
+                    let query = match (layer.mode, layer.attention.indexer.as_ref()) {
+                        (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
+                            Some(crate::attention::indexer_query_batch_prepass(
+                                &self.ctx, idx, &proj.c_q_normed, &normed,
+                                prefill_shared.as_deref_mut(), &mut keepalive,
+                            )?)
+                        }
+                        _ => None,
+                    };
+                    (main, indexer, query)
+                };
                 // ── 0c. Full-flatten P1a: per-row compressor
                 // STATE-update DEFER (gather each row's ring-state pointers + advance
                 // compressed.seq_len, NO per-row FFI) → ONE
