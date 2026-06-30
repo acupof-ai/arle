@@ -413,6 +413,19 @@ impl CudaExecutor {
         }
     }
 
+    /// Fixed logical page-band width per slot for backends whose device cache is
+    /// not sequential in token position. DSv4 FlashMLA uses a full
+    /// `[SW ring | compressed]` band; the host pool must allocate that band once
+    /// so `KvBatchDescriptor` can carry the row's complete page table.
+    #[must_use]
+    pub fn effective_fixed_pages_per_slot(&self) -> Option<usize> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => None,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.effective_fixed_pages_per_slot(),
+        }
+    }
+
     /// OPD teacher raw-logits forward (Qwen3.5/3.6 hybrid only).
     ///
     /// Runs the full hybrid forward over `(input_ids, positions)` and returns the
@@ -658,14 +671,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn promote_slot(&mut self, key: u64, slot: usize) -> anyhow::Result<()> {
+    fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = (key, slot);
+                let _ = (key, slot, slot_pages);
                 anyhow::bail!("placeholder CUDA executor has no whole-slot KV tier store")
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.promote_slot(key, slot),
+            CudaExecutorInner::Real(real) => real.promote_slot(key, slot, slot_pages),
         }
     }
 
@@ -679,11 +692,11 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
+    fn cached_prefix_match_len(&self, tokens: &[u32]) -> anyhow::Result<usize> {
         match &self.inner {
             CudaExecutorInner::Placeholder => {
                 let _ = tokens;
-                0
+                Ok(0)
             }
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => real.cached_prefix_match_len(tokens),
@@ -706,14 +719,17 @@ impl BackendExecutor for CudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
+        slot_pages: &[u32],
     ) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = (slot, tokens, matched_len);
+                let _ = (slot, tokens, matched_len, slot_pages);
                 anyhow::bail!("placeholder CUDA executor has no position-0 prefix store")
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.restore_cached_prefix(slot, tokens, matched_len),
+            CudaExecutorInner::Real(real) => {
+                real.restore_cached_prefix(slot, tokens, matched_len, slot_pages)
+            }
         }
     }
 

@@ -7604,7 +7604,14 @@ pub(crate) fn compressor_batch_prepass(
     let mut kv_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
     let nvtx_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv_batched", || {
-        proj_batched(ctx, &compressor.wkv, compressor.wkv_deepgemm.as_ref(), scratch.as_deref_mut(), normed_batch, &mut kv_raw_batch)
+        proj_batched(
+            ctx,
+            &compressor.wkv,
+            compressor.wkv_deepgemm.as_ref(),
+            scratch.as_deref_mut(),
+            normed_batch,
+            &mut kv_raw_batch,
+        )
     })?;
     drop(nvtx_wkv);
     keepalive.keep_hidden(&kv_raw_batch);
@@ -7612,7 +7619,14 @@ pub(crate) fn compressor_batch_prepass(
     let mut score_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
     let nvtx_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate_batched", || {
-        proj_batched(ctx, &compressor.wgate, compressor.wgate_deepgemm.as_ref(), scratch.as_deref_mut(), normed_batch, &mut score_raw_batch)
+        proj_batched(
+            ctx,
+            &compressor.wgate,
+            compressor.wgate_deepgemm.as_ref(),
+            scratch.as_deref_mut(),
+            normed_batch,
+            &mut score_raw_batch,
+        )
     })?;
     drop(nvtx_wgate);
     keepalive.keep_hidden(&score_raw_batch);
@@ -7666,7 +7680,14 @@ pub(crate) fn indexer_query_batch_prepass(
     let mut q_i_batch = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, n)? };
     let nvtx_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b_batched", || {
-        proj_batched(ctx, &indexer.wq_b, indexer.wq_b_deepgemm.as_ref(), scratch.as_deref_mut(), c_q_normed_batch, &mut q_i_batch)
+        proj_batched(
+            ctx,
+            &indexer.wq_b,
+            indexer.wq_b_deepgemm.as_ref(),
+            scratch.as_deref_mut(),
+            c_q_normed_batch,
+            &mut q_i_batch,
+        )
     })?;
     drop(nvtx_wq_b);
     keepalive.keep_hidden(&q_i_batch);
@@ -7674,7 +7695,14 @@ pub(crate) fn indexer_query_batch_prepass(
     let mut weights_batch = unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, n)? };
     let nvtx_weights = crate::nvtx::range("dsv4/linear/indexer_weights_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights_batched", || {
-        proj_batched(ctx, &indexer.weights_proj, indexer.weights_proj_deepgemm.as_ref(), scratch.as_deref_mut(), normed_batch, &mut weights_batch)
+        proj_batched(
+            ctx,
+            &indexer.weights_proj,
+            indexer.weights_proj_deepgemm.as_ref(),
+            scratch.as_deref_mut(),
+            normed_batch,
+            &mut weights_batch,
+        )
     })?;
     drop(nvtx_weights);
     keepalive.keep_hidden(&weights_batch);

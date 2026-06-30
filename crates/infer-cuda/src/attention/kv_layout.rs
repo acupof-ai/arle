@@ -168,12 +168,6 @@ pub(crate) struct Dsv4KvAdapter {
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
-
-/// Encode (slot, logical_page) into a single u64 key for the per-layer tier store.
-fn tier_key_for(slot: u64, logical_page: u64) -> u64 {
-    (slot << 24) | (logical_page & 0x00FF_FFFF)
-}
-
 pub(crate) struct Dsv4LayerKvLayout {
     /// Shared FP8 MLA latent pool for this layer (#85 P2 Stage A): a
     /// `TokenKVPool` of opaque packed records (`KVFormat::PackedBytes`,
@@ -193,53 +187,17 @@ pub(crate) struct Dsv4LayerKvLayout {
     pub(super) flashmla_page_bytes: usize,
     pub(super) dsa_slot_bytes: usize,
     pub(super) num_slots: usize,
-    pub(super) flashmla_tier: Option<CudaKvTierStore>,
 }
 
 impl Dsv4LayerKvLayout {
-    pub(super) fn init_flashmla_tier(&mut self, budget_bytes: usize) {
-        self.flashmla_tier = Some(CudaKvTierStore::with_budget(
-            budget_bytes / self.flashmla_page_bytes.max(1),
-            self.flashmla_page_bytes,
-        ));
-    }
-
-    pub(super) fn set_flashmla_tier_disk(&mut self, root: &std::path::Path, budget_bytes: usize) -> bool {
-        self.flashmla_tier.as_mut()
-            .is_some_and(|t| t.set_disk(root.to_path_buf(), budget_bytes, self.flashmla_page_bytes))
-    }
-
-    pub(super) fn demote_flashmla_page(&mut self, ctx: &DeviceContext, slot: usize, logical_page: u32, tier_key: u64) -> Result<bool> {
-        let Some(tier) = self.flashmla_tier.as_mut() else { return Ok(false); };
-        let pool = self.flashmla_pool()?;
-        let payload = pool.copy_pages_to_host(ctx, &[logical_page])?;
-        Ok(tier.insert(tier_key, payload))
-    }
-
-    pub(super) fn promote_flashmla_page(&mut self, ctx: &DeviceContext, key: u64, logical_page: u32) -> Result<()> {
-        let Some(tier) = self.flashmla_tier.as_ref() else { anyhow::bail!("FlashMLA tier not initialised"); };
-        let payload = tier.read(key)?;
-        self.flashmla_pool_mut()?.copy_pages_from_host(ctx, &[logical_page], &payload)?;
-        Ok(())
-    }
-
-    pub(super) fn flashmla_tier_contains(&self, slot: usize, logical_page: u32) -> bool {
-        self.flashmla_tier.as_ref()
-            .is_some_and(|t| t.contains(tier_key_for(slot as u64, logical_page as u64)))
-    }
-
-    pub(super) fn drop_flashmla_tier_entries(&mut self, keys: &[u64]) {
-        if let Some(tier) = self.flashmla_tier.as_mut() { tier.remove(keys); }
-    }
-
-    pub(super) fn flashmla_tier_capacity_pages(&self) -> usize {
-        self.flashmla_tier.as_ref().map_or(0, |t| t.capacity_pages())
-    }
-
     pub(crate) fn flashmla_total_pages(&self) -> usize {
         self.flashmla_kv_pool
             .as_ref()
             .map_or(0, |pool| pool.max_total_pages)
+    }
+
+    pub(crate) fn flashmla_slot_pages(&self) -> usize {
+        self.flashmla_slot_pages
     }
 
     pub(crate) fn flashmla_page_size(&self) -> usize {
@@ -362,6 +320,7 @@ pub(crate) trait ModelKvAdapter {
 pub(crate) struct Dsv4KvBatchView {
     pub(crate) rows: Vec<Dsv4KvBatchRowView>,
     pub(crate) flat_page_ids: Vec<u32>,
+    pub(crate) flat_slot_page_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -374,14 +333,10 @@ pub(crate) struct Dsv4KvBatchRowView {
     #[allow(dead_code)]
     pub(crate) slot_epoch: u64,
     pub(crate) page_range: std::ops::Range<usize>,
+    pub(crate) slot_page_range: std::ops::Range<usize>,
 }
 
 impl Dsv4KvAdapter {
-
-    pub(crate) fn flashmla_layer_count(&self) -> usize {
-        self.layers.iter().filter(|l| l.flashmla_kv_pool.is_some()).count()
-    }
-
     /// Upper bound on serialized bytes of one Dsv4SlotImage for any slot.
     /// Used to size the KV tier store's page budget.
     /// Conservative upper bound for one serialized `Dsv4SlotImage`, used to
@@ -401,7 +356,9 @@ impl Dsv4KvAdapter {
             // Upper bound for per-token bf16 vectors (sw_window, compressor/indexer):
             // each token has up to ~8 bf16 state entries → 16 B/token per vector.
             // Conservative: 256 B/token to cover all layer variants.
-            let max_tokens = layer.flashmla_kv_pool.as_ref()
+            let max_tokens = layer
+                .flashmla_kv_pool
+                .as_ref()
                 .map_or(0, |p| p.max_total_pages.saturating_mul(p.page_size));
             total += max_tokens.saturating_mul(256);
         }
@@ -808,6 +765,40 @@ impl Dsv4KvAdapter {
             .first()
             .map(Dsv4LayerKvLayout::flashmla_page_size)
     }
+
+    pub(crate) fn flashmla_max_slot_pages(&self) -> Option<usize> {
+        let pages = self
+            .layers
+            .iter()
+            .map(Dsv4LayerKvLayout::flashmla_slot_pages)
+            .max()
+            .unwrap_or(0);
+        (pages > 0).then_some(pages)
+    }
+
+    pub(crate) fn mirror_slot_pages(
+        &mut self,
+        slot: usize,
+        slot_pages: &[u32],
+        seq_len: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 mirror slot {slot} outside adapter slots {}",
+            self.num_slots
+        );
+        ensure!(
+            !slot_pages.is_empty(),
+            "DSv4 mirror slot {slot} has no pages"
+        );
+        for layer in &mut self.layers {
+            let n = layer.flashmla_slot_pages().min(slot_pages.len());
+            if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
+                pool.mirror_band(slot, &slot_pages[..n], seq_len)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ModelKvAdapter for Dsv4KvAdapter {
@@ -838,11 +829,26 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 row.page_range.start < row.page_range.end,
                 "DSv4 KV batch row {idx} has empty page range"
             );
+            ensure!(
+                row.slot_page_range.end <= desc.flat_slot_page_ids.len(),
+                "DSv4 KV batch row {idx} slot page range {:?} outside flat slot page len {}",
+                row.slot_page_range,
+                desc.flat_slot_page_ids.len()
+            );
+            let slot_pages = &desc.flat_slot_page_ids[row.slot_page_range.clone()];
+            ensure!(
+                !slot_pages.is_empty(),
+                "DSv4 KV batch row {idx} has empty slot page table"
+            );
             let layer_count = self.layers.len();
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
+                let layer_pages = &slot_pages[..layer.flashmla_slot_pages().min(slot_pages.len())];
                 match row.kind {
                     KvBatchRowKind::Prefill => {
+                        if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
+                            pool.mirror_band(row.slot, layer_pages, row.append_pos)?;
+                        }
                         ensure!(
                             layer
                                 .flashmla_pool()
@@ -855,6 +861,9 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                         layer.flashmla_alloc_append(row.slot, row.append_len)?;
                     }
                     KvBatchRowKind::Decode => {
+                        if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
+                            pool.mirror_band(row.slot, layer_pages, row.append_pos)?;
+                        }
                         ensure!(
                             layer
                                 .flashmla_pool()
@@ -877,12 +886,14 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 append_len: row.append_len,
                 slot_epoch: row.slot_epoch,
                 page_range: row.page_range.clone(),
+                slot_page_range: row.slot_page_range.clone(),
             });
         }
 
         Ok(Dsv4KvBatchView {
             rows,
             flat_page_ids: desc.flat_page_ids.clone(),
+            flat_slot_page_ids: desc.flat_slot_page_ids.clone(),
         })
     }
 }
@@ -1004,7 +1015,6 @@ impl Dsv4LayerKvLayout {
             dsa_key_cache,
             flashmla_slot_pages,
             flashmla_page_bytes,
-            flashmla_tier: None,
             dsa_slot_bytes,
             num_slots,
         })
@@ -1209,4 +1219,3 @@ impl Dsv4LayerKvLayout {
 }
 use crate::attention::DeviceContext;
 use anyhow::Result;
-

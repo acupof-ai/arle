@@ -306,11 +306,7 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_capacity_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_capacity_pages(),
-            Self::Dsv4(d) => d.kv_adapter.layers.iter()
-                .filter_map(|l| l.flashmla_tier.as_ref())
-                .map(|t| t.capacity_pages())
-                .min()
-                .unwrap_or(0),
+            Self::Dsv4(_) => 0,
             Self::Qwen35(_) => 0,
         }
     }
@@ -342,9 +338,7 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
             Self::Qwen(q) => q.kv_tier_location(key),
-            Self::Dsv4(d) => d.kv_adapter.layers.iter().find_map(|l| {
-                l.flashmla_tier.as_ref().and_then(|t| t.contains(key).then(|| t.location(key)).flatten())
-            }),
+            Self::Dsv4(_) => None,
             Self::Qwen35(_) => None,
         }
     }
@@ -353,14 +347,14 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
             Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
-            Self::Dsv4(d) => d.reusable_flashmla_prefix_blocks(blocks),
+            Self::Dsv4(_) => 0,
         }
     }
 
     pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
         match self {
             Self::Qwen(q) => q.demote_prefix_pages(entries),
-            Self::Dsv4(d) => d.demote_flashmla_pages(entries),
+            Self::Dsv4(_) => Ok(0),
             Self::Qwen35(_) => Ok(0),
         }
     }
@@ -368,7 +362,7 @@ impl RealCudaExecutor {
     pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
         match self {
             Self::Qwen(q) => q.promote_prefix_pages(entries),
-            Self::Dsv4(d) => d.promote_flashmla_pages(entries),
+            Self::Dsv4(_) => Ok(()),
             Self::Qwen35(_) => {
                 anyhow::bail!(
                     "page-granular KV tier store is implemented only for dense Qwen3 CUDA"
@@ -380,9 +374,6 @@ impl RealCudaExecutor {
     pub(crate) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
         if let Self::Qwen(q) = self {
             q.drop_kv_tier_entries(keys);
-        }
-        if let Self::Dsv4(d) = self {
-            d.drop_flashmla_tier_entries(keys);
         }
     }
 
@@ -405,10 +396,13 @@ impl RealCudaExecutor {
         }
     }
 
-    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
+    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         match self {
-            Self::Dsv4(d) => d.promote_slot(key, slot),
-            Self::Qwen35(q) => q.promote_slot(key, slot),
+            Self::Dsv4(d) => d.promote_slot(key, slot, slot_pages),
+            Self::Qwen35(q) => {
+                let _ = slot_pages;
+                q.promote_slot(key, slot)
+            }
             Self::Qwen(_) => {
                 anyhow::bail!("whole-slot KV tier store is not implemented for dense Qwen3 CUDA")
             }
@@ -425,10 +419,10 @@ impl RealCudaExecutor {
 
     /// Cross-request position-0 prefix reuse. Only the DSv4 arm holds a store;
     /// page-radix-reusing arms (dense Qwen) report no match here.
-    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
+    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
         match self {
             Self::Dsv4(d) => d.cached_prefix_match_len(tokens),
-            Self::Qwen(_) | Self::Qwen35(_) => 0,
+            Self::Qwen(_) | Self::Qwen35(_) => Ok(0),
         }
     }
 
@@ -445,9 +439,10 @@ impl RealCudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
+        slot_pages: &[u32],
     ) -> Result<()> {
         match self {
-            Self::Dsv4(d) => d.restore_cached_prefix(slot, tokens, matched_len),
+            Self::Dsv4(d) => d.restore_cached_prefix(slot, tokens, matched_len, slot_pages),
             Self::Qwen(_) | Self::Qwen35(_) => {
                 anyhow::bail!("position-0 prefix store is implemented only for DSv4 CUDA")
             }
@@ -477,7 +472,7 @@ impl RealCudaExecutor {
             Self::Qwen(q) => q.set_kv_tier_budget_bytes(bytes),
             // L2: the Qwen3.6 arm's G3 slot_tier also honors the explicit cap.
             Self::Qwen35(q) => q.set_kv_tier_budget_bytes(bytes),
-            Self::Dsv4(d) => d.set_kv_tier_budget_bytes(bytes)
+            Self::Dsv4(d) => d.set_kv_tier_budget_bytes(bytes),
         }
     }
 
@@ -490,7 +485,7 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.set_dram_fraction(fraction),
             Self::Qwen35(q) => q.set_dram_fraction(fraction),
-            Self::Dsv4(d) => d.set_dram_fraction(fraction)
+            Self::Dsv4(d) => d.set_dram_fraction(fraction),
         }
     }
 
@@ -575,6 +570,13 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(_) | Self::Qwen35(_) => None,
             Self::Dsv4(d) => d.kv_adapter.flashmla_page_size(),
+        }
+    }
+
+    pub(crate) fn effective_fixed_pages_per_slot(&self) -> Option<usize> {
+        match self {
+            Self::Qwen(_) | Self::Qwen35(_) => None,
+            Self::Dsv4(d) => d.kv_adapter.flashmla_max_slot_pages(),
         }
     }
 
@@ -1910,6 +1912,26 @@ impl<P> PrefixImageStore<P> {
         best
     }
 
+    fn cover_len(&self, tokens: &[u32], len: usize) -> usize {
+        if len == 0 || len > tokens.len() {
+            return 0;
+        }
+        let mut best = 0usize;
+        for entries in self.by_hash.values() {
+            for entry in entries {
+                let entry_len = entry.tokens.len();
+                if entry_len >= len
+                    && entry_len > best
+                    && entry_len <= tokens.len()
+                    && tokens[..entry_len] == entry.tokens[..]
+                {
+                    best = entry_len;
+                }
+            }
+        }
+        best
+    }
+
     fn touch(&mut self, hash: u64) {
         if let Some(pos) = self.order.iter().position(|&h| h == hash) {
             self.order.remove(pos);
@@ -1938,6 +1960,11 @@ impl<P> PrefixImageStore<P> {
         }
         self.used_bytes = self.used_bytes.saturating_sub(entry.host_bytes);
         Some(entry)
+    }
+
+    fn take_covering(&mut self, tokens: &[u32], len: usize) -> Option<PrefixStoreEntry<P>> {
+        let cover_len = self.cover_len(tokens, len);
+        self.take(tokens, cover_len)
     }
 
     /// Re-insert an entry pulled out by [`Self::take`], marking it hottest.
@@ -2236,6 +2263,17 @@ fn validate_dsv4_decode_kv_view(
             !pages.is_empty(),
             "DSv4 decode KV adapter row {idx} has no page ids"
         );
+        ensure!(
+            view_row.slot_page_range.end <= view.flat_slot_page_ids.len(),
+            "DSv4 decode KV adapter row {idx} slot page range {:?} outside flat slot page len {}",
+            view_row.slot_page_range,
+            view.flat_slot_page_ids.len()
+        );
+        let slot_pages = &view.flat_slot_page_ids[view_row.slot_page_range.clone()];
+        ensure!(
+            !slot_pages.is_empty(),
+            "DSv4 decode KV adapter row {idx} has no slot page ids"
+        );
     }
     Ok(())
 }
@@ -2280,6 +2318,17 @@ fn validate_dsv4_prefill_kv_view(
         !pages.is_empty(),
         "DSv4 prefill KV adapter row has no page ids"
     );
+    ensure!(
+        view_row.slot_page_range.end <= view.flat_slot_page_ids.len(),
+        "DSv4 prefill KV adapter row slot page range {:?} outside flat slot page len {}",
+        view_row.slot_page_range,
+        view.flat_slot_page_ids.len()
+    );
+    let slot_pages = &view.flat_slot_page_ids[view_row.slot_page_range.clone()];
+    ensure!(
+        !slot_pages.is_empty(),
+        "DSv4 prefill KV adapter row has no slot page ids"
+    );
     Ok(())
 }
 
@@ -2293,6 +2342,28 @@ impl std::fmt::Debug for Dsv4CudaExecutor {
 }
 
 impl Dsv4CudaExecutor {
+    fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
+        let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
+        self.model
+            .tp
+            .all_reduce_min_scalar_i32(&self.model.ctx, capped)
+            .map(|v| v.max(0) as usize)
+            .map_err(|e| anyhow::anyhow!("DSv4 TP min-reduce {what} failed: {e}"))
+    }
+
+    fn mirror_restore_pages(
+        &mut self,
+        slot: usize,
+        slot_pages: &[u32],
+        seq_len: usize,
+    ) -> Result<()> {
+        ensure!(
+            !slot_pages.is_empty(),
+            "DSv4 restore slot {slot} has empty host slot page table"
+        );
+        self.kv_adapter.mirror_slot_pages(slot, slot_pages, seq_len)
+    }
+
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
@@ -2432,60 +2503,21 @@ impl Dsv4CudaExecutor {
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.slot_tier.set_disk(root.clone(), budget_bytes, self.slot_image_bytes);
-        let n = self.kv_adapter.flashmla_layer_count();
-        if n == 0 { return true; }
-        let per_layer = budget_bytes / n.max(1) as usize;
-        let mut ok = true;
-        for idx in 0..n {
-            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                if !layer.set_flashmla_tier_disk(&root, per_layer) { ok = false; }
-            }
-        }
-        ok
+        self.slot_tier
+            .set_disk(root, budget_bytes, self.slot_image_bytes)
     }
 
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
-        let per_layer = if self.kv_adapter.flashmla_layer_count() > 0 {
-            bytes / self.kv_adapter.flashmla_layer_count() as usize
-        } else { return; };
-        for idx in 0..self.kv_adapter.flashmla_layer_count() {
-            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                layer.init_flashmla_tier(per_layer);
-            }
-        }
     }
 
     pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
-        let budget = default_t1_budget_bytes(fraction);
-        self.slot_tier = CudaKvTierStore::with_budget(budget, self.slot_image_bytes);
-        let n = self.kv_adapter.flashmla_layer_count();
-        if n == 0 { return; }
-        let per_layer = (budget / n as usize).max(1);
-        for idx in 0..n {
-            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                layer.init_flashmla_tier(per_layer);
-            }
-        }
+        self.slot_tier =
+            CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), self.slot_image_bytes);
     }
 
-    /// Whole-slot swap is single-rank today.
+    /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        let world_size = self.model.tp.config().world_size;
-        if world_size > 1 {
-            // Multi-rank demote/promote must execute on EVERY rank in lockstep
-            // (the seam hooks fire on the coordinator only), or the
-            // deterministic planner diverges and NCCL deadlocks.
-            static MULTI_RANK_LOGGED: std::sync::Once = std::sync::Once::new();
-            MULTI_RANK_LOGGED.call_once(|| {
-                info!(
-                    "DSv4 whole-slot KV tier disabled at world_size={world_size}: \
-                     multi-rank lockstep swap is not implemented"
-                );
-            });
-            return false;
-        }
         true
     }
 
@@ -2500,13 +2532,21 @@ impl Dsv4CudaExecutor {
             "DSv4 demote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        if self.slot_tier.is_full() {
+        let local_room = usize::from(!self.slot_tier.is_full());
+        if self.tp_min_usize(local_room, "slot demote room")? == 0 {
             return Ok(false);
         }
-        let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
-        let mut bytes = image.to_bytes();
-        // Pad to fixed page size so CudaKvTierStore's L2/L3 layers work.
-        if bytes.len() > self.slot_image_bytes {
+        let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter);
+        let capture_ok = usize::from(image.is_ok());
+        if self.tp_min_usize(capture_ok, "slot demote capture")? == 0 {
+            return Err(image
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot demote capture")));
+        }
+        let image = image?;
+        let bytes = image.to_bytes();
+        let fit = usize::from(bytes.len() <= self.slot_image_bytes);
+        if self.tp_min_usize(fit, "slot demote image fit")? == 0 {
             log::warn!(
                 "DSv4 slot image {} bytes exceeds tier page budget {}; falling back to recompute",
                 bytes.len(),
@@ -2514,10 +2554,17 @@ impl Dsv4CudaExecutor {
             );
             return Ok(false);
         }
+        let mut bytes = bytes;
+        // Pad to fixed page size so CudaKvTierStore's L2/L3 layers work.
         if bytes.len() < self.slot_image_bytes {
             bytes.resize(self.slot_image_bytes, 0);
         }
-        Ok(self.slot_tier.insert(key, bytes))
+        let inserted = usize::from(self.slot_tier.insert(key, bytes));
+        let inserted_all = self.tp_min_usize(inserted, "slot demote insert")? != 0;
+        if !inserted_all && inserted != 0 {
+            self.slot_tier.remove(&[key]);
+        }
+        Ok(inserted_all)
     }
 
     /// Restore the whole-slot image stored under `key` into `slot`. The engine
@@ -2527,102 +2574,51 @@ impl Dsv4CudaExecutor {
     /// `ctx.sync()`, so both the device restore and the spec-hidden H2D (same
     /// stream, ordered before it) are complete before the host image can be
     /// dropped.
-    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
+    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         ensure!(
             slot < self.num_slots,
             "DSv4 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        let bytes = self.slot_tier.read(key)?;
+        let bytes = self.slot_tier.read(key).map(|b| b.into_owned());
+        let read_ok = usize::from(bytes.is_ok());
+        if self.tp_min_usize(read_ok, "slot promote read")? == 0 {
+            return Err(bytes
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote read")));
+        }
+        let bytes = bytes?;
         let image = crate::dsv4::Dsv4SlotImage::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"))?;
+            .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"));
+        let parse_ok = usize::from(image.is_ok());
+        if self.tp_min_usize(parse_ok, "slot promote parse")? == 0 {
+            return Err(image
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote parse")));
+        }
+        let image = image?;
+        self.mirror_restore_pages(slot, slot_pages, image.seq_len())?;
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
-        self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &image)
+        let restored =
+            self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &image);
+        let restore_ok = usize::from(restored.is_ok());
+        if self.tp_min_usize(restore_ok, "slot promote restore")? == 0 {
+            return Err(restored
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote restore")));
+        }
+        restored
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
         self.slot_tier.remove(keys);
     }
 
-    // ---- FlashMLA page-tier hooks ----
-
-    pub(crate) fn demote_flashmla_pages(
-        &mut self,
-        entries: &[(u32, u64)],
-    ) -> Result<usize> {
-        let n = self.kv_adapter.flashmla_layer_count();
-        if n == 0 { return Ok(0); }
-        let mut accepted = 0;
-        for &(logical_page, tier_key) in entries {
-            let slot = (tier_key >> 24) as usize;
-            let mut all_ok = true;
-            for idx in 0..n {
-                if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                    match layer.demote_flashmla_page(&self.model.ctx, slot, logical_page, tier_key) {
-                        Ok(true) => {},
-                        _ => { all_ok = false; break; }
-                    }
-                } else { all_ok = false; break; }
-            }
-            if all_ok { accepted += 1; } else { break; }
-        }
-        Ok(accepted)
-    }
-
-    pub(crate) fn promote_flashmla_pages(
-        &mut self,
-        entries: &[(u64, u32)],
-    ) -> Result<()> {
-        let n = self.kv_adapter.flashmla_layer_count();
-        if n == 0 { return Ok(()); }
-        for &(tier_key, logical_page) in entries {
-            for idx in 0..n {
-                if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                    layer.promote_flashmla_page(&self.model.ctx, tier_key, logical_page)?;
-                }
-            }
-        }
-        self.model.ctx.sync()?;
-        Ok(())
-    }
-
-    pub(crate) fn drop_flashmla_tier_entries(&mut self, keys: &[u64]) {
-        let n = self.kv_adapter.flashmla_layer_count();
-        for idx in 0..n {
-            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                layer.drop_flashmla_tier_entries(keys);
-            }
-        }
-    }
-
-    pub(crate) fn reusable_flashmla_prefix_blocks(
-        &self,
-        blocks: &[infer_seam::PrefixBlock],
-    ) -> usize {
-        let flash_pages = self.kv_adapter.flashmla_layer_count();
-        if flash_pages == 0 { return 0; }
-        let mut reusable = 0;
-        for block in blocks {
-            match *block {
-                infer_seam::PrefixBlock::ResidentPage(_) => reusable += 1,
-                infer_seam::PrefixBlock::DemotedKey(key) => {
-                    let slot = (key >> 24) as usize;
-                    let logical_page = (key & 0x00FF_FFFF) as u32;
-                    let all_have = (0..flash_pages).all(|idx| {
-                        self.kv_adapter.layer(idx)
-                            .is_ok_and(|l| l.flashmla_tier_contains(slot, logical_page))
-                    });
-                    if all_have { reusable += 1 } else { break; }
-                }
-            }
-        }
-        reusable
-    }
-
     /// Length of the longest stored position-0 prompt that is an exact leading
     /// prefix of `tokens`. `0` when the store is disabled or has no match.
-    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
-        self.prefix_cache.match_len(tokens)
+    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
+        let local = self.prefix_cache.match_len(tokens);
+        self.tp_min_usize(local, "prefix match len")
     }
 
     /// Capture `slot`'s whole-slot KV image into the position-0 prefix store,
@@ -2680,6 +2676,7 @@ impl Dsv4CudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
+        slot_pages: &[u32],
     ) -> Result<()> {
         ensure!(
             slot < self.num_slots,
@@ -2694,23 +2691,47 @@ impl Dsv4CudaExecutor {
         // Take the image out of the store so the restore can mutably borrow
         // `self.slots`/`self.kv_adapter` without aliasing `self.prefix_cache`;
         // re-insert it after to keep the prefix hot for the next request.
-        let entry = self.prefix_cache.take(tokens, matched_len).ok_or_else(|| {
-            anyhow::anyhow!(
-                "DSv4 position-0 prefix store has no image for prompt prefix len {matched_len}"
-            )
-        })?;
+        let mut entry = self.prefix_cache.take_covering(tokens, matched_len);
+        let entry_ok = usize::from(entry.is_some());
+        if self.tp_min_usize(entry_ok, "prefix restore take")? == 0 {
+            if let Some(entry) = entry.take() {
+                self.prefix_cache.reinsert(entry);
+            }
+            return Err(anyhow::anyhow!(
+                "DSv4 position-0 prefix store has no image covering prompt prefix len {matched_len}"
+            ));
+        }
+        let entry = entry.expect("TP consensus says local prefix entry exists");
+        let image_len = entry.image.seq_len();
         ensure!(
-            entry.image.seq_len() == matched_len,
-            "DSv4 cached prefix image seq_len {} != requested matched_len {matched_len}",
-            entry.image.seq_len()
+            image_len >= matched_len,
+            "DSv4 cached prefix image len {image_len} < requested matched_len {matched_len}"
         );
+        self.mirror_restore_pages(slot, slot_pages, image_len)?;
         // Reset the slot's spec (MTP) draft state: the tail prefill re-seeds it.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
-        let result =
-            self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &entry.image);
+        let result = self.slots[slot]
+            .swap_in_image(&self.model.ctx, &mut self.kv_adapter, &entry.image)
+            .and_then(|()| {
+                if image_len > matched_len {
+                    self.slots[slot].truncate(
+                        &self.model.layers,
+                        &mut self.kv_adapter,
+                        matched_len,
+                    )?;
+                }
+                Ok(())
+            });
+        let restore_ok = usize::from(result.is_ok());
+        let restore_all = self.tp_min_usize(restore_ok, "prefix restore image")? != 0;
         // Keep the entry hot regardless of restore outcome (the image is intact;
         // a failure is a slot/device error, not a corrupt image).
         self.prefix_cache.reinsert(entry);
+        if !restore_all {
+            return Err(result
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 prefix restore")));
+        }
         result
     }
 
@@ -4062,14 +4083,6 @@ impl Qwen35CudaExecutor {
     /// existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
-        let per_layer = if self.kv_adapter.flashmla_layer_count() > 0 {
-            bytes / self.kv_adapter.flashmla_layer_count() as usize
-        } else { return; };
-        for idx in 0..self.kv_adapter.flashmla_layer_count() {
-            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
-                layer.init_flashmla_tier(per_layer);
-            }
-        }
     }
 
     /// Attach durable NVMe spill for the recall tier (`--kv-ssd-path`).
@@ -5444,6 +5457,20 @@ mod tests {
         s.reinsert(entry);
         assert_eq!(s.match_len(&[5, 6, 7]), 3, "reinsert restores the entry");
         assert_eq!(s.used_bytes, 100, "reinsert re-credits the bytes");
+    }
+
+    #[test]
+    fn take_covering_allows_shorter_tp_consensus_restore() {
+        let mut s = store(1 << 20);
+        s.insert(vec![1, 2, 3, 4], 99, 100);
+        assert_eq!(s.cover_len(&[1, 2, 3, 4, 5], 2), 4);
+        let entry = s
+            .take_covering(&[1, 2, 3, 4, 5], 2)
+            .expect("longer image covers shorter prefix consensus");
+        assert_eq!(entry.tokens, vec![1, 2, 3, 4]);
+        assert_eq!(entry.image, 99);
+        s.reinsert(entry);
+        assert_eq!(s.match_len(&[1, 2, 3, 4, 5]), 4);
     }
 
     #[test]

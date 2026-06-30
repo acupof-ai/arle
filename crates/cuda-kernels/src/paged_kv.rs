@@ -889,6 +889,28 @@ impl TokenKVPool {
         Ok(())
     }
 
+    /// Mirror a fixed logical page band for a slot while setting an independent
+    /// logical token cursor. Used by DSv4 FlashMLA: the slot page table is
+    /// `[SW ring | compressed region]`, not `ceil(seq_len / page_size)`.
+    pub fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "TokenKVPool::mirror_band slot {slot} out of range {}",
+            self.num_slots
+        );
+        for &page in pages {
+            ensure!(
+                page == EVICTED_PAGE || (page as usize) < self.max_total_pages,
+                "TokenKVPool::mirror_band page {page} out of range {}",
+                self.max_total_pages
+            );
+        }
+        self.page_indices[slot].clear();
+        self.page_indices[slot].extend_from_slice(pages);
+        self.seq_lens[slot] = seq_len;
+        Ok(())
+    }
+
     /// Attach already-live pages to an empty slot.
     ///
     /// Monolith-era allocator-mode prefix attach (the deleted scheduler drove
@@ -1064,7 +1086,11 @@ impl TokenKVPool {
         {
             // See copy_pages_to_host: validate ids before any byte math.
             self.validate_page_ids(pages, "copy_pages_from_host")?;
-            let stream = if on_copy_stream { &ctx.copy_stream } else { &ctx.stream };
+            let stream = if on_copy_stream {
+                &ctx.copy_stream
+            } else {
+                &ctx.stream
+            };
             let token_bytes = self.data_plane_bytes_per_page();
             let single_plane = self.is_single_plane();
             let scale_len = self.page_size * self.num_kv_heads;

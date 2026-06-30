@@ -12,14 +12,12 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-
 /// Atomic replacement for cache payloads that are safe to rebuild after a
 /// crash. Keeps the temp-write + rename property, but skips data and directory
 /// fsyncs to avoid turning cache spill into a durability workload.
 pub fn write_file_atomic_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_file_atomic_impl(path, bytes, false)
 }
-
 
 fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
@@ -69,7 +67,6 @@ fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Resul
     result
 }
 
-
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -81,7 +78,6 @@ pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     // `std::fs::read` already handles both correctly.
     std::fs::read(path)
 }
-
 
 pub fn read_file_into(path: &Path, dst: &mut Vec<u8>) -> io::Result<()> {
     if path.as_os_str().is_empty() {
@@ -104,7 +100,6 @@ pub fn read_file_into(path: &Path, dst: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-
 pub fn remove_file(path: &Path, ignore_not_found: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -119,7 +114,6 @@ pub fn remove_file(path: &Path, ignore_not_found: bool) -> io::Result<()> {
     }
 }
 
-
 pub fn block_path_sharded(root: &Path, fingerprint: [u8; 16]) -> io::Result<PathBuf> {
     let filename = block_filename(fingerprint);
     Ok(root
@@ -127,7 +121,6 @@ pub fn block_path_sharded(root: &Path, fingerprint: [u8; 16]) -> io::Result<Path
         .join(&filename[2..4])
         .join(filename))
 }
-
 
 fn block_filename(fingerprint: [u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -143,7 +136,6 @@ fn block_filename(fingerprint: [u8; 16]) -> String {
         .collect()
 }
 
-
 pub fn write_block_cache_sharded(
     root: &Path,
     fingerprint: [u8; 16],
@@ -156,7 +148,6 @@ pub fn write_block_cache_sharded(
     write_file_atomic_cache(&path, bytes)
 }
 
-
 pub fn read_block_into_sharded(
     root: &Path,
     fingerprint: [u8; 16],
@@ -166,7 +157,6 @@ pub fn read_block_into_sharded(
     read_file_into(&path, dst)
 }
 
-
 pub fn remove_block_sharded(
     root: &Path,
     fingerprint: [u8; 16],
@@ -175,7 +165,6 @@ pub fn remove_block_sharded(
     let path = block_path_sharded(root, fingerprint)?;
     remove_file(&path, ignore_not_found)
 }
-
 
 /// File-backed mmap page-slot store — one file per disk tier namespace, a
 /// fixed-size slot per page. Writes memcpy into the mapping (no per-page
@@ -333,8 +322,6 @@ impl KvMmapStore {
         self.mapping.flush()
     }
 }
-
-
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)

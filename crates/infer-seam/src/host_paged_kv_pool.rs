@@ -41,6 +41,7 @@ pub struct HostPagedKvPool {
     slot_epoch: Vec<u64>,
     /// Ref counts for pages retained by an external owner such as prefix cache.
     page_refs: HashMap<u32, u32>,
+    fixed_pages_per_slot: Option<usize>,
 }
 
 impl HostPagedKvPool {
@@ -57,7 +58,14 @@ impl HostPagedKvPool {
             slot_len: vec![0; num_slots],
             slot_epoch: vec![0; num_slots],
             page_refs: HashMap::new(),
+            fixed_pages_per_slot: None,
         }
+    }
+
+    /// Configure fixed-band allocation for slots whose backend needs a full page
+    /// table independent of the current logical token cursor (DSv4 FlashMLA).
+    pub fn set_fixed_pages_per_slot(&mut self, pages: usize) {
+        self.fixed_pages_per_slot = (pages > 0).then_some(pages);
     }
 
     fn pages_for_tokens(&self, tokens: usize) -> usize {
@@ -75,6 +83,26 @@ impl HostPagedKvPool {
         if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
             self.free.push(page);
         }
+    }
+
+    fn alloc_fixed_band(&mut self, slot: usize, pages: usize, tokens: usize) -> anyhow::Result<()> {
+        if slot >= self.slot_pages.len() {
+            bail!("HostPagedKvPool fixed alloc: slot {slot} out of range");
+        }
+        if self.slot_pages[slot].is_empty() {
+            if pages > self.free.len() {
+                bail!(
+                    "HostPagedKvPool out of fixed-band pages: slot {slot} needs {pages}, free {}",
+                    self.free.len()
+                );
+            }
+            for _ in 0..pages {
+                let page = self.free.pop().expect("checked free >= fixed pages");
+                self.slot_pages[slot].push(page);
+            }
+        }
+        self.slot_len[slot] = self.slot_len[slot].saturating_add(tokens);
+        Ok(())
     }
 }
 
@@ -112,6 +140,13 @@ impl KvQuery for HostPagedKvPool {
     }
 
     fn append_pages_needed(&self, slot: usize, tokens: usize) -> usize {
+        if let Some(pages) = self.fixed_pages_per_slot {
+            return if self.slot_pages.get(slot).is_some_and(Vec::is_empty) {
+                pages
+            } else {
+                0
+            };
+        }
         let have = self.slot_pages.get(slot).map_or(0, Vec::len);
         let after = self.pages_for_tokens(self.seq_len(slot) + tokens);
         after.saturating_sub(have)
@@ -136,6 +171,9 @@ impl KvQuery for HostPagedKvPool {
 
 impl KvAllocator for HostPagedKvPool {
     fn alloc(&mut self, slot: usize, tokens: usize) -> anyhow::Result<()> {
+        if let Some(pages) = self.fixed_pages_per_slot {
+            return self.alloc_fixed_band(slot, pages, tokens);
+        }
         if slot >= self.slot_pages.len() {
             bail!("HostPagedKvPool alloc: slot {slot} out of range");
         }
@@ -205,6 +243,13 @@ impl KvAllocator for HostPagedKvPool {
     }
 
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
+        if self.fixed_pages_per_slot.is_some() {
+            if slot >= self.slot_pages.len() {
+                bail!("truncate_slot: slot {slot} out of range");
+            }
+            self.slot_len[slot] = new_len;
+            return Ok(());
+        }
         let keep_pages = self.pages_for_tokens(new_len);
         let pages = self
             .slot_pages
@@ -257,6 +302,9 @@ impl KvPrefixStore for HostPagedKvPool {
             .slot_pages
             .get_mut(slot)
             .ok_or_else(|| anyhow::anyhow!("attach_pages: slot {slot} out of range"))?;
+        if self.fixed_pages_per_slot.is_some() {
+            dst.clear();
+        }
         dst.extend_from_slice(pages);
         self.slot_len[slot] = self.slot_len[slot].max(token_count);
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
@@ -325,6 +373,23 @@ mod tests {
         assert_eq!(pool.page_indices(0).len(), 1);
         assert_eq!(pool.seq_len(0), 16);
         assert_eq!(pool.free_pages(), 7);
+    }
+
+    #[test]
+    fn fixed_band_truncate_keeps_slot_table() {
+        let mut pool = HostPagedKvPool::new(1, 8, 16);
+        pool.set_fixed_pages_per_slot(4);
+        pool.alloc(0, 48).unwrap();
+        let pages = pool.page_indices(0).to_vec();
+        assert_eq!(pages.len(), 4);
+        let free_after_alloc = pool.free_pages();
+        pool.truncate_slot(0, 16).unwrap();
+        assert_eq!(pool.seq_len(0), 16);
+        assert_eq!(pool.page_indices(0), pages.as_slice());
+        assert_eq!(pool.free_pages(), free_after_alloc);
+        pool.alloc(0, 1).unwrap();
+        assert_eq!(pool.seq_len(0), 17);
+        assert_eq!(pool.page_indices(0), pages.as_slice());
     }
 
     #[test]

@@ -4099,7 +4099,9 @@ impl SafetensorLoader {
         if crate::attention::dsv4_fused_wqkv_decode_alloc_enabled()?
             && weight.weight_format == WeightFormat::Dsv4Fp8BlockScaled
         {
-            Ok(Some(cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, weight)?))
+            Ok(Some(
+                cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache::from_dsv4_weight(ctx, weight)?,
+            ))
         } else {
             Ok(None)
         }

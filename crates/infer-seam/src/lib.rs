@@ -269,7 +269,7 @@ pub trait BackendExecutor {
     /// exact demoted materialized position right after, so every byte of
     /// required backend state MUST be restored before returning. Only called
     /// when [`BackendExecutor::kv_slot_tier_enabled`] is `true`.
-    fn promote_slot(&mut self, _key: u64, _slot: usize) -> anyhow::Result<()> {
+    fn promote_slot(&mut self, _key: u64, _slot: usize, _slot_pages: &[u32]) -> anyhow::Result<()> {
         anyhow::bail!("backend has no whole-slot KV tier store")
     }
 
@@ -288,8 +288,8 @@ pub trait BackendExecutor {
     /// a new request that also starts at position 0. The default `0` means the
     /// backend has no such store and the engine never calls the capture/restore
     /// hooks — the page-radix reuse path stays byte-for-byte unchanged.
-    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> usize {
-        0
+    fn cached_prefix_match_len(&self, _tokens: &[u32]) -> anyhow::Result<usize> {
+        Ok(0)
     }
 
     /// Capture `slot`'s complete restore image into the backend's
@@ -317,6 +317,7 @@ pub trait BackendExecutor {
         _slot: usize,
         _tokens: &[u32],
         _matched_len: usize,
+        _slot_pages: &[u32],
     ) -> anyhow::Result<()> {
         anyhow::bail!("backend has no position-0 prefix store")
     }

@@ -177,6 +177,34 @@ fold (MODEL1) / `copy_row_to_vec` (GLM) → final `rms_norm_vec` →
 | Grouped GEMM layout | allreduce=contiguous, deepep=masked (both vendored DeepGEMM) | pooled masked / small-R hand GEMV |
 | Comm overlap | — | shared-expert ∥ routed all-reduce |
 
+### 2.6 Page-attn / page-tier identity (2026-06-30)
+
+DSv4 now connects to the same host page identity flow as other CUDA models, but
+with DSv4's fixed-band semantics:
+
+- `infer-seam::HostPagedKvPool::set_fixed_pages_per_slot(pages)` makes host
+  allocation draw the whole logical FlashMLA band once per slot. `truncate_slot`
+  only moves the logical cursor in this mode; it never frees tail band pages.
+- `KvBatchDescriptor` carries both `flat_page_ids` (live token prefix) and
+  `flat_slot_page_ids` (complete slot page table). Sequential models keep using
+  `page_range`; DSv4 lowers `slot_page_range`.
+- `Dsv4KvAdapter::prepare_kv_batch` mirrors `flat_slot_page_ids` into every
+  layer's `TokenKVPool` via `mirror_band`, then advances the FlashMLA cursor.
+  FlashMLA prefill/decode pack and read paths therefore resolve through the
+  engine/radix/tier page identity rather than `slot * fixed_band` arithmetic.
+- Whole-slot restore and position-0 prefix restore receive the host slot page
+  table from `infer-core` and mirror it before copying `Dsv4SlotImage` payloads
+  back to device memory.
+- TP support is rank-local bytes + TP scalar consensus: each rank stores its own
+  shard image under the same engine key; hit length, demote room, image-fit, insert,
+  read/parse/restore success are all reduced with `TpRuntime::all_reduce_min_scalar_i32`.
+  Any rank miss/failure makes every rank take the same recompute/error branch.
+
+The page-granular radix tier remains dense-Qwen-only until the DSA sidecar is
+itself page-addressable at arbitrary radix boundaries. DSv4's safe reuse route is
+position-0 whole-slot images plus fixed-band page-table restore; whole-slot
+capacity spill uses the same rank-local image protocol.
+
 ---
 
 ## 3. FlashMLA decode core — split-KV + combine (vendored FlashMLA)
@@ -258,12 +286,13 @@ config-driven (GLM-DSA 32/128/2048, a DSv4 fixture 64/128/512).
   thread radix-2 butterflies + 5-step `shfl_xor` warp Walsh–Hadamard + `rsqrt(128)`.
 - **FP8 store** (`fused_store_indexer_cache_kernel`, `.cu:334`): page=8448B/64slot,
   per-slot `[128B fp8 key][4B f32 scale]=132B`; `page=index>>6, offset=index&63`.
-- **Separate allocation — NOT in the FlashMLA budget**:
+- **Fixed-band sidecar — NOT in the FlashMLA page pool**:
   `Dsv4LayerKvLayout.dsa_key_cache` (`attention.rs:262`, FP8, full history, what
   the scoring kernel reads), summed as `state_caches_per_slot` in
   `kv_budget_num_slots` (`dsv4.rs:1645`). The FP8 cache still grows linearly with
-  `max_seq` and is not pooled like the FlashMLA latent — a 1M-context OOM
-  contributor. The bf16 `rotated_keys` is **no longer** a full-history mirror: as
+  `max_seq` and is restored as part of `Dsv4SlotImage`; it is not yet a
+  page-granular radix-tier object. The bf16 `rotated_keys` is **no longer** a
+  full-history mirror: as
   of 2026-06-29 it is a transient drain-immediate staging ring
   (`dsv4_dsa_rotated_ring_rows`, capped at `DSV4_INDEXER_STAGING_RING_ROWS`),
   removing its O(max_seq) per-slot term (−254 MiB/slot/layer at 1M) — see

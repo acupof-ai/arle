@@ -219,7 +219,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let seq_len = std::mem::take(&mut request.swap_seq_len);
         let restored = self
             .alloc_with_prefix_reclaim(slot, seq_len)
-            .and_then(|()| self.executor.promote_slot(key, slot));
+            .and_then(|()| {
+                let slot_pages = self.kv.page_indices(slot).to_vec();
+                self.executor.promote_slot(key, slot, &slot_pages)
+            });
         match restored {
             Ok(()) => {
                 self.executor.drop_kv_slot_entries(&[key]);
