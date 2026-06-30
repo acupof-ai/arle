@@ -347,6 +347,8 @@ fn run_lockstep_driver(
             Some(RelayEnvelope::StatsQuery { request_id }) => {
                 let prefix = engine.prefix_cache_stats();
                 let throughput = engine.throughput_stats();
+                let tier = engine.kv_tier_stats();
+                let system = engine.kv_system_metrics();
                 let data = WireStats {
                     active_requests: engine.active_count(),
                     queue_depth: engine.waiting_count(),
@@ -361,6 +363,32 @@ fn run_lockstep_driver(
                     prefix_hit_pages: prefix.hit_pages,
                     prefix_published_pages: prefix.published_pages,
                     prefix_cached_pages: prefix.cached_pages,
+                    kv_tier_demoted_pages: tier.demoted_pages,
+                    kv_tier_promoted_pages: tier.promoted_pages,
+                    kv_tier_promote_failures: tier.promote_failures,
+                    kv_tier_resident_blocks: tier.resident_blocks,
+                    kv_tier_demoted_slots: tier.demoted_slots,
+                    kv_tier_promoted_slots: tier.promoted_slots,
+                    kv_tier_slot_promote_failures: tier.slot_promote_failures,
+                    kv_system_resident_pages: system.resident_pages,
+                    kv_system_resident_evictable_pages: system.resident_evictable_pages,
+                    kv_system_host_demoted_pages: system.host_demoted_pages,
+                    kv_system_host_demoted_pending_inflight: system.host_demoted_pending_inflight,
+                    kv_system_disk_pages: system.disk_pages,
+                    kv_system_reuse_hit_resident: system.reuse_hit_resident,
+                    kv_system_reuse_hit_host_demoted: system.reuse_hit_host_demoted,
+                    kv_system_reuse_hit_disk: system.reuse_hit_disk,
+                    kv_system_reuse_miss: system.reuse_miss,
+                    kv_system_demote_mset_count: system.demote_mset_count,
+                    kv_system_demote_mset_copy_bytes: system.demote_mset_copy_bytes,
+                    kv_system_demote_mset_copy_ms: system.demote_mset_copy_ms,
+                    kv_system_promote_mget_count: system.promote_mget_count,
+                    kv_system_promote_mget_copy_bytes: system.promote_mget_copy_bytes,
+                    kv_system_promote_mget_copy_ms: system.promote_mget_copy_ms,
+                    kv_system_fetch_wait_ms: system.fetch_wait_ms,
+                    kv_system_fallback_recompute: system.fallback_recompute,
+                    kv_system_prefix_match_full_blocks: system.prefix_match_full_blocks,
+                    kv_system_prefix_match_clamped_blocks: system.prefix_match_clamped_blocks,
                 };
                 if let Err(e) = relay.send(&RelayEnvelope::StatsResponse { request_id, data }) {
                     log::warn!("[arle-worker rank={rank}] stats response send failed: {e:#}");
