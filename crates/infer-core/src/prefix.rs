@@ -155,7 +155,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         let matched_len = self
             .executor
-            .cached_prefix_match_len(&request.prompt_tokens)
+            .cached_prefix_match_len(&request.prompt_tokens)?
             .min(request.prompt_len());
         if matched_len == 0 {
             return Ok(0);
@@ -169,10 +169,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             );
             return Ok(0);
         }
-        if let Err(err) =
-            self.executor
-                .restore_cached_prefix(slot, &request.prompt_tokens, matched_len)
-        {
+        let slot_pages = self.kv.page_indices(slot).to_vec();
+        if let Err(err) = self.executor.restore_cached_prefix(
+            slot,
+            &request.prompt_tokens,
+            matched_len,
+            &slot_pages,
+        ) {
             log::warn!(
                 "position-0 prefix restore failed for request {}: {err:#}; recomputing",
                 request.handle.id()

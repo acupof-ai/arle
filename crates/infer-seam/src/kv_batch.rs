@@ -24,6 +24,10 @@ pub struct KvBatchDescriptor {
     /// Flattened logical page ids. Rows point into this buffer with
     /// [`KvBatchRow::page_range`].
     pub flat_page_ids: Vec<u32>,
+    /// Flattened whole-slot page tables. Rows point into this buffer with
+    /// [`KvBatchRow::slot_page_range`]. Sequential models usually read only
+    /// `page_range`; fixed-band models (DSv4) need the full slot table.
+    pub flat_slot_page_ids: Vec<u32>,
 }
 
 /// One row in a [`KvBatchDescriptor`].
@@ -45,6 +49,8 @@ pub struct KvBatchRow {
     pub token_range: Range<usize>,
     /// Range in [`KvBatchDescriptor::flat_page_ids`].
     pub page_range: Range<usize>,
+    /// Range in [`KvBatchDescriptor::flat_slot_page_ids`].
+    pub slot_page_range: Range<usize>,
 }
 
 /// Forward row kind.
@@ -66,6 +72,7 @@ impl KvBatchDescriptor {
             rows: Vec::with_capacity(plan.prefill_rows.len() + plan.decode_rows.len()),
             flat_token_ids: Vec::new(),
             flat_page_ids: Vec::new(),
+            flat_slot_page_ids: Vec::new(),
         };
 
         for row in &plan.prefill_rows {
@@ -118,6 +125,7 @@ impl KvBatchDescriptor {
             rows: Vec::with_capacity(range.len()),
             flat_token_ids: Vec::new(),
             flat_page_ids: Vec::new(),
+            flat_slot_page_ids: Vec::new(),
         };
         let mut has_prefill = false;
         let mut has_decode = false;
@@ -132,9 +140,13 @@ impl KvBatchDescriptor {
             let page_start = desc.flat_page_ids.len();
             desc.flat_page_ids
                 .extend_from_slice(&self.flat_page_ids[row.page_range.clone()]);
+            let slot_page_start = desc.flat_slot_page_ids.len();
+            desc.flat_slot_page_ids
+                .extend_from_slice(&self.flat_slot_page_ids[row.slot_page_range.clone()]);
             desc.rows.push(KvBatchRow {
                 token_range: token_start..desc.flat_token_ids.len(),
                 page_range: page_start..desc.flat_page_ids.len(),
+                slot_page_range: slot_page_start..desc.flat_slot_page_ids.len(),
                 ..row.clone()
             });
         }
@@ -180,6 +192,10 @@ impl KvBatchDescriptor {
                 .extend_from_slice(kv.page_indices_for_token_range(slot, 0, append_end));
         }
         let page_range = page_start..self.flat_page_ids.len();
+        let slot_page_start = self.flat_slot_page_ids.len();
+        self.flat_slot_page_ids
+            .extend_from_slice(kv.page_indices(slot));
+        let slot_page_range = slot_page_start..self.flat_slot_page_ids.len();
 
         self.rows.push(KvBatchRow {
             slot,
@@ -190,6 +206,7 @@ impl KvBatchDescriptor {
             slot_epoch: kv.slot_epoch(slot),
             token_range,
             page_range,
+            slot_page_range,
         });
         Ok(())
     }
@@ -365,6 +382,7 @@ mod tests {
         assert_eq!(desc.rows[0].slot_epoch, 7);
         assert_eq!(desc.rows[0].token_range, 0..1);
         assert_eq!(desc.rows[0].page_range, 0..2);
+        assert_eq!(desc.rows[0].slot_page_range, 0..2);
         assert_eq!(desc.rows[1].slot, 1);
         assert_eq!(desc.rows[1].seq_len, 8);
         assert_eq!(desc.rows[1].append_pos, 8);
@@ -372,6 +390,8 @@ mod tests {
         assert_eq!(desc.rows[1].slot_epoch, 8);
         assert_eq!(desc.rows[1].token_range, 1..2);
         assert_eq!(desc.rows[1].page_range, 2..5);
+        assert_eq!(desc.rows[1].slot_page_range, 2..5);
+        assert_eq!(desc.flat_slot_page_ids, vec![10, 11, 20, 21, 22]);
     }
 
     #[test]
@@ -410,6 +430,8 @@ mod tests {
         assert_eq!(row.slot_epoch, 3);
         assert_eq!(row.token_range, 0..3);
         assert_eq!(row.page_range, 0..2);
+        assert_eq!(row.slot_page_range, 0..2);
+        assert_eq!(desc.flat_slot_page_ids, vec![30, 31]);
     }
 
     #[test]
@@ -473,6 +495,8 @@ mod tests {
         assert_eq!(prefill.rows[0].slot, 0);
         assert_eq!(prefill.rows[0].token_range, 0..3);
         assert_eq!(prefill.rows[0].page_range, 0..2);
+        assert_eq!(prefill.rows[0].slot_page_range, 0..2);
+        assert_eq!(prefill.flat_slot_page_ids, vec![30, 31]);
 
         // Decode sub-descriptor: ranges rebased to its own flat buffers.
         let decode = desc.subset(1..3).unwrap();
@@ -484,9 +508,12 @@ mod tests {
         assert_eq!(decode.rows[0].slot, 1);
         assert_eq!(decode.rows[0].token_range, 0..1);
         assert_eq!(decode.rows[0].page_range, 0..2);
+        assert_eq!(decode.rows[0].slot_page_range, 0..2);
         assert_eq!(decode.rows[1].slot, 2);
         assert_eq!(decode.rows[1].token_range, 1..2);
         assert_eq!(decode.rows[1].page_range, 2..5);
+        assert_eq!(decode.rows[1].slot_page_range, 2..5);
+        assert_eq!(decode.flat_slot_page_ids, vec![10, 11, 20, 21, 22]);
 
         assert!(desc.subset(0..0).is_err());
         assert!(desc.subset(2..4).is_err());

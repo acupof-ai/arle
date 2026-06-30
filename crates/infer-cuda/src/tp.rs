@@ -708,8 +708,9 @@ mod tests {
             // x restricted to this rank's input columns.
             let x_shard: Vec<f32> = x[spec.range()].to_vec();
             // W restricted to the same input columns, kept row-major [out, size].
+            let w_ref = &w;
             let w_shard: Vec<f32> = (0..out_dim)
-                .flat_map(|o| spec.range().map(move |i| w[o * in_dim + i]))
+                .flat_map(|o| spec.range().map(move |i| w_ref[o * in_dim + i]))
                 .collect();
             partials.push(dense_gemv(&x_shard, &w_shard, out_dim, spec.size));
         }
