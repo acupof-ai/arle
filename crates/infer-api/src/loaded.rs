@@ -1649,7 +1649,7 @@ mod backend {
             anyhow::ensure!(
                 consumed,
                 "--kv-ssd-path: the loaded model has no page-addressable KV tier store \
-                 (Qwen3-dense + Qwen3.6 recall; DSv4 pending)"
+                 (Qwen3-dense + Qwen3.6 + DSv4 slot swap)"
             );
         }
         Ok((serve, tokenizer, model_id))

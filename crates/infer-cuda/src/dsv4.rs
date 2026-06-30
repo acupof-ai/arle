@@ -375,6 +375,33 @@ impl Dsv4SlotImage {
     /// Materialized sequence length the image was captured at.
     pub(crate) fn seq_len(&self) -> usize {
         self.seq_len
+
+    /// Flatten the image to bytes for tier storage.
+    /// Format: [magic 4B "DSIM"][seq_len 4B LE][layer_count 4B LE]
+    /// Each layer: [n_fields 2B LE] for each Vec<bf16>: [len 4B LE][raw bytes]
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.host_bytes() + 64);
+        buf.extend_from_slice(b"DSIM");
+        buf.extend_from_slice(&(self.seq_len as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for layer in &self.layers {
+            layer.serialize_into(&mut buf);
+        }
+        buf
+    }
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(bytes.len() >= 12 && &bytes[..4] == b"DSIM", "bad DSv4 image header");
+        let seq_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let nlayers = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let mut pos = 12usize;
+        let mut layers = Vec::with_capacity(nlayers);
+        for _ in 0..nlayers {
+            let (layer, used) = crate::attention::Dsv4LayerImage::deserialize_from(&bytes[pos..])?;
+            pos += used;
+            layers.push(layer);
+        }
+        Ok(Self { seq_len, layers })
+    }
     }
 
     /// Total host RAM owned by this whole-slot image, summed over every layer's
