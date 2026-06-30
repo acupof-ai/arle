@@ -2830,15 +2830,11 @@ impl Dsv4Model {
                         pack_page_tables.reserve(n);
                     }
                     for r in 0..n {
-                        let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
-                        ctx.stream
-                            .memcpy_dtod(&src, &mut normed_row.data)
-                            .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                        // Copy this row's batched c_q_normed slice into the reused
-                        // per-row [*, 1] scratch (WAR-safe under stream ordering,
-                        // like normed_row); the compressed-only finish reads it by
-                        // reference for the CSA indexer query projection.
-                        {
+                        if !full_flatten {
+                            let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
+                            ctx.stream
+                                .memcpy_dtod(&src, &mut normed_row.data)
+                                .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
                             let cq_src = proj
                                 .c_q_normed
                                 .data
