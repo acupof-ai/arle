@@ -2795,10 +2795,13 @@ mod dsv4_gpu {
         )
     }
 
-    /// Routed-row ceiling for the FP8 decode lane: B=1 × topk (DSv4 top_k=6,
-    /// so ≤8 covers single-token decode). Above it (batched decode / prefill)
-    /// the contiguous DeepGEMM lane's weight-once GEMM amortizes better.
-    const DSV4_DECODE_GEMV_MAX_ROUTES: usize = 8;
+    /// Routed-row ceiling for the compact FP8 decode lane.
+    ///
+    /// The kernels operate on real routed rows only (`max_count` chunks of 8 rows per
+    /// active expert), so the same decode-band ceiling as the 64-aligned contiguous
+    /// fallback keeps B<=~16 off padded DeepGEMM materialization. Larger prefill
+    /// shapes still use tensor-core DeepGEMM.
+    const DSV4_DECODE_GEMV_MAX_ROUTES: usize = DSV4_DECODE_CONTIG_MAX_ROUTES;
 
     /// Per-expert pointer tables over the layer's f32 block-scale buffers for the
     /// decode-band grouped-GEMM MoE lane. Built once per layer on first use; the
