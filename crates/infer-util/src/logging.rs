@@ -37,16 +37,16 @@ const DEFAULT_NOISY_MODULE_LEVELS: [(&str, &str); 5] = [
 ];
 
 fn apply_default_module_levels(mut filter: String) -> String {
-    for (module, level) in DEFAULT_NOISY_MODULE_LEVELS {
-        let module_pattern = format!("{module}=");
-        if !filter.contains(&module_pattern) {
-            if !filter.is_empty() {
-                filter.push(',');
-            }
-            filter.push_str(module);
-            filter.push('=');
-            filter.push_str(level);
+    let missing = DEFAULT_NOISY_MODULE_LEVELS
+        .iter()
+        .filter(|(module, _)| !filter.contains(&format!("{module}=")))
+        .map(|(module, level)| format!("{module}={level}"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        if !filter.is_empty() {
+            filter.push(',');
         }
+        filter.push_str(&missing.join(","));
     }
     filter
 }
