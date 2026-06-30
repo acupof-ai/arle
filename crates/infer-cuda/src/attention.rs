@@ -8207,10 +8207,12 @@ pub(crate) struct Dsv4CompressorPrecomputed<'a> {
 }
 
 pub(crate) struct Dsv4DsaBatchedGather<'a> {
-    /// N-row staging for indexer query, shape `[local_index_heads*index_head_dim, n]`.
-    pub(crate) q_i_batch: &'a mut HiddenStates,
-    /// N-row staging for gating weights, shape `[local_index_heads, n]`.
-    pub(crate) weights_batch: &'a mut HiddenStates,
+    /// Optional N-row staging for indexer query, shape `[local_index_heads*index_head_dim, n]`.
+    /// `None` when the batched indexer-query prepass already produced the exact
+    /// buffer consumed by the batched selector.
+    pub(crate) q_i_batch: Option<&'a mut HiddenStates>,
+    /// Optional N-row staging for gating weights, shape `[local_index_heads, n]`.
+    pub(crate) weights_batch: Option<&'a mut HiddenStates>,
     /// Row index in `[0, n)` to gather into.
     pub(crate) row: usize,
     /// Per-row captured `key_count` (push exactly one per call), for the batched
@@ -8567,7 +8569,7 @@ fn csa_select(
     // N rows' caches are populated. Requires the official DSA path (per-slot
     // `official` + shared scratch). Never reached on the single-row / prefill
     // path (batched_gather stays None there → byte-identical below).
-    if let Some(gather) = batched_gather {
+    if let Some(mut gather) = batched_gather {
         // Per-row CACHE WRITES (block (a) of csa_select_official). When the ONE
         // batched P1b pre-pass already populated all N slots' DSA caches
         // (`cache_writes_in_prepass`, the CompressedSparse full-flatten lane),
@@ -8619,32 +8621,36 @@ fn csa_select(
         // Source is the unified VIEW (`q_i`/`weights`): the prepass column view
         // (precomputed, zero copy) or the owned buffer's view (non-precomputed).
         let r = gather.row;
-        let q_width = q_i.data.len();
-        let w_width = weights.data.len();
-        ensure!(
-            gather.q_i_batch.data.len() >= (r + 1) * q_width
-                && gather.weights_batch.data.len() >= (r + 1) * w_width,
-            "DSv4 batched DSA staging too small for row {r} (q {} w {})",
-            q_width,
-            w_width
-        );
-        {
-            let mut dst = gather
-                .q_i_batch
-                .data
-                .slice_mut(r * q_width..(r + 1) * q_width);
-            ctx.stream
-                .memcpy_dtod(&q_i.data, &mut dst)
-                .map_err(|e| anyhow!("DSv4 batched DSA q_i gather D2D failed: {e}"))?;
-        }
-        {
-            let mut dst = gather
-                .weights_batch
-                .data
-                .slice_mut(r * w_width..(r + 1) * w_width);
-            ctx.stream
-                .memcpy_dtod(&weights.data, &mut dst)
-                .map_err(|e| anyhow!("DSv4 batched DSA weights gather D2D failed: {e}"))?;
+        if let (Some(q_i_batch), Some(weights_batch)) = (
+            gather.q_i_batch.as_deref_mut(),
+            gather.weights_batch.as_deref_mut(),
+        ) {
+            let q_width = q_i.data.len();
+            let w_width = weights.data.len();
+            ensure!(
+                q_i_batch.data.len() >= (r + 1) * q_width
+                    && weights_batch.data.len() >= (r + 1) * w_width,
+                "DSv4 batched DSA staging too small for row {r} (q {} w {})",
+                q_width,
+                w_width
+            );
+            {
+                let mut dst = q_i_batch.data.slice_mut(r * q_width..(r + 1) * q_width);
+                ctx.stream
+                    .memcpy_dtod(&q_i.data, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 batched DSA q_i gather D2D failed: {e}"))?;
+            }
+            {
+                let mut dst = weights_batch.data.slice_mut(r * w_width..(r + 1) * w_width);
+                ctx.stream
+                    .memcpy_dtod(&weights.data, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 batched DSA weights gather D2D failed: {e}"))?;
+            }
+        } else {
+            ensure!(
+                gather.q_i_batch.is_none() && gather.weights_batch.is_none(),
+                "DSv4 batched DSA staging must provide both q_i and weights or neither"
+            );
         }
         gather.key_counts.push(
             i32::try_from(key_count)

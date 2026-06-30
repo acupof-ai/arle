@@ -2510,26 +2510,13 @@ impl Dsv4Model {
                         .1
                         .is_some();
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_batched");
-                // N-row staging for the batched CSA select: each row's indexer
-                // query (`q_i`, bf16 `[local_index_heads*index_head_dim, n]`) and
-                // gating weights (bf16 `[local_index_heads, n]`), gathered during
-                // the per-row prepare, read once by `csa_select_official_batched`.
-                // Allocated per-layer (overwritten before the batched select reads
-                // it); tiny (~n*128*128*2B). Plus per-row captured key_count.
-                let (mut dsa_q_i_batch, mut dsa_weights_batch, mut dsa_key_counts) =
-                    if use_batched_dsa_select {
-                        let index_heads = self.config.index_n_heads;
-                        let q_width = index_heads * self.config.index_head_dim;
-                        // SAFETY: each row's slice is fully written by the per-row
-                        // gather (memcpy_dtod) before the batched select reads it.
-                        let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
-                        let w_b = unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
-                        keepalive.keep_hidden(&q_b);
-                        keepalive.keep_hidden(&w_b);
-                        (Some(q_b), Some(w_b), Some(Vec::<i32>::with_capacity(n)))
-                    } else {
-                        (None, None, None)
-                    };
+                // N-row staging for the batched CSA select. CompressedSparse uses the
+                // batched indexer-query prepass output directly; lanes without that
+                // prepass (SparseIndexed) stage per-row q_i/weights here.
+                let mut dsa_stage_q_i: Option<HiddenStates> = None;
+                let mut dsa_stage_weights: Option<HiddenStates> = None;
+                let mut dsa_key_counts =
+                    use_batched_dsa_select.then(|| Vec::<i32>::with_capacity(n));
                 // ── 1. per-row PREPARE + pack + Q-gather.
                 let mut prepared: Vec<crate::attention::Dsv4MlaPrepared> = Vec::with_capacity(n);
                 let mut slot_block_offsets = Vec::with_capacity(n);
@@ -2899,14 +2886,24 @@ impl Dsv4Model {
                         // ONE `csa_select_official_batched` after the loop fills
                         // `selected_batched`. When not batching DSA, `None` →
                         // byte-identical per-row select.
+                        let need_dsa_stage =
+                            use_batched_dsa_select && indexer_query_kv_score.is_none();
+                        if need_dsa_stage && dsa_stage_q_i.is_none() {
+                            let index_heads = self.config.index_n_heads;
+                            let q_width = index_heads * self.config.index_head_dim;
+                            // SAFETY: each row's slice is fully written by the per-row
+                            // gather before the batched select reads it.
+                            let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
+                            let w_b = unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
+                            keepalive.keep_hidden(&q_b);
+                            keepalive.keep_hidden(&w_b);
+                            dsa_stage_q_i = Some(q_b);
+                            dsa_stage_weights = Some(w_b);
+                        }
                         let batched_gather = if use_batched_dsa_select {
                             Some(crate::attention::Dsv4DsaBatchedGather {
-                                q_i_batch: dsa_q_i_batch
-                                    .as_mut()
-                                    .expect("batched DSA staging q present"),
-                                weights_batch: dsa_weights_batch
-                                    .as_mut()
-                                    .expect("batched DSA staging weights present"),
+                                q_i_batch: dsa_stage_q_i.as_mut(),
+                                weights_batch: dsa_stage_weights.as_mut(),
                                 row: r,
                                 key_counts: dsa_key_counts
                                     .as_mut()
@@ -3192,10 +3189,19 @@ impl Dsv4Model {
                     None
                 };
                 if use_batched_dsa_select {
-                    let q_i_batch = dsa_q_i_batch.take().expect("batched DSA staging q present");
-                    let weights_batch = dsa_weights_batch
-                        .take()
-                        .expect("batched DSA staging weights present");
+                    let (q_i_batch, weights_batch) =
+                        if let Some((q_i, weights)) = indexer_query_kv_score.as_ref() {
+                            (q_i, weights)
+                        } else {
+                            (
+                                dsa_stage_q_i
+                                    .as_ref()
+                                    .expect("batched DSA staging q present"),
+                                dsa_stage_weights
+                                    .as_ref()
+                                    .expect("batched DSA staging weights present"),
+                            )
+                        };
                     let key_counts = dsa_key_counts
                         .take()
                         .expect("batched DSA key_counts present");
