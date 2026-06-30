@@ -1008,8 +1008,8 @@ impl QwenCudaExecutor {
             buf.extend_from_slice(&payload);
         }
         self.kv
-            .copy_pages_from_host(&self.model.ctx, &pages, &buf)?;
-        self.model.ctx.sync()?;
+            .copy_pages_from_host_on_copy_stream(&self.model.ctx, &pages, &buf)?;
+        self.model.ctx.sync_copy()?;
         Ok(())
     }
 

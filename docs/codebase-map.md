@@ -386,7 +386,7 @@ These crates sit around the runtime graph:
 - `crates/vulkan-sys`: ash-backed Vulkan loader wrapper (stub off the `vulkan` feature, mirroring `hip-sys`)
 - `crates/vulkan-kernels`: glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` (typecheck-only without `glslc`)
 - `crates/infer-gguf`: GGUF v2/v3 memmap reader + llama.cpp-port CPU dequantizers + per-arch GGUF→spec-config mappers (`deepseek4`); consumers: `infer-hip`, `infer-vulkan`
-- `crates/kv-native-sys`: local persistence substrate (POSIX file + content-addressed block object ops, WAL append/replay, mmap + shared-memory descriptors) backing the KV T2 disk tiers — consumers: `infer-cuda/src/kv_tier.rs` (RAM + disk store) and `infer-metal`'s SSD tier (`MetalSsdTier`)
+- `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). Unused: WAL, shm, mmap descriptors (kept for future shared-memory tier). Sharded block ops (`write_block_cache_sharded` / `read_block_into_sharded` / `remove_block_sharded`) — consumers: `infer-cuda/src/kv_tier.rs` (L2 DRAM + L3 mmap store) and `infer-metal`'s SSD tier (`kv_ssd.rs`).
 - `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — **zero code consumers** since the monolith deletion; license-or-kill verdict pending ([roadmap §6](plans/2026-06-12-architecture-refactor-roadmap.md))
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
