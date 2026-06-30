@@ -6886,6 +6886,7 @@ pub(crate) fn mla_oproj(
     // one grouped-GEMM per group, no per-row loop. Decode lane only (no prefill
     // scratch); grouped prefill stays on its own gate below.
     let wo_a_group_decode_dg = shape.groups > 1
+        && token_count == 1
         && dsv4_decode_proj_deepgemm_enabled()
         && state.fused_wqkv.is_some()
         && attention.wo_a_group_deepgemm.is_some()
