@@ -169,6 +169,11 @@ pub(crate) struct Dsv4KvAdapter {
 }
 
 
+/// Encode (slot, logical_page) into a single u64 key for the per-layer tier store.
+fn tier_key_for(slot: u64, logical_page: u64) -> u64 {
+    (slot << 24) | (logical_page & 0x00FF_FFFF)
+}
+
 pub(crate) struct Dsv4LayerKvLayout {
     /// Shared FP8 MLA latent pool for this layer (#85 P2 Stage A): a
     /// `TokenKVPool` of opaque packed records (`KVFormat::PackedBytes`,
@@ -188,9 +193,49 @@ pub(crate) struct Dsv4LayerKvLayout {
     pub(super) flashmla_page_bytes: usize,
     pub(super) dsa_slot_bytes: usize,
     pub(super) num_slots: usize,
+    pub(super) flashmla_tier: Option<CudaKvTierStore>,
 }
 
 impl Dsv4LayerKvLayout {
+    pub(super) fn init_flashmla_tier(&mut self, budget_bytes: usize) {
+        self.flashmla_tier = Some(CudaKvTierStore::with_budget(
+            budget_bytes / self.flashmla_page_bytes.max(1),
+            self.flashmla_page_bytes,
+        ));
+    }
+
+    pub(super) fn set_flashmla_tier_disk(&mut self, root: &std::path::Path, budget_bytes: usize) -> bool {
+        self.flashmla_tier.as_mut()
+            .is_some_and(|t| t.set_disk(root.to_path_buf(), budget_bytes, self.flashmla_page_bytes))
+    }
+
+    pub(super) fn demote_flashmla_page(&mut self, ctx: &DeviceContext, slot: usize, logical_page: u32, tier_key: u64) -> Result<bool> {
+        let Some(tier) = self.flashmla_tier.as_mut() else { return Ok(false); };
+        let pool = self.flashmla_pool()?;
+        let payload = pool.copy_pages_to_host(ctx, &[logical_page])?;
+        Ok(tier.insert(tier_key, payload))
+    }
+
+    pub(super) fn promote_flashmla_page(&mut self, ctx: &DeviceContext, key: u64, logical_page: u32) -> Result<()> {
+        let Some(tier) = self.flashmla_tier.as_ref() else { anyhow::bail!("FlashMLA tier not initialised"); };
+        let payload = tier.read(key)?;
+        self.flashmla_pool_mut()?.copy_pages_from_host(ctx, &[logical_page], &payload)?;
+        Ok(())
+    }
+
+    pub(super) fn flashmla_tier_contains(&self, slot: usize, logical_page: u32) -> bool {
+        self.flashmla_tier.as_ref()
+            .is_some_and(|t| t.contains(tier_key_for(slot as u64, logical_page as u64)))
+    }
+
+    pub(super) fn drop_flashmla_tier_entries(&mut self, keys: &[u64]) {
+        if let Some(tier) = self.flashmla_tier.as_mut() { tier.remove(keys); }
+    }
+
+    pub(super) fn flashmla_tier_capacity_pages(&self) -> usize {
+        self.flashmla_tier.as_ref().map_or(0, |t| t.capacity_pages())
+    }
+
     pub(crate) fn flashmla_total_pages(&self) -> usize {
         self.flashmla_kv_pool
             .as_ref()
@@ -332,6 +377,11 @@ pub(crate) struct Dsv4KvBatchRowView {
 }
 
 impl Dsv4KvAdapter {
+
+    pub(crate) fn flashmla_layer_count(&self) -> usize {
+        self.layers.iter().filter(|l| l.flashmla_kv_pool.is_some()).count()
+    }
+
     /// Upper bound on serialized bytes of one Dsv4SlotImage for any slot.
     /// Used to size the KV tier store's page budget.
     /// Conservative upper bound for one serialized `Dsv4SlotImage`, used to
@@ -954,6 +1004,7 @@ impl Dsv4LayerKvLayout {
             dsa_key_cache,
             flashmla_slot_pages,
             flashmla_page_bytes,
+            flashmla_tier: None,
             dsa_slot_bytes,
             num_slots,
         })
