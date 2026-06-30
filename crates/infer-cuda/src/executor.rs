@@ -1812,50 +1812,50 @@ pub(crate) struct Dsv4CudaExecutor {
     /// The count cap bounds host RAM; beyond it, the engine falls back to
     /// recompute instead of accumulating swap images.
     /// Cross-request position-0 prefix store. Maps a full captured prompt to its
-    /// whole-slot KV image; a new request whose leading tokens exactly equal a
+    /// whole-slot KV snapshot; a new request whose leading tokens exactly equal a
     /// stored prompt restores that prefix and re-prefills only the tail. LRU over
     /// a host-byte budget (see `Dsv4PrefixCache`). Default-on (pod-verified:
     /// correct + 11.7x prefill speedup); size knob `ARLE_DSV4_PREFIX_CACHE_BYTES`.
     /// L2 DRAM + optional L3 NVMe tier for whole-slot swap images.
-    /// One "page" = one serialized slot image, sized to the max possible
+    /// One "page" = one serialized slot snapshot, sized to the max possible
     /// byte count (`slot_image_bytes`). The mmap is sparse so padding
     /// doesn't waste physical blocks.
     slot_tier: CudaKvTierStore,
-    /// Upper-bound byte size of one serialized slot image.
+    /// Upper-bound byte size of one serialized slot snapshot.
     slot_image_bytes: usize,
-    prefix_cache: Dsv4PrefixCache,
+    prefix_cache: Dsv4PrefixSnapshotCache,
 }
 
 /// Concrete DSv4 prefix store: the LRU keyed by full prompt, payload = the
-/// whole-slot KV image captured at absolute positions `[0, tokens.len())`.
-type Dsv4PrefixCache = PrefixImageStore<crate::dsv4::Dsv4SlotImage>;
+/// whole-slot KV snapshot captured at absolute positions `[0, tokens.len())`.
+type Dsv4PrefixSnapshotCache = PrefixSnapshotStore<crate::dsv4::Dsv4SlotSnapshot>;
 
 /// One position-0-anchored cached prefix: the full prompt tokens that produced
 /// the image plus the payload `image`. The store keeps `host_bytes` separately
 /// so the LRU/budget logic never inspects the payload (host-only testable).
-struct PrefixStoreEntry<P> {
+struct PrefixSnapshotEntry<P> {
     tokens: Vec<u32>,
     image: P,
     host_bytes: usize,
 }
 
-/// LRU host-byte-bounded store of position-0 prefix images, generic over the
+/// LRU host-byte-bounded store of position-0 prefix snapshots, generic over the
 /// payload `P` so the key/LRU/budget logic is unit-testable without a device.
 ///
 /// Keyed by a token hash for candidate lookup, with an exact token-vector
 /// compare to reject hash collisions. `order` is the LRU recency list (front =
 /// coldest). Match returns the LONGEST stored prompt that is an exact leading
 /// prefix of the query — the longest skip-able prefill.
-struct PrefixImageStore<P> {
+struct PrefixSnapshotStore<P> {
     /// `hash(prompt) -> entries that hashed there` (collision chains rare).
-    by_hash: std::collections::HashMap<u64, Vec<PrefixStoreEntry<P>>>,
+    by_hash: std::collections::HashMap<u64, Vec<PrefixSnapshotEntry<P>>>,
     /// LRU recency: prompt hashes, coldest at front, hottest at back.
     order: std::collections::VecDeque<u64>,
     budget_bytes: usize,
     used_bytes: usize,
 }
 
-impl<P> PrefixImageStore<P> {
+impl<P> PrefixSnapshotStore<P> {
     /// Position-0 prefix store with an explicit host-byte budget. The store is
     /// ALWAYS active — cross-request prefix KV reuse is default-on (verified
     /// correct + 11.7x prefill speedup on pod; the on/off env tag was removed).
@@ -1943,7 +1943,7 @@ impl<P> PrefixImageStore<P> {
     /// so the caller can borrow `&entry.image` without aliasing the rest of the
     /// executor. The caller MUST re-insert it via [`Self::reinsert`] after the
     /// restore to keep it hot. `None` when no exact entry exists.
-    fn take(&mut self, tokens: &[u32], len: usize) -> Option<PrefixStoreEntry<P>> {
+    fn take(&mut self, tokens: &[u32], len: usize) -> Option<PrefixSnapshotEntry<P>> {
         if len == 0 || len > tokens.len() {
             return None;
         }
@@ -1962,13 +1962,13 @@ impl<P> PrefixImageStore<P> {
         Some(entry)
     }
 
-    fn take_covering(&mut self, tokens: &[u32], len: usize) -> Option<PrefixStoreEntry<P>> {
+    fn take_covering(&mut self, tokens: &[u32], len: usize) -> Option<PrefixSnapshotEntry<P>> {
         let cover_len = self.cover_len(tokens, len);
         self.take(tokens, cover_len)
     }
 
     /// Re-insert an entry pulled out by [`Self::take`], marking it hottest.
-    fn reinsert(&mut self, entry: PrefixStoreEntry<P>) {
+    fn reinsert(&mut self, entry: PrefixSnapshotEntry<P>) {
         let hash = Self::hash_tokens(&entry.tokens);
         self.used_bytes = self.used_bytes.saturating_add(entry.host_bytes);
         self.by_hash.entry(hash).or_default().push(entry);
@@ -1976,10 +1976,10 @@ impl<P> PrefixImageStore<P> {
         self.evict_to_budget();
     }
 
-    /// Insert (or replace) a position-0 prefix image keyed by its full prompt.
+    /// Insert (or replace) a position-0 prefix snapshot keyed by its full prompt.
     /// `host_bytes` is the payload's host RAM (the caller computes it from the
     /// concrete image), keeping the LRU logic payload-agnostic. Evicts coldest
-    /// entries until the new image fits the byte budget; a prompt larger than the
+    /// entries until the new snapshot fits the byte budget; a prompt larger than the
     /// whole budget is dropped.
     fn insert(&mut self, tokens: Vec<u32>, image: P, host_bytes: usize) {
         if host_bytes == 0 || host_bytes > self.budget_bytes {
@@ -2010,7 +2010,7 @@ impl<P> PrefixImageStore<P> {
         self.by_hash
             .entry(hash)
             .or_default()
-            .push(PrefixStoreEntry {
+            .push(PrefixSnapshotEntry {
                 tokens,
                 image,
                 host_bytes,
@@ -2493,7 +2493,7 @@ impl Dsv4CudaExecutor {
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 slot_image_bytes,
             ),
-            prefix_cache: Dsv4PrefixCache::from_env(),
+            prefix_cache: Dsv4PrefixSnapshotCache::from_env(),
         })
     }
 
@@ -2546,9 +2546,9 @@ impl Dsv4CudaExecutor {
         let image = image?;
         let bytes = image.to_bytes();
         let fit = usize::from(bytes.len() <= self.slot_image_bytes);
-        if self.tp_min_usize(fit, "slot demote image fit")? == 0 {
+        if self.tp_min_usize(fit, "slot demote snapshot fit")? == 0 {
             log::warn!(
-                "DSv4 slot image {} bytes exceeds tier page budget {}; falling back to recompute",
+                "DSv4 slot snapshot {} bytes exceeds tier page budget {}; falling back to recompute",
                 bytes.len(),
                 self.slot_image_bytes
             );
@@ -2567,7 +2567,7 @@ impl Dsv4CudaExecutor {
         Ok(inserted_all)
     }
 
-    /// Restore the whole-slot image stored under `key` into `slot`. The engine
+    /// Restore the whole-slot snapshot stored under `key` into `slot`. The engine
     /// resumes decode at the demoted position right after this returns, and
     /// drops the entry via [`Self::drop_kv_slot_entries`] — the entry
     /// intentionally stays in the store here. `swap_in_image` ends in
@@ -2588,7 +2588,7 @@ impl Dsv4CudaExecutor {
                 .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote read")));
         }
         let bytes = bytes?;
-        let image = crate::dsv4::Dsv4SlotImage::from_bytes(&bytes)
+        let image = crate::dsv4::Dsv4SlotSnapshot::from_bytes(&bytes)
             .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"));
         let parse_ok = usize::from(image.is_ok());
         if self.tp_min_usize(parse_ok, "slot promote parse")? == 0 {
@@ -2621,7 +2621,7 @@ impl Dsv4CudaExecutor {
         self.tp_min_usize(local, "prefix match len")
     }
 
-    /// Capture `slot`'s whole-slot KV image into the position-0 prefix store,
+    /// Capture `slot`'s whole-slot KV snapshot into the position-0 prefix store,
     /// keyed by `tokens` (the full prompt).
     ///
     /// CORRECTNESS INVARIANT: the request must have prefilled from absolute
@@ -2652,14 +2652,14 @@ impl Dsv4CudaExecutor {
         debug_assert_eq!(
             image.seq_len(),
             tokens.len(),
-            "DSv4 position-0 prefix image seq_len must equal prompt length"
+            "DSv4 position-0 prefix snapshot seq_len must equal prompt length"
         );
         let host_bytes = image.host_bytes();
         self.prefix_cache.insert(tokens.to_vec(), image, host_bytes);
         Ok(())
     }
 
-    /// Restore the cached position-0 prefix image for `tokens[..matched_len]`
+    /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
     /// into `slot`. The engine has already allocated `matched_len` tokens of
     /// host KV pages on `slot` and resumes prefill from absolute position
     /// `matched_len` right after.
@@ -2698,14 +2698,14 @@ impl Dsv4CudaExecutor {
                 self.prefix_cache.reinsert(entry);
             }
             return Err(anyhow::anyhow!(
-                "DSv4 position-0 prefix store has no image covering prompt prefix len {matched_len}"
+                "DSv4 position-0 prefix store has no snapshot covering prompt prefix len {matched_len}"
             ));
         }
         let entry = entry.expect("TP consensus says local prefix entry exists");
         let image_len = entry.image.seq_len();
         ensure!(
             image_len >= matched_len,
-            "DSv4 cached prefix image len {image_len} < requested matched_len {matched_len}"
+            "DSv4 cached prefix snapshot len {image_len} < requested matched_len {matched_len}"
         );
         self.mirror_restore_pages(slot, slot_pages, image_len)?;
         // Reset the slot's spec (MTP) draft state: the tail prefill re-seeds it.
@@ -2723,7 +2723,7 @@ impl Dsv4CudaExecutor {
                 Ok(())
             });
         let restore_ok = usize::from(result.is_ok());
-        let restore_all = self.tp_min_usize(restore_ok, "prefix restore image")? != 0;
+        let restore_all = self.tp_min_usize(restore_ok, "prefix restore snapshot")? != 0;
         // Keep the entry hot regardless of restore outcome (the image is intact;
         // a failure is a slot/device error, not a corrupt image).
         self.prefix_cache.reinsert(entry);
@@ -3344,12 +3344,12 @@ pub(crate) struct Qwen35CudaExecutor {
     /// A slot's recurrent state is EMPTY until its first request activates it.
     slots: Vec<crate::qwen35::Qwen35SlotState>,
     /// G3 whole-slot capacity spill: an inactive/retracted request parks its
-    /// whole slot image here (instead of being dropped + recomputed) and is
+    /// whole slot snapshot here (instead of being dropped + recomputed) and is
     /// restored byte-exact on resume. Routes through the SAME `CudaKvTierStore`
     /// transport as the page-granular `recall_tier` (the unified-tier plan — all
     /// grains move bytes through ONE store kind by opaque `u64` key), so G3 gets
     /// the managed 850 GB DRAM budget + NVMe spill + durability for free instead
-    /// of a private DRAM map. Sized for whole-slot images (one entry ≈ one
+    /// of a private DRAM map. Sized for whole-slot snapshots (one entry ≈ one
     /// recurrent-block image), so its count cap = budget / image-bytes (the
     /// budget-aware ~5500 cap, not the old `num_slots*2`). Always built — G3 is
     /// default-on and independent of `--kv-recall` (the page grain). Keyed by the
@@ -3652,7 +3652,7 @@ impl Qwen35CudaExecutor {
         Ok(slot_tier.insert(key, image.to_bytes()))
     }
 
-    /// Restore the whole-slot image stored under `key` into `slot`. The engine
+    /// Restore the whole-slot snapshot stored under `key` into `slot`. The engine
     /// resumes decode at the demoted position right after this returns, and drops
     /// the entry via [`Self::drop_kv_slot_entries`] — the entry intentionally
     /// stays in the tier here. `swap_in_image` ends in `ctx.sync()`, so the
@@ -3773,7 +3773,7 @@ impl Qwen35CudaExecutor {
         )?;
         cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
 
-        // G3 whole-slot spill tier: one entry == one serialized slot image. Its
+        // G3 whole-slot spill tier: one entry == one serialized slot snapshot. Its
         // count cap = DRAM budget / per-image bytes ≈ the budget-aware ~5500
         // (replaces the old `num_slots*2`). Size the per-image unit from the
         // recurrent-block floor (gdr f32 + conv bf16, × num_linear) — the
@@ -5412,14 +5412,14 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaKvCacheDtype, PrefixImageStore};
+    use super::{CudaKvCacheDtype, PrefixSnapshotStore};
     use infer_seam::KvCacheDtype;
 
     // The payload is opaque to the store, so tests use a `u32` tag as the image
     // and pass an explicit host-byte size — exactly how the executor passes the
-    // real `Dsv4SlotImage::host_bytes()`.
-    fn store(budget_bytes: usize) -> PrefixImageStore<u32> {
-        PrefixImageStore::new(budget_bytes)
+    // real `Dsv4SlotSnapshot::host_bytes()`.
+    fn store(budget_bytes: usize) -> PrefixSnapshotStore<u32> {
+        PrefixSnapshotStore::new(budget_bytes)
     }
 
     #[test]

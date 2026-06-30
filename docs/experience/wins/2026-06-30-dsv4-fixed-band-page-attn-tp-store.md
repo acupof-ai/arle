@@ -1,8 +1,8 @@
-# DSv4 fixed-band page-attn and TP-safe slot image store
+# DSv4 fixed-band page-attn and TP-safe slot snapshot store
 
 ## Context
 
-DSv4 could not treat the KV tier as a serialized whole-slot image forever. The
+DSv4 could not treat the KV tier as a serialized whole-slot snapshot forever. The
 engine/radix/tier layer owns page identity, while FlashMLA and DSA read their own
 fixed-band device layouts. The missing connection was a backend-owned page
 metadata path that lets DSv4 lower the host slot page table into FlashMLA without
@@ -19,10 +19,10 @@ pretending DSv4 is a sequential paged cache.
 - `Dsv4KvAdapter::prepare_kv_batch` mirrors the host slot page table into each
   layer's `TokenKVPool` with `mirror_band`, then advances the FlashMLA cursor.
 - Whole-slot and position-0 prefix restore receive the host slot page table from
-  `infer-core`, mirror it first, then restore `Dsv4SlotImage` payloads into those
+  `infer-core`, mirror it first, then restore `Dsv4SlotSnapshot` payloads into those
   physical pages.
 - TP is supported by deterministic rank-local storage: every rank stores/restores
-  its own shard under the same engine key. Hit length, demote room, image fit,
+  its own shard under the same engine key. Hit length, demote room, snapshot fit,
   insert, read/parse/restore success all go through TP min-reduce, so any rank miss
   or failure makes every rank take the same branch.
 

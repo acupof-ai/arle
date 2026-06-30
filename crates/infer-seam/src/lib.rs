@@ -265,7 +265,7 @@ pub trait BackendExecutor {
         Ok(false)
     }
 
-    /// Restore a whole-slot image into `slot`. The engine resumes from the
+    /// Restore a whole-slot snapshot into `slot`. The engine resumes from the
     /// exact demoted materialized position right after, so every byte of
     /// required backend state MUST be restored before returning. Only called
     /// when [`BackendExecutor::kv_slot_tier_enabled`] is `true`.
@@ -277,7 +277,7 @@ pub trait BackendExecutor {
     fn drop_kv_slot_entries(&mut self, _keys: &[u64]) {}
 
     /// Length of the longest leading prefix of `tokens` for which the backend
-    /// holds a position-0-anchored cached KV image it can restore into a fresh
+    /// holds a position-0-anchored cached KV snapshot it can restore into a fresh
     /// slot.
     ///
     /// This is the cross-request prefix-reuse seam for backends whose KV cannot
@@ -304,7 +304,7 @@ pub trait BackendExecutor {
         Ok(())
     }
 
-    /// Restore the cached position-0 prefix image for `tokens[..matched_len]`
+    /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
     /// into `slot`, setting the slot's materialized length to `matched_len`.
     ///
     /// `matched_len` is the value returned by [`Self::cached_prefix_match_len`].

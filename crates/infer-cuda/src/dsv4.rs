@@ -374,12 +374,12 @@ pub(crate) struct Dsv4Model {
 /// Host-side image used by CUDA whole-slot swap: per-layer attention images
 /// plus slot-level scalars. The image is executor-internal and slot-agnostic;
 /// swap-in resolves pool pages from the target slot.
-pub(crate) struct Dsv4SlotImage {
+pub(crate) struct Dsv4SlotSnapshot {
     seq_len: usize,
     layers: Vec<crate::attention::Dsv4LayerImage>,
 }
 
-impl Dsv4SlotImage {
+impl Dsv4SlotSnapshot {
     /// Materialized sequence length the image was captured at.
     pub(crate) fn seq_len(&self) -> usize {
         self.seq_len
@@ -415,7 +415,7 @@ impl Dsv4SlotImage {
         Ok(Self { seq_len, layers })
     }
 
-    /// Total host RAM owned by this whole-slot image, summed over every layer's
+    /// Total host RAM owned by this whole-slot snapshot, summed over every layer's
     /// snapshotted host vectors. Bounds the executor's position-0 prefix store.
     pub(crate) fn host_bytes(&self) -> usize {
         self.layers
@@ -1133,7 +1133,7 @@ impl Dsv4SlotState {
         &self,
         ctx: &DeviceContext,
         kv_adapter: &crate::attention::Dsv4KvAdapter,
-    ) -> Result<Dsv4SlotImage> {
+    ) -> Result<Dsv4SlotSnapshot> {
         let layers: Vec<_> = self
             .attention
             .iter()
@@ -1146,20 +1146,20 @@ impl Dsv4SlotState {
         // The clone_dtoh copies above are stream-ordered; the image's host
         // vectors are only valid once the stream drains.
         ctx.sync()?;
-        Ok(Dsv4SlotImage {
+        Ok(Dsv4SlotSnapshot {
             seq_len: self.seq_len,
             layers,
         })
     }
 
-    /// Restore a whole-slot image into this slot at the demoted `seq_len`.
+    /// Restore a whole-slot snapshot into this slot at the demoted `seq_len`.
     /// The engine resumes decode immediately after `promote_slot`, so the
     /// trailing `ctx.sync()` is required.
     pub(crate) fn swap_in_image(
         &mut self,
         ctx: &DeviceContext,
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
-        image: &Dsv4SlotImage,
+        image: &Dsv4SlotSnapshot,
     ) -> Result<()> {
         ensure!(
             image.seq_len <= self.max_seq_len,
