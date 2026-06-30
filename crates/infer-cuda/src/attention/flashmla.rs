@@ -227,15 +227,9 @@ impl Dsv4FlashMlaDecodeState {
         Ok(())
     }
 
-    pub(super) fn reset(
-        &mut self,
-        ctx: &DeviceContext,
-        pool: &mut Dsv4LayerKvLayout,
-    ) -> Result<()> {
+    pub(super) fn reset(&mut self) {
         self.fp8_kv_sw_bootstrapped = false;
         self.fp8_kv_comp_packed_rows = 0;
-        pool.reset_flashmla_slot(ctx, self)?;
-        Ok(())
     }
 
     /// This (slot, layer) FlashMLA decode state's pool slot index — the ONLY

@@ -3087,6 +3087,9 @@ impl Dsv4CudaExecutor {
         }
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_prefill_kv_view(row, &kv_view)?;
+        if row.start_pos == 0 {
+            self.kv_adapter.zero_slot_band(&self.model.ctx, row.slot)?;
+        }
         let position = (row.start_pos + row.tokens.len()) as u64;
         let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
         let tokens = self.forward_prefill_tokens(
