@@ -1,2 +1,7 @@
 [build]
+rustc-wrapper = "sccache"
+
+# CUDA stub lib is Linux/NVIDIA-only; scoping avoids a spurious linker warning
+# on macOS from a path that doesn't exist.
+[target.x86_64-unknown-linux-gnu]
 rustflags = ["-L", "/usr/local/cuda/lib64/stubs"]
