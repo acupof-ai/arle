@@ -414,6 +414,10 @@ async fn completions(
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
+        request
+            .return_token_ids
+            .unwrap_or(false)
+            .then_some(outcome.generated_tokens),
     ))
     .into_response())
 }

@@ -36,6 +36,7 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
     pub stream: Option<bool>,
     pub stop: Option<Vec<String>>,
+    pub return_token_ids: Option<bool>,
 }
 
 impl CompletionRequest {
@@ -321,6 +322,7 @@ impl CompletionResponse {
         prompt_tokens: usize,
         completion_tokens: usize,
         finish: Option<&FinishReason>,
+        token_ids: Option<Vec<u32>>,
     ) -> Self {
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -332,6 +334,7 @@ impl CompletionResponse {
                 index: 0,
                 logprobs: None,
                 finish_reason: finish_reason(finish).to_string(),
+                token_ids,
             }],
             usage: Usage::new(prompt_tokens, completion_tokens),
         }
@@ -380,31 +383,80 @@ pub struct StatsResponse {
 
 impl StatsResponse {
     pub(crate) fn from_wire(w: WireStats) -> Self {
+        Self::from_counters(w.into_counter_snapshot())
+    }
+
+    pub(crate) fn from_counters(counters: crate::execution::CounterSnapshot) -> Self {
+        let prefix = counters.prefix_cache;
+        let tier = counters.kv_tier;
+        let system = counters.kv_system;
+        let tier_available = tier.demoted_pages > 0
+            || tier.promoted_pages > 0
+            || tier.promote_failures > 0
+            || tier.resident_blocks > 0
+            || tier.demoted_slots > 0
+            || tier.promoted_slots > 0
+            || tier.slot_promote_failures > 0;
+        let ssd_available = system.disk_pages > 0 || system.reuse_hit_disk > 0;
         Self {
             scheduler: SchedulerStats {
-                active_requests: w.active_requests,
-                queue_depth: w.queue_depth,
-                kv_free_pages: w.kv_free_pages,
+                active_requests: counters.active_requests,
+                queue_depth: counters.queue_depth,
+                kv_free_pages: counters.kv_free_pages,
             },
             throughput: ThroughputStatsResponse {
-                steps: w.throughput_steps,
-                prefill_tokens: w.throughput_prefill_tokens,
-                generated_tokens: w.throughput_generated_tokens,
-                requests_completed: w.throughput_requests_completed,
+                steps: counters.throughput.steps,
+                prefill_tokens: counters.throughput.prefill_tokens,
+                generated_tokens: counters.throughput.generated_tokens,
+                requests_completed: counters.throughput.requests_completed,
             },
             prefix_cache: PrefixCacheStatsResponse {
-                lookups: w.prefix_lookups,
-                hits: w.prefix_hits,
-                hit_rate: ratio(w.prefix_hits, w.prefix_lookups),
-                hit_tokens: w.prefix_hit_tokens,
-                hit_pages: w.prefix_hit_pages,
-                published_pages: w.prefix_published_pages,
-                cached_pages: w.prefix_cached_pages,
+                lookups: prefix.lookups,
+                hits: prefix.hits,
+                hit_rate: ratio(prefix.hits, prefix.lookups),
+                hit_tokens: prefix.hit_tokens,
+                hit_pages: prefix.hit_pages,
+                published_pages: prefix.published_pages,
+                cached_pages: prefix.cached_pages,
             },
-            kv_tier: KvTierStatsResponse::default(),
-            kv_system: KvSystemMetricsResponse::default(),
+            kv_tier: KvTierStatsResponse {
+                available: tier_available,
+                demoted_pages: tier.demoted_pages,
+                promoted_pages: tier.promoted_pages,
+                promote_failures: tier.promote_failures,
+                resident_blocks: tier.resident_blocks,
+                demoted_slots: tier.demoted_slots,
+                promoted_slots: tier.promoted_slots,
+                slot_promote_failures: tier.slot_promote_failures,
+            },
+            kv_system: KvSystemMetricsResponse {
+                resident_pages: system.resident_pages,
+                resident_evictable_pages: system.resident_evictable_pages,
+                host_demoted_pages: system.host_demoted_pages,
+                host_demoted_pending_inflight: system.host_demoted_pending_inflight,
+                disk_pages: system.disk_pages,
+                reuse_hit_resident: system.reuse_hit_resident,
+                reuse_hit_host_demoted: system.reuse_hit_host_demoted,
+                reuse_hit_disk: system.reuse_hit_disk,
+                reuse_miss: system.reuse_miss,
+                demote_mset_count: system.demote_mset_count,
+                demote_mset_copy_bytes: system.demote_mset_copy_bytes,
+                demote_mset_copy_ms: system.demote_mset_copy_ms,
+                promote_mget_count: system.promote_mget_count,
+                promote_mget_copy_bytes: system.promote_mget_copy_bytes,
+                promote_mget_copy_ms: system.promote_mget_copy_ms,
+                fetch_wait_ms: system.fetch_wait_ms,
+                fallback_recompute: system.fallback_recompute,
+                prefix_match_full_blocks: system.prefix_match_full_blocks,
+                prefix_match_clamped_blocks: system.prefix_match_clamped_blocks,
+            },
             ssd_recall: SsdRecallStats {
-                not_available_reason: "multiproc coordinator: kv_tier/kv_system not yet relayed",
+                available: ssd_available,
+                not_available_reason: if ssd_available {
+                    ""
+                } else {
+                    "no SSD recall activity observed"
+                },
                 ..SsdRecallStats::default()
             },
         }
@@ -499,6 +551,8 @@ pub struct CompletionChoice {
     pub index: usize,
     pub logprobs: Option<serde_json::Value>,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -733,6 +787,44 @@ mod tests {
         }))
         .unwrap();
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn completion_token_ids_are_opt_in() {
+        let hidden = CompletionResponse::from_parts(
+            "m".to_string(),
+            String::new(),
+            3,
+            2,
+            Some(&FinishReason::Length),
+            None,
+        );
+        let hidden_json = serde_json::to_value(&hidden).expect("serialize hidden");
+        assert!(hidden_json["choices"][0].get("token_ids").is_none());
+
+        let visible = CompletionResponse::from_parts(
+            "m".to_string(),
+            String::new(),
+            3,
+            2,
+            Some(&FinishReason::Length),
+            Some(vec![1, 2]),
+        );
+        let visible_json = serde_json::to_value(&visible).expect("serialize visible");
+        assert_eq!(visible_json["choices"][0]["token_ids"], json!([1, 2]));
+    }
+
+    #[test]
+    fn stats_response_relays_tier_counters() {
+        let mut counters = crate::execution::CounterSnapshot::default();
+        counters.kv_tier.demoted_slots = 2;
+        counters.kv_system.reuse_hit_host_demoted = 3;
+        counters.kv_system.disk_pages = 4;
+        let stats = StatsResponse::from_counters(counters);
+        assert!(stats.kv_tier.available);
+        assert_eq!(stats.kv_tier.demoted_slots, 2);
+        assert_eq!(stats.kv_system.reuse_hit_host_demoted, 3);
+        assert!(stats.ssd_recall.available);
     }
 
     #[test]
