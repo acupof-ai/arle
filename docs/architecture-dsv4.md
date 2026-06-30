@@ -193,7 +193,7 @@ with DSv4's fixed-band semantics:
   FlashMLA prefill/decode pack and read paths therefore resolve through the
   engine/radix/tier page identity rather than `slot * fixed_band` arithmetic.
 - Whole-slot restore and position-0 prefix restore receive the host slot page
-  table from `infer-core` and mirror it before copying `Dsv4SlotImage` payloads
+  table from `infer-core` and mirror it before copying `Dsv4SlotSnapshot` payloads
   back to device memory.
 - TP support is rank-local bytes + TP scalar consensus: each rank stores its own
   shard image under the same engine key; hit length, demote room, image-fit, insert,
@@ -202,7 +202,7 @@ with DSv4's fixed-band semantics:
 
 The page-granular radix tier remains dense-Qwen-only until the DSA sidecar is
 itself page-addressable at arbitrary radix boundaries. DSv4's safe reuse route is
-position-0 whole-slot images plus fixed-band page-table restore; whole-slot
+position-0 snapshots plus fixed-band page-table restore; whole-slot
 capacity spill uses the same rank-local image protocol.
 
 ---
@@ -290,7 +290,7 @@ config-driven (GLM-DSA 32/128/2048, a DSv4 fixture 64/128/512).
   `Dsv4LayerKvLayout.dsa_key_cache` (`attention.rs:262`, FP8, full history, what
   the scoring kernel reads), summed as `state_caches_per_slot` in
   `kv_budget_num_slots` (`dsv4.rs:1645`). The FP8 cache still grows linearly with
-  `max_seq` and is restored as part of `Dsv4SlotImage`; it is not yet a
+  `max_seq` and is restored as part of `Dsv4SlotSnapshot`; it is not yet a
   page-granular radix-tier object. The bf16 `rotated_keys` is **no longer** a
   full-history mirror: as
   of 2026-06-29 it is a transient drain-immediate staging ring
