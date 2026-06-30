@@ -1939,6 +1939,16 @@ mod backend {
             self.engine.throughput_stats()
         }
 
+        /// Snapshot KV tier counters for the coordinator `/v1/stats` relay.
+        pub fn kv_tier_stats(&self) -> infer_core::KvTierStats {
+            self.engine.kv_tier_stats()
+        }
+
+        /// Snapshot KV system counters for the coordinator `/v1/stats` relay.
+        pub fn kv_system_metrics(&self) -> infer_core::KvSystemMetrics {
+            self.engine.kv_system_metrics()
+        }
+
         /// Active (running) request count.
         pub fn active_count(&self) -> usize {
             self.engine.active_count()
