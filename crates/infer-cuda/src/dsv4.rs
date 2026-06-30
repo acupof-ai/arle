@@ -383,6 +383,7 @@ impl Dsv4SlotImage {
     /// Materialized sequence length the image was captured at.
     pub(crate) fn seq_len(&self) -> usize {
         self.seq_len
+    }
 
     /// Flatten the image to bytes for tier storage.
     /// Format: [magic 4B "DSIM"][seq_len 4B LE][layer_count 4B LE]
@@ -409,7 +410,6 @@ impl Dsv4SlotImage {
             layers.push(layer);
         }
         Ok(Self { seq_len, layers })
-    }
     }
 
     /// Total host RAM owned by this whole-slot image, summed over every layer's
