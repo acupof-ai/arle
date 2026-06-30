@@ -1132,11 +1132,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // cached-prefix attach path, so the cached length is irrelevant to
         // their prefill (which is 0).
         let reuse_matched_len = if self.config.enable_prefix_cache && candidate.swap_key.is_none() {
-            prefix_match.matched_len.max(
-                self.executor
-                    .cached_prefix_match_len(&candidate.prompt_tokens)
-                    .min(candidate.prompt_len()),
-            )
+            let cached = self
+                .executor
+                .cached_prefix_match_len(&candidate.prompt_tokens)?
+                .min(candidate.prompt_len());
+            prefix_match.matched_len.max(cached)
         } else {
             prefix_match.matched_len
         };
@@ -1765,8 +1765,9 @@ mod testing {
             0
         }
 
-        fn cached_prefix_match_len(&self, tokens: &[u32]) -> usize {
-            self.store
+        fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
+            Ok(self
+                .store
                 .borrow()
                 .iter()
                 .filter(|stored| {
@@ -1774,7 +1775,7 @@ mod testing {
                 })
                 .map(Vec::len)
                 .max()
-                .unwrap_or(0)
+                .unwrap_or(0))
         }
 
         fn capture_cached_prefix(&mut self, _slot: usize, tokens: &[u32]) -> Result<()> {
@@ -1791,6 +1792,7 @@ mod testing {
             slot: usize,
             tokens: &[u32],
             matched_len: usize,
+            _slot_pages: &[u32],
         ) -> Result<()> {
             let key = &tokens[..matched_len];
             if !self.store.borrow().iter().any(|s| s == key) {
@@ -2511,7 +2513,7 @@ mod testing {
             Ok(true)
         }
 
-        fn promote_slot(&mut self, key: u64, _slot: usize) -> Result<()> {
+        fn promote_slot(&mut self, key: u64, _slot: usize, _slot_pages: &[u32]) -> Result<()> {
             if self.fail_promotes {
                 bail!("mock slot promote failure");
             }

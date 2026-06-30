@@ -1851,7 +1851,10 @@ mod backend {
             );
             scheduler.num_slots = num_slots;
         }
-        let kv = CudaKvPool::new(num_slots, total_pages, page_size);
+        let mut kv = CudaKvPool::new(num_slots, total_pages, page_size);
+        if let Some(pages) = executor.effective_fixed_pages_per_slot() {
+            kv.set_fixed_pages_per_slot(pages);
+        }
         Ok(infer_core::Engine::with_config(executor, kv, scheduler))
     }
 

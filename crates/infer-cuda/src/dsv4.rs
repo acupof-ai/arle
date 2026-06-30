@@ -399,7 +399,10 @@ impl Dsv4SlotImage {
         buf
     }
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        anyhow::ensure!(bytes.len() >= 12 && &bytes[..4] == b"DSIM", "bad DSv4 image header");
+        anyhow::ensure!(
+            bytes.len() >= 12 && &bytes[..4] == b"DSIM",
+            "bad DSv4 image header"
+        );
         let seq_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let nlayers = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let mut pos = 12usize;
@@ -2591,7 +2594,11 @@ impl Dsv4Model {
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
                     let main = match layer.attention.compressor.as_ref() {
                         Some(c) => crate::attention::compressor_batch_prepass(
-                            &self.ctx, c, &normed, prefill_shared.as_deref_mut(), &mut keepalive,
+                            &self.ctx,
+                            c,
+                            &normed,
+                            prefill_shared.as_deref_mut(),
+                            &mut keepalive,
                         )?,
                         None => None,
                     };
@@ -2599,8 +2606,12 @@ impl Dsv4Model {
                         (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
                             crate::attention::compressor_batch_prepass(
                                 &self.ctx,
-                                idx.compressor.as_ref().expect("DSv4 CSA indexer has a key compressor"),
-                                &normed, prefill_shared.as_deref_mut(), &mut keepalive,
+                                idx.compressor
+                                    .as_ref()
+                                    .expect("DSv4 CSA indexer has a key compressor"),
+                                &normed,
+                                prefill_shared.as_deref_mut(),
+                                &mut keepalive,
                             )?
                         }
                         _ => None,
@@ -2608,8 +2619,12 @@ impl Dsv4Model {
                     let query = match (layer.mode, layer.attention.indexer.as_ref()) {
                         (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
                             Some(crate::attention::indexer_query_batch_prepass(
-                                &self.ctx, idx, &proj.c_q_normed, &normed,
-                                prefill_shared.as_deref_mut(), &mut keepalive,
+                                &self.ctx,
+                                idx,
+                                &proj.c_q_normed,
+                                &normed,
+                                prefill_shared.as_deref_mut(),
+                                &mut keepalive,
                             )?)
                         }
                         _ => None,
