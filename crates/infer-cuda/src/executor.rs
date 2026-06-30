@@ -2457,6 +2457,13 @@ impl Dsv4CudaExecutor {
         let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
         let mut bytes = image.to_bytes();
         // Pad to fixed page size so CudaKvTierStore's L2/L3 layers work.
+        if bytes.len() > self.slot_image_bytes {
+            log::warn!(
+                "DSv4 slot image {} bytes exceeds tier page budget {}; falling back to recompute",
+                bytes.len(), self.slot_image_bytes
+            );
+            return Ok(false);
+        }
         if bytes.len() < self.slot_image_bytes {
             bytes.resize(self.slot_image_bytes, 0);
         }

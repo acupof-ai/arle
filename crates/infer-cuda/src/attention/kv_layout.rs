@@ -333,24 +333,28 @@ pub(crate) struct Dsv4KvBatchRowView {
 impl Dsv4KvAdapter {
     /// Upper bound on serialized bytes of one Dsv4SlotImage for any slot.
     /// Used to size the KV tier store's page budget.
+    /// Conservative upper bound for one serialized `Dsv4SlotImage`, used to
+    /// size the sparse-mmapped KV tier. The actual image is smaller; the
+    /// mmap file is sparse so padding bytes don't consume physical blocks.
+    /// Per-layer: FlashMLA pool + DSA cache + ~16 KiB/seq_len-token for bf16
+    /// sw_window/compressor/indexer vectors.
     pub(crate) fn max_slot_image_bytes(&self) -> usize {
         let mut total = 0usize;
         for layer in &self.layers {
-            // FlashMLA pool pages (PackedBytes, one data plane)
             if let Some(ref pool) = layer.flashmla_kv_pool {
                 total += pool.storage_bytes_per_page() * pool.max_total_pages;
             }
-            // DSA key cache
             if let Some(ref dsa) = layer.dsa_key_cache {
                 total += dsa.len();
             }
-            // Worst-case compressor/indexer sw_window (seq_len × local_heads × 2 for kv, ×2 for score)
-            // Conservative: alloc for max slot pages × page_size tokens
+            // Upper bound for per-token bf16 vectors (sw_window, compressor/indexer):
+            // each token has up to ~8 bf16 state entries → 16 B/token per vector.
+            // Conservative: 256 B/token to cover all layer variants.
             let max_tokens = layer.flashmla_kv_pool.as_ref()
                 .map_or(0, |p| p.max_total_pages.saturating_mul(p.page_size));
-            total += max_tokens.saturating_mul(4096); // ~8KB/token for bf16 window
+            total += max_tokens.saturating_mul(256);
         }
-        total + 65536 // header overhead
+        total + 65536
     }
     pub(crate) fn new(
         ctx: &DeviceContext,
