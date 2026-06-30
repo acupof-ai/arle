@@ -11,10 +11,6 @@ use crate::hardware::{CompiledBackend, SystemInfo};
 pub(crate) struct CatalogEntry {
     pub(crate) hf_id: &'static str,
     pub(crate) display_name: &'static str,
-    #[allow(dead_code)]
-    pub(crate) family: &'static str,
-    #[allow(dead_code)]
-    pub(crate) param_count: &'static str,
     pub(crate) quantization: Option<&'static str>,
     /// Approximate download size in GB.
     pub(crate) size_gb: f64,
@@ -54,8 +50,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-0.6B-4bit",
         display_name: "Qwen3 0.6B",
-        family: "Qwen3",
-        param_count: "0.6B",
         quantization: Some("4-bit"),
         size_gb: 0.5,
         min_memory_gb: 1.0,
@@ -66,8 +60,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-0.6B-bf16",
         display_name: "Qwen3 0.6B",
-        family: "Qwen3",
-        param_count: "0.6B",
         quantization: Some("bf16"),
         size_gb: 1.2,
         min_memory_gb: 2.0,
@@ -79,8 +71,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "Qwen/Qwen3-0.6B",
         display_name: "Qwen3 0.6B",
-        family: "Qwen3",
-        param_count: "0.6B",
         quantization: None,
         size_gb: 1.6,
         min_memory_gb: 2.5,
@@ -91,8 +81,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "Qwen/Qwen3-4B",
         display_name: "Qwen3 4B",
-        family: "Qwen3",
-        param_count: "4B",
         quantization: None,
         size_gb: 9.4,
         min_memory_gb: 10.0,
@@ -103,8 +91,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "Qwen/Qwen3-8B",
         display_name: "Qwen3 8B",
-        family: "Qwen3",
-        param_count: "8B",
         quantization: None,
         size_gb: 17.0,
         min_memory_gb: 18.0,
@@ -115,8 +101,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "Qwen/Qwen3.5-4B",
         display_name: "Qwen3.5 4B",
-        family: "Qwen3.5",
-        param_count: "4B",
         quantization: None,
         size_gb: 9.8,
         min_memory_gb: 10.5,
@@ -128,8 +112,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-4B-4bit",
         display_name: "Qwen3 4B",
-        family: "Qwen3",
-        param_count: "4B",
         quantization: Some("4-bit"),
         size_gb: 2.8,
         min_memory_gb: 4.0,
@@ -140,8 +122,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-8B-4bit",
         display_name: "Qwen3 8B",
-        family: "Qwen3",
-        param_count: "8B",
         quantization: Some("4-bit"),
         size_gb: 5.0,
         min_memory_gb: 6.0,
@@ -155,8 +135,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3.6-27B-OptiQ-4bit",
         display_name: "Qwen3.6 27B",
-        family: "Qwen3.6",
-        param_count: "27B",
         quantization: Some("OptiQ 4/8-bit"),
         size_gb: 19.0,
         min_memory_gb: 31.0,
@@ -168,8 +146,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         hf_id: "mlx-community/Qwen3.6-35B-A3B-4bit",
         display_name: "Qwen3.6 35B-A3B",
-        family: "Qwen3.5-MoE",
-        param_count: "35B",
         quantization: Some("4-bit"),
         size_gb: 20.4,
         min_memory_gb: 24.0,
@@ -261,7 +237,7 @@ mod tests {
     fn large_cuda_system_includes_big_models() {
         let info = make_info(CompiledBackend::Cuda, 24.0);
         let recs = recommend_models(&info);
-        assert!(recs.iter().any(|e| e.param_count == "8B"));
+        assert!(recs.iter().any(|e| e.display_name.contains("8B")));
     }
 
     #[test]
