@@ -193,65 +193,6 @@ __global__ void dsv4_mhc_params_kernel(
   }
   __syncthreads();
 
-  // hc_mult==4 (the production shape): warp-parallel tail. The original
-  // single-thread tail serialized 8 sigmoids + 20 Sinkhorn iterations
-  // (~32 dependent divisions each) on ONE thread — 35.5 µs/instance on H20,
-  // ×86 instances/token = 2.2 ms/token of pure serial-chain wall time at
-  // B=1 (the largest non-GEMM kernel in the decode census). Lanes 0-7 run
-  // the pre/post sigmoids; lanes 0-15 each own one cell of the 4×4 Sinkhorn
-  // matrix (lane = row*4 + col) with shuffle-xor row/column sums. FP sums
-  // associate pairwise instead of left-to-right, so results can differ from
-  // the serial tail in the last ULP — gated by correct-inference, not
-  // byte-identity (MoE non-determinism rule).
-  if (hc_mult == 4) {
-    if (threadIdx.x >= WARP_SIZE) return;
-    const int lane = threadIdx.x;
-    const float scale0 = bf16_to_f32(scale[0]);
-    const float scale1 = bf16_to_f32(scale[1]);
-    const float scale2 = bf16_to_f32(scale[2]);
-    const int token_hc = token * 4;
-    if (lane < 4) {
-      pre[token_hc + lane] =
-          dsv4_sigmoid(scale0 * mixes_shared[lane] + bf16_to_f32(base[lane])) + eps;
-    } else if (lane < 8) {
-      const int l = lane - 4;
-      post[token_hc + l] = 2.0f * dsv4_sigmoid(scale1 * mixes_shared[4 + l] +
-                                               bf16_to_f32(base[4 + l]));
-    }
-    if (lane >= 16) return;
-    const unsigned mask = 0xFFFFu;
-    // Cell value: row = lane >> 2 (xor bits 2-3 spans the column's rows),
-    // col = lane & 3 (xor bits 0-1 spans the row's columns).
-    float v = scale2 * mixes_shared[8 + lane] + bf16_to_f32(base[8 + lane]);
-    // row_softmax_plus_eps4: max/denom over the row, out = exp/denom + eps
-    // (denom carries NO eps).
-    float m = v;
-    m = fmaxf(m, __shfl_xor_sync(mask, m, 1));
-    m = fmaxf(m, __shfl_xor_sync(mask, m, 2));
-    v = expf(v - m);
-    float rs = v;
-    rs += __shfl_xor_sync(mask, rs, 1);
-    rs += __shfl_xor_sync(mask, rs, 2);
-    v = v / rs + eps;
-    // column_normalize4: sum = eps + Σ_rows, then divide.
-    float cs = v;
-    cs += __shfl_xor_sync(mask, cs, 4);
-    cs += __shfl_xor_sync(mask, cs, 8);
-    v /= (eps + cs);
-    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-      float rsum = v;
-      rsum += __shfl_xor_sync(mask, rsum, 1);
-      rsum += __shfl_xor_sync(mask, rsum, 2);
-      v /= (eps + rsum);
-      float csum = v;
-      csum += __shfl_xor_sync(mask, csum, 4);
-      csum += __shfl_xor_sync(mask, csum, 8);
-      v /= (eps + csum);
-    }
-    comb[token * 16 + lane] = v;
-    return;
-  }
-
   if (threadIdx.x != 0) return;
 
   float scale0 = bf16_to_f32(scale[0]);
