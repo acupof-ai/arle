@@ -43,8 +43,7 @@
 //!
 //! Build / run (pod, sm_90a, CUDA 12.9):
 //!   See `scripts/dsv4_multigpu_parity.sh` for the full 8-rank launch + build
-//!   flags (`ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`, FlashMLA, `ARLE_DEEPEP_DIR`,
-//!   nccl).
+//!   flags (FlashMLA, `ARLE_DEEPEP_DIR`, nccl).
 
 // This example only does anything under `cuda`; the NCCL file-rendezvous
 // additionally needs `nccl`. Under a host-only build it is an explanatory no-op

@@ -164,7 +164,7 @@ pub(crate) struct Dsv4KvAdapter {
     /// instance is valid for every layer and slot — DSv4 forward runs layers
     /// sequentially and the engine runs one forward at a time, so it is reused,
     /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
-    /// decode-graph scratch). `None` when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off.
+    /// decode-graph scratch). `None` when native DeepGEMM is unavailable.
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
@@ -610,8 +610,8 @@ impl Dsv4KvAdapter {
     /// model-wide shared FP8 prefill DeepGEMM linear scratch (all disjoint
     /// fields, so all can be `&mut` at once). The FlashMLA scratch is `None`
     /// when FlashMLA decode is disabled at the build/override level (same gate
-    /// as the per-slot state); the prefill scratch is `None` when
-    /// `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
+    /// as the per-slot state); the prefill scratch is `None` when native DeepGEMM
+    /// is unavailable.
     #[allow(clippy::type_complexity)]
     pub(crate) fn layer_and_dsa_shared_mut(
         &mut self,
@@ -686,7 +686,7 @@ impl Dsv4KvAdapter {
 
     /// `&mut` accessor for the model-wide shared FP8 prefill DeepGEMM linear
     /// scratch alone (mirrors `dsa_shared`/`flashmla_batch` accessors). `None`
-    /// when `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
+    /// when native DeepGEMM is unavailable.
     #[allow(dead_code)]
     pub(crate) fn prefill_linear_mut(&mut self) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
         self.prefill_linear.as_mut()
@@ -697,8 +697,8 @@ impl Dsv4KvAdapter {
     /// model-wide batched-decode scratch, AND the model-wide shared FP8 prefill
     /// DeepGEMM linear scratch (all disjoint fields). `None` for the batched
     /// scratch when the build/override disabled FlashMLA decode — the caller
-    /// then takes the per-row lane; `None` for the prefill scratch when
-    /// `ARLE_DSV4_FP8_LINEAR_DEEPGEMM` is off (default).
+    /// then takes the per-row lane; `None` for the prefill scratch when native
+    /// DeepGEMM is unavailable.
     #[allow(clippy::type_complexity)]
     pub(crate) fn layer_dsa_and_flashmla_batch_mut(
         &mut self,

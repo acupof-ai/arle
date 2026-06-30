@@ -1510,14 +1510,13 @@ impl SafetensorLoader {
             format_args!("layer={}", names.mlp_prefix),
         );
 
-        // DeepGEMM grouped-B caches (opt-in): concat the per-expert matrices
+        // DeepGEMM grouped-B caches: concat the per-expert matrices
         // into one contiguous [G, n, k] buffer per projection, repoint the
         // pointer tables into it, and DROP the per-expert copies — keeping
         // both would double the routed-expert VRAM (~2x model weights on
         // Qwen3.6-35B). The hand kernels keep working through the rebuilt
         // tables (same [n, k] row-major slabs, new addresses).
-        // Default-ON safety: a build-time stub bridge (no
-        // ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1) must degrade to the hand-kernel
+        // Default-ON safety: an unavailable native bridge must degrade to the hand-kernel
         // path instead of erroring at the first MoE forward — probe once here
         // and skip the grouped caches so `use_deepgemm` self-disables.
         let (expert_weight_format, gate_sig, down_sig) =

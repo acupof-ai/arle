@@ -77,9 +77,9 @@ move to `csrc/attention/`.
 | gemm (Marlin) | `gemm/marlin_int4_fp8_preprocess.cu` | `marlin_int4_fp8_preprocess_without_zp_cuda` | `[ck tensor.rs::from_hybrid_w4_marlin]` | W4 hybrid Marlin preprocess (no zero-point) | int4/fp8 |
 | gemm (DSv4 cache) | `gemm/dsv4_fp8_cache.cu` | `dsv4_block_scaled_to_fp8_deepgemm_cuda` | `[ck tensor.rs::dsv4_fill_fp8_deepgemm_weight_cache]` | block-scaled→FP8 DeepGEMM weight cache fill | fp8-e4m3 |
 
-> `deepgemm_native.cu` is build-gated by `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`;
-> `deepgemm_bridge_stub.cu` links the same symbols and returns
-> `CUDA_ERROR_NOT_SUPPORTED` when the native build flag is off.
+> `deepgemm_native.cu` is default-built when sm_90 plus vendored DeepGEMM/CUTLASS
+> sources are present; `deepgemm_bridge_stub.cu` links the same symbols and returns
+> `CUDA_ERROR_NOT_SUPPORTED` when native DeepGEMM is unavailable or disabled.
 
 ## moe/ — DSv4 / Qwen3.6 expert routing
 
