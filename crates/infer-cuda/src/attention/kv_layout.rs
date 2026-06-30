@@ -1126,7 +1126,7 @@ impl Dsv4LayerKvLayout {
             flash.fp8_kv_pool_len
         );
         self.flashmla_pool_mut()?
-            .copy_pages_from_host(ctx, &table, &payload, false)
+            .copy_pages_from_host(ctx, &table, &payload)
             .map_err(|e| anyhow!("DSv4 shared FlashMLA slot reset failed: {e}"))?;
         Ok(())
     }
