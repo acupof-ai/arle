@@ -514,6 +514,18 @@ the runtime already has the batch/SLO state the scheduler needs.
 
 ---
 
+## 8. Kernel Roadmap (post-2026-06-30 profile)
+
+Priority follows measured TP=4 B=4 wall-clock/kernels.
+
+| Priority | Work | Status | Gate |
+| --- | --- | --- | --- |
+| **P0** | Extend DeepGEMM to compressor/indexer batched projections (`compressor.wkv`, `compressor.wgate`, `indexer.weights_proj`; `indexer.wq_b` shares the same helper). | Built and verified on H20 TP=4; no DeepGEMM fallback. HTTP c=4 is noisy, so use phase/nsys for final verdict. | Keep only for `M>1`; M=1 stays scalar. |
+| **P1** | Fuse RMSNorm + FP8 activation pack (`dsv4_rms_norm_fp8_quantize`): compute norm and directly encode E4M3 + E8M0 block scale in registers. | Next. Target is the MoE `rms_norm` + `dsv4_deepgemm_pack_quantize_bf16_to_fp8` pair (measured ~12.1%). | A/B on B=4 decode; correctness via needle gate. |
+| **P2** | FLUX `ag_gemm` allreduce-GEMM overlap (ByteDance/SGLang practice). | Deferred; integration is multi-day. | Decide after P0+P1 wall-clock A/B. |
+
+---
+
 ## Symbol index (stable anchors)
 
 | Concern | Symbol | File |

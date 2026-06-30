@@ -293,7 +293,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DSV4_DEEPGEMM_DEVICE_COUNTS` | `1`, `0`, unset | `1` | Enables the padded B=1 DeepGEMM local-expert path that keeps recv-side local expert counts and offsets on device. It uses dense all-local-expert metadata, initializes unused compact route slots to `-1`, and skips them during scatter. Set `0` to force the older host `local_counts` D2H path for A/B diagnosis. |
 | `ARLE_DSV4_DEEPGEMM_ZERO_FP8_SCRATCH` | `1` / unset | unset | Forces the pre-2026-06-01 DeepGEMM behavior of clearing FP8 input/activation scratch every expert call. Default unset skips those large FP8 memsets and relies on `masked_m` plus valid-row unpad/scatter; scale buffers are still cleared for TMA-aligned padding safety. |
 | `ARLE_DSV4_DEEPGEMM_WEIGHT_CACHE` | `1` / unset | unset | Builds the DSv4 routed-expert FP8 E4M3 + FP32-scale cache at load time without selecting the runtime DeepGEMM backend. On H20/SM90 this is the required conversion boundary for FP4 Flash experts before DeepGEMM masked/contiguous grouped GEMM can replace raw GEMV. It fuses `w1`/`w3` rows into one gate/up cache and builds a separate `w2` cache. |
-| `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE` | `1` / unset | unset | Build-time switch for the optional raw-pointer DeepGEMM C ABI bridge. Requires CUDA driver/runtime libs and DeepGEMM/CUTLASS sources; runtime JIT uses `${CUDA_HOME}/bin/nvcc` plus `cuobjdump`, so the CUDA bin tools must be present. Without this switch the required `deepgemm` backend fails preflight before serving. |
+| `ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE` | `1` / unset | unset | Opt-out for the raw-pointer DeepGEMM C ABI bridge. Native DeepGEMM is default-on when an sm_90 target and vendored DeepGEMM/CUTLASS sources are present. Runtime JIT still needs `${CUDA_HOME}/bin/nvcc`, `cuobjdump`, and a C++20-capable host compiler or a warm `DG_JIT_CACHE_DIR`. |
 | `ARLE_DEEPGEMM_ROOT` | path | `crates/cuda-kernels/vendor/deepgemm` | Build-time DeepGEMM source root for the optional native bridge. Use a recursive upstream clone when the vendored third-party submodules are not populated. |
 | `ARLE_DEEPGEMM_LIBRARY_ROOT` | path | `${ARLE_DEEPGEMM_ROOT}/deep_gemm` | Runtime DeepGEMM JIT library root consumed by the native bridge. Set this when the runtime source tree differs from the build-time path. |
 | `ARLE_DEEPGEMM_CUTLASS_INCLUDE` | path | `${ARLE_DEEPGEMM_ROOT}/third-party/cutlass/include`, falling back to FlashMLA vendor CUTLASS when available | Optional runtime CUTLASS include override for the native NVCC JIT path. The fast-build/toolchain helpers print the effective path, and the native bridge preflight reports whether `cutlass/arch/barrier.h`, `nvcc`, `cuobjdump`, and `deep_gemm/include` are present before any request runs. |
@@ -323,7 +323,7 @@ export ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_ROOT}/deep_gemm
 
 The helper validates CUDA/NVCC, NCCL, DeepGEMM/CUTLASS, model path, and
 decode token count before running. Build uses `cargo build --release
---features cuda,nccl --bin arle` with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`.
+--features cuda,nccl --bin arle`.
 Smoke/nsys default to the 8-rank DSv4 validation envelope (`num_slots=1`,
 `mem_fraction_static=0.10`, FP8 KV, 43 distributed layers). `max_tokens=1`
 must only be used for explicit prefill/TTFT smoke outside this helper; decode

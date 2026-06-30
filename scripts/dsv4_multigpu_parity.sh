@@ -23,8 +23,7 @@
 #     # FlashMLA auto-enables when its vendor root is present; the bf16 MLA
 #     # correctness core this harness uses does NOT require the FP8 decode path.
 #     # Ensure libnccl.so is on LD_LIBRARY_PATH.
-#     ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1 \
-#       cargo build --release -p infer-cuda \
+#     cargo build --release -p infer-cuda \
 #         --features cuda,nccl,deepep --example dsv4_parity
 #
 #   The example binary lands at:  target/release/examples/dsv4_parity

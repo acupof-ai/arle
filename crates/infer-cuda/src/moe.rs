@@ -147,8 +147,8 @@ pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 /// `ARLE_QWEN35_DEEPGEMM=1`: swap the Qwen3.5/3.6 hand CUDA-core grouped
 /// expert GEMMs (~3.9 TFLOP/s class) for DeepGEMM SM90 BF16 m-grouped GEMMs
 /// (vendored official kernels, JIT-compiled through the torch-free native
-/// bridge; requires a binary built with `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`,
-/// preflight fails loud otherwise).
+/// bridge; default-on for sm_90 builds with vendored DeepGEMM present, with
+/// runtime preflight failing loud otherwise).
 ///
 /// Default ON (licensed 2026-06-11 pod A/B, warm JIT cache, n=3 each):
 /// hybrid dispatch keeps decode on the hand kernels (40.86 vs 40.46 tok/s,
@@ -159,9 +159,8 @@ pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 /// `ARLE_QWEN35_DEEPGEMM=0` restores the hand-kernel-only path. Read at
 /// LOAD time as well: the loader builds the contiguous grouped-B weight
 /// caches (and drops the per-expert copies) only when enabled, so flipping
-/// requires a process restart. Requires a binary built with
-/// `ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1`; without it the preflight fails
-/// loud and `=0` is the operator's escape hatch.
+/// requires a process restart. Native DeepGEMM is default-on when buildable;
+/// `=0` is the operator's escape hatch.
 #[cfg(feature = "cuda")]
 pub(crate) fn qwen35_deepgemm_enabled() -> bool {
     !matches!(

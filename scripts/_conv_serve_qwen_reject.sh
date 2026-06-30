@@ -22,7 +22,6 @@ setsid bash -lc '
   export INFER_TP_SIZE=1
   export RUST_LOG=info
   export NCCL_DEBUG=WARN
-  export ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1
   export ARLE_DEEPGEMM_ROOT=/data01/build/arle/crates/cuda-kernels/vendor/deepgemm
   export ARLE_DEEPGEMM_LIBRARY_ROOT=/data01/build/arle/crates/cuda-kernels/vendor/deepgemm/deep_gemm
   export CUDA_HOME=/usr/local/cuda

@@ -6,7 +6,8 @@
 extern "C" CUresult dsv4_deepgemm_native_preflight_cuda(char* out, size_t out_len) {
   static constexpr const char* kMessage =
       "status=failed native_bridge=not_compiled "
-      "reason=build_with_ARLE_CUDA_ENABLE_DEEPGEMM_NATIVE=1";
+      "reason=deepgemm_not_buildable "
+      "hint=build_with_sm90_vendored_deepgemm_or_disable_with_ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1";
   if (out != nullptr && out_len > 0) {
     size_t n = 0;
     while (n + 1 < out_len && kMessage[n] != '\0') {
