@@ -1430,7 +1430,7 @@ impl Dsv4Model {
         let loader = SafetensorLoader::new(model_path)?;
         let names = config.tensor_names();
 
-        let embed_tokens = loader.load_dsv4_global_matrix(&ctx, names.embed_tokens())?;
+        let embed_tokens = loader.load_dsv4_bf16_matrix(&ctx, names.embed_tokens())?;
         let lm_head = loader.load_dsv4_global_matrix(&ctx, names.lm_head())?;
 
         // GLM (`glm_moe_dsa`) markers: re-encode FP8 MoE experts from `weight_scale_inv`,
