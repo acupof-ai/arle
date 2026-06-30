@@ -347,16 +347,14 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
             Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
-            // DSv4 reuses prefixes via the position-0 whole-slot store, not page-radix
-            // (its MLA KV is per-slot, not yet paged — Phase 5).
-            Self::Dsv4(_) => 0,
+            Self::Dsv4(d) => d.reusable_flashmla_prefix_blocks(blocks),
         }
     }
 
     pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
         match self {
             Self::Qwen(q) => q.demote_prefix_pages(entries),
-            Self::Dsv4(_) => Ok(0),
+            Self::Dsv4(d) => d.demote_flashmla_pages(entries),
             Self::Qwen35(_) => Ok(0),
         }
     }
@@ -364,7 +362,7 @@ impl RealCudaExecutor {
     pub(crate) fn promote_prefix_pages(&mut self, entries: &[(u64, u32)]) -> Result<()> {
         match self {
             Self::Qwen(q) => q.promote_prefix_pages(entries),
-            Self::Dsv4(_) => Ok(()),
+            Self::Dsv4(d) => d.promote_flashmla_pages(entries),
             Self::Qwen35(_) => {
                 anyhow::bail!(
                     "page-granular KV tier store is implemented only for dense Qwen3 CUDA"
@@ -376,6 +374,9 @@ impl RealCudaExecutor {
     pub(crate) fn drop_kv_tier_entries(&mut self, keys: &[u64]) {
         if let Self::Qwen(q) = self {
             q.drop_kv_tier_entries(keys);
+        }
+        if let Self::Dsv4(d) = self {
+            d.drop_flashmla_tier_entries(keys);
         }
     }
 
@@ -2512,6 +2513,81 @@ impl Dsv4CudaExecutor {
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
         self.slot_tier.remove(keys);
+    }
+
+    // ---- FlashMLA page-tier hooks ----
+
+    pub(crate) fn demote_flashmla_pages(
+        &mut self,
+        entries: &[(u32, u64)],
+    ) -> Result<usize> {
+        let n = self.kv_adapter.flashmla_layer_count();
+        if n == 0 { return Ok(0); }
+        let mut accepted = 0;
+        for &(logical_page, tier_key) in entries {
+            let slot = (tier_key >> 24) as usize;
+            let mut all_ok = true;
+            for idx in 0..n {
+                if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                    match layer.demote_flashmla_page(&self.model.ctx, slot, logical_page, tier_key) {
+                        Ok(true) => {},
+                        _ => { all_ok = false; break; }
+                    }
+                } else { all_ok = false; break; }
+            }
+            if all_ok { accepted += 1; } else { break; }
+        }
+        Ok(accepted)
+    }
+
+    pub(crate) fn promote_flashmla_pages(
+        &mut self,
+        entries: &[(u64, u32)],
+    ) -> Result<()> {
+        let n = self.kv_adapter.flashmla_layer_count();
+        if n == 0 { return Ok(()); }
+        for &(tier_key, logical_page) in entries {
+            for idx in 0..n {
+                if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                    layer.promote_flashmla_page(&self.model.ctx, tier_key, logical_page)?;
+                }
+            }
+        }
+        self.model.ctx.sync()?;
+        Ok(())
+    }
+
+    pub(crate) fn drop_flashmla_tier_entries(&mut self, keys: &[u64]) {
+        let n = self.kv_adapter.flashmla_layer_count();
+        for idx in 0..n {
+            if let Ok(layer) = self.kv_adapter.layer_mut(idx) {
+                layer.drop_flashmla_tier_entries(keys);
+            }
+        }
+    }
+
+    pub(crate) fn reusable_flashmla_prefix_blocks(
+        &self,
+        blocks: &[infer_seam::PrefixBlock],
+    ) -> usize {
+        let flash_pages = self.kv_adapter.flashmla_layer_count();
+        if flash_pages == 0 { return 0; }
+        let mut reusable = 0;
+        for block in blocks {
+            match *block {
+                infer_seam::PrefixBlock::ResidentPage(_) => reusable += 1,
+                infer_seam::PrefixBlock::DemotedKey(key) => {
+                    let slot = (key >> 24) as usize;
+                    let logical_page = (key & 0x00FF_FFFF) as u32;
+                    let all_have = (0..flash_pages).all(|idx| {
+                        self.kv_adapter.layer(idx)
+                            .is_ok_and(|l| l.flashmla_tier_contains(slot, logical_page))
+                    });
+                    if all_have { reusable += 1 } else { break; }
+                }
+            }
+        }
+        reusable
     }
 
     /// Length of the longest stored position-0 prompt that is an exact leading
