@@ -114,6 +114,11 @@ pub(crate) struct Dsv4Compressor {
     pub wgate: DeviceMatrix,
     pub ape: DeviceMatrix,
     pub norm: DeviceVec,
+    /// DeepGEMM repacks of the FP8 `wkv`/`wgate` projections for the batched (m=N)
+    /// decode pre-pass — tensor-core `sm90_fp8_gemm_1d2d` instead of the scalar
+    /// `dsv4_fp8_gemv_batch`. `None` ⇒ scalar (bf16 GLM dialect, or gate off).
+    pub wkv_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
+    pub wgate_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
 }
 
 /// Sparse indexer sub-block. DSv4 CompressedSparse: a key compressor over
@@ -139,6 +144,9 @@ pub(crate) struct Dsv4Indexer {
     /// remaining projection after wq_b/wo: 135ms / 67% of linear at M=1024). Built
     /// when the prefill DeepGEMM scratch is enabled; `None` falls back to scalar.
     pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
+    /// DeepGEMM repack of `weights_proj` for the batched (m=N) decode indexer-query
+    /// pre-pass. Same gate as `wq_b_deepgemm`; `None` ⇒ scalar.
+    pub weights_proj_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
 }
 
 /// One hyper-connection mixing block (`hc_attn` / `hc_ffn` per layer, `hc_head`

@@ -7551,10 +7551,31 @@ fn compressor_forward(
 /// Both outputs are fresh per-step allocations kept alive via
 /// `keepalive.keep_hidden`. Mirrors `mla_attention_prepare_proj_batch`'s q/kv
 /// pre-pass; touches NO slot state.
+/// One batched (m=N) decode projection: tensor-core DeepGEMM when an FP8 repack
+/// cache AND the shared prefill scratch are present (m>1 amortizes the weight
+/// read), else the scalar `dsv4_linear` GEMV. The single routing point for every
+/// compressor/indexer batch pre-pass projection.
+fn proj_batched(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    cache: Option<&cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache>,
+    scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    input: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    match (cache, scratch) {
+        (Some(cache), Some(scratch)) if input.seq_len > 1 => {
+            prefill_proj_deepgemm(ctx, scratch, cache, input, out)
+        }
+        _ => dsv4_linear(ctx, weight, input, out),
+    }
+}
+
 pub(crate) fn compressor_batch_prepass(
     ctx: &DeviceContext,
     compressor: &Dsv4Compressor,
     normed_batch: &HiddenStates,
+    mut scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<Option<(HiddenStates, HiddenStates)>> {
     // Batch the per-row compressor projections into ONE m=N GEMM each. `dsv4_linear`
@@ -7583,7 +7604,7 @@ pub(crate) fn compressor_batch_prepass(
     let mut kv_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
     let nvtx_wkv = crate::nvtx::range("dsv4/linear/compressor_wkv_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wkv_batched", || {
-        dsv4_linear(ctx, &compressor.wkv, normed_batch, &mut kv_raw_batch)
+        proj_batched(ctx, &compressor.wkv, compressor.wkv_deepgemm.as_ref(), scratch.as_deref_mut(), normed_batch, &mut kv_raw_batch)
     })?;
     drop(nvtx_wkv);
     keepalive.keep_hidden(&kv_raw_batch);
@@ -7591,7 +7612,7 @@ pub(crate) fn compressor_batch_prepass(
     let mut score_raw_batch = unsafe { HiddenStates::uninit(ctx, width, n)? };
     let nvtx_wgate = crate::nvtx::range("dsv4/linear/compressor_wgate_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/compressor_wgate_batched", || {
-        dsv4_linear(ctx, &compressor.wgate, normed_batch, &mut score_raw_batch)
+        proj_batched(ctx, &compressor.wgate, compressor.wgate_deepgemm.as_ref(), scratch.as_deref_mut(), normed_batch, &mut score_raw_batch)
     })?;
     drop(nvtx_wgate);
     keepalive.keep_hidden(&score_raw_batch);
@@ -7619,6 +7640,7 @@ pub(crate) fn indexer_query_batch_prepass(
     indexer: &Dsv4Indexer,
     c_q_normed_batch: &HiddenStates,
     normed_batch: &HiddenStates,
+    mut scratch: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<(HiddenStates, HiddenStates)> {
     let n = c_q_normed_batch.seq_len;
@@ -7644,7 +7666,7 @@ pub(crate) fn indexer_query_batch_prepass(
     let mut q_i_batch = unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, n)? };
     let nvtx_wq_b = crate::nvtx::range("dsv4/linear/indexer_wq_b_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/indexer_wq_b_batched", || {
-        dsv4_linear(ctx, &indexer.wq_b, c_q_normed_batch, &mut q_i_batch)
+        proj_batched(ctx, &indexer.wq_b, indexer.wq_b_deepgemm.as_ref(), scratch.as_deref_mut(), c_q_normed_batch, &mut q_i_batch)
     })?;
     drop(nvtx_wq_b);
     keepalive.keep_hidden(&q_i_batch);
@@ -7652,7 +7674,7 @@ pub(crate) fn indexer_query_batch_prepass(
     let mut weights_batch = unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, n)? };
     let nvtx_weights = crate::nvtx::range("dsv4/linear/indexer_weights_batched");
     crate::linear_profile::profile(ctx, "dsv4/linear/indexer_weights_batched", || {
-        dsv4_linear(ctx, &indexer.weights_proj, normed_batch, &mut weights_batch)
+        proj_batched(ctx, &indexer.weights_proj, indexer.weights_proj_deepgemm.as_ref(), scratch.as_deref_mut(), normed_batch, &mut weights_batch)
     })?;
     drop(nvtx_weights);
     keepalive.keep_hidden(&weights_batch);
