@@ -278,6 +278,8 @@ impl VulkanQwen36Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vulkan")]
+    use crate::utils::argmax_of;
 
     #[test]
     fn moe_ops_include_router_routed_and_shared_experts() {
@@ -471,15 +473,6 @@ mod tests {
             all_ok,
             "at least one prompt produced degenerate output — inspect the printed continuations"
         );
-    }
-
-    #[cfg(feature = "vulkan")]
-    fn argmax_of(v: &[f32]) -> usize {
-        v.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
     }
 
     #[cfg(feature = "vulkan")]

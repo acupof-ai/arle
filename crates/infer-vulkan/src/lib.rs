@@ -6,6 +6,9 @@
 //! `model_qwen3`. Device execution stays feature-gated and pending the P1
 //! shader ABI.
 
+#[cfg(test)]
+mod utils;
+
 pub use infer_gguf::{deepseek4, dequant, gguf};
 
 pub mod config;
