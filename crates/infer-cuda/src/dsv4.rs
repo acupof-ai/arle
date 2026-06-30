@@ -45,6 +45,7 @@ fn dsv4_trace_values(label: &str, len: usize, values: impl Iterator<Item = f32>)
     let mut first_bad = None;
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
+    let mut max_abs = 0.0f32;
     for (idx, value) in values.enumerate() {
         if value.is_nan() {
             nan += 1;
@@ -59,11 +60,12 @@ fn dsv4_trace_values(label: &str, len: usize, values: impl Iterator<Item = f32>)
             finite += 1;
             min = min.min(value);
             max = max.max(value);
+            max_abs = max_abs.max(value.abs());
         }
     }
-    if nan + pos_inf + neg_inf > 0 {
+    if nan + pos_inf + neg_inf > 0 || max_abs > 1.0e6 {
         println!(
-            "[dsv4-nan] {label} len={len} checked={} finite={finite} nan={nan} pos_inf={pos_inf} neg_inf={neg_inf} first_bad={:?} min={min:.6} max={max:.6}",
+            "[dsv4-nan] {label} len={len} checked={} finite={finite} nan={nan} pos_inf={pos_inf} neg_inf={neg_inf} first_bad={:?} min={min:.6} max={max:.6} max_abs={max_abs:.6}",
             finite + nan + pos_inf + neg_inf,
             first_bad
         );
@@ -97,6 +99,21 @@ fn dsv4_trace_vec(ctx: &DeviceContext, label: impl AsRef<str>, x: &DeviceVec) ->
         .map_err(|e| anyhow!("DSv4 NaN trace vec D2H failed: {e}"))?;
     ctx.sync()?;
     dsv4_trace_values(label.as_ref(), len, host.iter().map(|v| v.to_f32()));
+    Ok(())
+}
+
+fn dsv4_trace_f32(ctx: &DeviceContext, label: impl AsRef<str>, x: &CudaSlice<f32>) -> Result<()> {
+    if !dsv4_nan_trace_enabled() {
+        return Ok(());
+    }
+    let len = x.len();
+    let check = len.min(8192);
+    let host = ctx
+        .stream
+        .clone_dtoh(&x.slice(0..check))
+        .map_err(|e| anyhow!("DSv4 NaN trace f32 D2H failed: {e}"))?;
+    ctx.sync()?;
+    dsv4_trace_values(label.as_ref(), len, host.into_iter());
     Ok(())
 }
 
@@ -4908,6 +4925,9 @@ impl Dsv4Model {
                 let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_params", || {
                     crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_attn, &stream)
                 })?;
+                dsv4_trace_f32(ctx, format!("layer{layer_idx}/attn_mhc_pre"), &mhc.pre)?;
+                dsv4_trace_f32(ctx, format!("layer{layer_idx}/attn_mhc_post"), &mhc.post)?;
+                dsv4_trace_f32(ctx, format!("layer{layer_idx}/attn_mhc_comb"), &mhc.comb)?;
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
@@ -5079,6 +5099,9 @@ impl Dsv4Model {
                 let mhc = crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_params", || {
                     crate::hc::gen_mhc_params(&self.ctx, &self.config, &layer.hc_ffn, &stream)
                 })?;
+                dsv4_trace_f32(ctx, format!("layer{layer_idx}/ffn_mhc_pre"), &mhc.pre)?;
+                dsv4_trace_f32(ctx, format!("layer{layer_idx}/ffn_mhc_post"), &mhc.post)?;
+                dsv4_trace_f32(ctx, format!("layer{layer_idx}/ffn_mhc_comb"), &mhc.comb)?;
                 keepalive.keep_f32(&mhc.pre);
                 keepalive.keep_f32(&mhc.post);
                 keepalive.keep_f32(&mhc.comb);
