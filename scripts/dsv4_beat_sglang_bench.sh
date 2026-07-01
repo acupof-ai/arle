@@ -62,7 +62,7 @@ run_arle_server() {
   ARLE_DSV4_INCREMENTAL_KV=1 ARLE_DSV4_FLASHMLA_PREFILL=1 ARLE_DSV4_FLASHMLA_DECODE=1 \
   ARLE_DSV4_MOE_BACKEND=native-deepep ARLE_DSV4_EXPERT_BACKEND=deepgemm \
   "$ARLE_BIN" --model-path "$MODEL" --port $ARLE_PORT \
-    --num-slots 128 --max-seq-len 4096 --mem-fraction-static 0.80 \
+    --max-running-requests 128 --max-seq-len 4096 --mem-fraction-static 0.80 \
     --kv-cache-dtype fp8 --cuda-graph-max-bs 16 \
     --deepseek-distributed-layers 43
 }

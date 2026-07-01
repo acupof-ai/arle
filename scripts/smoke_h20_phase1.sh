@@ -25,7 +25,7 @@ TARGET="${TARGET:-http://${HOST}:${PORT}}"
 LABEL="${LABEL:-h20-phase1-longctx-c4}"
 SERVER_LOG="${SERVER_LOG:-$ROOT/h20_phase1_server.log}"
 WAIT_SECONDS="${WAIT_SECONDS:-600}"
-NUM_SLOTS="${NUM_SLOTS:-16}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-131072}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
@@ -80,7 +80,7 @@ fi
     --model-path "$MODEL_PATH" \
     --port "$PORT" \
     --kv-cache-dtype fp8 \
-    --num-slots "$NUM_SLOTS" \
+    --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --max-seq-len "$MAX_SEQ_LEN" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
