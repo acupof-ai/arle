@@ -19,7 +19,7 @@ jobs:
     runs-on: macos-14
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -28,7 +28,7 @@ jobs:
       # written by main-branch Metal CI runs (tag refs can read default-branch
       # caches; the old macos-arm64-cargo prefix had no writer left).
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +81,7 @@ jobs:
         run: pip install --no-cache-dir -r requirements-build.txt
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -130,7 +130,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The default ubuntu-22.04 runner has ~14 GB free on /, and this job's
       # chain is unusually disk-heavy: CUDA toolkit 12.8 (~4 GB) + torch cu129
@@ -185,7 +185,7 @@ jobs:
           pip install --no-cache-dir --no-build-isolation /tmp/tilelang-sm70
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -228,7 +228,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -243,7 +243,7 @@ jobs:
         run: pip install --no-cache-dir -r requirements-build.txt
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -299,7 +299,7 @@ jobs:
           merge-multiple: true
 
       - name: Check out repo (for install.sh)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: src
 
