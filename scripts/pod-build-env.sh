@@ -1,7 +1,13 @@
 # Build environment for the H20 (sm_90) box — the single source of truth.
 # Sourced by scripts/pod-remote-build.sh on the pod. Edit here, never inline a
 # one-off env in an exec command (that drift is how builds became non-deterministic).
-export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
+export ARLE_RUST_TOOLCHAIN_DIR="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu}"
+if [ -x "$ARLE_RUST_TOOLCHAIN_DIR/bin/cargo" ] && [ -x "$ARLE_RUST_TOOLCHAIN_DIR/bin/rustc" ]; then
+  export PATH="$ARLE_RUST_TOOLCHAIN_DIR/bin:/root/.cargo/bin:/usr/local/cuda/bin:$PATH"
+  export RUSTC="${RUSTC:-$ARLE_RUST_TOOLCHAIN_DIR/bin/rustc}"
+else
+  export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
+fi
 export CUDA_HOME=/usr/local/cuda
 export TORCH_CUDA_ARCH_LIST=9.0          # H20 == sm_90
 export CMAKE_CUDA_ARCHITECTURES=90
@@ -24,11 +30,15 @@ fi
 # (the container $HOME is ephemeral). Measured: a forced kernel regen 251s -> 53s on a
 # warm cache. Disable with ARLE_CUDA_KERNEL_CACHE=0.
 export ARLE_CUDA_KERNEL_CACHE_DIR="${ARLE_CUDA_KERNEL_CACHE_DIR:-/host/arle-kernel-cache}"
-# Fast network path: ckl's reverse SOCKS5 proxy (pod -> local network). The pod's
-# direct route to crates.io / static.rust-lang.org stalls; the proxy does not.
-export all_proxy="${all_proxy:-socks5h://127.0.0.1:1080}"
-export https_proxy="${https_proxy:-$all_proxy}"
-export http_proxy="${http_proxy:-$all_proxy}"
+# Fast network path: use ckl's reverse SOCKS5 proxy only when it is actually up.
+# A stale proxy env makes rustup fail before it tries the pod's working direct route.
+if timeout 1 bash -lc '</dev/tcp/127.0.0.1/1080' >/dev/null 2>&1; then
+  export all_proxy="${all_proxy:-socks5h://127.0.0.1:1080}"
+  export https_proxy="${https_proxy:-$all_proxy}"
+  export http_proxy="${http_proxy:-$all_proxy}"
+else
+  unset all_proxy https_proxy http_proxy
+fi
 # Shared compile cache: sccache caches each rustc compilation keyed by content, so a
 # FRESH tree (or a toolchain-switch rebuild) reuses unchanged crates instead of
 # recompiling — the cross-POD_TREE / cross-restart reuse the per-tree target/ can't give.

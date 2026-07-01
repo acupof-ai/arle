@@ -2993,9 +2993,16 @@ fn writeback_vram_trace_enabled() -> bool {
 }
 
 fn trim_after_writeback_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("ARLE_OPD_TRIM_AFTER_WRITEBACK").as_deref(),
-        Ok("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+        Ok(v) if !matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+    )
+}
+
+fn trim_before_backward_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_OPD_TRIM_BEFORE_BACKWARD").as_deref(),
+        Ok(v) if !matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
     )
 }
 
@@ -3033,10 +3040,20 @@ fn maybe_trim_after_writeback(store: &TensorStore, scope: &str) -> Result<Option
     Ok(log_writeback_vram(store, scope, "post trim"))
 }
 
+fn maybe_trim_before_backward(store: &TensorStore, scope: &str) -> Result<Option<VramSample>> {
+    if !trim_before_backward_enabled() {
+        return Ok(None);
+    }
+    let trimmed = store.backend().trim_memory_pool().map_err(OpdError::from)?;
+    eprintln!("[opd-vram] {scope} trim_before_backward applied={trimmed}");
+    Ok(log_writeback_vram(store, scope, "post pre-backward trim"))
+}
+
 fn log_writeback_vram_ledger(
     scope: &str,
     base: Option<VramSample>,
     post_forward: Option<VramSample>,
+    post_forward_trim: Option<VramSample>,
     post_backward: Option<VramSample>,
     post_cleanup: Option<VramSample>,
     post_trim: Option<VramSample>,
@@ -3051,10 +3068,11 @@ fn log_writeback_vram_ledger(
     };
     eprintln!(
         "[opd-vram-ledger] {scope} base_used_mib={} post_forward_used_mib={} \
-         post_backward_used_mib={} post_cleanup_used_mib={} allocator_retained_delta_mib={} \
-         post_trim_used_mib={}",
+         post_forward_trim_used_mib={} post_backward_used_mib={} post_cleanup_used_mib={} \
+         allocator_retained_delta_mib={} post_trim_used_mib={}",
         used(base),
         used(post_forward),
+        used(post_forward_trim),
         used(post_backward),
         used(post_cleanup),
         allocator_delta,
@@ -3165,6 +3183,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     let vram_post_forward =
         log_writeback_vram(store, "masked-writeback", "post forward_hidden_states");
     eprintln!("[masked-writeback] phase=forward_hidden_states seconds={fwd_secs:.3}");
+    let vram_post_forward_trim = maybe_trim_before_backward(store, "masked-writeback")?;
 
     // Chunked fused CE: per chunk computes hidden_chunk @ lm_headᵀ → logits → CE
     // → gradient, freeing each chunk. Never materializes [seq, vocab]. The loss
@@ -3201,6 +3220,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         "masked-writeback",
         vram_base,
         vram_post_forward,
+        vram_post_forward_trim,
         vram_post_backward,
         vram_post_cleanup,
         vram_post_trim,
@@ -3337,6 +3357,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
         "post forward_hidden_states_gen_segment",
     );
     eprintln!("[masked-writeback-frozen] phase=forward_gen_segment seconds={fwd_secs:.3}");
+    let vram_post_forward_trim = maybe_trim_before_backward(store, "masked-writeback-frozen")?;
 
     let t_ce = Instant::now();
     let loss = fused_linear_ce_loss_indexed(
@@ -3369,6 +3390,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
         "masked-writeback-frozen",
         vram_base,
         vram_post_forward,
+        vram_post_forward_trim,
         vram_post_backward,
         vram_post_cleanup,
         vram_post_trim,

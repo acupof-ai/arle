@@ -94,7 +94,9 @@ case "$cmd" in
   sync)
     paths=("$@")
     if [ ${#paths[@]} -eq 0 ]; then
-      mapfile -t paths < <(cd "$ROOT" && git status --porcelain | awk '{print $2}')
+      while IFS= read -r p; do
+        paths+=("$p")
+      done < <(cd "$ROOT" && git status --porcelain | awk '{print $2}')
     fi
     [ ${#paths[@]} -eq 0 ] && { echo "nothing to sync"; exit 0; }
     for p in "${paths[@]}"; do
@@ -127,18 +129,25 @@ case "$cmd" in
     ;;
   status)
     label="${1:-arle}"
-    "$POD" "for k in build run; do f=/root/\$k-$label; [ -f \$f.log ] || continue; \
+    case "$label" in *[!A-Za-z0-9_.-]*) echo "invalid label: $label"; exit 2;; esac
+    "$POD" "found=0; for k in build run; do f=/root/\$k-$label; [ -f \$f.log ] || continue; found=1; \
       p=\$(cat \$f.pid 2>/dev/null); \
-      if [ -n \"\$p\" ] && kill -0 \$p 2>/dev/null; then echo \"[\$k] RUNNING pid=\$p\"; else echo \"[\$k] not running (done or never started)\"; fi; \
+      stat=; [ -n \"\$p\" ] && stat=\$(ps -p \$p -o stat= 2>/dev/null | tr -d ' ' || true); \
+      if [ -n \"\$stat\" ] && ! echo \"\$stat\" | grep -q Z; then echo \"[\$k] RUNNING pid=\$p stat=\$stat\"; \
+      elif [ -n \"\$stat\" ]; then echo \"[\$k] not running (zombie/done) pid=\$p stat=\$stat\"; \
+      else echo \"[\$k] not running (done or never started)\"; fi; \
       echo '--- tail ---'; tail -20 \$f.log 2>/dev/null; \
-      echo '--- marker ---'; grep -E 'BUILD_EXIT|RUN_EXIT|DONE' \$f.log 2>/dev/null | tail -2; done"
+      echo '--- marker ---'; grep -E 'BUILD_EXIT|RUN_EXIT|DONE' \$f.log 2>/dev/null | tail -2; done; \
+      [ \$found -eq 1 ] || echo \"no build/run logs for label '$label'\""
     ;;
   log)
     label="${1:-arle}"
+    case "$label" in *[!A-Za-z0-9_.-]*) echo "invalid label: $label"; exit 2;; esac
     "$POD" "for k in build run; do [ -f /root/\$k-$label.log ] && { echo \"==== \$k-$label.log ====\"; cat /root/\$k-$label.log; }; done"
     ;;
   kill)
     label="${1:-arle}"
+    case "$label" in *[!A-Za-z0-9_.-]*) echo "invalid label: $label"; exit 2;; esac
     "$POD" "for k in build run; do p=\$(cat /root/\$k-$label.pid 2>/dev/null); \
       [ -n \"\$p\" ] && { kill -- -\$p 2>/dev/null; kill \$p 2>/dev/null; echo \"killed \$k pgid \$p\"; }; done"
     ;;

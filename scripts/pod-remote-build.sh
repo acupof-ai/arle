@@ -23,10 +23,12 @@ TREE_LOCK="/tmp/arle-build$(echo "$TREE" | tr '/.' '__').lock"
   echo "=== BUILD START $(date -u) label=$LABEL tree=$TREE ==="
   # Racy step #1: ensure toolchain under a GLOBAL lock (idempotent + self-healing).
   flock /tmp/arle-toolchain.lock bash -c '
-    if ! ls ~/.rustup/toolchains/1.95.0-*/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1; then
-      echo "[setup] installing rust 1.95.0 via proxy"
+    toolchain_dir="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu}"
+    if ! [ -x "$toolchain_dir/bin/rustc" ] || ! ls "$toolchain_dir"/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1; then
+      echo "[setup] installing rust 1.95.0 via available network"
       rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy
     fi'
+  source "$TREE/scripts/pod-build-env.sh"
   echo "rustc: $(rustc --version 2>&1)"
   echo "args : cargo build $*"
   # Racy step #2: build under a PER-TREE lock (same tree serializes, diff trees parallel).
