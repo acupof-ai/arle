@@ -1,4 +1,4 @@
-# OPD LoRA writeback VRAM optimization — pending-remote perf ledger
+# OPD LoRA writeback VRAM optimization on Qwen3.6-27B-FP8
 
 ## Context
 
@@ -82,61 +82,71 @@ pass (sandbox/score tests skipped — pre-existing bash-not-found under
 `crates/train/src/qwen35.rs:6361` (77aac056 added `lora_skip_experts`
 arg) fixed in `ad8d6d0e`.
 
-Pod (H20 pod-tree `/host/arle-build`, GPU 4, build tag `arle`):
+## Pod perf ledger — Qwen3.6-27B-FP8, seq=512, attention-qv LoRA (r=16)
 
-```bash
-scripts/pod.sh build
-# → BUILD_EXIT=0 (~56s incremental over prior sm_90 cache)
-LABEL=opd-smoke GPU=4 arle train opd --smoke --steps 5 \
-  --prompt-ids 1,2,3,4,5 --rollout-len 16 \
-  ARLE_OPD_VRAM_TRACE=1 ARLE_OPD_TRIM_AFTER_WRITEBACK=1
-# → RUN_EXIT=0 in <1s (tiny embedded Qwen3.5 config, vocab=16,
-#   hidden=16, layers=2, backend=cuda:0)
-```
+H20 pod (94 GB HBM per GPU, CUDA 12.9, sm_90). Same binary, same
+dataset stub, same synthetic 512-token trajectory (256 prompt / 256
+response, all masked). Optimized run on GPU 4, legacy run on GPU 5
+in parallel — same-binary matched A/B, `--writeback-window 256`.
 
-Confirms the OPD hot loop (tape backward + `AdamW::zero_grad` free
-path + `trim_memory_pool`) runs green on CUDA under the new code.
+`/host/Qwen3.6-27B-FP8` — Qwen3.6 hybrid (linear + full attention),
+64 layers, head_dim 256, FP8 base, `attn_output_gate=true`. Manifest
+built via `arle model index-shards` (walk every `layers-N.safetensors`
+into a `model.safetensors.index.json`; upstream loader expects HF
+layout).
 
-## Perf ledger — pending-remote
+| phase / metric | optimized | legacy | Δ |
+|---|---|---|---|
+| base_used_mib (autograd student + AdamW resident) | 33707 | 33707 | 0 |
+| post_forward_used_mib | 34415 | 34415 | 0 |
+| **post_backward_used_mib (peak)** | **36367** | **36399** | **−32 MiB (−0.09 %)** |
+| post_cleanup_used_mib | 36367 | 36399 | −32 |
+| allocator_retained_delta_mib | 2660 | 2692 | −32 |
+| **post_trim_used_mib** | **34223** | **36399 (no trim)** | **−2176 MiB (−6.0 %)** |
+| forward_hidden_states seconds | 61.62 | 61.67 | wash |
+| backward seconds | 154.11 | 153.99 | wash |
+| **loss** | **3.819344** | **3.819344** | **byte-identical** |
+| synthetic-writeback wall (s) | 215.78 | 215.71 | wash |
 
-The masked-writeback / agent-OPD LoRA-scale VRAM bench that would
-land the peak-VRAM Δ is deferred:
+Env flips (matched A/B, one variable per axis, seq=512 held constant):
 
-* The H20 pod only ships two Qwen3.5-format bases —
-  `/host/Qwen3.5-122B-A10B` (too big for a single-GPU LoRA smoke) and
-  `/host/Qwen3.6-27B-FP8` (per-layer `layers-N.safetensors` weight
-  split; the current `discover_shards` only reads HF standard
-  `model.safetensors[.index.json]` layouts).
-* Patching `/host/Qwen3-4B` (vanilla Qwen3 flat schema) into a
-  Qwen3.5-loader-compatible directory only satisfies serde — the
-  `Qwen35Config::validate` check fails
-  ("linear-attention heads and dims must be non-zero") because
-  Qwen3-4B has no `linear_attention` layers to populate those
-  fields with, and forcing plausible non-zero values is a lie the
-  loader would then use.
+* Optimized: `ARLE_OPD_VRAM_TRACE=1 ARLE_OPD_TRIM_AFTER_WRITEBACK=1
+  ARLE_OPD_LEGACY_LORA_LINEAR_BWD=0 ARLE_OPD_LEGACY_SDPA_BWD=0`.
+* Legacy: same seq, `ARLE_OPD_TRIM_AFTER_WRITEBACK=0
+  ARLE_OPD_LEGACY_LORA_LINEAR_BWD=1 ARLE_OPD_LEGACY_SDPA_BWD=1`.
 
-To land the perf ledger:
+Read: at seq=512 with attention-qv LoRA on a 27B hybrid, the peak
+backward gain is small — the live grad set was already bounded by
+checkpointing + a shallow trainable tape (attention-qv only). The
+big signal is the post-step *residual*: `trim_memory_pool` released
+2176 MiB (6 %) of allocator-retained pages back to the pool, so the
+next step starts against the base floor rather than the previous
+peak. Correctness is confirmed by byte-identical loss between the
+two paths (both `--lora_skip_experts` implicitly, no MoE experts).
 
-1. Stage a small Qwen3.5-format base (dense or MoE) in HF layout —
-   e.g. `Qwen/Qwen3-5-4B` on ModelScope once mirrored, or
-   round-trip `Qwen3.6-27B-FP8` through
-   `arle model export --format hf` — under `/host/`.
-2. `arle train agent-opd --student-model <dir> --dataset
-   /tmp/lora_smoke_ds.jsonl --staged-root /tmp --task-limit 1
-   --synthetic-writeback-seq {512, 1024, 2048}
-   --lora-target-set attention-qv --lora-rank 16 --lora-alpha 32
-   --lora-skip-experts` (MoE only) — matched A/B optimized vs
-   `ARLE_OPD_LEGACY_LORA_LINEAR_BWD=1 ARLE_OPD_LEGACY_SDPA_BWD=1
-   ARLE_OPD_TRIM_AFTER_WRITEBACK=0`, ledger from
-   `[opd-vram-ledger] masked-writeback base_used_mib=…
-    post_forward_used_mib=… post_backward_used_mib=…
-    post_cleanup_used_mib=… allocator_retained_delta_mib=…
-    post_trim_used_mib=…`.
+Attention: LoRA row-tiling did NOT bind at this shape — the
+attention-qv LoRA on Qwen3.6 is 5120 × 16 (q) + 5120 × 16 (v), well
+below the 1024-row tile threshold. Expected: the row-tile pays on
+long trajectories (rows == seq_len at LM head), which the writeback
+window bounds at 256 here; a longer window or `all-linear` target
+set would surface it.
 
-The ledger tags to fill in when the bench lands:
-`peak_used_mib_opt`, `peak_used_mib_legacy`, `Δ`,
-`allocator_retained_delta_mib_opt`,
-`allocator_retained_delta_mib_legacy`.
+Deferred to a follow-up bench:
+
+* Longer trajectories (`--synthetic-writeback-seq {2048, 4096}` +
+  `--writeback-window 1024`) — where the row-tile in
+  `matmul_bt_lora_backward_tiled` first binds.
+* MoE grouped-LoRA (`--lora-target-set all-linear` on a Qwen3.5-MoE
+  base) — where `grouped_lora_backward_tiled` bounds the active-
+  expert axis. The 27B-FP8 is dense; needs `/host/Qwen3.5-122B-A10B`
+  with TP=8, or a stubbed MoE small model.
+* Fused SDPA backward wall-clock on `head_dim > 128` — Qwen3.6 has
+  `head_dim=256` full-attention layers; the fused kernel is on the
+  active path here (154 s backward) but not measurably faster than
+  legacy chunked — the chunked path also runs on-device for
+  `head_dim ≤ 256`, so the kernel-launch amortization is the only
+  saving and it disappears in the noise for 4 full-attn layers /
+  64 total. Signal would show on a dense long-context student.
 
 ## Rule
 
@@ -147,3 +157,12 @@ transient stays bounded, free the grad in `zero_grad`, hand pages
 back to the allocator between steps. Byte-identity gates on the
 baseline path (kill-switch env vars) keep the shipping bar low —
 the new paths are opt-out, not "trust me".
+
+At seq=512 attention-qv LoRA on 27B hybrid the *peak* delta is
+noise-floor (32 MiB, 0.1 %) but the *residual* delta is
+6 % (2.1 GiB) — the trim is what turns "peak = residual" into
+"peak decays back to base between steps", which is exactly the
+grinding-OOM failure mode `errors/2026-06-24` was hitting. Peak
+gain from row-tiling / MoE-tiling / fused-SDPA-bwd is expected to
+bind on longer sequences or MoE — the current bench doesn't
+exercise those axes.
