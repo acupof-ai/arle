@@ -770,7 +770,7 @@ fn serve_handle_relay_driver<E, K>(
             }
             Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
                 let counters = serve.counters();
-                let data = WireStats::from_counters(&counters);
+                let data = Box::new(WireStats::from_counters(&counters));
                 let _ = engine_tx.send(RelayEnvelope::StatsResponse { request_id, data });
             }
             Ok(Some(RelayEnvelope::Shutdown)) | Ok(None) => {

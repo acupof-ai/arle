@@ -156,6 +156,9 @@ impl Default for EngineLoadConfig {
 }
 
 impl EngineLoadConfig {
+    // All callsites are under cfg(feature = "cuda"/"metal"/"hip"/"vulkan");
+    // the cpu-only CI surface compiles none of them.
+    #[allow(dead_code)]
     fn hot_workspace_slots(&self) -> usize {
         self.num_slots
             .max(self.max_running_requests.unwrap_or(0))

@@ -448,8 +448,12 @@ pub enum RelayEnvelope {
     /// Coordinator-to-rank-0 stats probe. Bypasses lockstep tick sequencing;
     /// the worker replies immediately with its current engine counters.
     StatsQuery { request_id: u64 },
-    /// Rank-0-to-coordinator response to a `StatsQuery`.
-    StatsResponse { request_id: u64, data: WireStats },
+    /// Rank-0-to-coordinator response to a `StatsQuery`. `data` is boxed so
+    /// the enum's other variants stay small (WireStats is ~320 B).
+    StatsResponse {
+        request_id: u64,
+        data: Box<WireStats>,
+    },
 }
 
 /// Serializable counterpart of the rewrite serve request. Captures the minimum
@@ -944,7 +948,7 @@ fn spawn_completion_reader(
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .remove(&request_id)
                         {
-                            let _ = tx.send(data);
+                            let _ = tx.send(*data);
                         }
                     }
                     Ok(Some(RelayEnvelope::Completion { request_id, delta })) => {
