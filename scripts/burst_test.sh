@@ -7,18 +7,18 @@ set -uo pipefail
 TREE="${POD_TREE:-/host/arle-build}"
 PORT="${BURST_PORT:-8088}"
 MODEL_PATH=/host/Qwen3-4B
-NUM_SLOTS=1024
+MAX_RUNNING_REQUESTS=1024
 GPU="${BURST_GPU:-3}"  # override with BURST_GPU env var; default GPU 3 (free on shared box)
 
 log() { echo "[burst] $*"; }
 
 # ---- Start server ----
-log "starting arle serve --num-slots $NUM_SLOTS --port $PORT"
+log "starting arle serve --max-running-requests $MAX_RUNNING_REQUESTS --port $PORT"
 CUDA_VISIBLE_DEVICES=$GPU INFER_CUDA_DEVICE=0 \
   "$TREE/target/release/arle" serve \
     --backend cuda \
     --model-path "$MODEL_PATH" \
-    --num-slots "$NUM_SLOTS" \
+    --max-running-requests "$MAX_RUNNING_REQUESTS" \
     --port "$PORT" \
     &
 SERVER_PID=$!

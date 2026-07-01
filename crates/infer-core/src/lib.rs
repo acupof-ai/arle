@@ -53,6 +53,8 @@ pub enum RequestPriority {
 pub struct SchedulerConfig {
     /// Maximum number of concurrently active request slots.
     pub num_slots: usize,
+    /// Scheduler-only cap on active requests. `None` means `num_slots`.
+    pub max_running_requests: Option<usize>,
     /// Maximum total tokens assigned to one scheduler tick.
     pub max_num_batched_tokens: usize,
     /// Maximum prompt tokens admitted for prefill in one scheduler tick.
@@ -78,11 +80,9 @@ pub struct SchedulerConfig {
     /// default) means unbounded; the deepep_ll DSv4 arm reports its LL dispatch
     /// cap so the planner never builds a forward the executor would reject.
     pub max_tokens_per_step: usize,
-    /// Opt-in slot oversubscription: admit more waiters than `num_slots` by
-    /// demoting (parking) the longest-running decode's whole-slot image to the
-    /// DRAM tier to free a slot, round-robin. Requires a whole-slot tier
-    /// executor (`kv_slot_tier_enabled`). Default false → byte-identical to a
-    /// build without this trigger; only changes WHEN the proven demote fires.
+    /// Opt-in running-cap oversubscription: admit waiters beyond
+    /// `max_running_requests` by demoting (parking) the longest-running decode's
+    /// whole-slot image, round-robin. Requires a whole-slot tier executor.
     pub slot_oversubscription: bool,
 }
 
@@ -97,7 +97,16 @@ impl SchedulerConfig {
     }
 
     fn max_concurrent_prefill(&self) -> usize {
-        self.prefill_max_requests.unwrap_or(self.num_slots).max(1)
+        self.prefill_max_requests
+            .unwrap_or_else(|| self.running_cap())
+            .max(1)
+    }
+
+    fn running_cap(&self) -> usize {
+        self.max_running_requests
+            .unwrap_or(self.num_slots)
+            .min(self.num_slots)
+            .max(1)
     }
 
     fn prefill_step_budget(&self) -> usize {
@@ -113,6 +122,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             num_slots: 4,
+            max_running_requests: None,
             max_num_batched_tokens: 16_384,
             max_prefill_tokens: 16_384,
             prefill_max_requests: None,
@@ -445,6 +455,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         config.max_tokens_per_step = executor.max_tokens_per_step().max(1);
         config.num_slots = config.num_slots.min(config.max_tokens_per_step);
         config.num_slots = config.num_slots.max(1);
+        if let Some(cap) = config.max_running_requests
+            && cap > config.num_slots
+        {
+            log::warn!(
+                "max_running_requests={cap} exceeds executor hot workspace slots {}; active cap follows capacity",
+                config.num_slots
+            );
+        }
         let radix = RadixCache::new(kv.page_size().max(1));
         let model_stop_token_ids = executor.model_stop_token_ids();
         Self {
@@ -1059,13 +1077,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         let mut free_slots = self.free_slots();
+        let running_cap = self.config.running_cap();
         let mut remaining_prefill_tokens = self.config.prefill_step_budget();
         let mut active_prefills = self.active_prefill_count();
         let max_prefills = self.config.max_concurrent_prefill();
         let mut remaining_pages = self.kv.free_pages();
         self.evict_prefix_cache_if_below_low_water();
 
-        while let Some(&slot) = free_slots.first() {
+        while self.active.len() < running_cap {
+            let Some(&slot) = free_slots.first() else {
+                break;
+            };
             match self.try_admit_front_waiter(
                 slot,
                 &mut remaining_prefill_tokens,
@@ -1080,13 +1102,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
-        // P5 — slot-pressure oversubscription. After the budget-bounded admit
-        // loop above drains every free slot, if waiters remain we may demote
-        // (park) the longest-running decode's whole-slot image to free a slot
-        // and admit a waiter in its place, round-robin. Default-off and the
-        // whole-slot tier gate keep this byte-identical to before when unused;
-        // it only adds WHEN the proven demote/resume fires.
-        if self.config.slot_oversubscription && self.executor.kv_slot_tier_enabled() {
+        // P5 — running-cap oversubscription. Once the scheduler cap is full,
+        // waiters may rotate in by parking the longest-running decode's
+        // whole-slot image. Executor capacity stays independent from this cap.
+        if self.config.slot_oversubscription
+            && self.executor.kv_slot_tier_enabled()
+            && self.active.len() >= running_cap
+        {
             self.admit_via_oversubscription(
                 &mut remaining_prefill_tokens,
                 &mut active_prefills,
@@ -1204,9 +1226,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         Ok(AdmitOutcome::Admitted)
     }
 
-    /// P5 oversubscription trigger: free slots by parking the longest-running
-    /// decode (smallest `admit_seq`) and admit a waiter in its place, capped at
-    /// `num_slots/4` (>=1) preemptions per call to bound swap churn. Terminates:
+    /// P5 oversubscription trigger: free a running slot by parking the
+    /// longest-running decode (smallest `admit_seq`) and admit a waiter in its
+    /// place, capped at `running_cap/4` (>=1) preemptions per call. Terminates:
     /// each iteration either demotes+admits one (decrementing the bounded cap)
     /// or breaks (no eligible victim / waiter throttled / queue empty).
     fn admit_via_oversubscription(
@@ -1216,7 +1238,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         max_prefills: usize,
         remaining_pages: &mut usize,
     ) -> Result<()> {
-        let cap = self.config.num_slots.div_ceil(4).max(1);
+        let cap = self.config.running_cap().div_ceil(4).max(1);
         let mut preempted = 0usize;
         while preempted < cap && !self.waiting.is_empty() {
             let Some(victim_slot) = self.oversubscription_victim() else {
@@ -3128,23 +3150,25 @@ mod tests {
         Ok(())
     }
 
-    /// P5 slot-pressure trigger: with `slot_oversubscription` on and a single
-    /// physical slot, admitting a second request parks the running decode's
-    /// whole-slot image (demote) to free the slot; the waiter runs, then the
-    /// parked request resumes via promote with its generation intact.
+    /// P5 running-cap trigger: with two physical slots but
+    /// `max_running_requests=1`, admitting a second request parks the running
+    /// decode's whole-slot image; the waiter runs, then the parked request
+    /// resumes via promote with its generation intact. This proves the
+    /// scheduler cap is independent from executor hot-workspace capacity.
     #[test]
     fn oversubscription_parks_running_decode_to_admit_waiter() -> Result<()> {
         let config = SchedulerConfig {
             slot_oversubscription: true,
-            ..test_config(1)
+            max_running_requests: Some(1),
+            ..test_config(2)
         };
         let mut engine = Engine::with_config(
             SlotTierMockExecutor::enabled(),
-            MockKvPool::with_capacity(1, 4, 64),
+            MockKvPool::with_capacity(2, 8, 64),
             config,
         );
 
-        // Request A occupies the only slot and decodes past the min slice so it
+        // Request A fills the scheduler cap and decodes past the min slice so it
         // is an eligible park victim (a just-resumed request would not be).
         let a = engine.submit_request((1..=8).collect(), 20);
         for _ in 0..(OVERSUBSCRIPTION_MIN_SLICE + 3) {
@@ -3162,12 +3186,15 @@ mod tests {
         let a_gen_prefix: Vec<u32> = (9..9 + a_gen_at_arrival as u32).collect();
         assert_eq!(request.generated_tokens, a_gen_prefix);
 
-        // Request B arrives; no free slot, so the next admit oversubscribes:
-        // A (the only eligible Decoding request) is parked.
+        // Request B arrives; a physical slot is free, but the scheduler cap is
+        // full, so the next admit oversubscribes: A is parked, then B is admitted.
         let b = engine.submit_request((20..=24).collect(), 3);
         engine.step()?;
         let tier = engine.kv_tier_stats();
-        assert_eq!(tier.demoted_slots, 1, "A parked to free the slot: {tier:?}");
+        assert_eq!(
+            tier.demoted_slots, 1,
+            "A parked to free the running cap: {tier:?}"
+        );
         let parked = engine
             .waiting
             .iter()
@@ -3181,7 +3208,8 @@ mod tests {
             parked.generated_tokens
         );
         assert!(parked.swap_key.is_some(), "A carries its whole-slot key");
-        // B holds the freed slot — A genuinely yielded it.
+        assert_eq!(engine.active_count(), 1, "scheduler cap remains 1");
+        // B holds the active lane — A genuinely yielded it.
         assert!(engine.active.values().any(|r| r.handle == b), "B admitted");
 
         // B runs to completion on the freed slot, then A resumes via promote

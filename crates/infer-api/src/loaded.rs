@@ -18,8 +18,13 @@ pub use infer_seam::KvCacheDtype;
 /// deterministic planner across ranks and deadlocks the NCCL lockstep.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EngineLoadConfig {
-    /// Logical request slots.
+    /// Executor hot-workspace slots. Serving CLI leaves this at the default
+    /// unless an internal caller deliberately budgets executor capacity.
     pub num_slots: usize,
+    /// Requested active-request cap. Builders size hot workspace to cover it;
+    /// the scheduler enforces it after backend budget clamps.
+    #[serde(default)]
+    pub max_running_requests: Option<usize>,
     /// Physical KV pages.
     pub total_pages: usize,
     /// Tokens per KV page.
@@ -95,9 +100,9 @@ pub struct EngineLoadConfig {
     /// without `--kv-ssd-max-bytes`.
     #[serde(default = "default_ssd_fraction")]
     pub ssd_fraction: f64,
-    /// Opt-in slot oversubscription: admit more waiters than `num_slots` by
-    /// parking the longest-running decode's whole-slot image to the DRAM tier
-    /// (requires a whole-slot tier backend). Default false → byte-identical.
+    /// Opt-in running-cap oversubscription: rotate waiters in by parking the
+    /// longest-running decode's whole-slot image (requires a whole-slot tier
+    /// backend). Default false → byte-identical.
     #[serde(default)]
     pub slot_oversubscription: bool,
 }
@@ -126,6 +131,7 @@ impl Default for EngineLoadConfig {
         // Conservative local-serving defaults shared by every backend builder.
         Self {
             num_slots: 4,
+            max_running_requests: None,
             total_pages: 8192,
             page_size: 16,
             max_prompt_tokens: 32_768,
@@ -150,6 +156,12 @@ impl Default for EngineLoadConfig {
 }
 
 impl EngineLoadConfig {
+    fn hot_workspace_slots(&self) -> usize {
+        self.num_slots
+            .max(self.max_running_requests.unwrap_or(0))
+            .max(1)
+    }
+
     pub fn mtp_enabled(&self) -> bool {
         self.mtp_draft_tokens.is_some() || self.mtp_draft_topk.is_some()
     }
@@ -350,7 +362,7 @@ mod backend {
 
     impl EngineLoadConfig {
         pub(super) fn scheduler_config(&self) -> SchedulerConfig {
-            let mut config = SchedulerConfig::for_slots(self.num_slots);
+            let mut config = SchedulerConfig::for_slots(self.hot_workspace_slots());
             // Prompt cap tracks the real per-request KV capacity
             // (max_seq_len = total_pages × page_size), minus a generation
             // reserve — NOT a hardcoded 32K that aborts moderate prompts even
@@ -362,6 +374,7 @@ mod backend {
                 .max(per_req_cap.saturating_sub(gen_reserve));
             config.max_total_tokens = self.max_total_tokens;
             config.chunked_prefill_size = self.chunked_prefill_size;
+            config.max_running_requests = self.max_running_requests;
             config.slot_oversubscription = self.slot_oversubscription;
             config
         }
@@ -1024,7 +1037,11 @@ mod backend {
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
             let model_id = crate::serve_engine::model_id_from_path(model_path);
             let executor = MetalExecutor::new();
-            let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
+            let kv = HostPagedKvPool::new(
+                config.hot_workspace_slots(),
+                config.total_pages,
+                config.page_size,
+            );
             let serve = ServeHandle::spawn(executor, kv, config.scheduler_config());
             Ok(Self::Cpu(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
@@ -1125,7 +1142,7 @@ mod backend {
 
         let model_source = resolved.to_string_lossy().to_string();
         let mut scheduler = config.scheduler_config();
-        let num_slots = config.num_slots;
+        let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
         let low_impact = config.low_impact;
         let kv_recall = config.kv_recall;
@@ -1732,7 +1749,7 @@ mod backend {
             scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(max_seq);
             scheduler.max_total_tokens = scheduler.max_total_tokens.min(max_seq + 4096);
         }
-        let num_slots = config.num_slots;
+        let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
         let mtp_requested = config.mtp_enabled();
         if mtp_requested && !matches!(kind, CudaModelKind::Dsv4) {
@@ -2229,7 +2246,11 @@ mod backend {
         let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
         let model_id = crate::serve_engine::model_id_from_path(model_path);
         let executor = MetalExecutor::new();
-        let kv = HostPagedKvPool::new(config.num_slots, config.total_pages, config.page_size);
+        let kv = HostPagedKvPool::new(
+            config.hot_workspace_slots(),
+            config.total_pages,
+            config.page_size,
+        );
         let serve =
             ServeHandle::spawn_with_shutdown(executor, kv, config.scheduler_config(), shutdown);
         Ok(infer_server::coordinator_local_router(

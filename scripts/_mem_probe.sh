@@ -10,7 +10,7 @@ cd "$ROOT"
 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 ARLE_DSV4_MOE_BACKEND=allreduce ARLE_DSV4_EXPERT_BACKEND=native \
 ARLE_DSV4_LOAD_LAYER_WEIGHTS=1 ARLE_DSV4_GPU_FULL_LAYERS=43 ARLE_DSV4_INCREMENTAL_KV=1 \
 ARLE_DSV4_FLASHMLA_PREFILL=1 ARLE_DSV4_FLASHMLA_DECODE=1 RUST_LOG=info NCCL_DEBUG=WARN \
-"$BIN" --model-path "$MODEL" --port "$PORT" --num-slots 1 --max-seq-len 17408 \
+"$BIN" --model-path "$MODEL" --port "$PORT" --max-running-requests 1 --max-seq-len 17408 \
   --mem-fraction-static 0.10 --kv-cache-dtype fp8 --deepseek-distributed-layers 43 >>"$LOG" 2>&1 &
 SVPID=$!
 ready=0
