@@ -41,7 +41,7 @@ ssh outdoors-arrow-guide-participate.trycloudflare.com \
   'cd /content/workspace/agent-infer && \
    CUDA_HOME=/usr/local/cuda PATH=/root/.cargo/bin:$CUDA_HOME/bin:$PATH \
    LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH TORCH_CUDA_ARCH_LIST=8.9 \
-   nohup setsid ./target/release/infer --model-path infer/models/Qwen3-4B \
+   nohup setsid ./target/release/arle --model-path infer/models/Qwen3-4B \
      --port 8000 --num-slots 16 --max-seq-len 5120 \
      > /tmp/arle_server.log 2>&1 < /dev/null &'
 
@@ -129,7 +129,7 @@ experiments guarded by `model.supports_mixed_batch(...)`.
 - The remote root crate had stale root-level files that made
   `cargo build --release --features cuda` compile the wrong root surface.
   Building the actual server package with `cargo build -p infer --release
-  --features cuda` succeeded and produced `target/release/infer`.
+  --features cuda` succeeded and produced `target/release/arle`.
 
 ## Rule
 

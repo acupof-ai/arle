@@ -22,7 +22,7 @@ attention latency.
 ```bash
 # On A100-SXM4-80GB sm_80 with Qwen3-4B BF16 weights:
 ./scripts/bench_int8_vs_bf16.sh   # see attached, runs:
-#   ./target/release/infer --model-path infer/models/Qwen3-4B --port 8000 \
+#   ./target/release/arle --model-path infer/models/Qwen3-4B --port 8000 \
 #     --num-slots 16 --max-seq-len 5120 --mem-fraction-static 0.85 \
 #     --kv-cache-dtype <bf16|int8>
 #   scripts/bench_guidellm.sh kv-<label> --target http://localhost:8000 \

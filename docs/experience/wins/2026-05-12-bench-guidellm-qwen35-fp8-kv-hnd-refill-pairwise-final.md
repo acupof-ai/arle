@@ -35,7 +35,7 @@ cargo bench -p infer --features cuda --bench ops_bench -- \
 - **Commit:** working tree based on `9150f36`; this entry is committed with the code delta
 - **Feature set:** `cargo build --release -p infer --features cuda --bin infer`
 - **Non-default flags / env vars:** `NVCC_CCBIN=/usr/bin/g++-14`, `INFER_TILELANG_PYTHON=$PWD/.venv/bin/python`, `TORCH_CUDA_ARCH_LIST=8.9`
-- **Server launch:** `./target/release/infer --model-path infer/models/Qwen3.5-4B --port 8000 --num-slots 8 --max-seq-len 5120 --kv-cache-dtype fp8 --mem-fraction-static 0.85`
+- **Server launch:** `./target/release/arle --model-path infer/models/Qwen3.5-4B --port 8000 --num-slots 8 --max-seq-len 5120 --kv-cache-dtype fp8 --mem-fraction-static 0.85`
 - **Scheduling envelope:** `max_num_batched_tokens=16384`, `chunked_prefill_size=2048`, `max_prefill_tokens=16384`, `mem_fraction_static=0.85`, `max_slots=8`
 - **KV pool:** `81552` max tokens, `5097` pages, `page_size=16`, `4 kv_heads x 256 head_dim`, `kv_dim=1024`, `format=FP8E4M3`
 

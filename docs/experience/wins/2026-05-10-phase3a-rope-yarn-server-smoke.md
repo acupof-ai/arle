@@ -37,7 +37,7 @@ CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 \
   INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
   TORCH_CUDA_ARCH_LIST=8.9 \
   RUST_LOG=info \
-  ./target/release/infer \
+  ./target/release/arle \
     --model-path infer/models/Qwen3-4B-yarn-f2.0 \
     --port 8765 --num-slots 4 --max-seq-len 65536 &
 

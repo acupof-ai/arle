@@ -2,12 +2,12 @@
 # native-deepep serve only (stays alive for manual probing). Pod tmux session.
 set -u
 ROOT=/data01/build/arle
-BIN=$ROOT/target-pod/release/infer
+BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash
 PORT=18200
 LOG=/tmp/nd_serve.log
 : >"$LOG"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true
 sleep 3
 cd "$ROOT"
 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \

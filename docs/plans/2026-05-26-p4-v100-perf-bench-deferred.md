@@ -78,7 +78,7 @@ The P4 attempt 2026-05-26 left the following on V100 — reuse on revival:
 ARLE infer launch (proven working for P3 capability + P4 quick):
 
 ```bash
-./target/release/infer \
+./target/release/arle \
   --model-path /home/chenkailun.c/.cache/modelscope/hub/models/Qwen/Qwen3.5-4B \
   --port 8000 --num-slots 16 --max-seq-len 5120
 ```

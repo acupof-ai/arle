@@ -37,7 +37,7 @@ crates/train/src/eval_lm.rs               — train-side eval harness (Rust)
 ```
 
 Server start command in eval_ppl.py:73 uses
-`target/release/infer --model-path <X> --port 8090 --num-slots 1`
+`target/release/arle --model-path <X> --port 8090 --num-slots 1`
 plus optional `--kv-cache-dtype <bf16|fp8|int8>`.
 
 **Already designed for sequential A/B between quant formats.**

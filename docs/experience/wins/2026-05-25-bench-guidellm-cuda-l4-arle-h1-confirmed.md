@@ -26,7 +26,7 @@ counter / log。
 cd agent-infer
 export CUDA_HOME=/usr/local/cuda PATH=$CUDA_HOME/bin:$PATH \
   LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH TORCH_CUDA_ARCH_LIST=8.9
-./target/release/infer --model-path infer/models/Qwen3-4B \
+./target/release/arle --model-path infer/models/Qwen3-4B \
   --port 8000 --num-slots 16 --max-seq-len 5120
 
 scripts/bench_guidellm.sh cuda-l4-arle-2026-05-25 \

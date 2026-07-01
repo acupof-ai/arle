@@ -88,7 +88,7 @@ test -f infer/models/Qwen3-4B-W4A8-marlin/model.safetensors.index.json && echo O
 
 # Start ARLE auto-FP8 KV (no override)
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer --model-path infer/models/Qwen3-4B-W4A8-marlin \
+  ./target/release/arle --model-path infer/models/Qwen3-4B-W4A8-marlin \
   --port 8000 --num-slots 8 --max-seq-len 5120 \
   > /tmp/arle-w4a8.log 2>&1 &
 sleep 35

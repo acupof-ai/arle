@@ -19,7 +19,7 @@ Build and verification:
 ```bash
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
-PEGAINFER_CUDA_SM=89 \
+TORCH_CUDA_ARCH_LIST=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \
@@ -30,7 +30,7 @@ git diff --check
 
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
-PEGAINFER_CUDA_SM=89 \
+TORCH_CUDA_ARCH_LIST=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \
@@ -45,11 +45,11 @@ Canonical W4 server:
 ```bash
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
-PEGAINFER_CUDA_SM=89 \
+TORCH_CUDA_ARCH_LIST=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \
-./target/release/infer \
+./target/release/arle \
   --model-path models/default \
   --port 8000 \
   --num-slots 8 \
@@ -104,7 +104,7 @@ python3 scripts/bench_agent_trace.py \
 - **Session / prefix flags:** OpenAI-compatible `session_id` on every request
 - **Non-default flags / env vars:** `--num-slots 8`, `--max-seq-len 12288`,
   `--kv-cache-dtype fp8`, `--mem-fraction-static 0.85`,
-  `PEGAINFER_CUDA_SM=89`, `INFER_TILELANG_PYTHON=/usr/bin/python3`
+  `TORCH_CUDA_ARCH_LIST=89`, `INFER_TILELANG_PYTHON=/usr/bin/python3`
 
 Server startup resolved:
 

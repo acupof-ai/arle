@@ -178,7 +178,7 @@ Worker's relay-receiver thread needs `Arc<SchedulerHandle>` from the
 ### 5. Smoke test (~80 LOC, new `infer/tests/multiproc_serve_smoke.rs`)
 
 `#[ignore]` (needs 2 GPUs), behind `cuda + nccl` features:
-- Spawn `target/release/infer serve` with `ARLE_MULTIPROC_SERVE=1
+- Spawn `target/release/arle serve` with `ARLE_MULTIPROC_SERVE=1
   ARLE_MULTIPROC_ALLOW_DEADLOCK=` unset, `INFER_CUDA_DEVICES=0,1`,
   tiny DSv4 model.
 - Wait for HTTP `:8000/v1/health`.

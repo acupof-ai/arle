@@ -18,13 +18,13 @@
 # Same workload: 32000 in / 128 out / c=1 (single user long-context decode)
 
 # Arm A (no-spec):
-./target/release/infer --model-path ... --port 8000 --num-slots 4 --max-seq-len 33000
+./target/release/arle --model-path ... --port 8000 --num-slots 4 --max-seq-len 33000
 scripts/bench_guidellm.sh w4a16-no-spec-32k-c1 ... \
   --concurrencies 1 --max-seconds 180 --warmup 10 \
   --data 'prompt_tokens=32000,...,output_tokens=128,...'
 
 # Arm B (self-spec sparse-KV K=5):
-./target/release/infer --model-path ... --port 8000 --num-slots 4 --max-seq-len 33000 \
+./target/release/arle --model-path ... --port 8000 --num-slots 4 --max-seq-len 33000 \
   --spec-enabled --spec-draft-model self --spec-draft-k 5 --spec-sparse-kv-enabled
 scripts/bench_guidellm.sh w4a16-self-spec-32k-c1 ... (same data spec)
 ```

@@ -35,7 +35,7 @@ env CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 \
 
 # 2. Bench A: graph OFF baseline
 INFER_HYBRID_W4A8_PREFILL=1 \
-   ./target/release/infer --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
+   ./target/release/arle --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
    --port 8765 --num-slots 8 --max-seq-len 8192 --admission-policy prefix-aware &
 sleep 40
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
@@ -47,7 +47,7 @@ killall infer
 
 # 3. Bench B: graph ON treatment
 INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1 \
-   ./target/release/infer ... &
+   ./target/release/arle ... &
 sleep 40
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
    scripts/bench_guidellm.sh p37-pathB-graph-on-treatment \

@@ -18,7 +18,7 @@ c=4 60s smoke did not produce a valid performance result.
 Spec-enabled command:
 
 ```bash
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --kv-cache-dtype fp8 \
@@ -62,7 +62,7 @@ A no-spec control using the same current binary and the same 60s c=4 workload
 also produced an invalid result:
 
 ```bash
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --kv-cache-dtype fp8 \

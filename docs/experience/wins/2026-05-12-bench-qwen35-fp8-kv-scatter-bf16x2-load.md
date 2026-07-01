@@ -49,7 +49,7 @@ INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
 TORCH_CUDA_ARCH_LIST=8.9 \
 cargo build --release -p infer --features cuda --bin infer
 
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3.5-4B \
   --port 8000 \
   --num-slots 8 \

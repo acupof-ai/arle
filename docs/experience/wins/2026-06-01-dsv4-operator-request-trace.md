@@ -43,7 +43,7 @@ ARTIFACT_ROOT=/data01/build/arle/docs/trace-artifacts/2026-06-01-dsv4-operator-r
 ARLE_DSV4_OPERATOR_TRACE=1 \
 ARLE_DSV4_EXPERT_BACKEND=deepgemm-auto \
 ARLE_DSV4_MOE_BACKEND=allreduce \
-SERVER_BIN=/data01/build/arle/target-pod/release/infer \
+SERVER_BIN=/data01/build/arle/target-pod/release/arle \
 ./scripts/dsv4_toolchain.sh smoke \
   --model-path /data01/models/DeepSeek-V4-Flash \
   --max-tokens 32 \
@@ -54,13 +54,13 @@ SERVER_BIN=/data01/build/arle/target-pod/release/infer \
 
 Result:
 
-- Build: `/data01/build/arle/target-pod/release/infer` from commit
+- Build: `/data01/build/arle/target-pod/release/arle` from commit
   `bf9c51398d5b52d9dd072b712a2a65d1268def80`.
 - Smoke response: 17 prompt tokens, 32 completion tokens, 3.596 s elapsed.
 - `request_trace_count=1`.
 - `dsv4_operator_trace_process_delta` present.
 - `operators=38`, `layers=1308`.
-- Service cleanup verified: no `target-pod/release/infer` process and no
+- Service cleanup verified: no `target-pod/release/arle` process and no
   response on ports `18188-18194`.
 
 Top request-level operators from the remote trace:
