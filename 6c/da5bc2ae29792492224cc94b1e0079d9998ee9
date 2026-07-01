@@ -1,0 +1,584 @@
+scripts/pod-build-env.sh
+  s_ad211f042b68fc::t_4d04d8af3dcecc 4-10,33-41 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[4,10]},{"Range":[33,41]}]}]}
+crates/autograd/src/tape.rs
+  s_ad211f042b68fc::t_4d04d8af3dcecc 628,710-712,751-753,793,813,818,829-868 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":628},{"Range":[710,712]},{"Range":[751,753]},{"Single":793},{"Single":813},{"Single":818},{"Range":[829,868]}]}]}
+scripts/pod.sh
+  s_ad211f042b68fc::t_4d04d8af3dcecc 97-99,132-133,135-138,140-141,145,150 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[97,99]},{"Range":[132,133]},{"Range":[135,138]},{"Range":[140,141]},{"Single":145},{"Single":150}]}]}
+crates/autograd/src/ops/fused_linear_distill.rs
+  s_ad211f042b68fc::t_4d04d8af3dcecc 1-2,577,590,632,634-640,646,648-654,659-664,671-675,685,731-744 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[1,2]},{"Single":577},{"Single":590},{"Single":632},{"Range":[634,640]},{"Single":646},{"Range":[648,654]},{"Range":[659,664]},{"Range":[671,675]},{"Single":685},{"Range":[731,744]}]}]}
+crates/train/src/opd.rs
+  s_ad211f042b68fc::t_4d04d8af3dcecc 2996,2998-3005,3043-3051,3056,3071-3072,3075,3186,3223,3360,3393 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":2996},{"Range":[2998,3005]},{"Range":[3043,3051]},{"Single":3056},{"Range":[3071,3072]},{"Single":3075},{"Single":3186},{"Single":3223},{"Single":3360},{"Single":3393}]}]}
+scripts/pod-remote-build.sh
+  s_ad211f042b68fc::t_4d04d8af3dcecc 26-28,31 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[26,28]},{"Single":31}]}]}
+crates/infer-cuda/src/executor.rs
+  s_ad211f042b68fc::t_4d04d8af3dcecc 2354-2356,2367-2370,2605-2608 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[2354,2356]},{"Range":[2367,2370]},{"Range":[2605,2608]}]}]}
+crates/autograd/src/ops/attention.rs
+  s_ad211f042b68fc::t_4d04d8af3dcecc 112,117-118 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fad9ee65fd601cb7ac1","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":112},{"Range":[117,118]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6cda5bc2ae29792492224cc94b1e0079d9998ee9",
+  "prompts": {},
+  "sessions": {
+    "s_ad211f042b68fc": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a450f679ee65fd601cb7a6a",
+        "model": "gpt-5.4__dev",
+        "display_model_name": "GPT-5.4"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {
+    "crates/autograd/src/ops/attention.rs": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Single": 112
+          },
+          {
+            "Range": [
+              117,
+              118
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 112
+              },
+              {
+                "Range": [
+                  117,
+                  118
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "crates/autograd/src/ops/fused_linear_distill.rs": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              2
+            ]
+          },
+          {
+            "Single": 577
+          },
+          {
+            "Single": 590
+          },
+          {
+            "Single": 632
+          },
+          {
+            "Range": [
+              634,
+              640
+            ]
+          },
+          {
+            "Single": 646
+          },
+          {
+            "Range": [
+              648,
+              654
+            ]
+          },
+          {
+            "Range": [
+              659,
+              664
+            ]
+          },
+          {
+            "Range": [
+              671,
+              675
+            ]
+          },
+          {
+            "Single": 685
+          },
+          {
+            "Range": [
+              731,
+              744
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "Single": 577
+              },
+              {
+                "Single": 590
+              },
+              {
+                "Single": 632
+              },
+              {
+                "Range": [
+                  634,
+                  640
+                ]
+              },
+              {
+                "Single": 646
+              },
+              {
+                "Range": [
+                  648,
+                  654
+                ]
+              },
+              {
+                "Range": [
+                  659,
+                  664
+                ]
+              },
+              {
+                "Range": [
+                  671,
+                  675
+                ]
+              },
+              {
+                "Single": 685
+              },
+              {
+                "Range": [
+                  731,
+                  744
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "crates/autograd/src/tape.rs": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Single": 628
+          },
+          {
+            "Range": [
+              710,
+              712
+            ]
+          },
+          {
+            "Range": [
+              751,
+              753
+            ]
+          },
+          {
+            "Single": 793
+          },
+          {
+            "Single": 813
+          },
+          {
+            "Single": 818
+          },
+          {
+            "Range": [
+              829,
+              868
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 628
+              },
+              {
+                "Range": [
+                  710,
+                  712
+                ]
+              },
+              {
+                "Range": [
+                  751,
+                  753
+                ]
+              },
+              {
+                "Single": 793
+              },
+              {
+                "Single": 813
+              },
+              {
+                "Single": 818
+              },
+              {
+                "Range": [
+                  829,
+                  868
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "crates/infer-cuda/src/executor.rs": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Range": [
+              2354,
+              2356
+            ]
+          },
+          {
+            "Range": [
+              2367,
+              2370
+            ]
+          },
+          {
+            "Range": [
+              2605,
+              2608
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  2354,
+                  2356
+                ]
+              },
+              {
+                "Range": [
+                  2367,
+                  2370
+                ]
+              },
+              {
+                "Range": [
+                  2605,
+                  2608
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "crates/train/src/opd.rs": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Single": 2996
+          },
+          {
+            "Range": [
+              2998,
+              3005
+            ]
+          },
+          {
+            "Range": [
+              3043,
+              3051
+            ]
+          },
+          {
+            "Single": 3056
+          },
+          {
+            "Range": [
+              3071,
+              3072
+            ]
+          },
+          {
+            "Single": 3075
+          },
+          {
+            "Single": 3186
+          },
+          {
+            "Single": 3223
+          },
+          {
+            "Single": 3360
+          },
+          {
+            "Single": 3393
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 2996
+              },
+              {
+                "Range": [
+                  2998,
+                  3005
+                ]
+              },
+              {
+                "Range": [
+                  3043,
+                  3051
+                ]
+              },
+              {
+                "Single": 3056
+              },
+              {
+                "Range": [
+                  3071,
+                  3072
+                ]
+              },
+              {
+                "Single": 3075
+              },
+              {
+                "Single": 3186
+              },
+              {
+                "Single": 3223
+              },
+              {
+                "Single": 3360
+              },
+              {
+                "Single": 3393
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/pod-build-env.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Range": [
+              4,
+              10
+            ]
+          },
+          {
+            "Range": [
+              33,
+              41
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  4,
+                  10
+                ]
+              },
+              {
+                "Range": [
+                  33,
+                  41
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/pod-remote-build.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Range": [
+              26,
+              28
+            ]
+          },
+          {
+            "Single": 31
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  26,
+                  28
+                ]
+              },
+              {
+                "Single": 31
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/pod.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_4d04d8af3dcecc",
+        "line_ranges": [
+          {
+            "Range": [
+              97,
+              99
+            ]
+          },
+          {
+            "Range": [
+              132,
+              133
+            ]
+          },
+          {
+            "Range": [
+              135,
+              138
+            ]
+          },
+          {
+            "Range": [
+              140,
+              141
+            ]
+          },
+          {
+            "Single": 145
+          },
+          {
+            "Single": 150
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fad9ee65fd601cb7ac1",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  97,
+                  99
+                ]
+              },
+              {
+                "Range": [
+                  132,
+                  133
+                ]
+              },
+              {
+                "Range": [
+                  135,
+                  138
+                ]
+              },
+              {
+                "Range": [
+                  140,
+                  141
+                ]
+              },
+              {
+                "Single": 145
+              },
+              {
+                "Single": 150
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_ad211f042b68fc": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_4d04d8af3dcecc": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
