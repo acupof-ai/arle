@@ -158,12 +158,18 @@ struct DiskTier {
     root_dir: PathBuf,
     /// Fixed-size page-slot mmap store.
     store: kv_native_sys::KvMmapStore,
-    /// Key -> slot index in the mmap store.
-    keys: BTreeMap<u64, u32>,
+    /// Key -> slot index plus valid payload length in the mmap store.
+    keys: BTreeMap<u64, DiskRecord>,
     /// Durable tier: suppress drop-time wipe, persist manifest on mutation.
     durable: bool,
     /// Model/weights-version tag written into the manifest.
     epoch: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiskRecord {
+    slot: u32,
+    len: usize,
 }
 
 impl Drop for DiskTier {
@@ -187,20 +193,21 @@ impl DiskTier {
     }
 
     fn write_manifest(&self) -> Result<()> {
-        let mut buf = String::with_capacity(64 + self.keys.len() * 24);
+        let mut buf = String::with_capacity(64 + self.keys.len() * 32);
         buf.push_str(MANIFEST_MAGIC);
         buf.push('\n');
         buf.push_str(&self.epoch);
         buf.push('\n');
         let slot_bytes = self.store.slot_bytes();
-        for (key, slot) in &self.keys {
-            writeln!(&mut buf, "{key} {slot} {slot_bytes}").expect("write to String never fails");
+        for (key, record) in &self.keys {
+            writeln!(&mut buf, "{key} {} {} {slot_bytes}", record.slot, record.len)
+                .expect("write to String never fails");
         }
         kv_native_sys::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
             .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()))
     }
 
-    fn parse_manifest(bytes: &[u8]) -> Option<(String, Vec<(u64, u32)>)> {
+    fn parse_manifest(bytes: &[u8]) -> Option<(String, Vec<(u64, DiskRecord)>)> {
         // Accept both V1 ("ARLE-KVTIER-MANIFEST-V1" with key+byte_len) and V2
         // ("ARLE-KVTIER-MANIFEST-V2" with key+slot_idx+slot_bytes). V1 manifests
         // start cold (caller gets None and rebuilds).
@@ -211,7 +218,7 @@ impl DiskTier {
             return None;
         }
         let epoch = lines.next()?.to_string();
-        let records: Vec<(u64, u32)> = lines
+        let records: Vec<(u64, DiskRecord)> = lines
             .filter_map(|line| {
                 let line = line.trim();
                 if line.is_empty() {
@@ -220,9 +227,25 @@ impl DiskTier {
                 let mut parts = line.split_whitespace();
                 let key: u64 = parts.next()?.parse().ok()?;
                 let slot_idx: u32 = parts.next()?.parse().ok()?;
-                // Third field (slot_bytes) parsed for forward-compat.
-                let _slot_bytes: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                Some((key, slot_idx))
+                let third = parts.next()?;
+                let fourth = parts.next();
+                let (len, _slot_bytes) = match fourth {
+                    Some(slot_bytes) => (
+                        third.parse::<usize>().ok()?,
+                        slot_bytes.parse::<u32>().ok().unwrap_or(0),
+                    ),
+                    None => (
+                        0,
+                        third.parse::<u32>().ok().unwrap_or(0),
+                    ),
+                };
+                Some((
+                    key,
+                    DiskRecord {
+                        slot: slot_idx,
+                        len,
+                    },
+                ))
             })
             .collect();
         Some((epoch, records))
@@ -376,13 +399,20 @@ impl CudaKvTierStore {
                 );
             } else {
                 let mut indices = Vec::with_capacity(records.len());
-                for (key, slot_idx) in &records {
+                for (key, record) in &records {
                     if keys.len() >= capacity_pages {
                         break;
                     }
-                    if (*slot_idx as usize) < capacity_pages {
-                        keys.insert(*key, *slot_idx);
-                        indices.push(*slot_idx);
+                    if (record.slot as usize) < capacity_pages {
+                        let len = record.len.min(bytes_per_page);
+                        keys.insert(
+                            *key,
+                            DiskRecord {
+                                slot: record.slot,
+                                len,
+                            },
+                        );
+                        indices.push(record.slot);
                     }
                 }
                 store.reserve_indices(&indices);
@@ -504,7 +534,7 @@ impl CudaKvTierStore {
         };
         let already_present = disk.keys.contains_key(&key);
         let slot = if already_present {
-            disk.keys[&key]
+            disk.keys[&key].slot
         } else {
             match disk.store.alloc_slot() {
                 Some(s) => s,
@@ -518,7 +548,13 @@ impl CudaKvTierStore {
             }
             return false;
         }
-        disk.keys.insert(key, slot);
+        disk.keys.insert(
+            key,
+            DiskRecord {
+                slot,
+                len: payload.len(),
+            },
+        );
         if disk.durable {
             if let Err(err) = disk.write_manifest() {
                 log::warn!("KV recall manifest update failed for key {key}: {err}");
@@ -561,8 +597,13 @@ impl CudaKvTierStore {
         }
         // Disk hit: zero-copy mmap slice.
         if let Some(disk) = self.disk.as_ref() {
-            if let Some(&slot) = disk.keys.get(&key) {
-                return Ok(Cow::Borrowed(disk.store.read_slot(slot)));
+            if let Some(record) = disk.keys.get(&key) {
+                let len = if record.len == 0 {
+                    self.bytes_per_page
+                } else {
+                    record.len.min(self.bytes_per_page)
+                };
+                return Ok(Cow::Borrowed(&disk.store.read_slot(record.slot)[..len]));
             }
         }
         Err(anyhow!("KV tier store has no entry for key {key}"))
@@ -578,8 +619,8 @@ impl CudaKvTierStore {
                 self.host_lru.remove(&(entry.stamp, *key));
             }
             if let Some(disk) = &mut self.disk {
-                if let Some(slot) = disk.keys.remove(key) {
-                    disk.store.free_slot(slot);
+                if let Some(record) = disk.keys.remove(key) {
+                    disk.store.free_slot(record.slot);
                     disk_index_changed = true;
                 }
             }
@@ -718,6 +759,17 @@ mod tests {
             assert_eq!(second.as_ref(), &[1u8; 8]);
         }
 
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn disk_read_respects_recorded_payload_length() {
+        let root = temp_root("disk_len");
+        let mut store = CudaKvTierStore::with_budget(0, 16);
+        assert!(store.set_disk(root.clone(), 32, 16));
+        assert!(store.insert(7, b"short".to_vec()));
+        let read = store.read(7).expect("disk read");
+        assert_eq!(read.as_ref(), b"short");
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -861,11 +913,11 @@ mod tests {
             namespace = root.join(format!("arle-kv-recall-{}", std::process::id()));
             assert!(namespace.exists());
             assert!(namespace.join("kv.mmap").exists());
-            assert!(namespace.join(MANIFEST_FILE).exists());
 
             assert!(store.insert(1, vec![1; 8]));
             assert!(store.insert(2, vec![2; 8]));
             assert!(store.insert(3, vec![3; 8]));
+            assert!(namespace.join(MANIFEST_FILE).exists());
             assert_eq!(store.disk_pages(), 3);
         }
         // Durable namespace survives drop.
@@ -885,8 +937,54 @@ mod tests {
         {
             let mut store = CudaKvTierStore::with_budget(0, 8);
             let reloaded = store.load(root.clone(), 32, 8, "epoch-B".to_string());
-            assert!(!reloaded, "stale epoch must not reload");
+            assert!(reloaded, "durable disk tier still attaches");
             assert_eq!(store.disk_pages(), 0, "stale-epoch index starts cold");
+            assert!(store.read(1).is_err(), "stale-epoch key must not resolve");
+        }
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_manifest_round_trips_variable_payload_length() {
+        let root = temp_root("durable_varlen");
+        let epoch = "epoch-A".to_string();
+
+        {
+            let mut store = CudaKvTierStore::with_budget(0, 16);
+            assert!(store.set_disk_durable(root.clone(), 32, 16, epoch.clone()));
+            assert!(store.insert(11, b"tiny".to_vec()));
+            assert!(store.insert(12, b"payload-123".to_vec()));
+            let disk = store.disk.as_ref().expect("disk tier");
+            assert_eq!(
+                disk.keys.get(&11),
+                Some(&DiskRecord { slot: 1, len: 4 }),
+                "latest alloc pops highest free slot first"
+            );
+            assert_eq!(
+                disk.keys.get(&12),
+                Some(&DiskRecord { slot: 0, len: 11 }),
+            );
+        }
+
+        {
+            let mut store = CudaKvTierStore::with_budget(0, 16);
+            let reloaded = store.load(root.clone(), 32, 16, epoch.clone());
+            assert!(reloaded, "load reports prior blocks reloaded");
+            assert_eq!(store.read(11).expect("reload read 11").as_ref(), b"tiny");
+            assert_eq!(
+                store.read(12).expect("reload read 12").as_ref(),
+                b"payload-123"
+            );
+            let disk = store.disk.as_ref().expect("disk tier");
+            assert_eq!(
+                disk.keys.get(&11),
+                Some(&DiskRecord { slot: 1, len: 4 }),
+            );
+            assert_eq!(
+                disk.keys.get(&12),
+                Some(&DiskRecord { slot: 0, len: 11 }),
+            );
         }
 
         std::fs::remove_dir_all(&root).expect("cleanup");
