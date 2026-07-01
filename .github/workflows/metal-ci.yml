@@ -62,9 +62,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-metal-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-metal-ninja-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-metal-
+            ${{ runner.os }}-metal-ninja-
 
       # Verify Metal C++ shim compiles and Rust type-checks cleanly.
       - name: cargo check (metal + no-cuda infer lib)
