@@ -19,14 +19,14 @@ requests to attach long session prefixes.
   - `758ea29e` `feat(scheduler): evict inactive session slots under pressure`
   - `d505e06e` `fix(scheduler): treat unset slot block location as gpu`
 - Server:
-  - `./target/release/infer --model-path models/default --port 8000 --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 --mem-fraction-static 0.85 --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 --t1-host-pinned-capacity-mb 32768 --t1-host-pinned-min-prompt-tokens 4096`
+  - `./target/release/arle --model-path models/default --port 8000 --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 --mem-fraction-static 0.85 --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 --t1-host-pinned-capacity-mb 32768 --t1-host-pinned-min-prompt-tokens 4096`
 - Trace:
   - `scripts/bench_agent_trace.py --workload agent-w4-tool-resume`
 - Env:
   - NVIDIA L4 24GB
   - `CUDA_HOME=/usr/local/cuda`
   - `CARGO_HOME=/tmp/cargo-home-local`
-  - `PEGAINFER_CUDA_SM=89`
+  - `TORCH_CUDA_ARCH_LIST=89`
   - `LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64`
   - `ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig`
   - `INFER_TILELANG_PYTHON=/usr/bin/python3`

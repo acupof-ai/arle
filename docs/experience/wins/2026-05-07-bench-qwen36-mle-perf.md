@@ -39,7 +39,7 @@ The auto-detector resolves `~/.cache/huggingface/hub/models--…--Qwen3.6-35B-A3
 
 ```
 auto wired_limit = 20 GiB (21475946095 bytes; model dir
-/Users/.../snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46)
+$HOME/.cache/huggingface/hub/models--...--/snapshots/<sha>)
 Metal runtime wired limit set to 21475946095 bytes (previous 0)
 ```
 

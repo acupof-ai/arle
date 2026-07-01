@@ -19,7 +19,7 @@ ZIG=$PWD/.toolchains/zig/zig-x86_64-linux-0.16.0/zig \
   INFER_TILELANG_PYTHON=/usr/bin/python3 \
   cargo build --release -p infer --features cuda
 
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --kv-cache-dtype fp8 \

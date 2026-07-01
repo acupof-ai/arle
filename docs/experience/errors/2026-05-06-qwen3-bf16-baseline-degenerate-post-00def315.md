@@ -5,7 +5,7 @@
 Discovered while doing an intermittent GPU smoke during the FP8 KV Tier 1
 diagnostic effort (codex's `infer/src/bin/fp8_kv_boundary_diag.rs` + module).
 
-The pre-built release binary at `/tmp/arle-target-release/release/infer`
+The pre-built release binary at `/tmp/arle-target-release/release/arle`
 (built `2026-05-06 05:29:05`, post-`00def315` "fix(cuda): finalize qwen3 fp8
 paged prefill kv") was launched on `Qwen3-4B` with **BF16 KV** (`--kv-cache-dtype bf16`)
 and exercised with two trivial prompts under greedy `temperature=0`. Both
@@ -23,7 +23,7 @@ unreliable: the BF16 reference itself is corrupt on this binary.
 Server:
 
 ```bash
-RUST_LOG=warn CUDA_HOME=/usr/local/cuda /tmp/arle-target-release/release/infer \
+RUST_LOG=warn CUDA_HOME=/usr/local/cuda /tmp/arle-target-release/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8090 \
   --kv-cache-dtype bf16 \
@@ -53,7 +53,7 @@ curl http://127.0.0.1:8090/v1/completions -d \
 - CUDA target: `sm_89`
 - Model: Qwen3-4B (`infer/models/Qwen3-4B`, weights from
   `/content/drive/MyDrive/dev/project/agent-infer/models/Qwen3-4B`)
-- Binary: `/tmp/arle-target-release/release/infer`, built 2026-05-06 05:29:05
+- Binary: `/tmp/arle-target-release/release/arle`, built 2026-05-06 05:29:05
   by codex against post-`00def315` HEAD; the binary's git ancestry includes
   PR #43 / #44 / #45 and the FP8 paged-prefill KV finalization patch
   (`00def315`)

@@ -46,7 +46,7 @@ All else identical to prior tests:
 
 ```bash
 cargo build --release -p infer --features cuda  # incremental rebuild (warmup change)
-./target/release/infer --port 8000 --num-slots 16 --max-seq-len 9216
+./target/release/arle --port 8000 --num-slots 16 --max-seq-len 9216
 # (no --prefill-max-requests flag → uses model default Some(8))
 
 bench_agent_trace.py --workload agent-w4-tool-resume --num-concurrent 8

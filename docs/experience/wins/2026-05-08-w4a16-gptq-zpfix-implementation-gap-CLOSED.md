@@ -35,7 +35,7 @@ All else identical to Round 1 buggy bench:
 # 2. marlin_repack.py → Qwen3-4B-GPTQ-W4A16-marlin-zpfix
 
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer \
+  ./target/release/arle \
   --model-path infer/models/Qwen3-4B-GPTQ-W4A16-marlin-zpfix \
   --port 8000 --num-slots 8 --max-seq-len 5120
 

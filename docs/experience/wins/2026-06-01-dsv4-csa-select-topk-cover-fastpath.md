@@ -25,7 +25,7 @@ selected set must be the full causal range.
 - Dirty runtime diff: `crates/cuda-kernels/csrc/misc/dsv4_attention.cu`
 - Build: `CARGO_TARGET_DIR=/sgl-workspace/arle/target-pod cargo build --release -p infer --features cuda,nccl --bin infer`
 - Model: `/data01/models/DeepSeek-V4-Flash`
-- Launch: `target-pod/release/infer --num-slots 1 --max-seq-len 4096 --mem-fraction-static 0.85 --kv-cache-dtype fp8 --deepseek-distributed-layers 43`
+- Launch: `target-pod/release/arle --num-slots 1 --max-seq-len 4096 --mem-fraction-static 0.85 --kv-cache-dtype fp8 --deepseek-distributed-layers 43`
 - Env: `INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7`, `ARLE_DSV4_MOE_BACKEND=allreduce`, `ARLE_DSV4_INCREMENTAL_KV=1`, DeepGEMM roots under `/root/DeepGEMM`
 
 ## Results

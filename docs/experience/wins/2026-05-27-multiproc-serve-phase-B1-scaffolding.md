@@ -150,7 +150,7 @@ all N rank schedulers (1 in-process + N-1 in worker processes).
 After commit C lands:
 - New test `infer/tests/multiproc_serve_smoke.rs` (`#[ignore]` since
   needs 2 GPUs).
-- Launches `target/release/infer serve` with `ARLE_MULTIPROC_SERVE=1`,
+- Launches `target/release/arle serve` with `ARLE_MULTIPROC_SERVE=1`,
   posts one greedy non-streaming `/v1/chat/completions`, captures
   response bytes.
 - Asserts byte-identical to a baseline run with `ARLE_MULTIPROC_SERVE`

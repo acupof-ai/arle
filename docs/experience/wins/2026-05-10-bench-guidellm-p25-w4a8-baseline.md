@@ -36,7 +36,7 @@ baseline at c=1 and c=4, with no request errors and no queue growth.
 | Processor | `infer/models/Qwen3-4B` |
 | Feature set | `cargo build --release -p infer --features cuda` |
 | Non-default env | none for selector arm |
-| Server launch | `./target/release/infer --model-path infer/models/Qwen3-4B-GPTQ-W4A8-zpfix --port 8000 --num-slots 8 --max-seq-len 5120` |
+| Server launch | `./target/release/arle --model-path infer/models/Qwen3-4B-GPTQ-W4A8-zpfix --port 8000 --num-slots 8 --max-seq-len 5120` |
 
 ## Command
 

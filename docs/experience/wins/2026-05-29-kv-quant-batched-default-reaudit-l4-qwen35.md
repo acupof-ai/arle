@@ -36,7 +36,7 @@ So this audit re-ran the errors-entry's own Rule **directly through the L4
 serving path on Qwen3.5-4B**: decode the actual greedy tokens, bf16 vs
 int8/fp8/int4, and compare.
 
-L4 sm_89 / CUDA 12.8, `target/release/infer` @ `be706204`,
+L4 sm_89 / CUDA 12.8, `target/release/arle` @ `be706204`,
 `ARLE_CUDA_DISABLE_FLASHMLA=1`, model `/content/Qwen3.5-4B`.
 
 ## Results — correctness (decoded greedy tokens, Qwen3.5-4B, n=8 prompts × 64 tok)
@@ -155,8 +155,8 @@ and divergence may grow. Both are cheap and are the licensed next step.
 # Correctness: decode the actual tokens through the server (not the unit test —
 # kv_precision_parity.rs is Qwen3-dense-only and rejects qwen3_5).
 for prec in bf16 int8 fp8 int4; do
-  pkill -9 -x infer; sleep 3        # -x infer, NOT -f target/release/infer (self-kill)
-  ./target/release/infer --model-path /content/Qwen3.5-4B --port 8000 \
+  pkill -9 -x infer; sleep 3        # -x infer, NOT -f target/release/arle (self-kill)
+  ./target/release/arle --model-path /content/Qwen3.5-4B --port 8000 \
                          --kv-cache-dtype "$prec" --num-slots 4 &
   # wait /v1/models 200, then POST /v1/completions {temperature:0, max_tokens:64}
   # for N coherent prompts; diff generated text vs bf16. Full driver:

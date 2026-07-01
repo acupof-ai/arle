@@ -20,7 +20,7 @@ The user-provided launch shape used auto KV cache mode, which resolves to FP8 on
 
 ```bash
 INFER_PREFILL_GRAPH=1 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer \
+  ./target/release/arle \
     --model-path infer/models/Qwen3-4B \
     --port 8000 \
     --num-slots 8 \

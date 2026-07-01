@@ -5,13 +5,13 @@
 # FlashMLA engaged on the >24576 chunk; ~190s => legacy fallback) + IMA/TMA grep.
 set -u
 ROOT=/data01/build/arle
-BIN=$ROOT/target-pod/release/infer
+BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash
 PORT=18201
 LOG=/tmp/fmla_serve.log
 RESP=/tmp/fmla_resp.txt
 : >"$LOG"; : >"$RESP"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true
 sleep 3
 
 cd "$ROOT"
@@ -78,5 +78,5 @@ echo "=== flashmla engagement (Once probe / legacy markers) ===" | tee -a "$RESP
 grep -iE "prefill=.*us|flashmla|use_flashmla|hybrid_attention|legacy" "$LOG" | tail -8 | tee -a "$RESP"
 echo "=== server tail ===" | tee -a "$RESP"
 tail -6 "$LOG" | tee -a "$RESP"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true
 echo "FMLA_DONE" | tee -a "$RESP"

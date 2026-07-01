@@ -90,7 +90,7 @@ cargo build --release -p infer --no-default-features --features metal
 
 The Metal serving binary is `target/release/metal_serve` (gated on
 `--features metal` per `infer/Cargo.toml`). On Mac the CUDA-only
-`target/release/infer` from the M6 CUDA snapshot **does not exist**;
+`target/release/arle` from the M6 CUDA snapshot **does not exist**;
 the cited M6 CUDA commands are not portable here. The workspace also
 ships `target/release/arle` (CLI front door) which can invoke
 `metal_serve` for you via `arle serve --backend metal`. Either entry

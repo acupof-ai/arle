@@ -13,7 +13,7 @@ Validation used the local L4 box:
 - GPU: NVIDIA L4 24GB
 - Model: `models/default` -> `Qwen3-4B`
 - Server:
-  `./target/release/infer --model-path models/default --port 8000 --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 --mem-fraction-static 0.85 --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 --t1-host-pinned-capacity-mb 32768 --t1-host-pinned-min-prompt-tokens 4096`
+  `./target/release/arle --model-path models/default --port 8000 --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 --mem-fraction-static 0.85 --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 --t1-host-pinned-capacity-mb 32768 --t1-host-pinned-min-prompt-tokens 4096`
 - Trace:
   `python3 scripts/bench_agent_trace.py --workload agent-w4-tool-resume --server http://127.0.0.1:8000 --label a-session-keyed-w4-canonical --out bench-results/a-session-keyed-w4-canonical/results.json --trace-out bench-results/a-session-keyed-w4-canonical/trace.jsonl`
 

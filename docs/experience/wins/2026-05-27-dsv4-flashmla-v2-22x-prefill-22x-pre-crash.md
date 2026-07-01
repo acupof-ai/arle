@@ -114,7 +114,7 @@ cuda,nccl` (without `-p infer --bin infer`) only re-links the workspace
 launch. Verify binary mtime after every build:
 
 ```
-stat -c %y /sgl-workspace/arle-fresh/target/release/infer
+stat -c %y /sgl-workspace/arle-fresh/target/release/arle
 ```
 
 If unchanged after a code change, re-run with `cargo build --release

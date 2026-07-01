@@ -33,7 +33,7 @@ nsys profile \
   --capture-range-end=stop \
   --export=sqlite \
   --kill none \
-  -- target/release/infer \
+  -- target/release/arle \
     --model-path infer/models/Qwen3-4B \
     --port 8000 --num-slots 8 --max-seq-len 5120
 ```

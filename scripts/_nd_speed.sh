@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # native-deepep prefill wall-time after event-based combine. 16K + needle.
 set -u
-ROOT=/data01/build/arle; BIN=$ROOT/target-pod/release/infer
+ROOT=/data01/build/arle; BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash; PORT=18206
 LOG=/tmp/nds_serve.log; RESP=/tmp/nds_resp.txt
 : >"$LOG"; : >"$RESP"
-pkill -9 -f release/infer 2>/dev/null || true; sleep 4
+pkill -9 -f release/arle 2>/dev/null || true; sleep 4
 cd "$ROOT"
 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 ARLE_MULTIPROC_SERVE=1 \
 ARLE_DSV4_MOE_BACKEND=native-deepep ARLE_DSV4_EXPERT_BACKEND=native \
@@ -40,5 +40,5 @@ PY
 fi >> "$RESP" 2>&1
 grep RESULT "$RESP"
 echo "IMA/OOM=$(grep -icE 'illegal memory|out of memory|combine failed' "$LOG")" | tee -a "$RESP"
-pkill -9 -f release/infer 2>/dev/null || true
+pkill -9 -f release/arle 2>/dev/null || true
 echo "NDS_DONE" | tee -a "$RESP"

@@ -98,7 +98,7 @@ After landing:
 cargo build --release -p infer --features cuda
 
 # Re-run W4 c=8 8K bench fresh build N≥3
-INFER_LOG_LEVEL=info ./target/release/infer ... # cold start
+INFER_LOG_LEVEL=info ./target/release/arle ... # cold start
 # Expected log:
 #   "Warming up CUDA Graphs for 16 batch sizes (max 16)..."
 #   "Prefill warmup done in <expected ~1500ms> ms"

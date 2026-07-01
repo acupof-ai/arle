@@ -20,7 +20,7 @@ inside the 8-GPU Kubernetes container.
 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 RUST_LOG=info NCCL_DEBUG=WARN \
-./target/release/infer \
+./target/release/arle \
   --port 18084 \
   --num-slots 1 \
   --max-seq-len 8192
@@ -37,7 +37,7 @@ nsys profile --trace cuda,nvtx,osrt \
   --kill=none \
   --force-overwrite=true \
   --output trace \
-  ./target/release/infer --port 18084 --num-slots 1 --max-seq-len 8192
+  ./target/release/arle --port 18084 --num-slots 1 --max-seq-len 8192
 ```
 
 ## Environment

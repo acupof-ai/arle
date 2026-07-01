@@ -32,7 +32,7 @@ Baseline server:
 ```bash
 source /tmp/arle-env.sh
 INFER_DECODE_METADATA_FAST_PAGE16=0 RUST_LOG=info CUDA_HOME=/usr/local/cuda \
-  ./target/release/infer --model-path models/default --port 8000 \
+  ./target/release/arle --model-path models/default --port 8000 \
   --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 \
   --mem-fraction-static 0.85 \
   --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 \
@@ -60,7 +60,7 @@ Fast-path server:
 ```bash
 source /tmp/arle-env.sh
 INFER_DECODE_METADATA_FAST_PAGE16=1 RUST_LOG=info CUDA_HOME=/usr/local/cuda \
-  ./target/release/infer --model-path models/default --port 8000 \
+  ./target/release/arle --model-path models/default --port 8000 \
   --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 \
   --mem-fraction-static 0.85 \
   --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 \

@@ -25,7 +25,7 @@ NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
 CUDARC_CUDA_VERSION=13010 \
 TORCH_CUDA_ARCH_LIST=8.9 \
-./target/release/infer \
+./target/release/arle \
   --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base \
   --port 8123 --num-slots 1 --max-seq-len 4096 \
   --chunked-prefill-size 4096 --max-num-batched-tokens 4096

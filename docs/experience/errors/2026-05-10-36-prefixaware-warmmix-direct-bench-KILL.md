@@ -46,7 +46,7 @@ TORCH_CUDA_ARCH_LIST=8.9 \
 INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
 INFER_HYBRID_W4A8_PREFILL=1 \
 INFER_PREFILL_GRAPH=1 \
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
   --port 8765 \
   --num-slots 8 \

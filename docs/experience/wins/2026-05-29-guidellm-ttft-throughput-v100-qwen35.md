@@ -7,7 +7,7 @@ numbers first; published-baseline comparison lands in a follow-up
 commit. Validates the `--kv-cache-dtype int4` CLI exposure that
 shipped at commit `591d1bf6` and the kv_tier refactor at `67745ebc`.
 
-`infer/target/release/infer` on V100 sm_70 / CUDA 12.4, model
+`infer/target/release/arle` on V100 sm_70 / CUDA 12.4, model
 `Qwen3.5-4B`. guidellm 0.6.0 from `~/arle/.venv`. One server per
 precision (bf16 / int8 / fp8 / int4), torn down between runs to
 drop the KV pool cleanly. Identical guidellm config across precisions:
@@ -138,7 +138,7 @@ limit-bound or paging-bound — separate run.
 #    docs/experience/wins/2026-05-29-kv-precision-bench-v100-qwen35.md
 #    "Substrate footnote".
 # 2. For each precision in {bf16, int8, fp8, int4}:
-./target/release/infer --model-path <Qwen3.5-4B-dir> --port 8000 \
+./target/release/arle --model-path <Qwen3.5-4B-dir> --port 8000 \
                        --kv-cache-dtype <prec> --num-slots 8 &
 # wait for /v1/models 200
 env -i HOME=$HOME PATH=/usr/bin GUIDELLM__MP_CONTEXT_TYPE=forkserver \

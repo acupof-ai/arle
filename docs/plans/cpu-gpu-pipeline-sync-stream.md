@@ -653,7 +653,7 @@ Terminal A starts the server:
 
 ```bash
 CUDA_HOME=/usr/local/cuda cargo build --release -p infer --features cuda
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --max-seq-len 8192

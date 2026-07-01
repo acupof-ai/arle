@@ -49,7 +49,7 @@ To benchmark long-context paths properly:
 ```bash
 # For prompt=2048 + output=128 → max_seq_len ≥ 4400 (2048 + 128 + ~10% overhead)
 RUST_MIN_STACK=33554432 \
-  setsid target/release/infer \
+  setsid target/release/arle \
     --model-path infer/models/Qwen3-4B-GPTQ-W4A16-marlin-zpfix \
     --max-seq-len 8192 \                    # ← EXPLICIT overide
     --port 8000 \

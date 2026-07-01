@@ -13,7 +13,7 @@ existing W4 GEMV path and added zero-point subtraction in the CUDA unpack loop.
 The loader then passed the load/smoke gate:
 
 ```text
-target/release/infer --model-path /home/ckl/.cache/modelscope/hub/tclf90/Qwen3___5-9B-AWQ \
+target/release/arle --model-path /home/ckl/.cache/modelscope/hub/tclf90/Qwen3___5-9B-AWQ \
   --port 8123 --num-slots 1 --max-seq-len 128 --chunked-prefill-size 128 \
   --max-num-batched-tokens 128
 

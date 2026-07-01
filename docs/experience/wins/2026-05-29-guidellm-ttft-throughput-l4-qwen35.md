@@ -185,8 +185,8 @@ cargo build --release -p infer --bin infer --features cuda
 
 # Sweep — one server per precision, torn down between:
 for prec in bf16 int8 fp8 int4; do
-  pkill -9 -x infer; sleep 3   # NB: -x infer (exact comm), NOT -f target/release/infer
-  ./target/release/infer --model-path /content/Qwen3.5-4B --port 8000 \
+  pkill -9 -x infer; sleep 3   # NB: -x infer (exact comm), NOT -f target/release/arle
+  ./target/release/arle --model-path /content/Qwen3.5-4B --port 8000 \
                          --kv-cache-dtype "$prec" --num-slots 16 &
   # wait for /v1/models 200, then:
   env -i HOME=$HOME PATH=/usr/bin:/usr/local/bin GUIDELLM__MP_CONTEXT_TYPE=forkserver \
@@ -201,9 +201,9 @@ done
 
 Three L4-box gotchas (kept so the next person doesn't burn the hour I did):
 
-- **`pkill -9 -f target/release/infer` SELF-KILLS the launcher.** The
+- **`pkill -9 -f target/release/arle` SELF-KILLS the launcher.** The
   cleanup pattern matches the bash process running the sweep (its argv
-  contains `./target/release/infer …`), SIGKILLing the shell before the
+  contains `./target/release/arle …`), SIGKILLing the shell before the
   server ever starts — symptom is "server exits 1 with zero output and no
   log file". Use `pkill -9 -x infer` (exact process name) instead.
 - **`env -i … PATH=/usr/bin` cannot find guidellm** — it lives in

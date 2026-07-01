@@ -24,7 +24,7 @@ gain at high-conc.
 
 Same as M3.6 Phase 1 / F4-Small bench:
 ```bash
-target/release/infer --port 8000 --max-seq-len 5120 --num-slots 48
+target/release/arle --port 8000 --max-seq-len 5120 --num-slots 48
 guidellm benchmark run --profile concurrent --rate 64 \
   --data 'prompt_tokens=1024,...,output_tokens=256,...' \
   --max-seconds 45 --warmup 5 --random-seed 20260416

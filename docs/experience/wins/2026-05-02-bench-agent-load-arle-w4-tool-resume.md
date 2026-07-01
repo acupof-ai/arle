@@ -34,11 +34,11 @@ Server:
 ```bash
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
-PEGAINFER_CUDA_SM=89 \
+TORCH_CUDA_ARCH_LIST=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \
-./target/release/infer \
+./target/release/arle \
   --model-path models/default \
   --port 8000 \
   --num-slots 8 \
@@ -90,12 +90,12 @@ exit "$STATUS"
 - **Tokenizer / processor:** `models/default -> models/Qwen3-4B`
 - **Hardware:** NVIDIA L4, 23,034 MiB, driver 580.82.07, CUDA nvcc 12.8.93
 - **Commit:** `c6a43717`, clean tree before run
-- **Feature set:** existing `target/release/infer` CUDA release binary
+- **Feature set:** existing `target/release/arle` CUDA release binary
 - **KV dtype / cache mode:** FP8E4M3 paged KV, RadixCache on
 - **Session / prefix flags:** OpenAI-compatible `session_id` on every request
 - **Non-default flags / env vars:** `--num-slots 8`, `--max-seq-len 12288`,
   `--kv-cache-dtype fp8`, `--mem-fraction-static 0.85`,
-  `PEGAINFER_CUDA_SM=89`, `INFER_TILELANG_PYTHON=/usr/bin/python3`
+  `TORCH_CUDA_ARCH_LIST=89`, `INFER_TILELANG_PYTHON=/usr/bin/python3`
 
 Server startup resolved:
 

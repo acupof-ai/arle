@@ -23,7 +23,7 @@ python3 -m pip install -e '.[tilelang]'
 python3 -c "import tilelang; print(tilelang.__version__)"  # 0.1.9
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
-PEGAINFER_CUDA_SM=89 \
+TORCH_CUDA_ARCH_LIST=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \

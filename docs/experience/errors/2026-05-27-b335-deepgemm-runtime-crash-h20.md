@@ -153,7 +153,7 @@ Cheapest crash-clearing test: change (1) alone at mlp.rs:5294; if the launch fai
 scale-stride-on-reuse divergence is confirmed; then `compute-sanitizer --tool memcheck` one prefill to name
 the exact trapping load + add (2).
 
-**Validation blocked 2026-05-31**: a parallel-session rebuild left the pod `target-pod/release/infer` WITHOUT
+**Validation blocked 2026-05-31**: a parallel-session rebuild left the pod `target-pod/release/arle` WITHOUT
 `--features nccl` (boot panics "TP/EP world_size > 1 requires building infer with --features nccl"). A clean
 `--features cuda,nccl` rebuild is needed before the discriminator/fix can be pod-tested. Root cause above is
 from source (high confidence on the class; medium on the exact trapping line — needs the sanitizer run).

@@ -16,7 +16,7 @@
 
 ```bash
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer \
+  ./target/release/arle \
   --model-path infer/models/Qwen3-4B-W4A16-sym-g128-marlin \
   --port 8000 --num-slots 16 --max-seq-len 9216
 

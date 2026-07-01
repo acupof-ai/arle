@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Memory probe: baseline after boot + single 16K-token prompt (single chunk, V2.4 scenario).
 set -u
-ROOT=/data01/build/arle; BIN=$ROOT/target-pod/release/infer
+ROOT=/data01/build/arle; BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash; PORT=18202
 LOG=/tmp/mp_serve.log; RESP=/tmp/mp_resp.txt
 : >"$LOG"; : >"$RESP"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true; sleep 3
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true; sleep 3
 cd "$ROOT"
 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 ARLE_DSV4_MOE_BACKEND=allreduce ARLE_DSV4_EXPERT_BACKEND=native \
 ARLE_DSV4_LOAD_LAYER_WEIGHTS=1 ARLE_DSV4_GPU_FULL_LAYERS=43 ARLE_DSV4_INCREMENTAL_KV=1 \
@@ -35,5 +35,5 @@ echo "=== nvidia-smi PEAK (after request) ===" | tee -a "$RESP"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader | head -8 | tee -a "$RESP"
 echo "=== OOM grep ===" | tee -a "$RESP"
 grep -icE "out of memory|Alloc failed" "$LOG" | tee -a "$RESP"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true
 echo "MP_DONE" | tee -a "$RESP"

@@ -44,7 +44,7 @@
 # Start ARLE with production defaults (auto-FP8 KV) — match real
 # user shape, not BF16-forced.
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer --model-path infer/models/Qwen3-4B \
+  ./target/release/arle --model-path infer/models/Qwen3-4B \
   --port 8000 --num-slots 8 --max-seq-len 5120
 
 # In a second terminal:
@@ -57,7 +57,7 @@ PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
 If `scripts/profile_nsys_guidellm.sh` also has stale syntax (mirror of
 the ncu wrapper bug found in the E2 errors entry), fix it OR drop to
 direct `nsys profile --capture-range=cudaProfilerApi --output=baseline
-./target/release/infer ...` + cuProfilerStart/Stop signal trigger
+./target/release/arle ...` + cuProfilerStart/Stop signal trigger
 (per master §4.2 M_nsys P0 substrate).
 
 **License gate (Phase 0v2.A → Phase 0v2.B)**:

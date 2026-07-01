@@ -42,7 +42,7 @@ Invoked via: `WORKLOAD=longctx-32k LONGCTX_CONCURRENCIES=4 LONGCTX_MAX_SECONDS=3
   `INFER_TILELANG_PYTHON=/usr/bin/python3`,
   `CARGO_TARGET_DIR=/tmp/arle-target`,
   `ZIG=/content/workspace/agent-infer/.toolchains/zig/zig-x86_64-linux-0.16.0/zig`
-- **Server launch:** `/tmp/arle-target/release/infer --model-path infer/models/Qwen3-4B --port 8000 --kv-cache-dtype fp8 --num-slots 16 --max-seq-len 131072 --mem-fraction-static 0.85 --max-num-batched-tokens 16384 --max-prefill-tokens 16384 --schedule-policy fcfs`
+- **Server launch:** `/tmp/arle-target/release/arle --model-path infer/models/Qwen3-4B --port 8000 --kv-cache-dtype fp8 --num-slots 16 --max-seq-len 131072 --mem-fraction-static 0.85 --max-num-batched-tokens 16384 --max-prefill-tokens 16384 --schedule-policy fcfs`
 - **KV pool:** `136976` max tokens, `8561` pages, `11.0 GB`, FP8E4M3
 
 ## Canonical params (resolved by wrapper)

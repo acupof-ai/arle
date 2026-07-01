@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # native-deepep per-phase prefill profile (4K, ARLE_DSV4_TRACE_LAYER=1).
 set -u
-ROOT=/data01/build/arle; BIN=$ROOT/target-pod/release/infer
+ROOT=/data01/build/arle; BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash; PORT=18205
 LOG=/tmp/ndt_serve.log; RESP=/tmp/ndt_resp.txt
 : >"$LOG"; : >"$RESP"
-pkill -9 -f release/infer 2>/dev/null || true; sleep 4
+pkill -9 -f release/arle 2>/dev/null || true; sleep 4
 cd "$ROOT"
 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 ARLE_MULTIPROC_SERVE=1 \
 ARLE_DSV4_MOE_BACKEND=native-deepep ARLE_DSV4_EXPERT_BACKEND=native \
@@ -38,5 +38,5 @@ for ln in sys.stdin:
 for ph,(ms,n) in sorted(agg.items(),key=lambda x:-x[1][0])[:14]:
  print(f'{ph:34s} total={ms:9.1f}ms calls={n} avg={ms/max(n,1):7.2f}')
 " | tee -a "$RESP"
-pkill -9 -f release/infer 2>/dev/null || true
+pkill -9 -f release/arle 2>/dev/null || true
 echo "NDT_DONE" | tee -a "$RESP"

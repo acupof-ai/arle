@@ -37,7 +37,7 @@ Server:
 
 ```bash
 source /tmp/arle-env.sh
-./target/release/infer --model-path models/default --port 8000 \
+./target/release/arle --model-path models/default --port 8000 \
   --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 \
   --mem-fraction-static 0.85 \
   --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 \

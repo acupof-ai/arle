@@ -64,7 +64,7 @@ single-row prefill immediately.
 Baseline from [`2026-05-07-m3.9-mixed-policy-budget-fix.md`](2026-05-07-m3.9-mixed-policy-budget-fix.md):
 
 ```bash
-target/release/infer --model-path infer/models/Qwen3-4B --port 8000 \
+target/release/arle --model-path infer/models/Qwen3-4B --port 8000 \
   --num-slots 8 --max-seq-len 12288 --max-prefill-tokens 16384
 
 PATH=.venv/bin:$PATH scripts/bench_guidellm.sh p0prime-default-split-c4 \
@@ -74,7 +74,7 @@ PATH=.venv/bin:$PATH scripts/bench_guidellm.sh p0prime-default-split-c4 \
 H_LP2 scout:
 
 ```bash
-target/release/infer --model-path infer/models/Qwen3-4B --port 8000 \
+target/release/arle --model-path infer/models/Qwen3-4B --port 8000 \
   --num-slots 8 --max-seq-len 12288 --max-prefill-tokens 16384 \
   --chunked-prefill-size 4096 --scheduler-mixed-policy split
 
@@ -85,7 +85,7 @@ PATH=.venv/bin:$PATH scripts/bench_guidellm.sh lp-hlp2-chunk4096-c4 \
 H_LP1 full-row control:
 
 ```bash
-target/release/infer --model-path infer/models/Qwen3-4B --port 8000 \
+target/release/arle --model-path infer/models/Qwen3-4B --port 8000 \
   --num-slots 8 --max-seq-len 12288 \
   --max-num-batched-tokens 17408 --max-prefill-tokens 17408 \
   --chunked-prefill-size 4097 --scheduler-mixed-policy split

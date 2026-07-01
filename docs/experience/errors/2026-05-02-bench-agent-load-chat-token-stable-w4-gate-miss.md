@@ -17,11 +17,11 @@ Gate target: canonical W4 `avoided-prefill >= 90%`; partial success threshold fr
 - GPU: NVIDIA L4 24GB.
 - Model: `models/default -> Qwen3-4B`.
 - Server:
-  - `./target/release/infer --model-path models/default --port 8000 --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 --mem-fraction-static 0.85 --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 --t1-host-pinned-capacity-mb 32768 --t1-host-pinned-min-prompt-tokens 4096`
+  - `./target/release/arle --model-path models/default --port 8000 --num-slots 8 --max-seq-len 12288 --kv-cache-dtype fp8 --mem-fraction-static 0.85 --t1-host-pinned-high-water 0.98 --t1-host-pinned-low-water 0.95 --t1-host-pinned-capacity-mb 32768 --t1-host-pinned-min-prompt-tokens 4096`
 - Env:
   - `CUDA_HOME=/usr/local/cuda`
   - `CARGO_HOME=/tmp/cargo-home-local`
-  - `PEGAINFER_CUDA_SM=89`
+  - `TORCH_CUDA_ARCH_LIST=89`
   - `LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64`
   - `ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig`
   - `INFER_TILELANG_PYTHON=/usr/bin/python3`

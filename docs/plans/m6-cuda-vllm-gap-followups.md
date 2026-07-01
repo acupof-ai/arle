@@ -188,7 +188,7 @@ RUST_LOG=info RUST_BACKTRACE=full \
 NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
 TORCH_CUDA_ARCH_LIST=8.9 \
-target/release/infer \
+target/release/arle \
   --model-path /home/ckl/projects/arle/infer/models/Qwen3-4B \
   --port 8000 \
   --max-seq-len 2048 \
@@ -292,7 +292,7 @@ RUST_LOG=info RUST_BACKTRACE=full \
 NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
 TORCH_CUDA_ARCH_LIST=8.9 \
-target/release/infer \
+target/release/arle \
   --model-path /home/ckl/projects/arle/infer/models/Qwen3-4B \
   --port 8000 \
   --max-seq-len 2048 \

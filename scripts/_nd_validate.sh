@@ -4,7 +4,7 @@
 # reports combine-IMA presence. Run INSIDE a pod tmux session.
 set -u
 ROOT=/data01/build/arle
-BIN=$ROOT/target-pod/release/infer
+BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash
 PORT=18200
 LOG=/tmp/nd_serve.log
@@ -12,7 +12,7 @@ RESP=/tmp/nd_resp.txt
 : >"$LOG"; : >"$RESP"
 
 # Clean any stale server bound to our binary (never pkill by script name).
-pkill -f "target-pod/release/infer" 2>/dev/null || true
+pkill -f "target-pod/release/arle" 2>/dev/null || true
 sleep 3
 
 cd "$ROOT"
@@ -60,5 +60,5 @@ echo "=== combine IMA grep ===" | tee -a "$RESP"
 grep -iE "illegal memory access|combine failed|unspecified launch failure|sync after combine" "$LOG" | tail -5 | tee -a "$RESP"
 echo "=== server tail ===" | tee -a "$RESP"
 tail -8 "$LOG" | tee -a "$RESP"
-pkill -f "target-pod/release/infer" 2>/dev/null || true
+pkill -f "target-pod/release/arle" 2>/dev/null || true
 echo "VALIDATE_DONE" | tee -a "$RESP"

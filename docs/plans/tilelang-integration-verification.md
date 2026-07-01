@@ -179,11 +179,11 @@ the bench entry §Problems.
 
 ```bash
 # 1) Binary contains the cubin bytes (cuModuleLoadData wrapper, not path)
-strings target/release/infer | grep -c "tilelang_batch_prefill_paged_hd128_q.._kv8_run" || true
+strings target/release/arle | grep -c "tilelang_batch_prefill_paged_hd128_q.._kv8_run" || true
 # Expect ≥4 (one symbol per supported head config).
 
 # 2) Cubin embedded, not stored as a string path
-strings target/release/infer | grep -E "tilelang_aot/batch_prefill_paged_hd128_q.._kv8/.+\.cubin" && {
+strings target/release/arle | grep -E "tilelang_aot/batch_prefill_paged_hd128_q.._kv8/.+\.cubin" && {
   echo "FAIL: binary references cubin by absolute path; cubin embedding broke." >&2
   exit 1
 } || echo "PASS: no embedded cubin paths in binary"
@@ -269,8 +269,8 @@ If the `on` run shows the same TTFT / out-tok-s as `off` to ≤1 %, double-
 check that the binary really has TileLang on:
 
 ```bash
-file target/release/infer
-strings target/release/infer | grep -c tilelang_batch_prefill_paged_hd128_q
+file target/release/arle
+strings target/release/arle | grep -c tilelang_batch_prefill_paged_hd128_q
 # Expect ≥4. If 0, INFER_FEATURES did not propagate — re-build manually
 # with `cargo build --release --features cuda,tilelang-attn` and rerun §4.2.
 ```

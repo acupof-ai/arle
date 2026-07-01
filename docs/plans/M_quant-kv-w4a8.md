@@ -118,7 +118,7 @@ full-attention smoke passes in the long-context wall-clock regime.
 
 ```bash
 # Setup:weight BF16 baseline + KV W4A8(只验 KV axis 单 axis effect)
-nohup ./target/release/infer \
+nohup ./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --kv-cache-dtype w4a8 \
   --port 8000 --num-slots 8 --max-seq-len 32768 \

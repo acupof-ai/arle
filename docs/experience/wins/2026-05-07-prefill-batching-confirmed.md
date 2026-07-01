@@ -27,7 +27,7 @@ prefill: c=8 capacity, single-chunk requests (prompt 2048 = 1
 full chunk):
 
 ```bash
-target/release/infer --port 8000 --max-seq-len 5120 --num-slots 16 \
+target/release/arle --port 8000 --max-seq-len 5120 --num-slots 16 \
   --max-prefill-tokens 16384
 ```
 

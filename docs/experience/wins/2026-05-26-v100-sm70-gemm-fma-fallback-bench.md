@@ -119,7 +119,7 @@ during cargo build, so the patch's codegen path is what actually runs on V100.
 
 ### V100 end-to-end smoke (Qwen3.5-4B, audit service)
 
-The V100 audit service (`./target/release/infer --num-slots 16 --max-seq-len 5120
+The V100 audit service (`./target/release/arle --num-slots 16 --max-seq-len 5120
 --long-prefill-active-limit 16 --chunked-prefill-size 512`) is already running
 against the rebuilt binary + new libtilelang.so. Smoke against it:
 

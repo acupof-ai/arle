@@ -54,7 +54,7 @@ If α < 0.3 → axis dead even at production shape,Medusa REQUIRED firmer。
 
 ```bash
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer \
+  ./target/release/arle \
   --model-path infer/models/Qwen3-4B-W4A16-sym-g128-marlin \
   --port 8000 --num-slots 8 --max-seq-len 5120 \
   --spec-enabled --spec-draft-model self --spec-draft-k 5 --spec-sparse-kv-enabled

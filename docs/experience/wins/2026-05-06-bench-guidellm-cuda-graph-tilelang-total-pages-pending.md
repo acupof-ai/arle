@@ -13,7 +13,7 @@ Pending canonical GuideLLM run:
 
 ```bash
 CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 \
-  target/release/infer \
+  target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --num-slots 4 \

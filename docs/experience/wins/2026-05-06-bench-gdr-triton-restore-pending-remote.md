@@ -18,7 +18,7 @@ Pending remote CUDA validation:
 source /tmp/arle-env.sh
 CUDA_HOME=/usr/local/cuda cargo test --release -p infer --features cuda --test e2e_qwen35
 CUDA_HOME=/usr/local/cuda cargo build --release -p infer --features cuda --bin infer
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3.5-4B \
   --port 8000 \
   --num-slots 16 \

@@ -43,7 +43,7 @@ cargo test -p infer --lib            # default features
   tests under default features (cuda `cargo test` link-fails on Mac).
 - Source: `origin/main` merge `789b6fea`. Pod tree re-synced (`git reset --hard
   origin/main`); `dispatch_fallback:` log strings confirmed present in
-  `target/release/infer` (anti-stale-tree precondition, per
+  `target/release/arle` (anti-stale-tree precondition, per
   `errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md`).
 
 ## Results
@@ -52,7 +52,7 @@ cargo test -p infer --lib            # default features
 |---|---|
 | **H20 build, T1+B+C** (`--bin infer`, cuda,nccl) | **PASS** — `Finished release in 12m12s`, 0 errors, 7 pre-existing lib warnings |
 | **H20 build, round-2** (oplib + codex-fix + scheduler-knob) | **PASS** — `Finished release in 12m06s`, `BUILD_DONE_rc=0`. Verifies the cuda-gated `LinearKernelPlan→LinearKernel` rename links on `nvcc` |
-| **Symbols in binary** (anti-stale) | **PASS** — `strings target/release/infer \| grep dispatch_fallback:` → 2 hits (C's loud-fallback code is in the binary) |
+| **Symbols in binary** (anti-stale) | **PASS** — `strings target/release/arle \| grep dispatch_fallback:` → 2 hits (C's loud-fallback code is in the binary) |
 | **Mac default lib suite** | **604 passed, 0 failed, 14 ignored** — incl. `oplib::` full-sweep `plan()`-vs-legacy-oracle equivalence (3) + `dispatch_policy::` parser/token-set (7, incl. bypass presence + r4-only-`"1"`) |
 | **Mac cuda,no-cuda typecheck** | clean (no new warnings) |
 | **H20 cuda test harness + pure tests** | **PASS** — `cargo test --features cuda --lib` harness compiled on `nvcc` and **13 tests passed, 0 failed** (`dispatch_policy` + `oplib`). The harness compile verifies the cuda-gated test code Mac `cfg`s out: the `LinearKernelPlan→LinearKernel` rename in test arms **and** the codex-fix `weight_loader.rs` `reset_dispatch_policy_cache()` guard edit (previously pending-remote typecheck). |

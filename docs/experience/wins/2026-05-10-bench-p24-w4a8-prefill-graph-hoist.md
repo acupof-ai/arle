@@ -46,7 +46,7 @@ Functional smoke:
 ```bash
 INFER_PREFILL_GRAPH=1 INFER_HYBRID_W4A8_PREFILL=1 RUST_LOG=info \
   CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer \
+  ./target/release/arle \
     --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
     --port 8000 --num-slots 4 --max-seq-len 5120
 
@@ -63,7 +63,7 @@ curl -sS --fail http://127.0.0.1:8000/v1/completions \
 - **CUDA:** `/opt/cuda`, CUDA 13.2 toolchain, `NVCC_CCBIN=/usr/bin/g++-14`
 - **Feature set:** `-p infer --features cuda --release`
 - **Non-default flags / env vars:** `INFER_PREFILL_GRAPH=1`, `INFER_HYBRID_W4A8_PREFILL=1`
-- **Server launch:** direct `target/release/infer`, port 8000
+- **Server launch:** direct `target/release/arle`, port 8000
 
 ## Results
 

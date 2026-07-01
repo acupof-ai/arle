@@ -16,7 +16,7 @@ Diagnosis: nsys trace c=16 30s 的实测,直接判定 §11 hypothesis H1-H6,把
 # Machine: L4 / 24GB / cuda-12.8 + cuda-13.2
 /usr/local/cuda-13.2/bin/nsys profile --trace=cuda,nvtx \
   -o arle_c16 --force-overwrite=true \
-  ./target/release/infer --model-path infer/models/Qwen3-4B --port 8000 --num-slots 16 --max-seq-len 5120
+  ./target/release/arle --model-path infer/models/Qwen3-4B --port 8000 --num-slots 16 --max-seq-len 5120
 
 # c=16 30s bench during nsys recording window
 scripts/bench_guidellm.sh cuda-l4-arle-nsys-vg --target http://localhost:8000 \

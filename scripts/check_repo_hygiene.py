@@ -88,6 +88,17 @@ DISALLOWED_PUBLIC_MARKERS = [
     "file://",
 ]
 
+MAX_EXPERIENCE_FILES = {
+    Path("docs/experience/wins"): 826,
+    Path("docs/experience/errors"): 296,
+}
+
+REPO_WIDE_DISALLOWED_MARKERS = [
+    ("/Users/", re.compile(re.escape("/Users/"))),
+    ("PEGAINFER", re.compile(re.escape("PEGA" + "INFER"))),
+    ("release/infer", re.compile(re.escape("release" + "/infer"))),
+]
+
 JUNK_PATH_RE = re.compile(r"(^|/)(\.DS_Store|Thumbs\.db|__pycache__/|.*\.pyc)$")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
@@ -254,6 +265,64 @@ def check_git_tracked_junk() -> list[str]:
     return [f"tracked junk file: {path}" for path in offenders]
 
 
+def list_git_tracked_files(*paths: Path) -> list[str]:
+    command = ["git", "ls-files", "--"]
+    command.extend(str(path) for path in paths)
+    try:
+        output = subprocess.check_output(
+            command,
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        tracked = []
+        for path in paths:
+            abs_path = ROOT / path
+            if abs_path.is_file():
+                tracked.append(repo_path(abs_path))
+                continue
+            if abs_path.is_dir():
+                tracked.extend(
+                    repo_path(candidate)
+                    for candidate in abs_path.rglob("*")
+                    if candidate.is_file()
+                )
+        return sorted(tracked)
+    return [line for line in output.splitlines() if line]
+
+
+def check_repo_wide_disallowed_markers() -> list[str]:
+    errors = []
+    for rel_path in list_git_tracked_files(Path(".")):
+        if rel_path == repo_path(Path(__file__).resolve()):
+            continue
+        abs_path = ROOT / rel_path
+        try:
+            text = abs_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except UnicodeDecodeError:
+            continue
+        for marker_name, marker_re in REPO_WIDE_DISALLOWED_MARKERS:
+            if marker_re.search(text):
+                errors.append(
+                    f"{rel_path}: contains repo-wide banned marker {marker_name!r}"
+                )
+    return errors
+
+
+def check_experience_doc_inventory() -> list[str]:
+    errors = []
+    for rel_path, max_files in MAX_EXPERIENCE_FILES.items():
+        count = len(list_git_tracked_files(rel_path))
+        if count > max_files:
+            errors.append(
+                f"{rel_path}: tracked file count {count} exceeds cap {max_files}; archive old entries before adding more"
+            )
+    return errors
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -269,6 +338,8 @@ def main() -> int:
     errors.extend(check_template(Path(".github/ISSUE_TEMPLATE/bug_report.md"), BUG_TEMPLATE_REQUIRED_FIELDS))
     errors.extend(check_template(Path(".github/ISSUE_TEMPLATE/feature_request.md"), FEATURE_TEMPLATE_REQUIRED_FIELDS))
     errors.extend(check_git_tracked_junk())
+    errors.extend(check_experience_doc_inventory())
+    errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
 
     if errors:

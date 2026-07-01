@@ -41,7 +41,7 @@ env INFER_HYBRID_W4A8_PREFILL=1 \
   INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
   TORCH_CUDA_ARCH_LIST=8.9 \
   RUST_LOG=info \
-  ./target/release/infer \
+  ./target/release/arle \
     --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
     --port 8000 --num-slots 8 --max-seq-len 8192 \
     --admission-policy prefix-aware

@@ -41,7 +41,7 @@ Three measured contributors explain the regression:
 Server:
 
 ```bash
-ZIG=/tmp/zig14/zig CUDA_HOME=/usr/local/cuda target/release/infer \
+ZIG=/tmp/zig14/zig CUDA_HOME=/usr/local/cuda target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --kv-cache-dtype fp8 \
