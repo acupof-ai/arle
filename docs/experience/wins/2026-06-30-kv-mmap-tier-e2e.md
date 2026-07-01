@@ -62,6 +62,10 @@ Before: N inodes for N pages → 1 inode total
 
 ## Rule
 
-Tiered KV demotion/promotion is production-ready for CUDA Qwen3-dense. The mmap
-page-slot model is the canonical storage format: `set_len` sparse file, slot
-allocator, manifest-based index. Per-page block files are obsolete.
+Tiered KV demotion/promotion is production-ready for CUDA Qwen3-dense page-tier.
+The mmap page-slot model is the canonical storage format: `set_len` sparse file,
+slot allocator, manifest-based index. Per-page block files are obsolete.
+
+The DSv4/Qwen3.5 whole-slot path reuses the same store, but it must be judged
+separately from page-tier: whole-slot online use is licensed only when the
+measured disk spill + restore path beats recompute for that workload.

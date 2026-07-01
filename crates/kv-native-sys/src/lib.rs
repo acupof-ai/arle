@@ -281,16 +281,17 @@ impl KvMmapStore {
         self.free_list.pop()
     }
 
-    /// Memcpy `data` into `slot` (must be exactly `slot_bytes`).
+    /// Memcpy `data` into `slot` (`data.len() <= slot_bytes`).
+    /// Trailing bytes are left untouched; callers must track the valid length.
     pub fn write_slot(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
         assert!(
-            data.len() == self.slot_bytes,
-            "write_slot: data len {} != slot_bytes {}",
+            data.len() <= self.slot_bytes,
+            "write_slot: data len {} > slot_bytes {}",
             data.len(),
             self.slot_bytes,
         );
         let offset = (slot as usize) * self.slot_bytes;
-        self.mapping[offset..offset + self.slot_bytes].copy_from_slice(data);
+        self.mapping[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
     }
 
@@ -341,6 +342,16 @@ mod tests {
         let s = store.alloc_slot().unwrap();
         store.write_slot(s, b"0123456789abcdef").unwrap();
         assert_eq!(store.read_slot(s), b"0123456789abcdef");
+    }
+
+    #[test]
+    fn mmap_store_short_write_preserves_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("short.mmap");
+        let mut store = KvMmapStore::create(&path, 2, 16).unwrap();
+        let slot = store.alloc_slot().unwrap();
+        store.write_slot(slot, b"short").unwrap();
+        assert_eq!(&store.read_slot(slot)[..5], b"short");
     }
 
     #[test]
