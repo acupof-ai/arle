@@ -121,6 +121,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "write_scalar_at_f32",
     "causal_sdpa_decode_gqa_f32",
     "causal_sdpa_decode_gqa_cache_f32",
+    "causal_sdpa_recompute_backward_f32",
     "causal_sdpa_decode_gqa_cache_online_f32_hd256",
     "qwen_decode_prepare_q_f32",
     "qwen_decode_prepare_q_gated_f32",

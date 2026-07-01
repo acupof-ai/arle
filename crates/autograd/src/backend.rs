@@ -21,6 +21,24 @@ pub enum Device {
 
 pub type CausalSdpaHostGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
 
+#[derive(Debug, Clone, Copy)]
+pub struct CausalSdpaDeviceBackwardArgs<'a> {
+    pub q: &'a DeviceHandle,
+    pub k: &'a DeviceHandle,
+    pub v: &'a DeviceHandle,
+    pub upstream: &'a DeviceHandle,
+    pub shape: &'a [usize],
+    pub need_grad_q: bool,
+    pub need_grad_k: bool,
+    pub need_grad_v: bool,
+}
+
+pub type CausalSdpaDeviceGradTriplet = (
+    Option<DeviceHandle>,
+    Option<DeviceHandle>,
+    Option<DeviceHandle>,
+);
+
 #[cfg(feature = "metal")]
 #[derive(Debug, Clone)]
 pub struct MlxHandle {
@@ -525,6 +543,19 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         }
     }
 
+    fn readback_into(&self, handle: &DeviceHandle, dst: &mut [f32]) -> Result<()> {
+        let src = self.readback(handle)?;
+        if src.len() != dst.len() {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: src.len(),
+                shape: vec![dst.len()],
+                size: dst.len(),
+            });
+        }
+        dst.copy_from_slice(&src);
+        Ok(())
+    }
+
     fn eval(&self, _handles: &[&DeviceHandle]) -> Result<()> {
         Ok(())
     }
@@ -553,6 +584,44 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         _args: LinearAttentionDeviceBackwardArgs<'_>,
     ) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
         Ok(None)
+    }
+
+    fn causal_sdpa_recompute_backward_device(
+        &self,
+        args: CausalSdpaDeviceBackwardArgs<'_>,
+    ) -> Result<CausalSdpaDeviceGradTriplet> {
+        let q = self.readback(args.q)?;
+        let k = self.readback(args.k)?;
+        let v = self.readback(args.v)?;
+        let upstream = self.readback(args.upstream)?;
+        let (grad_q, grad_k, grad_v) = cpu_causal_sdpa_recompute_backward(
+            &q,
+            &k,
+            &v,
+            &upstream,
+            args.shape,
+            args.need_grad_q,
+            args.need_grad_k,
+            args.need_grad_v,
+        )?;
+        Ok((
+            grad_q
+                .as_ref()
+                .map(|grad| self.upload(grad, args.shape))
+                .transpose()?,
+            grad_k
+                .as_ref()
+                .map(|grad| self.upload(grad, args.shape))
+                .transpose()?,
+            grad_v
+                .as_ref()
+                .map(|grad| self.upload(grad, args.shape))
+                .transpose()?,
+        ))
+    }
+
+    fn trim_memory_pool(&self) -> Result<bool> {
+        Ok(false)
     }
 
     /// Whether `Tape::backward` should `flush_to_host_batch` every

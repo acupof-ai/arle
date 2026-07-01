@@ -390,10 +390,11 @@ impl AdamW {
 
         for &param_id in params {
             let grad_id = store.get(param_id).and_then(|tensor| tensor.grad);
-            if let Some(grad_id) = grad_id
-                && let Some(grad) = store.get_mut(grad_id)
-            {
-                grad.data.fill(0.0);
+            if let Some(grad_id) = grad_id {
+                store
+                    .set_grad(param_id, None)
+                    .expect("clear host-backed grad id");
+                store.free(grad_id).expect("free host-backed grad tensor");
             }
         }
     }

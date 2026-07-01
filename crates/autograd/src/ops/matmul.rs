@@ -1,4 +1,5 @@
 use smallvec::smallvec;
+use std::collections::HashSet;
 
 use crate::{
     AutogradError, Result,
@@ -302,6 +303,20 @@ pub(crate) fn matmul_bt_backward(
             && g_t.device_handle.is_some()
     };
     if device_path_ok {
+        if let Some(tiled) = matmul_bt_lora_backward_tiled(
+            a,
+            b,
+            output_grad_id,
+            site,
+            &a_shape,
+            &b_shape,
+            &upstream_shape,
+            need_grad_a,
+            need_grad_b,
+            store,
+        )? {
+            return Ok(tiled);
+        }
         let a_handle = store
             .tensor(a)?
             .device_handle
@@ -364,6 +379,184 @@ pub(crate) fn matmul_bt_backward(
     }
 
     Ok(grads)
+}
+
+fn legacy_lora_linear_backward_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_OPD_LEGACY_LORA_LINEAR_BWD").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+fn lora_linear_backward_tile_rows() -> usize {
+    std::env::var("ARLE_OPD_LORA_LINEAR_BWD_TILE_ROWS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&rows| rows > 0)
+        .unwrap_or(1024)
+}
+
+fn is_lora_matmul_site(site: &str) -> bool {
+    site.ends_with(".lora_a") || site.ends_with(".lora_b")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_bt_lora_backward_tiled(
+    a: TensorId,
+    b: TensorId,
+    output_grad_id: TensorId,
+    site: &'static str,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    upstream_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+    store: &mut TensorStore,
+) -> Result<Option<GradPairs>> {
+    if legacy_lora_linear_backward_enabled() || !is_lora_matmul_site(site) {
+        return Ok(None);
+    }
+    let tile_rows = lora_linear_backward_tile_rows();
+    if a_shape[0] <= tile_rows {
+        return Ok(None);
+    }
+
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[0];
+    let mut tape = Tape::new();
+    tape.set_enabled(false);
+    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+    let mut grad_a_chunks = Vec::new();
+    let mut grad_b_acc = None;
+
+    let mut row0 = 0usize;
+    while row0 < m {
+        let row1 = (row0 + tile_rows).min(m);
+        let rows = row1 - row0;
+        let a_chunk = crate::ops::slice(a, &[row0, 0], &[row1, k], store, &mut tape)?;
+        let g_chunk = crate::ops::slice(output_grad_id, &[row0, 0], &[row1, n], store, &mut tape)?;
+        store.ensure_device(a_chunk)?;
+        store.ensure_device(g_chunk)?;
+        let a_handle = store
+            .tensor(a_chunk)?
+            .device_handle
+            .as_ref()
+            .expect("ensure_device")
+            .clone();
+        let b_handle = store
+            .tensor(b)?
+            .device_handle
+            .as_ref()
+            .expect("checked by caller")
+            .clone();
+        let g_handle = store
+            .tensor(g_chunk)?
+            .device_handle
+            .as_ref()
+            .expect("ensure_device")
+            .clone();
+        let a_chunk_shape = vec![rows, k];
+        let g_chunk_shape = vec![rows, n];
+        let (grad_a_part, grad_b_part) = store.backend().matmul_bt_backward_device(
+            &a_handle,
+            &a_chunk_shape,
+            &b_handle,
+            b_shape,
+            &g_handle,
+            &g_chunk_shape,
+            need_grad_a,
+            need_grad_b,
+        )?;
+        if let Some(handle) = grad_a_part {
+            grad_a_chunks.push(store.alloc_device_tensor(a_chunk_shape, handle)?);
+        }
+        if let Some(handle) = grad_b_part {
+            grad_b_acc = Some(match grad_b_acc {
+                None => handle,
+                Some(acc) => store.backend().add_into_device(&acc, &handle, b_shape)?,
+            });
+        }
+
+        let keep = grad_a_chunks.iter().copied().collect::<HashSet<_>>();
+        store.free_new_except(&live_before, &keep)?;
+        row0 = row1;
+    }
+
+    let mut grads = GradPairs::new();
+    if need_grad_a {
+        let grad_a = concat_row_chunks(&grad_a_chunks, k, store)?;
+        if store.tensor(grad_a)?.shape != a_shape {
+            return Err(AutogradError::ShapeMismatch {
+                expected: a_shape.to_vec(),
+                got: store.tensor(grad_a)?.shape.clone(),
+            });
+        }
+        grads.push((a, grad_a));
+    }
+    if need_grad_b {
+        let handle = grad_b_acc.ok_or(AutogradError::TapeInvariant(
+            "matmul_bt lora tiled backward requested grad_b but produced none",
+        ))?;
+        grads.push((b, store.alloc_device_tensor(b_shape.to_vec(), handle)?));
+    }
+    if upstream_shape != [m, n] {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![m, n],
+            got: upstream_shape.to_vec(),
+        });
+    }
+    Ok(Some(grads))
+}
+
+fn concat_row_chunks(
+    chunks: &[TensorId],
+    cols: usize,
+    store: &mut TensorStore,
+) -> Result<TensorId> {
+    if chunks.is_empty() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: 1,
+            got: 0,
+        });
+    }
+    if chunks.len() == 1 {
+        return Ok(chunks[0]);
+    }
+
+    store.ensure_device(chunks[0])?;
+    let mut acc_handle =
+        store
+            .tensor(chunks[0])?
+            .device_handle
+            .clone()
+            .ok_or(AutogradError::TapeInvariant(
+                "concat_row_chunks: chunk missing device handle",
+            ))?;
+    let rows0 = store.tensor(chunks[0])?.shape[0];
+    let mut acc_shape = vec![1, 1, rows0, cols];
+
+    for &id in &chunks[1..] {
+        store.ensure_device(id)?;
+        let rows = store.tensor(id)?.shape[0];
+        let next_handle =
+            store
+                .tensor(id)?
+                .device_handle
+                .clone()
+                .ok_or(AutogradError::TapeInvariant(
+                    "concat_row_chunks: chunk missing device handle",
+                ))?;
+        let next_shape = vec![1, 1, rows, cols];
+        let (out_handle, out_shape) =
+            store
+                .backend()
+                .concat_axis2(&acc_handle, &acc_shape, &next_handle, &next_shape)?;
+        acc_handle = out_handle;
+        acc_shape = out_shape;
+    }
+
+    store.alloc_device_tensor(vec![acc_shape[2], cols], acc_handle)
 }
 
 fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {

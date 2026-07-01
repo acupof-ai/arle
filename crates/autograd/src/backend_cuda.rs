@@ -15,7 +15,8 @@
 use crate::{
     AutogradError,
     backend::{
-        CudaBf16Storage, CudaFp8BlockScaledStorage, CudaStorage, dequantize_fp8_block_scaled_host,
+        CudaBf16Storage, CudaFp8BlockScaledStorage, CudaStorage,
+        cpu_causal_sdpa_recompute_backward, dequantize_fp8_block_scaled_host,
         matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
         validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes, validate_fp8_block_scaled,
         validate_qwen_decode_prepare_kv_shapes, validate_qwen_decode_prepare_q_shapes,
@@ -24,7 +25,8 @@ use crate::{
 use crate::{
     Result,
     backend::{
-        Backend, Device, DeviceGradClipResult, DeviceHandle, LinearAttentionDeviceBackwardArgs,
+        Backend, CausalSdpaDeviceBackwardArgs, CausalSdpaDeviceGradTriplet, Device,
+        DeviceGradClipResult, DeviceHandle, LinearAttentionDeviceBackwardArgs,
         LinearAttentionDeviceBackwardResult, LinearAttentionDeviceForwardArgs,
         LinearAttentionDeviceForwardResult, LinearAttentionScanBackwardArgs,
         LinearAttentionScanBackwardGrads,
@@ -49,7 +51,9 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
 #[cfg(not(feature = "no-cuda"))]
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg, result,
+};
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
 
@@ -1329,6 +1333,59 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn readback_into(&self, handle: &DeviceHandle, dst: &mut [f32]) -> Result<()> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (handle, dst);
+            todo!("GPU required: cuda readback_into is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            match handle {
+                DeviceHandle::Cpu(data) => {
+                    if data.len() != dst.len() {
+                        return Err(AutogradError::DataLengthMismatch {
+                            len: data.len(),
+                            shape: vec![dst.len()],
+                            size: dst.len(),
+                        });
+                    }
+                    dst.copy_from_slice(data);
+                    Ok(())
+                }
+                DeviceHandle::Cuda(storage) => {
+                    let slice = self.cuda_storage_slice(storage)?;
+                    if slice.len() != dst.len() {
+                        return Err(AutogradError::DataLengthMismatch {
+                            len: slice.len(),
+                            shape: vec![dst.len()],
+                            size: dst.len(),
+                        });
+                    }
+                    self.stream.memcpy_dtoh(slice, dst).map_err(|_| {
+                        AutogradError::TapeInvariant("cuda dtoh copy failed (readback_into)")
+                    })?;
+                    self.stream.synchronize().map_err(|_| {
+                        AutogradError::TapeInvariant("cuda synchronize failed (readback_into)")
+                    })
+                }
+                _ => {
+                    let src = self.readback(handle)?;
+                    if src.len() != dst.len() {
+                        return Err(AutogradError::DataLengthMismatch {
+                            len: src.len(),
+                            shape: vec![dst.len()],
+                            size: dst.len(),
+                        });
+                    }
+                    dst.copy_from_slice(&src);
+                    Ok(())
+                }
+            }
+        }
+    }
+
     fn eval(&self, handles: &[&DeviceHandle]) -> Result<()> {
         #[cfg(feature = "no-cuda")]
         {
@@ -1398,6 +1455,47 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_linear_attention_backward_device(self, args)
+        }
+    }
+
+    fn causal_sdpa_recompute_backward_device(
+        &self,
+        args: CausalSdpaDeviceBackwardArgs<'_>,
+    ) -> Result<CausalSdpaDeviceGradTriplet> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = args;
+            todo!(
+                "GPU required: cuda causal_sdpa_recompute_backward_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_causal_sdpa_recompute_backward_device(self, args)
+        }
+    }
+
+    fn trim_memory_pool(&self) -> Result<bool> {
+        #[cfg(feature = "no-cuda")]
+        {
+            Ok(false)
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            self.stream.synchronize().map_err(|_| {
+                AutogradError::TapeInvariant("cuda synchronize failed before mempool trim")
+            })?;
+            // Safety: the pool belongs to this backend's live CUDA context and
+            // the stream is synchronized above, so no queued allocation uses it.
+            let pool = unsafe { result::device::get_mem_pool(self.stream.context().cu_device()) }
+                .map_err(|_| AutogradError::TapeInvariant("cuda get_mem_pool failed"))?;
+            // Safety: trimming the current device pool after stream sync only
+            // releases retained allocator pages; live allocations stay owned.
+            unsafe { result::mem_pool::trim_to(pool, 0) }
+                .map_err(|_| AutogradError::TapeInvariant("cuda mem_pool trim_to(0) failed"))?;
+            Ok(true)
         }
     }
 
@@ -4487,6 +4585,12 @@ fn shape_size(shape: &[usize]) -> usize {
     }
 }
 
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> AutogradError {
+    let bytes = shape_size(&shape).saturating_mul(std::mem::size_of::<f32>());
+    AutogradError::CudaAllocFailed { op, shape, bytes }
+}
+
 // Compute both matmul gradients via two cuBLAS SGEMM calls with an OP_T on
 // whichever operand must be transposed; avoids the host-side physical
 // transpose the old CPU fallback did and keeps the math on-device.
@@ -4539,7 +4643,7 @@ fn cuda_matmul_backward(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(m * k)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| cuda_alloc_failed("matmul_backward grad_a", vec![m, k]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -4570,7 +4674,7 @@ fn cuda_matmul_backward(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(k * n)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| cuda_alloc_failed("matmul_backward grad_b", vec![k, n]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_T,
@@ -4616,7 +4720,9 @@ fn cuda_matmul_backward(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(batch * m * k)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| {
+                        cuda_alloc_failed("matmul_backward batched grad_a", vec![batch, m, k])
+                    })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -4656,7 +4762,9 @@ fn cuda_matmul_backward(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(batch * k * n)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| {
+                        cuda_alloc_failed("matmul_backward batched grad_b", vec![batch, k, n])
+                    })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_T,
@@ -4758,7 +4866,7 @@ fn cuda_matmul_backward_device(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(m * k)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| cuda_alloc_failed("matmul_backward_device grad_a", vec![m, k]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -4789,7 +4897,7 @@ fn cuda_matmul_backward_device(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(k * n)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| cuda_alloc_failed("matmul_backward_device grad_b", vec![k, n]))?;
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_T,
@@ -4833,7 +4941,12 @@ fn cuda_matmul_backward_device(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(batch * m * k)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| {
+                        cuda_alloc_failed(
+                            "matmul_backward_device batched grad_a",
+                            vec![batch, m, k],
+                        )
+                    })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -4873,7 +4986,12 @@ fn cuda_matmul_backward_device(
                 let mut c = backend
                     .stream
                     .alloc_zeros::<f32>(batch * k * n)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| {
+                        cuda_alloc_failed(
+                            "matmul_backward_device batched grad_b",
+                            vec![batch, k, n],
+                        )
+                    })?;
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_T,
@@ -5106,7 +5224,7 @@ fn cuda_matmul_bt_backward_device(
         let mut c = backend
             .stream
             .alloc_zeros::<f32>(n * k)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            .map_err(|_| cuda_alloc_failed("matmul_bt_backward_device grad_b", vec![n, k]))?;
         let cfg = GemmConfig::<f32> {
             transa: cublasOperation_t::CUBLAS_OP_N,
             transb: cublasOperation_t::CUBLAS_OP_T,
@@ -5133,6 +5251,151 @@ fn cuda_matmul_bt_backward_device(
     };
 
     Ok((grad_a, grad_b))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_causal_sdpa_recompute_backward_device(
+    backend: &CudaBackend,
+    args: CausalSdpaDeviceBackwardArgs<'_>,
+) -> Result<CausalSdpaDeviceGradTriplet> {
+    if args.shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: args.shape.len(),
+        });
+    }
+    if !args.need_grad_q && !args.need_grad_k && !args.need_grad_v {
+        return Ok((None, None, None));
+    }
+
+    let batch = args.shape[0];
+    let heads = args.shape[1];
+    let seq_len = args.shape[2];
+    let head_dim = args.shape[3];
+    let total = shape_size(args.shape);
+    if seq_len == 0 || head_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero sequence and head_dim",
+            got: args.shape.len(),
+        });
+    }
+
+    if head_dim > 256 {
+        let q = backend.readback(args.q)?;
+        let k = backend.readback(args.k)?;
+        let v = backend.readback(args.v)?;
+        let upstream = backend.readback(args.upstream)?;
+        let (grad_q, grad_k, grad_v) = cpu_causal_sdpa_recompute_backward(
+            &q,
+            &k,
+            &v,
+            &upstream,
+            args.shape,
+            args.need_grad_q,
+            args.need_grad_k,
+            args.need_grad_v,
+        )?;
+        return Ok((
+            match grad_q {
+                Some(grad) => Some(DeviceHandle::Cuda(CudaStorage::new(
+                    backend.upload_slice(&grad, args.shape)?,
+                ))),
+                None => None,
+            },
+            match grad_k {
+                Some(grad) => Some(DeviceHandle::Cuda(CudaStorage::new(
+                    backend.upload_slice(&grad, args.shape)?,
+                ))),
+                None => None,
+            },
+            match grad_v {
+                Some(grad) => Some(DeviceHandle::Cuda(CudaStorage::new(
+                    backend.upload_slice(&grad, args.shape)?,
+                ))),
+                None => None,
+            },
+        ));
+    }
+
+    let d_q = backend.cuda_slice(args.q, "causal_sdpa_recompute_backward_device")?;
+    let d_k = backend.cuda_slice(args.k, "causal_sdpa_recompute_backward_device")?;
+    let d_v = backend.cuda_slice(args.v, "causal_sdpa_recompute_backward_device")?;
+    let d_up = backend.cuda_slice(args.upstream, "causal_sdpa_recompute_backward_device")?;
+    if d_q.len() != total || d_k.len() != total || d_v.len() != total || d_up.len() != total {
+        return Err(AutogradError::TapeInvariant(
+            "cuda causal_sdpa_recompute_backward_device handle size does not match shape",
+        ));
+    }
+
+    let out_len_q = if args.need_grad_q { total } else { 1 };
+    let out_len_k = if args.need_grad_k { total } else { 1 };
+    let out_len_v = if args.need_grad_v { total } else { 1 };
+    let mut grad_q = backend
+        .stream
+        .alloc_zeros::<f32>(out_len_q)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa grad_q)"))?;
+    let mut grad_k = backend
+        .stream
+        .alloc_zeros::<f32>(out_len_k)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa grad_k)"))?;
+    let mut grad_v = backend
+        .stream
+        .alloc_zeros::<f32>(out_len_v)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa grad_v)"))?;
+
+    let rows = batch
+        .checked_mul(heads)
+        .and_then(|v| v.checked_mul(seq_len))
+        .ok_or(AutogradError::TapeInvariant("cuda sdpa row count overflow"))?;
+    let rows_i = i32::try_from(rows)
+        .map_err(|_| AutogradError::TapeInvariant("cuda sdpa rows exceeds i32"))?;
+    let seq_i = i32::try_from(seq_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda sdpa seq_len exceeds i32"))?;
+    let head_dim_i = i32::try_from(head_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda sdpa head_dim exceeds i32"))?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let need_q_i = if args.need_grad_q { 1 } else { 0 };
+    let need_k_i = if args.need_grad_k { 1 } else { 0 };
+    let need_v_i = if args.need_grad_v { 1 } else { 0 };
+
+    const BLOCK: u32 = 32;
+    const SHARED: u32 = 0;
+    launch_rows(
+        &backend.stream,
+        backend
+            .kernels
+            .function("causal_sdpa_recompute_backward_f32")?,
+        rows,
+        BLOCK,
+        SHARED,
+        |mut builder| {
+            builder
+                .arg(d_q)
+                .arg(d_k)
+                .arg(d_v)
+                .arg(d_up)
+                .arg(&mut grad_q)
+                .arg(&mut grad_k)
+                .arg(&mut grad_v)
+                .arg(&rows_i)
+                .arg(&seq_i)
+                .arg(&head_dim_i)
+                .arg(&scale)
+                .arg(&need_q_i)
+                .arg(&need_k_i)
+                .arg(&need_v_i);
+            builder
+        },
+    )?;
+
+    Ok((
+        args.need_grad_q
+            .then(|| DeviceHandle::Cuda(CudaStorage::new(grad_q))),
+        args.need_grad_k
+            .then(|| DeviceHandle::Cuda(CudaStorage::new(grad_k))),
+        args.need_grad_v
+            .then(|| DeviceHandle::Cuda(CudaStorage::new(grad_v))),
+    ))
 }
 
 // P3: device-resident backward for `mul_scalar(x, k)`. Reads
@@ -6890,10 +7153,16 @@ fn cuda_transpose_axes_swap_device(
         .stream
         .clone_htod(&new_shape_i32)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (transpose shape)"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (transpose)"))?;
+    let bytes = total.saturating_mul(std::mem::size_of::<f32>());
+    let mut d_out =
+        backend
+            .stream
+            .alloc_zeros::<f32>(total)
+            .map_err(|_| AutogradError::CudaAllocFailed {
+                op: "transpose",
+                shape: new_shape.clone(),
+                bytes,
+            })?;
     let rank_i = i32::try_from(rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda transpose rank exceeds i32"))?;
     let axis1_i = i32::try_from(axis1)

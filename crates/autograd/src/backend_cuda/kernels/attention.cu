@@ -86,6 +86,123 @@ extern "C" __global__ void causal_sdpa_decode_gqa_f32(
     }
 }
 
+__inline__ __device__ float arle_warp_sum_f32(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return __shfl_sync(0xffffffffu, value, 0);
+}
+
+extern "C" __global__ void causal_sdpa_recompute_backward_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ upstream,
+    float* __restrict__ grad_q,
+    float* __restrict__ grad_k,
+    float* __restrict__ grad_v,
+    int rows,
+    int seq_len,
+    int head_dim,
+    float scale,
+    int need_grad_q,
+    int need_grad_k,
+    int need_grad_v
+) {
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    int merged_head = row / seq_len;
+    int q_pos = row - merged_head * seq_len;
+    int visible = q_pos + 1;
+    int q_base = (merged_head * seq_len + q_pos) * head_dim;
+    int kv_base = merged_head * seq_len * head_dim;
+    float dq_acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        dq_acc[i] = 0.0f;
+    }
+
+    float max_score = -3.4028234663852886e38f;
+    for (int pos = 0; pos < visible; ++pos) {
+        int k_base = kv_base + pos * head_dim;
+        float partial = 0.0f;
+        for (int dim = lane; dim < head_dim; dim += 32) {
+            partial += q[q_base + dim] * k[k_base + dim];
+        }
+        float score = arle_warp_sum_f32(partial) * scale;
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    float denom = 0.0f;
+    for (int pos = 0; pos < visible; ++pos) {
+        int k_base = kv_base + pos * head_dim;
+        float partial = 0.0f;
+        for (int dim = lane; dim < head_dim; dim += 32) {
+            partial += q[q_base + dim] * k[k_base + dim];
+        }
+        float score = arle_warp_sum_f32(partial) * scale;
+        denom += expf(score - max_score);
+    }
+    float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+
+    float weighted_dprob_sum = 0.0f;
+    for (int pos = 0; pos < visible; ++pos) {
+        int k_base = kv_base + pos * head_dim;
+        int v_base = kv_base + pos * head_dim;
+        float qk_partial = 0.0f;
+        float dv_partial = 0.0f;
+        for (int dim = lane; dim < head_dim; dim += 32) {
+            qk_partial += q[q_base + dim] * k[k_base + dim];
+            dv_partial += upstream[q_base + dim] * v[v_base + dim];
+        }
+        float score = arle_warp_sum_f32(qk_partial) * scale;
+        float prob = expf(score - max_score) * inv_denom;
+        if (need_grad_v) {
+            for (int dim = lane; dim < head_dim; dim += 32) {
+                atomicAdd(&grad_v[v_base + dim], prob * upstream[q_base + dim]);
+            }
+        }
+        float dprob = arle_warp_sum_f32(dv_partial);
+        weighted_dprob_sum += prob * dprob;
+    }
+
+    for (int pos = 0; pos < visible; ++pos) {
+        int k_base = kv_base + pos * head_dim;
+        int v_base = kv_base + pos * head_dim;
+        float qk_partial = 0.0f;
+        float dv_partial = 0.0f;
+        for (int dim = lane; dim < head_dim; dim += 32) {
+            qk_partial += q[q_base + dim] * k[k_base + dim];
+            dv_partial += upstream[q_base + dim] * v[v_base + dim];
+        }
+        float score = arle_warp_sum_f32(qk_partial) * scale;
+        float prob = expf(score - max_score) * inv_denom;
+        float dprob = arle_warp_sum_f32(dv_partial);
+        float d_score = prob * (dprob - weighted_dprob_sum) * scale;
+        int local = 0;
+        for (int dim = lane; dim < head_dim; dim += 32, ++local) {
+            if (need_grad_q) {
+                dq_acc[local] += d_score * k[k_base + dim];
+            }
+            if (need_grad_k) {
+                atomicAdd(&grad_k[k_base + dim], d_score * q[q_base + dim]);
+            }
+        }
+    }
+    if (need_grad_q) {
+        int local = 0;
+        for (int dim = lane; dim < head_dim; dim += 32, ++local) {
+            grad_q[q_base + dim] = dq_acc[local];
+        }
+    }
+}
+
 extern "C" __global__ void causal_sdpa_decode_gqa_cache_f32(
     const float* __restrict__ q,
     const float* __restrict__ k,

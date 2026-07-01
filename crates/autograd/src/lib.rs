@@ -67,6 +67,12 @@ pub enum AutogradError {
     IndexOutOfBounds { index: usize, upper: usize },
     #[error("invalid indices length: expected {expected}, got {got}")]
     InvalidIndicesLen { expected: usize, got: usize },
+    #[error("cuda allocation failed in {op}: shape {shape:?}, bytes {bytes}")]
+    CudaAllocFailed {
+        op: &'static str,
+        shape: Vec<usize>,
+        bytes: usize,
+    },
     #[error("{0}")]
     TapeInvariant(&'static str),
 }

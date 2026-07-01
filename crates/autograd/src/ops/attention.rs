@@ -4,7 +4,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
-    backend::cpu_causal_sdpa_recompute_backward,
+    backend::{CausalSdpaDeviceBackwardArgs, cpu_causal_sdpa_recompute_backward},
     ops::{
         add, add_broadcast, matmul, mul_scalar, reshape, slice, softmax, softmax_backward,
         transpose,
@@ -259,8 +259,57 @@ pub(crate) fn causal_sdpa_recompute_backward(
             && upstream.dirty != Dirty::Host
             && upstream.device_handle.is_some()
     };
+    if device_path_ok && !legacy_sdpa_backward_enabled() {
+        let q_handle = store
+            .tensor(q)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let k_handle = store
+            .tensor(k)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let v_handle = store
+            .tensor(v)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let (grad_q, grad_k, grad_v) = store.backend().causal_sdpa_recompute_backward_device(
+            CausalSdpaDeviceBackwardArgs {
+                q: &q_handle,
+                k: &k_handle,
+                v: &v_handle,
+                upstream: &upstream_handle,
+                shape: &q_shape,
+                need_grad_q,
+                need_grad_k,
+                need_grad_v,
+            },
+        )?;
+        if let Some(handle) = grad_q {
+            grads.push((q, store.alloc_device_tensor(q_shape.clone(), handle)?));
+        }
+        if let Some(handle) = grad_k {
+            grads.push((k, store.alloc_device_tensor(k_shape.clone(), handle)?));
+        }
+        if let Some(handle) = grad_v {
+            grads.push((v, store.alloc_device_tensor(v_shape.clone(), handle)?));
+        }
+        return Ok(grads);
+    }
+
     if device_path_ok {
-        return causal_sdpa_recompute_backward_device(
+        return causal_sdpa_recompute_backward_device_legacy_chunked(
             q,
             k,
             v,
@@ -310,6 +359,13 @@ pub(crate) fn causal_sdpa_recompute_backward(
     Ok(grads)
 }
 
+fn legacy_sdpa_backward_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_OPD_LEGACY_SDPA_BWD").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
 /// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live
 /// `[merged_heads, q_chunk, seq]` score/prob transients to avoid the O(seq²)
 /// peak (the writeback-OOM fix). The unchunked path materialized the full
@@ -333,7 +389,7 @@ fn sdpa_backward_q_chunk(merged_heads: usize, seq_len: usize) -> usize {
 // the unchunked backward — softmax is row-wise, so each q-row's gradient is
 // independent, and grad_k/grad_v are exact sums over q.
 #[allow(clippy::too_many_arguments)]
-fn causal_sdpa_recompute_backward_device(
+fn causal_sdpa_recompute_backward_device_legacy_chunked(
     q: TensorId,
     k: TensorId,
     v: TensorId,

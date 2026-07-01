@@ -330,6 +330,7 @@ pub struct Tape {
     pub enabled: bool,
     checkpoint_fns: Vec<CheckpointFn>,
     pub(crate) offload_checkpoints: bool,
+    skip_next_checkpoint_input_offload: bool,
 }
 
 impl fmt::Debug for Tape {
@@ -349,6 +350,7 @@ impl Tape {
             enabled: true,
             checkpoint_fns: Vec::new(),
             offload_checkpoints: false,
+            skip_next_checkpoint_input_offload: false,
         }
     }
 
@@ -367,6 +369,14 @@ impl Tape {
     /// for less VRAM on long training forwards.
     pub fn set_offload_checkpoints(&mut self, on: bool) {
         self.offload_checkpoints = on;
+    }
+
+    pub(crate) fn set_skip_next_checkpoint_input_offload(&mut self, skip: bool) {
+        self.skip_next_checkpoint_input_offload = skip;
+    }
+
+    pub(crate) fn take_skip_next_checkpoint_input_offload(&mut self) -> bool {
+        std::mem::take(&mut self.skip_next_checkpoint_input_offload)
     }
 
     pub(crate) fn register_checkpoint_fn(&mut self, checkpoint_fn: CheckpointFn) -> usize {
@@ -400,6 +410,34 @@ impl Tape {
         Ok((grads, profile))
     }
 
+    pub fn backward_accumulate_only(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+    ) -> Result<()> {
+        let targets = HashSet::new();
+        self.backward_impl_seed(loss_id, None, store, None, true, Some(&targets))?;
+        Ok(())
+    }
+
+    pub fn backward_accumulate_only_profiled(
+        &mut self,
+        loss_id: TensorId,
+        store: &mut TensorStore,
+    ) -> Result<BackwardProfile> {
+        let mut profile = BackwardProfile::default();
+        let targets = HashSet::new();
+        self.backward_impl_seed(
+            loss_id,
+            None,
+            store,
+            Some(&mut profile),
+            true,
+            Some(&targets),
+        )?;
+        Ok(profile)
+    }
+
     pub fn backward_accumulate_targets(
         &mut self,
         loss_id: TensorId,
@@ -422,7 +460,8 @@ impl Tape {
         store: &mut TensorStore,
         target_ids: &[TensorId],
     ) -> Result<HashMap<TensorId, TensorId>> {
-        let grads = self.backward_impl_seed(output_id, Some(seed_grad_id), store, None, false)?;
+        let grads =
+            self.backward_impl_seed(output_id, Some(seed_grad_id), store, None, false, None)?;
         for &target_id in target_ids {
             if let Some(&grad_id) = grads.get(&target_id) {
                 store.accumulate_grad(target_id, grad_id)?;
@@ -445,6 +484,7 @@ impl Tape {
             store,
             Some(&mut profile),
             false,
+            None,
         )?;
         for &target_id in target_ids {
             if let Some(&grad_id) = grads.get(&target_id) {
@@ -462,12 +502,14 @@ impl Tape {
         self.backward_impl(loss_id, store, None, false)
     }
 
-    fn backward_collect_only(
+    fn backward_collect_targets_only(
         &mut self,
         loss_id: TensorId,
         store: &mut TensorStore,
+        target_ids: &[TensorId],
     ) -> Result<HashMap<TensorId, TensorId>> {
-        self.backward_collect(loss_id, store)
+        let targets = target_ids.iter().copied().collect::<HashSet<_>>();
+        self.backward_impl_seed(loss_id, None, store, None, false, Some(&targets))
     }
 
     fn backward_impl(
@@ -477,7 +519,7 @@ impl Tape {
         profile: Option<&mut BackwardProfile>,
         accumulate_into_store: bool,
     ) -> Result<HashMap<TensorId, TensorId>> {
-        self.backward_impl_seed(loss_id, None, store, profile, accumulate_into_store)
+        self.backward_impl_seed(loss_id, None, store, profile, accumulate_into_store, None)
     }
 
     fn backward_impl_seed(
@@ -487,6 +529,7 @@ impl Tape {
         store: &mut TensorStore,
         mut profile: Option<&mut BackwardProfile>,
         accumulate_into_store: bool,
+        return_filter: Option<&HashSet<TensorId>>,
     ) -> Result<HashMap<TensorId, TensorId>> {
         let total_started = profile.is_some().then(Instant::now);
         let was_enabled = self.enabled;
@@ -562,13 +605,21 @@ impl Tape {
             // from the first step. Explicit seed gradients follow the same
             // device-residency rule so downstream ops stay on-device.
             store.ensure_device(loss_grad_id)?;
-            grads.insert(loss_id, loss_grad_id);
-            if store
-                .get(loss_id)
-                .is_some_and(|tensor| tensor.requires_grad)
-                && accumulate_into_store
+            let loss_is_tape_output = entry_by_output.contains_key(&loss_id);
+            let keep_loss_grad = return_filter
+                .is_none_or(|targets| targets.contains(&loss_id) || loss_is_tape_output);
+            if accumulate_into_store
+                && !loss_is_tape_output
+                && store
+                    .get(loss_id)
+                    .is_some_and(|tensor| tensor.requires_grad)
             {
                 store.accumulate_grad(loss_id, loss_grad_id)?;
+            }
+            if keep_loss_grad {
+                grads.insert(loss_id, loss_grad_id);
+            } else if store.get(loss_grad_id).is_some() {
+                store.free(loss_grad_id)?;
             }
             if let (Some(profile), Some(started)) = (profile.as_deref_mut(), prelude_started) {
                 profile.prelude_duration += started.elapsed();
@@ -668,8 +719,30 @@ impl Tape {
                     sync_profile_boundary(store)?;
                 }
                 let merge_started = profile.is_some().then(Instant::now);
+                let output_grad_reused = input_grads
+                    .iter()
+                    .any(|(_, grad_id)| *grad_id == output_grad_id);
                 for (input_id, grad_id) in input_grads {
-                    merge_grad(&mut grads, input_id, grad_id, store, accumulate_into_store)?;
+                    merge_grad(
+                        &mut grads,
+                        input_id,
+                        grad_id,
+                        store,
+                        accumulate_into_store,
+                        &entry_by_output,
+                        return_filter,
+                    )?;
+                }
+                let keep_output_grad =
+                    return_filter.is_some_and(|targets| targets.contains(&entry.output_id));
+                let release_output_grad = (accumulate_into_store || return_filter.is_some())
+                    && !keep_output_grad
+                    && (entry.output_id != loss_id || return_filter.is_some());
+                if release_output_grad {
+                    grads.remove(&entry.output_id);
+                    if !output_grad_reused && store.get(output_grad_id).is_some() {
+                        store.free(output_grad_id)?;
+                    }
                 }
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), merge_started) {
                     sync_profile_boundary(store)?;
@@ -712,7 +785,8 @@ impl Tape {
             let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
             let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
             let loss = ops::sum(weighted, store, &mut inner_tape)?;
-            let inner_grads = inner_tape.backward_collect_only(loss, store)?;
+            let inner_grads =
+                inner_tape.backward_collect_targets_only(loss, store, &entry.input_ids)?;
 
             let mut grads = GradPairs::new();
             let mut keep = HashSet::new();
@@ -780,7 +854,18 @@ fn merge_grad(
     new_grad_id: TensorId,
     store: &mut TensorStore,
     accumulate_into_store: bool,
+    entry_by_output: &HashMap<TensorId, usize>,
+    return_filter: Option<&HashSet<TensorId>>,
 ) -> Result<()> {
+    let keep_in_grads = return_filter.is_none_or(|targets| {
+        targets.contains(&tensor_id) || entry_by_output.contains_key(&tensor_id)
+    });
+    let should_store_grad = accumulate_into_store
+        && !entry_by_output.contains_key(&tensor_id)
+        && store
+            .get(tensor_id)
+            .is_some_and(|tensor| tensor.requires_grad);
+
     if let Some(existing_grad_id) = grads.get(&tensor_id).copied() {
         let expected = store.tensor(existing_grad_id)?.shape.clone();
         let incoming = store.tensor(new_grad_id)?.shape.clone();
@@ -832,21 +917,24 @@ fn merge_grad(
                 *dst += src;
             }
         }
+        if should_store_grad {
+            store.accumulate_grad(tensor_id, new_grad_id)?;
+        }
+        if new_grad_id != existing_grad_id && store.get(new_grad_id).is_some() {
+            store.free(new_grad_id)?;
+        }
+    } else if keep_in_grads {
+        grads.insert(tensor_id, new_grad_id);
+        if should_store_grad {
+            store.accumulate_grad(tensor_id, new_grad_id)?;
+        }
     } else {
-        let grad_id = if accumulate_into_store {
-            store.clone_tensor(new_grad_id)?
-        } else {
-            new_grad_id
-        };
-        grads.insert(tensor_id, grad_id);
-    }
-
-    if store
-        .get(tensor_id)
-        .is_some_and(|tensor| tensor.requires_grad)
-        && accumulate_into_store
-    {
-        store.accumulate_grad(tensor_id, new_grad_id)?;
+        if should_store_grad {
+            store.accumulate_grad(tensor_id, new_grad_id)?;
+        }
+        if store.get(new_grad_id).is_some() {
+            store.free(new_grad_id)?;
+        }
     }
 
     Ok(())
@@ -913,6 +1001,86 @@ mod tests {
         assert_eq!(profile.op_totals[&BackwardOp::Sum].count, 1);
         assert_eq!(profile.op_totals[&BackwardOp::Mul].count, 1);
         assert!(profile.total_duration >= profile.total_op_duration());
+    }
+
+    #[test]
+    fn backward_does_not_persist_intermediate_grads() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+        let mut tape = Tape::new();
+        let y = ops::mul(x, x, &mut store, &mut tape).expect("x*x");
+        let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+
+        let grads = tape.backward(loss, &mut store).expect("backward");
+
+        assert!(grads.contains_key(&x), "leaf grad is returned");
+        assert!(
+            store.get(x).and_then(|tensor| tensor.grad).is_some(),
+            "leaf grad is stored"
+        );
+        assert!(
+            !grads.contains_key(&y),
+            "intermediate grad is freed after its last consumer"
+        );
+        assert!(
+            store.get(y).and_then(|tensor| tensor.grad).is_none(),
+            "intermediate grad is not persisted on the tensor"
+        );
+    }
+
+    #[test]
+    fn backward_collect_targets_only_drops_unrequested_leaf_grads() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+        let y = store.alloc(Tensor::new(vec![4.0, 5.0], vec![2], true).expect("create y"));
+        let mut tape = Tape::new();
+        let prod = ops::mul(x, y, &mut store, &mut tape).expect("x*y");
+        let loss = ops::sum(prod, &mut store, &mut tape).expect("sum");
+
+        let grads = tape
+            .backward_collect_targets_only(loss, &mut store, &[x])
+            .expect("target-only collect");
+
+        assert!(grads.contains_key(&x));
+        assert!(
+            !grads.contains_key(&y),
+            "unrequested leaf grad should not be retained"
+        );
+        assert!(
+            !grads.contains_key(&prod),
+            "intermediate grad should be freed after its last consumer"
+        );
+        let x_grad = store.to_host(grads[&x]).expect("x grad host");
+        assert_eq!(x_grad, vec![4.0, 5.0]);
+    }
+
+    #[test]
+    fn backward_accumulate_only_persists_leaf_grads_without_return_map() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+        let y = store.alloc(Tensor::new(vec![4.0, 5.0], vec![2], true).expect("create y"));
+        let mut tape = Tape::new();
+        let prod = ops::mul(x, y, &mut store, &mut tape).expect("x*y");
+        let sum = ops::add(prod, prod, &mut store, &mut tape).expect("prod+prod");
+        let loss = ops::sum(sum, &mut store, &mut tape).expect("sum");
+
+        tape.backward_accumulate_only(loss, &mut store)
+            .expect("accumulate-only backward");
+
+        let x_grad = store
+            .get(x)
+            .and_then(|tensor| tensor.grad)
+            .expect("x stored grad");
+        let y_grad = store
+            .get(y)
+            .and_then(|tensor| tensor.grad)
+            .expect("y stored grad");
+        assert_eq!(store.to_host(x_grad).expect("x grad host"), vec![8.0, 10.0]);
+        assert_eq!(store.to_host(y_grad).expect("y grad host"), vec![4.0, -6.0]);
+        assert!(
+            store.get(prod).and_then(|tensor| tensor.grad).is_none(),
+            "intermediate grad is not persisted"
+        );
     }
 
     #[test]
