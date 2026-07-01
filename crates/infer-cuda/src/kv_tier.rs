@@ -200,8 +200,12 @@ impl DiskTier {
         buf.push('\n');
         let slot_bytes = self.store.slot_bytes();
         for (key, record) in &self.keys {
-            writeln!(&mut buf, "{key} {} {} {slot_bytes}", record.slot, record.len)
-                .expect("write to String never fails");
+            writeln!(
+                &mut buf,
+                "{key} {} {} {slot_bytes}",
+                record.slot, record.len
+            )
+            .expect("write to String never fails");
         }
         kv_native_sys::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
             .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()))
@@ -234,10 +238,7 @@ impl DiskTier {
                         third.parse::<usize>().ok()?,
                         slot_bytes.parse::<u32>().ok().unwrap_or(0),
                     ),
-                    None => (
-                        0,
-                        third.parse::<u32>().ok().unwrap_or(0),
-                    ),
+                    None => (0, third.parse::<u32>().ok().unwrap_or(0)),
                 };
                 Some((
                     key,
@@ -961,10 +962,7 @@ mod tests {
                 Some(&DiskRecord { slot: 1, len: 4 }),
                 "latest alloc pops highest free slot first"
             );
-            assert_eq!(
-                disk.keys.get(&12),
-                Some(&DiskRecord { slot: 0, len: 11 }),
-            );
+            assert_eq!(disk.keys.get(&12), Some(&DiskRecord { slot: 0, len: 11 }),);
         }
 
         {
@@ -977,14 +975,8 @@ mod tests {
                 b"payload-123"
             );
             let disk = store.disk.as_ref().expect("disk tier");
-            assert_eq!(
-                disk.keys.get(&11),
-                Some(&DiskRecord { slot: 1, len: 4 }),
-            );
-            assert_eq!(
-                disk.keys.get(&12),
-                Some(&DiskRecord { slot: 0, len: 11 }),
-            );
+            assert_eq!(disk.keys.get(&11), Some(&DiskRecord { slot: 1, len: 4 }),);
+            assert_eq!(disk.keys.get(&12), Some(&DiskRecord { slot: 0, len: 11 }),);
         }
 
         std::fs::remove_dir_all(&root).expect("cleanup");
