@@ -393,7 +393,10 @@ fn run_lockstep_driver(
                     kv_system_prefix_match_full_blocks: system.prefix_match_full_blocks,
                     kv_system_prefix_match_clamped_blocks: system.prefix_match_clamped_blocks,
                 };
-                if let Err(e) = relay.send(&RelayEnvelope::StatsResponse { request_id, data }) {
+                if let Err(e) = relay.send(&RelayEnvelope::StatsResponse {
+                    request_id,
+                    data: Box::new(data),
+                }) {
                     log::warn!("[arle-worker rank={rank}] stats response send failed: {e:#}");
                 }
             }
