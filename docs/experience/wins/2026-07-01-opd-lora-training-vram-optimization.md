@@ -131,7 +131,57 @@ long trajectories (rows == seq_len at LM head), which the writeback
 window bounds at 256 here; a longer window or `all-linear` target
 set would surface it.
 
-Deferred to a follow-up bench:
+## Pod 训推一体 (train-infer unified) end-to-end — Qwen3.6-27B-FP8, single GPU
+
+Same GPU 4 hosts BOTH the rollout engine (FP8 27B, generates tokens
+for the agent bash-tool loop) AND the autograd student (bf16
+materialization + LoRA r=16 attention-qv + AdamW). `--share-frozen-
+base` (default) zero-copies the FP8 base pointers from the rollout
+engine into the student — ONE copy of the 27B lives on GPU.
+
+Toy SWE-bench-Pro-shaped task (`/tmp/aopd-smoke/staged/toy-1/`,
+`foo(x) = x + 0` bug, `fail_to_pass = test_foo.py::test_foo_doubles`
+asserting `foo(2) == 4`). One rollout, `--max-turns 6 --max-tokens
+256 --rollout-temperature 0.0`.
+
+The agent solved it in 2 turns (read → replace → stop) with a clean
+`git diff`; `test_patch` applied, pytest exit 0. That trajectory then
+drove ONE real masked-CE writeback step:
+
+```
+[agent-opd-debug] toy-1 terminal=Stop turns=2 sub_turns=3
+[agent-opd] toy-1 sample 0: passed=true (turns=2) :: [exit 0]
+[agent-opd] released inference scratch
+[agent-opd] released rollout KV pool
+[opd-vram-ledger] masked-writeback
+  base_used_mib=33835 post_forward_used_mib=34991
+  post_backward_used_mib=37519 post_cleanup_used_mib=37519
+  allocator_retained_delta_mib=3684 post_trim_used_mib=34415
+[masked-writeback] phase=forward_hidden_states seconds=122.802
+[masked-writeback] phase=backward seconds=315.403
+[masked-writeback] DONE loss=0.283432 total_targets=122
+[agent-opd] round 0: tasks=1 rollouts=1 passed=1 distinct=1
+                    trained_pairs=1 mean_loss=0.2834
+```
+
+Read (seq_len=1011, 122 masked targets, chunk_rows=512):
+
+| phase | used_mib | Δ vs base |
+|---|---|---|
+| autograd student resident floor | 35723 | (before rollout release) |
+| pre-writeback (after rollout release) | 33835 | 0 (base) |
+| post_forward | 34991 | +1156 |
+| **post_backward (peak)** | **37519** | **+3684** |
+| post_cleanup | 37519 | +3684 |
+| **post_trim** | **34415** | **+580 (−3104 MiB released to pool)** |
+
+The `trim_memory_pool` released **3104 MiB (8.3 %) of allocator-
+retained pages** — the next round starts from 34.4 GiB, not 37.5 GiB.
+On a multi-round agent-OPD loop this is the difference between "peak
+grows monotonically until OOM" and "peak decays to base between
+rounds".
+
+## Deferred to a follow-up bench
 
 * Longer trajectories (`--synthetic-writeback-seq {2048, 4096}` +
   `--writeback-window 1024`) — where the row-tile in
