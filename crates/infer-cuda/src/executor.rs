@@ -2342,6 +2342,40 @@ impl std::fmt::Debug for Dsv4CudaExecutor {
 }
 
 impl Dsv4CudaExecutor {
+    const SLOT_CHUNK_BYTES: usize = 16 << 20;
+
+    fn slot_chunk_key(key: u64, chunk_idx: usize) -> u64 {
+        key.wrapping_mul(1_000_003)
+            .wrapping_add(0xD54C_0000)
+            .wrapping_add(chunk_idx as u64)
+    }
+
+    fn slot_chunk_keys(key: u64, chunks: usize) -> Vec<u64> {
+        (0..chunks).map(|idx| Self::slot_chunk_key(key, idx)).collect()
+    }
+
+    fn slot_chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
+        format!("DSCHUNK {chunks} {bytes}\n").into_bytes()
+    }
+
+    fn parse_slot_chunk_manifest(bytes: &[u8]) -> Result<(usize, usize)> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("DSv4 slot chunk manifest utf8: {e}"))?;
+        let mut fields = text.split_whitespace();
+        ensure!(fields.next() == Some("DSCHUNK"), "bad DSv4 slot chunk manifest");
+        let chunks = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 slot chunk manifest missing chunks"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("DSv4 slot chunk manifest chunks: {e}"))?;
+        let bytes = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("DSv4 slot chunk manifest missing bytes"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("DSv4 slot chunk manifest bytes: {e}"))?;
+        Ok((chunks, bytes))
+    }
+
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
         let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
         self.model
@@ -2562,12 +2596,31 @@ impl Dsv4CudaExecutor {
             );
             return Ok(false);
         }
-        let inserted = usize::from(self.slot_tier.insert(key, bytes));
+        let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES).max(1);
+        let inserted = usize::from(self.slot_tier.insert(
+            key,
+            Self::slot_chunk_manifest(chunks, bytes.len()),
+        ));
         let inserted_all = self.tp_min_usize(inserted, "slot demote insert")? != 0;
         if !inserted_all && inserted != 0 {
             self.slot_tier.remove(&[key]);
         }
-        Ok(inserted_all)
+        if !inserted_all {
+            return Ok(false);
+        }
+        let mut inserted_keys = Vec::with_capacity(chunks + 1);
+        inserted_keys.push(key);
+        for (chunk_idx, chunk) in bytes.chunks(Self::SLOT_CHUNK_BYTES).enumerate() {
+            let chunk_key = Self::slot_chunk_key(key, chunk_idx);
+            let inserted = usize::from(self.slot_tier.insert(chunk_key, chunk.to_vec()));
+            if self.tp_min_usize(inserted, "slot demote chunk insert")? == 0 {
+                inserted_keys.push(chunk_key);
+                self.slot_tier.remove(&inserted_keys);
+                return Ok(false);
+            }
+            inserted_keys.push(chunk_key);
+        }
+        Ok(true)
     }
 
     /// Restore the whole-slot snapshot stored under `key` into `slot`. The engine
@@ -2583,14 +2636,27 @@ impl Dsv4CudaExecutor {
             "DSv4 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        let bytes = self.slot_tier.read(key).map(|b| b.into_owned());
-        let read_ok = usize::from(bytes.is_ok());
+        let manifest = self.slot_tier.read(key).map(|b| b.into_owned());
+        let read_ok = usize::from(manifest.is_ok());
         if self.tp_min_usize(read_ok, "slot promote read")? == 0 {
-            return Err(bytes
+            return Err(manifest
                 .err()
                 .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote read")));
         }
-        let bytes = bytes?;
+        let (chunks, total_bytes) = Self::parse_slot_chunk_manifest(&manifest?)?;
+        let mut bytes = Vec::with_capacity(total_bytes);
+        for chunk_idx in 0..chunks {
+            let chunk_key = Self::slot_chunk_key(key, chunk_idx);
+            let chunk = self.slot_tier.read(chunk_key).map(|b| b.into_owned());
+            let chunk_ok = usize::from(chunk.is_ok());
+            if self.tp_min_usize(chunk_ok, "slot promote chunk read")? == 0 {
+                return Err(chunk.err().unwrap_or_else(|| {
+                    anyhow::anyhow!("peer rank failed DSv4 slot promote chunk read")
+                }));
+            }
+            bytes.extend_from_slice(&chunk?);
+        }
+        bytes.truncate(total_bytes);
         let image = crate::dsv4::Dsv4SlotSnapshot::from_bytes(&bytes)
             .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"));
         let parse_ok = usize::from(image.is_ok());
@@ -2614,7 +2680,16 @@ impl Dsv4CudaExecutor {
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        self.slot_tier.remove(keys);
+        let mut all = Vec::new();
+        for &key in keys {
+            if let Ok(manifest) = self.slot_tier.read(key)
+                && let Ok((chunks, _)) = Self::parse_slot_chunk_manifest(manifest.as_ref())
+            {
+                all.extend(Self::slot_chunk_keys(key, chunks));
+            }
+            all.push(key);
+        }
+        self.slot_tier.remove(&all);
     }
 
     /// Length of the longest stored position-0 prompt that is an exact leading
@@ -5542,6 +5617,27 @@ mod tests {
         assert_eq!(s.used_bytes, 150, "in-place replace re-accounts bytes");
         let entry = s.take(&[1, 2], 2).expect("present");
         assert_eq!(entry.image, 2, "replaced payload is the latest");
+    }
+
+    #[test]
+    fn dsv4_slot_chunk_manifest_round_trips() {
+        let manifest = super::Dsv4CudaExecutor::slot_chunk_manifest(3, 33_554_433);
+        assert_eq!(
+            super::Dsv4CudaExecutor::parse_slot_chunk_manifest(&manifest).unwrap(),
+            (3, 33_554_433)
+        );
+        assert_ne!(
+            super::Dsv4CudaExecutor::slot_chunk_key(7, 0),
+            super::Dsv4CudaExecutor::slot_chunk_key(7, 1)
+        );
+        assert_eq!(
+            super::Dsv4CudaExecutor::slot_chunk_keys(7, 3),
+            vec![
+                super::Dsv4CudaExecutor::slot_chunk_key(7, 0),
+                super::Dsv4CudaExecutor::slot_chunk_key(7, 1),
+                super::Dsv4CudaExecutor::slot_chunk_key(7, 2),
+            ]
+        );
     }
 
     #[test]
