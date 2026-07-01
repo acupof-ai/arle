@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use smallvec::smallvec;
 
 use crate::{
@@ -572,7 +574,7 @@ fn fused_linear_ce_loss_indexed_device(
     // positions. reshape is a metadata-only lazy op; grad flows back to `hidden`.
     let total_rows = store.tensor(hidden)?.size / shape.hidden_dim;
     let mut view_tape = Tape::new();
-    view_tape.set_enabled(requires_grad);
+    view_tape.set_enabled(false);
     let hidden_2d = crate::ops::reshape(
         hidden,
         &[total_rows, shape.hidden_dim],
@@ -585,6 +587,7 @@ fn fused_linear_ce_loss_indexed_device(
     let mut grad_weight_accum: Option<TensorId> = None;
 
     for chunk_start in (0..num_targets).step_by(chunk_rows) {
+        let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
         let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_targets);
         let chunk_positions: Vec<usize> = position_indices[chunk_start..chunk_end]
             .iter()
@@ -626,38 +629,50 @@ fn fused_linear_ce_loss_indexed_device(
             let grads = chunk_tape.backward_collect(chunk_loss, store)?;
             if need_hidden_grad {
                 if let Some(&g) = grads.get(&hidden_2d) {
-                    grad_hidden_2d_accum = Some(match grad_hidden_2d_accum {
+                    grad_hidden_2d_accum = Some(match grad_hidden_2d_accum.take() {
                         None => store.clone_tensor(g)?,
-                        Some(acc) => crate::ops::add(acc, g, store, &mut view_tape)?,
+                        Some(acc) => {
+                            let next = crate::ops::add(acc, g, store, &mut view_tape)?;
+                            if store.get(acc).is_some() {
+                                store.free(acc)?;
+                            }
+                            next
+                        }
                     });
                 }
             }
             if need_weight_grad {
                 if let Some(&g) = grads.get(&weight) {
-                    grad_weight_accum = Some(match grad_weight_accum {
+                    grad_weight_accum = Some(match grad_weight_accum.take() {
                         None => store.clone_tensor(g)?,
-                        Some(acc) => crate::ops::add(acc, g, store, &mut view_tape)?,
+                        Some(acc) => {
+                            let next = crate::ops::add(acc, g, store, &mut view_tape)?;
+                            if store.get(acc).is_some() {
+                                store.free(acc)?;
+                            }
+                            next
+                        }
                     });
                 }
             }
         }
+
+        let keep = [grad_hidden_2d_accum, grad_weight_accum]
+            .into_iter()
+            .flatten()
+            .collect::<HashSet<_>>();
+        store.free_new_except(&live_before, &keep)?;
     }
 
     let loss_id = store.alloc(Tensor::new(vec![loss_sum], Vec::new(), requires_grad)?);
     if requires_grad {
-        // Re-shape the [total_rows, hidden_dim] grad back to the original hidden
-        // shape (host copy, mirroring the CPU path's saved-grad tensor).
         let grad_hidden_id = match grad_hidden_2d_accum {
             Some(g) => {
-                let data = store.to_host(g)?;
-                Some(store.alloc(Tensor::new(data, shape.hidden_shape.clone(), false)?))
-            }
-            None => None,
-        };
-        let grad_weight_id = match grad_weight_accum {
-            Some(g) => {
-                let data = store.to_host(g)?;
-                Some(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?))
+                let reshaped = crate::ops::reshape(g, &shape.hidden_shape, store, &mut view_tape)?;
+                if store.get(g).is_some() {
+                    store.free(g)?;
+                }
+                Some(reshaped)
             }
             None => None,
         };
@@ -667,7 +682,7 @@ fn fused_linear_ce_loss_indexed_device(
             input_ids: smallvec![hidden, weight],
             saved: SavedContext::FusedLinearDistillCtx {
                 grad_hidden: grad_hidden_id,
-                grad_weight: grad_weight_id,
+                grad_weight: grad_weight_accum,
             },
         });
     }
@@ -712,6 +727,21 @@ pub(crate) fn fused_linear_distill_backward(
 fn scale_saved_grad(grad_id: TensorId, scale: f32, store: &mut TensorStore) -> Result<TensorId> {
     if (scale - 1.0).abs() < f32::EPSILON {
         return store.clone_tensor(grad_id);
+    }
+    let device_path_ok = {
+        let grad = store.tensor(grad_id)?;
+        grad.dirty != crate::tensor::Dirty::Host && grad.device_handle.is_some()
+    };
+    if device_path_ok {
+        let (shape, handle) = {
+            let grad = store.tensor(grad_id)?;
+            (
+                grad.shape.clone(),
+                grad.device_handle.as_ref().expect("checked above").clone(),
+            )
+        };
+        let scaled = store.backend().mul_scalar(&handle, scale, &shape)?;
+        return store.alloc_device_tensor(shape, scaled);
     }
     let grad = store.tensor_host(grad_id)?;
     let data = grad.data.into_iter().map(|value| value * scale).collect();

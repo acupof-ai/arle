@@ -2351,7 +2351,9 @@ impl Dsv4CudaExecutor {
     }
 
     fn slot_chunk_keys(key: u64, chunks: usize) -> Vec<u64> {
-        (0..chunks).map(|idx| Self::slot_chunk_key(key, idx)).collect()
+        (0..chunks)
+            .map(|idx| Self::slot_chunk_key(key, idx))
+            .collect()
     }
 
     fn slot_chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
@@ -2362,7 +2364,10 @@ impl Dsv4CudaExecutor {
         let text = std::str::from_utf8(bytes)
             .map_err(|e| anyhow::anyhow!("DSv4 slot chunk manifest utf8: {e}"))?;
         let mut fields = text.split_whitespace();
-        ensure!(fields.next() == Some("DSCHUNK"), "bad DSv4 slot chunk manifest");
+        ensure!(
+            fields.next() == Some("DSCHUNK"),
+            "bad DSv4 slot chunk manifest"
+        );
         let chunks = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("DSv4 slot chunk manifest missing chunks"))?
@@ -2597,10 +2602,10 @@ impl Dsv4CudaExecutor {
             return Ok(false);
         }
         let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES).max(1);
-        let inserted = usize::from(self.slot_tier.insert(
-            key,
-            Self::slot_chunk_manifest(chunks, bytes.len()),
-        ));
+        let inserted = usize::from(
+            self.slot_tier
+                .insert(key, Self::slot_chunk_manifest(chunks, bytes.len())),
+        );
         let inserted_all = self.tp_min_usize(inserted, "slot demote insert")? != 0;
         if !inserted_all && inserted != 0 {
             self.slot_tier.remove(&[key]);

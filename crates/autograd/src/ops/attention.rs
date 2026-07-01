@@ -109,10 +109,13 @@ pub fn causal_sdpa_recompute(
     store.ensure_device(k)?;
     store.ensure_device(v)?;
 
+    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     let mut inner_tape = crate::Tape::new();
     inner_tape.set_enabled(false);
     let output_id = causal_sdpa(q, k, v, store, &mut inner_tape)?;
     store.set_requires_grad(output_id, requires_grad)?;
+    let keep = HashSet::from([q, k, v, output_id]);
+    store.free_new_except(&live_before, &keep)?;
 
     if tape.enabled && requires_grad {
         tape.record(crate::TapeEntry {
