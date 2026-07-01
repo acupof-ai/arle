@@ -308,11 +308,11 @@ fn backward_with_optional_profile(
     tape: &mut Tape,
 ) -> Result<()> {
     if !opd_backward_profile_enabled() {
-        tape.backward(loss, store)?;
+        tape.backward_accumulate_only(loss, store)?;
         return Ok(());
     }
 
-    let (_, backward_profile) = tape.backward_profiled(loss, store)?;
+    let backward_profile = tape.backward_accumulate_only_profiled(loss, store)?;
     log_opd_backward_profile(loss_value, &backward_profile);
     Ok(())
 }
@@ -2964,25 +2964,106 @@ fn build_masked_loss_targets(
 /// `--share-frozen-base` the head is frozen/tied so only `d_hidden` flows. The
 /// returned scalar is the mean CE per masked (LLM-generated) token.
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct VramSample {
+    free: usize,
+    total: usize,
+}
+
+impl VramSample {
+    fn used(self) -> usize {
+        self.total.saturating_sub(self.free)
+    }
+
+    fn used_mib(self) -> usize {
+        self.used() >> 20
+    }
+
+    fn free_mib(self) -> usize {
+        self.free >> 20
+    }
+
+    fn total_mib(self) -> usize {
+        self.total >> 20
+    }
+}
+
+fn writeback_vram_trace_enabled() -> bool {
+    std::env::var("ARLE_OPD_VRAM_TRACE").is_ok()
+}
+
+fn trim_after_writeback_enabled() -> bool {
+    !matches!(
+        std::env::var("ARLE_OPD_TRIM_AFTER_WRITEBACK").as_deref(),
+        Ok("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+    )
+}
+
 /// Log device VRAM at a writeback milestone when `ARLE_OPD_VRAM_TRACE` is set
-/// (default off). Brackets the `forward_hidden_states` peak to attribute the
-/// writeback's forward-activation transient (the ~34 GB term).
-fn log_writeback_vram(store: &TensorStore, label: &str) {
-    if std::env::var("ARLE_OPD_VRAM_TRACE").is_err() {
-        return;
+/// (default off). Brackets forward/backward/cleanup to attribute retained
+/// allocator floor separately from live tensors.
+fn log_writeback_vram(store: &TensorStore, scope: &str, label: &str) -> Option<VramSample> {
+    if !writeback_vram_trace_enabled() {
+        return None;
     }
     match store.backend().device_mem_info() {
         Some((free, total)) => {
-            let used = total.saturating_sub(free);
+            let sample = VramSample { free, total };
             eprintln!(
-                "[opd-vram] masked-writeback {label}: used={}MiB free={}MiB total={}MiB",
-                used >> 20,
-                free >> 20,
-                total >> 20,
+                "[opd-vram] {scope} {label}: used={}MiB free={}MiB total={}MiB",
+                sample.used_mib(),
+                sample.free_mib(),
+                sample.total_mib(),
             );
+            Some(sample)
         }
-        None => eprintln!("[opd-vram] masked-writeback {label}: device_mem_info unavailable"),
+        None => {
+            eprintln!("[opd-vram] {scope} {label}: device_mem_info unavailable");
+            None
+        }
     }
+}
+
+fn maybe_trim_after_writeback(store: &TensorStore, scope: &str) -> Result<Option<VramSample>> {
+    if !trim_after_writeback_enabled() {
+        return Ok(None);
+    }
+    let trimmed = store.backend().trim_memory_pool().map_err(OpdError::from)?;
+    eprintln!("[opd-vram] {scope} trim_after_writeback applied={trimmed}");
+    Ok(log_writeback_vram(store, scope, "post trim"))
+}
+
+fn log_writeback_vram_ledger(
+    scope: &str,
+    base: Option<VramSample>,
+    post_forward: Option<VramSample>,
+    post_backward: Option<VramSample>,
+    post_cleanup: Option<VramSample>,
+    post_trim: Option<VramSample>,
+) {
+    if !writeback_vram_trace_enabled() {
+        return;
+    }
+    let used = |sample: Option<VramSample>| sample.map(|s| s.used_mib()).unwrap_or(0);
+    let allocator_delta = match (base, post_cleanup) {
+        (Some(base), Some(cleanup)) => cleanup.used().saturating_sub(base.used()) >> 20,
+        _ => 0,
+    };
+    eprintln!(
+        "[opd-vram-ledger] {scope} base_used_mib={} post_forward_used_mib={} \
+         post_backward_used_mib={} post_cleanup_used_mib={} allocator_retained_delta_mib={} \
+         post_trim_used_mib={}",
+        used(base),
+        used(post_forward),
+        used(post_backward),
+        used(post_cleanup),
+        allocator_delta,
+        used(post_trim),
+    );
+}
+
+fn trim_memory_pool_for_writeback(store: &TensorStore, scope: &str) -> Result<Option<VramSample>> {
+    maybe_trim_after_writeback(store, scope)
 }
 
 pub fn masked_writeback_ce_step<O: Optimizer>(
@@ -3075,13 +3156,14 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
 
     // ONE checkpointed forward over prompt++response → [1, seq, hidden]. No
     // per-window re-forward of the growing prefix (was O(N²)).
-    log_writeback_vram(store, "pre forward_hidden_states");
+    let vram_base = log_writeback_vram(store, "masked-writeback", "pre forward_hidden_states");
     let t_fwd = Instant::now();
     let hidden = student
         .forward_hidden_states(store, &mut tape, &full, &positions)
         .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?;
     let fwd_secs = t_fwd.elapsed().as_secs_f64();
-    log_writeback_vram(store, "post forward_hidden_states");
+    let vram_post_forward =
+        log_writeback_vram(store, "masked-writeback", "post forward_hidden_states");
     eprintln!("[masked-writeback] phase=forward_hidden_states seconds={fwd_secs:.3}");
 
     // Chunked fused CE: per chunk computes hidden_chunk @ lm_headᵀ → logits → CE
@@ -3106,12 +3188,23 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
+    let vram_post_backward = log_writeback_vram(store, "masked-writeback", "post backward");
     eprintln!("[masked-writeback] phase=backward seconds={bwd_secs:.3}");
     let t_opt = Instant::now();
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     let opt_secs = t_opt.elapsed().as_secs_f64();
+    let vram_post_cleanup = log_writeback_vram(store, "masked-writeback", "post cleanup");
+    let vram_post_trim = trim_memory_pool_for_writeback(store, "masked-writeback")?;
+    log_writeback_vram_ledger(
+        "masked-writeback",
+        vram_base,
+        vram_post_forward,
+        vram_post_backward,
+        vram_post_cleanup,
+        vram_post_trim,
+    );
     eprintln!("[masked-writeback] phase=optimizer_cleanup seconds={opt_secs:.3}");
 
     eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
@@ -3219,7 +3312,11 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
 
     // ONE checkpointed gen-segment forward → [1, gen_len, hidden]; the prompt
     // prefix KV/state is captured off-tape and seeds the attention.
-    log_writeback_vram(store, "pre forward_hidden_states_gen_segment");
+    let vram_base = log_writeback_vram(
+        store,
+        "masked-writeback-frozen",
+        "pre forward_hidden_states_gen_segment",
+    );
     let t_fwd = Instant::now();
     let hidden = student
         .forward_hidden_states_gen_segment(
@@ -3234,7 +3331,11 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
             map_qwen35_forward_error("masked writeback frozen-prompt-KV student hidden", err)
         })?;
     let fwd_secs = t_fwd.elapsed().as_secs_f64();
-    log_writeback_vram(store, "post forward_hidden_states_gen_segment");
+    let vram_post_forward = log_writeback_vram(
+        store,
+        "masked-writeback-frozen",
+        "post forward_hidden_states_gen_segment",
+    );
     eprintln!("[masked-writeback-frozen] phase=forward_gen_segment seconds={fwd_secs:.3}");
 
     let t_ce = Instant::now();
@@ -3255,12 +3356,23 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
+    let vram_post_backward = log_writeback_vram(store, "masked-writeback-frozen", "post backward");
     eprintln!("[masked-writeback-frozen] phase=backward seconds={bwd_secs:.3}");
     let t_opt = Instant::now();
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     let opt_secs = t_opt.elapsed().as_secs_f64();
+    let vram_post_cleanup = log_writeback_vram(store, "masked-writeback-frozen", "post cleanup");
+    let vram_post_trim = trim_memory_pool_for_writeback(store, "masked-writeback-frozen")?;
+    log_writeback_vram_ledger(
+        "masked-writeback-frozen",
+        vram_base,
+        vram_post_forward,
+        vram_post_backward,
+        vram_post_cleanup,
+        vram_post_trim,
+    );
     eprintln!("[masked-writeback-frozen] phase=optimizer_cleanup seconds={opt_secs:.3}");
 
     eprintln!("[masked-writeback-frozen] DONE loss={loss_value:.6} total_targets={total_targets}");
