@@ -14,7 +14,7 @@ extern "C" __global__ void argmax_last_dim_f32(
     int best_idx = 0;
     for (int i = tid; i < vocab; i += block) {
         float value = row_x[i];
-        if (value > best_val || (value == best_val && i < best_idx)) {
+        if (value > best_val || (value == best_val && i > best_idx)) {
             best_val = value;
             best_idx = i;
         }
@@ -31,7 +31,7 @@ extern "C" __global__ void argmax_last_dim_f32(
         if (tid < stride) {
             float other_val = vals[tid + stride];
             int other_idx = idxs[tid + stride];
-            if (other_val > vals[tid] || (other_val == vals[tid] && other_idx < idxs[tid])) {
+            if (other_val > vals[tid] || (other_val == vals[tid] && other_idx > idxs[tid])) {
                 vals[tid] = other_val;
                 idxs[tid] = other_idx;
             }

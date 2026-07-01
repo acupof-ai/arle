@@ -48,8 +48,12 @@ where
         // via ensure_device), so this frees the ~30 GB of grad-checkpoints a long
         // training forward would otherwise pin in VRAM.
         if tape.offload_checkpoints {
-            for &id in &input_ids {
-                store.offload_to_host(id)?;
+            let skip_hidden = tape.take_skip_next_checkpoint_input_offload();
+            for (idx, &id) in input_ids.iter().enumerate() {
+                if skip_hidden && idx == 0 {
+                    continue;
+                }
+                store.offload_checkpoint_to_host(id)?;
             }
         }
         let checkpoint_fn: CheckpointFn = Arc::new(replay);
@@ -61,6 +65,7 @@ where
             saved: SavedContext::CheckpointCtx { function_id },
         });
     } else if tape.offload_checkpoints {
+        let _ = tape.take_skip_next_checkpoint_input_offload();
         // FROZEN group (no trainable param → no backward replay, no tape entry):
         // its input hidden (`input_ids[0]`, = the PRIOR group's output) is the
         // unbounded leak. It's in `keep` here (this group's saved input) so the
@@ -135,6 +140,9 @@ where
 
         let f = layer_fn.clone();
         let (start, stop) = (li, end);
+        if tape.offload_checkpoints && end == num_layers {
+            tape.set_skip_next_checkpoint_input_offload(true);
+        }
         hidden = checkpoint(input_ids, store, tape, move |s, t, inp| {
             let mut h = *inp.first().ok_or(AutogradError::TapeInvariant(
                 "checkpoint_sequential missing hidden input",

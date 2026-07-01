@@ -22,7 +22,8 @@
 #![cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 
 use autograd::backend::{
-    CpuBackend, cpu_causal_sdpa_decode_gqa, cpu_concat_axis2, cpu_embedding_forward,
+    CausalSdpaDeviceBackwardArgs, CpuBackend, cpu_causal_sdpa_decode_gqa,
+    cpu_causal_sdpa_recompute_backward, cpu_concat_axis2, cpu_embedding_forward,
     cpu_gather_last_dim_backward, cpu_gather_last_dim_forward, cpu_log_softmax_backward,
     cpu_log_softmax_forward_last_axis, cpu_matmul_backward, cpu_matmul_bt_backward,
     cpu_matmul_bt_forward, cpu_rms_norm_forward, cpu_scatter_add_rows_forward, cpu_slice,
@@ -103,6 +104,13 @@ fn max_err_with_tol(dev: &[f32], host: &[f32], atol: f32, rtol: f32) -> (f32, f3
         })
         .max_by(|(e1, _, _), (e2, _, _)| e1.total_cmp(e2))
         .unwrap_or((0.0, 0.0, 0))
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
 }
 
 #[test]
@@ -300,7 +308,7 @@ fn cuda_argmax_last_dim_device_lazy_matches_cpu_tie_breaking() {
     let dev_out = backend.readback(&out_h).expect("argmax readback");
 
     assert_eq!(dev_out, expected);
-    assert_eq!(dev_out[0], 5.0, "ties must choose the smallest vocab index");
+    assert_eq!(dev_out[0], 17.0, "ties must match CPU max_by ordering");
 }
 
 #[test]
@@ -821,6 +829,88 @@ fn cuda_causal_sdpa_decode_gqa_matches_cpu() {
         dev[idx],
         host[idx]
     );
+}
+
+#[test]
+fn cuda_causal_sdpa_recompute_backward_matches_cpu() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_causal_sdpa_recompute_backward_matches_cpu: no CUDA device");
+        return;
+    };
+
+    let cases = [
+        (17usize, 64usize, true, false, true),
+        (64, 128, true, true, true),
+        (17, 256, false, false, true),
+        (33, 64, false, true, false),
+    ];
+    for (case_idx, (seq, head_dim, need_q, need_k, need_v)) in cases.into_iter().enumerate() {
+        let shape = vec![1usize, 2, seq, head_dim];
+        let size: usize = shape.iter().product();
+        let seed = 0x5D0A_BA00 + case_idx as u64 * 0x100;
+        let q = rng_vec(seed + 1, size, 0.25);
+        let k = rng_vec(seed + 2, size, 0.25);
+        let v = rng_vec(seed + 3, size, 0.35);
+        let upstream = rng_vec(seed + 4, size, 0.3);
+
+        let (host_q, host_k, host_v) = cpu_causal_sdpa_recompute_backward(
+            &q, &k, &v, &upstream, &shape, need_q, need_k, need_v,
+        )
+        .expect("cpu recompute sdpa backward");
+
+        let q_h = backend.upload(&q, &shape).expect("upload q");
+        let k_h = backend.upload(&k, &shape).expect("upload k");
+        let v_h = backend.upload(&v, &shape).expect("upload v");
+        let up_h = backend.upload(&upstream, &shape).expect("upload upstream");
+        let (dev_q_h, dev_k_h, dev_v_h) = backend
+            .causal_sdpa_recompute_backward_device(CausalSdpaDeviceBackwardArgs {
+                q: &q_h,
+                k: &k_h,
+                v: &v_h,
+                upstream: &up_h,
+                shape: &shape,
+                need_grad_q: need_q,
+                need_grad_k: need_k,
+                need_grad_v: need_v,
+            })
+            .expect("cuda recompute sdpa backward");
+
+        let mut eval = Vec::new();
+        if let Some(handle) = dev_q_h.as_ref() {
+            eval.push(handle);
+        }
+        if let Some(handle) = dev_k_h.as_ref() {
+            eval.push(handle);
+        }
+        if let Some(handle) = dev_v_h.as_ref() {
+            eval.push(handle);
+        }
+        backend
+            .eval(&eval)
+            .expect("cuda eval recompute sdpa backward");
+
+        for (name, dev_h, host) in [
+            ("q", dev_q_h.as_ref(), host_q.as_ref()),
+            ("k", dev_k_h.as_ref(), host_k.as_ref()),
+            ("v", dev_v_h.as_ref(), host_v.as_ref()),
+        ] {
+            match (dev_h, host) {
+                (Some(dev_h), Some(host)) => {
+                    let dev = backend
+                        .readback(dev_h)
+                        .expect("sdpa backward grad readback");
+                    let err = max_abs_diff(&dev, host);
+                    assert!(
+                        err < 1e-3,
+                        "sdpa backward case={case_idx} grad_{name} seq={seq} head_dim={head_dim} \
+                         need=({need_q},{need_k},{need_v}) max_abs={err:.3e}"
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("sdpa backward case={case_idx} grad_{name} option mismatch"),
+            }
+        }
+    }
 }
 
 #[test]
