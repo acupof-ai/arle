@@ -85,15 +85,15 @@ follow Triton's `out_name = triton_<kernel>_sm{sm}` and TileLang's
 # Triton: only the 7-stage gated_delta_rule_chunkwise pipeline remains as live
 # Triton AOT post-Phase-0 (silu_mul / add / embedding / flash_attention_prefill_hd256
 # moved to native csrc or were dead — see commit 38d4d773).
-nm target/release/infer | grep -E '\b(silu_mul_triton_aot_cuda|add_cuda)\b' | wc -l                # expect 2 (csrc native symbols)
-nm target/release/infer | grep triton_gated_delta_rule_chunk_prepare_sm | sort                     # expect 4: sm80/86/89/90
-nm target/release/infer | grep -c triton_gated_delta_rule_                                         # expect 35: 7 dispatch + 28 per-SM
+nm target/release/arle | grep -E '\b(silu_mul_triton_aot_cuda|add_cuda)\b' | wc -l                # expect 2 (csrc native symbols)
+nm target/release/arle | grep triton_gated_delta_rule_chunk_prepare_sm | sort                     # expect 4: sm80/86/89/90
+nm target/release/arle | grep -c triton_gated_delta_rule_                                         # expect 35: 7 dispatch + 28 per-SM
 
 # TileLang (canonical `cuda,tilelang-attn` build — HD256 decode is GATED behind
 # the separate `tilelang-decode-hd256` feature and not part of this expansion):
 # 7 head-config families = 4 HD128 prefill + 3 HD256 prefill (no decode).
-nm target/release/infer | grep tilelang_batch_prefill_paged_hd128_q16_kv8_run_sm | sort   # expect 4
-nm target/release/infer | grep -c tilelang_batch_                                     # expect 35: 7 dispatch + 28 per-SM
+nm target/release/arle | grep tilelang_batch_prefill_paged_hd128_q16_kv8_run_sm | sort   # expect 4
+nm target/release/arle | grep -c tilelang_batch_                                     # expect 35: 7 dispatch + 28 per-SM
 # With `--features cuda,tilelang-attn,tilelang-decode-hd256`: expect 50 (10 dispatch + 40 per-SM).
 ```
 
@@ -185,13 +185,13 @@ bench results can't be directly compared against the row's baseline.
 # A100 (sm_80, 40/80 GB): Qwen3-8B full bf16.
 # Stub declares `cargo build --release --features cuda` (no tilelang-attn:
 # sm_80 has no Phase-0 TileLang validation; first run is the baseline).
-./target/release/infer --model-path models/Qwen3-8B --port 8000 \
+./target/release/arle --model-path models/Qwen3-8B --port 8000 \
   --num-slots 16 --max-seq-len 8192 &
 
 # A10 / RTX 3090 (sm_86, 24 GB): Qwen3-8B fits at this VRAM.
 # Stub declares `cargo build --release --features cuda` (no tilelang-attn,
 # same reason as sm_80).
-./target/release/infer --model-path models/Qwen3-8B --port 8000 \
+./target/release/arle --model-path models/Qwen3-8B --port 8000 \
   --num-slots 8 --max-seq-len 4096 &
 
 # L4 / RTX 4090 (sm_89, 24 GB): Qwen3.5-0.8B Q4_K_M to match the existing
@@ -203,13 +203,13 @@ bench results can't be directly compared against the row's baseline.
 # enough; `infer` has no `--gguf-quant` flag (quant is detected from the
 # .gguf header). `--max-seq-len 4608` is required for the canonical
 # guidellm `prompt=4096+output=256` workload to admit on 24 GB.
-./target/release/infer --model-path models/Qwen3.5-0.8B-GGUF \
+./target/release/arle --model-path models/Qwen3.5-0.8B-GGUF \
   --port 8000 --num-slots 8 --max-seq-len 4608 --mem-fraction-static 0.85 &
 
 # H100 (sm_90, 80 GB): Qwen3.5-4B (matches Phase-0 H100 reference workload).
 # Stub declares `cargo build --release --features cuda,tilelang-attn`
 # (sm_90 is where TileLang TMA/WGMMA leverage fires; tilelang-attn must be on).
-./target/release/infer --model-path models/Qwen3.5-4B --port 8000 \
+./target/release/arle --model-path models/Qwen3.5-4B --port 8000 \
   --num-slots 16 --max-seq-len 8192 &
 ```
 

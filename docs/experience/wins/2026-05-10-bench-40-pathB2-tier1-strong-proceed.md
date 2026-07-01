@@ -40,7 +40,7 @@ ARLE server(per bench):
 ```bash
 [INFER_PREFILL_GRAPH=1 for B] INFER_HYBRID_W4A8_PREFILL=1 \
   CUDA_HOME=/opt/cuda NVCC_CCBIN=/usr/bin/g++-14 \
-  ./target/release/infer --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
+  ./target/release/arle --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix \
   --port 8765 --num-slots 8 --max-seq-len 8192 --admission-policy prefix-aware
 ```
 

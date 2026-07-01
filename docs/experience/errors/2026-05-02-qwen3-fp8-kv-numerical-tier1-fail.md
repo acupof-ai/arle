@@ -35,7 +35,7 @@ ZIG=/tmp/zig14/zig CUDA_HOME=/usr/local/cuda \
 BF16 server:
 
 ```bash
-RUST_LOG=info CUDA_HOME=/usr/local/cuda ./target/release/infer \
+RUST_LOG=info CUDA_HOME=/usr/local/cuda ./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8011 \
   --kv-cache-dtype bf16 \
@@ -50,7 +50,7 @@ RUST_LOG=info CUDA_HOME=/usr/local/cuda ./target/release/infer \
 FP8 server:
 
 ```bash
-RUST_LOG=info CUDA_HOME=/usr/local/cuda ./target/release/infer \
+RUST_LOG=info CUDA_HOME=/usr/local/cuda ./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8012 \
   --kv-cache-dtype fp8 \

@@ -21,7 +21,7 @@
 > **2026-06-04 — cutover landed (post PR #53).** The monolithic `infer/` crate
 > is gone: it was split into the device-neutral `crates/infer-*` graph
 > (infer-plan → seam → core → cuda/metal → server/api, plus topo/moe/util).
-> `infer/src/**`, `-p infer`, `target/release/infer`, `metal_serve`,
+> `infer/src/**`, `-p infer`, `target/release/arle`, `metal_serve`,
 > `metal_bench`, `bench_serving`, and `cpu_serve` are **stale** — the only
 > binary the workspace produces is `arle` (root `arle` package,
 > `src/main.rs`), and serving is `arle serve`. The leftover `infer/` directory

@@ -56,7 +56,7 @@ Setup:
 ```bash
 # Marlin treatment
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer --model-path infer/models/Qwen3-4B-GPTQ-Int4-marlin \
+  ./target/release/arle --model-path infer/models/Qwen3-4B-GPTQ-Int4-marlin \
   --port 8000 --num-slots 8 --max-seq-len 5120 --kv-cache-dtype bf16
 
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \

@@ -37,7 +37,7 @@ legacy config at c=1 and c=4. Gate: all shapes within +/-5%; soft win only at
 | Processor | `infer/models/Qwen3-4B` |
 | Feature set | `cargo build --release -p infer --features cuda` |
 | Non-default env | `INFER_MARLIN_W4A8_AUTOCONFIG=1` |
-| Server launch | `INFER_MARLIN_W4A8_AUTOCONFIG=1 ./target/release/infer --model-path infer/models/Qwen3-4B-GPTQ-W4A8-zpfix --port 8000 --num-slots 8 --max-seq-len 5120` |
+| Server launch | `INFER_MARLIN_W4A8_AUTOCONFIG=1 ./target/release/arle --model-path infer/models/Qwen3-4B-GPTQ-W4A8-zpfix --port 8000 --num-slots 8 --max-seq-len 5120` |
 
 ## Command
 

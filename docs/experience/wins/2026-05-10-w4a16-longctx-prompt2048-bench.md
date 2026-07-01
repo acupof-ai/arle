@@ -15,7 +15,7 @@ default config). Per the procedural rule sedimented there, set
 
 ```bash
 RUST_MIN_STACK=33554432 \
-  setsid target/release/infer \
+  setsid target/release/arle \
     --model-path infer/models/Qwen3-4B-GPTQ-W4A16-marlin-zpfix \
     --max-seq-len 8192 \                    # ← NEW: was default 4096
     --port 8000 \

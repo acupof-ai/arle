@@ -30,7 +30,7 @@ guidellm output table.
 
 ### v3 conc=8 crash (Task #43 manifest)
 
-Server `target/release/infer` PID 1907144 ABORTED (核心已转储) at
+Server `target/release/arle` PID 1907144 ABORTED (核心已转储) at
 conc=8 phase. Per `dc0db7e` errors entry: Task #43 manifests at
 512-token prompts (not just 4k as originally documented). 8MB
 RUST_MIN_STACK insufficient.
@@ -88,7 +88,7 @@ PATH=$PWD/.venv/bin:$PATH
 # Start server with PF8 enabled
 RUST_MIN_STACK=33554432 INFER_HYBRID_W4A8_PREFILL=1 \
   INFER_MARLIN_W4_FP8_PREFILL=1 \
-  target/release/infer \
+  target/release/arle \
   --model-path infer/models/Qwen3-4B-W4-hybrid-zpfix --port 8000 \
   > /tmp/pf83-treatment-fp8-direct.log 2>&1 &
 sleep 30  # wait for warmup
@@ -103,7 +103,7 @@ guidellm benchmark run --target http://127.0.0.1:8000 \
   --output-dir bench-output/2026-05-10-pf83-treatment-direct
 
 # Kill server
-pkill -f "target/release/infer.*--port 8000"
+pkill -f "target/release/arle.*--port 8000"
 ```
 
 Compare manually to v3 baseline INT8 numbers for license decision.

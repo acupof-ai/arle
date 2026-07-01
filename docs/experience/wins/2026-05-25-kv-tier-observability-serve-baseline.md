@@ -25,7 +25,7 @@ cargo build --release -p infer --features cuda --no-default-features
 Baseline server:
 
 ```bash
-RUST_LOG=info target/release/infer \
+RUST_LOG=info target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8131 \
   --num-slots 1 \

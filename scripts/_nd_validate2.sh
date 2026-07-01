@@ -4,13 +4,13 @@
 # the CORRECT model name, expects coherent output (was ': is?' garbage before).
 set -u
 ROOT=/data01/build/arle
-BIN=$ROOT/target-pod/release/infer
+BIN=$ROOT/target-pod/release/arle
 MODEL=/data01/models/DeepSeek-V4-Flash
 PORT=18200
 LOG=/tmp/nd2_serve.log
 RESP=/tmp/nd2_resp.txt
 : >"$LOG"; : >"$RESP"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true
 sleep 3
 
 cd "$ROOT"
@@ -55,5 +55,5 @@ echo "=== boot ranks ===" | tee -a "$RESP"
 grep -c "booted (device_id" "$LOG" | tee -a "$RESP"
 echo "=== IMA grep ===" | tee -a "$RESP"
 grep -icE "illegal memory|combine failed|unspecified launch" "$LOG" | tee -a "$RESP"
-pkill -9 -f "target-pod/release/infer" 2>/dev/null || true
+pkill -9 -f "target-pod/release/arle" 2>/dev/null || true
 echo "ND2_DONE" | tee -a "$RESP"

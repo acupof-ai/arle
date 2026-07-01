@@ -115,7 +115,7 @@ because the bench is the *first* check, and it runs last.
    path under test. "链路不通" becomes a red bench, not a 0-delta surprise three weeks in.
 3. **Harness precondition checks** (codify the Theme-5 lessons mechanically): the bench
    script refuses to run unless the served binary's commit is clean and non-dirty (§4 of
-   bench-spec already wants this) and — for pod runs — `strings target/release/infer |
+   bench-spec already wants this) and — for pod runs — `strings target/release/arle |
    grep <expected_symbol>` passes (`errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md`).
 4. **Correctness-before-perf gate.** Wire the existing KV-precision-parity harness
    (`cargo test … kv_precision_parity`) and a decoded-token sanity print into the

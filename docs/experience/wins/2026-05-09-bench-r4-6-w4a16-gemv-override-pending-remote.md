@@ -67,7 +67,7 @@ CUDA_HOME=/opt/cuda \
 NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=/home/ckl/projects/arle/.venv/bin/python \
 TORCH_CUDA_ARCH_LIST=8.9 \
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B-GPTQ-Int4-marlin \
   --port 8000 \
   --num-slots 8 \

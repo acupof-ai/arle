@@ -18,7 +18,7 @@ related_skills: [#34 (multi-conc essential), #38 (warmup clamp)]
 
 Same as `8d32576` W4A16 except model:
 - Model: `infer/models/Qwen3-4B-GPTQ-W4A8-zpfix`
-- Server: `target/release/infer --model-path ... --port 8000` (no PF8 env)
+- Server: `target/release/arle --model-path ... --port 8000` (no PF8 env)
 - Workload: guidellm `--profile concurrent --rate {2,4} --max-seconds 60 --warmup 5`
 - Data: `prompt_tokens=512, output_tokens=128`
 - Same server reused (warmup amortized), only `--rate` changes

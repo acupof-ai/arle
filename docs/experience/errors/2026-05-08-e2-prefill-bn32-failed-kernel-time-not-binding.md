@@ -24,7 +24,7 @@ on both arms — production auto-FP8 was deliberately avoided to isolate
 kernel-tile effect from KV format).
 
 ```bash
-CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 ./target/release/infer \
+CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 ./target/release/arle \
     --model-path infer/models/Qwen3-4B --port 8000 --num-slots 8 \
     --max-seq-len 5120 --kv-cache-dtype bf16
 

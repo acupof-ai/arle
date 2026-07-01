@@ -63,10 +63,10 @@ cargo build --release -p infer --bin infer --features cuda
 
 # 2. Step 1 sweep — one server per precision
 for prec in bf16 int8 fp8 int4; do
-  pkill -9 -f target/release/infer 2>/dev/null
+  pkill -9 -f target/release/arle 2>/dev/null
   sleep 3
   mkdir -p /tmp/bench_runs/$prec
-  nohup ./target/release/infer \
+  nohup ./target/release/arle \
     --model-path <QWEN35_4B_DIR> \
     --port 8000 \
     --kv-cache-dtype "$prec" \

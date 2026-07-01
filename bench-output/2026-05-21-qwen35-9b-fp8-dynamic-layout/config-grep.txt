@@ -1,3 +1,0 @@
-11:        "format": "float-quantized",
-46:    "format": "float-quantized",
-283:    "quant_method": "compressed-tensors",

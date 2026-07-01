@@ -28,7 +28,7 @@ baseline (`docs/experience/wins/2026-04-29-bench-guidellm-cuda-l4-headline-summa
 ```bash
 source /tmp/arle-env.sh
 CUDA_HOME=/usr/local/cuda cargo build --release -p infer --features cuda --bin infer
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --num-slots 16 \

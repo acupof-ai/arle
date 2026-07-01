@@ -37,7 +37,7 @@ ARLE_DEEPEP_DIR=/sgl-workspace/DeepEP \
 cargo build --release -p infer --features cuda,nccl --bin infer
 ```
 
-Build artifact: `target/release/infer`. The deepep-sys static archive
+Build artifact: `target/release/arle`. The deepep-sys static archive
 (`libarle_deepep.a` ~3 MB) is linked into the binary. If `ARLE_DEEPEP_DIR`
 is missing, `build.rs` falls back to **deepep_stub** mode — the build
 still succeeds, but `ARLE_DSV4_MOE_BACKEND=native-deepep` will bail at

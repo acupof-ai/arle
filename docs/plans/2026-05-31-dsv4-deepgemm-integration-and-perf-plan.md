@@ -252,11 +252,11 @@ nsys/phase profile of a 1024-tok prefill at 0.85** (do NOT act on stale profilin
   `tmux new-session -d -s <name> "bash /tmp/<script>.sh"`. **Do NOT prefix the launch with
   `pkill`** — a `pkill` in the same exec call trips the tunnel's SIGTERM (137/143) and the
   session never starts. Kill stale `infer` in a *separate* call
-  (`~/bin/pod 'pkill -9 -f target-pod/release/infer'`), then launch. Poll with short separate
+  (`~/bin/pod 'pkill -9 -f target-pod/release/arle'`), then launch. Poll with short separate
   calls reading the script's output file.
 - **Serve / bench:** `scripts/dsv4_toolchain.sh smoke --moe-backend native-deepep
   --expert-backend {deepgemm|native} --deepep-dir <deepep-src> --model-path <models>/DeepSeek-V4-Flash
-  --server-bin target-pod/release/infer ...`. For OOB tracing set
+  --server-bin target-pod/release/arle ...`. For OOB tracing set
   `ARLE_SERVER_WRAP="/usr/local/cuda/bin/compute-sanitizer --tool memcheck --target-processes all"`.
 - **mem-fraction-static:** use **0.85** (default) for perf; the toolchain smoke default 0.10
   starves KV and produces false timeouts (§2.0.2).

@@ -29,7 +29,7 @@ hazard: killing the wrapper process can leave the backend `infer` child alive,
 which makes a sequential checkpoint sweep risk hitting the previous adapter's
 server. That attempt was discarded and its output directory was removed.
 
-The accepted sweep launched `target/release/infer` directly, one checkpoint at
+The accepted sweep launched `target/release/arle` directly, one checkpoint at
 a time. After every eval, the script killed the process group, verified port
 8125 closed, and checked GPU memory returned to the Edge-only baseline
 (`1093 MiB used`, `14851 MiB free`).
@@ -110,7 +110,7 @@ sits earlier than 5k and is task-dependent. The next informative run is not
 
 ```bash
 nvidia-smi --query-gpu=name,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits
-target/release/infer --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --port 8125 ...
+target/release/arle --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --port 8125 ...
 .venv/bin/python scripts/arle_capability_eval.py --backend arle --base-url http://127.0.0.1:8125 --model-id Qwen3___5-0___8B-Base --tasks mmlu,gsm8k --n-samples 200 --output <step-dir>
 ```
 

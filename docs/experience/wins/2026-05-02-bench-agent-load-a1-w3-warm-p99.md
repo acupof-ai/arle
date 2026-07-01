@@ -22,11 +22,11 @@ Server, first with the requested model path:
 ```bash
 CUDA_HOME=/usr/local/cuda \
 CARGO_HOME=/tmp/cargo-home-local \
-PEGAINFER_CUDA_SM=89 \
+TORCH_CUDA_ARCH_LIST=89 \
 LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64 \
 ZIG=/root/.local/lib/python3.12/site-packages/ziglang/zig \
 INFER_TILELANG_PYTHON=/usr/bin/python3 \
-./target/release/infer --model-path models/Qwen3-4B --port 8000 --num-slots 16
+./target/release/arle --model-path models/Qwen3-4B --port 8000 --num-slots 16
 ```
 
 Preflight result:
@@ -41,7 +41,7 @@ HTTP replay was run against the same weights through the existing symlink:
 
 ```bash
 ln -sfn Qwen3-4B models/default
-./target/release/infer --model-path models/default --port 8000 --num-slots 16
+./target/release/arle --model-path models/default --port 8000 --num-slots 16
 ```
 
 Client:

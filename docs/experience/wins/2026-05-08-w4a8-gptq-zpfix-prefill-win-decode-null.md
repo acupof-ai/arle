@@ -26,7 +26,7 @@ class(Qwen3-4B),different quant format only。
 
 ```bash
 CUDA_HOME=/opt/cuda TORCH_CUDA_ARCH_LIST=8.9 \
-  ./target/release/infer \
+  ./target/release/arle \
   --model-path infer/models/Qwen3-4B-GPTQ-W4A8-zpfix \
   --port 8000 --num-slots 8 --max-seq-len 5120
 

@@ -21,7 +21,7 @@ Server:
 NVCC_CCBIN=/usr/bin/g++-14 \
 INFER_TILELANG_PYTHON=$PWD/.venv/bin/python \
 TORCH_CUDA_ARCH_LIST=8.9 \
-./target/release/infer \
+./target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --num-slots 8 \
@@ -61,7 +61,7 @@ cargo bench -p infer --features cuda --bench ops_bench -- ops_cuda/add_batch --q
 - **Hardware:** NVIDIA GeForce RTX 4070 Ti SUPER, 16376 MiB VRAM
 - **Driver / CUDA:** 595.71.05 / CUDA 13.2 (`nvcc` 13.2.78)
 - **Commit under test:** working tree based on `36e3113`
-- **Feature set:** `cargo bench -p infer --features cuda`; server binary from `target/release/infer`
+- **Feature set:** `cargo bench -p infer --features cuda`; server binary from `target/release/arle`
 - **Non-default flags / env vars:** `NVCC_CCBIN=/usr/bin/g++-14`,
   `INFER_TILELANG_PYTHON=$PWD/.venv/bin/python`,
   `TORCH_CUDA_ARCH_LIST=8.9`

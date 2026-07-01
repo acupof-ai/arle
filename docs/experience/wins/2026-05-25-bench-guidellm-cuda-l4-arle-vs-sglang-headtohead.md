@@ -21,7 +21,7 @@ Supersedes stale 2026-04-26 L4 comparison.
 ```bash
 # Same flags, same machine, model swapped only via --port and --model.
 # ARLE
-./target/release/infer --model-path infer/models/Qwen3-4B --port 8000 \
+./target/release/arle --model-path infer/models/Qwen3-4B --port 8000 \
   --num-slots 16 --max-seq-len 5120
 scripts/bench_guidellm.sh cuda-l4-arle-2026-05-25-v2 \
   --target http://localhost:8000 --model Qwen3-4B \

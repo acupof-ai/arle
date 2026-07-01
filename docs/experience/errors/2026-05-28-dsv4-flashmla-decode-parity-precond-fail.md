@@ -27,7 +27,7 @@ Pod reality (verified `2026-05-28` via `pod-exec`):
 | `/sgl-workspace/arle-fresh` is the canonical pod workspace | Exists, but contains only `crates/` and `infer/` shells — no `Cargo.toml`, no `scripts/`, **not a git repo** |
 | Pod workspace is a git checkout supporting `git fetch origin` | No `.git` anywhere on the pod that ARLE lives in. `/root/.git` is an empty unrelated repo (`master` with no commits); `/data01/build/DeepEP/.git` is DeepEP, unrelated |
 | `git worktree add 8ebe3ff5` will materialize the target commit | Impossible — no git history to worktree from |
-| Pod source ≈ `origin/main HEAD` (`8ebe3ff5`) with the three target commits' source present | `/data01/build/arle/` (the *actual* working dir with `target/release/infer` + `scripts/bench_dsv4_trace_http.py`) has the Rust side of the three commits, **but is missing the CUDA-side dependencies they need** |
+| Pod source ≈ `origin/main HEAD` (`8ebe3ff5`) with the three target commits' source present | `/data01/build/arle/` (the *actual* working dir with `target/release/arle` + `scripts/bench_dsv4_trace_http.py`) has the Rust side of the three commits, **but is missing the CUDA-side dependencies they need** |
 
 ## What's actually missing on `/data01/build/arle/`
 
@@ -50,7 +50,7 @@ The Rust side has `dsv4_flashmla_decode_enabled`, `ensure_fm_decode_arena`,
 the entire FlashMLA vendor tree they FFI into is absent. `cargo build`
 cannot link.
 
-Existing pod binary `/data01/build/arle/target/release/infer`
+Existing pod binary `/data01/build/arle/target/release/arle`
 (timestamp `May 27 16:38`) confirms this: `strings` on the binary shows
 **none** of `ARLE_DSV4_FLASHMLA_DECODE`,
 `arle_flashmla_sm90_sparse_decode_*`, or
@@ -127,10 +127,10 @@ result will gate a default-on flip:
 1. Verify the pod workspace **is** a git repo and at HEAD via
    `git rev-parse HEAD`.
 2. Verify the target binary on disk contains the symbol(s) the probe
-   exercises (`strings target/release/infer | grep <symbol>`).
+   exercises (`strings target/release/arle | grep <symbol>`).
 3. If either check fails: STOP, write errors entry, do not flip
    defaults — even if the rebuild "looks easy" via scp/manual sync.
-4. The presence of `target/release/infer` is not evidence the source
+4. The presence of `target/release/arle` is not evidence the source
    tree is current; it's evidence *some* source tree was current
    *whenever it was last built*.
 

@@ -112,7 +112,7 @@ project README is reserved for achievements, not partial recipe probes.
 
 ```bash
 nvidia-smi
-target/release/infer --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --port 8125 --num-slots 1 --max-seq-len 4096 --chunked-prefill-size 4096 --max-num-batched-tokens 4096
+target/release/arle --model-path /home/ckl/.cache/modelscope/hub/Qwen/Qwen3___5-0___8B-Base --port 8125 --num-slots 1 --max-seq-len 4096 --chunked-prefill-size 4096 --max-num-batched-tokens 4096
 .venv/bin/python scripts/arle_capability_eval.py --backend arle --base-url http://127.0.0.1:8125 --model-id Qwen3___5-0___8B-Base --tasks mmlu,gsm8k --n-samples 200 --output bench-output/2026-05-25-t18-capability-sweep/<step>
 ```
 

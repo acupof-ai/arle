@@ -50,7 +50,7 @@ scatter race**.
 | Single profile request elapsed | 2.546 s for 17 prompt + 32 completion tokens |
 
 Binary on pod was built earlier today (16:38, `/data01/build/arle/target/
-release/infer`); no rebuild needed because the route switch is a runtime
+release/arle`); no rebuild needed because the route switch is a runtime
 env flip only — Rust source unchanged.
 
 ## Results

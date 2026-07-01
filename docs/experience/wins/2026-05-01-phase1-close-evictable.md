@@ -18,7 +18,7 @@
 ## Command
 
 ```bash
-/tmp/arle-target/release/infer \
+/tmp/arle-target/release/arle \
   --model-path infer/models/Qwen3-4B \
   --port 8000 \
   --kv-cache-dtype fp8 \
