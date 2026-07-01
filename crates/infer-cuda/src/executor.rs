@@ -2562,11 +2562,6 @@ impl Dsv4CudaExecutor {
             );
             return Ok(false);
         }
-        let mut bytes = bytes;
-        // Pad to fixed page size so CudaKvTierStore's L2/L3 layers work.
-        if bytes.len() < self.slot_image_bytes {
-            bytes.resize(self.slot_image_bytes, 0);
-        }
         let inserted = usize::from(self.slot_tier.insert(key, bytes));
         let inserted_all = self.tp_min_usize(inserted, "slot demote insert")? != 0;
         if !inserted_all && inserted != 0 {
