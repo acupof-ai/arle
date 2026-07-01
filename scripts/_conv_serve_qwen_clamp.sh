@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# C2 clamp test (Qwen3.5/3.6 MoE lane, TP=2): oversized --num-slots at the
+# C2 clamp test (Qwen3.5/3.6 MoE lane, TP=2): oversized --max-running-requests at the
 # default 128K context (internal total_pages 8192 × page_size 16) drives requested ≫ affordable,
 # so Qwen35Model::kv_budget_num_slots must (a) log the real per_slot/free budget
 # on every rank, (b) emit the clamp warn, (c) boot with the clamped slot count
@@ -27,6 +27,6 @@ setsid bash -lc '
   export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
   exec /data01/build/arle/target/release-fast/arle serve --backend cuda \
     --model-path /data01/models/Qwen3.6-35B-A3B --port 18188 \
-    --num-slots 1024 --kv-cache-dtype auto
+    --max-running-requests 1024 --kv-cache-dtype auto
 ' < /dev/null > "$LOG" 2>&1 &
 echo "qwen-clamp serve launched pid=$!"

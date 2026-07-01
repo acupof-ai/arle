@@ -324,8 +324,10 @@ export ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_ROOT}/deep_gemm
 The helper validates CUDA/NVCC, NCCL, DeepGEMM/CUTLASS, model path, and
 decode token count before running. Build uses `cargo build --release
 --features cuda,nccl --bin arle`.
-Smoke/nsys default to the 8-rank DSv4 validation envelope (`num_slots=1`,
-`mem_fraction_static=0.10`, FP8 KV, 43 distributed layers). `max_tokens=1`
+Smoke/nsys default to the DSv4 validation envelope; use
+`--max-running-requests` when a smoke needs a tighter active-request cap.
+Executor hot-workspace slots are model/VRAM-derived, not a public serve flag.
+`max_tokens=1`
 must only be used for explicit prefill/TTFT smoke outside this helper; decode
 evidence uses `max_tokens>=32`.
 

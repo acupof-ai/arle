@@ -26,6 +26,6 @@ setsid bash -lc '
   export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
   exec /data01/build/arle/target/release-fast/arle serve --backend cuda \
     --model-path /data01/models/DeepSeek-V4-Flash --port 18188 \
-    --num-slots 8 --kv-cache-dtype auto
+    --max-running-requests 8 --kv-cache-dtype auto
 ' < /dev/null > "$LOG" 2>&1 &
 echo "c1-serve launched pid=$!"

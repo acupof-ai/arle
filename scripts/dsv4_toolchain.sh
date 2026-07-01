@@ -29,7 +29,7 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 # a stub binary the runtime then tries to run as LL -> boot fail.
 MOE_BACKEND="${ARLE_DSV4_MOE_TRANSPORT:-${ARLE_DSV4_MOE_BACKEND:-allreduce}}"
 EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
-NUM_SLOTS="${NUM_SLOTS:-}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 SPEC_TYPE="${SPEC_TYPE:-none}"
 MTP_DRAFT_TOKENS="${MTP_DRAFT_TOKENS:-}"
 MTP_DRAFT_TOPK="${MTP_DRAFT_TOPK:-}"
@@ -53,7 +53,7 @@ Options:
   --port PORT        HTTP port (default: $PORT)
   --max-tokens N     smoke max_tokens; default 32, must be >=32
   --devices LIST     CUDA device list (default: $DEVICES)
-  --num-slots N      logical scheduler slots passed to arle serve
+  --max-running-requests N      logical scheduler slots passed to arle serve
   --spec-type NAME   speculative decode route passed to arle serve
                     (default: $SPEC_TYPE)
   --mtp-draft-tokens N
@@ -82,7 +82,7 @@ Environment:
   ARLE_DSV4_MODEL_PATH, ARLE_DSV4_MOE_BACKEND, ARLE_DSV4_EXPERT_BACKEND,
   ARLE_DEEPEP_DIR, ARTIFACT_ROOT, PORT, SERVER_BIN, MAX_TOKENS, PROMPT.
   NSYS_DELAY_SECONDS, NSYS_DURATION_SECONDS.
-  NUM_SLOTS, SPEC_TYPE, MTP_DRAFT_TOKENS, MTP_DRAFT_TOPK.
+  MAX_RUNNING_REQUESTS, SPEC_TYPE, MTP_DRAFT_TOKENS, MTP_DRAFT_TOPK.
 EOF
 }
 
@@ -117,7 +117,7 @@ parse_args() {
             --port) need_value "$@"; PORT="$2"; TARGET="http://${HOST}:${PORT}"; shift 2 ;;
             --max-tokens) need_value "$@"; MAX_TOKENS="$2"; shift 2 ;;
             --devices) need_value "$@"; DEVICES="$2"; shift 2 ;;
-            --num-slots) need_value "$@"; NUM_SLOTS="$2"; shift 2 ;;
+            --max-running-requests) need_value "$@"; MAX_RUNNING_REQUESTS="$2"; shift 2 ;;
             --spec-type) need_value "$@"; SPEC_TYPE="$2"; shift 2 ;;
             --mtp-draft-tokens) need_value "$@"; MTP_DRAFT_TOKENS="$2"; shift 2 ;;
             --mtp-draft-topk) need_value "$@"; MTP_DRAFT_TOPK="$2"; shift 2 ;;
@@ -313,7 +313,7 @@ env_check() {
     echo "CUDA_VISIBLE_DEVICES=$DEVICES"
     echo "ARLE_DSV4_MOE_BACKEND=$MOE_BACKEND"
     echo "ARLE_DSV4_EXPERT_BACKEND=$EXPERT_BACKEND"
-    echo "NUM_SLOTS=${NUM_SLOTS:-auto}"
+    echo "MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-auto}"
     echo "SPEC_TYPE=$SPEC_TYPE"
     echo "MTP_DRAFT_TOKENS=${MTP_DRAFT_TOKENS:-unset}"
     echo "MTP_DRAFT_TOPK=${MTP_DRAFT_TOPK:-unset}"
@@ -372,7 +372,7 @@ serve_args() {
         --port "$PORT"
         --spec-type "$SPEC_TYPE"
     )
-    [[ -z "$NUM_SLOTS" ]] || out+=(--num-slots "$NUM_SLOTS")
+    [[ -z "$MAX_RUNNING_REQUESTS" ]] || out+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
     [[ -z "$MTP_DRAFT_TOKENS" ]] || out+=(--mtp-draft-tokens "$MTP_DRAFT_TOKENS")
     [[ -z "$MTP_DRAFT_TOPK" ]] || out+=(--mtp-draft-topk "$MTP_DRAFT_TOPK")
 }

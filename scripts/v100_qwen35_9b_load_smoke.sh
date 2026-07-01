@@ -106,7 +106,7 @@ echo "starting Qwen3.5-9B smoke server: target=$TARGET model=$MODEL_PATH log=$SE
     --model-path "$MODEL_PATH" \
     --port "$PORT" \
     -- \
-    --num-slots 1 \
+    --max-running-requests 1 \
     --max-seq-len 2048 \
     --kv-cache-dtype bf16 \
     >"$SERVER_LOG" 2>&1 &

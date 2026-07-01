@@ -547,9 +547,8 @@ pub(crate) struct ServeArgs {
     pub(crate) allow_swap: bool,
 
     /// Soft cap on concurrently-running requests (SGLang `max_running_requests`).
-    /// Zero-HBM index cap — it never multiplies the shared KV pool. `--num-slots`
-    /// is the legacy alias for the same internal `SchedulerConfig.num_slots`.
-    #[arg(long, visible_alias = "num-slots", value_parser = parse_positive_usize)]
+    /// The executor derives hot-workspace capacity from this plus model/VRAM budget.
+    #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) max_running_requests: Option<usize>,
 
     /// Fraction of total VRAM for the static KV pool, profiled from MEASURED
@@ -596,10 +595,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) chunked_prefill_size: Option<usize>,
 
-    /// Opt into slot oversubscription: admit more concurrent requests than
-    /// `--max-running-requests` by parking the longest-running decode's
-    /// whole-slot KV image to the DRAM tier (round-robin) to free a slot for a
-    /// waiter. Requires a whole-slot tier backend; default off (byte-identical).
+    /// Opt into running-cap oversubscription: rotate waiters in by parking the
+    /// longest-running decode's whole-slot KV image to the tier store. Requires
+    /// a whole-slot tier backend; default off (byte-identical).
     #[arg(long, default_value_t = false)]
     pub(crate) slot_oversubscription: bool,
 

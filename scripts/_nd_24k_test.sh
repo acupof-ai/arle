@@ -13,7 +13,7 @@ ARLE_DEEPEP_DIR=/data01/build/DeepEP \
 ARLE_DSV4_LOAD_LAYER_WEIGHTS=1 ARLE_DSV4_GPU_FULL_LAYERS=43 ARLE_DSV4_INCREMENTAL_KV=1 \
 ARLE_DSV4_FLASHMLA_PREFILL=1 ARLE_DSV4_FLASHMLA_DECODE=1 \
 RUST_LOG=info NCCL_DEBUG=WARN \
-"$BIN" --model-path "$MODEL" --port "$PORT" --num-slots 1 --max-seq-len 32768 \
+"$BIN" --model-path "$MODEL" --port "$PORT" --max-running-requests 1 --max-seq-len 32768 \
   --mem-fraction-static 0.10 --kv-cache-dtype bf16 --deepseek-distributed-layers 43 >>"$LOG" 2>&1 &
 SVPID=$!
 ready=0

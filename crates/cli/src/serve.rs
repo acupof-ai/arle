@@ -443,14 +443,14 @@ fn resolve_engine_config(
 
     if serve_args.low_impact {
         config.low_impact = true;
-        config.num_slots = 1;
+        config.max_running_requests = Some(1);
         config.chunked_prefill_size = config.chunked_prefill_size.min(32);
     }
 
     config.kv_recall = serve_args.kv_recall;
 
     if let Some(value) = serve_args.max_running_requests {
-        config.num_slots = value;
+        config.max_running_requests = Some(value);
     }
     if let Some(value) = serve_args.max_prompt_tokens {
         config.max_prompt_tokens = value;
@@ -692,7 +692,12 @@ mod tests {
             "--low-impact",
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
-        assert_eq!(config.options.engine_config.num_slots, 1);
+        assert_eq!(
+            config.options.engine_config.num_slots,
+            defaults.num_slots,
+            "low-impact must not shrink executor hot workspace"
+        );
+        assert_eq!(config.options.engine_config.max_running_requests, Some(1));
         assert_eq!(
             config.options.engine_config.total_pages,
             defaults.total_pages
@@ -904,10 +909,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_engine_budget_overrides_low_impact() {
+    fn max_running_requests_is_scheduler_only() {
         if skip_if_no_backend() {
             return;
         }
+        let defaults = EngineLoadConfig::default();
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -916,7 +922,7 @@ mod tests {
             "--model-path",
             "model",
             "--low-impact",
-            "--num-slots",
+            "--max-running-requests",
             "2",
             "--max-prompt-tokens",
             "8192",
@@ -924,9 +930,35 @@ mod tests {
             "16384",
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
-        assert_eq!(config.options.engine_config.num_slots, 2);
+        assert_eq!(config.options.engine_config.num_slots, defaults.num_slots);
+        assert_eq!(config.options.engine_config.max_running_requests, Some(2));
+        assert_eq!(
+            config.options.engine_config.max_running_requests.unwrap(),
+            2,
+            "serve exposes one concurrency knob"
+        );
         assert_eq!(config.options.engine_config.max_prompt_tokens, 8192);
         assert_eq!(config.options.engine_config.max_total_tokens, 16_384);
+    }
+
+    #[test]
+    fn num_slots_is_not_a_serve_flag() {
+        let parsed = Args::try_parse_from([
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--num-slots",
+            "2",
+        ])
+        .map_err(|err| err.to_string());
+        let err = match parsed {
+            Ok(_) => panic!("serve no longer exposes --num-slots"),
+            Err(err) => err,
+        };
+        assert!(err.contains("num-slots"), "got: {err}");
     }
 
     #[test]
@@ -1029,7 +1061,7 @@ mod tests {
             "--model-path",
             "model",
             "--",
-            "--num-slots",
+            "--unknown-backend-flag",
             "8",
         ]);
         let err = resolve_config(&args, &serve).expect_err("extra args rejected");
