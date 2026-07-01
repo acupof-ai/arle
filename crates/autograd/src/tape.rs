@@ -625,6 +625,7 @@ impl Tape {
                 profile.prelude_duration += started.elapsed();
             }
 
+            let vram_profile = backward_vram_profile_enabled();
             for &entry_index in post_order.iter().rev() {
                 let entry = self.entries[entry_index].clone();
                 let output_grad_id = match grads.get(&entry.output_id).copied() {
@@ -706,6 +707,9 @@ impl Tape {
                         self.checkpoint_backward(&entry, output_grad_id, store)?
                     }
                 };
+                if vram_profile {
+                    log_backward_vram_profile("after_op", entry_index, &entry, store)?;
+                }
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), op_started) {
                     sync_profile_boundary(store)?;
                     let duration = started.elapsed();
@@ -743,6 +747,9 @@ impl Tape {
                     if !output_grad_reused && store.get(output_grad_id).is_some() {
                         store.free(output_grad_id)?;
                     }
+                }
+                if vram_profile {
+                    log_backward_vram_profile("after_merge", entry_index, &entry, store)?;
                 }
                 if let (Some(profile), Some(started)) = (profile.as_deref_mut(), merge_started) {
                     sync_profile_boundary(store)?;
@@ -783,6 +790,7 @@ impl Tape {
         let result = (|| {
             let mut inner_tape = Tape::new();
             let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
+            trim_after_checkpoint_replay(store)?;
             let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
             let loss = ops::sum(weighted, store, &mut inner_tape)?;
             let inner_grads =
@@ -802,10 +810,12 @@ impl Tape {
         match result {
             Ok((grads, keep)) => {
                 store.free_new_except(&live_before, &keep)?;
+                trim_after_checkpoint_replay(store)?;
                 Ok(grads)
             }
             Err(err) => {
                 let _ = store.free_new_except(&live_before, &HashSet::new());
+                let _ = trim_after_checkpoint_replay(store);
                 Err(err)
             }
         }
@@ -814,6 +824,48 @@ impl Tape {
 
 fn sync_profile_boundary(store: &TensorStore) -> Result<()> {
     store.backend().eval(&[])
+}
+
+fn backward_vram_profile_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_OPD_BACKWARD_VRAM_PROFILE").as_deref(),
+        Ok(value) if !matches!(value, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+    )
+}
+
+fn trim_after_checkpoint_replay(store: &TensorStore) -> Result<()> {
+    if matches!(
+        std::env::var("ARLE_OPD_TRIM_AFTER_CHECKPOINT_REPLAY").as_deref(),
+        Ok(value) if !matches!(value, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+    ) {
+        store.backend().trim_memory_pool()?;
+    }
+    Ok(())
+}
+
+fn log_backward_vram_profile(
+    stage: &str,
+    entry_index: usize,
+    entry: &TapeEntry,
+    store: &TensorStore,
+) -> Result<()> {
+    store.backend().eval(&[])?;
+    if let Some((free, total)) = store.backend().device_mem_info() {
+        let used_mib = total.saturating_sub(free) >> 20;
+        let free_mib = free >> 20;
+        let total_mib = total >> 20;
+        let site = entry.profile_site().unwrap_or("-");
+        let live_tensors = store.live_ids().len();
+        eprintln!(
+            "[autograd-backward-vram] stage={stage} index={entry_index} op={} site={} \
+             output_id={} used_mib={used_mib} free_mib={free_mib} total_mib={total_mib} \
+             live_tensors={live_tensors}",
+            entry.op.name(),
+            site,
+            entry.output_id,
+        );
+    }
+    Ok(())
 }
 
 fn collect_relevant(
