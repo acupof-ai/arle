@@ -20,9 +20,12 @@ use infer_api::{
     CudaWorkerEngine, EngineLoadConfig, RelayCoordinator, RelayEnvelope, RelayWorker, WireStats,
 };
 
-/// Relay accept / worker-connect timeout. Generous: a cold rank-0 build can
-/// take tens of seconds before it reaches the accept point.
+/// Relay accept / worker-connect timeout. This covers only the socket handshake;
+/// model build has its own wider barrier below.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(120);
+/// DSv4 cold worker builds can spend several minutes in checkpoint load /
+/// DeepGEMM setup before sending EngineReady.
+const ENGINE_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 // (Model-kind gating lives in `infer_api::cuda_model_takes_multiproc_serve` —
 // one classifier shared with `build_cuda_engine`, covering DSv4 AND the
@@ -170,13 +173,13 @@ pub(crate) fn bind_relay_and_spawn_workers(
 
 /// Block until all `world_size` ranks report [`RelayEnvelope::EngineReady`], or
 /// fail fast if a child exits first (a crashed rank never acks). Bounded by
-/// [`RELAY_TIMEOUT`].
+/// [`ENGINE_READY_TIMEOUT`].
 fn wait_all_engines_ready(
     relay: &RelayCoordinator,
     children: &mut WorkerChildren,
     world_size: usize,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + RELAY_TIMEOUT;
+    let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
     loop {
         let ready = relay.ready_count();
         if ready >= world_size {
@@ -191,7 +194,7 @@ fn wait_all_engines_ready(
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out after {RELAY_TIMEOUT:?} waiting for worker engine-ready \
+                "timed out after {ENGINE_READY_TIMEOUT:?} waiting for worker engine-ready \
                  ({ready}/{world_size} ready)"
             );
         }
