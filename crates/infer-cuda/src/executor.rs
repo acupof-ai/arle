@@ -322,16 +322,16 @@ impl RealCudaExecutor {
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_host_demoted_pages(),
-            Self::Dsv4(_) => 0,
-            Self::Qwen35(_) => 0,
+            Self::Dsv4(d) => d.kv_tier_host_demoted_pages(),
+            Self::Qwen35(q) => q.kv_tier_host_demoted_pages(),
         }
     }
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_disk_pages(),
-            Self::Dsv4(_) => 0,
-            Self::Qwen35(_) => 0,
+            Self::Dsv4(d) => d.kv_tier_disk_pages(),
+            Self::Qwen35(q) => q.kv_tier_disk_pages(),
         }
     }
 
@@ -2516,6 +2516,14 @@ impl Dsv4CudaExecutor {
             CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), self.slot_image_bytes);
     }
 
+    pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
+        self.slot_tier.host_demoted_pages()
+    }
+
+    pub(crate) fn kv_tier_disk_pages(&self) -> usize {
+        self.slot_tier.disk_pages()
+    }
+
     /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         true
@@ -3622,6 +3630,14 @@ impl Qwen35CudaExecutor {
             return false;
         }
         true
+    }
+
+    pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
+        self.slot_tier.host_demoted_pages()
+    }
+
+    pub(crate) fn kv_tier_disk_pages(&self) -> usize {
+        self.slot_tier.disk_pages()
     }
 
     /// Demote `slot`'s entire device state into the host `slot_tier` under `key`.
