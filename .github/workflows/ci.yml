@@ -28,6 +28,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # .cargo/config.toml pins `rustc-wrapper = "sccache"`; every job that
+  # runs cargo must install sccache via mozilla-actions/sccache-action.
+  SCCACHE_GHA_ENABLED: "true"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -57,6 +60,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -91,6 +97,9 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

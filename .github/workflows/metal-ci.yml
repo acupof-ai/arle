@@ -30,6 +30,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # .cargo/config.toml pins `rustc-wrapper = "sccache"`; install via
+  # mozilla-actions/sccache-action so cargo doesn't fail on missing wrapper.
+  SCCACHE_GHA_ENABLED: "true"
 
 concurrency:
   group: metal-ci-${{ github.ref }}
@@ -45,6 +48,9 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       # Raw target/ caching on purpose (NOT Swatinem/rust-cache): rust-cache
       # prunes workspace-crate artifacts, which would drop mlx-sys' OUT_DIR
