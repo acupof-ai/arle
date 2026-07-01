@@ -6362,6 +6362,7 @@ mod tests {
             &cfg,
             lora,
             LoraTargetSet::AllLinear,
+            false,
             &mut store,
         )?;
         let params = model.param_name_map();
