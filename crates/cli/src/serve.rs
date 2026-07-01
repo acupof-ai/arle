@@ -693,8 +693,7 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
-            config.options.engine_config.num_slots,
-            defaults.num_slots,
+            config.options.engine_config.num_slots, defaults.num_slots,
             "low-impact must not shrink executor hot workspace"
         );
         assert_eq!(config.options.engine_config.max_running_requests, Some(1));
