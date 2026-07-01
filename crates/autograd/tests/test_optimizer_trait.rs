@@ -82,7 +82,7 @@ fn adamw_dispatches_through_optimizer_trait() {
         "all tracked internal state is covered by names"
     );
 
-    // zero_grad through the trait should clear the grad buffer in place.
+    // zero_grad through the trait should clear and release the grad buffer.
     let grad_id = store
         .get(param)
         .and_then(|t| t.grad)
@@ -93,9 +93,12 @@ fn adamw_dispatches_through_optimizer_trait() {
         .data
         .copy_from_slice(&grad_values);
     opt.zero_grad(&mut store, &[param]);
-    let cleared = store.to_host(grad_id).expect("host copy of grad");
     assert!(
-        cleared.iter().all(|&x| x == 0.0),
-        "zero_grad via trait should leave grad tensor all-zero"
+        store.get(param).and_then(|t| t.grad).is_none(),
+        "zero_grad via trait should clear the grad id"
+    );
+    assert!(
+        store.to_host(grad_id).is_err(),
+        "zero_grad via trait should free the old grad tensor"
     );
 }
