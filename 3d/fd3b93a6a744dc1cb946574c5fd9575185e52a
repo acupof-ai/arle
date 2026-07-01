@@ -1,0 +1,4617 @@
+docs/experience/wins/2026-05-07-m3.9-mixed-policy-budget-fix.md
+  s_ad211f042b68fc::t_7b360a7024e84e 37 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":37}]}]}
+docs/experience/errors/2026-05-10-36-warmmix-guidellm-jsonl-invalid.md
+  s_ad211f042b68fc::t_7b360a7024e84e 70 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":70}]}]}
+docs/experience/errors/2026-05-01-bench-guidellm-phase15-evictable-c4-r1-invalid-051b1081.md
+  s_ad211f042b68fc::t_7b360a7024e84e 45 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":45}]}]}
+docs/experience/wins/2026-05-07-m3.7-b1.2-bench-after-snapshot.md
+  s_ad211f042b68fc::t_7b360a7024e84e 25 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":25}]}]}
+docs/experience/errors/2026-05-05-fp8-kv-tier1-still-fail.md
+  s_ad211f042b68fc::t_7b360a7024e84e 28,43 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":28},{"Single":43}]}]}
+docs/experience/wins/2026-05-01-p23-verifier-bit-ident-eager.md
+  s_ad211f042b68fc::t_7b360a7024e84e 22 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":22}]}]}
+docs/experience/errors/2026-05-08-spec-decode-w3-c4-self-spec-k5-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 57 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":57}]}]}
+scripts/_flashmla_24k_test.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 8,14,81 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":8},{"Single":14},{"Single":81}]}]}
+docs/plans/M3.6-nsight-trace-analysis-runbook.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 28 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":28}]}]}
+docs/plans/M6-metal-world-rank-snapshot.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 93 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":93}]}]}
+docs/plans/M_quant-marlin-round4-hybrid-dispatch.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 137 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":137}]}]}
+docs/experience/errors/2026-05-08-spec-decode-32k-self-spec-kill-axis-level.md
+  s_ad211f042b68fc::t_7b360a7024e84e 21,27 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":21},{"Single":27}]}]}
+docs/experience/wins/2026-05-06-bench-gdr-triton-restore-pending-remote.md
+  s_ad211f042b68fc::t_7b360a7024e84e 21 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":21}]}]}
+docs/experience/wins/2026-05-27-multiproc-relay-C1-C3.md
+  s_ad211f042b68fc::t_7b360a7024e84e 181 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":181}]}]}
+docs/experience/wins/2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md
+  s_ad211f042b68fc::t_7b360a7024e84e 49 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":49}]}]}
+docs/experience/wins/2026-05-25-kv-tier-observability-serve-baseline.md
+  s_ad211f042b68fc::t_7b360a7024e84e 28 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":28}]}]}
+docs/plans/2026-05-26-p4-v100-perf-bench-deferred.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 81 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":81}]}]}
+scripts/_dg_cons.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 7,13,58 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":7},{"Single":13},{"Single":58}]}]}
+docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-autoconfig.md
+  s_ad211f042b68fc::t_7b360a7024e84e 40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":40}]}]}
+docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-vs-sglang-headtohead.md
+  s_ad211f042b68fc::t_7b360a7024e84e 24 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":24}]}]}
+docs/research/2026-05-10-w4a8-vs-w4a16-concurrency-scaling-full-matrix.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 21 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":21}]}]}
+docs/experience/wins/2026-05-08-w4a8-marlin-prod-bench-mixed-outcome.md
+  s_ad211f042b68fc::t_7b360a7024e84e 31 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":31}]}]}
+docs/experience/errors/2026-05-08-spec-decode-ext-draft-k5-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 17 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":17}]}]}
+scripts/_nd_serve_allreduce.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 5,10 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":5},{"Single":10}]}]}
+docs/experience/errors/2026-05-08-m_pgc-phase0-killed-ttft-under-threshold.md
+  s_ad211f042b68fc::t_7b360a7024e84e 23 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":23}]}]}
+docs/experience/errors/2026-05-21-arle-infer-awq-zero-point-relerr-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 16 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":16}]}]}
+scripts/_dg_short.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 7,13,58 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":7},{"Single":13},{"Single":58}]}]}
+docs/plans/m6-cuda-vllm-gap-followups.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 191,295 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":191},{"Single":295}]}]}
+docs/experience/errors/2026-05-08-e2-prefill-bn32-failed-kernel-time-not-binding.md
+  s_ad211f042b68fc::t_7b360a7024e84e 27 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":27}]}]}
+docs/plans/M_quant-w4a8-prod-bench.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 91 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":91}]}]}
+docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md
+  s_ad211f042b68fc::t_7b360a7024e84e 49,66 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":49},{"Single":66}]}]}
+docs/experience/wins/2026-05-02-bench-agent-load-a1-session-affinity-admission.md
+  s_ad211f042b68fc::t_7b360a7024e84e 27 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":27}]}]}
+docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-scatter-packed-store.md
+  s_ad211f042b68fc::t_7b360a7024e84e 46 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":46}]}]}
+docs/experience/wins/2026-05-08-w3-c4-baseline-first-valid.md
+  s_ad211f042b68fc::t_7b360a7024e84e 17 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":17}]}]}
+docs/experience/errors/2026-05-02-bench-agent-load-chat-token-stable-w4-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 20,24 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":20},{"Single":24}]}]}
+docs/experience/wins/2026-06-01-dsv4-csa-select-topk-cover-fastpath.md
+  s_ad211f042b68fc::t_7b360a7024e84e 28 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":28}]}]}
+docs/experience/wins/2026-06-01-dsv4-operator-request-trace.md
+  s_ad211f042b68fc::t_7b360a7024e84e 46,57,63 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":46},{"Single":57},{"Single":63}]}]}
+docs/plans/2026-05-09-prefill-graph-phase0v3-validation-protocol.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 68 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":68}]}]}
+docs/plans/sm-coverage-verification.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 88-90,95-96,188,194,206,212 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[88,90]},{"Range":[95,96]},{"Single":188},{"Single":194},{"Single":206},{"Single":212}]}]}
+docs/experience/errors/2026-05-10-pf85-bench-v3-v4-v5-cascade-failures.md
+  s_ad211f042b68fc::t_7b360a7024e84e 33,91,106 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":33},{"Single":91},{"Single":106}]}]}
+docs/experience/errors/2026-05-27-b335-deepgemm-runtime-crash-h20.md
+  s_ad211f042b68fc::t_7b360a7024e84e 156 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":156}]}]}
+docs/experience/wins/2026-05-07-m3.6-f4small-bench-world-first.md
+  s_ad211f042b68fc::t_7b360a7024e84e 34 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":34}]}]}
+docs/plans/gpu-dispatch-governance.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 118 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":118}]}]}
+docs/experience/wins/2026-05-07-m3.6-f4small-longctx-8k.md
+  s_ad211f042b68fc::t_7b360a7024e84e 28 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":28}]}]}
+docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-baseline-c4-rerun.md
+  s_ad211f042b68fc::t_7b360a7024e84e 40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":40}]}]}
+docs/experience/errors/2026-05-04-bench-agent-load-w4-canonical-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":40}]}]}
+docs/experience/wins/2026-05-07-prefill-batching-confirmed.md
+  s_ad211f042b68fc::t_7b360a7024e84e 30 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":30}]}]}
+docs/experience/wins/2026-05-07-m6-world-rank-snapshot-cuda.md
+  s_ad211f042b68fc::t_7b360a7024e84e 46,59 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":46},{"Single":59}]}]}
+docs/experience/wins/2026-05-08-w4a16-gptq-zpfix-implementation-gap-CLOSED.md
+  s_ad211f042b68fc::t_7b360a7024e84e 38 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":38}]}]}
+docs/codebase-map.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 24 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":24}]}]}
+docs/plans/2026-05-10-post-37-license-decision-tree.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 38,50 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":38},{"Single":50}]}]}
+docs/plans/M_pf-graph-v2.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 47,60 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":47},{"Single":60}]}]}
+docs/experience/errors/2026-05-25-axis3-chunked-prefill-size-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 43,61 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":43},{"Single":61}]}]}
+docs/experience/wins/2026-05-25-dsv4-longseq-prefill-decode-split.md
+  s_ad211f042b68fc::t_7b360a7024e84e 23,40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":23},{"Single":40}]}]}
+docs/experience/errors/2026-05-01-phase2b-magicdec-sparse-kv-no-spec.md
+  s_ad211f042b68fc::t_7b360a7024e84e 27 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":27}]}]}
+docs/experience/errors/2026-05-02-bench-agent-load-a3-tool-resume-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 22,33,48,52,107 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":22},{"Single":33},{"Single":48},{"Single":52},{"Single":107}]}]}
+docs/experience/wins/2026-05-05-bench-tilelang-phase2b-pending-remote.md
+  s_ad211f042b68fc::t_7b360a7024e84e 26 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":26}]}]}
+docs/experience/wins/2026-05-10-phase3a-rope-yarn-server-smoke.md
+  s_ad211f042b68fc::t_7b360a7024e84e 40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":40}]}]}
+docs/experience/wins/2026-05-05-bench-tilelang-phase2-pending-remote.md
+  s_ad211f042b68fc::t_7b360a7024e84e 65 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":65}]}]}
+docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-autoconfig-c4-rerun.md
+  s_ad211f042b68fc::t_7b360a7024e84e 39 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":39}]}]}
+docs/trace-artifacts/2026-05-27-allreduce-nsys/command.txt
+  s_ad211f042b68fc::t_1a0b6e4af6e861 1 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":1}]}]}
+docs/experience/errors/2026-05-01-phase2-real-spec-regression.md
+  s_ad211f042b68fc::t_7b360a7024e84e 44 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":44}]}]}
+docs/research/2026-05-10-p0b-ppl-eval-infra-inventory.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":40}]}]}
+docs/experience/errors/2026-05-08-spec-decode-self-spec-k5-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 23 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":23}]}]}
+docs/experience/wins/2026-05-05-bench-agent-load-w3-h1-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 35,63 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":35},{"Single":63}]}]}
+docs/experience/wins/2026-05-27-multiproc-serve-phase-B1-scaffolding.md
+  s_ad211f042b68fc::t_7b360a7024e84e 153 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":153}]}]}
+docs/experience/wins/2026-05-25-t18-recipe-variant-result.md
+  s_ad211f042b68fc::t_7b360a7024e84e 115 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":115}]}]}
+docs/experience/wins/2026-05-27-dsv4-flashmla-v2-22x-prefill-22x-pre-crash.md
+  s_ad211f042b68fc::t_7b360a7024e84e 117 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":117}]}]}
+docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md
+  s_ad211f042b68fc::t_7b360a7024e84e 43 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":43}]}]}
+docs/experience/errors/2026-05-25-axis2-mixed-default-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 44,132 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":44},{"Single":132}]}]}
+docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md
+  s_ad211f042b68fc::t_7b360a7024e84e 20 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":20}]}]}
+docs/experience/wins/2026-05-10-path-b-phase1-substep1.1-dequant-port.md
+  s_ad211f042b68fc::t_7b360a7024e84e 65 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":65}]}]}
+docs/experience/wins/2026-05-12-bench-guidellm-qwen35-fp8-kv-hnd-refill-pairwise-final.md
+  s_ad211f042b68fc::t_7b360a7024e84e 38 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":38}]}]}
+docs/experience/wins/2026-05-26-bench-int8-vs-bf16-kv-a100.md
+  s_ad211f042b68fc::t_7b360a7024e84e 25 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":25}]}]}
+docs/experience/wins/2026-05-07-longctx-4k-c4-prefill-gap-license-kill.md
+  s_ad211f042b68fc::t_7b360a7024e84e 67,77,88 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":67},{"Single":77},{"Single":88}]}]}
+docs/experience/wins/2026-05-08-m_quant-w4a16-marlin-bench.md
+  s_ad211f042b68fc::t_7b360a7024e84e 54 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":54}]}]}
+docs/experience/wins/2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md
+  s_ad211f042b68fc::t_7b360a7024e84e 48 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":48}]}]}
+docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-baseline.md
+  s_ad211f042b68fc::t_7b360a7024e84e 39 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":39}]}]}
+docs/experience/wins/2026-05-02-bench-agent-load-a1-w3-warm-p99.md
+  s_ad211f042b68fc::t_7b360a7024e84e 25,29,44 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":25},{"Single":29},{"Single":44}]}]}
+docs/experience/wins/2026-05-07-m_b1-phaseB-no-highconc-delta.md
+  s_ad211f042b68fc::t_7b360a7024e84e 27 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":27}]}]}
+docs/plans/M_quant-kv-w4a8.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 121 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":121}]}]}
+docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-scatter-x4.md
+  s_ad211f042b68fc::t_7b360a7024e84e 43 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":43}]}]}
+docs/experience/wins/2026-05-07-m3.6-phase1-nsys-arle-s48-highconc.md
+  s_ad211f042b68fc::t_7b360a7024e84e 33 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":33}]}]}
+docs/plans/2026-05-29-l4-day1-bench-handover.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 66,69 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":66},{"Single":69}]}]}
+docs/experience/wins/2026-05-10-w4a16-longctx-prompt2048-bench.md
+  s_ad211f042b68fc::t_7b360a7024e84e 18 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":18}]}]}
+docs/experience/errors/2026-05-03-bench-agent-load-session-slot-eviction-w4-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 22,29 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":22},{"Single":29}]}]}
+docs/plans/2026-05-31-dsv4-deepgemm-integration-and-perf-plan.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 255,259 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":255},{"Single":259}]}]}
+docs/plans/M_warmup-prefill-pass-directive.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 101 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":101}]}]}
+docs/experience/wins/2026-05-26-v100-sm70-gemm-fma-fallback-bench.md
+  s_ad211f042b68fc::t_7b360a7024e84e 122 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":122}]}]}
+docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-h1-confirmed.md
+  s_ad211f042b68fc::t_7b360a7024e84e 29 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":29}]}]}
+docs/experience/wins/2026-05-05-bench-tilelang-phase0-pending-remote.md
+  s_ad211f042b68fc::t_7b360a7024e84e 31 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":31}]}]}
+docs/experience/wins/2026-05-25-capability-eval-preflight.md
+  s_ad211f042b68fc::t_7b360a7024e84e 117 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":117}]}]}
+docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-scatter-bf16x2-load.md
+  s_ad211f042b68fc::t_7b360a7024e84e 52 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":52}]}]}
+docs/experience/wins/2026-05-08-ttft-p99-cap8-fix-86pct-reduction.md
+  s_ad211f042b68fc::t_7b360a7024e84e 33 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":33}]}]}
+docs/experience/errors/2026-05-01-bench-guidellm-phase15-evictable-c4-r2-invalid-051b1081.md
+  s_ad211f042b68fc::t_7b360a7024e84e 36 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":36}]}]}
+docs/experience/wins/2026-05-01-phase1-close-evictable.md
+  s_ad211f042b68fc::t_7b360a7024e84e 21 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":21}]}]}
+scripts/check_repo_hygiene.py
+  s_ad211f042b68fc::t_0129927949489e 303-304 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510419ee65fd601cb7bb7","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[303,304]}]}]}
+  s_ad211f042b68fc::t_9389646ab586e3 91-98,100-101,268-297,300-302,305-325,341-342 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fd69ee65fd601cb7b01","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[91,98]},{"Range":[100,101]},{"Range":[268,297]},{"Range":[300,302]},{"Range":[305,325]},{"Range":[341,342]}]}]}
+  s_ad211f042b68fc::t_af4f203655fac4 99,298-299 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45102c9ee65fd601cb7b93","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":99},{"Range":[298,299]}]}]}
+docs/experience/wins/2026-05-07-m3.9-phase0-validation-mixed-disabled-confirmed.md
+  s_ad211f042b68fc::t_7b360a7024e84e 37 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":37}]}]}
+docs/experience/wins/2026-05-12-bench-guidellm-qwen35-fp8-kv-decode-x4-load.md
+  s_ad211f042b68fc::t_7b360a7024e84e 32 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":32}]}]}
+docs/experience/errors/2026-05-06-qwen3-bf16-baseline-degenerate-post-00def315.md
+  s_ad211f042b68fc::t_7b360a7024e84e 8,26,56 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":8},{"Single":26},{"Single":56}]}]}
+docs/plans/tilelang-integration-verification.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 182,186,272-273 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":182},{"Single":186},{"Range":[272,273]}]}]}
+docs/experience/errors/2026-05-01-bench-guidellm-longctx-ratio15-hang-cf1d3b81.md
+  s_ad211f042b68fc::t_7b360a7024e84e 44 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":44}]}]}
+docs/experience/errors/2026-05-01-p24-adaptive-spec-longctx-smoke-invalid.md
+  s_ad211f042b68fc::t_7b360a7024e84e 21,65 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":21},{"Single":65}]}]}
+docs/experience/errors/2026-05-03-bench-agent-load-session-keyed-w4-capacity-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 16 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":16}]}]}
+docs/experience/wins/2026-05-09-bench-hybrid-phase2-dispatch.md
+  s_ad211f042b68fc::t_7b360a7024e84e 21,40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":21},{"Single":40}]}]}
+scripts/_nd_serve_only.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 5,10 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":5},{"Single":10}]}]}
+scripts/_nd_validate2.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 7,13,58 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":7},{"Single":13},{"Single":58}]}]}
+docs/experience/errors/2026-05-08-w3-c16-deadlock-not-just-admission.md
+  s_ad211f042b68fc::t_7b360a7024e84e 16 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":16}]}]}
+.env.example
+  s_ad211f042b68fc::t_2634ccad3441ba 8,12,15,18,21-22 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450ffa9ee65fd601cb7b46","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":8},{"Single":12},{"Single":15},{"Single":18},{"Range":[21,22]}]}]}
+docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-hnd-refill-x4.md
+  s_ad211f042b68fc::t_7b360a7024e84e 45 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":45}]}]}
+docs/experience/wins/2026-05-27-dsv4-tp-allreduce-route-switch.md
+  s_ad211f042b68fc::t_7b360a7024e84e 53 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":53}]}]}
+scripts/_mem_probe.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 4,8,38 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":4},{"Single":8},{"Single":38}]}]}
+docs/experience/errors/2026-05-08-marlin-w4a16-bench-implementation-gap.md
+  s_ad211f042b68fc::t_7b360a7024e84e 59 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":59}]}]}
+docs/experience/errors/2026-05-08-w3-bench-capacity-503-admission-backlog.md
+  s_ad211f042b68fc::t_7b360a7024e84e 12 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":12}]}]}
+docs/experience/errors/2026-05-10-longctx-bench-rejected-default-max-input-1997.md
+  s_ad211f042b68fc::t_7b360a7024e84e 52 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":52}]}]}
+docs/experience/errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md
+  s_ad211f042b68fc::t_7b360a7024e84e 30,53,130,133 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":30},{"Single":53},{"Single":130},{"Single":133}]}]}
+docs/experience/wins/2026-05-06-bench-guidellm-cuda-graph-tilelang-total-pages-pending.md
+  s_ad211f042b68fc::t_7b360a7024e84e 16 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":16}]}]}
+docs/experience/wins/2026-05-07-m3.9-phase0-split-plan-tax-instrumentation.md
+  s_ad211f042b68fc::t_7b360a7024e84e 58 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":58}]}]}
+docs/experience/errors/2026-05-02-bench-agent-load-a6-t1-retention-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 25,36 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":25},{"Single":36}]}]}
+docs/experience/wins/2026-05-08-w3-w4-marlin-prefill-deadlock-unblocked.md
+  s_ad211f042b68fc::t_7b360a7024e84e 47 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":47}]}]}
+docs/experience/wins/2026-05-01-bench-guidellm-phase15-evictable-c1-guard.md
+  s_ad211f042b68fc::t_7b360a7024e84e 17 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":17}]}]}
+docs/experience/wins/2026-05-12-bench-guidellm-cuda-bf16-add-native.md
+  s_ad211f042b68fc::t_7b360a7024e84e 24,64 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":24},{"Single":64}]}]}
+docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md
+  s_ad211f042b68fc::t_b4edd72d159785 42 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a450fff9ee65fd601cb7b5a","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":42}]}]}
+docs/experience/wins/2026-05-29-guidellm-ttft-throughput-v100-qwen35.md
+  s_ad211f042b68fc::t_7b360a7024e84e 10,141 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":10},{"Single":141}]}]}
+.claude/projects/-Users-user-code-agent-infer/memory/feedback_no_absolute_user_paths_in_committed_docs.md
+  s_ad211f042b68fc::t_07566be6245fe3 3,8,14 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510659ee65fd601cb7be1","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":3},{"Single":8},{"Single":14}]}]}
+docs/experience/wins/2026-05-09-bench-p1.2-graph-capture-hoist.md
+  s_ad211f042b68fc::t_7b360a7024e84e 22 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":22}]}]}
+docs/experience/wins/2026-05-08-w4a8-gptq-zpfix-prefill-win-decode-null.md
+  s_ad211f042b68fc::t_7b360a7024e84e 29 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":29}]}]}
+docs/experience/wins/TEMPLATE-2026-05-10-bench-37-w4hybrid-prefill-graph-throughput.md
+  s_ad211f042b68fc::t_7b360a7024e84e 42 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":42}]}]}
+scripts/_nd_24k_test.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 4,8,48 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":4},{"Single":8},{"Single":48}]}]}
+docs/experience/wins/2026-05-02-bench-agent-load-arle-w4-tool-resume.md
+  s_ad211f042b68fc::t_7b360a7024e84e 37,41,93,98 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":37},{"Single":41},{"Single":93},{"Single":98}]}]}
+scripts/_nd_trace.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 4,8,41 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":4},{"Single":8},{"Single":41}]}]}
+scripts/_trace_profile.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 4,8,44 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":4},{"Single":8},{"Single":44}]}]}
+docs/experience/wins/2026-05-09-bench-sglang-reverify-post-p1.0-p1.2.md
+  s_ad211f042b68fc::t_7b360a7024e84e 44 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":44}]}]}
+docs/experience/errors/2026-05-02-phase2b-magicdec-sparse-kv-rerun-regression.md
+  s_ad211f042b68fc::t_7b360a7024e84e 36 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":36}]}]}
+docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-nsys-h1-h5-confirmed.md
+  s_ad211f042b68fc::t_7b360a7024e84e 19 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":19}]}]}
+docs/experience/wins/2026-05-29-guidellm-ttft-throughput-l4-qwen35.md
+  s_ad211f042b68fc::t_7b360a7024e84e 188-189,204,206 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Range":[188,189]},{"Single":204},{"Single":206}]}]}
+docs/experience/wins/2026-05-27-dsv4-native-deepep-run-guide.md
+  s_ad211f042b68fc::t_7b360a7024e84e 40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":40}]}]}
+docs/experience/wins/2026-05-29-kv-quant-batched-default-reaudit-l4-qwen35.md
+  s_ad211f042b68fc::t_7b360a7024e84e 39,158-159 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":39},{"Range":[158,159]}]}]}
+docs/experience/errors/2026-05-08-w4-c8-deadlock-confirms-workload-dependent.md
+  s_ad211f042b68fc::t_7b360a7024e84e 19 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":19}]}]}
+docs/experience/errors/2026-05-01-bench-guidellm-longctx-ratio20-hang-4b2e563a.md
+  s_ad211f042b68fc::t_7b360a7024e84e 45 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":45}]}]}
+docs/experience/wins/2026-05-08-m_pf_graph_v2-nsys-baseline.md
+  s_ad211f042b68fc::t_7b360a7024e84e 36 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":36}]}]}
+docs/experience/errors/2026-05-10-36-prefix-aware-bench-workload-invalid.md
+  s_ad211f042b68fc::t_7b360a7024e84e 35 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":35}]}]}
+docs/experience/wins/2026-05-22-arle-serve-long-prompt-bug-fix.md
+  s_ad211f042b68fc::t_7b360a7024e84e 28 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":28}]}]}
+docs/experience/wins/2026-05-09-bench-r4-6-w4a16-gemv-override-pending-remote.md
+  s_ad211f042b68fc::t_7b360a7024e84e 70 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":70}]}]}
+docs/experience/errors/2026-05-10-36-prefixaware-warmmix-direct-bench-KILL.md
+  s_ad211f042b68fc::t_7b360a7024e84e 49 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":49}]}]}
+docs/experience/errors/2026-05-05-bench-agent-load-w4-h5-gate-miss.md
+  s_ad211f042b68fc::t_7b360a7024e84e 33 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":33}]}]}
+scripts/_nd_speed.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 4,8,43 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":4},{"Single":8},{"Single":43}]}]}
+docs/plans/cpu-gpu-pipeline-sync-stream.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 656 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":656}]}]}
+docs/plans/2026-06-05-eagle-mtp-integration-design.md
+  s_ad211f042b68fc::t_1a0b6e4af6e861 89 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4510549ee65fd601cb7bd8","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":89}]}]}
+docs/experience/errors/2026-05-02-qwen3-fp8-kv-numerical-tier1-fail.md
+  s_ad211f042b68fc::t_7b360a7024e84e 38,53 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":38},{"Single":53}]}]}
+docs/experience/wins/2026-05-02-bench-agent-load-a2-stats-surface-pending.md
+  s_ad211f042b68fc::t_7b360a7024e84e 26 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":26}]}]}
+docs/experience/wins/2026-05-29-dispatch-governance-h20-build-verify.md
+  s_ad211f042b68fc::t_7b360a7024e84e 46,55 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":46},{"Single":55}]}]}
+scripts/_nd_validate.sh
+  s_ad211f042b68fc::t_7b360a7024e84e 7,15,63 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":7},{"Single":15},{"Single":63}]}]}
+docs/experience/wins/2026-05-25-p5-pure-opd-5k-capability-sweep.md
+  s_ad211f042b68fc::t_7b360a7024e84e 32,113 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":32},{"Single":113}]}]}
+docs/experience/wins/2026-05-25-v100-sm70-p1-smoke-pass.md
+  s_ad211f042b68fc::t_7b360a7024e84e 98 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45100f9ee65fd601cb7b84","tool_type":"agent","tool_id":"RunCommand","line_ranges":[{"Single":98}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3dfd3b93a6a744dc1cb946574c5fd9575185e52a",
+  "prompts": {},
+  "sessions": {
+    "s_ad211f042b68fc": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a450f679ee65fd601cb7a6a",
+        "model": "gpt-5.4__dev",
+        "display_model_name": "GPT-5.4"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {
+    ".claude/projects/-Users-user-code-agent-infer/memory/feedback_no_absolute_user_paths_in_committed_docs.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_07566be6245fe3",
+        "line_ranges": [
+          {
+            "Single": 3
+          },
+          {
+            "Single": 8
+          },
+          {
+            "Single": 14
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510659ee65fd601cb7be1",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 3
+              },
+              {
+                "Single": 8
+              },
+              {
+                "Single": 14
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    ".env.example": [
+      {
+        "hash": "s_ad211f042b68fc::t_2634ccad3441ba",
+        "line_ranges": [
+          {
+            "Single": 8
+          },
+          {
+            "Single": 12
+          },
+          {
+            "Single": 15
+          },
+          {
+            "Single": 18
+          },
+          {
+            "Range": [
+              21,
+              22
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450ffa9ee65fd601cb7b46",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 8
+              },
+              {
+                "Single": 12
+              },
+              {
+                "Single": 15
+              },
+              {
+                "Single": 18
+              },
+              {
+                "Range": [
+                  21,
+                  22
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/codebase-map.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 24
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 24
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-bench-guidellm-longctx-ratio15-hang-cf1d3b81.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 44
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 44
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-bench-guidellm-longctx-ratio20-hang-4b2e563a.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 45
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 45
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-bench-guidellm-phase15-evictable-c4-r1-invalid-051b1081.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 45
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 45
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-bench-guidellm-phase15-evictable-c4-r2-invalid-051b1081.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 36
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 36
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-p24-adaptive-spec-longctx-smoke-invalid.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 21
+          },
+          {
+            "Single": 65
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 21
+              },
+              {
+                "Single": 65
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-phase2-real-spec-regression.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 44
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 44
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-01-phase2b-magicdec-sparse-kv-no-spec.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 27
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 27
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-02-bench-agent-load-a3-tool-resume-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 22
+          },
+          {
+            "Single": 33
+          },
+          {
+            "Single": 48
+          },
+          {
+            "Single": 52
+          },
+          {
+            "Single": 107
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 22
+              },
+              {
+                "Single": 33
+              },
+              {
+                "Single": 48
+              },
+              {
+                "Single": 52
+              },
+              {
+                "Single": 107
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-02-bench-agent-load-a6-t1-retention-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 25
+          },
+          {
+            "Single": 36
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 25
+              },
+              {
+                "Single": 36
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-02-bench-agent-load-chat-token-stable-w4-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 20
+          },
+          {
+            "Single": 24
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 20
+              },
+              {
+                "Single": 24
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-02-phase2b-magicdec-sparse-kv-rerun-regression.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 36
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 36
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-02-qwen3-fp8-kv-numerical-tier1-fail.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 38
+          },
+          {
+            "Single": 53
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 38
+              },
+              {
+                "Single": 53
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-03-bench-agent-load-session-keyed-w4-capacity-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 16
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 16
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-03-bench-agent-load-session-slot-eviction-w4-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 22
+          },
+          {
+            "Single": 29
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 22
+              },
+              {
+                "Single": 29
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-04-bench-agent-load-w4-canonical-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-05-bench-agent-load-w4-h5-gate-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 33
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 33
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-05-fp8-kv-tier1-still-fail.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 28
+          },
+          {
+            "Single": 43
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 28
+              },
+              {
+                "Single": 43
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-06-qwen3-bf16-baseline-degenerate-post-00def315.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 8
+          },
+          {
+            "Single": 26
+          },
+          {
+            "Single": 56
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 8
+              },
+              {
+                "Single": 26
+              },
+              {
+                "Single": 56
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-e2-prefill-bn32-failed-kernel-time-not-binding.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 27
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 27
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-m_pgc-phase0-killed-ttft-under-threshold.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 23
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 23
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-marlin-w4a16-bench-implementation-gap.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 59
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 59
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-spec-decode-32k-self-spec-kill-axis-level.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 21
+          },
+          {
+            "Single": 27
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 21
+              },
+              {
+                "Single": 27
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-spec-decode-ext-draft-k5-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 17
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 17
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-spec-decode-self-spec-k5-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 23
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 23
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-spec-decode-w3-c4-self-spec-k5-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 57
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 57
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-w3-bench-capacity-503-admission-backlog.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 12
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 12
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-w3-c16-deadlock-not-just-admission.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 16
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 16
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-08-w4-c8-deadlock-confirms-workload-dependent.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 19
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 19
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-10-36-prefix-aware-bench-workload-invalid.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 35
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 35
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-10-36-prefixaware-warmmix-direct-bench-KILL.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 49
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 49
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-10-36-warmmix-guidellm-jsonl-invalid.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 70
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 70
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-10-longctx-bench-rejected-default-max-input-1997.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 52
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 52
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-10-pf85-bench-v3-v4-v5-cascade-failures.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 33
+          },
+          {
+            "Single": 91
+          },
+          {
+            "Single": 106
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 33
+              },
+              {
+                "Single": 91
+              },
+              {
+                "Single": 106
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-21-arle-infer-awq-zero-point-relerr-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 16
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 16
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-25-axis2-mixed-default-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 44
+          },
+          {
+            "Single": 132
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 44
+              },
+              {
+                "Single": 132
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-25-axis3-chunked-prefill-size-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 43
+          },
+          {
+            "Single": 61
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 43
+              },
+              {
+                "Single": 61
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-27-b335-deepgemm-runtime-crash-h20.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 156
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 156
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 30
+          },
+          {
+            "Single": 53
+          },
+          {
+            "Single": 130
+          },
+          {
+            "Single": 133
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 30
+              },
+              {
+                "Single": 53
+              },
+              {
+                "Single": 130
+              },
+              {
+                "Single": 133
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-01-bench-guidellm-phase15-evictable-c1-guard.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 17
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 17
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-01-p23-verifier-bit-ident-eager.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 22
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 22
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-01-phase1-close-evictable.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 21
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 21
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-02-bench-agent-load-a1-session-affinity-admission.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 27
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 27
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-02-bench-agent-load-a1-w3-warm-p99.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 25
+          },
+          {
+            "Single": 29
+          },
+          {
+            "Single": 44
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 25
+              },
+              {
+                "Single": 29
+              },
+              {
+                "Single": 44
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-02-bench-agent-load-a2-stats-surface-pending.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 26
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 26
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-02-bench-agent-load-arle-w4-tool-resume.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 37
+          },
+          {
+            "Single": 41
+          },
+          {
+            "Single": 93
+          },
+          {
+            "Single": 98
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 37
+              },
+              {
+                "Single": 41
+              },
+              {
+                "Single": 93
+              },
+              {
+                "Single": 98
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-05-bench-agent-load-w3-h1-miss.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 35
+          },
+          {
+            "Single": 63
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 35
+              },
+              {
+                "Single": 63
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-05-bench-tilelang-phase0-pending-remote.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 31
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 31
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-05-bench-tilelang-phase2-pending-remote.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 65
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 65
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-05-bench-tilelang-phase2b-pending-remote.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 26
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 26
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-06-bench-gdr-triton-restore-pending-remote.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 21
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 21
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-06-bench-guidellm-cuda-graph-tilelang-total-pages-pending.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 16
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 16
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-bench-qwen36-mle-perf.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_b4edd72d159785",
+        "line_ranges": [
+          {
+            "Single": 42
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fff9ee65fd601cb7b5a",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 42
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-longctx-4k-c4-prefill-gap-license-kill.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 67
+          },
+          {
+            "Single": 77
+          },
+          {
+            "Single": 88
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 67
+              },
+              {
+                "Single": 77
+              },
+              {
+                "Single": 88
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.6-f4small-bench-world-first.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 34
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 34
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.6-f4small-longctx-8k.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 28
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 28
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.6-phase1-nsys-arle-s48-highconc.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 33
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 33
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.7-b1.2-bench-after-snapshot.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 25
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 25
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.9-mixed-policy-budget-fix.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 37
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 37
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.9-phase0-split-plan-tax-instrumentation.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 58
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 58
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m3.9-phase0-validation-mixed-disabled-confirmed.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 37
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 37
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m6-world-rank-snapshot-cuda.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 46
+          },
+          {
+            "Single": 59
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 46
+              },
+              {
+                "Single": 59
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-m_b1-phaseB-no-highconc-delta.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 27
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 27
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-07-prefill-batching-confirmed.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 30
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 30
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-m_pf_graph_v2-nsys-baseline.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 36
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 36
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-m_quant-w4a16-marlin-bench.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 54
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 54
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-ttft-p99-cap8-fix-86pct-reduction.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 33
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 33
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-w3-c4-baseline-first-valid.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 17
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 17
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-w3-c4-cap8-default-clean-100pct-tt-improved.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 48
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 48
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-w3-w4-marlin-prefill-deadlock-unblocked.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 47
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 47
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-w4a16-gptq-zpfix-implementation-gap-CLOSED.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 38
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 38
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-w4a8-gptq-zpfix-prefill-win-decode-null.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 29
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 29
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-w4a8-marlin-prod-bench-mixed-outcome.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 31
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 31
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-08-warmup-fix-c20b1ce-verified-92pct-turn-success.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 49
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 49
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-09-bench-b3-step2-prefix-aware.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 20
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 20
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-09-bench-hybrid-phase2-dispatch.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 21
+          },
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 21
+              },
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-09-bench-p1.2-graph-capture-hoist.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 22
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 22
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-09-bench-r4-6-w4a16-gemv-override-pending-remote.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 70
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 70
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-09-bench-sglang-reverify-post-p1.0-p1.2.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 44
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 44
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 43
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 43
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-autoconfig-c4-rerun.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 39
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 39
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-autoconfig.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-baseline-c4-rerun.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-bench-guidellm-p25-w4a8-baseline.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 39
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 39
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 49
+          },
+          {
+            "Single": 66
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 49
+              },
+              {
+                "Single": 66
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-path-b-phase1-substep1.1-dequant-port.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 65
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 65
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-phase3a-rope-yarn-server-smoke.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-10-w4a16-longctx-prompt2048-bench.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 18
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 18
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-guidellm-cuda-bf16-add-native.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 24
+          },
+          {
+            "Single": 64
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 24
+              },
+              {
+                "Single": 64
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-guidellm-qwen35-fp8-kv-decode-x4-load.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 32
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 32
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-guidellm-qwen35-fp8-kv-hnd-refill-pairwise-final.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 38
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 38
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-hnd-refill-x4.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 45
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 45
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-scatter-bf16x2-load.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 52
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 52
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-scatter-packed-store.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 46
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 46
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-12-bench-qwen35-fp8-kv-scatter-x4.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 43
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 43
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-22-arle-serve-long-prompt-bug-fix.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 28
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 28
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-h1-confirmed.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 29
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 29
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-nsys-h1-h5-confirmed.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 19
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 19
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-bench-guidellm-cuda-l4-arle-vs-sglang-headtohead.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 24
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 24
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-capability-eval-preflight.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 117
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 117
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-dsv4-longseq-prefill-decode-split.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 23
+          },
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 23
+              },
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-kv-tier-observability-serve-baseline.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 28
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 28
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-p5-pure-opd-5k-capability-sweep.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 32
+          },
+          {
+            "Single": 113
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 32
+              },
+              {
+                "Single": 113
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-t18-recipe-variant-result.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 115
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 115
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-25-v100-sm70-p1-smoke-pass.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 98
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 98
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-26-bench-int8-vs-bf16-kv-a100.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 25
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 25
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-26-v100-sm70-gemm-fma-fallback-bench.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 122
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 122
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-27-dsv4-flashmla-v2-22x-prefill-22x-pre-crash.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 117
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 117
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-27-dsv4-native-deepep-run-guide.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-27-dsv4-tp-allreduce-route-switch.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 53
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 53
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-27-multiproc-relay-C1-C3.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 181
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 181
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-27-multiproc-serve-phase-B1-scaffolding.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 153
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 153
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-29-dispatch-governance-h20-build-verify.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 46
+          },
+          {
+            "Single": 55
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 46
+              },
+              {
+                "Single": 55
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-29-guidellm-ttft-throughput-l4-qwen35.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Range": [
+              188,
+              189
+            ]
+          },
+          {
+            "Single": 204
+          },
+          {
+            "Single": 206
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  188,
+                  189
+                ]
+              },
+              {
+                "Single": 204
+              },
+              {
+                "Single": 206
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-29-guidellm-ttft-throughput-v100-qwen35.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 10
+          },
+          {
+            "Single": 141
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 10
+              },
+              {
+                "Single": 141
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-05-29-kv-quant-batched-default-reaudit-l4-qwen35.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 39
+          },
+          {
+            "Range": [
+              158,
+              159
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 39
+              },
+              {
+                "Range": [
+                  158,
+                  159
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-06-01-dsv4-csa-select-topk-cover-fastpath.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 28
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 28
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/2026-06-01-dsv4-operator-request-trace.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 46
+          },
+          {
+            "Single": 57
+          },
+          {
+            "Single": 63
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 46
+              },
+              {
+                "Single": 57
+              },
+              {
+                "Single": 63
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/experience/wins/TEMPLATE-2026-05-10-bench-37-w4hybrid-prefill-graph-throughput.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 42
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 42
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/2026-05-09-prefill-graph-phase0v3-validation-protocol.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 68
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 68
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/2026-05-10-post-37-license-decision-tree.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 38
+          },
+          {
+            "Single": 50
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 38
+              },
+              {
+                "Single": 50
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/2026-05-26-p4-v100-perf-bench-deferred.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 81
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 81
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/2026-05-29-l4-day1-bench-handover.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 66
+          },
+          {
+            "Single": 69
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 66
+              },
+              {
+                "Single": 69
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/2026-05-31-dsv4-deepgemm-integration-and-perf-plan.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 255
+          },
+          {
+            "Single": 259
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 255
+              },
+              {
+                "Single": 259
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/2026-06-05-eagle-mtp-integration-design.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 89
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 89
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M3.6-nsight-trace-analysis-runbook.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 28
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 28
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M6-metal-world-rank-snapshot.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 93
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 93
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M_pf-graph-v2.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 47
+          },
+          {
+            "Single": 60
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 47
+              },
+              {
+                "Single": 60
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M_quant-kv-w4a8.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 121
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 121
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M_quant-marlin-round4-hybrid-dispatch.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 137
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 137
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M_quant-w4a8-prod-bench.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 91
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 91
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/M_warmup-prefill-pass-directive.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 101
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 101
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/cpu-gpu-pipeline-sync-stream.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 656
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 656
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/gpu-dispatch-governance.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 118
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 118
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/m6-cuda-vllm-gap-followups.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 191
+          },
+          {
+            "Single": 295
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 191
+              },
+              {
+                "Single": 295
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/sm-coverage-verification.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Range": [
+              88,
+              90
+            ]
+          },
+          {
+            "Range": [
+              95,
+              96
+            ]
+          },
+          {
+            "Single": 188
+          },
+          {
+            "Single": 194
+          },
+          {
+            "Single": 206
+          },
+          {
+            "Single": 212
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Range": [
+                  88,
+                  90
+                ]
+              },
+              {
+                "Range": [
+                  95,
+                  96
+                ]
+              },
+              {
+                "Single": 188
+              },
+              {
+                "Single": 194
+              },
+              {
+                "Single": 206
+              },
+              {
+                "Single": 212
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/plans/tilelang-integration-verification.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 182
+          },
+          {
+            "Single": 186
+          },
+          {
+            "Range": [
+              272,
+              273
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 182
+              },
+              {
+                "Single": 186
+              },
+              {
+                "Range": [
+                  272,
+                  273
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/research/2026-05-10-p0b-ppl-eval-infra-inventory.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 40
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 40
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/research/2026-05-10-w4a8-vs-w4a16-concurrency-scaling-full-matrix.md": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 21
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 21
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "docs/trace-artifacts/2026-05-27-allreduce-nsys/command.txt": [
+      {
+        "hash": "s_ad211f042b68fc::t_1a0b6e4af6e861",
+        "line_ranges": [
+          {
+            "Single": 1
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510549ee65fd601cb7bd8",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 1
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_dg_cons.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 7
+          },
+          {
+            "Single": 13
+          },
+          {
+            "Single": 58
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 7
+              },
+              {
+                "Single": 13
+              },
+              {
+                "Single": 58
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_dg_short.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 7
+          },
+          {
+            "Single": 13
+          },
+          {
+            "Single": 58
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 7
+              },
+              {
+                "Single": 13
+              },
+              {
+                "Single": 58
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_flashmla_24k_test.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 8
+          },
+          {
+            "Single": 14
+          },
+          {
+            "Single": 81
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 8
+              },
+              {
+                "Single": 14
+              },
+              {
+                "Single": 81
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_mem_probe.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 4
+          },
+          {
+            "Single": 8
+          },
+          {
+            "Single": 38
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 4
+              },
+              {
+                "Single": 8
+              },
+              {
+                "Single": 38
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_24k_test.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 4
+          },
+          {
+            "Single": 8
+          },
+          {
+            "Single": 48
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 4
+              },
+              {
+                "Single": 8
+              },
+              {
+                "Single": 48
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_serve_allreduce.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 5
+          },
+          {
+            "Single": 10
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 5
+              },
+              {
+                "Single": 10
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_serve_only.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 5
+          },
+          {
+            "Single": 10
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 5
+              },
+              {
+                "Single": 10
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_speed.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 4
+          },
+          {
+            "Single": 8
+          },
+          {
+            "Single": 43
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 4
+              },
+              {
+                "Single": 8
+              },
+              {
+                "Single": 43
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_trace.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 4
+          },
+          {
+            "Single": 8
+          },
+          {
+            "Single": 41
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 4
+              },
+              {
+                "Single": 8
+              },
+              {
+                "Single": 41
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_validate.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 7
+          },
+          {
+            "Single": 15
+          },
+          {
+            "Single": 63
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 7
+              },
+              {
+                "Single": 15
+              },
+              {
+                "Single": 63
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_nd_validate2.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 7
+          },
+          {
+            "Single": 13
+          },
+          {
+            "Single": 58
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 7
+              },
+              {
+                "Single": 13
+              },
+              {
+                "Single": 58
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/_trace_profile.sh": [
+      {
+        "hash": "s_ad211f042b68fc::t_7b360a7024e84e",
+        "line_ranges": [
+          {
+            "Single": 4
+          },
+          {
+            "Single": 8
+          },
+          {
+            "Single": 44
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45100f9ee65fd601cb7b84",
+            "tool_type": "agent",
+            "tool_id": "RunCommand",
+            "line_ranges": [
+              {
+                "Single": 4
+              },
+              {
+                "Single": 8
+              },
+              {
+                "Single": 44
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scripts/check_repo_hygiene.py": [
+      {
+        "hash": "s_ad211f042b68fc::t_0129927949489e",
+        "line_ranges": [
+          {
+            "Range": [
+              303,
+              304
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4510419ee65fd601cb7bb7",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  303,
+                  304
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_ad211f042b68fc::t_9389646ab586e3",
+        "line_ranges": [
+          {
+            "Range": [
+              91,
+              98
+            ]
+          },
+          {
+            "Range": [
+              100,
+              101
+            ]
+          },
+          {
+            "Range": [
+              268,
+              297
+            ]
+          },
+          {
+            "Range": [
+              300,
+              302
+            ]
+          },
+          {
+            "Range": [
+              305,
+              325
+            ]
+          },
+          {
+            "Range": [
+              341,
+              342
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a450fd69ee65fd601cb7b01",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  91,
+                  98
+                ]
+              },
+              {
+                "Range": [
+                  100,
+                  101
+                ]
+              },
+              {
+                "Range": [
+                  268,
+                  297
+                ]
+              },
+              {
+                "Range": [
+                  300,
+                  302
+                ]
+              },
+              {
+                "Range": [
+                  305,
+                  325
+                ]
+              },
+              {
+                "Range": [
+                  341,
+                  342
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_ad211f042b68fc::t_af4f203655fac4",
+        "line_ranges": [
+          {
+            "Single": 99
+          },
+          {
+            "Range": [
+              298,
+              299
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45102c9ee65fd601cb7b93",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 99
+              },
+              {
+                "Range": [
+                  298,
+                  299
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_ad211f042b68fc": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_0129927949489e": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_07566be6245fe3": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_1a0b6e4af6e861": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_2634ccad3441ba": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_7b360a7024e84e": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_9389646ab586e3": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_9f5f7ef64f2325": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_af4f203655fac4": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ad211f042b68fc::t_b4edd72d159785": {
+      "tool": "trae",
+      "conversation_id": "6a450f679ee65fd601cb7a6a",
+      "session_id": "6a450f679ee65fd601cb7a6a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
