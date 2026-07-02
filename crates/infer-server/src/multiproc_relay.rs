@@ -499,6 +499,11 @@ pub struct TickAckLedger {
     /// `(rank, acked tick count)` per connected rank; the count is
     /// `last_acked_seq + 1`, so 0 means "never acked".
     per_rank: Vec<(usize, AtomicU64)>,
+    /// Ranks whose reader observed EOF/failure. A dead rank never acks again,
+    /// so the ack-window wait must stop waiting on it and let the next
+    /// broadcast surface the dead socket (-> `fail_all`), or the coordinator
+    /// wedges forever on rate-limited warns while HTTP requests hang.
+    dead_ranks: AtomicUsize,
 }
 
 impl TickAckLedger {
@@ -508,7 +513,19 @@ impl TickAckLedger {
                 .into_iter()
                 .map(|rank| (rank, AtomicU64::new(0)))
                 .collect(),
+            dead_ranks: AtomicUsize::new(0),
         }
+    }
+
+    /// A reader thread lost its rank (EOF / hard error).
+    pub fn mark_dead(&self) {
+        self.dead_ranks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether any rank's reader has died since boot.
+    #[must_use]
+    pub fn any_dead(&self) -> bool {
+        self.dead_ranks.load(Ordering::Acquire) > 0
     }
 
     /// Record that `rank` consumed the tick with `seq`. Acks are monotonic per
@@ -786,6 +803,15 @@ impl RelayCoordinator {
         self.tick_acks.min_acked()
     }
 
+    /// Whether any rank's completion reader has died (EOF / hard error). The
+    /// ack-window wait consults this: a dead rank never acks again, so waiting
+    /// on it would wedge the coordinator; instead the wait returns and the
+    /// next broadcast surfaces the dead socket (-> `fail_all`).
+    #[must_use]
+    pub fn any_worker_dead(&self) -> bool {
+        self.tick_acks.any_dead()
+    }
+
     /// Clone the shared completion-sink registry so the async HTTP path can
     /// (un)register sinks directly, without contending for the `RelayCoordinator`
     /// mutex the lockstep loop holds across its blocking broadcast.
@@ -1044,7 +1070,15 @@ fn spawn_completion_reader(
                         }
                     }
                     Ok(Some(RelayEnvelope::TickAck { rank: ack_rank, seq })) => {
-                        tick_acks.ack(ack_rank, seq);
+                        // The connection identifies the rank; the payload rank is
+                        // only cross-checked (a mis-ranked ack must never re-open
+                        // the window for a stalled peer).
+                        if ack_rank != rank {
+                            log::warn!(
+                                "[relay-coordinator] tick ack rank mismatch: envelope says {ack_rank}, connection is {rank}"
+                            );
+                        }
+                        tick_acks.ack(rank, seq);
                     }
                     Ok(Some(RelayEnvelope::EngineReady { rank: ready_rank })) => {
                         ready_count.fetch_add(1, Ordering::AcqRel);
@@ -1059,6 +1093,7 @@ fn spawn_completion_reader(
                     }
                     Ok(None) => {
                         log::info!("[relay-coordinator] worker rank {rank} completion stream EOF");
+                        tick_acks.mark_dead();
                         break;
                     }
                     Err(err) if is_timeout_error(&err) => {
@@ -1070,6 +1105,7 @@ fn spawn_completion_reader(
                         log::warn!(
                             "[relay-coordinator] worker rank {rank} completion reader failed: {err:#}"
                         );
+                        tick_acks.mark_dead();
                         break;
                     }
                 }

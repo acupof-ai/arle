@@ -45,18 +45,22 @@ const IDLE_PARK: Duration = Duration::from_millis(2);
 const TICK_WINDOW: u64 = 4;
 
 /// Block until `seq` is within [`TICK_WINDOW`] of the slowest rank's tick ack.
-/// Never aborts: a wedged worker already hangs its NCCL peers today, and a long
-/// prefill chunk legitimately holds acks for seconds — warn (rate-limited) and
-/// keep waiting.
+/// Never aborts on a SLOW worker (a long prefill chunk legitimately holds acks
+/// for seconds — warn rate-limited and keep waiting), but a CRASHED worker's
+/// reader marks it dead and we return immediately: it will never ack again, and
+/// the next broadcast hits its dead socket and takes the `fail_all` path that
+/// surfaced worker crashes before the window existed.
 fn wait_for_ack_window(relay: &Arc<Mutex<RelayCoordinator>>, seq: u64) {
     let started = Instant::now();
     let mut next_warn = Duration::from_secs(10);
     loop {
-        let min_acked = relay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .min_acked_ticks();
-        if seq < min_acked + TICK_WINDOW {
+        let (min_acked, any_dead) = {
+            let coord = relay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (coord.min_acked_ticks(), coord.any_worker_dead())
+        };
+        if any_dead || seq < min_acked + TICK_WINDOW {
             return;
         }
         if started.elapsed() >= next_warn {
