@@ -183,7 +183,7 @@ where
             .into_iter()
             .map(|(ticket, prompt_token_ids, req)| {
                 let completed: CompletedRequest = ticket.collect()?;
-                Ok(self.project_completion(prompt_token_ids, &req, completed)?)
+                self.project_completion(prompt_token_ids, &req, completed)
             })
             .collect()
     }
