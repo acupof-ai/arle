@@ -921,6 +921,51 @@ mod tests {
         assert_eq!(store.available_pages(), baseline);
     }
 
+    /// Saturation probe, NOT a unit test (`cargo test ... -- --ignored`):
+    /// streams 2 GiB of production-shaped chunked blobs (32 MiB blob = two
+    /// 16 MiB chunks + manifest) through the disk level under `--kv-dram 0`
+    /// semantics and prints GB/s. Expectations: burst writes ≈ page-cache
+    /// memcpy speed (the store is ephemeral and never msyncs — the kernel
+    /// writes back behind us, exactly the serve behavior); warm reads ≈
+    /// memcpy. Cold-device numbers come from a `dd`/`fio` baseline beside it.
+    /// Root override: `ARLE_KV_BENCH_ROOT` (point it at the real NVMe).
+    #[test]
+    #[ignore = "bandwidth probe — run on the target box with --ignored"]
+    fn bench_chunked_blob_disk_bandwidth() {
+        const BLOB: usize = 32 << 20;
+        const NUM: u64 = 64; // 2 GiB payload total
+        let page = 16 << 20;
+        let root = std::env::var("ARLE_KV_BENCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| temp_root("bw"));
+        std::fs::create_dir_all(&root).expect("bench root");
+        let mut store = CudaKvTierStore::with_budget(0, page);
+        assert!(store.set_disk(root.clone(), (NUM as usize + 8) * 3 * page, page));
+        let blob = vec![0xA5u8; BLOB];
+
+        let t0 = std::time::Instant::now();
+        for key in 0..NUM {
+            assert!(store.insert_chunked(3, 4, key, &blob), "insert {key}");
+        }
+        let write = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let mut total = 0usize;
+        for key in 0..NUM {
+            total += store.read_chunked(3, 4, key).expect("read").len();
+        }
+        let read = t1.elapsed();
+        assert_eq!(total, NUM as usize * BLOB);
+
+        let gib = (NUM as f64 * BLOB as f64) / (1u64 << 30) as f64;
+        println!(
+            "chunked-blob disk bandwidth over {gib:.1} GiB: \
+             write {:.2} GiB/s ({write:?}), read(warm) {:.2} GiB/s ({read:?})",
+            gib / write.as_secs_f64(),
+            gib / read.as_secs_f64(),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Round-3 pod finding: an oversized payload must be REFUSED, not abort
     /// the process. The disk level's `write_slot` asserts `len <= slot_bytes`;
     /// before the insert-side guard, a host-accepted oversize payload
