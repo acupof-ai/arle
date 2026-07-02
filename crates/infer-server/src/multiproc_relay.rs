@@ -1204,7 +1204,8 @@ mod tests {
         let coord = pending
             .accept(world_size, Duration::from_secs(5))
             .expect("worker connected within 5s");
-        assert_eq!(coord.min_acked_ticks(), 0, "no acks consumed yet");
+        // No 0-before-ack assert here: the reader thread races the accept
+        // return (the pure-ledger test covers the unacked state).
         let deadline = Instant::now() + Duration::from_secs(5);
         while coord.min_acked_ticks() < 3 {
             assert!(Instant::now() < deadline, "acks not observed within 5s");
