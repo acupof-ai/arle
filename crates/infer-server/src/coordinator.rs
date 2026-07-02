@@ -28,7 +28,10 @@ use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
     ModelsResponse, StatsResponse,
 };
-use crate::sse_util::{completion_stream_chunk, finish_reason, unix_time_secs};
+use crate::sse_util::{
+    StreamingReasoningSplitter, chat_stream_chunk, completion_stream_chunk, finish_reason,
+    unix_time_secs,
+};
 use crate::tokenizer::OpenAiTokenizer;
 
 /// Idle park on the submit channel; matches the in-process engine loop.
@@ -466,9 +469,10 @@ async fn completions(
 async fn chat_completions(
     State(state): State<Arc<CoordinatorHandle>>,
     Json(request): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     request.validate()?;
     let sampling = request.sampling_params();
+    let stream = request.stream.unwrap_or(false);
     // A configured thinking budget also flips the server default to thinking-on
     // (so terminus/litellm, which can't set the kwarg, still gets the split +
     // budget); `0` keeps it off and byte-identical. Mirrors the in-process path.
@@ -489,6 +493,11 @@ async fn chat_completions(
     if let Some(kind) = state.multimodal_kind {
         let images = crate::multimodal::extract_images(&request.messages, Some(kind))?;
         if !images.is_empty() {
+            if stream {
+                return Err(ApiError::bad_request(
+                    "stream=true is not supported for multimodal chat yet",
+                ));
+            }
             let prompt = if kind == MultimodalKind::DeepseekOcr {
                 crate::multimodal::build_deepseek_ocr_prompt(&request.messages)
             } else {
@@ -532,7 +541,8 @@ async fn chat_completions(
                 delta.token_ids.len(),
                 delta.finish_reason.as_ref(),
                 thinking,
-            )));
+            ))
+            .into_response());
         }
     }
 
@@ -545,6 +555,119 @@ async fn chat_completions(
             .render_chat_with_kwargs(&request.messages, request.chat_template_kwargs.as_ref())?
     };
     let prompt_tokens = encode(&state, &prompt)?;
+
+    if stream {
+        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
+        let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+        let created = unix_time_secs();
+        let model = state.model.clone();
+        let state_clone = Arc::clone(&state);
+        // Bounded channel: backpressure keeps the task from racing too far ahead.
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::channel::<Result<Vec<u8>, std::convert::Infallible>>(64);
+        tokio::spawn(async move {
+            // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
+            let _guard = guard;
+            let mut splitter = StreamingReasoningSplitter::new(thinking);
+            // OpenAI convention: the first emitted chunk's delta carries `role`.
+            let mut role_sent = false;
+            let mut with_role = move |mut delta: serde_json::Value| {
+                if !std::mem::replace(&mut role_sent, true) {
+                    delta["role"] = serde_json::json!("assistant");
+                }
+                delta
+            };
+            'stream: while let Some(delta) = rx.recv().await {
+                if let Some(err) = delta.error {
+                    let chunk = serde_json::to_string(&chat_stream_chunk(
+                        &id,
+                        created,
+                        &model,
+                        with_role(serde_json::json!({"content": err})),
+                        Some("error"),
+                    ))
+                    .unwrap_or_default();
+                    let _ = chunk_tx
+                        .send(Ok(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()))
+                        .await;
+                    break;
+                }
+                if !delta.token_ids.is_empty() {
+                    let text = {
+                        let tok = state_clone
+                            .tokenizer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        tok.decode(&delta.token_ids).unwrap_or_default()
+                    };
+                    for piece in splitter.push(&text) {
+                        let chunk = serde_json::to_string(&chat_stream_chunk(
+                            &id,
+                            created,
+                            &model,
+                            with_role(piece.into_delta()),
+                            None,
+                        ))
+                        .unwrap_or_default();
+                        if chunk_tx
+                            .send(Ok(format!("data: {chunk}\n\n").into_bytes()))
+                            .await
+                            .is_err()
+                        {
+                            break 'stream; // Client disconnected; guard drops, releasing in_flight.
+                        }
+                    }
+                }
+                if delta.finish {
+                    // Truncated thinking: flush the held-back partial closer as reasoning.
+                    if let Some(piece) = splitter.finish() {
+                        let chunk = serde_json::to_string(&chat_stream_chunk(
+                            &id,
+                            created,
+                            &model,
+                            with_role(piece.into_delta()),
+                            None,
+                        ))
+                        .unwrap_or_default();
+                        if chunk_tx
+                            .send(Ok(format!("data: {chunk}\n\n").into_bytes()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let fr = finish_reason(delta.finish_reason.as_ref());
+                    let final_chunk = serde_json::to_string(&chat_stream_chunk(
+                        &id,
+                        created,
+                        &model,
+                        with_role(serde_json::json!({})),
+                        Some(fr),
+                    ))
+                    .unwrap_or_default();
+                    let _ = chunk_tx
+                        .send(Ok(
+                            format!("data: {final_chunk}\n\ndata: [DONE]\n\n").into_bytes()
+                        ))
+                        .await;
+                    break;
+                }
+            }
+        });
+        let body =
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(chunk_rx));
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
+            body,
+        )
+            .into_response());
+    }
+
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
     let content = decode(&state, &outcome.generated_tokens)?;
     Ok(Json(ChatCompletionResponse::from_parts(
@@ -554,7 +677,8 @@ async fn chat_completions(
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
         thinking,
-    )))
+    ))
+    .into_response())
 }
 
 async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<ModelsResponse> {
