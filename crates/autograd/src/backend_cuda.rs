@@ -119,6 +119,26 @@ fn linear_attention_gdr_chunkwise_prefill_enabled() -> bool {
     })
 }
 
+/// A/B escape hatch: force the legacy monolithic chunked-scan backward (one
+/// block per batch x value_head) instead of the staged chunk-parallel path.
+#[cfg(not(feature = "no-cuda"))]
+fn linear_attention_mono_backward_forced() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ARLE_LA_BACKWARD_MONO").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+        )
+    })
+}
+
+/// Max concurrent chunk lanes in the stage-3 grad kernel. Bounds the per-block
+/// history slab at `wave x rows x 64 x state_elems` f32 (1.6 GiB at 48 heads,
+/// 128x128 state) independent of seq_len; 8 lanes x 48 rows = 384 blocks fills
+/// H20's ~624-resident-block budget without oversubscribing it.
+#[cfg(not(feature = "no-cuda"))]
+const LA_BWD_CHUNK_WAVE: usize = 8;
+
 /// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
 /// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
 /// safe to share across threads.
@@ -4184,8 +4204,6 @@ fn cuda_linear_attention_backward_device(
     let rows = p.batch * p.num_value_heads;
     let state_elems = p.key_dim * p.value_dim;
     let state_len = rows * state_elems;
-    let chunk_history_len = rows * 64 * state_elems;
-    let chunk_kv_len = rows * 64 * p.value_dim;
     let num_chunks = p.seq_len.div_ceil(64);
     let chunk_state_len = num_chunks * p.num_value_heads * state_elems;
 
@@ -4261,23 +4279,6 @@ fn cuda_linear_attention_backward_device(
         .stream
         .alloc_zeros::<f32>(p.value_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la dnorm)"))?;
-    let mut grad_state_scratch = backend
-        .stream
-        .alloc_zeros::<f32>(state_len)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la grad_state)"))?;
-    let mut state_recompute_scratch =
-        backend.stream.alloc_zeros::<f32>(state_len).map_err(|_| {
-            AutogradError::TapeInvariant("cuda alloc_zeros failed (la state_recompute)")
-        })?;
-    let mut chunk_history_scratch = backend
-        .stream
-        .alloc_zeros::<f32>(chunk_history_len)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_history)"))?;
-    let mut chunk_kv_scratch = backend
-        .stream
-        .alloc_zeros::<f32>(chunk_kv_len)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_kv)"))?;
-
     let batch_i32 = i32::try_from(p.batch)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention batch exceeds i32"))?;
     let seq_len_i32 = i32::try_from(p.seq_len)
@@ -4297,7 +4298,28 @@ fn cuda_linear_attention_backward_device(
     let conv_kernel_i32 = i32::try_from(p.conv_kernel)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
 
-    {
+    if linear_attention_mono_backward_forced() {
+        // Legacy monolithic scan: one block per (batch x value_head) walks every
+        // chunk sequentially. Kept as the A/B fallback (ARLE_LA_BACKWARD_MONO=1).
+        let mut grad_state_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(state_len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la grad_state)"))?;
+        let mut state_recompute_scratch =
+            backend.stream.alloc_zeros::<f32>(state_len).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (la state_recompute)")
+            })?;
+        let mut chunk_history_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(rows * 64 * state_elems)
+            .map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_history)")
+            })?;
+        let mut chunk_kv_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(rows * 64 * p.value_dim)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_kv)"))?;
+
         let (dqkv_conv_ptr, _dqkv_conv_guard) = dqkv_conv.device_ptr_mut(&backend.stream);
         let (dz_ptr, _dz_guard) = dz.device_ptr_mut(&backend.stream);
         let (db_ptr, _db_guard) = db.device_ptr_mut(&backend.stream);
@@ -4363,6 +4385,196 @@ fn cuda_linear_attention_backward_device(
                     .arg(&key_dim_i32)
                     .arg(&value_dim_i32)
                     .arg(&qkv_dim_i32)
+                    .arg(&p.eps);
+                builder
+            },
+        )?;
+    } else {
+        // Staged chunk-parallel backward
+        // (docs/plans/linear-attention-chunked-backward.md): stage 1 emits the
+        // per-chunk affine grad-state transfer (M_c, B_c) in parallel over
+        // chunk x row blocks, stage 2 runs the num_chunks-step boundary carry,
+        // stage 3 replays the exact per-token grad pass per chunk in parallel.
+        let rows_i32 = i32::try_from(rows)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
+        let num_chunks_i32 = i32::try_from(num_chunks)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention num_chunks exceeds i32"))?;
+        let wave = num_chunks.min(LA_BWD_CHUNK_WAVE);
+        let wave_i32 = i32::try_from(wave)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention wave exceeds i32"))?;
+        let grid = wave * rows;
+        let carry_len = num_chunks * rows * state_elems;
+
+        // g_in[c] = grad-state entering chunk c from the right; the last chunk's
+        // slot must stay zero (alloc_zeros provides it) — stage 2 fills the rest.
+        let mut g_in_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(carry_len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la g_in)"))?;
+
+        if num_chunks > 1 {
+            let mut m_scratch = backend
+                .stream
+                .alloc_zeros::<f32>(num_chunks * rows * p.key_dim * p.key_dim)
+                .map_err(|_| {
+                    AutogradError::TapeInvariant("cuda alloc_zeros failed (la transfer_m)")
+                })?;
+            let mut b_scratch = backend.stream.alloc_zeros::<f32>(carry_len).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (la transfer_b)")
+            })?;
+            let mut state_scratch = backend.stream.alloc_zeros::<f32>(carry_len).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (la transfer_state)")
+            })?;
+
+            {
+                let (m_ptr, _m_guard) = m_scratch.device_ptr_mut(&backend.stream);
+                let (b_ptr, _b_guard) = b_scratch.device_ptr_mut(&backend.stream);
+                let (state_ptr, _state_guard) = state_scratch.device_ptr_mut(&backend.stream);
+                let (upstream_ptr, _upstream_guard) = upstream.device_ptr(&backend.stream);
+                let (z_ptr, _z_guard) = z.device_ptr(&backend.stream);
+                let (norm_ptr, _norm_guard) = norm_weight.device_ptr(&backend.stream);
+                let (qkv_conv_saved_ptr, _qkv_conv_saved_guard) =
+                    qkv_conv.device_ptr(&backend.stream);
+                let (beta_ptr, _beta_guard) = beta.device_ptr(&backend.stream);
+                let (g_ptr, _g_guard) = g.device_ptr(&backend.stream);
+                let (chunk_state_ptr, _chunk_state_guard) = chunk_state.device_ptr(&backend.stream);
+                launch_rows(
+                    &backend.stream,
+                    backend
+                        .kernels
+                        .function("linear_attention_chunk_transfer_f32")?,
+                    num_chunks * rows,
+                    256,
+                    0,
+                    |mut builder| {
+                        builder
+                            .arg(&m_ptr)
+                            .arg(&b_ptr)
+                            .arg(&state_ptr)
+                            .arg(&upstream_ptr)
+                            .arg(&z_ptr)
+                            .arg(&norm_ptr)
+                            .arg(&qkv_conv_saved_ptr)
+                            .arg(&beta_ptr)
+                            .arg(&g_ptr)
+                            .arg(&chunk_state_ptr)
+                            .arg(&batch_i32)
+                            .arg(&seq_len_i32)
+                            .arg(&num_key_heads_i32)
+                            .arg(&num_value_heads_i32)
+                            .arg(&key_dim_i32)
+                            .arg(&value_dim_i32)
+                            .arg(&qkv_dim_i32)
+                            .arg(&p.eps);
+                        builder
+                    },
+                )?;
+            }
+            {
+                let (g_in_ptr, _g_in_guard) = g_in_scratch.device_ptr_mut(&backend.stream);
+                let (m_ptr, _m_guard) = m_scratch.device_ptr(&backend.stream);
+                let (b_ptr, _b_guard) = b_scratch.device_ptr(&backend.stream);
+                launch_rows(
+                    &backend.stream,
+                    backend
+                        .kernels
+                        .function("linear_attention_chunk_carry_f32")?,
+                    rows,
+                    256,
+                    0,
+                    |mut builder| {
+                        builder
+                            .arg(&g_in_ptr)
+                            .arg(&m_ptr)
+                            .arg(&b_ptr)
+                            .arg(&rows_i32)
+                            .arg(&num_chunks_i32)
+                            .arg(&key_dim_i32)
+                            .arg(&value_dim_i32);
+                        builder
+                    },
+                )?;
+            }
+        }
+
+        let mut grad_state_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(grid * state_elems)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la grad_state)"))?;
+        let mut chunk_history_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(grid * 64 * state_elems)
+            .map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_history)")
+            })?;
+        let mut chunk_kv_scratch = backend
+            .stream
+            .alloc_zeros::<f32>(grid * 64 * p.value_dim)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la chunk_kv)"))?;
+
+        let (dqkv_conv_ptr, _dqkv_conv_guard) = dqkv_conv.device_ptr_mut(&backend.stream);
+        let (dz_ptr, _dz_guard) = dz.device_ptr_mut(&backend.stream);
+        let (db_ptr, _db_guard) = db.device_ptr_mut(&backend.stream);
+        let (da_ptr, _da_guard) = da.device_ptr_mut(&backend.stream);
+        let (ddt_ptr, _ddt_guard) = ddt.device_ptr_mut(&backend.stream);
+        let (da_log_ptr, _da_log_guard) = da_log.device_ptr_mut(&backend.stream);
+        let (dnorm_ptr, _dnorm_guard) = dnorm.device_ptr_mut(&backend.stream);
+        let (grad_state_ptr, _grad_state_guard) =
+            grad_state_scratch.device_ptr_mut(&backend.stream);
+        let (chunk_history_ptr, _chunk_history_guard) =
+            chunk_history_scratch.device_ptr_mut(&backend.stream);
+        let (chunk_kv_ptr, _chunk_kv_guard) = chunk_kv_scratch.device_ptr_mut(&backend.stream);
+        let (upstream_ptr, _upstream_guard) = upstream.device_ptr(&backend.stream);
+        let (z_ptr, _z_guard) = z.device_ptr(&backend.stream);
+        let (a_proj_ptr, _a_proj_guard) = a_proj.device_ptr(&backend.stream);
+        let (dt_ptr, _dt_guard) = dt_bias.device_ptr(&backend.stream);
+        let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&backend.stream);
+        let (norm_ptr, _norm_guard) = norm_weight.device_ptr(&backend.stream);
+        let (qkv_conv_saved_ptr, _qkv_conv_saved_guard) = qkv_conv.device_ptr(&backend.stream);
+        let (beta_ptr, _beta_guard) = beta.device_ptr(&backend.stream);
+        let (g_ptr, _g_guard) = g.device_ptr(&backend.stream);
+        let (chunk_state_ptr, _chunk_state_guard) = chunk_state.device_ptr(&backend.stream);
+        let (g_in_ptr, _g_in_guard) = g_in_scratch.device_ptr(&backend.stream);
+
+        launch_rows(
+            &backend.stream,
+            backend
+                .kernels
+                .function("linear_attention_chunk_grad_f32")?,
+            grid,
+            256,
+            0,
+            |mut builder| {
+                builder
+                    .arg(&dqkv_conv_ptr)
+                    .arg(&dz_ptr)
+                    .arg(&db_ptr)
+                    .arg(&da_ptr)
+                    .arg(&ddt_ptr)
+                    .arg(&da_log_ptr)
+                    .arg(&dnorm_ptr)
+                    .arg(&grad_state_ptr)
+                    .arg(&chunk_history_ptr)
+                    .arg(&chunk_kv_ptr)
+                    .arg(&upstream_ptr)
+                    .arg(&z_ptr)
+                    .arg(&a_proj_ptr)
+                    .arg(&dt_ptr)
+                    .arg(&a_log_ptr)
+                    .arg(&norm_ptr)
+                    .arg(&qkv_conv_saved_ptr)
+                    .arg(&beta_ptr)
+                    .arg(&g_ptr)
+                    .arg(&chunk_state_ptr)
+                    .arg(&g_in_ptr)
+                    .arg(&batch_i32)
+                    .arg(&seq_len_i32)
+                    .arg(&num_key_heads_i32)
+                    .arg(&num_value_heads_i32)
+                    .arg(&key_dim_i32)
+                    .arg(&value_dim_i32)
+                    .arg(&qkv_dim_i32)
+                    .arg(&wave_i32)
                     .arg(&p.eps);
                 builder
             },
