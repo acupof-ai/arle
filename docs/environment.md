@@ -48,7 +48,7 @@ document the debug-only status here.
 | --- | --- |
 | Linux + NVIDIA 完整构建 | `cargo build --release --features cuda --bin arle` |
 | Apple Silicon | `cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle` |
-| Mac 上 CUDA Rust 类型检查（无 GPU） | `CUDARC_CUDA_VERSION=12060 cargo check -p infer-api --no-default-features --features cuda,no-cuda` |
+| Mac 上 CUDA Rust 类型检查（无 GPU） | `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --no-default-features --features cuda,no-cuda` |
 | CPU smoke | `cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle` |
 | Multi-GPU NCCL | `cargo build --release --features cuda,nccl --bin arle` |
 
@@ -70,6 +70,13 @@ Example:
 export ARLE_MODEL=models/Qwen3.5-4B
 ./target/release/arle --max-turns 10
 ```
+
+### `ARLE_KV_SSD_PATH`
+
+Default root for the opt-in L3 (NVMe) KV spill when `arle serve --kv-ssd` or
+`--kv-ssd-max-bytes` is passed without `--kv-ssd-path`; an explicit
+`--kv-ssd-path` wins. Unset, the default is the platform cache dir
+(`~/.cache/arle/kv-ssd` on Linux).
 
 ### Apple Silicon one-command bring-up
 
