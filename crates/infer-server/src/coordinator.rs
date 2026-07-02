@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header;
@@ -33,6 +33,38 @@ use crate::tokenizer::OpenAiTokenizer;
 
 /// Idle park on the submit channel; matches the in-process engine loop.
 const IDLE_PARK: Duration = Duration::from_millis(2);
+
+/// Cap on ticks broadcast beyond the slowest rank's [`RelayEnvelope::TickAck`].
+/// Pacing the tick stream to engine speed bounds the worker FIFO depth, so a
+/// mid-decode submission (or `StatsQuery`, which rides the same FIFO) waits
+/// ≤ window × step time instead of queue-depth × step time (measured pre-fix:
+/// ~608k queued ticks for ~600 engine steps).
+const TICK_WINDOW: u64 = 4;
+
+/// Block until `seq` is within [`TICK_WINDOW`] of the slowest rank's tick ack.
+/// Never aborts: a wedged worker already hangs its NCCL peers today, and a long
+/// prefill chunk legitimately holds acks for seconds — warn (rate-limited) and
+/// keep waiting.
+fn wait_for_ack_window(relay: &Arc<Mutex<RelayCoordinator>>, seq: u64) {
+    let started = Instant::now();
+    let mut next_warn = Duration::from_secs(10);
+    loop {
+        let min_acked = relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .min_acked_ticks();
+        if seq < min_acked + TICK_WINDOW {
+            return;
+        }
+        if started.elapsed() >= next_warn {
+            log::warn!(
+                "[coordinator] lockstep stalled: tick #{seq} awaiting acks (min_acked={min_acked})"
+            );
+            next_warn += Duration::from_secs(10);
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+}
 
 struct CoordSubmission {
     request: WireRequest,
@@ -122,8 +154,10 @@ pub fn coordinator_router(
 
 /// Broadcasts exactly one `TickAdmissions` per step to every worker (carrying
 /// that step's drained submissions, empty on pure-decode ticks), stepping while
-/// `in_flight` remains and parking when idle. A broadcast failure breaks the
-/// lockstep group, so it logs at error and stops (workers then EOF and exit).
+/// `in_flight` remains and parking when idle. Per-rank tick acks pace the busy
+/// path to engine speed ([`wait_for_ack_window`]), so ticks never flood the
+/// worker FIFOs. A broadcast failure breaks the lockstep group, so it logs at
+/// error and stops (workers then EOF and exit).
 fn lockstep_loop(
     relay: Arc<Mutex<RelayCoordinator>>,
     in_flight: Arc<AtomicUsize>,
@@ -133,6 +167,19 @@ fn lockstep_loop(
     let mut seq: u64 = 0;
     let mut submit_open = true;
     loop {
+        // LOCKSTEP INVARIANT (load-bearing): `in_flight > 0` must strictly contain
+        // every rank's non-idle window — increment BEFORE submit, decrement only
+        // AFTER the terminal delta. Then the coordinator can only OVER-send
+        // decode-only ticks (idle workers skip them), never UNDER-send one a worker
+        // needs for an NCCL collective. Reordering the inc/dec can deadlock NCCL.
+        let busy = in_flight.load(Ordering::Acquire) > 0;
+        if busy {
+            // Flow control: wait for the ack window BEFORE the drain, so a
+            // submission landing during the wait coalesces into the very next
+            // allowed tick instead of queueing behind unacked ones.
+            wait_for_ack_window(&relay, seq);
+        }
+
         // Drain queued submissions without blocking.
         let mut drained: Vec<WireRequest> = Vec::new();
         loop {
@@ -146,12 +193,6 @@ fn lockstep_loop(
             }
         }
 
-        // LOCKSTEP INVARIANT (load-bearing): `in_flight > 0` must strictly contain
-        // every rank's non-idle window — increment BEFORE submit, decrement only
-        // AFTER the terminal delta. Then the coordinator can only OVER-send
-        // decode-only ticks (idle workers skip them), never UNDER-send one a worker
-        // needs for an NCCL collective. Reordering the inc/dec can deadlock NCCL.
-        let busy = in_flight.load(Ordering::Acquire) > 0;
         if !drained.is_empty() || busy {
             let requests = drained;
             let send = {
