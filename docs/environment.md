@@ -73,10 +73,9 @@ export ARLE_MODEL=models/Qwen3.5-4B
 
 ### `ARLE_KV_SSD_PATH`
 
-Default root for the opt-in L3 (NVMe) KV spill when `arle serve --kv-ssd` or
-`--kv-ssd-max-bytes` is passed without `--kv-ssd-path`; an explicit
-`--kv-ssd-path` wins. Unset, the default is the platform cache dir
-(`~/.cache/arle/kv-ssd` on Linux).
+Default root for the opt-in L3 (NVMe) KV spill when `arle serve` gets a bare
+`--kv-disk` (no directory value); an explicit `--kv-disk DIR` wins. Unset, the
+default is the platform cache dir (`~/.cache/arle/kv-ssd` on Linux).
 
 ### Apple Silicon one-command bring-up
 
