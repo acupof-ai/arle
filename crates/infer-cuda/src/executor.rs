@@ -5375,8 +5375,8 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
 mod tests {
     use super::{
         CudaKvCacheDtype, NS_PREFIX, NS_PREFIX_CHUNK, NS_SLOT, NS_SLOT_CHUNK, PrefixIndex,
-        chunk_sub, tier_key,
     };
+    use crate::kv_tier::{chunk_sub, tier_key};
     use infer_seam::KvCacheDtype;
 
     #[test]
