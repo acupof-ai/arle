@@ -1213,6 +1213,34 @@ fn cuda_linear_attention_hard_forget_grad_matches_cpu_and_stays_finite() -> Resu
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 #[test]
+fn cuda_linear_attention_chunk_parallel_grad_matches_cpu() -> Result<()> {
+    // 200 tokens = 4 x 64-token chunks (last partial) on a small head count —
+    // exercises the staged chunk-parallel backward end to end: parallel
+    // per-chunk transfer operators (M_c, B_c), a multi-step reverse boundary
+    // carry, and the parallel per-chunk grad replay, vs the CPU reference.
+    // (`ARLE_LA_BACKWARD_MONO=1` re-routes to the legacy monolithic scan for
+    // manual A/B on the same shapes.)
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 200,
+        num_key_heads: 2,
+        num_value_heads: 4,
+        key_dim: 128,
+        value_dim: 128,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    };
+    let fixture = LinearAttentionFixture::new(params);
+    compare_cpu_cuda_device_linear_attention(
+        params,
+        &fixture,
+        "cuda chunk-parallel linear_attention",
+        2.0e-2,
+    )
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
 fn cuda_linear_attention_qwen36_27b_chunked_grad_matches_cpu() -> Result<()> {
     // 48 value heads — exercises the device LA kernel after the head-count guard
     // was relaxed from the hardcoded 32. Falls back to the host path (still
