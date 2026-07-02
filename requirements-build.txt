@@ -1,30 +1,25 @@
 # Build-time Python dependencies for arle.
 # TileLang: AOT attention/GDR kernel codegen for the CUDA feature set.
 #
-# Pinned to the EXACT cu12 stack on the 8xH20 pod (verified 2026-06-15), which
-# is what every current DSv4 AOT kernel build/bench runs against. These pins
-# are LOAD-BEARING, not cosmetic: a bare `pip install tilelang==0.1.11` now
-# resolves the CUDA-13 stack (torch 2.12 + apache-tvm-ffi 0.1.12 +
-# cuda-bindings 13.x), and apache-tvm-ffi 0.1.12 is ABI-incompatible with
-# tilelang 0.1.11 — `import tilelang` aborts with `tvm::ffi::Error`
-# (build.rs:1037), killing every CUDA release/Docker build. The pod's working
-# set is the cu12 stack below. Bump deliberately, backed by a pod build + bench
-# entry.
+# Pinned as a SET to the current coherent resolve (tilelang 0.1.11 is the
+# latest release; it declares apache-tvm-ffi>=0.1.10,~=0.1.0). Bump the set
+# together, backed by a pod build — a clean venv is required: mixing with a
+# system tilelang (e.g. 0.1.8 via --system-site-packages leakage) double-
+# registers the tvm-ffi runtime and aborts `import tilelang` with
+# `TypeAttr __ffi_repr__ is already registered`.
 #
 # torch ships its own bundled CUDA runtime (nvidia-*-cu12 12.9.x), so the cu129
 # wheel imports cleanly in the CUDA-12.8 build image — no GPU and no matching
 # system CUDA are needed at build time (build.rs only imports tilelang for
-# codegen; nvcc 12.8 compiles the emitted .cu separately).
-# torch pins its own triton (==3.5.1 on Linux) — don't re-pin it here. apache-tvm-ffi
-# and cuda-python ARE pinned: tilelang 0.1.11 leaves them loose, so a fresh resolve
-# grabs the cu13 0.1.12 / 13.x wheels that abort `import tilelang`.
+# codegen; nvcc 12.8 compiles the emitted .cu separately). torch pins its own
+# triton — don't re-pin it here.
 --extra-index-url https://download.pytorch.org/whl/cu129
-torch==2.9.1+cu129
-apache-tvm-ffi==0.1.11
+torch==2.12.1+cu129
+apache-tvm-ffi==0.1.12
 cuda-python==12.9.0
 tilelang==0.1.11
 # tilelang's tvm dlopens libz3 at import (wheel RUNPATH looks beside libtvm /
-# in ../../z3/lib); unpinned resolves drifted on the pod.
+# in ../../z3/lib); pinned inside tilelang's declared <4.15.5 range.
 z3-solver==4.15.4
 
 # Model downloads in setup.sh use huggingface_hub.snapshot_download.
