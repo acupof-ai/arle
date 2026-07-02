@@ -92,17 +92,41 @@ case "$cmd" in
       fi"
     ;;
   sync)
-    paths=("$@")
-    if [ ${#paths[@]} -eq 0 ]; then
-      while IFS= read -r p; do
-        paths+=("$p")
-      done < <(cd "$ROOT" && git status --porcelain | awk '{print $2}')
+    # Explicit paths => push exactly those. No args => make the pod tree EQUAL
+    # this tree: committed state via pod-side git fetch+reset to our HEAD (a
+    # `git status`-only push misses committed work), then dirty files on top.
+    # git-reset also writes fresh mtimes, so cargo can't mistake the new
+    # sources for "fresh" (tn push preserves local mtimes; see remote-build).
+    if [ $# -gt 0 ]; then
+      for p in "$@"; do
+        [ -f "$ROOT/$p" ] || { echo "skip (not a file): $p"; continue; }
+        "$TN" push "$ROOT/$p" "$NODE_TREE/$p" && echo "synced  $p"
+      done
+      exit 0
     fi
-    [ ${#paths[@]} -eq 0 ] && { echo "nothing to sync"; exit 0; }
-    for p in "${paths[@]}"; do
-      [ -f "$ROOT/$p" ] || { echo "skip (not a file): $p"; continue; }
-      "$TN" push "$ROOT/$p" "$NODE_TREE/$p" && echo "synced  $p"
-    done
+    head="$(git -C "$ROOT" rev-parse HEAD)"
+    pod_head="$("$POD" "git -C $TREE rev-parse HEAD 2>/dev/null" | tr -d '\r\n')"
+    if [ "$pod_head" = "$head" ]; then
+      echo "pod tree already @ $head"
+    else
+      # Pod-side `git fetch origin` hangs when the proxy is down (observed
+      # 2026-07-02); a git bundle rides the same tn lane as file pushes —
+      # no pod-side network. git-reset also writes fresh mtimes.
+      git -C "$ROOT" rev-parse -q --verify "$pod_head^{commit}" >/dev/null 2>&1 \
+        || { echo "pod HEAD $pod_head unknown locally — re-provision the pod tree"; exit 1; }
+      bundle="$(mktemp -t arle-sync-XXXX).bundle"
+      git -C "$ROOT" bundle create "$bundle" "$pod_head..HEAD" >/dev/null 2>&1
+      "$TN" push "$bundle" "$NODE_TREE/.arle-sync.bundle"
+      rm -f "$bundle"
+      "$POD" "cd $TREE && git fetch -q .arle-sync.bundle HEAD && \
+        git reset --hard -q FETCH_HEAD && rm -f .arle-sync.bundle && \
+        echo \"pod tree @ \$(git log --oneline -1)\"" \
+        || { echo "pod bundle apply failed"; exit 1; }
+    fi
+    while IFS= read -r p; do
+      [ -f "$ROOT/$p" ] || continue
+      "$TN" push "$ROOT/$p" "$NODE_TREE/$p" && echo "synced  $p (dirty)"
+    done < <(cd "$ROOT" && git status --porcelain | awk '{print $2}')
     ;;
   build)
     # No args => standard arle build (label "arle"). Else: first arg = label.

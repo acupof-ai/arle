@@ -31,8 +31,19 @@ TREE_LOCK="/tmp/arle-build$(echo "$TREE" | tr '/.' '__').lock"
   source "$TREE/scripts/pod-build-env.sh"
   echo "rustc: $(rustc --version 2>&1)"
   echo "args : cargo build $*"
+  # tn push preserves local mtimes, and cargo trusts mtime alone — a pushed
+  # file older than the previous build reads as "fresh" and silently no-ops.
+  # Bump exactly the git-dirty files that predate the last build; the stamp
+  # is taken before the build so a bumped file is never re-bumped.
+  STAMP="$TREE/target/.arle-sync-stamp"
+  git ls-files -m -o --exclude-standard -z 2>/dev/null |
+    while IFS= read -r -d '' f; do
+      { [ ! -f "$STAMP" ] || [ "$f" -ot "$STAMP" ]; } && touch -c "$f"
+    done
+  mkdir -p "$TREE/target" && touch "$STAMP"
   # Racy step #2: build under a PER-TREE lock (same tree serializes, diff trees parallel).
   flock "$TREE_LOCK" cargo build "$@"
-  echo "BUILD_EXIT=$?"
+  rc=$?
+  echo "BUILD_EXIT=$rc (compiled $(grep -c '^ *Compiling ' "$LOG" || true) crates)"
   echo "=== BUILD DONE $(date -u) ==="
 } >"$LOG" 2>&1
