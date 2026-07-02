@@ -19,6 +19,83 @@ Related governance docs:
 
 ## [Unreleased]
 
+Post-v0.2.1 progress spine. Entry classes recorded here the day they land:
+phase exits, default flips, license-or-kill verdicts (AGENTS.md §Docs
+lifecycle & progress spine).
+
+### Verdicts
+
+- **Phase 2 re-scoped; whole-step decode CUDA graph RE-KILLED (2026-06-21).**
+  The B=1 chain-map/roofline shows the wall is foundation-bound (per-step
+  `ctx.sync` + cross-process barrier; HBM ~2.8% util, 36× below roofline) —
+  the graph lever measured −41%. MTP stays acceptance-gated opt-in
+  (break-even ~57% accept; typical 50–53% is a wash); no universal spec-decode
+  default. #70 closed.
+  ([chain-map](docs/plans/2026-06-20-dsv4-b1-decode-chain-map.md))
+
+### CUDA
+
+- **Qwen3.6 serves on CUDA (2026-06-29):** FP8 MoE via DeepGEMM; batched paged
+  decode scales c=1→8 (Qwen3.6-27B-FP8, 1×H20: 21 → 26 tok/s aggregate).
+  ([wins](docs/experience/wins/2026-06-29-cuda-qwen36-paged-batched-decode.md))
+- **Qwen3.5-122B-A10B serves at TP4** via GQA KV-head replication;
+  numerical-completion gate pending a clean re-run.
+  ([wins](docs/experience/wins/2026-06-29-cuda-gqa-replication-122b-tp4.md))
+- **GLM-5.2 (`glm_moe_dsa`, DSv4-DSA family) wired on the DSv4 path** —
+  forward tranches landed, verification pending-remote; not
+  production-verified. (wins `2026-06-19-glm52-*`)
+
+### Metal
+
+- **Qwen3.6 NextN/MTP spec decode shipped (2026-06-21)** on the canonical
+  Metal model.
+  ([wins](docs/experience/wins/2026-06-21-metal-qwen36-mtp-spec-decode.md))
+- **VLM bring-up:** Gemma4 forward + image smoke landed (2026-06-15);
+  DeepSeek-OCR wired (2026-06-24/25, vision numerics not yet faithful).
+  Quality/throughput validation pending for both.
+
+### Repo
+
+- **Renamed `agent-infer` → `arle`** across source, config, and docs
+  (2026-06-29).
+
+## [0.2.1] — 2026-06-15
+
+> Consolidated section: tags `v0.1.5` (2026-05-02), `v0.2.0` and `v0.2.1`
+> (both 2026-06-15) were cut without changelog sections. Everything below
+> spans v0.1.4 → v0.2.1; per-tag artifacts live on GitHub Releases.
+
+### Runtime rewrite — `infer-*` stack becomes the serving truth (2026-06-04)
+
+- **Breaking:** the monolithic `infer` crate is deleted (`e81b98fb`,
+  ~167k LOC). Serving stack: `infer-plan` → `infer-seam` → `infer-core` →
+  `infer-cuda`/`infer-metal` → `infer-server`/`infer-api`; `infer-api`
+  (`LoadedInferenceEngine`) is the single programmatic front door. Any command
+  referencing `-p infer` is stale. Consolidated verification + performance
+  verdict:
+  [final report](docs/projects/2026-06-04-qwen35-dsv4-final-report.md).
+
+### Training surface — OPD-only (2026-05-18)
+
+- **Breaking:** scratch pretrain / SFT / GRPO / multi-turn RL surfaces are
+  deleted; OPD is the only training axis.
+  ([pivot](docs/projects/2026-05-18-opd-only-pivot.md))
+
+### DSv4 perf campaign — adopt official kernels (2026-06-06 → 06-12)
+
+- Official DSA indexer default-on: decode 124 ms → 26 ms flat @4096.
+  ([wins](docs/experience/wins/2026-06-07-dsv4-official-dsa-default-on.md))
+- FlashMLA `sparse_fwd` + FP8 DeepGEMM prefill default-on: 7.2 s → 3.48 s.
+  ([wins](docs/experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md))
+- Phase 0 debt closed 2026-06-10 (#56–#59). KV precision parity gate re-ported
+  as correct-inference (needle ladder, not byte-identity); FlashMLA decode +
+  fused-wqkv correctness LICENSED; pooled/contig-MoE default flip KILLED
+  (−24%).
+  ([lever verdicts](docs/experience/wins/2026-06-10-dsv4-lever-gate-license-or-kill.md))
+- Seam-level KV-dtype dispatch `--kv-cache-dtype` (default bf16 unchanged);
+  INT8/FP8 correctness LICENSED, opt-in pending a perf license (2026-06-12).
+  ([wins](docs/experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md))
+
 ### OPD train (CUDA) — new beta surface
 
 - **OPD mainline queue moved from experiment-only to operator-facing workflow.**
