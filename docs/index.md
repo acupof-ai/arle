@@ -7,78 +7,14 @@
 > [docs/http-api.md](http-api.md) instead. This file is for ARLE maintainers
 > tracking canonical truth surfaces, active plans, and experience logs.
 
-**Current status (2026-06-10):** the strategic single truth is
-[`projects/2026-06-10-arle-master-strategy-v2.md`](projects/2026-06-10-arle-master-strategy-v2.md)
-(supersedes the 2026-05-07 master strategy; v2 §1 lists every overturned
-claim). Evolution path = Phase 0 debt (long-ctx correctness closeout,
-KV-precision-parity re-port to `infer-cuda`, truth-surface resync) →
-Phase 1 batched serving lane
-([`plans/2026-06-07-unified-batched-kvpool-abstraction.md`](plans/2026-06-07-unified-batched-kvpool-abstraction.md);
-`cd421794` made c≥2 exist as a sequential plan-split, bench
-pending-remote) → Phase 2 frozen-KV MTP default-good → Phase 3 product
-re-aim (W3/W4 baseline, OPD GPU resume; Qwen3.6 adapter now
-serving on CUDA — hybrid + FP8 MoE, batched paged decode
-[`experience/wins/2026-06-29-cuda-qwen36-paged-batched-decode.md`](experience/wins/2026-06-29-cuda-qwen36-paged-batched-decode.md)).
-DSv4 perf
-coordinates: decode ~26–27 ms/token vs same-pod SGLang 15.89 no-spec /
-8.24 +EAGLE; 5–6 ms is an H100 number, not an H20 target. deepep_ll is
-correct but gated (B=1 −55%, its batched lane pending Phase 1 —
-[`experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md`](experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md)).
-Progress tracking: [umbrella #55](https://github.com/cklxx/arle/issues/55)
-(Phase 0 #56–#59 · Phase 1 #60–#61 · Phase 2 #62 · Phase 3 #63–#65).
-
-OPD remains the only training surface
-([`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md));
-its GPU experiments are queued behind Phase 1–2 (D4 serial rule). The
-"multi-seed before wins" capability-eval rule from
-[`experience/errors/2026-05-28-mmlu-cross-base-was-noise.md`](experience/errors/2026-05-28-mmlu-cross-base-was-noise.md)
-stands. Open thread:
-[rollout-perf O(n²) characterization](research/2026-05-28-opd-rollout-perf-208s-bottleneck.md).
-The 2026-05-24 OPD backlog and the 2026-06-01 SGLang-path-alignment plan
-are historical (superseded by the v2 phase sequence).
-
-**Rewrite + DSv4/Qwen final verdict (2026-06-04):** the device-neutral `infer-*`
-rewrite is the serving truth (monolithic `infer` deleted); for the consolidated
-verification + performance verdict — Metal + CUDA, TP/EP, FP8 DeepGEMM MoE, DeepEP,
-the honest "DSv4 incremental decode is broken (prefill-only correctness)" correction,
-and the path to SGLang-class decode — see
-[`projects/2026-06-04-qwen35-dsv4-final-report.md`](projects/2026-06-04-qwen35-dsv4-final-report.md)
-and the DSv4 decode perf roadmap
-[`plans/2026-06-04-dsv4-decode-sglang-class-perf.md`](plans/2026-06-04-dsv4-decode-sglang-class-perf.md).
-
-**DSv4 perf campaign (2026-06-06/07) — adopt official kernels, not hand-roll.** The
-campaign's truth-order: (1) early narrow per-kernel / 8-token smoke profiling gave
-WRONG bottlenecks ("decode comm 32.4%", GEMV/mhc levers, 6ms-via-EAGLE-now) — those
-docs are marked *Superseded by later evidence*; (2) an end-to-end **wall-clock** trace
-at the 4096 SLO shape found the real bottleneck = `dsv4_csa_select` (the hand-rolled
-1/78-SM sparse selector), see
-[`plans/2026-06-06-dsv4-pd-systematic-analysis.md`](plans/2026-06-06-dsv4-pd-systematic-analysis.md);
-(3) the fix was to ADOPT the official DeepSeek/SGLang kernels (official DSA indexer →
-decode 124ms→26ms flat @4096, default-on
-[`experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](experience/wins/2026-06-07-dsv4-official-dsa-default-on.md);
-FlashMLA `sparse_fwd` + FP8 DeepGEMM → prefill 7.2s→3.48s, default-on
-[`experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md)),
-the principle recorded in the retro
-[`experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`](experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md);
-(4) targets re-anchored on the
-[`plans/2026-06-06-dsv4-h20-reference-baseline.md`](plans/2026-06-06-dsv4-h20-reference-baseline.md)
-(base decode ~20-35ms; 6ms needs MTP/EAGLE spec); (5) MTP/6ms parked at the
-draft-quality wall
-[`experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md`](experience/errors/2026-06-06-dsv4-mtp-perf-acceptance-workload-blockers.md);
-(6) the forward-looking program is the engine-generic
-[`plans/2026-06-07-unified-batched-kvpool-abstraction.md`](plans/2026-06-07-unified-batched-kvpool-abstraction.md)
-(authoritative). The session code-cleanup task list (flags → CLI `--`, legacy
-fallbacks, dead hand-rolled paths) is
-[`plans/2026-06-07-dsv4-code-cleanup-audit.md`](plans/2026-06-07-dsv4-code-cleanup-audit.md).
-
-**Qwen3.5 Medusa is not pickup-ready** — recurrent-state accepted-length
-commit/rollback contract is the gate. Active plan:
-[`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md);
-Step 0 audit:
-[`research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md`](research/2026-05-10-medusa-phase1b-qwen35-step0-audit.md).
-
-For older session retros, run `git log -- docs/index.md` — they no longer
-live in this file.
+**This file is a pure index — no narrative state.** Current phase table and
+in-flight model items: [`ROADMAP.md`](../ROADMAP.md). Strategic master
+(positioning, evolution path, kill registry):
+[`projects/2026-06-10-arle-master-strategy-v2.md`](projects/2026-06-10-arle-master-strategy-v2.md).
+Chronological progress spine (phase exits, default flips, license-or-kill
+verdicts): [`CHANGELOG.md`](../CHANGELOG.md). The status snapshots that used
+to live here rotted against ROADMAP.md and were removed 2026-07-02; recover
+any of them with `git log -- docs/index.md`.
 
 ## Canonical Truth Surfaces
 
