@@ -1,6 +1,6 @@
 # ARLE Roadmap
 
-Updated 2026-06-21. Derived planning surface. On any conflict the canonical
+Updated 2026-07-02. Derived planning surface. On any conflict the canonical
 doc wins:
 
 - Strategic master: [`docs/projects/2026-06-10-arle-master-strategy-v2.md`](docs/projects/2026-06-10-arle-master-strategy-v2.md)
@@ -31,21 +31,22 @@ Issues carry `phase-N` labels; off-path infra carries `infra`.
 | Phase | Status | Goal | Exit condition | Anchor |
 | --- | --- | --- | --- | --- |
 | **0 — Debt** | ✅ **Closed 2026-06-10** (#56–#59). Open residue: [#68](https://github.com/cklxx/arle/issues/68) model-generic KV-quant parity gate (Qwen 4-precision matrix) — does not re-block Phase 1. | Long-ctx correctness closeout, 256K admission real fix, KV-precision-parity re-port to `infer-cuda`, truth-surface resync. | All four items closed; parity harness unlocks the gated FlashMLA/fused-wqkv/contig-MoE default flips. | v2 §3 Phase 0 |
-| **1 — Batched serving lane (keystone)** | **ACTIVE** ([#60](https://github.com/cklxx/arle/issues/60), [#61](https://github.com/cklxx/arle/issues/61)) | True batched lowering per [`unified-batched-kvpool-abstraction`](docs/plans/2026-06-07-unified-batched-kvpool-abstraction.md) (`KvBatchDescriptor` + `ModelKvAdapter`, DSv4 first). `cd421794` (sequential plan-split, c≥2 no longer crashes) is the starting point, not the goal. | c-sweep clears TTFT+ITL+tok/s per bench spec; then deepep_ll-vs-allreduce A/B at its real lane, license-or-kill. | v2 §3 Phase 1 |
+| **1 — Batched serving lane (keystone)** | ✅ **Keystone closed** ([#61](https://github.com/cklxx/arle/issues/61) 2026-06-11 · [#60](https://github.com/cklxx/arle/issues/60) 2026-06-15): DSv4 B>1 decode takes the batched lane by default. Residual c>1 throughput lever: DP-attn ([#89](https://github.com/cklxx/arle/issues/89)). | True batched lowering per [`unified-batched-kvpool-abstraction`](docs/plans/2026-06-07-unified-batched-kvpool-abstraction.md) (`KvBatchDescriptor` + `ModelKvAdapter`, DSv4 first). `cd421794` (sequential plan-split, c≥2 no longer crashes) is the starting point, not the goal. | c-sweep clears TTFT+ITL+tok/s per bench spec; then deepep_ll-vs-allreduce A/B at its real lane, license-or-kill. | v2 §3 Phase 1 |
 | **2 — Spec decode default-good** | **Re-scoped 2026-06-21.** [#70](https://github.com/cklxx/arle/issues/70) **CLOSED — whole-step graph KILLED** by the [B=1 chain-map/roofline](docs/plans/2026-06-20-dsv4-b1-decode-chain-map.md) (−41%, foundation-bound: per-step `ctx.sync` + cross-process barrier — the skew-anatomy re-license is overturned by measurement, launches aren't the wall). [#62](https://github.com/cklxx/arle/issues/62) closed. | The B=1 wall is latency/foundation-bound (HBM ~2.8% util, **36× below roofline**); MTP d2 is **acceptance-gated** (break-even ~57%; typical 50–53% → wash, +14% only on high-accept ShareGPT) → **stays opt-in, not default-flipped**. The throughput headroom is in **batching** (Phase 1), not single-stream. | No universal spec-default; MTP opt-in for high-acceptance workloads. | [chain-map](docs/plans/2026-06-20-dsv4-b1-decode-chain-map.md), v2 §3 Phase 2 |
-| **3 — Product re-aim** | Queued ([#64](https://github.com/cklxx/arle/issues/64), [#65](https://github.com/cklxx/arle/issues/65), [#71](https://github.com/cklxx/arle/issues/71), [#90](https://github.com/cklxx/arle/issues/90)) | long-ctx mission restart on the new substrate, OPD GPU experiments resume, **AIPC route** (Metal single-user convergence + HIP/ROCm third backend on the seam — local unified-memory hardware, no pod contention), **SOPD self-training axis** (umbrella [#90](https://github.com/cklxx/arle/issues/90) → children [#91](https://github.com/cklxx/arle/issues/91)–[#98](https://github.com/cklxx/arle/issues/98), incl. [#98](https://github.com/cklxx/arle/issues/98) rubric-graded A5 — the open-ended bridge; teacher-free LoRA self-distill at rollout time; OPD-only, never GRPO; gated on its own Phase-0 keystone, off the serial critical path — see below). | Per-item; mission threshold ≥1.30 stands. | v2 §3 Phase 3, [SOPD plan](docs/plans/2026-06-14-self-training-lora-opd-sopd.md) |
+| **3 — Product re-aim** | **ACTIVE** — [#64](https://github.com/cklxx/arle/issues/64)/[#65](https://github.com/cklxx/arle/issues/65) closed-completed (2026-06-23 / 06-29: OPD GPU resume, Qwen3.6 CUDA serving); live: [#71](https://github.com/cklxx/arle/issues/71) AIPC, [#90](https://github.com/cklxx/arle/issues/90) SOPD, [#102](https://github.com/cklxx/arle/issues/102)/[#103](https://github.com/cklxx/arle/issues/103) train-side | long-ctx mission restart on the new substrate, OPD GPU experiments resume, **AIPC route** (Metal single-user convergence + HIP/ROCm third backend on the seam — local unified-memory hardware, no pod contention), **SOPD self-training axis** (umbrella [#90](https://github.com/cklxx/arle/issues/90) → children [#91](https://github.com/cklxx/arle/issues/91)–[#98](https://github.com/cklxx/arle/issues/98), incl. [#98](https://github.com/cklxx/arle/issues/98) rubric-graded A5 — the open-ended bridge; teacher-free LoRA self-distill at rollout time; OPD-only, never GRPO; gated on its own Phase-0 keystone, off the serial critical path — see below). | Per-item; mission threshold ≥1.30 stands. | v2 §3 Phase 3, [SOPD plan](docs/plans/2026-06-14-self-training-lora-opd-sopd.md) |
 
 Off-path / opportunistic (no serial-phase contention):
 [#69](https://github.com/cklxx/arle/issues/69) DSv4 serve cold-boot ~6 min
 (rank-0 serialization + 8× read amplification);
-[#91](https://github.com/cklxx/arle/issues/91) SOPD Phase-0 keystone (+ its
-prerequisite [#92](https://github.com/cklxx/arle/issues/92) prefix-cache
-epoch-invalidation) — a cheap CUDA+Qwen3.5 probe of the inline self-update loop,
-runnable on the pod off the Phase-1 critical path (zero new kernels; 4 of 5
-architecture cruxes proven dormant at this scope). Everything after Phase-0
-(children [#93](https://github.com/cklxx/arle/issues/93)–[#98](https://github.com/cklxx/arle/issues/98))
-is gated on a PASS and does not pre-empt the batched-lane keystone
-([#60](https://github.com/cklxx/arle/issues/60)).
+[#91](https://github.com/cklxx/arle/issues/91) SOPD Phase-0 keystone —
+**closed-completed 2026-06-14 (PASS)**; children
+[#93](https://github.com/cklxx/arle/issues/93)–[#98](https://github.com/cklxx/arle/issues/98)
+unlocked (prerequisite [#92](https://github.com/cklxx/arle/issues/92)
+prefix-cache epoch-invalidation still open);
+[#123](https://github.com/cklxx/arle/issues/123) DSpark umbrella —
+semi-autoregressive draft + confidence-scheduled verify (children #124–#131),
+the spec-decode acceptance-wall attack after the Phase-2 re-scope; off-path
+until a child earns a license.
 
 Killed/deferred work (B=1 per-kernel micro-levers, deepep_ll default-on,
 classical spec, 5–6 ms-on-H20 framing, FlashInfer migration, ROCm, …) is

@@ -81,7 +81,7 @@ lifecycle & progress spine).
   deleted; OPD is the only training axis.
   ([pivot](docs/projects/2026-05-18-opd-only-pivot.md))
 
-### DSv4 perf campaign — adopt official kernels (2026-06-06 → 06-12)
+### DSv4 perf campaign — adopt official kernels (2026-06-06 → 06-15)
 
 - Official DSA indexer default-on: decode 124 ms → 26 ms flat @4096.
   ([wins](docs/experience/wins/2026-06-07-dsv4-official-dsa-default-on.md))
@@ -95,6 +95,9 @@ lifecycle & progress spine).
 - Seam-level KV-dtype dispatch `--kv-cache-dtype` (default bf16 unchanged);
   INT8/FP8 correctness LICENSED, opt-in pending a perf license (2026-06-12).
   ([wins](docs/experience/wins/2026-06-12-cuda-quant-kv-dispatch-int8-fp8.md))
+- Phase 1 batched-lane keystone closed (#61 2026-06-11, #60 2026-06-15): DSv4
+  B>1 decode takes the batched serving lane by default; residual c>1
+  throughput lever is DP-attn (#89).
 
 ### OPD train (CUDA) — new beta surface
 
