@@ -747,7 +747,7 @@ fn serve_handle_relay_driver<E, K>(
 
     loop {
         match engine_recv.recv() {
-            Ok(Some(RelayEnvelope::TickAdmissions { seq: _, requests })) => {
+            Ok(Some(RelayEnvelope::TickAdmissions { seq, requests })) => {
                 for wire in requests {
                     let request_id = wire.request_id;
                     let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
@@ -767,6 +767,10 @@ fn serve_handle_relay_driver<E, K>(
                         }
                     }
                 }
+                // Flow-control ack (rank 0 = the only local worker); without it
+                // the lockstep loop's ack window stalls at TICK_WINDOW. A send
+                // failure means the coordinator is gone — recv EOFs us out next.
+                let _ = engine_tx.send(RelayEnvelope::TickAck { rank: 0, seq });
             }
             Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
                 let counters = serve.counters();

@@ -34,7 +34,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -430,6 +430,12 @@ pub enum RelayEnvelope {
         seq: u64,
         requests: Vec<WireRequest>,
     },
+    /// Worker→coordinator flow control: rank consumed the tick with this seq
+    /// (sent whether or not the engine stepped — an idle skip still consumes).
+    /// The coordinator caps unacked ticks at a fixed window so the tick stream
+    /// paces to engine speed instead of flooding the FIFO (admission latency
+    /// was queue-depth × step time; now ≤ window × step time).
+    TickAck { rank: usize, seq: u64 },
     /// Worker readiness ack, sent once a rank's engine (incl. NCCL rendezvous) is
     /// built. The coordinator blocks HTTP bind until all `world_size` readies
     /// arrive, so no request is broadcast before the collective has formed.
@@ -485,6 +491,49 @@ impl WireRequest {
     }
 }
 
+/// Per-rank [`RelayEnvelope::TickAck`] bookkeeping for lockstep flow control.
+/// Reader threads record each rank's acks; the coordinator lockstep loop reads
+/// [`Self::min_acked`] to cap unacked ticks at a fixed window.
+#[derive(Debug)]
+pub struct TickAckLedger {
+    /// `(rank, acked tick count)` per connected rank; the count is
+    /// `last_acked_seq + 1`, so 0 means "never acked".
+    per_rank: Vec<(usize, AtomicU64)>,
+}
+
+impl TickAckLedger {
+    fn new(ranks: impl IntoIterator<Item = usize>) -> Self {
+        Self {
+            per_rank: ranks
+                .into_iter()
+                .map(|rank| (rank, AtomicU64::new(0)))
+                .collect(),
+        }
+    }
+
+    /// Record that `rank` consumed the tick with `seq`. Acks are monotonic per
+    /// rank; a stale/duplicate ack is a no-op (`fetch_max`).
+    pub fn ack(&self, rank: usize, seq: u64) {
+        match self.per_rank.iter().find(|(r, _)| *r == rank) {
+            Some((_, count)) => {
+                count.fetch_max(seq + 1, Ordering::AcqRel);
+            }
+            None => log::warn!("[relay-coordinator] tick ack from unknown rank {rank} (seq {seq})"),
+        }
+    }
+
+    /// Number of ticks fully acked by ALL ranks (min over per-rank acked
+    /// counts). A rank that never acked holds this at 0.
+    #[must_use]
+    pub fn min_acked(&self) -> u64 {
+        self.per_rank
+            .iter()
+            .map(|(_, count)| count.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(0)
+    }
+}
+
 /// Coordinator-side TCP relay. Binds a port, accepts N-1 worker connections at
 /// boot, then provides `broadcast()` to send envelopes to every worker stream.
 pub struct RelayCoordinator {
@@ -497,6 +546,9 @@ pub struct RelayCoordinator {
     /// Count of ranks that sent [`RelayEnvelope::EngineReady`]; the coordinator
     /// polls it via [`Self::ready_count`] before opening HTTP.
     ready_count: Arc<AtomicUsize>,
+    /// Per-rank tick-ack ledger, fed by the reader threads; the lockstep loop
+    /// polls [`Self::min_acked_ticks`] to pace the tick stream to engine speed.
+    tick_acks: Arc<TickAckLedger>,
 }
 
 /// Pending coordinator state — listener is bound and port is known but workers
@@ -590,6 +642,7 @@ impl PendingRelayCoordinator {
         >::new()));
         let completion_shutdown = Arc::new(AtomicBool::new(false));
         let ready_count = Arc::new(AtomicUsize::new(0));
+        let tick_acks = Arc::new(TickAckLedger::new(workers.keys().copied()));
         for (&rank, channel) in &workers {
             let reader = channel
                 .try_clone_channel()
@@ -601,6 +654,7 @@ impl PendingRelayCoordinator {
                 Arc::clone(&stats_sinks),
                 Arc::clone(&completion_shutdown),
                 Arc::clone(&ready_count),
+                Arc::clone(&tick_acks),
             );
         }
         Ok(RelayCoordinator {
@@ -610,6 +664,7 @@ impl PendingRelayCoordinator {
             stats_sinks,
             completion_shutdown,
             ready_count,
+            tick_acks,
         })
     }
 
@@ -672,6 +727,7 @@ impl RelayCoordinator {
         let shutdown = Arc::new(AtomicBool::new(false));
         // Mark rank-0 as ready immediately — no boot handshake for local workers.
         let ready_count = Arc::new(AtomicUsize::new(1));
+        let tick_acks = Arc::new(TickAckLedger::new([0]));
 
         let mut workers = BTreeMap::new();
         workers.insert(0usize, Box::new(coord_send) as Box<dyn RelayChannel>);
@@ -683,6 +739,7 @@ impl RelayCoordinator {
             Arc::clone(&stats_sinks),
             Arc::clone(&shutdown),
             Arc::clone(&ready_count),
+            Arc::clone(&tick_acks),
         );
 
         let relay = Self {
@@ -692,6 +749,7 @@ impl RelayCoordinator {
             stats_sinks,
             completion_shutdown: shutdown,
             ready_count,
+            tick_acks,
         };
 
         (relay, engine_recv, engine_tx)
@@ -717,6 +775,15 @@ impl RelayCoordinator {
     #[must_use]
     pub fn ready_count(&self) -> usize {
         self.ready_count.load(Ordering::Acquire)
+    }
+
+    /// Number of ticks fully acked by ALL ranks (min over per-rank
+    /// [`RelayEnvelope::TickAck`] counts); ranks that never acked → 0. The
+    /// lockstep loop caps `seq` at `min_acked_ticks() + window` so the tick
+    /// stream paces to engine speed instead of flooding the worker FIFOs.
+    #[must_use]
+    pub fn min_acked_ticks(&self) -> u64 {
+        self.tick_acks.min_acked()
     }
 
     /// Clone the shared completion-sink registry so the async HTTP path can
@@ -935,6 +1002,7 @@ fn spawn_completion_reader(
     stats_sinks: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<WireStats>>>>,
     shutdown: Arc<AtomicBool>,
     ready_count: Arc<AtomicUsize>,
+    tick_acks: Arc<TickAckLedger>,
 ) {
     let _ = channel.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = std::thread::Builder::new()
@@ -974,6 +1042,9 @@ fn spawn_completion_reader(
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             sinks.remove(&request_id);
                         }
+                    }
+                    Ok(Some(RelayEnvelope::TickAck { rank: ack_rank, seq })) => {
+                        tick_acks.ack(ack_rank, seq);
                     }
                     Ok(Some(RelayEnvelope::EngineReady { rank: ready_rank })) => {
                         ready_count.fetch_add(1, Ordering::AcqRel);
@@ -1083,6 +1154,66 @@ mod tests {
             }
             other => panic!("expected TickAdmissions, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tick_ack_round_trip() {
+        let env = RelayEnvelope::TickAck { rank: 3, seq: 17 };
+        let bytes = serde_json::to_vec(&env).unwrap();
+        match serde_json::from_slice(&bytes).unwrap() {
+            RelayEnvelope::TickAck { rank, seq } => {
+                assert_eq!(rank, 3);
+                assert_eq!(seq, 17);
+            }
+            other => panic!("expected TickAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tick_ack_ledger_min_over_all_ranks() {
+        let ledger = TickAckLedger::new([0, 1]);
+        assert_eq!(ledger.min_acked(), 0, "no acks yet");
+        ledger.ack(0, 0);
+        assert_eq!(ledger.min_acked(), 0, "rank 1 never acked");
+        ledger.ack(1, 2);
+        assert_eq!(ledger.min_acked(), 1, "rank 0 only acked seq 0");
+        ledger.ack(0, 2);
+        assert_eq!(ledger.min_acked(), 3, "both ranks acked through seq 2");
+        ledger.ack(0, 1);
+        assert_eq!(ledger.min_acked(), 3, "stale ack is a no-op");
+    }
+
+    #[test]
+    fn coordinator_tracks_min_acked_ticks_from_worker_acks() {
+        let world_size = 2;
+        let pending = RelayCoordinator::bind().unwrap();
+        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+
+        let worker_thread = thread::spawn(move || {
+            let mut worker =
+                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
+                    .unwrap();
+            for seq in 0..3 {
+                worker
+                    .send(&RelayEnvelope::TickAck { rank: 1, seq })
+                    .unwrap();
+            }
+            assert!(worker.recv().unwrap().is_none(), "EOF on coordinator drop");
+        });
+
+        let coord = pending
+            .accept(world_size, Duration::from_secs(5))
+            .expect("worker connected within 5s");
+        assert_eq!(coord.min_acked_ticks(), 0, "no acks consumed yet");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coord.min_acked_ticks() < 3 {
+            assert!(Instant::now() < deadline, "acks not observed within 5s");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(coord.min_acked_ticks(), 3);
+        drop(coord);
+
+        worker_thread.join().unwrap();
     }
 
     #[test]
