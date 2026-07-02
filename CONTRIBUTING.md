@@ -97,6 +97,16 @@ without CUDA. Set `ARLE_SKIP_WEB=1` to skip the web step inside `--full` /
    benchmark claim, or migration-sensitive workflow, include the relevant docs
    updates in the same PR.
 
+## Experience Entries
+
+- Keep new benchmark / incident narratives as top-level markdown entries under
+  `docs/experience/wins/` or `docs/experience/errors/`.
+- Put bulky auxiliary data under `docs/experience/wins/assets/` (or another
+  nested subdirectory) instead of creating more top-level entry files.
+- `python3 scripts/check_repo_hygiene.py` freezes the top-level entry inventory.
+  If you need a new wins/errors entry and the cap is full, archive or
+  consolidate older entries in the same change.
+
 ## PR Readiness Checklist
 
 Before opening a PR, make sure you can answer these clearly:
