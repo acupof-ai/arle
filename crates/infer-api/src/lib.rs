@@ -52,8 +52,8 @@ pub use loaded::{EngineLoadConfig, KvCacheDtype};
 #[cfg(feature = "cuda")]
 pub use serve::serve_coordinator_http;
 pub use serve::{
-    DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeKvSsdOptions,
-    ServeSpecOptions, ServeSpecType, serve_http,
+    DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeSpecOptions,
+    ServeSpecType, default_kv_ssd_root, serve_http, validate_kv_ssd_config,
 };
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so

@@ -16,7 +16,7 @@ pub use infer_seam::KvCacheDtype;
 /// `ARLE_WORKER_ENGINE_CONFIG` so worker ranks build their engines from the
 /// SAME values — any divergence (slots, budgets, chunk size) diverges the
 /// deterministic planner across ranks and deadlocks the NCCL lockstep.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineLoadConfig {
     /// Executor hot-workspace slots. Serving CLI leaves this at the default
     /// unless an internal caller deliberately budgets executor capacity.
@@ -100,6 +100,17 @@ pub struct EngineLoadConfig {
     /// without `--kv-ssd-max-bytes`.
     #[serde(default = "default_ssd_fraction")]
     pub ssd_fraction: f64,
+    /// Opt-in L3 (NVMe) KV spill root (`--kv-ssd-path`). Lives in the engine
+    /// config — not the serve-layer options — so the multiproc coordinator's
+    /// `ARLE_WORKER_ENGINE_CONFIG` carries it and every worker rank attaches
+    /// the tier at build (each process namespaces its own store under this
+    /// root, so ranks never collide).
+    #[serde(default)]
+    pub kv_ssd_root: Option<std::path::PathBuf>,
+    /// L3 budget bytes (`--kv-ssd-max-bytes`), per engine (so per rank under
+    /// multiproc). `None` derives from free disk × `ssd_fraction` at attach.
+    #[serde(default)]
+    pub kv_ssd_max_bytes: Option<usize>,
     /// Opt-in running-cap oversubscription: rotate waiters in by parking the
     /// longest-running decode's whole-slot image (requires a whole-slot tier
     /// backend). Default false → byte-identical.
@@ -150,6 +161,8 @@ impl Default for EngineLoadConfig {
             mem_fraction_static: default_mem_fraction_static(),
             dram_fraction: default_dram_fraction(),
             ssd_fraction: default_ssd_fraction(),
+            kv_ssd_root: None,
+            kv_ssd_max_bytes: None,
             slot_oversubscription: false,
         }
     }
@@ -167,6 +180,30 @@ impl EngineLoadConfig {
 
     pub fn mtp_enabled(&self) -> bool {
         self.mtp_draft_tokens.is_some() || self.mtp_draft_topk.is_some()
+    }
+
+    /// Whether an L3 (NVMe) KV spill was requested at all.
+    #[allow(dead_code)]
+    fn kv_ssd_requested(&self) -> bool {
+        self.kv_ssd_root.is_some() || self.kv_ssd_max_bytes.is_some()
+    }
+
+    /// The resolved L3 spill request: `Some((root, budget))` when a root is
+    /// set; the budget falls back to `default_budget(root, ssd_fraction)`
+    /// (a free-disk probe). A budget without a root fails closed.
+    #[allow(dead_code)]
+    fn kv_ssd_spill(
+        &self,
+        default_budget: impl FnOnce(&std::path::Path, f64) -> usize,
+    ) -> anyhow::Result<Option<(std::path::PathBuf, usize)>> {
+        match (&self.kv_ssd_root, self.kv_ssd_max_bytes) {
+            (Some(root), max_bytes) => {
+                let budget = max_bytes.unwrap_or_else(|| default_budget(root, self.ssd_fraction));
+                Ok(Some((root.clone(), budget)))
+            }
+            (None, Some(_)) => anyhow::bail!("--kv-ssd-max-bytes requires --kv-ssd-path"),
+            (None, None) => Ok(None),
+        }
     }
 }
 
@@ -925,14 +962,12 @@ mod backend {
 
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
-            let kv_ssd = crate::serve::ServeKvSsdOptions::default();
             let resolved = infer_metal::resolve_model_path(model_path)?;
             if infer_metal::model_dir_is_diffusion_gemma(&resolved) {
                 let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
                     model_path,
                     &resolved,
                     config,
-                    &kv_ssd,
                     infer_server::ServeShutdown::new(),
                 )?;
                 return Ok(Self::MetalDiffusionGemma(ServeInferenceEngine::new(
@@ -944,7 +979,6 @@ mod backend {
                     model_path,
                     &resolved,
                     config,
-                    &kv_ssd,
                     infer_server::ServeShutdown::new(),
                 )?;
                 return Ok(Self::MetalGemma4(ServeInferenceEngine::new(
@@ -956,19 +990,14 @@ mod backend {
                     model_path,
                     &resolved,
                     config,
-                    &kv_ssd,
                     infer_server::ServeShutdown::new(),
                 )?;
                 return Ok(Self::MetalDeepseekOcr(ServeInferenceEngine::new(
                     model_id, tokenizer, serve,
                 )));
             }
-            let (serve, tokenizer, model_id) = metal_serve_handle(
-                model_path,
-                config,
-                &kv_ssd,
-                infer_server::ServeShutdown::new(),
-            )?;
+            let (serve, tokenizer, model_id) =
+                metal_serve_handle(model_path, config, infer_server::ServeShutdown::new())?;
             Ok(Self::Metal(ServeInferenceEngine::new(
                 model_id, tokenizer, serve,
             )))
@@ -989,7 +1018,6 @@ mod backend {
                 model_path,
                 enable_cuda_graph,
                 config,
-                &crate::serve::ServeKvSsdOptions::default(),
                 infer_server::ServeShutdown::new(),
             )?;
             Ok(Self::Cuda(ServeInferenceEngine::new(
@@ -1066,27 +1094,26 @@ mod backend {
         model_path: &str,
         enable_cuda_graph: bool,
         config: EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
-        // The T2 disk tier is consumed by CUDA and Metal; every other
+        // The L3 disk tier is consumed by CUDA and Metal; every other
         // backend fails closed on an explicit request instead of silently
         // serving without it.
         #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         anyhow::ensure!(
-            !kv_ssd.requested(),
-            "--kv-ssd-path: the T2 KV tier is only supported by CUDA and Metal today"
+            !config.kv_ssd_requested(),
+            "--kv-ssd-path: the L3 KV tier is only supported by CUDA and Metal today"
         );
 
         #[cfg(feature = "metal")]
         {
             let _ = enable_cuda_graph;
-            return router_metal(model_path, &config, kv_ssd, shutdown);
+            return router_metal(model_path, &config, shutdown);
         }
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
         {
-            return router_cuda(model_path, enable_cuda_graph, &config, kv_ssd, shutdown);
+            return router_cuda(model_path, enable_cuda_graph, &config, shutdown);
         }
 
         #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
@@ -1126,7 +1153,6 @@ mod backend {
     fn metal_serve_handle(
         model_path: &str,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<MetalExecutor, MetalKvPool>,
@@ -1181,6 +1207,9 @@ mod backend {
             );
             scheduler.max_prompt_tokens = scheduler.max_total_tokens;
         }
+        // Opt-in L3 NVMe spill (`--kv-ssd-path`): attached inside the builder —
+        // at construction, like every other tier knob — never post-spawn.
+        let kv_ssd = config.kv_ssd_spill(infer_metal::default_t2_budget_bytes)?;
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
                 let mut executor =
@@ -1190,6 +1219,13 @@ mod backend {
                         resource_plan,
                     )?;
                 executor.set_kv_recall(kv_recall);
+                if let Some((root, budget)) = kv_ssd {
+                    anyhow::ensure!(
+                        executor.set_kv_tier_disk(root, budget, page_size),
+                        "--kv-ssd-path: the loaded Metal model has no usable \
+                         page-addressable KV tier store"
+                    );
+                }
                 let kv = MetalKvPool::new(num_slots, total_pages, page_size);
                 if low_impact {
                     let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
@@ -1209,22 +1245,6 @@ mod backend {
             },
             shutdown,
         )?;
-        if kv_ssd.requested() {
-            let root = kv_ssd
-                .root
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
-            let ssd_fraction = config.ssd_fraction;
-            let budget = kv_ssd
-                .max_bytes
-                .unwrap_or_else(|| infer_metal::default_t2_budget_bytes(&root, ssd_fraction));
-            let consumed =
-                serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget, page_size))?;
-            anyhow::ensure!(
-                consumed,
-                "--kv-ssd-path: the loaded Metal model has no usable page-addressable KV tier store"
-            );
-        }
         Ok((serve, tokenizer, model_id))
     }
 
@@ -1235,14 +1255,12 @@ mod backend {
     fn router_metal(
         model_path: &str,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let resolved = infer_metal::resolve_model_path(model_path)?;
         if infer_metal::model_dir_is_diffusion_gemma(&resolved) {
-            let (serve, tokenizer, model_id) = metal_diffusion_gemma_serve_handle(
-                model_path, &resolved, config, kv_ssd, shutdown,
-            )?;
+            let (serve, tokenizer, model_id) =
+                metal_diffusion_gemma_serve_handle(model_path, &resolved, config, shutdown)?;
             return Ok(infer_server::coordinator_local_router(
                 serve,
                 tokenizer,
@@ -1253,7 +1271,7 @@ mod backend {
         }
         if infer_metal::model_dir_is_gemma4(&resolved) {
             let (serve, tokenizer, model_id) =
-                metal_gemma4_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
+                metal_gemma4_serve_handle(model_path, &resolved, config, shutdown)?;
             return Ok(infer_server::coordinator_local_router(
                 serve,
                 tokenizer,
@@ -1264,7 +1282,7 @@ mod backend {
         }
         if infer_metal::model_dir_is_deepseek_ocr(&resolved) {
             let (serve, tokenizer, model_id) =
-                metal_deepseek_ocr_serve_handle(model_path, &resolved, config, kv_ssd, shutdown)?;
+                metal_deepseek_ocr_serve_handle(model_path, &resolved, config, shutdown)?;
             return Ok(infer_server::coordinator_local_router(
                 serve,
                 tokenizer,
@@ -1273,8 +1291,7 @@ mod backend {
                 Some(infer_plan::MultimodalKind::DeepseekOcr),
             ));
         }
-        let (serve, tokenizer, model_id) =
-            metal_serve_handle(model_path, config, kv_ssd, shutdown)?;
+        let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
@@ -1289,7 +1306,6 @@ mod backend {
         model_path: &str,
         resolved: &std::path::Path,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<BufferedDiffusionExecutor<MetalDiffusionGemmaModel>, HostPagedKvPool>,
@@ -1302,7 +1318,7 @@ mod backend {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         anyhow::ensure!(
-            !kv_ssd.requested(),
+            !config.kv_ssd_requested(),
             "--kv-ssd-path: DiffusionGemma Metal owns no page-addressable KV tier store"
         );
 
@@ -1364,7 +1380,6 @@ mod backend {
         model_path: &str,
         resolved: &std::path::Path,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<BufferedDiffusionExecutor<MetalGemma4Model>, HostPagedKvPool>,
@@ -1377,7 +1392,7 @@ mod backend {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         anyhow::ensure!(
-            !kv_ssd.requested(),
+            !config.kv_ssd_requested(),
             "--kv-ssd-path: Gemma4 Metal owns no page-addressable KV tier store"
         );
 
@@ -1446,7 +1461,6 @@ mod backend {
         model_path: &str,
         resolved: &std::path::Path,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<BufferedDiffusionExecutor<MetalDeepseekOcrModel>, HostPagedKvPool>,
@@ -1459,7 +1473,7 @@ mod backend {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
         anyhow::ensure!(
-            !kv_ssd.requested(),
+            !config.kv_ssd_requested(),
             "--kv-ssd-path: DeepSeek-OCR Metal owns no page-addressable KV tier store"
         );
 
@@ -1631,7 +1645,6 @@ mod backend {
         model_path: &str,
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<(
         ServeHandle<CudaExecutor, CudaKvPool>,
@@ -1645,33 +1658,11 @@ mod backend {
         let model_id = crate::serve_engine::model_id_from_path(model_path);
 
         let model_source = model_path.to_string();
-        let engine_config = *config;
+        let engine_config = config.clone();
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || build_cuda_engine(&model_source, &engine_config),
             shutdown,
         )?;
-        // Opt-in T2 disk spill (`--kv-ssd-path`): attach pre-traffic via the
-        // engine-thread control seam; fail closed instead of silently
-        // serving without the requested tier.
-        if kv_ssd.requested() {
-            let root = kv_ssd
-                .root
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--kv-ssd-max-bytes requires --kv-ssd-path"))?;
-            // Machine-derived L3 (NVMe) budget when `--kv-ssd-max-bytes` is
-            // unset: probe free disk at the spill root and claim
-            // `--ssd-fraction` of it (under a reserve). Borrow ends before move.
-            let ssd_fraction = config.ssd_fraction;
-            let budget = kv_ssd
-                .max_bytes
-                .unwrap_or_else(|| infer_cuda::default_t2_budget_bytes(&root, ssd_fraction));
-            let consumed = serve.run_on_executor(move |e| e.set_kv_tier_disk(root, budget))?;
-            anyhow::ensure!(
-                consumed,
-                "--kv-ssd-path: the loaded model has no page-addressable KV tier store \
-                 (Qwen3-dense + Qwen3.6 + DSv4 FlashMLA page-tier)"
-            );
-        }
         Ok((serve, tokenizer, model_id))
     }
 
@@ -1821,6 +1812,19 @@ mod backend {
         // decode hot path is byte-identical (CUDA is the Stable backend). Set here
         // (the ONE engine constructor every rank uses) so single-GPU + TP agree.
         executor.set_kv_recall(config.kv_recall)?;
+        // Opt-in L3 NVMe spill (`--kv-ssd-path`): attached HERE so single-proc
+        // rank 0 and multiproc worker ranks agree (the old post-spawn serve-layer
+        // hook never reached multiproc workers → workers served with a zero-page
+        // tier and every demote fell back to recompute). Must follow the budget
+        // setters above: the tier-store arms rebuild their store on re-budget,
+        // which would drop an earlier disk attach.
+        if let Some((root, budget)) = config.kv_ssd_spill(infer_cuda::default_t2_budget_bytes)? {
+            anyhow::ensure!(
+                executor.set_kv_tier_disk(root, budget),
+                "--kv-ssd-path: the loaded model has no KV tier store to spill \
+                 (Qwen3-dense page tier + Qwen3.6/DSv4 slot tier)"
+            );
+        }
         // The DSv4 constructor may clamp slots below the request (dynamic KV
         // mem budget, NCCL min-reduced ⇒ identical on every rank). Scheduler +
         // admission pool MUST follow the effective count: admitting to a slot
@@ -2039,11 +2043,10 @@ mod backend {
         model_path: &str,
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
-        kv_ssd: &crate::serve::ServeKvSsdOptions,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) =
-            cuda_serve_handle(model_path, enable_cuda_graph, config, kv_ssd, shutdown)?;
+            cuda_serve_handle(model_path, enable_cuda_graph, config, shutdown)?;
         Ok(infer_server::coordinator_local_router(
             serve,
             tokenizer,
