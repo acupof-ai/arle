@@ -567,6 +567,18 @@ impl CudaKvTierStore {
     }
 
     pub(crate) fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
+        // ONE size contract for both levels: a payload that cannot land in a
+        // disk slot is refused up front. Without this, the host level accepts
+        // it and a later cold-spill (or a `--kv-dram 0` direct write) hits
+        // `KvMmapStore::write_slot`'s assert — a process abort, not a miss.
+        if payload.len() > self.bytes_per_page {
+            log::warn!(
+                "KV tier insert refused: payload {} B > page {} B (key {key})",
+                payload.len(),
+                self.bytes_per_page
+            );
+            return false;
+        }
         if self.host.len() < self.host_capacity_pages {
             self.insert_host(key, payload);
             return true;
@@ -844,10 +856,11 @@ mod tests {
 
     #[test]
     fn chunked_blob_round_trips_and_accounts() {
-        // 8-byte pages; a 20-byte blob = 1 manifest + 3 chunks = 4 pages.
-        let mut store = CudaKvTierStore::with_budget(80, 8);
+        // 32-byte pages (the manifest must fit ONE page); an 80-byte blob =
+        // 1 manifest + 3 chunks = 4 pages.
+        let mut store = CudaKvTierStore::with_budget(32 * 10, 32);
         let baseline = store.available_pages();
-        let blob: Vec<u8> = (0..20u8).collect();
+        let blob: Vec<u8> = (0..80u8).collect();
         assert!(store.insert_chunked(3, 4, 7, &blob));
         assert_eq!(store.available_pages(), baseline - 4);
         assert_eq!(store.read_chunked(3, 4, 7).expect("read back"), blob);
@@ -866,9 +879,9 @@ mod tests {
     /// as monotonic page counts.
     #[test]
     fn superseded_chunked_blob_removal_returns_store_to_baseline() {
-        let mut store = CudaKvTierStore::with_budget(160, 8);
+        let mut store = CudaKvTierStore::with_budget(32 * 20, 32);
         let baseline = store.available_pages();
-        let blob: Vec<u8> = (0..20u8).collect();
+        let blob: Vec<u8> = (0..80u8).collect();
         assert!(store.insert_chunked(3, 4, 1, &blob), "v1 inserts");
         assert!(store.insert_chunked(3, 4, 2, &blob), "v2 inserts alongside");
         assert_eq!(store.available_pages(), baseline - 8);
@@ -886,10 +899,10 @@ mod tests {
         // Zero host pages: everything goes straight to the mmap level
         // (the --kv-dram 0 shape used on the pod).
         let root = temp_root("chunked_disk");
-        let mut store = CudaKvTierStore::with_budget(0, 8);
-        assert!(store.set_disk(root.clone(), 160, 8));
+        let mut store = CudaKvTierStore::with_budget(0, 32);
+        assert!(store.set_disk(root.clone(), 32 * 20, 32));
         let baseline = store.available_pages();
-        let blob: Vec<u8> = (0..20u8).collect();
+        let blob: Vec<u8> = (0..80u8).collect();
         assert!(store.insert_chunked(3, 4, 1, &blob));
         assert_eq!(store.disk_pages(), 4, "manifest + 3 chunks on disk");
         assert!(store.insert_chunked(3, 4, 2, &blob));
@@ -902,10 +915,29 @@ mod tests {
 
     #[test]
     fn remove_chunked_tolerates_missing_manifest() {
-        let mut store = CudaKvTierStore::with_budget(80, 8);
+        let mut store = CudaKvTierStore::with_budget(32 * 10, 32);
         let baseline = store.available_pages();
         store.remove_chunked(3, 4, 99); // never inserted
         assert_eq!(store.available_pages(), baseline);
+    }
+
+    /// Round-3 pod finding: an oversized payload must be REFUSED, not abort
+    /// the process. The disk level's `write_slot` asserts `len <= slot_bytes`;
+    /// before the insert-side guard, a host-accepted oversize payload
+    /// panicked there on cold-spill (or immediately under `--kv-dram 0`).
+    #[test]
+    fn oversized_payload_fails_closed_on_both_levels() {
+        // Disk-only shape (--kv-dram 0): refusal, not the write_slot assert.
+        let root = temp_root("oversize");
+        let mut store = CudaKvTierStore::with_budget(0, 8);
+        assert!(store.set_disk(root.clone(), 64, 8));
+        assert!(!store.insert(1, vec![0; 13]), "oversize refused, no panic");
+        assert_eq!(store.disk_pages(), 0);
+        // Host shape: refused up front too (one contract for both levels).
+        let mut host_store = CudaKvTierStore::with_budget(64, 8);
+        assert!(!host_store.insert(1, vec![0; 13]));
+        assert_eq!(host_store.host_demoted_pages(), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
