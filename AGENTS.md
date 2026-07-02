@@ -226,6 +226,15 @@ source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
 
 Skip rules: trivial → Implement + Verify; exploration questions → Explore only.
 
+**Tests — minimal, end-to-end, only when the logic needs one.** Default is no
+new unit test; YAGNI applies to tests too. Add one only when the change carries
+logic that can silently break (a branch, parser, quant / rollback / sampling /
+security path), and then the **smallest single end-to-end gate** that fails when
+that logic breaks — the correct-inference gate (`needle_gate.py` /
+`lever_gate.sh`) or one bench / smoke run — not a per-function suite of granular
+unit tests. `cargo test --workspace` in the Verify row is the "keep the existing
+suite green" gate, not a mandate to add tests per change.
+
 ### Editing
 
 - **Preserve by default.** Never delete content not explicitly in scope.
