@@ -18,6 +18,22 @@ pub fn argmax_logit(logits: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Merge per-rank `(max_logit, global_argmax)` pairs from a vocab-sharded
+/// lm_head (`ARLE_DSV4_LM_HEAD_SHARD=1`, #99) into the global greedy token.
+/// Exactly reproduces the CUDA device argmax it replaces (`sampling.cu`
+/// `warp_reduce_argmax`): max value wins, ties resolve to the LOWEST index.
+/// (NB: [`argmax_logit`]'s `max_by` resolves ties to the highest index — the
+/// device kernel, not the host helper, is this merge's parity reference.)
+/// Pure host math, so every TP rank derives the same winner from the same
+/// gathered pairs. `None` iff `pairs` is empty.
+#[must_use]
+pub fn merge_vocab_shard_argmax(pairs: impl IntoIterator<Item = (f32, u32)>) -> Option<u32> {
+    pairs
+        .into_iter()
+        .max_by(|(a_val, a_idx), (b_val, b_idx)| a_val.total_cmp(b_val).then(b_idx.cmp(a_idx)))
+        .map(|(_, idx)| idx)
+}
+
 /// SplitMix64 — a tiny dependency-free mixer turning a seed into a u64 stream.
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -238,6 +254,48 @@ mod sampler_tests {
             }
             assert_eq!(sample_token(&logits, &p, position), expected);
         }
+    }
+
+    /// Host mimic of the device argmax tie rule (`sampling.cu`): first
+    /// (lowest-index) maximum wins. `argmax_logit` differs on ties (max_by
+    /// keeps the LAST maximum), so it is not the parity reference here.
+    fn device_argmax(logits: &[f32]) -> u32 {
+        let mut best = 0usize;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > logits[best] {
+                best = i;
+            }
+        }
+        best as u32
+    }
+
+    #[test]
+    fn vocab_shard_merge_matches_full_device_argmax() {
+        // 4 "ranks" of 4 logits each: the merge over per-slice (max, argmax)
+        // must equal the device argmax over the concatenated vector.
+        let slices: Vec<Vec<f32>> = vec![
+            vec![0.1, -2.0, 0.9, 0.3],
+            vec![4.0, 0.0, 0.0, 0.0],
+            vec![-1.0, 4.0, 2.0, 3.9],
+            vec![0.0, 0.0, 0.0, 3.99],
+        ];
+        let full: Vec<f32> = slices.iter().flatten().copied().collect();
+        let pairs = slices.iter().enumerate().map(|(rank, s)| {
+            let local = device_argmax(s);
+            (s[local as usize], rank as u32 * 4 + local)
+        });
+        // Tie between global 4 (rank 1) and global 9 (rank 2): lowest index
+        // wins, matching the device kernel's `idx <` tie rule.
+        assert_eq!(merge_vocab_shard_argmax(pairs), Some(4));
+        assert_eq!(device_argmax(&full), 4);
+    }
+
+    #[test]
+    fn vocab_shard_merge_tie_resolves_to_lowest_index() {
+        let pairs = [(1.5, 700u32), (1.5, 3u32), (1.5, 42u32)];
+        assert_eq!(merge_vocab_shard_argmax(pairs), Some(3));
+        assert_eq!(merge_vocab_shard_argmax([]), None);
+        assert_eq!(merge_vocab_shard_argmax([(f32::NEG_INFINITY, 9)]), Some(9));
     }
 
     #[test]
