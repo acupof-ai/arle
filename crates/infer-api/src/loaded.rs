@@ -9,6 +9,10 @@
 /// service/scheduler layers stay backend-agnostic. Backends resolve it against
 /// their own support matrix at construction (Metal → `MetalKvCacheDtype`).
 pub use infer_seam::KvCacheDtype;
+/// Requested KV tier budget (bytes | fraction | off) — re-exported from the
+/// seam like [`KvCacheDtype`]. Deployment-total; the engine constructor
+/// divides by the TP world size.
+pub use infer_seam::KvTierBudget;
 
 /// Slot / page configuration for [`LoadedInferenceEngine::load_with_config`].
 ///
@@ -44,11 +48,6 @@ pub struct EngineLoadConfig {
     /// builder so the service/scheduler layers stay device-neutral.
     #[serde(default)]
     pub kv_cache_dtype: KvCacheDtype,
-    /// Host-RAM budget for the T1 prefix-KV tier in bytes. `None` keeps the
-    /// backend default (CUDA dense: 4 GiB, default-on); `Some(0)` disables
-    /// the tier. Backends without a tier store ignore it.
-    #[serde(default)]
-    pub kv_t1_budget_bytes: Option<usize>,
     /// Whole-process memory budget for unified-memory backends. Metal maps this
     /// to MLX memory/cache/wired limits before loading weights and clamps KV
     /// capacity to fit. `None` lets the backend derive a budget from physical
@@ -87,30 +86,21 @@ pub struct EngineLoadConfig {
     /// Qwen3.5/3.6 and DSv4 keep their per-slot sizing this phase.
     #[serde(default = "default_mem_fraction_static")]
     pub mem_fraction_static: f64,
-    /// Fraction of *available* host DRAM the L2 (host-DRAM) KV tier may claim
-    /// (`--dram-fraction`, default 0.5 — the store is pageable host memory on a
-    /// shared box). Budget = `clamp(frac × MemAvailable, [4 GiB, MemAvailable −
-    /// max(64 GiB, 0.15 × MemTotal)])`. CUDA only; `--kv-t1-budget-bytes` is an
-    /// explicit override that wins over this fraction.
-    #[serde(default = "default_dram_fraction")]
-    pub dram_fraction: f64,
-    /// Fraction of *free* disk the L3 (NVMe) KV tier may claim (`--ssd-fraction`,
-    /// default 0.5). Budget = `clamp(frac × free_disk, [8 GiB, free_disk −
-    /// max(50 GiB, 0.1 × total_disk)])`. Applies when `--kv-ssd-path` is set
-    /// without `--kv-ssd-max-bytes`.
-    #[serde(default = "default_ssd_fraction")]
-    pub ssd_fraction: f64,
-    /// Opt-in L3 (NVMe) KV spill root (`--kv-ssd-path`). Lives in the engine
+    /// L2 (host DRAM) KV tier budget, deployment-total. Default: half of
+    /// MemAvailable. `Off` disables the level.
+    #[serde(default)]
+    pub kv_dram: KvTierBudget,
+    /// Opt-in L3 (NVMe) KV spill root (`--kv-disk`). Lives in the engine
     /// config — not the serve-layer options — so the multiproc coordinator's
     /// `ARLE_WORKER_ENGINE_CONFIG` carries it and every worker rank attaches
     /// the tier at build (each process namespaces its own store under this
     /// root, so ranks never collide).
     #[serde(default)]
     pub kv_ssd_root: Option<std::path::PathBuf>,
-    /// L3 budget bytes (`--kv-ssd-max-bytes`), per engine (so per rank under
-    /// multiproc). `None` derives from free disk × `ssd_fraction` at attach.
+    /// L3 (NVMe) cap under `kv_ssd_root`, deployment-total. `None` derives
+    /// half of free disk at the root; `Some` without a root fails closed.
     #[serde(default)]
-    pub kv_ssd_max_bytes: Option<usize>,
+    pub kv_disk_limit: Option<KvTierBudget>,
     /// Opt-in running-cap oversubscription: rotate waiters in by parking the
     /// longest-running decode's whole-slot image (requires a whole-slot tier
     /// backend). Default false → byte-identical.
@@ -123,18 +113,6 @@ pub struct EngineLoadConfig {
 /// inline literal) so `#[serde(default = ...)]` can name it.
 fn default_mem_fraction_static() -> f64 {
     0.9
-}
-
-/// Default L2 host-DRAM tier fraction (0.5): the store is pageable host memory
-/// on a shared box, so half of available DRAM (under a reserve) — never greedy.
-fn default_dram_fraction() -> f64 {
-    0.5
-}
-
-/// Default L3 NVMe tier fraction (0.5): half of free disk under a reserve for
-/// the FS + co-tenants.
-fn default_ssd_fraction() -> f64 {
-    0.5
 }
 
 impl Default for EngineLoadConfig {
@@ -151,7 +129,6 @@ impl Default for EngineLoadConfig {
             mtp_draft_tokens: None,
             mtp_draft_topk: None,
             kv_cache_dtype: KvCacheDtype::Auto,
-            kv_t1_budget_bytes: None,
             memory_budget_bytes: None,
             system_reserve_bytes: None,
             allow_swap: false,
@@ -159,10 +136,9 @@ impl Default for EngineLoadConfig {
             kv_recall: false,
             max_thinking_tokens: 0,
             mem_fraction_static: default_mem_fraction_static(),
-            dram_fraction: default_dram_fraction(),
-            ssd_fraction: default_ssd_fraction(),
+            kv_dram: KvTierBudget::default(),
             kv_ssd_root: None,
-            kv_ssd_max_bytes: None,
+            kv_disk_limit: None,
             slot_oversubscription: false,
         }
     }
@@ -185,23 +161,41 @@ impl EngineLoadConfig {
     /// Whether an L3 (NVMe) KV spill was requested at all.
     #[allow(dead_code)]
     fn kv_ssd_requested(&self) -> bool {
-        self.kv_ssd_root.is_some() || self.kv_ssd_max_bytes.is_some()
+        self.kv_ssd_root.is_some() || self.kv_disk_limit.is_some()
     }
 
-    /// The resolved L3 spill request: `Some((root, budget))` when a root is
-    /// set; the budget falls back to `default_budget(root, ssd_fraction)`
-    /// (a free-disk probe). A budget without a root fails closed.
+    /// The resolved per-rank L3 spill request: `Some((root, budget_bytes))`.
+    /// `default_budget(root, fraction)` probes free disk; `world` divides the
+    /// deployment-total cap into per-rank shares.
     #[allow(dead_code)]
     fn kv_ssd_spill(
         &self,
+        world: usize,
         default_budget: impl FnOnce(&std::path::Path, f64) -> usize,
     ) -> anyhow::Result<Option<(std::path::PathBuf, usize)>> {
-        match (&self.kv_ssd_root, self.kv_ssd_max_bytes) {
-            (Some(root), max_bytes) => {
-                let budget = max_bytes.unwrap_or_else(|| default_budget(root, self.ssd_fraction));
-                Ok(Some((root.clone(), budget)))
+        let world = world.max(1);
+        match (&self.kv_ssd_root, self.kv_disk_limit) {
+            (Some(root), limit) => {
+                let total = match limit {
+                    None => default_budget(root, 0.5),
+                    Some(KvTierBudget::Fraction(f)) => {
+                        anyhow::ensure!(
+                            f > 0.0 && f <= 1.0,
+                            "--kv-disk-limit fraction must be in (0, 1]"
+                        );
+                        default_budget(root, f)
+                    }
+                    Some(KvTierBudget::Bytes(b)) => {
+                        anyhow::ensure!(b > 0, "--kv-disk-limit must be positive");
+                        b
+                    }
+                    Some(KvTierBudget::Off) => {
+                        anyhow::bail!("--kv-disk-limit off is meaningless; omit --kv-disk instead")
+                    }
+                };
+                Ok(Some((root.clone(), total / world)))
             }
-            (None, Some(_)) => anyhow::bail!("--kv-ssd-max-bytes requires --kv-ssd-path"),
+            (None, Some(_)) => anyhow::bail!("--kv-disk-limit requires --kv-disk"),
             (None, None) => Ok(None),
         }
     }
@@ -382,6 +376,7 @@ mod backend {
 
     #[cfg(feature = "cuda")]
     use infer_cuda::{CudaExecutor, CudaKvPool};
+    // For the `--kv-oversubscription` whole-slot-tier capability probe.
     #[cfg(feature = "hip")]
     use infer_hip::{HipDsv4Executor, HipKvPool};
     #[cfg(feature = "metal")]
@@ -389,6 +384,8 @@ mod backend {
         MetalDeepseekOcrModel, MetalDiffusionGemmaModel, MetalExecutor, MetalGemma4Model,
         MetalKvPool,
     };
+    #[cfg(feature = "cuda")]
+    use infer_seam::BackendExecutor;
     #[cfg(feature = "metal")]
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool};
     #[cfg(feature = "vulkan")]
@@ -1065,7 +1062,7 @@ mod backend {
             }
             anyhow::ensure!(
                 !config.kv_ssd_requested(),
-                "--kv-ssd-path: the CPU backend has no KV tier store"
+                "--kv-disk: the CPU backend has no KV tier store"
             );
             // CPU smoke: placeholder executor over a real host KV pool; still
             // needs a tokenizer dir for encode/decode.
@@ -1106,7 +1103,7 @@ mod backend {
         #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
         anyhow::ensure!(
             !config.kv_ssd_requested(),
-            "--kv-ssd-path: the L3 KV tier is only supported by CUDA and Metal today"
+            "--kv-disk: the L3 KV tier is only supported by CUDA and Metal today"
         );
 
         #[cfg(feature = "metal")]
@@ -1211,9 +1208,11 @@ mod backend {
             );
             scheduler.max_prompt_tokens = scheduler.max_total_tokens;
         }
-        // Opt-in L3 NVMe spill (`--kv-ssd-path`): attached inside the builder —
+        // Opt-in L3 NVMe spill (`--kv-disk`): attached inside the builder —
         // at construction, like every other tier knob — never post-spawn.
-        let kv_ssd = config.kv_ssd_spill(infer_metal::default_t2_budget_bytes)?;
+        // Metal serves single-process, so the deployment-total cap is the
+        // per-rank cap (world = 1).
+        let kv_ssd = config.kv_ssd_spill(1, infer_metal::default_t2_budget_bytes)?;
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
                 let mut executor =
@@ -1226,7 +1225,7 @@ mod backend {
                 if let Some((root, budget)) = kv_ssd {
                     anyhow::ensure!(
                         executor.set_kv_tier_disk(root, budget, page_size),
-                        "--kv-ssd-path: the loaded Metal model has no usable \
+                        "--kv-disk: the loaded Metal model has no usable \
                          page-addressable KV tier store"
                     );
                 }
@@ -1323,7 +1322,7 @@ mod backend {
         }
         anyhow::ensure!(
             !config.kv_ssd_requested(),
-            "--kv-ssd-path: DiffusionGemma Metal owns no page-addressable KV tier store"
+            "--kv-disk: DiffusionGemma Metal owns no page-addressable KV tier store"
         );
 
         let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
@@ -1397,7 +1396,7 @@ mod backend {
         }
         anyhow::ensure!(
             !config.kv_ssd_requested(),
-            "--kv-ssd-path: Gemma4 Metal owns no page-addressable KV tier store"
+            "--kv-disk: Gemma4 Metal owns no page-addressable KV tier store"
         );
 
         let tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
@@ -1478,7 +1477,7 @@ mod backend {
         }
         anyhow::ensure!(
             !config.kv_ssd_requested(),
-            "--kv-ssd-path: DeepSeek-OCR Metal owns no page-addressable KV tier store"
+            "--kv-disk: DeepSeek-OCR Metal owns no page-addressable KV tier store"
         );
 
         let mut tokenizer = OpenAiTokenizer::from_model_dir(resolved)?;
@@ -1670,6 +1669,25 @@ mod backend {
         Ok((serve, tokenizer, model_id))
     }
 
+    /// TP world size, mirroring cli::serve_multiproc::world_size_from_env —
+    /// INFER_TP_SIZE, else the INFER_CUDA_DEVICES count, else 1. Every rank
+    /// sees identical env, so budget division is rank-invariant.
+    #[cfg(feature = "cuda")]
+    fn tp_world_size() -> usize {
+        if let Some(n) = std::env::var("INFER_TP_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            return n;
+        }
+        std::env::var("INFER_CUDA_DEVICES")
+            .ok()
+            .map(|list| list.split(',').filter(|s| !s.trim().is_empty()).count())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    }
+
     /// Build the CUDA `Engine` (executor + admission KV pool + scheduler) for
     /// `model_path` — the ONE engine constructor every rank uses. rank 0 runs it
     /// inside [`ServeHandle::spawn_with_engine_builder`]; multiproc worker ranks
@@ -1801,34 +1819,63 @@ mod backend {
             }
         };
         let mut executor = executor;
-        // L2 (host DRAM) tier sizing: `--dram-fraction` (default 0.5) re-budgets
-        // the prefix/recall tier from MEASURED available DRAM with a reserve so
-        // the shared box never swaps. Run FIRST so an explicit
-        // `--kv-t1-budget-bytes` cap below still wins.
-        executor.set_dram_fraction(config.dram_fraction);
-        if let Some(bytes) = config.kv_t1_budget_bytes {
-            // Pre-serve re-budget of the T1 prefix tier (0 disables); None
-            // keeps the executor's --dram-fraction-derived budget.
-            executor.set_kv_tier_budget_bytes(bytes);
+        // Fail loud on flag+model combos the executor would otherwise silently
+        // ignore, BEFORE any budget setter runs.
+        if config.kv_recall {
+            anyhow::ensure!(
+                matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35),
+                "--kv-recall is not wired for {kind:?}; it would be silently ignored"
+            );
         }
-        // Session KV-recall ("infinite memory", `--kv-recall`, default off). Wired
-        // for the dense-Qwen3 paged decode arm; other arms log + ignore. Off → the
-        // decode hot path is byte-identical (CUDA is the Stable backend). Set here
-        // (the ONE engine constructor every rank uses) so single-GPU + TP agree.
+        if config.slot_oversubscription {
+            anyhow::ensure!(
+                executor.kv_slot_tier_enabled(),
+                "--kv-oversubscription: {kind:?} has no whole-slot tier \
+                 (dense Qwen3 preempts via its page tier instead)"
+            );
+        }
+        // L2 budget: deployment-total → per-rank share, resolved at the ONE
+        // constructor every rank runs (world size is env-identical per rank, so
+        // the division is lockstep-deterministic).
+        let world = tp_world_size();
+        let dram_rank_bytes = infer_cuda::resolve_dram_budget_bytes(config.kv_dram, world);
+        executor.set_kv_tier_budget_bytes(dram_rank_bytes);
+        // Session KV-recall ("infinite memory", `--kv-recall`, default off). Off →
+        // the decode hot path is byte-identical (CUDA is the Stable backend). Set
+        // here (the ONE engine constructor every rank uses) so single-GPU + TP
+        // agree.
         executor.set_kv_recall(config.kv_recall)?;
-        // Opt-in L3 NVMe spill (`--kv-ssd-path`): attached HERE so single-proc
+        // Opt-in L3 NVMe spill (`--kv-disk`): attached HERE so single-proc
         // rank 0 and multiproc worker ranks agree (the old post-spawn serve-layer
         // hook never reached multiproc workers → workers served with a zero-page
         // tier and every demote fell back to recompute). Must follow the budget
         // setters above: the tier-store arms rebuild their store on re-budget,
         // which would drop an earlier disk attach.
-        if let Some((root, budget)) = config.kv_ssd_spill(infer_cuda::default_t2_budget_bytes)? {
+        let kv_disk = config.kv_ssd_spill(world, infer_cuda::default_t2_budget_bytes)?;
+        if let Some((root, budget)) = &kv_disk {
             anyhow::ensure!(
-                executor.set_kv_tier_disk(root, budget),
-                "--kv-ssd-path: the loaded model has no KV tier store to spill \
+                executor.set_kv_tier_disk(root.clone(), *budget),
+                "--kv-disk: the loaded model has no KV tier store to spill \
                  (Qwen3-dense page tier + Qwen3.6/DSv4 slot tier)"
             );
         }
+        log::info!(
+            "KV tiers: dtype={} | L1 mem_fraction_static={} | L2 {dram_rank_bytes}B/rank \
+             (deployment {:?}, world {world}) | L3 {} | features: prefix{}{}",
+            kv_dtype.label(),
+            config.mem_fraction_static,
+            config.kv_dram,
+            match &kv_disk {
+                Some((root, budget)) => format!("root={} cap {budget}B/rank", root.display()),
+                None => "off".to_string(),
+            },
+            if config.slot_oversubscription {
+                ",park"
+            } else {
+                ""
+            },
+            if config.kv_recall { ",recall" } else { "" },
+        );
         // The DSv4 constructor may clamp slots below the request (dynamic KV
         // mem budget, NCCL min-reduced ⇒ identical on every rank). Scheduler +
         // admission pool MUST follow the effective count: admitting to a slot
@@ -2124,7 +2171,7 @@ mod backend {
         }
         anyhow::ensure!(
             !config.kv_ssd_requested(),
-            "--kv-ssd-path: the HIP backend has no KV tier store"
+            "--kv-disk: the HIP backend has no KV tier store"
         );
         let gguf_path = resolve_gguf_path(model_path, "HIP")?;
         let tokenizer_dir = gguf_path
@@ -2174,7 +2221,7 @@ mod backend {
         }
         anyhow::ensure!(
             !config.kv_ssd_requested(),
-            "--kv-ssd-path: the Vulkan backend has no KV tier store"
+            "--kv-disk: the Vulkan backend has no KV tier store"
         );
         let gguf_path = resolve_gguf_path(model_path, "Vulkan")?;
         let tokenizer_dir = gguf_path

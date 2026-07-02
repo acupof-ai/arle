@@ -276,12 +276,16 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     // it: the multiproc coordinator serializes ONLY engine_config into
     // ARLE_WORKER_ENGINE_CONFIG, so serve-layer-only options never reach
     // worker ranks (same reason as the MTP lowering below). Validated here,
-    // pre-spawn, for the same reason.
-    engine_config.kv_ssd_root = serve_args.kv_ssd_path.clone().or_else(|| {
-        (serve_args.kv_ssd || serve_args.kv_ssd_max_bytes.is_some())
-            .then(infer_api::default_kv_ssd_root)
+    // pre-spawn, for the same reason. A bare `--kv-disk` parses as the empty
+    // path (clap `default_missing_value`) and resolves to the default root.
+    engine_config.kv_ssd_root = serve_args.kv_disk.clone().map(|dir| {
+        if dir.as_os_str().is_empty() {
+            infer_api::default_kv_ssd_root()
+        } else {
+            dir
+        }
     });
-    engine_config.kv_ssd_max_bytes = serve_args.kv_ssd_max_bytes;
+    engine_config.kv_disk_limit = serve_args.kv_disk_limit;
     infer_api::validate_kv_ssd_config(&engine_config).map_err(|err| format!("{err:#}"))?;
     // Lower MTP spec into the engine config at the CLI level so BOTH paths carry the
     // draft depth: the multiproc coordinator serializes `config.options.engine_config`
@@ -454,13 +458,11 @@ fn resolve_engine_config(
     }
     config.max_thinking_tokens = serve_args.max_thinking_tokens;
     config.mem_fraction_static = serve_args.mem_fraction_static;
-    config.dram_fraction = serve_args.dram_fraction;
-    config.ssd_fraction = serve_args.ssd_fraction;
+    config.kv_dram = serve_args.kv_dram;
     if let Some(value) = serve_args.chunked_prefill_size {
         config.chunked_prefill_size = value;
     }
-    config.slot_oversubscription = serve_args.slot_oversubscription;
-    config.kv_t1_budget_bytes = serve_args.kv_t1_budget_bytes;
+    config.slot_oversubscription = serve_args.kv_oversubscription;
     config.memory_budget_bytes = serve_args.memory_budget_bytes;
     config.system_reserve_bytes = serve_args.system_reserve_bytes;
     config.allow_swap = serve_args.allow_swap;
@@ -708,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_ssd_flags_lower_into_engine_config() {
+    fn kv_disk_flags_lower_into_engine_config() {
         if skip_if_no_backend() {
             return;
         }
@@ -721,10 +723,10 @@ mod tests {
             compiled_backend_flag(),
             "--model-path",
             "model",
-            "--kv-ssd-path",
+            "--kv-disk",
             "/tmp/arle-kv",
-            "--kv-ssd-max-bytes",
-            "1073741824",
+            "--kv-disk-limit",
+            "1GiB",
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
@@ -732,13 +734,13 @@ mod tests {
             Some(std::path::Path::new("/tmp/arle-kv"))
         );
         assert_eq!(
-            config.options.engine_config.kv_ssd_max_bytes,
-            Some(1_073_741_824)
+            config.options.engine_config.kv_disk_limit,
+            Some(infer_api::KvTierBudget::Bytes(1 << 30))
         );
     }
 
     #[test]
-    fn kv_ssd_flag_uses_default_root() {
+    fn bare_kv_disk_flag_uses_default_root() {
         if skip_if_no_backend() {
             return;
         }
@@ -749,17 +751,18 @@ mod tests {
             compiled_backend_flag(),
             "--model-path",
             "model",
-            "--kv-ssd",
+            "--kv-disk",
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
             config.options.engine_config.kv_ssd_root,
             Some(infer_api::default_kv_ssd_root())
         );
+        assert_eq!(config.options.engine_config.kv_disk_limit, None);
     }
 
     #[test]
-    fn kv_ssd_max_bytes_uses_default_root_without_path() {
+    fn kv_disk_limit_without_kv_disk_errors() {
         if skip_if_no_backend() {
             return;
         }
@@ -770,18 +773,54 @@ mod tests {
             compiled_backend_flag(),
             "--model-path",
             "model",
-            "--kv-ssd-max-bytes",
-            "1073741824",
+            "--kv-disk-limit",
+            "1GiB",
+        ]);
+        let err = resolve_config(&args, &serve).expect_err("limit without root must error");
+        assert!(
+            err.contains("requires --kv-disk"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn kv_dram_zero_lowers_to_off() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--kv-dram",
+            "0",
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
-            config.options.engine_config.kv_ssd_root,
-            Some(infer_api::default_kv_ssd_root())
+            config.options.engine_config.kv_dram,
+            infer_api::KvTierBudget::Off
         );
-        assert_eq!(
-            config.options.engine_config.kv_ssd_max_bytes,
-            Some(1_073_741_824)
-        );
+    }
+
+    #[test]
+    fn kv_oversubscription_lowers_into_engine_config() {
+        if skip_if_no_backend() {
+            return;
+        }
+        let (args, serve) = parse_serve(&[
+            "arle",
+            "serve",
+            "--backend",
+            compiled_backend_flag(),
+            "--model-path",
+            "model",
+            "--kv-oversubscription",
+        ]);
+        let config = resolve_config(&args, &serve).expect("resolve");
+        assert!(config.options.engine_config.slot_oversubscription);
     }
 
     #[test]

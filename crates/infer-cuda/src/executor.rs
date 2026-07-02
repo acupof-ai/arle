@@ -476,19 +476,6 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Apply the `--dram-fraction` knob (default 0.5): re-budget the L2 host-DRAM
-    /// KV tier from measured DRAM at this fraction. Pre-serve only. The dense arm
-    /// re-budgets its eager prefix tier immediately; the Qwen3.6 arm stores it for
-    /// the lazily-built recall tier; DSv4 owns per-slot KV and has no tier (no-op).
-    /// Run BEFORE any `--kv-t1-budget-bytes` override (that explicit cap wins).
-    pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
-        match self {
-            Self::Qwen(q) => q.set_dram_fraction(fraction),
-            Self::Qwen35(q) => q.set_dram_fraction(fraction),
-            Self::Dsv4(d) => d.set_dram_fraction(fraction),
-        }
-    }
-
     /// Opt into session KV-recall (`--kv-recall`, default off). Wired for the
     /// dense-Qwen3 paged decode arm (the only CUDA arm with a paged page table +
     /// page-granular tier); the Qwen3.5/3.6 hybrid and DSv4 arms own per-slot KV
@@ -515,7 +502,7 @@ impl RealCudaExecutor {
 
     /// Attach the opt-in disk spill level (pre-serve only). Returns whether
     /// any arm consumed it, so callers can fail closed instead of silently
-    /// dropping an explicit `--kv-ssd-path` request.
+    /// dropping an explicit `--kv-disk` request.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -723,20 +710,16 @@ impl RealCudaExecutor {
 
 use crate::kv_tier::{CudaKvTierStore, default_t1_budget_bytes};
 
-/// Default fraction of available host DRAM the L2 KV tier may claim when
-/// `--dram-fraction` is unset — the shared-box-safe 0.5 (the store is pageable
-/// host memory; see `infer_seam::DramTierPolicy`). The constructor sizes the
-/// tier at this default; `--dram-fraction` re-budgets it pre-serve.
+/// Construction-time default fraction of available host DRAM the L2 KV tier
+/// may claim — the shared-box-safe 0.5 (the store is pageable host memory; see
+/// `infer_seam::DramTierPolicy`). The engine builder re-budgets pre-serve with
+/// the per-rank share resolved from `--kv-dram`.
 pub(crate) const DEFAULT_DRAM_FRACTION: f64 = 0.5;
 
 pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
     kv: PagedKVPool,
     tier: CudaKvTierStore,
-    /// Fraction of available host DRAM the L2 prefix/recall tier may claim
-    /// (`--dram-fraction`, default 0.5). Set post-construction via
-    /// [`Self::set_dram_fraction`]; the construction-time tier uses the default.
-    dram_fraction: f64,
     num_slots: usize,
     /// Per-slot (occupant epoch, materialized token count) continuity guard.
     ///
@@ -915,7 +898,6 @@ impl QwenCudaExecutor {
             model,
             kv,
             tier,
-            dram_fraction: DEFAULT_DRAM_FRACTION,
             num_slots,
             slot_progress,
             decode_ctx: None,
@@ -958,18 +940,6 @@ impl QwenCudaExecutor {
         self.tier = CudaKvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
     }
 
-    /// Apply the `--dram-fraction` knob: store it and re-budget the (eager) L2
-    /// prefix tier from measured DRAM at that fraction. Pre-serve only (drops any
-    /// existing entries, like `set_kv_tier_budget_bytes`). The explicit
-    /// `--kv-t1-budget-bytes` override, if set, runs AFTER this and wins.
-    pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
-        self.dram_fraction = fraction;
-        self.tier = CudaKvTierStore::with_budget(
-            default_t1_budget_bytes(fraction),
-            self.kv.storage_bytes_per_page(),
-        );
-    }
-
     /// Opt into session KV-recall (`--kv-recall`, default off). Mirrors the Metal
     /// `set_kv_recall`: a post-construction setter so the constructor signature
     /// stays stable. With recall off the decode hot path is unchanged
@@ -978,7 +948,7 @@ impl QwenCudaExecutor {
         self.kv_recall = enabled;
     }
 
-    /// Attach the opt-in disk spill level (`--kv-ssd-path`). Pre-serve only.
+    /// Attach the opt-in disk spill level (`--kv-disk`). Pre-serve only.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
@@ -2500,12 +2470,6 @@ impl Dsv4CudaExecutor {
         self.prefix_index = PrefixIndex::default();
     }
 
-    pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
-        self.slot_tier =
-            CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), Self::SLOT_CHUNK_BYTES);
-        self.prefix_index = PrefixIndex::default();
-    }
-
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
         self.slot_tier.host_demoted_pages()
     }
@@ -3371,7 +3335,7 @@ pub(crate) struct Qwen35CudaExecutor {
     /// `tier_block_u64(slot, page)` keys (separate store ⇒ no aliasing).
     slot_tier: CudaKvTierStore,
     /// Per-unit size (one whole-slot recurrent-block image) for the `slot_tier`
-    /// budget, stored so `set_dram_fraction` / `set_kv_tier_budget_bytes` can
+    /// budget, stored so `set_kv_tier_budget_bytes` can
     /// re-budget the tier post-construction without recomputing it (L2).
     slot_image_bytes: usize,
     /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
@@ -3435,10 +3399,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// `decode_row_recall` for that slot. Holds (logical, physical) so the parked
     /// physical page is the one actually returned to the pool one step later.
     recall_keepalive: Vec<Vec<(usize, u32)>>,
-    /// Fraction of available host DRAM the lazily-built L3 recall tier may claim
-    /// (`--dram-fraction`, default 0.5). Stored at construction; consumed when
-    /// `set_kv_recall(true)` builds `recall_tier`.
-    dram_fraction: f64,
+    /// Resolved per-rank L2 byte budget (`--kv-dram` ÷ world size). Recorded by
+    /// `set_kv_tier_budget_bytes` alongside the `slot_tier` rebuild; consumed
+    /// when `set_kv_recall(true)` lazily builds `recall_tier`.
+    recall_budget_bytes: usize,
 
     /// Model checkpoint path for deriving the weights epoch tag at durable
     /// NVMe spill time (`set_kv_recall` / `set_kv_tier_disk`).
@@ -3448,10 +3412,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// into the durable recall manifest so a restart drops stale KV after an
     /// OPD weight update.
     weights_epoch: String,
-    /// Operator-provided NVMe root for durable recall spill (`--kv-ssd-path`).
+    /// Operator-provided NVMe root for durable recall spill (`--kv-disk`).
     /// `None` until `set_kv_tier_disk` wires it.
     disk_root: Option<std::path::PathBuf>,
-    /// Budget bytes for durable NVMe recall spill (`--kv-ssd-max-bytes`).
+    /// Budget bytes for durable NVMe recall spill (`--kv-disk-limit`).
     /// `None` until `set_kv_tier_disk` wires it.
     disk_budget: Option<usize>,
     /// `mem_fraction_static` + requested page floor captured at construction so
@@ -3806,10 +3770,8 @@ impl Qwen35CudaExecutor {
         // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
         let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
         let slot_image_bytes = (num_linear * (gdr_state_len * 4 + conv_len * 2)).max(1);
-        let slot_tier = CudaKvTierStore::with_budget(
-            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-            slot_image_bytes,
-        );
+        let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
+        let slot_tier = CudaKvTierStore::with_budget(tier_budget_bytes, slot_image_bytes);
 
         // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
         // not graph-capturable on this stack — TP≥2 stays eager, same as
@@ -3840,7 +3802,7 @@ impl Qwen35CudaExecutor {
             kv_format,
             recall_tier: None,
             recall_keepalive: (0..num_slots).map(|_| Vec::new()).collect(),
-            dram_fraction: DEFAULT_DRAM_FRACTION,
+            recall_budget_bytes: tier_budget_bytes,
             model_path: model_path_buf,
             weights_epoch,
             disk_root: None,
@@ -4089,25 +4051,15 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// Apply the `--dram-fraction` knob: store it so the lazily-built L3 recall
-    /// tier sizes its host-DRAM budget at that fraction, AND re-budget the eager
-    /// G3 `slot_tier` from measured DRAM at this fraction (L2 — it was pinned at
-    /// `DEFAULT_DRAM_FRACTION` at construction, ignoring the flag). Pre-serve only
-    /// (drops any existing entries, like the dense arm).
-    pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
-        self.dram_fraction = fraction;
-        self.slot_tier =
-            CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), self.slot_image_bytes);
-    }
-
-    /// Explicit `--kv-t1-budget-bytes` cap for the G3 `slot_tier` (L2). Runs AFTER
-    /// `set_dram_fraction`, so the explicit cap wins. Pre-serve only (drops any
-    /// existing entries).
+    /// Resolved per-rank L2 byte cap (`--kv-dram` ÷ world size) for the G3
+    /// `slot_tier`, also recorded for the lazily-built recall tier. Pre-serve
+    /// only (drops any existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        self.recall_budget_bytes = bytes;
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
     }
 
-    /// Attach NVMe spill (`--kv-ssd-path`): an ephemeral disk level under the
+    /// Attach NVMe spill (`--kv-disk`): an ephemeral disk level under the
     /// G3 `slot_tier` (whole-slot capacity spill) plus a durable level for the
     /// recall tier (attached now if built, else stashed for `set_kv_recall`).
     /// Pre-serve only. The budget is a per-store cap, not a reservation — both
@@ -4147,10 +4099,11 @@ impl Qwen35CudaExecutor {
         if enabled && self.recall_tier.is_none() {
             // L3 write-through tier: source of truth for evict-dropped middle
             // blocks. One entry == one pool page image (all `num_full` layers,
-            // K+V). Host-DRAM budget is dram_fraction-profiled (same policy as the
-            // prefix tier); NVMe spill is opt-in via the prefix-tier
-            // `--kv-ssd-path` wiring. Reuses the SAME `CudaKvTierStore` transport
-            // the dense arm's prefix/write-through tier uses (R5 — one store kind).
+            // K+V). Host-DRAM budget is the resolved per-rank `--kv-dram` share
+            // (same cap as the slot tier); NVMe spill is opt-in via the
+            // prefix-tier `--kv-disk` wiring. Reuses the SAME `CudaKvTierStore`
+            // transport the dense arm's prefix/write-through tier uses (R5 —
+            // one store kind).
             let page_bytes = self
                 .full_attn_kv
                 .as_ref()
@@ -4158,10 +4111,7 @@ impl Qwen35CudaExecutor {
                 .ok_or_else(|| {
                     anyhow::anyhow!("--kv-recall: full-attn paged pool not allocated")
                 })?;
-            let mut tier = CudaKvTierStore::with_budget(
-                default_t1_budget_bytes(self.dram_fraction),
-                page_bytes,
-            );
+            let mut tier = CudaKvTierStore::with_budget(self.recall_budget_bytes, page_bytes);
             // Try loading prior session durable NVMe spill if disk is configured.
             // Falls through to set_disk_durable on first run or epoch mismatch.
             if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {

@@ -59,7 +59,7 @@ impl ServeHttpOptions {
     }
 }
 
-/// The L3 (NVMe) KV spill root a bare `--kv-ssd` resolves to:
+/// The L3 (NVMe) KV spill root a bare `--kv-disk` resolves to:
 /// `ARLE_KV_SSD_PATH`, else the platform cache dir.
 #[must_use]
 pub fn default_kv_ssd_root() -> PathBuf {
@@ -72,39 +72,33 @@ pub fn default_kv_ssd_root() -> PathBuf {
 }
 
 /// Structural validation of the L3 spill request carried by
-/// [`EngineLoadConfig`] (`kv_ssd_root` / `kv_ssd_max_bytes`): the root must be
-/// an absolute, creatable directory. Whether the loaded backend/model can
-/// actually consume the tier is decided at engine build, which fails closed
-/// for arms without a tier store.
+/// [`EngineLoadConfig`] (`kv_ssd_root` / `kv_disk_limit`): the root must be
+/// an absolute, creatable directory, and a limit needs a root. Budget
+/// positivity is enforced where the budget resolves (`kv_ssd_spill`); whether
+/// the loaded backend/model can actually consume the tier is decided at
+/// engine build, which fails closed for arms without a tier store.
 pub fn validate_kv_ssd_config(config: &EngineLoadConfig) -> Result<()> {
     let Some(root) = config.kv_ssd_root.as_ref() else {
         anyhow::ensure!(
-            config.kv_ssd_max_bytes.is_none(),
-            "--kv-ssd-max-bytes requires --kv-ssd-path"
+            config.kv_disk_limit.is_none(),
+            "--kv-disk-limit requires --kv-disk"
         );
         return Ok(());
     };
-    anyhow::ensure!(
-        !root.as_os_str().is_empty(),
-        "--kv-ssd-path must not be empty"
-    );
+    anyhow::ensure!(!root.as_os_str().is_empty(), "--kv-disk must not be empty");
     anyhow::ensure!(
         root.is_absolute(),
-        "--kv-ssd-path must be absolute for serving; got {}",
+        "--kv-disk must be absolute for serving; got {}",
         root.display()
     );
     std::fs::create_dir_all(root)
-        .with_context(|| format!("create --kv-ssd-path {}", root.display()))?;
-    let meta = std::fs::metadata(root)
-        .with_context(|| format!("inspect --kv-ssd-path {}", root.display()))?;
+        .with_context(|| format!("create --kv-disk {}", root.display()))?;
+    let meta =
+        std::fs::metadata(root).with_context(|| format!("inspect --kv-disk {}", root.display()))?;
     anyhow::ensure!(
         meta.is_dir(),
-        "--kv-ssd-path must be a directory; got {}",
+        "--kv-disk must be a directory; got {}",
         root.display()
-    );
-    anyhow::ensure!(
-        config.kv_ssd_max_bytes.is_none_or(|value| value > 0),
-        "--kv-ssd-max-bytes must be positive"
     );
     Ok(())
 }
@@ -331,15 +325,16 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{EngineLoadConfig, validate_kv_ssd_config};
+    use infer_seam::KvTierBudget;
 
     #[test]
-    fn kv_ssd_max_bytes_without_root_is_rejected() {
+    fn kv_disk_limit_without_root_is_rejected() {
         let err = validate_kv_ssd_config(&EngineLoadConfig {
-            kv_ssd_max_bytes: Some(1),
+            kv_disk_limit: Some(KvTierBudget::Bytes(1)),
             ..EngineLoadConfig::default()
         })
-        .expect_err("budget without a root should fail");
-        assert!(err.to_string().contains("requires --kv-ssd-path"));
+        .expect_err("limit without a root should fail");
+        assert!(err.to_string().contains("requires --kv-disk"));
     }
 
     #[test]
@@ -359,35 +354,39 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         validate_kv_ssd_config(&EngineLoadConfig {
             kv_ssd_root: Some(dir.path().to_path_buf()),
-            kv_ssd_max_bytes: Some(1 << 30),
+            kv_disk_limit: Some(KvTierBudget::Bytes(1 << 30)),
             ..EngineLoadConfig::default()
         })
         .expect("valid absolute root should pass structural validation");
     }
 
     /// The multiproc coordinator ships its resolved config to worker ranks as
-    /// JSON (`ARLE_WORKER_ENGINE_CONFIG`); the L3 spill request must survive
+    /// JSON (`ARLE_WORKER_ENGINE_CONFIG`); the KV tier request must survive
     /// that trip, and configs serialized before the fields existed must parse.
     #[test]
     fn kv_ssd_fields_round_trip_worker_config_json() {
         let config = EngineLoadConfig {
+            kv_dram: KvTierBudget::Bytes(64 << 30),
             kv_ssd_root: Some(std::path::PathBuf::from("/data/kv-spill")),
-            kv_ssd_max_bytes: Some(8 << 30),
+            kv_disk_limit: Some(KvTierBudget::Fraction(0.25)),
             ..EngineLoadConfig::default()
         };
         let json = serde_json::to_string(&config).expect("serialize");
         let back: EngineLoadConfig = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.kv_dram, KvTierBudget::Bytes(64 << 30));
         assert_eq!(back.kv_ssd_root, config.kv_ssd_root);
-        assert_eq!(back.kv_ssd_max_bytes, Some(8 << 30));
+        assert_eq!(back.kv_disk_limit, Some(KvTierBudget::Fraction(0.25)));
 
         let mut legacy = serde_json::to_value(EngineLoadConfig::default()).expect("to_value");
         let fields = legacy.as_object_mut().expect("object");
+        fields.remove("kv_dram");
         fields.remove("kv_ssd_root");
-        fields.remove("kv_ssd_max_bytes");
+        fields.remove("kv_disk_limit");
         let parsed: EngineLoadConfig =
             serde_json::from_value(legacy).expect("pre-field worker JSON parses");
+        assert_eq!(parsed.kv_dram, KvTierBudget::default());
         assert_eq!(parsed.kv_ssd_root, None);
-        assert_eq!(parsed.kv_ssd_max_bytes, None);
+        assert_eq!(parsed.kv_disk_limit, None);
     }
 }
 
