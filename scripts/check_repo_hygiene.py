@@ -23,6 +23,7 @@ PUBLIC_DOCS = [
     Path("README.zh-CN.md"),
     Path("CONTRIBUTING.md"),
     Path("CHANGELOG.md"),
+    Path("ROADMAP.md"),
 ]
 
 GOVERNANCE_DOCS = [
