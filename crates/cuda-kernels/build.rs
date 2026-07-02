@@ -1239,6 +1239,24 @@ fn generate_tilelang_artifacts_per_sm(
         results.push((sm_token.clone(), gen_func_name, c_path));
     }
 
+    // ARLE_KERNEL_VENDOR=1: mirror every consumed/restored/regenerated artifact
+    // into the (gitignored) vendored tier — `scripts/kernel_artifacts.sh pack`
+    // tars that directory into the GitHub-Release kernel bundle, and `fetch`
+    // extracts back into it so consumers build with zero Python.
+    if env_truthy("ARLE_KERNEL_VENDOR") {
+        for (_, _, c_path) in &results {
+            let src = c_path.parent().expect("artifact .c has a parent dir");
+            let dst = manifest_dir
+                .join("generated")
+                .join(src.file_name().expect("artifact dir has a name"));
+            if src != dst {
+                let _ = std::fs::remove_dir_all(&dst);
+                copy_dir_recursive(src, &dst)
+                    .unwrap_or_else(|err| panic!("vendor export {}: {err}", dst.display()));
+            }
+        }
+    }
+
     results
 }
 
