@@ -28,9 +28,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # .cargo/config.toml pins `rustc-wrapper = "sccache"`; every job that
-  # runs cargo must install sccache via mozilla-actions/sccache-action.
-  SCCACHE_GHA_ENABLED: "true"
+  # .cargo/config.toml pins `rustc-wrapper = "sccache"` for local dev; in CI
+  # the empty override disables it. sccache's GHA backend flooded the 10 GB
+  # Actions cache quota with per-object entries (10.7 GB / 2581 entries,
+  # 2026-07-02), evicting the rust-cache snapshots below — every run built
+  # cold (~50 min, was 5m39s warm) until the runner died OOM ("lost
+  # communication"). One cache system per lane: Swatinem only on ubuntu.
+  RUSTC_WRAPPER: ""
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -61,9 +65,6 @@ jobs:
         with:
           components: clippy
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
@@ -92,14 +93,14 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Cold rebuild after a cache miss is ~30-50 min at codegen-units=1; the
+    # timeout is a zombie-run backstop, not a perf target (warm ≈ 6 min).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

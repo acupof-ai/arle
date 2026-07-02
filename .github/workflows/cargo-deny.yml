@@ -32,12 +32,23 @@ jobs:
   cargo-deny:
     name: Advisories / Bans / Licenses
     runs-on: ubuntu-latest
+    env:
+      # config.toml pins rustc-wrapper=sccache for local dev; not installed here.
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v7
 
-      # Prebuilt binary — the old `cargo install cargo-deny` compiled it
-      # from source on every push (~2-3 min of pure waste).
-      - name: Run cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # Host-side, not the EmbarkStudios docker action: its musl container
+      # can't satisfy rust-toolchain.toml (uninstalled 1.95.0-musl override
+      # broke every run since 2026-06-30). Prebuilt binary via install-action
+      # keeps the no-compile speed.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny (prebuilt)
+        uses: taiki-e/install-action@v2
         with:
-          command: check advisories bans licenses sources
+          tool: cargo-deny
+
+      - name: Run cargo deny
+        run: cargo deny check advisories bans licenses sources
