@@ -88,6 +88,7 @@ numbers await config.json's N/hidden/vocab):
   KV is replicated anyway). Local-head attention + the EXISTING O all-reduce
   is algebraically identical and deletes one collective per layer. This is
   the cheapest structural cut in the inventory.
+  **BLOCKED at TP>1 (2026-07-02) — see the H1 feasibility verdict below.**
 - **H2 — comm latency per collective**: allreduce of one hidden vector
   (~14 KB bf16) is pure latency. Candidates: DeepEP-LL decode MoE (#61
   license open), NCCL low-latency algo tuning, TP=4-vs-8 A/B (fewer ranks =
@@ -102,6 +103,62 @@ numbers await config.json's N/hidden/vocab):
 
 Phase-1 measurement now has ONE job: confirm the collective/launch share
 (expected dominant) and price t_collective(TP) — then H1/H2 go first.
+
+### H1 feasibility verdict (2026-07-02): BLOCKED at TP>1 — FlashMLA head-count contract
+
+Source-read of the full decode call chain (`try_flashmla_decode_attention`
+→ `arle_flashmla_sm90_sparse_decode_fwd` → vendored SM90 sparse-FP8 kernel).
+The kernel hard-requires the FULL head count; local-head decode cannot run it:
+
+- `crates/cuda-kernels/vendor/flashmla/csrc/sm90/decode/sparse_fp8/config.h:19`
+  — `static_assert(NUM_HEADS == 64 || NUM_HEADS == 128)`; `NUM_M_BLOCKS =
+  NUM_HEADS / 64`, `CLUSTER_SIZE = NUM_M_BLOCKS`, `BLOCK_M = 64`. The M tile
+  is one 64-head block per CTA (GMMA 64-row atoms `MMA_64x64x16_F32BF16BF16` /
+  `MMA_64x256x16`, config.h:113-131); 128 heads = a 2-CTA cluster.
+- `…/sparse_fp8/splitkv_mla.cuh:692` — host launcher
+  `KU_ASSERT(params.h_q % BLOCK_M == 0)`; grid is
+  `dim3(NUM_M_BLOCKS, s_q, num_sm_parts)` with compile-time `NUM_M_BLOCKS`
+  (`splitkv_mla.cuh:769-775`).
+- Only h64/h128 instantiations exist:
+  `…/sparse_fp8/instantiations/{model1,v32}_persistent_h{64,128}.cu`.
+- The ARLE shim pre-flights the same set: `h_q != 64 && h_q != 128 →
+  cudaErrorInvalidValue` (`crates/cuda-kernels/csrc/misc/
+  arle_flashmla_decode_shim.cu:260` fwd, `:108` get_meta).
+- ARLE already encodes the constraint: `ensure!(matches!(global_heads, 64 |
+  128))` (`crates/infer-cuda/src/attention.rs:2629-2632`). The Q all-gather at
+  `attention.rs:2745-2780` (and the batched lane's `gather_q_row`,
+  `attention/flashmla.rs:1095`) exists BECAUSE of this kernel contract — both
+  lanes share it, so H1 is blocked identically on eager, MTP-verify, and
+  batched paths.
+
+DSv4-Flash has `num_attention_heads = 64` (config; spec fixture
+`crates/deepseek-spec/src/v4.rs:1230`). Local head slabs are 8 (TP=8), 16
+(TP=4), 32 (TP=2) — every TP>1 slicing fails `h_q % 64 == 0`. There is no
+runnable-parameter escape: the epilogue DOES mask partial head blocks
+(`num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M)`,
+`splitkv_mla.cuh:326,428`), but the host assert forbids exercising it.
+
+Realistic options (all deferred; none is a padding hack):
+
+1. **Vendored-kernel patch**: relax `KU_ASSERT(h_q % 64 == 0)` and lean on the
+   existing `num_valid_seq_q` masking (Q TMA reads are bounds-checked against
+   the tensor-map shape, so the 48/56 out-of-range M rows load zero); fix
+   `get_meta`'s `num_sms / (s_q * (h_q/64))` integer division (shim:127) for
+   h_q<64. The 64-row wgmma then computes 8 valid + 56 wasted rows — decode
+   attention is KV-read-bound so the FLOP waste is plausibly a wash, but the
+   patch needs its own correctness license (needle gate) + perf A/B on pod.
+2. **Split the KV/topk bands instead of heads**: all ranks keep all 64 heads
+   but attend disjoint index bands, merged by an LSE-weighted combine (the
+   split-KV combine kernel already merges partials with LSE). Turns the Q
+   all-gather into an O(heads) LSE+O exchange — a bigger redesign of the
+   indices builder + a new inter-rank combine.
+3. **H2 route (no kernel change)**: keep 3 collectives/layer but cut
+   t_collective — the one-shot AG/AR path is already default-on; remaining
+   levers are TP=4-vs-8 A/B and DeepEP-LL (#61).
+
+Consequence: collectives stay 3·N/token on the FlashMLA decode lane at TP>1;
+H1 produces no runtime knob. H3 (lm_head shard, #99) proceeds independently
+(`ARLE_DSV4_LM_HEAD_SHARD=1`).
 
 ## Phase 2 — levers (enumerated, NOT ranked; order = Phase-1 shares)
 
