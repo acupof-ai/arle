@@ -105,7 +105,11 @@ non-zero lens forces eager decode past the `ARLE_DSV4_DECODE_GRAPH` dispatch).
 fully off (production default; one `OnceLock` load per hook, no alloc/D2H).
 Set via `arle serve --probe-out <path> [--probe-lens-layers N]
 [--probe-token-entropy BOOL]`; direct env also honored (multiproc rank
-children inherit it).
+children inherit it). Consumer caveats (measured 2026-07-02, see
+[wins entry](experience/wins/2026-07-02-cuda-probe-lens-entropy.md)): filter
+`decode` records to `pos ≥ prompt_len` (non-final prefill chunks emit one
+discarded boundary sample); positions restart per request; bf16 argmax ties
+can flag `agree=false` (detect via `top1_logprob == −nll`).
 
 ### `ARLE_KV_SSD_PATH`
 
