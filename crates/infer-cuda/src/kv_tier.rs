@@ -4,8 +4,8 @@
 //! Disk spill is optional on the `kv-native-sys` block substrate
 //! (`--kv-ssd-path`, opt-in): when host RAM fills, the coldest host entry spills
 //! to a file-backed mmap page-slot store, so the capacity the engine sees is
-//! host-demoted + disk pages. Payloads are full
-//! `PagedKVPool` page images; this module never touches the device.
+//! host-demoted + disk pages. Payloads are opaque fixed-limit blocks
+//! (paged-KV pages or chunked slot images); this module never touches the device.
 //!
 //! ## Mmap store
 //!
@@ -37,8 +37,8 @@ use anyhow::{Context, Result, anyhow};
 use infer_seam::{DramTierPolicy, NvmeTierPolicy, dram_l2_budget, nvme_l3_budget};
 
 /// Manifest filename under a durable disk namespace. Records the epoch tag plus
-/// one `key slot_idx slot_bytes` line per disk-resident block so a restart can
-/// rebuild the in-memory disk index and replay slot allocations.
+/// one `key slot_idx len slot_bytes` line per disk-resident block so a restart
+/// can rebuild the in-memory disk index and replay slot allocations.
 const MANIFEST_FILE: &str = "manifest.kvm";
 
 /// Manifest header magic + version. A mismatch — or a missing manifest — makes
@@ -212,9 +212,8 @@ impl DiskTier {
     }
 
     fn parse_manifest(bytes: &[u8]) -> Option<(String, Vec<(u64, DiskRecord)>)> {
-        // Accept both V1 ("ARLE-KVTIER-MANIFEST-V1" with key+byte_len) and V2
-        // ("ARLE-KVTIER-MANIFEST-V2" with key+slot_idx+slot_bytes). V1 manifests
-        // start cold (caller gets None and rebuilds).
+        // Accept current four-field records plus the earlier three-field V2
+        // records (len=0 means the full mmap slot is valid).
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
         let magic = lines.next()?;
@@ -462,6 +461,11 @@ impl CudaKvTierStore {
                 .as_ref()
                 .map_or(0, |d| d.store.num_slots() as usize),
         )
+    }
+
+    pub(crate) fn available_pages(&self) -> usize {
+        self.capacity_pages()
+            .saturating_sub(self.host.len().saturating_add(self.disk_pages()))
     }
 
     pub(crate) fn page_bytes(&self) -> usize {
@@ -809,6 +813,29 @@ mod tests {
         assert!(store.insert(2, vec![2; 8]));
         assert!(store.is_full());
         assert!(!store.insert(3, vec![3; 8]), "disk full rejects");
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn available_pages_counts_host_and_disk_blocks() {
+        let root = temp_root("available_pages");
+        let mut store = CudaKvTierStore::with_budget(8, 4);
+        assert!(store.set_disk(root.clone(), 8, 4));
+        assert_eq!(store.capacity_pages(), 4);
+        assert_eq!(store.available_pages(), 4);
+
+        assert!(store.insert(1, vec![1; 4]));
+        assert!(store.insert(2, vec![2; 4]));
+        assert_eq!(store.available_pages(), 2);
+
+        assert!(store.insert(3, vec![3; 4]));
+        assert_eq!(store.host_demoted_pages(), 2);
+        assert_eq!(store.disk_pages(), 1);
+        assert_eq!(store.available_pages(), 1);
+
+        store.remove(&[3]);
+        assert_eq!(store.available_pages(), 2);
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
