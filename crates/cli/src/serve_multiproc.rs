@@ -346,6 +346,12 @@ fn run_lockstep_driver(
                             )
                         })?;
                 }
+                // Flow-control ack, sent unconditionally (an idle skip still
+                // consumes the tick — the coordinator may legitimately over-send
+                // decode-only ticks). Paces the coordinator's tick window.
+                relay
+                    .send(&RelayEnvelope::TickAck { rank, seq })
+                    .with_context(|| format!("worker rank {rank} tick ack (tick #{seq})"))?;
             }
             Some(RelayEnvelope::StatsQuery { request_id }) => {
                 let prefix = engine.prefix_cache_stats();
@@ -409,6 +415,14 @@ fn run_lockstep_driver(
             Some(RelayEnvelope::Completion { request_id, .. }) => {
                 log::warn!(
                     "[arle-worker rank={rank}] unexpected completion envelope request_id={request_id}"
+                );
+            }
+            Some(RelayEnvelope::TickAck {
+                rank: ack_rank,
+                seq,
+            }) => {
+                log::warn!(
+                    "[arle-worker rank={rank}] unexpected tick-ack envelope (rank {ack_rank}, seq {seq})"
                 );
             }
             Some(RelayEnvelope::EngineReady { rank: ready_rank }) => {
