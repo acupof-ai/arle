@@ -37,3 +37,16 @@ Round anatomy (live phase trace, per round):
 - GPU util sampling (15×2s) is the cheapest rollout-vs-sandbox attribution:
   0% util during a "rollout-dominated" phase kills the decode-bound
   hypothesis instantly.
+
+## Addendum — full10-v2 after the LoRA-promotion fix (same day)
+
+run-full10-v2 (16a95fe0 + e584863d): **4min38s total = 27.8s/round** —
+**15.8× vs the original 438s/round**, 3.3× vs the morning's 90.5s. Loss
+trajectory improved beyond every prior run: 0.2829 → 0.2737 → 0.2665 →
+0.2531 → 0.2405 → 0.3220 → 0.2244 → 0.2012 → 0.2011 → **0.1740** (old code
+never went below ~0.24) — consistent with the frozen-base drift bug the
+promotion incidentally fixed: the student now trains against an honest
+frozen base and the per-round LoRA sync compounds correctly.
+
+Round anatomy now: rollout ~11s + writeback ~12.3s (backward 10.0s, of
+which LinearAttention 4.2s = the next wall) + sync_lora 0.02s + misc ~4s.
