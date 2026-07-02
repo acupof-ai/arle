@@ -516,6 +516,9 @@ fn server_chat_messages(messages: &[ChatPromptMessage]) -> Vec<infer_server::Cha
         .map(|message| infer_server::ChatMessage {
             role: message.role.clone(),
             content: Some(server_chat_content(message)),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         })
         .collect()
 }

@@ -92,6 +92,15 @@ pub struct ChatCompletionRequest {
     /// Absent (the default) renders byte-identically to before this field.
     #[serde(default)]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// OpenAI function-tool definitions. Empty (the default) = no tools, so the
+    /// prompt/response wire shape stays byte-identical to a tool-less request.
+    #[serde(default)]
+    pub tools: Vec<chat::OpenAiToolDefinition>,
+    /// OpenAI `tool_choice`: `"auto"` / `"none"` / `"required"` or a
+    /// `{"type":"function","function":{"name":…}}` object. Parsed lazily into
+    /// [`chat::ToolChoiceMode`] via [`Self::tool_choice_mode`].
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl ChatCompletionRequest {
@@ -136,12 +145,51 @@ impl ChatCompletionRequest {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_on)
     }
+
+    /// Map the OpenAI `tool_choice` wire value to [`chat::ToolChoiceMode`].
+    /// Absent → `Auto`; a forced-function object collapses to `Function(name)`
+    /// (treated as `Required` when the name is missing).
+    pub(crate) fn tool_choice_mode(&self) -> chat::ToolChoiceMode {
+        use chat::ToolChoiceMode;
+        match self.tool_choice.as_ref() {
+            None => ToolChoiceMode::Auto,
+            Some(serde_json::Value::String(choice)) => match choice.as_str() {
+                "none" => ToolChoiceMode::None,
+                "required" => ToolChoiceMode::Required,
+                _ => ToolChoiceMode::Auto,
+            },
+            Some(serde_json::Value::Object(object)) => object
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map_or(ToolChoiceMode::Required, |name| {
+                    ToolChoiceMode::Function(name.to_string())
+                }),
+            Some(_) => ToolChoiceMode::Auto,
+        }
+    }
+
+    /// Whether tools should be advertised to the model and parsed back out:
+    /// tool definitions present AND `tool_choice` not `"none"`.
+    #[must_use]
+    pub(crate) fn wants_tools(&self) -> bool {
+        !self.tools.is_empty() && !matches!(self.tool_choice_mode(), chat::ToolChoiceMode::None)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<ChatContent>,
+    /// Assistant tool calls carried in the request history (round-trip form).
+    #[serde(default)]
+    pub tool_calls: Vec<chat::OpenAiToolCall>,
+    /// `tool`-role reply linkage — the call id being answered.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// `tool`-role reply linkage — the tool name.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl ChatMessage {
@@ -150,6 +198,19 @@ impl ChatMessage {
         self.content
             .as_ref()
             .map_or_else(String::new, ChatContent::to_text)
+    }
+
+    /// Convert to the `chat` crate's OpenAI wire message so the shared
+    /// renderers (DeepSeek-V4, ChatML+tools) consume one canonical shape.
+    #[must_use]
+    pub(crate) fn to_openai(&self) -> chat::OpenAiChatMessage {
+        chat::OpenAiChatMessage {
+            role: self.role.clone(),
+            content: Some(chat::OpenAiChatContent::Text(self.content_text())),
+            tool_calls: self.tool_calls.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            name: self.name.clone(),
+        }
     }
 
     #[must_use]
@@ -573,8 +634,15 @@ impl ChatCompletionResponse {
         completion_tokens: usize,
         finish: Option<&FinishReason>,
         enable_thinking: bool,
+        tool_calls: Vec<ResponseToolCall>,
     ) -> Self {
         let (reasoning_content, content) = split_reasoning(&content, enable_thinking);
+        // OpenAI semantics: any emitted tool call overrides the finish reason.
+        let finish_reason = if tool_calls.is_empty() {
+            finish_reason(finish).to_string()
+        } else {
+            "tool_calls".to_string()
+        };
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             object: "chat.completion",
@@ -586,8 +654,9 @@ impl ChatCompletionResponse {
                     role: "assistant",
                     content,
                     reasoning_content,
+                    tool_calls,
                 },
-                finish_reason: finish_reason(finish).to_string(),
+                finish_reason,
             }],
             usage: Usage::new(prompt_tokens, completion_tokens),
         }
@@ -610,6 +679,42 @@ pub struct AssistantMessage {
     /// byte-identical to before for those.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Tool calls parsed from the model output. Empty (the default) is omitted so
+    /// a tool-less response is byte-identical to before this field existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ResponseToolCall>,
+}
+
+/// One OpenAI-format tool call in a chat completion response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: &'static str,
+    pub function: ResponseFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseFunctionCall {
+    pub name: String,
+    /// JSON-encoded argument object (OpenAI wire shape is a string, not object).
+    pub arguments: String,
+}
+
+impl ResponseToolCall {
+    /// Build a response tool call from a parsed [`chat::ToolCall`], minting a
+    /// stable-per-response id from the call index plus a uuid tail.
+    pub(crate) fn from_parsed(call: &chat::ToolCall, index: usize) -> Self {
+        Self {
+            id: format!("call_{index}_{}", uuid::Uuid::new_v4().simple()),
+            call_type: "function",
+            function: ResponseFunctionCall {
+                name: call.name.clone(),
+                arguments: serde_json::to_string(&call.arguments)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            },
+        }
+    }
 }
 
 const THINK_END: &str = "</think>";
@@ -928,6 +1033,7 @@ mod tests {
             2,
             Some(&FinishReason::Stop),
             false,
+            Vec::new(),
         );
         let v = serde_json::to_value(&resp).expect("serialize");
         let message = &v["choices"][0]["message"];
@@ -935,6 +1041,73 @@ mod tests {
         assert!(
             message.get("reasoning_content").is_none(),
             "reasoning_content must be omitted for non-thinking output"
+        );
+        assert!(
+            message.get("tool_calls").is_none(),
+            "tool_calls must be omitted when the model emitted none (byte-identical wire)"
+        );
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_choice_maps_wire_values() {
+        use chat::ToolChoiceMode;
+        let mode = |choice: serde_json::Value| {
+            serde_json::from_value::<ChatCompletionRequest>(json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": choice,
+            }))
+            .unwrap()
+            .tool_choice_mode()
+        };
+        assert_eq!(mode(json!("auto")), ToolChoiceMode::Auto);
+        assert_eq!(mode(json!("none")), ToolChoiceMode::None);
+        assert_eq!(mode(json!("required")), ToolChoiceMode::Required);
+        assert_eq!(
+            mode(json!({"type": "function", "function": {"name": "shell"}})),
+            ToolChoiceMode::Function("shell".to_string())
+        );
+        // absent tool_choice defaults to Auto; empty tools ⇒ not wanted
+        let absent: ChatCompletionRequest =
+            serde_json::from_value(json!({"messages": [{"role": "user", "content": "hi"}]}))
+                .unwrap();
+        assert_eq!(absent.tool_choice_mode(), ToolChoiceMode::Auto);
+        assert!(!absent.wants_tools());
+    }
+
+    #[test]
+    fn parsed_tool_calls_populate_response_and_finish_reason() {
+        let (content, calls) = chat::openai_parse_tool_calls(
+            "Let me check.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+        );
+        let tool_calls: Vec<ResponseToolCall> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| ResponseToolCall::from_parsed(call, index))
+            .collect();
+        // openai_parse_tool_calls strips the tool block from visible content, so
+        // the response splits with thinking off (no re-scan) — no double strip.
+        let resp = ChatCompletionResponse::from_parts(
+            "dsv4".to_string(),
+            content,
+            5,
+            4,
+            Some(&FinishReason::Stop),
+            false,
+            tool_calls,
+        );
+        let v = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(v["choices"][0]["message"]["content"], "Let me check.");
+        let call = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "shell");
+        assert_eq!(call["function"]["arguments"], "{\"command\":\"pwd\"}");
+        assert!(
+            call["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("call_0_")),
+            "tool call id encodes its index"
         );
     }
 
