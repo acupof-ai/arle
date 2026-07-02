@@ -7,8 +7,8 @@
 multiproc workers that build engines solely from `ARLE_WORKER_ENGINE_CONFIG`
 — so workers never attached the disk tier. With `--kv-t1-budget-bytes 0` the
 slot tier had zero pages and every `demote_slot` returned `Ok(false)`: no
-demoted slots, no disk pages, no mmap files. Fix series `358d5178` +
-`5ce632c9` + `35109d64`: `EngineLoadConfig` carries
+demoted slots, no disk pages, no mmap files. Fix series `da0f40e2` +
+`a80e0aa8` + `35109d64`: `EngineLoadConfig` carries
 `kv_ssd_root`/`kv_ssd_max_bytes`, every rank attaches inside
 `build_cuda_engine` (after the budget setters that rebuild the store),
 `ServeKvSsdOptions` and both post-spawn hooks deleted, DSv4 `slot_image_bytes`
@@ -17,7 +17,9 @@ now actually attaches its disk level.
 
 ## What Worked
 
-Pod verify at `651b3759`, 8×H20 box, DSv4-Flash-FP8,
+Pod verify ran the fix-series tree (pre-rebase head `651b3759`; the series
+now lives on main as `da0f40e2`+`a80e0aa8`+`0ef6a72e`), 8×H20 box,
+DSv4-Flash-FP8,
 `INFER_CUDA_DEVICES=1,3,4,6 INFER_TP_SIZE=4 INFER_DSV4_MAX_SEQ_LEN=4096`,
 serve flags `--max-total-tokens 4096 --max-running-requests 1
 --slot-oversubscription --kv-ssd-path /host/arle-kv-ssd-verify
