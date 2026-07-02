@@ -710,6 +710,24 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "K")]
     pub(crate) mtp_draft_topk: Option<usize>,
 
+    /// Inference-analysis probe: write per-token entropy/NLL + decode logit-lens
+    /// JSONL to this path (TP rank 0 only; truncated on open). Activates the
+    /// probe; unset = probe fully off, zero hot-path cost. CUDA backend
+    /// (DSv4/GLM lens lane). Env transport: `ARLE_PROBE_*` (docs/environment.md).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) probe_out: Option<PathBuf>,
+
+    /// Logit-lens depth: after each of the last N layers of a decode step,
+    /// project the residual stream through the head and record entropy/NLL/
+    /// top-1 agreement. `0` disables the lens (per-token entropy stays on).
+    #[arg(long, default_value_t = 10, value_name = "N")]
+    pub(crate) probe_lens_layers: usize,
+
+    /// Per-token entropy/NLL records (all prefill positions + every decode
+    /// token, raw T=1 logits). Requires --probe-out.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) probe_token_entropy: bool,
+
     /// Additional engine-pool model metadata to expose from the serving control plane.
     ///
     /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.
