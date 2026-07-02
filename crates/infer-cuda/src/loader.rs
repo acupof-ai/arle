@@ -3008,21 +3008,16 @@ impl SafetensorLoader {
                 )
                 .with_context(|| format!("upload DSv4 FP8 matrix {name}"))
             }
-            // FP4 E2M1 is row-major, 2 nibbles per byte → logical_cols = 2 * bytes.
-            Dtype::I8 => {
-                let (rows, packed_cols) = (tensor.shape[0], tensor.shape[1]);
-                let logical_cols = packed_cols * 2;
-                DeviceMatrix::from_dsv4_fp4_block_scaled(
-                    ctx,
-                    tensor.bytes(),
-                    &scale_e8m0,
-                    rows,
-                    logical_cols,
-                    scale_rows,
-                    scale_cols,
-                )
-                .with_context(|| format!("upload DSv4 FP4 matrix {name}"))
-            }
+            // FP4 E2M1 (I8-packed, 2 nibbles/byte). FAIL-CLOSED: the FP4/MX
+            // checkpoint lane produces NaN from the first compressed-attention
+            // layer (#137, decoded 2026-07-02: L3→L2 at 4-token chunk
+            // boundaries; the FP8-native export is clean on the same binary).
+            // Reject at load rather than serve invisible output. The FP4
+            // dequant plumbing below it stays for a future re-license.
+            Dtype::I8 => bail!(
+                "{name}: FP4/MX DSv4 checkpoints are unsupported — the compressed-attention \
+                 path NaNs (#137). Use the FP8-native export."
+            ),
             other => bail!("{name}: unsupported DSv4 block-scaled dtype {other:?}"),
         }
     }
