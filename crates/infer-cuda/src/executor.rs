@@ -708,7 +708,7 @@ impl RealCudaExecutor {
     }
 }
 
-use crate::kv_tier::{CudaKvTierStore, chunk_sub, default_t1_budget_bytes, tier_key};
+use crate::kv_tier::{CudaKvTierStore, default_t1_budget_bytes};
 
 /// Construction-time default fraction of available host DRAM the L2 KV tier
 /// may claim — the shared-box-safe 0.5 (the store is pageable host memory; see
