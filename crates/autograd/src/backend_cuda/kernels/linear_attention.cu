@@ -981,6 +981,756 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
     }
 }
 
+// ── Staged chunk-parallel backward ───────────────────────────────────────────
+// docs/plans/linear-attention-chunked-backward.md. The reverse grad-state
+// recurrence is affine in the incoming grad-state:
+//   G_{t-1} = gamma_t (I - beta_t k_t k_t^T) (G_t + q_t dcore_t^T)
+// so a chunk's action collapses to G_out = M_c G_in + B_c with
+//   M_c = A_{t0} A_{t0+1} ... A_{t1},  B_c = sum_t (A_{t0}...A_t) q_t dcore_t^T,
+// both computable chunk-locally during a forward recompute walk (stage 1,
+// parallel over chunk x head). Only the num_chunks-step boundary carry is
+// sequential (stage 2); stage 3 replays the exact per-token grad pass per chunk
+// in parallel with the carried boundary grad-state.
+
+// Stage 1: per (chunk, row) block, recompute the chunk from its saved incoming
+// state and emit the transfer operator M_c [key_dim x key_dim] and offset B_c
+// [key_dim x value_dim]. No grad outputs are written here.
+extern "C" __global__ void linear_attention_chunk_transfer_f32(
+    float* __restrict__ m_out,
+    float* __restrict__ b_out,
+    float* __restrict__ state_scratch,
+    const float* __restrict__ upstream,
+    const float* __restrict__ z,
+    const float* __restrict__ norm_weight,
+    const unsigned short* __restrict__ qkv_conv,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    const float* __restrict__ chunk_state,
+    int batch,
+    int seq_len,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int value_dim,
+    int qkv_dim,
+    float eps
+) {
+    constexpr int BT = 64;
+    int rows = batch * num_value_heads;
+    int item = blockIdx.x;
+    int chunk_idx = item / rows;
+    int row = item - chunk_idx * rows;
+    int batch_idx = row / num_value_heads;
+    int value_head = row - (batch_idx * num_value_heads);
+    if (batch_idx >= batch || key_dim > LINEAR_ATTENTION_MAX_DIM ||
+        value_dim > LINEAR_ATTENTION_MAX_DIM) {
+        return;
+    }
+    int base = chunk_idx * BT;
+    int limit = seq_len - base;
+    if (limit > BT) {
+        limit = BT;
+    }
+    if (limit <= 0) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int q_dim = num_key_heads * key_dim;
+    int v_offset = q_dim + q_dim;
+    int key_head = value_head * num_key_heads / num_value_heads;
+    int state_elems = key_dim * value_dim;
+    int m_elems = key_dim * key_dim;
+    float* m_mat = m_out + item * m_elems;
+    float* b_mat = b_out + item * state_elems;
+    float* state_cur = state_scratch + item * state_elems;
+    const float* chunk_state_base =
+        chunk_state + (chunk_idx * num_value_heads + value_head) * state_elems;
+
+    __shared__ float q_raw[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float k_raw[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float q_vec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float k_vec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float v_raw[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float delta[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float core_out[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float dcore[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float mvec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float reduce[LINEAR_ATTENTION_BLOCK];
+    __shared__ float scalar0;
+
+    for (int idx = tid; idx < m_elems; idx += blockDim.x) {
+        m_mat[idx] = idx / key_dim == idx % key_dim ? 1.0f : 0.0f;
+    }
+    for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+        b_mat[idx] = 0.0f;
+        state_cur[idx] = chunk_state_base[idx];
+    }
+    __syncthreads();
+
+    float q_scale = rsqrtf((float)key_dim);
+
+    for (int local_t = 0; local_t < limit; ++local_t) {
+        int seq_idx = base + local_t;
+        for (int i = tid; i < key_dim; i += blockDim.x) {
+            q_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)]);
+            k_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len, qkv_dim)]);
+        }
+        for (int i = tid; i < value_dim; i += blockDim.x) {
+            v_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                batch_idx, seq_idx, v_offset + value_head * value_dim + i, seq_len, qkv_dim)]);
+        }
+        __syncthreads();
+
+        float local_q_sq = 0.0f;
+        float local_k_sq = 0.0f;
+        for (int i = tid; i < key_dim; i += blockDim.x) {
+            local_q_sq += q_raw[i] * q_raw[i];
+            local_k_sq += k_raw[i] * k_raw[i];
+        }
+        reduce[tid] = local_q_sq;
+        __syncthreads();
+        for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar0 = sqrtf(reduce[0] + 1.0e-12f);
+        }
+        __syncthreads();
+        float q_norm = scalar0;
+
+        reduce[tid] = local_k_sq;
+        __syncthreads();
+        for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar0 = sqrtf(reduce[0] + 1.0e-12f);
+        }
+        __syncthreads();
+        float k_norm = scalar0;
+
+        for (int i = tid; i < key_dim; i += blockDim.x) {
+            q_vec[i] = q_scale * q_raw[i] / q_norm;
+            k_vec[i] = k_raw[i] / k_norm;
+        }
+        __syncthreads();
+
+        float exp_g_value =
+            expf(g[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)]);
+        float beta_value =
+            beta[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+        for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+            state_cur[idx] *= exp_g_value;
+        }
+        __syncthreads();
+
+        for (int v = tid; v < value_dim; v += blockDim.x) {
+            float accum = 0.0f;
+            for (int k = 0; k < key_dim; ++k) {
+                accum += state_cur[k * value_dim + v] * k_vec[k];
+            }
+            delta[v] = (v_raw[v] - accum) * beta_value;
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+            int k = idx / value_dim;
+            int v = idx - k * value_dim;
+            state_cur[idx] += k_vec[k] * delta[v];
+        }
+        __syncthreads();
+
+        // dcore at token t — identical math to the reverse grad pass; it feeds
+        // only the affine offset B_c here (dz/dnorm stay in the grad stage).
+        for (int v = tid; v < value_dim; v += blockDim.x) {
+            float accum = 0.0f;
+            for (int k = 0; k < key_dim; ++k) {
+                accum += state_cur[k * value_dim + v] * q_vec[k];
+            }
+            core_out[v] = accum;
+        }
+        __syncthreads();
+
+        float local_core_sq = 0.0f;
+        for (int v = tid; v < value_dim; v += blockDim.x) {
+            local_core_sq += core_out[v] * core_out[v];
+        }
+        reduce[tid] = local_core_sq;
+        __syncthreads();
+        for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar0 = rsqrtf((reduce[0] / (float)value_dim) + eps);
+        }
+        __syncthreads();
+        float inv_rms = scalar0;
+
+        float local_dot_beta = 0.0f;
+        for (int v = tid; v < value_dim; v += blockDim.x) {
+            int out_idx = la_idx4(
+                batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
+            float dcore_v = upstream[out_idx] * la_silu(z[out_idx]);
+            dcore[v] = dcore_v;
+            local_dot_beta += dcore_v * core_out[v] * norm_weight[v];
+        }
+        reduce[tid] = local_dot_beta;
+        __syncthreads();
+        for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+            if (tid < step) {
+                reduce[tid] += reduce[tid + step];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            scalar0 = reduce[0];
+        }
+        __syncthreads();
+        float dot_beta = scalar0;
+        float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
+        for (int v = tid; v < value_dim; v += blockDim.x) {
+            dcore[v] = dcore[v] * norm_weight[v] * inv_rms - core_out[v] * coeff * dot_beta;
+        }
+        __syncthreads();
+
+        // M <- gamma (M - beta (M k) k^T), i.e. compose A_t on the right.
+        for (int k = tid; k < key_dim; k += blockDim.x) {
+            float accum = 0.0f;
+            for (int j = 0; j < key_dim; ++j) {
+                accum += m_mat[k * key_dim + j] * k_vec[j];
+            }
+            mvec[k] = accum;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < m_elems; idx += blockDim.x) {
+            int k = idx / key_dim;
+            int j = idx - k * key_dim;
+            m_mat[idx] = exp_g_value * (m_mat[idx] - beta_value * mvec[k] * k_vec[j]);
+        }
+        __syncthreads();
+
+        // B += (M q_t) dcore_t^T with the updated M (= A_{t0}..A_t).
+        for (int k = tid; k < key_dim; k += blockDim.x) {
+            float accum = 0.0f;
+            for (int j = 0; j < key_dim; ++j) {
+                accum += m_mat[k * key_dim + j] * q_vec[j];
+            }
+            mvec[k] = accum;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+            int k = idx / value_dim;
+            int v = idx - k * value_dim;
+            b_mat[idx] += mvec[k] * dcore[v];
+        }
+        __syncthreads();
+    }
+}
+
+// Stage 2: sequential reverse chunk-boundary carry, one block per row.
+// g_in[c] is the grad-state entering chunk c from the right; the slot for the
+// last chunk arrives pre-zeroed. g_in[c-1] = M_c g_in[c] + B_c.
+extern "C" __global__ void linear_attention_chunk_carry_f32(
+    float* __restrict__ g_in,
+    const float* __restrict__ m_mats,
+    const float* __restrict__ b_mats,
+    int rows,
+    int num_chunks,
+    int key_dim,
+    int value_dim
+) {
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int tid = threadIdx.x;
+    int state_elems = key_dim * value_dim;
+    int m_elems = key_dim * key_dim;
+    for (int c = num_chunks - 1; c >= 1; --c) {
+        const float* m_mat = m_mats + (c * rows + row) * m_elems;
+        const float* b_mat = b_mats + (c * rows + row) * state_elems;
+        const float* g_cur = g_in + (c * rows + row) * state_elems;
+        float* g_prev = g_in + ((c - 1) * rows + row) * state_elems;
+        for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+            int k = idx / value_dim;
+            int v = idx - k * value_dim;
+            float accum = b_mat[idx];
+            for (int j = 0; j < key_dim; ++j) {
+                accum += m_mat[k * key_dim + j] * g_cur[j * value_dim + v];
+            }
+            g_prev[idx] = accum;
+        }
+        __syncthreads();
+    }
+}
+
+// Stage 3: exact per-token grad pass per chunk, parallel over `wave` chunk
+// lanes x rows; each block strides chunks by `wave` and re-derives the chunk
+// history from the saved incoming state (the per-block slab keeps scratch at
+// grid x 64 x state instead of seq x state). Same math as the monolithic scan
+// with grad_state seeded from the stage-2 carry instead of carried in-block.
+extern "C" __global__ void linear_attention_chunk_grad_f32(
+    float* __restrict__ dqkv_conv,
+    float* __restrict__ dz,
+    float* __restrict__ db,
+    float* __restrict__ da,
+    float* __restrict__ ddt,
+    float* __restrict__ da_log,
+    float* __restrict__ dnorm,
+    float* __restrict__ grad_state_scratch,
+    float* __restrict__ chunk_history_scratch,
+    float* __restrict__ chunk_kv_scratch,
+    const float* __restrict__ upstream,
+    const float* __restrict__ z,
+    const float* __restrict__ a_proj,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ a_log,
+    const float* __restrict__ norm_weight,
+    const unsigned short* __restrict__ qkv_conv,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    const float* __restrict__ chunk_state,
+    const float* __restrict__ g_in,
+    int batch,
+    int seq_len,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int value_dim,
+    int qkv_dim,
+    int wave,
+    float eps
+) {
+    constexpr int BT = 64;
+    int rows = batch * num_value_heads;
+    int lane = blockIdx.x / rows;
+    int row = blockIdx.x - lane * rows;
+    int batch_idx = row / num_value_heads;
+    int value_head = row - (batch_idx * num_value_heads);
+    if (batch_idx >= batch || key_dim > LINEAR_ATTENTION_MAX_DIM ||
+        value_dim > LINEAR_ATTENTION_MAX_DIM) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int q_dim = num_key_heads * key_dim;
+    int v_offset = q_dim + q_dim;
+    int key_head = value_head * num_key_heads / num_value_heads;
+    int state_elems = key_dim * value_dim;
+    int num_chunks = (seq_len + BT - 1) / BT;
+    float* grad_state = grad_state_scratch + blockIdx.x * state_elems;
+    float* history = chunk_history_scratch + blockIdx.x * BT * state_elems;
+    float* kv_chunk = chunk_kv_scratch + blockIdx.x * BT * value_dim;
+
+    __shared__ float q_raw[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float k_raw[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float q_vec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float k_vec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float dq_vec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float dk_vec[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float v_raw[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float delta[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float d_delta[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float dkv_mem[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float core_out[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float dcore[LINEAR_ATTENTION_MAX_DIM];
+    __shared__ float reduce[LINEAR_ATTENTION_BLOCK];
+    __shared__ float scalar0;
+    __shared__ float scalar1;
+
+    float exp_a = expf(a_log[value_head]);
+    float q_scale = rsqrtf((float)key_dim);
+
+    for (int chunk_idx = lane; chunk_idx < num_chunks; chunk_idx += wave) {
+        int base = chunk_idx * BT;
+        int limit = seq_len - base;
+        if (limit > BT) {
+            limit = BT;
+        }
+        if (limit <= 0) {
+            continue;
+        }
+
+        const float* chunk_state_base =
+            chunk_state + (chunk_idx * num_value_heads + value_head) * state_elems;
+        const float* g_in_chunk = g_in + (chunk_idx * rows + row) * state_elems;
+        for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+            grad_state[idx] = g_in_chunk[idx];
+        }
+        __syncthreads();
+
+        for (int local_t = 0; local_t < limit; ++local_t) {
+            int seq_idx = base + local_t;
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                k_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                    batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len, qkv_dim)]);
+            }
+            for (int i = tid; i < value_dim; i += blockDim.x) {
+                v_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                    batch_idx, seq_idx, v_offset + value_head * value_dim + i, seq_len, qkv_dim)]);
+            }
+            __syncthreads();
+
+            float local_k_sq = 0.0f;
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                local_k_sq += k_raw[i] * k_raw[i];
+            }
+            reduce[tid] = local_k_sq;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = sqrtf(reduce[0] + 1.0e-12f);
+            }
+            __syncthreads();
+            float k_norm = scalar0;
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                k_vec[i] = k_raw[i] / k_norm;
+            }
+            __syncthreads();
+
+            const float* prev =
+                local_t == 0 ? chunk_state_base : history + (local_t - 1) * state_elems;
+            float* cur = history + local_t * state_elems;
+            float exp_g_value =
+                expf(g[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)]);
+            for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+                cur[idx] = prev[idx] * exp_g_value;
+            }
+            __syncthreads();
+
+            float beta_value =
+                beta[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                float accum = 0.0f;
+                for (int k = 0; k < key_dim; ++k) {
+                    accum += cur[k * value_dim + v] * k_vec[k];
+                }
+                kv_chunk[local_t * value_dim + v] = accum;
+                delta[v] = (v_raw[v] - accum) * beta_value;
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+                int k = idx / value_dim;
+                int v = idx - k * value_dim;
+                cur[idx] += k_vec[k] * delta[v];
+            }
+            __syncthreads();
+        }
+
+        for (int local_t = limit - 1; local_t >= 0; --local_t) {
+            int seq_idx = base + local_t;
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                q_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                    batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)]);
+                k_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                    batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len, qkv_dim)]);
+            }
+            for (int i = tid; i < value_dim; i += blockDim.x) {
+                v_raw[i] = la_bf16_to_float(qkv_conv[la_idx3(
+                    batch_idx, seq_idx, v_offset + value_head * value_dim + i, seq_len, qkv_dim)]);
+            }
+            __syncthreads();
+
+            float local_q_sq = 0.0f;
+            float local_k_sq = 0.0f;
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                local_q_sq += q_raw[i] * q_raw[i];
+                local_k_sq += k_raw[i] * k_raw[i];
+            }
+            reduce[tid] = local_q_sq;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = sqrtf(reduce[0] + 1.0e-12f);
+            }
+            __syncthreads();
+            float q_norm = scalar0;
+
+            reduce[tid] = local_k_sq;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = sqrtf(reduce[0] + 1.0e-12f);
+            }
+            __syncthreads();
+            float k_norm = scalar0;
+
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                q_vec[i] = q_scale * q_raw[i] / q_norm;
+                k_vec[i] = k_raw[i] / k_norm;
+            }
+            __syncthreads();
+
+            const float* state = history + local_t * state_elems;
+            const float* prev_state =
+                local_t == 0 ? chunk_state_base : history + (local_t - 1) * state_elems;
+
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                float accum = 0.0f;
+                for (int k = 0; k < key_dim; ++k) {
+                    accum += state[k * value_dim + v] * q_vec[k];
+                }
+                core_out[v] = accum;
+            }
+            __syncthreads();
+
+            float local_core_sq = 0.0f;
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                local_core_sq += core_out[v] * core_out[v];
+            }
+            reduce[tid] = local_core_sq;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = rsqrtf((reduce[0] / (float)value_dim) + eps);
+            }
+            __syncthreads();
+            float inv_rms = scalar0;
+
+            float local_dot_beta = 0.0f;
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                int out_idx = la_idx4(
+                    batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
+                float normed = core_out[v] * inv_rms * norm_weight[v];
+                float gate = z[out_idx];
+                float gate_silu = la_silu(gate);
+                float dcore_v = upstream[out_idx] * gate_silu;
+                dcore[v] = dcore_v;
+                dz[out_idx] = upstream[out_idx] * normed * la_silu_grad(gate);
+                atomicAdd(&dnorm[v], dcore_v * core_out[v] * inv_rms);
+                local_dot_beta += dcore_v * core_out[v] * norm_weight[v];
+            }
+            reduce[tid] = local_dot_beta;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = reduce[0];
+            }
+            __syncthreads();
+            float dot_beta = scalar0;
+            float coeff = inv_rms * inv_rms * inv_rms / (float)value_dim;
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                dcore[v] = dcore[v] * norm_weight[v] * inv_rms - core_out[v] * coeff * dot_beta;
+            }
+            __syncthreads();
+
+            for (int k = tid; k < key_dim; k += blockDim.x) {
+                float accum = 0.0f;
+                for (int v = 0; v < value_dim; ++v) {
+                    accum += state[k * value_dim + v] * dcore[v];
+                }
+                dq_vec[k] = accum;
+            }
+            for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+                int k = idx / value_dim;
+                int v = idx - k * value_dim;
+                grad_state[idx] += q_vec[k] * dcore[v];
+            }
+            __syncthreads();
+
+            float beta_value =
+                beta[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+            float exp_g_value =
+                expf(g[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)]);
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                float kv = kv_chunk[local_t * value_dim + v];
+                delta[v] = (v_raw[v] - kv) * beta_value;
+            }
+            __syncthreads();
+
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                float accum = 0.0f;
+                for (int k = 0; k < key_dim; ++k) {
+                    accum += grad_state[k * value_dim + v] * k_vec[k];
+                }
+                d_delta[v] = accum;
+            }
+            for (int k = tid; k < key_dim; k += blockDim.x) {
+                float accum = 0.0f;
+                for (int v = 0; v < value_dim; ++v) {
+                    accum += grad_state[k * value_dim + v] * delta[v];
+                }
+                dk_vec[k] = accum;
+            }
+            __syncthreads();
+
+            float local_dbeta = 0.0f;
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                float kv = kv_chunk[local_t * value_dim + v];
+                local_dbeta += d_delta[v] * (v_raw[v] - kv);
+                dkv_mem[v] = -d_delta[v] * beta_value;
+            }
+            reduce[tid] = local_dbeta;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = reduce[0];
+            }
+            __syncthreads();
+            float dbeta_scalar = scalar0;
+
+            for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+                int k = idx / value_dim;
+                int v = idx - k * value_dim;
+                grad_state[idx] += k_vec[k] * dkv_mem[v];
+            }
+            __syncthreads();
+            for (int k = tid; k < key_dim; k += blockDim.x) {
+                float accum = 0.0f;
+                for (int v = 0; v < value_dim; ++v) {
+                    float s_decay = state[k * value_dim + v] - k_vec[k] * delta[v];
+                    accum += s_decay * dkv_mem[v];
+                }
+                dk_vec[k] += accum;
+            }
+            __syncthreads();
+
+            float local_dexp_g = 0.0f;
+            for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+                local_dexp_g += prev_state[idx] * grad_state[idx];
+            }
+            reduce[tid] = local_dexp_g;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = reduce[0];
+            }
+            __syncthreads();
+            float dexp_g = scalar0;
+
+            if (tid == 0) {
+                float a_value = a_proj[la_idx3(
+                    batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+                float softplus_input = a_value + dt_bias[value_head];
+                float softplus_value = la_softplus(softplus_input);
+                float softplus_grad = la_sigmoid(softplus_input);
+                float dg = dexp_g * exp_g_value;
+                float common = dg * (-exp_a);
+                da[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
+                    common * softplus_grad;
+                atomicAdd(&ddt[value_head], common * softplus_grad);
+                atomicAdd(&da_log[value_head], common * softplus_value);
+                db[la_idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] =
+                    dbeta_scalar * beta_value * (1.0f - beta_value);
+            }
+
+            float local_q_dot = 0.0f;
+            float local_k_dot = 0.0f;
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                local_q_dot += q_raw[i] * dq_vec[i];
+                local_k_dot += k_raw[i] * dk_vec[i];
+            }
+            reduce[tid] = local_q_dot;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar0 = reduce[0];
+            }
+            __syncthreads();
+            float q_dot = scalar0;
+
+            reduce[tid] = local_k_dot;
+            __syncthreads();
+            for (int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                    reduce[tid] += reduce[tid + step];
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                scalar1 = reduce[0];
+            }
+            __syncthreads();
+            float k_dot = scalar1;
+            float q_norm_cubed = q_norm * q_norm * q_norm;
+            float k_norm_cubed = k_norm * k_norm * k_norm;
+
+            for (int i = tid; i < key_dim; i += blockDim.x) {
+                float dq_raw =
+                    q_scale * (dq_vec[i] / q_norm - q_raw[i] * q_dot / q_norm_cubed);
+                float dk_raw = dk_vec[i] / k_norm - k_raw[i] * k_dot / k_norm_cubed;
+                atomicAdd(
+                    &dqkv_conv[la_idx3(batch_idx, seq_idx, key_head * key_dim + i, seq_len, qkv_dim)],
+                    dq_raw);
+                atomicAdd(
+                    &dqkv_conv[la_idx3(
+                        batch_idx, seq_idx, q_dim + key_head * key_dim + i, seq_len, qkv_dim)],
+                    dk_raw);
+            }
+            for (int v = tid; v < value_dim; v += blockDim.x) {
+                float dv_raw = d_delta[v] * beta_value;
+                atomicAdd(
+                    &dqkv_conv[la_idx3(
+                        batch_idx,
+                        seq_idx,
+                        v_offset + value_head * value_dim + v,
+                        seq_len,
+                        qkv_dim)],
+                    dv_raw);
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < state_elems; idx += blockDim.x) {
+                grad_state[idx] = grad_state[idx] * exp_g_value;
+            }
+            __syncthreads();
+        }
+    }
+}
+
 extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
     float* __restrict__ grad_input,
     float* __restrict__ grad_weight,
