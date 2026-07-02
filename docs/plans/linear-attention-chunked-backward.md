@@ -65,3 +65,16 @@ Concrete steps:
 LA backward 4.2s → ~1.1s, backward 10.0s → ~7s, round 27.8s → ~25s (−10%).
 Kill if the A/B shows <30% op-level gain after step 3 — the carry recurrence
 may dominate at 128×128 state (measure, don't assume).
+
+## Outcome (2026-07-02, ec23705e)
+
+Shipped: 3-stage transfer-operator design (chunk_transfer/carry/grad, mono
+kept behind ARLE_LA_BACKWARD_MONO=1). Parity: qwen35+qwen36-27b shapes, all
+grads max_abs <= 1.2e-4. Same-binary env-flip A/B at seq~1010:
+mono 4.135s -> chunked 3.186s per round (92 -> 71ms/call) = 29.7% op gain —
+AT the pre-declared kill threshold. Verdict per the kill rule: keep the
+kernel, stop iterating this design. Decoded floor: the per-token
+__syncthreads chain (mono ~= 16 chunks x 2 scans x 64 tokens x ~45us matches
+92ms exactly); stage-parallelism cannot beat it while the intra-chunk math
+stays a per-token loop. The real next step is the full fla-style chunkwise
+GEMM formulation (no token loop) — a separate derivation, out of scope here.
