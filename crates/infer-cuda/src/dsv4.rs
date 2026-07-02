@@ -346,6 +346,26 @@ pub(crate) struct Dsv4MtpLayer {
     pub norm: DeviceVec,
 }
 
+/// Vocab-shard geometry for the opt-in `ARLE_DSV4_LM_HEAD_SHARD=1` lever
+/// (#99, `docs/plans/2026-07-02-dsv4-6ms-token-plan.md` H3). When set,
+/// `lm_head` holds `[rows_per_rank, hidden]` = this rank's contiguous vocab
+/// rows `[rank*rows_per_rank, rank*rows_per_rank + local_rows)` plus zero-pad
+/// rows up to the uniform 128-aligned `rows_per_rank`. Padding exists only
+/// past the global vocab end, so a rank-order logits gather is vocab-ordered
+/// with the pad tail strictly after `vocab`.
+// The fields are read by the nccl-gated cross-rank sampler
+// (`executor::sample_cuda_token_vocab_sharded`); non-nccl builds bail before use.
+#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Dsv4LmHeadShard {
+    /// Global vocab rows (`config.vocab_size`).
+    pub vocab: usize,
+    /// Uniform padded rows per rank (128-aligned; the local `lm_head.rows`).
+    pub rows_per_rank: usize,
+    /// This rank's real (unpadded) row count; `<= rows_per_rank`.
+    pub local_rows: usize,
+}
+
 /// Loaded DSv4-Flash model for one TP/EP rank.
 pub(crate) struct Dsv4Model {
     pub ctx: DeviceContext,
@@ -355,6 +375,9 @@ pub(crate) struct Dsv4Model {
     pub kv_arena: Dsv4MlaKvArena,
     pub embed_tokens: DeviceMatrix,
     pub lm_head: DeviceMatrix,
+    /// `Some` iff `ARLE_DSV4_LM_HEAD_SHARD=1` at TP>1: `lm_head` then holds
+    /// this rank's vocab slice and decode sampling merges across ranks.
+    pub lm_head_shard: Option<Dsv4LmHeadShard>,
     pub layers: Vec<Dsv4Layer>,
     pub norm: DeviceVec,
     /// Head hyper-connection: folds the wide residual stream back to one hidden
@@ -1339,7 +1362,35 @@ impl Dsv4Model {
         let names = config.tensor_names();
 
         let embed_tokens = loader.load_dsv4_bf16_matrix(&ctx, names.embed_tokens())?;
-        let lm_head = loader.load_dsv4_global_matrix(&ctx, names.lm_head())?;
+        // Opt-in lever #99 (`ARLE_DSV4_LM_HEAD_SHARD=1`): row-shard lm_head
+        // across TP ranks instead of replicating the full-vocab GEMV. TP=1
+        // no-ops (byte-identical load). The batched lm_head consumers (MTP
+        // verify/draft heads, entropy probes) still need full-vocab logits, so
+        // the knob refuses those configs loudly instead of degrading silently.
+        let (lm_head, lm_head_shard) = if dsv4_lm_head_shard_enabled() && !tp_cfg.is_single() {
+            ensure!(
+                tp.is_collective(),
+                "ARLE_DSV4_LM_HEAD_SHARD=1 needs real TP collectives (nccl build) at world_size {}",
+                tp_cfg.world_size
+            );
+            ensure!(
+                !spec_decode_on,
+                "ARLE_DSV4_LM_HEAD_SHARD=1 does not support MTP spec decode (the MTP \
+                 verify/draft heads consume full-vocab lm_head logits); disable spec \
+                 decode (--spec-type / ARLE_DSV4_SPEC_DECODE) or unset the shard knob"
+            );
+            ensure!(
+                !crate::probe::token_entropy(),
+                "ARLE_DSV4_LM_HEAD_SHARD=1 does not support the prefill token-entropy \
+                 probe (full-vocab batched lm_head); unset ARLE_PROBE_TOKEN_ENTROPY or \
+                 the shard knob"
+            );
+            let (matrix, shard) =
+                loader.load_dsv4_global_matrix_vocab_sharded(&ctx, names.lm_head(), &tp_cfg)?;
+            (matrix, Some(shard))
+        } else {
+            (loader.load_dsv4_global_matrix(&ctx, names.lm_head())?, None)
+        };
 
         // GLM (`glm_moe_dsa`) markers: re-encode FP8 MoE experts from `weight_scale_inv`,
         // and bypass the absent hyper-connections (`hc_mult == 1`, identity mixers).
@@ -1456,6 +1507,7 @@ impl Dsv4Model {
             kv_arena,
             embed_tokens,
             lm_head,
+            lm_head_shard,
             layers,
             norm,
             head_hc,
@@ -4477,9 +4529,26 @@ impl Dsv4Model {
         })?;
         keepalive.keep_vec(&logits);
         let token = crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
-            crate::executor::sample_cuda_token(ctx, &logits, params, position)
+            self.sample_logits(&logits, params, position)
         })?;
         Ok(token)
+    }
+
+    /// Sample the next token from the decode-tail logits: the standard
+    /// full-vocab sampler, or the cross-rank merge when the vocab-sharded
+    /// lm_head is active (`logits` then hold this rank's padded slice).
+    fn sample_logits(
+        &self,
+        logits: &DeviceVec,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<u32> {
+        match &self.lm_head_shard {
+            Some(shard) => crate::executor::sample_cuda_token_vocab_sharded(
+                &self.ctx, &self.tp, logits, shard, params, position,
+            ),
+            None => crate::executor::sample_cuda_token(&self.ctx, logits, params, position),
+        }
     }
 
     fn forward_tokens_verify_stream_persistent(
@@ -5737,6 +5806,15 @@ impl Dsv4Model {
     /// format (`dsv4_linear`: bf16 → cuBLAS gemm_batch, FP8/FP4 → mla_linear),
     /// weight read once for all `m` rows.
     fn lm_head_project_batch(&self, x: &HiddenStates, out: &mut HiddenStates) -> Result<()> {
+        // The batched consumers (MTP verify/draft heads, entropy probes) need
+        // full-vocab logits per row; the vocab-sharded lm_head only holds this
+        // rank's slice. The load-time gates make this unreachable in serving —
+        // keep it loud for probe/selftest paths.
+        ensure!(
+            self.lm_head_shard.is_none(),
+            "DSv4 batched lm_head consumers (MTP verify/draft, entropy probes) are \
+             not supported with ARLE_DSV4_LM_HEAD_SHARD=1"
+        );
         ensure!(
             self.lm_head.cols == x.hidden_dim
                 && self.lm_head.rows == out.hidden_dim
@@ -6277,7 +6355,7 @@ impl Dsv4Model {
         }
 
         slot.seq_len += 1;
-        crate::executor::sample_cuda_token(&self.ctx, &graph.logits, params, position)
+        self.sample_logits(&graph.logits, params, position)
     }
 
     /// Project the final hidden vector through the LM head into `logits`. The
@@ -6438,6 +6516,18 @@ fn dsv4_use_deepep_transport() -> Result<bool> {
 fn dsv4_decode_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
+    )
+}
+
+/// Opt-in decode lever #99 (`docs/plans/2026-07-02-dsv4-6ms-token-plan.md` H3):
+/// row-shard lm_head across TP ranks (replicated full-vocab GEMV → vocab/N rows
+/// per rank). Greedy sampling merges per-rank (max, argmax) via one 8-byte host
+/// all-gather; non-greedy all-gathers the bf16 logit slices to full vocab first.
+/// OFF by default; perf license pending pod A/B + needle gate. TP=1 no-ops.
+fn dsv4_lm_head_shard_enabled() -> bool {
+    matches!(
+        std::env::var("ARLE_DSV4_LM_HEAD_SHARD").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }

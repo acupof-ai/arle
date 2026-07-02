@@ -14,7 +14,7 @@ pub use diffusion::{
     diffusion_prediction_from_logits, entropy_bound_acceptance_mask, generate_diffusion,
     generate_diffusion_with_cancel,
 };
-pub use sample::{argmax_logit, sample_token};
+pub use sample::{argmax_logit, merge_vocab_shard_argmax, sample_token};
 
 /// Forward execution mode requested by the engine core.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
