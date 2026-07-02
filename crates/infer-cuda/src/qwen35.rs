@@ -29,6 +29,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
@@ -48,7 +49,7 @@ use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35Config};
 use safetensors::tensor::Dtype;
 
 use crate::executor::sample_cuda_token_scratched;
-use crate::loader::{MoeFp8ExpertGroup, SafetensorLoader};
+use crate::loader::SafetensorLoader;
 use crate::moe::{
     DEEPGEMM_CONTIG_ALIGN, MoeForwardScratch, QWEN35_DEEPGEMM_MIN_ROUTES, deepgemm_contig_rows_cap,
     moe_forward_into,
@@ -1633,20 +1634,23 @@ pub(crate) struct Qwen35Model {
     /// weight buffers are 1-element placeholders in that state and must NOT be
     /// forwarded through until reloaded.
     offloaded: Option<Box<OffloadedWeights>>,
-    /// Pristine base-weight cache for the per-step student LoRA re-merge, keyed
-    /// by absolute layer index plus projection. Populated lazily on the first
-    /// [`Qwen35Model::remerge_student_lora`] call (before any merge mutates the
-    /// resident weights) so every re-merge recomputes `W = base + scale·B·A`
-    /// from the *original* checkpoint weight, never from an already-merged one.
-    lora_base: HashMap<LoraBaseKey, LoraBaseSnapshot>,
     /// Pristine *device* copy of each dense-BF16 base weight, captured on the
-    /// first touch (device→device clone of the resident matrix). The per-step
-    /// re-merge then runs entirely on-device: upload the tiny A/B, GEMM `B·A`,
-    /// scaled-add `W = base + scale·(B·A)` straight into the resident matrix —
-    /// no host triple-loop, no full-W host→device upload. FP8/grouped targets
-    /// fall back to the host [`LoraBaseSnapshot`] path (re-quant needs host
-    /// per-block scaling).
+    /// first touch (device→device clone of the resident matrix, after any
+    /// FP8→BF16 promotion). The per-step re-merge then runs entirely on-device:
+    /// upload the tiny A/B, GEMM `B·A`, scaled-add `W = base + scale·(B·A)`
+    /// straight into the resident matrix — no host triple-loop, no full-W
+    /// host→device upload.
     lora_base_dev: HashMap<LoraBaseKey, DeviceVec>,
+    /// FP8 side buffers retired by [`Qwen35Model::promote_lora_target_to_bf16`]
+    /// whose device pointers may still be aliased by a co-resident autograd
+    /// student (`--share-frozen-base` imports NON-OWNING views of the pointers
+    /// exported by [`Qwen35Model::frozen_base_fp8_pointers`]). Kept alive so the
+    /// student keeps reading the pristine FP8 base; never exported → freed on
+    /// promotion instead.
+    lora_promoted_fp8_keepalive: Vec<(CudaSlice<u8>, CudaSlice<f32>)>,
+    /// Latched by [`Qwen35Model::frozen_base_fp8_pointers`]: resident FP8 base
+    /// pointers have been exported for train-infer weight sharing.
+    frozen_base_ptrs_exported: AtomicBool,
     /// Reusable device scratch for the `B·A` delta (sized to the largest dense
     /// merged matrix seen). Avoids a per-projection device alloc each step.
     lora_delta_scratch: Option<DeviceVec>,
@@ -1666,74 +1670,6 @@ pub(crate) struct Qwen35Model {
 struct LoraBaseKey {
     layer_idx: usize,
     projection: StudentLoraProjection,
-}
-
-#[derive(Clone)]
-enum LoraBaseSnapshot {
-    DenseBf16 {
-        base: Vec<bf16>,
-        rows: usize,
-        cols: usize,
-    },
-    Fp8BlockScaled {
-        base: Vec<bf16>,
-        qweight: Vec<u8>,
-        scales: Vec<f32>,
-        rows: usize,
-        cols: usize,
-        block_m: usize,
-        block_k: usize,
-        scale_rows: usize,
-        scale_cols: usize,
-    },
-}
-
-enum LoraWeightTarget<'a> {
-    Matrix(&'a DeviceMatrix),
-    Fp8Grouped {
-        group: &'a MoeFp8ExpertGroup,
-        group_idx: usize,
-        row_offset: usize,
-        rows: usize,
-        cols: usize,
-        scale_row_offset: usize,
-        scale_rows: usize,
-        scale_cols: usize,
-    },
-}
-
-enum LoraWeightTargetMut<'a> {
-    Matrix(&'a mut DeviceMatrix),
-    Fp8Grouped {
-        group: &'a mut MoeFp8ExpertGroup,
-        group_idx: usize,
-        row_offset: usize,
-        rows: usize,
-        cols: usize,
-        scale_row_offset: usize,
-        scale_rows: usize,
-        scale_cols: usize,
-    },
-}
-
-impl LoraBaseSnapshot {
-    fn rows(&self) -> usize {
-        match self {
-            Self::DenseBf16 { rows, .. } | Self::Fp8BlockScaled { rows, .. } => *rows,
-        }
-    }
-
-    fn cols(&self) -> usize {
-        match self {
-            Self::DenseBf16 { cols, .. } | Self::Fp8BlockScaled { cols, .. } => *cols,
-        }
-    }
-
-    fn base(&self) -> &[bf16] {
-        match self {
-            Self::DenseBf16 { base, .. } | Self::Fp8BlockScaled { base, .. } => base,
-        }
-    }
 }
 
 /// Host-resident snapshot of one transformer block's device weight buffers,
@@ -2682,8 +2618,9 @@ impl Qwen35Model {
             mtp,
             spec_draft_tokens,
             offloaded: None,
-            lora_base: HashMap::new(),
             lora_base_dev: HashMap::new(),
+            lora_promoted_fp8_keepalive: Vec::new(),
+            frozen_base_ptrs_exported: AtomicBool::new(false),
             lora_delta_scratch: None,
             lora_dirty: HashSet::new(),
             weights_epoch: crate::kv_tier::weights_epoch_tag(model_path),
@@ -3880,6 +3817,10 @@ impl Qwen35Model {
             "frozen-base FP8 sharing is single-GPU only; got TP world_size={}",
             self.tp.config().world_size
         );
+        // From here on a LoRA FP8→BF16 promotion must retire (not free) the FP8
+        // buffers: the importer holds non-owning views of these pointers.
+        self.frozen_base_ptrs_exported
+            .store(true, Ordering::Relaxed);
         let ctx = &self.ctx;
         // Plain helper (not a closure) so the grouped-buffer `out.push` calls
         // below don't conflict with a captured `&mut out` borrow.
@@ -4185,30 +4126,102 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Capture a pristine host copy of one base weight on first touch.
-    fn ensure_lora_base_cached(
+    /// Promote an FP8-block-scaled LoRA target to dense BF16 on first touch:
+    /// dequantize on-device into a fresh dense buffer and swap the matrix's
+    /// resident storage in place (same rows/cols). Replaces the former host
+    /// remerge lane (O(rows·cols·rank) triple loop + re-quant + full-W upload,
+    /// 60-83s/round) with a one-time kernel; every later re-merge rides the
+    /// on-device dense lane. Dense targets are a no-op; grouped targets error
+    /// in [`Qwen35Model::lora_matrix_mut`].
+    ///
+    /// VRAM: trades FP8→BF16 storage (2×) for the touched projections only;
+    /// their rollout GEMMs ride the dense-BF16 path thereafter (both formats
+    /// are first-class in serving). If `--share-frozen-base` exported the FP8
+    /// pointers, the retired buffers are kept alive (aliased non-owningly by
+    /// the autograd student); otherwise they are freed.
+    fn promote_lora_target_to_bf16(
         &mut self,
         layer_idx: usize,
         projection: StudentLoraProjection,
     ) -> Result<()> {
-        let key = LoraBaseKey {
-            layer_idx,
-            projection,
-        };
-        if self.lora_base.contains_key(&key) {
+        let label = projection.label();
+        let ctx = self.ctx.clone();
+        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+        if matrix.is_dense_bf16() {
             return Ok(());
         }
-        let label = projection.label();
-        let base = {
-            let target = self.lora_weight_target(layer_idx, projection)?;
-            clone_lora_base_target_to_host(&self.ctx, target, layer_idx, label.as_ref())?
-        };
-        self.lora_base.insert(key, base);
+        ensure!(
+            matrix.weight_format() == WeightFormat::Fp8BlockScaled,
+            "layer {layer_idx} {label}: LoRA merge supports dense BF16 or FP8 block-scaled \
+             weights; got {:?}",
+            matrix.weight_format()
+        );
+        ensure!(
+            matrix.quant_block_m > 0
+                && matrix.quant_block_k > 0
+                && matrix.quant_scale_rows > 0
+                && matrix.quant_scale_cols > 0,
+            "layer {layer_idx} {label}: FP8 LoRA target missing block-scale metadata"
+        );
+        let mut dense = ctx
+            .stream
+            .alloc_zeros::<bf16>(matrix.rows * matrix.cols)
+            .map_err(|e| anyhow!("layer {layer_idx} {label}: BF16 promotion alloc failed: {e}"))?;
+        {
+            let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: FP8 LoRA target missing qweight")
+            })?;
+            let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
+                anyhow!("layer {layer_idx} {label}: FP8 LoRA target missing f32 scales")
+            })?;
+            ensure!(
+                qweight.len() == matrix.rows * matrix.cols,
+                "layer {layer_idx} {label}: FP8 qweight len {} != rows*cols {}",
+                qweight.len(),
+                matrix.rows * matrix.cols
+            );
+            let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
+            let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
+            let (dense_ptr, _gd) = dense.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
+                    qw_ptr as *const u8,
+                    scale_ptr as *const f32,
+                    dense_ptr as *mut ffi::Half,
+                    matrix.rows as i32,
+                    matrix.cols as i32,
+                    matrix.quant_scale_rows as i32,
+                    matrix.quant_scale_cols as i32,
+                    matrix.quant_block_m as i32,
+                    matrix.quant_block_k as i32,
+                    ctx.stream.cu_stream(),
+                )
+            }
+            .result()
+            .map_err(|e| {
+                anyhow!("layer {layer_idx} {label}: FP8→BF16 promotion dequant failed: {e}")
+            })?;
+        }
+        // Success — swap the resident storage to dense BF16 (infallible).
+        let retired = (matrix.qweight_u8.take(), matrix.scale_f32.take());
+        matrix.data = dense;
+        matrix.weight_format = WeightFormat::DenseBf16;
+        matrix.quant_scale_rows = 0;
+        matrix.quant_scale_cols = 0;
+        matrix.quant_block_m = 0;
+        matrix.quant_block_k = 0;
+        if self.frozen_base_ptrs_exported.load(Ordering::Relaxed) {
+            if let (Some(qweight), Some(scales)) = retired {
+                self.lora_promoted_fp8_keepalive.push((qweight, scales));
+            }
+        }
         Ok(())
     }
 
-    /// Recompute `W = base + scale·(B·A)` for one projection and upload it into
-    /// the resident `DeviceMatrix`. `base` is the pristine cached host copy.
+    /// Merge `W = base + scale·(B·A)` for one projection, entirely on device.
+    /// FP8-stored targets are promoted to dense BF16 on first touch, so every
+    /// projection rides one lane: pristine device base cache → rank-`rank`
+    /// GEMM + full-buffer scaled-add into the resident matrix.
     fn merge_lora_proj(
         &mut self,
         layer_idx: usize,
@@ -4227,14 +4240,6 @@ impl Qwen35Model {
             return Ok(());
         }
 
-        // Determine the resident storage format without forcing a host copy: a
-        // standalone dense-BF16 matrix takes the on-device merge path; FP8 /
-        // grouped targets fall back to the host snapshot path.
-        let target_is_dense = matches!(
-            self.lora_weight_target(layer_idx, projection)?,
-            LoraWeightTarget::Matrix(m) if m.is_dense_bf16()
-        );
-
         // Shape checks against the adapter's declared features (cheap; no copy).
         let rows = adapter.out_features;
         let cols = adapter.in_features;
@@ -4251,81 +4256,16 @@ impl Qwen35Model {
             rows * adapter.rank
         );
 
-        if target_is_dense {
-            if adapter_is_zero {
-                // Restore the pristine *device* base (no host round-trip).
-                if self.lora_dirty.remove(&key) {
-                    self.restore_lora_base_dev(layer_idx, projection, &key)?;
-                }
-                return Ok(());
-            }
-            // Dense BF16 (the all-linear hot set): merge entirely on-device.
-            // `W = base_dev + scale·(B·A)` via one rank-`rank` GEMM + a
-            // full-buffer scaled-add into the resident matrix — replaces the
-            // O(rows·cols·rank) host triple-loop + full-W host→device upload.
-            return self.merge_lora_proj_device(layer_idx, projection, adapter, scale, &key);
-        }
-
-        // FP8 / grouped path: cache the pristine base host-side, validate
-        // against it, and recompute on host (re-quant needs host per-block
-        // scaling).
-        self.ensure_lora_base_cached(layer_idx, projection)?;
-        let snapshot = self
-            .lora_base
-            .get(&key)
-            .ok_or_else(|| anyhow!("layer {layer_idx} {label}: base weight not cached"))?
-            .clone();
-        ensure!(
-            snapshot.rows() == rows && snapshot.cols() == cols,
-            "layer {layer_idx} {label}: FP8 base shape {}x{} != adapter {rows}x{cols}",
-            snapshot.rows(),
-            snapshot.cols()
-        );
+        self.promote_lora_target_to_bf16(layer_idx, projection)?;
 
         if adapter_is_zero {
+            // Restore the pristine *device* base (no host round-trip).
             if self.lora_dirty.remove(&key) {
-                let ctx = self.ctx.clone();
-                let target = self.lora_weight_target_mut(layer_idx, projection)?;
-                restore_lora_base_target_in_place(
-                    &ctx,
-                    target,
-                    &snapshot,
-                    layer_idx,
-                    label.as_ref(),
-                )?;
+                self.restore_lora_base_dev(layer_idx, projection, &key)?;
             }
             return Ok(());
         }
-
-        let rank = adapter.rank;
-
-        // W[r, c] = base[r, c] + scale · Σ_k B[r, k] · A[k, c].
-        let mut merged = vec![bf16::ZERO; rows * cols];
-        let base = snapshot.base();
-        for row in 0..rows {
-            let b_row = &adapter.b[row * rank..row * rank + rank];
-            for col in 0..cols {
-                let mut delta = 0.0f32;
-                for (k, &b_rk) in b_row.iter().enumerate() {
-                    delta += b_rk * adapter.a[k * cols + col];
-                }
-                let idx = row * cols + col;
-                merged[idx] = bf16::from_f32(base[idx].to_f32() + scale * delta);
-            }
-        }
-
-        let ctx = self.ctx.clone();
-        let target = self.lora_weight_target_mut(layer_idx, projection)?;
-        upload_lora_merged_target_in_place(
-            &ctx,
-            target,
-            &snapshot,
-            &merged,
-            layer_idx,
-            label.as_ref(),
-        )?;
-        self.lora_dirty.insert(key);
-        Ok(())
+        self.merge_lora_proj_device(layer_idx, projection, adapter, scale, &key)
     }
 
     /// On-device dense-BF16 LoRA merge. Caches the pristine base on-device on
@@ -4408,12 +4348,7 @@ impl Qwen35Model {
             .clone();
         let delta_view = delta_data.slice(0..needed);
 
-        let target = self.lora_weight_target_mut(layer_idx, projection)?;
-        let LoraWeightTargetMut::Matrix(matrix) = target else {
-            return Err(anyhow!(
-                "layer {layer_idx} {label}: dense device merge requires a standalone matrix target"
-            ));
-        };
+        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
         ensure!(
             matrix.is_dense_bf16() && matrix.rows == rows && matrix.cols == cols,
             "layer {layer_idx} {label}: dense device merge shape/format mismatch \
@@ -4447,12 +4382,7 @@ impl Qwen35Model {
             return Ok(());
         }
         let label = projection.label();
-        let target = self.lora_weight_target(layer_idx, projection)?;
-        let LoraWeightTarget::Matrix(matrix) = target else {
-            return Err(anyhow!(
-                "layer {layer_idx} {label}: device base cache requires a standalone matrix target"
-            ));
-        };
+        let matrix = self.lora_matrix(layer_idx, projection)?;
         ensure!(
             matrix.is_dense_bf16(),
             "layer {layer_idx} {label}: device base cache requires dense BF16; got {:?}",
@@ -4485,12 +4415,7 @@ impl Qwen35Model {
             })?
             .data
             .clone();
-        let target = self.lora_weight_target_mut(layer_idx, projection)?;
-        let LoraWeightTargetMut::Matrix(matrix) = target else {
-            return Err(anyhow!(
-                "layer {layer_idx} {label}: dense device restore requires a standalone matrix target"
-            ));
-        };
+        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
         ctx.stream
             .memcpy_dtod(&base_dev, &mut matrix.data)
             .map_err(|e| {
@@ -4508,253 +4433,6 @@ impl Qwen35Model {
             self.expert_split.local_expert_end()
         );
         Ok(global_expert - self.expert_split.local_expert_start)
-    }
-
-    fn fp8_grouped_expert_target<'a>(
-        &'a self,
-        layer_idx: usize,
-        projection: StudentLoraProjection,
-        local_idx: usize,
-    ) -> Result<LoraWeightTarget<'a>> {
-        let layer = &self.layers[layer_idx];
-        let moe = layer.moe.as_ref().ok_or_else(|| {
-            anyhow!(
-                "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
-                projection.label()
-            )
-        })?;
-        match projection {
-            StudentLoraProjection::MoeExpertGate { .. }
-            | StudentLoraProjection::MoeExpertUp { .. } => {
-                let group = moe.w13_fp8_grouped.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "layer {layer_idx} {} expert matrix is not resident as per-expert \
-                         weights and no FP8 grouped gate/up cache is available",
-                        projection.label()
-                    )
-                })?;
-                let rows = self.config.moe_intermediate_size;
-                let row_offset = match projection {
-                    StudentLoraProjection::MoeExpertGate { .. } => 0,
-                    StudentLoraProjection::MoeExpertUp { .. } => rows,
-                    _ => unreachable!("gate/up projection arm checked above"),
-                };
-                self.validate_fp8_grouped_lora_target(
-                    layer_idx,
-                    projection,
-                    group,
-                    local_idx,
-                    row_offset,
-                    rows,
-                    self.config.hidden_size,
-                )?;
-                Ok(LoraWeightTarget::Fp8Grouped {
-                    group,
-                    group_idx: local_idx,
-                    row_offset,
-                    rows,
-                    cols: self.config.hidden_size,
-                    scale_row_offset: row_offset / 128,
-                    scale_rows: rows.div_ceil(128),
-                    scale_cols: self.config.hidden_size.div_ceil(128),
-                })
-            }
-            StudentLoraProjection::MoeExpertDown { .. } => {
-                let group = moe.down_fp8_grouped.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "layer {layer_idx} {} expert matrix is not resident as per-expert \
-                         weights and no FP8 grouped down cache is available",
-                        projection.label()
-                    )
-                })?;
-                let rows = self.config.hidden_size;
-                let cols = self.config.moe_intermediate_size;
-                self.validate_fp8_grouped_lora_target(
-                    layer_idx, projection, group, local_idx, 0, rows, cols,
-                )?;
-                Ok(LoraWeightTarget::Fp8Grouped {
-                    group,
-                    group_idx: local_idx,
-                    row_offset: 0,
-                    rows,
-                    cols,
-                    scale_row_offset: 0,
-                    scale_rows: rows.div_ceil(128),
-                    scale_cols: cols.div_ceil(128),
-                })
-            }
-            _ => unreachable!("expert projection arm checked by caller"),
-        }
-    }
-
-    fn fp8_grouped_expert_target_mut<'a>(
-        &'a mut self,
-        layer_idx: usize,
-        projection: StudentLoraProjection,
-        local_idx: usize,
-    ) -> Result<LoraWeightTargetMut<'a>> {
-        let hidden_size = self.config.hidden_size;
-        let moe_intermediate_size = self.config.moe_intermediate_size;
-        let layer = &mut self.layers[layer_idx];
-        let moe = layer.moe.as_mut().ok_or_else(|| {
-            anyhow!(
-                "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
-                projection.label()
-            )
-        })?;
-        match projection {
-            StudentLoraProjection::MoeExpertGate { .. }
-            | StudentLoraProjection::MoeExpertUp { .. } => {
-                let group = moe.w13_fp8_grouped.as_mut().ok_or_else(|| {
-                    anyhow!(
-                        "layer {layer_idx} {} expert matrix is not resident as per-expert \
-                         weights and no FP8 grouped gate/up cache is available",
-                        projection.label()
-                    )
-                })?;
-                let rows = moe_intermediate_size;
-                let row_offset = match projection {
-                    StudentLoraProjection::MoeExpertGate { .. } => 0,
-                    StudentLoraProjection::MoeExpertUp { .. } => rows,
-                    _ => unreachable!("gate/up projection arm checked above"),
-                };
-                validate_fp8_grouped_lora_shape(
-                    layer_idx,
-                    projection,
-                    group,
-                    local_idx,
-                    row_offset,
-                    rows,
-                    hidden_size,
-                )?;
-                Ok(LoraWeightTargetMut::Fp8Grouped {
-                    group,
-                    group_idx: local_idx,
-                    row_offset,
-                    rows,
-                    cols: hidden_size,
-                    scale_row_offset: row_offset / 128,
-                    scale_rows: rows.div_ceil(128),
-                    scale_cols: hidden_size.div_ceil(128),
-                })
-            }
-            StudentLoraProjection::MoeExpertDown { .. } => {
-                let group = moe.down_fp8_grouped.as_mut().ok_or_else(|| {
-                    anyhow!(
-                        "layer {layer_idx} {} expert matrix is not resident as per-expert \
-                         weights and no FP8 grouped down cache is available",
-                        projection.label()
-                    )
-                })?;
-                let rows = hidden_size;
-                let cols = moe_intermediate_size;
-                validate_fp8_grouped_lora_shape(
-                    layer_idx, projection, group, local_idx, 0, rows, cols,
-                )?;
-                Ok(LoraWeightTargetMut::Fp8Grouped {
-                    group,
-                    group_idx: local_idx,
-                    row_offset: 0,
-                    rows,
-                    cols,
-                    scale_row_offset: 0,
-                    scale_rows: rows.div_ceil(128),
-                    scale_cols: cols.div_ceil(128),
-                })
-            }
-            _ => unreachable!("expert projection arm checked by caller"),
-        }
-    }
-
-    fn validate_fp8_grouped_lora_target(
-        &self,
-        layer_idx: usize,
-        projection: StudentLoraProjection,
-        group: &MoeFp8ExpertGroup,
-        group_idx: usize,
-        row_offset: usize,
-        rows: usize,
-        cols: usize,
-    ) -> Result<()> {
-        validate_fp8_grouped_lora_shape(
-            layer_idx, projection, group, group_idx, row_offset, rows, cols,
-        )
-    }
-
-    fn lora_weight_target(
-        &self,
-        layer_idx: usize,
-        projection: StudentLoraProjection,
-    ) -> Result<LoraWeightTarget<'_>> {
-        match projection {
-            StudentLoraProjection::MoeExpertGate { expert_idx }
-            | StudentLoraProjection::MoeExpertUp { expert_idx }
-            | StudentLoraProjection::MoeExpertDown { expert_idx } => {
-                let local_idx = self.local_expert_idx(expert_idx)?;
-                let layer = &self.layers[layer_idx];
-                let moe = layer.moe.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "layer {layer_idx} {} requires a Qwen3.6 MoE layer",
-                        projection.label()
-                    )
-                })?;
-                let experts = match projection {
-                    StudentLoraProjection::MoeExpertGate { .. } => &moe.gate,
-                    StudentLoraProjection::MoeExpertUp { .. } => &moe.up,
-                    StudentLoraProjection::MoeExpertDown { .. } => &moe.down,
-                    _ => unreachable!("expert MoE projection arm checked above"),
-                };
-                if let Some(matrix) = experts.get(local_idx) {
-                    Ok(LoraWeightTarget::Matrix(matrix))
-                } else {
-                    self.fp8_grouped_expert_target(layer_idx, projection, local_idx)
-                }
-            }
-            _ => Ok(LoraWeightTarget::Matrix(
-                self.lora_matrix(layer_idx, projection)?,
-            )),
-        }
-    }
-
-    fn lora_weight_target_mut(
-        &mut self,
-        layer_idx: usize,
-        projection: StudentLoraProjection,
-    ) -> Result<LoraWeightTargetMut<'_>> {
-        match projection {
-            StudentLoraProjection::MoeExpertGate { expert_idx }
-            | StudentLoraProjection::MoeExpertUp { expert_idx }
-            | StudentLoraProjection::MoeExpertDown { expert_idx } => {
-                let local_start = self.expert_split.local_expert_start;
-                let local_end = self.expert_split.local_expert_end();
-                ensure!(
-                    (local_start..local_end).contains(&expert_idx),
-                    "Qwen3.6 LoRA sync expert {expert_idx} is not local to this rank \
-                     (local range {local_start}..{local_end})"
-                );
-                let local_idx = expert_idx - local_start;
-                let layer = &self.layers[layer_idx];
-                let has_per_expert = match &layer.moe {
-                    Some(moe) => match projection {
-                        StudentLoraProjection::MoeExpertGate { .. } => local_idx < moe.gate.len(),
-                        StudentLoraProjection::MoeExpertUp { .. } => local_idx < moe.up.len(),
-                        StudentLoraProjection::MoeExpertDown { .. } => local_idx < moe.down.len(),
-                        _ => unreachable!("expert MoE projection arm checked above"),
-                    },
-                    None => false,
-                };
-                if has_per_expert {
-                    Ok(LoraWeightTargetMut::Matrix(
-                        self.lora_matrix_mut(layer_idx, projection)?,
-                    ))
-                } else {
-                    self.fp8_grouped_expert_target_mut(layer_idx, projection, local_idx)
-                }
-            }
-            _ => Ok(LoraWeightTargetMut::Matrix(
-                self.lora_matrix_mut(layer_idx, projection)?,
-            )),
-        }
     }
 
     fn lora_matrix(
@@ -7530,692 +7208,6 @@ fn v_head_shard_range(name: &str, total_v_heads: usize, tp: &TpConfig) -> Result
     Ok((tp.rank * local, local))
 }
 
-fn validate_fp8_grouped_lora_shape(
-    layer_idx: usize,
-    projection: StudentLoraProjection,
-    group: &MoeFp8ExpertGroup,
-    group_idx: usize,
-    row_offset: usize,
-    rows: usize,
-    cols: usize,
-) -> Result<()> {
-    ensure!(
-        group_idx < group.groups,
-        "layer {layer_idx} {} grouped FP8 expert index {group_idx} outside groups {}",
-        projection.label(),
-        group.groups
-    );
-    ensure!(
-        row_offset.is_multiple_of(128) && rows.is_multiple_of(128) && cols == group.cols,
-        "layer {layer_idx} {} grouped FP8 LoRA slice row_offset={row_offset} rows={rows} cols={cols} invalid for group cols {}",
-        projection.label(),
-        group.cols
-    );
-    ensure!(
-        row_offset + rows <= group.rows,
-        "layer {layer_idx} {} grouped FP8 LoRA slice rows {}..{} exceed group rows {}",
-        projection.label(),
-        row_offset,
-        row_offset + rows,
-        group.rows
-    );
-    ensure!(
-        group.scale_rows == group.rows.div_ceil(128)
-            && group.scale_cols == group.cols.div_ceil(128),
-        "layer {layer_idx} {} grouped FP8 scale shape {}x{} != ceil({}/{}) x ceil({}/{})",
-        projection.label(),
-        group.scale_rows,
-        group.scale_cols,
-        group.rows,
-        128,
-        group.cols,
-        128
-    );
-    Ok(())
-}
-
-/// Copy the resident LoRA target to a row-major host snapshot before the first
-/// re-merge. For Qwen3.6 FP8 DeepGEMM routed experts, the runtime target is the
-/// grouped cache, not the dropped per-expert `DeviceMatrix`.
-fn clone_lora_base_target_to_host(
-    ctx: &DeviceContext,
-    target: LoraWeightTarget<'_>,
-    layer_idx: usize,
-    label: &str,
-) -> Result<LoraBaseSnapshot> {
-    match target {
-        LoraWeightTarget::Matrix(matrix) => clone_lora_base_to_host(ctx, matrix, layer_idx, label),
-        LoraWeightTarget::Fp8Grouped {
-            group,
-            group_idx,
-            row_offset,
-            rows,
-            cols,
-            scale_row_offset,
-            scale_rows,
-            scale_cols,
-        } => clone_grouped_fp8_lora_base_to_host(
-            ctx,
-            group,
-            group_idx,
-            row_offset,
-            rows,
-            cols,
-            scale_row_offset,
-            scale_rows,
-            scale_cols,
-            layer_idx,
-            label,
-        ),
-    }
-}
-
-/// Copy a dense BF16 or FP8-block-scaled `DeviceMatrix` to a row-major host
-/// snapshot. Used when the projection is still resident as a standalone matrix.
-fn clone_lora_base_to_host(
-    ctx: &DeviceContext,
-    matrix: &DeviceMatrix,
-    layer_idx: usize,
-    label: &str,
-) -> Result<LoraBaseSnapshot> {
-    match matrix.weight_format() {
-        WeightFormat::DenseBf16 if matrix.is_dense_bf16() => {
-            let host = ctx.stream.clone_dtoh(&matrix.data).map_err(|e| {
-                anyhow!("layer {layer_idx} {label}: D2H base weight copy failed: {e}")
-            })?;
-            ctx.sync()?;
-            ensure!(
-                host.len() == matrix.rows * matrix.cols,
-                "layer {layer_idx} {label}: base copy len {} != rows*cols {}",
-                host.len(),
-                matrix.rows * matrix.cols
-            );
-            Ok(LoraBaseSnapshot::DenseBf16 {
-                base: host,
-                rows: matrix.rows,
-                cols: matrix.cols,
-            })
-        }
-        WeightFormat::Fp8BlockScaled => {
-            ensure!(
-                matrix.quant_block_m > 0
-                    && matrix.quant_block_k > 0
-                    && matrix.quant_scale_rows > 0
-                    && matrix.quant_scale_cols > 0,
-                "layer {layer_idx} {label}: FP8 LoRA base missing block-scale metadata"
-            );
-            let qweight = matrix.qweight_u8.as_ref().ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: FP8 LoRA base missing qweight")
-            })?;
-            let scales = matrix.scale_f32.as_ref().ok_or_else(|| {
-                anyhow!("layer {layer_idx} {label}: FP8 LoRA base missing f32 scales")
-            })?;
-            ensure!(
-                qweight.len() == matrix.rows * matrix.cols,
-                "layer {layer_idx} {label}: FP8 qweight len {} != rows*cols {}",
-                qweight.len(),
-                matrix.rows * matrix.cols
-            );
-            ensure!(
-                scales.len() == matrix.quant_scale_rows * matrix.quant_scale_cols,
-                "layer {layer_idx} {label}: FP8 scale len {} != {}x{}",
-                scales.len(),
-                matrix.quant_scale_rows,
-                matrix.quant_scale_cols
-            );
-            let qweight_host = ctx.stream.clone_dtoh(qweight).map_err(|e| {
-                anyhow!("layer {layer_idx} {label}: D2H FP8 base weight failed: {e}")
-            })?;
-            let scales_host = ctx.stream.clone_dtoh(scales).map_err(|e| {
-                anyhow!("layer {layer_idx} {label}: D2H FP8 base scales failed: {e}")
-            })?;
-            ctx.sync()?;
-            let base = dequantize_fp8_block_scaled(
-                &qweight_host,
-                &scales_host,
-                matrix.rows,
-                matrix.cols,
-                matrix.quant_block_m,
-                matrix.quant_block_k,
-                matrix.quant_scale_rows,
-                matrix.quant_scale_cols,
-            )?;
-            Ok(LoraBaseSnapshot::Fp8BlockScaled {
-                base,
-                qweight: qweight_host,
-                scales: scales_host,
-                rows: matrix.rows,
-                cols: matrix.cols,
-                block_m: matrix.quant_block_m,
-                block_k: matrix.quant_block_k,
-                scale_rows: matrix.quant_scale_rows,
-                scale_cols: matrix.quant_scale_cols,
-            })
-        }
-        other => Err(anyhow!(
-            "layer {layer_idx} {label}: LoRA base snapshot supports dense BF16 or FP8 block-scaled weights, got {other:?}"
-        )),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn clone_grouped_fp8_lora_base_to_host(
-    ctx: &DeviceContext,
-    group: &MoeFp8ExpertGroup,
-    group_idx: usize,
-    row_offset: usize,
-    rows: usize,
-    cols: usize,
-    scale_row_offset: usize,
-    scale_rows: usize,
-    scale_cols: usize,
-    layer_idx: usize,
-    label: &str,
-) -> Result<LoraBaseSnapshot> {
-    ensure!(
-        cols == group.cols && row_offset + rows <= group.rows,
-        "layer {layer_idx} {label}: grouped FP8 snapshot slice {}x{} at row_offset {} invalid for group {}x{}",
-        rows,
-        cols,
-        row_offset,
-        group.rows,
-        group.cols
-    );
-    ensure!(
-        group_idx < group.groups,
-        "layer {layer_idx} {label}: grouped FP8 snapshot group {group_idx} outside {}",
-        group.groups
-    );
-    ensure!(
-        scale_cols == group.scale_cols && scale_row_offset + scale_rows <= group.scale_rows,
-        "layer {layer_idx} {label}: grouped FP8 scale slice {}x{} at row_offset {} invalid for group scales {}x{}",
-        scale_rows,
-        scale_cols,
-        scale_row_offset,
-        group.scale_rows,
-        group.scale_cols
-    );
-
-    let group_weight_base = group_idx * group.rows * group.cols;
-    let weight_start = group_weight_base + row_offset * group.cols;
-    let weight_len = rows * cols;
-    let qweight = ctx
-        .stream
-        .clone_dtoh(&group.weight.slice(weight_start..weight_start + weight_len))
-        .map_err(|e| anyhow!("layer {layer_idx} {label}: D2H grouped FP8 weight failed: {e}"))?;
-
-    let group_scale_base = group_idx * group.scale_rows * group.scale_cols;
-    let scale_start = group_scale_base + scale_row_offset * group.scale_cols;
-    let scale_len = scale_rows * scale_cols;
-    let scales = ctx
-        .stream
-        .clone_dtoh(&group.scales.slice(scale_start..scale_start + scale_len))
-        .map_err(|e| anyhow!("layer {layer_idx} {label}: D2H grouped FP8 scales failed: {e}"))?;
-    ctx.sync()?;
-
-    let base = dequantize_fp8_block_scaled(
-        &qweight, &scales, rows, cols, 128, 128, scale_rows, scale_cols,
-    )?;
-    Ok(LoraBaseSnapshot::Fp8BlockScaled {
-        base,
-        qweight,
-        scales,
-        rows,
-        cols,
-        block_m: 128,
-        block_k: 128,
-        scale_rows,
-        scale_cols,
-    })
-}
-
-/// Restore a cached pristine LoRA base into the existing runtime allocation.
-fn restore_lora_base_target_in_place(
-    ctx: &DeviceContext,
-    target: LoraWeightTargetMut<'_>,
-    snapshot: &LoraBaseSnapshot,
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    match target {
-        LoraWeightTargetMut::Matrix(matrix) => {
-            restore_lora_base_in_place(ctx, matrix, snapshot, layer_idx, label)
-        }
-        LoraWeightTargetMut::Fp8Grouped {
-            group,
-            group_idx,
-            row_offset,
-            rows,
-            cols,
-            scale_row_offset,
-            scale_rows,
-            scale_cols,
-        } => {
-            let LoraBaseSnapshot::Fp8BlockScaled {
-                qweight, scales, ..
-            } = snapshot
-            else {
-                return Err(anyhow!(
-                    "layer {layer_idx} {label}: grouped FP8 restore got non-FP8 base snapshot"
-                ));
-            };
-            upload_grouped_fp8_lora_slice_in_place(
-                ctx,
-                group,
-                group_idx,
-                row_offset,
-                rows,
-                cols,
-                scale_row_offset,
-                scale_rows,
-                scale_cols,
-                qweight,
-                scales,
-                layer_idx,
-                label,
-            )
-        }
-    }
-}
-
-/// Restore a cached pristine LoRA base into the existing standalone matrix.
-fn restore_lora_base_in_place(
-    ctx: &DeviceContext,
-    matrix: &mut DeviceMatrix,
-    snapshot: &LoraBaseSnapshot,
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    match snapshot {
-        LoraBaseSnapshot::DenseBf16 { base, .. } => {
-            upload_dense_matrix_in_place(ctx, matrix, base, layer_idx, label)
-        }
-        LoraBaseSnapshot::Fp8BlockScaled {
-            qweight, scales, ..
-        } => upload_fp8_block_scaled_in_place(ctx, matrix, qweight, scales, layer_idx, label),
-    }
-}
-
-/// Upload a LoRA-merged matrix into the existing runtime target, preserving the
-/// resident storage format.
-fn upload_lora_merged_target_in_place(
-    ctx: &DeviceContext,
-    target: LoraWeightTargetMut<'_>,
-    snapshot: &LoraBaseSnapshot,
-    merged: &[bf16],
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    match target {
-        LoraWeightTargetMut::Matrix(matrix) => {
-            upload_lora_merged_in_place(ctx, matrix, snapshot, merged, layer_idx, label)
-        }
-        LoraWeightTargetMut::Fp8Grouped {
-            group,
-            group_idx,
-            row_offset,
-            rows,
-            cols,
-            scale_row_offset,
-            scale_rows,
-            scale_cols,
-        } => {
-            let LoraBaseSnapshot::Fp8BlockScaled { .. } = snapshot else {
-                return Err(anyhow!(
-                    "layer {layer_idx} {label}: grouped FP8 upload got non-FP8 base snapshot"
-                ));
-            };
-            let quant = quantize_bf16_to_fp8_block_scaled(
-                merged, rows, cols, 128, 128, scale_rows, scale_cols,
-            )?;
-            upload_grouped_fp8_lora_slice_in_place(
-                ctx,
-                group,
-                group_idx,
-                row_offset,
-                rows,
-                cols,
-                scale_row_offset,
-                scale_rows,
-                scale_cols,
-                &quant.qweight,
-                &quant.scales,
-                layer_idx,
-                label,
-            )
-        }
-    }
-}
-
-/// Upload a LoRA-merged matrix into the existing standalone allocation,
-/// preserving its storage format.
-fn upload_lora_merged_in_place(
-    ctx: &DeviceContext,
-    matrix: &mut DeviceMatrix,
-    snapshot: &LoraBaseSnapshot,
-    merged: &[bf16],
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    match snapshot {
-        LoraBaseSnapshot::DenseBf16 { .. } => {
-            upload_dense_matrix_in_place(ctx, matrix, merged, layer_idx, label)
-        }
-        LoraBaseSnapshot::Fp8BlockScaled {
-            rows,
-            cols,
-            block_m,
-            block_k,
-            scale_rows,
-            scale_cols,
-            ..
-        } => {
-            let quant = quantize_bf16_to_fp8_block_scaled(
-                merged,
-                *rows,
-                *cols,
-                *block_m,
-                *block_k,
-                *scale_rows,
-                *scale_cols,
-            )?;
-            upload_fp8_block_scaled_in_place(
-                ctx,
-                matrix,
-                &quant.qweight,
-                &quant.scales,
-                layer_idx,
-                label,
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn upload_grouped_fp8_lora_slice_in_place(
-    ctx: &DeviceContext,
-    group: &mut MoeFp8ExpertGroup,
-    group_idx: usize,
-    row_offset: usize,
-    rows: usize,
-    cols: usize,
-    scale_row_offset: usize,
-    scale_rows: usize,
-    scale_cols: usize,
-    qweight: &[u8],
-    scales: &[f32],
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    ensure!(
-        group_idx < group.groups && cols == group.cols && row_offset + rows <= group.rows,
-        "layer {layer_idx} {label}: grouped FP8 upload slice group={group_idx} row_offset={row_offset} rows={rows} cols={cols} invalid for group groups={} shape={}x{}",
-        group.groups,
-        group.rows,
-        group.cols
-    );
-    ensure!(
-        qweight.len() == rows * cols,
-        "layer {layer_idx} {label}: grouped FP8 upload qweight len {} != {}",
-        qweight.len(),
-        rows * cols
-    );
-    ensure!(
-        scale_cols == group.scale_cols
-            && scale_row_offset + scale_rows <= group.scale_rows
-            && scales.len() == scale_rows * scale_cols,
-        "layer {layer_idx} {label}: grouped FP8 upload scale len {} / slice {}x{} invalid for group scales {}x{}",
-        scales.len(),
-        scale_rows,
-        scale_cols,
-        group.scale_rows,
-        group.scale_cols
-    );
-
-    let group_weight_base = group_idx * group.rows * group.cols;
-    let weight_start = group_weight_base + row_offset * group.cols;
-    let mut weight_dst = group
-        .weight
-        .slice_mut(weight_start..weight_start + qweight.len());
-    ctx.stream
-        .memcpy_htod(qweight, &mut weight_dst)
-        .map_err(|e| anyhow!("layer {layer_idx} {label}: grouped FP8 weight upload failed: {e}"))?;
-
-    let group_scale_base = group_idx * group.scale_rows * group.scale_cols;
-    let scale_start = group_scale_base + scale_row_offset * group.scale_cols;
-    let mut scale_dst = group
-        .scales
-        .slice_mut(scale_start..scale_start + scales.len());
-    ctx.stream
-        .memcpy_htod(scales, &mut scale_dst)
-        .map_err(|e| anyhow!("layer {layer_idx} {label}: grouped FP8 scale upload failed: {e}"))?;
-    Ok(())
-}
-
-/// Upload a dense BF16 LoRA-merged matrix into the existing allocation.
-///
-/// Keeping the device address stable matters for MoE expert pointer tables and
-/// CUDA graph capture: those tables reference resident matrices by pointer.
-fn upload_dense_matrix_in_place(
-    ctx: &DeviceContext,
-    matrix: &mut DeviceMatrix,
-    data: &[bf16],
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    ensure!(
-        matrix.is_dense_bf16(),
-        "layer {layer_idx} {label}: LoRA re-merge requires dense BF16; got {:?}",
-        matrix.weight_format()
-    );
-    ensure!(
-        data.len() == matrix.rows * matrix.cols && data.len() == matrix.data.len(),
-        "layer {layer_idx} {label}: merged len {} != resident matrix {}x{} / data len {}",
-        data.len(),
-        matrix.rows,
-        matrix.cols,
-        matrix.data.len()
-    );
-    let mut dst = matrix.data.slice_mut(0..data.len());
-    ctx.stream
-        .memcpy_htod(data, &mut dst)
-        .map_err(|e| anyhow!("layer {layer_idx} {label}: in-place LoRA upload failed: {e}"))?;
-    Ok(())
-}
-
-fn upload_fp8_block_scaled_in_place(
-    ctx: &DeviceContext,
-    matrix: &mut DeviceMatrix,
-    qweight: &[u8],
-    scales: &[f32],
-    layer_idx: usize,
-    label: &str,
-) -> Result<()> {
-    ensure!(
-        matrix.weight_format() == WeightFormat::Fp8BlockScaled,
-        "layer {layer_idx} {label}: FP8 LoRA upload requires FP8 block-scaled resident weights; got {:?}",
-        matrix.weight_format()
-    );
-    let resident_qweight = matrix
-        .qweight_u8
-        .as_mut()
-        .ok_or_else(|| anyhow!("layer {layer_idx} {label}: resident FP8 qweight missing"))?;
-    let resident_scales = matrix
-        .scale_f32
-        .as_mut()
-        .ok_or_else(|| anyhow!("layer {layer_idx} {label}: resident FP8 scales missing"))?;
-    ensure!(
-        qweight.len() == resident_qweight.len() && qweight.len() == matrix.rows * matrix.cols,
-        "layer {layer_idx} {label}: FP8 merged qweight len {} != resident {} / rows*cols {}",
-        qweight.len(),
-        resident_qweight.len(),
-        matrix.rows * matrix.cols
-    );
-    ensure!(
-        scales.len() == resident_scales.len()
-            && scales.len() == matrix.quant_scale_rows * matrix.quant_scale_cols,
-        "layer {layer_idx} {label}: FP8 merged scale len {} != resident {} / {}x{}",
-        scales.len(),
-        resident_scales.len(),
-        matrix.quant_scale_rows,
-        matrix.quant_scale_cols
-    );
-    ctx.stream
-        .memcpy_htod(qweight, resident_qweight)
-        .map_err(|e| {
-            anyhow!("layer {layer_idx} {label}: in-place FP8 qweight upload failed: {e}")
-        })?;
-    ctx.stream
-        .memcpy_htod(scales, resident_scales)
-        .map_err(|e| anyhow!("layer {layer_idx} {label}: in-place FP8 scale upload failed: {e}"))?;
-    Ok(())
-}
-
-struct QuantizedFp8BlockScaled {
-    qweight: Vec<u8>,
-    scales: Vec<f32>,
-}
-
-fn dequantize_fp8_block_scaled(
-    qweight: &[u8],
-    scales: &[f32],
-    rows: usize,
-    cols: usize,
-    block_m: usize,
-    block_k: usize,
-    scale_rows: usize,
-    scale_cols: usize,
-) -> Result<Vec<bf16>> {
-    ensure!(
-        qweight.len() == rows * cols,
-        "FP8 dequant qweight len {} != rows*cols {}",
-        qweight.len(),
-        rows * cols
-    );
-    ensure!(
-        scales.len() == scale_rows * scale_cols,
-        "FP8 dequant scales len {} != {}x{}",
-        scales.len(),
-        scale_rows,
-        scale_cols
-    );
-    let mut out = vec![bf16::ZERO; rows * cols];
-    for row in 0..rows {
-        let scale_row = (row / block_m).min(scale_rows - 1);
-        for col in 0..cols {
-            let scale_col = (col / block_k).min(scale_cols - 1);
-            let scale = scales[scale_row * scale_cols + scale_col];
-            let value = fp8_e4m3fn_to_f32(qweight[row * cols + col]) * scale;
-            out[row * cols + col] = bf16::from_f32(value);
-        }
-    }
-    Ok(out)
-}
-
-fn quantize_bf16_to_fp8_block_scaled(
-    data: &[bf16],
-    rows: usize,
-    cols: usize,
-    block_m: usize,
-    block_k: usize,
-    scale_rows: usize,
-    scale_cols: usize,
-) -> Result<QuantizedFp8BlockScaled> {
-    ensure!(
-        data.len() == rows * cols,
-        "FP8 quant data len {} != rows*cols {}",
-        data.len(),
-        rows * cols
-    );
-    ensure!(
-        scale_rows == rows.div_ceil(block_m) && scale_cols == cols.div_ceil(block_k),
-        "FP8 quant scale shape {}x{} != ceil({rows}/{block_m}) x ceil({cols}/{block_k})",
-        scale_rows,
-        scale_cols
-    );
-    let mut qweight = vec![0_u8; rows * cols];
-    let mut scales = vec![1.0_f32; scale_rows * scale_cols];
-    for sr in 0..scale_rows {
-        let row_start = sr * block_m;
-        let row_end = ((sr + 1) * block_m).min(rows);
-        for sc in 0..scale_cols {
-            let col_start = sc * block_k;
-            let col_end = ((sc + 1) * block_k).min(cols);
-            let mut max_abs = 0.0_f32;
-            for row in row_start..row_end {
-                for col in col_start..col_end {
-                    max_abs = max_abs.max(data[row * cols + col].to_f32().abs());
-                }
-            }
-            let scale = if max_abs > 0.0 {
-                (max_abs / FP8_E4M3FN_MAX).max(f32::MIN_POSITIVE)
-            } else {
-                1.0
-            };
-            scales[sr * scale_cols + sc] = scale;
-            for row in row_start..row_end {
-                for col in col_start..col_end {
-                    let idx = row * cols + col;
-                    qweight[idx] = f32_to_fp8_e4m3fn(data[idx].to_f32() / scale);
-                }
-            }
-        }
-    }
-    Ok(QuantizedFp8BlockScaled { qweight, scales })
-}
-
-const FP8_E4M3FN_MAX: f32 = 448.0;
-
-fn fp8_e4m3fn_to_f32(byte: u8) -> f32 {
-    let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exp = (byte >> 3) & 0x0f;
-    let mant = byte & 0x07;
-    let mag = match exp {
-        0 => (mant as f32) * 2_f32.powi(-9),
-        1..=14 => (1.0 + mant as f32 / 8.0) * 2_f32.powi(exp as i32 - 7),
-        _ => {
-            if mant >= 7 {
-                FP8_E4M3FN_MAX
-            } else {
-                (1.0 + mant as f32 / 8.0) * 256.0
-            }
-        }
-    };
-    sign * mag
-}
-
-fn f32_to_fp8_e4m3fn(value: f32) -> u8 {
-    if !value.is_finite() || value == 0.0 {
-        return 0;
-    }
-    let sign = if value.is_sign_negative() { 0x80 } else { 0x00 };
-    let x = value.abs().min(FP8_E4M3FN_MAX);
-    if x < 2_f32.powi(-9) * 0.5 {
-        return sign;
-    }
-    if x < 2_f32.powi(-6) {
-        let mant = (x / 2_f32.powi(-9)).round().clamp(1.0, 7.0) as u8;
-        return sign | mant;
-    }
-    if x >= 256.0 {
-        let mant = ((x / 256.0 - 1.0) * 8.0).round().clamp(0.0, 6.0) as u8;
-        return sign | 0x78 | mant;
-    }
-
-    let exp_unbiased = x.log2().floor() as i32;
-    let mut exp = (exp_unbiased + 7).clamp(1, 14);
-    let base = 2_f32.powi(exp_unbiased);
-    let mut mant = ((x / base - 1.0) * 8.0).round() as i32;
-    if mant >= 8 {
-        mant = 0;
-        exp += 1;
-        if exp >= 15 {
-            return sign | 0x78;
-        }
-    }
-    sign | ((exp as u8) << 3) | (mant.clamp(0, 7) as u8)
-}
-
 /// Offset RMSNorm (1+weight) over a batch — Qwen3.5 norms store `weight - 1`.
 /// Spec-decode phase attribution: returns `Some(Instant)` only when
 /// `ARLE_MTP_PHASE` is set (the per-phase sync needed for accurate GPU timing is
@@ -8565,33 +7557,7 @@ mod tests {
         assert!(validate_qwen35_cuda_config(&cfg).is_err());
     }
 
-    #[test]
-    fn fp8_block_scaled_lora_quant_roundtrip_is_bounded() {
-        let rows = 4;
-        let cols = 8;
-        let data: Vec<bf16> = (0..rows * cols)
-            .map(|idx| {
-                let signed = idx as f32 - 15.0;
-                bf16::from_f32(signed / 64.0)
-            })
-            .collect();
-        let quant = quantize_bf16_to_fp8_block_scaled(&data, rows, cols, 4, 4, 1, 2).unwrap();
-        let dequant =
-            dequantize_fp8_block_scaled(&quant.qweight, &quant.scales, rows, cols, 4, 4, 1, 2)
-                .unwrap();
-        let max_abs = data
-            .iter()
-            .zip(dequant.iter())
-            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            max_abs <= 8.0e-3,
-            "FP8 roundtrip error {max_abs:e} exceeded bound"
-        );
-    }
-
     /// Reference host merge: `W[r,c] = base[r,c] + scale·Σ_k B[r,k]·A[k,c]`.
-    /// Mirrors the (now FP8-only) host triple-loop in `merge_lora_proj`.
     fn host_merge_reference(
         base: &[bf16],
         a: &[f32],
