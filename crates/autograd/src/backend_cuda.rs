@@ -6704,10 +6704,13 @@ fn cuda_rope(
             got: vec![x.len()],
         });
     }
-    let cache_len = seq * half_dim;
-    if cos.len() != cache_len || sin.len() != cache_len {
+    // Partial rotary (cos rows = rotary_dim/2 ≤ head_dim/2): rotate the leading
+    // segment, pass the tail through — mirrors `cpu_rope_forward`.
+    let rot_half = if seq > 0 { cos.len() / seq } else { 0 };
+    if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
+    {
         return Err(AutogradError::ShapeMismatch {
-            expected: vec![cache_len],
+            expected: vec![seq * half_dim],
             got: vec![cos.len().min(sin.len())],
         });
     }
@@ -6734,6 +6737,8 @@ fn cuda_rope(
         .map_err(|_| AutogradError::TapeInvariant("cuda rope seq exceeds i32"))?;
     let head_dim_i = i32::try_from(head_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda rope head_dim exceeds i32"))?;
+    let rot_half_i = i32::try_from(rot_half)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope rot_half exceeds i32"))?;
 
     let rows = batch * heads * seq;
     let block = std::cmp::min(half_dim, 256) as u32;
@@ -6753,7 +6758,8 @@ fn cuda_rope(
                 .arg(&batch_i)
                 .arg(&heads_i)
                 .arg(&seq_i)
-                .arg(&head_dim_i);
+                .arg(&head_dim_i)
+                .arg(&rot_half_i);
             builder
         },
     )?;
@@ -6793,10 +6799,12 @@ fn cuda_rope_device(
             got: vec![d_x.len()],
         });
     }
-    let cache_len = seq * half_dim;
-    if cos.len() != cache_len || sin.len() != cache_len {
+    // Partial rotary: see `cuda_rope_forward`.
+    let rot_half = if seq > 0 { cos.len() / seq } else { 0 };
+    if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
+    {
         return Err(AutogradError::ShapeMismatch {
-            expected: vec![cache_len],
+            expected: vec![seq * half_dim],
             got: vec![cos.len().min(sin.len())],
         });
     }
@@ -6822,6 +6830,8 @@ fn cuda_rope_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda rope seq exceeds i32"))?;
     let head_dim_i = i32::try_from(head_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda rope head_dim exceeds i32"))?;
+    let rot_half_i = i32::try_from(rot_half)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope rot_half exceeds i32"))?;
 
     let rows = batch * heads * seq;
     let block = std::cmp::min(half_dim, 256) as u32;
@@ -6841,7 +6851,8 @@ fn cuda_rope_device(
                 .arg(&batch_i)
                 .arg(&heads_i)
                 .arg(&seq_i)
-                .arg(&head_dim_i);
+                .arg(&head_dim_i)
+                .arg(&rot_half_i);
             builder
         },
     )?;
@@ -8726,10 +8737,12 @@ fn cuda_rope_backward_device(
             got: vec![d_up.len()],
         });
     }
-    let cache_len = seq * half_dim;
-    if cos.len() != cache_len || sin.len() != cache_len {
+    // Partial rotary: see `cuda_rope_forward`.
+    let rot_half = if seq > 0 { cos.len() / seq } else { 0 };
+    if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
+    {
         return Err(AutogradError::ShapeMismatch {
-            expected: vec![cache_len],
+            expected: vec![seq * half_dim],
             got: vec![cos.len().min(sin.len())],
         });
     }
@@ -8755,6 +8768,8 @@ fn cuda_rope_backward_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward seq exceeds i32"))?;
     let head_dim_i = i32::try_from(head_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward head_dim exceeds i32"))?;
+    let rot_half_i = i32::try_from(rot_half)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward rot_half exceeds i32"))?;
 
     let rows = batch * heads * seq;
     let block = std::cmp::min(half_dim, 256) as u32;
@@ -8774,7 +8789,8 @@ fn cuda_rope_backward_device(
                 .arg(&batch_i)
                 .arg(&heads_i)
                 .arg(&seq_i)
-                .arg(&head_dim_i);
+                .arg(&head_dim_i)
+                .arg(&rot_half_i);
             builder
         },
     )?;

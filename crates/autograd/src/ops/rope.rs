@@ -35,7 +35,9 @@ pub fn rope(
         let x_shape = store.tensor(x)?.shape.clone();
         let cos_shape = store.tensor(cos)?.shape.clone();
         validate_shapes(&x_shape, &cos_shape, &store.tensor(sin)?.shape)?;
-        cos_shape[1] * 2 == x_shape[3]
+        // Partial rotary included: the kernel rotates cos_shape[1]*2 leading
+        // dims and passes the tail through.
+        cos_shape[1] * 2 <= x_shape[3]
     };
     if has_device_handle && can_use_device_rope {
         rope_device_lazy(x, cos, sin, store, tape)
@@ -180,16 +182,18 @@ pub(crate) fn rope_backward(
     }
 
     // Wave 2.1: route through `rope_backward_device` whenever upstream is
-    // device-resident and the rotary-dim covers the full head (the CUDA
-    // kernel requires that). Pre-2.1 this op did `tensor_host(upstream)
+    // device-resident. Pre-2.1 this op did `tensor_host(upstream)
     // → backend.rope_forward(host, ...)`, demoting every layer's q/k
     // grad to host immediately after `mul_scalar_backward_device` /
-    // `matmul_backward_device` had kept it on-device.
+    // `matmul_backward_device` had kept it on-device. The kernel handles
+    // partial rotary (tail passthrough) — the full-head `==` gate here made
+    // every Qwen3.6 full-attn q/k grad fall to host and cascade the whole
+    // upstream chain (Transpose/Slice backwards) onto the CPU.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host
             && upstream.device_handle.is_some()
-            && cos_tensor.shape[1] * 2 == x_shape[3]
+            && cos_tensor.shape[1] * 2 <= x_shape[3]
     };
     if device_path_ok {
         let upstream_handle = store
