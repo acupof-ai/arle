@@ -50,3 +50,10 @@ frozen base and the per-round LoRA sync compounds correctly.
 
 Round anatomy now: rollout ~11s + writeback ~12.3s (backward 10.0s, of
 which LinearAttention 4.2s = the next wall) + sync_lora 0.02s + misc ~4s.
+
+## Addendum 2 — adaptive checkpointing (f6d11206)
+
+run-adaptckpt-toy1r: full tape fits at seq~1010 (est ~24GB vs 60GB free) so
+backward skips the recompute entirely: **backward 10.0s → 5.06s (−49%)**,
+`calls=2` count 0, VRAM peak 80-85GB trims back to 36-40GB per round, loss
+0.2795 in band. LinearAttention backward (4.2s) is now 83% of backward.
