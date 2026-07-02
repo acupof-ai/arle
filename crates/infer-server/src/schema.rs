@@ -101,11 +101,6 @@ impl ChatCompletionRequest {
                 "messages must contain at least one message",
             ));
         }
-        if self.stream.unwrap_or(false) {
-            return Err(ApiError::bad_request(
-                "chat stream=true is deferred in R5 tranche 2",
-            ));
-        }
         validate_common(self.stream, self.max_tokens)
     }
 
@@ -634,9 +629,8 @@ const THINK_END: &str = "</think>";
 ///
 /// Empty reasoning collapses to `None` so the field is omitted.
 ///
-// ponytail: only the non-streaming chat builders split reasoning; chat
-// streaming (SSE delta) is gated off in `validate()`, so there's no chat SSE
-// builder to split yet — wire it here if/when chat streaming lands.
+// ponytail: chat SSE splits incrementally via
+// `sse_util::StreamingReasoningSplitter` — keep the two policies in lockstep.
 fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
     if !enable_thinking {
         return (None, text.to_string());
@@ -945,14 +939,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_streaming_still_fails_closed() {
+    fn chat_completions_allow_streaming() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true,
             "max_tokens": 1
         }))
         .unwrap();
-        let err = request.validate().expect_err("chat stream should be gated");
-        assert!(err.message.contains("chat stream=true is deferred"));
+        assert!(request.validate().is_ok());
     }
 }
