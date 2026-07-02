@@ -50,13 +50,6 @@ pub struct OpenAiTokenizer {
     template: ChatTemplate,
 }
 
-// Official DSv4 prompt pieces (encoding_dsv4.py constants; fullwidth bars).
-const DSV4_BOS: &str = "<｜begin▁of▁sentence｜>";
-const DSV4_EOS: &str = "<｜end▁of▁sentence｜>";
-const DSV4_USER: &str = "<｜User｜>";
-const DSV4_ASSISTANT: &str = "<｜Assistant｜>";
-const DSV4_THINK_END: &str = "</think>";
-
 impl OpenAiTokenizer {
     /// Load `tokenizer.json` from a model dir and resolve the chat template:
     /// checkpoint `chat_template` / `chat_template.jinja` → builtin
@@ -143,6 +136,15 @@ impl OpenAiTokenizer {
             .with_decoder(Some(DecoderWrapper::ByteLevel(ByteLevel::default())));
     }
 
+    /// `true` if this checkpoint's template defaults to thinking-on. Only
+    /// DeepSeek-V4-Flash does: it is reasoning-trained and degenerates
+    /// (looping, bare `</think>` leaks) when forced non-thinking. Jinja/ChatML
+    /// stay thinking-off (unchanged default behavior).
+    #[must_use]
+    pub fn defaults_thinking_on(&self) -> bool {
+        matches!(self.template, ChatTemplate::BuiltinDeepseekV4)
+    }
+
     /// Render OpenAI chat messages into the model's prompt form.
     pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String> {
         self.render_chat_with_kwargs(messages, None)
@@ -152,10 +154,28 @@ impl OpenAiTokenizer {
     /// `enable_thinking`) into the Jinja template context. `None` kwargs render
     /// byte-identically to [`Self::render_chat`]. Builtin (non-Jinja) renderers
     /// have no template variables and ignore the kwargs.
+    ///
+    /// Thin wrapper over [`Self::render_chat_full`] with no tools and
+    /// thinking-off — the byte-identical legacy path for tool-less callers.
     pub fn render_chat_with_kwargs(
         &self,
         messages: &[ChatMessage],
         chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String> {
+        self.render_chat_full(messages, chat_template_kwargs, &[], false, None)
+    }
+
+    /// Full chat render: threads tool definitions, per-message tool calls, and
+    /// the thinking / reasoning-effort switches into whichever renderer the
+    /// checkpoint resolved to. Tool-less, thinking-off calls render
+    /// byte-identically to the legacy [`Self::render_chat_with_kwargs`].
+    pub fn render_chat_full(
+        &self,
+        messages: &[ChatMessage],
+        chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+        tools: &[chat::OpenAiToolDefinition],
+        thinking: bool,
+        reasoning_effort: Option<&str>,
     ) -> Result<String> {
         ensure!(
             !messages.is_empty(),
@@ -178,9 +198,27 @@ impl OpenAiTokenizer {
                 source,
                 bos_token,
                 eos_token,
-            } => render_jinja(source, bos_token, eos_token, messages, chat_template_kwargs),
-            ChatTemplate::BuiltinDeepseekV4 => render_deepseek_v4(messages),
-            ChatTemplate::BuiltinChatMl => render_chatml(messages),
+            } => render_jinja(
+                source,
+                bos_token,
+                eos_token,
+                messages,
+                chat_template_kwargs,
+                tools,
+            ),
+            ChatTemplate::BuiltinDeepseekV4 => {
+                let oai: Vec<chat::OpenAiChatMessage> =
+                    messages.iter().map(ChatMessage::to_openai).collect();
+                Ok(chat::openai_messages_to_deepseek_v4_prompt(
+                    &oai,
+                    tools,
+                    &chat::DeepSeekV4ChatTemplateOptions {
+                        thinking,
+                        reasoning_effort: reasoning_effort.map(str::to_owned),
+                    },
+                ))
+            }
+            ChatTemplate::BuiltinChatMl => render_chatml(messages, tools),
             ChatTemplate::UnsupportedChat { reason } => {
                 anyhow::bail!("chat completions are not supported for this tokenizer: {reason}")
             }
@@ -218,6 +256,7 @@ fn render_jinja(
     eos_token: &str,
     messages: &[ChatMessage],
     chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    tools: &[chat::OpenAiToolDefinition],
 ) -> Result<String> {
     use minijinja::{Environment, UndefinedBehavior, context};
 
@@ -245,9 +284,13 @@ fn render_jinja(
         .iter()
         .map(|m| {
             let content = minijinja::Value::from_serialize(m.template_content());
-            context! {
-                role => m.role.as_str(),
-                content => content,
+            // Omit `tool_calls` when empty so a tool-less message is byte-identical
+            // even under templates that probe `is defined`, not just truthiness.
+            if m.tool_calls.is_empty() {
+                context! { role => m.role.as_str(), content => content }
+            } else {
+                let tool_calls = minijinja::Value::from_serialize(&m.tool_calls);
+                context! { role => m.role.as_str(), content => content, tool_calls => tool_calls }
             }
         })
         .collect();
@@ -256,6 +299,13 @@ fn render_jinja(
         add_generation_prompt => true,
         bos_token => bos_token,
         eos_token => eos_token,
+    };
+    // Expose `tools` only when present — absent (not empty-list) keeps tool-less
+    // renders byte-identical for templates probing `tools is defined`/`is not none`.
+    let base = if tools.is_empty() {
+        base
+    } else {
+        context! { tools => minijinja::Value::from_serialize(tools), ..base }
     };
     // Pass-through `chat_template_kwargs` (e.g. `enable_thinking`) as top-level
     // template variables, merged ON TOP of the standard HF context. When absent
@@ -277,8 +327,15 @@ fn render_jinja(
         .map_err(|err| anyhow!("render checkpoint chat_template failed: {err}"))
 }
 
-/// Last-resort Qwen ChatML rendering.
-fn render_chatml(messages: &[ChatMessage]) -> Result<String> {
+/// Last-resort Qwen ChatML rendering. A tool-less render stays byte-identical to
+/// the legacy path; when tools are present the shared `chat` ChatML+tools
+/// renderer takes over (one source of the tool block + native XML call format).
+fn render_chatml(messages: &[ChatMessage], tools: &[chat::OpenAiToolDefinition]) -> Result<String> {
+    if !tools.is_empty() {
+        let oai: Vec<chat::OpenAiChatMessage> =
+            messages.iter().map(ChatMessage::to_openai).collect();
+        return Ok(chat::openai_messages_to_prompt(&oai, tools));
+    }
     let mut out = String::new();
     for message in messages {
         let role = message.role.trim();
@@ -290,51 +347,6 @@ fn render_chatml(messages: &[ChatMessage]) -> Result<String> {
         out.push_str("<|im_end|>\n");
     }
     out.push_str("<|im_start|>assistant\n");
-    Ok(out)
-}
-
-/// Official DeepSeek-V4 rendering, non-thinking "chat" mode, text-only v1
-/// (no tools / response_format / reasoning_content — those raise instead of
-/// silently mis-rendering). Mirrors `encoding_dsv4.py`:
-///   - `system`: bare content (immediately after bos)
-///   - `user`: `<｜User｜>` + content
-///   - `assistant`: content + `<｜end▁of▁sentence｜>`
-///   - final generation suffix: `<｜Assistant｜></think>` (chat mode)
-fn render_deepseek_v4(messages: &[ChatMessage]) -> Result<String> {
-    let mut out = String::from(DSV4_BOS);
-    for (index, message) in messages.iter().enumerate() {
-        let role = message.role.trim();
-        let content = message.content_text();
-        match role {
-            "system" => {
-                ensure!(
-                    index == 0,
-                    "DeepSeek-V4 template: system message must be first"
-                );
-                out.push_str(&content);
-            }
-            "user" => {
-                out.push_str(DSV4_USER);
-                out.push_str(&content);
-            }
-            "assistant" => {
-                out.push_str(DSV4_ASSISTANT);
-                out.push_str(DSV4_THINK_END);
-                out.push_str(&content);
-                out.push_str(DSV4_EOS);
-            }
-            other => anyhow::bail!(
-                "DeepSeek-V4 template: unsupported role `{other}` (text-only \
-                 system/user/assistant in v1; tools ride the DSML format, not yet wired)"
-            ),
-        }
-    }
-    ensure!(
-        messages.last().map(|m| m.role.trim()) != Some("assistant"),
-        "DeepSeek-V4 template: conversation must end with a user/system message"
-    );
-    out.push_str(DSV4_ASSISTANT);
-    out.push_str(DSV4_THINK_END);
     Ok(out)
 }
 
@@ -442,6 +454,9 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: Some(ChatContent::Text(content.to_string())),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 
@@ -482,6 +497,7 @@ mod tests {
             "<|im_end|>",
             &[msg("system", "be brief"), msg("user", "hi")],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -499,6 +515,7 @@ mod tests {
             "",
             &[msg("user", "x")],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(out, "x");
@@ -525,6 +542,7 @@ mod tests {
             "",
             &[msg("user", "hi")],
             Some(&kwargs_on),
+            &[],
         )
         .unwrap();
         let off = render_jinja(
@@ -533,11 +551,12 @@ mod tests {
             "",
             &[msg("user", "hi")],
             Some(&kwargs_off),
+            &[],
         )
         .unwrap();
         // absent kwargs must render byte-identically to the explicit `false`
         // case (lenient-undefined makes the probe falsy) — backward compat.
-        let absent = render_jinja(THINK_TEMPLATE, "", "", &[msg("user", "hi")], None).unwrap();
+        let absent = render_jinja(THINK_TEMPLATE, "", "", &[msg("user", "hi")], None, &[]).unwrap();
 
         assert_eq!(on, "hi<think>");
         assert_eq!(off, "hi</think>");
@@ -564,6 +583,7 @@ mod tests {
             "",
             &[message],
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(out, "look<|image|>");
@@ -577,18 +597,35 @@ mod tests {
             "",
             &[msg("user", "x")],
             None,
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("render checkpoint chat_template"));
     }
 
+    fn dsv4_tokenizer() -> OpenAiTokenizer {
+        OpenAiTokenizer {
+            inner: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
+            template: ChatTemplate::BuiltinDeepseekV4,
+        }
+    }
+
     #[test]
-    fn deepseek_v4_single_turn_with_system() {
-        let rendered = render_deepseek_v4(&[
-            msg("system", "You are a helpful assistant."),
-            msg("user", "What's the capital of France?"),
-        ])
-        .unwrap();
+    fn deepseek_v4_render_full_single_turn_non_thinking() {
+        // Tool-less, thinking-off render is byte-identical to the legacy builtin's
+        // single-turn output (the `chat` crate is now the single source).
+        let rendered = dsv4_tokenizer()
+            .render_chat_full(
+                &[
+                    msg("system", "You are a helpful assistant."),
+                    msg("user", "What's the capital of France?"),
+                ],
+                None,
+                &[],
+                false,
+                None,
+            )
+            .unwrap();
         assert_eq!(
             rendered,
             "<｜begin▁of▁sentence｜>You are a helpful assistant.\
@@ -597,30 +634,47 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_multi_turn_appends_eos_per_assistant() {
-        let rendered = render_deepseek_v4(&[
-            msg("user", "hi"),
-            msg("assistant", "hello"),
-            msg("user", "again"),
-        ])
-        .unwrap();
-        assert_eq!(
-            rendered,
-            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>hello\
-             <｜end▁of▁sentence｜><｜User｜>again<｜Assistant｜></think>"
-        );
+    fn deepseek_v4_render_full_thinking_opens_think_and_renders_tools() {
+        let tools = vec![chat::OpenAiToolDefinition {
+            tool_type: "function".into(),
+            function: chat::OpenAiFunctionDefinition {
+                name: "shell".into(),
+                description: Some("Run a shell command".into()),
+                parameters: None,
+            },
+        }];
+        let rendered = dsv4_tokenizer()
+            .render_chat_full(&[msg("user", "list files")], None, &tools, true, None)
+            .unwrap();
+        // DSML tool schema block is present and the generation prefix opens a
+        // thinking block (reasoning model default).
+        assert!(rendered.contains("｜DSML｜tool_calls"));
+        assert!(rendered.contains(r#""name": "shell""#) || rendered.contains(r#""name":"shell""#));
+        assert!(rendered.ends_with("<｜Assistant｜><think>"));
     }
 
     #[test]
-    fn deepseek_v4_rejects_trailing_assistant_and_odd_roles() {
-        assert!(render_deepseek_v4(&[msg("user", "q"), msg("assistant", "a")]).is_err());
-        assert!(render_deepseek_v4(&[msg("tool", "x")]).is_err());
-        assert!(render_deepseek_v4(&[msg("user", "q"), msg("system", "late")]).is_err());
+    fn defaults_thinking_on_only_for_deepseek_v4() {
+        assert!(dsv4_tokenizer().defaults_thinking_on());
+        let chatml = OpenAiTokenizer {
+            inner: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
+            template: ChatTemplate::BuiltinChatMl,
+        };
+        assert!(!chatml.defaults_thinking_on());
+        let jinja = OpenAiTokenizer {
+            inner: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
+            template: ChatTemplate::Jinja {
+                source: "{{ messages[0].content }}".into(),
+                bos_token: String::new(),
+                eos_token: String::new(),
+            },
+        };
+        assert!(!jinja.defaults_thinking_on());
     }
 
     #[test]
     fn chatml_fallback_unchanged() {
-        let rendered = render_chatml(&[msg("user", "hi")]).unwrap();
+        let rendered = render_chatml(&[msg("user", "hi")], &[]).unwrap();
         assert_eq!(
             rendered,
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
@@ -729,13 +783,20 @@ mod real_checkpoint_tests {
                 ChatMessage {
                     role: "system".into(),
                     content: Some(ChatContent::Text("be brief".into())),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
                 },
                 ChatMessage {
                     role: "user".into(),
                     content: Some(ChatContent::Text("hi".into())),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
                 },
             ],
             None,
+            &[],
         )
         .unwrap();
         assert!(out.contains("<|im_start|>user\nhi<|im_end|>"), "got: {out}");
@@ -780,8 +841,12 @@ mod real_checkpoint_tests {
             &[ChatMessage {
                 role: "user".into(),
                 content: Some(ChatContent::Text("hi".into())),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
             }],
             None,
+            &[],
         )
         .unwrap();
         assert!(out.contains("<|turn>user"), "got: {out}");

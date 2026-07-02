@@ -26,7 +26,7 @@ use crate::multiproc_relay::{
 };
 use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
-    ModelsResponse, StatsResponse,
+    ModelsResponse, ResponseToolCall, StatsResponse,
 };
 use crate::sse_util::{
     StreamingReasoningSplitter, chat_stream_chunk, completion_stream_chunk, finish_reason,
@@ -82,6 +82,10 @@ pub struct CoordinatorHandle {
     model: String,
     tokenizer: Mutex<OpenAiTokenizer>,
     max_thinking_tokens: usize,
+    /// Resolved once at load: does this checkpoint's template default to
+    /// thinking-on? True only for DeepSeek-V4-Flash (reasoning-trained). Cached
+    /// here so the hot path never locks the tokenizer just to read it.
+    template_defaults_thinking: bool,
     next_request_id: AtomicU64,
     /// Submitted but not yet terminally completed; gates decode-only ticks.
     in_flight: Arc<AtomicUsize>,
@@ -136,10 +140,12 @@ pub fn coordinator_router(
 
     let (multimodal_tx, multimodal_kind) = multimodal.unzip();
 
+    let template_defaults_thinking = tokenizer.defaults_thinking_on();
     let state = Arc::new(CoordinatorHandle {
         model: model.into(),
         tokenizer: Mutex::new(tokenizer),
         max_thinking_tokens,
+        template_defaults_thinking,
         next_request_id: AtomicU64::new(1),
         in_flight,
         submit_tx,
@@ -385,6 +391,32 @@ fn decode(state: &Arc<CoordinatorHandle>, tokens: &[u32]) -> Result<String, ApiE
     Ok(tokenizer.decode(tokens)?)
 }
 
+/// Split a decoded chat completion into visible content + response tool calls.
+///
+/// Tool-less requests pass the text straight through so [`from_parts`]' standard
+/// reasoning split runs (byte-identical). When tools are active,
+/// `openai_parse_tool_calls` strips `<think>` AND the tool blocks and collects
+/// the calls, so the response must split with thinking OFF (third return value)
+/// — re-scanning already-stripped text would move all content into reasoning.
+///
+/// [`from_parts`]: ChatCompletionResponse::from_parts
+fn finalize_chat_content(
+    decoded: String,
+    tools_active: bool,
+    thinking: bool,
+) -> (String, Vec<ResponseToolCall>, bool) {
+    if !tools_active {
+        return (decoded, Vec::new(), thinking);
+    }
+    let (content, calls) = chat::openai_parse_tool_calls(&decoded);
+    let tool_calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| ResponseToolCall::from_parsed(call, index))
+        .collect();
+    (content, tool_calls, false)
+}
+
 async fn completions(
     State(state): State<Arc<CoordinatorHandle>>,
     Json(request): Json<CompletionRequest>,
@@ -498,10 +530,21 @@ async fn chat_completions(
     request.validate()?;
     let sampling = request.sampling_params();
     let stream = request.stream.unwrap_or(false);
-    // A configured thinking budget also flips the server default to thinking-on
-    // (so terminus/litellm, which can't set the kwarg, still gets the split +
-    // budget); `0` keeps it off and byte-identical. Mirrors the in-process path.
-    let thinking = request.enable_thinking(state.max_thinking_tokens > 0);
+    // Thinking defaults on when a budget is configured OR the checkpoint is a
+    // reasoning model (DeepSeek-V4-Flash) that degenerates when forced
+    // non-thinking; `0` + non-reasoning keeps it off and byte-identical.
+    let thinking =
+        request.enable_thinking(state.max_thinking_tokens > 0 || state.template_defaults_thinking);
+    // Tool definitions the model may call — empty when none supplied or
+    // `tool_choice=none`; gates prompt rendering AND response parsing so a
+    // tool-less request stays byte-identical on the wire.
+    let tools_active = request.wants_tools();
+    let tools: &[chat::OpenAiToolDefinition] = if tools_active { &request.tools } else { &[] };
+    let reasoning_effort = request
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|kwargs| kwargs.get("reasoning_effort"))
+        .and_then(serde_json::Value::as_str);
     let mut max_tokens = sampling.max_new_tokens.unwrap_or_else(|| {
         if thinking && state.max_thinking_tokens > 0 {
             state.max_thinking_tokens
@@ -530,9 +573,12 @@ async fn chat_completions(
                     .tokenizer
                     .lock()
                     .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
-                tokenizer.render_chat_with_kwargs(
+                tokenizer.render_chat_full(
                     &request.messages,
                     request.chat_template_kwargs.as_ref(),
+                    tools,
+                    thinking,
+                    reasoning_effort,
                 )?
             };
             let prompt = crate::multimodal::expand_image_markers(&prompt, &images, Some(kind))?;
@@ -558,14 +604,17 @@ async fn chat_completions(
             if let Some(err) = delta.error {
                 return Err(ApiError::internal(err));
             }
-            let content = decode(&state, &delta.token_ids)?;
+            let decoded = decode(&state, &delta.token_ids)?;
+            let (content, tool_calls, split_thinking) =
+                finalize_chat_content(decoded, tools_active, thinking);
             return Ok(Json(ChatCompletionResponse::from_parts(
                 state.model.clone(),
                 content,
                 prompt_token_count,
                 delta.token_ids.len(),
                 delta.finish_reason.as_ref(),
-                thinking,
+                split_thinking,
+                tool_calls,
             ))
             .into_response());
         }
@@ -576,8 +625,13 @@ async fn chat_completions(
             .tokenizer
             .lock()
             .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
-        tokenizer
-            .render_chat_with_kwargs(&request.messages, request.chat_template_kwargs.as_ref())?
+        tokenizer.render_chat_full(
+            &request.messages,
+            request.chat_template_kwargs.as_ref(),
+            tools,
+            thinking,
+            reasoning_effort,
+        )?
     };
     let prompt_tokens = encode(&state, &prompt)?;
 
@@ -593,7 +647,11 @@ async fn chat_completions(
         tokio::spawn(async move {
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
-            let mut splitter = StreamingReasoningSplitter::new(thinking);
+            // With tools active, `StreamingToolCalls` already strips `<think>`, so
+            // the reasoning splitter just forwards the visible remainder as content.
+            let mut splitter = StreamingReasoningSplitter::new(thinking && !tools_active);
+            let mut tool_stream = tools_active.then(chat::StreamingToolCalls::default);
+            let mut completed_calls: Vec<chat::ToolCall> = Vec::new();
             // OpenAI convention: the first emitted chunk's delta carries `role`.
             let mut role_sent = false;
             let mut with_role = move |mut delta: serde_json::Value| {
@@ -625,7 +683,15 @@ async fn chat_completions(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         tok.decode(&delta.token_ids).unwrap_or_default()
                     };
-                    for piece in splitter.push(&text) {
+                    let visible = match tool_stream.as_mut() {
+                        Some(stream) => {
+                            let (visible, calls) = stream.push(&text);
+                            completed_calls.extend(calls);
+                            visible
+                        }
+                        None => text,
+                    };
+                    for piece in splitter.push(&visible) {
                         let chunk = serde_json::to_string(&chat_stream_chunk(
                             &id,
                             created,
@@ -644,6 +710,28 @@ async fn chat_completions(
                     }
                 }
                 if delta.finish {
+                    // Drain the tool stream's buffered tail + its trailing visible text.
+                    if let Some(stream) = tool_stream.as_mut() {
+                        let (visible, calls) = stream.finish();
+                        completed_calls.extend(calls);
+                        for piece in splitter.push(&visible) {
+                            let chunk = serde_json::to_string(&chat_stream_chunk(
+                                &id,
+                                created,
+                                &model,
+                                with_role(piece.into_delta()),
+                                None,
+                            ))
+                            .unwrap_or_default();
+                            if chunk_tx
+                                .send(Ok(format!("data: {chunk}\n\n").into_bytes()))
+                                .await
+                                .is_err()
+                            {
+                                break 'stream;
+                            }
+                        }
+                    }
                     // Truncated thinking: flush the held-back partial closer as reasoning.
                     if let Some(piece) = splitter.finish() {
                         let chunk = serde_json::to_string(&chat_stream_chunk(
@@ -662,7 +750,37 @@ async fn chat_completions(
                             break;
                         }
                     }
-                    let fr = finish_reason(delta.finish_reason.as_ref());
+                    // Each completed tool call rides one OpenAI streaming delta.
+                    for (index, call) in completed_calls.iter().enumerate() {
+                        let tool_call = ResponseToolCall::from_parsed(call, index);
+                        let delta = with_role(serde_json::json!({
+                            "tool_calls": [{
+                                "index": index,
+                                "id": tool_call.id,
+                                "type": tool_call.call_type,
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }],
+                        }));
+                        let chunk = serde_json::to_string(&chat_stream_chunk(
+                            &id, created, &model, delta, None,
+                        ))
+                        .unwrap_or_default();
+                        if chunk_tx
+                            .send(Ok(format!("data: {chunk}\n\n").into_bytes()))
+                            .await
+                            .is_err()
+                        {
+                            break 'stream;
+                        }
+                    }
+                    let fr = if completed_calls.is_empty() {
+                        finish_reason(delta.finish_reason.as_ref())
+                    } else {
+                        "tool_calls"
+                    };
                     let final_chunk = serde_json::to_string(&chat_stream_chunk(
                         &id,
                         created,
@@ -694,14 +812,17 @@ async fn chat_completions(
     }
 
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
-    let content = decode(&state, &outcome.generated_tokens)?;
+    let decoded = decode(&state, &outcome.generated_tokens)?;
+    let (content, tool_calls, split_thinking) =
+        finalize_chat_content(decoded, tools_active, thinking);
     Ok(Json(ChatCompletionResponse::from_parts(
         state.model.clone(),
         content,
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
-        thinking,
+        split_thinking,
+        tool_calls,
     ))
     .into_response())
 }
