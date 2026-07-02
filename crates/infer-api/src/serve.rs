@@ -425,9 +425,19 @@ async fn shutdown_signal(shutdown: infer_server::ServeShutdown) {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    // Programmatic teardown (#135): `ServeShutdown::request()` from the
+    // coordinator's fatal lockstep path must also unwind this loop — signals
+    // alone would leave the HTTP server (and thus the worker guard) alive.
+    let requested = async {
+        while !shutdown.is_requested() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    };
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate => {}
+        _ = requested => {}
     }
     shutdown.request();
     log::info!("shutdown signal received");
