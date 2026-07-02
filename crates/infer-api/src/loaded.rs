@@ -1840,17 +1840,15 @@ mod backend {
         let world = tp_world_size();
         let dram_rank_bytes = infer_cuda::resolve_dram_budget_bytes(config.kv_dram, world);
         executor.set_kv_tier_budget_bytes(dram_rank_bytes);
-        // Session KV-recall ("infinite memory", `--kv-recall`, default off). Off →
-        // the decode hot path is byte-identical (CUDA is the Stable backend). Set
-        // here (the ONE engine constructor every rank uses) so single-GPU + TP
-        // agree.
-        executor.set_kv_recall(config.kv_recall)?;
         // Opt-in L3 NVMe spill (`--kv-disk`): attached HERE so single-proc
         // rank 0 and multiproc worker ranks agree (the old post-spawn serve-layer
         // hook never reached multiproc workers → workers served with a zero-page
         // tier and every demote fell back to recompute). Must follow the budget
         // setters above: the tier-store arms rebuild their store on re-budget,
-        // which would drop an earlier disk attach.
+        // which would drop an earlier disk attach. Must PRECEDE `set_kv_recall`:
+        // Qwen3.6 lazily builds its recall tier on first enable, and only a disk
+        // root stashed beforehand lets it take the durable prior-session reload
+        // (`tier.load`) instead of a fresh create.
         let kv_disk = config.kv_ssd_spill(world, infer_cuda::default_t2_budget_bytes)?;
         if let Some((root, budget)) = &kv_disk {
             anyhow::ensure!(
@@ -1859,6 +1857,11 @@ mod backend {
                  (Qwen3-dense page tier + Qwen3.6/DSv4 slot tier)"
             );
         }
+        // Session KV-recall ("infinite memory", `--kv-recall`, default off). Off →
+        // the decode hot path is byte-identical (CUDA is the Stable backend). Set
+        // here (the ONE engine constructor every rank uses) so single-GPU + TP
+        // agree, and after the disk attach so the recall tier sees the stash.
+        executor.set_kv_recall(config.kv_recall)?;
         log::info!(
             "KV tiers: dtype={} | L1 mem_fraction_static={} | L2 {dram_rank_bytes}B/rank \
              (deployment {:?}, world {world}) | L3 {} | features: prefix{}{}",
