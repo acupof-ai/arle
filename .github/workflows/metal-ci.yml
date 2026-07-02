@@ -44,19 +44,19 @@ jobs:
     runs-on: macos-14   # ARM64 Apple Silicon runner
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # Raw target/ caching on purpose (NOT Swatinem/rust-cache): rust-cache
       # prunes workspace-crate artifacts, which would drop mlx-sys' OUT_DIR
       # cmake build of MLX — the single most expensive thing this job makes.
       - name: Cache cargo registry + build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

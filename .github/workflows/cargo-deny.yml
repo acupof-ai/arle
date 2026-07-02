@@ -33,7 +33,7 @@ jobs:
     name: Advisories / Bans / Licenses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Prebuilt binary — the old `cargo install cargo-deny` compiled it
       # from source on every push (~2-3 min of pure waste).
