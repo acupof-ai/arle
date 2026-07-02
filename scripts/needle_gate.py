@@ -65,7 +65,7 @@ def wrap_template(prompt):
 
 def one_completion(prompt):
     body = {"model": os.environ.get("MODEL", "x"), "prompt": wrap_template(prompt),
-            "max_tokens": 16, "temperature": 0}
+            "max_tokens": int(os.environ.get("NEEDLE_MAX_TOKENS", 16)), "temperature": 0}
     req = urllib.request.Request(BASE + "/v1/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -80,7 +80,7 @@ def one_completion(prompt):
 def one_chat(prompt):
     body = {"model": os.environ.get("MODEL", "x"),
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 16, "temperature": 0}
+            "max_tokens": int(os.environ.get("NEEDLE_MAX_TOKENS", 16)), "temperature": 0}
     req = urllib.request.Request(BASE + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
