@@ -146,18 +146,6 @@ pub fn causal_sdpa_with_q_start(
     attention::causal_sdpa_with_q_start(q, k, v, q_start, store, tape)
 }
 
-pub fn head_chunked_sdpa_with_q_start(
-    q: TensorId,
-    k: TensorId,
-    v: TensorId,
-    q_start: usize,
-    chunk: usize,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    attention::head_chunked_sdpa_with_q_start(q, k, v, q_start, chunk, store, tape)
-}
-
 pub fn cat_seq(
     a: TensorId,
     b: TensorId,

@@ -9,12 +9,12 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, all_reduce_sum, cat_heads, cat_seq, causal_sdpa_recompute,
-        causal_sdpa_with_q_start, checkpoint, checkpoint_sequential, embedding,
-        head_chunked_sdpa_with_q_start, linear_attention_core, linear_attention_core_with_carry,
-        linear_attention_core_with_carry_taped, matmul_bt_with_site, moe_grouped_linear,
-        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
-        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        MoeTopK, add, add_broadcast, all_reduce_sum, cat_seq, causal_sdpa_recompute,
+        causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_core,
+        linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
+        matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
+        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
 };
 use half::bf16;
@@ -279,10 +279,6 @@ impl Qwen35TensorParallelConfig {
     }
 }
 
-/// Heads per chunk for `head_chunked_sdpa_recompute` — bounds the live
-/// `[chunk_heads, seq, seq]` scores to avoid OOM at long seq.
-const ATTN_HEAD_CHUNK: usize = 8;
-
 /// Max layers per gradient-checkpoint group. Group checkpointing does one host
 /// offload per K layers (K× less PCIe), BUT a group's forward holds all K
 /// layers' live activations until it's saved — so K× the per-layer activation,
@@ -293,9 +289,9 @@ const CKPT_GROUP_MAX: usize = 8;
 
 /// Adaptive checkpoint group size: bound a group's live forward activations to
 /// ~8 GiB. The per-layer peak is dominated by the ATTENTION transient at long
-/// seq — head-chunked SDPA holds `chunk×seq²` scores plus the same again for
-/// softmax (capped ~6 GiB/term by `head_chunked_sdpa_recompute`), and the linear
-/// attention layers carry comparable chunk-state buffers — NOT the MLP
+/// seq — the composed-SDPA fallback holds `chunk×seq²` scores plus the same
+/// again for softmax (head-chunked to budget inside the autograd op), and the
+/// linear attention layers carry comparable chunk-state buffers — NOT the MLP
 /// `seq×(hidden+3×intermediate)` term the original formula used (it under-counted
 /// the seq=16000 peak ~6×: measured +43 GiB for a 2-layer group vs the formula's
 /// ~7 GiB, so it returned group_size=2 and OOMed). Model the peak as the MLP term
@@ -313,77 +309,6 @@ fn ckpt_group_size(seq_len: usize, hidden: usize, intermediate: usize) -> usize 
     let attn_floor = 12usize << 30;
     let per_layer = mlp.saturating_add(attn_floor).max(1);
     ((8usize << 30) / per_layer).clamp(1, CKPT_GROUP_MAX)
-}
-
-// Head-chunked causal SDPA: heads are independent so chunking is numerically exact;
-// bounds the live [chunk_heads, seq, seq] scores to avoid OOM at long seq.
-fn head_chunked_sdpa_recompute(
-    q: TensorId,
-    k: TensorId,
-    v: TensorId,
-    chunk: usize,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    let q_shape = store
-        .get(q)
-        .ok_or(AutogradError::InvalidTensorId(q))?
-        .shape
-        .clone();
-    let (batch, heads, seq, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
-    // Adaptive: bound the per-chunk transient to ~8 GiB so long writeback
-    // sequences don't OOM. `causal_sdpa` holds ~4 simultaneous `[chunk, seq, seq]`
-    // buffers (scores, scaled, masked, probs), so the live cost is `4×chunk×seq²×4B`
-    // — the OLD budget counted only ONE buffer (`seq²×4`), under-bounding the peak
-    // 4× and (combined with the per-chunk transients piling up across the loop)
-    // OOMing at seq=16000. Budget the full 4-buffer footprint. `seq*seq*4` per head.
-    let per_head = seq.saturating_mul(seq).saturating_mul(4).max(1);
-    let chunk = chunk
-        .min((8usize << 30) / per_head.saturating_mul(4))
-        .max(1);
-    if chunk >= heads {
-        return Ok(causal_sdpa_recompute(q, k, v, store, tape)?);
-    }
-
-    // Per-chunk transient control: keep only one chunk's scores/softmax live at a time.
-    //
-    // • tape disabled (outer checkpoint forward, no backward needed): capture
-    //   `live_before` before each chunk's slices and `free_new_except` after —
-    //   frees scores/scaled/masked/probs AND the q/k/v slices, keeping only `out`.
-    //
-    // • tape enabled (inner backward recompute, inner_tape is active): wrap each
-    //   chunk in a nested `checkpoint` so the inner backward re-executes each chunk
-    //   on demand instead of keeping ALL chunks' intermediates alive simultaneously.
-    //   Without this, 7 chunks × 4 × [8, seq, seq] ≈ 46 GiB pile up for one layer
-    //   at seq=7184 → OOM. With nested checkpointing, only ONE chunk's ~6.6 GiB
-    //   is live during its backward, giving ~48 GiB peak vs 94 GiB.
-    let mut chunks: Vec<TensorId> = Vec::new();
-    let mut h0 = 0usize;
-    while h0 < heads {
-        let h1 = (h0 + chunk).min(heads);
-        if tape.enabled {
-            let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-            let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-            let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-            let out = checkpoint(vec![q_chunk, k_chunk, v_chunk], store, tape, |s, t, inp| {
-                causal_sdpa_recompute(inp[0], inp[1], inp[2], s, t)
-            })?;
-            chunks.push(out);
-        } else {
-            let live_before = store.live_ids().into_iter().collect::<HashSet<TensorId>>();
-            let q_chunk = slice(q, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-            let k_chunk = slice(k, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-            let v_chunk = slice(v, &[0, h0, 0, 0], &[batch, h1, seq, head_dim], store, tape)?;
-            let out = causal_sdpa_recompute(q_chunk, k_chunk, v_chunk, store, tape)?;
-            // Keep only this chunk's output; free scores/scaled/masked/probs and
-            // the q/k/v slices created since `live_before`.
-            let keep = HashSet::from([out]);
-            store.free_new_except(&live_before, &keep)?;
-            chunks.push(out);
-        }
-        h0 = h1;
-    }
-    Ok(cat_heads(&chunks, store, tape)?)
 }
 
 fn divide_tp(value: usize, world_size: usize, message: &'static str) -> Result<usize> {
@@ -1702,7 +1627,7 @@ impl Qwen35Layer {
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
-        let attn_hidden = head_chunked_sdpa_recompute(q, k, v, ATTN_HEAD_CHUNK, store, tape)?;
+        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -1871,15 +1796,7 @@ impl Qwen35Layer {
         let k_full = cat_seq(prefix_kv.k, k_gen, store, tape)?;
         let v_full = cat_seq(prefix_kv.v, v_gen, store, tape)?;
 
-        let attn_hidden = head_chunked_sdpa_with_q_start(
-            q,
-            k_full,
-            v_full,
-            gen_start,
-            ATTN_HEAD_CHUNK,
-            store,
-            tape,
-        )?;
+        let attn_hidden = causal_sdpa_with_q_start(q, k_full, v_full, gen_start, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -2013,7 +1930,7 @@ impl Qwen35Layer {
         trace_attention_component(trace, layer_index, "repeat_kv", profile.repeat_kv);
 
         let started = Instant::now();
-        let attn_hidden = head_chunked_sdpa_recompute(q, k, v, ATTN_HEAD_CHUNK, store, tape)?;
+        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
         profile.sdpa += started.elapsed();
         trace_attention_component(trace, layer_index, "sdpa", profile.sdpa);
 
@@ -6641,89 +6558,6 @@ mod tests {
         let backend = Arc::new(CudaBackend::new(ordinal)?);
         let mut store = TensorStore::with_backend(backend);
         run_qwen35_checkpoint_lora_fd_gate(&mut store)?;
-        Ok(())
-    }
-
-    fn det_vec(len: usize, seed: u64, scale: f32) -> Vec<f32> {
-        std::iter::successors(Some(seed), |&s| {
-            Some(
-                s.wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407),
-            )
-        })
-        .skip(1)
-        .take(len)
-        .map(|s| (((s >> 40) as f32) / ((1u64 << 24) as f32) - 0.5) * scale)
-        .collect()
-    }
-
-    #[test]
-    fn head_chunked_sdpa_matches_unchunked() -> TestResult {
-        use autograd::Tensor;
-
-        const BATCH: usize = 1;
-        const HEADS: usize = 4;
-        const SEQ: usize = 8;
-        const HEAD_DIM: usize = 16;
-        let shape = vec![BATCH, HEADS, SEQ, HEAD_DIM];
-        let size: usize = shape.iter().product();
-
-        let mut store = TensorStore::default();
-        let q = store.alloc(Tensor::new(
-            det_vec(size, 0x4d59_5df4, 0.1),
-            shape.clone(),
-            false,
-        )?);
-        let k = store.alloc(Tensor::new(
-            det_vec(size, 0x7a35_2b19, 0.1),
-            shape.clone(),
-            false,
-        )?);
-        let v = store.alloc(Tensor::new(
-            det_vec(size, 0x1f12_d9e7, 0.3),
-            shape.clone(),
-            false,
-        )?);
-
-        let mut tape = Tape::new();
-        tape.set_enabled(false);
-        let reference_id = super::causal_sdpa_recompute(q, k, v, &mut store, &mut tape)?;
-        let reference = store.to_host(reference_id)?;
-
-        for chunk in [4usize, 2, 1] {
-            let mut tape = Tape::new();
-            tape.set_enabled(false);
-            let live_before = store.live_tensor_count();
-            let out = super::head_chunked_sdpa_recompute(q, k, v, chunk, &mut store, &mut tape)?;
-            let got = store.to_host(out)?;
-            let max_abs = reference
-                .iter()
-                .zip(got.iter())
-                .map(|(&a, &b)| (a - b).abs())
-                .fold(0.0_f32, f32::max);
-            eprintln!("head_chunked_sdpa chunk={chunk} max_abs_diff={max_abs:.3e}");
-            assert!(
-                max_abs < 1e-4,
-                "chunk={chunk} diverged from unchunked: max_abs={max_abs:.3e}"
-            );
-            // Tape-disabled (recompute / checkpoint-forward) path must FREE each
-            // chunk's scores/scaled/masked/probs transients before the next chunk
-            // — the writeback-OOM fix. Without it, the per-chunk `[chunk,seq,seq]`
-            // buffers pile up across the head loop (~100 GiB at seq=16000). When
-            // the loop actually runs (chunk < HEADS) only the chunk outputs + cat
-            // result survive, so net live growth is bounded and INDEPENDENT of the
-            // chunk count (it would scale with `heads/chunk` if the transients
-            // leaked). (chunk >= HEADS early-returns the unchunked path — no loop.)
-            if chunk < HEADS {
-                let grew = store.live_tensor_count() - live_before;
-                let n_chunks = HEADS.div_ceil(chunk);
-                assert!(
-                    grew <= n_chunks + 4,
-                    "chunk={chunk}: {grew} tensors live (>{}); per-chunk SDPA transients not freed",
-                    n_chunks + 4
-                );
-            }
-        }
         Ok(())
     }
 }

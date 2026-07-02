@@ -148,10 +148,12 @@ pub fn causal_sdpa_recompute(
     let output_id = if let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, 0, store)? {
         fused
     } else {
+        // Composed fallback, off-tape (this entry owns the backward): the
+        // with-q-start path head-chunks itself to the transient budget.
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
         let mut inner_tape = crate::Tape::new();
         inner_tape.set_enabled(false);
-        let out = causal_sdpa(q, k, v, store, &mut inner_tape)?;
+        let out = causal_sdpa_with_q_start(q, k, v, 0, store, &mut inner_tape)?;
         let keep = HashSet::from([q, k, v, out]);
         store.free_new_except(&live_before, &keep)?;
         out
@@ -193,6 +195,13 @@ pub fn causal_sdpa_with_q_start(
         && let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, q_start, store)?
     {
         return Ok(fused);
+    }
+    // Bound the composed path's 4 simultaneous `[heads, q_len, kv_len]`
+    // transients (scores/scaled/masked/probs) to the budget; heads are
+    // independent, so chunking is numerically exact.
+    let chunk = sdpa_head_chunk(heads, q_len, kv_len);
+    if chunk < heads {
+        return sdpa_head_chunked(q, k, v, q_start, chunk, store, tape);
     }
     if q_start == 0 && q_len == kv_len {
         return causal_sdpa(q, k, v, store, tape);
@@ -815,14 +824,16 @@ pub(crate) fn cat_heads_backward(
     Ok(grads)
 }
 
-/// Head-chunked cached SDPA with a query-start offset: heads are independent so
-/// chunking is numerically exact, bounding the live `[chunk, q_len, kv_len]`
-/// scores to avoid OOM at long kv_len. Mirrors qwen35's
-/// `head_chunked_sdpa_recompute` but over `causal_sdpa_with_q_start` (the q rows
-/// start at absolute position `q_start`; `kv_len = q_start + q_len`). Used by the
-/// OPD frozen-prompt-KV gen-segment forward, where the gen rows query a
-/// prefix++gen concatenated K/V.
-pub fn head_chunked_sdpa_with_q_start(
+/// Heads per chunk for the composed SDPA: bound its 4 simultaneous
+/// `[chunk, q_len, kv_len]` f32 buffers (scores/scaled/masked/probs) to ~8 GiB.
+fn sdpa_head_chunk(heads: usize, q_len: usize, kv_len: usize) -> usize {
+    let per_head = q_len.saturating_mul(kv_len).saturating_mul(4).max(1);
+    ((8usize << 30) / per_head.saturating_mul(4)).clamp(1, heads.max(1))
+}
+
+/// Composed SDPA over head chunks — heads are independent, so chunking is
+/// numerically exact while bounding the live `[chunk, q_len, kv_len]` scores.
+fn sdpa_head_chunked(
     q: TensorId,
     k: TensorId,
     v: TensorId,
@@ -835,16 +846,6 @@ pub fn head_chunked_sdpa_with_q_start(
     let k_shape = store.tensor(k)?.shape.clone();
     let (batch, heads, q_len, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
     let kv_len = k_shape[2];
-    // Same adaptive transient cap as `head_chunked_sdpa_recompute`: bound the
-    // 4 simultaneous `[chunk, q_len, kv_len]` buffers (scores/scaled/masked/probs)
-    // to ~8 GiB.
-    let per_head = q_len.saturating_mul(kv_len).saturating_mul(4).max(1);
-    let chunk = chunk
-        .min((8usize << 30) / per_head.saturating_mul(4))
-        .max(1);
-    if chunk >= heads {
-        return causal_sdpa_with_q_start(q, k, v, q_start, store, tape);
-    }
 
     // When the tape is disabled the per-chunk SDPA intermediates have no backward
     // dependency but nothing frees them until a checkpoint boundary, so they pile
@@ -1140,6 +1141,55 @@ mod tests {
             .zip(b.iter())
             .map(|(&x, &y)| (x - y).abs())
             .fold(0.0_f32, f32::max)
+    }
+
+    // Head-chunking only regroups independent heads, so the chunked composed
+    // forward must match the whole-tensor one exactly; and with the tape off
+    // each chunk's scores/scaled/masked/probs must be freed before the next
+    // (the writeback-OOM fix) — live growth is bounded by the chunk outputs.
+    #[test]
+    fn head_chunked_sdpa_matches_unchunked() -> Result<()> {
+        const HEADS: usize = 4;
+        const SEQ: usize = 8;
+        const HEAD_DIM: usize = 16;
+        let shape = vec![1, HEADS, SEQ, HEAD_DIM];
+        let size: usize = shape.iter().product();
+
+        let mut store = TensorStore::default();
+        let mut tape = crate::Tape::new();
+        tape.set_enabled(false);
+        let q = store.alloc(Tensor::new(
+            det_vec(size, 0x4d59_5df4, 0.1),
+            shape.clone(),
+            false,
+        )?);
+        let k = store.alloc(Tensor::new(
+            det_vec(size, 0x7a35_2b19, 0.1),
+            shape.clone(),
+            false,
+        )?);
+        let v = store.alloc(Tensor::new(
+            det_vec(size, 0x1f12_d9e7, 0.3),
+            shape.clone(),
+            false,
+        )?);
+        let reference_id = causal_sdpa_with_q_start(q, k, v, 0, &mut store, &mut tape)?;
+        let reference = store.to_host(reference_id)?;
+
+        for chunk in [2usize, 1] {
+            let live_before = store.live_tensor_count();
+            let out = sdpa_head_chunked(q, k, v, 0, chunk, &mut store, &mut tape)?;
+            let got = store.to_host(out)?;
+            let diff = max_abs_diff(&reference, &got);
+            assert!(diff < 1e-4, "chunk={chunk} diverged: max_abs={diff:.3e}");
+            let grew = store.live_tensor_count() - live_before;
+            let n_chunks = HEADS.div_ceil(chunk);
+            assert!(
+                grew <= n_chunks + 4,
+                "chunk={chunk}: {grew} tensors live; per-chunk SDPA transients not freed"
+            );
+        }
+        Ok(())
     }
 
     // The chunked device backward must be numerically identical to the unchunked
