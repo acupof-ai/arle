@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Guardrails for public docs, templates, and repository hygiene.
 
-This checker stays intentionally narrow:
-- only public/governance docs and GitHub templates
+This checker stays intentionally lightweight:
+- public/governance docs and GitHub templates
 - workspace-members <-> codebase-map truth-surface sync (refactor roadmap R0.2)
-- no deep validation of historical plans / experience logs
+- repo-wide banned-marker scan on tracked text files
+- docs/experience entry inventory caps
 - no external dependencies
 """
 
@@ -88,15 +89,15 @@ DISALLOWED_PUBLIC_MARKERS = [
     "file://",
 ]
 
-MAX_EXPERIENCE_FILES = {
-    Path("docs/experience/wins"): 826,
+MAX_EXPERIENCE_ENTRIES = {
+    Path("docs/experience/wins"): 790,
     Path("docs/experience/errors"): 296,
 }
 
 REPO_WIDE_DISALLOWED_MARKERS = [
-    ("/Users/", re.compile(re.escape("/Users/"))),
-    ("PEGAINFER", re.compile(re.escape("PEGA" + "INFER"))),
-    ("release/infer", re.compile(re.escape("release" + "/infer"))),
+    "/Users/",
+    "PEGAINFER",
+    "release/infer",
 ]
 
 JUNK_PATH_RE = re.compile(r"(^|/)(\.DS_Store|Thumbs\.db|__pycache__/|.*\.pyc)$")
@@ -292,10 +293,55 @@ def list_git_tracked_files(*paths: Path) -> list[str]:
     return [line for line in output.splitlines() if line]
 
 
+def list_experience_entries(path: Path) -> list[str]:
+    return [
+        rel_path
+        for rel_path in list_git_tracked_files(path)
+        if Path(rel_path).parent == path and Path(rel_path).suffix == ".md"
+    ]
+
+
 def check_repo_wide_disallowed_markers() -> list[str]:
+    own_path = repo_path(Path(__file__).resolve())
+    try:
+        command = ["git", "grep", "-I", "-n"]
+        for marker in REPO_WIDE_DISALLOWED_MARKERS:
+            command.extend(["-e", marker])
+        command.extend(["--", "."])
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        output = None
+    else:
+        if result.returncode == 0:
+            output = result.stdout
+        elif result.returncode == 1:
+            output = ""
+        else:
+            output = None
+
+    if output is not None:
+        errors = set()
+        for line in output.splitlines():
+            path_str, _, content = line.partition(":")
+            if not content or path_str == own_path:
+                continue
+            for marker in REPO_WIDE_DISALLOWED_MARKERS:
+                if marker in content:
+                    errors.add(
+                        f"{path_str}: contains repo-wide banned marker {marker!r}"
+                    )
+        return sorted(errors)
+
     errors = []
     for rel_path in list_git_tracked_files(Path(".")):
-        if rel_path == repo_path(Path(__file__).resolve()):
+        if rel_path == own_path:
             continue
         abs_path = ROOT / rel_path
         try:
@@ -304,21 +350,21 @@ def check_repo_wide_disallowed_markers() -> list[str]:
             continue
         except UnicodeDecodeError:
             continue
-        for marker_name, marker_re in REPO_WIDE_DISALLOWED_MARKERS:
-            if marker_re.search(text):
+        for marker in REPO_WIDE_DISALLOWED_MARKERS:
+            if marker in text:
                 errors.append(
-                    f"{rel_path}: contains repo-wide banned marker {marker_name!r}"
+                    f"{rel_path}: contains repo-wide banned marker {marker!r}"
                 )
     return errors
 
 
 def check_experience_doc_inventory() -> list[str]:
     errors = []
-    for rel_path, max_files in MAX_EXPERIENCE_FILES.items():
-        count = len(list_git_tracked_files(rel_path))
-        if count > max_files:
+    for rel_path, max_entries in MAX_EXPERIENCE_ENTRIES.items():
+        count = len(list_experience_entries(rel_path))
+        if count > max_entries:
             errors.append(
-                f"{rel_path}: tracked file count {count} exceeds cap {max_files}; archive old entries before adding more"
+                f"{rel_path}: top-level markdown entry count {count} exceeds cap {max_entries}; archive or consolidate old entries before adding more"
             )
     return errors
 
@@ -350,8 +396,8 @@ def main() -> int:
 
     print("[repo-hygiene] OK")
     print(
-        "[repo-hygiene] public docs, templates, local links, tracked junk, and "
-        "workspace truth-surface checks all passed"
+        "[repo-hygiene] public docs, templates, local links, tracked junk, "
+        "repo-wide marker bans, experience entry caps, and workspace truth-surface checks all passed"
     )
     return 0
 
