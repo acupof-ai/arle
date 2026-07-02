@@ -3580,22 +3580,9 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    /// G3 whole-slot spill is single-rank today (mirror of DSv4's guard).
-    /// Multi-rank demote/promote must execute on EVERY rank in lockstep (the
-    /// seam hooks fire on the coordinator only) or the deterministic planner
-    /// diverges and NCCL deadlocks — out of scope.
+    /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus
+    /// ([`Self::tp_min_usize`] in demote/promote), mirroring DSv4's arm.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        let world_size = self.model.tp.config().world_size;
-        if world_size > 1 {
-            static MULTI_RANK_LOGGED: std::sync::Once = std::sync::Once::new();
-            MULTI_RANK_LOGGED.call_once(|| {
-                info!(
-                    "Qwen3.6 whole-slot KV tier disabled at world_size={world_size}: \
-                     multi-rank lockstep swap is not implemented"
-                );
-            });
-            return false;
-        }
         true
     }
 
@@ -3607,78 +3594,122 @@ impl Qwen35CudaExecutor {
         self.slot_tier.disk_pages()
     }
 
+    fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
+        let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
+        self.model
+            .tp
+            .all_reduce_min_scalar_i32(&self.model.ctx, capped)
+            .map(|v| v.max(0) as usize)
+            .map_err(|e| anyhow::anyhow!("Qwen3.6 TP min-reduce {what} failed: {e}"))
+    }
+
     /// Demote `slot`'s entire device state into the host `slot_tier` under `key`.
     /// The copy is complete before returning (`swap_out_image` ends in
     /// `ctx.sync()`), so the engine may free the slot immediately. The image is
     /// serialized byte-exact ([`Qwen35SlotImage::to_bytes`]) and handed to the
     /// shared `CudaKvTierStore` transport, which manages the 850 GB DRAM budget
     /// (+ optional NVMe spill). Returns `Ok(false)` when the tier is at budget
-    /// (engine falls back to plain recompute, same contract as the old cap).
+    /// on ANY rank (engine falls back to plain recompute, same contract as the
+    /// old cap). Exactly TWO collectives on every path (capture consensus,
+    /// insert consensus), so the lockstep collective count is rank-invariant.
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         ensure!(
             slot < self.num_slots,
             "Qwen3.6 demote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        let Self {
-            model,
-            slots,
-            full_attn_kv,
-            recurrent_pool,
-            slot_tier,
-            ..
-        } = self;
-        let pool = full_attn_kv
-            .as_mut()
-            .expect("full_attn_kv present (whole-slot demote)");
-        let image = slots[slot].swap_out_image(&model.ctx, slot, pool, recurrent_pool)?;
+        let image = {
+            let Self {
+                model,
+                slots,
+                full_attn_kv,
+                recurrent_pool,
+                ..
+            } = &mut *self;
+            let pool = full_attn_kv
+                .as_mut()
+                .expect("full_attn_kv present (whole-slot demote)");
+            slots[slot].swap_out_image(&model.ctx, slot, pool, recurrent_pool)
+        };
+        let capture_ok = usize::from(image.is_ok());
+        if self.tp_min_usize(capture_ok, "slot demote capture")? == 0 {
+            return Err(image.err().unwrap_or_else(|| {
+                anyhow::anyhow!("peer rank failed Qwen3.6 slot demote capture")
+            }));
+        }
         // The tier's own budget (host DRAM count cap + NVMe spill) replaces the
-        // old `num_slots*2` cap: `insert` returns false when no level has room,
-        // and `demote_slot` reports `Ok(false)` so the engine recomputes.
-        Ok(slot_tier.insert(key, image.to_bytes()))
+        // old `num_slots*2` cap: `insert` returns false when no level has room.
+        // Per-rank DRAM headroom can diverge, so the verdict is min-reduced; on
+        // a mixed verdict, locally-successful ranks roll their insert back so
+        // no rank keeps a blob the others lack.
+        let inserted = self.slot_tier.insert(key, image?.to_bytes());
+        if self.tp_min_usize(usize::from(inserted), "slot demote insert")? == 0 {
+            if inserted {
+                self.slot_tier.remove(&[key]);
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Restore the whole-slot snapshot stored under `key` into `slot`. The engine
     /// resumes decode at the demoted position right after this returns, and drops
     /// the entry via [`Self::drop_kv_slot_entries`] — the entry intentionally
     /// stays in the tier here. `swap_in_image` ends in `ctx.sync()`, so the
-    /// device restore is complete before the host image can be dropped.
+    /// device restore is complete before the host image can be dropped. Exactly
+    /// TWO collectives on every path (read+parse consensus, restore consensus) —
+    /// nothing rank-local errs between them.
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
         ensure!(
             slot < self.num_slots,
             "Qwen3.6 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Read the serialized image out of the tier (host hit or NVMe read) and
         // deserialize it byte-exact before touching the device.
-        let image = {
-            let bytes = self
-                .slot_tier
-                .read(key)
-                .map_err(|err| anyhow::anyhow!("Qwen3.6 whole-slot tier read key {key}: {err}"))?;
-            crate::qwen35::Qwen35SlotImage::from_bytes(bytes.as_ref())?
+        let image = self
+            .slot_tier
+            .read(key)
+            .map_err(|err| anyhow::anyhow!("Qwen3.6 whole-slot tier read key {key}: {err}"))
+            .and_then(|bytes| crate::qwen35::Qwen35SlotImage::from_bytes(bytes.as_ref()));
+        let image_ok = usize::from(image.is_ok());
+        if self.tp_min_usize(image_ok, "slot promote read")? == 0 {
+            return Err(image
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed Qwen3.6 slot promote read")));
+        }
+        let image = image?;
+        // Infallible config data — safe between the collectives.
+        let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
+        let restored = {
+            let Self {
+                model,
+                slots,
+                full_attn_kv,
+                recurrent_pool,
+                ..
+            } = &mut *self;
+            let pool = full_attn_kv
+                .as_mut()
+                .expect("full_attn_kv present (whole-slot promote)");
+            slots[slot].swap_in_image(
+                &model.ctx,
+                slot,
+                pool,
+                recurrent_pool,
+                num_linear,
+                gdr_len,
+                conv_len,
+                &image,
+            )
         };
-        let Self {
-            model,
-            slots,
-            full_attn_kv,
-            recurrent_pool,
-            ..
-        } = self;
-        let pool = full_attn_kv
-            .as_mut()
-            .expect("full_attn_kv present (whole-slot promote)");
-        slots[slot].swap_in_image(
-            &model.ctx,
-            slot,
-            pool,
-            recurrent_pool,
-            num_linear,
-            gdr_len,
-            conv_len,
-            &image,
-        )
+        let restore_ok = usize::from(restored.is_ok());
+        if self.tp_min_usize(restore_ok, "slot promote restore")? == 0 {
+            return Err(restored.err().unwrap_or_else(|| {
+                anyhow::anyhow!("peer rank failed Qwen3.6 slot promote restore")
+            }));
+        }
+        restored
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
