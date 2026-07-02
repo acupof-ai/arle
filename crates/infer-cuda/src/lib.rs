@@ -104,9 +104,10 @@ pub use executor::CudaKvCacheDtype;
 pub use executor::dsv4_max_seq_len;
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
-/// Machine-derived disk budget when `--kv-ssd-path` is given without
-/// `--kv-ssd-max-bytes` (probes free disk; capped at the proven 20 GiB).
-pub use kv_tier::default_t2_budget_bytes;
+/// Tier budget resolution: machine-derived disk budget when `--kv-disk` has no
+/// `--kv-disk-limit` (probes free disk), and the per-rank L2 share from a
+/// deployment-total `--kv-dram` request.
+pub use kv_tier::{default_t2_budget_bytes, resolve_dram_budget_bytes};
 /// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
 #[cfg(feature = "nccl")]
 pub use loader::mint_nccl_unique_id_hex;
@@ -227,23 +228,9 @@ impl CudaExecutor {
         }
     }
 
-    /// Apply the `--dram-fraction` knob (default 0.5): size the L2 host-DRAM KV
-    /// tier from MEASURED available DRAM at this fraction, leaving a reserve so
-    /// the shared box never swaps. Pre-serve only; run BEFORE any explicit
-    /// `--kv-t1-budget-bytes` override (the explicit cap wins).
-    pub fn set_dram_fraction(&mut self, fraction: f64) {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = fraction;
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.set_dram_fraction(fraction),
-        }
-    }
-
     /// Attach the opt-in disk spill level under `root` (pre-serve only).
     /// Returns whether the loaded model's arm consumed it; callers fail
-    /// closed on `false` so an explicit `--kv-ssd-path` is never a silent
+    /// closed on `false` so an explicit `--kv-disk` is never a silent
     /// no-op.
     pub fn set_kv_tier_disk(&mut self, root: std::path::PathBuf, budget_bytes: usize) -> bool {
         match &mut self.inner {

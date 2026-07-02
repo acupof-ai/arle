@@ -2,7 +2,7 @@
 //!
 //! Host-demoted blocks live in a capacity-capped in-RAM map (default-on, 4 GiB).
 //! Disk spill is optional on the `kv-native-sys` block substrate
-//! (`--kv-ssd-path`, opt-in): when host RAM fills, the coldest host entry spills
+//! (`--kv-disk`, opt-in): when host RAM fills, the coldest host entry spills
 //! to a file-backed mmap page-slot store, so the capacity the engine sees is
 //! host-demoted + disk slots. Payloads are opaque fixed-limit blocks (paged-KV
 //! pages or DSv4 slot-image chunks); this module never touches the device.
@@ -112,6 +112,18 @@ pub(crate) fn default_t1_budget_bytes(dram_fraction: f64) -> usize {
         total_ram_bytes().map_or(0, |b| b / (1 << 20)),
     );
     budget
+}
+
+/// Per-rank L2 budget from a deployment-total request. `Off` → 0 (tier
+/// disabled); `Fraction` resolves against measured MemAvailable via
+/// `default_t1_budget_bytes` before the world split.
+pub fn resolve_dram_budget_bytes(budget: infer_seam::KvTierBudget, world: usize) -> usize {
+    let world = world.max(1);
+    match budget {
+        infer_seam::KvTierBudget::Off => 0,
+        infer_seam::KvTierBudget::Bytes(b) => b / world,
+        infer_seam::KvTierBudget::Fraction(f) => default_t1_budget_bytes(f) / world,
+    }
 }
 
 pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
