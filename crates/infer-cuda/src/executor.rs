@@ -1808,20 +1808,14 @@ pub(crate) struct Dsv4CudaExecutor {
     /// promote to a `--mtp-adaptive` CLI flag once pod-calibrated).
     mtp_accept_ema: f32,
     mtp_skip_streak: usize,
-    /// Host images of demoted DSv4 slots, keyed by the engine-minted swap key.
-    /// The count cap bounds host RAM; beyond it, the engine falls back to
-    /// recompute instead of accumulating swap images.
-    /// Cross-request position-0 prefix store. Maps a full captured prompt to its
-    /// whole-slot KV snapshot; a new request whose leading tokens exactly equal a
-    /// stored prompt restores that prefix and re-prefills only the tail. LRU over
-    /// a host-byte budget (see `Dsv4PrefixCache`). Default-on (pod-verified:
-    /// correct + 11.7x prefill speedup); size knob `ARLE_DSV4_PREFIX_CACHE_BYTES`.
-    /// L2 DRAM + optional L3 NVMe tier for chunked whole-slot swap images.
-    /// One store page = one 16MiB chunk; `slot_image_bytes` only bounds the
-    /// complete serialized snapshot.
+    /// L2 DRAM + optional L3 NVMe tier for demoted slot state, stored as
+    /// 16 MiB chunks (one store page = one chunk) under a per-key manifest.
     slot_tier: CudaKvTierStore,
-    /// Upper-bound byte size of one serialized slot snapshot.
-    slot_image_bytes: usize,
+    /// Cross-request position-0 prefix store: maps a full captured prompt to
+    /// its slot KV snapshot; a new request whose leading tokens exactly equal
+    /// a stored prompt restores the prefix and re-prefills only the tail. LRU
+    /// over a host-byte budget. Default-on (pod-verified: correct + 11.7x
+    /// prefill speedup); size knob `ARLE_DSV4_PREFIX_CACHE_BYTES`.
     prefix_cache: Dsv4PrefixSnapshotCache,
 }
 
@@ -2513,7 +2507,6 @@ impl Dsv4CudaExecutor {
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
             .collect();
-        let slot_image_bytes = kv_adapter.max_slot_image_bytes().max(1);
         Ok(Self {
             model,
             slots,
@@ -2526,7 +2519,6 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
-            slot_image_bytes,
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 Self::SLOT_CHUNK_BYTES,
@@ -2587,18 +2579,9 @@ impl Dsv4CudaExecutor {
         }
         let image = image?;
         let bytes = image.to_bytes();
-        let fit = usize::from(bytes.len() <= self.slot_image_bytes);
-        if self.tp_min_usize(fit, "slot demote snapshot fit")? == 0 {
-            log::warn!(
-                "DSv4 slot snapshot {} bytes exceeds tier page budget {}; falling back to recompute",
-                bytes.len(),
-                self.slot_image_bytes
-            );
-            return Ok(false);
-        }
         let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES);
         ensure!(chunks > 0, "DSv4 slot snapshot is empty");
-        let room = usize::from(self.slot_tier.available_pages() >= chunks + 1);
+        let room = usize::from(self.slot_tier.available_pages() > chunks);
         if self.tp_min_usize(room, "slot demote chunk room")? == 0 {
             return Ok(false);
         }
