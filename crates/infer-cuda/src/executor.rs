@@ -708,7 +708,7 @@ impl RealCudaExecutor {
     }
 }
 
-use crate::kv_tier::{CudaKvTierStore, default_t1_budget_bytes};
+use crate::kv_tier::{BLOB_CHUNK_BYTES, CudaKvTierStore, default_t1_budget_bytes};
 
 /// Construction-time default fraction of available host DRAM the L2 KV tier
 /// may claim — the shared-box-safe 0.5 (the store is pageable host memory; see
@@ -2192,8 +2192,6 @@ impl std::fmt::Debug for Dsv4CudaExecutor {
 }
 
 impl Dsv4CudaExecutor {
-    const SLOT_CHUNK_BYTES: usize = 16 << 20;
-
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
         let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
         self.model
@@ -2341,7 +2339,7 @@ impl Dsv4CudaExecutor {
             mtp_skip_streak: 0,
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-                Self::SLOT_CHUNK_BYTES,
+                BLOB_CHUNK_BYTES,
             ),
             prefix_index: PrefixIndex::default(),
         })
@@ -2354,14 +2352,14 @@ impl Dsv4CudaExecutor {
         budget_bytes: usize,
     ) -> bool {
         self.slot_tier
-            .set_disk(root, budget_bytes, Self::SLOT_CHUNK_BYTES)
+            .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
     }
 
     /// Pre-serve re-budget rebuilds THE store, orphaning every stored blob —
     /// the prefix index must reset with it (rank-symmetric: every rank
     /// rebuilds from the same config, so key counters stay aligned).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        self.slot_tier = CudaKvTierStore::with_budget(bytes, Self::SLOT_CHUNK_BYTES);
+        self.slot_tier = CudaKvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
         self.prefix_index = PrefixIndex::default();
     }
 
@@ -2495,6 +2493,10 @@ impl Dsv4CudaExecutor {
         if materialized != tokens.len() {
             return Ok(());
         }
+        // Minted BEFORE anything fallible so rank-local capture/insert
+        // outcomes never desync the cross-rank key counters (match is
+        // TP-min'd, so a divergent rank just yields no reuse — no collectives).
+        let key = self.prefix_index.mint_key();
         let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
         debug_assert_eq!(
             image.seq_len(),
@@ -2502,11 +2504,7 @@ impl Dsv4CudaExecutor {
             "DSv4 position-0 prefix snapshot seq_len must equal prompt length"
         );
         let bytes = image.to_bytes();
-        // Minted unconditionally so rank-local insert outcomes never desync
-        // the cross-rank key counters (match is TP-min'd, so a rank that
-        // failed to insert just yields no reuse — no collectives here).
-        let key = self.prefix_index.mint_key();
-        if bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES) >= self.slot_tier.capacity_pages() {
+        if bytes.len().div_ceil(self.slot_tier.page_bytes()) >= self.slot_tier.capacity_pages() {
             return Ok(()); // larger than the whole store — never insertable
         }
         // Best-effort under store pressure: evict coldest PREFIX blobs until
@@ -3265,7 +3263,6 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Per-unit size (one whole-slot recurrent-block image) for the `slot_tier`
     /// budget, stored so `set_kv_tier_budget_bytes` can
     /// re-budget the tier post-construction without recomputing it (L2).
-    slot_image_bytes: usize,
     /// Free-list of detached recurrent blocks (~147 MiB each). Released here by a
     /// finished request, popped by the next — so only ACTIVE slots hold a block,
     /// not all `num_slots`. Grows to `num_slots` at full concurrency (then HBM ==
@@ -3565,15 +3562,19 @@ impl Qwen35CudaExecutor {
                 anyhow::anyhow!("peer rank failed Qwen3.6 slot demote capture")
             }));
         }
-        // The tier's own budget (host DRAM count cap + NVMe spill) replaces the
-        // old `num_slots*2` cap: `insert` returns false when no level has room.
+        // Chunked like DSv4 (16 MiB store pages): the whole image never fit a
+        // recurrent-floor-sized page — the review-6 blocker where every insert
+        // was refused post-oversize-guard and park degraded to pure recompute.
         // Per-rank DRAM headroom can diverge, so the verdict is min-reduced; on
         // a mixed verdict, locally-successful ranks roll their insert back so
         // no rank keeps a blob the others lack.
-        let inserted = self.slot_tier.insert(key, image?.to_bytes());
+        let bytes = image?.to_bytes();
+        let inserted = self
+            .slot_tier
+            .insert_chunked(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
         if self.tp_min_usize(usize::from(inserted), "slot demote insert")? == 0 {
             if inserted {
-                self.slot_tier.remove(&[key]);
+                self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
             }
             return Ok(false);
         }
@@ -3597,9 +3598,9 @@ impl Qwen35CudaExecutor {
         // deserialize it byte-exact before touching the device.
         let image = self
             .slot_tier
-            .read(key)
+            .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
             .map_err(|err| anyhow::anyhow!("Qwen3.6 whole-slot tier read key {key}: {err}"))
-            .and_then(|bytes| crate::qwen35::Qwen35SlotImage::from_bytes(bytes.as_ref()));
+            .and_then(|bytes| crate::qwen35::Qwen35SlotImage::from_bytes(&bytes));
         let image_ok = usize::from(image.is_ok());
         if self.tp_min_usize(image_ok, "slot promote read")? == 0 {
             return Err(image
@@ -3641,7 +3642,9 @@ impl Qwen35CudaExecutor {
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        self.slot_tier.remove(keys);
+        for &key in keys {
+            self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
+        }
     }
 
     pub(crate) fn from_qwen35_safetensors(
@@ -3718,19 +3721,14 @@ impl Qwen35CudaExecutor {
         )?;
         cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
 
-        // G3 whole-slot spill tier: one entry == one serialized slot snapshot. Its
-        // count cap = DRAM budget / per-image bytes ≈ the budget-aware ~5500
-        // (replaces the old `num_slots*2`). Size the per-image unit from the
-        // recurrent-block floor (gdr f32 + conv bf16, × num_linear) — the
-        // dominant fixed cost (~147 MiB); the variable full-attn pages ride on
-        // top. `max(1)` so a degenerate config can't divide by zero. Same
+        // G3 whole-slot spill tier: snapshots stored as 16 MiB chunked blobs
+        // (manifest + chunks, the DSv4 pattern) — a whole image never fits one
+        // fixed page, and the store's size contract is per-page. Same
         // `CudaKvTierStore` transport as the page-granular recall tier — the
         // unified plan: every grain moves bytes through ONE store kind. NVMe
         // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
-        let (num_linear, gdr_state_len, conv_len) = model.recurrent_dims();
-        let slot_image_bytes = (num_linear * (gdr_state_len * 4 + conv_len * 2)).max(1);
         let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
-        let slot_tier = CudaKvTierStore::with_budget(tier_budget_bytes, slot_image_bytes);
+        let slot_tier = CudaKvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
 
         // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
         // not graph-capturable on this stack — TP≥2 stays eager, same as
@@ -3744,7 +3742,6 @@ impl Qwen35CudaExecutor {
             model,
             slots,
             slot_tier,
-            slot_image_bytes,
             recurrent_pool: Vec::new(),
             workspace: crate::qwen35::Qwen35Workspace::new(),
             num_slots,
@@ -4015,7 +4012,7 @@ impl Qwen35CudaExecutor {
     /// only (drops any existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.recall_budget_bytes = bytes;
-        self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
+        self.slot_tier = CudaKvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
     }
 
     /// Attach NVMe spill (`--kv-disk`): an ephemeral disk level under the
@@ -4043,7 +4040,7 @@ impl Qwen35CudaExecutor {
             None => false,
         };
         self.slot_tier
-            .set_disk(root, budget_bytes, self.slot_image_bytes)
+            .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
             || recall_attached
     }
 
