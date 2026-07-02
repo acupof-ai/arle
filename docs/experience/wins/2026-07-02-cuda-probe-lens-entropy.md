@@ -78,10 +78,35 @@ agent); the flag-absent = flags-off match bounds the probe's off-cost at ≈0.
   probes also write records) — slice by offset for multi-request analysis.
 - `--probe-out` with lens 0 + entropy off lazily creates no file at all.
 
+## Follow-up: agentic multi-turn analysis (same day, `scripts/probe_report.py`)
+
+3-turn coding-agent scenario (greedy, 200 tok/turn, prompts 148/536/1129;
+turn 1 degenerated into a repetition loop with leaked think markers — no JSON
+tool call any turn, chat-template/think-token handling suspected; per-turn
+splits below keep the loop turn from biasing the read):
+
+- **Per-token settlement** (597 tokens, 0 genuine final-layer disagreements):
+  44.9% settle ≥2 layers early (≤L40), but the median token settles only at
+  the final layer (50.4% settle=L42). The final-layer PPL cliff (14.1 → 1.33)
+  is a **hard-token tail, not uniform late convergence**: tokens settled by
+  L41 have L41-PPL 1.18; the settle-42 half has L41-PPL 161.6 and carries
+  96.9% of total L41 NLL. Final-layer entropy predicts settle depth (early
+  settlers mean H 0.37 vs 0.88) — a cheap proxy.
+- **Per-token entropy along the sequence is stationary and low** (coherent
+  turns: mean 0.64/0.80, 25-tok bucket means wander 0.3–1.2 with no drift,
+  1 spike ≥3 nats in 600 tokens vs 2–11% on the morning prose run); greedy
+  per-token PPL 1.22–1.45 per turn. The **loop turn's entropy collapses
+  along the sequence** (buckets 0.9 → 0.16, 40% of tokens H<0.1) —
+  entropy-trajectory slope is a usable repetition detector. Deeper turns:
+  decode H rises mildly (0.64 → 0.80), prefill H falls (0.59 → 0.47 mean;
+  self-generated context is near-zero surprise).
+
 ## Rule
 
 Instrument at existing convergence/sync points (sampler entry, post-sampling
 sync) instead of inside per-layer hot loops; stash device buffers and defer
 D2H to a sync point the path already pays for. Verify a probe's "zero cost
 when off" claim with a same-binary flag-absent vs flags-off A/B, not code
-inspection alone.
+inspection alone. Aggregate layer-PPL hides the split population — always
+pair it with per-token settlement before concluding anything about early
+exit.
