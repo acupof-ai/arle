@@ -1816,10 +1816,9 @@ pub(crate) struct Dsv4CudaExecutor {
     /// stored prompt restores that prefix and re-prefills only the tail. LRU over
     /// a host-byte budget (see `Dsv4PrefixCache`). Default-on (pod-verified:
     /// correct + 11.7x prefill speedup); size knob `ARLE_DSV4_PREFIX_CACHE_BYTES`.
-    /// L2 DRAM + optional L3 NVMe tier for whole-slot swap images.
-    /// One "page" = one serialized slot snapshot, sized to the max possible
-    /// byte count (`slot_image_bytes`). The mmap is sparse so padding
-    /// doesn't waste physical blocks.
+    /// L2 DRAM + optional L3 NVMe tier for chunked whole-slot swap images.
+    /// One store page = one 16MiB chunk; `slot_image_bytes` only bounds the
+    /// complete serialized snapshot.
     slot_tier: CudaKvTierStore,
     /// Upper-bound byte size of one serialized slot snapshot.
     slot_image_bytes: usize,
@@ -2530,7 +2529,7 @@ impl Dsv4CudaExecutor {
             slot_image_bytes,
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-                slot_image_bytes,
+                Self::SLOT_CHUNK_BYTES,
             ),
             prefix_cache: Dsv4PrefixSnapshotCache::from_env(),
         })
@@ -2543,16 +2542,16 @@ impl Dsv4CudaExecutor {
         budget_bytes: usize,
     ) -> bool {
         self.slot_tier
-            .set_disk(root, budget_bytes, self.slot_image_bytes)
+            .set_disk(root, budget_bytes, Self::SLOT_CHUNK_BYTES)
     }
 
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
+        self.slot_tier = CudaKvTierStore::with_budget(bytes, Self::SLOT_CHUNK_BYTES);
     }
 
     pub(crate) fn set_dram_fraction(&mut self, fraction: f64) {
         self.slot_tier =
-            CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), self.slot_image_bytes);
+            CudaKvTierStore::with_budget(default_t1_budget_bytes(fraction), Self::SLOT_CHUNK_BYTES);
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
@@ -2602,6 +2601,10 @@ impl Dsv4CudaExecutor {
             return Ok(false);
         }
         let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES).max(1);
+        let room = usize::from(self.slot_tier.available_pages() >= chunks + 1);
+        if self.tp_min_usize(room, "slot demote chunk room")? == 0 {
+            return Ok(false);
+        }
         let inserted = usize::from(
             self.slot_tier
                 .insert(key, Self::slot_chunk_manifest(chunks, bytes.len())),
@@ -2615,7 +2618,11 @@ impl Dsv4CudaExecutor {
         }
         let mut inserted_keys = Vec::with_capacity(chunks + 1);
         inserted_keys.push(key);
-        for (chunk_idx, chunk) in bytes.chunks(Self::SLOT_CHUNK_BYTES).enumerate() {
+        for (chunk_idx, chunk) in bytes
+            .chunks(Self::SLOT_CHUNK_BYTES)
+            .chain(std::iter::once([].as_slice()).take(usize::from(bytes.is_empty())))
+            .enumerate()
+        {
             let chunk_key = Self::slot_chunk_key(key, chunk_idx);
             let inserted = usize::from(self.slot_tier.insert(chunk_key, chunk.to_vec()));
             if self.tp_min_usize(inserted, "slot demote chunk insert")? == 0 {
