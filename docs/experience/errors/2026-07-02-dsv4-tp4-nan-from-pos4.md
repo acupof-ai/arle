@@ -43,3 +43,26 @@ softmax; establish when (if ever) this exact TP=4 shape last produced text.
 assertion; an HTTP-200/no-crash smoke passes straight through an all-NaN
 forward (usage counts tokens even when every one is invisible). Decode the
 generation (probe/ids), don't trust the transcript.
+
+## CORRECTION (same day, controlled A/B — supersedes the analysis above)
+
+The premise "bf16 dir" was FALSE. `/host/DeepSeek-V4-Flash` (149G) is an
+FP4/MX quant export (routed experts I8-packed + F8_E8M0 scales); the
+FP8-native dir (274G) is clean on the identical binary/GPUs/flags
+(single-variable control c2). Both dirs carry a byte-identical config.json
+declaring `quant_method: fp8, scale_fmt: ue8m0` — matching NEITHER dir
+exactly, which is what misled this entry. Rounds 4/6's coherent text came
+from the FP8 dir; there is NO regression window, NO GPU-set dependence
+(the "GPUs 4-7" lead was also wrong — the failing runs were on 0,1,2,3),
+NO probe dependence (probe-off control c0 reproduces).
+
+Real bug (issue #137, reframed): the FP4 checkpoint lane
+(`load_dsv4_block_scaled` I8 arm) NaNs from the first compressed-attention
+layer (L3 then L2, onsets tracking 4-token chunk boundaries; final-logit
+wall at pos 4 = first ratio-4 chunk consumption). Layers 0/1 (uncompressed,
+also MoE) stay sane, so the FP4 expert dequant is not globally garbage —
+the divergence is in the compressed path of the FP4 lane specifically.
+
+Rule (the real one): before filing a model-correctness bug, fingerprint the
+CHECKPOINT (shard dtypes, size), not just its config.json — two dirs with
+identical configs can be different quant exports.
