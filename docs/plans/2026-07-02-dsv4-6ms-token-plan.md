@@ -22,6 +22,25 @@ Gap ≈ 3.1×. The anchor itself gets derived, not assumed (Phase 0).
   `feedback_ideal_roofline_gap_is_not_launch_overhead` — the roofline states
   the FLOOR; it does not attribute the gap.
 
+## Phase-0 arithmetic (config.json, round-7b): latency-dominated CONFIRMED
+
+DSv4-Flash: **N=43 layers**, hidden 4096, 256 experts top-6,
+moe_intermediate 2048, vocab 129280, head_dim 512, native MTP depth 1.
+
+- Active bytes/token (FP8): ~6×3×4096×2048/expert-layer + shared + attn
+  ≈ ~230 MB/layer × 43 + lm_head 0.53 GB ≈ **~10.5 GB aggregate** →
+  TP=8: ~0.33 ms/rank, TP=4: ~0.66 ms at 4 TB/s. Bandwidth floor ≪ 1 ms.
+- **Collectives/token = 3 × 43 = 129.** For a 6 ms budget with ~1 ms
+  compute, average effective collective cost must be ≲ 40 µs. The measured
+  18.9 ms implies t_eff ≈ 130 µs equivalent (collectives + gaps) — Phase-1
+  prices the split. NVLink small-message NCCL is typically 10-30 µs, so
+  **6 ms is arithmetically reachable** if the collective path is tightened
+  (H1-via-vendored-mask or H2) and gaps close.
+
+**BLOCKER for Phase 1: #137 (TP=4 NaN from pos 4)** — perf numbers on NaN
+outputs are void. Correctness first; the GPU-set lead (round-6 GPUs 0,2,3,4
+produced text; round-7b GPUs 4-7 NaN, same build) is the first A/B.
+
 ## Code facts (source-verified 2026-07-02; see the inventory read)
 
 Per committed token, MODEL1 B=1 eager decode, default env:
