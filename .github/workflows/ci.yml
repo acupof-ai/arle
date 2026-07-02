@@ -24,6 +24,8 @@ on:
       - 'bench-output/**'
       - 'memory/**'
       - '**/*.md'
+  # Manual cache-warming lane — see the concurrency note below.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,7 +39,10 @@ env:
   RUSTC_WRAPPER: ""
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Dispatched runs get a unique group: a manual cache-warming run must survive
+  # the push stream — under cancel-in-progress the ~40 min cold rebuild was
+  # cancelled 6× in a row and the rust-cache never got saved (2026-07-02).
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:
