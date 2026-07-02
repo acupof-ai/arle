@@ -152,6 +152,14 @@ pub(crate) fn matmul_backward(
     // 1 GB DtoH that Wave 1 surfaced — the LM-head GEMM's
     // `grad_out: &[f32]` was the single largest readback per step
     // (`docs/research/2026-05-17-cuda-training-architectural-correction.md`).
+    // Heal host-resident operands first (mirrors matmul_bt_backward) so one
+    // upstream host grad (e.g. from a host concat backward) doesn't demote
+    // this GEMM — and everything downstream — to the host contract.
+    if store.backend().device() != Device::Cpu {
+        store.ensure_device(a)?;
+        store.ensure_device(b)?;
+        store.ensure_device(output_grad_id)?;
+    }
     let device_path_ok = {
         let a_t = store.tensor(a)?;
         let b_t = store.tensor(b)?;

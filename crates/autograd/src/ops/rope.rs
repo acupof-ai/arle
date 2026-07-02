@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::Device,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -35,9 +36,10 @@ pub fn rope(
         let x_shape = store.tensor(x)?.shape.clone();
         let cos_shape = store.tensor(cos)?.shape.clone();
         validate_shapes(&x_shape, &cos_shape, &store.tensor(sin)?.shape)?;
-        // Partial rotary included: the kernel rotates cos_shape[1]*2 leading
-        // dims and passes the tail through.
-        cos_shape[1] * 2 <= x_shape[3]
+        // Partial rotary (cos rows < head/2) rides the device kernel on CUDA
+        // only — the Metal graph builder is full-rotary-only.
+        cos_shape[1] * 2 == x_shape[3]
+            || (cos_shape[1] * 2 < x_shape[3] && store.backend().device() == Device::Cuda)
     };
     if has_device_handle && can_use_device_rope {
         rope_device_lazy(x, cos, sin, store, tape)
@@ -193,7 +195,9 @@ pub(crate) fn rope_backward(
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host
             && upstream.device_handle.is_some()
-            && cos_tensor.shape[1] * 2 <= x_shape[3]
+            && (cos_tensor.shape[1] * 2 == x_shape[3]
+                || (cos_tensor.shape[1] * 2 < x_shape[3]
+                    && store.backend().device() == Device::Cuda))
     };
     if device_path_ok {
         let upstream_handle = store
