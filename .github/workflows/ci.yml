@@ -137,6 +137,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.lane.name }}
+          # A failed/cancelled lane still saves its build cache — otherwise one
+          # broken test strands every later run cold (support lane, 2026-07-02).
+          cache-on-failure: true
 
       - name: cargo test (${{ matrix.lane.name }})
         run: ${{ matrix.lane.cmd }}
