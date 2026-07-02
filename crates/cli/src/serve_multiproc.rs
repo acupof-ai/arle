@@ -208,7 +208,7 @@ fn wait_all_engines_ready(
 #[must_use]
 pub(crate) fn worker_entry() -> Option<ExitCode> {
     let rank: usize = std::env::var("ARLE_WORKER_RANK").ok()?.parse().ok()?;
-    infer_util::logging::init_stderr("info");
+    infer_util::logging::init_stderr_with_prefix("info", &format!("[rank{rank}] "));
     match run_worker_mode(rank) {
         Ok(()) => Some(ExitCode::SUCCESS),
         Err(err) => {
