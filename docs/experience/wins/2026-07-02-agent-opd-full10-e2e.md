@@ -57,3 +57,11 @@ run-adaptckpt-toy1r: full tape fits at seq~1010 (est ~24GB vs 60GB free) so
 backward skips the recompute entirely: **backward 10.0s → 5.06s (−49%)**,
 `calls=2` count 0, VRAM peak 80-85GB trims back to 36-40GB per round, loss
 0.2795 in band. LinearAttention backward (4.2s) is now 83% of backward.
+
+## Addendum 3 — chunk-parallel LA backward (ec23705e)
+
+Parity licensed (two model shapes, max_abs <= 1.2e-4); same-binary A/B:
+LA backward 4.135s -> 3.186s (29.7%, at the plan's kill threshold), backward
+phase 5.06s -> 4.22s, loss in band. Kernel kept; design lane closed per the
+kill rule — floor is the per-token sync chain, next step would be full
+chunkwise GEMMs (docs/plans/linear-attention-chunked-backward.md Outcome).
