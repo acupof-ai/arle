@@ -1244,9 +1244,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let Some(victim_slot) = self.oversubscription_victim() else {
                 break;
             };
-            // Park `AfterEqual`: the victim yields to the existing equal-priority
-            // waiter so we admit THAT one, not re-admit the just-parked victim.
-            self.requeue_preempted_decode_with_bias(victim_slot, WaitingInsertBias::AfterEqual);
+            // PARK-OR-NOTHING: demote first; a refused park leaves the victim
+            // running and stops the rotation this tick (retrying next tick is
+            // the same refusal — the old reset-to-recompute path livelocked).
+            if !self.try_park_for_oversubscription(victim_slot) {
+                break;
+            }
             *remaining_pages = self.kv.free_pages();
             // The freed slot may not match `victim_slot` if requeue reshuffled;
             // admit onto whichever slot is now free. There is exactly one.
@@ -3155,6 +3158,47 @@ mod tests {
         // The discriminator: the prompt prefilled exactly once — a recompute
         // fallback would have prefilled it twice.
         assert_eq!(engine.throughput_stats().prefill_tokens, 8);
+        Ok(())
+    }
+
+    /// Pod round-5 livelock regression: with a store that REFUSES every demote
+    /// (page-size violation / full / zero budget), oversubscription must be
+    /// park-or-nothing. The old path reset the failed park to recompute, and
+    /// the running pair ping-ponged at the 8-token min slice forever (~2,060
+    /// park→refuse→recompute cycles, zero completions). Now a refused park
+    /// leaves the victim running: A completes untouched, then B admits and
+    /// completes, with zero demotes recorded.
+    #[test]
+    fn oversubscription_refused_park_keeps_victim_running() -> Result<()> {
+        let config = SchedulerConfig {
+            slot_oversubscription: true,
+            max_running_requests: Some(1),
+            ..test_config(2)
+        };
+        let mut engine = Engine::with_config(
+            SlotTierMockExecutor::rejecting_demotes(),
+            MockKvPool::with_capacity(2, 8, 64),
+            config,
+        );
+        let a = engine.submit_request((1..=8).collect(), OVERSUBSCRIPTION_MIN_SLICE + 6);
+        for _ in 0..(OVERSUBSCRIPTION_MIN_SLICE + 3) {
+            engine.step()?;
+        }
+        let b = engine.submit_request((20..=24).collect(), 3);
+        // Old code never terminated here (reset→re-admit→reset). Bounded run.
+        engine.run_to_idle()?;
+        let done_a = engine.completed(a).expect("A completed");
+        assert_finished(done_a);
+        assert_eq!(
+            done_a.generated_tokens.len(),
+            OVERSUBSCRIPTION_MIN_SLICE + 6,
+            "A ran to its cap without ever being reset"
+        );
+        let done_b = engine.completed(b).expect("B completed after A");
+        assert_finished(done_b);
+        let tier = engine.kv_tier_stats();
+        assert_eq!(tier.demoted_slots, 0, "no successful park: {tier:?}");
+        assert_eq!(tier.promoted_slots, 0);
         Ok(())
     }
 

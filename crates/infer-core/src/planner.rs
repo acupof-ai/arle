@@ -136,6 +136,53 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.requeue_preempted_decode_with_bias(slot, WaitingInsertBias::BeforeEqual);
     }
 
+    /// Oversubscription park — PARK-OR-NOTHING. Demote the victim's whole-slot
+    /// image FIRST; only a successful park preempts (parked `AfterEqual` so the
+    /// freed slot goes to the existing waiter). A refused/failed demote leaves
+    /// the victim running untouched and returns false. The old path reset a
+    /// failed park to recompute: with a persistently refusing store that
+    /// ping-ponged the running pair at the 8-token min slice forever (pod
+    /// round-5 livelock: ~2,060 park→refuse→recompute cycles at 3.6/s, zero
+    /// completions). KV-overflow retract keeps its recompute fallback — there
+    /// the pages MUST free; here keeping the victim running is strictly better.
+    pub(crate) fn try_park_for_oversubscription(&mut self, slot: usize) -> bool {
+        let Some(request) = self.active.get(&slot) else {
+            return false;
+        };
+        if !matches!(request.phase, RequestPhase::Decoding) {
+            return false;
+        }
+        let demoted_seq_len = self.kv.seq_len(slot);
+        if demoted_seq_len == 0 {
+            return false;
+        }
+        let key = self.next_tier_key;
+        self.next_tier_key = self.next_tier_key.wrapping_add(1);
+        match self.executor.demote_slot(slot, key) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(err) => {
+                log::warn!("whole-slot KV demote failed for slot {slot}: {err:#}");
+                return false;
+            }
+        }
+        self.kv_tier_stats.demoted_slots = self.kv_tier_stats.demoted_slots.saturating_add(1);
+        let mut request = self.active.remove(&slot).expect("checked above");
+        // free_slot before release_reused_prefix — same ordering as finish_slot.
+        self.kv.free_slot(slot);
+        self.release_reused_prefix(&request.reused_prefix_pages);
+        // Keep the generation: decode resumes at the demoted position after
+        // promote (see requeue_preempted_decode_with_bias for the length note).
+        request.swap_key = Some(key);
+        request.swap_seq_len = demoted_seq_len;
+        request.reused_prefix_pages.clear();
+        request.prefill_start_pos = 0;
+        request.phase = RequestPhase::Prefilling { progress: 0 };
+        request.waiting_hint = crate::WaitingRequestHint::default();
+        self.enqueue_waiting_request(request, WaitingInsertBias::AfterEqual);
+        true
+    }
+
     /// As [`Self::requeue_preempted_decode`] but with an explicit waiting-queue
     /// bias. Oversubscription parks the victim `AfterEqual` so it yields its
     /// place to the existing equal-priority waiter (the one it freed the slot

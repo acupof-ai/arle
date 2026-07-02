@@ -23,9 +23,31 @@ use infer_api::{
 /// Relay accept / worker-connect timeout. This covers only the socket handshake;
 /// model build has its own wider barrier below.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(120);
-/// DSv4 cold worker builds can spend several minutes in checkpoint load /
-/// DeepGEMM setup before sending EngineReady.
-const ENGINE_READY_TIMEOUT: Duration = Duration::from_secs(600);
+/// Engine-ready barrier floor: NCCL rendezvous + DeepGEMM setup + a warm-cache
+/// checkpoint load fit comfortably.
+const ENGINE_READY_FLOOR: Duration = Duration::from_secs(600);
+/// Conservative cold-read floor for scaling the barrier with checkpoint size
+/// (pod round-5: a 274 GB FP8 load off virtio needed ~31 min — the old fixed
+/// 600 s killed every cold boot).
+const ENGINE_READY_COLD_READ_BPS: u64 = 100 << 20;
+const ENGINE_READY_CAP: Duration = Duration::from_secs(2 * 3600);
+
+/// Ready barrier scaled to the checkpoint: floor + dir bytes at a cold-read
+/// rate, capped. A missing/opaque path falls back to the floor (the crashed-
+/// child fail-fast below stays the real guard against a wedged build).
+fn engine_ready_timeout(model_path: &str) -> Duration {
+    let bytes: u64 = std::fs::read_dir(model_path)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    (ENGINE_READY_FLOOR + Duration::from_secs(bytes / ENGINE_READY_COLD_READ_BPS))
+        .min(ENGINE_READY_CAP)
+}
 
 // (Model-kind gating lives in `infer_api::cuda_model_takes_multiproc_serve` —
 // one classifier shared with `build_cuda_engine`, covering DSv4 AND the
@@ -160,7 +182,9 @@ pub(crate) fn bind_relay_and_spawn_workers(
     // 5. Engine-ready barrier: block until all N ranks report `EngineReady` before
     //    binding HTTP, else requests broadcast into socket buffers while workers are
     //    still in NCCL rendezvous. Fails fast if a child exits during the build.
-    wait_all_engines_ready(&relay, &mut children, world_size)?;
+    let ready_timeout = engine_ready_timeout(model_path);
+    log::info!("[multiproc-coord] engine-ready barrier: {ready_timeout:?} (checkpoint-scaled)");
+    wait_all_engines_ready(&relay, &mut children, world_size, ready_timeout)?;
     log::info!("[multiproc-coord] all {world_size} worker engines ready; opening HTTP");
 
     Ok(Some(MultiprocCoordinator {
@@ -173,13 +197,14 @@ pub(crate) fn bind_relay_and_spawn_workers(
 
 /// Block until all `world_size` ranks report [`RelayEnvelope::EngineReady`], or
 /// fail fast if a child exits first (a crashed rank never acks). Bounded by
-/// [`ENGINE_READY_TIMEOUT`].
+/// the checkpoint-scaled [`engine_ready_timeout`].
 fn wait_all_engines_ready(
     relay: &RelayCoordinator,
     children: &mut WorkerChildren,
     world_size: usize,
+    timeout: Duration,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let ready = relay.ready_count();
         if ready >= world_size {
@@ -194,7 +219,7 @@ fn wait_all_engines_ready(
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out after {ENGINE_READY_TIMEOUT:?} waiting for worker engine-ready \
+                "timed out after {timeout:?} waiting for worker engine-ready \
                  ({ready}/{world_size} ready)"
             );
         }
