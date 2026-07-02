@@ -4162,26 +4162,33 @@ impl Qwen35CudaExecutor {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, self.slot_image_bytes);
     }
 
-    /// Attach durable NVMe spill for the recall tier (`--kv-ssd-path`).
-    /// Pre-serve only. If `recall_tier` already exists, attaches L3 immediately;
-    /// otherwise stores the config for `set_kv_recall` to consume on first enable.
+    /// Attach NVMe spill (`--kv-ssd-path`): an ephemeral disk level under the
+    /// G3 `slot_tier` (whole-slot capacity spill) plus a durable level for the
+    /// recall tier (attached now if built, else stashed for `set_kv_recall`).
+    /// Pre-serve only. The budget is a per-store cap, not a reservation — both
+    /// stores are sparse mmaps, so disk is consumed only by actual spill.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.disk_root = Some(root);
+        self.disk_root = Some(root.clone());
         self.disk_budget = Some(budget_bytes);
-        if let Some(tier) = self.recall_tier.as_mut() {
-            let page_bytes = tier.page_bytes();
-            tier.set_disk_durable(
-                self.disk_root.clone().unwrap(),
-                self.disk_budget.unwrap(),
-                page_bytes,
-                self.weights_epoch.clone(),
-            );
-        }
-        true
+        let recall_attached = match self.recall_tier.as_mut() {
+            Some(tier) => {
+                let page_bytes = tier.page_bytes();
+                tier.set_disk_durable(
+                    root.clone(),
+                    budget_bytes,
+                    page_bytes,
+                    self.weights_epoch.clone(),
+                )
+            }
+            None => false,
+        };
+        self.slot_tier
+            .set_disk(root, budget_bytes, self.slot_image_bytes)
+            || recall_attached
     }
 
     /// Opt into session KV-recall (`--kv-recall`, default off). The paged

@@ -505,8 +505,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) kv_ssd: bool,
 
-    /// Opt into the SSD/NVMe KV tier root. The rewrite stack validates this
-    /// request and fails closed until a backend exposes real SSD recall.
+    /// L3 (SSD/NVMe) KV spill root. Rides the engine config, so every engine —
+    /// including each multiproc TP worker — attaches the tier at build; backends
+    /// without a consuming tier store fail closed.
     #[arg(long, value_name = "DIR")]
     pub(crate) kv_ssd_path: Option<PathBuf>,
 
@@ -524,7 +525,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) kv_recall: bool,
 
-    /// Maximum bytes this serve process may use under the SSD KV tier root.
+    /// SSD KV tier byte cap PER ENGINE PROCESS (each multiproc TP worker gets
+    /// its own cap; the stores are sparse mmaps, so disk is consumed only by
+    /// actual spill). Unset derives from free disk via --ssd-fraction.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) kv_ssd_max_bytes: Option<usize>,
 

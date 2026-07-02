@@ -1063,6 +1063,10 @@ mod backend {
             if config.mtp_enabled() {
                 anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
             }
+            anyhow::ensure!(
+                !config.kv_ssd_requested(),
+                "--kv-ssd-path: the CPU backend has no KV tier store"
+            );
             // CPU smoke: placeholder executor over a real host KV pool; still
             // needs a tokenizer dir for encode/decode.
             let tokenizer = OpenAiTokenizer::from_model_dir(model_path)?;
@@ -2118,6 +2122,10 @@ mod backend {
         if config.mtp_enabled() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
+        anyhow::ensure!(
+            !config.kv_ssd_requested(),
+            "--kv-ssd-path: the HIP backend has no KV tier store"
+        );
         let gguf_path = resolve_gguf_path(model_path, "HIP")?;
         let tokenizer_dir = gguf_path
             .parent()
@@ -2164,6 +2172,10 @@ mod backend {
         if config.mtp_enabled() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
+        anyhow::ensure!(
+            !config.kv_ssd_requested(),
+            "--kv-ssd-path: the Vulkan backend has no KV tier store"
+        );
         let gguf_path = resolve_gguf_path(model_path, "Vulkan")?;
         let tokenizer_dir = gguf_path
             .parent()
