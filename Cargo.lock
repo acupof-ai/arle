@@ -1679,6 +1679,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "chat",
  "image",
  "infer-core",
  "infer-plan",
