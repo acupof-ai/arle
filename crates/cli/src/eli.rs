@@ -614,9 +614,17 @@ mod tests {
         let held = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("ephemeral");
         let occupied = held.local_addr().expect("addr").port();
         // Scan a window starting at the occupied port; it must move past it.
+        // NO port_is_free(next) re-probe: `next` lies in the ephemeral range,
+        // so any parallel socket activity can claim it between find_free_port's
+        // bind-probe and a re-check (TOCTOU) — and the scan already proved it
+        // bindable once. The held listener keeps `occupied` bound throughout,
+        // so the skip assertion is deterministic.
         let next = find_free_port(occupied, 50).expect("a later port is free");
         assert_ne!(next, occupied, "scan must not return the occupied port");
-        assert!(port_is_free(next), "the returned port must be bindable");
+        assert!(
+            (occupied..occupied.saturating_add(50)).contains(&next),
+            "the returned port must come from the scan window"
+        );
         drop(held);
     }
 

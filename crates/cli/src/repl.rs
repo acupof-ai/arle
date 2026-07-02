@@ -2210,6 +2210,7 @@ mod tests {
 
     #[test]
     fn models_command_offline_message() {
+        let _env = crate::test_env_lock();
         // Point HF cache at an empty temp dir so discover_hub_snapshots
         // returns zero entries. handle_models_command should then emit
         // the offline hint without touching the filesystem further.
@@ -2218,11 +2219,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Use HUGGINGFACE_HUB_CACHE which hub_discovery::hub_cache_root
-        // honours with highest priority.
-        //
-        // Safety: this test is a single-threaded unit test; setting an env
-        // var from this process scope is safe because no other test in
-        // this file reads HUGGINGFACE_HUB_CACHE concurrently.
+        // honours with highest priority. The crate-wide env lock serializes us
+        // against every other env-mutating unit test.
         let prior = std::env::var_os("HUGGINGFACE_HUB_CACHE");
         unsafe {
             std::env::set_var("HUGGINGFACE_HUB_CACHE", &tmp);
