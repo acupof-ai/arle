@@ -3866,48 +3866,12 @@ impl Qwen35Model {
             let cfg = self.config.clone();
             let tp = self.tp;
             let (cos_id, sin_id) = (cos, sin);
-
-            // Per-layer wall aggregation for ARLE_OPD_PROFILE=1. Each layer_fn call is
-            // both timed and (when ARLE_OPD_PROFILE_SYNC=1) stream-synced so the
-            // measurement captures kernel wall rather than enqueue latency. Backward
-            // recompute re-invokes layer_fn, so counts[idx] surfaces the recompute
-            // multiplier separately.
-            let profile_enabled = std::env::var("ARLE_OPD_PROFILE").is_ok();
-            let profile_sync = std::env::var("ARLE_OPD_PROFILE_SYNC").is_ok();
-            let num_layers = self.layers.len();
-            let layer_times: Arc<Mutex<Vec<Duration>>> =
-                Arc::new(Mutex::new(vec![Duration::default(); num_layers]));
-            let layer_counts: Arc<Mutex<Vec<usize>>> =
-                Arc::new(Mutex::new(vec![0usize; num_layers]));
-
             let layer_fn = {
                 let layers = Arc::clone(&layers);
-                let layer_times = Arc::clone(&layer_times);
-                let layer_counts = Arc::clone(&layer_counts);
                 move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
-                    if !profile_enabled {
-                        return layers[idx]
-                            .forward(h, &cfg, tp, cos_id, sin_id, s, t)
-                            .map_err(qwen35_to_autograd);
-                    }
-                    if profile_sync {
-                        let _ = s.backend().stream_synchronize();
-                    }
-                    let t0 = Instant::now();
-                    let result = layers[idx]
+                    layers[idx]
                         .forward(h, &cfg, tp, cos_id, sin_id, s, t)
-                        .map_err(qwen35_to_autograd);
-                    if profile_sync {
-                        let _ = s.backend().stream_synchronize();
-                    }
-                    let dt = t0.elapsed();
-                    if let Ok(mut times) = layer_times.lock() {
-                        times[idx] += dt;
-                    }
-                    if let Ok(mut counts) = layer_counts.lock() {
-                        counts[idx] += 1;
-                    }
-                    result
+                        .map_err(qwen35_to_autograd)
                 }
             };
             // Param ids only read `requires_grad`; precompute so `layer_params`
@@ -3935,27 +3899,6 @@ impl Qwen35Model {
             profile
                 .layers
                 .resize_with(self.layers.len(), Qwen35LayerForwardProfile::default);
-
-            if profile_enabled {
-                if let (Ok(times), Ok(counts)) = (layer_times.lock(), layer_counts.lock()) {
-                    let total: Duration = times.iter().sum();
-                    eprintln!(
-                        "[opd-profile] forward layer wall (checkpointed, sync={profile_sync}); \
-                         counts include backward recompute:"
-                    );
-                    for (idx, (t, c)) in times.iter().zip(counts.iter()).enumerate() {
-                        eprintln!(
-                            "[opd-profile]   layer[{idx:>2}] wall={:>10.3}ms calls={}",
-                            t.as_secs_f64() * 1000.0,
-                            c
-                        );
-                    }
-                    eprintln!(
-                        "[opd-profile] forward layers sum: {:.3}s across {num_layers} layers",
-                        total.as_secs_f64()
-                    );
-                }
-            }
         } else {
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
@@ -4029,12 +3972,49 @@ impl Qwen35Model {
             let cfg = self.config.clone();
             let tp = self.tp;
             let (cos_id, sin_id) = (cos, sin);
+
+            // Per-layer wall aggregation for ARLE_OPD_PROFILE=1 (this is the
+            // masked-writeback forward path). Each layer_fn call is timed and —
+            // when ARLE_OPD_PROFILE_SYNC=1 — stream-synced so the measurement
+            // captures kernel wall not enqueue latency. Backward recompute
+            // re-invokes layer_fn, so counts[idx] surfaces the recompute
+            // multiplier. Both env vars default OFF: shipping path unchanged.
+            let profile_enabled = std::env::var("ARLE_OPD_PROFILE").is_ok();
+            let profile_sync = std::env::var("ARLE_OPD_PROFILE_SYNC").is_ok();
+            let num_layers = self.layers.len();
+            let layer_times: Arc<Mutex<Vec<Duration>>> =
+                Arc::new(Mutex::new(vec![Duration::default(); num_layers]));
+            let layer_counts: Arc<Mutex<Vec<usize>>> =
+                Arc::new(Mutex::new(vec![0usize; num_layers]));
+
             let layer_fn = {
                 let layers = Arc::clone(&layers);
+                let layer_times = Arc::clone(&layer_times);
+                let layer_counts = Arc::clone(&layer_counts);
                 move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
-                    layers[idx]
+                    if !profile_enabled {
+                        return layers[idx]
+                            .forward(h, &cfg, tp, cos_id, sin_id, s, t)
+                            .map_err(qwen35_to_autograd);
+                    }
+                    if profile_sync {
+                        let _ = s.backend().stream_synchronize();
+                    }
+                    let t0 = Instant::now();
+                    let result = layers[idx]
                         .forward(h, &cfg, tp, cos_id, sin_id, s, t)
-                        .map_err(qwen35_to_autograd)
+                        .map_err(qwen35_to_autograd);
+                    if profile_sync {
+                        let _ = s.backend().stream_synchronize();
+                    }
+                    let dt = t0.elapsed();
+                    if let Ok(mut times) = layer_times.lock() {
+                        times[idx] += dt;
+                    }
+                    if let Ok(mut counts) = layer_counts.lock() {
+                        counts[idx] += 1;
+                    }
+                    result
                 }
             };
             // See forward_batch_indices_profiled: precompute param ids so the
@@ -4058,6 +4038,27 @@ impl Qwen35Model {
                 |idx| param_ids[idx].clone(),
                 layer_fn,
             )?;
+
+            if profile_enabled {
+                if let (Ok(times), Ok(counts)) = (layer_times.lock(), layer_counts.lock()) {
+                    let total: Duration = times.iter().sum();
+                    eprintln!(
+                        "[opd-profile] masked-writeback forward layer wall \
+                         (checkpointed, sync={profile_sync}); counts include backward recompute:"
+                    );
+                    for (idx, (t, c)) in times.iter().zip(counts.iter()).enumerate() {
+                        eprintln!(
+                            "[opd-profile]   layer[{idx:>2}] wall={:>10.3}ms calls={}",
+                            t.as_secs_f64() * 1000.0,
+                            c
+                        );
+                    }
+                    eprintln!(
+                        "[opd-profile] forward layers sum: {:.3}s across {num_layers} layers",
+                        total.as_secs_f64()
+                    );
+                }
+            }
         } else {
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
