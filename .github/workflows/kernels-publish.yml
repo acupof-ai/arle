@@ -51,7 +51,7 @@ jobs:
           tar -xzf /tmp/ffi/apache*tvm*ffi-*.tar.gz -C /tmp/ffi
           patch -p1 -d /tmp/ffi/apache*tvm*ffi-*/ \
             < crates/cuda-kernels/tools/tilelang/patches/tvm-ffi-legacy-tvm-compat.patch
-          pip install --no-cache-dir "cython>=3.1.0" scikit-build-core ninja cmake
+          pip install --no-cache-dir "cython>=3.1.0" scikit-build-core setuptools-scm ninja cmake
           pip wheel --no-deps --no-build-isolation -w /tmp/ffi /tmp/ffi/apache*tvm*ffi-*/
           pip install --force-reinstall --no-deps /tmp/ffi/apache*tvm*ffi-*.whl
           python -c "import tilelang; print('tilelang OK', tilelang.__version__)"
