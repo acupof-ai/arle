@@ -353,7 +353,11 @@ mechanical changes.
   win); ② index "Active" sweep — Active docs untouched for 30 days get
   confirmed or moved to Archived; ③ CHANGELOG catch-up for the week's three
   event classes; ④ promote errors/wins patterns recurring ≥3× into
-  §Distilled lessons. Bench-entry drift probe: diff
+  §Distilled lessons; ⑤ wins-cap headroom — when the top-level count is
+  within ~20 of the `check_repo_hygiene` cap, archive the oldest
+  zero-inbound-reference entries (verify per basename via `git grep`) so
+  the ratchet batches here instead of blocking mid-week pushes (it tripped
+  twice on 2026-07-02). Bench-entry drift probe: diff
   `git log --since='7 days ago' --oneline -- 'crates/infer-*/src' crates/cuda-kernels/csrc`
   against the same for `docs/experience/`.
 
