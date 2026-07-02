@@ -336,6 +336,27 @@ mechanical changes.
   feature set. Raw output table, not summaries. Install once:
   `pip install -e .[bench]` (guidellm ships in the `bench` extra).
 
+### Docs lifecycle & progress spine
+
+- **Per-file status header is the truth.** Every `docs/plans/` +
+  `docs/projects/` doc carries `> Status: Active | Shipped | Superseded by
+  <link> | Killed — <date>` directly under its title; `docs/index.md` tables
+  are pointers only and carry no narrative state snapshots (they rot against
+  ROADMAP — the 2026-06-10 index snapshot contradicted it by 06-21). Migrate
+  legacy docs on touch, not in bulk.
+- **CHANGELOG is the progress spine.** Three event classes land a CHANGELOG
+  line the same day, linking the wins/errors entry: **phase exit · default
+  flip · license-or-kill verdict**. Phase exits also cut a release tag; a tag
+  without its CHANGELOG section is a regression (v0.1.5→v0.2.1 backfilled
+  2026-07-02).
+- **Weekly resync (~30 min):** ① ROADMAP phase table ↔ GitHub issues (issues
+  win); ② index "Active" sweep — Active docs untouched for 30 days get
+  confirmed or moved to Archived; ③ CHANGELOG catch-up for the week's three
+  event classes; ④ promote errors/wins patterns recurring ≥3× into
+  §Distilled lessons. Bench-entry drift probe: diff
+  `git log --since='7 days ago' --oneline -- 'crates/infer-*/src' crates/cuda-kernels/csrc`
+  against the same for `docs/experience/`.
+
 ### Git
 
 - Commitizen: `<type>(<scope>): <subject>`. Scopes: `metal`, `cuda`,
