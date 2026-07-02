@@ -37,7 +37,7 @@ use crate::{
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{KernelCache, launch_1d, launch_2d, launch_rows};
+use self::kernels::{KernelCache, launch_1d, launch_rows};
 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
 use cuda_kernels::collective::{CollectiveBackend, DType, NcclBackend, ReduceOp};
 #[cfg(not(feature = "no-cuda"))]
@@ -888,6 +888,58 @@ impl CudaBackend {
         Ok((c, out_shape))
     }
 
+    /// Dequantize an FP8 block-scaled weight to a BF16 device buffer (returns
+    /// the buffer + its `[rows, cols]` shape). One memory-bound elementwise
+    /// launch; GEMMs then ride the tensor-core cuBLAS BF16 path instead of the
+    /// naive per-output-element FP8 kernel this replaced (~290× on 27B OPD).
+    #[cfg(not(feature = "no-cuda"))]
+    fn fp8_block_scaled_as_bf16(
+        &self,
+        storage: &CudaFp8BlockScaledStorage,
+    ) -> Result<(CudaSlice<u16>, Vec<usize>)> {
+        let (weight, scales, rows, cols, block_m, block_k) =
+            self.cuda_fp8_block_scaled_storage(storage)?;
+        let total = rows * cols;
+        let scale_cols = cols.div_ceil(block_k);
+        if weight.len() != total || scales.len() != rows.div_ceil(block_m) * scale_cols {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend fp8 dequant handle size does not match shape",
+            ));
+        }
+        let mut out = self
+            .stream
+            .alloc_zeros::<u16>(total)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (fp8 dequant)"))?;
+        let total_i32 = i32::try_from(total)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 dequant total exceeds i32"))?;
+        let cols_i32 = i32::try_from(cols)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 dequant cols exceeds i32"))?;
+        let block_m_i32 = i32::try_from(block_m)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 dequant block_m exceeds i32"))?;
+        let block_k_i32 = i32::try_from(block_k)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 dequant block_k exceeds i32"))?;
+        let scale_cols_i32 = i32::try_from(scale_cols)
+            .map_err(|_| AutogradError::TapeInvariant("fp8 dequant scale_cols exceeds i32"))?;
+        launch_1d(
+            &self.stream,
+            self.kernels.function("fp8_block_scaled_to_bf16")?,
+            total,
+            |mut builder| {
+                builder
+                    .arg(weight)
+                    .arg(scales)
+                    .arg(&mut out)
+                    .arg(&total_i32)
+                    .arg(&cols_i32)
+                    .arg(&block_m_i32)
+                    .arg(&block_k_i32)
+                    .arg(&scale_cols_i32);
+                builder
+            },
+        )?;
+        Ok((out, vec![rows, cols]))
+    }
+
     #[cfg(not(feature = "no-cuda"))]
     fn matmul_bt_device_f32_fp8_block_scaled(
         &self,
@@ -895,69 +947,8 @@ impl CudaBackend {
         a_shape: &[usize],
         storage: &CudaFp8BlockScaledStorage,
     ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
-        let (weight, scales, rows, cols, block_m, block_k) =
-            self.cuda_fp8_block_scaled_storage(storage)?;
-        let b_shape = [rows, cols];
-        if a.len() != shape_size(a_shape) || weight.len() != shape_size(&b_shape) {
-            return Err(AutogradError::TapeInvariant(
-                "cuda backend fp8 matmul_bt handle size does not match shape",
-            ));
-        }
-        let out_shape = matmul_bt_output_shape(a_shape, &b_shape)?;
-        if a_shape.len() != 2 {
-            return Err(AutogradError::InvalidRank {
-                expected: "both operands must be rank-2",
-                got: a_shape.len(),
-            });
-        }
-        let m = a_shape[0];
-        let k = a_shape[1];
-        let n = rows;
-        let scale_cols = cols.div_ceil(block_k);
-        if scales.len() != rows.div_ceil(block_m) * scale_cols {
-            return Err(AutogradError::TapeInvariant(
-                "cuda backend fp8 matmul_bt scale shape mismatch",
-            ));
-        }
-        let mut c = self
-            .stream
-            .alloc_zeros::<f32>(m * n)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-        let m_i32 = i32::try_from(m)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt M exceeds i32"))?;
-        let n_i32 = i32::try_from(n)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt N exceeds i32"))?;
-        let k_i32 = i32::try_from(k)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt K exceeds i32"))?;
-        let block_m_i32 = i32::try_from(block_m)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt block_m exceeds i32"))?;
-        let block_k_i32 = i32::try_from(block_k)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt block_k exceeds i32"))?;
-        let scale_cols_i32 = i32::try_from(scale_cols)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul_bt scale_cols exceeds i32"))?;
-        launch_2d(
-            &self.stream,
-            self.kernels.function("fp8_block_scaled_matmul_bt_f32")?,
-            m,
-            n,
-            256,
-            0,
-            |mut builder| {
-                builder
-                    .arg(a)
-                    .arg(weight)
-                    .arg(scales)
-                    .arg(&mut c)
-                    .arg(&m_i32)
-                    .arg(&n_i32)
-                    .arg(&k_i32)
-                    .arg(&block_m_i32)
-                    .arg(&block_k_i32)
-                    .arg(&scale_cols_i32);
-                builder
-            },
-        )?;
-        Ok((c, out_shape))
+        let (b_bf16, b_shape) = self.fp8_block_scaled_as_bf16(storage)?;
+        self.matmul_bt_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
     }
 
     #[cfg(not(feature = "no-cuda"))]
@@ -967,69 +958,8 @@ impl CudaBackend {
         a_shape: &[usize],
         storage: &CudaFp8BlockScaledStorage,
     ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
-        let (weight, scales, rows, cols, block_m, block_k) =
-            self.cuda_fp8_block_scaled_storage(storage)?;
-        let b_shape = [rows, cols];
-        if a.len() != shape_size(a_shape) || weight.len() != shape_size(&b_shape) {
-            return Err(AutogradError::TapeInvariant(
-                "cuda backend fp8 matmul handle size does not match shape",
-            ));
-        }
-        let out_shape = matmul_output_shape(a_shape, &b_shape)?;
-        if a_shape.len() != 2 {
-            return Err(AutogradError::InvalidRank {
-                expected: "both operands must be rank-2",
-                got: a_shape.len(),
-            });
-        }
-        let m = a_shape[0];
-        let n = a_shape[1];
-        let k = cols;
-        let scale_cols = cols.div_ceil(block_k);
-        if scales.len() != rows.div_ceil(block_m) * scale_cols {
-            return Err(AutogradError::TapeInvariant(
-                "cuda backend fp8 matmul scale shape mismatch",
-            ));
-        }
-        let mut c = self
-            .stream
-            .alloc_zeros::<f32>(m * k)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-        let m_i32 = i32::try_from(m)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul M exceeds i32"))?;
-        let n_i32 = i32::try_from(n)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul N exceeds i32"))?;
-        let k_i32 = i32::try_from(k)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul K exceeds i32"))?;
-        let block_m_i32 = i32::try_from(block_m)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul block_m exceeds i32"))?;
-        let block_k_i32 = i32::try_from(block_k)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul block_k exceeds i32"))?;
-        let scale_cols_i32 = i32::try_from(scale_cols)
-            .map_err(|_| AutogradError::TapeInvariant("fp8 matmul scale_cols exceeds i32"))?;
-        launch_2d(
-            &self.stream,
-            self.kernels.function("fp8_block_scaled_matmul_f32")?,
-            m,
-            k,
-            256,
-            0,
-            |mut builder| {
-                builder
-                    .arg(a)
-                    .arg(weight)
-                    .arg(scales)
-                    .arg(&mut c)
-                    .arg(&m_i32)
-                    .arg(&n_i32)
-                    .arg(&k_i32)
-                    .arg(&block_m_i32)
-                    .arg(&block_k_i32)
-                    .arg(&scale_cols_i32);
-                builder
-            },
-        )?;
-        Ok((c, out_shape))
+        let (b_bf16, b_shape) = self.fp8_block_scaled_as_bf16(storage)?;
+        self.matmul_device_f32_bf16(a, a_shape, &b_bf16, &b_shape)
     }
 }
 
