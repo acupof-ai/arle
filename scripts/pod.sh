@@ -47,7 +47,7 @@ cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   push-scripts)
-    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pick-gpu.sh; do
+    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh; do
       "$TN" push "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
     done
     echo "pushed pod-side helpers -> $NODE_TREE/scripts/"
@@ -77,19 +77,10 @@ case "$cmd" in
     "$POD" "sccache --show-stats 2>/dev/null | grep -iE 'compile requests|cache hits|cache misses|cache hit rate|stored|errors' | head"
     ;;
   setup-tilelang)
-    # Ensure a python with tilelang for the CUDA AOT regen (generated/ is gitignored;
-    # kernels regenerate on demand). The build image usually ships tilelang in system
-    # python3 — then nothing to do (pod-build-env.sh falls back to it). Else create the
-    # dedicated venv from the pinned requirements-build.txt (the apache-tvm-ffi/cuda-python
-    # pins are load-bearing — a bare `pip install tilelang` grabs the cu13 ABI-break). Idempotent.
-    "$POD" "if python3 -c 'import tilelang' 2>/dev/null; then \
-        echo \"tilelang OK via python3 \$(python3 -c 'import tilelang;print(tilelang.__version__)')\"; \
-      else \
-        v=$TREE/crates/cuda-kernels/tools/tilelang/.venv; \
-        export all_proxy=socks5h://127.0.0.1:1080 https_proxy=socks5h://127.0.0.1:1080; \
-        python3 -m venv \$v && \$v/bin/pip install --no-cache-dir -r $TREE/requirements-build.txt && \
-        \$v/bin/python -c 'import tilelang;print(\"venv tilelang\", tilelang.__version__)'; \
-      fi"
+    # Codegen venv + ARLE-patched apache-tvm-ffi; the gate is `import tilelang`
+    # in THE venv (a system tilelang no longer short-circuits — it was version-
+    # blind). Idempotent; see scripts/pod-tilelang-env.sh.
+    "$POD" "bash $TREE/scripts/pod-tilelang-env.sh"
     ;;
   sync)
     # Explicit paths => push exactly those. No args => make the pod tree EQUAL

@@ -1,0 +1,20 @@
+--- a/src/ffi/object.cc	2022-11-09 20:37:21
++++ b/src/ffi/object.cc	2026-07-02 13:37:13
+@@ -322,10 +322,13 @@
+     column->begin_index = 0;
+     Any& slot = column->data_[type_index - column->begin_index];
+     if (slot.type_index() != kTVMFFINone) {
+-      TVM_FFI_THROW(RuntimeError)
+-          << "TypeAttr `" << name_str << "` is already registered for type index " << type_index
+-          << ". To update the stored value, register a mutable container (e.g., Dict/List) "
+-          << "once and mutate it in place on subsequent calls.";
++      // ARLE patch (first-wins): tolerate duplicate TypeAttr registration.
++      // tvm-ffi >=0.1.12 registers builtin entries the bundled TVM of older
++      // consumers (tilelang 0.1.11) still registers at load; the duplicate
++      // aborted `import tilelang` (tile-ai/tilelang#2367). The first (ffi)
++      // registration stays authoritative; genuinely new entries hit an empty
++      // slot and register normally.
++      return;
+     }
+     slot = value_view;
+   }
