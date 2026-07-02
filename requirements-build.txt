@@ -19,10 +19,13 @@
 # and cuda-python ARE pinned: tilelang 0.1.11 leaves them loose, so a fresh resolve
 # grabs the cu13 0.1.12 / 13.x wheels that abort `import tilelang`.
 --extra-index-url https://download.pytorch.org/whl/cu129
-torch==2.12.1+cu129
-apache-tvm-ffi==0.1.12
+torch==2.9.1+cu129
+apache-tvm-ffi==0.1.11
 cuda-python==12.9.0
 tilelang==0.1.11
+# tilelang's tvm dlopens libz3 at import (wheel RUNPATH looks beside libtvm /
+# in ../../z3/lib); unpinned resolves drifted on the pod.
+z3-solver==4.15.4
 
 # Model downloads in setup.sh use huggingface_hub.snapshot_download.
 huggingface_hub==1.21.0

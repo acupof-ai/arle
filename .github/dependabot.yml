@@ -69,3 +69,14 @@ updates:
         update-types:
           - patch
           - minor
+    ignore:
+      # The tilelang AOT stack is a pod-verified SET (requirements-build.txt
+      # header): apache-tvm-ffi 0.1.12 ABI-aborts `import tilelang` 0.1.11,
+      # and the torch pin rides the verified cu12 stack. #121 bumped them
+      # anyway and broke every fresh kernel build. Bump deliberately, backed
+      # by a pod build — never via dependabot.
+      - dependency-name: "apache-tvm-ffi"
+      - dependency-name: "torch"
+      - dependency-name: "tilelang"
+      - dependency-name: "cuda-python"
+      - dependency-name: "z3-solver"
