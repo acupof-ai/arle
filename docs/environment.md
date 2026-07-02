@@ -86,6 +86,12 @@ export ARLE_MODEL=models/Qwen3.5-4B
 ./target/release/arle --max-turns 10
 ```
 
+### `ARLE_KV_MMAP_HUGEPAGE` (debug/probe)
+
+`1` = `madvise(MADV_HUGEPAGE)` on freshly created KV spill mmaps
+(`kv-native-sys`). Probe for the write-burst first-touch-fault ceiling;
+off by default until an A/B licenses it. Linux only.
+
 ### `ARLE_KV_SSD_PATH`
 
 Default root for the opt-in L3 (NVMe) KV spill when `arle serve` gets a bare
