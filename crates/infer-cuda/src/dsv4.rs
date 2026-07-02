@@ -1981,10 +1981,13 @@ impl Dsv4Model {
         // gone). ponytail: pod-verify GLM V32 SparseIndexed decode captures+replays
         // cleanly under the decode-graph (no host launches / per-call alloc in the
         // indexer/sparse-attention forward) before relying on it for GLM serving.
+        // Lens needs the eager layer loop — a graph replay never executes it
+        // (the entropy probe is unaffected: sampling runs outside the graph).
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
             && seq_len == 1
             && !use_deepep_transport
+            && crate::probe::lens_layers() == 0
         {
             return self.forward_tokens_decode_graph(
                 slot, kv_adapter, tokens[0], start_pos, params, position,
@@ -1993,6 +1996,9 @@ impl Dsv4Model {
 
         let (stream, mut keepalive) =
             self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
+        if seq_len > 1 && crate::probe::token_entropy() {
+            self.probe_prefill_entropy(&stream, tokens, start_pos)?;
+        }
         if let Some(out) = last_hidden_out {
             self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
         }
@@ -2004,6 +2010,12 @@ impl Dsv4Model {
             None,
             &mut keepalive,
         )?;
+        // Post-sampling sync point: the emitted token is known, stashed lens
+        // logits can D2H without adding a mid-loop sync. seq_len==1 mirrors the
+        // arming condition — a prefill call must not drain another step's stash.
+        if seq_len == 1 {
+            crate::probe::lens_flush(&self.ctx, &[position], &[token]);
+        }
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(token)
@@ -2046,25 +2058,28 @@ impl Dsv4Model {
         })
     }
 
-    /// Fold every row's stream into a full target logits matrix.
-    fn verify_logits_from_stream(
+    /// Head recipe for stream rows `rows`: per-row HC fold (GLM `hc_mult == 1`
+    /// identity) + final RMSNorm, written to `out` rows `0..rows.len()`.
+    fn head_normed_rows(
         &self,
         stream: &HiddenStates,
-        rows: usize,
-        keepalive: &mut Dsv4ForwardKeepalive,
-    ) -> Result<HiddenStates> {
-        ensure!(rows > 0, "DSv4 verify logits requires at least one row");
-        ensure!(
-            stream.seq_len >= rows,
-            "DSv4 verify stream rows {} < requested logits rows {rows}",
-            stream.seq_len
-        );
+        rows: std::ops::Range<usize>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
         let hidden_size = self.config.hidden_size;
         let eps = self.config.rms_norm_eps;
-        let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, rows)? };
+        ensure!(
+            stream.seq_len >= rows.end
+                && out.hidden_dim == hidden_size
+                && out.seq_len >= rows.len(),
+            "DSv4 head rows {rows:?} out of stream rows {} / out {}x{}",
+            stream.seq_len,
+            out.hidden_dim,
+            out.seq_len
+        );
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
-        for row in 0..rows {
+        for (i, row) in rows.enumerate() {
             if self.config.hc_mult == 1 {
                 // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
                 // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
@@ -2080,18 +2095,75 @@ impl Dsv4Model {
                 )?;
             }
             crate::ops::rms_norm_vec(&self.ctx, &last_hidden, &self.norm, eps, &mut last_normed)?;
-            let mut dst = head_normed
-                .data
-                .slice_mut(row * hidden_size..(row + 1) * hidden_size);
+            let mut dst = out.data.slice_mut(i * hidden_size..(i + 1) * hidden_size);
             self.ctx
                 .stream
                 .memcpy_dtod(&last_normed.data, &mut dst)
                 .map_err(|e| anyhow!("DSv4 verify head row copy failed: {e}"))?;
         }
+        Ok(())
+    }
+
+    /// Fold every row's stream into a full target logits matrix.
+    fn verify_logits_from_stream(
+        &self,
+        stream: &HiddenStates,
+        rows: usize,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<HiddenStates> {
+        ensure!(rows > 0, "DSv4 verify logits requires at least one row");
+        ensure!(
+            stream.seq_len >= rows,
+            "DSv4 verify stream rows {} < requested logits rows {rows}",
+            stream.seq_len
+        );
+        let hidden_size = self.config.hidden_size;
+        let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, rows)? };
+        self.head_normed_rows(stream, 0..rows, &mut head_normed)?;
         keepalive.keep_hidden(&head_normed);
         let mut logits = unsafe { HiddenStates::uninit(&self.ctx, self.lm_head.rows, rows)? };
         self.lm_head_project_batch(&head_normed, &mut logits)?;
         Ok(logits)
+    }
+
+    /// Prefill per-position entropy/NLL: head recipe + lm_head over 256-row
+    /// chunks of the full prefill stream, one D2H per chunk (prefill already
+    /// syncs at its sample tail; the probe is ON here, so the extra sync is
+    /// probe-only cost). Buffers drop after the chunk's D2H sync — safe.
+    fn probe_prefill_entropy(
+        &self,
+        stream: &HiddenStates,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<()> {
+        const CHUNK: usize = 256;
+        let hidden_size = self.config.hidden_size;
+        let vocab = self.lm_head.rows;
+        for chunk_start in (0..tokens.len()).step_by(CHUNK) {
+            let chunk_end = (chunk_start + CHUNK).min(tokens.len());
+            let rows = chunk_end - chunk_start;
+            let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, rows)? };
+            self.head_normed_rows(stream, chunk_start..chunk_end, &mut head_normed)?;
+            let mut logits = unsafe { HiddenStates::uninit(&self.ctx, vocab, rows)? };
+            self.lm_head_project_batch(&head_normed, &mut logits)?;
+            let host = crate::probe::stream_to_host_f32(&self.ctx, &logits)?;
+            for i in 0..rows {
+                let global = chunk_start + i;
+                // Target = the actual next prompt token; None on the call's last
+                // row (the target is in the next prefill chunk / the sampled token).
+                let target = tokens.get(global + 1).copied();
+                let (entropy, nll) =
+                    crate::probe::entropy_nll(&host[i * vocab..(i + 1) * vocab], target);
+                crate::probe::emit_token(
+                    "prefill",
+                    (start_pos + global) as u64,
+                    target,
+                    nll,
+                    entropy,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Verify `tokens` in ONE scheduled sparse forward under `sched`'s per-row
@@ -2215,6 +2287,8 @@ impl Dsv4Model {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        // Post-sampling sync point: all rows' emitted tokens are known.
+        crate::probe::lens_flush(&self.ctx, positions, &out_tokens);
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(out_tokens)
@@ -2418,6 +2492,15 @@ impl Dsv4Model {
         // when phase_time.
         let (mut perrow_ms, mut batchedread_ms) = (0f64, 0f64);
 
+        // Logit lens (batched decode is always a decode step): capture the last
+        // N layers' head projections; off = one Option compare per layer.
+        let lens_from = match crate::probe::lens_layers() {
+            0 => None,
+            depth => Some(self.layers.len().saturating_sub(depth)),
+        };
+        if lens_from.is_some() {
+            crate::probe::lens_begin();
+        }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
@@ -3835,6 +3918,12 @@ impl Dsv4Model {
                 ctx.stream.synchronize().ok();
                 moe_ms += t.elapsed().as_secs_f64() * 1000.0;
             }
+            // Lens capture: head-project the layer's final stream for all rows
+            // and stash the DEVICE logits (no sync/D2H until lens_flush).
+            if lens_from.is_some_and(|from| layer_idx >= from) {
+                let logits = self.verify_logits_from_stream(&stream, seq_len, &mut keepalive)?;
+                crate::probe::lens_push(layer_idx, logits);
+            }
         }
 
         for r in 0..n {
@@ -4807,6 +4896,18 @@ impl Dsv4Model {
             }
             _ => None,
         };
+        // Logit lens: single-row eager DECODE steps only (prefill and
+        // spec-decode/MTP verify are not lens-instrumented); off = one Option
+        // compare per layer.
+        let lens_from = match crate::probe::lens_layers() {
+            depth if depth > 0 && seq_len == 1 && verify.is_none() => {
+                Some(self.layers.len().saturating_sub(depth))
+            }
+            _ => None,
+        };
+        if lens_from.is_some() {
+            crate::probe::lens_begin();
+        }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             // ── Attention half: HC-wrap MLA attention.
@@ -5331,6 +5432,13 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            // Lens capture: head-project the layer's final stream (row 0, the
+            // decode token) and stash the DEVICE logits (no sync/D2H until
+            // lens_flush at the post-sampling sync point).
+            if lens_from.is_some_and(|from| layer_idx >= from) {
+                let logits = self.verify_logits_from_stream(&stream, seq_len, &mut keepalive)?;
+                crate::probe::lens_push(layer_idx, logits);
+            }
         }
 
         slot.seq_len += seq_len;
