@@ -3353,8 +3353,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// Sidecar snapshot store: token-prefix hash → recurrent state at that boundary.
     /// Enables page-radix prefix reuse for hybrid models by restoring the
     /// recurrent layers when a KV prefix is reattached (issue #85).
-    /// Capped at `RECURRENT_SIDECAR_CAP` entries; oldest-inserted entry evicted on overflow.
+    /// Capped at `RECURRENT_SIDECAR_CAP` entries, least-recently-used evicted
+    /// (`sidecar_order` front = coldest; capture and restore-hit both touch).
     prefix_sidecar: std::collections::HashMap<u64, crate::qwen35::Qwen35RecurrentSnapshot>,
+    sidecar_order: std::collections::VecDeque<u64>,
 }
 
 /// Maximum number of recurrent sidecar snapshots to keep. Each entry is
@@ -3401,10 +3403,14 @@ impl Qwen35CudaExecutor {
             return Ok(());
         }
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-        if self.prefix_sidecar.len() >= RECURRENT_SIDECAR_CAP {
-            if let Some(&evict_key) = self.prefix_sidecar.keys().next() {
-                self.prefix_sidecar.remove(&evict_key);
-            }
+        // LRU eviction — the old `keys().next()` picked an ARBITRARY HashMap
+        // victim and could drop the boundary key captured moments earlier.
+        self.sidecar_order.retain(|&k| k != key);
+        while self.prefix_sidecar.len() >= RECURRENT_SIDECAR_CAP {
+            let Some(evict_key) = self.sidecar_order.pop_front() else {
+                break;
+            };
+            self.prefix_sidecar.remove(&evict_key);
         }
         let mut snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
         // snapshot_recurrent synchronizes the stream so pages are flushed before D2H.
@@ -3426,6 +3432,7 @@ impl Qwen35CudaExecutor {
             }
         }
         self.prefix_sidecar.insert(key, snap);
+        self.sidecar_order.push_back(key);
         Ok(())
     }
 
@@ -3468,6 +3475,11 @@ impl Qwen35CudaExecutor {
         )?;
 
         let snap = self.prefix_sidecar.get(&key).cloned();
+        if snap.is_some() {
+            // LRU touch: a restored boundary is the hottest key.
+            self.sidecar_order.retain(|&k| k != key);
+            self.sidecar_order.push_back(key);
+        }
 
         // restore_recurrent_from_snapshot doesn't advance seq_len; set it for submit_decode_row invariant.
         match snap.as_ref() {
@@ -3766,6 +3778,7 @@ impl Qwen35CudaExecutor {
             kv_pool_mem_fraction_static: mem_fraction_static,
             kv_pool_requested_pages: total_pages.max(1),
             prefix_sidecar: std::collections::HashMap::new(),
+            sidecar_order: std::collections::VecDeque::new(),
         };
         cuda_startup_log(
             "qwen35_executor_total",
@@ -5234,6 +5247,11 @@ impl Qwen35CudaExecutor {
         // The merge REPLACES `DeviceMatrix` buffers (new device addresses);
         // captured decode graphs bake the old ones — drop and recapture lazily.
         self.decode_graph = None;
+        // Weight epoch changed: sidecar recurrent snapshots are as stale as the
+        // radix the caller invalidates — a skipped capture must never serve
+        // old-epoch state.
+        self.prefix_sidecar.clear();
+        self.sidecar_order.clear();
         self.model.remerge_student_lora(update)
     }
 
