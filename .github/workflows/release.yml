@@ -75,10 +75,14 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Install Python build dependencies (required for AOT kernel compilation)
-        # Keep release CUDA builds aligned with the repo build image and
-        # cuda-kernels build script requirements.
-        run: pip install --no-cache-dir -r requirements-build.txt
+      - name: Fetch prebuilt TileLang kernel bundle (zero-Python lane)
+        # The T1 bundle from the rolling `kernel-artifacts` release feeds
+        # build.rs's vendored tier (SRC_HASH-verified per kernel). A stale
+        # bundle fails the build loudly at the regen step — re-run after the
+        # kernels-publish workflow refreshes it; no tilelang/torch installed.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/kernel_artifacts.sh fetch
 
       - name: Cache cargo registry
         uses: actions/cache@v6
