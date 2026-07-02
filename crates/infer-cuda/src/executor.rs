@@ -2600,7 +2600,8 @@ impl Dsv4CudaExecutor {
             );
             return Ok(false);
         }
-        let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES).max(1);
+        let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES);
+        ensure!(chunks > 0, "DSv4 slot snapshot is empty");
         let room = usize::from(self.slot_tier.available_pages() >= chunks + 1);
         if self.tp_min_usize(room, "slot demote chunk room")? == 0 {
             return Ok(false);
@@ -2618,11 +2619,7 @@ impl Dsv4CudaExecutor {
         }
         let mut inserted_keys = Vec::with_capacity(chunks + 1);
         inserted_keys.push(key);
-        for (chunk_idx, chunk) in bytes
-            .chunks(Self::SLOT_CHUNK_BYTES)
-            .chain(std::iter::once([].as_slice()).take(usize::from(bytes.is_empty())))
-            .enumerate()
-        {
+        for (chunk_idx, chunk) in bytes.chunks(Self::SLOT_CHUNK_BYTES).enumerate() {
             let chunk_key = Self::slot_chunk_key(key, chunk_idx);
             let inserted = usize::from(self.slot_tier.insert(chunk_key, chunk.to_vec()));
             if self.tp_min_usize(inserted, "slot demote chunk insert")? == 0 {
