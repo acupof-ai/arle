@@ -134,8 +134,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "linear_attention_chunked_scan_backward_f32",
     "linear_attention_conv1d_silu_backward_f32",
     "linear_attention_scan_backward_f32",
-    "fp8_block_scaled_matmul_bt_f32",
-    "fp8_block_scaled_matmul_f32",
+    "fp8_block_scaled_to_bf16",
 ];
 
 #[derive(Debug)]
@@ -407,57 +406,6 @@ where
                     grid_dim: (grid_x, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
-                })
-                .map_err(|_| AutogradError::TapeInvariant("cuda kernel launch failed"))?;
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn launch_2d<'a, F>(
-    stream: &'a Arc<CudaStream>,
-    func: &'a CudaFunction,
-    grid_x: usize,
-    grid_y: usize,
-    block: u32,
-    shared_bytes: u32,
-    build_args: F,
-) -> Result<()>
-where
-    F: FnOnce(LaunchArgs<'a>) -> LaunchArgs<'a>,
-{
-    #[cfg(feature = "no-cuda")]
-    {
-        let _ = (
-            stream,
-            func,
-            grid_x,
-            grid_y,
-            block,
-            shared_bytes,
-            build_args,
-        );
-        todo!("GPU required: cuda kernel launch is unavailable under feature no-cuda")
-    }
-
-    #[cfg(not(feature = "no-cuda"))]
-    {
-        if grid_x == 0 || grid_y == 0 {
-            return Ok(());
-        }
-        let grid_x = u32::try_from(grid_x)
-            .map_err(|_| AutogradError::TapeInvariant("cuda launch grid x exceeds u32"))?;
-        let grid_y = u32::try_from(grid_y)
-            .map_err(|_| AutogradError::TapeInvariant("cuda launch grid y exceeds u32"))?;
-        let mut launch_args = build_args(stream.launch_builder(func));
-        // Safety: caller controls the kernel symbol + argument order, and all
-        // device buffers outlive the asynchronous launch.
-        unsafe {
-            launch_args
-                .launch(LaunchConfig {
-                    grid_dim: (grid_x, grid_y, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: shared_bytes,
                 })
                 .map_err(|_| AutogradError::TapeInvariant("cuda kernel launch failed"))?;
         }
