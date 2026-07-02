@@ -72,6 +72,37 @@ Instrumentation-free first, nsys second:
    `ffn_all_reduce` 340 µs/layer-call — if allreduce still owns a similar
    share, it outranks every kernel lever.
 
+## Emergent structure (from the code facts; ordering still a HYPOTHESIS until Phase-1)
+
+The inventory converts the gap from mystery to arithmetic. Sketch (exact
+numbers await config.json's N/hidden/vocab):
+
+- **Bandwidth is NOT the wall.** Even at ~20B active params FP8, TP=8 reads
+  ~2.5 GB/rank/token ⇒ ~0.6 ms at 4 TB/s; latent-KV reads are tens of MB.
+  The roofline floor is sub-millisecond — so ~18 of the 18.9 ms live in
+  LATENCY terms: 3·N serialized collectives + launch gaps + the replicated
+  work.
+- **H1 — drop the Q all-gather (3→2 collectives/layer, −33% collective
+  latency).** Today every rank gathers the full Q head slab and runs
+  ALL-head FlashMLA (attention compute replicated across ranks; the latent
+  KV is replicated anyway). Local-head attention + the EXISTING O all-reduce
+  is algebraically identical and deletes one collective per layer. This is
+  the cheapest structural cut in the inventory.
+- **H2 — comm latency per collective**: allreduce of one hidden vector
+  (~14 KB bf16) is pure latency. Candidates: DeepEP-LL decode MoE (#61
+  license open), NCCL low-latency algo tuning, TP=4-vs-8 A/B (fewer ranks =
+  lower per-collective latency; bandwidth headroom says TP=4 may WIN B=1).
+- **H3 — lm_head shard (#99)**: replicated full-vocab GEMV reads
+  vocab×hidden bytes per rank per token (~0.5-1 GB, ~0.1-0.25 ms) — sharding
+  is a quantified, bounded win, not the main course.
+- **H4 — MTP deeper/dynamic verify** (DSpark C1 #124): multiplies committed
+  tokens per step; orthogonal to H1-H3.
+- H5 (allocs/sync hygiene): 7·N device allocs + alloc-per-token sampler —
+  measure first; B=1 GPU-bound history says wash.
+
+Phase-1 measurement now has ONE job: confirm the collective/launch share
+(expected dominant) and price t_collective(TP) — then H1/H2 go first.
+
 ## Phase 2 — levers (enumerated, NOT ranked; order = Phase-1 shares)
 
 | Lever | Mechanism | Existing track | License gate |
