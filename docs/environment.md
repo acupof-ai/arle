@@ -92,6 +92,21 @@ export ARLE_MODEL=models/Qwen3.5-4B
 (`kv-native-sys`). Probe for the write-burst first-touch-fault ceiling;
 off by default until an A/B licenses it. Linux only.
 
+### `ARLE_PROBE_JSONL` / `ARLE_PROBE_LENS_LAYERS` / `ARLE_PROBE_TOKEN_ENTROPY` (debug/probe)
+
+CUDA inference-analysis probe (`infer-cuda/src/probe.rs`). `ARLE_PROBE_JSONL=
+<path>` is the master switch: TP rank 0 truncates/creates the file and writes
+one JSONL record per token — raw-logit (T=1, pre-penalty) entropy + NLL for
+every prefill position and every sampled decode token — plus, on the DSv4/GLM
+eager decode path, a logit-lens record per layer for the last
+`ARLE_PROBE_LENS_LAYERS` layers (default `10`; `0` disables the lens; a
+non-zero lens forces eager decode past the `ARLE_DSV4_DECODE_GRAPH` dispatch).
+`ARLE_PROBE_TOKEN_ENTROPY=0` turns off the per-token records. Unset = probe
+fully off (production default; one `OnceLock` load per hook, no alloc/D2H).
+Set via `arle serve --probe-out <path> [--probe-lens-layers N]
+[--probe-token-entropy BOOL]`; direct env also honored (multiproc rank
+children inherit it).
+
 ### `ARLE_KV_SSD_PATH`
 
 Default root for the opt-in L3 (NVMe) KV spill when `arle serve` gets a bare
