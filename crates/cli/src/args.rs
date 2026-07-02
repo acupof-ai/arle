@@ -26,6 +26,73 @@ fn parse_max_tokens_or_auto(value: &str) -> Result<usize, String> {
     parse_positive_usize(trimmed)
 }
 
+/// `--kv-disk` spill root. Clap's stock `PathBuf` parser rejects empty input,
+/// which would reject the bare-flag `default_missing_value = ""` sentinel the
+/// serve lowering resolves to the default root — so accept any string here.
+fn parse_kv_disk(value: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(value))
+}
+
+/// KV tier budget (`--kv-dram` / `--kv-disk-limit`): "off"/"0" disables,
+/// "N%" or a bare float in (0,1) is a fraction of the measured resource, and
+/// anything else is bytes with an optional binary suffix (K/KB/KiB … T/TB/TiB,
+/// all treated as binary multiples).
+fn parse_kv_budget(s: &str) -> Result<infer_api::KvTierBudget, String> {
+    use infer_api::KvTierBudget;
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") || s == "0" {
+        return Ok(KvTierBudget::Off);
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        let pct: f64 = pct
+            .trim()
+            .parse()
+            .map_err(|_| format!("expected a percentage like \"50%\", got '{s}'"))?;
+        if !(pct > 0.0 && pct <= 100.0) {
+            return Err(format!("percentage must be in (0, 100], got '{s}'"));
+        }
+        return Ok(KvTierBudget::Fraction(pct / 100.0));
+    }
+    if let Ok(frac) = s.parse::<f64>()
+        && frac > 0.0
+        && frac < 1.0
+    {
+        return Ok(KvTierBudget::Fraction(frac));
+    }
+    const SUFFIXES: [(&str, usize); 12] = [
+        ("kib", 1 << 10),
+        ("kb", 1 << 10),
+        ("k", 1 << 10),
+        ("mib", 1 << 20),
+        ("mb", 1 << 20),
+        ("m", 1 << 20),
+        ("gib", 1 << 30),
+        ("gb", 1 << 30),
+        ("g", 1 << 30),
+        ("tib", 1 << 40),
+        ("tb", 1 << 40),
+        ("t", 1 << 40),
+    ];
+    let lower = s.to_ascii_lowercase();
+    let (digits, mult) = SUFFIXES
+        .iter()
+        .find_map(|&(suffix, mult)| lower.strip_suffix(suffix).map(|d| (d, mult)))
+        .unwrap_or((lower.as_str(), 1));
+    let value: usize = digits.trim().parse().map_err(|_| {
+        format!(
+            "expected bytes (\"16GiB\"), a percentage (\"50%\"), a fraction in (0,1), \
+             or 0/off; got '{s}'"
+        )
+    })?;
+    let bytes = value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("byte budget overflows: '{s}'"))?;
+    if bytes == 0 {
+        return Err("byte budget must be positive (use 0/off to disable)".to_string());
+    }
+    Ok(KvTierBudget::Bytes(bytes))
+}
+
 /// `--speculative-tokens` draft depth. The Metal DFlash runtime clamps the
 /// effective block size into `[2, draft_head_block_size]` and rejects a depth
 /// below 2, so reject `0`/`1` at the CLI boundary with a clear message.
@@ -501,15 +568,22 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) low_impact: bool,
 
-    /// Opt into the SSD/NVMe KV tier using the default local cache root.
-    #[arg(long, default_value_t = false)]
-    pub(crate) kv_ssd: bool,
+    /// L2 (host DRAM) KV tier budget for the WHOLE deployment, split across
+    /// TP ranks: bytes ("64GiB"), a fraction of available DRAM ("50%"), or
+    /// 0/off to disable. A cap, not a reservation.
+    #[arg(long, value_parser = parse_kv_budget, default_value = "50%")]
+    pub(crate) kv_dram: infer_api::KvTierBudget,
 
-    /// L3 (SSD/NVMe) KV spill root. Rides the engine config, so every engine —
-    /// including each multiproc TP worker — attaches the tier at build; backends
-    /// without a consuming tier store fail closed.
-    #[arg(long, value_name = "DIR")]
-    pub(crate) kv_ssd_path: Option<PathBuf>,
+    /// L3 (SSD/NVMe) KV spill root. A bare --kv-disk uses ARLE_KV_SSD_PATH or
+    /// the platform cache dir. Every engine — including each multiproc TP
+    /// worker — attaches at build; backends without a tier store fail closed.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "", value_parser = parse_kv_disk)]
+    pub(crate) kv_disk: Option<PathBuf>,
+
+    /// L3 cap for the WHOLE deployment (bytes or a fraction of free disk),
+    /// split across TP ranks. Requires --kv-disk; default 50% of free disk.
+    #[arg(long, value_parser = parse_kv_budget)]
+    pub(crate) kv_disk_limit: Option<infer_api::KvTierBudget>,
 
     /// KV cache storage dtype. `auto` lets the backend choose its default.
     #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
@@ -524,17 +598,6 @@ pub(crate) struct ServeArgs {
     /// See `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`.
     #[arg(long, default_value_t = false)]
     pub(crate) kv_recall: bool,
-
-    /// SSD KV tier byte cap PER ENGINE PROCESS (each multiproc TP worker gets
-    /// its own cap; the stores are sparse mmaps, so disk is consumed only by
-    /// actual spill). Unset derives from free disk via --ssd-fraction.
-    #[arg(long, value_parser = parse_positive_usize)]
-    pub(crate) kv_ssd_max_bytes: Option<usize>,
-
-    /// Host-RAM budget in bytes for the T1 prefix-KV tier (default-on:
-    /// CUDA dense keeps 4 GiB when unset). `0` disables the tier.
-    #[arg(long, value_name = "BYTES")]
-    pub(crate) kv_t1_budget_bytes: Option<usize>,
 
     /// Whole-process memory budget in bytes for unified-memory backends.
     /// Metal applies this before loading weights and clamps KV capacity to fit.
@@ -563,22 +626,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.9)]
     pub(crate) mem_fraction_static: f64,
 
-    /// Fraction of *available* host DRAM the L2 (host-DRAM) KV tier may claim.
-    /// The store is pageable host memory on a (shared) box, so the default 0.5
-    /// is deliberately conservative — the budget is
-    /// `clamp(frac × MemAvailable, [4 GiB, MemAvailable − max(64 GiB, 0.15 ×
-    /// MemTotal)])`, leaving a reserve so the OS never swaps/OOM-kills. CUDA
-    /// only; `--kv-t1-budget-bytes` is an explicit override that wins. Default 0.5.
-    #[arg(long, default_value_t = 0.5)]
-    pub(crate) dram_fraction: f64,
-
-    /// Fraction of *free* disk the L3 (NVMe) KV tier may claim when `--kv-ssd-path`
-    /// is set without `--kv-ssd-max-bytes`. Budget is `clamp(frac × free_disk,
-    /// [8 GiB, free_disk − max(50 GiB, 0.1 × total_disk)])`, reserving room for
-    /// the FS + co-tenants. Default 0.5.
-    #[arg(long, default_value_t = 0.5)]
-    pub(crate) ssd_fraction: f64,
-
     /// Max prompt tokens accepted at ingress.
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) max_prompt_tokens: Option<usize>,
@@ -598,11 +645,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) chunked_prefill_size: Option<usize>,
 
-    /// Opt into running-cap oversubscription: rotate waiters in by parking the
-    /// longest-running decode's whole-slot KV image to the tier store. Requires
-    /// a whole-slot tier backend; default off (byte-identical).
+    /// Rotate waiters past the running cap by parking whole decode slots into
+    /// the KV tier (whole-slot-tier models only; others fail closed at start).
     #[arg(long, default_value_t = false)]
-    pub(crate) slot_oversubscription: bool,
+    pub(crate) kv_oversubscription: bool,
 
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
@@ -1535,6 +1581,23 @@ mod tests {
         RunArgs, TrainCommand,
     };
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn parse_kv_budget_accepts_percent_fraction_bytes_and_off() {
+        use infer_api::KvTierBudget;
+
+        use super::parse_kv_budget;
+        assert_eq!(parse_kv_budget("50%"), Ok(KvTierBudget::Fraction(0.5)));
+        assert_eq!(parse_kv_budget("0.5"), Ok(KvTierBudget::Fraction(0.5)));
+        assert_eq!(parse_kv_budget("16GiB"), Ok(KvTierBudget::Bytes(16 << 30)));
+        assert_eq!(
+            parse_kv_budget("1073741824"),
+            Ok(KvTierBudget::Bytes(1 << 30))
+        );
+        assert_eq!(parse_kv_budget("0"), Ok(KvTierBudget::Off));
+        assert_eq!(parse_kv_budget("off"), Ok(KvTierBudget::Off));
+        assert!(parse_kv_budget("junk").is_err());
+    }
 
     #[test]
     fn rejects_removed_max_gpu_kv_flag() {
