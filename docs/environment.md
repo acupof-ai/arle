@@ -325,7 +325,6 @@ as diagnostics and validation gates, not stable tuning API.
 |---|---|---|---|
 | `ARLE_DSV4_MOE_BACKEND` (alias `ARLE_DSV4_MOE_TRANSPORT`) | `allreduce` (default), `deepep`, `deepep_ll` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/dsv4.rs::dsv4_use_deepep_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
-| `ARLE_DSV4_TRACE_LAYER` | `1` / unset | unset | Emits CUDA-synchronizing per-layer phase traces and request-level DSv4 operator aggregates. Use for diagnosis only; it changes latency. |
 | `ARLE_DSV4_OPERATOR_TRACE` | `1` / unset | unset | Enables the same CUDA-synchronizing DSv4 operator aggregate in `request_trace` JSON without emitting every per-layer event log line. The field is `dsv4_operator_trace_process_delta` and is valid for single-inflight profiling only. |
 | `ARLE_DSV4_OPERATOR_TRACE_EVENTS` | `1` / unset | unset | With `ARLE_DSV4_OPERATOR_TRACE=1`, also emits the legacy `dsv4_trace layer=... phase=...` event log lines. |
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
