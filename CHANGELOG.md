@@ -54,6 +54,14 @@ lifecycle & progress spine).
   DeepSeek-OCR wired (2026-06-24/25, vision numerics not yet faithful).
   Quality/throughput validation pending for both.
 
+### Server
+
+- **`/v1/chat/completions` now supports `stream=true`** (SSE
+  `chat.completion.chunk` frames with `reasoning_content`/`content` deltas;
+  closes the R5 tranche-2 deferral, #79). Multimodal chat streaming still
+  fails closed with 400.
+  ([wins](docs/experience/wins/2026-07-02-http-chat-sse-streaming.md))
+
 ### Repo
 
 - **Renamed `agent-infer` → `arle`** across source, config, and docs
