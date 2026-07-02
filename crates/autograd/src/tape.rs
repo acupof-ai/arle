@@ -507,9 +507,10 @@ impl Tape {
         loss_id: TensorId,
         store: &mut TensorStore,
         target_ids: &[TensorId],
+        profile: Option<&mut BackwardProfile>,
     ) -> Result<HashMap<TensorId, TensorId>> {
         let targets = target_ids.iter().copied().collect::<HashSet<_>>();
-        self.backward_impl_seed(loss_id, None, store, None, false, Some(&targets))
+        self.backward_impl_seed(loss_id, None, store, profile, false, Some(&targets))
     }
 
     fn backward_impl(
@@ -703,9 +704,12 @@ impl Tape {
                     BackwardOp::AllReduceSum => {
                         ops::all_reduce_sum_backward(&entry, output_grad_id, store)?
                     }
-                    BackwardOp::Checkpoint => {
-                        self.checkpoint_backward(&entry, output_grad_id, store)?
-                    }
+                    BackwardOp::Checkpoint => self.checkpoint_backward(
+                        &entry,
+                        output_grad_id,
+                        store,
+                        profile.as_deref_mut(),
+                    )?,
                 };
                 if vram_profile {
                     log_backward_vram_profile("after_op", entry_index, &entry, store)?;
@@ -772,6 +776,7 @@ impl Tape {
         entry: &TapeEntry,
         output_grad_id: TensorId,
         store: &mut TensorStore,
+        profile: Option<&mut BackwardProfile>,
     ) -> Result<GradPairs> {
         let SavedContext::CheckpointCtx { function_id } = entry.saved else {
             return Err(AutogradError::TapeInvariant(
@@ -787,14 +792,19 @@ impl Tape {
             .clone();
 
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+        let mut inner_profile = profile.as_ref().map(|_| BackwardProfile::default());
         let result = (|| {
             let mut inner_tape = Tape::new();
             let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
             trim_after_checkpoint_replay(store)?;
             let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
             let loss = ops::sum(weighted, store, &mut inner_tape)?;
-            let inner_grads =
-                inner_tape.backward_collect_targets_only(loss, store, &entry.input_ids)?;
+            let inner_grads = inner_tape.backward_collect_targets_only(
+                loss,
+                store,
+                &entry.input_ids,
+                inner_profile.as_mut(),
+            )?;
 
             let mut grads = GradPairs::new();
             let mut keep = HashSet::new();
@@ -811,6 +821,12 @@ impl Tape {
             Ok((grads, keep)) => {
                 store.free_new_except(&live_before, &keep)?;
                 trim_after_checkpoint_replay(store)?;
+                if let (Some(outer), Some(mut inner)) = (profile, inner_profile) {
+                    // The inner wall already sits inside this entry's own
+                    // Checkpoint envelope — merge the attribution rows only.
+                    inner.total_duration = Duration::ZERO;
+                    outer.merge(&inner);
+                }
                 Ok(grads)
             }
             Err(err) => {
