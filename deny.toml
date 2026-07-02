@@ -25,12 +25,8 @@ ignore = [
     # fastrace-macro -> fastrace -> infer-api; no runtime/security surface.
     # Revisit when fastrace drops the dep or migrates its macro error path.
     "RUSTSEC-2026-0173",
-    # Two `rustls`/`webpki`/CRL-related vulnerabilities. Pulled in via
-    # reqwest's TLS path. Bumping the TLS stack is queued as a deliberate
-    # PR; ignoring here so dep-bumps unrelated to TLS don't get blocked.
-    # (The third, RUSTSEC-2026-0104, left the tree — ignore removed 2026-07-02.)
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
+    # (The rustls/webpki CRL trio RUSTSEC-2026-0098/0099/0104 left the tree
+    # with the TLS-stack bump — ignores removed 2026-07-02.)
 ]
 
 [licenses]
