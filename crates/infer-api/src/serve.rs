@@ -267,8 +267,14 @@ pub fn serve_coordinator_http(
         .with_context(|| format!("coordinator tokenizer load for {model_path}"))?;
     let model_id = crate::serve_engine::model_id_from_path(model_path);
     let shutdown = infer_server::ServeShutdown::new();
-    let router =
-        infer_server::coordinator_router(relay, tokenizer, model_id, max_thinking_tokens, None);
+    let router = infer_server::coordinator_router(
+        relay,
+        tokenizer,
+        model_id,
+        max_thinking_tokens,
+        None,
+        Some(shutdown.clone()),
+    );
     bind_and_serve(bind, port, router, model_path, shutdown)
 }
 
