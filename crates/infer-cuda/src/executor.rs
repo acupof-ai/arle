@@ -2571,17 +2571,13 @@ impl Dsv4CudaExecutor {
     /// Contract (see `infer_seam::BackendExecutor::demote_slot`): the copy is
     /// complete before returning — `swap_out_image` ends in `ctx.sync()` — so
     /// the engine may free the slot immediately. Returns `Ok(false)` when the
-    /// store is at its v1 count cap (engine falls back to plain recompute).
+    /// chunk store has no room (engine falls back to plain recompute).
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         ensure!(
             slot < self.num_slots,
             "DSv4 demote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        let local_room = usize::from(!self.slot_tier.is_full());
-        if self.tp_min_usize(local_room, "slot demote room")? == 0 {
-            return Ok(false);
-        }
         let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter);
         let capture_ok = usize::from(image.is_ok());
         if self.tp_min_usize(capture_ok, "slot demote capture")? == 0 {

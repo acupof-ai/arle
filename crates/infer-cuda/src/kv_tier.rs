@@ -1,11 +1,11 @@
-//! Two-level host store for demoted prefix-KV pages.
+//! Two-level host store for demoted KV blocks.
 //!
-//! Host-demoted pages live in a capacity-capped in-RAM map (default-on, 4 GiB).
+//! Host-demoted blocks live in a capacity-capped in-RAM map (default-on, 4 GiB).
 //! Disk spill is optional on the `kv-native-sys` block substrate
 //! (`--kv-ssd-path`, opt-in): when host RAM fills, the coldest host entry spills
 //! to a file-backed mmap page-slot store, so the capacity the engine sees is
-//! host-demoted + disk pages. Payloads are opaque fixed-limit blocks
-//! (paged-KV pages or chunked slot images); this module never touches the device.
+//! host-demoted + disk slots. Payloads are opaque fixed-limit blocks (paged-KV
+//! pages or DSv4 slot-image chunks); this module never touches the device.
 //!
 //! ## Mmap store
 //!
