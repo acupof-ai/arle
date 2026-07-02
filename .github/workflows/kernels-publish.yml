@@ -21,6 +21,10 @@ concurrency:
   group: kernels-publish
   cancel-in-progress: true
 
+env:
+  # .cargo/config.toml pins rustc-wrapper=sccache for local dev; not installed here.
+  RUSTC_WRAPPER: ""
+
 permissions:
   contents: write
 
