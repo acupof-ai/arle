@@ -2402,9 +2402,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
         // Sync the trained LoRA into the rollout engine (always): the next round
         // needs this round's improved student. Round 0 sampled from base.
+        let sync_started = Instant::now();
         infer_student
             .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
             .context("sync trained LoRA into rollout engine")?;
+        eprintln!(
+            "[agent-opd] phase=sync_lora seconds={:.3}",
+            sync_started.elapsed().as_secs_f64()
+        );
 
         // HELD-OUT eval of THIS round's student (rollout engine now holds the
         // round-N LoRA). Eval-only: drives the same rollout+score harness with no
@@ -2481,6 +2486,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             }
         }
 
+        let save_started = Instant::now();
         let mut ckpt_tape = Tape::new();
         maybe_save_full_student_checkpoint(
             "agent-opd",
@@ -2493,6 +2499,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             &mut store,
             &mut ckpt_tape,
         )?;
+        eprintln!(
+            "[agent-opd] phase=round_tail_save seconds={:.3}",
+            save_started.elapsed().as_secs_f64()
+        );
     }
 
     eprintln!("[arle train agent-opd] done ({} rounds)", args.rounds);
