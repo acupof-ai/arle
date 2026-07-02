@@ -85,10 +85,18 @@ fn try_causal_sdpa_prefill_device(
     ) else {
         return Ok(None);
     };
-    let Some((out, out_shape)) = store
+    let fused = store
         .backend()
-        .causal_sdpa_prefill_device(&q_h, &q_shape, &k_h, &k_shape, &v_h, &v_shape, q_start)?
-    else {
+        .causal_sdpa_prefill_device(&q_h, &q_shape, &k_h, &k_shape, &v_h, &v_shape, q_start)?;
+    // The backend rejects out-of-envelope shapes with a silent None; surface
+    // the verdict + shapes under the trace flag so a wrong guard is visible.
+    if std::env::var("ARLE_SDPA_TRACE").is_ok() {
+        eprintln!(
+            "[sdpa-trace] fused={} q={q_shape:?} k={k_shape:?} q_start={q_start}",
+            if fused.is_some() { "TAKEN" } else { "REJECTED" }
+        );
+    }
+    let Some((out, out_shape)) = fused else {
         return Ok(None);
     };
     Ok(Some(store.alloc_device_tensor(out_shape, out)?))
