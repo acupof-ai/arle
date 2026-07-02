@@ -223,6 +223,13 @@ impl KvMmapStore {
                 .len(total_bytes)
                 .map_mut(&file)?
         };
+        // Write-burst ceiling on the sparse mapping is first-touch soft faults
+        // (~524k 4KiB faults per 2 GiB streamed). MADV_HUGEPAGE collapses them
+        // 512x where THP allows; opt-in probe until an A/B licenses a default.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("ARLE_KV_MMAP_HUGEPAGE").is_some_and(|v| v == "1") {
+            let _ = mapping.advise(memmap2::Advice::HugePage);
+        }
 
         let free_list: Vec<u32> = (0..num_slots).collect();
 
