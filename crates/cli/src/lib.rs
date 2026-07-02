@@ -67,24 +67,27 @@ pub fn run() -> ExitCode {
         return ExitCode::from(train::spawner::serve_loop() as u8);
     }
 
-    // Install the logger FIRST, before any subcommand dispatch. `serve`, `train`,
-    // and `model` early-return from the match below and never reach `run_impl`'s
-    // init, so without this they would run with NO logger — every `log::error!`
-    // in the serve/engine path (e.g. an engine-thread `step()` failure) became a
-    // silent no-op, masking real failures. Default `warn`; RUST_LOG overrides.
-    // Idempotent (`call_once`), so `run_impl`'s later call is a harmless no-op.
-    infer_util::logging::init_stderr("warn");
-
     // DSv4 multiproc-serve worker entry. When ARLE_WORKER_RANK>0 is set (by the
     // serve coordinator before spawning this process), this process is a worker
     // rank: short-circuit BEFORE clap parsing — it joins the NCCL group as its
     // rank and runs the relay-receiver loop instead of the normal CLI. Mirrors
     // the deleted `infer/src/main.rs` fn main worker-entry. No-op on non-CUDA /
     // non-Unix builds (the module isn't compiled there).
+    // MUST run before the generic logger init below: workers install their own
+    // `[rankN]`-prefixed logger, and `init` is call_once — a generic init first
+    // silently drops the prefix (pod round-4 finding).
     #[cfg(all(unix, feature = "cuda"))]
     if let Some(code) = serve_multiproc::worker_entry() {
         return code;
     }
+
+    // Install the logger before any subcommand dispatch. `serve`, `train`,
+    // and `model` early-return from the match below and never reach `run_impl`'s
+    // init, so without this they would run with NO logger — every `log::error!`
+    // in the serve/engine path (e.g. an engine-thread `step()` failure) became a
+    // silent no-op, masking real failures. Default `warn`; RUST_LOG overrides.
+    // Idempotent (`call_once`), so `run_impl`'s later call is a harmless no-op.
+    infer_util::logging::init_stderr("warn");
 
     let mut args = Args::parse();
     let command = args.command.take();
