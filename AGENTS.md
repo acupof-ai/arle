@@ -476,10 +476,12 @@ cargo build --release --no-default-features --features cpu,no-cuda           # p
 # Mac CUDA-Rust typecheck without nvcc (CI-mirrored):
 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 
-# Tests (CI-mirrored; see .github/workflows/*.yml for the full matrix):
-cargo test -p arle --release --no-default-features --features cpu,no-cuda,cli
+# Tests (CI-mirrored; see .github/workflows/*.yml for the full matrix).
+# CI test lanes use `--profile release-fast` (cu=16, no LTO) — the release
+# profile's cu=1 cold build OOMs 16 GB CI runners:
+cargo test -p arle --profile release-fast --no-default-features --features cpu,no-cuda,cli
 cargo test -p cli --release --no-default-features --features metal,no-cuda   # Metal
-cargo test -p kv-native-sys --release
+cargo test -p kv-native-sys --profile release-fast
 ```
 
 **KV precision parity gate — re-ported 2026-06-10 (#58).** The monolith's
