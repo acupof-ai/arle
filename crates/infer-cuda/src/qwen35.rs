@@ -905,12 +905,18 @@ impl Qwen35SlotState {
         conv_len: usize,
         image: &Qwen35SlotImage,
     ) -> Result<()> {
-        ensure!(
-            !self.has_recurrent() && full_attn_kv.seq_len(slot) == 0,
-            "Qwen3.6 swap-in requires an empty slot {slot} (recurrent={}, pool seq_len={})",
-            self.has_recurrent(),
-            full_attn_kv.seq_len(slot)
-        );
+        // A scheduler-free slot may still hold its FINISHED previous occupant's
+        // device state: this arm vacates lazily at the next position-0 prefill,
+        // and a swap re-admission is exactly such a fresh occupancy. Release the
+        // stale state the same way `submit_prefill_row` does (#134 — the old
+        // empty-slot ensure here cost one graceful recompute per rotation pair).
+        if self.has_recurrent() {
+            self.release_recurrent(recurrent_pool);
+        }
+        if full_attn_kv.seq_len(slot) != 0 {
+            full_attn_kv.free_slot(slot);
+        }
+        self.seq_len = 0;
         ensure!(
             image.gdr_host.len() == num_linear && image.conv_host.len() == num_linear,
             "Qwen3.6 swap image linear count {}/{} != num_linear {num_linear}",

@@ -631,6 +631,8 @@ where
         model.into(),
         max_thinking_tokens,
         coord_multimodal,
+        // Local lane: the engine thread and this process share fate already.
+        None,
     )
 }
 

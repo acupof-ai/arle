@@ -117,6 +117,7 @@ pub fn coordinator_router(
     model: impl Into<String>,
     max_thinking_tokens: usize,
     multimodal: Option<(crate::LocalMultimodalTx, MultimodalKind)>,
+    shutdown: Option<crate::ServeShutdown>,
 ) -> Router {
     let sinks = relay.completion_sinks();
     let relay = Arc::new(Mutex::new(relay));
@@ -129,7 +130,7 @@ pub fn coordinator_router(
         let sinks = sinks.clone();
         std::thread::Builder::new()
             .name("arle-coordinator-lockstep".to_string())
-            .spawn(move || lockstep_loop(relay, in_flight, sinks, submit_rx))
+            .spawn(move || lockstep_loop(relay, in_flight, sinks, submit_rx, shutdown))
             .expect("spawn coordinator lockstep thread");
     }
 
@@ -170,7 +171,21 @@ fn lockstep_loop(
     in_flight: Arc<AtomicUsize>,
     sinks: CompletionSinks,
     submit_rx: SyncReceiver<CoordSubmission>,
+    shutdown: Option<crate::ServeShutdown>,
 ) {
+    // Group teardown on a fatal lockstep error (#135): failing the sinks stops
+    // the hang, but surviving workers spin inside the broken NCCL collective
+    // until killed. Requesting serve shutdown unwinds the coordinator HTTP
+    // loop, whose exit drops the worker guard — pipe EOF, 5s grace, SIGKILL.
+    let teardown = |sinks: &CompletionSinks, reason: &str| {
+        sinks.fail_all(reason);
+        if let Some(shutdown) = &shutdown {
+            log::error!(
+                "[coordinator] tearing down the serve (worker group unwound by the child guard)"
+            );
+            shutdown.request();
+        }
+    };
     let mut seq: u64 = 0;
     let mut submit_open = true;
     loop {
@@ -215,7 +230,10 @@ fn lockstep_loop(
                 );
                 // Worker group broken: fail every in-flight sink so awaiting
                 // handlers return an error (and drop their guard) instead of hanging.
-                sinks.fail_all("multiproc worker group failed (admission broadcast error)");
+                teardown(
+                    &sinks,
+                    "multiproc worker group failed (admission broadcast error)",
+                );
                 return;
             }
             seq += 1;
@@ -242,7 +260,10 @@ fn lockstep_loop(
                         "[coordinator] tick #{seq} admission broadcast failed; stopping lockstep \
                          loop: {err:#}"
                     );
-                    sinks.fail_all("multiproc worker group failed (admission broadcast error)");
+                    teardown(
+                        &sinks,
+                        "multiproc worker group failed (admission broadcast error)",
+                    );
                     return;
                 }
                 seq += 1;
