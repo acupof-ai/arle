@@ -13,7 +13,7 @@
 set -euo pipefail
 TREE="${POD_TREE:-/host/arle-build}"
 VENV="$TREE/crates/cuda-kernels/tools/tilelang/.venv"
-PATCH="$TREE/crates/cuda-kernels/tools/tilelang/patches/tvm-ffi-typeattr-first-wins.patch"
+PATCH="$TREE/crates/cuda-kernels/tools/tilelang/patches/tvm-ffi-legacy-tvm-compat.patch"
 PY="$VENV/bin/python"
 PIN="$(grep -oE 'apache-tvm-ffi==[0-9.]+' "$TREE/requirements-build.txt" | cut -d= -f3)"
 

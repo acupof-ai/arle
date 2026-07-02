@@ -6,7 +6,7 @@
 # (duplicate builtin TypeAttr registration from tilelang's bundled TVM —
 # tile-ai/tilelang#2367; 2x2-verified on the pod, clean venv included). WE
 # CARRY THE FIX: crates/cuda-kernels/tools/tilelang/patches/
-# tvm-ffi-typeattr-first-wins.patch, applied by scripts/pod-tilelang-env.sh
+# tvm-ffi-legacy-tvm-compat.patch, applied by scripts/pod-tilelang-env.sh
 # (`pod.sh setup-tilelang`), which rebuilds the tvm-ffi wheel from sdist.
 # Drop the patch when a tilelang release imports cleanly against >=0.1.12.
 #
