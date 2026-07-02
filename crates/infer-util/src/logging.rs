@@ -16,6 +16,9 @@ struct LoggingConfig {
     level: String,
     /// Enable colored output (info=green, warn=yellow, error=red).
     colored: bool,
+    /// Fixed prefix prepended to every formatted record (e.g. `"[rank0] "`),
+    /// so interleaved multi-process stderr stays attributable.
+    prefix: Option<String>,
 }
 
 impl Default for LoggingConfig {
@@ -23,7 +26,28 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             colored: true,
+            prefix: None,
         }
+    }
+}
+
+/// Layout decorator: prepends [`LoggingConfig::prefix`] to whatever the
+/// wrapped layout formats.
+#[derive(Debug)]
+struct PrefixedLayout {
+    prefix: String,
+    inner: Box<dyn logforth::Layout>,
+}
+
+impl logforth::Layout for PrefixedLayout {
+    fn format(
+        &self,
+        record: &logforth::record::Record,
+        diags: &[Box<dyn logforth::Diagnostic>],
+    ) -> Result<Vec<u8>, logforth::Error> {
+        let mut out = self.prefix.clone().into_bytes();
+        out.extend(self.inner.format(record, diags)?);
+        Ok(out)
     }
 }
 
@@ -59,37 +83,47 @@ fn apply_default_module_levels(mut filter: String) -> String {
 /// keep debug output focused on application components.
 fn init(config: LoggingConfig) {
     INIT.call_once(|| {
-        let LoggingConfig { level, colored } = config;
+        let LoggingConfig {
+            level,
+            colored,
+            prefix,
+        } = config;
 
         let filter_str =
             std::env::var("RUST_LOG").unwrap_or_else(|_| apply_default_module_levels(level));
-
-        let mut builder = logforth::starter_log::builder();
 
         // Parse filter from string using EnvFilterBuilder
         let filter =
             logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str)
                 .build();
 
-        if colored {
-            let layout = TextLayout::default()
-                .info_color(Green)
-                .warn_color(Yellow)
-                .error_color(Red);
-            builder = builder.dispatch(|d| {
+        // No prefix keeps both layouts byte-identical to before (the plain
+        // layout IS `Stderr::default()`'s built-in layout).
+        let layout: Box<dyn logforth::Layout> = if colored {
+            Box::new(
+                TextLayout::default()
+                    .info_color(Green)
+                    .warn_color(Yellow)
+                    .error_color(Red),
+            )
+        } else {
+            Box::new(logforth::layout::PlainTextLayout::default())
+        };
+        let layout = match prefix {
+            Some(prefix) => Box::new(PrefixedLayout {
+                prefix,
+                inner: layout,
+            }) as Box<dyn logforth::Layout>,
+            None => layout,
+        };
+
+        logforth::starter_log::builder()
+            .dispatch(|d| {
                 d.filter(filter)
                     .diagnostic(ThreadLocalDiagnostic::default())
                     .append(logforth::append::Stderr::default().with_layout(layout))
-            });
-        } else {
-            builder = builder.dispatch(|d| {
-                d.filter(filter)
-                    .diagnostic(ThreadLocalDiagnostic::default())
-                    .append(logforth::append::Stderr::default())
-            });
-        }
-
-        builder.apply();
+            })
+            .apply();
     });
 }
 
@@ -100,6 +134,18 @@ pub fn init_stderr(level: &str) {
     init(LoggingConfig {
         level: level.to_string(),
         colored: false,
+        prefix: None,
+    });
+}
+
+/// Initialize stderr logging (no colors) with a fixed per-record prefix, e.g.
+/// `"[rank2] "` — multiproc workers share one terminal, so every record must
+/// name its rank to stay attributable.
+pub fn init_stderr_with_prefix(level: &str, prefix: &str) {
+    init(LoggingConfig {
+        level: level.to_string(),
+        colored: false,
+        prefix: Some(prefix.to_string()),
     });
 }
 
