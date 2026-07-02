@@ -22,6 +22,34 @@ Gap ≈ 3.1×. The anchor itself gets derived, not assumed (Phase 0).
   `feedback_ideal_roofline_gap_is_not_launch_overhead` — the roofline states
   the FLOOR; it does not attribute the gap.
 
+## Code facts (source-verified 2026-07-02; see the inventory read)
+
+Per committed token, MODEL1 B=1 eager decode, default env:
+
+- **Collectives/token = 3·N at TP>1** — per layer: Q head-slab all-gather
+  (`attention.rs:2750`), attn O-LoRA all-reduce (`dsv4.rs:5055`), MoE
+  all-reduce (`dsv4.rs:5308`). No per-step collectives. At TP=1 all are
+  no-ops. The collective-latency floor is therefore
+  `3·N × t_collective(TP)` — with N from config.json this is computable
+  BEFORE any nsys run, and history (monolith trace: `ffn_all_reduce`
+  340 µs/layer-call avg) says this term alone may dominate the 18.9 ms.
+- **lm_head is replicated** full-vocab GEMV per rank (`dsv4.rs:6286`,
+  `loader.rs:74`) — #99 confirmed in code; no gather on the head.
+- **Host: 1 sync + 1 D2H(4 B) + 2 H2D per token** (argmax `ops.rs:467`);
+  non-greedy adds a full-vocab D2H.
+- **Allocations/token**: ~7 `HiddenStates::uninit` device allocs PER LAYER
+  (`dsv4.rs:4917-5413`) + 3 tail `DeviceVec::zeros` + the DSv4 tail uses the
+  alloc-per-token sampler (`dsv4.rs:4479` → `ops.rs:432`), not the
+  zero-alloc scratched one Qwen3.5 uses. Measurable hypothesis, NOT a
+  pre-approved fix (B=1 GPU-bound → overhead-removal wash, per memory).
+- **MTP D2/T2 (default-on)**: one committed token ≈ 0.33 backbone forwards
+  at full acceptance (1 verify over 3 rows + 2 single-layer draft
+  forwards); the 18.9 ms/token measured is ALREADY the MTP-folded rate —
+  the plain-decode step cost is higher.
+- **Decode graph**: exists (`dsv4.rs:5889`), default off, requires
+  allreduce transport + no probe lens + MODEL1; sampling stays outside.
+- **B=1 never takes the batched lane** (`executor.rs:2798` early-return).
+
 ## Phase 1 — decomposition on the CURRENT stack (single pod session)
 
 The monolith's `ARLE_DSV4_TRACE_LAYER` / operator trace did NOT survive the
@@ -51,7 +79,7 @@ Instrumentation-free first, nsys second:
 | DeepEP-LL / comm | replace per-layer allreduce on the decode path | #61 batched-lane license open | same-binary A/B, ms/token |
 | lm_head vocab-shard | 8× weight/rank + logits all-gather | #99 | A/B ms/token |
 | MTP always-on + dynamic verify | more committed tokens/step | #89 spec-flip + DSpark C1 (#124) | ms/committed-token + correctness gate |
-| DSv4 decode graph | `ARLE_DSV4_DECODE_GRAPH` branch exists (arch doc §0); executor default off | re-license on rewrite | A/B + needle gate |
+| DSv4 decode graph | branch exists, default off | **already RE-KILLED 2026-06-10** (B=1 GPU-bound, wash −1.5%, `errors/2026-06-10-dsv4-wholestep-graph-production-path-wash-rekill.md`) | revisit ONLY if Phase-1 host-gap share is material |
 | Host/lockstep overhead | tick relay + submit path | window fix landed | only if Phase-1 host-gap share is material (B=1 GPU-bound → wash per feedback memory) |
 | Kernel fusion (small ops) | — | KILLED twice before (fp8 pair-quantize, swiglu) | paired component A/B only |
 | DP-attn | c>1 throughput, NOT B=1 latency | #89 | out of scope for the 6 ms/token anchor |
