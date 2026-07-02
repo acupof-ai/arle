@@ -206,18 +206,12 @@ impl OpenAiTokenizer {
                 chat_template_kwargs,
                 tools,
             ),
-            ChatTemplate::BuiltinDeepseekV4 => {
-                let oai: Vec<chat::OpenAiChatMessage> =
-                    messages.iter().map(ChatMessage::to_openai).collect();
-                Ok(chat::openai_messages_to_deepseek_v4_prompt(
-                    &oai,
-                    tools,
-                    &chat::DeepSeekV4ChatTemplateOptions {
-                        thinking,
-                        reasoning_effort: reasoning_effort.map(str::to_owned),
-                    },
-                ))
-            }
+            ChatTemplate::BuiltinDeepseekV4 => Ok(render_deepseek_v4(
+                messages,
+                tools,
+                thinking,
+                reasoning_effort,
+            )),
             ChatTemplate::BuiltinChatMl => render_chatml(messages, tools),
             ChatTemplate::UnsupportedChat { reason } => {
                 anyhow::bail!("chat completions are not supported for this tokenizer: {reason}")
@@ -327,14 +321,39 @@ fn render_jinja(
         .map_err(|err| anyhow!("render checkpoint chat_template failed: {err}"))
 }
 
+/// The `chat` crate's OpenAI wire messages — the shared shape its DeepSeek-V4
+/// and ChatML+tools renderers consume.
+fn to_openai_messages(messages: &[ChatMessage]) -> Vec<chat::OpenAiChatMessage> {
+    messages.iter().map(ChatMessage::to_openai).collect()
+}
+
+/// DeepSeek-V4 prompt via the `chat` crate — the single source of the DSML tool
+/// format and the thinking / non-thinking generation prefix.
+fn render_deepseek_v4(
+    messages: &[ChatMessage],
+    tools: &[chat::OpenAiToolDefinition],
+    thinking: bool,
+    reasoning_effort: Option<&str>,
+) -> String {
+    chat::openai_messages_to_deepseek_v4_prompt(
+        &to_openai_messages(messages),
+        tools,
+        &chat::DeepSeekV4ChatTemplateOptions {
+            thinking,
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+        },
+    )
+}
+
 /// Last-resort Qwen ChatML rendering. A tool-less render stays byte-identical to
 /// the legacy path; when tools are present the shared `chat` ChatML+tools
 /// renderer takes over (one source of the tool block + native XML call format).
 fn render_chatml(messages: &[ChatMessage], tools: &[chat::OpenAiToolDefinition]) -> Result<String> {
     if !tools.is_empty() {
-        let oai: Vec<chat::OpenAiChatMessage> =
-            messages.iter().map(ChatMessage::to_openai).collect();
-        return Ok(chat::openai_messages_to_prompt(&oai, tools));
+        return Ok(chat::openai_messages_to_prompt(
+            &to_openai_messages(messages),
+            tools,
+        ));
     }
     let mut out = String::new();
     for message in messages {
