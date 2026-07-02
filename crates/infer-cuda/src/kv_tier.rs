@@ -155,6 +155,8 @@ pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
 /// `key << CHUNK_IDX_BITS | idx` (a blob is ≤ 2^16 × page_bytes).
 pub(crate) const TIER_NS_SHIFT: u32 = 56;
 pub(crate) const CHUNK_IDX_BITS: u32 = 16;
+/// Canonical chunk/page size for whole-slot blob stores (DSv4 + Qwen3.6).
+pub(crate) const BLOB_CHUNK_BYTES: usize = 16 << 20;
 
 pub(crate) fn tier_key(ns: u64, sub: u64) -> u64 {
     debug_assert!(
@@ -698,7 +700,10 @@ impl CudaKvTierStore {
     ) -> bool {
         debug_assert!(!bytes.is_empty(), "chunked blob must be non-empty");
         let chunks = bytes.len().div_ceil(self.bytes_per_page);
-        if self.available_pages() <= chunks {
+        // Refuse blobs whose chunk index would alias the next key's chunks
+        // (chunk_sub packs idx into CHUNK_IDX_BITS) — unreachable at 16 MiB
+        // pages, load-bearing for small-page callers of this general API.
+        if chunks > (1 << CHUNK_IDX_BITS) || self.available_pages() <= chunks {
             return false;
         }
         let manifest_key = tier_key(ns, key);
@@ -935,9 +940,12 @@ mod tests {
         const BLOB: usize = 32 << 20;
         const NUM: u64 = 64; // 2 GiB payload total
         let page = 16 << 20;
+        // Own a subdirectory so the cleanup below can never delete a
+        // user-supplied tree (ARLE_KV_BENCH_ROOT may be a live data root).
         let root = std::env::var("ARLE_KV_BENCH_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| temp_root("bw"));
+            .unwrap_or_else(|_| temp_root("bw"))
+            .join(format!("arle-bw-probe-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("bench root");
         let mut store = CudaKvTierStore::with_budget(0, page);
         assert!(store.set_disk(root.clone(), (NUM as usize + 8) * 3 * page, page));
