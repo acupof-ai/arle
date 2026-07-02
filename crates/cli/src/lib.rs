@@ -85,9 +85,18 @@ pub fn run() -> ExitCode {
     // and `model` early-return from the match below and never reach `run_impl`'s
     // init, so without this they would run with NO logger — every `log::error!`
     // in the serve/engine path (e.g. an engine-thread `step()` failure) became a
-    // silent no-op, masking real failures. Default `warn`; RUST_LOG overrides.
-    // Idempotent (`call_once`), so `run_impl`'s later call is a harmless no-op.
-    infer_util::logging::init_stderr("warn");
+    // silent no-op, masking real failures. RUST_LOG overrides. Serve defaults
+    // to `info`: the operator-facing startup truth (resolved KV tiers, the
+    // checkpoint-scaled engine-ready barrier) is logged at info, and the
+    // multiproc coordinator was silently dropping it at `warn` (pod round-6).
+    // Pre-clap sniff — this must run before `Args::parse` (workers/subcommands
+    // early-return) and `init` is call_once, so parse-then-init is not an option.
+    let level = if std::env::args().any(|arg| arg == "serve") {
+        "info"
+    } else {
+        "warn"
+    };
+    infer_util::logging::init_stderr(level);
 
     let mut args = Args::parse();
     let command = args.command.take();
