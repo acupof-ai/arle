@@ -68,3 +68,37 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/kernel_artifacts.sh publish
+
+  # The consumer contract, proven cold on every refresh: a fresh runner with
+  # NO Python kernel stack fetches the bundle and builds the full T1 set —
+  # any regen attempt (bundle stale/incomplete) panics with the tilelang
+  # probe error and fails this job.
+  consume-check:
+    name: Zero-Python consume check
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit 12.8
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+
+      - name: Fetch the just-published bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/kernel_artifacts.sh fetch
+
+      - name: Build the T1 kernel set with zero Python
+        env:
+          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+          ARLE_CUDA_KERNEL_CACHE: '0'
+          # Poison the tilelang probe: consume must never need it.
+          INFER_TILELANG_PYTHON: /usr/bin/false
+        run: cargo build --release --features cuda -p cuda-kernels
