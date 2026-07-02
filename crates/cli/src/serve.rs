@@ -11,7 +11,7 @@ use std::{env, process::ExitCode};
 
 use infer_api::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, EngineLoadConfig, KvCacheDtype,
-    ServeHttpOptions, ServeKvSsdOptions, ServeSpecOptions, ServeSpecType, serve_http,
+    ServeHttpOptions, ServeSpecOptions, ServeSpecType, serve_http,
 };
 
 use crate::{
@@ -272,7 +272,17 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         engine_config.max_total_tokens = max_ctx;
     }
     let spec = resolve_spec_options(backend, serve_args);
-    let kv_ssd = resolve_kv_ssd_options(serve_args)?;
+    // The L3 spill request rides the engine config so BOTH CUDA paths carry
+    // it: the multiproc coordinator serializes ONLY engine_config into
+    // ARLE_WORKER_ENGINE_CONFIG, so serve-layer-only options never reach
+    // worker ranks (same reason as the MTP lowering below). Validated here,
+    // pre-spawn, for the same reason.
+    engine_config.kv_ssd_root = serve_args.kv_ssd_path.clone().or_else(|| {
+        (serve_args.kv_ssd || serve_args.kv_ssd_max_bytes.is_some())
+            .then(infer_api::default_kv_ssd_root)
+    });
+    engine_config.kv_ssd_max_bytes = serve_args.kv_ssd_max_bytes;
+    infer_api::validate_kv_ssd_config(&engine_config).map_err(|err| format!("{err:#}"))?;
     // Lower MTP spec into the engine config at the CLI level so BOTH paths carry the
     // draft depth: the multiproc coordinator serializes `config.options.engine_config`
     // into `ARLE_WORKER_ENGINE_CONFIG` before spawning workers and NEVER runs
@@ -294,7 +304,6 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         enable_cuda_graph: !args.no_cuda_graph,
         engine_config,
         spec,
-        kv_ssd,
     };
 
     Ok(ServeConfig {
@@ -326,21 +335,6 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         mtp_draft_tokens: serve_args.mtp_draft_tokens,
         mtp_draft_topk: serve_args.mtp_draft_topk,
     }
-}
-
-fn resolve_kv_ssd_options(serve_args: &ServeArgs) -> Result<ServeKvSsdOptions, String> {
-    let root = serve_args.kv_ssd_path.clone().or_else(|| {
-        (serve_args.kv_ssd || serve_args.kv_ssd_max_bytes.is_some())
-            .then(ServeKvSsdOptions::default_root)
-    });
-
-    Ok(ServeKvSsdOptions {
-        root,
-        max_bytes: serve_args.kv_ssd_max_bytes,
-        high_performance_non_preemptive: serve_args.kv_ssd
-            || serve_args.kv_ssd_path.is_some()
-            || serve_args.kv_ssd_max_bytes.is_some(),
-    })
 }
 
 fn resolve_backend(arg: ServeBackendArg) -> Result<ServeBackend, String> {
@@ -714,10 +708,12 @@ mod tests {
     }
 
     #[test]
-    fn kv_ssd_options_are_forwarded_to_service_layer() {
+    fn kv_ssd_flags_lower_into_engine_config() {
         if skip_if_no_backend() {
             return;
         }
+        // Multiproc contract: ONLY engine_config reaches worker ranks
+        // (ARLE_WORKER_ENGINE_CONFIG), so the L3 spill request must ride it.
         let (args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -732,11 +728,13 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
-            config.options.kv_ssd.root.as_deref(),
+            config.options.engine_config.kv_ssd_root.as_deref(),
             Some(std::path::Path::new("/tmp/arle-kv"))
         );
-        assert_eq!(config.options.kv_ssd.max_bytes, Some(1_073_741_824));
-        assert!(config.options.kv_ssd.high_performance_non_preemptive);
+        assert_eq!(
+            config.options.engine_config.kv_ssd_max_bytes,
+            Some(1_073_741_824)
+        );
     }
 
     #[test]
@@ -755,10 +753,9 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
-            config.options.kv_ssd.root,
-            Some(ServeKvSsdOptions::default_root())
+            config.options.engine_config.kv_ssd_root,
+            Some(infer_api::default_kv_ssd_root())
         );
-        assert!(config.options.kv_ssd.high_performance_non_preemptive);
     }
 
     #[test]
@@ -778,11 +775,13 @@ mod tests {
         ]);
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
-            config.options.kv_ssd.root,
-            Some(ServeKvSsdOptions::default_root())
+            config.options.engine_config.kv_ssd_root,
+            Some(infer_api::default_kv_ssd_root())
         );
-        assert_eq!(config.options.kv_ssd.max_bytes, Some(1_073_741_824));
-        assert!(config.options.kv_ssd.high_performance_non_preemptive);
+        assert_eq!(
+            config.options.engine_config.kv_ssd_max_bytes,
+            Some(1_073_741_824)
+        );
     }
 
     #[test]

@@ -42,10 +42,6 @@ pub struct ServeHttpOptions {
     /// Speculative-decode request surface. The rewrite server keeps this
     /// fail-closed until a backend actually consumes it.
     pub spec: ServeSpecOptions,
-    /// Optional SSD-backed KV tier request. The option is backend-neutral at the
-    /// service boundary; current rewrite backends fail closed until they expose a
-    /// real recall path below the executor seam.
-    pub kv_ssd: ServeKvSsdOptions,
 }
 
 impl ServeHttpOptions {
@@ -59,45 +55,58 @@ impl ServeHttpOptions {
             enable_cuda_graph: true,
             engine_config: EngineLoadConfig::default(),
             spec: ServeSpecOptions::default(),
-            kv_ssd: ServeKvSsdOptions::default(),
         }
     }
 }
 
-/// SSD-backed KV tier request carried at the serve boundary.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct ServeKvSsdOptions {
-    /// Root directory for local SSD/NVMe KV blocks.
-    pub root: Option<PathBuf>,
-    /// Optional capacity guard for this serve process.
-    pub max_bytes: Option<usize>,
-    /// The only intended SSD serving mode in the rewrite stack: synchronous,
-    /// high-throughput promotion without background preemption.
-    pub high_performance_non_preemptive: bool,
+/// The L3 (NVMe) KV spill root a bare `--kv-ssd` resolves to:
+/// `ARLE_KV_SSD_PATH`, else the platform cache dir.
+#[must_use]
+pub fn default_kv_ssd_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("ARLE_KV_SSD_PATH")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    default_cache_root().join("arle").join("kv-ssd")
 }
 
-impl ServeKvSsdOptions {
-    #[must_use]
-    pub fn requested(&self) -> bool {
-        self.root.is_some() || self.max_bytes.is_some() || self.high_performance_non_preemptive
-    }
-
-    #[must_use]
-    pub fn default_root() -> PathBuf {
-        if let Some(path) = std::env::var_os("ARLE_KV_SSD_PATH")
-            && !path.is_empty()
-        {
-            return PathBuf::from(path);
-        }
-        default_cache_root().join("arle").join("kv-ssd")
-    }
-
-    pub fn fill_default_root(&mut self) {
-        if self.requested() && self.root.is_none() {
-            self.root = Some(Self::default_root());
-            self.high_performance_non_preemptive = true;
-        }
-    }
+/// Structural validation of the L3 spill request carried by
+/// [`EngineLoadConfig`] (`kv_ssd_root` / `kv_ssd_max_bytes`): the root must be
+/// an absolute, creatable directory. Whether the loaded backend/model can
+/// actually consume the tier is decided at engine build, which fails closed
+/// for arms without a tier store.
+pub fn validate_kv_ssd_config(config: &EngineLoadConfig) -> Result<()> {
+    let Some(root) = config.kv_ssd_root.as_ref() else {
+        anyhow::ensure!(
+            config.kv_ssd_max_bytes.is_none(),
+            "--kv-ssd-max-bytes requires --kv-ssd-path"
+        );
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !root.as_os_str().is_empty(),
+        "--kv-ssd-path must not be empty"
+    );
+    anyhow::ensure!(
+        root.is_absolute(),
+        "--kv-ssd-path must be absolute for serving; got {}",
+        root.display()
+    );
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create --kv-ssd-path {}", root.display()))?;
+    let meta = std::fs::metadata(root)
+        .with_context(|| format!("inspect --kv-ssd-path {}", root.display()))?;
+    anyhow::ensure!(
+        meta.is_dir(),
+        "--kv-ssd-path must be a directory; got {}",
+        root.display()
+    );
+    anyhow::ensure!(
+        config.kv_ssd_max_bytes.is_none_or(|value| value > 0),
+        "--kv-ssd-max-bytes must be positive"
+    );
+    Ok(())
 }
 
 fn default_cache_root() -> PathBuf {
@@ -194,9 +203,8 @@ impl ServeSpecOptions {
     feature = "vulkan",
     feature = "cpu"
 ))]
-pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
-    opts.kv_ssd.fill_default_root();
-    validate_kv_ssd_options(&opts.kv_ssd)?;
+pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
+    validate_kv_ssd_config(&opts.engine_config)?;
 
     // Lower the requested spec surface into the engine config. The blanket
     // fail-close is now narrowed: an external draft model and `auto` are still
@@ -236,7 +244,6 @@ pub fn serve_http(mut opts: ServeHttpOptions) -> Result<()> {
         &opts.model_path,
         opts.enable_cuda_graph,
         engine_config,
-        &opts.kv_ssd,
         shutdown.clone(),
     )
     .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
@@ -306,49 +313,6 @@ fn bind_and_serve(
     })
 }
 
-fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
-    if !opts.requested() {
-        return Ok(());
-    }
-
-    let root = opts
-        .root
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("KV SSD tier requested without a resolved root"))?;
-    anyhow::ensure!(
-        !root.as_os_str().is_empty(),
-        "--kv-ssd-path must not be empty"
-    );
-    anyhow::ensure!(
-        root.is_absolute(),
-        "--kv-ssd-path must be absolute for serving; got {}",
-        root.display()
-    );
-    std::fs::create_dir_all(root)
-        .with_context(|| format!("create --kv-ssd-path {}", root.display()))?;
-    let meta = std::fs::metadata(root)
-        .with_context(|| format!("inspect --kv-ssd-path {}", root.display()))?;
-    anyhow::ensure!(
-        meta.is_dir(),
-        "--kv-ssd-path must be a directory; got {}",
-        root.display()
-    );
-    anyhow::ensure!(
-        opts.max_bytes.is_none_or(|value| value > 0),
-        "--kv-ssd-max-bytes must be positive"
-    );
-    anyhow::ensure!(
-        opts.high_performance_non_preemptive,
-        "--kv-ssd-path currently only supports the high-performance non-preemptive mode"
-    );
-
-    // Structural validation only — whether the loaded backend/model can
-    // actually consume the T2 tier is decided at engine build
-    // (`router_for_backend` / `cuda_serve_handle`), which fails closed for
-    // arms without a page-addressable tier store.
-    Ok(())
-}
-
 /// Backend-absent build: report the same way `--doctor` does and return an error.
 #[cfg(not(any(
     feature = "metal",
@@ -358,7 +322,7 @@ fn validate_kv_ssd_options(opts: &ServeKvSsdOptions) -> Result<()> {
     feature = "cpu"
 )))]
 pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
-    validate_kv_ssd_options(&opts.kv_ssd)?;
+    validate_kv_ssd_config(&opts.engine_config)?;
     anyhow::bail!(
         "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
     )
@@ -366,44 +330,64 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServeKvSsdOptions, validate_kv_ssd_options};
+    use super::{EngineLoadConfig, validate_kv_ssd_config};
 
     #[test]
-    fn kv_ssd_capacity_without_root_uses_default_root() {
-        let mut opts = ServeKvSsdOptions {
-            root: None,
-            max_bytes: Some(1),
-            high_performance_non_preemptive: true,
-        };
-        opts.fill_default_root();
-
-        assert_eq!(opts.root, Some(ServeKvSsdOptions::default_root()));
-        validate_kv_ssd_options(&opts).expect("default root should pass structural validation");
+    fn kv_ssd_max_bytes_without_root_is_rejected() {
+        let err = validate_kv_ssd_config(&EngineLoadConfig {
+            kv_ssd_max_bytes: Some(1),
+            ..EngineLoadConfig::default()
+        })
+        .expect_err("budget without a root should fail");
+        assert!(err.to_string().contains("requires --kv-ssd-path"));
     }
 
     #[test]
     fn kv_ssd_rejects_relative_root() {
-        let err = validate_kv_ssd_options(&ServeKvSsdOptions {
-            root: Some("relative/kv".into()),
-            max_bytes: None,
-            high_performance_non_preemptive: true,
+        let err = validate_kv_ssd_config(&EngineLoadConfig {
+            kv_ssd_root: Some("relative/kv".into()),
+            ..EngineLoadConfig::default()
         })
         .expect_err("relative root should fail");
-
         assert!(err.to_string().contains("must be absolute"));
     }
 
     #[test]
     fn kv_ssd_valid_root_passes_structural_validation() {
-        // Backend consumption is gated at engine build (CUDA-only today,
-        // fails closed there); structural validation accepts a valid root.
+        // Backend consumption is gated at engine build (fails closed there);
+        // structural validation accepts a valid absolute root.
         let dir = tempfile::tempdir().expect("tempdir");
-        validate_kv_ssd_options(&ServeKvSsdOptions {
-            root: Some(dir.path().to_path_buf()),
-            max_bytes: Some(1 << 30),
-            high_performance_non_preemptive: true,
+        validate_kv_ssd_config(&EngineLoadConfig {
+            kv_ssd_root: Some(dir.path().to_path_buf()),
+            kv_ssd_max_bytes: Some(1 << 30),
+            ..EngineLoadConfig::default()
         })
         .expect("valid absolute root should pass structural validation");
+    }
+
+    /// The multiproc coordinator ships its resolved config to worker ranks as
+    /// JSON (`ARLE_WORKER_ENGINE_CONFIG`); the L3 spill request must survive
+    /// that trip, and configs serialized before the fields existed must parse.
+    #[test]
+    fn kv_ssd_fields_round_trip_worker_config_json() {
+        let config = EngineLoadConfig {
+            kv_ssd_root: Some(std::path::PathBuf::from("/data/kv-spill")),
+            kv_ssd_max_bytes: Some(8 << 30),
+            ..EngineLoadConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: EngineLoadConfig = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.kv_ssd_root, config.kv_ssd_root);
+        assert_eq!(back.kv_ssd_max_bytes, Some(8 << 30));
+
+        let mut legacy = serde_json::to_value(EngineLoadConfig::default()).expect("to_value");
+        let fields = legacy.as_object_mut().expect("object");
+        fields.remove("kv_ssd_root");
+        fields.remove("kv_ssd_max_bytes");
+        let parsed: EngineLoadConfig =
+            serde_json::from_value(legacy).expect("pre-field worker JSON parses");
+        assert_eq!(parsed.kv_ssd_root, None);
+        assert_eq!(parsed.kv_ssd_max_bytes, None);
     }
 }
 
