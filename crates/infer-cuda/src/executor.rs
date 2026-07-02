@@ -708,7 +708,7 @@ impl RealCudaExecutor {
     }
 }
 
-use crate::kv_tier::{CudaKvTierStore, default_t1_budget_bytes};
+use crate::kv_tier::{CudaKvTierStore, chunk_sub, default_t1_budget_bytes, tier_key};
 
 /// Construction-time default fraction of available host DRAM the L2 KV tier
 /// may claim — the shared-box-safe 0.5 (the store is pageable host memory; see
@@ -1789,30 +1789,15 @@ pub(crate) struct Dsv4CudaExecutor {
     prefix_index: PrefixIndex,
 }
 
-/// `slot_tier` key namespaces (top byte of the u64 key), so features sharing
-/// THE store never collide and a future kind (e.g. a suffix cache) is one new
-/// constant. Manifest keys carry the feature key in the low bits; chunk keys
-/// carry `key << CHUNK_IDX_BITS | idx` (a blob is ≤ 2^16 × 16 MiB = 1 TiB).
-const TIER_NS_SHIFT: u32 = 56;
-const CHUNK_IDX_BITS: u32 = 16;
+/// `slot_tier` key namespaces (top byte, see `kv_tier::tier_key`), so features
+/// sharing THE store never collide and a future kind (e.g. a suffix cache) is
+/// one new constant.
 /// Parked whole-slot images (key = engine-minted swap key).
 const NS_SLOT: u64 = 1;
 const NS_SLOT_CHUNK: u64 = 2;
 /// Position-0 prefix snapshots (key = executor-minted, see [`PrefixIndex`]).
 const NS_PREFIX: u64 = 3;
 const NS_PREFIX_CHUNK: u64 = 4;
-
-fn tier_key(ns: u64, sub: u64) -> u64 {
-    debug_assert!(
-        sub >> TIER_NS_SHIFT == 0,
-        "tier sub-key overflows namespace"
-    );
-    (ns << TIER_NS_SHIFT) | sub
-}
-
-fn chunk_sub(key: u64, idx: usize) -> u64 {
-    (key << CHUNK_IDX_BITS) | idx as u64
-}
 
 /// Token index over position-0 prefix snapshots whose payload bytes live in
 /// the shared tier store. Owns only match + LRU policy (host-only testable);
@@ -2209,96 +2194,6 @@ impl std::fmt::Debug for Dsv4CudaExecutor {
 impl Dsv4CudaExecutor {
     const SLOT_CHUNK_BYTES: usize = 16 << 20;
 
-    fn chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
-        format!("DSCHUNK {chunks} {bytes}\n").into_bytes()
-    }
-
-    fn parse_chunk_manifest(bytes: &[u8]) -> Result<(usize, usize)> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| anyhow::anyhow!("DSv4 chunk manifest utf8: {e}"))?;
-        let mut fields = text.split_whitespace();
-        ensure!(fields.next() == Some("DSCHUNK"), "bad DSv4 chunk manifest");
-        let chunks = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("DSv4 chunk manifest missing chunks"))?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("DSv4 chunk manifest chunks: {e}"))?;
-        let bytes = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("DSv4 chunk manifest missing bytes"))?
-            .parse()
-            .map_err(|e| anyhow::anyhow!("DSv4 chunk manifest bytes: {e}"))?;
-        Ok((chunks, bytes))
-    }
-
-    /// Rank-LOCAL chunked-blob insert into THE store: manifest under
-    /// `tier_key(ns, key)`, 16 MiB chunks under the paired chunk namespace.
-    /// On any failed insert removes everything already added and returns
-    /// false. No collectives — callers own the TP consensus.
-    fn insert_chunked_local(&mut self, ns: u64, ns_chunk: u64, key: u64, bytes: &[u8]) -> bool {
-        debug_assert!(!bytes.is_empty(), "chunked blob must be non-empty");
-        let chunks = bytes.len().div_ceil(Self::SLOT_CHUNK_BYTES);
-        if self.slot_tier.available_pages() <= chunks {
-            return false;
-        }
-        let manifest_key = tier_key(ns, key);
-        if !self
-            .slot_tier
-            .insert(manifest_key, Self::chunk_manifest(chunks, bytes.len()))
-        {
-            return false;
-        }
-        let mut added = Vec::with_capacity(chunks + 1);
-        added.push(manifest_key);
-        for (idx, chunk) in bytes.chunks(Self::SLOT_CHUNK_BYTES).enumerate() {
-            let chunk_key = tier_key(ns_chunk, chunk_sub(key, idx));
-            if !self.slot_tier.insert(chunk_key, chunk.to_vec()) {
-                self.slot_tier.remove(&added);
-                return false;
-            }
-            added.push(chunk_key);
-        }
-        true
-    }
-
-    /// Rank-LOCAL chunked-blob read-back (host hit or zero-copy mmap slices,
-    /// assembled owned). Err on any missing piece. No collectives.
-    fn read_chunked_local(&mut self, ns: u64, ns_chunk: u64, key: u64) -> Result<Vec<u8>> {
-        let manifest = self.slot_tier.read(tier_key(ns, key))?.into_owned();
-        let (chunks, total) = Self::parse_chunk_manifest(&manifest)?;
-        let mut bytes = Vec::with_capacity(total);
-        for idx in 0..chunks {
-            bytes.extend_from_slice(
-                &self
-                    .slot_tier
-                    .read(tier_key(ns_chunk, chunk_sub(key, idx)))?,
-            );
-        }
-        bytes.truncate(total);
-        ensure!(
-            bytes.len() == total,
-            "DSv4 chunked blob {key} truncated: {} < {total}",
-            bytes.len()
-        );
-        Ok(bytes)
-    }
-
-    /// Rank-LOCAL chunked-blob drop (manifest + chunks). Tolerates a missing
-    /// or unparsable manifest (drops whatever resolves). No collectives.
-    fn remove_chunked_local(&mut self, ns: u64, ns_chunk: u64, key: u64) {
-        let manifest_key = tier_key(ns, key);
-        let chunks = self
-            .slot_tier
-            .read(manifest_key)
-            .ok()
-            .and_then(|m| Self::parse_chunk_manifest(m.as_ref()).ok())
-            .map_or(0, |(chunks, _)| chunks);
-        let mut all = Vec::with_capacity(chunks + 1);
-        all.push(manifest_key);
-        all.extend((0..chunks).map(|idx| tier_key(ns_chunk, chunk_sub(key, idx))));
-        self.slot_tier.remove(&all);
-    }
-
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
         let capped = i32::try_from(value.min(i32::MAX as usize)).unwrap_or(i32::MAX);
         self.model
@@ -2505,10 +2400,12 @@ impl Dsv4CudaExecutor {
                 .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot demote capture")));
         }
         let bytes = image?.to_bytes();
-        let inserted = self.insert_chunked_local(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
+        let inserted = self
+            .slot_tier
+            .insert_chunked(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
         if self.tp_min_usize(usize::from(inserted), "slot demote insert")? == 0 {
             if inserted {
-                self.remove_chunked_local(NS_SLOT, NS_SLOT_CHUNK, key);
+                self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
             }
             return Ok(false);
         }
@@ -2530,7 +2427,8 @@ impl Dsv4CudaExecutor {
             self.num_slots
         );
         let image = self
-            .read_chunked_local(NS_SLOT, NS_SLOT_CHUNK, key)
+            .slot_tier
+            .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
             .and_then(|bytes| {
                 crate::dsv4::Dsv4SlotSnapshot::from_bytes(&bytes)
                     .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"))
@@ -2559,7 +2457,7 @@ impl Dsv4CudaExecutor {
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
         for &key in keys {
-            self.remove_chunked_local(NS_SLOT, NS_SLOT_CHUNK, key);
+            self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
         }
     }
 
@@ -2614,16 +2512,46 @@ impl Dsv4CudaExecutor {
         // Best-effort under store pressure: evict coldest PREFIX blobs until
         // the new one fits. Parked slots (NS_SLOT*) are engine-owned and
         // never touched by prefix eviction.
-        let mut inserted = self.insert_chunked_local(NS_PREFIX, NS_PREFIX_CHUNK, key, &bytes);
+        let mut inserted = self
+            .slot_tier
+            .insert_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key, &bytes);
         while !inserted {
             let Some(coldest) = self.prefix_index.pop_coldest() else {
                 break;
             };
-            self.remove_chunked_local(NS_PREFIX, NS_PREFIX_CHUNK, coldest);
-            inserted = self.insert_chunked_local(NS_PREFIX, NS_PREFIX_CHUNK, key, &bytes);
+            log::info!(
+                "DSv4 prefix capture: evicting coldest blob key={coldest} to fit key={key} \
+                 ({} bytes; store host={} disk={})",
+                bytes.len(),
+                self.slot_tier.host_demoted_pages(),
+                self.slot_tier.disk_pages()
+            );
+            self.slot_tier
+                .remove_chunked(NS_PREFIX, NS_PREFIX_CHUNK, coldest);
+            inserted = self
+                .slot_tier
+                .insert_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key, &bytes);
         }
         if inserted && let Some(superseded) = self.prefix_index.insert(tokens.to_vec(), key) {
-            self.remove_chunked_local(NS_PREFIX, NS_PREFIX_CHUNK, superseded);
+            self.slot_tier
+                .remove_chunked(NS_PREFIX, NS_PREFIX_CHUNK, superseded);
+            log::info!(
+                "DSv4 prefix capture: key={key} ({} tokens, {} bytes) superseded key={superseded} \
+                 (store after: host={} disk={})",
+                tokens.len(),
+                bytes.len(),
+                self.slot_tier.host_demoted_pages(),
+                self.slot_tier.disk_pages()
+            );
+        } else {
+            log::debug!(
+                "DSv4 prefix capture: key={key} ({} tokens, {} bytes) inserted={inserted} \
+                 (store: host={} disk={})",
+                tokens.len(),
+                bytes.len(),
+                self.slot_tier.host_demoted_pages(),
+                self.slot_tier.disk_pages()
+            );
         }
         Ok(())
     }
@@ -2668,7 +2596,7 @@ impl Dsv4CudaExecutor {
                     "DSv4 prefix store has no snapshot covering prompt prefix len {matched_len}"
                 )
             })
-            .and_then(|(key, _)| self.read_chunked_local(NS_PREFIX, NS_PREFIX_CHUNK, key))
+            .and_then(|(key, _)| self.slot_tier.read_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key))
             .and_then(|bytes| {
                 crate::dsv4::Dsv4SlotSnapshot::from_bytes(&bytes)
                     .map_err(|e| anyhow::anyhow!("DSv4 prefix snapshot parse: {e:#}"))
@@ -5531,15 +5459,6 @@ mod tests {
         // Chunk indices stay disjoint per key and across adjacent keys.
         assert_ne!(chunk_sub(7, 0), chunk_sub(7, 1));
         assert_ne!(chunk_sub(7, 65_535), chunk_sub(8, 0));
-    }
-
-    #[test]
-    fn dsv4_chunk_manifest_round_trips() {
-        let manifest = super::Dsv4CudaExecutor::chunk_manifest(3, 33_554_433);
-        assert_eq!(
-            super::Dsv4CudaExecutor::parse_chunk_manifest(&manifest).unwrap(),
-            (3, 33_554_433)
-        );
     }
 
     #[test]

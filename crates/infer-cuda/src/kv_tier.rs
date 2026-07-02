@@ -147,6 +147,52 @@ pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
     budget
 }
 
+// ---- chunked-blob key layout ----
+
+/// One u64 key space partitioned by a top-byte namespace so features sharing a
+/// store never collide; callers own the namespace constants. Manifest keys
+/// carry the feature key in the low bits; chunk keys carry
+/// `key << CHUNK_IDX_BITS | idx` (a blob is ≤ 2^16 × page_bytes).
+pub(crate) const TIER_NS_SHIFT: u32 = 56;
+pub(crate) const CHUNK_IDX_BITS: u32 = 16;
+
+pub(crate) fn tier_key(ns: u64, sub: u64) -> u64 {
+    debug_assert!(
+        sub >> TIER_NS_SHIFT == 0,
+        "tier sub-key overflows namespace"
+    );
+    (ns << TIER_NS_SHIFT) | sub
+}
+
+pub(crate) fn chunk_sub(key: u64, idx: usize) -> u64 {
+    (key << CHUNK_IDX_BITS) | idx as u64
+}
+
+fn chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
+    format!("DSCHUNK {chunks} {bytes}\n").into_bytes()
+}
+
+fn parse_chunk_manifest(bytes: &[u8]) -> Result<(usize, usize)> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|e| anyhow!("chunked-blob manifest utf8: {e}"))?;
+    let mut fields = text.split_whitespace();
+    anyhow::ensure!(
+        fields.next() == Some("DSCHUNK"),
+        "bad chunked-blob manifest"
+    );
+    let chunks = fields
+        .next()
+        .ok_or_else(|| anyhow!("chunked-blob manifest missing chunks"))?
+        .parse()
+        .map_err(|e| anyhow!("chunked-blob manifest chunks: {e}"))?;
+    let bytes = fields
+        .next()
+        .ok_or_else(|| anyhow!("chunked-blob manifest missing bytes"))?
+        .parse()
+        .map_err(|e| anyhow!("chunked-blob manifest bytes: {e}"))?;
+    Ok((chunks, bytes))
+}
+
 // ---- CudaKvTierStore ----
 
 pub(crate) struct CudaKvTierStore {
@@ -626,6 +672,73 @@ impl CudaKvTierStore {
         Err(anyhow!("KV tier store has no entry for key {key}"))
     }
 
+    /// Rank-LOCAL chunked-blob insert: one manifest page under
+    /// `tier_key(ns, key)` + N chunk pages (`bytes_per_page` each) under
+    /// `tier_key(ns_chunk, chunk_sub(key, i))`. On any failed insert removes
+    /// everything already added and returns false. No collectives — callers
+    /// own any TP consensus.
+    pub(crate) fn insert_chunked(
+        &mut self,
+        ns: u64,
+        ns_chunk: u64,
+        key: u64,
+        bytes: &[u8],
+    ) -> bool {
+        debug_assert!(!bytes.is_empty(), "chunked blob must be non-empty");
+        let chunks = bytes.len().div_ceil(self.bytes_per_page);
+        if self.available_pages() <= chunks {
+            return false;
+        }
+        let manifest_key = tier_key(ns, key);
+        if !self.insert(manifest_key, chunk_manifest(chunks, bytes.len())) {
+            return false;
+        }
+        let mut added = Vec::with_capacity(chunks + 1);
+        added.push(manifest_key);
+        for (idx, chunk) in bytes.chunks(self.bytes_per_page).enumerate() {
+            let chunk_key = tier_key(ns_chunk, chunk_sub(key, idx));
+            if !self.insert(chunk_key, chunk.to_vec()) {
+                self.remove(&added);
+                return false;
+            }
+            added.push(chunk_key);
+        }
+        true
+    }
+
+    /// Rank-LOCAL chunked-blob read-back (host hit or zero-copy mmap slices,
+    /// assembled owned). Err on any missing piece.
+    pub(crate) fn read_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) -> Result<Vec<u8>> {
+        let manifest = self.read(tier_key(ns, key))?.into_owned();
+        let (chunks, total) = parse_chunk_manifest(&manifest)?;
+        let mut bytes = Vec::with_capacity(total);
+        for idx in 0..chunks {
+            bytes.extend_from_slice(&self.read(tier_key(ns_chunk, chunk_sub(key, idx)))?);
+        }
+        bytes.truncate(total);
+        anyhow::ensure!(
+            bytes.len() == total,
+            "chunked blob {key} truncated: {} < {total}",
+            bytes.len()
+        );
+        Ok(bytes)
+    }
+
+    /// Rank-LOCAL chunked-blob drop (manifest + chunks). Tolerates a missing
+    /// or unparsable manifest (drops whatever resolves).
+    pub(crate) fn remove_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) {
+        let manifest_key = tier_key(ns, key);
+        let chunks = self
+            .read(manifest_key)
+            .ok()
+            .and_then(|m| parse_chunk_manifest(m.as_ref()).ok())
+            .map_or(0, |(chunks, _)| chunks);
+        let mut all = Vec::with_capacity(chunks + 1);
+        all.push(manifest_key);
+        all.extend((0..chunks).map(|idx| tier_key(ns_chunk, chunk_sub(key, idx))));
+        self.remove(&all);
+    }
+
     /// Drop entries from both levels. In the mmap store, freed slots return to
     /// the free list (no file unlink needed — the slot bytes are simply
     /// overwritten on next allocation).
@@ -727,6 +840,80 @@ mod tests {
         assert!(store.is_full());
         assert!(!store.insert(3, vec![3; 8]), "no disk level: reject");
         assert_eq!(store.read(1).expect("host read").as_ref(), &[1u8; 8]);
+    }
+
+    #[test]
+    fn chunked_blob_round_trips_and_accounts() {
+        // 8-byte pages; a 20-byte blob = 1 manifest + 3 chunks = 4 pages.
+        let mut store = CudaKvTierStore::with_budget(80, 8);
+        let baseline = store.available_pages();
+        let blob: Vec<u8> = (0..20u8).collect();
+        assert!(store.insert_chunked(3, 4, 7, &blob));
+        assert_eq!(store.available_pages(), baseline - 4);
+        assert_eq!(store.read_chunked(3, 4, 7).expect("read back"), blob);
+        store.remove_chunked(3, 4, 7);
+        assert_eq!(
+            store.available_pages(),
+            baseline,
+            "remove returns the store to baseline"
+        );
+        assert!(store.read_chunked(3, 4, 7).is_err(), "blob gone");
+    }
+
+    /// The leak class the pod verify surfaced: a superseded blob (identical
+    /// prompt re-captured under a fresh key) must be fully reclaimed —
+    /// supersede-without-remove is invisible functionally and shows up only
+    /// as monotonic page counts.
+    #[test]
+    fn superseded_chunked_blob_removal_returns_store_to_baseline() {
+        let mut store = CudaKvTierStore::with_budget(160, 8);
+        let baseline = store.available_pages();
+        let blob: Vec<u8> = (0..20u8).collect();
+        assert!(store.insert_chunked(3, 4, 1, &blob), "v1 inserts");
+        assert!(store.insert_chunked(3, 4, 2, &blob), "v2 inserts alongside");
+        assert_eq!(store.available_pages(), baseline - 8);
+        store.remove_chunked(3, 4, 1); // supersede: drop v1
+        assert_eq!(
+            store.available_pages(),
+            baseline - 4,
+            "exactly one blob's pages remain"
+        );
+        assert_eq!(store.read_chunked(3, 4, 2).expect("v2 intact"), blob);
+    }
+
+    #[test]
+    fn chunked_blob_spills_to_disk_and_survives_supersede() {
+        // Zero host pages: everything goes straight to the mmap level
+        // (the --kv-dram 0 shape used on the pod).
+        let root = temp_root("chunked_disk");
+        let mut store = CudaKvTierStore::with_budget(0, 8);
+        assert!(store.set_disk(root.clone(), 160, 8));
+        let baseline = store.available_pages();
+        let blob: Vec<u8> = (0..20u8).collect();
+        assert!(store.insert_chunked(3, 4, 1, &blob));
+        assert_eq!(store.disk_pages(), 4, "manifest + 3 chunks on disk");
+        assert!(store.insert_chunked(3, 4, 2, &blob));
+        store.remove_chunked(3, 4, 1);
+        assert_eq!(store.disk_pages(), 4, "superseded disk blob reclaimed");
+        assert_eq!(store.available_pages(), baseline - 4);
+        assert_eq!(store.read_chunked(3, 4, 2).expect("v2 via mmap"), blob);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_chunked_tolerates_missing_manifest() {
+        let mut store = CudaKvTierStore::with_budget(80, 8);
+        let baseline = store.available_pages();
+        store.remove_chunked(3, 4, 99); // never inserted
+        assert_eq!(store.available_pages(), baseline);
+    }
+
+    #[test]
+    fn chunk_manifest_round_trips() {
+        assert_eq!(
+            parse_chunk_manifest(&chunk_manifest(3, 33_554_433)).unwrap(),
+            (3, 33_554_433)
+        );
     }
 
     #[test]

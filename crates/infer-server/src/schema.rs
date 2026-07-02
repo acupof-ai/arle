@@ -390,13 +390,18 @@ impl StatsResponse {
         let prefix = counters.prefix_cache;
         let tier = counters.kv_tier;
         let system = counters.kv_system;
+        // Stored pages count as tier activity too: a prefix blob parked in the
+        // store (host or disk) proves the tier is live before the first
+        // demote/promote flips a counter.
         let tier_available = tier.demoted_pages > 0
             || tier.promoted_pages > 0
             || tier.promote_failures > 0
             || tier.resident_blocks > 0
             || tier.demoted_slots > 0
             || tier.promoted_slots > 0
-            || tier.slot_promote_failures > 0;
+            || tier.slot_promote_failures > 0
+            || system.host_demoted_pages > 0
+            || system.disk_pages > 0;
         let ssd_available = system.disk_pages > 0 || system.reuse_hit_disk > 0;
         Self {
             scheduler: SchedulerStats {

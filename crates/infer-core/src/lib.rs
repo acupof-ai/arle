@@ -2922,7 +2922,9 @@ mod tests {
 
         // Second request: leading 10 tokens match the sidecar-captured sequence
         // [1..10] (prefill captured [1..8]; finish-sidecar extended to [1..10]).
-        let before_hits = engine.kv_system_metrics().reuse_hit_resident;
+        let before = engine.kv_system_metrics();
+        let (before_full_blocks, before_resident) =
+            (before.prefix_match_full_blocks, before.reuse_hit_resident);
         let second = engine.submit_request((1..=12).collect(), 2);
         engine.run_to_idle()?;
         assert_finished(engine.completed(second).expect("second completed"));
@@ -2933,8 +2935,14 @@ mod tests {
             "restored the sidecar-captured 10-token leading prefix"
         );
         assert!(
-            engine.kv_system_metrics().reuse_hit_resident > before_hits,
-            "DSv4 cached-prefix reuse bumps reuse_hit_resident (closes the WS2 counter gap)"
+            engine.kv_system_metrics().prefix_match_full_blocks > before_full_blocks,
+            "cached-prefix reuse bumps the placement-neutral full-block counter"
+        );
+        assert_eq!(
+            engine.kv_system_metrics().reuse_hit_resident,
+            before_resident,
+            "whole-slot reuse must NOT claim the page-route resident bucket \
+             (the engine cannot see host-vs-disk placement)"
         );
         assert!(
             engine.prefix_cache_stats().hits >= 1,

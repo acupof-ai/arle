@@ -196,10 +196,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 progress: matched_len,
             }
         };
-        // Count the reuse against the same kv-system counters the page route
-        // uses, so /v1/stats reports a nonzero resident hit + full-block match
-        // for DSv4 (closes the WS2 counter gap for this backend). Block-count
-        // granularity is the radix block size, matching `record_attached_prefix_metrics`.
+        // Placement-neutral counters only: the engine cannot see whether the
+        // whole-slot blob was served from host RAM or NVMe, so the page-route
+        // `reuse_hit_{resident,host_demoted,disk}` buckets stay untouched
+        // (they would lie under `--kv-dram 0`). Reuse truth for this route =
+        // prefix_cache hits/hit_tokens + prefix_match_full_blocks.
         let block_size = self.radix.block_size().max(1);
         let pages = (matched_len / block_size) as u64;
         if pages > 0 {
@@ -211,10 +212,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.kv_system_metrics.prefix_match_full_blocks = self
                 .kv_system_metrics
                 .prefix_match_full_blocks
-                .saturating_add(pages);
-            self.kv_system_metrics.reuse_hit_resident = self
-                .kv_system_metrics
-                .reuse_hit_resident
                 .saturating_add(pages);
         }
         Ok(matched_len)
