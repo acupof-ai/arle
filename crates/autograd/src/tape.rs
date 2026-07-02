@@ -1106,7 +1106,7 @@ mod tests {
         let loss = ops::sum(prod, &mut store, &mut tape).expect("sum");
 
         let grads = tape
-            .backward_collect_targets_only(loss, &mut store, &[x])
+            .backward_collect_targets_only(loss, &mut store, &[x], None)
             .expect("target-only collect");
 
         assert!(grads.contains_key(&x));
@@ -1285,6 +1285,33 @@ mod tests {
             store.live_tensor_count(),
             3,
             "only x, w, and checkpoint output should remain live"
+        );
+    }
+
+    // The backward profile must see THROUGH checkpoint entries: inner-tape ops
+    // (here Mul) must appear in the op table, else 99% of a checkpointed
+    // backward reads as one opaque Checkpoint row.
+    #[test]
+    fn backward_profile_attributes_checkpoint_inner_ops() {
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("x"));
+        let w = store.alloc(Tensor::new(vec![0.5, -2.0], vec![2], true).expect("w"));
+        let mut tape = Tape::new();
+        let y = ops::checkpoint(vec![x, w], &mut store, &mut tape, |store, tape, inputs| {
+            let prod = ops::mul(inputs[0], inputs[1], store, tape)?;
+            ops::mul(prod, prod, store, tape)
+        })
+        .expect("checkpoint forward");
+        let loss = ops::sum(y, &mut store, &mut tape).expect("sum");
+        let (_, profile) = tape.backward_profiled(loss, &mut store).expect("backward");
+        assert!(
+            profile.op_totals.contains_key(&BackwardOp::Checkpoint),
+            "outer Checkpoint row missing"
+        );
+        assert!(
+            profile.op_totals.contains_key(&BackwardOp::Mul),
+            "inner Mul rows not merged through the checkpoint: {:?}",
+            profile.op_totals.keys().collect::<Vec<_>>()
         );
     }
 
