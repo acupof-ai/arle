@@ -1626,6 +1626,26 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((handle, out_shape))
     }
 
+    /// Fused causal SDPA prefill forward (flash-style online softmax — no
+    /// `[seq, seq]` score transient). `q` is `[1, q_heads, q_len, head_dim]`,
+    /// `k`/`v` `[1, kv_heads, kv_len, head_dim]` with `kv_len = q_start +
+    /// q_len`; GQA native. `None` => no fused path for this backend/shape and
+    /// the caller composes from primitives.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_sdpa_prefill_device(
+        &self,
+        q: &DeviceHandle,
+        q_shape: &[usize],
+        k: &DeviceHandle,
+        k_shape: &[usize],
+        v: &DeviceHandle,
+        v_shape: &[usize],
+        q_start: usize,
+    ) -> Result<Option<(DeviceHandle, Vec<usize>)>> {
+        let _ = (q, q_shape, k, k_shape, v, v_shape, q_start);
+        Ok(None)
+    }
+
     /// Decode-time GQA attention over a preallocated KV cache. `k_shape` and
     /// `v_shape` are the full cache shapes `[batch, kv_heads, max_seq, dim]`;
     /// `kv_len` declares how many prefix tokens are valid.

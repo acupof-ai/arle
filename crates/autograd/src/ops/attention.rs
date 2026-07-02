@@ -4,7 +4,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
-    backend::{CausalSdpaDeviceBackwardArgs, cpu_causal_sdpa_recompute_backward},
+    backend::{CausalSdpaDeviceBackwardArgs, Device, cpu_causal_sdpa_recompute_backward},
     ops::{
         add, add_broadcast, matmul, mul_scalar, reshape, slice, softmax, softmax_backward,
         transpose,
@@ -58,6 +58,42 @@ pub fn repeat_kv(
     )
 }
 
+/// Fused flash-style prefill on the device backend (the adopted inference
+/// kernel — no `[seq, seq]` score transient). `None` => compose from
+/// primitives. Forward-only: callers own the tape entry (recompute backward
+/// never consumes the forward output, so the fused output is a drop-in).
+fn try_causal_sdpa_prefill_device(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    store: &mut TensorStore,
+) -> Result<Option<TensorId>> {
+    if store.backend().device() != Device::Cuda {
+        return Ok(None);
+    }
+    for id in [q, k, v] {
+        store.ensure_device(id)?;
+    }
+    let q_shape = store.tensor(q)?.shape.clone();
+    let k_shape = store.tensor(k)?.shape.clone();
+    let v_shape = store.tensor(v)?.shape.clone();
+    let (Some(q_h), Some(k_h), Some(v_h)) = (
+        store.tensor(q)?.device_handle.clone(),
+        store.tensor(k)?.device_handle.clone(),
+        store.tensor(v)?.device_handle.clone(),
+    ) else {
+        return Ok(None);
+    };
+    let Some((out, out_shape)) = store
+        .backend()
+        .causal_sdpa_prefill_device(&q_h, &q_shape, &k_h, &k_shape, &v_h, &v_shape, q_start)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(store.alloc_device_tensor(out_shape, out)?))
+}
+
 pub fn causal_sdpa(
     q: TensorId,
     k: TensorId,
@@ -109,13 +145,18 @@ pub fn causal_sdpa_recompute(
     store.ensure_device(k)?;
     store.ensure_device(v)?;
 
-    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
-    let mut inner_tape = crate::Tape::new();
-    inner_tape.set_enabled(false);
-    let output_id = causal_sdpa(q, k, v, store, &mut inner_tape)?;
+    let output_id = if let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, 0, store)? {
+        fused
+    } else {
+        let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+        let mut inner_tape = crate::Tape::new();
+        inner_tape.set_enabled(false);
+        let out = causal_sdpa(q, k, v, store, &mut inner_tape)?;
+        let keep = HashSet::from([q, k, v, out]);
+        store.free_new_except(&live_before, &keep)?;
+        out
+    };
     store.set_requires_grad(output_id, requires_grad)?;
-    let keep = HashSet::from([q, k, v, output_id]);
-    store.free_new_except(&live_before, &keep)?;
 
     if tape.enabled && requires_grad {
         tape.record(crate::TapeEntry {
@@ -147,6 +188,12 @@ pub fn causal_sdpa_with_q_start(
     let q_len = q_shape[2];
     let kv_len = k_shape[2];
     let head_dim = q_shape[3];
+    // Off-tape only: on-tape the composed primitives carry the gradient graph.
+    if !tape.enabled
+        && let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, q_start, store)?
+    {
+        return Ok(fused);
+    }
     if q_start == 0 && q_len == kv_len {
         return causal_sdpa(q, k, v, store, tape);
     }

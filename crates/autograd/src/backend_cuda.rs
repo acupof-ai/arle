@@ -1370,6 +1370,30 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn causal_sdpa_prefill_device(
+        &self,
+        q: &DeviceHandle,
+        q_shape: &[usize],
+        k: &DeviceHandle,
+        k_shape: &[usize],
+        v: &DeviceHandle,
+        v_shape: &[usize],
+        q_start: usize,
+    ) -> Result<Option<(DeviceHandle, Vec<usize>)>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (q, q_shape, k, k_shape, v, v_shape, q_start);
+            todo!(
+                "GPU required: cuda causal_sdpa_prefill_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_causal_sdpa_prefill_device(self, q, q_shape, k, k_shape, v, v_shape, q_start)
+        }
+    }
+
     fn linear_attention_backward_device(
         &self,
         args: LinearAttentionDeviceBackwardArgs<'_>,
@@ -3589,6 +3613,95 @@ fn cuda_gather_last_dim_backward(
     )?;
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+// Fused causal prefill SDPA — the production inference kernel
+// (`nonpaged_prefill_attention_cuda`: bf16, online softmax, GQA native)
+// adopted for the training forward. Layout bridge: training q `[1, h, s, d]`
+// transposes to the kernel's token-major `[s, h, d]`; k/v `[1, h_kv, kv, d]`
+// contiguous already match its head-major cache view (`max_seq_len = kv`).
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_causal_sdpa_prefill_device(
+    backend: &CudaBackend,
+    q: &DeviceHandle,
+    q_shape: &[usize],
+    k: &DeviceHandle,
+    k_shape: &[usize],
+    v: &DeviceHandle,
+    v_shape: &[usize],
+    q_start: usize,
+) -> Result<Option<(DeviceHandle, Vec<usize>)>> {
+    if q_shape.len() != 4 || k_shape.len() != 4 || v_shape != k_shape {
+        return Ok(None);
+    }
+    let (batch, heads, seq, dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+    let (kv_heads, kv_len) = (k_shape[1], k_shape[2]);
+    // Kernel envelope: head_dim ∈ {128, 256}, grid.y = seq ≤ 65535, exact
+    // causal window, whole GQA groups. Outside it => compose from primitives.
+    if batch != 1
+        || k_shape[0] != 1
+        || k_shape[3] != dim
+        || !(dim == 128 || dim == 256)
+        || seq > 65_535
+        || kv_heads == 0
+        || heads % kv_heads != 0
+        || q_start + seq != kv_len
+    {
+        return Ok(None);
+    }
+
+    let (q_t, _) = backend.transpose_axes_swap(q, q_shape, 1, 2)?; // [1, s, h, d]
+    let q_slice = backend.cuda_slice(&q_t, "sdpa_prefill q")?;
+    let k_slice = backend.cuda_slice(k, "sdpa_prefill k")?;
+    let v_slice = backend.cuda_slice(v, "sdpa_prefill v")?;
+    let q_bf16 = backend.local_f32_as_bf16(q_slice, q_slice.len())?;
+    let k_bf16 = backend.local_f32_as_bf16(k_slice, k_slice.len())?;
+    let v_bf16 = backend.local_f32_as_bf16(v_slice, v_slice.len())?;
+    let out_len = seq * heads * dim;
+    let mut out_bf16 = backend
+        .stream
+        .alloc_zeros::<u16>(out_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (sdpa prefill out)"))?;
+
+    let as_i32 = |value: usize, label: &'static str| {
+        i32::try_from(value).map_err(|_| AutogradError::TapeInvariant(label))
+    };
+    let heads_i32 = as_i32(heads, "sdpa prefill heads exceeds i32")?;
+    let kv_heads_i32 = as_i32(kv_heads, "sdpa prefill kv_heads exceeds i32")?;
+    let dim_i32 = as_i32(dim, "sdpa prefill head_dim exceeds i32")?;
+    let seq_i32 = as_i32(seq, "sdpa prefill seq exceeds i32")?;
+    let kv_i32 = as_i32(kv_len, "sdpa prefill kv_len exceeds i32")?;
+    {
+        let (q_ptr, _q_guard) = q_bf16.device_ptr(&backend.stream);
+        let (k_ptr, _k_guard) = k_bf16.device_ptr(&backend.stream);
+        let (v_ptr, _v_guard) = v_bf16.device_ptr(&backend.stream);
+        let (out_ptr, _out_guard) = out_bf16.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            unsafe {
+                ffi::nonpaged_prefill_attention_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    heads_i32,
+                    kv_heads_i32,
+                    dim_i32,
+                    seq_i32,
+                    kv_i32,
+                    kv_i32,
+                    (dim as f32).sqrt().recip(),
+                    backend.stream.cu_stream(),
+                )
+            },
+            "nonpaged_prefill_attention_cuda",
+        )?;
+    }
+
+    let out_f32 = backend.import_local_bf16_as_f32(&out_bf16, out_len)?;
+    let out_handle = DeviceHandle::Cuda(CudaStorage::new(out_f32));
+    let (out, out_shape) = backend.transpose_axes_swap(&out_handle, &[1, seq, heads, dim], 1, 2)?; // [1, h, s, d]
+    Ok(Some((out, out_shape)))
 }
 
 #[cfg(not(feature = "no-cuda"))]
