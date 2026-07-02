@@ -9,7 +9,15 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 1024;
+// Dense-GEMM floor for FP8 weights: at or above this M, DeepGEMM dense (or
+// the dequant+cuBLAS fallback) takes the GEMM; below it the scalar
+// warp-per-row GEMV keeps decode-sized calls. The old 1024 floor sent every
+// sub-1024 prefill chunk to the GEMV the code itself forbids for prefill —
+// measured on the agent-OPD toy round: 52k gemv_batch calls, zero DeepGEMM,
+// prefill 138 tok/s vs 453 tok/s for the same trajectory's training forward
+// (docs/plans/rollout-optimization.md). Tool-result tail prefills are 64-128
+// tokens, so the floor belongs at the decode/prefill boundary, not at 1024.
+const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 64;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
