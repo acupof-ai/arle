@@ -54,6 +54,20 @@ document the debug-only status here.
 
 `default = ["cli"]` — 默认 feature **不含** cuda/metal，须显式选择 backend。
 
+**Lane 切换必设 `CARGO_TARGET_DIR`。** feature 统一化让 cuda/metal/cpu lane
+互相打脏共享 `target/` 的产物——在 lane 间交替（typecheck ↔ test）会反复全量
+重编共同依赖。给每条 lane 固定一个产物目录，切换成本归零（磁盘 ~3×，
+`cargo sweep` 定期清）：
+
+```bash
+CARGO_TARGET_DIR=target/lane-cuda  CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
+CARGO_TARGET_DIR=target/lane-metal cargo test  -p cli       --release --no-default-features --features metal,no-cuda
+CARGO_TARGET_DIR=target/lane-cpu   cargo test  -p arle      --release --no-default-features --features cpu,no-cuda,cli
+```
+
+纯宿主单测（cli / infer-api，不含 GPU 路径）可去掉 `--release`：debug 编译
+快数倍，deps 已 `debug = false`，`--release` 的强制理由只适用于 GPU 构建。
+
 ---
 
 ## 2. User-Facing Runtime Variables
