@@ -2587,6 +2587,30 @@ impl Qwen35Model {
         self.gradient_checkpointing = enabled;
     }
 
+    /// The one checkpointing decision. Checkpointing trades a full forward
+    /// re-run in backward (plus boundary host offload) for tape memory — a
+    /// good trade only when the full tape would NOT fit: estimate the
+    /// non-checkpointed footprint (per layer the hidden-stream tensors plus
+    /// the dominant MLP gate/up/act term, f32) against half of free VRAM.
+    /// Unknown memory info keeps the safe default (checkpoint).
+    fn should_checkpoint(
+        &self,
+        batch: usize,
+        seq_len: usize,
+        store: &TensorStore,
+        tape: &Tape,
+    ) -> bool {
+        self.gradient_checkpointing
+            && tape.enabled
+            && store.backend().device_mem_info().is_none_or(|(free, _)| {
+                let per_layer = batch
+                    * seq_len
+                    * (8 * self.config.hidden_size + 3 * self.config.intermediate_size)
+                    * 4;
+                per_layer.saturating_mul(self.layers.len()) > (free as usize) / 2
+            })
+    }
+
     pub fn supports_rollout_kv_cache(&self) -> bool {
         !self.tp.is_enabled()
             && self
@@ -3774,7 +3798,7 @@ impl Qwen35Model {
         profile.embedding += started.elapsed();
         trace_model_component(trace, "embedding", profile.embedding);
 
-        if self.gradient_checkpointing && tape.enabled {
+        if self.should_checkpoint(batch, seq_len, store, tape) {
             // Checkpoint layers in adaptive groups (one host offload per
             // group). Numerically exact vs per-layer: same layer order, same
             // detach point (the LoRA boundary forces a group split), same params
@@ -3882,7 +3906,7 @@ impl Qwen35Model {
             store,
             tape,
         )?;
-        if self.gradient_checkpointing && tape.enabled {
+        if self.should_checkpoint(batch, seq_len, store, tape) {
             // Group-checkpoint (see forward_batch_indices_profiled) — exact vs
             // per-layer.
             let layers = Arc::new(self.layers.clone());
@@ -4346,7 +4370,7 @@ impl Qwen35Model {
             tape,
         )?;
 
-        if self.gradient_checkpointing && tape.enabled {
+        if self.should_checkpoint(batch, gen_len, store, tape) {
             let cache = Arc::new(prefix_cache);
             let layers = Arc::new(self.layers.clone());
             let cfg = self.config.clone();
