@@ -459,6 +459,7 @@ mod tests {
 
     #[test]
     fn cache_dir_layout_is_flat_org_name() {
+        let _env = crate::test_env_lock();
         // Force HOME to a known temp value to avoid clobbering.
         let dir = tempfile::tempdir().unwrap();
         unsafe {
@@ -471,6 +472,7 @@ mod tests {
 
     #[test]
     fn cache_dir_respects_modelscope_cache_env() {
+        let _env = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("MODELSCOPE_CACHE", dir.path());

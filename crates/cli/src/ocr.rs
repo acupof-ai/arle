@@ -363,6 +363,7 @@ mod tests {
 
     #[test]
     fn pdf_render_error_mentions_renderer() {
+        let _env = crate::test_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = dir.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4").expect("write pdf");
@@ -379,6 +380,7 @@ mod tests {
 
     #[test]
     fn pdf_render_uses_override_renderer_for_all_pages() {
+        let _env = crate::test_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = dir.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4").expect("write pdf");
@@ -408,6 +410,7 @@ mod tests {
 
     #[test]
     fn pdf_render_selected_pages_use_singlefile() {
+        let _env = crate::test_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = dir.path().join("doc.pdf");
         std::fs::write(&pdf, b"%PDF-1.4").expect("write pdf");
