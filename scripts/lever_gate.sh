@@ -26,7 +26,9 @@ set -uo pipefail
 
 LABEL="${1:?usage: lever_gate.sh <label> [ENV=V ...]}"
 shift || true
-BIN="${BIN:-/data01/build/arle/target/release/arle}"
+# Default to THIS tree's release binary; the old /data01 absolute default
+# broke on every other box layout (silent exit 3 at serve boot).
+BIN="${BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/arle}"
 MODEL="${MODEL:-/data01/models/DeepSeek-V4-Flash}"
 PORT="${PORT:-18189}"
 LENGTHS="${LENGTHS:-115,300,446,2000,8000}"
