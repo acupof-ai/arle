@@ -12,7 +12,7 @@ This doc records the target shape for:
 - asynchronous prefetch / write-back pipelines
 - a cluster-shared L3 backend contract
 
-Current implementation truth stays in [`../projects/tiered-kv-cache.md`](../projects/tiered-kv-cache.md) and [`../../infer/src/kv_tier.rs`](../../infer/src/kv_tier.rs). As of 2026-04-21, the local CUDA lane already ships:
+Implementation truth is the code (`crates/infer-cuda/src/kv_tier.rs` + the `infer-seam` tier hooks); status truth is [support-matrix §4b](../support-matrix.md). The monolith-era design rationale lives in [`../projects/tiered-kv-cache.md`](../projects/tiered-kv-cache.md) (Historical). As of 2026-04-21, the monolith's local CUDA lane already shipped:
 
 - `KVBlock / KVSpan / KVHandle` control-plane objects
 - `KVPayload*` and `KVBackend*` data-plane surfaces

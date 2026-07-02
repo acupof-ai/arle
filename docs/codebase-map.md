@@ -199,7 +199,7 @@ server → front door), with `infer-core` carrying **no** backend dependency.
 - `crates/infer-seam/src/lib.rs`: `BackendExecutor` — the proven seam trait:
   `submit`/`poll`/`warmup` core plus opt-in capability default-methods
   (model stop ids, `max_rows_per_step`/`max_live_requests`, prefix-reuse
-  hooks, page-tier demote/promote ×4, whole-slot tier ×3, OPD weight
+  hooks, page-tier and whole-slot tier demote/promote, OPD weight
   offload/reload). Also `ResourceGovernor` (+ `Permissive`/`Cooperative`
   impls) — **driven**: `Engine` holds a `Box<dyn ResourceGovernor>`
   (`infer-core/src/lib.rs`) and `infer-api/src/loaded.rs` wires the

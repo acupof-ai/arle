@@ -1,9 +1,13 @@
 # Tiered KV Cache — hierarchical KV with auto offload and forward-compat RDMA
 
-**Status**: Active — opened 2026-04-13, **revised 2026-04-15** after an
-internal survey + 7-system industry comparison exposed three corrections to
-the original design. See §13 for the corrections summary and §6 for the
-revised execution path (Milestones M0–M5 replace the old P0–P5 phase plan).
+**Status**: Historical (closed 2026-07-02) — monolith-era design spec; every
+`infer/src/kv_tier/**` module path below died with the 2026-06-04 rewrite
+cutover. The design shaped the rewrite tier, but implementation truth is the
+code (`crates/infer-cuda/src/kv_tier.rs` + the `infer-seam` tier hooks) and
+status truth is [support-matrix §4b](../support-matrix.md). Kept for the
+design rationale: §13 corrections and the 7-system industry comparison.
+Opened 2026-04-13, revised 2026-04-15; Milestones M0–M5 replaced the old
+P0–P5 phase plan.
 
 **Goal**: Every agent session reuses prior work across requests, survives
 memory pressure without OOM, survives process restarts without paying the
