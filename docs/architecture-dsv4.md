@@ -36,7 +36,8 @@ and `start_pos_device` (filled only when `seq_len==1`).
 
 ```
 forward_tokens_impl  (dsv4.rs:1917)
-├─ decode-graph branch (dsv4.rs:1937)   seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH
+├─ decode-graph branch (dsv4.rs:1986)   seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH
+│                                        && last_hidden_out.is_none() && probe lens off; MODEL1 only (GLM bails)
 │     → forward_tokens_decode_graph (dsv4.rs:5736)
 └─ eager branch (dsv4.rs:1947)
       → forward_tokens_stream_impl (dsv4.rs:4661)   ← prefill (seq_len>1) AND eager decode (seq_len==1)
@@ -111,9 +112,18 @@ RoPE / indexer) + `mla_attention_fwd` (the attention kernel).
 
 ## 2. Decode path (`seq_len == 1`)
 
-Three physical lanes share the same kernels:
+Three physical lanes share the same kernels. **B=1 always takes the eager
+single-row lane**: `forward_decode_batch` early-returns to the single-row path
+when `rows.len()==1` (`executor.rs:2798`) — the batched lane never executes at
+B=1.
 
 ### 2.1 Eager decode (`forward_tokens_stream_impl`, `seq_len==1` branch)
+
+**Per-token collectives at TP>1 = 3 per layer** (nothing per-step): the Q
+head-slab all-gather (`attention.rs:2750`), the attn O-LoRA all-reduce
+(`dsv4.rs:5055`), and the MoE all-reduce (`dsv4.rs:5308`). lm_head is
+replicated (full-vocab GEMV per rank, `dsv4.rs:6286`) and sampling is
+rank-local, so the step total is exactly `3 × num_hidden_layers`.
 MODEL1 (`w_kc/w_vc/o_proj` all `None`) → `mla_attention_decode_graph`
 (`dsv4.rs:4859`, eager call does not capture); V32/GLM → `mla_attention`
 (`dsv4.rs:4881`). Attention core = `try_flashmla_decode_attention`
@@ -137,8 +147,10 @@ Eager fallback (FlashMLA decode off): hand-rolled fused MLA cores
 `dsv4_swa_attention_start_pos_ptr_cuda` (SW, `csrc/misc/dsv4_attention.cu:751`) /
 `dsv4_hybrid_attention_start_pos_ptr_cuda` (CSA/HCA, `.cu:1765`).
 
-MoE half **prefers low-latency** at decode:
-- LL transport (`dsv4.rs:5063`) = DeepEP `internode_ll` dispatch/combine (NVSHMEM
+MoE half at decode — **default transport is `allreduce`** (`ARLE_DSV4_MOE_TRANSPORT`
+unset ⇒ local routed experts + per-layer TP all-reduce, `dsv4.rs:5308`); DeepEP-LL
+is opt-in:
+- LL transport (opt-in) = DeepEP `internode_ll` dispatch/combine (NVSHMEM
   IBGDA, **FP8 e4m3 packed in-flight**).
 - Small-batch bypass: `total_routes ≤ 8` → `dsv4_moe_forward_decode_fp8`
   (`moe.rs:2918`), a hand-rolled warp-per-row w8a16 grouped GEMV (not DeepGEMM).
@@ -146,7 +158,8 @@ MoE half **prefers low-latency** at decode:
   routed all-reduce (`dsv4.rs:4989/5140`, pipeline fence).
 
 ### 2.2 CUDA-graph decode (`forward_tokens_decode_graph`, `dsv4.rs:5736`)
-Only `seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH`. Capture-safe (all metadata
+Gate: `seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH && last_hidden_out.is_none()
+&& probe lens off`; MODEL1 only (GLM `hc_mult==1` bails, `dsv4.rs:5899`). Capture-safe (all metadata
 derived on-device from `start_pos_device`). Same `try_flashmla_decode_attention`
 core; MoE via `deepgemm_grouped_experts_pooled` (masked, persistent scratch) +
 `dsv4_shared_expert_forward_decode_graph`.
@@ -164,7 +177,9 @@ max_seq=16384, ~3.62×).
 ### 2.4 LM-head tail (all lanes)
 `forward_stream_last_token` (`dsv4.rs:4285`): last-token wide-stream row → head HC
 fold (MODEL1) / `copy_row_to_vec` (GLM) → final `rms_norm_vec` →
-`lm_head_project` (GEMV) → `sample_cuda_token`.
+`lm_head_project` (GEMV, replicated full-vocab per rank) → `sample_cuda_token`
+(the NON-scratched sampler: greedy argmax allocs a 1-int scratch every token,
+`ops.rs:432` — unlike Qwen3.5's zero-alloc `sample_cuda_token_scratched`).
 
 ### 2.5 Prefill vs decode quick-diff
 
