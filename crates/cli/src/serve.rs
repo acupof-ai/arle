@@ -1209,6 +1209,7 @@ mod tests {
 
     #[test]
     fn metal_speculative_env_lowers_flags_and_honors_no_spec() {
+        let _env = crate::test_env_lock();
         // env is process-global, so this single test drives all three states in
         // sequence (flag -> no-spec -> clean default) to stay self-contained.
         let clear = || unsafe {

@@ -44,6 +44,18 @@ use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_api::{InferenceEngine, LoadedInferenceEngine};
 
+/// Serializes unit tests that mutate process-global state (env vars, override
+/// registries): the default test harness runs threads in ONE process, so an
+/// unguarded `set_var`/`remove_var` races every other test touching the same
+/// global. Every such test takes this lock first. Poison-tolerant so one
+/// failing test doesn't cascade into every later env test.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn run() -> ExitCode {
     // Pre-CUDA sandbox-spawner helper entry. When `ARLE_SPAWNER_LISTEN` is set
     // (only by `SpawnerHandle::launch`, which re-exec's THIS binary before any
