@@ -39,25 +39,25 @@ document the debug-only status here.
 
 ---
 
-## 1b. Cargo Feature 决策表（root `arle` 包）
+## 1b. Cargo feature lanes (root `arle` package)
 
-来源：根 `Cargo.toml` `[features]`。完整说明见
-[`onboarding.md`](onboarding.md) §4。
+Source: root `Cargo.toml` `[features]`. Full notes:
+[`onboarding.md`](onboarding.md) §4.
 
-| 目标 | 命令 |
+| Target | Command |
 | --- | --- |
-| Linux + NVIDIA 完整构建 | `cargo build --release --features cuda --bin arle` |
+| Linux + NVIDIA full build | `cargo build --release --features cuda --bin arle` |
 | Apple Silicon | `cargo build --release --no-default-features --features metal,no-cuda,cli --bin arle` |
-| Mac 上 CUDA Rust 类型检查（无 GPU） | `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --no-default-features --features cuda,no-cuda` |
+| Mac CUDA typecheck (no GPU) | `CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --no-default-features --features cuda,no-cuda` |
 | CPU smoke | `cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arle` |
 | Multi-GPU NCCL | `cargo build --release --features cuda,nccl --bin arle` |
 
-`default = ["cli"]` — 默认 feature **不含** cuda/metal，须显式选择 backend。
+`default = ["cli"]` — no backend by default; pick one explicitly.
 
-**Lane 切换必设 `CARGO_TARGET_DIR`。** feature 统一化让 cuda/metal/cpu lane
-互相打脏共享 `target/` 的产物——在 lane 间交替（typecheck ↔ test）会反复全量
-重编共同依赖。给每条 lane 固定一个产物目录，切换成本归零（磁盘 ~3×，
-`cargo sweep` 定期清）：
+**Set `CARGO_TARGET_DIR` per lane.** Feature unification makes the lanes
+clobber each other's artifacts in a shared `target/`; alternating lanes pays a
+full dep rebuild every switch. Pin one dir per lane (disk ~3×, pruned by
+`cargo sweep`):
 
 ```bash
 CARGO_TARGET_DIR=target/lane-cuda  CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
@@ -65,8 +65,9 @@ CARGO_TARGET_DIR=target/lane-metal cargo test  -p cli       --release --no-defau
 CARGO_TARGET_DIR=target/lane-cpu   cargo test  -p arle      --release --no-default-features --features cpu,no-cuda,cli
 ```
 
-纯宿主单测（cli / infer-api，不含 GPU 路径）可去掉 `--release`：debug 编译
-快数倍，deps 已 `debug = false`，`--release` 的强制理由只适用于 GPU 构建。
+Host-only unit tests (cli / infer-api) may drop `--release`: debug builds are
+several times faster, deps are already `debug = false`, and the `--release`
+mandate exists for GPU builds only.
 
 ---
 
