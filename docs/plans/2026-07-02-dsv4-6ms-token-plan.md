@@ -37,9 +37,17 @@ moe_intermediate 2048, vocab 129280, head_dim 512, native MTP depth 1.
   **6 ms is arithmetically reachable** if the collective path is tightened
   (H1-via-vendored-mask or H2) and gaps close.
 
-**BLOCKER for Phase 1: #137 (TP=4 NaN from pos 4)** — perf numbers on NaN
-outputs are void. Correctness first; the GPU-set lead (round-6 GPUs 0,2,3,4
-produced text; round-7b GPUs 4-7 NaN, same build) is the first A/B.
+**Phase-1 first pass (TP=4/EP=4, FP8, 2026-07-02)**: MTP-on row measured —
+**25.59 ms/committed-token, 59.87 ms/step, 2.34 tok/step acceptance**,
+coherent at 1795-token prompts. Rows 2/4/5 (MTP-off baseline, H3 A/B,
+nsys t_collective) **BLOCKED by #138**: the MTP-off eager decode lane goes
+invisible above a sharp prompt wall ∈ (123, 162] (straddles
+sliding_window=128 / first compressed chunk) while the MTP verify lane is
+clean — converges with the owner's probe observation (NaN onset ~pos 128)
+and the un-root-caused 2026-06-07 ">=122-token decode garbage" memory.
+(#137 resolved separately: that was the FP4/MX checkpoint, deleted;
+FP8 lane's SHORT-prompt behavior is clean.) Correctness first: #138 owns
+the lane debug; Phase-1 resumes on its fix.
 
 ## Code facts (source-verified 2026-07-02; see the inventory read)
 
