@@ -388,7 +388,9 @@ impl MessagesResponse {
     pub(crate) fn from_chat(chat: &ChatCompletionResponse) -> Self {
         let choice = &chat.choices[0];
         let mut content = Vec::new();
-        if !choice.message.content.is_empty() {
+        // Whitespace-only text never becomes a block (the stream encoder's
+        // held-whitespace rule — keep the two paths converged).
+        if !choice.message.content.trim().is_empty() {
             content.push(ResponseBlock::Text {
                 text: choice.message.content.clone(),
             });
@@ -424,13 +426,23 @@ pub(crate) fn mint_tool_use_id() -> String {
     format!("toolu_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Normalize parsed tool-call arguments into the Anthropic `input` object;
+/// non-object arguments are preserved under `{"_raw": …}`. The single
+/// normalization for BOTH response paths (non-streaming via
+/// [`arguments_to_input`], streaming via [`StreamEncoder::tool_use`]).
+pub(crate) fn input_from_value(value: &Value) -> Value {
+    if value.is_object() {
+        value.clone()
+    } else {
+        json!({ "_raw": value.to_string() })
+    }
+}
+
 /// Parse an OpenAI arguments-JSON string into the Anthropic `input` object;
-/// non-object / unparseable arguments are preserved under `{"_raw": …}`.
+/// unparseable arguments are preserved under `{"_raw": …}`.
 pub(crate) fn arguments_to_input(raw: &str) -> Value {
     serde_json::from_str::<Value>(raw)
-        .ok()
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({ "_raw": raw }))
+        .map_or_else(|_| json!({ "_raw": raw }), |value| input_from_value(&value))
 }
 
 /// Anthropic `stop_reason` from the engine finish reason. Any emitted tool
@@ -569,8 +581,11 @@ impl StreamEncoder {
     }
 
     /// Emit one complete tool_use block (start → whole-arguments
-    /// `input_json_delta` → stop), closing any open text block first.
-    pub(crate) fn tool_use(&mut self, name: &str, arguments_json: &str) -> String {
+    /// `input_json_delta` → stop), closing any open text block first. The
+    /// arguments normalize through [`input_from_value`] — same `input` object
+    /// the non-streaming envelope builds.
+    pub(crate) fn tool_use(&mut self, name: &str, arguments: &Value) -> String {
+        let arguments_json = input_from_value(arguments).to_string();
         let mut out = self.close_text();
         let index = self.next_index;
         self.next_index += 1;
@@ -960,6 +975,29 @@ mod tests {
         assert_eq!(arguments_to_input("not json"), json!({"_raw": "not json"}));
         // Parseable but non-object arguments also fall back to _raw.
         assert_eq!(arguments_to_input("[1,2]"), json!({"_raw": "[1,2]"}));
+        // The streaming lane normalizes through the same Value-level helper.
+        assert_eq!(
+            input_from_value(&json!({"city": "Paris"})),
+            json!({"city": "Paris"})
+        );
+        assert_eq!(input_from_value(&json!([1, 2])), json!({"_raw": "[1,2]"}));
+    }
+
+    /// Whitespace-only content never becomes a text block — the non-streaming
+    /// twin of the stream encoder's held-whitespace rule.
+    #[test]
+    fn whitespace_only_content_is_suppressed_in_envelope() {
+        let chat = ChatCompletionResponse::from_parts(
+            "m".to_string(),
+            " \n".to_string(),
+            1,
+            1,
+            Some(&FinishReason::Stop),
+            false,
+            Vec::new(),
+        );
+        let response = MessagesResponse::from_chat(&chat);
+        assert!(response.content.is_empty());
     }
 
     #[test]
@@ -999,7 +1037,7 @@ mod tests {
         raw.push_str(&StreamEncoder::ping());
         raw.push_str(&encoder.text_delta("Hel"));
         raw.push_str(&encoder.text_delta("lo"));
-        raw.push_str(&encoder.tool_use("bash", r#"{"command":"ls"}"#));
+        raw.push_str(&encoder.tool_use("bash", &json!({"command": "ls"})));
         raw.push_str(&encoder.finish("tool_use", 7));
 
         let frames = parse_frames(&raw);
@@ -1060,7 +1098,7 @@ mod tests {
     #[test]
     fn sse_block_opening_whitespace_is_held() {
         let mut encoder = StreamEncoder::new("msg_t".to_string(), "m".to_string());
-        let mut raw = encoder.tool_use("bash", "{}");
+        let mut raw = encoder.tool_use("bash", &json!({}));
         assert_eq!(encoder.text_delta("\n"), "", "trailing newline held");
         raw.push_str(&encoder.finish("tool_use", 3));
         let events: Vec<String> = parse_frames(&raw)
