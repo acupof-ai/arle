@@ -283,7 +283,8 @@ fn render_jinja(
             if m.tool_calls.is_empty() {
                 context! { role => m.role.as_str(), content => content }
             } else {
-                let tool_calls = minijinja::Value::from_serialize(&m.tool_calls);
+                let tool_calls =
+                    minijinja::Value::from_serialize(template_tool_calls(&m.tool_calls));
                 context! { role => m.role.as_str(), content => content, tool_calls => tool_calls }
             }
         })
@@ -319,6 +320,25 @@ fn render_jinja(
         .expect("template registered above")
         .render(render_context)
         .map_err(|err| anyhow!("render checkpoint chat_template failed: {err}"))
+}
+
+/// Tool calls in HF chat-template convention: `function.arguments` is a
+/// mapping, not the OpenAI wire's JSON string — templates iterate it
+/// (`arguments|items`), so parse for the render (HF/vLLM do the same);
+/// unparseable arguments fall back to the raw string.
+fn template_tool_calls(calls: &[chat::OpenAiToolCall]) -> Vec<serde_json::Value> {
+    calls
+        .iter()
+        .map(|call| {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(call.function.arguments.clone()));
+            serde_json::json!({
+                "id": call.id,
+                "type": call.call_type,
+                "function": {"name": call.function.name, "arguments": arguments},
+            })
+        })
+        .collect()
 }
 
 /// The `chat` crate's OpenAI wire messages — the shared shape its DeepSeek-V4
@@ -538,6 +558,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "x");
+    }
+
+    /// Qwen-family templates render tool schemas via `{{ tool | tojson }}` —
+    /// requires minijinja's `json` feature (tools were unrenderable without it).
+    #[test]
+    fn jinja_tojson_filter_renders_tools() {
+        let tools = vec![chat::OpenAiToolDefinition {
+            tool_type: "function".into(),
+            function: chat::OpenAiFunctionDefinition {
+                name: "get_weather".into(),
+                description: Some("Get the weather".into()),
+                parameters: Some(serde_json::json!({"type": "object"})),
+            },
+        }];
+        let out = render_jinja(
+            "{%- for tool in tools %}{{ tool | tojson }}{%- endfor %}",
+            "",
+            "",
+            &[msg("user", "x")],
+            None,
+            &tools,
+        )
+        .unwrap();
+        assert!(out.contains(r#""name":"get_weather""#), "got: {out}");
+    }
+
+    /// Qwen-family templates iterate `tool_call.function.arguments|items` —
+    /// history arguments must render as a mapping (HF convention), not the
+    /// OpenAI wire's JSON string.
+    #[test]
+    fn jinja_tool_call_arguments_render_as_mapping() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            }]
+        }))
+        .unwrap();
+        let out = render_jinja(
+            "{%- for tc in messages[0].tool_calls %}\
+             {%- for k, v in tc.function.arguments|items %}{{ k }}={{ v }}{%- endfor %}\
+             {%- endfor %}",
+            "",
+            "",
+            &[message],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out, "city=Paris");
     }
 
     #[test]

@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tokenizers = { workspace = true }
 uuid = { workspace = true }
-minijinja = { version = "2.20.0", features = ["loop_controls"] }
+minijinja = { version = "2.20.0", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2.20.0", features = ["pycompat"] }
 
 [lints]
