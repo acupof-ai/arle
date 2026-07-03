@@ -2297,6 +2297,22 @@ impl Dsv4CudaExecutor {
                         .map(|(name, bytes)| (*name, bytes >> 20))
                         .collect::<Vec<_>>()
                 );
+                // Drift guard: the KV budget divides free VRAM by the STATIC
+                // `per_slot_device_bytes`; if it drifts from the real slot alloc,
+                // `affordable` mis-clamps num_slots and engine build OOMs (the
+                // 43→382 MB under-count). Warn on >5% so it can't silently return.
+                let predicted = model.per_slot_device_bytes(max_seq_len)?;
+                let actual = slots[0].device_bytes();
+                let drift = (predicted as i64 - actual as i64).unsigned_abs() as usize;
+                if drift.saturating_mul(20) > actual {
+                    log::warn!(
+                        "[vram-ledger] DSv4 per-slot budget drift {}%: static per_slot_device_bytes {}MB vs \
+                         slot0 device_bytes {}MB — reconcile per_slot_device_bytes with Dsv4SlotState::new",
+                        drift.saturating_mul(100) / actual.max(1),
+                        predicted >> 20,
+                        actual >> 20,
+                    );
+                }
             }
         }
         let measured_used_after_all = mem_dbg("after all slots (build complete)");

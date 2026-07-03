@@ -258,6 +258,18 @@ impl Dsv4FlashMlaDecodeState {
             + self.sched_meta.len() * i32_sz
             + self.num_splits.len() * i32_sz
     }
+
+    /// STATIC estimate of `device_bytes` for `Dsv4Model::per_slot_device_bytes`.
+    /// `sched_meta`'s exact length uses `num_sm_parts` from a device-only FFI meta
+    /// call; `new` floors it at `max(num_sm_parts, 256)`, so this static value uses
+    /// the 256 floor. The whole term is ~8 KB/layer (<0.1% of a slot) — any
+    /// FFI-driven excess is caught by the executor's per-slot drift guard.
+    pub(crate) fn device_bytes_estimate() -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let num_sm_parts_max = 256usize;
+        // topk_length[1] + sched_meta[num_sm_parts_max * 8] + num_splits[2].
+        (1 + num_sm_parts_max * 8 + 2) * i32_sz
+    }
 }
 
 /// Model-wide (one instance, NOT per-slot/per-layer) per-forward SCRATCH for the
@@ -1423,6 +1435,24 @@ impl Dsv4FusedWqkvDecodeScratch {
             + self.active_experts.len() * i32_sz
             + self.active_offsets.len() * i32_sz
             + self.active_counts.len() * i32_sz
+    }
+
+    /// STATIC predictor of `device_bytes` from config dims — MUST mirror `new`.
+    /// Feeds `Dsv4Model::per_slot_device_bytes`.
+    pub(crate) fn device_bytes_for(config: &DeepSeekV4Config) -> usize {
+        let i32_sz = std::mem::size_of::<i32>();
+        let f32_sz = std::mem::size_of::<f32>();
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let max_m = 128usize;
+        let scale_stride_m = 128usize;
+        let hidden_dim = config.hidden_size;
+        let scale_cols = hidden_dim.div_ceil(128);
+        // input_fp8 (u8, max_m*hidden) + input_scales (f32, scale_stride_m*scale_cols)
+        // + qkv_raw[q_lora_rank+head_dim, 1] (bf16) + active_experts/offsets/counts (1 i32 each).
+        max_m * hidden_dim
+            + scale_stride_m * scale_cols * f32_sz
+            + (config.q_lora_rank + config.head_dim) * bf16
+            + 3 * i32_sz
     }
 }
 

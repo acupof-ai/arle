@@ -13,11 +13,6 @@ pub(crate) struct Dsv4CompressorState {
 /// Indexer key-staging ring depth (rows): 2 × the max per-forward query chunk.
 pub(super) const DSV4_INDEXER_STAGING_RING_ROWS: usize = 2 * DSV4_PREFILL_QUERY_CHUNK;
 
-/// Indexer staging-ring depth (rows) — exported for kv_budget_plan.
-pub(crate) fn dsv4_indexer_staging_ring_rows() -> usize {
-    DSV4_INDEXER_STAGING_RING_ROWS
-}
-
 impl Dsv4CompressorState {
     pub(super) fn new(
         ctx: &DeviceContext,
@@ -114,6 +109,29 @@ impl Dsv4CompressorState {
             + self.prev_overlap_kv.len() * bf16
             + self.prev_overlap_score.len() * bf16
             + self.compressed.device_bytes()
+    }
+
+    /// STATIC predictor of `device_bytes` from `new`'s dims — MUST mirror `new`
+    /// (kept adjacent so drift is visible). Feeds `Dsv4Model::per_slot_device_bytes`
+    /// (the KV budget runs before any slot exists, so it cannot measure one).
+    pub(crate) fn device_bytes_for(
+        head_dim: usize,
+        ratio: usize,
+        overlap: bool,
+        max_seq_len: usize,
+        staging_ring: bool,
+    ) -> usize {
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let width = if overlap { 2 * head_dim } else { head_dim };
+        let compressed_capacity = max_seq_len.div_ceil(ratio.max(1)).max(1);
+        let ring_rows = if staging_ring {
+            DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity)
+        } else {
+            compressed_capacity
+        };
+        // pending_kv + pending_score (ratio*width each) + prev_overlap_kv +
+        // prev_overlap_score (ratio*head_dim each) + compressed[head_dim, ring_rows].
+        (2 * ratio * width + 2 * ratio * head_dim + head_dim * ring_rows) * bf16
     }
 }
 
