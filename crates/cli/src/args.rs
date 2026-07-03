@@ -654,6 +654,22 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub(crate) train_control_url: Option<String>,
 
+    /// Dump every raw `/v1/messages` request body to
+    /// `<dir>/<epoch_ms>_<seq>.json` (CC-trajectory capture for
+    /// `arle train cc-convert`). Fire-and-forget; unset = zero cost.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dump_messages_dir: Option<PathBuf>,
+
+    /// LoRA adapter safetensors (train `--save-lora-adapters` output) re-merged
+    /// into the resident student weights once at startup. CUDA Qwen3.5/3.6 only.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) lora_adapters: Option<PathBuf>,
+
+    /// LoRA alpha for --lora-adapters (`scale = alpha / rank`; rank is read
+    /// from the adapter tensor shapes).
+    #[arg(long, default_value_t = 32.0)]
+    pub(crate) lora_alpha: f32,
+
     /// Speculative decode route. Currently only CUDA accepts checkpoint-native
     /// `mtp`; external draft-model routes are not re-ported in the rewrite.
     #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
@@ -798,6 +814,36 @@ pub(crate) enum TrainCommand {
     /// (run the hidden tests), no text judge — passing trajectories are written
     /// back as CE targets.
     AgentOpd(TrainAgentOpdArgs),
+    /// Convert captured `/v1/messages` dumps (`arle serve --dump-messages-dir`)
+    /// into verl-style token records for the agent-OPD masked-CE replay
+    /// (`agent-opd --replay-records`).
+    CcConvert(TrainCcConvertArgs),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Groups the dumps into attempts via --window/--windows (whole dir when omitted),\npicks each window's session-final request (largest `messages` array), maps it\nthrough the serve's own /v1/messages adapter, renders ChatML with supervised\nspans, and emits one JSONL token record per attempt:\n  {\"label\":…, \"prompt_ids\":[…], \"response_ids\":[…], \"response_mask\":[…], …}"
+)]
+pub(crate) struct TrainCcConvertArgs {
+    /// Directory of raw /v1/messages dumps (`<epoch_ms>_<seq>.json`).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dump_dir: PathBuf,
+
+    /// tokenizer.json used to tokenize the rendered conversation.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) tokenizer: PathBuf,
+
+    /// Output JSONL (one record per attempt window).
+    #[arg(long, value_name = "FILE")]
+    pub(crate) out: PathBuf,
+
+    /// Attempt window `<t_start_ms>:<t_end_ms>[:<label>]` (repeatable).
+    #[arg(long = "window", value_name = "START:END[:LABEL]")]
+    pub(crate) window: Vec<String>,
+
+    /// JSONL of windows: rows `{"label":…, "t_start_ms":…, "t_end_ms":…}`.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) windows: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -1407,13 +1453,26 @@ pub(crate) struct TrainAgentOpdArgs {
 
     /// SWE-bench-Pro dataset JSONL (one task object per line: instance_id,
     /// problem_statement, repo, base_commit, test_patch, fail_to_pass, ...).
-    #[arg(long, value_name = "FILE")]
-    pub(crate) dataset: PathBuf,
+    /// Not used (and not required) with --replay-records.
+    #[arg(long, value_name = "FILE", required_unless_present = "replay_records")]
+    pub(crate) dataset: Option<PathBuf>,
 
     /// Directory holding each task's repo already checked out at its
     /// `base_commit`, addressed as `<staged-root>/<instance_id>/`.
-    #[arg(long, value_name = "DIR")]
-    pub(crate) staged_root: PathBuf,
+    /// Not used (and not required) with --replay-records.
+    #[arg(long, value_name = "DIR", required_unless_present = "replay_records")]
+    pub(crate) staged_root: Option<PathBuf>,
+
+    /// Replay pre-converted token records (`arle train cc-convert` output JSONL)
+    /// through the same masked-CE writeback instead of rolling out: no rollout
+    /// engine, sandboxes, or datasets are loaded. Honors --writeback-cap; saves
+    /// adapters via --save-lora-adapters.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) replay_records: Option<PathBuf>,
+
+    /// Epochs over --replay-records.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) replay_epochs: usize,
 
     /// Root dir under which each task's per-rollout sandbox is built (copied from
     /// the staged tree, reset between samples).

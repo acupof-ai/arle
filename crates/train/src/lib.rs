@@ -2,6 +2,8 @@
 pub mod agent_opd;
 #[path = "causal_lm.rs"]
 pub mod causal_lm;
+#[path = "cc_convert.rs"]
+pub mod cc_convert;
 #[path = "checkpoint.rs"]
 pub mod checkpoint;
 #[path = "control.rs"]

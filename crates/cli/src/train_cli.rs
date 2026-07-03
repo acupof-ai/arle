@@ -23,8 +23,8 @@ use crate::{
     args::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
         OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainAgentOpdArgs,
-        TrainArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs, TrainOpdArgs,
-        TrainRubricOpdArgs, TrainSelfOpdArgs,
+        TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs,
+        TrainOpdArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -84,7 +84,63 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::SelfOpd(args) => run_self_opd(args),
         TrainCommand::RubricOpd(args) => exit_from_result(run_rubric_opd_impl(args)),
         TrainCommand::AgentOpd(args) => exit_from_result(run_agent_opd_impl(args)),
+        TrainCommand::CcConvert(args) => exit_from_result(run_cc_convert_impl(args)),
     }
+}
+
+/// `arle train cc-convert` — backend-independent (no CUDA): dumps → verl-style
+/// token records via `train::cc_convert`.
+fn run_cc_convert_impl(args: TrainCcConvertArgs) -> Result<()> {
+    use train::cc_convert::CcWindow;
+
+    // Windows from --windows (JSONL) plus repeated --window START:END[:LABEL].
+    let mut windows: Vec<CcWindow> = Vec::new();
+    if let Some(path) = args.windows.as_deref() {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("read --windows {}", path.display()))?;
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            windows.push(
+                serde_json::from_str(line)
+                    .with_context(|| format!("parse --windows row: {line}"))?,
+            );
+        }
+    }
+    for (idx, spec) in args.window.iter().enumerate() {
+        let mut parts = spec.splitn(3, ':');
+        let (Some(start), Some(end)) = (parts.next(), parts.next()) else {
+            bail!("--window {spec}: expected <t_start_ms>:<t_end_ms>[:<label>]");
+        };
+        windows.push(CcWindow {
+            t_start_ms: start
+                .parse()
+                .with_context(|| format!("--window {spec}: bad t_start_ms"))?,
+            t_end_ms: end
+                .parse()
+                .with_context(|| format!("--window {spec}: bad t_end_ms"))?,
+            label: parts
+                .next()
+                .map_or_else(|| format!("w{idx}"), str::to_owned),
+        });
+    }
+
+    let records =
+        train::cc_convert::run_cc_convert(&args.dump_dir, &args.tokenizer, &args.out, &windows)?;
+    for record in &records {
+        eprintln!(
+            "[arle train cc-convert] {}: prompt={} response={} masked={}/{} tokens",
+            record.label,
+            record.prompt_ids.len(),
+            record.response_ids.len(),
+            record.masked_tokens,
+            record.total_tokens
+        );
+    }
+    eprintln!(
+        "[arle train cc-convert] wrote {} record(s) to {}",
+        records.len(),
+        args.out.display()
+    );
+    Ok(())
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -1918,6 +1974,214 @@ fn run_agent_opd_eval_pass(
     Ok(pass_rate)
 }
 
+/// PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
+/// adapter_config.json + adapter_model.safetensors).
+#[cfg(feature = "cuda")]
+fn agent_opd_adapter_config(
+    student_dir: &Path,
+    target_set: train::lora::LoraTargetSet,
+    lora: train::lora::LoraConfig,
+) -> train::lora::LoraAdapterConfig {
+    use train::lora::{LoraAdapterConfig, LoraTargetSet};
+
+    let mut config = LoraAdapterConfig::new(student_dir.display().to_string(), "qwen35", lora);
+    config.target_modules = match target_set {
+        LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
+        LoraTargetSet::AttentionFull => vec![
+            "q_proj".to_owned(),
+            "k_proj".to_owned(),
+            "v_proj".to_owned(),
+            "o_proj".to_owned(),
+            "in_proj_qkv".to_owned(),
+            "out_proj".to_owned(),
+        ],
+        LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
+    };
+    config
+}
+
+/// Fast adapter-only (LoRA) save as a mainstream HF PEFT adapter dir — shared
+/// by the per-round agent-OPD save and the replay-mode final save. Avoids the
+/// full-materialize host-loop hang; loadable by HF PEFT / vLLM / SGLang.
+#[cfg(feature = "cuda")]
+fn save_agent_opd_adapters(
+    adapter_dir: &Path,
+    dirname: &str,
+    step: usize,
+    student_dir: &Path,
+    student: &train::qwen35::Qwen35Model,
+    store: &mut TensorStore,
+    adapter_config: &train::lora::LoraAdapterConfig,
+) -> Result<()> {
+    use train::qwen35_checkpoint::{
+        ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StudentWeights,
+        save_named_qwen35_student_checkpoint,
+    };
+
+    fs::create_dir_all(adapter_dir)
+        .with_context(|| format!("create LoRA adapter dir {}", adapter_dir.display()))?;
+    let sources = checkpoint_sources(student_dir)?;
+    let started = Instant::now();
+    let mut adapter_tape = Tape::new();
+    let saved_dir = save_named_qwen35_student_checkpoint(
+        Qwen35NamedCheckpoint {
+            out_dir: adapter_dir,
+            dirname,
+            tokenizer_path: Some(&sources.tokenizer_path),
+            config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
+            generation_config: GenerationConfigSource::CopyOrSynthesize {
+                source_path: &sources.generation_config_path,
+                fallback_config_path: &sources.config_path,
+            },
+        },
+        student,
+        store,
+        &mut adapter_tape,
+        Qwen35StudentWeights::AdapterOnly {
+            bf16: true,
+            adapter_config,
+        },
+    )
+    .with_context(|| format!("save LoRA PEFT adapter dir {dirname}"))?;
+    println!(
+        "checkpoint_saved kind=peft_adapter mode=agent-opd step={step} dir={} seconds={:.6}",
+        saved_dir.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// One `--replay-records` JSONL row (`arle train cc-convert` output).
+#[cfg(feature = "cuda")]
+#[derive(serde::Deserialize)]
+struct ReplayRecord {
+    #[serde(default)]
+    label: Option<String>,
+    prompt_ids: Vec<u32>,
+    response_ids: Vec<u32>,
+    response_mask: Vec<u8>,
+}
+
+/// Agent-OPD replay mode: run the SAME masked-CE writeback the round loop
+/// passes as `train_on_accepted` over pre-converted token records — no rollout
+/// engine, sandboxes, or datasets (no engine VRAM, no staged trees).
+#[cfg(feature = "cuda")]
+fn run_agent_opd_replay(
+    args: &TrainAgentOpdArgs,
+    records_path: &Path,
+    lora: train::lora::LoraConfig,
+    target_set: train::lora::LoraTargetSet,
+) -> Result<()> {
+    use autograd::optim::AdamW;
+    use train::{
+        opd::masked_writeback_ce_step_dispatch,
+        qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
+    };
+
+    let student_dir = args.student_model.as_path();
+    let raw = fs::read_to_string(records_path)
+        .with_context(|| format!("read --replay-records {}", records_path.display()))?;
+    let records: Vec<ReplayRecord> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).with_context(|| format!("parse replay record: {line}"))
+        })
+        .collect::<Result<_>>()?;
+    if records.is_empty() {
+        bail!("no records in {}", records_path.display());
+    }
+    for (idx, record) in records.iter().enumerate() {
+        if record.response_ids.len() != record.response_mask.len() {
+            bail!(
+                "replay record {idx} ({:?}): response_ids len {} != response_mask len {}",
+                record.label,
+                record.response_ids.len(),
+                record.response_mask.len()
+            );
+        }
+    }
+
+    let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
+    let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
+        .with_context(|| format!("read config.json from {}", student_dir.display()))?;
+    let vocab = hf_config.vocab_size;
+
+    eprintln!(
+        "[arle train agent-opd] replay: {} record(s) from {} on {backend_label} (no rollout engine)",
+        records.len(),
+        records_path.display()
+    );
+    let mut student = load_qwen35_lora_from_hf_dir_with_shared_base(
+        student_dir,
+        lora,
+        target_set,
+        args.lora_layer_start,
+        args.lora_skip_experts,
+        // No rollout engine in replay mode, so no FP8 base to share.
+        None,
+        &mut store,
+    )
+    .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
+    if args.grad_checkpointing {
+        student.set_gradient_checkpointing(true);
+    }
+    let all_params: Vec<TensorId> = student.all_parameter_ids();
+    let trainable: Vec<TensorId> = all_params
+        .iter()
+        .copied()
+        .filter(|id| store.get(*id).is_some_and(|tensor| tensor.requires_grad))
+        .collect();
+    if trainable.is_empty() {
+        bail!("agent-opd student has no trainable (LoRA) parameters; check --lora-target-set");
+    }
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    log_opd_vram("replay: after student load", &train_backend);
+
+    let epochs = args.replay_epochs.max(1);
+    let per_epoch_cap = args.writeback_cap.unwrap_or(usize::MAX);
+    for epoch in 0..epochs {
+        let mut losses = Vec::new();
+        for record in records.iter().take(per_epoch_cap) {
+            let loss = masked_writeback_ce_step_dispatch(
+                &student,
+                all_params.as_slice(),
+                trainable.as_slice(),
+                &mut optimizer,
+                &record.prompt_ids,
+                &record.response_ids,
+                &record.response_mask,
+                vocab,
+                args.writeback_window,
+                &mut store,
+            )
+            .with_context(|| format!("replay writeback ({:?})", record.label))?;
+            losses.push(loss);
+        }
+        let mean_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+        eprintln!(
+            "[agent-opd] replay epoch={epoch} trained_pairs={} mean_loss={mean_loss:.4}",
+            losses.len()
+        );
+    }
+    log_opd_vram("replay: after writeback", &train_backend);
+
+    if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
+        let adapter_config = agent_opd_adapter_config(student_dir, target_set, lora);
+        save_agent_opd_adapters(
+            adapter_dir,
+            "adapters_replay",
+            epochs,
+            student_dir,
+            &student,
+            &mut store,
+            &adapter_config,
+        )?;
+    }
+    eprintln!("[arle train agent-opd] replay done ({epochs} epoch(s))");
+    Ok(())
+}
+
 /// Agent-OPD RFT loop: the student drives the read/write/replace/bash tool loop
 /// against a per-task repo sandbox (SWE-bench-Pro); the reward is EXECUTION (the
 /// hidden tests are run on `git diff`), no text judge is loaded; passing
@@ -1930,12 +2194,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
     use train::{
         infer_student::InferStudent,
-        lora::{LoraAdapterConfig, LoraConfig, LoraTargetSet},
+        lora::LoraConfig,
         opd::masked_writeback_ce_step_dispatch,
-        qwen35_checkpoint::{
-            ConfigJsonSource, GenerationConfigSource, Qwen35NamedCheckpoint, Qwen35StudentWeights,
-            save_named_qwen35_student_checkpoint,
-        },
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         swe_dataset::SweTask,
     };
@@ -1946,6 +2206,20 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         rank: args.lora_rank,
         alpha: args.lora_alpha,
     };
+
+    // Replay mode: no rollout engine / sandboxes / datasets — just the trainer
+    // student + the same masked-CE writeback over pre-converted records.
+    if let Some(records_path) = args.replay_records.clone() {
+        return run_agent_opd_replay(&args, &records_path, lora, target_set);
+    }
+    let dataset = args
+        .dataset
+        .as_deref()
+        .ok_or_else(|| anyhow!("--dataset is required without --replay-records"))?;
+    let staged_root = args
+        .staged_root
+        .as_deref()
+        .ok_or_else(|| anyhow!("--staged-root is required without --replay-records"))?;
 
     // Pre-CUDA sandbox-spawner: fork ONE non-CUDA helper to own all rollout
     // subprocess spawns (bash/cp/git/pytest) BEFORE the first CUDA context below.
@@ -1967,24 +2241,24 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     let vocab = hf_config.vocab_size;
 
     // SWE-bench-Pro tasks; each task's staged tree is `<staged_root>/<instance_id>/`.
-    let mut tasks_raw = train::swe_dataset::load_swe_tasks(&args.dataset)?;
+    let mut tasks_raw = train::swe_dataset::load_swe_tasks(dataset)?;
     if let Some(n) = args.task_limit {
         tasks_raw.truncate(n);
     }
     let tasks: Vec<(SweTask, PathBuf)> = tasks_raw
         .into_iter()
         .map(|t| {
-            let tree = args.staged_root.join(&t.instance_id);
+            let tree = staged_root.join(&t.instance_id);
             (t, tree)
         })
         .collect();
     if tasks.is_empty() {
-        bail!("no usable tasks in {}", args.dataset.display());
+        bail!("no usable tasks in {}", dataset.display());
     }
     eprintln!(
         "[arle train agent-opd] loaded {} tasks from {}",
         tasks.len(),
-        args.dataset.display()
+        dataset.display()
     );
 
     // HELD-OUT eval tasks (separate from --dataset). Staged under
@@ -1992,10 +2266,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // the round-0 baseline + per-round eval reuse the same set.
     let eval_tasks: Vec<(SweTask, PathBuf)> = match args.eval_dataset.as_deref() {
         Some(eval_path) => {
-            let eval_staged_root = args
-                .eval_staged_root
-                .as_deref()
-                .unwrap_or(args.staged_root.as_path());
+            let eval_staged_root = args.eval_staged_root.as_deref().unwrap_or(staged_root);
             let mut eval_raw = train::swe_dataset::load_swe_tasks(eval_path)?;
             if let Some(n) = args.eval_n {
                 eval_raw.truncate(n);
@@ -2284,22 +2555,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
     // adapter_config.json + adapter_model.safetensors). Built once; borrowed by
     // every per-round adapter save.
-    let lora_adapter_config = {
-        let mut config = LoraAdapterConfig::new(student_dir.display().to_string(), "qwen35", lora);
-        config.target_modules = match target_set {
-            LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
-            LoraTargetSet::AttentionFull => vec![
-                "q_proj".to_owned(),
-                "k_proj".to_owned(),
-                "v_proj".to_owned(),
-                "o_proj".to_owned(),
-                "in_proj_qkv".to_owned(),
-                "out_proj".to_owned(),
-            ],
-            LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
-        };
-        config
-    };
+    let lora_adapter_config = agent_opd_adapter_config(student_dir, target_set, lora);
 
     // Round-0 BASELINE held-out eval BEFORE any training: the un-tuned student's
     // pass-rate. Every per-round eval is read against this, so the operator sees
@@ -2455,39 +2711,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         // / vLLM / SGLang. Avoids the full-materialize host-loop hang.
         if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
             if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
-                fs::create_dir_all(adapter_dir).with_context(|| {
-                    format!("create LoRA adapter dir {}", adapter_dir.display())
-                })?;
-                let sources = checkpoint_sources(student_dir)?;
-                let dirname = format!("adapters_round{}", round + 1);
-                let started = Instant::now();
-                let mut adapter_tape = Tape::new();
-                let saved_dir = save_named_qwen35_student_checkpoint(
-                    Qwen35NamedCheckpoint {
-                        out_dir: adapter_dir,
-                        dirname: &dirname,
-                        tokenizer_path: Some(&sources.tokenizer_path),
-                        config_json: ConfigJsonSource::CopyFrom(&sources.config_path),
-                        generation_config: GenerationConfigSource::CopyOrSynthesize {
-                            source_path: &sources.generation_config_path,
-                            fallback_config_path: &sources.config_path,
-                        },
-                    },
+                save_agent_opd_adapters(
+                    adapter_dir,
+                    &format!("adapters_round{}", round + 1),
+                    round + 1,
+                    student_dir,
                     &student,
                     &mut store,
-                    &mut adapter_tape,
-                    Qwen35StudentWeights::AdapterOnly {
-                        bf16: true,
-                        adapter_config: &lora_adapter_config,
-                    },
-                )
-                .with_context(|| format!("save LoRA PEFT adapter dir at round {}", round + 1))?;
-                println!(
-                    "checkpoint_saved kind=peft_adapter mode=agent-opd step={} dir={} seconds={:.6}",
-                    round + 1,
-                    saved_dir.display(),
-                    started.elapsed().as_secs_f64()
-                );
+                    &lora_adapter_config,
+                )?;
             }
         }
 

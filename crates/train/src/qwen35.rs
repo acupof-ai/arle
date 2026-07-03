@@ -2615,7 +2615,7 @@ impl Qwen35Model {
                 per_layer
                     .saturating_mul(self.layers.len())
                     .saturating_mul(3)
-                    > free as usize
+                    > free
             })
     }
 

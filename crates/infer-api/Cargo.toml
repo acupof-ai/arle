@@ -46,6 +46,10 @@ cudarc = { version = "0.19", features = [
     "cublas",
     "f16",
 ], optional = true }
+# CUDA-only: `--lora-adapters` safetensors -> StudentLoraUpdate loading
+# (`student_lora.rs`); host-only decode, no device code.
+safetensors = { workspace = true, optional = true }
+half = { version = "2", optional = true }
 
 [features]
 # No backend defaulted, mirroring the legacy `infer` crate: callers pick one.
@@ -61,6 +65,8 @@ cuda = [
     "dep:cuda-kernels",
     "cuda-kernels/cuda",
     "dep:cudarc",
+    "dep:safetensors",
+    "dep:half",
 ]
 # Marker feature for builds without a CUDA toolchain (macOS, dev CI).
 no-cuda = ["infer-cuda?/no-cuda", "cuda-kernels?/no-cuda"]
