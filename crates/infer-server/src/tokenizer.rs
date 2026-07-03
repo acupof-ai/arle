@@ -244,7 +244,7 @@ fn hoist_system_first(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 /// The environment is built per call — chat rendering is the COLD facade path
 /// and per-call compile keeps [`OpenAiTokenizer`] `Clone` without sharing a
 /// non-`Clone` minijinja environment.
-fn render_jinja(
+pub(crate) fn render_jinja(
     source: &str,
     bos_token: &str,
     eos_token: &str,
