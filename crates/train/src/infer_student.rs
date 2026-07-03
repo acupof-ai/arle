@@ -20,8 +20,8 @@ use anyhow::{Result, anyhow, bail};
 use autograd::{Backend, TensorId, TensorStore};
 #[cfg(feature = "cuda")]
 use infer_api::{
-    LoadedInferenceEngine, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
-    StudentLoraProjectionUpdate, StudentLoraUpdate,
+    LoadedInferenceEngine, LoraHalf, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
+    StudentLoraProjectionUpdate, StudentLoraUpdate, parse_student_adapter_name,
 };
 #[cfg(feature = "cuda")]
 use infer_plan::{SamplingParams, sample_token};
@@ -327,7 +327,7 @@ impl InferStudent {
         let mut layers: HashMap<usize, PartialLayer> = HashMap::new();
         let mut unsupported = Vec::new();
         for (&name, &tensor_id) in adapter_map {
-            let Some((layer_idx, projection, which)) = parse_adapter_name(name) else {
+            let Some((layer_idx, projection, which)) = parse_student_adapter_name(name) else {
                 unsupported.push(name);
                 continue;
             };
@@ -347,14 +347,10 @@ impl InferStudent {
             let entry = layers.entry(layer_idx).or_default();
             let slot = entry.projections.entry(projection).or_default();
             match which {
-                Which::A => {
-                    // lora_A shape = [rank, in_features]
-                    slot.a = Some((values, shape[0], shape[1]));
-                }
-                Which::B => {
-                    // lora_B shape = [out_features, rank]
-                    slot.b = Some((values, shape[0], shape[1]));
-                }
+                // lora_A shape = [rank, in_features]
+                LoraHalf::A => slot.a = Some((values, shape[0], shape[1])),
+                // lora_B shape = [out_features, rank]
+                LoraHalf::B => slot.b = Some((values, shape[0], shape[1])),
             }
         }
 
@@ -362,7 +358,7 @@ impl InferStudent {
             unsupported.sort_unstable();
             bail!(
                 "LoRA sync: unsupported adapter tensor name(s): {}. \
-                 Hint: extend InferStudent::parse_adapter_name before using infer-engine rollout \
+                 Hint: extend infer_api::parse_student_adapter_name before using infer-engine rollout \
                  for this LoRA target set.",
                 unsupported.join(", ")
             );
@@ -502,69 +498,6 @@ impl PartialProj {
 }
 
 #[cfg(feature = "cuda")]
-#[derive(Copy, Clone)]
-enum Which {
-    A,
-    B,
-}
-
-/// Parse a train adapter tensor name like
-/// `model.language_model.layers.7.self_attn.q_proj.weight.lora_a` into
-/// `(layer_idx, projection, which)`. Returns `None` for non-linear adapters
-/// such as norms or conv state tensors.
-#[cfg(feature = "cuda")]
-fn parse_adapter_name(name: &str) -> Option<(usize, StudentLoraProjection, Which)> {
-    let which = if name.ends_with(".lora_a") {
-        Which::A
-    } else if name.ends_with(".lora_b") {
-        Which::B
-    } else {
-        return None;
-    };
-    let parts: Vec<&str> = name.split('.').collect();
-    let layers_pos = parts.iter().position(|part| *part == "layers")?;
-    let layer_idx: usize = parts.get(layers_pos + 1)?.parse().ok()?;
-    let projection = match (*parts.get(layers_pos + 2)?, *parts.get(layers_pos + 3)?) {
-        ("self_attn", "q_proj") => StudentLoraProjection::FullQ,
-        ("self_attn", "k_proj") => StudentLoraProjection::FullK,
-        ("self_attn", "v_proj") => StudentLoraProjection::FullV,
-        ("self_attn", "o_proj") => StudentLoraProjection::FullO,
-        ("self_attn", "in_proj_qkv") => StudentLoraProjection::LinearQkv,
-        ("self_attn", "in_proj_z") => StudentLoraProjection::LinearZ,
-        ("self_attn", "in_proj_b") => StudentLoraProjection::LinearB,
-        ("self_attn", "in_proj_a") => StudentLoraProjection::LinearA,
-        ("self_attn", "out_proj") => StudentLoraProjection::LinearOut,
-        ("linear_attn", "in_proj_qkv") => StudentLoraProjection::LinearQkv,
-        ("linear_attn", "in_proj_z") => StudentLoraProjection::LinearZ,
-        ("linear_attn", "in_proj_b") => StudentLoraProjection::LinearB,
-        ("linear_attn", "in_proj_a") => StudentLoraProjection::LinearA,
-        ("linear_attn", "out_proj") => StudentLoraProjection::LinearOut,
-        ("mlp", "gate_proj") => StudentLoraProjection::MlpGate,
-        ("mlp", "up_proj") => StudentLoraProjection::MlpUp,
-        ("mlp", "down_proj") => StudentLoraProjection::MlpDown,
-        ("mlp", "gate") => StudentLoraProjection::MoeRouter,
-        ("mlp", "shared_expert_gate") => StudentLoraProjection::MoeSharedExpertGate,
-        ("mlp", "shared_expert") => match *parts.get(layers_pos + 4)? {
-            "gate_proj" => StudentLoraProjection::MoeSharedGate,
-            "up_proj" => StudentLoraProjection::MoeSharedUp,
-            "down_proj" => StudentLoraProjection::MoeSharedDown,
-            _ => return None,
-        },
-        ("mlp", "experts") => {
-            let expert_idx: usize = parts.get(layers_pos + 4)?.parse().ok()?;
-            match *parts.get(layers_pos + 5)? {
-                "gate_proj" => StudentLoraProjection::MoeExpertGate { expert_idx },
-                "up_proj" => StudentLoraProjection::MoeExpertUp { expert_idx },
-                "down_proj" => StudentLoraProjection::MoeExpertDown { expert_idx },
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-    Some((layer_idx, projection, which))
-}
-
-#[cfg(feature = "cuda")]
 fn argmax(logits: &[f32]) -> Result<usize> {
     if logits.is_empty() {
         bail!("argmax over empty logits");
@@ -590,136 +523,4 @@ fn validate_token_ids(label: &str, tokens: &[u32], vocab_size: usize) -> Result<
         }
     }
     Ok(())
-}
-
-#[cfg(all(test, feature = "cuda"))]
-mod tests {
-    use infer_api::StudentLoraProjection;
-
-    use super::{Which, parse_adapter_name};
-
-    fn parsed_projection(name: &str) -> Option<StudentLoraProjection> {
-        parse_adapter_name(name).map(|(_, projection, _)| projection)
-    }
-
-    #[test]
-    fn parse_adapter_name_covers_all_linear_targets() {
-        let prefix = "model.language_model.layers.7";
-        let cases = [
-            (
-                format!("{prefix}.self_attn.q_proj.weight.lora_a"),
-                StudentLoraProjection::FullQ,
-            ),
-            (
-                format!("{prefix}.self_attn.k_proj.weight.lora_a"),
-                StudentLoraProjection::FullK,
-            ),
-            (
-                format!("{prefix}.self_attn.v_proj.weight.lora_b"),
-                StudentLoraProjection::FullV,
-            ),
-            (
-                format!("{prefix}.self_attn.o_proj.weight.lora_a"),
-                StudentLoraProjection::FullO,
-            ),
-            (
-                format!("{prefix}.self_attn.in_proj_qkv.weight.lora_a"),
-                StudentLoraProjection::LinearQkv,
-            ),
-            (
-                format!("{prefix}.self_attn.in_proj_z.weight.lora_a"),
-                StudentLoraProjection::LinearZ,
-            ),
-            (
-                format!("{prefix}.self_attn.in_proj_b.weight.lora_a"),
-                StudentLoraProjection::LinearB,
-            ),
-            (
-                format!("{prefix}.self_attn.in_proj_a.weight.lora_a"),
-                StudentLoraProjection::LinearA,
-            ),
-            (
-                format!("{prefix}.self_attn.out_proj.weight.lora_a"),
-                StudentLoraProjection::LinearOut,
-            ),
-            (
-                format!("{prefix}.linear_attn.in_proj_qkv.weight.lora_a"),
-                StudentLoraProjection::LinearQkv,
-            ),
-            (
-                format!("{prefix}.linear_attn.in_proj_z.weight.lora_a"),
-                StudentLoraProjection::LinearZ,
-            ),
-            (
-                format!("{prefix}.linear_attn.in_proj_b.weight.lora_a"),
-                StudentLoraProjection::LinearB,
-            ),
-            (
-                format!("{prefix}.linear_attn.in_proj_a.weight.lora_a"),
-                StudentLoraProjection::LinearA,
-            ),
-            (
-                format!("{prefix}.linear_attn.out_proj.weight.lora_b"),
-                StudentLoraProjection::LinearOut,
-            ),
-            (
-                format!("{prefix}.mlp.gate_proj.weight.lora_a"),
-                StudentLoraProjection::MlpGate,
-            ),
-            (
-                format!("{prefix}.mlp.up_proj.weight.lora_a"),
-                StudentLoraProjection::MlpUp,
-            ),
-            (
-                format!("{prefix}.mlp.down_proj.weight.lora_a"),
-                StudentLoraProjection::MlpDown,
-            ),
-            (
-                format!("{prefix}.mlp.gate.weight.lora_a"),
-                StudentLoraProjection::MoeRouter,
-            ),
-            (
-                format!("{prefix}.mlp.shared_expert.gate_proj.weight.lora_a"),
-                StudentLoraProjection::MoeSharedGate,
-            ),
-            (
-                format!("{prefix}.mlp.shared_expert.up_proj.weight.lora_a"),
-                StudentLoraProjection::MoeSharedUp,
-            ),
-            (
-                format!("{prefix}.mlp.shared_expert.down_proj.weight.lora_a"),
-                StudentLoraProjection::MoeSharedDown,
-            ),
-            (
-                format!("{prefix}.mlp.shared_expert_gate.weight.lora_a"),
-                StudentLoraProjection::MoeSharedExpertGate,
-            ),
-            (
-                format!("{prefix}.mlp.experts.13.gate_proj.weight.lora_a"),
-                StudentLoraProjection::MoeExpertGate { expert_idx: 13 },
-            ),
-            (
-                format!("{prefix}.mlp.experts.13.up_proj.weight.lora_a"),
-                StudentLoraProjection::MoeExpertUp { expert_idx: 13 },
-            ),
-            (
-                format!("{prefix}.mlp.experts.13.down_proj.weight.lora_b"),
-                StudentLoraProjection::MoeExpertDown { expert_idx: 13 },
-            ),
-        ];
-
-        for (name, expected) in cases {
-            assert_eq!(parsed_projection(&name), Some(expected), "{name}");
-        }
-
-        let (layer_idx, projection, which) =
-            parse_adapter_name(&format!("{prefix}.self_attn.q_proj.weight.lora_a"))
-                .expect("q_proj parses");
-        assert_eq!(layer_idx, 7);
-        assert_eq!(projection, StudentLoraProjection::FullQ);
-        assert!(matches!(which, Which::A));
-
-        assert!(parse_adapter_name(&format!("{prefix}.self_attn.q_norm.weight.lora_a")).is_none());
-        assert!(parse_adapter_name(&format!("{prefix}.self_attn.conv1d.weight.lora_a")).is_none());
-    }
 }

@@ -73,6 +73,21 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
     // MUST run pre-spawn: multiproc TP rank children inherit the parent env
     // (env is the transport; flags are the only public interface).
     apply_probe_env(&serve_args);
+    // CC-trajectory capture: install the /v1/messages dump sink before the
+    // router (single- and multiproc coordinator both handle HTTP in-process).
+    if let Some(dir) = serve_args.dump_messages_dir.as_deref() {
+        if let Err(err) = infer_api::set_messages_dump_dir(dir) {
+            eprintln!(
+                "[ARLE serve] error: create --dump-messages-dir {}: {err}",
+                dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "[ARLE serve] dumping raw /v1/messages bodies to {}",
+            dir.display()
+        );
+    }
     match resolve_config(args, &serve_args) {
         Ok(config) => run_config(config),
         Err(err) => {
@@ -299,7 +314,15 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         ));
     }
 
+    if serve_args.lora_adapters.is_some() && backend != ServeBackend::Cuda {
+        return Err("--lora-adapters is currently only supported by the CUDA backend".to_string());
+    }
+
     let mut engine_config = resolve_engine_config(backend, serve_args)?;
+    // The student-LoRA re-merge rides the engine config so multiproc worker
+    // ranks (which see only ARLE_WORKER_ENGINE_CONFIG) apply it too.
+    engine_config.student_lora_adapters = serve_args.lora_adapters.clone();
+    engine_config.student_lora_alpha = serve_args.lora_alpha;
     // DSv4 multiproc auto-context: resolve max_total_tokens from the checkpoint
     // when unset. CUDA-only (the gate fns are CUDA-gated) — no non-CUDA path.
     #[cfg(feature = "cuda")]

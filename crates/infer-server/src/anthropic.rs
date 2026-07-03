@@ -241,6 +241,15 @@ impl MessagesRequest {
     }
 }
 
+/// Offline entry for CC-trajectory tooling (`arle train cc-convert`): parse a
+/// raw `/v1/messages` body and map it through the EXACT request path
+/// [`MessagesRequest::to_chat_request`] the serve handler runs, so converted
+/// records can never drift from the served prompt format.
+pub fn messages_body_to_chat_request(body: Value) -> anyhow::Result<ChatCompletionRequest> {
+    let request: MessagesRequest = serde_json::from_value(body)?;
+    Ok(request.to_chat_request())
+}
+
 fn text_message(role: &str, text: String) -> ChatMessage {
     ChatMessage {
         role: role.to_string(),

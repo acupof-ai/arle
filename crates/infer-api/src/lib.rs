@@ -32,6 +32,8 @@
 mod loaded;
 mod serve;
 mod serve_engine;
+#[cfg(feature = "cuda")]
+mod student_lora;
 mod types;
 
 #[cfg(feature = "cuda")]
@@ -63,7 +65,7 @@ pub use serve_engine::ServeInferenceEngine;
 pub use infer_server::{
     PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator, RelayEnvelope,
     RelayWorker, TcpChannel, WireRequest, WireStats, coordinator_local_router,
-    set_tick_broadcaster,
+    set_messages_dump_dir, set_tick_broadcaster,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy
@@ -78,6 +80,8 @@ pub use infer_cuda::{
 };
 #[cfg(feature = "metal")]
 pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes;
+#[cfg(feature = "cuda")]
+pub use student_lora::{LoraHalf, load_student_lora_update, parse_student_adapter_name};
 #[cfg(feature = "cuda")]
 pub use types::RawLogits;
 pub use types::{
