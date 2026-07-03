@@ -113,7 +113,21 @@ baseline ≥ **+15pp** AND above the baseline envelope max. Baseline stuck at 0
 ⇒ bootstrap gap confirmed ⇒ KILL the RFT-only claim, G6 becomes the licensed
 next step (that is itself a publishable finding, documented in errors/).
 
-## Phase 2 — teacher-rescue agentic OPD on real SWE-Pro
+## Phase 2 — cc-as-harness (ckl pivot 2026-07-03) + teacher-rescue on real SWE-Pro
+
+**Pivot: Claude Code is the rollout harness; ARLE serves the student behind
+an Anthropic `/v1/messages` adapter** (shipped 2026-07-03, `crates/
+infer-server/src/anthropic.rs`; live CC verified locally and on the pod).
+First pod probe (n=3 real ansible instances, 27B FP8, 1×H20): the same model
+that got 0 edits in the in-house loop **edited 2/3 repos under CC**, pass@1
+0/3 —
+[wins/2026-07-04](../experience/wins/2026-07-04-cc-as-harness-pod-e2e-baseline-probe.md).
+Harness = capability multiplier; the remaining correctness gap is the OPD
+target. Next: ① stage a runnable real corpus (≥12+12, staging gate:
+base-FAILS-not-ERRORS / gold-PASSES on the pod's python3.12); ② curve =
+CC-driven pass@1 baseline → distill CC trajectories (re-render + tokenize →
+existing masked-CE writeback) → CC-driven pass@1 again; ③ the in-house-loop
+rescue features below remain the fallback lane.
 
 Why this is the curve: at real-repo scale the 27B has a decoded 0-accept wall
 (explore-forever, never edits) — the regime where RFT starves (0 accepts ⇒ no
