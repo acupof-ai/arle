@@ -106,6 +106,8 @@ print(client.chat.completions.create(
 
 同一套 loop 也提升 *agentic* 能力:think-on OPD 下 4B student 学会**拒绝不相关的工具调用 —— BFCL-live abstention 0.60 → 1.00**。[<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
+**并且在 agent 轨迹上端到端闭环。** `arle train agent-opd` 让 27B FP8 student 在每任务的 repo 沙箱里驱动真实的 read/write/replace/bash 工具循环;奖励就是执行(对 `git diff` 跑隐藏测试);通过的轨迹以 masked next-token CE 写回,LoRA 每轮同步回 rollout 引擎 —— student 与 rollout 引擎共享同一份 FP8 base 权重(训推一体、零拷贝),**单张 H20 上 ~11.75 s/轮(比朴素 loop 快 37×)**,自带 held-out 执行评测通道(baseline → 逐轮 Δ),12 轮多任务运行 loss 下行、pass-rate ≥ baseline、零 OOM。[<a href="docs/experience/wins/2026-07-03-opd-full20-curve.md">loop perf</a> · <a href="docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md">12 轮运行</a>]
+
 **稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3-dense + Qwen3.5/3.6(hybrid·MoE)on CUDA + Metal;DeepSeek-V4-Flash + GLM-5.2(CUDA 8×H20 TP=8/EP=8;GLM-5.2 verify pending)· Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma(Metal)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
 ---
