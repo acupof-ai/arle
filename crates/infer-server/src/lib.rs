@@ -38,6 +38,7 @@ use infer_core::{CompletedRequest, Engine, RequestHandle, SchedulerConfig};
 use infer_plan::{ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult};
 
+mod anthropic;
 mod coordinator;
 mod execution;
 mod metrics;
