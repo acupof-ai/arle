@@ -1,6 +1,7 @@
 # DSv4 mhc_params: first-warp-parallel tail + fused params|pre_rms_norm (#143)
 
-> Status: pending-remote — H20 build + needle gate + matched A/B ride the next pod run.
+> Status: LICENSED 2026-07-04 — measured on 8×H20 in the shared campaign with
+> the GEMV levers; aggregate deltas + per-kernel evidence below.
 
 ## Goal
 Remove the `threadIdx.x==0` serial tail of `dsv4_mhc_params_kernel` (sigmoids +
@@ -25,14 +26,27 @@ with `pre` as the only coupling — fusing them drops 1 of 2 launches and the
 - 1024-thread launch kept (measured −48% for the rms read at that width).
 
 ## Env
-pending-remote (8×H20, TP=4/EP=4, DSv4-Flash-FP8).
+Shared campaign with the GEMV levers — see
+[the GEMV entry](2026-07-03-dsv4-gemv-uint4-tile-template.md) for binaries,
+method, and the aggregate A/B (MTP-off TPOT −37.1%; MTP-on −33.0%).
 
-## Results
-pending-remote: needle gate ×3 + same-shell binary-pair A/B + nsys
-`dsv4_mhc_params*` share re-measure.
+## Results (mhc-specific evidence)
+- MTP-on lane (decode-graph, where the fused pair lives): ms/step 59.1 → 41.4
+  with accept-rate unchanged — the graph-lane launch savings are inside this.
+- nsys MTP-off eager window: `dsv4_mhc_params_kernel` share 9.5% → 7.8%
+  (19.7 µs avg — the warp-parallel tail's savings on the standalone kernel);
+  `dsv4_mhc_params_pre_rms_norm_kernel` 0 instances in THIS lane — the three
+  fused sites sit inside `attn_graph.run_or_capture` (dsv4.rs:6102/6169/6247),
+  and eager spec-none uses the unfused pair by design.
+- Correctness gates: same campaign, all pass; MTP count drift shown
+  pre-existing via the paired baseline control.
 
 ## Problems
-none yet.
+- The eager spec-none lane still pays the unfused pair (params 7.8% +
+  pre_rms_norm 2.0%) — fusing the eager sites is a follow-on if that lane
+  stays on the critical path.
 
 ## Learnings
-pending-remote.
+- When a fused kernel shows 0 nsys instances, check WHICH lane the window
+  captured before calling it dead code — lane-scoped optimizations need
+  lane-scoped measurement.
