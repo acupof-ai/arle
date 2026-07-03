@@ -4294,7 +4294,10 @@ impl SafetensorLoader {
         Ok(crate::dsv4::Dsv4Compressor {
             wkv_deepgemm: self.decode_proj_cache(ctx, &wkv)?,
             wgate_deepgemm: self.decode_proj_cache(ctx, &wgate)?,
-            ape: load_matrix(&names.ape)?,
+            // `ape` is read RAW as bf16 by the compressor kernel (not via the
+            // quant-aware `dsv4_linear` like wkv/wgate), so it must be dense
+            // bf16 — the dialect dequants FP8 in both GLM and DSv4 (#138).
+            ape: self.load_dsv4_block_scaled_dialect(ctx, &names.ape)?,
             norm: self.load_dsv4_vec(ctx, &names.norm)?,
             wkv,
             wgate,
@@ -4380,10 +4383,16 @@ impl SafetensorLoader {
         let base = name
             .strip_suffix(".weight")
             .ok_or_else(|| anyhow!("{name}: quantized tensor name must end with .weight"))?;
-        let has_inv = self
+        // Dequant when a block scale is present in EITHER dialect: GLM's F32
+        // `weight_scale_inv` or DSv4's E8M0 `<base>.scale`. `dequantize_..._host`
+        // handles both. (Before, DSv4 fell through to the quantized form whose
+        // `.data` is a 1-element dummy — fatal for a raw-bf16 reader like the
+        // compressor `ape`, #138.)
+        let has_scale = self
             .borrow_raw_tensor(&format!("{base}.weight_scale_inv"))
-            .is_ok();
-        if has_inv {
+            .is_ok()
+            || self.borrow_raw_tensor(&format!("{base}.scale")).is_ok();
+        if has_scale {
             ensure!(
                 tensor.shape.len() == 2,
                 "{name}: expected 2D quantized tensor, got {:?}",
@@ -4396,7 +4405,7 @@ impl SafetensorLoader {
                 .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
                 .collect();
             DeviceMatrix::from_safetensors(ctx, &bytes, rows, cols)
-                .with_context(|| format!("upload GLM dequant bf16 {name}"))
+                .with_context(|| format!("upload dequant bf16 {name}"))
         } else {
             self.load_dsv4_block_scaled(ctx, name)
         }

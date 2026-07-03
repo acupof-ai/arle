@@ -1404,39 +1404,6 @@ impl Dsv4Model {
                 .ok_or_else(|| anyhow!("DSv4 layer {layer_idx} has no attention plan"))?;
             let lnames = config.layer_tensor_names(layer_idx);
             let attention = loader.load_dsv4_attention(&ctx, &config, &lnames.attn, &tp_cfg)?;
-            // #138 TEMP: the compressor kernel reads ape/wkv/wgate as bf16
-            // (`*const ffi::Half`). If any is stored QUANTIZED (FP8/FP4), the
-            // kernel reads quant bytes as bf16 → garbage/NaN. Log dtype+shape
-            // per compressor matrix, HCA vs CSA. Gated by ARLE_DSV4_SCAN_WEIGHTS.
-            if std::env::var_os("ARLE_DSV4_SCAN_WEIGHTS").is_some() {
-                let ratio = config.compress_ratios.get(layer_idx).copied().unwrap_or(0);
-                let scan = |tag: &str, m: &DeviceMatrix| {
-                    log::error!(
-                        "[scan138] layer={layer_idx} ratio={ratio} mode={:?} {tag} \
-                         {}x{} quantized={}",
-                        plan.mode,
-                        m.rows,
-                        m.cols,
-                        m.is_quantized()
-                    );
-                };
-                for (tag, comp) in [
-                    ("attn", attention.compressor.as_ref()),
-                    (
-                        "idx",
-                        attention
-                            .indexer
-                            .as_ref()
-                            .and_then(|i| i.compressor.as_ref()),
-                    ),
-                ] {
-                    if let Some(c) = comp {
-                        scan(&format!("{tag}.ape"), &c.ape);
-                        scan(&format!("{tag}.wkv"), &c.wkv);
-                        scan(&format!("{tag}.wgate"), &c.wgate);
-                    }
-                }
-            }
             // GLM dense layers (`per_layer_dense_mlp[i]`): a plain FFN, no experts.
             let is_dense = config
                 .per_layer_dense_mlp
