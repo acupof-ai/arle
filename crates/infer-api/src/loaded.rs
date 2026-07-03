@@ -106,6 +106,22 @@ pub struct EngineLoadConfig {
     /// backend). Default false → byte-identical.
     #[serde(default)]
     pub slot_oversubscription: bool,
+    /// `--lora-adapters`: trained student LoRA safetensors (train
+    /// `--save-lora-adapters` output) re-merged into the resident projection
+    /// weights once at engine build. Rides the engine config so multiproc
+    /// worker ranks apply it too. CUDA Qwen3.5/3.6 only.
+    #[serde(default)]
+    pub student_lora_adapters: Option<std::path::PathBuf>,
+    /// LoRA alpha for the `--lora-adapters` re-merge (`scale = alpha / rank`;
+    /// rank is read from the adapter tensor shapes).
+    #[serde(default = "default_student_lora_alpha")]
+    pub student_lora_alpha: f32,
+}
+
+/// `--lora-alpha` default (the common rank-32 PEFT convention); a free function
+/// so `#[serde(default = ...)]` can name it.
+fn default_student_lora_alpha() -> f32 {
+    32.0
 }
 
 /// SGLang's default static-memory fraction (0.9): 90% of VRAM for weights+KV,
@@ -147,6 +163,8 @@ impl Default for EngineLoadConfig {
             kv_ssd_root: None,
             kv_disk_limit: None,
             slot_oversubscription: false,
+            student_lora_adapters: None,
+            student_lora_alpha: default_student_lora_alpha(),
         }
     }
 }
@@ -1935,6 +1953,22 @@ mod backend {
                 scheduler.num_slots
             );
             scheduler.num_slots = num_slots;
+        }
+        // `--lora-adapters`: fold the trained student LoRA into the resident
+        // base once, pre-serving. Applied at the ONE engine constructor every
+        // rank runs, so single-GPU and multiproc TP ranks agree; the engine is
+        // not built yet, so no prefix cache exists to invalidate.
+        if let Some(path) = &config.student_lora_adapters {
+            let update =
+                crate::student_lora::load_student_lora_update(path, config.student_lora_alpha)?;
+            log::info!(
+                "student LoRA re-merge: {} layers, rank={} alpha={} from {}",
+                update.layers.len(),
+                update.rank,
+                update.alpha,
+                path.display()
+            );
+            executor.remerge_student_lora(update)?;
         }
         let mut kv = CudaKvPool::new(num_slots, total_pages, page_size);
         if let Some(pages) = executor.effective_fixed_pages_per_slot() {

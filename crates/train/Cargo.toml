@@ -47,6 +47,10 @@ agent = { path = "../agent" }
 tools = { path = "../tools" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
+# cc-convert reuses the REAL /v1/messages -> ChatCompletionRequest mapping
+# (host-only crate; no device code), so converted records can't drift from the
+# served prompt format.
+infer-server = { path = "../infer-server" }
 cuda-kernels = { path = "../cuda-kernels", default-features = false, optional = true }
 # Non-test use: sandbox run_captured writes subprocess output to a temp file
 # (avoids the wait_with_output pipe-hold hang when a tool command backgrounds a

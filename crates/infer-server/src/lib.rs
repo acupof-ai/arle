@@ -51,7 +51,8 @@ mod tokenizer;
 use execution::{ControlMessage, Submission, engine_loop};
 pub use execution::{CounterSnapshot, StreamItem};
 
-pub use coordinator::coordinator_router;
+pub use anthropic::messages_body_to_chat_request;
+pub use coordinator::{coordinator_router, set_messages_dump_dir};
 
 /// In-process channel for multimodal requests from coordinator → relay driver.
 pub struct LocalMultimodalRequest {

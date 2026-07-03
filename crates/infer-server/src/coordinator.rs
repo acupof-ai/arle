@@ -38,6 +38,40 @@ use crate::tokenizer::OpenAiTokenizer;
 /// Idle park on the submit channel; matches the in-process engine loop.
 const IDLE_PARK: Duration = Duration::from_millis(2);
 
+/// `--dump-messages-dir`: raw `/v1/messages` bodies land here as
+/// `<epoch_ms>_<seq>.json` (CC-trajectory capture). Unset = zero cost.
+static MESSAGES_DUMP: std::sync::OnceLock<(std::path::PathBuf, AtomicU64)> =
+    std::sync::OnceLock::new();
+
+/// Enable raw `/v1/messages` request dumping. Creates `dir`; call once at
+/// startup, before the router serves traffic. A second call is a no-op.
+pub fn set_messages_dump_dir(dir: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
+    let dir = dir.into();
+    std::fs::create_dir_all(&dir)?;
+    let _ = MESSAGES_DUMP.set((dir, AtomicU64::new(0)));
+    Ok(())
+}
+
+/// Fire-and-forget dump of one `/v1/messages` body (log-and-continue on error).
+fn dump_messages_body(body: &serde_json::Value) {
+    let Some((dir, seq)) = MESSAGES_DUMP.get() else {
+        return;
+    };
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let path = dir.join(format!(
+        "{epoch_ms}_{}.json",
+        seq.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = serde_json::to_vec(body)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&path, bytes));
+    if let Err(err) = result {
+        log::warn!("dump /v1/messages body to {} failed: {err}", path.display());
+    }
+}
+
 /// Cap on ticks broadcast beyond the slowest rank's [`RelayEnvelope::TickAck`].
 /// Pacing the tick stream to engine speed bounds the worker FIFO depth, so a
 /// mid-decode submission (or `StatsQuery`, which rides the same FIFO) waits
@@ -876,6 +910,7 @@ async fn anthropic_messages(
     State(state): State<Arc<CoordinatorHandle>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, MessagesError> {
+    dump_messages_body(&body);
     let request: MessagesRequest = serde_json::from_value(body)
         .map_err(|err| MessagesError::invalid_request(err.to_string()))?;
     request.validate()?;
