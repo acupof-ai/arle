@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include <cstdio>
 #include <cuda.h>
 #include <stdint.h>
 
@@ -1041,6 +1042,14 @@ __device__ void dsv4_compressor_update_body(
         if (denom > 0.0f) {
           acc /= denom;
         }
+      }
+      // #138 TEMP: self-gating — fires only when a finalized column is non-finite.
+      // max_logit non-finite => a score input (score_raw/pending/ape) is bad;
+      // denom==0 with finite max_logit => empty/masked block; else acc's raw KV
+      // input is bad. Pins the NaN source without a D2H. Revert after the run.
+      if (!isfinite(acc)) {
+        printf("[nan138b] block=%d col=%d ratio=%d has_prev=%d max_logit=%g denom=%g acc=%g\n",
+               block, col, ratio, has_prev_overlap, max_logit, denom, acc);
       }
       row[col] = acc;
     }
