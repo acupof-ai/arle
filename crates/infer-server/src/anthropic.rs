@@ -179,6 +179,13 @@ impl MessagesRequest {
     /// Map into the internal OpenAI chat request the existing machinery
     /// consumes (template render, sampling, tools gating). One Anthropic
     /// message may fan out into several internal messages (tool results).
+    ///
+    /// Claude Code sends `role:"system"` entries inside `messages[]`
+    /// (mid-conversation system messages). A leading one (with no top-level
+    /// `system`) becomes the system prompt; any other degrades to a user turn
+    /// wrapped in `<system-reminder>` — strict checkpoint templates (Qwen)
+    /// `raise_exception` on a non-first system message, and they tolerate
+    /// consecutive user turns, so degraded reminders stay separate messages.
     pub(crate) fn to_chat_request(&self) -> ChatCompletionRequest {
         let mut messages = Vec::new();
         if let Some(system) = &self.system {
@@ -187,7 +194,23 @@ impl MessagesRequest {
                 messages.push(text_message("system", text));
             }
         }
-        for message in &self.messages {
+        for (position, message) in self.messages.iter().enumerate() {
+            if message.role == "system" {
+                let text = match &message.content {
+                    MessageContent::Text(text) => text.clone(),
+                    MessageContent::Blocks(blocks) => join_text_blocks(blocks, "\n\n"),
+                };
+                // First entry with no top-level `system` = THE system prompt.
+                if position == 0 && messages.is_empty() {
+                    messages.push(text_message("system", text));
+                } else {
+                    messages.push(text_message(
+                        "user",
+                        format!("<system-reminder>\n{text}\n</system-reminder>"),
+                    ));
+                }
+                continue;
+            }
             match &message.content {
                 MessageContent::Text(text) => {
                     messages.push(text_message(&message.role, text.clone()));
@@ -786,6 +809,75 @@ mod tests {
         assert!(zero.validate().is_err(), "max_tokens=0 rejected");
         let empty = parse(json!({"max_tokens": 16, "messages": []}));
         assert!(empty.validate().is_err(), "empty messages rejected");
+    }
+
+    /// Claude Code sends `role:"system"` entries inside `messages[]`. A
+    /// leading one (no top-level `system`) is THE system prompt; mid-list ones
+    /// degrade to separate `<system-reminder>` user turns, and the result must
+    /// survive a strict Qwen-style template that rejects non-first system
+    /// messages (consecutive user turns are tolerated).
+    #[test]
+    fn mid_conversation_system_messages_degrade_to_reminders() {
+        let chat = parse(json!({
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "terse mode"},
+                {"role": "user", "content": "and?"},
+            ],
+        }))
+        .to_chat_request();
+        let roles: Vec<&str> = chat.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "user", "user"]);
+        assert_eq!(
+            chat.messages[1].content_text(),
+            "<system-reminder>\nterse mode\n</system-reminder>"
+        );
+        // Render gate: a strict template raising on non-first system messages
+        // (the Qwen rule) accepts the mapped conversation.
+        const STRICT: &str = "{%- for message in messages %}\
+            {%- if message.role == 'system' and not loop.first %}\
+            {{ raise_exception('System message must be at the beginning.') }}\
+            {%- endif %}\
+            {{- '<|' + message.role + '|>' + message.content }}\
+            {%- endfor %}";
+        let out =
+            crate::tokenizer::render_jinja(STRICT, "", "", &chat.messages, None, &[]).unwrap();
+        assert_eq!(
+            out,
+            "<|user|>hi<|user|><system-reminder>\nterse mode\n</system-reminder><|user|>and?"
+        );
+
+        // Leading system entry with no top-level `system` = the system prompt.
+        let leading = parse(json!({
+            "max_tokens": 16,
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "be terse"}]},
+                {"role": "user", "content": "hi"},
+            ],
+        }))
+        .to_chat_request();
+        let roles: Vec<&str> = leading.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user"]);
+        assert_eq!(leading.messages[0].content_text(), "be terse");
+
+        // With a top-level `system`, even a leading entry degrades to a reminder.
+        let both = parse(json!({
+            "max_tokens": 16,
+            "system": "top-level prompt",
+            "messages": [
+                {"role": "system", "content": "extra system"},
+                {"role": "user", "content": "hi"},
+            ],
+        }))
+        .to_chat_request();
+        let roles: Vec<&str> = both.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "user"]);
+        assert_eq!(both.messages[0].content_text(), "top-level prompt");
+        assert_eq!(
+            both.messages[1].content_text(),
+            "<system-reminder>\nextra system\n</system-reminder>"
+        );
     }
 
     #[test]
