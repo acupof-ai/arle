@@ -444,6 +444,11 @@ pub(crate) struct StreamEncoder {
     next_index: usize,
     /// Index of the currently-open text block, if any.
     text_index: Option<usize>,
+    /// Whitespace held back while NO text block is open: emitted only if
+    /// non-whitespace text follows, dropped at block/message boundaries — so a
+    /// stray newline around a tool call never opens a whitespace-only text
+    /// block (mirrors the non-streaming path's trim).
+    pending_ws: String,
 }
 
 impl StreamEncoder {
@@ -453,6 +458,7 @@ impl StreamEncoder {
             model,
             next_index: 0,
             text_index: None,
+            pending_ws: String::new(),
         }
     }
 
@@ -487,10 +493,17 @@ impl StreamEncoder {
     }
 
     /// Emit a text delta, opening a text content block first if none is open.
+    /// Whitespace that would OPEN a block is held until non-whitespace follows.
     pub(crate) fn text_delta(&mut self, text: &str) -> String {
         if text.is_empty() {
             return String::new();
         }
+        if self.text_index.is_none() && text.chars().all(char::is_whitespace) {
+            self.pending_ws.push_str(text);
+            return String::new();
+        }
+        let merged = format!("{}{text}", std::mem::take(&mut self.pending_ws));
+        let text = merged.as_str();
         let mut out = String::new();
         let index = match self.text_index {
             Some(index) => index,
@@ -521,6 +534,9 @@ impl StreamEncoder {
     }
 
     fn close_text(&mut self) -> String {
+        // Held whitespace never materialized into a block — drop it at the
+        // boundary so it can't leak into a later block.
+        self.pending_ws.clear();
         self.text_index.take().map_or_else(String::new, |index| {
             frame(
                 "content_block_stop",
@@ -944,6 +960,38 @@ mod tests {
         assert!(frames[9].1["delta"]["stop_sequence"].is_null());
         assert_eq!(frames[9].1["usage"]["output_tokens"], 7);
         assert_eq!(frames[10].1["type"], "message_stop");
+    }
+
+    /// Whitespace-only text never opens a block: a stray newline around a tool
+    /// call is dropped (like the non-streaming trim), while whitespace followed
+    /// by real text is preserved into the block's first delta.
+    #[test]
+    fn sse_block_opening_whitespace_is_held() {
+        let mut encoder = StreamEncoder::new("msg_t".to_string(), "m".to_string());
+        let mut raw = encoder.tool_use("bash", "{}");
+        assert_eq!(encoder.text_delta("\n"), "", "trailing newline held");
+        raw.push_str(&encoder.finish("tool_use", 3));
+        let events: Vec<String> = parse_frames(&raw)
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+            "no whitespace-only text block after the tool block"
+        );
+
+        // Held whitespace flushes into the first real delta of the next block.
+        let mut encoder = StreamEncoder::new("msg_t".to_string(), "m".to_string());
+        assert_eq!(encoder.text_delta("\n\n"), "");
+        let frames = parse_frames(&encoder.text_delta("Done."));
+        assert_eq!(frames[1].1["delta"]["text"], "\n\nDone.");
     }
 
     /// Finishing with an open text block closes it before message_delta.
