@@ -2365,20 +2365,10 @@ fn try_flashmla_prefill_attention(
                 .stream
                 .alloc_zeros::<half::bf16>(token_count * global_width)
                 .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP Q pack alloc failed: {e}"))?;
-            let mut full_out = ctx
+            let full_out = ctx
                 .stream
                 .alloc_zeros::<half::bf16>(token_count * global_width)
                 .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP output alloc failed: {e}"))?;
-            // Explicit on-stream zero before FlashMLA writes it (#138 prefill
-            // side): the sparse prefill kernel leaves empty-selection
-            // (position,head) slices unwritten, and the rank-slice then reads
-            // them — `alloc_zeros`'s memset may not be ordered on THIS stream
-            // vs the compute stream (initcheck flagged these as uninitialized
-            // reads), so a garbage/NaN pool tenant leaks through. Zero here,
-            // ctx.stream-ordered before the write, mirroring the decode fix.
-            ctx.stream
-                .memset_zeros(&mut full_out)
-                .map_err(|e| anyhow!("DSv4 FlashMLA prefill TP output zero failed: {e}"))?;
             let (gather_ptr, gather_guard) = gathered.device_ptr_mut(&ctx.stream);
             {
                 let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_allgather");
