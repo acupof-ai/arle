@@ -1019,7 +1019,6 @@ impl Dsv4SlotState {
     ///   captured CUDA-graph internal allocations are opaque to a byte sum.
     /// - `deepep_ll_scratch`: lives behind `#[cfg(feature = "deepep")]` and is
     ///   only `Some` when the NVSHMEM LL transport is booted; sized off-band.
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.device_bytes_breakdown().iter().map(|(_, b)| *b).sum()
     }
@@ -1599,6 +1598,56 @@ impl Dsv4Model {
         Dsv4SlotState::new(self, max_seq_len, slot_idx, kv_adapter)
     }
 
+    /// STATIC per-slot device bytes — exactly what one [`Dsv4SlotState::new`]
+    /// allocates, derived from config so [`Self::kv_budget_plan`] can size the
+    /// per-slot divisor BEFORE any slot (or `kv_adapter`) exists (chicken-and-egg:
+    /// the budget runs first). Single source of truth against per-slot
+    /// under-counting; the executor's post-slot-0 drift guard reconciles it with
+    /// the real `slots[0].device_bytes()`. MUST track `Dsv4SlotState::new` — the
+    /// spec_* terms gate on `spec_decode_on` exactly as the constructor does.
+    ///
+    /// EXCLUDES two per-slot terms that live OUTSIDE the slot struct (`kv_budget_plan`
+    /// adds them): the shared-scratch N-row batched-decode buffers and the
+    /// per-(slot,CSA-layer) DSA key-cache band. The FP8 MLA KV arena is drawn from
+    /// the shared pool, never the per-slot divisor.
+    pub(crate) fn per_slot_device_bytes(&self, max_seq_len: usize) -> Result<usize> {
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let rows = MAX_SPEC_VERIFY_ROWS;
+        let hidden = self.config.hidden_size;
+        let stream_dim = hidden * self.config.hc_mult;
+        let n = self.layers.len();
+        // attention(per-layer): Σ over layers + the start_pos scalar.
+        let mut total = std::mem::size_of::<i32>();
+        for layer in &self.layers {
+            total =
+                total.saturating_add(crate::attention::Dsv4LayerAttentionState::device_bytes_for(
+                    &self.config,
+                    layer.mode,
+                    layer.compress_ratio,
+                    max_seq_len,
+                )?);
+        }
+        if self.spec_decode_on {
+            // spec_rings: one uniform snapshot per layer.
+            let ring = crate::attention::Dsv4SpecRingSnapshot::device_bytes_for(
+                &self.config,
+                &self.kv_arena,
+            )?;
+            total = total.saturating_add(n.saturating_mul(ring));
+            // spec_normed: per layer HiddenStates[hidden, rows].
+            total = total.saturating_add(n.saturating_mul(hidden * rows * bf16));
+            // spec_verify: embeddings + initial_stream, then per layer 7 row-major
+            // temporaries (5 hidden-wide + 2 stream-wide), all `rows` columns. This
+            // is the dominant per-slot term the old budget missed entirely.
+            let verify_scratch = (hidden + stream_dim) * rows * bf16;
+            let verify_per_layer = (5 * hidden + 2 * stream_dim) * rows * bf16;
+            total = total
+                .saturating_add(verify_scratch)
+                .saturating_add(n.saturating_mul(verify_per_layer));
+        }
+        Ok(total)
+    }
+
     /// Clamp `requested` decode slots to what the KV budget affords, from
     /// `cudaMemGetInfo() × MEM_FRACTION ÷ per-slot KV bytes`. This is the dynamic-mem-budget
     /// fix for the c=32 OOM CRASH (root cause: a fixed `num_slots` whose arena alloc OOMs at
@@ -1624,10 +1673,6 @@ impl Dsv4Model {
         max_seq_len: usize,
     ) -> Result<Dsv4KvBudgetPlan> {
         const MEM_FRACTION: f64 = 0.9;
-        const PER_SLOT_OVERHEAD_X: usize = 2;
-        let arena_per_slot = max_seq_len
-            .saturating_mul(self.kv_arena.bytes_per_token)
-            .saturating_mul(self.kv_arena.num_layers);
         // Official-DSA selector memory splits into the ONE model-wide shared
         // scratch (a fixed subtraction from the budget) and the per-(slot,
         // CSA-layer) transient rotated_keys staging (a per-slot term). #67.
@@ -1702,65 +1747,33 @@ impl Dsv4Model {
                 )
             })
             .sum();
-        // Per-slot stateful selector/compressor caches, itemized per layer:
-        // rotated_keys + DSA key-cache band (CSA only), compressor compressed
-        // cache (every cr>0 layer, head_dim wide) + indexer compressed cache
-        // (CSA, index_head_dim wide). All scale with max_seq/cr.
-        let mut dsa_rotated_per_slot: usize = 0;
-        let mut state_caches_per_slot: usize = 0;
-        for layer in &self.layers {
-            // SlidingWindow: no compressor, no indexer — skip. (GLM SparseIndexed
-            // has compress_ratio==0 but DOES run the indexer, so it must NOT skip;
-            // gate on the mode, not on compress_ratio==0.)
-            if !layer.mode.has_compressor() && !layer.mode.has_indexer() {
-                continue;
-            }
-            // GLM SparseIndexed: full-sequence indexer, every token a key (ratio=1,
-            // no compressor). CompressedSparse/HCA keep their real compress_ratio.
-            let index_ratio = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
-                1
-            } else {
-                layer.compress_ratio
-            };
-            // MAIN compressor compressed-key cache (CSA/HCA only, head_dim wide).
-            // GLM SparseIndexed has no main compressor — skip this term entirely.
-            if layer.mode.has_compressor() {
-                let cc = max_seq_len.div_ceil(layer.compress_ratio).max(1);
-                state_caches_per_slot = state_caches_per_slot
-                    .saturating_add(cc.saturating_mul(self.config.head_dim).saturating_mul(2));
-            }
-            // Indexer terms (CSA + GLM SparseIndexed): index_head_dim compressed
-            // cache + (official) rotated_keys + DSA key-cache band, all at
-            // index_ratio (=1 for GLM, full-length).
-            if layer.mode.has_indexer() {
-                let index_cc = max_seq_len.div_ceil(index_ratio).max(1);
-                let index_band_rows = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
-                    crate::attention::dsv4_indexer_staging_ring_rows().min(index_cc)
-                } else {
-                    index_cc
-                };
-                state_caches_per_slot = state_caches_per_slot.saturating_add(
-                    index_band_rows
-                        .saturating_mul(self.config.index_head_dim)
-                        .saturating_mul(2),
-                );
-                if official_on {
-                    dsa_rotated_per_slot = dsa_rotated_per_slot.saturating_add(
-                        crate::attention::dsv4_dsa_rotated_keys_bytes(
-                            &self.config,
-                            index_ratio,
-                            max_seq_len,
-                        ),
-                    );
-                    state_caches_per_slot = state_caches_per_slot.saturating_add(
-                        crate::attention::dsv4_dsa_key_cache_bytes(
-                            &self.config,
-                            index_ratio,
-                            max_seq_len,
-                        )
-                        .unwrap_or(0),
-                    );
+        // TRUE per-slot cost = the slot struct itself (statically — no slot exists
+        // yet). Fixes the 43→382 MB under-count — the old hand-roll missed
+        // spec_verify, the dominant term — that ran `affordable` ~9× high.
+        let slot_state_bytes = self.per_slot_device_bytes(max_seq_len)?;
+        // Per-(slot,CSA-layer) DSA key-cache band lives in `Dsv4LayerKvLayout`
+        // (`dsa_slot_bytes × num_slots`), NOT the slot struct, so it is a per-slot
+        // budget term on top of `slot_state_bytes`. Official-gated to match the
+        // pool alloc gate (`dsv4_dsa_key_cache_bytes`; index_ratio=1 for GLM).
+        let mut dsa_key_cache_per_slot: usize = 0;
+        if official_on {
+            for layer in &self.layers {
+                if !layer.mode.has_indexer() {
+                    continue;
                 }
+                let index_ratio = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    1
+                } else {
+                    layer.compress_ratio
+                };
+                dsa_key_cache_per_slot = dsa_key_cache_per_slot.saturating_add(
+                    crate::attention::dsv4_dsa_key_cache_bytes(
+                        &self.config,
+                        index_ratio,
+                        max_seq_len,
+                    )
+                    .unwrap_or(0),
+                );
             }
         }
         // The N-row batched-decode DSA scratch (`*_batch` buffers inside the ONE
@@ -1776,8 +1789,8 @@ impl Dsv4Model {
             ),
             _ => 0,
         };
-        let per_slot = dsa_rotated_per_slot
-            .saturating_add(state_caches_per_slot)
+        let per_slot = slot_state_bytes
+            .saturating_add(dsa_key_cache_per_slot)
             .saturating_add(dsa_batched_per_slot);
         let (affordable_local, pool_budget_bytes_per_layer_local): (i32, usize) =
             match cudarc::driver::result::mem_get_info() {
@@ -1804,19 +1817,20 @@ impl Dsv4Model {
                     let pool_budget_bytes_per_layer =
                         pool_budget_total / self.kv_arena.num_layers.max(1);
                     log::info!(
-                        "DSv4 KV budget: free {}MB, per_slot {}MB (arena×2 {}MB moved to shared pool + rotated {}MB + \
-                         state caches {}MB), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
-                         shared MLA decode {}MB, pool_per_layer {}MB",
+                        "DSv4 KV budget: free {}MB, per_slot {}MB (slot-state {}MB + DSA key-cache {}MB + DSA batched {}MB; \
+                         FP8 arena in shared pool), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
+                         shared MLA decode {}MB, pool_per_layer {}MB, affordable {}",
                         free >> 20,
                         per_slot >> 20,
-                        arena_per_slot.saturating_mul(PER_SLOT_OVERHEAD_X) >> 20,
-                        dsa_rotated_per_slot >> 20,
-                        state_caches_per_slot >> 20,
+                        slot_state_bytes >> 20,
+                        dsa_key_cache_per_slot >> 20,
+                        dsa_batched_per_slot >> 20,
                         dsa_shared_bytes >> 20,
                         moe_decode_shared_bytes >> 20,
                         shared_expert_scratch_bytes >> 20,
                         mla_decode_bytes >> 20,
                         pool_budget_bytes_per_layer >> 20,
+                        affordable,
                     );
                     (affordable, pool_budget_bytes_per_layer)
                 }
@@ -1852,13 +1866,11 @@ impl Dsv4Model {
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
         if clamped {
             log::warn!(
-                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (shared-pool path: arena moved out of divisor; \
-                 per-slot selector/compressor caches ~{}MB) + shared DSA scratch ~{}MB exceeds the \
-                 cross-rank-min affordable {affordable} (local affordable {affordable_local}, \
-                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
+                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (slot-state {}MB + DSA key-cache/batched; \
+                 FP8 arena out of divisor) exceeds the cross-rank-min affordable {affordable} \
+                 (local affordable {affordable_local}, {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
                 per_slot >> 20,
-                dsa_rotated_per_slot.saturating_add(state_caches_per_slot) >> 20,
-                dsa_shared_bytes >> 20,
+                slot_state_bytes >> 20,
             );
         }
         Ok(Dsv4KvBudgetPlan {
