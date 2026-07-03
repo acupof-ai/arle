@@ -1704,14 +1704,12 @@ impl QwenCudaExecutor {
 
     /// Sample the next token from the captured graph's fixed logits buffer.
     /// Sampling stays outside the graph (replay ends at `decode_ctx.logits`).
-    fn sample_decode_logits(&mut self, params: &SamplingParams, position: u64) -> Result<u32> {
-        let ctx = &self.model.ctx;
+    fn sample_decode_logits(&self, params: &SamplingParams, position: u64) -> Result<u32> {
         let decode_ctx = self
             .decode_ctx
-            .as_mut()
+            .as_ref()
             .expect("decode_ctx present when sampling captured logits");
-        // Qwen dense has no input-only suppressed tokens ⇒ `&[]` no-op mask.
-        sample_cuda_token(ctx, &mut decode_ctx.logits, params, position, &[])
+        sample_cuda_token(&self.model.ctx, &decode_ctx.logits, params, position)
     }
 
     /// Loud-error continuity guard replacing the old device-allocator
@@ -5269,38 +5267,12 @@ impl Qwen35CudaExecutor {
     }
 }
 
-/// Mask input-only special tokens the model must never emit (e.g. DSv4 BOS /
-/// User / Assistant / `<｜image｜>`) by writing -inf into their bf16 logit slots
-/// before selection — an input-only token has no learned continuation, so once
-/// the decode distribution flattens it wins and the model spirals into an
-/// infinite repeat. This runs ahead of both the device argmax (greedy) and the
-/// host copy (non-greedy), so every path skips them. An empty set is a true
-/// no-op (zero device writes), so every non-DSv4 caller stays byte-identical.
-fn mask_suppressed(ctx: &DeviceContext, logits: &mut DeviceVec, suppressed: &[u32]) -> Result<()> {
-    if suppressed.is_empty() {
-        return Ok(());
-    }
-    for &id in suppressed {
-        let id = id as usize;
-        if id >= logits.len {
-            continue;
-        }
-        let mut slot = logits.data.slice_mut(id..id + 1);
-        ctx.stream
-            .memcpy_htod(&[half::bf16::NEG_INFINITY], &mut slot)
-            .map_err(|e| anyhow::anyhow!("suppressed-token mask write failed: {e}"))?;
-    }
-    Ok(())
-}
-
 pub(crate) fn sample_cuda_token(
     ctx: &DeviceContext,
-    logits: &mut DeviceVec,
+    logits: &DeviceVec,
     params: &SamplingParams,
     position: u64,
-    suppressed: &[u32],
 ) -> Result<u32> {
-    mask_suppressed(ctx, logits, suppressed)?;
     maybe_dump_sample_topk(ctx, logits, position)?;
     if params.is_greedy() {
         let token = argmax(ctx, logits)?;
@@ -5323,13 +5295,11 @@ pub(crate) fn sample_cuda_token(
 /// OUTSIDE any CUDA-graph capture (argmax syncs + reads D2H).
 pub(crate) fn sample_cuda_token_scratched(
     ctx: &DeviceContext,
-    logits: &mut DeviceVec,
+    logits: &DeviceVec,
     params: &SamplingParams,
     position: u64,
     argmax_out: &mut cudarc::driver::CudaSlice<i32>,
-    suppressed: &[u32],
 ) -> Result<u32> {
-    mask_suppressed(ctx, logits, suppressed)?;
     maybe_dump_sample_topk(ctx, logits, position)?;
     if params.is_greedy() {
         let token = crate::ops::argmax_into(ctx, logits, argmax_out)?;
