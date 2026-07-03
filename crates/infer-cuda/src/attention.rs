@@ -2211,44 +2211,6 @@ fn try_flashmla_prefill_attention(
         }
     }
 
-    // TEMP #138 probe (self-gating; revert after the run): segment-wise NaN
-    // scan of the packed unified KV + its sources at every prefill chunk.
-    // Attributes which region (SW ring / current chunk / compressed staging /
-    // q) carries the NaN that FlashMLA propagates from context >=129.
-    if env_flag("ARLE_DSV4_PREFILL_KV_NAN_PROBE")? {
-        ctx.sync()?;
-        let d = config.head_dim;
-        let seg = |v: &[half::bf16]| {
-            let nan = v.iter().filter(|x| x.to_f32().is_nan()).count();
-            let first = v
-                .chunks(d)
-                .position(|row| row.iter().any(|x| x.to_f32().is_nan()));
-            (nan, first)
-        };
-        let kv_host = ctx.stream.clone_dtoh(&kv_unified.data)?;
-        let sw_end = config.sliding_window * d;
-        let chunk_end = (config.sliding_window + token_count) * d;
-        let (sw_n, sw_f) = seg(&kv_host[..sw_end]);
-        let (ck_n, ck_f) = seg(&kv_host[sw_end..chunk_end]);
-        let (cp_n, cp_f) = seg(&kv_host[chunk_end..]);
-        let (q_n, q_f) = seg(&ctx.stream.clone_dtoh(&q_prepared.data)?);
-        let (ring_n, ring_f) = seg(&ctx.stream.clone_dtoh(&*sw_window_cache)?);
-        let (src_n, src_f) = match compressed.filter(|_| compressed_count > 0) {
-            Some(c) => seg(&ctx.stream.clone_dtoh(&c.data)?),
-            None => (0, None),
-        };
-        // Pre-format to ONE string => one write syscall: unbuffered stderr writes
-        // each format fragment separately, and 4 TP ranks sharing the log fd
-        // interleave at fragment boundaries. pid tags the rank stream.
-        let line = format!(
-            "[kvprobe] pid={} mode={mode:?} cr={compress_ratio} start_pos={start_pos} n={token_count} C={compressed_count} \
-             kv[sw]={sw_n}@{sw_f:?} kv[chunk]={ck_n}@{ck_f:?} kv[comp]={cp_n}@{cp_f:?} \
-             src ring={ring_n}@{ring_f:?} comp={src_n}@{src_f:?} q={q_n}@{q_f:?}\n",
-            std::process::id()
-        );
-        eprint!("{line}");
-    }
-
     let mut indices = ctx
         .stream
         .alloc_zeros::<i32>(token_count * topk_unified)
@@ -4679,6 +4641,12 @@ fn glm_absorb_q(
              wired: needs a batched-head bf16 GEMM. Decode (token_count==1) is exact."
         );
     }
+    // Raw bf16 read (per-head GEMM): quantized `.data` is a dummy — #138 OOB class.
+    ensure!(
+        w_kc.is_dense_bf16(),
+        "GLM w_kc must be dense bf16 (raw-read per-head GEMM); got {:?}",
+        w_kc.weight_format
+    );
     let mut q_absorbed = HiddenStates::zeros(ctx, local_heads * head_dim, token_count)?;
     let stream = ctx.stream.cu_stream();
     // Phase 1: per-head q_nope · w_kc → q_latent (raw pointers; guards scoped here).
@@ -4769,6 +4737,12 @@ fn glm_absorb_v(
              wired: needs a batched-head bf16 GEMM. Decode (token_count==1) is exact."
         );
     }
+    // Raw bf16 read (per-head GEMM): quantized `.data` is a dummy — #138 OOB class.
+    ensure!(
+        w_vc.is_dense_bf16(),
+        "GLM w_vc must be dense bf16 (raw-read per-head GEMM); got {:?}",
+        w_vc.weight_format
+    );
     let mut v_out = HiddenStates::zeros(ctx, local_heads * v_head, token_count)?;
     let stream = ctx.stream.cu_stream();
     // Per-head attn_out · w_vc → v (raw pointers; guards scoped to drop before return).
@@ -7496,6 +7470,13 @@ fn compressor_forward(
     } else {
         (0, config.compress_rope_theta)
     };
+    // Raw bf16 read: on a quantized matrix `.data` is a 1-element dummy (bytes
+    // live in qweight) — the #138 OOB class. The loader dequants ape to dense.
+    ensure!(
+        compressor.ape.is_dense_bf16(),
+        "DSv4 compressor ape must be dense bf16 (raw-read by the update kernel); got {:?}",
+        compressor.ape.weight_format
+    );
     {
         let (kv_ptr, _kg) = kv_raw.data.device_ptr(&ctx.stream);
         let (score_ptr, _scg) = score_raw.data.device_ptr(&ctx.stream);
@@ -7582,28 +7563,6 @@ fn compressor_forward(
     // accepted-prefix commit re-forward (non-frozen) advances it for real.
     if !dsv4_verify_frozen() {
         state.compressed.seq_len = compressed_rows;
-    }
-    // TEMP #138 probe v2 (self-gating; revert with d4dccfc6): scan the
-    // compressor projection outputs and the staging right after the fold —
-    // splits projection-NaN vs fold-NaN vs post-fold clobber. Prefill only.
-    if token_count > 1 && env_flag("ARLE_DSV4_PREFILL_KV_NAN_PROBE")? {
-        ctx.sync()?;
-        let seg = |v: &[half::bf16], d: usize| {
-            let nan = v.iter().filter(|x| x.to_f32().is_nan()).count();
-            let first = v
-                .chunks(d.max(1))
-                .position(|r| r.iter().any(|x| x.to_f32().is_nan()));
-            (nan, first)
-        };
-        let (kv_n, kv_f) = seg(&ctx.stream.clone_dtoh(&kv_raw.data)?, width);
-        let (sc_n, sc_f) = seg(&ctx.stream.clone_dtoh(&score_raw.data)?, width);
-        let (st_n, st_f) = seg(&ctx.stream.clone_dtoh(&state.compressed.data)?, head_dim);
-        let line = format!(
-            "[cprobe] pid={} ratio={ratio} start_pos={start_pos} n={token_count} rows={compressed_rows} \
-             kv={kv_n}@{kv_f:?} score={sc_n}@{sc_f:?} staging={st_n}@{st_f:?}\n",
-            std::process::id()
-        );
-        eprint!("{line}");
     }
     Ok(())
 }
@@ -8197,6 +8156,12 @@ pub(crate) fn dsv4_compressor_update_batched(
     // push below (the SyncOnDrop guards would otherwise borrow the arrays past the
     // move into `ptr_keepalive`). The raw u64 ptrs stay valid — the buffers are not
     // reallocated; single-stream ordering keeps the launched kernel correct.
+    // Same raw-read contract as the per-row path: ape must be dense bf16 (#138).
+    ensure!(
+        compressor.ape.is_dense_bf16(),
+        "DSv4 compressor ape must be dense bf16 (raw-read by the batched update kernel); got {:?}",
+        compressor.ape.weight_format
+    );
     {
         let (kv_ptr, kg) = kv_raw_batch.data.device_ptr(&ctx.stream);
         let (score_ptr, scg) = score_raw_batch.data.device_ptr(&ctx.stream);

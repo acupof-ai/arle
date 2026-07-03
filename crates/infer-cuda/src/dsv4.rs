@@ -107,8 +107,10 @@ impl Dsv4MlaKvArena {
 
 /// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
 /// wide hidden into the compressed-key latent stream the sparse attention reads.
-/// `wkv`/`wgate`/`ape` may be FP8/FP4 block-scaled or bf16 (`dsv4_linear`
-/// dispatches on `weight_format`); `norm` is bf16.
+/// `wkv`/`wgate` may be FP8/FP4 block-scaled or bf16 (`dsv4_linear` dispatches on
+/// `weight_format`); `ape` is ALWAYS dense bf16 — the update kernel raw-reads its
+/// `.data`, which on a quantized matrix is a 1-element dummy (#138 OOB); the
+/// loader dequants it. `norm` is bf16.
 pub(crate) struct Dsv4Compressor {
     pub wkv: DeviceMatrix,
     pub wgate: DeviceMatrix,
