@@ -234,8 +234,7 @@ impl CudaModel {
             &last_normed,
             &mut logits,
         )?;
-        // Qwen dense has no input-only suppressed tokens ⇒ `&[]` no-op mask.
-        sample_cuda_token(&self.ctx, &mut logits, params, position, &[])
+        sample_cuda_token(&self.ctx, &logits, params, position)
     }
 
     /// Batched decode forward (BF16, single-GPU): run `tokens.len() == B`
@@ -397,10 +396,9 @@ impl CudaModel {
             )?;
             out.push(sample_cuda_token(
                 &self.ctx,
-                &mut logits,
+                &logits,
                 &params[row],
                 positions[row],
-                &[],
             )?);
         }
         Ok(out)
@@ -553,7 +551,7 @@ impl CudaModel {
             &last_normed,
             &mut logits,
         )?;
-        let token = sample_cuda_token(&self.ctx, &mut logits, params, position, &[])?;
+        let token = sample_cuda_token(&self.ctx, &logits, params, position)?;
         Ok((token, layer0_query))
     }
 

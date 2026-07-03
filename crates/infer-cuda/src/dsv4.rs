@@ -1268,18 +1268,6 @@ impl std::fmt::Debug for Dsv4Model {
 }
 
 impl Dsv4Model {
-    /// Input-only special tokens the sampler must mask to -inf so decode never
-    /// emits them (they have no learned continuation and otherwise trigger a
-    /// repeat-spiral once the distribution flattens). `&'static` — no per-call
-    /// alloc. GLM is the same arch family but ships a distinct (currently empty)
-    /// set; branch on the loaded checkpoint's tensor dialect.
-    pub(crate) fn suppressed_token_ids(&self) -> &'static [u32] {
-        match self.config.tensor_dialect {
-            deepseek_spec::v4::TensorDialect::Glm => deepseek_spec::glm::GLM_SUPPRESSED_TOKEN_IDS,
-            deepseek_spec::v4::TensorDialect::Dsv4 => deepseek_spec::v4::DSV4_SUPPRESSED_TOKEN_IDS,
-        }
-    }
-
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
     /// caps decode_rows + prefill chunk tokens to this so the LL dispatch buffer
@@ -4541,7 +4529,7 @@ impl Dsv4Model {
         })?;
         keepalive.keep_vec(&logits);
         let token = crate::stage_profile::profile(ctx, "dsv4/stage/sample", || {
-            self.sample_logits(&mut logits, params, position)
+            self.sample_logits(&logits, params, position)
         })?;
         Ok(token)
     }
@@ -4551,24 +4539,15 @@ impl Dsv4Model {
     /// lm_head is active (`logits` then hold this rank's padded slice).
     fn sample_logits(
         &self,
-        logits: &mut DeviceVec,
+        logits: &DeviceVec,
         params: &SamplingParams,
         position: u64,
     ) -> Result<u32> {
         match &self.lm_head_shard {
-            // Vocab-sharded lm_head (opt-in `ARLE_DSV4_LM_HEAD_SHARD=1`): logits
-            // hold only this rank's slice, so the input-only mask is not applied
-            // here (the served DSv4-Flash default uses the full-vocab arm below).
             Some(shard) => crate::executor::sample_cuda_token_vocab_sharded(
                 &self.ctx, &self.tp, logits, shard, params, position,
             ),
-            None => crate::executor::sample_cuda_token(
-                &self.ctx,
-                logits,
-                params,
-                position,
-                self.suppressed_token_ids(),
-            ),
+            None => crate::executor::sample_cuda_token(&self.ctx, logits, params, position),
         }
     }
 
@@ -6376,7 +6355,7 @@ impl Dsv4Model {
         }
 
         slot.seq_len += 1;
-        self.sample_logits(&mut graph.logits, params, position)
+        self.sample_logits(&graph.logits, params, position)
     }
 
     /// Project the final hidden vector through the LM head into `logits`. The
