@@ -566,6 +566,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_mention_without_payload_stays_text() {
+        // A literal `<tool_call>` in prose with no JSON payload after it is a
+        // mention, not a call — the tail must not be swallowed.
+        let text = "The <tool_call> XML tag wraps a JSON payload the model emits.";
+        let (content, calls) = openai_parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn nameless_tool_call_payload_stays_text() {
+        // Example JSON without a `name` is unroutable — prose about tool
+        // calls, not a call; the block stays visible verbatim.
+        let text =
+            "Example: <tool_call>\n{\"arguments\":{\"city\":\"Paris\"}}\n</tool_call> shape.";
+        let (content, calls) = openai_parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(content, text);
+    }
+
+    #[test]
     fn invalid_openai_tool_arguments_fall_back_to_string() {
         let prompt = openai_messages_to_prompt(
             &[OpenAiChatMessage {
