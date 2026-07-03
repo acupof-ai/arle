@@ -1,12 +1,10 @@
 // BF16 grouped expert GEMM kernels for the Qwen3.5-MoE / Qwen3.6 single-GPU
 // SOTA-grouped MoE path (permute -> grouped GEMM -> combine).
 //
-// These mirror the *structure* of the DSv4 FP8 grouped GEMM kernels in
-// dsv4_grouped_gemm.cu (M-axis grouping by expert via per-expert
-// offsets/counts, CUDA-core warp-reduce, DSV4_BATCH_TILE=32-way M reuse,
-// no tensor-core / mma => sm_70-safe). The only difference is the weight
-// element type: BF16 (`__nv_bfloat16`) instead of FP8 E4M3 + E8M0 block
-// scales, so there is no quant decode — just `__bfloat162float` MAC.
+// Structure: M-axis grouping by expert via per-expert offsets/counts,
+// CUDA-core warp-reduce, 32-way M-tile weight reuse, no tensor-core / mma
+// => sm_70-safe. Weight element type is BF16 (`__nv_bfloat16`), so there
+// is no quant decode — just `__bfloat162float` MAC.
 //
 // Layout (token-major, identical to the DSv4 packed grouped buffers):
 //   input    : [num_routes, K]   (each route = one (token, expert) pair's
@@ -19,14 +17,12 @@
 //                    null => identity (expert e uses weight_ptrs[e]).
 //
 // The pair variant computes gate (a) and up (b) outputs from the same input
-// row in one pass for ~2x input-bandwidth saving — matches the DSv4 pair
-// kernel and the way the Rust orchestration pairs gate_proj + up_proj.
+// row in one pass for ~2x input-bandwidth saving — matches the way the Rust
+// orchestration pairs gate_proj + up_proj.
 //
 // W4 nibble-decode variant is an explicit follow-up (the Qwen3.6 production
 // checkpoint ships 4-bit experts); this BF16 path is correctness-first and
 // runs on tiny-random/qwen3.5-moe (BF16 HF safetensors).
-//
-// Refs: crates/cuda-kernels/csrc/gemm/dsv4_grouped_gemm.cu (FP8 template)
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

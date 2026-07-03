@@ -214,51 +214,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn dsv4_fp8_gemv_cuda(
-        weight: *const u8,
-        scales: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp4_gemv_cuda(
-        weight: *const u8,
-        scales: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn dsv4_fp8_gemv_batch_cuda(
-        weight: *const u8,
-        scales: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // GAP-A CUTLASS-MMA path for FP8E4M3 batched GEMV (decode shape B <= 16).
-    // Mirrors `dsv4_fp8_gemv_batch_cuda` arg order/types. Self-gates on
-    // N%8 / K%16 and returns a non-success CUresult for shapes it can't tile
-    // (caller falls back to the scalar kernel). The runtime dispatch shim
-    // lives in `quantized_gemv.cu::dsv4_fp8_gemv_batch_cuda` behind the
-    // `ARLE_DSV4_FP8_GEMV_MMA` env knob; this decl exists so the parity test
-    // (and any future direct caller) can invoke the MMA launch explicitly.
-    pub fn dsv4_fp8_gemv_batch_mma_launch(
         weight: *const u8,
         scales: *const u8,
         input: *const Half,
@@ -441,55 +397,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn dsv4_fp8_gemv_pair_batch_cuda(
-        weight_a: *const u8,
-        scales_a: *const u8,
-        weight_b: *const u8,
-        scales_b: *const u8,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp4_gemv_pair_batch_cuda(
-        weight_a: *const u8,
-        scales_a: *const u8,
-        weight_b: *const u8,
-        scales_b: *const u8,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp8_grouped_gemv_batch_cuda(
-        weight_ptrs: *const u64,
-        scale_ptrs: *const u64,
-        input: *const Half,
-        output: *mut Half,
-        offsets: *const i32,
-        counts: *const i32,
-        expert_indices: *const i32,
-        num_experts: i32,
-        max_count: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn dsv4_fp8_grouped_swiglu_decode_cuda(
         weight_gate_ptrs: *const u64,
         scale_gate_ptrs: *const u64,
@@ -521,103 +428,6 @@ unsafe extern "C" {
         max_count: i32,
         n: i32,
         k: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp4_grouped_gemv_batch_cuda(
-        weight_ptrs: *const u64,
-        scale_ptrs: *const u64,
-        input: *const Half,
-        output: *mut Half,
-        offsets: *const i32,
-        counts: *const i32,
-        expert_indices: *const i32,
-        num_experts: i32,
-        max_count: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp8_grouped_gemv_pair_batch_cuda(
-        weight_a_ptrs: *const u64,
-        scale_a_ptrs: *const u64,
-        weight_b_ptrs: *const u64,
-        scale_b_ptrs: *const u64,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        offsets: *const i32,
-        counts: *const i32,
-        expert_indices: *const i32,
-        num_experts: i32,
-        max_count: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp4_grouped_gemv_pair_batch_cuda(
-        weight_a_ptrs: *const u64,
-        scale_a_ptrs: *const u64,
-        weight_b_ptrs: *const u64,
-        scale_b_ptrs: *const u64,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        offsets: *const i32,
-        counts: *const i32,
-        expert_indices: *const i32,
-        num_experts: i32,
-        max_count: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // GEMM-shape grouped variants (M-tile = DSV4_BATCH_TILE = 32 weight reuse).
-    // Use when caller knows max_count >= 4. See
-    // docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md.
-    pub fn dsv4_fp8_grouped_gemm_batch_cuda(
-        weight_ptrs: *const u64,
-        scale_ptrs: *const u64,
-        input: *const Half,
-        output: *mut Half,
-        offsets: *const i32,
-        counts: *const i32,
-        expert_indices: *const i32,
-        num_experts: i32,
-        max_count: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp8_grouped_gemm_pair_batch_cuda(
-        weight_a_ptrs: *const u64,
-        scale_a_ptrs: *const u64,
-        weight_b_ptrs: *const u64,
-        scale_b_ptrs: *const u64,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        offsets: *const i32,
-        counts: *const i32,
-        expert_indices: *const i32,
-        num_experts: i32,
-        max_count: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
         scale_cols: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -725,44 +535,6 @@ unsafe extern "C" {
         scale_rows: i32,
         scale_cols: i32,
         apply_route_weight: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp8_route_gemv_pair_batch_cuda(
-        weight_a_ptrs: *const u64,
-        scale_a_ptrs: *const u64,
-        weight_b_ptrs: *const u64,
-        scale_b_ptrs: *const u64,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        route_meta: *const i32,
-        local_expert_start: i32,
-        experts_per_rank: i32,
-        num_routes: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fp4_route_gemv_pair_batch_cuda(
-        weight_a_ptrs: *const u64,
-        scale_a_ptrs: *const u64,
-        weight_b_ptrs: *const u64,
-        scale_b_ptrs: *const u64,
-        input: *const Half,
-        output_a: *mut Half,
-        output_b: *mut Half,
-        route_meta: *const i32,
-        local_expert_start: i32,
-        experts_per_rank: i32,
-        num_routes: i32,
-        n: i32,
-        k: i32,
-        scale_rows: i32,
-        scale_cols: i32,
         stream: CUstream,
     ) -> CUresult;
 

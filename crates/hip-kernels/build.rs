@@ -16,24 +16,19 @@ use std::process::Command;
 /// asm volatile`) and use only shim-covered CUDA APIs:
 /// - `misc/norm.cu`: bf16 conversions + `__ldg` only.
 /// - `misc/sampling.cu`: `__shfl_down_sync` full-mask reductions (shim-mapped).
-/// - `gemm/quantized_gemv.cu`: `__shfl_xor_sync` + bf16/fp8 includes; its
-///   `dsv4_fp8_gemv_batch_mma_launch` extern lives in `quantized_gemv_mma.cu`
-///   (PTX `mma.sync` asm — NOT portable), so `csrc/quantized_gemv_mma_stub.cu`
-///   satisfies the symbol and forces the scalar fallback path.
+/// - `gemm/quantized_gemv.cu`: `__shfl_xor_sync` + bf16/fp8 includes.
 ///
 /// Excluded: `gemm/gemv.cu` — depends on cuBLAS/cuBLASLt (`cublasGemmEx`,
 /// `cublasLtMatmul`, autotune cache); the HIP GEMM lane is hipBLASLt per the
 /// plan §3, not a shim port.
 const SOURCES: &[&str] = &[
     "crates/hip-kernels/csrc/iq2_mmvq.cu",
-    "crates/hip-kernels/csrc/quantized_gemv_mma_stub.cu",
     "crates/cuda-kernels/csrc/misc/dsv4_attention.cu",
     "crates/cuda-kernels/csrc/misc/dsv4_mhc.cu",
     "crates/cuda-kernels/csrc/misc/elementwise_basic.cu",
     "crates/cuda-kernels/csrc/misc/norm.cu",
     "crates/cuda-kernels/csrc/misc/sampling.cu",
     "crates/cuda-kernels/csrc/attention/decode_prep_paged.cu",
-    "crates/cuda-kernels/csrc/gemm/dsv4_grouped_gemm.cu",
     "crates/cuda-kernels/csrc/gemm/moe_grouped_gemm.cu",
     "crates/cuda-kernels/csrc/gemm/quantized_gemv.cu",
 ];

@@ -501,36 +501,6 @@ extern "C" CUresult dsv4_prepare_qk_start_pos_ptr_cuda(
   return (CUresult)cudaGetLastError();
 }
 
-extern "C" CUresult dsv4_prepare_qk_fused_cuda(
-    const uint16_t *q_raw,
-    const uint16_t *k_raw,
-    uint16_t *q_out,
-    uint16_t *k_out,
-    int num_tokens,
-    int local_heads,
-    int head_dim,
-    int rope_dim,
-    int start_pos,
-    float rms_eps,
-    float rope_base,
-    int original_seq_len,
-    float factor,
-    float beta_fast,
-    float beta_slow,
-    CUstream stream) {
-  if (num_tokens < 0 || local_heads <= 0 || head_dim <= 0 || rope_dim < 0 ||
-      rope_dim > head_dim || start_pos < 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (num_tokens == 0) return CUDA_SUCCESS;
-  int rows = num_tokens * (local_heads + 1);
-  dsv4_prepare_qk_fused_kernel<<<rows, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
-      q_raw, k_raw, q_out, k_out, num_tokens, local_heads, head_dim, rope_dim,
-      start_pos, nullptr, rms_eps, rope_base, original_seq_len, factor, beta_fast,
-      beta_slow);
-  return (CUresult)cudaGetLastError();
-}
-
 extern "C" CUresult dsv4_prepare_qk_fused_start_pos_ptr_cuda(
     const uint16_t *q_raw,
     const uint16_t *k_raw,
