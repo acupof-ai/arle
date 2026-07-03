@@ -1520,6 +1520,23 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
     pub(crate) rollout_temperature: f32,
 
+    /// Enable Qwen3.x thinking for ALL rollouts (train + rescue + eval) —
+    /// think-on everywhere, never mixed (2026-06-20 precedent). Default off
+    /// (`/no_think` soft-switch appended: tool calls, no deliberation).
+    #[arg(long, default_value_t = false)]
+    pub(crate) think_rollouts: bool,
+
+    /// Budget-asymmetric self-rescue: a task with ZERO accepted samples gets
+    /// up to N extra rollouts at --rescue-max-tokens (stops at the first
+    /// accept). Bootstraps regimes where plain rejection sampling starves
+    /// (the real-repo 0-accept wall). 0 = off.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub(crate) rescue_samples: usize,
+
+    /// Per-sub-turn token budget for rescue rollouts (thinking needs room).
+    #[arg(long, default_value_t = 8192)]
+    pub(crate) rescue_max_tokens: usize,
+
     /// Rollout nucleus sampling threshold (1.0 disables top-p).
     #[arg(long, default_value_t = 1.0)]
     pub(crate) rollout_top_p: f32,

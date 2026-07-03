@@ -2270,6 +2270,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         max_turns: args.max_turns,
         max_tokens: args.max_tokens,
         temperature: args.rollout_temperature,
+        think: args.think_rollouts,
+        rescue_samples: args.rescue_samples,
+        rescue_max_tokens: args.rescue_max_tokens,
         writeback_batch: args.writeback_batch,
         writeback_cap: args.writeback_cap,
         work_root: args.work_root.clone(),
@@ -2389,14 +2392,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             )?
         };
         eprintln!(
-            "[arle train agent-opd] round {round}: tasks={} rollouts={} passed={} distinct={} no_token_record={} trained_pairs={} mean_loss={:.4}",
+            "[arle train agent-opd] round {round}: tasks={} rollouts={} passed={} distinct={} no_token_record={} trained_pairs={} mean_loss={:.4} rescue_rollouts={} rescue_passed={}",
             report.tasks,
             report.rollouts,
             report.passed,
             report.distinct_passed,
             report.no_token_record,
             report.trained_pairs,
-            report.mean_train_loss
+            report.mean_train_loss,
+            report.rescue_rollouts,
+            report.rescue_passed
         );
         log_opd_vram(&format!("after round {round} writeback"), &train_backend);
 
