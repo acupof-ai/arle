@@ -1404,6 +1404,42 @@ impl Dsv4Model {
                 .ok_or_else(|| anyhow!("DSv4 layer {layer_idx} has no attention plan"))?;
             let lnames = config.layer_tensor_names(layer_idx);
             let attention = loader.load_dsv4_attention(&ctx, &config, &lnames.attn, &tp_cfg)?;
+            // #138 TEMP weight scan: is any compressor weight NaN/inf on load?
+            // Gated by ARLE_DSV4_SCAN_WEIGHTS (D2H per matrix — off the hot path).
+            if std::env::var_os("ARLE_DSV4_SCAN_WEIGHTS").is_some() {
+                let ratio = config.compress_ratios.get(layer_idx).copied().unwrap_or(0);
+                let mut scan = |tag: &str, m: &DeviceMatrix| -> Result<()> {
+                    let h = m.to_host(&ctx)?;
+                    let bad = h.iter().filter(|v| !v.is_finite()).count();
+                    if bad > 0 {
+                        let first = h.iter().position(|v| !v.is_finite()).unwrap_or(0);
+                        log::error!(
+                            "[scan138] layer={layer_idx} ratio={ratio} mode={:?} {tag} \
+                             {}x{} NON-FINITE {bad} (first idx {first})",
+                            plan.mode,
+                            m.rows,
+                            m.cols
+                        );
+                    }
+                    Ok(())
+                };
+                for (tag, comp) in [
+                    ("attn", attention.compressor.as_ref()),
+                    (
+                        "idx",
+                        attention
+                            .indexer
+                            .as_ref()
+                            .and_then(|i| i.compressor.as_ref()),
+                    ),
+                ] {
+                    if let Some(c) = comp {
+                        scan(&format!("{tag}.ape"), &c.ape)?;
+                        scan(&format!("{tag}.wkv"), &c.wkv)?;
+                        scan(&format!("{tag}.wgate"), &c.wgate)?;
+                    }
+                }
+            }
             // GLM dense layers (`per_layer_dense_mlp[i]`): a plain FFN, no experts.
             let is_dense = config
                 .per_layer_dense_mlp
