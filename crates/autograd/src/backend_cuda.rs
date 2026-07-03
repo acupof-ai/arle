@@ -926,10 +926,13 @@ impl CudaBackend {
                 "cuda backend fp8 dequant handle size does not match shape",
             ));
         }
-        let mut out = self
-            .stream
-            .alloc_zeros::<u16>(total)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (fp8 dequant)"))?;
+        let mut out = self.stream.alloc_zeros::<u16>(total).map_err(|e| {
+            // Surface the real driver error: alloc failure here is either true
+            // OOM or a prior async fault turning sticky — indistinguishable
+            // without the code (smoke 2026-07-03 hit both attribution paths).
+            eprintln!("[autograd] alloc_zeros {total} x u16 failed (fp8 dequant): {e}");
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (fp8 dequant)")
+        })?;
         let total_i32 = i32::try_from(total)
             .map_err(|_| AutogradError::TapeInvariant("fp8 dequant total exceeds i32"))?;
         let cols_i32 = i32::try_from(cols)
@@ -3479,10 +3482,10 @@ fn cuda_log_softmax_last_axis_backward(
     let rows = expected / last_dim;
     let cols = i32::try_from(last_dim)
         .map_err(|_| AutogradError::TapeInvariant("cuda log_softmax_backward cols exceeds i32"))?;
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(expected)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)"))?;
+    let mut d_grad = backend.stream.alloc_zeros::<f32>(expected).map_err(|e| {
+        eprintln!("[autograd] alloc_zeros {expected} x f32 failed (log_softmax_bwd): {e}");
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)")
+    })?;
 
     const BLOCK: u32 = 256;
     const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
