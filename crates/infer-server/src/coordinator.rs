@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use infer_plan::{FinishReason, MultimodalKind, SamplingParams};
 use uuid::Uuid;
 
+use crate::anthropic::{self, MessagesError, MessagesRequest, StreamEncoder};
 use crate::multiproc_relay::{
     CompletionSinks, RelayCompletionDelta, RelayCoordinator, RelayEnvelope, WireRequest,
 };
@@ -29,8 +30,8 @@ use crate::schema::{
     ModelsResponse, ResponseToolCall, StatsResponse,
 };
 use crate::sse_util::{
-    StreamingReasoningSplitter, chat_stream_chunk, completion_stream_chunk, finish_reason,
-    unix_time_secs,
+    ChatDelta, StreamingReasoningSplitter, chat_stream_chunk, completion_stream_chunk,
+    finish_reason, unix_time_secs,
 };
 use crate::tokenizer::OpenAiTokenizer;
 
@@ -159,6 +160,8 @@ pub fn coordinator_router(
     Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/models", get(list_models))
         .route("/v1/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -825,6 +828,215 @@ async fn chat_completions(
         tool_calls,
     ))
     .into_response())
+}
+
+/// Anthropic → internal prompt: map the Messages request onto the shared chat
+/// machinery (same template render / thinking / tools gating as
+/// [`chat_completions`]) and tokenize. Returns the mapped chat request plus
+/// the resolved `(thinking, tools_active)` switches and prompt tokens.
+fn anthropic_prompt(
+    state: &Arc<CoordinatorHandle>,
+    request: &MessagesRequest,
+) -> Result<(ChatCompletionRequest, bool, bool, Vec<u32>), ApiError> {
+    let chat_request = request.to_chat_request();
+    let thinking = chat_request
+        .enable_thinking(state.max_thinking_tokens > 0 || state.template_defaults_thinking);
+    let tools_active = chat_request.wants_tools();
+    let tools: &[chat::OpenAiToolDefinition] = if tools_active {
+        &chat_request.tools
+    } else {
+        &[]
+    };
+    let prompt = {
+        let tokenizer = state
+            .tokenizer
+            .lock()
+            .map_err(|_| ApiError::internal("tokenizer lock poisoned"))?;
+        tokenizer.render_chat_full(&chat_request.messages, None, tools, thinking, None)?
+    };
+    let prompt_tokens = encode(state, &prompt)?;
+    Ok((chat_request, thinking, tools_active, prompt_tokens))
+}
+
+fn tool_call_arguments_json(call: &chat::ToolCall) -> String {
+    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Route visible (post-tool-strip) text through the reasoning splitter into
+/// Anthropic text deltas. Reasoning deltas have no Anthropic lane — dropped.
+fn push_anthropic_text(
+    events: &mut String,
+    splitter: &mut StreamingReasoningSplitter,
+    encoder: &mut StreamEncoder,
+    visible: &str,
+) {
+    for piece in splitter.push(visible) {
+        if let ChatDelta::Content(text) = piece {
+            events.push_str(&encoder.text_delta(&text));
+        }
+    }
+}
+
+/// `POST /v1/messages` — Anthropic Messages API onto the OpenAI chat machinery.
+async fn anthropic_messages(
+    State(state): State<Arc<CoordinatorHandle>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, MessagesError> {
+    let request: MessagesRequest = serde_json::from_value(body)
+        .map_err(|err| MessagesError::invalid_request(err.to_string()))?;
+    request.validate()?;
+    let (chat_request, thinking, tools_active, prompt_tokens) = anthropic_prompt(&state, &request)?;
+    let sampling = chat_request.sampling_params();
+    // max_tokens is validated present; mirror the chat path's thinking clamp.
+    let mut max_tokens = sampling.max_new_tokens.unwrap_or(16);
+    if state.max_thinking_tokens > 0 && thinking {
+        max_tokens = max_tokens.min(state.max_thinking_tokens);
+    }
+    // Echo the request's model string back (Anthropic contract).
+    let model = request.model.clone().unwrap_or_else(|| state.model.clone());
+    let prompt_token_count = prompt_tokens.len();
+
+    if request.stream.unwrap_or(false) {
+        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
+        let state_clone = Arc::clone(&state);
+        // Bounded channel: backpressure keeps the task from racing too far ahead.
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::channel::<Result<Vec<u8>, std::convert::Infallible>>(64);
+        tokio::spawn(async move {
+            // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
+            let _guard = guard;
+            let mut encoder = StreamEncoder::new(format!("msg_{}", Uuid::new_v4().simple()), model);
+            if chunk_tx
+                .send(Ok(encoder.message_start(prompt_token_count).into_bytes()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Same delta pipeline as the chat SSE path: tool stream strips
+            // `<think>` + `<tool_call>` blocks when tools are active, else the
+            // reasoning splitter lifts thinking out of the visible text.
+            let mut splitter = StreamingReasoningSplitter::new(thinking && !tools_active);
+            let mut tool_stream = tools_active.then(chat::StreamingToolCalls::default);
+            let mut saw_tool_use = false;
+            let mut output_tokens = 0usize;
+            // Keep-alive pings while generation runs (long prefills).
+            let mut ping = tokio::time::interval(Duration::from_secs(5));
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ping.tick().await; // the first tick fires immediately — consume it
+            loop {
+                tokio::select! {
+                    maybe = rx.recv() => {
+                        let Some(delta) = maybe else {
+                            let _ = chunk_tx
+                                .send(Ok(StreamEncoder::error("engine stream closed unexpectedly")
+                                    .into_bytes()))
+                                .await;
+                            break;
+                        };
+                        if let Some(err) = delta.error {
+                            let _ = chunk_tx.send(Ok(StreamEncoder::error(&err).into_bytes())).await;
+                            break;
+                        }
+                        let mut events = String::new();
+                        if !delta.token_ids.is_empty() {
+                            output_tokens += delta.token_ids.len();
+                            let text = {
+                                let tok = state_clone
+                                    .tokenizer
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                tok.decode(&delta.token_ids).unwrap_or_default()
+                            };
+                            let (visible, calls) = match tool_stream.as_mut() {
+                                Some(stream) => stream.push(&text),
+                                None => (text, Vec::new()),
+                            };
+                            push_anthropic_text(&mut events, &mut splitter, &mut encoder, &visible);
+                            for call in &calls {
+                                saw_tool_use = true;
+                                events.push_str(
+                                    &encoder.tool_use(&call.name, &tool_call_arguments_json(call)),
+                                );
+                            }
+                        }
+                        if delta.finish {
+                            // Drain the tool stream's buffered tail + trailing visible text.
+                            if let Some(stream) = tool_stream.as_mut() {
+                                let (visible, calls) = stream.finish();
+                                push_anthropic_text(&mut events, &mut splitter, &mut encoder, &visible);
+                                for call in &calls {
+                                    saw_tool_use = true;
+                                    events.push_str(
+                                        &encoder.tool_use(&call.name, &tool_call_arguments_json(call)),
+                                    );
+                                }
+                            }
+                            // Truncated thinking flushes as reasoning — no Anthropic lane.
+                            let _ = splitter.finish();
+                            events.push_str(&encoder.finish(
+                                anthropic::stop_reason(delta.finish_reason.as_ref(), saw_tool_use),
+                                output_tokens,
+                            ));
+                            let _ = chunk_tx.send(Ok(events.into_bytes())).await;
+                            break;
+                        }
+                        if !events.is_empty()
+                            && chunk_tx.send(Ok(events.into_bytes())).await.is_err()
+                        {
+                            break; // Client disconnected; guard drops, releasing in_flight.
+                        }
+                    }
+                    _ = ping.tick() => {
+                        if chunk_tx.send(Ok(StreamEncoder::ping().into_bytes())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let body =
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(chunk_rx));
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
+            body,
+        )
+            .into_response());
+    }
+
+    let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
+    let decoded = decode(&state, &outcome.generated_tokens)?;
+    let (content, tool_calls, split_thinking) =
+        finalize_chat_content(decoded, tools_active, thinking);
+    // Build the OpenAI-shaped completion (reasoning split included), then map
+    // its parts onto the Anthropic envelope.
+    let chat = ChatCompletionResponse::from_parts(
+        model,
+        content,
+        outcome.prompt_tokens,
+        outcome.generated_tokens.len(),
+        outcome.finish.as_ref(),
+        split_thinking,
+        tool_calls,
+    );
+    Ok(Json(anthropic::MessagesResponse::from_chat(&chat)).into_response())
+}
+
+/// `POST /v1/messages/count_tokens` — render the prompt exactly like
+/// [`anthropic_messages`] would and return its token count.
+async fn anthropic_count_tokens(
+    State(state): State<Arc<CoordinatorHandle>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, MessagesError> {
+    let request: MessagesRequest = serde_json::from_value(body)
+        .map_err(|err| MessagesError::invalid_request(err.to_string()))?;
+    request.validate_for_count()?;
+    let (_, _, _, prompt_tokens) = anthropic_prompt(&state, &request)?;
+    Ok(Json(serde_json::json!({"input_tokens": prompt_tokens.len()})).into_response())
 }
 
 async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<ModelsResponse> {
