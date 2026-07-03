@@ -11,11 +11,14 @@ SWE-Pro ansible eval instances from the 06-27..30 campaign.
 
 ## Results (n=3 probe — infrastructure verdict, not a capability claim)
 
-| instance | edited | turns | wall | outcome |
+| instance | edited | turns | wall | corrected verdict (py3.11 venv, PYTHONPATH=lib:test, negative-control validated) |
 |---|---|---|---|---|
-| ansible-0ea40e0 | no | 3 | 34 s | no-edit bail |
-| ansible-12734fa | **yes** | 10 | 393 s | UNSCOREABLE on this pod (see below) |
-| ansible-5e36960 | **yes** | 6 | 651 s | genuine FAIL (5 failed with correct PYTHONPATH) |
+| ansible-0ea40e0 | no | 3 | 34 s | FAIL — no-edit bail (abstention) |
+| ansible-12734fa | **yes** | 10 | 393 s | FAIL — edited the wrong site (`plugins/filter/core.py`; RepresenterError persists) |
+| ansible-5e36960 | **yes** | 6 | 651 s | FAIL — right area, broke expected API (5 failed, 2 passed) |
+
+**Corrected baseline = genuine 0/3** (clean of harness artifacts): one
+abstention + two plausible-but-wrong fixes. Edits 2/3.
 
 - **The whole chain works**: adapter under real CC load (zero 4xx/5xx in the
   serve log, 4 slots absorbed CC's concurrent requests), 250 MB native binary
@@ -26,13 +29,21 @@ SWE-Pro ansible eval instances from the 06-27..30 campaign.
   edited 2/3 real repos under Claude Code's scaffolding. Harness quality is a
   capability multiplier; pass@1 = 0/3 says the fixes still aren't correct —
   exactly the gap OPD distillation is for.
-- Two scorer findings, both environmental:
+- Three scorer/env findings:
   1. `cc_swe_baseline.py` must pass `PYTHONPATH=lib:test` for ansible units
-     (the Rust path always had `--pythonpath`; the driver didn't).
-  2. ansible-12734fa's hidden tests cannot even COLLECT on the pod's Python
-     3.12 (`_AnsiblePathHookFinder has no attribute find_spec` — ansible-core
-     2.12-era loader vs py3.12). The instance is unscoreable in this env; the
-     06-2x campaign's eval numbers on it were fail-by-error, not fail-by-test.
+     (the Rust path always had `--pythonpath`; the driver didn't) and honor
+     `before_repo_set_cmd` (missing `resolvelib` dep).
+  2. These ansible-core 2.12/2.14 trees cannot even COLLECT on the pod's only
+     Python (3.12: `_AnsiblePathHookFinder has no attribute find_spec`) —
+     pod-side scoring needs a pinned ≤3.11 env; the 06-2x campaign's eval
+     numbers on these instances were fail-by-error, not fail-by-test.
+  3. Adapter: non-streaming responses can leak a stray `</think>` into the
+     text block (streaming drops reasoning; non-streaming must strip it too).
+- Serving perf lever for CC workloads: the radix prefix HITS CC's ~17K-token
+  system prompt but the hybrid recurrent sidecar is missing
+  (`recurrent sidecar restore failed → full recompute`, matched_len up to
+  17,232) — every turn re-prefills ~17K tokens; TTFT 82 s. Fixing sidecar
+  save/restore for the prefix path is the top lever.
 
 ## Learnings
 

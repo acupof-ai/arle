@@ -33,10 +33,15 @@ def run(cmd, cwd, timeout=None, env=None):
                           timeout=timeout, check=False, env=e)
 
 
-def boot_workdir(staged, workdir):
+def boot_workdir(staged, workdir, setup_cmd=None):
     if workdir.exists():
         shutil.rmtree(workdir)
     shutil.copytree(staged, workdir, symlinks=True)
+    if setup_cmd:
+        r = run(["bash", "-lc", setup_cmd], workdir, timeout=600)
+        if r.returncode != 0:
+            print(f"[cc-baseline] WARN before_repo_set_cmd rc={r.returncode}: "
+                  f"{r.stderr.strip()[:200]}", flush=True)
     for cmd in (["git", "init", "-q"], ["git", "add", "-A"],
                 ["git", "-c", "user.email=a@b.c", "-c", "user.name=arle",
                  "commit", "-qm", "base"]):
@@ -45,7 +50,7 @@ def boot_workdir(staged, workdir):
             raise RuntimeError(f"git setup failed: {r.stderr.strip()}")
 
 
-def score(workdir, task, test_timeout):
+def score(workdir, task, test_timeout, pythonpath=None, python="python3"):
     diff = run(["git", "diff"], workdir).stdout
     if not diff.strip():
         return False, False, "no edits"
@@ -66,9 +71,10 @@ def score(workdir, task, test_timeout):
     f2p = task.get("fail_to_pass", [])
     if isinstance(f2p, str):
         f2p = json.loads(f2p) if f2p.strip().startswith("[") else [f2p]
+    env = {"PYTHONPATH": pythonpath} if pythonpath else None
     try:
-        r = run(["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", *f2p],
-                workdir, timeout=test_timeout)
+        r = run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", *f2p],
+                workdir, timeout=test_timeout, env=env)
     except subprocess.TimeoutExpired:
         return False, True, "pytest timeout"
     tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
@@ -110,6 +116,10 @@ def main():
     ap.add_argument("--cc-timeout", type=int, default=1800)
     ap.add_argument("--test-timeout", type=int, default=300)
     ap.add_argument("--task-limit", type=int)
+    ap.add_argument("--pythonpath", default=None,
+                    help="PYTHONPATH for scoring, e.g. lib:test (ansible)")
+    ap.add_argument("--python", default="python3",
+                    help="scoring interpreter (old trees may need <=3.11)")
     ap.add_argument("--out", type=Path, default=Path("cc_baseline_results.jsonl"))
     args = ap.parse_args()
 
@@ -124,10 +134,11 @@ def main():
         staged = args.staged_root / iid
         workdir = args.work_root / iid
         print(f"[cc-baseline] {iid}: boot", flush=True)
-        boot_workdir(staged, workdir)
+        boot_workdir(staged, workdir, task.get("before_repo_set_cmd"))
         t0 = time.time()
         cc = cc_attempt(workdir, task, args)
-        passed, edited, note = score(workdir, task, args.test_timeout)
+        passed, edited, note = score(workdir, task, args.test_timeout,
+                                     args.pythonpath, args.python)
         row = {
             "instance_id": iid, "passed": passed, "edited": edited,
             "note": note, "wall_s": round(time.time() - t0, 1),
