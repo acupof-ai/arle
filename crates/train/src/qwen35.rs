@@ -2591,8 +2591,13 @@ impl Qwen35Model {
     /// re-run in backward (plus boundary host offload) for tape memory — a
     /// good trade only when the full tape would NOT fit: estimate the
     /// non-checkpointed footprint (per layer the hidden-stream tensors plus
-    /// the dominant MLP gate/up/act term, f32) against half of free VRAM.
-    /// Unknown memory info keeps the safe default (checkpoint).
+    /// the dominant MLP gate/up/act term, f32) against a third of free VRAM.
+    /// The estimate is a floor, not the footprint: the 27B hybrid measured
+    /// 2.54× it (83.1 GiB peak at seq=1000 vs 17.9 GiB estimated — LA
+    /// chunk_history, attention scratch and allocator slack are unmodeled),
+    /// and the old free/2 margin OOM'd the H20 at seq≈1350–1400 (agent-OPD
+    /// smoke 2026-07-03). 3× keeps the full-tape fast path only when it
+    /// truly fits. Unknown memory info keeps the safe default (checkpoint).
     fn should_checkpoint(
         &self,
         batch: usize,
@@ -2607,7 +2612,10 @@ impl Qwen35Model {
                     * seq_len
                     * (8 * self.config.hidden_size + 3 * self.config.intermediate_size)
                     * 4;
-                per_layer.saturating_mul(self.layers.len()) > (free as usize) / 2
+                per_layer
+                    .saturating_mul(self.layers.len())
+                    .saturating_mul(3)
+                    > free as usize
             })
     }
 
