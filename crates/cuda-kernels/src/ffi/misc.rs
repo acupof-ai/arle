@@ -51,6 +51,30 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    /// Fused [`dsv4_mhc_params_cuda`] + [`dsv4_mhc_pre_rms_norm_cuda`]: one
+    /// launch per token computes pre/post/comb AND the pre-mixed rms-normed
+    /// row (`pre` consumed from shared memory). Requires the wide-stream
+    /// layout `residual_hidden_dim == hidden_size * hc_mult`.
+    pub fn dsv4_mhc_params_pre_rms_norm_cuda(
+        residual: *const super::Half,
+        mixes: *const super::Half,
+        base: *const super::Half,
+        scale: *const super::Half,
+        weight: *const super::Half,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut super::Half,
+        num_tokens: i32,
+        hidden_size: i32,
+        mix_dim: i32,
+        hc_mult: i32,
+        params_eps: f32,
+        sinkhorn_iters: i32,
+        norm_eps: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_mhc_params_bench_cuda(
         residual: *const super::Half,
         mixes: *const super::Half,

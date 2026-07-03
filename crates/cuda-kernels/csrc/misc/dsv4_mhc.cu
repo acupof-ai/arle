@@ -38,45 +38,93 @@ __device__ float block_sum(float value) {
   return value;
 }
 
-__device__ void row_softmax_plus_eps(float *raw, int n, float eps) {
-  for (int row = 0; row < n; ++row) {
-    float max_value = -INFINITY;
-    for (int col = 0; col < n; ++col) {
-      max_value = fmaxf(max_value, raw[row * n + col]);
-    }
-    float denom = 0.0f;
-    for (int col = 0; col < n; ++col) {
-      float value = expf(raw[row * n + col] - max_value);
-      raw[row * n + col] = value;
-      denom += value;
-    }
-    for (int col = 0; col < n; ++col) {
-      raw[row * n + col] = raw[row * n + col] / denom + eps;
-    }
-  }
-}
-
-__device__ void row_normalize(float *raw, int n, float eps) {
-  for (int row = 0; row < n; ++row) {
-    float sum = eps;
-    for (int col = 0; col < n; ++col) {
-      sum += raw[row * n + col];
-    }
-    for (int col = 0; col < n; ++col) {
-      raw[row * n + col] /= sum;
-    }
-  }
-}
-
-__device__ void column_normalize(float *raw, int n, float eps) {
+// Sinkhorn phases, one row/column per calling lane. The n<=DSV4_MHC_MAX inner
+// reductions stay serial in the scalar order, so per-element math is unchanged.
+__device__ void row_softmax_plus_eps(float *raw, int n, float eps, int row) {
+  float max_value = -INFINITY;
   for (int col = 0; col < n; ++col) {
-    float sum = eps;
-    for (int row = 0; row < n; ++row) {
-      sum += raw[row * n + col];
-    }
-    for (int row = 0; row < n; ++row) {
-      raw[row * n + col] /= sum;
-    }
+    max_value = fmaxf(max_value, raw[row * n + col]);
+  }
+  float denom = 0.0f;
+  for (int col = 0; col < n; ++col) {
+    float value = expf(raw[row * n + col] - max_value);
+    raw[row * n + col] = value;
+    denom += value;
+  }
+  for (int col = 0; col < n; ++col) {
+    raw[row * n + col] = raw[row * n + col] / denom + eps;
+  }
+}
+
+__device__ void row_normalize(float *raw, int n, float eps, int row) {
+  float sum = eps;
+  for (int col = 0; col < n; ++col) {
+    sum += raw[row * n + col];
+  }
+  for (int col = 0; col < n; ++col) {
+    raw[row * n + col] /= sum;
+  }
+}
+
+__device__ void column_normalize(float *raw, int n, float eps, int col) {
+  float sum = eps;
+  for (int row = 0; row < n; ++row) {
+    sum += raw[row * n + col];
+  }
+  for (int row = 0; row < n; ++row) {
+    raw[row * n + col] /= sum;
+  }
+}
+
+// Params tail on the FIRST WARP: per-lane pre/post sigmoids, sinkhorn over
+// `raw_shared` (hc_mult^2 <= 64 = 2*WARP_SIZE), comb writeback. `pre` is also
+// staged into `pre_shared` so the fused kernel can consume it without a global
+// round trip. Warp-synchronous only (__syncwarp, no block syncs inside):
+// callers may retire warps > 0 before entry, or park them at a __syncthreads.
+__device__ void dsv4_mhc_params_tail(
+    const float *mixes_shared,
+    const uint16_t *__restrict__ base,
+    const uint16_t *__restrict__ scale,
+    float *raw_shared,
+    float *pre_shared,
+    float *__restrict__ pre,
+    float *__restrict__ post,
+    float *__restrict__ comb,
+    int token,
+    int hc_mult,
+    float eps,
+    int sinkhorn_iters) {
+  const int lane = threadIdx.x;
+  const int token_hc = token * hc_mult;
+  const int token_comb = token * hc_mult * hc_mult;
+  if (lane < hc_mult) {
+    float pre_value = dsv4_sigmoid(bf16_to_f32(scale[0]) * mixes_shared[lane] +
+                                   bf16_to_f32(base[lane])) +
+                      eps;
+    pre_shared[lane] = pre_value;
+    pre[token_hc + lane] = pre_value;
+    post[token_hc + lane] =
+        2.0f * dsv4_sigmoid(bf16_to_f32(scale[1]) * mixes_shared[hc_mult + lane] +
+                            bf16_to_f32(base[hc_mult + lane]));
+  }
+  const float scale2 = bf16_to_f32(scale[2]);
+  for (int idx = lane; idx < hc_mult * hc_mult; idx += WARP_SIZE) {
+    raw_shared[idx] = scale2 * mixes_shared[2 * hc_mult + idx] +
+                      bf16_to_f32(base[2 * hc_mult + idx]);
+  }
+  __syncwarp();
+  if (lane < hc_mult) row_softmax_plus_eps(raw_shared, hc_mult, eps, lane);
+  __syncwarp();
+  if (lane < hc_mult) column_normalize(raw_shared, hc_mult, eps, lane);
+  for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+    __syncwarp();
+    if (lane < hc_mult) row_normalize(raw_shared, hc_mult, eps, lane);
+    __syncwarp();
+    if (lane < hc_mult) column_normalize(raw_shared, hc_mult, eps, lane);
+  }
+  __syncwarp();
+  for (int idx = lane; idx < hc_mult * hc_mult; idx += WARP_SIZE) {
+    comb[token_comb + idx] = raw_shared[idx];
   }
 }
 
@@ -148,38 +196,12 @@ __global__ void dsv4_mhc_params_kernel(
   }
   __syncthreads();
 
-  if (threadIdx.x != 0) return;
-
-  float scale0 = bf16_to_f32(scale[0]);
-  float scale1 = bf16_to_f32(scale[1]);
-  float scale2 = bf16_to_f32(scale[2]);
-  int token_hc = token * hc_mult;
-  int token_comb = token * hc_mult * hc_mult;
-  for (int lane = 0; lane < hc_mult; ++lane) {
-    pre[token_hc + lane] =
-        dsv4_sigmoid(scale0 * mixes_shared[lane] + bf16_to_f32(base[lane])) + eps;
-    post[token_hc + lane] =
-        2.0f * dsv4_sigmoid(scale1 * mixes_shared[hc_mult + lane] +
-                            bf16_to_f32(base[hc_mult + lane]));
-  }
-
-  float raw[DSV4_MHC_MAX * DSV4_MHC_MAX];
-  for (int row = 0; row < hc_mult; ++row) {
-    for (int col = 0; col < hc_mult; ++col) {
-      int idx = row * hc_mult + col;
-      raw[idx] = scale2 * mixes_shared[2 * hc_mult + idx] +
-                 bf16_to_f32(base[2 * hc_mult + idx]);
-    }
-  }
-  row_softmax_plus_eps(raw, hc_mult, eps);
-  column_normalize(raw, hc_mult, eps);
-  for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-    row_normalize(raw, hc_mult, eps);
-    column_normalize(raw, hc_mult, eps);
-  }
-  for (int idx = 0; idx < hc_mult * hc_mult; ++idx) {
-    comb[token_comb + idx] = raw[idx];
-  }
+  // No block-level syncs remain: warps > 0 retire, the tail is warp 0 only.
+  __shared__ float raw_shared[DSV4_MHC_MAX * DSV4_MHC_MAX];
+  __shared__ float pre_shared[DSV4_MHC_MAX];
+  if (threadIdx.x >= WARP_SIZE) return;
+  dsv4_mhc_params_tail(mixes_shared, base, scale, raw_shared, pre_shared, pre,
+                       post, comb, token, hc_mult, eps, sinkhorn_iters);
 }
 
 extern "C" CUresult dsv4_mhc_params_cuda(
@@ -296,6 +318,143 @@ extern "C" CUresult dsv4_mhc_pre_rms_norm_cuda(
   dsv4_mhc_pre_rms_norm_kernel<<<num_tokens, 1024, shmem,
                                  (cudaStream_t)stream>>>(
       residual, pre, weight, out, num_tokens, hidden_size, hc_mult, eps);
+  return (CUresult)cudaGetLastError();
+}
+
+// Fused params + pre-mix + rms_norm for the decode critical path: one launch
+// per token replaces the back-to-back dsv4_mhc_params_cuda ->
+// dsv4_mhc_pre_rms_norm_cuda pair (2 HC sites/layer, 122 launches/token at
+// B=1). The params tail runs on warp 0 with `pre` staged in shared; the mix
+// stage reads it there instead of global. post/comb still land in global for
+// the later hc_post. Requires the stream layout residual_hidden_dim ==
+// hidden_size * hc_mult (the pre-mix indexes lanes by hidden_size).
+__global__ void dsv4_mhc_params_pre_rms_norm_kernel(
+    const uint16_t *__restrict__ residual,
+    const uint16_t *__restrict__ mixes,
+    const uint16_t *__restrict__ base,
+    const uint16_t *__restrict__ scale,
+    const uint16_t *__restrict__ weight,
+    float *__restrict__ pre,
+    float *__restrict__ post,
+    float *__restrict__ comb,
+    uint16_t *__restrict__ out,
+    int num_tokens,
+    int hidden_size,
+    int mix_dim,
+    int hc_mult,
+    float params_eps,
+    int sinkhorn_iters,
+    float norm_eps) {
+  extern __shared__ uint16_t x_row[];
+  const int token = blockIdx.x;
+  if (token >= num_tokens) return;
+  const int residual_hidden_dim = hidden_size * hc_mult;
+
+  float sumsq = 0.0f;
+  const int row_start = token * residual_hidden_dim;
+  for (int idx = threadIdx.x; idx < residual_hidden_dim; idx += blockDim.x) {
+    float value = bf16_to_f32(residual[row_start + idx]);
+    sumsq += value * value;
+  }
+  sumsq = block_sum(sumsq);
+
+  __shared__ float rsqrt_shared;
+  __shared__ float mixes_shared[DSV4_MHC_MAX * (2 + DSV4_MHC_MAX)];
+  __shared__ float raw_shared[DSV4_MHC_MAX * DSV4_MHC_MAX];
+  __shared__ float pre_shared[DSV4_MHC_MAX];
+  if (threadIdx.x == 0) {
+    rsqrt_shared =
+        rsqrtf(sumsq / fmaxf((float)residual_hidden_dim, 1.0f) + params_eps);
+  }
+  __syncthreads();
+
+  const int need_mix = hc_mult * (2 + hc_mult);
+  for (int idx = threadIdx.x; idx < need_mix; idx += blockDim.x) {
+    mixes_shared[idx] = bf16_to_f32(mixes[token * mix_dim + idx]) * rsqrt_shared;
+  }
+  __syncthreads();
+
+  // Warp 0 runs the syncwarp-only tail; other warps park at the __syncthreads
+  // (all threads stay alive — the mix stage below needs the full block).
+  if (threadIdx.x < WARP_SIZE) {
+    dsv4_mhc_params_tail(mixes_shared, base, scale, raw_shared, pre_shared,
+                         pre, post, comb, token, hc_mult, params_eps,
+                         sinkhorn_iters);
+  }
+  __syncthreads();
+
+  float pre_lane[DSV4_MHC_MAX];
+#pragma unroll
+  for (int lane = 0; lane < DSV4_MHC_MAX; ++lane) {
+    pre_lane[lane] = (lane < hc_mult) ? pre_shared[lane] : 0.0f;
+  }
+  float local_sum = 0.0f;
+  for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+    float value = 0.0f;
+    for (int lane = 0; lane < hc_mult; ++lane) {
+      value += pre_lane[lane] *
+               bf16_to_f32(residual[row_start + lane * hidden_size + col]);
+    }
+    const uint16_t bits = f32_to_bf16_bits(value);
+    x_row[col] = bits;
+    const float rounded = bf16_to_f32(bits);
+    local_sum += rounded * rounded;
+  }
+  const float total = block_sum(local_sum);
+
+  __shared__ float s_inv_rms;
+  if (threadIdx.x == 0) {
+    s_inv_rms = 1.0f / sqrtf(total / (float)hidden_size + norm_eps);
+  }
+  __syncthreads();
+  const float inv_rms = s_inv_rms;
+
+  uint16_t *out_row = out + token * hidden_size;
+  for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+    const float value =
+        bf16_to_f32(x_row[col]) * inv_rms * bf16_to_f32(weight[col]);
+    out_row[col] = f32_to_bf16_bits(value);
+  }
+}
+
+extern "C" CUresult dsv4_mhc_params_pre_rms_norm_cuda(
+    const uint16_t *residual,
+    const uint16_t *mixes,
+    const uint16_t *base,
+    const uint16_t *scale,
+    const uint16_t *weight,
+    float *pre,
+    float *post,
+    float *comb,
+    uint16_t *out,
+    int num_tokens,
+    int hidden_size,
+    int mix_dim,
+    int hc_mult,
+    float params_eps,
+    int sinkhorn_iters,
+    float norm_eps,
+    CUstream stream) {
+  if (num_tokens < 0 || hidden_size <= 0 || mix_dim <= 0 || hc_mult <= 0 ||
+      hc_mult > DSV4_MHC_MAX || mix_dim < hc_mult * (2 + hc_mult) ||
+      sinkhorn_iters <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_tokens == 0) return CUDA_SUCCESS;
+  const size_t shmem = (size_t)hidden_size * sizeof(uint16_t);
+  if (shmem > 192 * 1024) return CUDA_ERROR_INVALID_VALUE;
+  if (shmem > 48 * 1024) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        dsv4_mhc_params_pre_rms_norm_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+    if (attr != cudaSuccess) return (CUresult)attr;
+  }
+  // Same measured 1024-thread single-block-bandwidth shape as the two unfused
+  // entries above.
+  dsv4_mhc_params_pre_rms_norm_kernel<<<num_tokens, 1024, shmem,
+                                        (cudaStream_t)stream>>>(
+      residual, mixes, base, scale, weight, pre, post, comb, out, num_tokens,
+      hidden_size, mix_dim, hc_mult, params_eps, sinkhorn_iters, norm_eps);
   return (CUresult)cudaGetLastError();
 }
 
