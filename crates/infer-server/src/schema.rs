@@ -815,6 +815,14 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
