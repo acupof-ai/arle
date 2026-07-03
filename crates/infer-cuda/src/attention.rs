@@ -2830,16 +2830,6 @@ fn try_flashmla_decode_attention(
     };
 
     let flash_out_ptr = if tp_world > 1 {
-        // Zero the REUSED TP output scratch before FlashMLA writes it (#138):
-        // the sparse SM90 decode kernel leaves a (query,head) slice unwritten
-        // when its top-k selection is empty; on a reused scratch that slice
-        // returns the PRIOR step's value (initcheck: uninitialized read in
-        // dsv4_tp_out_slice_kernel), which the rank-slice then copies into the
-        // residual → non-deterministic NaN downstream. Zero = the correct
-        // empty-attention output, so unwritten slices read 0, not stale.
-        ctx.stream
-            .memset_zeros(&mut scratch.tp_full_out)
-            .map_err(|e| anyhow!("DSv4 FlashMLA decode TP full_out zero failed: {e}"))?;
         let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr_mut(&ctx.stream);
         drop(full_out_guard);
         full_out_ptr as *mut ffi::Half
