@@ -23,6 +23,13 @@ use serde::Deserialize;
 
 use crate::{DeepSeekConfigError, Result};
 
+/// GLM-5.2 input-only special tokens the sampler must never emit — the GLM
+/// counterpart to [`crate::v4::DSV4_SUPPRESSED_TOKEN_IDS`]. Empty (a
+/// byte-identical no-op, so GLM decode is unchanged) until GLM's
+/// User/Assistant/BOS/image ids are confirmed from a real checkpoint tokenizer.
+// TODO: populate from the GLM-5.2 tokenizer once verified — do not guess ids.
+pub const GLM_SUPPRESSED_TOKEN_IDS: &[u32] = &[];
+
 /// `rope_parameters` sub-object: `{"rope_theta": 8e6, "rope_type": "default"}`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GlmRopeParameters {

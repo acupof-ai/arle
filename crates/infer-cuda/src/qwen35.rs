@@ -3267,7 +3267,8 @@ impl Qwen35Model {
         } = ws;
         let logits = logits.get(&self.ctx, self.output_projection().rows)?;
         let argmax_out = argmax_out.get(&self.ctx, 1)?;
-        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out)
+        // Qwen3.5/3.6 has no input-only suppressed tokens ⇒ `&[]` no-op mask.
+        sample_cuda_token_scratched(&self.ctx, logits, params, position, argmax_out, &[])
     }
 
     /// Device address of the workspace logits buffer (allocating it at vocab

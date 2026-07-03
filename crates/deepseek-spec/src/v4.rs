@@ -18,6 +18,14 @@ pub enum TensorDialect {
     Glm,
 }
 
+/// Input-only special tokens DSv4-Flash must never generate (BOS / `<｜User｜>` /
+/// `<｜Assistant｜>` / `<｜image｜>`). Confirmed from the pod tokenizer + config
+/// (`bos_token_id=0`). An input-only token has no learned continuation, so once
+/// the decode distribution flattens it wins and the model spirals into an
+/// infinite repeat; the sampler masks these to -inf. EOS (1), `<think>`/`</think>`,
+/// and `｜DSML｜` (128825) stay generatable and are deliberately absent.
+pub const DSV4_SUPPRESSED_TOKEN_IDS: &[u32] = &[0, 128803, 128804, 129279];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeepSeekV4RopeParameters {
     #[serde(default, alias = "type")]
