@@ -172,6 +172,83 @@ fn trimmed_once<'a>(started: &mut bool, text: &'a str) -> Option<&'a str> {
     })
 }
 
+/// Converged decode pipeline shared by the OpenAI and Anthropic SSE paths —
+/// the streaming twin of `coordinator::finalize_chat_content`.
+///
+/// Reasoning splits FIRST: the chat template pre-fills `<think>` into the
+/// *prompt*, so thinking output arrives as `reasoning</think>answer` with no
+/// opening tag — the tool stream's opening-tag-triggered hiding misses it and
+/// leaks reasoning + a stray `</think>` into visible text. Only the content
+/// half then feeds tool-call extraction (so reasoning that merely *mentions*
+/// a tool block never parses as a call). In tools mode reasoning is dropped,
+/// matching the non-streaming finalize; tool-less thinking keeps emitting
+/// `Reasoning` deltas (the OpenAI `reasoning_content` lane — Anthropic has no
+/// lane and drops them at the encoder).
+pub(crate) struct StreamPipeline {
+    splitter: StreamingReasoningSplitter,
+    tool_stream: Option<chat::StreamingToolCalls>,
+}
+
+impl StreamPipeline {
+    pub(crate) fn new(thinking: bool, tools_active: bool) -> Self {
+        Self {
+            splitter: StreamingReasoningSplitter::new(thinking),
+            tool_stream: tools_active.then(chat::StreamingToolCalls::default),
+        }
+    }
+
+    fn route(
+        &mut self,
+        piece: ChatDelta,
+        deltas: &mut Vec<ChatDelta>,
+        calls: &mut Vec<chat::ToolCall>,
+    ) {
+        match piece {
+            // Tools mode: reasoning has no wire lane (matches non-streaming).
+            ChatDelta::Reasoning(_) if self.tool_stream.is_some() => {}
+            ChatDelta::Reasoning(text) => deltas.push(ChatDelta::Reasoning(text)),
+            ChatDelta::Content(text) => match self.tool_stream.as_mut() {
+                Some(stream) => {
+                    let (visible, new_calls) = stream.push(&text);
+                    calls.extend(new_calls);
+                    if !visible.is_empty() {
+                        deltas.push(ChatDelta::Content(visible));
+                    }
+                }
+                None => deltas.push(ChatDelta::Content(text)),
+            },
+        }
+    }
+
+    /// Feed one decoded delta; returns routed deltas + newly completed calls.
+    pub(crate) fn push(&mut self, text: &str) -> (Vec<ChatDelta>, Vec<chat::ToolCall>) {
+        let mut deltas = Vec::new();
+        let mut calls = Vec::new();
+        for piece in self.splitter.push(text) {
+            self.route(piece, &mut deltas, &mut calls);
+        }
+        (deltas, calls)
+    }
+
+    /// Flush both stages at end of stream (truncated thinking, buffered tool
+    /// tail). Ordered splitter → tool stream, mirroring `push`.
+    pub(crate) fn finish(&mut self) -> (Vec<ChatDelta>, Vec<chat::ToolCall>) {
+        let mut deltas = Vec::new();
+        let mut calls = Vec::new();
+        if let Some(piece) = self.splitter.finish() {
+            self.route(piece, &mut deltas, &mut calls);
+        }
+        if let Some(stream) = self.tool_stream.as_mut() {
+            let (visible, new_calls) = stream.finish();
+            calls.extend(new_calls);
+            if !visible.is_empty() {
+                deltas.push(ChatDelta::Content(visible));
+            }
+        }
+        (deltas, calls)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +346,84 @@ mod tests {
             splitter.push("nk>r</think>a"),
             vec![reasoning("r"), content("a")]
         );
+    }
+
+    /// Run chunks through the converged pipeline and flatten the results.
+    fn pipeline_run(
+        thinking: bool,
+        tools: bool,
+        chunks: &[&str],
+    ) -> (Vec<ChatDelta>, Vec<chat::ToolCall>) {
+        let mut pipeline = StreamPipeline::new(thinking, tools);
+        let (mut deltas, mut calls) = (Vec::new(), Vec::new());
+        for chunk in chunks {
+            let (d, c) = pipeline.push(chunk);
+            deltas.extend(d);
+            calls.extend(c);
+        }
+        let (d, c) = pipeline.finish();
+        deltas.extend(d);
+        calls.extend(c);
+        (deltas, calls)
+    }
+
+    fn visible_text(deltas: &[ChatDelta]) -> String {
+        deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                ChatDelta::Content(text) => Some(text.as_str()),
+                ChatDelta::Reasoning(_) => None,
+            })
+            .collect()
+    }
+
+    /// The `</think>` leak matrix, streaming path (tools active + thinking):
+    /// reasoning must never surface as content — including the prompt-prefilled
+    /// form with NO opening tag, which the tool stream's opening-tag-triggered
+    /// hiding misses.
+    #[test]
+    fn pipeline_reasoning_never_leaks_into_content() {
+        // (a) bare closer (opening <think> lives in the PROMPT), split mid-tag.
+        let (deltas, calls) = pipeline_run(
+            true,
+            true,
+            &["The user asks... Let's call the tool.\n</th", "ink>answer"],
+        );
+        assert_eq!(visible_text(&deltas), "answer");
+        assert!(deltas.iter().all(|d| matches!(d, ChatDelta::Content(_))));
+        assert!(calls.is_empty());
+        // (b) full <think>...</think> pair.
+        let (deltas, _) = pipeline_run(true, true, &["<think>r</think>ans", "wer"]);
+        assert_eq!(visible_text(&deltas), "answer");
+        // (c) unclosed think (generation cut mid-reasoning) → nothing visible.
+        let (deltas, calls) = pipeline_run(true, true, &["<think>only reasoning, no closer"]);
+        assert_eq!(visible_text(&deltas), "");
+        assert!(calls.is_empty());
+        // (d) reasoning then a tool call, no text answer.
+        let (deltas, calls) = pipeline_run(
+            true,
+            true,
+            &[
+                "I need the weather.</think>",
+                "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+            ],
+        );
+        assert_eq!(visible_text(&deltas).trim(), "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        // (e) plain answer, thinking off → byte-identical passthrough.
+        let (deltas, calls) = pipeline_run(false, true, &["plain answer"]);
+        assert_eq!(visible_text(&deltas), "plain answer");
+        assert!(calls.is_empty());
+    }
+
+    /// Tool-less thinking keeps the OpenAI reasoning lane; tools mode drops it
+    /// (matching the non-streaming finalize).
+    #[test]
+    fn pipeline_reasoning_lane_gated_by_tools() {
+        let (deltas, _) = pipeline_run(true, false, &["r</think>a"]);
+        assert_eq!(deltas, vec![reasoning("r"), content("a")]);
+        let (deltas, _) = pipeline_run(true, true, &["r</think>a"]);
+        assert_eq!(deltas, vec![content("a")]);
     }
 }

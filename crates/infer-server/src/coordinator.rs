@@ -30,8 +30,8 @@ use crate::schema::{
     ModelsResponse, ResponseToolCall, StatsResponse,
 };
 use crate::sse_util::{
-    ChatDelta, StreamingReasoningSplitter, chat_stream_chunk, completion_stream_chunk,
-    finish_reason, unix_time_secs,
+    ChatDelta, StreamPipeline, chat_stream_chunk, completion_stream_chunk, finish_reason,
+    unix_time_secs,
 };
 use crate::tokenizer::OpenAiTokenizer;
 
@@ -394,15 +394,21 @@ fn decode(state: &Arc<CoordinatorHandle>, tokens: &[u32]) -> Result<String, ApiE
     Ok(tokenizer.decode(tokens)?)
 }
 
-/// Split a decoded chat completion into visible content + response tool calls.
+/// Split a decoded chat completion into visible content + response tool calls
+/// (the non-streaming twin of [`crate::sse_util::StreamPipeline`]).
 ///
 /// Tool-less requests pass the text straight through so [`from_parts`]' standard
-/// reasoning split runs (byte-identical). When tools are active,
-/// `openai_parse_tool_calls` strips `<think>` AND the tool blocks and collects
-/// the calls, so the response must split with thinking OFF (third return value)
-/// — re-scanning already-stripped text would move all content into reasoning.
+/// reasoning split runs (byte-identical). When tools are active, the canonical
+/// [`split_reasoning`] runs FIRST: the chat template pre-fills `<think>` into
+/// the *prompt*, so thinking output arrives as `reasoning</think>answer` with
+/// no opening tag — `openai_parse_tool_calls`' paired-tag strip misses that
+/// form and leaks reasoning + a stray `</think>` into content. Only the
+/// content half then feeds tool parsing; reasoning is dropped (no wire lane in
+/// tools mode) and the response splits with thinking OFF (third return value)
+/// — re-scanning already-split text would move all content into reasoning.
 ///
 /// [`from_parts`]: ChatCompletionResponse::from_parts
+/// [`split_reasoning`]: crate::schema::split_reasoning
 fn finalize_chat_content(
     decoded: String,
     tools_active: bool,
@@ -411,7 +417,8 @@ fn finalize_chat_content(
     if !tools_active {
         return (decoded, Vec::new(), thinking);
     }
-    let (content, calls) = chat::openai_parse_tool_calls(&decoded);
+    let (_reasoning, content) = crate::schema::split_reasoning(&decoded, thinking);
+    let (content, calls) = chat::openai_parse_tool_calls(&content);
     let tool_calls = calls
         .iter()
         .enumerate()
@@ -650,10 +657,8 @@ async fn chat_completions(
         tokio::spawn(async move {
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
-            // With tools active, `StreamingToolCalls` already strips `<think>`, so
-            // the reasoning splitter just forwards the visible remainder as content.
-            let mut splitter = StreamingReasoningSplitter::new(thinking && !tools_active);
-            let mut tool_stream = tools_active.then(chat::StreamingToolCalls::default);
+            // Converged reasoning-then-tools pipeline (shared with /v1/messages).
+            let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut completed_calls: Vec<chat::ToolCall> = Vec::new();
             // OpenAI convention: the first emitted chunk's delta carries `role`.
             let mut role_sent = false;
@@ -686,15 +691,9 @@ async fn chat_completions(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         tok.decode(&delta.token_ids).unwrap_or_default()
                     };
-                    let visible = match tool_stream.as_mut() {
-                        Some(stream) => {
-                            let (visible, calls) = stream.push(&text);
-                            completed_calls.extend(calls);
-                            visible
-                        }
-                        None => text,
-                    };
-                    for piece in splitter.push(&visible) {
+                    let (pieces, calls) = pipeline.push(&text);
+                    completed_calls.extend(calls);
+                    for piece in pieces {
                         let chunk = serde_json::to_string(&chat_stream_chunk(
                             &id,
                             created,
@@ -713,30 +712,10 @@ async fn chat_completions(
                     }
                 }
                 if delta.finish {
-                    // Drain the tool stream's buffered tail + its trailing visible text.
-                    if let Some(stream) = tool_stream.as_mut() {
-                        let (visible, calls) = stream.finish();
-                        completed_calls.extend(calls);
-                        for piece in splitter.push(&visible) {
-                            let chunk = serde_json::to_string(&chat_stream_chunk(
-                                &id,
-                                created,
-                                &model,
-                                with_role(piece.into_delta()),
-                                None,
-                            ))
-                            .unwrap_or_default();
-                            if chunk_tx
-                                .send(Ok(format!("data: {chunk}\n\n").into_bytes()))
-                                .await
-                                .is_err()
-                            {
-                                break 'stream;
-                            }
-                        }
-                    }
-                    // Truncated thinking: flush the held-back partial closer as reasoning.
-                    if let Some(piece) = splitter.finish() {
+                    // Flush the pipeline: truncated thinking + buffered tool tail.
+                    let (pieces, calls) = pipeline.finish();
+                    completed_calls.extend(calls);
+                    for piece in pieces {
                         let chunk = serde_json::to_string(&chat_stream_chunk(
                             &id,
                             created,
@@ -750,7 +729,7 @@ async fn chat_completions(
                             .await
                             .is_err()
                         {
-                            break;
+                            break 'stream;
                         }
                     }
                     // Each completed tool call rides one OpenAI streaming delta.
@@ -858,23 +837,24 @@ fn anthropic_prompt(
     Ok((chat_request, thinking, tools_active, prompt_tokens))
 }
 
-fn tool_call_arguments_json(call: &chat::ToolCall) -> String {
-    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Route visible (post-tool-strip) text through the reasoning splitter into
-/// Anthropic text deltas. Reasoning deltas have no Anthropic lane — dropped.
-fn push_anthropic_text(
+/// Encode routed pipeline output as Anthropic events: content becomes text
+/// deltas (reasoning has no Anthropic lane — dropped), completed calls become
+/// tool_use blocks. Returns whether any tool call was emitted.
+fn push_anthropic_events(
     events: &mut String,
-    splitter: &mut StreamingReasoningSplitter,
     encoder: &mut StreamEncoder,
-    visible: &str,
-) {
-    for piece in splitter.push(visible) {
+    pieces: Vec<ChatDelta>,
+    calls: &[chat::ToolCall],
+) -> bool {
+    for piece in pieces {
         if let ChatDelta::Content(text) = piece {
             events.push_str(&encoder.text_delta(&text));
         }
     }
+    for call in calls {
+        events.push_str(&encoder.tool_use(&call.name, &call.arguments));
+    }
+    !calls.is_empty()
 }
 
 /// `POST /v1/messages` — Anthropic Messages API onto the OpenAI chat machinery.
@@ -913,11 +893,8 @@ async fn anthropic_messages(
             {
                 return;
             }
-            // Same delta pipeline as the chat SSE path: tool stream strips
-            // `<think>` + `<tool_call>` blocks when tools are active, else the
-            // reasoning splitter lifts thinking out of the visible text.
-            let mut splitter = StreamingReasoningSplitter::new(thinking && !tools_active);
-            let mut tool_stream = tools_active.then(chat::StreamingToolCalls::default);
+            // Converged reasoning-then-tools pipeline (shared with the OpenAI SSE path).
+            let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut saw_tool_use = false;
             let mut output_tokens = 0usize;
             // Keep-alive pings while generation runs (long prefills).
@@ -948,32 +925,15 @@ async fn anthropic_messages(
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 tok.decode(&delta.token_ids).unwrap_or_default()
                             };
-                            let (visible, calls) = match tool_stream.as_mut() {
-                                Some(stream) => stream.push(&text),
-                                None => (text, Vec::new()),
-                            };
-                            push_anthropic_text(&mut events, &mut splitter, &mut encoder, &visible);
-                            for call in &calls {
-                                saw_tool_use = true;
-                                events.push_str(
-                                    &encoder.tool_use(&call.name, &tool_call_arguments_json(call)),
-                                );
-                            }
+                            let (pieces, calls) = pipeline.push(&text);
+                            saw_tool_use |=
+                                push_anthropic_events(&mut events, &mut encoder, pieces, &calls);
                         }
                         if delta.finish {
-                            // Drain the tool stream's buffered tail + trailing visible text.
-                            if let Some(stream) = tool_stream.as_mut() {
-                                let (visible, calls) = stream.finish();
-                                push_anthropic_text(&mut events, &mut splitter, &mut encoder, &visible);
-                                for call in &calls {
-                                    saw_tool_use = true;
-                                    events.push_str(
-                                        &encoder.tool_use(&call.name, &tool_call_arguments_json(call)),
-                                    );
-                                }
-                            }
-                            // Truncated thinking flushes as reasoning — no Anthropic lane.
-                            let _ = splitter.finish();
+                            // Flush the pipeline: truncated thinking + buffered tool tail.
+                            let (pieces, calls) = pipeline.finish();
+                            saw_tool_use |=
+                                push_anthropic_events(&mut events, &mut encoder, pieces, &calls);
                             events.push_str(&encoder.finish(
                                 anthropic::stop_reason(delta.finish_reason.as_ref(), saw_tool_use),
                                 output_tokens,
@@ -1098,4 +1058,94 @@ async fn stats(
         .map_err(|_| ApiError::internal("stats query timed out"))?
         .map_err(|_| ApiError::internal("stats oneshot closed"))?;
     Ok(Json(StatsResponse::from_wire(wire)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Decoded text → [`finalize_chat_content`] → `from_parts` → Anthropic
+    /// envelope: the exact non-streaming response assembly both APIs share.
+    fn anthropic_content(decoded: &str, tools_active: bool, thinking: bool) -> serde_json::Value {
+        let (content, tool_calls, split_thinking) =
+            finalize_chat_content(decoded.to_string(), tools_active, thinking);
+        let chat = ChatCompletionResponse::from_parts(
+            "m".to_string(),
+            content,
+            1,
+            1,
+            Some(&FinishReason::Stop),
+            split_thinking,
+            tool_calls,
+        );
+        let value = serde_json::to_value(crate::anthropic::MessagesResponse::from_chat(&chat))
+            .expect("serialize");
+        value["content"].clone()
+    }
+
+    /// The `</think>` leak matrix, non-streaming path (twin of the
+    /// `sse_util::StreamPipeline` matrix): reasoning must never reach Anthropic
+    /// text blocks — including the prompt-prefilled form with NO opening tag
+    /// that the tool parser's paired-tag strip misses (observed on the pod:
+    /// `content[0].text` began with reasoning prose + a stray `</think>`).
+    #[test]
+    fn finalize_reasoning_never_leaks_into_text_blocks() {
+        // (a) bare closer: opening <think> lives in the PROMPT.
+        assert_eq!(
+            anthropic_content(
+                "The user asks for weather... Let's call the tool.\n</think>answer",
+                true,
+                true
+            ),
+            json!([{"type": "text", "text": "answer"}])
+        );
+        // (b) full <think>...</think> pair.
+        assert_eq!(
+            anthropic_content("<think>r</think>answer", true, true),
+            json!([{"type": "text", "text": "answer"}])
+        );
+        // (c) unclosed think (generation cut mid-reasoning) → no text block.
+        assert_eq!(
+            anthropic_content("<think>only reasoning", true, true),
+            json!([])
+        );
+        // (d) reasoning then a tool call, no text answer → tool_use block only.
+        let blocks = anthropic_content(
+            "I need the weather.</think><tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+            true,
+            true,
+        );
+        let blocks = blocks.as_array().expect("content array");
+        assert_eq!(blocks.len(), 1, "no text block, got: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["input"], json!({"city": "Paris"}));
+        // (e) plain answer, thinking off → byte-identical passthrough.
+        assert_eq!(
+            anthropic_content("plain answer", true, false),
+            json!([{"type": "text", "text": "plain answer"}])
+        );
+    }
+
+    /// Same fix on the OpenAI side of the shared finalize: content carries no
+    /// reasoning, the tool call still parses, and the response never re-splits.
+    #[test]
+    fn finalize_openai_content_clean_with_tools_and_thinking() {
+        let (content, calls, split_thinking) = finalize_chat_content(
+            "reasoning prose\n</think><tool_call>\n{\"name\":\"x\",\"arguments\":{}}\n</tool_call>"
+                .to_string(),
+            true,
+            true,
+        );
+        assert_eq!(content.trim(), "");
+        assert_eq!(calls.len(), 1);
+        assert!(!split_thinking);
+        // Tool-less stays a passthrough for from_parts' canonical split.
+        let (content, calls, split_thinking) =
+            finalize_chat_content("r</think>a".to_string(), false, true);
+        assert_eq!(content, "r</think>a");
+        assert!(calls.is_empty());
+        assert!(split_thinking);
+    }
 }
