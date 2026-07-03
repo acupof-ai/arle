@@ -427,6 +427,15 @@ fn finalize_chat_content(
     (content, tool_calls, false)
 }
 
+/// `true` when the rendered prompt ends with an open `<think>` — the chat
+/// template prefilled thinking (e.g. Qwen3.6's Jinja defaults `enable_thinking`
+/// on), so output arrives as `reasoning</think>answer` regardless of what the
+/// request or server flags said. The parse-side reasoning gate must key off
+/// this rendered truth: flags alone leak the bare `</think>` form.
+fn prompt_prefills_think(prompt: &str) -> bool {
+    prompt.trim_end().ends_with("<think>")
+}
+
 async fn completions(
     State(state): State<Arc<CoordinatorHandle>>,
     Json(request): Json<CompletionRequest>,
@@ -591,6 +600,7 @@ async fn chat_completions(
                     reasoning_effort,
                 )?
             };
+            let thinking = thinking || prompt_prefills_think(&prompt);
             let prompt = crate::multimodal::expand_image_markers(&prompt, &images, Some(kind))?;
             let prompt_tokens = encode(&state, &prompt)?;
             let prompt_token_count = prompt_tokens.len();
@@ -644,6 +654,7 @@ async fn chat_completions(
         )?
     };
     let prompt_tokens = encode(&state, &prompt)?;
+    let thinking = thinking || prompt_prefills_think(&prompt);
 
     if stream {
         let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
@@ -834,6 +845,9 @@ fn anthropic_prompt(
         tokenizer.render_chat_full(&chat_request.messages, None, tools, thinking, None)?
     };
     let prompt_tokens = encode(state, &prompt)?;
+    // /v1/messages carries no chat_template_kwargs, so the rendered-prompt gate
+    // is its ONLY route to the reasoning split for template-default thinking.
+    let thinking = thinking || prompt_prefills_think(&prompt);
     Ok((chat_request, thinking, tools_active, prompt_tokens))
 }
 
@@ -1064,6 +1078,17 @@ async fn stats(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prompt_prefills_think_keys_off_rendered_tail() {
+        assert!(prompt_prefills_think("<|im_start|>assistant\n<think>"));
+        assert!(prompt_prefills_think("…assistant\n<think>\n")); // template's trailing newline
+        // Explicit non-thinking prefill (Qwen3 dense) closes the block — off.
+        assert!(!prompt_prefills_think(
+            "…assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(!prompt_prefills_think("plain prompt"));
+    }
 
     /// Decoded text → [`finalize_chat_content`] → `from_parts` → Anthropic
     /// envelope: the exact non-streaming response assembly both APIs share.
