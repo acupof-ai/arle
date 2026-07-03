@@ -736,7 +736,10 @@ const THINK_END: &str = "</think>";
 ///
 // ponytail: chat SSE splits incrementally via
 // `sse_util::StreamingReasoningSplitter` — keep the two policies in lockstep.
-fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
+// pub(crate): also the canonical pre-split for the tools path
+// (`coordinator::finalize_chat_content`) — the tool parser's paired-tag strip
+// misses the prompt-prefilled `reasoning</think>` form.
+pub(crate) fn split_reasoning(text: &str, enable_thinking: bool) -> (Option<String>, String) {
     if !enable_thinking {
         return (None, text.to_string());
     }
