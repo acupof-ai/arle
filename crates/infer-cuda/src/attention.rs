@@ -2559,13 +2559,8 @@ fn try_flashmla_prefill_attention(
         update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
     }
 
-    if env_flag("ARLE_DSV4_FLASHMLA_PREFILL_SYNC")? {
-        ctx.sync()?;
-    }
-
     // Keep temporary buffers in scope until all launches that use their raw
-    // pointers have been enqueued. Optional sync above is available for
-    // diagnostics and for conservative lifetime validation on pod.
+    // pointers have been enqueued.
     drop(tp_gathered_q.take());
     drop(tp_packed_q.take());
     drop(tp_full_out.take());
