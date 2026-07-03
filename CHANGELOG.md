@@ -25,6 +25,15 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **DSv4 decode-kernel levers #141/#142/#143 LICENSED (2026-07-04).** uint4-vectorized
+  FP8 GEMVs + TILE-templated batch accumulator + warp-parallel mhc_params tail with a
+  fused params|pre_rms_norm decode-graph pair. Matched binary-pair A/B (TP=4/EP=4,
+  8×H20, same shell): decode TPOT 39.57→24.90 ms (−37.1%, MTP-off c=1) and
+  31.27→20.94 ms/committed-tok (−33.0%, MTP-on 2015-in); needle 3/3 + count gates
+  clean, MTP drift shown pre-existing via paired baseline control.
+  [wins/gemv](docs/experience/wins/2026-07-03-dsv4-gemv-uint4-tile-template.md) ·
+  [wins/mhc](docs/experience/wins/2026-07-03-dsv4-mhc-tail-parallel-fused.md)
+
 - **Agent-OPD toy-corpus capability lane KILLED; harness + 12-round loop SHIPPED (2026-07-03).**
   Five measured escalations (surface cues, gold-module scenery, turn budgets)
   all left the untrained 27B at ceiling on synthetic small-repo bug-fix tasks
