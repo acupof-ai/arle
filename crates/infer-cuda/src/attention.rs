@@ -2237,11 +2237,16 @@ fn try_flashmla_prefill_attention(
             Some(c) => seg(&ctx.stream.clone_dtoh(&c.data)?),
             None => (0, None),
         };
-        eprintln!(
-            "[kvprobe] mode={mode:?} cr={compress_ratio} start_pos={start_pos} n={token_count} C={compressed_count} \
+        // Pre-format to ONE string => one write syscall: unbuffered stderr writes
+        // each format fragment separately, and 4 TP ranks sharing the log fd
+        // interleave at fragment boundaries. pid tags the rank stream.
+        let line = format!(
+            "[kvprobe] pid={} mode={mode:?} cr={compress_ratio} start_pos={start_pos} n={token_count} C={compressed_count} \
              kv[sw]={sw_n}@{sw_f:?} kv[chunk]={ck_n}@{ck_f:?} kv[comp]={cp_n}@{cp_f:?} \
-             src ring={ring_n}@{ring_f:?} comp={src_n}@{src_f:?} q={q_n}@{q_f:?}"
+             src ring={ring_n}@{ring_f:?} comp={src_n}@{src_f:?} q={q_n}@{q_f:?}\n",
+            std::process::id()
         );
+        eprint!("{line}");
     }
 
     let mut indices = ctx
@@ -7577,6 +7582,28 @@ fn compressor_forward(
     // accepted-prefix commit re-forward (non-frozen) advances it for real.
     if !dsv4_verify_frozen() {
         state.compressed.seq_len = compressed_rows;
+    }
+    // TEMP #138 probe v2 (self-gating; revert with d4dccfc6): scan the
+    // compressor projection outputs and the staging right after the fold —
+    // splits projection-NaN vs fold-NaN vs post-fold clobber. Prefill only.
+    if token_count > 1 && env_flag("ARLE_DSV4_PREFILL_KV_NAN_PROBE")? {
+        ctx.sync()?;
+        let seg = |v: &[half::bf16], d: usize| {
+            let nan = v.iter().filter(|x| x.to_f32().is_nan()).count();
+            let first = v
+                .chunks(d.max(1))
+                .position(|r| r.iter().any(|x| x.to_f32().is_nan()));
+            (nan, first)
+        };
+        let (kv_n, kv_f) = seg(&ctx.stream.clone_dtoh(&kv_raw.data)?, width);
+        let (sc_n, sc_f) = seg(&ctx.stream.clone_dtoh(&score_raw.data)?, width);
+        let (st_n, st_f) = seg(&ctx.stream.clone_dtoh(&state.compressed.data)?, head_dim);
+        let line = format!(
+            "[cprobe] pid={} ratio={ratio} start_pos={start_pos} n={token_count} rows={compressed_rows} \
+             kv={kv_n}@{kv_f:?} score={sc_n}@{sc_f:?} staging={st_n}@{st_f:?}\n",
+            std::process::id()
+        );
+        eprint!("{line}");
     }
     Ok(())
 }
