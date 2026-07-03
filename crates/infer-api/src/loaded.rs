@@ -119,7 +119,14 @@ impl Default for EngineLoadConfig {
     fn default() -> Self {
         // Conservative local-serving defaults shared by every backend builder.
         Self {
-            num_slots: 4,
+            // Auto-budget ceiling, NOT a concurrency cap: the executor clamps
+            // this to what post-weights VRAM affords (`kv_budget_plan` /
+            // `kv_budget_num_slots`), and `max_running_requests` is the
+            // user-facing concurrency knob. `--num-slots` was removed; the old
+            // default of 4 lingered as a hard 4-slot cap that starved
+            // concurrency regardless of VRAM. 256 is beyond any single-box need,
+            // so the VRAM budget always binds first.
+            num_slots: 256,
             max_running_requests: None,
             total_pages: 8192,
             page_size: 16,
