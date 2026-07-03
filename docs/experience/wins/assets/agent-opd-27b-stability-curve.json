@@ -1,0 +1,184 @@
+{
+  "baseline_pass_rate": 0.9583333134651184,
+  "baseline_envelope": [
+    0.9583333134651184,
+    0.9166666865348816,
+    0.9583333134651184
+  ],
+  "evals": [
+    {
+      "round": 0,
+      "pass_rate": 0.9583333134651184,
+      "passed": 23,
+      "tasks": 24
+    },
+    {
+      "round": 2,
+      "pass_rate": 0.9583333134651184,
+      "passed": 23,
+      "tasks": 24
+    },
+    {
+      "round": 4,
+      "pass_rate": 0.9583333134651184,
+      "passed": 23,
+      "tasks": 24
+    },
+    {
+      "round": 6,
+      "pass_rate": 1.0,
+      "passed": 24,
+      "tasks": 24
+    },
+    {
+      "round": 8,
+      "pass_rate": 1.0,
+      "passed": 24,
+      "tasks": 24
+    },
+    {
+      "round": 10,
+      "pass_rate": 1.0,
+      "passed": 24,
+      "tasks": 24
+    },
+    {
+      "round": 12,
+      "pass_rate": 1.0,
+      "passed": 24,
+      "tasks": 24
+    }
+  ],
+  "train": [
+    {
+      "round": 0,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 23,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 0.9583333333333334,
+      "mean_loss": 0.3758
+    },
+    {
+      "round": 1,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.3607
+    },
+    {
+      "round": 2,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.3224
+    },
+    {
+      "round": 3,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.2878
+    },
+    {
+      "round": 4,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.2792
+    },
+    {
+      "round": 5,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.2787
+    },
+    {
+      "round": 6,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.2142
+    },
+    {
+      "round": 7,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.2455
+    },
+    {
+      "round": 8,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 23,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 0.9583333333333334,
+      "mean_loss": 0.1781
+    },
+    {
+      "round": 9,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 22,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 0.9166666666666666,
+      "mean_loss": 0.2177
+    },
+    {
+      "round": 10,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.1551
+    },
+    {
+      "round": 11,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 24,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 1.0,
+      "mean_loss": 0.1638
+    },
+    {
+      "round": 12,
+      "tasks": 12,
+      "rollouts": 24,
+      "passed": 22,
+      "distinct": 12,
+      "trained_pairs": 8,
+      "accept_rate": 0.9166666666666666,
+      "mean_loss": 0.1703
+    }
+  ]
+}
