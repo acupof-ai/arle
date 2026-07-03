@@ -1054,6 +1054,16 @@ __device__ void dsv4_compressor_update_body(
     __shared__ float norm_scale;
     if (threadIdx.x == 0) {
       norm_scale = rsqrtf(sumsq / fmaxf((float)head_dim, 1.0f) + eps);
+      // #138 TEMP diagnostic (self-gating: only fires when the finalize
+      // intermediate is already non-finite, so zero cost on the happy path;
+      // NOT to be committed — pins the NaN birth op: acc/sumsq overflow vs
+      // a non-finite input value).
+      if (!isfinite(sumsq) || !isfinite(norm_scale)) {
+        float maxabs = 0.0f;
+        for (int c = 0; c < head_dim; ++c) maxabs = fmaxf(maxabs, fabsf(row[c]));
+        printf("[nan138] block=%d sumsq=%g norm_scale=%g max|row|=%g ratio=%d\n",
+               block, sumsq, norm_scale, maxabs, ratio);
+      }
     }
     __syncthreads();
 
