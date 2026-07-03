@@ -56,3 +56,22 @@ requests exercise tools + multi-turn tool history that nothing else had.
 
 Bench: exempt (additive endpoint + COLD template-render repair; inference hot
 path untouched — OpenAI tool-less renders byte-identical by construction).
+
+## Addendum — live Claude Code end-to-end (same day)
+
+Real `claude` CLI pointed at the local Metal serve
+(`ANTHROPIC_BASE_URL=http://127.0.0.1:18123`, Qwen3.5-0.8B): **wire-level
+PASS** — `is_error=false`, `terminal_reason=completed`, 2 turns, 165,121
+input / 31,604 output tokens through `/v1/messages` with zero API errors.
+Two integration findings, both fixed en route:
+
+1. **Claude Code sends mid-conversation `role:"system"` messages** (Opus 4.8
+   feature); the Qwen template raises on non-first system → degraded to
+   `<system-reminder>` user turns (`29df035c`).
+2. **Claude Code fires concurrent requests** (main + side calls) — a 1-slot
+   serve 500s (`server is busy: backend allows at most 1 live request`).
+   CC-as-harness serves need `--max-running-requests ≥ 2` (used 4).
+
+The empty `result` text is 0.8B model quality (31K tokens of rambling CC
+couldn't reduce to a final answer), not a protocol gap — the harness target
+is the 27B on CUDA.
