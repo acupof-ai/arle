@@ -291,6 +291,10 @@ impl SandboxToolExecutor {
 
         let mut command = Command::new("bash");
         command.arg("-lc").arg(cmd).current_dir(&self.workdir);
+        // Never write bytecode in the sandbox: a stale in-tree __pycache__
+        // (same mtime-second + same size after an edit) makes a later pytest
+        // run pre-edit bytecode — byte-length-preserving fixes score as fails.
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
 
         if let Some(prefix) = &self.pythonpath {
             let combined = match std::env::var("PYTHONPATH") {
@@ -657,6 +661,9 @@ pub fn score_workdir(
 
     let mut command = Command::new("bash");
     command.arg("-lc").arg(&cmd).current_dir(workdir);
+    // Mirror run_bash: no bytecode, and ignore any stale pyc a rollout left
+    // behind (scoring must execute the edited source, not cached bytecode).
+    command.env("PYTHONDONTWRITEBYTECODE", "1");
     if let Some(pythonpath) = pythonpath {
         let combined = match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.is_empty() => format!("{pythonpath}:{existing}"),
