@@ -1,6 +1,19 @@
 # Plan — Agentic OPD showcase: a real 27B capability curve
 
-> Status: Active — 2026-07-03 · Driver: ckl ("真实的能提升 27B 模型的能力，拿到数据和曲线")
+> Status: Active — 2026-07-03 (phase 1 closed same day: toy-capability lane
+> KILLED, harness + stability run SHIPPED; phase 2 = teacher-rescue on real
+> SWE-Pro, below) · Driver: ckl ("真实的能提升 27B 模型的能力，拿到数据和曲线")
+
+**Phase-1 verdict (2026-07-03, measured).** The synthetic-corpus capability
+lane is dead: five escalations (easy → hard-v1 → hard-v2 neutral-docstrings +
+gold scenery → turn budgets 3/2/1) all landed outside the 10–40% band —
+baselines 8/8, 24/24, 24/24, 22/24, 20/24, 0/24. Root cause + rule:
+[errors/2026-07-03-agent-opd-toy-corpus-saturation-kill.md](../experience/errors/2026-07-03-agent-opd-toy-corpus-saturation-kill.md).
+What shipped anyway: the full harness (corpus gen + self-check, run script,
+curve plotter, eval channel), two real runtime fixes found under load (tape
+footprint 2.54× underestimate → OOM at seq≈1350, sandbox `__pycache__`
+staleness), the accept-wall nudges, and a 16-round stability run (wins entry).
+The capability curve moves to phase 2.
 
 **Goal.** Turn the agent-OPD infra win (438s → 11.75s/round, 37.3×,
 [wins/2026-07-03-opd-full20-curve.md](../experience/wins/2026-07-03-opd-full20-curve.md))
@@ -43,7 +56,7 @@ Supersedes the eval-surface portion of
 | G3 | **Tool-schema errors don't name the schema** — `read` with no `path` returns "ERROR: … is a directory"; unknown tool doesn't list valid tools (`sandbox.rs` `execute()`) | **Fix now** (flagged-not-fixed in the 06-29 entry) |
 | G4 | Edit-pressure: system prompt says "must edit" but the decoded rollout wandered 30 turns | **Prompt-only nudge now** (edit-by-turn-N line in `agent_system_prompt`); mid-rollout injected reminder in `agent::run_turn` deferred |
 | G5 | `--writeback-cap` truncates head-of-list — over-trains early tasks, no per-task dedup of the best-of-N accepts | Defer; note in wins entry if it binds |
-| G6 | **No teacher in the agentic loop** — current writeback is execution-filtered self-CE (RFT). The "OPD" completion = think-on teacher (or DSv4-Flash via `InferTeacher`) rescue on 0-accept tasks + masked CE/KL on teacher trajectories. Solves bootstrap when baseline = 0 | **Defer to phase 2**, own license |
+| G6 | **No teacher in the agentic loop** — current writeback is execution-filtered self-CE (RFT). The "OPD" completion = think-on teacher (or DSv4-Flash via `InferTeacher`) rescue on 0-accept tasks + masked CE/KL on teacher trajectories. Solves bootstrap when baseline = 0 | **Phase 2 — now the licensed path** (see below) |
 | G7 | Train-side metrics are stderr lines only (eval side already dumps JSONL) | Parse the stable log lines in the plot script; no Rust change |
 
 ---
@@ -99,6 +112,34 @@ The envelope width is the noise floor the curve must clear.
 baseline ≥ **+15pp** AND above the baseline envelope max. Baseline stuck at 0
 ⇒ bootstrap gap confirmed ⇒ KILL the RFT-only claim, G6 becomes the licensed
 next step (that is itself a publishable finding, documented in errors/).
+
+## Phase 2 — teacher-rescue agentic OPD on real SWE-Pro
+
+Why this is the curve: at real-repo scale the 27B has a decoded 0-accept wall
+(explore-forever, never edits) — the regime where RFT starves (0 accepts ⇒ no
+gradient) and where a runtime-served teacher is the ARLE-differentiated move.
+This is also what makes the loop *OPD* rather than plain rejection sampling.
+
+1. **Corpus staging** (prerequisite): `scripts/stage_swe_pro.py` — pick ≥12
+   train + 12 eval python SWE-Pro instances (pytest-runnable, bounded repo
+   size), clone at `base_commit` under `staged/<instance_id>/`, run
+   `before_repo_set_cmd`, verify each with the same base-FAILS/gold-PASSES
+   self-check. Pod already holds 4 ansible instances (269 MB) from 06-27..30.
+2. **Teacher = the same 27B engine, thinking ON** (zero extra VRAM; precedent:
+   the 2026-06-20 4B think-on BFCL win). Rescue pass in
+   `agent_opd.rs::run_agentic_opd_round`: tasks with 0 student accepts get M=2
+   teacher rollouts (prompts without the `/no_think` soft-switch, temp ~0.7,
+   `--teacher-max-tokens` ≥10K for thinking budget); passing teacher
+   trajectories enter the SAME masked-CE writeback. Open decision to settle by
+   reading the 06-20 entry first: train the student think-on too (no mask
+   mismatch) vs mask `<think>` spans out of the CE targets.
+3. **Curve**: held-out real-instance pass-rate, baseline → round N, with the
+   same envelope protocol. Secondary read: student accept-rate on train tasks
+   (does the rescued student start accepting on-policy? — the flywheel
+   igniting is the story).
+4. Escalation if the same-27B teacher also 0-accepts everything: DSv4-Flash
+   teacher via `InferTeacher` (time-share the device per
+   `offload_engine_weights`), at real extra cost — own license.
 
 ## Deliverables
 
