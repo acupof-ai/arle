@@ -121,9 +121,9 @@ Per decode step (~50.7 ms GPU-busy/rank, 2.34 committed tok/step, 25.6 ms/tok):
 
 | Lever | Target | Share | Why |
 |---|---|---|---|
-| **G1 — small-batch FP8 GEMV efficiency** | the 52 % GEMV stack (`gemv_handwritten`, `dsv4_fp8_gemv_batch*`) | 52 % | hand-rolled warp-per-row w8a16 GEMV at R≤8 runs ~4 % of HBM; a better grouped-GEMV / DeepGEMM-at-small-batch / tensor-core path is the main course. ncu the three kernels first. |
-| **G2 — MTP acceptance** (2.34 → higher tok/step) | committed-token cost, kernel-free | linear | deeper MTP / better draft (DSpark C1 #124) divides the 25.6 ms directly; orthogonal to G1. Blocked-adjacent by #140 (MTP crash ~613 ticks). |
-| **G3 — `dsv4_mhc_params` 9.5 %** | MODEL1 hyper-connection mixer | 9.5 % | suspiciously large for a param-gen op; is it recomputed per layer when it could be cached? read the HC path. |
+| **G1 — FP8 GEMV vectorization (#141)** | the 52 % GEMV stack (`dsv4_fp8_gemv_batch_tiled/batch`, `gemv_handwritten`) | 52 % | scalar per-byte inner loop (quantized_gemv.cu:611/551) → `uint4` (16 FP8/`__nv_fp8x4_e4m3`), in-tree template `fp8d_dot16` (dsv4_fp8_decode_moe.cu:77). **+ #142** template the batch_tiled accumulator over TILE==B (Qwen twin measured fixed-32 2.15-6.50× → 1.04-1.14× at B=2/4/8). **+ #144** consolidate 46 near-identical kernels onto the one vectorized primitive. |
+| **G2 — MTP acceptance** (2.34 → higher tok/step) | committed-token cost, kernel-free | linear | deeper MTP / better draft (DSpark C1 #124) divides the 25.6 ms directly; orthogonal to G1. |
+| **G3 — `dsv4_mhc_params` 9.5 % (#143)** | MODEL1 hyper-connection mixer | 9.5 % | serial threadIdx.x==0 tail (dsv4_mhc.cu:151) → parallelize across the block + fold 2 launches→1. NOT cacheable (audit killed that: reads the evolving residual). |
 | H1/H2 (collectives) | — | 1.3–6.7 % | demoted; revisit only if G1 shrinks the GEMV floor enough that 6.7 % matters. |
 
 Both correctness blockers must clear before G1/G2 A/Bs: **#138** (ctx-129
