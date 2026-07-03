@@ -6099,21 +6099,15 @@ impl Dsv4Model {
                             hc_mult,
                             &mut graph.initial_stream,
                         )?;
-                        let mhc = crate::hc::gen_mhc_params_into(
+                        crate::hc::gen_mhc_params_pre_rms_norm_into(
                             &self.ctx,
                             &self.config,
                             &layer.hc_attn,
                             &graph.initial_stream,
-                            attn_mhc,
-                        )?;
-                        crate::hc::mhc_pre_rms_norm(
-                            &self.ctx,
-                            &graph.initial_stream,
-                            mhc.pre,
                             &layer.attn_norm,
                             eps,
                             hidden_size,
-                            hc_mult,
+                            attn_mhc,
                             attn_normed,
                         )?;
                         crate::attention::mla_attention_decode_graph(
@@ -6172,21 +6166,15 @@ impl Dsv4Model {
                             hc_mult,
                             &mut prev.ffn_stream,
                         )?;
-                        let mhc = crate::hc::gen_mhc_params_into(
+                        crate::hc::gen_mhc_params_pre_rms_norm_into(
                             &self.ctx,
                             &self.config,
                             &layer.hc_attn,
                             &prev.ffn_stream,
-                            attn_mhc,
-                        )?;
-                        crate::hc::mhc_pre_rms_norm(
-                            &self.ctx,
-                            &prev.ffn_stream,
-                            mhc.pre,
                             &layer.attn_norm,
                             eps,
                             hidden_size,
-                            hc_mult,
+                            attn_mhc,
                             attn_normed,
                         )?;
                         crate::attention::mla_attention_decode_graph(
@@ -6256,21 +6244,15 @@ impl Dsv4Model {
                         hc_mult,
                         attn_stream,
                     )?;
-                    let mhc = crate::hc::gen_mhc_params_into(
+                    crate::hc::gen_mhc_params_pre_rms_norm_into(
                         &self.ctx,
                         &self.config,
                         &layer.hc_ffn,
                         attn_stream,
-                        ffn_mhc,
-                    )?;
-                    crate::hc::mhc_pre_rms_norm(
-                        &self.ctx,
-                        attn_stream,
-                        mhc.pre,
                         &layer.ffn_norm,
                         eps,
                         hidden_size,
-                        hc_mult,
+                        ffn_mhc,
                         ffn_normed,
                     )?;
                     crate::moe::dsv4_moe_forward_decode_graph(
