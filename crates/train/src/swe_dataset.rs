@@ -141,7 +141,17 @@ fn truncate_chars(text: &str, budget: usize) -> String {
 ///
 /// Deliberately excludes any environment / repo-tree detail — that is gathered
 /// at runtime by the sandbox executor.
-pub fn agent_system_prompt(task: &SweTask) -> String {
+///
+/// `think` selects the Qwen3.x thinking soft-switch: `false` appends
+/// `/no_think` (tool calls with no deliberation — the cheap default);
+/// `true` leaves thinking enabled (the 2026-06-20 think-on precedent:
+/// enable thinking EVERYWHERE, no `<think>`-span masking).
+pub fn agent_system_prompt(task: &SweTask, think: bool) -> String {
+    let closing = if think {
+        "Think the problem through, then act with tool calls."
+    } else {
+        "Respond directly with a tool call — do not deliberate at length. /no_think"
+    };
     format!(
         "You are an autonomous coding agent fixing a bug in the `{repo}` \
 repository. Your working directory is the repo root (cwd = repo root); the \
@@ -173,14 +183,14 @@ what you changed and why.
 
 Keep the change minimal and correct.
 
-Respond directly with a tool call — do not deliberate at length. /no_think",
+{closing}",
         repo = task.repo,
     )
 }
 
 /// The first user message: the problem statement, plus requirements when
 /// present, each truncated to a sane char budget (~3000 chars).
-pub fn agent_user_prompt(task: &SweTask) -> String {
+pub fn agent_user_prompt(task: &SweTask, think: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str("Problem statement:\n");
     prompt.push_str(&truncate_chars(&task.problem_statement, PROMPT_CHAR_BUDGET));
@@ -193,11 +203,13 @@ pub fn agent_user_prompt(task: &SweTask) -> String {
         }
     }
 
-    // Qwen3.x soft-switch: disable thinking-mode for the rollout so the student
-    // emits tool calls directly instead of an empty <think> block that strips to
-    // nothing (decoded EmptyNoProgress root cause). Scoped to agent-OPD, not the
+    // Qwen3.x soft-switch: with `think` off the student emits tool calls
+    // directly instead of an empty <think> block that strips to nothing
+    // (decoded EmptyNoProgress root cause). Scoped to agent-OPD, not the
     // chat renderer, so the local `arle run` agent keeps thinking available.
-    prompt.push_str("\n\n/no_think");
+    if !think {
+        prompt.push_str("\n\n/no_think");
+    }
     prompt
 }
 
@@ -287,16 +299,22 @@ mod tests {
         }"#;
         let task = task_from_line(line);
 
-        let system = agent_system_prompt(&task);
+        let system = agent_system_prompt(&task, false);
         assert!(system.contains("ansible/ansible"));
         for tool in ["`read`", "`write`", "`replace`", "`bash`"] {
             assert!(system.contains(tool), "system prompt missing {tool}");
         }
         assert!(system.contains("cwd = repo root"));
+        assert!(system.contains("/no_think"));
 
-        let user = agent_user_prompt(&task);
+        let user = agent_user_prompt(&task, false);
         assert!(user.contains("the foo module crashes on empty input"));
         assert!(user.contains("must keep backward compat"));
+        assert!(user.contains("/no_think"));
+
+        // Think mode drops the soft-switch from BOTH prompts.
+        assert!(!agent_system_prompt(&task, true).contains("/no_think"));
+        assert!(!agent_user_prompt(&task, true).contains("/no_think"));
     }
 
     #[test]
@@ -312,7 +330,7 @@ mod tests {
             }}"#
         );
         let task = task_from_line(&line);
-        let user = agent_user_prompt(&task);
+        let user = agent_user_prompt(&task, false);
         assert!(user.contains("[truncated]"));
     }
 
