@@ -25,6 +25,20 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **Agent-OPD toy-corpus capability lane KILLED; harness + 12-round loop SHIPPED (2026-07-03).**
+  Five measured escalations (surface cues, gold-module scenery, turn budgets)
+  all left the untrained 27B at ceiling on synthetic small-repo bug-fix tasks
+  (8/8 → 24/24 → 22/24→0/24 cliff) — classic single-line bugs are
+  pattern-matched, and read→edit completes in 2 turns. What shipped: the full
+  curve harness (corpus gen + self-check, `scripts/agent_opd_curve.sh`,
+  plotter, held-out eval channel), the tape-footprint 3× margin fix (OOM at
+  seq≈1350), sandbox `__pycache__` staleness fix, and a 12-round 27B run
+  (loss 0.376→0.155, pass-rate ≥ baseline, zero OOM). Phase 2 =
+  teacher-rescue on real SWE-Pro.
+  ([kill](docs/experience/errors/2026-07-03-agent-opd-toy-corpus-saturation-kill.md) ·
+  [run](docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md) ·
+  [plan](docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md))
+
 - **Phase 2 re-scoped; whole-step decode CUDA graph RE-KILLED (2026-06-21).**
   The B=1 chain-map/roofline shows the wall is foundation-bound (per-step
   `ctx.sync` + cross-process barrier; HBM ~2.8% util, 36× below roofline) —

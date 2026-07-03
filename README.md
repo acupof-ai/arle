@@ -112,6 +112,8 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 The same loop lifts *agentic* capability: with think-on OPD the 4B student learns to **decline irrelevant tool calls — BFCL-live abstention 0.60 → 1.00**. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
+**And it closes end-to-end on agent trajectories.** `arle train agent-opd` has a 27B FP8 student drive a real read/write/replace/bash tool loop in per-task repo sandboxes; the reward is execution (hidden tests run against the `git diff`); passing trajectories write back as masked next-token CE and the LoRA re-syncs into the rollout engine every round — student and rollout engine share one set of FP8 base weights (train-infer-unified, zero-copy) on **one H20 at ~11.75 s/round (37× vs the naive loop)**, with a held-out execution-eval channel (baseline → per-round Δ) and 12-round multi-task runs holding loss ↓ / pass-rate ≥ baseline / zero OOM. [<a href="docs/experience/wins/2026-07-03-opd-full20-curve.md">loop perf</a> · <a href="docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md">12-round run</a>]
+
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3-dense + Qwen3.5/3.6 (hybrid · MoE) on CUDA + Metal · DeepSeek-V4-Flash + GLM-5.2 (CUDA 8×H20 TP=8/EP=8; GLM-5.2 verify pending) · Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma (Metal). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
 ---
