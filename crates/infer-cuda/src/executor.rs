@@ -2735,13 +2735,33 @@ impl Dsv4CudaExecutor {
             )?;
             return Ok(vec![token]);
         }
-        let pending = self.spec_slots[slot_idx]
-            .pending
-            .ok_or_else(|| anyhow::anyhow!("DSv4 MTP decode missing pending token"))?;
-        ensure!(
-            pending == last_token,
-            "DSv4 MTP pending token {pending} != DecodeRow.last_token {last_token}"
-        );
+        // Self-heal an un-seeded / desynced MTP stream (#140). A request that
+        // enters Decoding WITHOUT a tail prefill — a full position-0 prefix-cache
+        // hit or a whole-slot promote, both of which reset `spec_slots` to
+        // default (pending=None) and rely on a tail warm-step that never runs on
+        // a full hit — reaches its first decode spec_step with no pending token.
+        // The old code bailed the whole TP group (crash observed ~613 verify
+        // ticks into sustained serving once the prefix cache warmed). Instead
+        // re-seed via one warm no-spec step for `last_token`: it stages
+        // pending + hidden and emits the token, so the NEXT step runs real MTP.
+        // A pending that disagrees with `last_token` is a stream desync (the
+        // staged hidden belongs to a different token) — same recovery, warned.
+        let seeded = match self.spec_slots[slot_idx].pending {
+            Some(pending) if pending == last_token => true,
+            Some(pending) => {
+                log::warn!(
+                    "DSv4 MTP stream desync (slot {slot_idx}): pending {pending} != last_token \
+                     {last_token}; re-seeding via a warm step"
+                );
+                false
+            }
+            None => false,
+        };
+        if !seeded {
+            let token =
+                self.forward_mtp_warm_step(slot_idx, &[last_token], start_pos, params, position)?;
+            return Ok(vec![token]);
+        }
         // Adaptive gate (B=1): when the running acceptance EMA predicts MTP would
         // lose to no-spec, run a warm no-spec step instead — keeps the draft head
         // staged so MTP resumes the moment acceptance recovers (a periodic probe
@@ -2806,20 +2826,45 @@ impl Dsv4CudaExecutor {
         let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
         if spec_on && all_greedy {
-            for row in &batch.rows {
-                ensure!(
-                    row.params.is_greedy(),
-                    "DSv4 MTP greedy verify currently supports greedy sampling only"
-                );
-                let pending = self.spec_slots[row.slot].pending.ok_or_else(|| {
-                    anyhow::anyhow!("DSv4 MTP batched decode missing pending token")
-                })?;
-                ensure!(
-                    pending == row.last_token,
-                    "DSv4 MTP pending token {pending} != DecodeRow.last_token {} (slot {})",
-                    row.last_token,
-                    row.slot
-                );
+            // Self-heal an un-seeded / desynced MTP stream (#140), the batched
+            // twin of the B=1 path: a slot entering Decoding without a tail
+            // prefill (full prefix-cache hit / whole-slot promote) has pending=
+            // None. Rather than bail the TP group, warm-step EVERY row this one
+            // tick to (re)seed pending+hidden, then batched MTP resumes next
+            // tick. Cheaper than splitting the batch; a one-tick per-slot
+            // degradation only when a slot joins un-seeded.
+            let needs_seed = batch
+                .rows
+                .iter()
+                .any(|row| self.spec_slots[row.slot].pending != Some(row.last_token));
+            if needs_seed {
+                let mut tokens = Vec::with_capacity(batch.rows.len());
+                for row in &batch.rows {
+                    if let Some(pending) = self.spec_slots[row.slot].pending {
+                        if pending != row.last_token {
+                            log::warn!(
+                                "DSv4 MTP batched stream desync (slot {}): pending {pending} != \
+                                 last_token {}; re-seeding",
+                                row.slot,
+                                row.last_token
+                            );
+                        }
+                    }
+                    let token = self.forward_mtp_warm_step(
+                        row.slot,
+                        &[row.last_token],
+                        row.start_pos,
+                        &row.params,
+                        row.position,
+                    )?;
+                    tokens.push(SlotToken {
+                        slot: row.slot,
+                        token,
+                        logprob: None,
+                        finish: None,
+                    });
+                }
+                return Ok(tokens);
             }
             let committed = self.spec_step_batched(&batch.slot_ids, &batch.start_positions)?;
             ensure!(
