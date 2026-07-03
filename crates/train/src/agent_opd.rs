@@ -166,6 +166,19 @@ mod cuda_rollout {
         pub max_tokens: usize,
         /// Sampling temperature for rollout diversity.
         pub temperature: f32,
+        /// Thinking soft-switch for ALL rollouts (train + rescue + eval):
+        /// think-on everywhere or off everywhere, never mixed — the
+        /// 2026-06-20 precedent (no `<think>`-span masking; the reasoning
+        /// transfer is the point).
+        pub think: bool,
+        /// Budget-asymmetric self-rescue: tasks with ZERO accepted samples
+        /// get this many extra rollouts at `rescue_max_tokens`. 0 = off.
+        /// This is the bootstrap for regimes where plain rejection sampling
+        /// starves (real-repo 0-accept wall).
+        pub rescue_samples: usize,
+        /// Per-sub-turn token budget for rescue rollouts (thinking needs
+        /// room; the normal `max_tokens` stays cheap).
+        pub rescue_max_tokens: usize,
         /// Legacy CE micro-batch size (inert under masked single-trajectory CE,
         /// which forwards one trajectory per window; retained for CLI back-compat).
         pub writeback_batch: usize,
@@ -192,6 +205,9 @@ mod cuda_rollout {
         pub no_token_record: usize,
         pub trained_pairs: usize,
         pub mean_train_loss: f32,
+        /// Rescue-pass rollouts run on 0-accept tasks (and how many passed).
+        pub rescue_rollouts: usize,
+        pub rescue_passed: usize,
     }
 
     /// Per-task held-out eval outcome: did the current student (greedy, no
@@ -273,7 +289,7 @@ mod cuda_rollout {
             ));
             let user_prompt = format!(
                 "{}\n\nRepo layout (cwd = repo root):\n{}",
-                agent_user_prompt(task),
+                agent_user_prompt(task, cfg.think),
                 overview
             );
 
@@ -281,7 +297,8 @@ mod cuda_rollout {
             // pass-rate vs the production single-shot the eval is meant to predict).
             reset_workdir(&workdir)
                 .with_context(|| format!("reset eval sandbox for {}", task.instance_id))?;
-            let mut session = AgentSession::with_system_prompt(agent_system_prompt(task));
+            let mut session =
+                AgentSession::with_system_prompt(agent_system_prompt(task, cfg.think));
             let result = {
                 let mut guard = student
                     .engine()
@@ -419,17 +436,32 @@ mod cuda_rollout {
                 eprintln!("[dbg-opd] overview done len={}", overview.len());
                 let user_prompt = format!(
                     "{}\n\nRepo layout (cwd = repo root):\n{}",
-                    agent_user_prompt(task),
+                    agent_user_prompt(task, cfg.think),
                     overview
                 );
 
                 let mut distinct_passed_this_task = 0usize;
-                for sample in 0..cfg.samples_per_prompt {
-                    eprintln!("[dbg-opd] sample={sample} reset_workdir");
+                // Normal samples first; a rescue block below re-samples 0-accept
+                // tasks at the bigger token budget.
+                let rescue_settings = AgentSettings {
+                    max_tokens: cfg.rescue_max_tokens,
+                    ..settings
+                };
+                let total_samples = cfg.samples_per_prompt + cfg.rescue_samples;
+                for sample in 0..total_samples {
+                    let rescue = sample >= cfg.samples_per_prompt;
+                    if rescue && distinct_passed_this_task > 0 {
+                        break; // rescue only fires on 0-accept tasks
+                    }
+                    if rescue {
+                        report.rescue_rollouts += 1;
+                    }
+                    eprintln!("[dbg-opd] sample={sample} rescue={rescue} reset_workdir");
                     reset_workdir(&workdir)
                         .with_context(|| format!("reset sandbox for {}", task.instance_id))?;
                     eprintln!("[dbg-opd] sample={sample} run_turn START");
-                    let mut session = AgentSession::with_system_prompt(agent_system_prompt(task));
+                    let mut session =
+                        AgentSession::with_system_prompt(agent_system_prompt(task, cfg.think));
                     let result = {
                         let mut guard = student
                             .engine()
@@ -442,7 +474,7 @@ mod cuda_rollout {
                             &tool_defs,
                             &executor,
                             &policy,
-                            settings,
+                            if rescue { rescue_settings } else { settings },
                         )
                     };
                     report.rollouts += 1;
@@ -525,6 +557,9 @@ mod cuda_rollout {
                         continue;
                     }
                     report.passed += 1;
+                    if rescue {
+                        report.rescue_passed += 1;
+                    }
                     distinct_passed_this_task += 1;
 
                     match &result.tokens {
@@ -570,14 +605,17 @@ mod cuda_rollout {
 
             eprintln!(
                 "[agent-opd] round {round}: tasks={} rollouts={} passed={} distinct={} \
-                 no_token_record={} trained_pairs={} mean_loss={:.4}",
+                 no_token_record={} trained_pairs={} mean_loss={:.4} rescue_rollouts={} \
+                 rescue_passed={}",
                 report.tasks,
                 report.rollouts,
                 report.passed,
                 report.distinct_passed,
                 report.no_token_record,
                 report.trained_pairs,
-                report.mean_train_loss
+                report.mean_train_loss,
+                report.rescue_rollouts,
+                report.rescue_passed
             );
             Ok(report)
         }
