@@ -1359,6 +1359,7 @@ impl Dsv4Model {
             config.n_routed_experts,
         )?;
         let loader = SafetensorLoader::new(model_path)?;
+        loader.prefetch_shards(); // warm page cache in parallel before mmap faults
         let names = config.tensor_names();
 
         let embed_tokens = loader.load_dsv4_bf16_matrix(&ctx, names.embed_tokens())?;
