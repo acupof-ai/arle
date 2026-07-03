@@ -738,6 +738,57 @@ fn shard_cache_bytes_limit() -> usize {
 }
 
 impl SafetensorLoader {
+    /// Parallel-read every shard into the OS page cache before the per-tensor
+    /// mmap loads below fault them in one page at a time. mmap page faults are
+    /// synchronous and single-stream (~150 MB/s cold here); a parallel readahead
+    /// hits the disk's multi-queue ceiling instead and leaves the checkpoint
+    /// warm (page-cached reads are ~55 GB/s). Best-effort: read errors are
+    /// ignored (a failed prefetch just falls back to cold faults). The GB/s log
+    /// line is also the measurement of the disk's real parallel ceiling.
+    pub(crate) fn prefetch_shards(&self) {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let t0 = Instant::now();
+        let n = self.shards.len();
+        if n == 0 {
+            return;
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(8, |p| p.get())
+            .clamp(1, 16)
+            .min(n);
+        let shards = &self.shards;
+        let next = AtomicUsize::new(0);
+        let bytes = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let mut buf = vec![0u8; 8 << 20];
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        if let Ok(mut f) = fs::File::open(&shards[i]) {
+                            while let Ok(read) = f.read(&mut buf) {
+                                if read == 0 {
+                                    break;
+                                }
+                                bytes.fetch_add(read, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let gb = bytes.load(Ordering::Relaxed) as f64 / 1e9;
+        let secs = t0.elapsed().as_secs_f64().max(1e-6);
+        log::info!(
+            "loader prefetch: {gb:.1} GB across {n} shards in {secs:.1}s ({:.2} GB/s, {threads} threads)",
+            gb / secs
+        );
+    }
+
     pub(crate) fn new(base: &Path) -> Result<Self> {
         let t0 = Instant::now();
         let quant_manifest = if base.join("config.json").exists() {
