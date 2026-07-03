@@ -120,6 +120,11 @@ def main():
                     help="PYTHONPATH for scoring, e.g. lib:test (ansible)")
     ap.add_argument("--python", default="python3",
                     help="scoring interpreter (old trees may need <=3.11)")
+    ap.add_argument("--samples", type=int, default=1,
+                    help="attempts per task; workdir re-booted per attempt")
+    ap.add_argument("--windows-out", type=Path, default=None,
+                    help="JSONL of `arle train cc-convert --windows` rows for "
+                         "PASSING attempts")
     ap.add_argument("--out", type=Path, default=Path("cc_baseline_results.jsonl"))
     args = ap.parse_args()
 
@@ -128,35 +133,66 @@ def main():
 
     tasks = [json.loads(l) for l in args.dataset.read_text().splitlines()
              if l.strip()][: args.task_limit]
-    results = []
+    results, windows = [], []
     for task in tasks:
         iid = task["instance_id"]
         staged = args.staged_root / iid
         workdir = args.work_root / iid
-        print(f"[cc-baseline] {iid}: boot", flush=True)
-        boot_workdir(staged, workdir, task.get("before_repo_set_cmd"))
-        t0 = time.time()
-        cc = cc_attempt(workdir, task, args)
-        passed, edited, note = score(workdir, task, args.test_timeout,
-                                     args.pythonpath, args.python)
-        row = {
-            "instance_id": iid, "passed": passed, "edited": edited,
-            "note": note, "wall_s": round(time.time() - t0, 1),
-            "cc_error": cc.get("error") or (cc.get("is_error") and cc.get("result")) or None,
-            "cc_turns": cc.get("num_turns"),
-            "cc_output_tokens": (cc.get("usage") or {}).get("output_tokens"),
-        }
-        results.append(row)
-        print(f"[cc-baseline] {iid}: passed={passed} edited={edited} "
-              f"turns={row['cc_turns']} wall={row['wall_s']}s :: {note}", flush=True)
+        for sample in range(args.samples):
+            print(f"[cc-baseline] {iid}#{sample}: boot", flush=True)
+            boot_workdir(staged, workdir, task.get("before_repo_set_cmd"))
+            t_start_ms = int(time.time() * 1000)
+            cc = cc_attempt(workdir, task, args)
+            t_end_ms = int(time.time() * 1000)
+            passed, edited, note = score(workdir, task, args.test_timeout,
+                                         args.pythonpath, args.python)
+            row = {
+                "instance_id": iid, "sample": sample, "passed": passed,
+                "edited": edited, "note": note,
+                "t_start_ms": t_start_ms, "t_end_ms": t_end_ms,
+                "wall_s": round((t_end_ms - t_start_ms) / 1000, 1),
+                "cc_error": cc.get("error") or (cc.get("is_error") and cc.get("result")) or None,
+                "cc_turns": cc.get("num_turns"),
+                "cc_output_tokens": (cc.get("usage") or {}).get("output_tokens"),
+            }
+            results.append(row)
+            if passed:
+                windows.append({"label": f"{iid}#{sample}",
+                                "t_start_ms": t_start_ms,
+                                "t_end_ms": t_end_ms})
+            print(f"[cc-baseline] {iid}#{sample}: passed={passed} "
+                  f"edited={edited} turns={row['cc_turns']} "
+                  f"wall={row['wall_s']}s :: {note}", flush=True)
 
-    n, p = len(results), sum(r["passed"] for r in results)
+    task_ids = list(dict.fromkeys(r["instance_id"] for r in results))
+    n = len(task_ids)
+    p1 = sum(1 for t in task_ids if any(
+        r["passed"] for r in results
+        if r["instance_id"] == t and r["sample"] == 0))
+    p_any = sum(1 for t in task_ids if any(
+        r["passed"] for r in results if r["instance_id"] == t))
+    per_sample = [sum(1 for r in results
+                      if r["sample"] == s and r["passed"])
+                  for s in range(args.samples)]
+    aggregate = {
+        "aggregate": True, "tasks": n, "samples": args.samples,
+        "passed": p1, "pass_rate": p1 / n if n else 0.0,  # legacy keys
+        "pass_at_1": p1 / n if n else 0.0,
+        "pass_at_any": p_any / n if n else 0.0,
+        "per_sample_passed": per_sample,
+    }
     with open(args.out, "w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
-        f.write(json.dumps({"aggregate": True, "passed": p, "tasks": n,
-                            "pass_rate": p / n if n else 0.0}) + "\n")
-    print(f"[cc-baseline] pass_rate={p}/{n} -> {args.out}", flush=True)
+        f.write(json.dumps(aggregate) + "\n")
+    if args.windows_out:
+        with open(args.windows_out, "w") as f:
+            for w in windows:
+                f.write(json.dumps(w) + "\n")
+        print(f"[cc-baseline] {len(windows)} passing window(s) -> "
+              f"{args.windows_out}", flush=True)
+    print(f"[cc-baseline] pass@1={p1}/{n} pass@any={p_any}/{n} "
+          f"per-sample={per_sample} -> {args.out}", flush=True)
 
 
 if __name__ == "__main__":
