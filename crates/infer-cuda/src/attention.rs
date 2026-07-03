@@ -2180,12 +2180,7 @@ fn try_flashmla_prefill_attention(
 
     // FlashMLA prefill consumes one unified bf16 pool:
     // [rolling SW cache rebased | current chunk K | compressed pool].
-    // Zeroed, not uninit (#138): this is the ONLY truly-uninitialized buffer the
-    // prefill attention reads — any pool row the pack leaves uncovered (a chunk
-    // whose SW/compressed extent the index math over-reaches at the pos-128
-    // boundary) otherwise reads NaN into the residual. A zeroed row is the
-    // correct empty key; the packed regions overwrite it.
-    let mut kv_unified = HiddenStates::zeros(ctx, config.head_dim, kv_rows)?;
+    let mut kv_unified = unsafe { HiddenStates::uninit(ctx, config.head_dim, kv_rows)? };
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_pack_kv");
         let (kv_ptr, _kvg) = kv_unified.data.device_ptr_mut(&ctx.stream);
