@@ -32,6 +32,7 @@ import difflib
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -1152,19 +1153,21 @@ def readme_for(task, files):
     )
 
 
-def module_source(task, fixed):
+def module_source(task, fixed, neutral=False):
     fn = task["gold"] if fixed else task["buggy"]
-    return (
+    src = (
         f'"""{task["slug"].replace("-", " ").title()} utilities."""\n\n\n'
         + fn
         + "\n\n"
         + task["extra"]
     )
+    return neutralize_docs(src) if neutral else src
 
 
 def repo_files(task, difficulty, seed, fixed=False):
+    neutral = difficulty == "hard"
     files = {
-        f"{task['module']}.py": module_source(task, fixed),
+        f"{task['module']}.py": module_source(task, fixed, neutral),
         "helpers.py": HELPERS_PY,
     }
     files.update(distractors_for(task, difficulty, seed))
@@ -1230,11 +1233,12 @@ def jsonl_row(task, difficulty):
         "test_patch": new_file_diff(hidden_test_path(task), task["test"]),
         "fail_to_pass": fail_to_pass_ids(task),
         "selected_test_files_to_run": [hidden_test_path(task)],
-        # Extras the Rust loader ignores (corpus provenance + self-check):
+        # Extras the Rust loader ignores (corpus provenance + self-check).
+        # The gold diff must match the STAGED (possibly neutralized) tree.
         "gold_patch": edit_diff(
             module_file,
-            module_source(task, fixed=False),
-            module_source(task, fixed=True),
+            module_source(task, fixed=False, neutral=difficulty == "hard"),
+            module_source(task, fixed=True, neutral=difficulty == "hard"),
         ),
         "archetype": task["archetype"],
         "split": task["split"],
@@ -1254,7 +1258,7 @@ def run(cmd, cwd):
     )
 
 
-def self_check_task(task, staged_dir):
+def self_check_task(task, staged_dir, difficulty):
     """Mirror sandbox.rs::score_workdir: base FAILS, gold-patched PASSES."""
     with tempfile.TemporaryDirectory(prefix="aopd-check-") as tmp:
         repo = Path(tmp) / "repo"
@@ -1269,7 +1273,7 @@ def self_check_task(task, staged_dir):
             if r.returncode != 0:
                 return f"git setup failed: {r.stderr.strip()}"
 
-        row = jsonl_row(task, "easy")
+        row = jsonl_row(task, difficulty)
         for name, patch in (("test_patch", row["test_patch"]),
                             ("gold_patch", None)):
             if patch is not None:
@@ -1339,7 +1343,9 @@ def main():
     if args.self_check:
         failures = []
         for task in TASKS:
-            err = self_check_task(task, staged_root / f"arle__{task['slug']}")
+            err = self_check_task(
+                task, staged_root / f"arle__{task['slug']}", args.difficulty
+            )
             status = "ok" if err is None else f"FAIL — {err}"
             print(f"  self-check {task['slug']}: {status}")
             if err:
