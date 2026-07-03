@@ -1029,7 +1029,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if let Err(err) = self.executor.capture_cached_prefix(slot, &full_tokens) {
             log::debug!("finish_slot sidecar capture failed for slot {slot}: {err:#}");
         }
-        self.publish_prefix_blocks(slot, &request);
+        self.publish_prefix_blocks(slot, &full_tokens);
         // free_slot BEFORE release_reused_prefix: reclaim_page sees page_refs>0
         // and skips retained prefix pages; release_reused_prefix then drops the
         // last ref and the page enters the free pool exactly once. Reversed order
