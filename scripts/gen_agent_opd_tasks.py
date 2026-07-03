@@ -551,7 +551,8 @@ TASKS = [
         "    assert transpose([[1, 2], [3, 4]]) == [[1, 3], [2, 4]]\n\n\n"
         "def test_rect_transpose():\n"
         "    assert transpose([[1, 2, 3]]) == [[1], [2], [3]]\n",
-        statement="transpose() returns the matrix UNCHANGED.\n\nRepro:\n"
+        statement="The matrix transpose operation returns its input "
+        "unchanged.\n\nRepro:\n"
         ">>> transpose([[1, 2], [3, 4]])\n"
         "[[1, 2], [3, 4]]   # expected: [[1, 3], [2, 4]]",
     ),
@@ -623,8 +624,8 @@ TASKS = [
         "def test_area_grows_quadratically():\n"
         "    assert circle_area(2) == 4 * circle_area(1)\n",
         statement="Circle areas scale LINEARLY with radius — doubling the "
-        "radius only doubles the area. circle_area(3) equals "
-        "circle_perimeter(3).\n\nRepro:\n>>> circle_area(3)\n"
+        "radius only doubles the area.\n\nRepro:\n"
+        ">>> circle_area(3)   # equals circle_perimeter(3)!\n"
         "18.84...   # expected: 28.27... (9*pi)",
     ),
     dict(
@@ -1108,15 +1109,38 @@ def render(rows, headers=None):
 ''',
 }
 
-DISTRACTOR_COUNT = {"easy": 0, "medium": 2, "hard": 8}
+DISTRACTOR_COUNT = {"easy": 0, "medium": 2, "hard": 4}
+# hard scenery: other tasks' GOLD modules — real, diverse code the buggy
+# module must be found among. Sampled from the SAME split only, so no eval
+# task's code (even fixed) ever appears in a training repo.
+GOLD_SCENERY_COUNT = {"easy": 0, "medium": 0, "hard": 18}
+
+DOC_RE = re.compile(r'"""[^"]*"""')
+
+
+def neutralize_docs(src):
+    """Uniformly bland docstrings (hard mode): the v1 corpus self-annotated
+    every bug — the docstring stated the correct behavior directly above the
+    contradicting line, so the 27B fixed 24/24 held-out untrained
+    (pod probe 2026-07-03). Applied to ALL modules, not just the buggy one."""
+    return DOC_RE.sub('"""See package documentation."""', src)
 
 
 def distractors_for(task, difficulty, seed):
-    k = DISTRACTOR_COUNT[difficulty]
-    names = random.Random(f"{seed}:{task['slug']}").sample(
-        sorted(DISTRACTOR_POOL), k
-    )
-    return {name: DISTRACTOR_POOL[name] for name in names}
+    rng = random.Random(f"{seed}:{task['slug']}")
+    names = rng.sample(sorted(DISTRACTOR_POOL), DISTRACTOR_COUNT[difficulty])
+    files = {name: DISTRACTOR_POOL[name] for name in names}
+    if GOLD_SCENERY_COUNT[difficulty]:
+        same_split = [
+            t for t in TASKS
+            if t["slug"] != task["slug"] and t["split"] == task["split"]
+        ]
+        k = min(GOLD_SCENERY_COUNT[difficulty], len(same_split))
+        for other in rng.sample(same_split, k):
+            files[f"{other['module']}.py"] = neutralize_docs(
+                module_source(other, fixed=True)
+            )
+    return files
 
 
 def readme_for(task, files):
