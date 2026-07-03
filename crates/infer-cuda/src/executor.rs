@@ -2247,6 +2247,15 @@ impl Dsv4CudaExecutor {
             }
         };
         let weights_used_at_model_load = mem_dbg("after model load (weights+experts)");
+        // Reclaim the cuMemAllocAsync pool BEFORE measuring free VRAM: weight
+        // loading allocs+frees large device scratch (FP8 dequant, DeepGEMM cache
+        // build, staging), and the retain-threshold=MAX pool holds it — so
+        // `mem_get_info` in the budget would count freed loading scratch as USED
+        // and starve the KV slot count. Trim returns it to the OS so the budget
+        // sees the true free (recovers the KV slots those GB should fund).
+        if let Err(e) = model.ctx.trim_memory_pool() {
+            log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
+        }
         // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
         // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
         let budget = model.kv_budget_plan(num_slots, max_seq_len)?;
@@ -3742,6 +3751,11 @@ impl Qwen35CudaExecutor {
         // previously admitted the requested count as-is → OOM at large
         // max_seq_len. Deterministic + NCCL min-reduced ⇒ TP-consistent.
         let budget_t0 = Instant::now();
+        // Reclaim retained loading scratch before the budget measures free VRAM
+        // (see the DSv4 path above — same starvation otherwise).
+        if let Err(e) = model.ctx.trim_memory_pool() {
+            log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
+        }
         let num_slots = model.kv_budget_num_slots(num_slots)?;
         cuda_startup_log(
             "qwen35_kv_budget",
