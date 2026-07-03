@@ -964,39 +964,162 @@ def clamp(value, lo, hi):
     return max(lo, min(hi, value))
 '''
 
-# Extra scenery for --difficulty medium (more files to explore).
-MEDIUM_DISTRACTORS = {
-    "report.py": '''"""Plain-text report rendering."""
+# Generic-but-plausible scenery modules. medium samples 2, hard samples 8 —
+# the buggy module hides in a wider tree, so locating it is a real search
+# (the 27B solved 8/8 held-out at easy on the 2026-07-03 smoke: no dynamic
+# range for a curve without this).
+DISTRACTOR_POOL = {
+    "validators.py": '''"""Input validation helpers."""
 
 
-def render_table(rows):
-    """Rows of equal-width columns as aligned text lines."""
-    if not rows:
-        return ""
-    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
-    return "\\n".join(
-        "  ".join(str(cell).ljust(w) for cell, w in zip(row, widths))
-        for row in rows
-    )
+def non_empty(s):
+    """True for a non-blank string."""
+    return isinstance(s, str) and bool(s.strip())
+
+
+def in_range(x, lo, hi):
+    """True when lo <= x <= hi."""
+    return lo <= x <= hi
 ''',
-    "cli.py": '''"""Tiny argv front-end (not under test)."""
-
-import sys
+    "formatting.py": '''"""Display formatting."""
 
 
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    print("usage: see README.md; args:", argv)
-    return 0
+def humanize_bytes(n):
+    """1536 -> '1.5 KB' (decimal steps)."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def ellipsize_middle(s, n):
+    """Shorten long ids keeping both ends."""
+    return s if len(s) <= n else s[: n // 2] + "…" + s[-(n - n // 2 - 1):]
+''',
+    "cachebox.py": '''"""A tiny bounded cache."""
+
+
+class CacheBox:
+    def __init__(self, cap=128):
+        self.cap = cap
+        self._d = {}
+
+    def get(self, k, default=None):
+        return self._d.get(k, default)
+
+    def put(self, k, v):
+        if len(self._d) >= self.cap:
+            self._d.pop(next(iter(self._d)))
+        self._d[k] = v
+''',
+    "textutils.py": '''"""Small text helpers."""
+
+
+def indent(text, n=2):
+    """Indent every line by n spaces."""
+    pad = " " * n
+    return "\\n".join(pad + line for line in text.splitlines())
+
+
+def word_count(text):
+    """Whitespace-separated word count."""
+    return len(text.split())
+''',
+    "mathutils.py": '''"""Numeric helpers."""
+
+
+def lerp(a, b, t):
+    """Linear interpolation at t in [0, 1]."""
+    return a + (b - a) * t
+
+
+def sign(x):
+    """-1, 0 or 1."""
+    return (x > 0) - (x < 0)
+''',
+    "ids.py": '''"""Opaque id helpers."""
+
+import hashlib
+
+
+def short_id(text, n=8):
+    """Stable short hex id for a string."""
+    return hashlib.sha256(text.encode()).hexdigest()[:n]
+
+
+def is_hex_id(s):
+    """True for a lowercase hex string."""
+    return bool(s) and all(c in "0123456789abcdef" for c in s)
+''',
+    "timers.py": '''"""Wall-clock helpers (no scheduling)."""
+
+import time
+
+
+class Stopwatch:
+    def __init__(self):
+        self._start = time.monotonic()
+
+    def elapsed(self):
+        return time.monotonic() - self._start
+
+    def restart(self):
+        self._start = time.monotonic()
+''',
+    "sorting.py": '''"""Ordering helpers."""
+
+
+def by_key(items, key, reverse=False):
+    """Sort dicts by a key, missing values last."""
+    return sorted(items, key=lambda d: (key not in d, d.get(key)), reverse=reverse)
+
+
+def top_n(xs, n):
+    """Largest n values, descending."""
+    return sorted(xs, reverse=True)[:n]
+''',
+    "encoding.py": '''"""Serialization helpers."""
+
+import base64
+import json
+
+
+def to_b64(obj):
+    """JSON -> urlsafe base64."""
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+
+
+def from_b64(s):
+    """Inverse of to_b64."""
+    return json.loads(base64.urlsafe_b64decode(s.encode()))
+''',
+    "tableview.py": '''"""Column-aligned plain-text tables."""
+
+
+def render(rows, headers=None):
+    """Rows (+ optional headers) as aligned text."""
+    data = ([headers] if headers else []) + [[str(c) for c in r] for r in rows]
+    if not data:
+        return ""
+    widths = [max(len(r[i]) for r in data) for i in range(len(data[0]))]
+    return "\\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)) for r in data)
 ''',
 }
 
+DISTRACTOR_COUNT = {"easy": 0, "medium": 2, "hard": 8}
 
-def readme_for(task, difficulty):
-    files = [f"{task['module']}.py", "helpers.py"]
-    if difficulty == "medium":
-        files += sorted(MEDIUM_DISTRACTORS)
-    listed = "\n".join(f"- `{f}`" for f in files)
+
+def distractors_for(task, difficulty, seed):
+    k = DISTRACTOR_COUNT[difficulty]
+    names = random.Random(f"{seed}:{task['slug']}").sample(
+        sorted(DISTRACTOR_POOL), k
+    )
+    return {name: DISTRACTOR_POOL[name] for name in names}
+
+
+def readme_for(task, files):
+    listed = "\n".join(f"- `{f}`" for f in sorted(files) if f.endswith(".py"))
     return (
         f"# {task['slug']}\n\n"
         f"Small utility package.\n\nModules:\n{listed}\n\n"
@@ -1014,14 +1137,13 @@ def module_source(task, fixed):
     )
 
 
-def repo_files(task, difficulty, fixed=False):
+def repo_files(task, difficulty, seed, fixed=False):
     files = {
         f"{task['module']}.py": module_source(task, fixed),
         "helpers.py": HELPERS_PY,
-        "README.md": readme_for(task, difficulty),
     }
-    if difficulty == "medium":
-        files.update(MEDIUM_DISTRACTORS)
+    files.update(distractors_for(task, difficulty, seed))
+    files["README.md"] = readme_for(task, files)
     return files
 
 
@@ -1071,6 +1193,10 @@ def jsonl_row(task, difficulty):
     statement = task["statement"]
     if difficulty == "easy":
         statement += f"\n\nThe bug is somewhere in `{module_file}`."
+    elif difficulty == "hard":
+        # Prose symptom only — no repro snippet naming the call, so locating
+        # the function is a real search through the (wider) tree.
+        statement = statement.split("\n\nRepro:")[0]
     return {
         "instance_id": f"arle__{task['slug']}",
         "problem_statement": statement,
@@ -1147,7 +1273,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=Path, default=Path("agent_opd_tasks"))
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--difficulty", choices=["easy", "medium"], default="easy")
+    ap.add_argument("--difficulty", choices=["easy", "medium", "hard"],
+                    default="easy")
     ap.add_argument("--self-check", action="store_true",
                     help="verify base-fails / gold-passes for every task")
     args = ap.parse_args()
@@ -1165,7 +1292,7 @@ def main():
         instance_dir = staged_root / f"arle__{task['slug']}"
         if instance_dir.exists():
             shutil.rmtree(instance_dir)
-        for rel, content in repo_files(task, args.difficulty).items():
+        for rel, content in repo_files(task, args.difficulty, args.seed).items():
             path = instance_dir / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
