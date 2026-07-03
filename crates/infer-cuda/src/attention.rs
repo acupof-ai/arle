@@ -5274,12 +5274,12 @@ pub(crate) fn mla_attention_prepare(
     };
 
     // TEMP #146 probe (self-gating; revert after the run): dump the LAST query
-    // row's DSA top-k selection per CSA layer — discriminates a
-    // scoring/selection bug (needle block absent from sel) from a
-    // gather/translation bug (present but content garbled) for the retrieval
-    // corruption past index_topk*cr = 2048 tokens.
+    // row's DSA top-k selection per CSA layer, on BOTH lanes — prefill sel was
+    // proven healthy (round 2: needle blocks present at all 21 CSA layers), so
+    // round 3 asks whether the DECODE-step selection (scored over the FP8
+    // rotated key cache, a different input than prefill's bf16 staging) still
+    // carries the needle blocks once C > index_topk.
     if let Some(sel) = selected.as_ref()
-        && token_count > 1
         && env_flag("ARLE_DSV4_DSA_TOPK_PROBE")?
     {
         ctx.sync()?;
