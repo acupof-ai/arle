@@ -242,19 +242,19 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Seal the request's full prompt blocks into the radix. Returns the
-    /// newly cached pages (already cache-retained), in prompt order.
-    pub(crate) fn publish_prefix_blocks(
-        &mut self,
-        slot: usize,
-        request: &RequestState,
-    ) -> Vec<BlockId> {
+    /// Seal the leading `tokens` blocks into the radix. Callers choose the
+    /// boundary: prompt-only at prefill time (planner), prompt+generated at
+    /// finish — the same full-sequence boundary the recurrent sidecar
+    /// captures, so an agentic follow-up turn radix-matches THROUGH the
+    /// previous turn's generated tokens instead of re-prefilling them.
+    /// Returns the newly cached pages (already cache-retained), in order.
+    pub(crate) fn publish_prefix_blocks(&mut self, slot: usize, tokens: &[u32]) -> Vec<BlockId> {
         if !self.kv.is_active() {
             return Vec::new();
         }
 
         let block_size = self.radix.block_size().max(1);
-        let publishable_tokens = request.prompt_len().min(self.kv.seq_len(slot));
+        let publishable_tokens = tokens.len().min(self.kv.seq_len(slot));
         let sealed_blocks = publishable_tokens / block_size;
         if sealed_blocks == 0 {
             return Vec::new();
@@ -295,10 +295,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         let token_len = publish_blocks * block_size;
-        let newly_cached = self.radix.insert(
-            &request.prompt_tokens[..token_len],
-            &pages[..publish_blocks],
-        );
+        let newly_cached = self
+            .radix
+            .insert(&tokens[..token_len], &pages[..publish_blocks]);
         if !newly_cached.is_empty() {
             self.prefix_cache_stats.published_pages = self
                 .prefix_cache_stats
