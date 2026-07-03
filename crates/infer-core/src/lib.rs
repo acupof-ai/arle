@@ -1385,9 +1385,24 @@ fn finish_reason_for(
         Some(FinishReason::Stop)
     } else if request.generated_tokens.len() >= request.max_tokens {
         Some(FinishReason::Length)
+    } else if !sampling.ignore_eos && tail_is_degenerate_loop(&request.generated_tokens) {
+        Some(FinishReason::Stop)
     } else {
         None
     }
+}
+
+/// Early-stop a runaway: the last [`LOOP_TAIL`] tokens collapsed into an exact
+/// period-`p` (`p ≤ 8`) repetition — a token-0 spin, a `a b a b …`, etc. A real
+/// generation of that length is never a pure short cycle, so the false-positive
+/// floor is high; gated off with `ignore_eos` (benchmarks that want raw length).
+fn tail_is_degenerate_loop(tokens: &[u32]) -> bool {
+    const LOOP_TAIL: usize = 48;
+    if tokens.len() < LOOP_TAIL {
+        return false;
+    }
+    let tail = &tokens[tokens.len() - LOOP_TAIL..];
+    (1..=8).any(|p| tail.chunks_exact(p).all(|c| c == &tail[..p]))
 }
 
 #[cfg(test)]
@@ -2572,6 +2587,23 @@ mod tests {
         TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
+
+    #[test]
+    fn degenerate_loop_tail_is_detected() {
+        // Below the window: never fires.
+        assert!(!tail_is_degenerate_loop(&[0u32; 47]));
+        // Token-0 spin (period 1) and a 2-cycle: both caught at 48.
+        assert!(tail_is_degenerate_loop(&[0u32; 48]));
+        let two_cycle: Vec<u32> = (0..48).map(|i| (i % 2) as u32).collect();
+        assert!(tail_is_degenerate_loop(&two_cycle));
+        // A real varied tail (strictly increasing) is not a short cycle.
+        let varied: Vec<u32> = (0..48).collect();
+        assert!(!tail_is_degenerate_loop(&varied));
+        // Only the last 48 matter: a healthy prefix + degenerate tail still fires.
+        let mut mixed: Vec<u32> = (0..100).collect();
+        mixed.extend(std::iter::repeat_n(7u32, 48));
+        assert!(tail_is_degenerate_loop(&mixed));
+    }
 
     /// Drive `turns` agentic re-prefills on one slot: each turn's prompt is the
     /// prior turn's full text (prompt + the deterministic generated tokens) plus
