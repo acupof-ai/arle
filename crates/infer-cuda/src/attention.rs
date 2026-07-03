@@ -1584,6 +1584,22 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
         DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
         _ => {}
     }
+    // Runtime A/B gate (documented in environment.md; the serve-side knob the
+    // #138 lane isolation needs): `ARLE_DSV4_FLASHMLA_DECODE=0` forces the eager
+    // dsv4_swa/hybrid fallback kernels, `=1` forces on (still compile-gated),
+    // unset keeps the default below. Read once — hot path (per layer per token).
+    static ENV_GATE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    if let Some(forced) = ENV_GATE.get_or_init(|| {
+        std::env::var("ARLE_DSV4_FLASHMLA_DECODE")
+            .ok()
+            .and_then(|v| match v.as_str() {
+                "0" | "false" | "off" => Some(false),
+                "1" | "true" | "on" => Some(true),
+                _ => None,
+            })
+    }) {
+        return Ok(*forced && cuda_kernels::HAS_FLASHMLA);
+    }
     // Default ON: FlashMLA SM90 sparse decode is the adopted decode attention — the
     // same vendored kernel SGLang uses. Licensed 2026-06-06 on the TP=8/EP=8 pod:
     // 64-tok resident same-load A/B token-exact vs scalar, 29.47 -> 36.59 tok/s
