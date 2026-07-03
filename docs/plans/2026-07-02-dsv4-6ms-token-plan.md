@@ -99,93 +99,36 @@ Instrumentation-free first, nsys second:
    `ffn_all_reduce` 340 µs/layer-call — if allreduce still owns a similar
    share, it outranks every kernel lever.
 
-## Emergent structure (from the code facts; ordering still a HYPOTHESIS until Phase-1)
+## MEASURED (2026-07-03 nsys, TP=4/EP=4, MTP-on) — hypothesis KILLED, retargeted
 
-The inventory converts the gap from mystery to arithmetic. Sketch (exact
-numbers await config.json's N/hidden/vocab):
+The emergent H1/H2 hypothesis ("129 serialized collectives dominate") was the
+load-bearing assumption, so it was the one to measure — and it is **FALSE**.
+Per decode step (~50.7 ms GPU-busy/rank, 2.34 committed tok/step, 25.6 ms/tok):
 
-- **Bandwidth is NOT the wall.** Even at ~20B active params FP8, TP=8 reads
-  ~2.5 GB/rank/token ⇒ ~0.6 ms at 4 TB/s; latent-KV reads are tens of MB.
-  The roofline floor is sub-millisecond — so ~18 of the 18.9 ms live in
-  LATENCY terms: 3·N serialized collectives + launch gaps + the replicated
-  work.
-- **H1 — drop the Q all-gather (3→2 collectives/layer, −33% collective
-  latency).** Today every rank gathers the full Q head slab and runs
-  ALL-head FlashMLA (attention compute replicated across ranks; the latent
-  KV is replicated anyway). Local-head attention + the EXISTING O all-reduce
-  is algebraically identical and deletes one collective per layer. This is
-  the cheapest structural cut in the inventory.
-  **BLOCKED at TP>1 (2026-07-02) — see the H1 feasibility verdict below.**
-- **H2 — comm latency per collective**: allreduce of one hidden vector
-  (~14 KB bf16) is pure latency. Candidates: DeepEP-LL decode MoE (#61
-  license open), NCCL low-latency algo tuning, TP=4-vs-8 A/B (fewer ranks =
-  lower per-collective latency; bandwidth headroom says TP=4 may WIN B=1).
-- **H3 — lm_head shard (#99)**: replicated full-vocab GEMV reads
-  vocab×hidden bytes per rank per token (~0.5-1 GB, ~0.1-0.25 ms) — sharding
-  is a quantified, bounded win, not the main course.
-- **H4 — MTP deeper/dynamic verify** (DSpark C1 #124): multiplies committed
-  tokens per step; orthogonal to H1-H3.
-- H5 (allocs/sync hygiene): 7·N device allocs + alloc-per-token sampler —
-  measure first; B=1 GPU-bound history says wash.
+- **Collectives = 6.7 % of GPU-busy** (3.40 ms; 129 kernels × 26.34 µs avg,
+  structure confirmed 86 AR + 43 AG = 43×3). H1 (drop the Q all-gather) saves
+  **0.68 ms = 1.3 %**; H2 (all comm) caps at 6.7 %. **Both demoted** — neither
+  moves the 6 ms needle. H1's vendored-kernel patch is NOT worth it.
+- **The step is GEMV-bound.** FP8 GEMV stack = **52 %** of GPU-busy
+  (`dsv4_fp8_gemv_batch_tiled` 27.7 % + `gemv_handwritten` 14.7 % +
+  `dsv4_fp8_gemv_batch` 9.8 %); grouped swiglu/down 13.6 %; `dsv4_mhc_params`
+  9.5 %; FlashMLA `sparse_attn_fwd` only 2.9 %.
+- **Roofline gap is the real bug**: active bytes/token ~10.5 GB ⇒ TP=4 HBM
+  floor ~0.66 ms, but measured ~17 ms/row → the small-batch FP8 GEMVs run at
+  **~4 % of HBM bandwidth**. 6 ms/token lives HERE, not in comm or launch.
 
-Phase-1 measurement now has ONE job: confirm the collective/launch share
-(expected dominant) and price t_collective(TP) — then H1/H2 go first.
+## Retargeted levers (measured shares)
 
-### H1 feasibility verdict (2026-07-02): BLOCKED at TP>1 — FlashMLA head-count contract
+| Lever | Target | Share | Why |
+|---|---|---|---|
+| **G1 — small-batch FP8 GEMV efficiency** | the 52 % GEMV stack (`gemv_handwritten`, `dsv4_fp8_gemv_batch*`) | 52 % | hand-rolled warp-per-row w8a16 GEMV at R≤8 runs ~4 % of HBM; a better grouped-GEMV / DeepGEMM-at-small-batch / tensor-core path is the main course. ncu the three kernels first. |
+| **G2 — MTP acceptance** (2.34 → higher tok/step) | committed-token cost, kernel-free | linear | deeper MTP / better draft (DSpark C1 #124) divides the 25.6 ms directly; orthogonal to G1. Blocked-adjacent by #140 (MTP crash ~613 ticks). |
+| **G3 — `dsv4_mhc_params` 9.5 %** | MODEL1 hyper-connection mixer | 9.5 % | suspiciously large for a param-gen op; is it recomputed per layer when it could be cached? read the HC path. |
+| H1/H2 (collectives) | — | 1.3–6.7 % | demoted; revisit only if G1 shrinks the GEMV floor enough that 6.7 % matters. |
 
-Source-read of the full decode call chain (`try_flashmla_decode_attention`
-→ `arle_flashmla_sm90_sparse_decode_fwd` → vendored SM90 sparse-FP8 kernel).
-The kernel hard-requires the FULL head count; local-head decode cannot run it:
-
-- `crates/cuda-kernels/vendor/flashmla/csrc/sm90/decode/sparse_fp8/config.h:19`
-  — `static_assert(NUM_HEADS == 64 || NUM_HEADS == 128)`; `NUM_M_BLOCKS =
-  NUM_HEADS / 64`, `CLUSTER_SIZE = NUM_M_BLOCKS`, `BLOCK_M = 64`. The M tile
-  is one 64-head block per CTA (GMMA 64-row atoms `MMA_64x64x16_F32BF16BF16` /
-  `MMA_64x256x16`, config.h:113-131); 128 heads = a 2-CTA cluster.
-- `…/sparse_fp8/splitkv_mla.cuh:692` — host launcher
-  `KU_ASSERT(params.h_q % BLOCK_M == 0)`; grid is
-  `dim3(NUM_M_BLOCKS, s_q, num_sm_parts)` with compile-time `NUM_M_BLOCKS`
-  (`splitkv_mla.cuh:769-775`).
-- Only h64/h128 instantiations exist:
-  `…/sparse_fp8/instantiations/{model1,v32}_persistent_h{64,128}.cu`.
-- The ARLE shim pre-flights the same set: `h_q != 64 && h_q != 128 →
-  cudaErrorInvalidValue` (`crates/cuda-kernels/csrc/misc/
-  arle_flashmla_decode_shim.cu:260` fwd, `:108` get_meta).
-- ARLE already encodes the constraint: `ensure!(matches!(global_heads, 64 |
-  128))` (`crates/infer-cuda/src/attention.rs:2629-2632`). The Q all-gather at
-  `attention.rs:2745-2780` (and the batched lane's `gather_q_row`,
-  `attention/flashmla.rs:1095`) exists BECAUSE of this kernel contract — both
-  lanes share it, so H1 is blocked identically on eager, MTP-verify, and
-  batched paths.
-
-DSv4-Flash has `num_attention_heads = 64` (config; spec fixture
-`crates/deepseek-spec/src/v4.rs:1230`). Local head slabs are 8 (TP=8), 16
-(TP=4), 32 (TP=2) — every TP>1 slicing fails `h_q % 64 == 0`. There is no
-runnable-parameter escape: the epilogue DOES mask partial head blocks
-(`num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M)`,
-`splitkv_mla.cuh:326,428`), but the host assert forbids exercising it.
-
-Realistic options (all deferred; none is a padding hack):
-
-1. **Vendored-kernel patch**: relax `KU_ASSERT(h_q % 64 == 0)` and lean on the
-   existing `num_valid_seq_q` masking (Q TMA reads are bounds-checked against
-   the tensor-map shape, so the 48/56 out-of-range M rows load zero); fix
-   `get_meta`'s `num_sms / (s_q * (h_q/64))` integer division (shim:127) for
-   h_q<64. The 64-row wgmma then computes 8 valid + 56 wasted rows — decode
-   attention is KV-read-bound so the FLOP waste is plausibly a wash, but the
-   patch needs its own correctness license (needle gate) + perf A/B on pod.
-2. **Split the KV/topk bands instead of heads**: all ranks keep all 64 heads
-   but attend disjoint index bands, merged by an LSE-weighted combine (the
-   split-KV combine kernel already merges partials with LSE). Turns the Q
-   all-gather into an O(heads) LSE+O exchange — a bigger redesign of the
-   indices builder + a new inter-rank combine.
-3. **H2 route (no kernel change)**: keep 3 collectives/layer but cut
-   t_collective — the one-shot AG/AR path is already default-on; remaining
-   levers are TP=4-vs-8 A/B and DeepEP-LL (#61).
-
-Consequence: collectives stay 3·N/token on the FlashMLA decode lane at TP>1;
-H1 produces no runtime knob. H3 (lm_head shard, #99) proceeds independently
-(`ARLE_DSV4_LM_HEAD_SHARD=1`).
+Both correctness blockers must clear before G1/G2 A/Bs: **#138** (ctx-129
+NaN, eager lane) gates any MTP-off measurement; **#140** (MTP crash ~613
+ticks) gates any sustained MTP-on run.
 
 ## Phase 2 — levers (enumerated, NOT ranked; order = Phase-1 shares)
 
