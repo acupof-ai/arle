@@ -2048,6 +2048,7 @@ checksum = "2929e494b2280e1e18959bb2e121da03347ae896896fdfaceaab43c88a02803f"
 dependencies = [
  "memo-map",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
