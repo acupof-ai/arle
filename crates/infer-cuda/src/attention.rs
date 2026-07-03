@@ -2211,6 +2211,39 @@ fn try_flashmla_prefill_attention(
         }
     }
 
+    // TEMP #138 probe (self-gating; revert after the run): segment-wise NaN
+    // scan of the packed unified KV + its sources at every prefill chunk.
+    // Attributes which region (SW ring / current chunk / compressed staging /
+    // q) carries the NaN that FlashMLA propagates from context >=129.
+    if env_flag("ARLE_DSV4_PREFILL_KV_NAN_PROBE")? {
+        ctx.sync()?;
+        let d = config.head_dim;
+        let seg = |v: &[half::bf16]| {
+            let nan = v.iter().filter(|x| x.to_f32().is_nan()).count();
+            let first = v
+                .chunks(d)
+                .position(|row| row.iter().any(|x| x.to_f32().is_nan()));
+            (nan, first)
+        };
+        let kv_host = ctx.stream.clone_dtoh(&kv_unified.data)?;
+        let sw_end = config.sliding_window * d;
+        let chunk_end = (config.sliding_window + token_count) * d;
+        let (sw_n, sw_f) = seg(&kv_host[..sw_end]);
+        let (ck_n, ck_f) = seg(&kv_host[sw_end..chunk_end]);
+        let (cp_n, cp_f) = seg(&kv_host[chunk_end..]);
+        let (q_n, q_f) = seg(&ctx.stream.clone_dtoh(&q_prepared.data)?);
+        let (ring_n, ring_f) = seg(&ctx.stream.clone_dtoh(&*sw_window_cache)?);
+        let (src_n, src_f) = match compressed.filter(|_| compressed_count > 0) {
+            Some(c) => seg(&ctx.stream.clone_dtoh(&c.data)?),
+            None => (0, None),
+        };
+        eprintln!(
+            "[kvprobe] mode={mode:?} cr={compress_ratio} start_pos={start_pos} n={token_count} C={compressed_count} \
+             kv[sw]={sw_n}@{sw_f:?} kv[chunk]={ck_n}@{ck_f:?} kv[comp]={cp_n}@{cp_f:?} \
+             src ring={ring_n}@{ring_f:?} comp={src_n}@{src_f:?} q={q_n}@{q_f:?}"
+        );
+    }
+
     let mut indices = ctx
         .stream
         .alloc_zeros::<i32>(token_count * topk_unified)
