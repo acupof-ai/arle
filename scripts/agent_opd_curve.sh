@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# End-to-end agentic-OPD capability curve on the 27B student.
+#
+#   scripts/agent_opd_curve.sh <label>
+#
+# gen corpus (+self-check) -> baseline-envelope repeats -> train+held-out-eval
+# -> curve PNG/JSON. One H20 GPU. Plan:
+# docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md
+#
+# Required env:
+#   STUDENT_MODEL   student model dir (27B Qwen3.6-FP8 safetensors layout)
+# Optional env (full-run defaults; SMOKE=1 = 2-round sizing run):
+#   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0
+#   ROUNDS=16 SAMPLES=2 MAX_TURNS=8 MAX_TOKENS=768 EVAL_EVERY=2 EVAL_N=24
+#   TASK_LIMIT=12 WRITEBACK_CAP=8 BASE_REPEATS=2 DIFFICULTY=easy SEED=0
+set -euo pipefail
+
+LABEL=${1:?usage: agent_opd_curve.sh <label>}
+STUDENT_MODEL=${STUDENT_MODEL:?set STUDENT_MODEL to the student model dir}
+ARLE_BIN=${ARLE_BIN:-target/release/arle}
+OUT=${OUT_ROOT:-runs}/agent-opd-"$LABEL"
+GPU=${GPU:-0}
+
+if [[ ${SMOKE:-0} == 1 ]]; then
+    ROUNDS=${ROUNDS:-2} SAMPLES=${SAMPLES:-2} EVAL_EVERY=${EVAL_EVERY:-1}
+    EVAL_N=${EVAL_N:-8} TASK_LIMIT=${TASK_LIMIT:-4} BASE_REPEATS=${BASE_REPEATS:-0}
+else
+    ROUNDS=${ROUNDS:-16} SAMPLES=${SAMPLES:-2} EVAL_EVERY=${EVAL_EVERY:-2}
+    EVAL_N=${EVAL_N:-24} TASK_LIMIT=${TASK_LIMIT:-12} BASE_REPEATS=${BASE_REPEATS:-2}
+fi
+MAX_TURNS=${MAX_TURNS:-8} MAX_TOKENS=${MAX_TOKENS:-768}
+WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
+
+command -v python3 >/dev/null || { echo "python3 missing" >&2; exit 1; }
+python3 -m pytest --version >/dev/null 2>&1 || { echo "pytest missing (scoring needs it)" >&2; exit 1; }
+[[ -x $ARLE_BIN ]] || { echo "arle binary missing at $ARLE_BIN" >&2; exit 1; }
+
+mkdir -p "$OUT"
+echo "[curve] out=$OUT rounds=$ROUNDS samples=$SAMPLES tasks=$TASK_LIMIT eval_n=$EVAL_N gpu=$GPU"
+
+# 1. Corpus (deterministic; self-check = base-FAILS / gold-PASSES gate).
+python3 scripts/gen_agent_opd_tasks.py \
+    --out "$OUT/corpus" --seed "$SEED" --difficulty "$DIFFICULTY" --self-check
+
+train_args=(
+    train agent-opd
+    --student-model "$STUDENT_MODEL"
+    --dataset "$OUT/corpus/tasks_train.jsonl"
+    --staged-root "$OUT/corpus/staged"
+    --work-root "$OUT/work"
+    --task-limit "$TASK_LIMIT"
+    --eval-dataset "$OUT/corpus/tasks_eval.jsonl"
+    --eval-n "$EVAL_N"
+    --samples-per-prompt "$SAMPLES"
+    --max-turns "$MAX_TURNS"
+    --max-tokens "$MAX_TOKENS"
+    --bash-timeout-secs 30
+    --test-timeout-secs 60
+    --writeback-cap "$WRITEBACK_CAP"
+    --rollout-temperature 1.0
+    --rollout-seed "$SEED"
+    --lora-rank 16
+    --lora-alpha 32
+    --lora-target-set attention-qv
+    --save-lora-adapters "$OUT/adapters"
+    --save-every 0
+)
+
+# 2. Baseline non-determinism envelope: same-config eval-only repeats
+#    (--rounds 0 runs just the round-0 baseline eval, trains nothing).
+for i in $(seq 1 "$BASE_REPEATS"); do
+    echo "[curve] baseline envelope repeat $i/$BASE_REPEATS"
+    CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" "${train_args[@]}" \
+        --rounds 0 --eval-every 0 --eval-out-dir "$OUT/base_rep$i" \
+        2>&1 | tee "$OUT/base_rep$i.log"
+done
+
+# 3. The training run (baseline eval + per-round held-out evals inside).
+CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" "${train_args[@]}" \
+    --rounds "$ROUNDS" --eval-every "$EVAL_EVERY" --eval-out-dir "$OUT/eval" \
+    2>&1 | tee "$OUT/train.log"
+
+# 4. Curve.
+base_extra=()
+for d in "$OUT"/base_rep*/; do [[ -d $d ]] && base_extra+=("$d"); done
+python3 scripts/plot_agent_opd_curve.py \
+    --eval-dir "$OUT/eval" --train-log "$OUT/train.log" \
+    ${base_extra:+--baseline-extra "${base_extra[@]}"} \
+    --out "$OUT/curve.png"
+
+echo "[curve] done: $OUT/curve.png $OUT/curve.json"
