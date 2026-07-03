@@ -5273,6 +5273,25 @@ pub(crate) fn mla_attention_prepare(
         }
     };
 
+    // TEMP #146 probe (self-gating; revert after the run): dump the LAST query
+    // row's DSA top-k selection per CSA layer — discriminates a
+    // scoring/selection bug (needle block absent from sel) from a
+    // gather/translation bug (present but content garbled) for the retrieval
+    // corruption past index_topk*cr = 2048 tokens.
+    if let Some(sel) = selected.as_ref()
+        && token_count > 1
+        && env_flag("ARLE_DSV4_DSA_TOPK_PROBE")?
+    {
+        ctx.sync()?;
+        let host: Vec<i32> = ctx.stream.clone_dtoh(sel)?;
+        let k = config.index_topk;
+        let last = &host[host.len().saturating_sub(k)..];
+        let line = format!(
+            "[dsaprobe] pid={} layer={layer_idx} sp={start_pos} n={token_count} sel={last:?}\n",
+            std::process::id()
+        );
+        eprint!("{line}");
+    }
     Ok(Dsv4MlaPrepared {
         q_prepared,
         k_prepared,
