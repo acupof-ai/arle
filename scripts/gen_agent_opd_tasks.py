@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -1220,8 +1221,12 @@ def jsonl_row(task, difficulty):
 
 
 def run(cmd, cwd):
+    # No bytecode: a stale __pycache__ (same mtime-second + size after the
+    # gold patch) runs pre-patch bytecode — flaked on-pod for the two
+    # byte-length-preserving bugs (stock-restock, pricing-discount).
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     return subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, check=False
+        cmd, cwd=cwd, capture_output=True, text=True, check=False, env=env
     )
 
 
