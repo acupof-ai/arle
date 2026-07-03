@@ -206,7 +206,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut slot_swap_key = None;
         let demoted_seq_len = self.kv.seq_len(slot);
         if self.kv_tier_capacity() > 0 {
-            published = self.publish_prefix_blocks(slot, &request);
+            published = self.publish_prefix_blocks(slot, &request.prompt_tokens);
         } else if self.executor.kv_slot_tier_enabled()
             && matches!(request.phase, RequestPhase::Decoding)
             && demoted_seq_len > 0
