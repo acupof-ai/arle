@@ -156,10 +156,13 @@ pub(crate) fn json_object_len(s: &str) -> Option<usize> {
 /// Shares the exact decoding contract used by [`parse_tool_calls`].
 pub(crate) fn parse_tool_call_block(json_str: &str) -> Option<ToolCall> {
     let value = serde_json::from_str::<Value>(json_str).ok()?;
+    // A nameless payload is unroutable — prose *about* tool calls (e.g. an
+    // example JSON in an explanation), not a call.
     let name = value
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or("")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?
         .to_string();
     let arguments = value
         .get("arguments")
@@ -405,11 +408,25 @@ fn extract_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                     } else {
                         calls.push(call);
                     }
+                } else {
+                    // Unparseable / nameless payload — a mention, not a call:
+                    // keep the literal text instead of swallowing it.
+                    out.push_str(tag);
+                    out.push_str(&after[..consumed]);
                 }
                 rest = &after[consumed..];
             }
             None => {
-                rest = "";
+                // No parseable JSON after the opener. A `{` adjacent to the
+                // opener is a truncated real call — drop it, don't leak
+                // half-JSON. Anything else is a literal tag mention: keep it.
+                match after.find('{') {
+                    Some(b) if after[..b].trim().is_empty() => rest = "",
+                    _ => {
+                        out.push_str(tag);
+                        rest = after;
+                    }
+                }
             }
         }
     }
