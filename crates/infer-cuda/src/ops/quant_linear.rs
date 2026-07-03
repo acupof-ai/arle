@@ -647,44 +647,6 @@ pub(super) fn gemv(
 
     unsafe {
         match weight.weight_format {
-            WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
-                let qw = weight
-                    .qweight
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("{} missing qweight", weight.weight_format))?;
-                let scales = weight
-                    .dsv4_scales
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("{} missing dsv4_scales", weight.weight_format))?;
-                let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
-                let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
-                let res = match weight.weight_format {
-                    WeightFormat::Dsv4Fp8BlockScaled => ffi::dsv4_fp8_gemv_cuda(
-                        qw_ptr as *const u8,
-                        scales_ptr as *const u8,
-                        x_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        weight.rows as i32,
-                        weight.cols as i32,
-                        weight.dsv4_scale_rows as i32,
-                        weight.dsv4_scale_cols as i32,
-                        stream,
-                    ),
-                    WeightFormat::Dsv4Fp4BlockScaled => ffi::dsv4_fp4_gemv_cuda(
-                        qw_ptr as *const u8,
-                        scales_ptr as *const u8,
-                        x_ptr as *const ffi::Half,
-                        out_ptr as *mut ffi::Half,
-                        weight.rows as i32,
-                        weight.cols as i32,
-                        weight.dsv4_scale_rows as i32,
-                        weight.dsv4_scale_cols as i32,
-                        stream,
-                    ),
-                    _ => unreachable!(),
-                };
-                res.result()?;
-            }
             WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {
                 let qw = weight
                     .qweight_u8

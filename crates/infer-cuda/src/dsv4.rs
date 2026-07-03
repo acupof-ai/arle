@@ -796,7 +796,6 @@ pub(crate) struct Dsv4ForwardKeepalive {
 
 impl Dsv4ForwardKeepalive {
     fn new(active: bool) -> Self {
-        let active = active && std::env::var_os("ARLE_DSV4_DEEP_COPY_KEEPALIVE").is_some();
         Self {
             active,
             bf16: Vec::with_capacity(512),
@@ -2966,15 +2965,6 @@ impl Dsv4Model {
                         pack_pt_ptrs.reserve(n);
                         pack_page_tables.reserve(n);
                     }
-                    // #138 probe/fix: the per-row read below consumes the batched
-                    // build (P1a compressor-update + P1b DSA cache-write). Under
-                    // disabled event-tracking a build→read ordering/lifetime race
-                    // corrupts it at first-context-≥129 (lens-maskable). A full sync
-                    // here serializes build→read like the lens's per-step sync does.
-                    // Env-gated, default off (byte-identical A/B lever).
-                    if dsv4_dsa_build_sync_enabled() {
-                        ctx.sync()?;
-                    }
                     for r in 0..n {
                         if !full_flatten {
                             let src = normed.data.slice(r * hidden_size..(r + 1) * hidden_size);
@@ -4926,7 +4916,7 @@ impl Dsv4Model {
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let use_deepep_transport = dsv4_use_deepep_transport()?;
-        let mut keepalive = Dsv4ForwardKeepalive::new(seq_len == 1);
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
         // DEBUG: catch any deferred CUDA error from init/boot before first forward op.
         if use_deepep_transport {
@@ -6522,18 +6512,6 @@ fn dsv4_use_deepep_transport() -> Result<bool> {
 fn dsv4_decode_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_DECODE_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
-/// #138 A/B lever: force a full context sync between the batched compressed/DSA
-/// build (P1a/P1b prepass) and the per-row read that consumes it, serializing
-/// the build→read boundary the way the probe lens's per-step sync accidentally
-/// does. Default off = byte-identical. On → tests whether the context-129 NaN
-/// wall is an ordering/lifetime race (wall clears) or deterministic (wall stays).
-fn dsv4_dsa_build_sync_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_DSA_BUILD_SYNC").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }

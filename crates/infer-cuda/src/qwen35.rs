@@ -22,7 +22,7 @@
 //! (`errors/2026-05-30-gated-delta-short-seq-prefill-hang-h20.md`).
 //!
 //! Precision: BF16 (the shared `moe::moe_forward` grouped GEMM). The two MoE swap
-//! points for FP8 (`dsv4_fp8_grouped_gemm`) / 4-bit (Qwen3.6-4bit q4k) are inside
+//! points for FP8 / 4-bit (Qwen3.6-4bit q4k) are inside
 //! [`crate::moe::moe_forward`]'s two `moe_bf16_grouped_gemm_*` calls — a follow-up.
 
 use std::borrow::Cow;

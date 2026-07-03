@@ -2,8 +2,6 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub fn dsv4_zero_bf16_cuda(data: *mut Half, elements: i32, stream: CUstream) -> CUresult;
-
     pub fn dsv4_swiglu_clamped_routes_cuda(
         gate: *const Half,
         up: *const Half,
@@ -25,15 +23,6 @@ unsafe extern "C" {
         hidden_dim: i32,
         local_expert_start: i32,
         experts_per_rank: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_dequantize_fp8_rows_to_bf16_cuda(
-        input: *const u8,
-        scales: *const f32,
-        output: *mut Half,
-        rows: i32,
-        cols: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -104,13 +93,6 @@ unsafe extern "C" {
     pub fn dsv4_cast_i32_to_i64_cuda(
         src: *const i32,
         dst: *mut i64,
-        n: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_cast_i64_to_i32_cuda(
-        src: *const i64,
-        dst: *mut i32,
         n: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -209,13 +191,6 @@ unsafe extern "C" {
         packed_route_slot: *mut i32,
         packed_meta: *mut i32,
         total_routes: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn dsv4_fill_i32_cuda(
-        data: *mut i32,
-        value: i32,
-        elements: i32,
         stream: CUstream,
     ) -> CUresult;
 

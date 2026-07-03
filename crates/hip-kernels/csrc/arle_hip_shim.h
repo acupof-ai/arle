@@ -9,10 +9,9 @@
 //   crates/cuda-kernels/csrc/misc/{dsv4_attention,dsv4_mhc,elementwise_basic,
 //                                  norm,sampling}.cu
 //   crates/cuda-kernels/csrc/attention/decode_prep_paged.cu
-//   crates/cuda-kernels/csrc/gemm/{dsv4_grouped_gemm,moe_grouped_gemm,
-//                                  quantized_gemv}.cu
+//   crates/cuda-kernels/csrc/gemm/{moe_grouped_gemm,quantized_gemv}.cu
 //   crates/cuda-kernels/csrc/common.cuh
-//   crates/hip-kernels/csrc/{iq2_mmvq,quantized_gemv_mma_stub}.cu
+//   crates/hip-kernels/csrc/iq2_mmvq.cu
 //
 // Basic-op additions (norm/sampling/quantized_gemv, 2026-06-10) introduce NO
 // new CUDA APIs beyond this inventory: bf16 conversions, __ldg, full-mask
