@@ -156,29 +156,37 @@ fn run_captured(
     // fixed by stream_synchronize, this is the NEXT blocker on the same loop). The
     // standalone `setsid` binary creates the new session AFTER `exec`, so there is
     // no in-child hook and the spawn stays fork-safe.
-    let prog = command.get_program().to_owned();
-    let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
-    let envs: Vec<_> = command
-        .get_envs()
-        .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
-        .collect();
-    let cwd = command.get_current_dir().map(|d| d.to_owned());
+    // macOS has no standalone `setsid` binary: spawn directly there (the timeout
+    // still kills the direct child; only backgrounded grandchildren can outlive
+    // it). Linux — the production lane — keeps the full session re-parent + kill.
+    let mut command = if cfg!(target_os = "linux") {
+        let prog = command.get_program().to_owned();
+        let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
+        let envs: Vec<_> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        let cwd = command.get_current_dir().map(|d| d.to_owned());
 
-    let mut command = Command::new("setsid");
-    command.arg(prog).args(args);
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    for (key, val) in envs {
-        match val {
-            Some(v) => {
-                command.env(key, v);
-            }
-            None => {
-                command.env_remove(key);
+        let mut wrapped = Command::new("setsid");
+        wrapped.arg(prog).args(args);
+        if let Some(dir) = cwd {
+            wrapped.current_dir(dir);
+        }
+        for (key, val) in envs {
+            match val {
+                Some(v) => {
+                    wrapped.env(key, v);
+                }
+                None => {
+                    wrapped.env_remove(key);
+                }
             }
         }
-    }
+        wrapped
+    } else {
+        command
+    };
     command
         .stdin(Stdio::null())
         .stdout(stdout_handle)
@@ -195,6 +203,7 @@ fn run_captured(
             None => {
                 if Instant::now() >= deadline {
                     killed = true;
+                    let _ = child.kill(); // direct child (the whole tree on Linux, via the group kill below)
                     kill_group(pgid);
                     let _ = child.wait();
                     break None;
@@ -298,15 +307,31 @@ impl SandboxToolExecutor {
     }
 }
 
+/// Non-empty string argument. Missing args get a schema-naming error (see
+/// TOOL_SCHEMAS): the decoded 0-accept wall (errors/2026-06-29) included `read`
+/// called with `command` instead of `path`, and the old fallback-to-"" error
+/// never taught the student the real schema.
+fn arg<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
+    call.arguments
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+const TOOL_SCHEMAS: &str =
+    "read(path, start?, end?), write(path, content), replace(path, old, new), bash(command)";
+
+fn schema_err(name: &str, key: &str) -> String {
+    format!("ERROR: {name} requires `{key}` — available tools: {TOOL_SCHEMAS}")
+}
+
 impl ToolExecutor for SandboxToolExecutor {
     fn execute(&self, call: &ToolCall) -> String {
         match call.name.as_str() {
             "read" => {
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some(path) = arg(call, "path") else {
+                    return schema_err("read", "path");
+                };
                 let start = call.arguments.get("start").and_then(|v| v.as_i64());
                 let end = call.arguments.get("end").and_then(|v| v.as_i64());
                 let resolved = match self.resolve(path) {
@@ -323,11 +348,9 @@ impl ToolExecutor for SandboxToolExecutor {
                 format_read(&contents, path, start, end)
             }
             "write" => {
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some(path) = arg(call, "path") else {
+                    return schema_err("write", "path");
+                };
                 let content = call
                     .arguments
                     .get("content")
@@ -348,16 +371,12 @@ impl ToolExecutor for SandboxToolExecutor {
                 }
             }
             "replace" => {
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let old = call
-                    .arguments
-                    .get("old")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some(path) = arg(call, "path") else {
+                    return schema_err("replace", "path");
+                };
+                let Some(old) = arg(call, "old") else {
+                    return schema_err("replace", "old");
+                };
                 let new = call
                     .arguments
                     .get("new")
@@ -379,16 +398,11 @@ impl ToolExecutor for SandboxToolExecutor {
                     },
                 }
             }
-            "bash" => {
-                let cmd = call
-                    .arguments
-                    .get("cmd")
-                    .or_else(|| call.arguments.get("command"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                self.run_bash(cmd)
-            }
-            other => format!("Error: unknown tool '{other}'"),
+            "bash" => match arg(call, "cmd").or_else(|| arg(call, "command")) {
+                Some(cmd) => self.run_bash(cmd),
+                None => schema_err("bash", "command"),
+            },
+            other => format!("ERROR: unknown tool '{other}' — available tools: {TOOL_SCHEMAS}"),
         }
     }
 }
@@ -720,6 +734,31 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "run_bash blocked {}s on a backgrounded child — the pipe-hang regressed",
             elapsed.as_secs()
+        );
+    }
+
+    #[test]
+    fn missing_args_name_the_schema() {
+        // The decoded 0-accept vector: `read` called with `command` instead of
+        // `path` must come back naming the schema, not "is a directory".
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = SandboxToolExecutor::new(tmp.path().to_path_buf(), 30, None);
+        for (name, args, key) in [
+            ("read", json!({"command": "ls"}), "path"),
+            ("write", json!({"content": "x"}), "path"),
+            ("replace", json!({"path": "a.py"}), "old"),
+            ("bash", json!({}), "command"),
+        ] {
+            let out = exec.execute(&call(name, args));
+            assert!(
+                out.contains(&format!("{name} requires `{key}`")) && out.contains("read(path"),
+                "{name} error must name `{key}` + the schemas: {out}"
+            );
+        }
+        let out = exec.execute(&call("grep", json!({"pattern": "x"})));
+        assert!(
+            out.contains("unknown tool 'grep'") && out.contains("bash(command)"),
+            "unknown tool must list the real tools: {out}"
         );
     }
 

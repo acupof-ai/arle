@@ -166,6 +166,8 @@ files and understand the failure).
 editing a file; do not refactor unrelated code.
 3. Do NOT run the hidden tests — they are not present and will be applied at \
 scoring time. Do not try to write or guess the tests.
+If you have not edited a file within your first 5 tool calls, STOP exploring \
+and apply your best minimal fix NOW — an imperfect edit beats no edit.
 4. Only after you have edited a file, reply with a short final message stating \
 what you changed and why.
 
