@@ -126,9 +126,11 @@ Per decode step (~50.7 ms GPU-busy/rank, 2.34 committed tok/step, 25.6 ms/tok):
 | **G3 — `dsv4_mhc_params` 9.5 % (#143)** | MODEL1 hyper-connection mixer | 9.5 % | serial threadIdx.x==0 tail (dsv4_mhc.cu:151) → parallelize across the block + fold 2 launches→1. NOT cacheable (audit killed that: reads the evolving residual). |
 | H1/H2 (collectives) | — | 1.3–6.7 % | demoted; revisit only if G1 shrinks the GEMV floor enough that 6.7 % matters. |
 
-Both correctness blockers must clear before G1/G2 A/Bs: **#138** (ctx-129
-NaN, eager lane) gates any MTP-off measurement; **#140** (MTP crash ~613
-ticks) gates any sustained MTP-on run.
+Both correctness blockers are now CLEAR: **#138** FIXED (`954d9905` — the
+compressor `ape` was FP8 with a 1-element dummy `.data`, read OOB as bf16;
+dequant to bf16; needle 3/3 >128 verified) and **#140** FIXED (`90cef35e`
+MTP self-heal). **The performance gate is OPEN** — G1/G2 A/Bs and the full
+guidellm sweep (TTFT/TPOT/throughput) can now run on a coherent model.
 
 ## Phase 2 — levers (enumerated, NOT ranked; order = Phase-1 shares)
 
