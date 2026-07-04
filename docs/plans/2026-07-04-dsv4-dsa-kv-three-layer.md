@@ -1,14 +1,24 @@
 # DSv4 KV storage — audit + map single-sourcing
 
-> Status: Shipped — 2026-07-05. The refactor is complete at P1/P2/P4. Audit
-> conclusion: DSv4 KV storage access is correct/race-free [V], the one real debt
-> (duplicated block map) is single-sourced, and there is **no remaining KV-storage
-> architecture work** — the "collapse to one FP8 value pool" redesign was dropped
-> (both premises wrong, §Retracted) and the budget layer is a fail-closed capacity
-> gate, not a correctness or architecture issue. Two things remain but are NOT this
-> refactor: #146 (a value-content bug) and long-context VRAM headroom (capacity). Every
-> claim is tagged **[V]** verified (code/measured, file:line) or **[I]** inferred
-> (follows from code, not measured); no untagged conclusions.
+> Status: Shipped — 2026-07-05, pod-verified same day. The refactor is complete at
+> P1/P2/P4. Audit conclusion: DSv4 KV storage access is correct/race-free [V], the
+> one real debt (duplicated block map) is single-sourced, and there is **no
+> remaining KV-storage architecture work** — the "collapse to one FP8 value pool"
+> redesign was dropped (both premises wrong, §Retracted) and the budget layer is a
+> fail-closed capacity gate, not a correctness or architecture issue. Two things
+> remain but are NOT this refactor: #146 (a value-content bug) and long-context VRAM
+> headroom (capacity). Every claim is tagged **[V]** verified (code/measured,
+> file:line) or **[I]** inferred (follows from code, not measured); no untagged
+> conclusions.
+>
+> **Pod needle gate** (2000/4000/8000/8500 tokens, crossing the 2048 comp-row
+> boundary): all-exact, no partial/miss — PASS. 32K leg blocked by an orthogonal
+> pre-existing TP=4 engine hang (control-verified against pre-P1 `c89c26ae`, not a
+> regression from this diff); recommend re-testing at TP=8/EP=8. Review during this
+> verification also found the P4 shape guard wired into only 1 of 3 live
+> `CompressedSparse` call sites (missing the default batched-decode lane and the
+> graph-decode lane) — fixed same day. Full write-up:
+> [wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md](../experience/wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md).
 
 ## Audit — storage access is race-free on every path  [V]
 
