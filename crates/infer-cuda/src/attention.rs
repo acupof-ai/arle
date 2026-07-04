@@ -4254,6 +4254,22 @@ pub(crate) fn mla_attention_decode_graph(
             .expect("indexer state checked above")
             .compressed
             .seq_len;
+        // #146 Index-layer guard (mirrors `mla_attention_prepare`'s eager-lane
+        // check): this decode-graph lane is CompressedSparse-only (asserted
+        // above), so the gate is unconditional — no GLM/frozen-verify path
+        // reaches here to false-fire on.
+        {
+            let value_rows = state
+                .compressor
+                .as_ref()
+                .map(|s| s.compressed.seq_len)
+                .unwrap_or(0);
+            ensure!(
+                indexer_rows_after == value_rows,
+                "DSv4 CSA select boundary (decode-graph): indexer rows {indexer_rows_after} != \
+                 value compressor rows {value_rows} (Shape drift — #146 guard)"
+            );
+        }
         let shared =
             dsa_shared.ok_or_else(|| anyhow!("DSv4 graph CSA shared DSA scratch missing"))?;
         // Read-only constants for the graph-safe read lane (slot index + key
@@ -5930,6 +5946,23 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                 .as_ref()
                 .map(|s| s.compressed.seq_len)
                 .unwrap_or(0);
+            // #146 Index-layer guard (mirrors `mla_attention_prepare`'s eager-lane
+            // check): this is the batched-decode twin of that function — same
+            // `Dsv4LayerAttentionState`, same CSA row-count invariant. No
+            // `chain_verify`/frozen-compressor lane exists on this path, so the
+            // gate is mode-only.
+            if mode == DeepSeekV4AttentionMode::CompressedSparse {
+                let value_rows = state
+                    .compressor
+                    .as_ref()
+                    .map(|s| s.compressed.seq_len)
+                    .unwrap_or(0);
+                ensure!(
+                    indexer_rows_after == value_rows,
+                    "DSv4 CSA select boundary (batched): indexer rows {indexer_rows_after} != \
+                     value compressor rows {value_rows} (Shape drift — #146 guard)"
+                );
+            }
             let keys_capacity = state
                 .indexer
                 .as_ref()
